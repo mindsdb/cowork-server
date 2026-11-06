@@ -38,7 +38,7 @@ from cowork.turnqueue.auth_keys import (
     register_datasource_grants,
 )
 from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
-from cowork.streaming.turn_index import record_turn
+from cowork.streaming.turn_index import record_channel_turn
 from cowork.turnqueue.redis_client import cancel_cause_key, cancel_flag_key, get_redis, reply_stream_key
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
@@ -755,9 +755,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # correlation_id to cancel it, its org to authorize the caller. Recorded
     # here rather than after the first buffer record, because this generator
     # does not own the buffer; _shared_turn covers the gap between the two.
+    # A turn with a run id was recorded by RunRegistry.start, which holds the
+    # conversation's claim; one without is skipped while such a run holds it.
     if run_id is None:
-        await record_turn(
-            conversation_id, turn_id=turn_id, correlation_id=corr,
+        await record_channel_turn(
+            conversation_id=conversation_id, turn_id=turn_id, correlation_id=corr,
             org_id=org_id, user_id=user_id, client=r,
         )
 

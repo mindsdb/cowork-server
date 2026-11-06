@@ -21,11 +21,16 @@ class FakeRequest:
 class QueuedPipeline:
     """``pipeline()`` for a hand-written fake Redis client: each command is
     queued, then run in order against that client's own async method on
-    ``execute()``, so the fake records it as if it were called directly."""
+    ``execute()``, so the fake records it as if it were called directly.
+
+    As redis-py's pipeline does, ``watch()`` switches it to running each
+    command at once, until ``multi()`` starts queueing again. The fake keeps
+    no keys, so a watched key never changes."""
 
     def __init__(self, client) -> None:
         self._client = client
         self._commands: list[tuple[str, tuple, dict]] = []
+        self._watching = False
 
     async def __aenter__(self):
         return self
@@ -33,7 +38,16 @@ class QueuedPipeline:
     async def __aexit__(self, *_exc) -> None:
         return None
 
+    async def watch(self, *_keys) -> None:
+        self._watching = True
+
+    def multi(self) -> None:
+        self._watching = False
+
     def __getattr__(self, name: str):
+        if self._watching:
+            return getattr(self._client, name)
+
         def queue(*args, **kwargs):
             self._commands.append((name, args, kwargs))
             return self

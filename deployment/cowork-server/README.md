@@ -176,6 +176,17 @@ reads no reply the controller sends after that and saves nothing. Ending the
 answer, saving it and stopping its sandbox turn leaves the user a saved answer
 to retry from instead of one that never ends.
 
+Each answer holds its conversation's turn claim in Redis while it runs, so a
+second question that reaches another pod is refused with `409` (README.md, the
+`turn_in_progress` refusal). A pod that stops this way releases each claim once
+the answer's stream has its last frame. A pod that never runs the steps above
+(a SIGKILL, an OOM kill, a lost node) releases nothing, so a question sent into
+one of its conversations is refused with `409` until that claim lapses, 70 s
+after the pod's last renewal. A liveness restart keeps the pod's name, and the
+new container releases the claims its pod left as it starts. That relies on one
+uvicorn process per pod, which `tests/test_turn_claim.py` pins for the image's
+command.
+
 Desktop and other non-hosted deployments are unchanged. They run turns in the
 server's own process, keep uvicorn's SIGTERM handling, and end their turns in
 the lifespan teardown, as before. A single-replica PR environment renders these

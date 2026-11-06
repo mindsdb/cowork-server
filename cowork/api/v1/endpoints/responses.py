@@ -9,6 +9,7 @@ An originating POST with cancel_on_disconnect=true owns its run and cancels
 that instance on transport loss. Tail readers never own the run. Explicit
 POST /responses/cancel remains available with an optional run-instance guard.
 """
+import asyncio
 import time
 from typing import Annotated, NamedTuple
 from uuid import UUID
@@ -38,6 +39,7 @@ from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import cancel_disconnected_run, cancel_run, request_cancel
 from cowork.streaming.disconnect import DisconnectStreamingResponse, DisconnectWatch
 from cowork.streaming.buffer import RedisStreamBuffer
+from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, TurnClaimUnavailable, live_holder
 from cowork.streaming.turn_index import TurnOwner, get_turn, list_turns
 from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
 from cowork.turnqueue.redis_client import (
@@ -206,14 +208,20 @@ async def options_handler():
     )
 
 
-def _refuse_while_answering(*, conversation: str | None, scope: TenantScope) -> None:
+async def _refuse_while_answering(*, conversation: str | None, scope: TenantScope) -> None:
     """Refuse a question into a conversation whose turn is still answering.
 
     Runs before any database read and before the routing gate, so the refusal
-    costs nothing. RunRegistry.start repeats the check under its lock for a
-    request that gets past this one while the running turn is still in its
-    own gate. Where conversations are partitioned only the caller's own turn
-    counts, so the refusal never reveals someone else's.
+    costs at most one Redis read. RunRegistry.start repeats the check under
+    its lock for a request that gets past this one while the running turn is
+    still in its own gate. Where conversations are partitioned only the
+    caller's own turn counts, so the refusal never reveals someone else's.
+
+    On the Redis backend a turn another replica runs counts too, read from the
+    conversation's turn claim (turn_claim.live_holder). Its owner comes from
+    the turn index entry its run wrote, so where conversations are partitioned
+    a claim whose entry does not name that run yet is left to start(). Raises
+    TurnClaimUnavailable when Redis cannot answer.
     """
     if not conversation:
         return
@@ -225,6 +233,23 @@ def _refuse_while_answering(*, conversation: str | None, scope: TenantScope) -> 
     handle = _authorized_handle(registry.get(conversation_id), scope)
     if handle is not None and handle.is_answering:
         raise TurnInProgress(conversation_id=conversation_id, turn_id=handle.turn_id)
+    if get_backend() != "redis":
+        return
+    holder = await live_holder(conversation_id=conversation_id)
+    if holder is None:
+        return
+    if scope.partitioned_for(PersonalResource.CONVERSATIONS):
+        try:
+            async with asyncio.timeout(REDIS_CALL_SECONDS):
+                turn = await get_turn(conversation_id)
+        except Exception as exc:
+            raise TurnClaimUnavailable(conversation_id=conversation_id) from exc
+        if (
+            turn is None or turn.get("run_id") != holder.run_id
+            or not _owner_matches(TurnOwner.from_index(turn), scope)
+        ):
+            return
+    raise TurnInProgress(conversation_id=conversation_id, turn_id=holder.turn_id)
 
 
 @router.post("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
@@ -235,7 +260,7 @@ async def responses(
 ):
     # No request session: the handler runs its reads as short units, so no
     # connection stays checked out for the stream this returns.
-    _refuse_while_answering(
+    await _refuse_while_answering(
         conversation=responses_request.conversation, scope=scope_from_principal(principal)
     )
     handler = ResponsesHandler(principal=principal, mindshub_bearer=caller_bearer(request))

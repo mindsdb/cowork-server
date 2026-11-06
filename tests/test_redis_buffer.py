@@ -292,3 +292,102 @@ async def test_a_live_turn_is_not_ended_by_a_quiet_stretch(fake_redis, monkeypat
     await asyncio.wait_for(task, timeout=5)
 
     assert [r.type for r in seen] == ["sse", "Done"]
+
+
+def _held_claim(conversation_id: str, turn_id: int) -> str:
+    from cowork.streaming.turn_claim import TurnClaim
+
+    return TurnClaim(
+        run_id="run-live", turn_id=turn_id, correlation_id="corr-live", pod="pod-a", started_at=1.0,
+    ).model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_turn_whose_claim_is_held_is_not_ended_by_its_readers(fake_redis, monkeypatch):
+    """A live run renews its turn claim while it waits, for instance on an
+    ask_user question nobody has answered. Its readers keep waiting through
+    the idle cut instead of ending the turn under it."""
+    from cowork.streaming.turn_claim import claim_key
+
+    monkeypatch.setattr(buffer_mod, "REDIS_TAIL_IDLE_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(RedisStreamBuffer, "_BLOCK_MS", 20)
+    await fake_redis.set(claim_key("asking"), _held_claim("asking", 1))
+    writer = RedisStreamBuffer(conversation_id="asking", turn_id=1)
+    await writer.append("sse", {"sse": "event: response.ask_user\ndata: {}\n\n"})
+    reader = RedisStreamBuffer(conversation_id="asking", turn_id=1)
+    seen = []
+
+    async def read():
+        async for rec in reader.tail(from_seq=0):
+            seen.append(rec)
+
+    task = asyncio.create_task(read())
+    await asyncio.sleep(0.3)   # many idle windows
+    assert not task.done()
+    await writer.close("completed")
+    await asyncio.wait_for(task, timeout=5)
+
+    assert [r.type for r in seen] == ["sse", "Done"]
+    entries = await fake_redis.xrange(stream_key("asking", 1))
+    assert [f["type"] for _id, f in entries] == ["sse", "Done"]
+
+
+@pytest.mark.asyncio
+async def test_a_claim_another_turn_number_holds_does_not_keep_a_dead_turn_open(fake_redis, monkeypatch):
+    """The conversation's next turn holds the claim; the turn before it,
+    whose replica died, is still ended by its reader."""
+    from cowork.streaming.turn_claim import claim_key
+
+    monkeypatch.setattr(buffer_mod, "REDIS_TAIL_IDLE_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(RedisStreamBuffer, "_BLOCK_MS", 20)
+    await fake_redis.set(claim_key("moved-on"), _held_claim("moved-on", 3))
+    writer = RedisStreamBuffer(conversation_id="moved-on", turn_id=1)
+    await writer.append("sse", {"sse": "event: a\ndata: {}\n\n"})
+
+    reader = RedisStreamBuffer(conversation_id="moved-on", turn_id=1)
+    seen = [rec async for rec in reader.tail(from_seq=0)]
+
+    assert seen[-1].type == "Interrupted"
+
+
+@pytest.mark.asyncio
+async def test_a_claim_that_cannot_be_read_keeps_the_readers_waiting(fake_redis, monkeypatch):
+    """Could not read is not absent: ending the turn on a guess would cut a
+    live answer."""
+    from cowork.streaming import turn_claim
+
+    monkeypatch.setattr(buffer_mod, "REDIS_TAIL_IDLE_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(RedisStreamBuffer, "_BLOCK_MS", 20)
+
+    async def unreadable(**_kwargs):
+        raise ConnectionError("Redis is unreachable")
+
+    monkeypatch.setattr(turn_claim, "claim_held_for_turn", unreadable)
+    writer = RedisStreamBuffer(conversation_id="blind", turn_id=1)
+    await writer.append("sse", {"sse": "event: a\ndata: {}\n\n"})
+    reader = RedisStreamBuffer(conversation_id="blind", turn_id=1)
+    task = asyncio.create_task(_drain(reader.tail(from_seq=0)))
+
+    await asyncio.sleep(0.2)
+    assert not task.done()
+    await writer.close("completed")
+    assert [r.type for r in await asyncio.wait_for(task, timeout=5)] == ["sse", "Done"]
+
+
+@pytest.mark.asyncio
+async def test_a_reader_never_closes_the_buffer_object_its_writer_holds(fake_redis, monkeypatch):
+    """On the replica running a turn, the POST stream and /tail read the
+    producer's own buffer object. When the idle cut does end the turn (its
+    claim gone), the terminal record goes to the stream, and the producer's
+    object stays open, so the registry still sees the turn answering and
+    refuses a second question until the producer ends."""
+    monkeypatch.setattr(buffer_mod, "REDIS_TAIL_IDLE_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(RedisStreamBuffer, "_BLOCK_MS", 20)
+    writer = RedisStreamBuffer(conversation_id="own", turn_id=1)
+    await writer.append("sse", {"sse": "event: a\ndata: {}\n\n"})
+
+    seen = [rec async for rec in writer.tail(from_seq=0)]
+
+    assert seen[-1].type == "Interrupted"
+    assert writer.is_closed is False
+    assert writer.latest_seq == 1

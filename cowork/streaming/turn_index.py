@@ -1,16 +1,19 @@
 """Which turn is current for each conversation, readable from any replica.
 
-A lookup table, not a lock. Nothing here decides who may run a turn:
-scratchpad-controller already serialises execution per conversation, and
-whether a turn is still going is answered by its buffer, whose terminal record
-any replica can read.
+A lookup table, not a lock. Nothing here decides who may run a turn: the
+conversation's turn claim does (turn_claim), and RunRegistry.start writes a
+run's entry only once that run holds the claim. Whether a turn is still going
+is answered by its buffer, whose terminal record any replica can read.
 
 This exists so a replica that did not start a turn can still find its turn_id,
 to open the right buffer, its correlation_id, to cancel it, and its org, to
-authorize the caller.
+authorize the caller. ``saved_question`` and ``question_id`` say the turn saved
+its question, and which row; RunRegistry.start reads the first to refuse a
+start whose history read predates that save.
 
 Keys:
-    cowork:turn:{conversation_id}   HASH turn_id, run_id, correlation_id, org_id, user_id, started_at
+    cowork:turn:{conversation_id}   HASH turn_id, run_id, correlation_id, org_id, user_id, started_at,
+                                         saved_question, question_id
     cowork:turns                    SET of conversation ids with a recorded turn
 """
 from __future__ import annotations
@@ -18,11 +21,14 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Mapping
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 from redis.asyncio import Redis
+from redis.asyncio.client import Pipeline
 from redis.exceptions import WatchError
 
+from cowork.streaming.turn_claim import claim_key
 from cowork.turnqueue.redis_client import get_redis, get_sync_redis
 
 logger = logging.getLogger(__name__)
@@ -57,6 +63,55 @@ class TurnOwner(BaseModel):
         return cls(org_id=turn.get("org_id") or None, user_id=turn.get("user_id") or None)
 
 
+class TurnIndexEntry(BaseModel):
+    """What admission reads from a turn's hash. A channel turn's entry has
+    no ``run_id``: no registry handle covers it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    turn_id: int
+    run_id: str | None
+    saved_question: bool
+    question_id: UUID | None
+
+    @classmethod
+    def from_index(cls, turn: Mapping[str, str]) -> TurnIndexEntry:
+        return cls(
+            turn_id=int(turn["turn_id"]),
+            run_id=turn.get("run_id") or None,
+            saved_question=turn.get("saved_question") == "1",
+            question_id=turn.get("question_id") or None,
+        )
+
+
+def _queue_record(
+    *,
+    pipe: Pipeline,
+    conversation_id: str,
+    turn_id: int,
+    correlation_id: str,
+    org_id: str | None,
+    user_id: str | None,
+    run_id: str | None,
+) -> None:
+    """Queue the writes that replace a conversation's entry on a MULTI.
+
+    One MULTI, so no reader finds the hash empty between its DELETE and its
+    HSET, which list_turns would read as an expired turn."""
+    key = _turn_key(conversation_id)
+    pipe.delete(key)
+    pipe.hset(key, mapping={
+        "turn_id": str(turn_id),
+        "correlation_id": correlation_id,
+        "org_id": org_id or "",
+        "user_id": user_id or "",
+        "started_at": str(time.time()),
+        **({"run_id": run_id} if run_id is not None else {}),
+    })
+    pipe.expire(key, TURN_INDEX_TTL_SECONDS)
+    pipe.sadd(_TURNS_SET, conversation_id)
+
+
 async def record_turn(
     conversation_id: str,
     *,
@@ -69,26 +124,76 @@ async def record_turn(
 ) -> None:
     """Note this turn as the conversation's current one, replacing any previous.
 
+    For a run that holds the conversation's turn claim (RunRegistry.start). A
+    turn no registry handle covers uses record_channel_turn.
+
     ``client`` lets a caller that already holds a Redis client reuse it, rather
     than this module reaching for a second one.
     """
     r = client or get_redis()
-    key = _turn_key(conversation_id)
-    # One MULTI, so no reader finds the hash empty between its DELETE and its
-    # HSET, which list_turns would read as an expired turn.
     async with r.pipeline(transaction=True) as pipe:
-        pipe.delete(key)
-        pipe.hset(key, mapping={
-            "turn_id": str(turn_id),
-            "correlation_id": correlation_id,
-            "org_id": org_id or "",
-            "user_id": user_id or "",
-            "started_at": str(time.time()),
-            **({"run_id": run_id} if run_id is not None else {}),
-        })
-        pipe.expire(key, TURN_INDEX_TTL_SECONDS)
-        pipe.sadd(_TURNS_SET, conversation_id)
+        _queue_record(
+            pipe=pipe, conversation_id=conversation_id, turn_id=turn_id, correlation_id=correlation_id,
+            org_id=org_id, user_id=user_id, run_id=run_id,
+        )
         await pipe.execute()
+
+
+async def record_channel_turn(
+    *,
+    conversation_id: str,
+    turn_id: int,
+    correlation_id: str,
+    org_id: str | None,
+    user_id: str | None,
+    client=None,
+) -> bool:
+    """record_turn for a turn no registry handle covers (a channel turn),
+    unless a run holds the conversation's turn claim. That run's entry is
+    what cancel and answer resolve through, so it is left as it is. True when
+    it wrote the entry."""
+    r = client or get_redis()
+    key = _turn_key(conversation_id)
+    claim = claim_key(conversation_id)
+    for _attempt in range(3):
+        try:
+            async with r.pipeline(transaction=True) as pipe:
+                await pipe.watch(claim, key)
+                if await pipe.exists(claim):
+                    return False
+                pipe.multi()
+                _queue_record(
+                    pipe=pipe, conversation_id=conversation_id, turn_id=turn_id, correlation_id=correlation_id,
+                    org_id=org_id, user_id=user_id, run_id=None,
+                )
+                await pipe.execute()
+                return True
+        except WatchError:
+            continue
+    raise WatchError(f"the turn index entry of {conversation_id} kept changing while it was recorded")
+
+
+async def stamp_question(
+    *, conversation_id: str, run_id: str, question_id: UUID | None, client=None,
+) -> bool:
+    """Note in ``run_id``'s entry that its turn saved its question, and which
+    row when known. Leaves another run's entry alone. True when it wrote."""
+    r = client or get_redis()
+    key = _turn_key(conversation_id)
+    fields = {"saved_question": "1", **({"question_id": str(question_id)} if question_id is not None else {})}
+    for _attempt in range(3):
+        try:
+            async with r.pipeline(transaction=True) as pipe:
+                await pipe.watch(key)
+                if await pipe.hget(key, "run_id") != run_id:
+                    return False
+                pipe.multi()
+                pipe.hset(key, mapping=fields)
+                await pipe.execute()
+                return True
+        except WatchError:
+            continue
+    raise WatchError(f"the turn index entry of {conversation_id} kept changing while it was stamped")
 
 
 async def get_turn(conversation_id: str) -> dict | None:

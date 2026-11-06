@@ -28,7 +28,9 @@ from weakref import WeakValueDictionary
 from uuid import UUID, uuid4
 
 from cowork.common.logger import log_context
+from cowork.streaming import turn_claim
 from cowork.streaming.buffer import StreamBuffer
+from cowork.streaming.turn_claim import TurnClaim, TurnClaimUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +165,10 @@ class TurnLifecycle:
     ``question_id`` is that row, once saved. A producer the turn is handed to
     (a direct answer that delegates to the agent) reuses it rather than saving
     the question a second time.
+
+    ``claim_lost`` means "another run now holds this conversation's turn
+    claim" (turn_claim.keep_claim), on the Redis backend only. Separate from
+    ``discarded``, which other code reads as "the conversation was deleted".
     """
 
     discarded: bool = False
@@ -174,6 +180,7 @@ class TurnLifecycle:
     question_id: UUID | None = None
     stalled: bool = False
     cancel_requested: bool = False
+    claim_lost: bool = False
     identity: RunIdentity = field(default_factory=RunIdentity)
 
 
@@ -200,6 +207,8 @@ class RunHandle:
     user_id: str | None = None
     # Shared with the producer coroutine, see TurnLifecycle.
     lifecycle: TurnLifecycle = field(default_factory=TurnLifecycle)
+    # The cross-replica claim start() took, on the Redis backend only.
+    claim: TurnClaim | None = None
 
     @property
     def run_id(self) -> str:
@@ -287,6 +296,35 @@ async def _stop_controller_turns(handles: list[RunHandle], *, timeout_seconds: f
     await asyncio.wait(writes, timeout=timeout_seconds)
 
 
+async def _publish_run(
+    *, conversation_id: str, turn_id: int, lifecycle: TurnLifecycle,
+    org_id: str | None, user_id: str | None,
+) -> None:
+    """Record a run start() admitted in the turn index, or remove it again
+    when that fails."""
+    from cowork.db.units import run_to_completion
+    from cowork.streaming.turn_index import record_turn
+
+    # Publish immutable identity before either the producer or its
+    # first reader can request cancellation. Dispatch never replaces it.
+    async def publish() -> None:
+        async with asyncio.timeout(5):
+            await record_turn(
+                conversation_id, turn_id=turn_id,
+                run_id=lifecycle.identity.run_id,
+                correlation_id=lifecycle.identity.correlation_id,
+                org_id=org_id, user_id=user_id,
+            )
+
+    try:
+        await run_to_completion(publish())
+    except BaseException:
+        # Setup can be cancelled while Redis has committed but not
+        # replied. Settle that write, then remove only this instance.
+        await _forget_unstarted_run(conversation_id, lifecycle.identity.run_id)
+        raise
+
+
 async def _forget_unstarted_run(conversation_id: str, run_id: str) -> None:
     """Remove a run start() published to the turn index but never started."""
     from cowork.streaming.turn_index import forget_run
@@ -296,6 +334,69 @@ async def _forget_unstarted_run(conversation_id: str, run_id: str) -> None:
             await forget_run(conversation_id, run_id)
     except Exception:
         logger.exception("Could not remove unstarted run %s", run_id)
+
+
+async def _stale_turn(
+    *, conversation_id: str, turn_id: int, existing: RunHandle | None, shared: bool,
+) -> int | None:
+    """The turn whose saved question makes a start at ``turn_id`` stale, or
+    None. See RunRegistry.start.
+
+    With one process the local handle answers. On the Redis backend the turn
+    index answers for every replica. It says a turn saved its question once
+    that turn released its claim; until then the claim refuses on its own.
+
+    The local handle still counts there, unless the index shows another
+    replica truncated the conversation since: discard_conversation forgets
+    the index entry, and a turn started after that carries a lower number
+    than the handle. Refusing on such a handle would refuse every send at its
+    number for as long as this process lives. A channel turn's entry carries
+    no run and no turn number of its own, so it shows nothing either way.
+    """
+    local = existing is not None and existing.lifecycle.saved_question and turn_id <= existing.turn_id
+    if not shared:
+        return existing.turn_id if local else None
+    from cowork.streaming.turn_index import TurnIndexEntry, get_turn
+
+    try:
+        async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
+            turn = await get_turn(conversation_id)
+    except Exception as exc:
+        raise TurnClaimUnavailable(conversation_id=conversation_id) from exc
+    if turn is None:
+        return None
+    entry = TurnIndexEntry.from_index(turn)
+    if entry.run_id is not None and entry.saved_question and turn_id <= entry.turn_id:
+        return entry.turn_id
+    if local and (entry.run_id in (None, existing.run_id) or entry.turn_id >= existing.turn_id):
+        return existing.turn_id
+    return None
+
+
+async def _end_claim(*, conversation_id: str, claim: TurnClaim, lifecycle: TurnLifecycle) -> None:
+    """Release a turn's claim, once its stream has a terminal record or the
+    turn was discarded. First notes in the turn index that the turn saved its
+    question, so another replica's stale-number check (_stale_turn) sees it
+    from the moment the claim is gone. Failures are logged; a claim left
+    behind lapses with its TTL."""
+    from cowork.streaming.turn_index import stamp_question
+
+    if lifecycle.saved_question and not lifecycle.discarded:
+        try:
+            async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
+                await stamp_question(
+                    conversation_id=conversation_id, run_id=claim.run_id, question_id=lifecycle.question_id,
+                )
+        except Exception:
+            logger.warning(
+                "Could not note a turn's saved question in the turn index.",
+                exc_info=True,
+                extra={
+                    "event": "turn_index_question_failed", "run_id": claim.run_id,
+                    **log_context(conversation_id=conversation_id),
+                },
+            )
+    await turn_claim.release_quietly(conversation_id=conversation_id, run_id=claim.run_id)
 
 
 async def _seal_interrupted(handle: RunHandle) -> None:
@@ -393,6 +494,16 @@ class RunRegistry:
         and removes the run it published to the turn index. An accepted start
         opens its buffer clear of the records of an earlier turn at the same
         number (backend.new_buffer).
+
+        On the Redis backend this process's memory is not the whole picture,
+        since another replica may run the conversation's turn. After the
+        checks above, start() takes the conversation's turn claim
+        (turn_claim.claim_turn) before it opens the buffer, and raises
+        TurnInProgress when another live run holds it. The stale-number check
+        reads the turn index there (_stale_turn). Raises TurnClaimUnavailable
+        when Redis cannot answer either. Only the claim's winner writes the
+        turn index, and every start refused after taking the claim releases
+        it.
         """
         loop = asyncio.get_running_loop()
         lock = self._start_locks.get(conversation_id)
@@ -409,56 +520,63 @@ class RunRegistry:
                     conversation_id, existing.turn_id,
                 )
                 raise TurnInProgress(conversation_id=conversation_id, turn_id=existing.turn_id)
-            if (
-                existing is not None and existing.lifecycle.saved_question
-                and turn_id <= existing.turn_id
-            ):
+            from cowork.streaming.backend import get_backend
+            published = get_backend() == "redis"
+            stale = await _stale_turn(
+                conversation_id=conversation_id, turn_id=turn_id, existing=existing, shared=published,
+            )
+            if stale is not None:
                 logger.info(
                     "Refused turn %d for conversation %s; it read the history before "
                     "turn %d saved its question.",
-                    turn_id, conversation_id, existing.turn_id,
+                    turn_id, conversation_id, stale,
                 )
-                raise TurnInProgress(conversation_id=conversation_id, turn_id=existing.turn_id)
+                raise TurnInProgress(conversation_id=conversation_id, turn_id=stale)
             if existing is not None and existing.is_running and not existing.buffer.is_closed:
                 # A final client frame is being written. Its reader can send
                 # the next question before the separate terminal record lands.
                 # Wait rather than refuse, and keep the old terminal out of a
                 # successor's buffer when a refused turn reused its number.
                 await asyncio.shield(asyncio.gather(existing.task, return_exceptions=True))
-            buffer = await open_buffer()
             lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
-            from cowork.streaming.backend import get_backend
-            published = get_backend() == "redis"
+            claim: TurnClaim | None = None
             if published:
-                from cowork.db.units import run_to_completion
-                from cowork.streaming.turn_index import record_turn
-                # Publish immutable identity before either the producer or its
-                # first reader can request cancellation. Dispatch never replaces it.
-                async def publish() -> None:
-                    async with asyncio.timeout(5):
-                        await record_turn(
-                            conversation_id, turn_id=turn_id,
-                            run_id=lifecycle.identity.run_id,
-                            correlation_id=lifecycle.identity.correlation_id,
-                            org_id=org_id, user_id=user_id,
-                        )
-
-                try:
-                    await run_to_completion(publish())
-                except BaseException:
-                    # Setup can be cancelled while Redis has committed but not
-                    # replied. Settle that write, then remove only this instance.
-                    await _forget_unstarted_run(conversation_id, lifecycle.identity.run_id)
-                    raise
-            # close() may have run during any await above. No await from this
-            # check to the registration below, so a shutdown that closed the
-            # registry either refuses this turn here or finds it in _by_cid.
-            if self._closed:
+                claim = turn_claim.new_claim(
+                    run_id=lifecycle.identity.run_id, turn_id=turn_id,
+                    correlation_id=lifecycle.identity.correlation_id,
+                    question_id=lifecycle.question_id,
+                )
+                claimed = await turn_claim.claim_turn(claim=claim, conversation_id=conversation_id)
+                if not claimed.acquired:
+                    logger.info(
+                        "Refused a turn; another replica's run holds the conversation.",
+                        extra={
+                            "event": "turn_claim_held", "holder_run_id": claimed.holder.run_id,
+                            "holder_pod": claimed.holder.pod,
+                            **log_context(conversation_id=conversation_id),
+                        },
+                    )
+                    raise TurnInProgress(conversation_id=conversation_id, turn_id=claimed.holder.turn_id)
+            try:
+                buffer = await open_buffer()
                 if published:
-                    await _forget_unstarted_run(conversation_id, lifecycle.identity.run_id)
-                raise self._shutdown_refusal(conversation_id)
+                    await _publish_run(
+                        conversation_id=conversation_id, turn_id=turn_id, lifecycle=lifecycle,
+                        org_id=org_id, user_id=user_id,
+                    )
+                # close() may have run during any await above. No await from this
+                # check to the registration below, so a shutdown that closed the
+                # registry either refuses this turn here or finds it in _by_cid.
+                if self._closed:
+                    if published:
+                        await _forget_unstarted_run(conversation_id, lifecycle.identity.run_id)
+                    raise self._shutdown_refusal(conversation_id)
+            except BaseException:
+                if claim is not None:
+                    await turn_claim.release_quietly(conversation_id=conversation_id, run_id=claim.run_id)
+                raise
             task = asyncio.create_task(
-                self._run_bounded(produce(buffer), buffer, conversation_id, turn_id, lifecycle),
+                self._run_bounded(produce(buffer), buffer, conversation_id, turn_id, lifecycle, claim=claim),
                 name=f"turn[{conversation_id}/{turn_id}]",
             )
             handle = RunHandle(
@@ -472,13 +590,14 @@ class RunRegistry:
                 # The SAME object the producer coroutine closed over, so
                 # discard() can tell it to drop the turn on the floor.
                 lifecycle=lifecycle,
+                claim=claim,
             )
             self._by_cid[conversation_id] = handle
             return handle
 
     async def _run_bounded(
         self, producer_coro, buffer: StreamBuffer, conversation_id: str, turn_id: int,
-        lifecycle: TurnLifecycle,
+        lifecycle: TurnLifecycle, *, claim: TurnClaim | None = None,
     ) -> None:
         """Run a producer under the idle bound (see module comment).
 
@@ -489,6 +608,12 @@ class RunRegistry:
         the producer, so
         ``RunHandle.cancel``/``discard`` still work; a producer that raises on
         its own propagates unchanged.
+
+        A turn that took a claim renews it beside the cancel watch
+        (turn_claim.keep_claim) and releases it here once its stream has a
+        terminal record, or once the turn was discarded. A turn that ends with
+        its stream open keeps its claim: shutdown() releases it after sealing
+        the stream, and otherwise it lapses with its TTL.
         """
         loop = asyncio.get_running_loop()
         task = asyncio.ensure_future(producer_coro)
@@ -532,6 +657,12 @@ class RunRegistry:
             asyncio.create_task(watch_cancel(task, buffer, lifecycle))
             if get_backend() == "redis" and not lifecycle.identity.remote else None
         )
+        claim_keeper = (
+            asyncio.create_task(turn_claim.keep_claim(
+                claim=claim, conversation_id=conversation_id, buffer=buffer, lifecycle=lifecycle,
+            ))
+            if claim is not None else None
+        )
         try:
             await task
         except asyncio.CancelledError:
@@ -546,10 +677,17 @@ class RunRegistry:
             # RunHandle.cancel is waiting to observe).
             watchdog.cancel()
             watchers = [watchdog]
-            if cancel_watch is not None:
-                cancel_watch.cancel()
-                watchers.append(cancel_watch)
+            for watcher in (cancel_watch, claim_keeper):
+                if watcher is not None:
+                    watcher.cancel()
+                    watchers.append(watcher)
             await asyncio.gather(*watchers, return_exceptions=True)
+            if claim is not None and (buffer.is_closed or lifecycle.discarded):
+                from cowork.db.units import run_to_completion
+
+                await run_to_completion(_end_claim(
+                    conversation_id=conversation_id, claim=claim, lifecycle=lifecycle,
+                ))
 
     def get(self, conversation_id: str) -> Optional[RunHandle]:
         """Current handle (incl. recently-finished, useful for replay)."""
@@ -684,6 +822,13 @@ class RunRegistry:
         for handle in handles:
             if handle.task.done() and not handle.lifecycle.discarded and not handle.buffer.is_closed:
                 await _seal_interrupted(handle)
+                # The turn's own release found its stream open and kept the
+                # claim. Released only once the seal wrote the terminal.
+                if handle.claim is not None and handle.buffer.is_closed:
+                    await _end_claim(
+                        conversation_id=handle.conversation_id, claim=handle.claim,
+                        lifecycle=handle.lifecycle,
+                    )
         return len(handles)
 
     def reset(self) -> None:
@@ -741,8 +886,29 @@ def discard_conversation(conversation_id: str) -> None:
     from cowork.streaming.turn_index import forget_turn_sync
 
     cid = str(conversation_id)
+    handle = registry.get(cid)
     registry.discard(cid)
     remove_conversation_buffers(cid)
     # The index outlives the buffers by an hour otherwise, so /in-flight would
     # keep naming a turn whose buffer has just been deleted.
     forget_turn_sync(cid)
+    if handle is not None and handle.claim is not None:
+        # Its stream is gone, so another replica would read the claim of a
+        # finished turn as one whose first record has not landed yet.
+        _release_claim_sync(conversation_id=cid, claim=handle.claim)
+
+
+def _release_claim_sync(*, conversation_id: str, claim: TurnClaim) -> None:
+    """Release a discarded turn's claim. Logged on failure; the claim then
+    lapses with its TTL, and the turn's own task releases it as it ends."""
+    try:
+        turn_claim.release_sync(conversation_id=conversation_id, run_id=claim.run_id)
+    except Exception:
+        logger.warning(
+            "Could not release a deleted turn's claim; it lapses with its TTL.",
+            exc_info=True,
+            extra={
+                "event": "turn_claim_release_failed", "run_id": claim.run_id,
+                **log_context(conversation_id=conversation_id),
+            },
+        )

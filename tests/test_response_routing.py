@@ -1102,13 +1102,13 @@ async def test_streaming_direct_response_registers_its_shared_redis_buffer(monke
     import fakeredis.aioredis
 
     import cowork.handlers.responses as responses
-    from cowork.streaming import buffer as buffer_mod, cancellation, turn_index
+    from cowork.streaming import buffer as buffer_mod, cancellation, turn_claim, turn_index
     from cowork.streaming.registry import RunRegistry
 
     handler = _routing_handler(monkeypatch)
     handler.scope = SimpleNamespace(org_id="org-1", user_id="user-1")
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    for module in (buffer_mod, cancellation, turn_index):
+    for module in (buffer_mod, cancellation, turn_claim, turn_index):
         monkeypatch.setattr(module, "get_redis", lambda: redis)
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
     runs = RunRegistry()

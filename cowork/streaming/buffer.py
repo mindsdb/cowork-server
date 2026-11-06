@@ -377,6 +377,11 @@ class RedisStreamBuffer(StreamBuffer):
             if not resp:
                 idle_ms += self._BLOCK_MS
                 if idle_ms >= REDIS_TAIL_IDLE_TIMEOUT_SECONDS * 1000:
+                    if await self._writer_holds_claim(client=r):
+                        # A live run is quiet, such as one waiting on an
+                        # unanswered ask_user question: keep waiting.
+                        idle_ms = 0
+                        continue
                     # Nothing is writing this turn. The producer replica died
                     # mid-turn, so no terminal record is ever coming and every
                     # reader would wait here forever. Write one, so this reader
@@ -430,6 +435,25 @@ class RedisStreamBuffer(StreamBuffer):
         self._closed = rec.is_terminal
         self._finishing = _is_final_client_frame(rec.type, rec.data)
 
+    async def _writer_holds_claim(self, *, client) -> bool:
+        """Whether a run holds this turn's claim (turn_claim), so its quiet
+        stretch is not an abandoned turn. A claim that cannot be read counts
+        as held: an idle cut on a guess would end a live turn."""
+        from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, claim_held_for_turn
+
+        try:
+            async with asyncio.timeout(REDIS_CALL_SECONDS):
+                return await claim_held_for_turn(
+                    conversation_id=self._conversation_id, turn_id=self._turn_id, client=client,
+                )
+        except Exception:
+            logger.warning(
+                "Could not read a quiet turn's claim; its readers keep waiting.",
+                exc_info=True,
+                extra={"event": "turn_claim_read_failed", "conversation_id": self._conversation_id},
+            )
+            return True
+
     async def _terminate_as_orphan(self) -> AsyncIterator[TurnRecord]:
         """Close an abandoned turn, and yield the terminal record.
 
@@ -438,6 +462,11 @@ class RedisStreamBuffer(StreamBuffer):
         conditional on the stream still having no terminal record, so a second
         reader arriving at the same moment replays this one rather than adding
         another.
+
+        Written through a buffer object of its own, never this one: on the
+        replica running the turn, this object can be the producer's own
+        buffer (the POST stream and /tail read it), and closing it would tell
+        the registry the turn had ended while its producer still writes.
         """
         logger.warning(
             "Turn buffer %s went quiet for %ss with no terminal record; ending it",
@@ -448,9 +477,9 @@ class RedisStreamBuffer(StreamBuffer):
         if entries and self._record(entries[0][1]).is_terminal:
             yield self._record(entries[0][1])
             return
-        self._next_seq = (self._record(entries[0][1]).seq + 1) if entries else 0
-        self._closed = False   # so close() writes rather than returning early
-        await self.close("interrupted", {"error": "the worker running this turn stopped responding"})
+        orphan = RedisStreamBuffer(conversation_id=self._conversation_id, turn_id=self._turn_id)
+        orphan._next_seq = (self._record(entries[0][1]).seq + 1) if entries else 0
+        await orphan.close("interrupted", {"error": "the worker running this turn stopped responding"})
         latest = await r.xrevrange(self.key, count=1)
         if latest:
             yield self._record(latest[0][1])

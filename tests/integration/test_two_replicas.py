@@ -17,7 +17,10 @@ import pytest
 import redis.asyncio as aioredis
 
 from cowork.streaming import turn_index
+from cowork.streaming.backend import new_buffer
 from cowork.streaming.buffer import RedisStreamBuffer
+from cowork.streaming.registry import RunRegistry, TurnInProgress
+from cowork.streaming.turn_claim import CLAIMS_KEY, claim_key
 from tests.integration.prereq import missing_prerequisite
 
 pytestmark = [pytest.mark.integration, pytest.mark.redis_service]
@@ -90,3 +93,53 @@ async def test_a_finished_turn_reads_as_closed_from_anywhere(redis_url):
 
     assert reader.is_closed is True
     assert reader.latest_seq == 2
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_send_on_the_other_replica_is_refused(redis_url):
+    """Two registries are two replicas: each knows only its own turns, and
+    the turn claim in Redis is what they share."""
+    replica_a, replica_b = RunRegistry(), RunRegistry()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def answer_once_released(buffer):
+        await buffer.append("sse", {"sse": "event: a\ndata: {}\n\n"})
+        started.set()
+        await release.wait()
+        await buffer.append("sse", {"sse": "event: response.completed\ndata: {}\n\n"})
+        await buffer.close("completed")
+
+    async def answer(buffer):
+        await buffer.close("completed")
+
+    first = await replica_a.start(
+        conversation_id="conv-dup", turn_id=1, open_buffer=lambda: new_buffer("conv-dup", 1),
+        produce=answer_once_released,
+    )
+    await asyncio.wait_for(started.wait(), timeout=10)
+    opened = []
+
+    async def open_on_b():
+        opened.append(1)
+        return await new_buffer("conv-dup", 1)
+
+    with pytest.raises(TurnInProgress) as refused:
+        await replica_b.start(conversation_id="conv-dup", turn_id=1, open_buffer=open_on_b, produce=answer)
+
+    client = aioredis.from_url(redis_url, decode_responses=True)
+    try:
+        assert refused.value.turn_id == 1
+        assert opened == []
+        assert (await turn_index.get_turn("conv-dup"))["run_id"] == first.run_id
+        assert await client.xlen("cowork:stream:conv-dup:1") == 1
+        release.set()
+        await asyncio.wait_for(first.task, timeout=10)
+        assert await client.exists(claim_key("conv-dup"), CLAIMS_KEY) == 0
+
+        after = await replica_b.start(
+            conversation_id="conv-dup", turn_id=3, open_buffer=lambda: new_buffer("conv-dup", 3),
+            produce=answer,
+        )
+        await asyncio.wait_for(after.task, timeout=10)
+    finally:
+        await client.aclose()

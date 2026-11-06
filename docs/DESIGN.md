@@ -92,6 +92,37 @@ For direct clients, cowork-server owns the originating connection and invokes th
 cancellation path without a proxy request. If the client leaves during preparation, cleanup
 must prevent that request from leaving a live producer behind.
 
+## One turn per conversation across replicas
+
+TLDR; On the Redis stream backend, a conversation's turn claim (`cowork/streaming/turn_claim.py`) is what every replica reads to refuse a second question while a turn answers. The run holding it renews it, releases it after its stream's terminal record, and alone writes the conversation's turn index entry. The file backend never touches it.
+
+`RunRegistry.start` checks its own process first, as on one replica. On the Redis backend it then takes the claim with `SET NX PX`, before it opens the turn's buffer, so a refused start writes nothing. The key `cowork:turn_claim:<conversation_id>` holds a `TurnClaim` (run id, turn number, correlation id, the saved question's id once known, the pod's name and the start time) and lapses 70 s after the last renewal. The hash `cowork:turn_claims` lists every claim by conversation. Compare-and-set runs as WATCH/MULTI, since the tests' fakeredis runs no Lua.
+
+What admission does with a claim another run holds:
+
+| The holder's stream | Admission |
+| -- | -- |
+| No record yet, or streaming | `409 turn_in_progress`, the body a turn on the same replica gets |
+| Writing its final client frame | Waits up to 10 s for the terminal record, then takes the claim, or refuses with `409` |
+| Ended, with the claim still there | Deletes that claim by compare-and-delete on its run id, and tries once more |
+| Redis does not answer | `503 server_busy` with `Retry-After: 2`. An acquire cut short is undone by compare-and-delete first, so the client's retry does not meet its own claim |
+
+Admission never writes to another run's stream. When a claim is absent, a start is admitted as it was before claims existed, even when the conversation's last turn died with its stream open.
+
+The early check in `POST /responses/` reads the claim too, before any database read. Where conversations are partitioned, it counts a claim only when the turn index entry its run wrote names the caller as the owner, so a refusal never reveals another user's turn.
+
+A running turn renews its claim every 10 s from a task beside the cancel watch (`turn_claim.keep_claim`), and stops once its buffer is closed or writing its final client frame. A renewal that finds the key gone takes it back while the turn's stream has no terminal record. A Redis error is tried again at the next renewal and never counts as a lost claim. A renewal that finds another run holding the claim, or the stream ended by someone else, sets `TurnLifecycle.claim_lost` and logs `turn_claim_lost` with the conversation, the run, and the holder's run and pod. `discarded` keeps meaning a deleted conversation.
+
+A turn releases its claim only once its stream has a terminal record: when it completes, is stopped or fails, after `RunRegistry.shutdown` seals a stream its producer left open, and when its conversation is deleted. The release first notes in the turn index that the turn saved its question (`saved_question` and `question_id`). On the Redis backend the stale-number check reads that, so a replica refuses a start whose history read predates another replica's save, and a finished handle on this replica no longer refuses a start after another replica truncated the conversation. A channel turn, which no registry handle covers, writes its turn index entry only while no run holds the claim.
+
+A process starting on the Redis backend releases the claims stamped with its own pod's name (`POD_NAME`, else the host name), since a fresh process holds no turn. A liveness restart keeps the pod's name, so this ends the refusals its dead turns would cause. It relies on one server process per pod, which `tests/test_turn_claim.py` pins for the hosted command.
+
+What the claim does not do:
+
+- Nothing ends a turn whose replica died without a shutdown. Its claim lapses after 70 s and the next send is admitted. Its stream stays open until a reader's idle cut ends it, and its question stays pending.
+- The claim does not order database writes. A save that outlives its producer at shutdown (`_saves_past_their_deadline` in `cowork/handlers/responses.py`) can still be writing after the claim is released and another replica's turn starts.
+- During a rollout, a turn on a pod that predates the claim holds none, so a duplicate on a newer pod is admitted, as before.
+
 ## Turn liveness and idle bounds
 
 TLDR; A turn that sends nothing for too long is ended by whichever idle bound fires first. While anton waits on a model call that sends no output, cowork-server (in cloud, the anton pod) writes a `model_wait` progress frame every 20 to 25 seconds, so no bound fires until anton's own 10-minute model-call deadline ends the call. In cloud, the controller's 600 s hard cap can end the turn first. A non-streamed call through MindsHub is ended sooner, by the gateway's 110 s budget.
@@ -105,7 +136,7 @@ Each bound watches a different wire. A bound restarts only on activity it can se
 | UI idle cut | 300 s. After a `response.ask_user` frame: the question's `timeout_s` plus 300 s | cowork `src/renderer/cowork/api.js`, `STREAM_IDLE_TIMEOUT_MS` | Any SSE event with a `data:` line. The server's `: keepalive` comments do not count | The UI aborts the stream, calls `POST /api/v1/responses/cancel` with `reason: "stalled"` and shows "The response stalled and was ended." |
 | SSE keepalive comment | Every 20 s of quiet | `SSE_KEEPALIVE_SECONDS` in `cowork/handlers/responses.py` | Not a bound | Keeps proxies from closing an idle connection. It never keeps a turn alive, so a hung server still meets the UI cut |
 | Idle watchdog | 600 s, checked every 15 s | `COWORK_MAX_TURN_IDLE_SECONDS`, `cowork/streaming/registry.py` | Any record appended to the turn's buffer | The producer is cancelled and saves `response.failed` with code `anton_error` and "The response was interrupted before it finished. Please try again." The buffer closes `interrupted` |
-| Redis tail | 300 s | `REDIS_TAIL_IDLE_TIMEOUT_SECONDS`, `cowork/streaming/buffer.py`. Only with `COWORK_STREAM_BACKEND=redis` | Any record in the turn's Redis stream | The reader writes an `Interrupted` terminal record and logs "went quiet for 300s" |
+| Redis tail | 300 s | `REDIS_TAIL_IDLE_TIMEOUT_SECONDS`, `cowork/streaming/buffer.py`. Only with `COWORK_STREAM_BACKEND=redis` | Any record in the turn's Redis stream. A run that holds the turn's claim restarts it too, and so does a claim the reader cannot read | The reader writes an `Interrupted` terminal record to the stream and logs "went quiet for 300s". It writes through a buffer object of its own, so the producer's own buffer stays open and its replica still refuses a second question |
 | Reply idle | 600 s | `COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS`. Only for remote turns | Any reply for this turn on the controller's reply stream | The turn fails with code `worker_unresponsive` |
 | Controller stall window | 120 s | scratchpad-controller `turn_stall_timeout_seconds` | Any line from the turn's pod, including its heartbeat every 5 s | The controller ends the turn, and the user sees "This turn stopped producing output and was ended." |
 | Controller hard cap | 600 s in total | scratchpad-controller `hard_turn_timeout_seconds` | Nothing | The controller ends the turn, and the user sees "This turn took too long and was stopped." In cloud this cap ends a stuck model call before anton's deadline does |

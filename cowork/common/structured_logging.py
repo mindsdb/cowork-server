@@ -34,6 +34,12 @@ EVENT_FIELDS = frozenset(
         "project_id",
         "schedule_id",
         "turn_id",
+        # A turn's run, the run holding its conversation's turn claim, and
+        # that run's pod (cowork.streaming.turn_claim).
+        "run_id",
+        "holder_run_id",
+        "holder_pod",
+        "pod",
         "job_id",
         "trace_id",
         "method",

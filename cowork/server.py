@@ -54,6 +54,7 @@ from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import ServerShuttingDown, TurnInProgress, registry
 from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
+from cowork.streaming.turn_claim import TurnClaimUnavailable
 from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import O_NONBLOCK, dir_open, dir_scandir, dir_stat, pinned_dir
@@ -199,6 +200,39 @@ def _server_busy(*, retry_after: int, status_code: int) -> JSONResponse:
 # Another replica already serves while this one shuts down, so the retry needs
 # no longer than the client's own round trip.
 _SHUTDOWN_RETRY_AFTER_SECONDS = 1
+
+# A Redis call that failed or timed out; a failover or a dropped connection
+# usually settles within a couple of seconds.
+_TURN_CLAIM_RETRY_AFTER_SECONDS = 2
+
+
+async def _release_own_turn_claims() -> None:
+    """On the Redis stream backend, release the turn claims a process of this
+    pod left behind (turn_claim.release_pod_claims): one a liveness restart
+    replaced, whose claims would otherwise refuse a send to each of its
+    conversations until the claim's TTL passed. Bounded and fail-open; a
+    claim it cannot release lapses with its TTL."""
+    from cowork.streaming.backend import get_backend
+    from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, pod_name, release_pod_claims
+
+    if get_backend() != "redis":
+        return
+    pod = pod_name()
+    try:
+        async with asyncio.timeout(REDIS_CALL_SECONDS):
+            released = await release_pod_claims(pod=pod)
+    except Exception:
+        logger.warning(
+            "Could not release the turn claims an earlier process of this pod left; they lapse with their TTL.",
+            exc_info=True,
+            extra={"event": "turn_claims_boot_release_failed", "pod": pod},
+        )
+        return
+    if released:
+        logger.warning(
+            "Released turn claims an earlier process of this pod left behind.",
+            extra={"event": "turn_claims_released_at_boot", "pod": pod, "count": released},
+        )
 
 
 def _end_remote_turns_on_sigterm() -> None:
@@ -360,6 +394,8 @@ async def lifespan(app: FastAPI):
         gc_old_buffers(get_streams_dir(), max_age_days=7)
     except Exception:
         logger.exception("turn-buffer boot recovery failed (non-fatal)")
+    # Before the port takes requests, so no turn of this process holds a claim yet.
+    await _release_own_turn_claims()
     # Reclaim scratchpad namespace snapshots whose conversation is gone (ENG-1124).
     # `delete_conversation` prunes its own from now on; this catches everything
     # deleted before that shipped, plus any path that drops a conversation row
@@ -676,6 +712,18 @@ def create_app() -> FastAPI:
     @app.exception_handler(ServerShuttingDown)
     async def _shutting_down(request, exc: ServerShuttingDown):
         return _server_busy(retry_after=_SHUTDOWN_RETRY_AFTER_SECONDS, status_code=exc.status_code)
+
+    # Redis could not say whether another replica's run holds the
+    # conversation (turn_claim). Refused as a busy server is, so the client
+    # waits Retry-After and sends again.
+    @app.exception_handler(TurnClaimUnavailable)
+    async def _turn_claim_unavailable(request, exc: TurnClaimUnavailable):
+        logger.warning(
+            "Refused a turn; Redis could not say whether another run holds the conversation.",
+            exc_info=exc,
+            extra={"event": "turn_claim_unavailable", "conversation_id": exc.conversation_id},
+        )
+        return _server_busy(retry_after=_TURN_CLAIM_RETRY_AFTER_SECONDS, status_code=exc.status_code)
 
     # A second question into a conversation whose turn is still answering.
     @app.exception_handler(TurnInProgress)
