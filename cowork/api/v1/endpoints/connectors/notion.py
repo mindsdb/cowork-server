@@ -40,7 +40,13 @@ class NotionFetchRequest(BaseModel):
 
 async def _access_token(name: str, scope: TenantScope, request: Request) -> str:
     if scope.org_mode:
-        token = await auth_proxy.proxy_token("notion", request, OAuthSettings(), name=name)
+        try:
+            token = await auth_proxy.proxy_token("notion", request, OAuthSettings(), name=name)
+        except HTTPException as exc:
+            # The auth service answers a dead grant (needs_reconnect) with 403.
+            if exc.status_code == status.HTTP_403_FORBIDDEN:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Notion needs to be reconnected.") from exc
+            raise
         return token.get("access_token") or ""
     # Desktop: Electron's refresh loop keeps the vault's access token current.
     return ConnectionsService(scope).mcp_access_token("notion", name) or ""

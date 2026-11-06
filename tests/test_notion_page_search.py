@@ -57,6 +57,20 @@ class TestParseSearchResults:
     def test_unrecognised_shapes_return_nothing(self, content):
         assert parse_search_results(content) == []
 
+    @pytest.mark.parametrize("content", [
+        SEARCH_RESPONSE + "\n\nConnected sources were not searched.",
+        [{"type": "text", "text": SEARCH_RESPONSE}, {"type": "text", "text": "Connected sources were not searched."}],
+    ])
+    def test_a_note_after_the_json_is_ignored(self, content):
+        assert [p["id"] for p in parse_search_results(content)] == ["p1", "d1"]
+
+    def test_an_unrecognised_result_is_logged_without_its_content(self, caplog):
+        private = json.dumps({"type": "ai_search", "answer": "Salary review for Ann"})
+        with caplog.at_level("WARNING", logger="cowork.connectors.notion_pages"):
+            assert parse_search_results(private) == []
+        assert caplog.records, "the unrecognised shape is still logged"
+        assert "Salary review" not in caplog.text
+
     def test_results_are_capped(self):
         many = [{"id": f"p{i}", "url": f"https://www.notion.so/p{i}"} for i in range(MAX_RESULTS + 5)]
         assert len(parse_search_results(json.dumps({"results": many}))) == MAX_RESULTS
@@ -171,6 +185,18 @@ async def test_org_mode_takes_the_token_from_auth(monkeypatch, mcp_calls):
     assert len(out["results"]) == 2
 
 
+async def test_org_mode_a_dead_grant_asks_for_a_reconnect(monkeypatch, mcp_calls):
+    async def needs_reconnect(engine, request, settings, *, name=""):
+        raise HTTPException(status_code=403, detail="notion/ws-a needs to be reconnected.")
+
+    monkeypatch.setattr("cowork.services.connectors.oauth.auth_proxy.proxy_token", needs_reconnect)
+    scope = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
+    with pytest.raises(HTTPException) as exc:
+        await search_notion_pages(NotionSearchRequest(name="ws-a", query="ML"), scope, object())
+    assert exc.value.status_code == 409
+    assert mcp_calls == []
+
+
 FETCH_RESPONSE = json.dumps({
     "metadata": {"type": "page"},
     "title": "Getting Started",
@@ -245,6 +271,26 @@ class TestProjectPages:
         for project in ("alpha", "beta"):
             assert service.picked_files_by_project(LocalDataVault(tmp_path), project, engine="notion")
 
+    def test_a_page_removed_from_its_only_project_reaches_no_project(self, vault, tmp_path):
+        self._add("notion", "mcp-ws", [{"id": "p1", "name": "ML Research", "url": "u", "projects": ["alpha"]}])
+        service = ConnectionsService(LOCAL_SCOPE)
+        assert service.remove_picked_file("notion", "mcp-ws", "p1", "alpha") == []
+        for project in ("alpha", "beta"):
+            assert service.picked_files_by_project(LocalDataVault(tmp_path), project, engine="notion") == {}
+
+    def test_a_page_removed_from_one_of_two_projects_stays_in_the_other(self, vault, tmp_path):
+        self._add("notion", "mcp-ws", [{"id": "p1", "name": "ML Research", "url": "u", "projects": ["alpha", "beta"]}])
+        service = ConnectionsService(LOCAL_SCOPE)
+        service.remove_picked_file("notion", "mcp-ws", "p1", "alpha")
+        assert service.picked_files_by_project(LocalDataVault(tmp_path), "alpha", engine="notion") == {}
+        assert service.picked_files_by_project(LocalDataVault(tmp_path), "beta", engine="notion")
+
+    def test_a_drive_file_removed_from_its_only_project_stays_connection_wide(self, vault, tmp_path):
+        vault.save("google_drive", "me-gmail-com", {"access_token": "t"})
+        self._add("google_drive", "me-gmail-com", [{"id": "d1", "name": "Sheet", "projects": ["alpha"]}])
+        remaining = ConnectionsService(LOCAL_SCOPE).remove_picked_file("google_drive", "me-gmail-com", "d1", "alpha")
+        assert remaining == [{"id": "d1", "name": "Sheet", "projects": []}]
+
     def test_engines_do_not_leak_into_each_other(self, vault, tmp_path):
         vault.save("google_drive", "me-gmail-com", {"access_token": "t"})
         self._add("google_drive", "me-gmail-com", [{"id": "d1", "name": "Sheet", "projects": ["alpha"]}])
@@ -264,6 +310,12 @@ class TestProjectPages:
         notes = registry.usage_notes_for(["notion"])["notion"]
         assert "notion__notion-fetch" in notes
         assert "notion-fetch" not in describe_project_pages({"mcp-ws": [{"id": "p1", "url": "https://www.notion.so/p1"}]})
+
+    def test_the_notes_name_tools_for_two_connected_workspaces_too(self):
+        # With two Notion connections in a turn, anton names tools per connection.
+        from cowork.services.connectors.specs._registry import registry
+
+        assert "notion__<connection>__<tool>" in registry.usage_notes_for(["notion"])["notion"]
 
     def test_no_pages_adds_nothing_to_the_prompt(self):
         assert describe_project_pages({}) == ""

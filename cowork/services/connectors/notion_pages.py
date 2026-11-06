@@ -31,8 +31,9 @@ def _decode(content: Any) -> Any:
             block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
         )
     if isinstance(content, str):
+        # raw_decode tolerates a note Notion may append after the JSON.
         try:
-            return json.loads(content)
+            return json.JSONDecoder().raw_decode(content.strip())[0]
         except ValueError:
             return None
     return content
@@ -42,6 +43,14 @@ def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _shape(value: Any) -> str:
+    if isinstance(value, dict):
+        return f"dict with keys {sorted(map(str, value))[:20]}"
+    if isinstance(value, (list, str)):
+        return f"{type(value).__name__} of length {len(value)}"
+    return type(value).__name__
+
+
 def parse_search_results(content: Any) -> list[dict[str, str]]:
     """Pages and databases from a `notion-search` result. The response shape
     isn't documented, so unknown fields are ignored and anything without an
@@ -49,7 +58,8 @@ def parse_search_results(content: Any) -> list[dict[str, str]]:
     data = _decode(content)
     items = data.get("results") if isinstance(data, dict) else data
     if not isinstance(items, list):
-        _log.warning("notion-search returned an unrecognised shape: %.300r", content)
+        # Shape only: the content can hold private page titles.
+        _log.warning("notion-search returned an unrecognised shape: %s", _shape(content))
         return []
     pages: list[dict[str, str]] = []
     for item in items:
@@ -84,19 +94,36 @@ def _http_status_error_types() -> tuple[type[BaseException], ...]:
     return tuple(types)
 
 
+def _token_rejected_type() -> type[BaseException] | None:
+    # anton raises this for a 401/403, which the MCP SDK otherwise reports
+    # with no HTTP status; older antons don't have it.
+    try:
+        from anton.core.mcp.errors import McpTokenRejected
+    except ImportError:
+        return None
+    return McpTokenRejected
+
+
 def is_token_rejection(exc: BaseException) -> bool:
     """True when the MCP server answered 401/403, looking through the
-    exception groups and causes the MCP client wraps it in. A rejection while
-    the session opens arrives unclassified, not as McpPermanentError."""
+    exception groups, causes and contexts the MCP client wraps it in."""
     status_errors = _http_status_error_types()
+    rejected = _token_rejected_type()
     seen: list[BaseException] = [exc]
+    visited: set[int] = set()
     while seen:
         e = seen.pop()
+        if id(e) in visited:
+            continue
+        visited.add(id(e))
+        if rejected is not None and isinstance(e, rejected):
+            return True
         if isinstance(e, status_errors) and e.response.status_code in (401, 403):
             return True
         seen.extend(getattr(e, "exceptions", ()))
-        if e.__cause__ is not None:
-            seen.append(e.__cause__)
+        for linked in (e.__cause__, e.__context__):
+            if linked is not None:
+                seen.append(linked)
     return False
 
 

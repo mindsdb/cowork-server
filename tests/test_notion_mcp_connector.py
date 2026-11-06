@@ -195,11 +195,12 @@ async def test_501_when_the_installed_anton_has_no_mcp_client(monkeypatch):
 
 
 class _FakeVault:
-    def __init__(self, path):
-        pass
+    # The desktop vault holds no refresh token for Notion; Electron keeps it.
+    def __init__(self, path, method="mcp"):
+        self._method = method
 
     def load(self, engine, name):
-        return {"auth_type": "oauth", "access_token": "at-1", "refresh_token": "rt-1"}
+        return {"auth_type": "oauth", "access_token": "at-1", "_method": self._method}
 
 
 class _FakeResponse:
@@ -210,7 +211,7 @@ class _FakeResponse:
         return False
 
 
-def test_revoke_posts_the_refresh_token_and_client_id_without_a_secret(monkeypatch):
+def test_revoke_posts_the_access_token_and_client_id_without_a_secret(monkeypatch):
     monkeypatch.setattr(google_module, "_vault_for", lambda *a, **k: _FakeVault(None))
     captured = {}
 
@@ -224,7 +225,17 @@ def test_revoke_posts_the_refresh_token_and_client_id_without_a_secret(monkeypat
     OAuthService().revoke("notion", "ann", ConnectorSettings(), OAuthSettings(_env_file=None, NOTION_CLIENT_ID=CIMD_URL))
 
     assert captured["url"] == "https://mcp.notion.com/token"
-    assert captured["body"] == {"token": ["rt-1"], "client_id": [CIMD_URL]}
+    assert captured["body"] == {"token": ["at-1"], "client_id": [CIMD_URL]}
+
+
+def test_a_connection_not_made_with_mcp_sign_in_is_not_revoked_at_mcp_notion(monkeypatch):
+    monkeypatch.setattr(google_module, "_vault_for", lambda *a, **k: _FakeVault(None, method="oauth"))
+    sent = []
+    monkeypatch.setattr(google_module, "urlopen", lambda request, timeout=10: sent.append(request) or _FakeResponse())
+
+    OAuthService().revoke("notion", "ann", ConnectorSettings(), OAuthSettings(_env_file=None, NOTION_CLIENT_ID=CIMD_URL))
+
+    assert sent == []
 
 
 def test_revoke_failure_does_not_block_disconnect(monkeypatch):

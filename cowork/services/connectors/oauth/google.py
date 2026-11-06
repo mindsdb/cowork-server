@@ -637,6 +637,11 @@ class OAuthService:
             return
         if fields.get("auth_type") != "oauth":
             return
+        if engine == "notion" and fields.get("_method") != "mcp":
+            # The hidden `oauth` method's token is api.notion.com's; only an
+            # MCP sign-in's token belongs to mcp.notion.com's revoke endpoint.
+            _log.debug("Not revoking %s/%s remotely: not an MCP sign-in", engine, name)
+            return
         token = fields.get("refresh_token", "").strip() or fields.get("access_token", "").strip()
         if not token:
             return

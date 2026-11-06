@@ -281,6 +281,10 @@ class ConnectionsService:
         being told about the file for this project); does not revoke
         Google's own server-side record of it.
 
+        A Notion page is dropped once its last project goes: Notion pages are
+        only ever added to projects, and an untagged entry would read as
+        connection-wide and reach every project's prompt.
+
         Returns the resulting list, or None if the connection doesn't exist.
         """
         vault = self._vault()
@@ -297,6 +301,8 @@ class ConnectionsService:
             for f in existing:
                 if isinstance(f, dict) and f.get("id") == file_id:
                     f = {**f, "projects": [p for p in (f.get("projects") or []) if p != project]}
+                    if engine == "notion" and not f["projects"]:
+                        continue
                 remaining.append(f)
 
             fields["_picked_files"] = json.dumps(remaining)
