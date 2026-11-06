@@ -278,6 +278,10 @@ publish, release, or deployment.
 
 **The nightly runs staging's copy of the tests, not main's.** GitHub starts every scheduled run on the default branch, so the checkout would otherwise take `main`. `main` trails `staging` by every commit waiting for the weekly release. Any behavior change among those commits fails `main`'s tests against staging's pods, even though staging works as intended. So the job passes `ref: staging`, and `tests-integration.yml` hands that input to `actions/checkout`. The deploy callers leave `ref` empty and keep testing the commit they just deployed. [`test_nightly_integration_workflow.py`](tests/test_nightly_integration_workflow.py) fails if a scheduled caller's `ref` differs from its `deploy-env`.
 
+### Code scanning
+
+[`codeql.yml`](.github/workflows/codeql.yml) runs CodeQL on every pull request and push to `staging` and `main`, and weekly on `main`. It scans Python, JavaScript/TypeScript and the workflows themselves with the default query suite, and needs no build. It replaces CodeQL's default setup, which scans only the default branch and branches under classic branch protection. `staging` is protected by rulesets, so default setup never scanned a pull request onto it. Default setup must stay off in the repository's code scanning settings, since GitHub refuses a workflow's results while it is on.
+
 The suite may create and delete test conversations, schedules, files, and agent
 turns in staging. The fixed test tenant is reserved for the `cowork` suite, and
 the workflow sets `COWORK_REQUIRE_INTEGRATION=true` for staging so a missing
