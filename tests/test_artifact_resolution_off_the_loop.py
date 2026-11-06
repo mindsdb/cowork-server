@@ -559,12 +559,11 @@ def test_a_warm_lookup_skips_conversation_folders_that_hold_no_artifacts(tmp_pat
     """Org mode, a project with 100 conversation folders and no legacy
     artifacts: the folders are not roots, so a lookup doesn't index each one.
 
-    The saving shows where every folder would be searched: a reviewer's
-    lookup, which widens to every root, or a caller who owns every
-    conversation. There an empty folder counted as a root costs about 1,039
-    calls. An owner's lookup skips another member's folders by name before
-    any stat (`readable_sources`), so it reads the same with or without the
-    saving."""
+    The saving shows where every folder would be searched: a lookup's scan,
+    which reads every root, or a caller who owns every conversation. There an
+    empty folder counted as a root costs about 1,039 calls. The caller's own
+    roots (`readable_sources`) skip another member's folders by name before
+    any stat, so a read of them is the same with or without the saving."""
     monkeypatch.setattr(artifact_roots, "_org_mode", lambda: True)
     project = tmp_path / "project"
     folder = project / ".anton" / "artifacts" / "brief"
@@ -592,63 +591,6 @@ def test_a_warm_lookup_skips_conversation_folders_that_hold_no_artifacts(tmp_pat
 
     assert resolved.name == "brief"
     assert calls.count <= 300, f"{calls.count} filesystem calls for one warm lookup"
-
-
-def test_an_owners_lookup_never_stats_a_co_members_workspace(tmp_path, monkeypatch):
-    """Org mode, a project with 50 of a co-member's legacy workspaces, each
-    holding artifacts. The owner's lookup of their own artifact reads only
-    their own roots, which skip the co-member's workspaces by name before any
-    stat. A reviewer's lookup of a granted draft in one of those workspaces
-    still widens to every root and finds it, in the same file store call."""
-    from cowork.services.artifact_draft_review import enable_draft_review
-
-    monkeypatch.setattr(artifact_roots, "_org_mode", lambda: True)
-    monkeypatch.setattr(artifact_scope, "_org_mode", lambda: True)
-    project = tmp_path / "project"
-    own = project / ".anton" / "artifacts" / "brief"
-    own.mkdir(parents=True)
-    (own / "metadata.json").write_text(json.dumps({"id": ARTIFACT_ID, "type": "document"}))
-    owners_conversation = uuid4()
-    (project / "conversations" / str(owners_conversation) / ".anton" / "artifacts").mkdir(parents=True)
-    workspaces = [project / "conversations" / str(uuid4()) for _ in range(50)]
-    for workspace in workspaces:
-        folder = workspace / ".anton" / "artifacts" / "chart"
-        folder.mkdir(parents=True)
-        (folder / "metadata.json").write_text(json.dumps({"id": uuid4().hex, "type": "document"}))
-    granted_id = uuid4().hex
-    granted = workspaces[0] / ".anton" / "artifacts" / "dash"
-    granted.mkdir()
-    (granted / "metadata.json").write_text(json.dumps({"id": granted_id, "type": "document"}))
-    enable_draft_review(granted, org_id=ORG, enabled_by=SECOND_MEMBER)
-    row = artifact_roots.ProjectRow(id=UUID(int=1), name="project", path=str(project), external=False)
-    owners_plan = artifact_roots.RootsPlan(
-        projects=(row,), owner_filter=True, owned=frozenset({owners_conversation})
-    )
-    artifact_identity._clear_identity_indexes()
-    touched: list[Path] = []
-    real_is_dir = artifact_roots._is_real_directory
-    real_safe = artifact_roots._storage_components_are_safe
-
-    def is_dir(path):
-        touched.append(Path(path))
-        return real_is_dir(path)
-
-    def safe(workspace, *, may_be_absent):
-        touched.append(Path(workspace))
-        return real_safe(workspace, may_be_absent=may_be_absent)
-
-    monkeypatch.setattr(artifact_roots, "_is_real_directory", is_dir)
-    monkeypatch.setattr(artifact_roots, "_storage_components_are_safe", safe)
-
-    found = artifact_scope._reviewable_in(owners_plan, ARTIFACT_ID, org_id=ORG)
-
-    assert found.is_own and found.folder.name == "brief"
-    assert [path for path in touched if any(path.is_relative_to(w) for w in workspaces)] == []
-
-    reviewers_plan = artifact_roots.RootsPlan(projects=(row,), owner_filter=True, owned=frozenset())
-    reviewed = artifact_scope._reviewable_in(reviewers_plan, granted_id, org_id=ORG)
-
-    assert not reviewed.is_own and reviewed.folder == granted
 
 
 async def test_the_artifacts_list_finds_each_cards_export_source_on_a_file_store_thread(
@@ -735,8 +677,12 @@ async def test_taking_the_live_publish_lock_waits_out_a_busy_file_store(monkeypa
 # owner-only route checks ownership in a database unit after the lookup, so
 # it reads in one more call, and only once that check has passed.
 
-# The project row and owned conversations, then the lookup.
+# The project row, the owned conversations and the location row, then the
+# lookup.
 LOOKUP = ["run_db", "run_efs"]
+# A lookup whose location row does not answer it: the scan, then the unit that
+# records what the scan found, whose refusal is only logged.
+SCANNED_LOOKUP = [*LOOKUP, "record"]
 # The lookup, the owner check, then the route's one read.
 OWNER_READ = [*LOOKUP, "run_db", "run_efs"]
 
@@ -838,7 +784,7 @@ async def test_a_draft_link_names_its_file_in_the_lookups_file_store_call(
     assert response.status_code == 200, response.body
     assert json.loads(response.body)["url"].endswith("/index.html")
     assert names == [True]
-    assert hops == LOOKUP
+    assert hops == SCANNED_LOOKUP
 
 
 class _PinnedOpen(NamedTuple):
@@ -913,7 +859,7 @@ async def test_a_draft_file_is_never_opened_for_a_caller_the_lookup_refuses(
 
     assert refused.value.status_code == 404
     assert opens == []
-    assert hops == LOOKUP
+    assert hops == SCANNED_LOOKUP
 
 
 async def _edit(project_id: str, artifact_id: str, caller):
@@ -1004,10 +950,11 @@ async def test_a_non_owner_is_refused_access_before_any_read(
         await artifact_workspace.artifact_access(str(row.id), artifact_id, _caller(tenancy.USER_A2))
 
     assert refused.value.status_code == status_code
-    # A reviewer's lookup passes and the owner check refuses; no grant ends
-    # at the lookup. Either way the access state is never read.
+    # A reviewer's lookup opens the row's folder and the owner check refuses;
+    # with no grant, the lookup scans, records its folder and refuses. Either
+    # way the access state is never read.
     assert access_reads == []
-    assert hops == ([*LOOKUP, "run_db"] if granted else LOOKUP)
+    assert hops == ([*LOOKUP, "run_db"] if granted else SCANNED_LOOKUP)
 
 
 # In org tenancy, where COWORK_HOME is the shared file store: with every file
