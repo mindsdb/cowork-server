@@ -40,7 +40,11 @@ class OrgAppearanceView(CamelResponse):
     """The org's look; every field null (stock) until an admin sets it."""
 
     accent: str | None = None
+    # For clients from before the light/dark split: backgroundLight ??
+    # backgroundDark.
     background: str | None = None
+    background_light: str | None = None
+    background_dark: str | None = None
     font: str | None = None
     radius: int | None = None
     skin: str | None = None
@@ -87,7 +91,11 @@ class OrgAppearanceUpdate(CamelRequest):
     keeps its stored value; an explicit null puts it back to stock."""
 
     accent: str | None = None
+    # A client from before the light/dark split sends one background: it
+    # sets both, unless the body names background_light or background_dark.
     background: str | None = None
+    background_light: str | None = None
+    background_dark: str | None = None
     font: str | None = None
     radius: int | None = Field(default=None, ge=RADIUS_MIN, le=RADIUS_MAX)
     skin: str | None = None
@@ -107,7 +115,7 @@ class OrgAppearanceUpdate(CamelRequest):
             raise ValueError(SIDEBAR_CUSTOM_NEEDS_TITLE)
         return self
 
-    @field_validator("accent", "background", mode="before")
+    @field_validator("accent", "background", "background_light", "background_dark", mode="before")
     @classmethod
     def _hex(cls, value: object) -> object:
         value = _blank_to_none(value)

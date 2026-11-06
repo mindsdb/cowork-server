@@ -26,7 +26,17 @@ class OrgAppearance(BaseSQLModel, table=True):
 
     org_id: UUID = Field(index=True, description="Owning organization")
     accent: str | None = Field(default=None, max_length=7, description="Accent color, #rrggbb")
+    # Legacy single background: mirrored on every write as
+    # background_light ?? background_dark, so a server or client from before
+    # the split still reads one; read only as a fallback when neither of
+    # the two below is set (cowork.services.org_branding.backgrounds).
     background: str | None = Field(default=None, max_length=7, description="Background color, #rrggbb")
+    background_light: str | None = Field(
+        default=None, max_length=7, description="Background in the light theme, #rrggbb"
+    )
+    background_dark: str | None = Field(
+        default=None, max_length=7, description="Background in the dark theme, #rrggbb"
+    )
     font: str | None = Field(default=None, max_length=32, description="One of the app's font keys")
     radius: int | None = Field(default=None, description="Base corner radius in px")
     skin: str | None = Field(default=None, max_length=32, description="One of the app's skin keys")

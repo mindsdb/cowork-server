@@ -68,9 +68,10 @@ BRAND_SKILL_BODY_BUDGET = 5000
 # The skill's access: everyone in the org, always on, owned by nobody.
 BRAND_SKILL_RULE = SkillAccessRule(org_allowed=True, always_on=True)
 
+# Copied as they are into the view; the backgrounds are resolved
+# (backgrounds).
 _APPEARANCE_FIELDS = (
     "accent",
-    "background",
     "font",
     "radius",
     "skin",
@@ -99,10 +100,46 @@ def appearance_row(session: ScopedSession) -> OrgAppearance | None:
     ).first()
 
 
+def backgrounds(row: OrgAppearance | None) -> tuple[str | None, str | None]:
+    """The org's light and dark backgrounds. A row with neither but a legacy
+    ``background`` (written before the split, or by a server from before it)
+    uses that for both."""
+    if row is None:
+        return None, None
+    if row.background_light or row.background_dark:
+        return row.background_light, row.background_dark
+    return row.background, row.background
+
+
 def appearance_view(row: OrgAppearance | None) -> OrgAppearanceView:
     if row is None:
         return OrgAppearanceView(members_can_choose=True, sidebar_title_mode="company")
-    return OrgAppearanceView(**{name: getattr(row, name) for name in _APPEARANCE_FIELDS})
+    light, dark = backgrounds(row)
+    return OrgAppearanceView(
+        **{name: getattr(row, name) for name in _APPEARANCE_FIELDS},
+        background_light=light,
+        background_dark=dark,
+        background=light or dark,
+    )
+
+
+def _apply_backgrounds(row: OrgAppearance, update: OrgAppearanceUpdate) -> None:
+    """The light and dark backgrounds from ``update``, then the legacy
+    ``background`` mirrored from them. A body with only ``background`` (a
+    client from before the split) sets both."""
+    sent = update.model_fields_set
+    if "background_light" in sent or "background_dark" in sent:
+        light, dark = backgrounds(row)
+        if "background_light" in sent:
+            light = update.background_light
+        if "background_dark" in sent:
+            dark = update.background_dark
+    elif "background" in sent:
+        light = dark = update.background
+    else:
+        return
+    row.background_light, row.background_dark = light, dark
+    row.background = light or dark
 
 
 def _apply_sidebar_title(row: OrgAppearance, update: OrgAppearanceUpdate) -> None:
@@ -127,12 +164,15 @@ def save_appearance(session: ScopedSession, update: OrgAppearanceUpdate) -> OrgA
     back before it propagates."""
     try:
         row = appearance_row(session) or OrgAppearance()
-        for name in update.model_fields_set - {"sidebar_title", "sidebar_title_mode"}:
+        for name in update.model_fields_set - {
+            "sidebar_title", "sidebar_title_mode", "background", "background_light", "background_dark",
+        }:
             value = getattr(update, name)
             if name == "members_can_choose" and value is None:
                 value = True
             setattr(row, name, value)
         _apply_sidebar_title(row, update)
+        _apply_backgrounds(row, update)
         session.add(row)
         session.commit()
         session.refresh(row)
@@ -291,7 +331,10 @@ def has_brand_content(images: AuthBranding, row: OrgAppearance | None) -> bool:
         return False
     return any(
         getattr(row, name) is not None
-        for name in ("accent", "background", "font", "radius", "default_theme", "guidelines")
+        for name in (
+            "accent", "background", "background_light", "background_dark",
+            "font", "radius", "default_theme", "guidelines",
+        )
     )
 
 
@@ -315,7 +358,7 @@ def render_brand_skill(images: AuthBranding, row: OrgAppearance | None) -> tuple
     logo_dark = fixed_image_url(images.logo_dark_url)
     icon = fixed_image_url(images.icon_url)
     accent = row.accent if row else None
-    background = row.background if row else None
+    background_light, background_dark = backgrounds(row)
     font = row.font if row else None
     radius = row.radius if row else None
     theme = row.default_theme if row else None
@@ -362,24 +405,45 @@ def render_brand_skill(images: AuthBranding, row: OrgAppearance | None) -> tuple
         elif logo:
             lines.append("On a dark background, place the logo on a light panel rather than recoloring it.")
 
-    if accent or background or theme:
+    if accent or background_light or background_dark or theme:
         lines += ["", "## Colors", ""]
         if accent:
             lines.append(
                 f"- Accent `{accent}`: primary buttons, links, highlights, key numbers, the first "
                 f"chart series. Text on it: `{_text_on(accent)}`."
             )
-        if background:
+        if background_light and background_light == background_dark:
             lines.append(
-                f"- Background `{background}`: page, slide and app background. Text on it: "
-                f"`{_text_on(background)}`."
+                f"- Background `{background_light}`: page, slide and app background. Text on it: "
+                f"`{_text_on(background_light)}`."
             )
+        else:
+            if background_light:
+                lines.append(
+                    f"- Light background `{background_light}`: page, slide and app background in a "
+                    f"light look. Text on it: `{_text_on(background_light)}`."
+                )
+            if background_dark:
+                lines.append(
+                    f"- Dark background `{background_dark}`: page, slide and app background in a "
+                    f"dark look. Text on it: `{_text_on(background_dark)}`."
+                )
         if theme:
             lines.append(f"- Default to a {theme} look unless the user asks otherwise.")
-        if accent and background and contrast_ratio(accent, background) < 3:
+        low_contrast = [
+            name
+            for name, color in (("light", background_light), ("dark", background_dark))
+            if accent and color and contrast_ratio(accent, color) < 3
+        ]
+        if accent and low_contrast:
+            where = (
+                "the background"
+                if background_light == background_dark or len(low_contrast) == 2
+                else f"the {low_contrast[0]} background"
+            )
             lines.append(
-                "- The accent is low-contrast on the background: use it for fills and large "
-                "shapes, not for text or thin lines on that background."
+                f"- The accent is low-contrast on {where}: use it there for fills and large "
+                "shapes, not for text or thin lines."
             )
 
     if font or radius is not None:

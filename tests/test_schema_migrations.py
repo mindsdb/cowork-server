@@ -1278,3 +1278,64 @@ def test_sidebar_title_mode_revision_is_a_no_op_where_the_column_already_exists(
     with sqlite3.connect(db_path) as connection:
         # Left as it was: the revision neither re-adds the column nor rewrites rows.
         assert connection.execute("select sidebar_title_mode from org_appearance").fetchone()[0] == "none"
+
+
+def test_the_backgrounds_are_added_and_the_single_background_copied_into_both(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "backgrounds.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "c3d548ba2bdb")
+    assert "background_light" not in _org_appearance_columns(db_path)
+    with sqlite3.connect(db_path) as connection:
+        for org_id, background in (("a" * 32, "#fafafa"), ("b" * 32, None)):
+            connection.execute(
+                "insert into org_appearance (id, org_id, background, members_can_choose) values (?, ?, ?, 1)",
+                (uuid.uuid4().hex, org_id, background),
+            )
+        connection.commit()
+
+    run_schema_migrations(engine, uri)
+
+    with sqlite3.connect(db_path) as connection:
+        rows = {
+            org_id: (light, dark)
+            for org_id, light, dark in connection.execute(
+                "select org_id, background_light, background_dark from org_appearance"
+            )
+        }
+    assert rows == {"a" * 32: ("#fafafa", "#fafafa"), "b" * 32: (None, None)}
+
+    _downgrade_to(engine, uri, "c3d548ba2bdb")
+    columns = _org_appearance_columns(db_path)
+    assert "background_light" not in columns and "background_dark" not in columns
+    assert "background" in columns
+
+
+def test_the_backgrounds_revision_keeps_columns_and_values_already_there(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "backgrounds-present.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "c3d548ba2bdb")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("alter table org_appearance add column background_light varchar(7)")
+        connection.execute(
+            "insert into org_appearance (id, org_id, background, background_light, members_can_choose) "
+            "values (?, ?, ?, ?, 1)",
+            (uuid.uuid4().hex, "c" * 32, "#fafafa", "#eeeeee"),
+        )
+        connection.commit()
+
+    run_schema_migrations(engine, uri)
+
+    columns = _org_appearance_columns(db_path)
+    assert columns.count("background_light") == 1 and columns.count("background_dark") == 1
+    with sqlite3.connect(db_path) as connection:
+        light, dark = connection.execute("select background_light, background_dark from org_appearance").fetchone()
+    # A value already there is kept; only the empty side takes the legacy one.
+    assert (light, dark) == ("#eeeeee", "#fafafa")

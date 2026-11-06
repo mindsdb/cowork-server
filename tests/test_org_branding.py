@@ -218,7 +218,8 @@ def test_a_member_reads_the_images_from_auth_and_the_stock_look(org):
         "logoUrl": BRANDING["logo_url"],
         "logoDarkUrl": None,
         "appearance": {
-            "accent": None, "background": None, "font": None, "radius": None, "skin": None,
+            "accent": None, "background": None, "backgroundLight": None, "backgroundDark": None,
+            "font": None, "radius": None, "skin": None,
             "defaultTheme": None, "greeting": None, "sidebarTitle": None,
             "sidebarTitleMode": "company", "membersCanChoose": True, "guidelines": None,
         },
@@ -260,7 +261,8 @@ def test_an_admin_sets_the_look_and_a_partial_change_keeps_the_rest(org):
         members_can_choose=False, guidelines="Write in plain English.",
     )
     assert out["appearance"] == {
-        "accent": "#1a2b3c", "background": "#ffffff", "font": "mono", "radius": 10, "skin": "custom",
+        "accent": "#1a2b3c", "background": "#ffffff", "backgroundLight": "#ffffff",
+        "backgroundDark": "#ffffff", "font": "mono", "radius": 10, "skin": "custom",
         "defaultTheme": "light", "greeting": "Welcome to Acme", "sidebarTitle": "Acme Assist",
         "sidebarTitleMode": "custom", "membersCanChoose": False, "guidelines": "Write in plain English.",
     }
@@ -283,6 +285,8 @@ def test_a_member_cannot_change_the_look(org):
         {"accent": "red"},
         {"accent": "#12345"},
         {"background": "#gggggg"},
+        {"background_light": "white"},
+        {"background_dark": "#12345z"},
         {"font": "comic-sans"},
         {"skin": "neon"},
         {"radius": -1},
@@ -296,6 +300,75 @@ def test_a_member_cannot_change_the_look(org):
 def test_values_the_app_cannot_apply_are_refused(body):
     with pytest.raises(ValidationError):
         OrgAppearanceUpdate(**body)
+
+
+# ── light and dark backgrounds ───────────────────────────────────────────────
+
+
+def test_light_and_dark_backgrounds_are_set_apart(org):
+    out = _put(org, ADMIN, background_light="#FAFAFA", background_dark="#0B0B10")
+    appearance = out["appearance"]
+    assert (appearance["backgroundLight"], appearance["backgroundDark"], appearance["background"]) == (
+        "#fafafa", "#0b0b10", "#fafafa",
+    )
+    # One side alone keeps the other.
+    out = _put(org, ADMIN, background_dark="#101820")
+    assert (out["appearance"]["backgroundLight"], out["appearance"]["backgroundDark"]) == ("#fafafa", "#101820")
+    out = _put(org, ADMIN, background_light=None)
+    appearance = out["appearance"]
+    assert (appearance["backgroundLight"], appearance["backgroundDark"], appearance["background"]) == (
+        None, "#101820", "#101820",
+    )
+    assert _get(org, ALICE)["appearance"]["backgroundDark"] == "#101820"
+
+
+def test_an_older_clients_single_background_sets_both(org):
+    out = _put(org, ADMIN, background="#123456")
+    appearance = out["appearance"]
+    assert (appearance["backgroundLight"], appearance["backgroundDark"], appearance["background"]) == (
+        "#123456", "#123456", "#123456",
+    )
+
+
+def test_the_legacy_column_is_mirrored_and_read_when_the_new_ones_are_empty(org):
+    _put(org, ADMIN, background_light="#fafafa", background_dark="#0b0b10")
+    row = org_branding.appearance_row(org.as_(ADMIN))
+    assert row.background == "#fafafa"
+    # A row only a server from before the split wrote.
+    session = org.as_(ADMIN)
+    row = org_branding.appearance_row(session)
+    row.background_light = row.background_dark = None
+    row.background = "#222222"
+    session.add(row)
+    session.commit()
+    appearance = _get(org, ALICE)["appearance"]
+    assert (appearance["backgroundLight"], appearance["backgroundDark"], appearance["background"]) == (
+        "#222222", "#222222", "#222222",
+    )
+
+
+def test_the_backgrounds_take_camel_case():
+    update = OrgAppearanceUpdate(backgroundLight="#FFFFFF", backgroundDark="#000000")
+    assert (update.background_light, update.background_dark) == ("#ffffff", "#000000")
+
+
+def test_the_skill_lists_both_backgrounds_with_readable_text(org):
+    _put(org, ADMIN, accent="#0055ff", background_light="#fafafa", background_dark="#0b0b10")
+    text = _skill_md(org)
+    assert "Light background `#fafafa`" in text and "Text on it: `#111111`" in text
+    assert "Dark background `#0b0b10`" in text and "Text on it: `#ffffff`" in text
+    _put(org, ADMIN, background_light=None)
+    text = _skill_md(org)
+    assert "Light background" not in text and "Dark background `#0b0b10`" in text
+    # One color for both reads as one background.
+    _put(org, ADMIN, background="#fafafa")
+    text = _skill_md(org)
+    assert "- Background `#fafafa`" in text and "Dark background" not in text
+
+
+def test_a_low_contrast_accent_is_flagged_for_the_background_it_fails_on(org):
+    _put(org, ADMIN, accent="#fbfbfb", background_light="#ffffff", background_dark="#000000")
+    assert "low-contrast on the light background" in _skill_md(org)
 
 
 def test_the_body_accepts_camel_case_too():
