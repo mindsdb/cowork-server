@@ -648,7 +648,10 @@ class UserSettings(Settings):
             "provider (see resolved_gate_model), except on openai-compatible, "
             "where this is the only model there is. Defaults to the recommended "
             "model for the selected provider (MindsHub → MindsHub Air; other "
-            "providers → their smallest model)."
+            "providers → their smallest model). Outside MindsHub mode it can be "
+            "set with the ROUTER_MODEL environment variable, meant for an own "
+            "inference provider: Settings hides the choice once turns are "
+            "routed by Jev or an own decision model."
         ),
     )
     harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
@@ -809,6 +812,48 @@ class UserSettings(Settings):
             "Act on reasonable defaults and state assumptions inline instead of "
             "stopping to ask. Turn off for a more cautious, ask-first agent."
         ),
+    )
+    # One switch for every call to Jev on MindsHub: the route gate (jev_route)
+    # and anton's completion check (verifier_jev, overlaid in anton_harness).
+    # Off is the opt-out for organizations that cannot send conversation text
+    # to it; with no decision model of their own configured below, every turn
+    # on MindsHub then runs the full agent. Jev is billed like any MindsHub
+    # model; when MindsHub refuses a call (allowance spent, a restriction on the
+    # organization), the gate falls back to the LLM gate (jev_route.decide).
+    jev_decisions_enabled: Annotated[bool, ORG] = Field(
+        default=True,
+        title="Use Jev on MindsHub",
+        description=(
+            "Send each message and the recent conversation to Jev, MindsHub's decision model, "
+            "to decide whether your chosen model can answer it directly instead of running the "
+            "full agent. Jev also checks whether the agent finished its work. Turn off to have "
+            "every message run the full agent, unless you configure a decision model of your own."
+        ),
+    )
+    # A decision model of the organization's own, for teams that bring their
+    # own inference keys or cannot use Jev on MindsHub. Any endpoint taking
+    # TypeSafe's decision body works: TypeSafe's own (/v1/systemone), a
+    # gateway serving Jev (MindsHub's or Portkey's /v1/decisions), or a
+    # MindsHub account used only for decisions. Configured (URL and key both set), it
+    # routes every turn whatever the provider, and jev_decisions_enabled does
+    # not apply to it: setting it up is the opt-in.
+    decision_model_url: Annotated[str, ORG, PINNED] = Field(
+        default="",
+        title="Decision Model Endpoint",
+        description=(
+            "Full URL of your decision model's endpoint, which must take TypeSafe's decision "
+            "request (model, state, questions), for example https://api.typesafe.ai/v1/systemone."
+        ),
+    )
+    decision_model_api_key: SecretStr | None = Field(
+        default=None,
+        title="Decision Model API Key",
+        description="API key for your own decision model.",
+    )
+    decision_model: Annotated[str, ORG, PINNED] = Field(
+        default="jev",
+        title="Decision Model",
+        description="The model name your decision endpoint expects.",
     )
     first_take_enabled: bool = Field(
         default=True,

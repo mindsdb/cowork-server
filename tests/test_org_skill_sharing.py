@@ -1493,7 +1493,9 @@ def test_handle_sends_a_plain_question_to_the_agent_without_the_gate_or_a_first_
     monkeypatch.setattr(responses, "run_db", unit)
     monkeypatch.setattr(responses, "decide_route", gate)
     monkeypatch.setattr(responses, "_start_first_take", first_take)
-    monkeypatch.setattr(responses, "_spawn_jev_shadow_probe", lambda **_kwargs: None)
+    # The LLM gate, whatever the org's provider: this test is about the skill,
+    # not which gate decides.
+    monkeypatch.setattr(ResponsesHandler, "_jev_gate", lambda _self, _turn_llm: None)
 
     def ask() -> None:
         handler = ResponsesHandler(principal=_principal(BOB), mindshub_bearer=MEMBER_BEARER)

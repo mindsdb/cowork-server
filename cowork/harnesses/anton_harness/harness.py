@@ -230,6 +230,13 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
             db_val = db_val.value.replace("_", "-")
         setattr(anton_settings, attr, db_val)
         applied.append(attr)
+    # The Jev opt-out covers anton's completion check too, so an organization
+    # that turns Jev off sends it nothing. Only ever turns it off: on leaves
+    # anton's own setting alone. An organization MindsHub refuses Jev to needs
+    # no switch: anton stops asking after the first refusal.
+    if getattr(user, "jev_decisions_enabled", True) is False and hasattr(anton_settings, "verifier_jev"):
+        anton_settings.verifier_jev = "off"
+        applied.append("verifier_jev")
     return applied
 
 
