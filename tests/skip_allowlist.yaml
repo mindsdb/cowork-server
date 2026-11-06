@@ -14,3 +14,8 @@
     Premise check. When the model ends the turn before it can be seen running,
     there is nothing to cancel, so the run proves nothing for this test. That
     is a fact about the deployment's speed, not a defect.
+
+- test: tests/test_notion_token_rejection.py
+  reason: >-
+    Needs anton's McpTokenRejected, which the pinned anton-agent predates.
+    Remove this entry in the commit that raises the anton-agent pin.
