@@ -334,7 +334,7 @@ async def test_compat_upload_leaves_a_busy_store_to_the_503_handlers(units_read_
         return stubs.upload_attachment("general", str(uuid4()), scoped=scoped, files=[_upload("notes.txt")])
 
     if busy == "file_store":
-        async with holding(units.EFS_SLOTS, LOCAL_SCOPE):
+        async with holding(db_session.settings.storage.efs_slots, LOCAL_SCOPE):
             with pytest.raises(FilesystemBusy):
                 await upload()
     else:
@@ -342,6 +342,50 @@ async def test_compat_upload_leaves_a_busy_store_to_the_503_handlers(units_read_
         async with units._slots(units_read_engine):
             with pytest.raises(DatabaseBusy):
                 await upload()
+
+
+async def test_a_refused_upload_row_answers_at_once_and_its_folder_goes_once_a_slot_frees(
+    units_read_engine, monkeypatch,
+):
+    """The row's unit is refused while every file store slot is held. The
+    refusal reaches the caller at once, rather than wait for a slot to clean
+    up and then answer FilesystemBusy in its place, and the folder the bytes
+    went to is removed once a slot frees: no row names it."""
+    import asyncio
+    import threading
+
+    import cowork.db.session as db_session
+    from cowork.db.units import DatabaseBusy
+    from cowork.services import files
+    from test_run_efs import holding
+
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    written: list[Path] = []
+    row_asked = threading.Event()
+    slots_held = threading.Event()
+
+    def refused_row(_session, *, file):
+        written.append(Path(file.path))
+        row_asked.set()
+        slots_held.wait(timeout=5)
+        raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+
+    monkeypatch.setattr(files, "_insert_file", refused_row)
+    svc = _svc(units_read_engine, _scope(ORG_A))
+    upload = asyncio.create_task(svc.create_file(_upload("notes.txt"), purpose="assistants"))
+    assert await asyncio.to_thread(row_asked.wait, 5)
+    [path] = written
+    loop = asyncio.get_running_loop()
+    async with holding(db_session.settings.storage.efs_slots, LOCAL_SCOPE):
+        slots_held.set()
+        refused_at = loop.time()
+        with pytest.raises(DatabaseBusy):
+            await upload
+        assert loop.time() - refused_at < 0.5
+        assert path.is_file()
+    await asyncio.wait_for(asyncio.gather(*files._upload_removals), timeout=5)
+
+    assert not path.parent.exists()
 
 
 @pytest.mark.asyncio

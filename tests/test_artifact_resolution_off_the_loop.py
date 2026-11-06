@@ -38,6 +38,7 @@ from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifact_workspace
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db import units
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.draft_host import app as draft_app
 from cowork.models.project import Project
 from cowork.server import create_app
@@ -285,7 +286,7 @@ async def test_a_draft_builds_its_preview_in_the_slot_it_opened_the_file_in(owne
     monkeypatch.setattr(artifact_files, "open_pinned_draft_file", open_while_the_store_fills)
     monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
     slots = units._efs_slots()
-    holders = [object() for _ in range(units.EFS_SLOTS)]
+    holders = [object() for _ in range(db_session.settings.storage.efs_slots)]
     next_free: asyncio.Task | None = None
     transport = httpx.ASGITransport(app=owners_draft.app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url=owners_draft.base_url) as client:
@@ -348,6 +349,25 @@ def _stick_lookups(monkeypatch, *, sticks=lambda _request: True):
     return state, released
 
 
+async def _plan_once(monkeypatch, project_ref: str, *scopes: TenantScope) -> None:
+    """Build each caller's roots plan for ``project_ref`` once, before a
+    burst, and answer every lookup's database half from it. The burst's
+    database work then stays the same whatever rows other tests left in the
+    session database, so under the 1 s POOL_TIMEOUT its requests reach the
+    file store, and only the file store's slots refuse them."""
+    plans = {
+        scope.user_id: await units.run_db(
+            partial(artifact_scope._plan_for_project_ref, project_ref=project_ref), scope=scope
+        )
+        for scope in scopes
+    }
+
+    def planned(session, **_ref):
+        return plans[session.scope.user_id]
+
+    monkeypatch.setattr(artifact_scope, "_plan_for_project_ref", planned)
+
+
 @pytest.fixture
 def stuck_lookup(monkeypatch, seeded_artifact):
     """Every artifact root lookup blocks until the test releases it."""
@@ -356,14 +376,15 @@ def stuck_lookup(monkeypatch, seeded_artifact):
     released.set()
 
 
-async def test_a_stuck_file_store_refuses_artifact_reviews_and_nothing_else(stuck_lookup):
+async def test_a_stuck_file_store_refuses_artifact_reviews_and_nothing_else(stuck_lookup, monkeypatch):
     state, released = stuck_lookup
+    await _plan_once(monkeypatch, "local", LOCAL_SCOPE)
     loop = asyncio.get_running_loop()
     extra = 4
     transport = httpx.ASGITransport(app=_marked(create_app()), raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         started = loop.time()
-        reviews = [asyncio.create_task(client.get(REVIEW)) for _ in range(units.EFS_SLOTS + extra)]
+        reviews = [asyncio.create_task(client.get(REVIEW)) for _ in range(db_session.settings.storage.efs_slots + extra)]
         refused: list[tuple[httpx.Response, float]] = []
         try:
             while len(refused) < extra and loop.time() - started < 5:
@@ -391,8 +412,8 @@ async def test_a_stuck_file_store_refuses_artifact_reviews_and_nothing_else(stuc
         assert seconds <= 1 + 1
     assert live.status_code == 200 and live_seconds < LIVE_BUDGET_SECONDS
     assert projects.status_code == 200 and projects_seconds < LIVE_BUDGET_SECONDS
-    assert blocked_now == units.EFS_SLOTS
-    assert state["most"] == units.EFS_SLOTS
+    assert blocked_now == db_session.settings.storage.efs_slots
+    assert state["most"] == db_session.settings.storage.efs_slots
 
 
 async def test_a_lookup_waiting_on_the_file_store_holds_no_pooled_connection(stuck_lookup):
@@ -457,25 +478,31 @@ def first_members_lookups_stuck(monkeypatch, org_project_review):
 
 
 async def test_a_second_member_gets_a_slot_while_the_first_holds_their_share(
-    org_project_review, first_members_lookups_stuck, granted_product_permissions,
+    org_project_review, first_members_lookups_stuck, granted_product_permissions, monkeypatch,
 ):
     """Two members of one organization. The first fires as many reviews as
     there are file store slots, and every one sticks on the file store: the
     first member holds their share, the rest of their reviews are refused,
     and the second member's review still gets a slot and answers."""
     state, released = first_members_lookups_stuck
+    project_ref = org_project_review.removeprefix("/api/v1/artifacts/workspace/").split("/")[0]
+    await _plan_once(
+        monkeypatch,
+        project_ref,
+        *(TenantScope(org_mode=True, org_id=ORG, user_id=user) for user in (FIRST_MEMBER, SECOND_MEMBER)),
+    )
     loop = asyncio.get_running_loop()
-    held = units.EFS_SHARE
+    held = db_session.settings.storage.efs_share
     transport = httpx.ASGITransport(app=_marked(create_app()), raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         firsts = [
             asyncio.create_task(client.get(org_project_review, headers=_as(FIRST_MEMBER)))
-            for _ in range(units.EFS_SLOTS)
+            for _ in range(db_session.settings.storage.efs_slots)
         ]
         refused: list[httpx.Response] = []
         try:
             started = loop.time()
-            while len(refused) < units.EFS_SLOTS - held and loop.time() - started < 5:
+            while len(refused) < db_session.settings.storage.efs_slots - held and loop.time() - started < 5:
                 for task in [t for t in firsts if t.done()]:
                     firsts.remove(task)
                     refused.append(task.result())
@@ -489,7 +516,7 @@ async def test_a_second_member_gets_a_slot_while_the_first_holds_their_share(
 
     assert second.status_code == 200, second.text
     assert blocked_before == blocked_after == held
-    assert len(refused) == units.EFS_SLOTS - held
+    assert len(refused) == db_session.settings.storage.efs_slots - held
     for response in refused:
         assert response.status_code == 503, response.text
         assert response.json()["code"] == "server_busy"
@@ -616,6 +643,33 @@ def test_an_owners_lookup_never_stats_a_co_members_workspace(tmp_path, monkeypat
     reviewed = artifact_scope._reviewable_in(reviewers_plan, granted_id, org_id=ORG)
 
     assert not reviewed.is_own and reviewed.folder == granted
+
+
+async def test_the_artifacts_list_finds_each_cards_export_source_on_a_file_store_thread(
+    seeded_artifact, monkeypatch,
+):
+    """A card's export source lstats its primary file where export is on. The
+    list finds it in its file store call, so the database unit after it reads
+    no artifact folder and holds no pooled connection while a stat waits."""
+    from cowork.services import artifact_export
+    from cowork.services.projects import GENERAL_PROJECT_ID
+
+    monkeypatch.setattr(artifact_export, "ORG_EXPORT_ENABLED", True)
+    real = artifact_export._is_single_named_file
+    on_file_store_thread: list[bool] = []
+
+    def spy(path):
+        on_file_store_thread.append(units.on_efs_thread())
+        return real(path)
+
+    monkeypatch.setattr(artifact_export, "_is_single_named_file", spy)
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/v1/artifacts/", params={"project_id": str(GENERAL_PROJECT_ID)})
+
+    assert response.status_code == 200, response.text
+    assert [card["slug"] for card in response.json()] == ["brief"]
+    assert on_file_store_thread == [True]
 
 
 @pytest.mark.parametrize(

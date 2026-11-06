@@ -19,7 +19,8 @@ thread with no time limit, so EFS work gets its own EFS_SLOTS threads, apart
 from anyio's default limiter, which sync routes and sync dependencies share.
 Only the wait for a slot has a deadline: a started call keeps its slot until
 it returns. One person holds at most EFS_SHARE of the slots, so one heavy
-client is refused with ``FilesystemBusy`` before anyone else waits.
+client is refused with ``FilesystemBusy`` before anyone else waits. Both come
+from the environment (StorageSettings in cowork.common.settings.app_settings).
 """
 from __future__ import annotations
 
@@ -27,8 +28,9 @@ import asyncio
 import logging
 import math
 import threading
-from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass, replace
 from typing import Any, TypeVar
 from uuid import UUID
 from weakref import WeakValueDictionary
@@ -265,6 +267,69 @@ async def run_to_completion(work: Coroutine[Any, Any, T]) -> T:
     return await _finish_even_if_cancelled(asyncio.ensure_future(work))
 
 
+#: How long the lifespan's last step waits for turn-end artifact records
+#: (drain_turn_end_records). The chart's grace period counts it
+#: (tests/test_chart_values.py).
+TURN_END_RECORD_DRAIN_SECONDS = 8.0
+
+
+@dataclass(frozen=True)
+class TurnEndRecord:
+    """The turn a turn-end artifact record belongs to, for the line that names
+    it when a shutdown cuts the record."""
+
+    conversation_id: UUID
+    project_id: str | None
+    # The slugs the record writes rows for. Empty until its diff finds them
+    # (note_turn_end_slugs).
+    touched: tuple[str, ...]
+
+
+_turn_end_records: dict[asyncio.Future[Any], TurnEndRecord] = {}
+
+
+async def run_turn_end_record(*, work: Coroutine[Any, Any, T], record: TurnEndRecord) -> T:
+    """``run_to_completion`` for a turn's artifact diff and record, tracked so
+    the lifespan's last step waits for it before the event loop closes and
+    cancels it (``drain_turn_end_records``)."""
+    task = asyncio.ensure_future(work)
+    _turn_end_records[task] = record
+    task.add_done_callback(lambda done: _turn_end_records.pop(done, None))
+    return await _finish_even_if_cancelled(task)
+
+
+def note_turn_end_slugs(*, slugs: Iterable[str]) -> None:
+    """Name the slugs the running turn-end record writes rows for, once its
+    diff has found them, so the ERROR a shutdown's cut logs names them
+    (drain_turn_end_records). The record's own task calls it; any other
+    caller changes nothing."""
+    task = asyncio.current_task()
+    record = _turn_end_records.get(task)
+    if record is not None:
+        _turn_end_records[task] = replace(record, touched=tuple(slugs))
+
+
+async def drain_turn_end_records(*, timeout: float) -> None:
+    """Wait up to ``timeout`` for the turn-end records still running, for the
+    end of shutdown. Each one still running then is cut by the event loop's
+    close, so its rows are lost, and an ERROR names its turn and the slugs
+    its diff found, none when the diff had not answered."""
+    if not _turn_end_records:
+        return
+    _, unfinished = await asyncio.wait(list(_turn_end_records), timeout=timeout)
+    for task in unfinished:
+        record = _turn_end_records[task]
+        logger.error(
+            "A turn's artifact record was still running at shutdown; its rows are lost",
+            extra={
+                "event": "shutdown_turn_record_lost",
+                "conversation_id": str(record.conversation_id),
+                "project_id": record.project_id,
+                "touched": list(record.touched),
+            },
+        )
+
+
 async def _finish_even_if_cancelled(task: asyncio.Future[T]) -> T:
     """Await ``task``, and make a cancel of the caller wait for it.
 
@@ -301,14 +366,11 @@ async def _drain(task: asyncio.Future[Any]) -> None:
         )
 
 
-#: Threads EFS work may hold at once, per event loop. A call stuck on the hard
-#: mount keeps its thread until the file server answers, so this is also the
-#: most threads a stalled mount can take.
-EFS_SLOTS = 16
-#: Slots one person, or one organization's work with no person, may hold at
-#: once.
-EFS_SHARE = 4
-
+# EFS_SLOTS, the threads EFS work may hold at once per event loop, and
+# EFS_SHARE, the slots one person, or one organization's work with no person,
+# may hold at once, are settings (StorageSettings.efs_slots and efs_share, 100
+# and 10 by default). Nothing caps an organization: ten busy people fill the
+# default EFS_SLOTS.
 _EFS_SLOTS: RunVar[anyio.CapacityLimiter] = RunVar("cowork_efs_slots")
 _EFS_SHARES: RunVar[WeakValueDictionary[str, anyio.CapacityLimiter]] = RunVar("cowork_efs_shares")
 _efs_thread = threading.local()
@@ -320,7 +382,7 @@ def _efs_slots() -> anyio.CapacityLimiter:
         return _EFS_SLOTS.get()
     except LookupError:
         pass
-    limiter = anyio.CapacityLimiter(EFS_SLOTS)
+    limiter = anyio.CapacityLimiter(db_session.settings.storage.efs_slots)
     _EFS_SLOTS.set(limiter)
     return limiter
 
@@ -333,7 +395,9 @@ def _efs_share(scope: TenantScope) -> anyio.CapacityLimiter | None:
     Work in a partitioned scope with no person, such as a channel turn
     (scope_for_org), shares as one person keyed ``org:<org_id>``, so one
     organization's channel bookkeeping cannot take every slot. That key
-    never matches a person's, which is their identity provider's subject id.
+    never matches a person's: ``TrustedHeaderMiddleware.dispatch``
+    (cowork/principal.py) parses X-User-Id as a UUID, so no person's key
+    starts with ``org:``.
     """
     if not scope.partitioned:
         return None
@@ -345,7 +409,7 @@ def _efs_share(scope: TenantScope) -> anyio.CapacityLimiter | None:
         _EFS_SHARES.set(shares)
     share = shares.get(key)
     if share is None:
-        share = anyio.CapacityLimiter(EFS_SHARE)
+        share = anyio.CapacityLimiter(db_session.settings.storage.efs_share)
         shares[key] = share
     return share
 

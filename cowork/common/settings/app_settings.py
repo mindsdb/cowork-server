@@ -506,6 +506,28 @@ class StorageSettings(Settings):
             "(cowork.shared_skills)."
         ),
     )
+    # Threads for work on the shared file store (cowork.db.units.run_efs),
+    # per event loop. These read their bare names, as the database pool
+    # settings do, and POOL_TIMEOUT bounds the wait for one of them too.
+    efs_slots: int = Field(
+        default=100,
+        ge=1,
+        description=(
+            "Threads file store work may hold at once. A call stuck on the hard "
+            "mount keeps its thread until the file server answers, so this is also "
+            "the most threads a stalled mount can take."
+        ),
+    )  # EFS_SLOTS
+    # Per person, or per organization for its work with no person. Nothing
+    # caps an organization: ten busy people fill the default EFS_SLOTS.
+    efs_share: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "File store threads one person may hold at once, so one heavy client "
+            "is refused before anyone else waits."
+        ),
+    )  # EFS_SHARE
 
 
 class SkillSettings(Settings):

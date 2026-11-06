@@ -779,7 +779,7 @@ async def test_a_cancel_while_a_lock_release_waits_for_a_slot_still_frees_the_lo
 
     monkeypatch.setattr(ap, "publish_artifact", blocked_publish)
     slots = units._efs_slots()
-    holders = [object() for _ in range(units.EFS_SLOTS)]
+    holders = [object() for _ in range(units.db_session.settings.storage.efs_slots)]
     reconcile = asyncio.create_task(
         ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
     )

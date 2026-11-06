@@ -58,7 +58,6 @@ from cowork.schemas.live_apps import (
 )
 from cowork.services.artifact_roots import (
     RootsPlan,
-    artifacts_sources_for_project,
     artifacts_sources_for_scan,
     plan_project_roots,
     plan_scope_roots,
@@ -84,6 +83,7 @@ from cowork.services.artifacts import (
 from cowork.services.projects import ProjectService, is_comparison_sandbox
 
 if TYPE_CHECKING:
+    from cowork.services.artifact_export import ExportSource
     from cowork.services.live_apps import CopyOfShare
 
 logger = logging.getLogger(__name__)
@@ -191,7 +191,17 @@ def _artifact_cards(session, sources) -> list[dict]:
     # Owner-side fields are stripped inside `card_for_folder`, not here: inline chat
     # cards use the same builder and would otherwise still carry the plaintext
     # password.
-    return _card_capabilities(session, sources=sources, cards=_list_artifacts(sources))
+    found = _sources_and_cards(find_sources=lambda: sources)
+    return _card_capabilities(session, sources=found.sources, cards=found.cards)
+
+
+class _FoundCard(NamedTuple):
+    """One card as the file store half found it, with the export source its
+    capabilities read. That is found there too: it can lstat the card's
+    primary file."""
+
+    card: dict
+    export_source: ExportSource
 
 
 class _SourcesAndCards(NamedTuple):
@@ -199,13 +209,19 @@ class _SourcesAndCards(NamedTuple):
     artifacts in them before the owner reads."""
 
     sources: list[ProjectArtifacts]
-    cards: list[dict]
+    cards: list[_FoundCard]
 
 
-def _sources_and_cards(find_sources: Callable[[], list[ProjectArtifacts]]) -> _SourcesAndCards:
-    """The roots ``find_sources`` finds and their cards, on the calling thread."""
+def _sources_and_cards(*, find_sources: Callable[[], list[ProjectArtifacts]]) -> _SourcesAndCards:
+    """The roots ``find_sources`` finds and their cards, each with its export
+    source, on the calling thread."""
+    from cowork.services.artifact_export import card_export_source
+
     sources = find_sources()
-    return _SourcesAndCards(sources=sources, cards=_list_artifacts(sources))
+    return _SourcesAndCards(
+        sources=sources,
+        cards=[_FoundCard(card, card_export_source(card)) for card in _list_artifacts(sources)],
+    )
 
 
 def _browsable_sources(*, plan: RootsPlan) -> list[ProjectArtifacts]:
@@ -225,16 +241,16 @@ async def _cards_for(
     file store call, then the owner reads in a database unit, so no pooled
     connection waits on the file server. ``find_sources`` runs in that file
     store call."""
-    found = await run_efs(partial(_sources_and_cards, find_sources), scope=scope)
+    found = await run_efs(partial(_sources_and_cards, find_sources=find_sources), scope=scope)
     return await run_db(
         partial(_card_capabilities, sources=found.sources, cards=found.cards), scope=scope
     )
 
 
-def _card_capabilities(session, *, sources, cards: list[dict]) -> list[dict]:
+def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[dict]:
     """The database half of the cards: each card's owner, its capabilities and,
-    with live apps, who shared it. Reads no artifact folder."""
-    from cowork.services.artifact_export import card_export_source
+    with live apps, who shared it. Reads no artifact folder: the file store
+    half found each card's export source (``_sources_and_cards``)."""
     from cowork.services.artifact_ownership import (
         OwnerRequest,
         resolve_artifact_owners_by_source,
@@ -247,11 +263,11 @@ def _card_capabilities(session, *, sources, cards: list[dict]) -> list[dict]:
     # and legacy roots' in one more (the unfiltered listing spans every project
     # of the organization).
     by_base = {Path(source.base): source for source in sources}
-    cards_by_base: dict[Path, list[tuple[str, dict]]] = {}
-    for card in cards:
-        folder = Path(str(card.get("folder") or ""))
+    cards_by_base: dict[Path, list[tuple[str, _FoundCard]]] = {}
+    for found in cards:
+        folder = Path(str(found.card.get("folder") or ""))
         if folder.parent in by_base:
-            cards_by_base.setdefault(folder.parent, []).append((folder.name, card))
+            cards_by_base.setdefault(folder.parent, []).append((folder.name, found))
     roots = list(cards_by_base.items())
     owners_by_root = resolve_artifact_owners_by_source(
         session,
@@ -262,19 +278,26 @@ def _card_capabilities(session, *, sources, cards: list[dict]) -> list[dict]:
     )
     for (base, entries), resolutions in zip(roots, owners_by_root, strict=True):
         source = by_base[base]
-        for slug, card in entries:
-            card["capabilities"] = artifact_capabilities(
+        for slug, found in entries:
+            found.card["capabilities"] = artifact_capabilities(
                 session,
                 source,
                 slug,
                 resolution=resolutions[slug],
-                export_source=card_export_source(card),
+                export_source=found.export_source,
             )
-    _mark_received_live_apps(session, cards_by_base, by_base, cards)
-    return cards
+    plain = [found.card for found in cards]
+    _mark_received_live_apps(session, cards_by_base=cards_by_base, by_base=by_base, cards=plain)
+    return plain
 
 
-def _mark_received_live_apps(session, cards_by_base, by_base, cards: list[dict]) -> None:
+def _mark_received_live_apps(
+    session,
+    *,
+    cards_by_base: dict[Path, list[tuple[str, _FoundCard]]],
+    by_base: dict[Path, ProjectArtifacts],
+    cards: list[dict],
+) -> None:
     """With live apps on, give each card ``receivedFrom``: the owner's email
     for a copy the caller duplicated from a share, from the server's own
     record of the copy (cowork.services.live_apps.received_from), else None."""
@@ -292,49 +315,20 @@ def _mark_received_live_apps(session, cards_by_base, by_base, cards: list[dict])
         project_id = by_base[base].project_id
         if not project_id:
             continue
-        for slug, card in entries:
+        for slug, found in entries:
             owner_email = received.get((UUID(str(project_id)), slug))
             if owner_email:
-                card["receivedFrom"] = {"email": owner_email}
-
-
-def _scoped_project_sources(session, project_id: UUID | str):
-    """Select roots with a server-loaded project identity, never the request.
-
-    ``basename`` is intentionally applied even though FastAPI already typed the
-    route value as a UUID. Snyk recognizes this standard path-leaf operation as
-    a sanitizer, while it does not model FastAPI's coercion or the server-catalog
-    equality boundary below. Equality with the original preserves UUID semantics
-    instead of silently accepting a path whose last component happens to be one.
-
-    ``scoped_project_id_for_request`` first enumerates the tenant-scoped project
-    catalog and uses the client UUID only as an in-memory equality key. Artifact
-    root discovery then receives the matching database value. Keeping this
-    boundary beside the two filesystem consumers below makes the dataflow
-    explicit to both reviewers and static analysis.
-    """
-    raw_project_ref = str(project_id)
-    project_ref = os.path.basename(raw_project_ref)
-    if project_ref != raw_project_ref:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid project",
-        )
-    server_project_id = scoped_project_id_for_request(session, project_ref)
-    try:
-        sources = artifacts_sources_for_project(session, server_project_id)
-    except ValueError as exc:
-        # The project can disappear between catalog recovery and root discovery.
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Unknown project",
-        ) from exc
-    return server_project_id, sources
+                found.card["receivedFrom"] = {"email": owner_email}
 
 
 def _plan_scoped_project(session, *, project_ref: str) -> RootsPlan:
-    """The database half of ``_scoped_project_sources``, run as a unit: the
-    server's own id for the selector, then the plan of that project's roots."""
+    """The database half of root discovery for one project, run as a unit:
+    the server's own id for the selector, then the plan of that project's
+    roots.
+
+    ``scoped_project_id_for_request`` first enumerates the tenant-scoped
+    project catalog and uses the client UUID only as an in-memory equality
+    key, so root discovery receives the matching database value."""
     server_project_id = scoped_project_id_for_request(session, project_ref)
     try:
         return plan_project_roots(session, server_project_id)
@@ -347,8 +341,15 @@ def _plan_scoped_project(session, *, project_ref: str) -> RootsPlan:
 
 
 async def _scoped_project_plan(scope: TenantScope, project_id: UUID | str) -> RootsPlan:
-    """The plan ``_scoped_project_sources`` reads, for async callers: the same
-    selector boundary, read in a database unit."""
+    """The plan of one request-selected project's roots, read in a database
+    unit.
+
+    ``basename`` is intentionally applied even though FastAPI already typed the
+    route value as a UUID. Snyk recognizes this standard path-leaf operation as
+    a sanitizer, while it does not model FastAPI's coercion or the server-catalog
+    equality boundary in ``_plan_scoped_project``. Equality with the original
+    preserves UUID semantics instead of silently accepting a path whose last
+    component happens to be one."""
     raw_project_ref = str(project_id)
     project_ref = os.path.basename(raw_project_ref)
     if project_ref != raw_project_ref:
@@ -413,28 +414,6 @@ def _desktop_registered_source(
         ) and secrets.compare_digest(entry.project_name, project_name):
             return entry.source
     return None
-
-
-def _desktop_artifacts_for_project_path(session, project_path: str) -> list[dict]:
-    """Select one desktop project's response by its legacy path.
-
-    ``project_path`` remains supported because older desktop builds address the
-    list this way. A complete source catalog is built first, then the request is
-    used only as an equality key. It is never joined or opened. The exact source
-    retained in that catalog keeps ``project_id=None``, preserving local draft
-    URLs and card addressing.
-    """
-    catalog = _desktop_registered_path_catalog(scope=session.scope)
-    if not project_path or "\x00" in project_path:
-        return []
-    requested = os.path.normpath(os.path.expanduser(project_path))
-    project_name = os.path.basename(requested)
-    if not project_name:
-        return []
-    source = _desktop_registered_source(catalog, requested, project_name)
-    if source is None:
-        return []
-    return _artifact_cards(session, [source])
 
 
 def _normalized_lookup_key(value: str) -> str:
@@ -793,16 +772,14 @@ async def delete_artifact_for_request(
     source = None
     folder = None
     if ref.artifact_id is not None:
-        # Only the server's own project id: the review lookup below finds
-        # the project's roots itself.
-        server_project_id = await run_db(
-            lambda unit: scoped_project_id_for_request(unit, str(project_id)), scope=session.scope
-        )
         # Keep UUID validation and pass the basename output to the resolver:
         # SAST does not recognize UUID parsing or dataclass fields as a path
         # sanitizer. Parsing first rejects traversal instead of truncating it.
+        # The project id was parsed as a UUID above; the review lookup below
+        # recovers the server's own id for it from the scoped catalog
+        # (scoped_project_id_for_request) before it finds any root.
         artifact_id = os.path.basename(UUID(ref.artifact_id).hex)
-        project_ref = os.path.basename(str(server_project_id))
+        project_ref = os.path.basename(str(project_id))
         # Resolved through the review path so a reviewer who was granted access
         # to this draft is told they cannot delete it, instead of being told it
         # does not exist. Without a grant it still 404s — `require_artifact_owner`
@@ -845,6 +822,10 @@ async def delete_artifact_for_request(
     admin_delete = await run_db(owner_decision, scope=session.scope)
     expected_artifact_id = artifact_id if ref.artifact_id is not None else None
     publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
+    # Set once the draft review rule is gone: the delete step may then no
+    # longer refuse a busy file store, which would leave the folder's review
+    # marker without its rule.
+    revoked = False
     if _org_mode():
         # `ScopedSession.scope` is the wrapper's own attribute — the same one
         # ProjectService reads for `scoped_storage_root`.
@@ -890,6 +871,7 @@ async def delete_artifact_for_request(
             if canonical_key is not None or not admin_delete:
                 authorization_id = canonical_key.split("/", 1)[1] if canonical_key else expected_artifact_id
                 await revoke_draft_review_access(authorization_id, scope)
+                revoked = True
         except ArtifactAccessUnavailable as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -906,17 +888,14 @@ async def delete_artifact_for_request(
                 detail=str(exc),
             ) from exc
     try:
-        await run_efs(
-            partial(
-                _delete_artifact_from_source,
-                source,
-                folder_name,
-                expected_artifact_id=expected_artifact_id,
-                api_key=api_key,
-                publish_url=publish_url,
-                scope=session.scope,
-            ),
+        await _delete_artifact_from_source(
+            source=source,
+            folder_name=folder_name,
+            expected_artifact_id=expected_artifact_id,
+            api_key=api_key,
+            publish_url=publish_url,
             scope=session.scope,
+            deadline=not revoked,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))

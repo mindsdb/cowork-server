@@ -29,7 +29,16 @@ from cowork.common.settings.user_settings import (
     use_settings_scope,
     use_turn_settings,
 )
-from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_efs, run_to_completion
+from cowork.db.units import (
+    TurnEndRecord,
+    busy_retry_seconds,
+    conversation_writes,
+    note_turn_end_slugs,
+    run_db,
+    run_efs,
+    run_to_completion,
+    run_turn_end_record,
+)
 from cowork.harnesses.base import available_harness_ids, get_harness, prompt_text
 from cowork.handlers import direct_answer, jev_route
 from cowork.services.providers import build_llm_client, minds_chat_base_url
@@ -2703,6 +2712,7 @@ class ResponsesHandler:
                     return None
                 if not changes.created:
                     return changes
+                note_turn_end_slugs(slugs=changes.created)
                 try:
                     await run_db(
                         partial(
@@ -2738,8 +2748,14 @@ class ResponsesHandler:
             # branches never record again. A Stop that lands while the diff
             # or the record waits for a slot, or while either runs, waits for
             # both and the record's error log, so the rows are written once
-            # and a refusal still names the slugs it left unrecorded.
-            return await run_to_completion(record())
+            # and a refusal still names the slugs it left unrecorded. A
+            # shutdown's last step waits for it too (drain_turn_end_records).
+            return await run_turn_end_record(
+                work=record(),
+                # record names the slugs once its diff finds them
+                # (note_turn_end_slugs).
+                record=TurnEndRecord(conversation_id=conv_id, project_id=directory.project_id, touched=()),
+            )
 
         async def persist(*, clean: bool) -> _SavedAnswer:
             """Save the answer as it stands, once per turn, in one unit.

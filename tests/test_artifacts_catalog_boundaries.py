@@ -207,7 +207,7 @@ def test_artifact_component_returns_the_basename_sanitizer_value(monkeypatch):
         artifact_identity._component("../artifacts")
 
 
-def test_project_path_leaf_sanitization_does_not_accept_a_prefixed_uuid(monkeypatch):
+async def test_project_path_leaf_sanitization_does_not_accept_a_prefixed_uuid(monkeypatch):
     def unexpected_catalog(*_args):
         raise AssertionError("path-like project value reached the catalog")
 
@@ -216,9 +216,7 @@ def test_project_path_leaf_sanitization_does_not_accept_a_prefixed_uuid(monkeypa
     )
 
     with pytest.raises(HTTPException) as error:
-        artifacts._scoped_project_sources(
-            SimpleNamespace(), f"nested/{uuid4()}"
-        )
+        await artifacts._scoped_project_plan(LOCAL_SCOPE, f"nested/{uuid4()}")
 
     assert error.value.status_code == 400
 

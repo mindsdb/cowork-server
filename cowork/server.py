@@ -38,7 +38,14 @@ from cowork.code_sandbox import check_startup as check_code_sandbox_startup
 from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.personal_resources import PersonalResource, check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
-from cowork.db.units import DatabaseBusy, FilesystemBusy, busy_retry_seconds, loop_limiters
+from cowork.db.units import (
+    TURN_END_RECORD_DRAIN_SECONDS,
+    DatabaseBusy,
+    FilesystemBusy,
+    busy_retry_seconds,
+    drain_turn_end_records,
+    loop_limiters,
+)
 from cowork.common.loop_watchdog import LoopWatchdog
 from cowork.draft_host.listener import start_draft_listener, stop_draft_listener
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
@@ -628,6 +635,10 @@ async def lifespan(app: FastAPI):
         await close_proxy_client()
         await close_inference_client()
         await close_jev_client()
+        # Last: a turn's artifact record that the drains above left waiting on
+        # a stalled file store gets up to TURN_END_RECORD_DRAIN_SECONDS more,
+        # since the event loop's close would cancel it and lose its rows.
+        await drain_turn_end_records(timeout=TURN_END_RECORD_DRAIN_SECONDS)
 
 
 @asynccontextmanager

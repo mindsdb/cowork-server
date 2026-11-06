@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -26,12 +27,27 @@ from cowork.common.paths import (
     safe_join,
 )
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import ScopedSession, scoped_storage_root
+from cowork.db.scoped import ScopedSession, TenantScope, scoped_storage_root
 from cowork.db.units import run_db, run_efs
 from cowork.models.file import File
 from cowork.schemas.files import FileResponse
 
 logger = logging.getLogger(__name__)
+
+#: Removals of an upload's folder whose row was refused, held here until each
+#: ends so the event loop keeps a reference to it.
+_upload_removals: set[asyncio.Task[None]] = set()
+
+
+def _remove_refused_upload(*, file_dir: Path, scope: TenantScope) -> None:
+    """Remove ``file_dir`` in the background, waiting as long as it takes for
+    a file store slot, so a busy or stuck mount never holds the caller's own
+    error, and the folder never outlives a row that was not written."""
+    removal = asyncio.ensure_future(
+        run_efs(partial(shutil.rmtree, file_dir, ignore_errors=True), scope=scope, deadline=False)
+    )
+    _upload_removals.add(removal)
+    removal.add_done_callback(_upload_removals.discard)
 
 
 def unlink_file_dirs(dirs: list[Path]) -> None:
@@ -403,7 +419,7 @@ class FileService:
         try:
             saved = await run_db(partial(_insert_file, file=file), scope=scope)
         except BaseException:
-            await run_efs(partial(shutil.rmtree, file_dir, ignore_errors=True), scope=scope)
+            _remove_refused_upload(file_dir=file_dir, scope=scope)
             raise
         return self._to_response(saved)
 

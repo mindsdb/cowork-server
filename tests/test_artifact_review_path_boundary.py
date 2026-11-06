@@ -136,10 +136,15 @@ def test_valid_draft_selectors_reach_review_as_canonical_identities(
 def test_delete_uuid_reaches_review_with_the_scoped_project(
     client, monkeypatch, artifact_id,
 ):
+    """The review lookup recovers the project from the scoped catalog
+    itself, so the delete asks for it there once, and in no unit of its own
+    before."""
     seen = []
-    monkeypatch.setattr(
-        artifacts_ep, "scoped_project_id_for_request", lambda _session, _project_ref: PROJECT_ID
-    )
+
+    def a_second_catalog_lookup(*_args):
+        pytest.fail("the delete read the project catalog before its review lookup")
+
+    monkeypatch.setattr(artifacts_ep, "scoped_project_id_for_request", a_second_catalog_lookup)
 
     def unexpected_discovery(*_args):
         pytest.fail("a delete by id planned the project's roots before its review lookup")

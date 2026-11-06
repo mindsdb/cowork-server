@@ -943,7 +943,7 @@ async def test_a_cancel_while_the_turn_end_waits_for_a_file_store_slot_still_rec
 
     recorded = _turn_with_a_new_artifact(monkeypatch, scope=LOCAL_SCOPE)
     slots = units._efs_slots()
-    holders = [object() for _ in range(units.EFS_SLOTS)]
+    holders = [object() for _ in range(units.db_session.settings.storage.efs_slots)]
 
     async def take_every_slot():
         for holder in holders:
@@ -1052,3 +1052,185 @@ async def test_a_channel_turns_artifact_bookkeeping_leaves_the_event_loop_free(m
     assert elapsed >= 2 * slow
     # A free loop ticks about 100 times a second here; a blocked one stops.
     assert ticks >= 50 * elapsed * 0.5, f"{ticks} ticks in {elapsed:.1f}s"
+
+
+async def _hold_a_share(*, scope, share: int, stall) -> list[asyncio.Task]:
+    """``share`` file store calls in ``scope``, each running and stuck until
+    ``stall`` is set, the way calls stuck on a stalled mount hold a share."""
+    import threading
+
+    from cowork.db import units
+
+    running = threading.Semaphore(0)
+
+    def stuck():
+        running.release()
+        stall.wait(timeout=30)
+
+    held = [asyncio.create_task(units.run_efs(stuck, scope=scope)) for _ in range(share)]
+    for _ in held:
+        assert await asyncio.to_thread(running.acquire, True, 5)
+    return held
+
+
+async def _until_the_turn_end_waits_for_the_share(*, scope) -> None:
+    from cowork.db import units
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while units._efs_share(scope).statistics().tasks_waiting == 0:
+        assert loop.time() < deadline, "the turn's end never waited for the share"
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.usefixtures("cleanup_tmp_projects")
+def test_a_shutdown_waits_at_its_end_for_a_turn_record_a_stall_held_and_keeps_its_rows(monkeypatch, tmp_path):
+    """The member's file store share is held by calls stuck on a stalled
+    mount, so a channel turn's end waits for a slot. The pod shuts down: the
+    channel drain cancels the turn, and the stall clears 0.5 s into the
+    teardown's last wait. The event loop then closes, as uvicorn's
+    asyncio.run closes it, and the turn's task_objects and owner rows exist."""
+    import threading
+    from unittest.mock import AsyncMock
+
+    import cowork.db.session as db_session
+    from cowork.channels import webhooks
+    from cowork.db import units
+    from cowork.db.scoped import TenantScope
+    from cowork.handlers.responses import ResponsesHandler
+    from cowork.models.task_object import TaskObject
+    from cowork.services import artifact_ownership as ownership
+    from cowork.services import task_objects
+    from test_artifact_ownership import make_conversation, make_project, project_root, scoped, write_artifact
+
+    org_id, creator = str(uuid4()), str(uuid4())
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, creator)
+    source = project_root(project)
+    slug = "sales-report"
+    _fake_handler(monkeypatch, remote_artifacts_context=ResponsesHandler._remote_artifacts_context)
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
+    stall = threading.Event()
+    held: list[asyncio.Task] = []
+
+    async def shut_down_during_a_stall():
+        with scoped(org_id, creator) as session:
+
+            async def replies(**kwargs):
+                yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+                write_artifact(source.base, slug, conversation=conversation_id)
+                held.extend(await _hold_a_share(scope=session.scope, share=db_session.settings.storage.efs_share, stall=stall))
+                yield "turn_completed", {}
+
+            monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+            webhooks._default_scheduler(_drain(remote_turn_events(
+                session=session, conv_id=conversation_id, org_id=org_id, user_id=creator,
+                input_text="hi", model="anton", turn_rows=[],
+            )))
+            try:
+                await _until_the_turn_end_waits_for_the_share(scope=session.scope)
+                await webhooks.drain_background_tasks(timeout=0.1, cancel_timeout=0.1)
+                asyncio.get_running_loop().call_later(0.5, stall.set)
+                await units.drain_turn_end_records(timeout=units.TURN_END_RECORD_DRAIN_SECONDS)
+            finally:
+                stall.set()
+
+    asyncio.run(shut_down_during_a_stall())
+
+    with units.unit_session(scope=TenantScope(org_mode=True, org_id=org_id, user_id=creator)) as session:
+        indexed = session.exec(
+            session.select(TaskObject).where(TaskObject.conversation_id == conversation_id, TaskObject.ref == slug)
+        ).all()
+        owner = ownership.resolve_artifact_owner(session, source, slug)
+    assert (len(indexed), owner) == (1, ownership.OwnerResolution(creator, "recorded"))
+
+
+def test_a_turn_record_a_stall_holds_past_the_last_wait_is_named_at_error(monkeypatch, caplog):
+    """The stall outlasts the teardown's last wait, so the event loop's close
+    cuts the turn's record. The ERROR names its conversation and project, and
+    no slug, since the diff still waits for the file store."""
+    import logging
+    import threading
+
+    import cowork.db.session as db_session
+    from cowork.channels import webhooks
+    from cowork.db import units
+    from cowork.db.scoped import TenantScope
+
+    recorded = _turn_with_a_new_artifact(monkeypatch, scope=None)
+    # The channel's scope: the organization's share, keyed by no person.
+    organization = TenantScope(org_mode=True, org_id=_FakeScope.org_id)
+    stall = threading.Event()
+    held: list[asyncio.Task] = []
+
+    async def take_the_share():
+        held.extend(await _hold_a_share(scope=organization, share=db_session.settings.storage.efs_share, stall=stall))
+
+    _completed_persistent_turn(monkeypatch, before_completed=take_the_share)
+    conv_id = uuid4()
+
+    async def shut_down_during_a_stall():
+        webhooks._default_scheduler(_drain(_channel_turn(conv_id=conv_id)))
+        try:
+            await _until_the_turn_end_waits_for_the_share(scope=organization)
+            await webhooks.drain_background_tasks(timeout=0.1, cancel_timeout=0.1)
+            await units.drain_turn_end_records(timeout=0.3)
+        finally:
+            stall.set()
+
+    with caplog.at_level(logging.ERROR, logger=units.logger.name):
+        asyncio.run(shut_down_during_a_stall())
+
+    [lost] = [
+        record for record in caplog.records
+        if record.name == units.logger.name and getattr(record, "event", None) == "shutdown_turn_record_lost"
+    ]
+    assert lost.levelname == "ERROR"
+    assert (lost.conversation_id, lost.project_id, lost.touched) == (str(conv_id), _PROJECT_ID, [])
+    assert recorded == []
+
+
+async def test_a_turn_record_that_waits_for_the_database_at_the_last_wait_names_its_new_artifacts(
+    monkeypatch, caplog, owned_logger,
+):
+    """The diff found the new artifact "report", and the record waits for a
+    database slot past the teardown's last wait. The ERROR names the slug,
+    on the record and in the line the console prints."""
+    import logging
+
+    from cowork.db import units
+
+    recorded = _turn_with_a_new_artifact(monkeypatch, scope=None)
+    logged = owned_logger(units.logger.name)
+    # The test database is SQLite, so units share one slot.
+    slots = units._slots(units._engine())
+    holder = object()
+
+    async def take_the_slot():
+        await slots.acquire_on_behalf_of(holder)
+
+    _completed_persistent_turn(monkeypatch, before_completed=take_the_slot)
+    conv_id = uuid4()
+    turn = asyncio.create_task(_drain(_channel_turn(conv_id=conv_id)))
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while slots.statistics().tasks_waiting == 0:
+            assert loop.time() < deadline, "the turn's record never waited for a database slot"
+            await asyncio.sleep(0.01)
+        await units.drain_turn_end_records(timeout=0.1)
+    finally:
+        if holder in slots.statistics().borrowers:
+            slots.release_on_behalf_of(holder)
+    await asyncio.wait_for(turn, timeout=5)
+
+    [lost] = [
+        record for record in caplog.records
+        if record.name == units.logger.name and getattr(record, "event", None) == "shutdown_turn_record_lost"
+    ]
+    assert lost.levelno == logging.ERROR
+    assert (lost.conversation_id, lost.project_id, lost.touched) == (str(conv_id), _PROJECT_ID, ["report"])
+    assert_log_fields(
+        logged.output(), event="shutdown_turn_record_lost", conversation_id=str(conv_id), touched=["report"],
+    )
+    assert [call.slugs for call in recorded] == [["report"]]

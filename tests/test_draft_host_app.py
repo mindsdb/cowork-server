@@ -402,8 +402,8 @@ def _assert_busy(response, caplog):
 @pytest.mark.parametrize(
     "held, scope",
     [
-        pytest.param(units.EFS_SHARE, TenantScope(org_mode=True, org_id=ORG, user_id=USER), id="own-share"),
-        pytest.param(units.EFS_SLOTS, LOCAL_SCOPE, id="every-slot"),
+        pytest.param("efs_share", TenantScope(org_mode=True, org_id=ORG, user_id=USER), id="own-share"),
+        pytest.param("efs_slots", LOCAL_SCOPE, id="every-slot"),
     ],
 )
 async def test_a_busy_file_store_answers_503_with_retry_after(
@@ -413,7 +413,7 @@ async def test_a_busy_file_store_answers_503_with_retry_after(
     # see its refusals. The file read waits in the real run_efs.
     monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
 
-    async with holding(held, scope):
+    async with holding(getattr(db_session.settings.storage, held), scope):
         with caplog.at_level("WARNING"):
             response = await _get_on_this_loop(f"/_t/{draft_token()}/index.html")
 
@@ -439,6 +439,31 @@ def test_a_path_outside_the_route_is_logged_without_a_route(client, seen, caplog
 
     [record] = events(caplog, "request_refused")
     assert (record.status_code, record.reason, record.route) == (404, "not_found", None)
+
+
+def test_a_stall_line_names_a_draft_request_by_its_route_never_by_its_token(client, seen, monkeypatch):
+    """The loop watchdog's stall line lists the requests in flight. A draft
+    link's path carries its signed token, its organization and its artifact,
+    so the line names the request by the route's template instead."""
+    from cowork.common import request_logging
+
+    summaries = []
+    real_flag = draft_app_module.wants_comment_layer
+
+    def while_in_flight(request):
+        summaries.append(request_logging.in_flight_summary())
+        return real_flag(request)
+
+    monkeypatch.setattr(draft_app_module, "wants_comment_layer", while_in_flight)
+    token = draft_token()
+
+    response = client.get(f"/_t/{token}/index.html", headers=FETCH)
+
+    assert response.status_code == 200
+    [summary] = summaries
+    assert f"GET {DRAFT_ROUTE} (" in summary
+    for secret in (token, *token.split("."), ORG, ARTIFACT):
+        assert secret not in summary
 
 
 def test_a_missing_file_is_404(client, seen):

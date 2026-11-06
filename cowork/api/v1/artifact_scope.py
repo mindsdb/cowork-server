@@ -1,7 +1,6 @@
 """Project-scoped artifact resolution shared by artifact HTTP endpoints."""
 from __future__ import annotations
 
-import os
 import secrets
 from collections.abc import Callable
 from functools import partial
@@ -15,8 +14,6 @@ from cowork.db.scoped import ScopedSession, TenantScope, tenant_scope_required
 from cowork.db.units import run_db, run_efs
 from cowork.services.artifact_roots import (
     RootsPlan,
-    artifacts_sources_for_project,
-    artifacts_sources_for_scope,
     discover_roots,
     plan_project_roots,
     plan_scope_roots,
@@ -28,52 +25,6 @@ if TYPE_CHECKING:
     from cowork.services.projects import ProjectService
 
 T = TypeVar("T")
-
-
-def _project_dir_matches(source, wanted: str) -> bool:
-    project_dir = source.base.parent.parent
-    try:
-        resolved = str(project_dir.resolve(strict=False))
-    except OSError:
-        resolved = ""
-    return wanted in (str(project_dir), resolved)
-
-
-def artifact_sources_for_request(
-    session,
-    project_id: UUID | None,
-    project_path: str | None,
-):
-    """Return only artifact roots authorized by this request's project scope.
-
-    ``project_id`` is honored in both tenancy modes. Organization requests
-    reject client filesystem paths; desktop paths only select from roots the
-    server already discovered and never become filesystem inputs themselves.
-    """
-    if _org_mode() and project_path is not None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="project_path is not accepted in org deployments; use project_id",
-        )
-    if project_id is not None:
-        # Even a typed FastAPI UUID originates at the request boundary. Recover
-        # the equal UUID object from the scoped project catalog before any root
-        # discovery so downstream paths depend only on server-owned records.
-        project_id = scoped_project_id_for_request(session, str(project_id))
-        try:
-            return artifacts_sources_for_project(session, project_id)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Unknown project",
-            ) from exc
-    sources = artifacts_sources_for_scope(session)
-    if _org_mode():
-        return sources
-    if project_path is not None:
-        wanted = os.path.normpath(os.path.expanduser(project_path))
-        sources = [source for source in sources if _project_dir_matches(source, wanted)]
-    return sources
 
 
 def scoped_project_id_for_request(session: ScopedSession, project_ref: str) -> UUID:

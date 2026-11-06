@@ -1,7 +1,10 @@
-"""The self-hosted router probe runs after bootstrap without delaying readiness."""
+"""The lifespan's background work: the self-hosted router probe runs after
+bootstrap without delaying readiness, and the loop watchdog runs while the
+server serves."""
 
 import asyncio
 import signal
+import threading
 from unittest.mock import AsyncMock
 
 import pytest
@@ -106,3 +109,22 @@ async def test_probe_is_absent_outside_local_self_hosted(boot, kind, tenancy, ba
         await asyncio.sleep(0)
         assert getattr(app.state, "router_startup_probe", None) is None
     probe_module.run_router_startup_probe.assert_not_called()
+
+
+async def test_the_lifespan_runs_the_watchdog_thread_and_stops_it(boot):
+    """The watchdog is the lifespan's: started once startup is done, and
+    stopped when the server shuts down."""
+    from cowork.common import loop_watchdog
+
+    app, _order, _probe = boot()
+
+    def watchdogs() -> set[threading.Thread]:
+        return {thread for thread in threading.enumerate() if thread.name == "cowork-loop-watchdog"}
+
+    # An earlier test's watchdog may still be ending.
+    earlier = watchdogs()
+    async with server.lifespan(app):
+        [running] = watchdogs() - earlier
+        assert running.daemon and running.is_alive()
+    await asyncio.to_thread(running.join, loop_watchdog.STALL_AFTER_S * 2)
+    assert not running.is_alive()

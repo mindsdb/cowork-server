@@ -1144,6 +1144,73 @@ async def test_a_stop_while_the_artifact_record_times_out_still_logs_the_unrecor
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("cleanup_tmp_projects")
+async def test_a_record_that_waits_for_the_database_at_shutdowns_last_wait_names_its_new_artifacts(
+    monkeypatch, tmp_path, caplog,
+):
+    """The pod finished cleanly and created an artifact, and the unit that
+    records it waits for a slot past the teardown's last wait. The ERROR
+    names the turn and the slug its diff found."""
+    from cowork.db import units
+    from cowork.db.scoped import TenantScope
+    from test_artifact_ownership import make_conversation, make_project, project_root, write_artifact
+
+    org_id, creator = str(uuid4()), str(uuid4())
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id=creator)
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, creator)
+    source = project_root(project)
+    slug = "sales-report"
+    handler = _remote_handler(monkeypatch, {})
+    _units_on_the_test_database(monkeypatch, scope=scope)
+    monkeypatch.setattr(
+        ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            SimpleNamespace(created_by=creator), source.base, str(project.id), project.name,
+        )),
+    )
+    # The test database is SQLite, so units share one slot.
+    slots = units._slots(units._engine())
+    holder = object()
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        write_artifact(source.base, slug, conversation=conversation_id)
+        yield "turn_delta", {"text": "done"}
+        await slots.acquire_on_behalf_of(holder)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    buffer = _RecBuffer()
+    task = asyncio.create_task(handler._produce_remote(
+        conv_id=conversation_id, input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    ))
+    with caplog.at_level(logging.ERROR, logger=units.logger.name):
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5
+            while slots.statistics().tasks_waiting == 0:
+                assert loop.time() < deadline, "the artifact record never waited for a slot"
+                await asyncio.sleep(0.01)
+            await units.drain_turn_end_records(timeout=0.1)
+        finally:
+            if holder in slots.statistics().borrowers:
+                slots.release_on_behalf_of(holder)
+    await asyncio.wait_for(task, timeout=5)
+
+    [lost] = [
+        r for r in caplog.records
+        if r.name == units.logger.name and getattr(r, "event", None) == "shutdown_turn_record_lost"
+    ]
+    assert lost.levelno == logging.ERROR
+    assert (lost.conversation_id, lost.project_id, lost.touched) == (
+        str(conversation_id), str(project.id), [slug],
+    )
+    assert buffer.frames[-1] == "CLOSE:completed"
+
+
+@pytest.mark.asyncio
 async def test_the_remote_turns_settings_reads_resolve_its_org_from_the_turn_snapshot(monkeypatch):
     """handle() binds the turn's settings snapshot around the producer's
     creation. The remote producer binds its org at its top, so a settings
@@ -3600,7 +3667,7 @@ class _FileStoreSlots:
         from cowork.db import units
 
         self.limiter = units._efs_slots()
-        self.holders = [object() for _ in range(units.EFS_SLOTS)]
+        self.holders = [object() for _ in range(units.db_session.settings.storage.efs_slots)]
 
     async def take(self) -> None:
         for holder in self.holders:

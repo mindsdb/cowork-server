@@ -9,7 +9,7 @@ from uuid import UUID
 
 from cowork.common.logger import log_context
 from cowork.db.scoped import ScopedSession
-from cowork.db.units import run_db, run_efs, run_to_completion
+from cowork.db.units import TurnEndRecord, note_turn_end_slugs, run_db, run_efs, run_turn_end_record
 from cowork.handlers.responses import ResponsesHandler, remote_turn_skills
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 from cowork.services.connectors.vault_secrets import register_vault_secrets
@@ -133,6 +133,7 @@ async def remote_turn_events(
             )
             return
         new_slugs, touched_slugs = changes.created, changes.touched
+        note_turn_end_slugs(slugs=new_slugs)
         try:
             turn_scope = _recover_turn_scope(conversation)
             if not new_slugs:
@@ -227,13 +228,17 @@ async def remote_turn_events(
             # slot, or while either runs, waits for both, so the rows are
             # written once. While the file store stalls, that wait has no
             # bound. At shutdown, the drain of channel tasks waits up to its
-            # timeout plus its cancel_timeout. Then the event loop's close at
-            # the end of the teardown cancels a diff not yet returned, or a
-            # record still waiting for a slot, so this turn's rows are lost.
-            # Only a file store call already running on a stuck mount keeps
-            # the process alive, until the kubelet's SIGKILL: its worker
-            # thread is not a daemon thread.
-            await run_to_completion(record_artifacts())
+            # timeout plus its cancel_timeout, then the teardown's last step
+            # waits up to TURN_END_RECORD_DRAIN_SECONDS more for this record
+            # (drain_turn_end_records). A stall longer than that still loses
+            # this turn's rows, when the event loop's close cancels the
+            # record, and that step logs an ERROR naming the conversation, the
+            # project and the new slugs, which record_artifacts names once its
+            # diff finds them (note_turn_end_slugs).
+            await run_turn_end_record(
+                work=record_artifacts(),
+                record=TurnEndRecord(conversation_id=conv_id, project_id=artifacts[2], touched=()),
+            )
 
     if artifacts is not None and artifact_writes_allowed:
         for card in await publish_and_card_turn_artifacts(

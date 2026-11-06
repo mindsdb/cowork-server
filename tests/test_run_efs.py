@@ -51,8 +51,30 @@ async def holding(count: int, scope: TenantScope):
         await asyncio.gather(*calls)
 
 
+def test_the_slots_and_the_share_default_to_100_and_10_and_read_the_environment(monkeypatch):
+    from cowork.common.settings.app_settings import StorageSettings
+
+    monkeypatch.delenv("EFS_SLOTS", raising=False)
+    monkeypatch.delenv("EFS_SHARE", raising=False)
+    defaults = StorageSettings()
+    assert (defaults.efs_slots, defaults.efs_share) == (100, 10)
+
+    monkeypatch.setenv("EFS_SLOTS", "40")
+    monkeypatch.setenv("EFS_SHARE", "6")
+    configured = StorageSettings()
+    assert (configured.efs_slots, configured.efs_share) == (40, 6)
+
+
+async def test_the_limiters_take_their_sizes_from_the_settings(monkeypatch):
+    monkeypatch.setattr(db_session.settings.storage, "efs_slots", 3)
+    monkeypatch.setattr(db_session.settings.storage, "efs_share", 2)
+
+    assert units._efs_slots().total_tokens == 3
+    assert units._efs_share(ALICE).total_tokens == 2
+
+
 async def test_one_person_holding_their_share_leaves_slots_for_everyone_else():
-    async with holding(units.EFS_SHARE, ALICE):
+    async with holding(db_session.settings.storage.efs_share, ALICE):
         with pytest.raises(FilesystemBusy):
             await run_efs(lambda: "alice again", scope=ALICE)
         assert await asyncio.wait_for(run_efs(lambda: "bob", scope=BOB), timeout=0.5) == "bob"
@@ -72,23 +94,23 @@ async def test_an_organizations_work_with_no_person_holds_one_share_and_leaves_s
 
     turns = [
         asyncio.create_task(run_efs(blocked, scope=ORG_1_CHANNELS, deadline=False))
-        for _ in range(units.EFS_SLOTS)
+        for _ in range(db_session.settings.storage.efs_slots)
     ]
     try:
-        for _ in range(units.EFS_SHARE):
+        for _ in range(db_session.settings.storage.efs_share):
             await asyncio.to_thread(started.acquire)
         await asyncio.sleep(0.2)
-        assert len(running) == units.EFS_SHARE
+        assert len(running) == db_session.settings.storage.efs_share
         assert await asyncio.wait_for(run_efs(lambda: "bob", scope=BOB), timeout=0.5) == "bob"
     finally:
         release.set()
         await asyncio.gather(*turns)
-    assert len(running) == units.EFS_SLOTS
+    assert len(running) == db_session.settings.storage.efs_slots
 
 
 async def test_a_full_file_store_refuses_a_call_after_pool_timeout():
     loop = asyncio.get_running_loop()
-    async with holding(units.EFS_SLOTS, LOCAL_SCOPE):
+    async with holding(db_session.settings.storage.efs_slots, LOCAL_SCOPE):
         started = loop.time()
         with pytest.raises(FilesystemBusy):
             await run_efs(lambda: "late", scope=LOCAL_SCOPE)
@@ -100,7 +122,7 @@ async def test_bookkeeping_without_a_deadline_waits_for_a_slot_and_runs():
     """A turn's artifact diff waits past POOL_TIMEOUT rather than fail: in org
     mode nothing reconciles a turn whose diff was refused."""
     ran = []
-    async with holding(units.EFS_SLOTS, LOCAL_SCOPE):
+    async with holding(db_session.settings.storage.efs_slots, LOCAL_SCOPE):
         diff = asyncio.create_task(
             run_efs(lambda: ran.append("diff") or "recorded", scope=LOCAL_SCOPE, deadline=False)
         )
@@ -135,7 +157,7 @@ async def test_a_stop_during_the_work_waits_for_it_and_leaves_no_lock_behind(tmp
 
 async def test_a_stop_while_waiting_for_a_slot_leaves_at_once_and_the_work_never_runs():
     ran = []
-    async with holding(units.EFS_SLOTS, LOCAL_SCOPE):
+    async with holding(db_session.settings.storage.efs_slots, LOCAL_SCOPE):
         waiting = asyncio.create_task(run_efs(lambda: ran.append("ran"), scope=LOCAL_SCOPE))
         await asyncio.sleep(0.1)
         waiting.cancel()

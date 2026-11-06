@@ -117,10 +117,11 @@ async def drain_background_tasks(
     artifacts and queues its scratchpad close before it ends, and the event
     loop's close cancels anything still running a second time, which would
     cut that work. A turn still running after ``cancel_timeout`` is left
-    running: its end-of-turn bookkeeping runs under run_to_completion, which
-    a file store stall holds off with no bound, and waiting for it would hold
-    off every teardown step after this one. So the drain takes at most
-    ``timeout`` plus ``cancel_timeout``."""
+    running: its end-of-turn bookkeeping runs under run_turn_end_record,
+    which a file store stall holds off with no bound, and waiting for it
+    would hold off every teardown step after this one. The teardown's last
+    step waits for that bookkeeping instead (drain_turn_end_records). So
+    this drain takes at most ``timeout`` plus ``cancel_timeout``."""
     tasks = list(_background_tasks)
     if not tasks:
         return

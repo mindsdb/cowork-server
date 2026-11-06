@@ -173,14 +173,20 @@ deployment:
   #           channel tasks (3 s, then up to 5 s more while each one
   #           cancelled writes its sandbox turn's cancel flag and records its
   #           artifacts) and scratchpad closes (5 s).
-  # About 42 s in all, so 60 s leaves room for the unbounded closes at the end
-  # of teardown before the kubelet's SIGKILL. During a file store stall the
-  # teardown waits for no turn past those bounds. The event loop's close then
-  # cuts an artifact diff that has not returned, so that turn's artifact rows
-  # are lost. A web answer still streaming at SIGTERM is saved anyway,
-  # marked turn_lost; one whose pod had finished starts its save only as the loop
-  # closes, and that save may not finish. A file store call already running
-  # on the stuck mount keeps the process alive until the SIGKILL.
+  #   up to 8 s  last, only while a turn's artifact diff or record is still
+  #           running, as during a file store stall: the wait for those
+  #           (TURN_END_RECORD_DRAIN_SECONDS, cowork/db/units.py).
+  # About 42 s in all, or about 50 s during a stall, so 60 s leaves room for
+  # the unbounded closes at the end of teardown before the kubelet's SIGKILL.
+  # A stall that clears within the last wait keeps the turn's artifact rows.
+  # A record still running after it is cut by the event loop's close, so that
+  # turn's artifact rows are lost, and the pod logs shutdown_turn_record_lost
+  # at ERROR with the conversation, the project and the new artifacts' slugs
+  # its diff found (touched). A web answer still streaming at SIGTERM is
+  # saved anyway, marked turn_lost; one whose pod had finished starts its
+  # save once its record ends, and a save that starts as the loop closes may
+  # not finish. A file store call already running on the stuck mount keeps
+  # the process alive until the SIGKILL.
   terminationGracePeriodSeconds: 60
 
   lifecycle:

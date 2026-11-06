@@ -736,6 +736,107 @@ async def test_delete_revokes_with_the_verified_owner_and_tenant_before_removing
     assert not folder.exists()
 
 
+@pytest.mark.parametrize("by_id", [False, True])
+async def test_a_delete_past_its_draft_rule_revoke_is_never_refused_a_file_store_slot(
+    session, tmp_path, org_mode, publish_key, monkeypatch, by_id
+):
+    """Once the draft review rule is gone, a busy file store must not refuse
+    the delete: the folder would keep its review marker, which still lets
+    co-members open the draft here, with no rule behind it. The lookup before
+    the revoke still refuses a busy store before anything irreversible runs."""
+    from cowork.db import units
+
+    row, folder = _project_with_artifact(session, tmp_path, name="owned", org_id=ORG_A, slug="dash")
+    artifact_id, _metadata = ensure_full_id(folder)
+
+    async def revoke(identifier, scope):
+        return True
+
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
+    real_run_efs = units.run_efs
+    delete_steps: list[tuple[str, bool]] = []
+
+    async def recorded(fn, *, scope, deadline=True):
+        delete_steps.append((getattr(fn, "func", fn).__name__, deadline))
+        return await real_run_efs(fn, scope=scope, deadline=deadline)
+
+    # The delete's own steps import run_efs when they run; the lookups bind it
+    # at import, so only the delete's steps are recorded.
+    monkeypatch.setattr(units, "run_efs", recorded)
+
+    await ep.delete_artifact_for_request(
+        _scoped(session, ORG_A), artifact_id if by_id else "dash", project_id=row.id
+    )
+
+    assert delete_steps == [("pin", False), ("_finish_delete", False)]
+    assert not folder.exists()
+
+
+async def test_deletes_waiting_on_a_slow_publish_service_leave_their_member_file_store_slots(
+    session, tmp_path, org_mode, publish_key, monkeypatch
+):
+    """A member deletes a share's worth of published artifacts while the
+    publish service hangs. The take-downs wait on the network, not in file
+    store calls, so that member's own artifact review still gets a slot."""
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import cowork.db.session as db_session
+    from cowork.api.v1.artifact_scope import review_artifact_for_request
+
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    share = db_session.settings.storage.efs_share
+    deleting = []
+    for n in range(share):
+        row, folder = _project_with_artifact(session, tmp_path, name=f"published-{n}", org_id=ORG_A, slug="dash")
+        (folder / ".published.json").write_text(
+            json.dumps({"index.html": {"report_id": f"rid-{n}", "published": True}})
+        )
+        deleting.append((row, folder, ensure_full_id(folder)[0]))
+    review_row, review_folder = _project_with_artifact(session, tmp_path, name="kept", org_id=ORG_A, slug="kept")
+    review_id, _metadata = ensure_full_id(review_folder)
+    publish_service = threading.Event()
+    waiting = threading.Semaphore(0)
+    taken_down: list[str] = []
+
+    def unpublish(identifier, **kwargs):
+        waiting.release()
+        publish_service.wait(timeout=10)
+        taken_down.append(identifier)
+
+    async def revoke(identifier, scope):
+        return True
+
+    monkeypatch.setattr("anton.publisher.unpublish", unpublish)
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
+    # The take-downs and this test's own waits run on the loop's default
+    # executor, whose size follows the CPU count. Sized here, the whole share
+    # hangs at once on any runner.
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=share + 2))
+    deletes = [
+        asyncio.create_task(ep.delete_artifact_for_request(_scoped(session, ORG_A), artifact_id, project_id=row.id))
+        for row, _folder, artifact_id in deleting
+    ]
+    try:
+        for _ in deleting:
+            assert await asyncio.to_thread(waiting.acquire, True, 10)
+        scope = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
+        resolved = await asyncio.wait_for(
+            review_artifact_for_request(scope, str(review_row.id), review_id), timeout=5,
+        )
+        assert resolved.folder == review_folder
+        assert taken_down == []
+    finally:
+        publish_service.set()
+        await asyncio.gather(*deletes, return_exceptions=True)
+
+    for task in deletes:
+        assert task.exception() is None
+    assert sorted(taken_down) == sorted(f"rid-{n}" for n in range(share))
+    assert not any(folder.exists() for _row, folder, _id in deleting)
+
+
 async def test_delete_keeps_files_when_draft_authorization_is_unavailable(
     session, tmp_path, org_mode, publish_key, monkeypatch
 ):

@@ -10,13 +10,14 @@ import asyncio
 import logging
 import threading
 import time
+from types import SimpleNamespace
 
 import anyio
 import httpx
 
 from cowork.common import loop_watchdog, request_logging
 from cowork.common.loop_watchdog import LoopWatchdog
-from cowork.common.request_logging import RequestLoggingApp
+from cowork.common.request_logging import RequestLoggingApp, _InFlight
 from cowork.db.units import loop_limiters
 
 STALL_SECONDS = 3.0
@@ -78,14 +79,20 @@ async def test_holding_the_default_thread_limiter_full_logs_one_saturation_namin
     release = threading.Event()
     held = [asyncio.create_task(anyio.to_thread.run_sync(release.wait, 30)) for _ in range(2)]
     watchdog = LoopWatchdog(loop_limiters())
+    started = time.monotonic()
     watchdog.start()
     try:
         # Held until the report, with room for a slow runner's thread starts
         # and checks: the limiter is free once released, so a late report
         # would never come.
-        deadline = time.monotonic() + loop_watchdog.SATURATED_AFTER_S + 3
+        deadline = started + loop_watchdog.SATURATED_AFTER_S + 3
         while not _records(caplog, "limiter_saturated") and time.monotonic() < deadline:
             await asyncio.sleep(0.1)
+        # Held past the criterion's 6 s, and for at least three checks after
+        # the report: a watchdog that reported a full limiter again would log
+        # a second line every LIMITER_CHECK_EVERY_S.
+        hold_until = started + loop_watchdog.SATURATED_AFTER_S + 1.5
+        await asyncio.sleep(max(3 * loop_watchdog.LIMITER_CHECK_EVERY_S, hold_until - time.monotonic()))
     finally:
         release.set()
         await asyncio.gather(*held)
@@ -114,15 +121,72 @@ async def test_stopping_with_a_ping_waiting_logs_no_stall_and_does_not_hold_the_
     assert not watchdog._thread.is_alive()
 
 
+def _routed(*, template: str) -> dict:
+    """An ASGI scope routing has matched to a route with ``template``."""
+    return {"route": SimpleNamespace(path=template)}
+
+
 def test_the_stall_line_names_the_newest_request_behind_long_streams(monkeypatch):
     now = time.monotonic()
-    streams = {n: ("POST", "/api/v1/responses/", now - 120 + n) for n in range(25)}
-    newest = ("GET", "/api/v1/artifacts/workspace/p/a/review", now - 3)
+    streams = {
+        n: _InFlight(method="POST", started=now - 120 + n, scope=_routed(template="/api/v1/responses/"))
+        for n in range(25)
+    }
+    newest = _InFlight(
+        method="GET", started=now - 3, scope=_routed(template="/api/v1/artifacts/workspace/{project_ref}/{artifact_id}/review"),
+    )
     monkeypatch.setattr(request_logging, "_in_flight", {**streams, 99: newest})
 
     summary = request_logging.in_flight_summary().split("; ")
 
-    assert summary[-1].startswith("GET /api/v1/artifacts/workspace/p/a/review (3.")
+    assert summary[-1].startswith("GET /api/v1/artifacts/workspace/{project_ref}/{artifact_id}/review (3.")
     assert summary[0].startswith("POST /api/v1/responses/ (120.")
     assert summary[10] == "6 more"
     assert len(summary) == 21
+
+
+async def test_a_request_in_flight_is_named_by_its_route_template_never_its_path():
+    """The stall line goes to the logs, so it carries no id or path segment a
+    request's own path holds. A request routing has not matched yet has no
+    template to give."""
+    app = RequestLoggingApp()
+    summaries = []
+
+    @app.get("/projects/{project_id}/files/{path:path}")
+    async def a_file(project_id: str, path: str):
+        summaries.append(request_logging.in_flight_summary())
+        return {}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/projects/7f3c1a52-private-id/files/reports/q3-salaries.csv")
+
+    assert response.status_code == 200
+    [summary] = summaries
+    assert summary.startswith("GET /projects/{project_id}/files/{path:path} (")
+    assert "7f3c1a52" not in summary and "salaries" not in summary
+    assert _InFlight(method="GET", started=time.monotonic(), scope={}).route == "<unrouted>"
+
+
+async def test_the_watchdog_watches_every_limiter_a_request_can_queue_on():
+    assert set(loop_limiters()) == {"anyio_default", "run_db", "run_efs"}
+
+
+async def test_holding_the_file_store_slots_full_logs_a_saturation_naming_run_efs(caplog, monkeypatch):
+    import cowork.db.session as db_session
+    from cowork.db.scoped import LOCAL_SCOPE
+    from test_run_efs import holding
+
+    caplog.set_level(logging.WARNING, logger="cowork.common.loop_watchdog")
+    monkeypatch.setattr(db_session.settings.storage, "efs_slots", 2)
+    watchdog = LoopWatchdog(loop_limiters())
+    watchdog.start()
+    try:
+        async with holding(2, LOCAL_SCOPE):
+            deadline = time.monotonic() + loop_watchdog.SATURATED_AFTER_S + 3
+            while not _records(caplog, "limiter_saturated") and time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+    finally:
+        watchdog.stop()
+
+    assert [record.limiter for record in _records(caplog, "limiter_saturated")] == ["run_efs"]
