@@ -272,6 +272,8 @@ def _remote_handler(monkeypatch, saved):
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
     monkeypatch.setattr(responses_mod, "run_db", inline_run_db(_FakeUnitSession()))
+    # The skills block's unit, on the file store's threads.
+    monkeypatch.setattr(responses_mod, "run_efs_unit", inline_run_db(_FakeUnitSession()))
     monkeypatch.setattr(responses_mod, "read_earlier_answers", _no_earlier_answers)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
     return handler
@@ -909,7 +911,7 @@ def _no_workspace_or_memory_units(monkeypatch):
 async def test_every_remote_unit_runs_in_the_turns_tenant_scope(monkeypatch, tmp_path, ending):
     """Every database unit of a remote turn runs in the scope the producer
     resolved from its principal, here an organization's: staging, the
-    question, the seed read, the memory, the compaction, the artifact record
+    question, the seed read, the skills block, the memory, the compaction, the artifact record
     and the answer on a clean finish, and the image-content repair when the
     pod reports a content-validation error. A unit in another scope reads or
     writes another tenant's rows."""
@@ -928,6 +930,7 @@ async def test_every_remote_unit_runs_in_the_turns_tenant_scope(monkeypatch, tmp
         return await inline(fn, scope=scope)
 
     monkeypatch.setattr(responses_mod, "run_db", spy)
+    monkeypatch.setattr(responses_mod, "run_efs_unit", spy)
     artifacts_base = tmp_path / "proj" / ".anton" / "artifacts"
     artifacts_base.mkdir(parents=True)
     _no_workspace_or_memory_units(monkeypatch)
@@ -975,9 +978,9 @@ async def test_every_remote_unit_runs_in_the_turns_tenant_scope(monkeypatch, tmp
         model="anton", harness_id="anton", buffer=buffer,
     )
 
-    # Staging, the question and the seed read open every turn, and the
-    # answer's save ends it.
-    expected = 7 if ending == "completed" else 5
+    # Staging, the question, the seed read and the skills block open every
+    # turn, and the answer's save ends it.
+    expected = 8 if ending == "completed" else 6
     assert [scope for _, scope in units] == [org] * expected, units
     assert buffer.frames[-1] == ("CLOSE:completed" if ending == "completed" else "CLOSE:error")
 
@@ -2522,9 +2525,8 @@ def test_a_remote_turns_inputs_look_up_the_workspace_once(monkeypatch):
     monkeypatch.setattr(ResponsesHandler, "_remote_started_at", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(remote_workspace))
     monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(remote_agent_files))
-    monkeypatch.setattr(responses_mod, "remote_turn_skills", lambda session, conv_id, *, viewer=None: {})
 
-    inputs = ResponsesHandler._read_remote_turn_inputs(None, conv_id=uuid4(), viewer=None, with_memory=True)
+    inputs = ResponsesHandler._read_remote_turn_inputs(None, conv_id=uuid4(), with_memory=True)
 
     assert len(looked_up) == 1
     assert inputs.workspace is workspace
@@ -3177,6 +3179,8 @@ def _remote_handler_with_message_id(monkeypatch, saved, *, assistant_message_id)
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
     monkeypatch.setattr(responses_mod, "run_db", inline_run_db(_FakeUnitSession()))
+    # The skills block's unit, on the file store's threads.
+    monkeypatch.setattr(responses_mod, "run_efs_unit", inline_run_db(_FakeUnitSession()))
     monkeypatch.setattr(responses_mod, "read_earlier_answers", _no_earlier_answers)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
     return handler

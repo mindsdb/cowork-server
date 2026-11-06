@@ -217,6 +217,7 @@ async def _draft_response(request: Request, grant: _DraftGrant) -> Response:
         read=partial(
             _draft_file_response,
             rel_path=request.path_params["rel_path"],
+            scope=scope,
             comments=wants_comment_layer(request),
         ),
     )

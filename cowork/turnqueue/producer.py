@@ -14,6 +14,7 @@ import logging
 import time
 import uuid
 from datetime import datetime
+from functools import partial
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from redis.exceptions import RedisError
@@ -674,7 +675,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # a valid minds alias, independent of any harness's built-in default.
     if not model:
         from cowork.common.settings.user_settings import get_user_settings
-        model = get_user_settings(scope).resolved_planning_model
+        from cowork.db.units import run_on_unit_threads
+
+        model = (await run_on_unit_threads(partial(get_user_settings, scope))).resolved_planning_model
 
     # Independent network round trips (llm's turn-key mint, oauth's active-
     # connections list) — run concurrently rather than paying both latencies
@@ -692,7 +695,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
             oauth_connections = await oauth_connections_coro
         else:
             from cowork.common.settings.user_settings import get_user_settings
-            workspace_id = getattr(get_user_settings(scope), "hub_workspace_id", "") or None
+            from cowork.db.units import run_on_unit_threads
+
+            user_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+            workspace_id = getattr(user_settings, "hub_workspace_id", "") or None
             if settings.datasource_enabled:
                 (llm_block, turn_key_id), oauth_connections = await asyncio.gather(
                     _mint_llm_block_with_turn_key_id(
@@ -748,9 +754,14 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     )
     workspace_rel_path = workspace.workspace_rel_path if workspace is not None else _DEFAULT_WORKSPACE_PATH
     from cowork.common.settings.user_settings import get_user_settings
+    from cowork.db.units import run_on_unit_threads
+
     # The organization's Jev opt-out, read here so every remote turn carries
-    # it: web UI, scheduled and channel turns alike.
-    jev_decisions = getattr(get_user_settings(scope), "jev_decisions_enabled", True) is not False
+    # it: web UI, scheduled and channel turns alike. Off the loop: a turn
+    # with no settings snapshot, such as a channel turn, reads it through a
+    # session of its own.
+    jev_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+    jev_decisions = getattr(jev_settings, "jev_decisions_enabled", True) is not False
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,

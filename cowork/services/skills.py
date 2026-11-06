@@ -433,6 +433,20 @@ def _turn_skill_service(
     return SkillService(scope, viewer=viewer, session=session)
 
 
+def has_always_on_rows(
+    scope: TenantScope | None,
+    *,
+    viewer: SkillViewer | None,
+    session: ScopedSession,
+) -> bool:
+    """Whether any of the org's skill_access rows is always on: the database
+    half of has_always_on_skills, which reads no SKILL.md. No turn has an
+    always-on skill when it is False. Never outside MindsHub mode."""
+    svc = _turn_skill_service(scope, viewer=viewer, session=session)
+    # No rows outside MindsHub mode (SkillService._access_rows).
+    return any(row.always_on for row in svc._access_rows().values())
+
+
 def has_always_on_skills(
     scope: TenantScope | None,
     *,

@@ -23,11 +23,12 @@ def _write(base, relative: str, content: str, monkeypatch):
     monkeypatch.setattr(
         project_files, "_opened_project_directory_inventory", opened_inventory
     )
-    return project_files.write_project_file(
-        "project",
-        project_files._validated_project_path(relative),
-        project_files._FileWriteRequest(content=content),
+    return project_files._write_project_file(
         SimpleNamespace(scope=LOCAL_SCOPE),
+        project_name="project",
+        path=project_files._validated_project_path(relative),
+        req=project_files._FileWriteRequest(content=content),
+        principal=None,
     )
 
 
@@ -63,11 +64,12 @@ def test_write_sanitizes_each_component_at_the_filesystem_boundary(
     )
     monkeypatch.setattr(project_files, "_opened_pinned_descendant", record_open)
 
-    result = project_files.write_project_file(
-        "project",
-        validated,
-        project_files._FileWriteRequest(content="hello"),
+    result = project_files._write_project_file(
         SimpleNamespace(scope=LOCAL_SCOPE),
+        project_name="project",
+        path=validated,
+        req=project_files._FileWriteRequest(content="hello"),
+        principal=None,
     )
 
     assert sanitized[:4] == ["project", "nested", "notes.txt", "nested"]
@@ -130,11 +132,12 @@ def test_write_refuses_a_symlinked_project_root(tmp_path, monkeypatch):
     monkeypatch.setattr(project_files, "ProjectService", Catalog)
 
     with pytest.raises(HTTPException) as error:
-        project_files.write_project_file(
-            "project",
-            project_files._validated_project_path("victim.txt"),
-            project_files._FileWriteRequest(content="replace"),
+        project_files._write_project_file(
             SimpleNamespace(scope=LOCAL_SCOPE),
+            project_name="project",
+            path=project_files._validated_project_path("victim.txt"),
+            req=project_files._FileWriteRequest(content="replace"),
+            principal=None,
         )
 
     assert error.value.status_code == 404
@@ -157,9 +160,7 @@ async def test_upload_writes_through_the_same_pinned_boundary(tmp_path, monkeypa
         file=BytesIO(b"uploaded"), filename="notes.txt"
     )
 
-    result = await project_files.upload_project_files(
-        "project", SimpleNamespace(scope=LOCAL_SCOPE), [upload]
-    )
+    result = await project_files.upload_project_files("project", LOCAL_SCOPE, [upload])
 
     assert result == {
         "results": [{"name": "notes.txt", "ok": True, "size": 8}]
@@ -187,9 +188,7 @@ async def test_upload_refuses_a_symlinked_final_file(tmp_path, monkeypatch):
         file=BytesIO(b"replace"), filename="notes.txt"
     )
 
-    result = await project_files.upload_project_files(
-        "project", SimpleNamespace(scope=LOCAL_SCOPE), [upload]
-    )
+    result = await project_files.upload_project_files("project", LOCAL_SCOPE, [upload])
 
     assert result == {
         "results": [

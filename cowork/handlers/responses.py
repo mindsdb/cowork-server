@@ -36,6 +36,8 @@ from cowork.db.units import (
     note_turn_end_slugs,
     run_db,
     run_efs,
+    run_efs_unit,
+    run_on_unit_threads,
     run_to_completion,
     run_turn_end_record,
 )
@@ -150,7 +152,7 @@ from cowork.services.projects import ProjectNotFoundError, ProjectService, is_co
 from cowork.services.settings import SettingService
 from cowork.schemas.turn_skills import TurnSkills
 from cowork.services.skill_sharing import SkillViewer, sharing_applies
-from cowork.services.skills import SkillService, has_always_on_skills
+from cowork.services.skills import SkillService, has_always_on_rows, has_always_on_skills
 from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result
 
 
@@ -396,6 +398,11 @@ class _TurnStart:
     # Whether an always-on skill reaches the turn (has_always_on_skills),
     # which sends it to the agent: the gate's answer would not follow it.
     always_on_skills: bool = False
+    # An always-on row exists and the gate could run: whether one reaches the
+    # turn takes its SKILL.md, read after this unit on the file store's
+    # threads, and the gate's history after that
+    # (ResponsesHandler._settle_always_on). gate_rows is unread until then.
+    always_on_unread: bool = False
     # Set when the conversation is a contained model-comparison side: what it
     # was set up with, read here because the side row stays in the unit.
     comparison_pin: "_ComparisonPin | None" = None
@@ -569,9 +576,6 @@ class _RemoteTurnInputs:
     # Where the pod's scratchpad works, as this server finds it in the
     # project, or None when it could not be resolved (_remote_agent_files).
     files: AgentFiles | None
-    # The skills the caller sees, the pod's whole recallable set
-    # (remote_turn_skills); empty when they see none.
-    skills: TurnSkills
 
 
 def remote_turn_skills(
@@ -734,6 +738,21 @@ def _start_first_take(
         reset_trace_context(token)
 
 
+def _carries_attachments(request: ResponsesRequest) -> bool:
+    """Whether the turn names an uploaded file, which its start reads from the
+    file store."""
+    if request.attachment_ids:
+        return True
+    if not isinstance(request.input, list):
+        return False
+    return any(
+        isinstance(item, Content) and item.type == ContentType.file and item.file_id
+        for message in request.input
+        if isinstance(message.content, list)
+        for item in message.content
+    )
+
+
 class ResponsesHandler:
     # Also the class default, so a producer reached without __init__ reads
     # the common case: a person watching who can answer a card.
@@ -816,11 +835,16 @@ class ResponsesHandler:
 
         # The request's reads run as one unit in a worker thread, which holds a
         # connection only while it reads: none is held across the gate's model
-        # call, and a wait for one never stalls the event loop.
-        start = await run_db(
+        # call, and a wait for one never stalls the event loop. Attachments are
+        # read from the file store, so a turn that carries them waits for a
+        # file store slot.
+        read_unit = run_efs_unit if _carries_attachments(request) else run_db
+        start = await read_unit(
             partial(self._read_turn_start, request=request, has_disabled_connections=bool(disabled)),
             scope=self.scope,
         )
+        if start.always_on_unread:
+            start = await self._settle_always_on(start)
         self.harness_name = start.harness_name
         self.last_conversation_id = str(start.conversation_id)
 
@@ -1186,20 +1210,22 @@ class ResponsesHandler:
         # cannot route skips the history read, as _route_request skips the gate.
         has_non_text_input = any(block.get("type") != "text" for block in harness_input)
         gate_rows: list[Message] | None = []
-        always_on_skills = False
+        always_on_unread = False
         if ineligible_reason(
             has_non_text_input=has_non_text_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=comparison_pin is not None,
         ) is None:
-            reaches = self._reads_always_on_skills(session, conversation=conversation)
-            if reaches is None:
+            rows = self._reads_always_on_rows(session, conversation_id=conversation_id)
+            if rows is None:
                 # The read failed: the turn goes to the agent as when the
                 # history read fails.
                 gate_rows = None
-            elif reaches:
-                always_on_skills = True
+            elif rows:
+                # Whether one reaches this turn takes its SKILL.md, which this
+                # unit does not read (_settle_always_on).
+                always_on_unread = True
             else:
                 gate_rows = self._read_gate_rows(session, conversation_id=conversation_id)
 
@@ -1210,11 +1236,50 @@ class ResponsesHandler:
             conversation_id=conversation_id,
             turn_id=turn_id,
             gate_rows=gate_rows,
-            always_on_skills=always_on_skills,
+            always_on_unread=always_on_unread,
             comparison_pin=comparison_pin,
         )
 
-    def _reads_always_on_skills(self, session: ScopedSession, *, conversation: Conversation) -> bool | None:
+    async def _settle_always_on(self, start: _TurnStart) -> _TurnStart:
+        """``start`` once its always-on read is done: whether an always-on
+        skill reaches the turn, which parses SKILL.md and so runs as a unit on
+        the file store's threads (run_efs_unit), then, when none does, the
+        gate's history in a database unit, as _read_turn_start reads it."""
+        reaches = await run_efs_unit(
+            partial(self._reads_always_on_skills, conversation_id=start.conversation_id), scope=self.scope
+        )
+        if reaches is None:
+            # The read failed: the turn goes to the agent as when the history
+            # read fails.
+            return replace(start, gate_rows=None, always_on_unread=False)
+        if reaches:
+            return replace(start, gate_rows=[], always_on_skills=True, always_on_unread=False)
+        gate_rows = await run_db(
+            partial(self._read_gate_rows, conversation_id=start.conversation_id), scope=self.scope
+        )
+        return replace(start, gate_rows=gate_rows, always_on_unread=False)
+
+    def _reads_always_on_rows(self, session: ScopedSession, *, conversation_id: UUID) -> bool | None:
+        """Whether any skill_access row of the org is always on in MindsHub
+        mode, for the viewer handle() resolved (has_always_on_rows): the
+        database half of the always-on read, which parses no SKILL.md. None
+        when the read fails, as _reads_always_on_skills."""
+        if not sharing_applies(session.scope):
+            return False
+        try:
+            return has_always_on_rows(session.scope, viewer=self._skill_viewer, session=session)
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.exception(
+                "[responses] could not read the turn's always-on skills; delegating",
+                extra=log_context(conversation_id=conversation_id),
+            )
+            # Rolling back loses nothing: creating or relinking above committed already.
+            session.rollback()
+            return None
+
+    def _reads_always_on_skills(self, session: ScopedSession, *, conversation_id: UUID) -> bool | None:
         """Whether an always-on skill reaches this turn in MindsHub mode, for
         the viewer handle() resolved (has_always_on_skills). None when the
         read fails: like a failed history read, that sends the turn to the
@@ -1223,6 +1288,7 @@ class ResponsesHandler:
         if not sharing_applies(session.scope):
             return False
         try:
+            conversation = ConversationService(session).get_conversation(conversation_id)
             return has_always_on_skills(
                 session.scope,
                 project_name=conversation.project.name,
@@ -1234,9 +1300,8 @@ class ResponsesHandler:
         except Exception:
             logger.exception(
                 "[responses] could not read the turn's always-on skills; delegating",
-                extra=log_context(conversation_id=conversation.id),
+                extra=log_context(conversation_id=conversation_id),
             )
-            # Rolling back loses nothing: creating or relinking above committed already.
             session.rollback()
             return None
 
@@ -2410,14 +2475,15 @@ class ResponsesHandler:
 
     @staticmethod
     def _read_remote_turn_inputs(
-        session: ScopedSession, *, conv_id: UUID, viewer: SkillViewer | None, with_memory: bool,
+        session: ScopedSession, *, conv_id: UUID, with_memory: bool,
     ) -> _RemoteTurnInputs:
         """What a remote turn's pod is seeded with, read as one unit once the
         question is saved: the scrubbed history, where the project's artifacts
         live and who created the conversation, the project's memory when
-        ``with_memory``, its workspace, when the conversation started, and the
-        skills ``viewer`` sees (remote_turn_skills). A browser turn reads
-        memory; a channel turn never sends it, and has no viewer."""
+        ``with_memory``, its workspace, and when the conversation started. A
+        browser turn reads memory; a channel turn never sends it. Its skills
+        block reads skill folders, so each turn reads it in a unit of its own
+        on the file store's threads (_produce_remote, remote_turn_events)."""
         history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
         workspace = ResponsesHandler._remote_workspace(session, conv_id)
         return _RemoteTurnInputs(
@@ -2428,7 +2494,6 @@ class ResponsesHandler:
             workspace=workspace,
             started_at=ResponsesHandler._remote_started_at(session, conv_id),
             files=ResponsesHandler._remote_agent_files(session, conv_id, workspace=workspace),
-            skills=remote_turn_skills(session, conv_id, viewer=viewer),
         )
 
     @staticmethod
@@ -2850,11 +2915,14 @@ class ResponsesHandler:
             # per caller) before the seed, which selects the skills they see.
             await self._resolve_skill_viewer(scope)
             seed = await run_db(
-                partial(
-                    self._read_remote_turn_inputs,
-                    conv_id=conv_id, viewer=self._skill_viewer, with_memory=True,
-                ),
-                scope=scope,
+                partial(self._read_remote_turn_inputs, conv_id=conv_id, with_memory=True), scope=scope
+            )
+            # The skills the caller sees, the pod's whole recallable set
+            # (remote_turn_skills); empty when they see none. It seeds the
+            # built-in skills and reads each selected skill's folder, so it
+            # runs on the file store's threads.
+            skills: TurnSkills = await run_efs_unit(
+                partial(remote_turn_skills, conv_id=conv_id, viewer=self._skill_viewer), scope=scope
             )
             # A unit of its own, so a failed read can't abort the seed's.
             earlier = await read_earlier_answers(conversation_id=conv_id, scope=scope)
@@ -2894,7 +2962,7 @@ class ResponsesHandler:
                 # a bounded, sheddable wire block. Skills travel as the
                 # caller's whole recallable set (remote_turn_skills).
                 memory=seed.memory,
-                skills=seed.skills,
+                skills=skills,
                 workspace=seed.workspace,
                 started_at=seed.started_at,
                 correlation_id=corr,
@@ -3131,7 +3199,9 @@ class ResponsesHandler:
             if isinstance(exc, PoolTimeoutError):
                 # No database connection freed in time. The frame says so with
                 # the wait, as a refused request's 503 does.
-                code, message = friendly_turn_error(exc)
+                # Off the loop: the classification reads settings, and the
+                # pool is full right now.
+                code, message = await run_on_unit_threads(partial(friendly_turn_error, exc))
                 retry_after = busy_retry_seconds()
                 extra: dict = {"retry_after": retry_after, "retry_at": retry_at_instant(retry_after)}
                 logger.warning(
@@ -3428,7 +3498,8 @@ class ResponsesHandler:
             # Resolve the model-403 info once and hand it to friendly_turn_error
             # so it isn't computed twice on this path (reused by the extras below).
             model_info = model_unavailable_info(exc)
-            friendly = friendly_turn_error(exc, model_info=model_info)
+            # Off the loop: the classification reads settings.
+            friendly = await run_on_unit_threads(partial(friendly_turn_error, exc, model_info=model_info))
             if friendly is not None:
                 code, message = friendly
                 logger.info(
@@ -3457,7 +3528,7 @@ class ResponsesHandler:
                 # (no reconnectable flag), so the stream still closes cleanly.
                 try:
                     provider = _auth_failure_provider(
-                        get_user_settings(), getattr(exc, "role", None)
+                        await run_on_unit_threads(get_user_settings), getattr(exc, "role", None)
                     )
                     # An unattributable failure keeps the generic auth copy with
                     # no provider fields, rather than naming a provider that may
@@ -3532,7 +3603,7 @@ class ResponsesHandler:
                 failed_model = overloaded_info[1] if overloaded_info else ""
                 extra = {"model": failed_model}
                 try:
-                    s = get_user_settings()
+                    s = await run_on_unit_threads(get_user_settings)
                     # The nudge keys on WHICH provider overloaded. anton passes the
                     # actual failing model (planning OR coding); map it back to its
                     # provider so a coding-model incident on a DIFFERENT provider
@@ -3738,7 +3809,8 @@ class ResponsesHandler:
             # Minted here rather than up front like the streaming twin: this
             # path has no seal to feed, so a successful turn needs no id.
             corr = str(uuid4())
-            friendly = friendly_turn_error(exc)
+            # Off the loop: the classification reads settings.
+            friendly = await run_on_unit_threads(partial(friendly_turn_error, exc))
             if friendly is not None:
                 code, message = friendly
                 logger.info(

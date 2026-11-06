@@ -201,7 +201,7 @@ async def test_send_failure_before_iteration_closes_the_pinned_file(tmp_path):
     fd = os.open(path, os.O_RDONLY)
     resources = ExitStack()
     resources.callback(os.close, fd)
-    response = workspace_ep._draft_stream(resources, fd, 5, "text/plain")
+    response = workspace_ep._draft_stream(resources, fd, 5, "text/plain", scope=LOCAL_SCOPE)
 
     async def receive():
         return {"type": "http.disconnect"}

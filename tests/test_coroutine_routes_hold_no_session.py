@@ -45,12 +45,6 @@ ALLOWLIST = (
         "desktop only (DesktopOnly on the router)",
     ),
     (
-        "project_files",
-        "upload_project_files",
-        "lists the projects inside the pinned-directory inventory it writes the uploads "
-        "through, on the loop; moving that inventory to the file store's threads moves both",
-    ),
-    (
         "settings",
         "write_raw_settings",
         "desktop only (LoopbackDesktopOnly): writes the deployment's dotenv",
@@ -175,3 +169,10 @@ def test_a_sync_route_with_a_coroutine_dependency_on_the_session_is_found():
     found = coroutine_routes_with_a_request_session(_app_with(router))
 
     assert found == Counter({(__name__, "guarded"): 1, (__name__, "through_a_dependency"): 1})
+
+
+def test_every_route_still_allowed_the_request_session_is_desktop_only():
+    """README.md says the routes still allowed it are all desktop-only, which
+    org mode refuses before any I/O. A route allowed for another reason has to
+    be named there too."""
+    assert [function for _module, function, reason in ALLOWLIST if not reason.startswith("desktop only")] == []

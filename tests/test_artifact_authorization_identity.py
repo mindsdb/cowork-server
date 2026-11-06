@@ -1177,7 +1177,7 @@ async def test_a_member_re_saving_their_legacy_artifact_shared_with_everyone_kee
     everyone = {"mode": "restricted", "org_allowed": True, "allowed_emails": ["a@else.com"]}
 
     saved = await artifact_workspace.set_artifact_access(
-        str(project.id), local_id, artifact_workspace._AccessBody(access=everyone), session.scope, member_request(),
+        str(project.id), local_id, artifact_workspace._AccessBody(access=everyone), session.scope, member_request(), principal=None,
     )
 
     # A refusal answers its 403 as a response of its own; a publish, its result.

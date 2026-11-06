@@ -53,9 +53,11 @@ def _fake_handler(
         return ()
 
     monkeypatch.setattr(remote_turn_mod, "read_earlier_answers", earlier_answers or no_earlier_answers)
-    monkeypatch.setattr(responses_mod, "remote_turn_skills", lambda session, conv_id, **kw: {})
-    # Each unit runs inline, on a session that reaches no database.
+    monkeypatch.setattr(remote_turn_mod, "remote_turn_skills", lambda session, conv_id, **kw: {})
+    # Each unit runs inline, on a session that reaches no database: the
+    # skills block's on the file store's threads too.
     monkeypatch.setattr(remote_turn_mod, "run_db", inline_run_db(_FakeSession()))
+    monkeypatch.setattr(remote_turn_mod, "run_efs_unit", inline_run_db(_FakeSession()))
     for name, read in {
         "_remote_artifacts_context": remote_artifacts_context or (lambda s, c: None),
         "_remote_seed_history": remote_seed_history or (lambda s, c: ([], None)),
@@ -143,7 +145,7 @@ async def test_a_channel_turn_always_sends_the_fail_closed_skills_block(monkeypa
         sent.append(kwargs["skills"])
         yield "turn_completed", {}
 
-    monkeypatch.setattr(responses_mod, "remote_turn_skills", remote_turn_skills)
+    monkeypatch.setattr(remote_turn_mod, "remote_turn_skills", remote_turn_skills)
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
     conv_id = uuid4()
     await _drain(remote_turn_events(
@@ -151,7 +153,7 @@ async def test_a_channel_turn_always_sends_the_fail_closed_skills_block(monkeypa
         input_text="hi", model="anton", turn_rows=[],
     ))
     # No viewer: the fail-closed set.
-    assert built == [(conv_id, {"viewer": None})]
+    assert built == [(conv_id, {})]
     assert sent == [block]
 
 
@@ -1358,3 +1360,33 @@ async def test_a_turn_record_that_waits_for_the_database_at_the_last_wait_names_
         logged.output(), event="shutdown_turn_record_lost", conversation_id=str(conv_id), touched=["report"],
     )
     assert [call.slugs for call in recorded] == [["report"]]
+
+
+@pytest.mark.asyncio
+async def test_a_busy_file_store_fails_the_channel_turn_before_its_seed_history_is_built(monkeypatch):
+    """With no file store slot free, the vault's secrets cannot be registered,
+    and a seed history scrubbed by key shape alone would carry a saved
+    password to the pod. The turn fails instead, as it does on a busy pool."""
+    import cowork.db.session as db_session
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.units import FilesystemBusy
+    from test_run_efs import holding
+
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    seeded = []
+    _fake_handler(monkeypatch, remote_seed_history=lambda s, c: seeded.append(c) or ([], None))
+
+    async def fake_replies(**kwargs):
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    session = _FakeSession()
+    async with holding(db_session.settings.storage.efs_slots, LOCAL_SCOPE):
+        with pytest.raises(FilesystemBusy):
+            await _drain(remote_turn_events(
+                scope=session.scope, conv_id=uuid4(), org_id="org-123", user_id=None,
+                input_text="hi", model="anton", turn_rows=[],
+            ))
+
+    assert seeded == []

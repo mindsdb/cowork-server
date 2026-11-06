@@ -39,8 +39,9 @@ from cowork.api.v1.artifact_scope import (
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
-from cowork.db.units import FilesystemBusy, run_db, run_efs
+from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.draft_host.token import DRAFT_TTL_SECONDS, issue_draft_token
+from cowork.principal import Principal, get_principal
 from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
@@ -244,10 +245,12 @@ def _draft_stream(
     size: int,
     media_type: str,
     *,
+    scope: TenantScope,
     extra_headers: dict[str, str] | None = None,
 ):
     """Stream at most *size* bytes from the pinned descriptor and close every
-    held handle.
+    held handle, reading and closing on the file store's threads in *scope*
+    (PinnedStreamingResponse).
 
     No ``Content-Length``: the agent may still be writing the file, and a
     length taken from ``fstat`` would then disagree with the bytes read, which
@@ -256,15 +259,10 @@ def _draft_stream(
     size at authorization) still bounds the body, so a file that keeps growing
     cannot keep the response open.
     """
-    def chunks():
-        try:
-            yield from read_bounded(fd, size)
-        finally:
-            resources.close()
-
     return PinnedStreamingResponse(
-        chunks(),
+        read_bounded(fd, size),
         resources=resources,
+        scope=scope,
         media_type=media_type,
         headers={**_DRAFT_RESPONSE_HEADERS, **(extra_headers or {})},
     )
@@ -343,6 +341,7 @@ def _draft_file_response(
     artifact: ResolvedArtifact,
     rel_path: str,
     *,
+    scope: TenantScope,
     comments: bool,
     download: bool = False,
 ):
@@ -354,7 +353,8 @@ def _draft_file_response(
     and the open share the lookup's file store call, and run only once the
     lookup authorized the caller. HTML goes out as the preview document unless
     ``download`` asks for the bytes; every other file, and HTML that is not
-    UTF-8, streams from the pinned descriptor.
+    UTF-8, streams from the pinned descriptor, read on the file store's
+    threads in ``scope``.
     """
     parts = _draft_file_parts(rel_path, artifact.metadata)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
@@ -378,14 +378,14 @@ def _draft_file_response(
             if download else None
         )
         return _draft_stream(
-            resources, fd, file_stat.st_size, media_type, extra_headers=extra,
+            resources, fd, file_stat.st_size, media_type, scope=scope, extra_headers=extra,
         )
     except BaseException:
         resources.close()
         raise
 
 
-def _artifact_id_from_path(artifact_id: UUID) -> str:
+async def _artifact_id_from_path(artifact_id: UUID) -> str:
     """The identity gate for every route in this file.
 
     Declaring the path parameter as a `UUID` makes FastAPI answer 422 before any
@@ -533,7 +533,7 @@ async def _sync_live_artifact(
             return False
 
         if scope.org_mode:
-            artifacts_base, publish_url, key = _owner_publish_context(scope, folder)
+            artifacts_base, publish_url, key = await run_on_unit_threads(partial(_owner_publish_context, scope, folder))
             api_key = await key.get()
             if not api_key:
                 logger.warning("Could not synchronize live artifact %s: no publish key", folder)
@@ -995,6 +995,7 @@ async def _checked_team_audience(
     *,
     request: Request,
     scope: TenantScope,
+    principal: Principal | None,
     stored_rule: Callable[[], Awaitable[ArtifactRule]],
 ) -> CheckedAccess:
     """``access``, a restricted save of the share dialog, checked against the
@@ -1035,12 +1036,14 @@ async def _checked_team_audience(
 
     The caller's teams and permissions, and the org's members, are read with
     the Authorization the gateway validated (cowork.principal.caller_bearer).
+    ``principal`` is the route's get_principal dependency, so an override of
+    it applies here too.
 
     Outside MindsHub mode, and for a save that isn't restricted, ``access``
     is returned as it is: there are no teams or org members there, and
     artifact_audience.for_publisher keeps a rule that names them
     restricted to its owner."""
-    from cowork.principal import caller_bearer, get_principal
+    from cowork.principal import caller_bearer
     from cowork.services.artifact_access import FOREIGN_TEAM_REFUSAL, NOT_A_MEMBER_REFUSAL
     from cowork.services.mindshub_client import (
         PERMISSIONS_UNREACHABLE,
@@ -1060,7 +1063,6 @@ async def _checked_team_audience(
 
     if not scope.org_mode or not access.restricted:
         return CheckedAccess(access)
-    principal = get_principal(request)
     own_email = (principal.email if principal is not None else "").strip().lower()
     if own_email and own_email in {e.strip().lower() for e in access.allowed_emails or []}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=OWN_EMAIL_REFUSAL)
@@ -1187,6 +1189,33 @@ def _access_state(folder: Path, metadata: dict) -> ArtifactAccessView:
     return published_access_view(folder, primary)
 
 
+class _AccessRead(NamedTuple):
+    """What artifact_access reads from the file store in its one hop: the
+    primary file's access state, and in MindsHub mode the keys the artifact's
+    rule is read under, which only MindsHub then answers."""
+
+    state: ArtifactAccessView
+    rule_keys: list[str]
+
+
+def _access_read(
+    folder: Path, metadata: dict, *, scope: TenantScope, project_id: str | None
+) -> _AccessRead:
+    """_access_state, and in MindsHub mode the rule's keys: those
+    stored_artifact_rule reads for a restricted entry, else those
+    rule_held_over_entry reads (cowork.services.publish)."""
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.publish import held_rule_keys_over_entry, stored_rule_keys
+
+    state = _access_state(folder, metadata)
+    if not scope.org_mode:
+        return _AccessRead(state, [])
+    rule_keys = stored_rule_keys if state.access_mode is AccessMode.RESTRICTED else held_rule_keys_over_entry
+    return _AccessRead(
+        state, rule_keys(folder, artifacts_base=folder.parent, scope=scope, project_id=project_id)
+    )
+
+
 @router.get("/workspace/{project_ref}/{artifact_id}/access", response_model=ArtifactAccessView)
 async def artifact_access(
     project_ref: str,
@@ -1210,29 +1239,27 @@ async def artifact_access(
     MindsHub still holds a rule for the artifact
     (cowork.services.publish.rule_held_over_entry, the check a re-publish
     makes before it goes ahead), the artifact is restricted to that rule's
-    audience, which is what this answers.
+    audience, which is what this answers. The rule's keys are read from the
+    file store with the access state, in one call on its threads (run_efs),
+    and MindsHub is asked on one of anyio's default threads.
     """
     from cowork.models.artifact_owner_choice import AccessMode
     from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
-    from cowork.services.publish import rule_held_over_entry, stored_artifact_rule
+    from cowork.services.publish import held_rule_under, stored_rule_under
 
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
     )
-    state = await run_efs(partial(_access_state, folder, metadata), scope=scope)
-    if not scope.org_mode:
-        return state
-    read_rule: Callable[..., ArtifactRule | None] = (
-        stored_artifact_rule if state.access_mode is AccessMode.RESTRICTED else rule_held_over_entry
-    )
     try:
-        rule = await run_in_threadpool(
-            read_rule,
-            folder,
-            artifacts_base=folder.parent,
-            scope=scope,
-            project_id=source.project_id,
+        state, keys = await run_efs(
+            partial(_access_read, folder, metadata, scope=scope, project_id=source.project_id), scope=scope
         )
+        if not scope.org_mode:
+            return state
+        rule_under: Callable[[list[str], TenantScope], ArtifactRule | None] = (
+            stored_rule_under if state.access_mode is AccessMode.RESTRICTED else held_rule_under
+        )
+        rule = await run_in_threadpool(rule_under, keys, scope)
     except ArtifactAccessUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except ArtifactAccessRefused as exc:
@@ -1246,6 +1273,7 @@ async def set_artifact_access(
     body: _AccessBody,
     scope: ScopeDep,
     request: Request,
+    principal: Principal | None = Depends(get_principal),
 ):
     """Re-publish this artifact with a new audience. Owner-only.
 
@@ -1268,7 +1296,7 @@ async def set_artifact_access(
             detail="This artifact has no publishable file.",
         )
     from cowork.services.artifact_audience import share_notify
-    from cowork.services.publish import stored_artifact_rule
+    from cowork.services.publish import stored_rule_keys, stored_rule_under
 
     # "Notify people" belongs to this save alone: read here and passed on its
     # own, so it is never stored with the access a later re-publish reads.
@@ -1279,13 +1307,15 @@ async def set_artifact_access(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     async def stored_rule() -> ArtifactRule:
-        return await run_in_threadpool(
-            stored_artifact_rule,
-            folder,
-            artifacts_base=folder.parent,
+        # The keys from the file store on its threads, then MindsHub on a
+        # default thread, as artifact_access reads the rule.
+        keys = await run_efs(
+            partial(
+                stored_rule_keys, folder, artifacts_base=folder.parent, scope=scope, project_id=source.project_id
+            ),
             scope=scope,
-            project_id=source.project_id,
         )
+        return await run_in_threadpool(stored_rule_under, keys, scope)
 
     if not await _acquire_live_publish_lock(folder, scope):
         raise HTTPException(
@@ -1302,9 +1332,9 @@ async def set_artifact_access(
         # its rule between the check's read and this publish, which plans
         # against the rule the check read rather than reading it again.
         checked = await _checked_team_audience(
-            access, request=request, scope=scope, stored_rule=stored_rule
+            access, request=request, scope=scope, principal=principal, stored_rule=stored_rule
         )
-        artifacts_base, publish_url, key = _owner_publish_context(scope, folder)
+        artifacts_base, publish_url, key = await run_on_unit_threads(partial(_owner_publish_context, scope, folder))
         api_key = await key.get()
         if not api_key:
             raise HTTPException(
@@ -1866,6 +1896,7 @@ async def serve_private_draft(
         read=partial(
             _draft_file_response,
             rel_path=rel_path,
+            scope=scope,
             comments=wants_comment_layer(request),
             download=download or wants_download(request),
         ),
