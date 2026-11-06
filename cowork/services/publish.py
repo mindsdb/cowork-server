@@ -13,6 +13,7 @@ import os
 import stat
 import tempfile
 import urllib.error
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -67,6 +68,7 @@ from cowork.services.providers import (
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.core.artifacts.internal_files import REVISIONS_DIRNAME
 from anton.minds_client import describe_minds_connection_error
+from anton.publisher import PUBLISH_JOB_BUDGET_S, PublishJobFailed, PublishJobTimeout
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
@@ -276,6 +278,9 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     everyone with SHARE_ORG_REQUIRED_CODE (ShareOrgRequired, its reason,
     clipped, as the text). Every other HTTP answer comes back as an
     UploadError; a failure that got no HTTP answer returns None.
+
+    A failed asynchronous job (`PublishJobFailed`) carries the status /upload
+    would have answered, but no code, so its 503 is the upload service itself.
     """
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
@@ -290,6 +295,10 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
         ),
     ):
         raise exc
+    if isinstance(exc, PublishJobFailed):
+        if exc.status_code == 503:
+            raise UploadServiceUnavailable() from exc
+        return UploadError(exc.status_code, None, exc.message)
     if not isinstance(exc, urllib.error.HTTPError):
         return None
     status = exc.code
@@ -1102,6 +1111,8 @@ def publish_artifact(
     notify: ShareNotify | None = None,
     stored: ArtifactRule | None = None,
     owner_save: bool = False,
+    job_budget_s: float = PUBLISH_JOB_BUDGET_S,
+    on_job_accepted: Callable[[dict], None] | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -1122,6 +1133,12 @@ def publish_artifact(
     datasources at all, and because `vault_for_scope` fail-closes on an org
     deployment when it is missing - a caller that forgets it gets an error, not
     another org's secrets.
+
+    `job_budget_s` caps how long an asynchronously accepted publish (server
+    202) is polled; defaults to anton's. `on_job_accepted` is
+    anton's callback, invoked with the 202 body the moment the server accepts
+    the job, so a caller that abandons the thread on its own timeout can tell
+    "upload still in flight" from "job accepted, still polling".
 
     `project_id` is the artifact's project; required in organization mode,
     where the owner lookup is keyed by it.
@@ -1359,6 +1376,8 @@ def publish_artifact(
                 # While the password is unchanged anton re-sends the hash stored
                 # here, so a content-only re-publish keeps viewers' password grants.
                 previous_access=previous if isinstance(previous, dict) else None,
+                job_budget_s=job_budget_s,
+                on_job_accepted=on_job_accepted,
             )
         except ArtifactOwnedByOtherUserError as exc:
             # Not a failure to log or wrap: the upload service holds this
@@ -1394,7 +1413,8 @@ def publish_artifact(
             if isinstance(exc, urllib.error.URLError):
                 headline, advice = describe_minds_connection_error(exc)
                 raise PublishRejected(f"Publishing failed. {headline} {advice}") from exc
-            if isinstance(exc, StatePublishBlocked):
+            # These texts come from the upload service or anton, never local paths.
+            if isinstance(exc, (StatePublishBlocked, PublishJobFailed, PublishJobTimeout)):
                 raise PublishRejected(f"Publishing failed: {exc}") from exc
             raise RuntimeError(f"Publishing failed: {exc}") from exc
         finally:

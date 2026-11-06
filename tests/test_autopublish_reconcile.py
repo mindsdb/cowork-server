@@ -72,7 +72,7 @@ def published(monkeypatch):
     calls = []
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url, password=None,
-                     access=None, scope=None, project_id=None):
+                     access=None, scope=None, project_id=None, job_budget_s=None, on_job_accepted=None):
         # The access as anton's publisher is handed it.
         calls.append({"folder": artifact, "api_key": api_key, "access": access.publisher_access(),
                       "scope": scope, "project_id": project_id})
