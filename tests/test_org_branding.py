@@ -25,7 +25,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.models.skill import Skill
 from cowork.principal import ORG_MANAGE_ROLE, Principal
-from cowork.schemas.org_branding import OrgAppearanceUpdate
+from cowork.schemas.org_branding import APPEARANCE_FIELDS, OrgAppearanceUpdate
 from cowork.schemas.skills import (
     SkillCreateRequest,
     SkillEnabledForMeRequest,
@@ -345,7 +345,18 @@ def test_auths_refusals_keep_their_status_and_message(org, auth_status, route_st
     org.auth.patch_reply = MindsHubReply(
         MindsHubAnswer.REFUSED, payload={"detail": message}, status_code=auth_status
     )
-    _refused(lambda: _put(org, ALICE, accent="red"), route_status, message)
+    _refused(lambda: _put(org, ALICE, accent="#0055ff"), route_status, message)
+
+
+def test_only_auths_message_is_passed_on_from_a_refusal(org):
+    org.auth.patch_reply = MindsHubReply(
+        MindsHubAnswer.REFUSED,
+        payload={"accent": ["Not a brand color."], "internal_trace": ["db host 10.0.0.5"], "stack": "boom"},
+        status_code=400,
+    )
+    with pytest.raises(HTTPException) as caught:
+        _put(org, ADMIN, accent="#0055ff")
+    assert (caught.value.status_code, caught.value.detail) == (422, "accent: Not a brand color.")
 
 
 def test_auth_unreachable_on_put_is_a_502(org, caplog):
@@ -361,6 +372,85 @@ def test_a_patch_that_answers_less_than_the_whole_body_is_read_again(org):
     out = _put(org, ADMIN, accent="#0055ff")
     assert out["appearance"]["accent"] == "#0055ff"
     assert org.auth.calls[-1][0] == "GET"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"evil": 1},
+        {"accent": "#0055ff", "org_id": "44444444-4444-4444-8444-444444444444"},
+        {"accent": "red"},
+        {"background_light": "#12345"},
+        {"font": "comic-sans"},
+        {"skin": "neon"},
+        {"radius": 17},
+        {"radius": -1},
+        {"radius": "8"},
+        {"radius": True},
+        {"default_theme": "sepia"},
+        {"greeting": "x" * 201},
+        {"sidebar_title": "x" * 41},
+        {"sidebar_title_mode": "logo"},
+        {"sidebar_title_mode": "custom"},
+        {"sidebar_title_mode": "custom", "sidebar_title": "   "},
+        {"members_can_choose": "yes"},
+        {"guidelines": "x" * 8001},
+    ],
+)
+def test_a_body_the_app_cant_apply_is_a_422_and_reaches_no_one(body):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    seen = []
+    app = FastAPI()
+
+    @app.put("/appearance")
+    def appearance(update: OrgAppearanceUpdate):
+        seen.append(update)
+        return {}
+
+    response = TestClient(app).put("/appearance", json=body)
+    assert response.status_code == 422, body
+    assert seen == []
+
+
+def test_the_outbound_body_is_a_new_dict_of_allowed_fields_only(org):
+    update = OrgAppearanceUpdate(
+        accent="#0055FF", background="#123456", font="mono", radius=8, skin="custom", default_theme="dark",
+        greeting="Hi", sidebarTitleMode="custom", sidebarTitle="Acme AI", members_can_choose=False,
+        guidelines="Plain words.",
+    )
+    _put(org, ADMIN, **update.model_dump(exclude_unset=True))
+    body = org.auth.calls[-1][3]
+    assert set(body) <= set(APPEARANCE_FIELDS)
+    assert "background" not in body
+    assert body == {
+        "accent": "#0055ff", "background_light": "#123456", "background_dark": "#123456", "font": "mono",
+        "radius": 8, "skin": "custom", "default_theme": "dark", "greeting": "Hi",
+        "sidebar_title_mode": "custom", "sidebar_title": "Acme AI", "members_can_choose": False,
+        "guidelines": "Plain words.",
+    }
+    assert update.auth_changes() is not update.auth_changes()
+
+
+def test_the_patch_goes_to_the_configured_auth_host_and_a_constant_path(org, monkeypatch):
+    from cowork.services import mindshub_client
+
+    sent = []
+
+    async def capture(method, path, bearer, *, json_body=None):
+        sent.append((method, f"{mindshub_client.mindshub_v1()}{path}", bearer, json_body))
+        return MindsHubReply(MindsHubAnswer.OK, payload=copy.deepcopy(org.auth.branding), status_code=200)
+
+    monkeypatch.setattr(org_branding, "send_mindshub", capture)
+    monkeypatch.setattr(mindshub_client, "mindshub_v1", lambda: "https://auth.acme.com/v1")
+    request = _request(MEMBER_BEARER, hub=HUB_BEARER)
+    request.url = SimpleNamespace(path="/api/v1/org-branding/appearance?next=https://evil.example")
+    _put(org, ADMIN, request=request, accent="#0055ff")
+    assert sent == [(
+        "PATCH", "https://auth.acme.com/v1/organizations/current/branding/appearance/", MEMBER_BEARER,
+        {"accent": "#0055ff"},
+    )]
 
 
 # ── the Brand guidelines skill, hosted ───────────────────────────────────────

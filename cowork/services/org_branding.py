@@ -240,8 +240,8 @@ class AuthAppearanceError(Exception):
     what the route answers; ``detail`` is auth's own message, or ours when
     auth gave none."""
 
-    def __init__(self, status_code: int, detail: Any) -> None:
-        super().__init__(str(detail))
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
 
@@ -249,19 +249,45 @@ class AuthAppearanceError(Exception):
 APPEARANCE_UNREACHABLE = "Couldn't reach MindsHub to save the organization's branding. Try again."
 
 
+def _auth_message(payload: Any) -> str | None:
+    """auth's own message from a refusal, picked from the keys auth uses and
+    only as text: ``detail`` (or ``message``), else DRF's field errors
+    (``{"field": ["message", ...]}``) as "field: message; ...". Nothing else
+    of auth's body is passed on."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("detail", "message"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:500]
+    errors = [
+        f"{field}: {message}"
+        for field, messages in payload.items()
+        if isinstance(field, str) and field in _AUTH_FIELD_NAMES and isinstance(messages, list)
+        for message in messages
+        if isinstance(message, str)
+    ]
+    return "; ".join(errors)[:500] or None
+
+
+# The fields whose errors auth's 422 may name.
+_AUTH_FIELD_NAMES = frozenset(
+    {
+        "accent", "background_light", "background_dark", "font", "radius", "skin", "default_theme",
+        "greeting", "sidebar_title_mode", "sidebar_title", "members_can_choose", "guidelines",
+        "non_field_errors",
+    }
+)
+
+
 def _refusal(reply: MindsHubReply) -> AuthAppearanceError:
-    payload = reply.payload
-    detail: Any = None
-    if isinstance(payload, dict):
-        detail = payload.get("detail") or payload.get("message") or payload
-    elif isinstance(payload, list | str):
-        detail = payload
+    message = _auth_message(reply.payload)
     code = reply.status_code or 400
     if code in (400, 422):
-        return AuthAppearanceError(422, detail or "The organization's branding was refused.")
+        return AuthAppearanceError(422, message or "The organization's branding was refused.")
     if code in (401, 403, 404):
-        return AuthAppearanceError(code, detail or "You can't change the organization's branding.")
-    return AuthAppearanceError(code, detail or APPEARANCE_UNREACHABLE)
+        return AuthAppearanceError(code, message or "You can't change the organization's branding.")
+    return AuthAppearanceError(code, message or APPEARANCE_UNREACHABLE)
 
 
 async def update_auth_appearance(
