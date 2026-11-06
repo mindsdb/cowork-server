@@ -6,7 +6,7 @@ import json
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
-from typing import TYPE_CHECKING, Annotated, Any, Callable, get_args
+from typing import TYPE_CHECKING, Annotated, Any, Callable, NamedTuple, get_args
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
@@ -648,7 +648,10 @@ class UserSettings(Settings):
             "provider (see resolved_gate_model), except on openai-compatible, "
             "where this is the only model there is. Defaults to the recommended "
             "model for the selected provider (MindsHub → MindsHub Air; other "
-            "providers → their smallest model)."
+            "providers → their smallest model). Outside MindsHub mode it can be "
+            "set with the ROUTER_MODEL environment variable, meant for an own "
+            "inference provider: Settings hides the choice once turns are "
+            "routed by Jev or an own decision model."
         ),
     )
     harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
@@ -812,6 +815,48 @@ class UserSettings(Settings):
             "stopping to ask. Turn off for a more cautious, ask-first agent."
         ),
     )
+    # One switch for every call to Jev on MindsHub: the route gate (jev_route)
+    # and anton's completion check (verifier_jev, overlaid in anton_harness).
+    # Off is the opt-out for organizations that cannot send conversation text
+    # to it; with no decision model of their own configured below, every turn
+    # on MindsHub then runs the full agent. Jev is billed like any MindsHub
+    # model; when MindsHub refuses a call (allowance spent, a restriction on the
+    # organization), the gate falls back to the LLM gate (jev_route.decide).
+    jev_decisions_enabled: Annotated[bool, ORG] = Field(
+        default=True,
+        title="Use Jev on MindsHub",
+        description=(
+            "Send each message and the recent conversation to Jev, MindsHub's decision model, "
+            "to decide whether your chosen model can answer it directly instead of running the "
+            "full agent. Jev also checks whether the agent finished its work. Turn off to have "
+            "every message run the full agent, unless you configure a decision model of your own."
+        ),
+    )
+    # A decision model of the organization's own, for teams that bring their
+    # own inference keys or cannot use Jev on MindsHub. Any endpoint taking
+    # TypeSafe's decision body works: TypeSafe's own (/v1/systemone), a
+    # gateway serving Jev (MindsHub's or Portkey's /v1/decisions), or a
+    # MindsHub account used only for decisions. Configured (URL and key both set), it
+    # routes every turn whatever the provider, and jev_decisions_enabled does
+    # not apply to it: setting it up is the opt-in.
+    decision_model_url: Annotated[str, ORG, PINNED] = Field(
+        default="",
+        title="Decision Model Endpoint",
+        description=(
+            "Full URL of your decision model's endpoint, which must take TypeSafe's decision "
+            "request (model, state, questions), for example https://api.typesafe.ai/v1/systemone."
+        ),
+    )
+    decision_model_api_key: SecretStr | None = Field(
+        default=None,
+        title="Decision Model API Key",
+        description="API key for your own decision model.",
+    )
+    decision_model: Annotated[str, ORG, PINNED] = Field(
+        default="jev",
+        title="Decision Model",
+        description="The model name your decision endpoint expects.",
+    )
     first_take_enabled: bool = Field(
         default=True,
         title="Instant first take",
@@ -820,13 +865,26 @@ class UserSettings(Settings):
             "what it is about to do, until the agent starts writing."
         ),
     )
+    # Off: turns run to the deployment defaults of the budgets below
+    # (``effective_turn_limits``), whatever is stored for them. A stored budget
+    # row is kept, so turning the switch back on restores it.
+    # ``enable_limits_for_saved_budgets`` turns it on wherever a budget row was
+    # saved before the switch existed.
+    limits_enabled: Annotated[bool, ORG, PINNED] = Field(
+        default=False,
+        title="Limit how much a task can do",
+        description=(
+            "Off: a task runs until it's done, up to a high safety limit where "
+            "it asks before going further. On: a task stops or asks at the "
+            "steps, auto-continues and tokens you set below."
+        ),
+    )
+
     # ── Advanced agent budgets ──
-    # Overlaid onto AntonSettings per conversation (anton_harness.harness);
-    # anton's own CLI defaults (25/3) are lower — Cowork deliberately runs
-    # with more headroom so long tasks finish without a mid-task check-in.
-    # Defaults come from app settings so hosted deployments (operator-paid
-    # inference, no Settings UI on web) can lower them via env without
-    # touching per-user rows.
+    # Overlaid onto AntonSettings per conversation (anton_harness.harness).
+    # The defaults are safety limits that a normal task never reaches, the
+    # values anton's own defaults move to; they come from app settings so a
+    # deployment can change them via env without touching per-user rows.
     max_tool_rounds: Annotated[int, ORG, PINNED] = Field(
         default_factory=lambda: get_app_settings().default_max_tool_rounds,
         ge=5,
@@ -862,13 +920,13 @@ class UserSettings(Settings):
         #
         # "No limit" is EFFECTIVELY, not literally, true — and the bound is
         # closer than it looks. A turn makes about
-        # `max_tool_rounds x (max_continuations + 1)` LLM calls, which at THIS
-        # repo's defaults (50 x 6) is ~306 calls, so 50M is reached at ~163k per
-        # call — below the ~190k context a long conversation carries. At the
-        # maxima a user can set (500 x 25) it is ~13,000 calls and ~3.8k per
-        # call. So the step cap does NOT always land first; it merely always has
-        # so far. The largest turn in 30 days of production was 8.26M, because
-        # real turns end and compaction intervenes long before that shape.
+        # `max_tool_rounds x (max_continuations + 1)` LLM calls, which at the
+        # defaults (250 x 11) is ~2,750 calls, so 50M is reached at ~18k per
+        # call — far below the ~190k context a long conversation carries. At the
+        # maxima a user can set (500 x 26) it is ~13,000 calls and ~3.8k per
+        # call. So the step cap does NOT always land first; the token ceiling
+        # usually does. The largest turn in 30 days of production (2026-10-14)
+        # was 34.4M.
         # Do not restate this as "the ceiling can never fire at max" — an
         # earlier version of this comment did, using anton's own 25x3 defaults
         # rather than Cowork's, which put the threshold at 480k per call and
@@ -1418,7 +1476,8 @@ def setting_is_org_scoped(key: str) -> bool:
 def setting_is_operator_pinned(key: str) -> bool:
     """True for a key the operator sets for the whole deployment: the model and
     provider choices, their endpoints and credentials, memory, the per-turn
-    budgets, and how the agent acts (act_first, proactive_dashboards).
+    budgets and the switch that applies them, and how the agent acts
+    (act_first, proactive_dashboards).
     SecretStr credentials are pinned structurally; other fields iff
     tagged with the PINNED marker. A personal partition resolves these from the
     global row, then the environment, and ignores a row of its own
@@ -1429,6 +1488,51 @@ def setting_is_operator_pinned(key: str) -> bool:
     if UserSettings.field_is_sensitive(key):
         return True
     return any(isinstance(m, _OperatorPinned) for m in field.metadata)
+
+
+#: The per-turn budgets the ``limits_enabled`` switch governs.
+BUDGET_SETTING_KEYS: tuple[str, ...] = ("max_turn_tokens", "max_tool_rounds", "max_continuations")
+
+#: What a renderer that predates the switch stores when a budget field is
+#: cleared, its way to reset it: the old defaults.
+_PRE_SWITCH_RESET_VALUES: dict[str, int] = {
+    "max_turn_tokens": 1_250_000, "max_tool_rounds": 50, "max_continuations": 5,
+}
+
+
+def is_chosen_budget(key: str, value: str) -> bool:
+    """Whether a stored budget is a limit the user chose, so it turns the
+    limits switch on. A value equal to the old default is most likely a
+    pre-switch reset, which meant "use the default", so it doesn't."""
+    try:
+        return int(value) != _PRE_SWITCH_RESET_VALUES[key]
+    except (KeyError, ValueError):
+        return True
+
+
+class TurnLimits(NamedTuple):
+    max_turn_tokens: int
+    max_tool_rounds: int
+    max_continuations: int
+
+
+def default_turn_limits() -> TurnLimits:
+    """The deployment defaults (``COWORK_DEFAULT_MAX_*``): the safety limits a
+    turn runs to while ``limits_enabled`` is off."""
+    app = get_app_settings()
+    return TurnLimits(app.default_max_turn_tokens, app.default_max_tool_rounds, app.default_max_continuations)
+
+
+def effective_turn_limits(settings: UserSettings) -> TurnLimits:
+    """The budgets a turn runs with.
+
+    With ``limits_enabled`` off these are ``default_turn_limits()``, and stored
+    budget values are ignored, not deleted. With it on, they are the resolved
+    settings.
+    """
+    if settings.limits_enabled:
+        return TurnLimits(settings.max_turn_tokens, settings.max_tool_rounds, settings.max_continuations)
+    return default_turn_limits()
 
 
 _current_scope: ContextVar["TenantScope | None"] = ContextVar("settings_scope", default=None)

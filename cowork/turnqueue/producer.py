@@ -687,6 +687,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         else None
     )
     workspace_rel_path = workspace.workspace_rel_path if workspace is not None else _DEFAULT_WORKSPACE_PATH
+    from cowork.common.settings.user_settings import get_user_settings
+    # The organization's Jev opt-out, read here so every remote turn carries
+    # it: web UI, scheduled and channel turns alike.
+    jev_decisions = getattr(get_user_settings(scope), "jev_decisions_enabled", True) is not False
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -696,6 +700,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # The cowork UI renders a tool's message to the user as an
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
+              # False when the organization opted out of Jev: the pod's
+              # completion check then never asks it. A controller that
+              # predates the field drops it, and the pod keeps Jev on.
+              "jev_decisions": jev_decisions,
               **({"memory": memory_block} if memory_block else {}),
               # Only the skills the caller sees, and the pod's whole
               # recallable set, so always present, even empty.

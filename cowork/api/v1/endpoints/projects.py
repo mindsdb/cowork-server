@@ -251,7 +251,7 @@ def list_projects(
     # the first listing (no-op in local mode / once claimed).
     service.ensure_general_for_scope()
     access = SharedResourceAccess(session, principal)
-    owned = [_project_response(project, access) for project in service.list_projects()]
+    owned = [_project_response(project, access) for project in service.list_visible_projects()]
     return [*owned, *SharedProjectFiles(session).list_projects()]
 
 
