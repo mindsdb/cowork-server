@@ -281,3 +281,36 @@ async def test_the_ack_wait_blocks_for_no_longer_than_the_shared_block(r, monkey
     await pod
 
     assert blocks and max(blocks) <= REDIS_BLOCK_MS
+
+
+async def test_the_ack_wait_stops_retrying_a_read_when_the_wait_ends(r, monkeypatch):
+    """The client retries a read for its whole call budget, 30 s by default.
+    A Redis that drops every read near the end of the wait would hold /answer
+    that long past its wait without a deadline that ends with the wait."""
+    import time
+
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    from cowork.turnqueue.redis_client import _AsyncDeadlineRetry
+
+    retry = _AsyncDeadlineRetry(budget_s=5)
+    reads_ended: list[float] = []
+
+    async def dropped():
+        raise RedisConnectionError("Connection closed by server.")
+
+    async def fail(_error):
+        return None
+
+    async def xread(*args, **kwargs):
+        try:
+            return await retry.call_with_retry(dropped, fail)
+        finally:
+            reads_ended.append(time.monotonic())
+
+    monkeypatch.setattr(r, "xread", xread)
+    started = time.monotonic()
+    assert await _submit(r, timeout=1.0) is RemoteAnswerResult.ACCEPTED
+
+    # One read, retried until the wait ends and no longer.
+    assert reads_ended == [pytest.approx(started + 1.0, abs=0.3)]

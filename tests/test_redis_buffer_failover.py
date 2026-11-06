@@ -23,17 +23,17 @@ def fake_redis(monkeypatch):
     return client
 
 
-async def _write(client, key, *, seq, type_="Delta", text=""):
+async def _write(*, client, key, seq, type_="Delta", text=""):
     """One entry as RedisStreamBuffer.append writes it, so a test can repeat a seq."""
     await client.xadd(key, {"seq": str(seq), "ts": "t", "type": type_, "data": json.dumps({"text": text})})
 
 
 async def test_a_replayed_seq_written_twice_is_read_once(fake_redis):
     key = stream_key("dup-replay", 1)
-    await _write(fake_redis, key, seq=0, text="a")
-    await _write(fake_redis, key, seq=1, text="b")
-    await _write(fake_redis, key, seq=1, text="b")
-    await _write(fake_redis, key, seq=2, type_="Done")
+    await _write(client=fake_redis, key=key, seq=0, text="a")
+    await _write(client=fake_redis, key=key, seq=1, text="b")
+    await _write(client=fake_redis, key=key, seq=1, text="b")
+    await _write(client=fake_redis, key=key, seq=2, type_="Done")
 
     reader = RedisStreamBuffer(conversation_id="dup-replay", turn_id=1)
     seen = [rec async for rec in reader.tail(from_seq=0)]
@@ -43,7 +43,7 @@ async def test_a_replayed_seq_written_twice_is_read_once(fake_redis):
 
 async def test_a_live_seq_written_twice_is_read_once(fake_redis):
     key = stream_key("dup-live", 1)
-    await _write(fake_redis, key, seq=0, text="a")
+    await _write(client=fake_redis, key=key, seq=0, text="a")
     reader = RedisStreamBuffer(conversation_id="dup-live", turn_id=1)
     seen = []
 
@@ -53,9 +53,9 @@ async def test_a_live_seq_written_twice_is_read_once(fake_redis):
 
     task = asyncio.create_task(read())
     await asyncio.sleep(0.05)  # past the replay, blocked on XREAD
-    await _write(fake_redis, key, seq=1, text="b")
-    await _write(fake_redis, key, seq=1, text="b")
-    await _write(fake_redis, key, seq=2, type_="Done")
+    await _write(client=fake_redis, key=key, seq=1, text="b")
+    await _write(client=fake_redis, key=key, seq=1, text="b")
+    await _write(client=fake_redis, key=key, seq=2, type_="Done")
     await asyncio.wait_for(task, timeout=5)
 
     assert [rec.seq for rec in seen] == [0, 1, 2]

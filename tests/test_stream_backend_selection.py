@@ -102,6 +102,44 @@ async def test_a_new_file_turn_starts_clear_of_an_ended_turn_at_its_number(monke
     assert [(record.seq, record.type) async for record in fresh.tail(0)] == [(0, "sse"), (1, "Done")]
 
 
+def test_a_scan_that_reconnects_on_every_page_stops_at_its_deadline(monkeypatch):
+    """A walk starts again from cursor 0 after a reconnect. On a Redis that
+    keeps dropping connections, it would restart forever and hold its
+    threadpool thread."""
+    import itertools
+    import time
+
+    from redis.exceptions import TimeoutError as RedisTimeoutError
+
+    pages = 0
+
+    class _Pinned:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def scan(self, *, cursor, match, count):
+            nonlocal pages
+            pages += 1
+            if pages > 400:
+                raise AssertionError("the walk never stopped")
+            time.sleep(0.005)
+            return 7, []
+
+    class _Client:
+        def client(self):
+            return _Pinned()
+
+    connects = itertools.count()
+    monkeypatch.setattr(backend_mod, "sync_connections_opened", lambda: next(connects))
+    monkeypatch.setattr(backend_mod, "SYNC_CALL_BUDGET_S", 0.2)
+
+    with pytest.raises(RedisTimeoutError):
+        backend_mod._scan_keys(r=_Client(), match="cowork:stream:c11:*")
+
+
 def test_a_file_backend_conversation_delete_never_calls_redis(monkeypatch, tmp_path):
     """Desktop and the single-container server have no Redis: each delete would
     wait out the client's connect retries against a localhost Redis."""

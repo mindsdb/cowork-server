@@ -19,6 +19,9 @@ failover without failing the call in flight:
 - The deadline lives in a context variable (``redis_deadline``). redis-py runs
   retry loops inside a command's own loop (a reconnect, a health-check PING),
   and those spend what is left of the call's budget instead of a new one.
+- Taking a connection from the pool retries the whole connect, its handshake
+  (AUTH, SELECT) included, so a connection the server closes mid-handshake is
+  replaced instead of failing the call.
 - The async pool connects outside its lock, so callers that need a connection
   do not queue behind one caller's connect retries.
 - ``send_once`` sends a command at most once, for the writes that duplicate
@@ -46,6 +49,7 @@ from redis.backoff import ExponentialWithJitterBackoff
 from redis.exceptions import (
     AuthenticationError,
     AuthorizationError,
+    BusyLoadingError,
     ReadOnlyError,
     ResponseError,
 )
@@ -169,7 +173,7 @@ def send_once() -> Iterator[None]:
     RPUSH whose reply was lost after Redis applied it: the failure is raised
     instead of resending the command. Retries that cannot send it twice still
     happen: opening a connection before the command goes out, and a READONLY
-    reply, which says Redis refused the write.
+    or LOADING reply, which says Redis refused the write.
     """
     token = _send_once.set(True)
     try:
@@ -202,13 +206,20 @@ def _backoff() -> ExponentialWithJitterBackoff:
     return ExponentialWithJitterBackoff(cap=2.0, base=0.25)
 
 
+#: Replies that say Redis refused a command without running it: a replica's
+#: READONLY, and LOADING from a Redis still loading its data after a restart.
+#: Inside MULTI either one aborts the EXEC, since MULTI and EXEC are allowed
+#: while loading and a refused queued command fails the transaction.
+REFUSED_UNRUN_ERRORS: tuple[type[Exception], ...] = (ReadOnlyError, BusyLoadingError)
+
+
 def _resend_refused(*, error: Exception) -> bool:
     """Whether ``send_once`` forbids resending a command that failed with ``error``.
 
-    A READONLY reply says Redis refused the write, so resending it cannot
-    duplicate it. Any other failure may have come after Redis applied it.
+    A READONLY or LOADING reply says Redis refused the write, so resending it
+    cannot duplicate it. Any other failure may have come after Redis applied it.
     """
-    return _send_once.get() and not isinstance(error, ReadOnlyError)
+    return _send_once.get() and not isinstance(error, REFUSED_UNRUN_ERRORS)
 
 
 class _AsyncDeadlineRetry(AsyncRetry):
@@ -268,12 +279,17 @@ class _SyncDeadlineRetry(SyncRetry):
 
 
 class _AsyncPool(aioredis.ConnectionPool):
-    """An async pool that connects outside its lock, and holds its clients' call budget.
+    """An async pool that connects outside its lock, retries a connect's handshake,
+    and holds its clients' call budget.
 
     redis-py 5's pool holds its lock while a new connection connects, retries
     included, so every caller that needs a connection, even one an idle pooled
     connection would serve, waits behind that one connect. This takes the
     connection under the lock and connects it after, as redis-py 8 does.
+
+    redis-py 5 retries only a connect's TCP step. The handshake after it (AUTH,
+    CLIENT SETINFO, SELECT) runs outside that loop and before the command's
+    own, so this runs the whole connect under the connection's retry.
     """
 
     def __init__(self, *, call_budget_s: float, **kwargs: Any) -> None:
@@ -284,7 +300,9 @@ class _AsyncPool(aioredis.ConnectionPool):
         async with self._lock:
             connection = self.get_available_connection()
         try:
-            await self.ensure_connection(connection)
+            await connection.retry.call_with_retry(
+                lambda: self.ensure_connection(connection), lambda _error: connection.disconnect(),
+            )
         except BaseException:
             await self.release(connection)
             raise
@@ -292,14 +310,24 @@ class _AsyncPool(aioredis.ConnectionPool):
 
 
 class _SyncPool(syncredis.ConnectionPool):
-    """A blocking pool that counts, per context, the connections it opens.
+    """A blocking pool that retries a connect's handshake and counts, per
+    context, the connections it opens.
 
-    redis-py 5's blocking pool already connects outside its lock.
+    redis-py 5's blocking pool already connects outside its lock, and retries
+    only a connect's TCP step, as the async pool does.
     """
 
     def __init__(self, *, call_budget_s: float, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.call_budget_s = call_budget_s
+
+    def get_connection(self, command_name=None, *keys, **options):
+        # A failed take releases its connection to the pool, and a failed
+        # handshake disconnects it, so the next attempt reconnects whichever
+        # connection it takes.
+        take = super().get_connection
+        retry: _SyncDeadlineRetry = self.connection_kwargs["retry"]
+        return retry.call_with_retry(take, lambda _error: None)
 
     def make_connection(self):
         connection = super().make_connection()

@@ -1,19 +1,23 @@
 """cowork-server's Redis clients against a real Redis that fails the way a failover does.
 
 A connection the server kills mid-call, a primary demoted to a read-only
-replica (REPLICAOF), a password changed under a live client, and a reply lost
-after Redis applied the write. The last needs a TCP proxy between the client
-and Redis, which this module starts in-process; it also delays new connections
-and stops accepting them.
+replica (REPLICAOF), a password changed under a live client, a connection
+closed during its handshake, and a reply lost after Redis applied the write.
+The last two need a TCP proxy between the client and Redis, which this module
+starts in-process; it also delays new connections and stops accepting them.
 
-Each test that changes the server (REPLICAOF, an ACL user) puts it back in a
-``finally``, since the service job runs every test against one Redis.
+These tests run only against the Redis ``COWORK_TEST_REDIS_URL`` names, never a
+default one, since they change the whole server: REPLICAOF, ACL users, CLIENT
+KILL and FLUSHDB. Each test that changes the server (REPLICAOF, an ACL user)
+puts it back in a ``finally``, since the service job runs every test against
+one Redis.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -36,7 +40,12 @@ ACL_USER = "cowork-failover-test"
 
 @pytest.fixture
 async def redis_url(monkeypatch):
-    url = os.environ.get("COWORK_TEST_REDIS_URL", "redis://localhost:6379/1")
+    url = os.environ.get("COWORK_TEST_REDIS_URL")
+    if not url:
+        missing_prerequisite(
+            "COWORK_TEST_REDIS_URL is not set, and these tests change the whole Redis they run on",
+            required_by="COWORK_REQUIRE_SERVICES",
+        )
     admin = aioredis.from_url(url, decode_responses=True)
     try:
         await admin.ping()
@@ -59,7 +68,7 @@ async def admin(redis_url):
     await client.aclose()
 
 
-def _with_netloc(url: str, *, host: str, port: int, credentials: str | None = None) -> str:
+def _with_netloc(*, url: str, host: str, port: int, credentials: str | None = None) -> str:
     """``url`` aimed at ``host:port``, keeping its database."""
     netloc = f"{credentials}@{host}:{port}" if credentials else f"{host}:{port}"
     return urlsplit(url)._replace(netloc=netloc).geturl()
@@ -73,8 +82,9 @@ class _Proxy:
     each new connection that long before it reaches Redis. The next command
     whose bytes contain ``drop_marker`` is held for ``drop_after_s``, then the
     proxy stops accepting connections and closes that one without sending it.
-    ``refuse`` stops accepting connections, and ``listen`` starts again on the
-    same port.
+    The next command whose bytes contain ``cut_marker`` closes its connection
+    without sending it, and later connections pass. ``refuse`` stops accepting
+    connections, and ``listen`` starts again on the same port.
     """
 
     def __init__(self, *, upstream_url: str) -> None:
@@ -84,6 +94,7 @@ class _Proxy:
         self.connect_delay_s = 0.0
         self.drop_marker: bytes | None = None
         self.drop_after_s = 0.0
+        self.cut_marker: bytes | None = None
         self.connections = 0
         self.port = 0
         self._server: asyncio.Server | None = None
@@ -123,6 +134,9 @@ class _Proxy:
 
     async def _to_redis(self, client_reader, upstream_writer) -> None:
         while data := await client_reader.read(65536):
+            if self.cut_marker is not None and self.cut_marker in data:
+                self.cut_marker = None
+                raise ConnectionResetError("command cut")
             if self.drop_marker is not None and self.drop_marker in data:
                 self.drop_marker = None
                 await asyncio.sleep(self.drop_after_s)
@@ -146,12 +160,12 @@ class _Proxy:
 async def proxy(redis_url):
     proxy = _Proxy(upstream_url=redis_url)
     await proxy.listen()
-    proxy.url = _with_netloc(redis_url, host="127.0.0.1", port=proxy.port)
+    proxy.url = _with_netloc(url=redis_url, host="127.0.0.1", port=proxy.port)
     yield proxy
     await proxy.close()
 
 
-async def _blocked_client_id(admin, *, command: str, other_than: str | None = None, user: str | None = None) -> str:
+async def _blocked_client_id(*, admin, command: str, other_than: str | None = None, user: str | None = None) -> str:
     """The id of the connection blocked in ``command``, once there is one."""
     for _ in range(250):
         for client in await admin.client_list():
@@ -168,11 +182,11 @@ async def test_a_call_whose_connection_is_killed_mid_call_is_retried_and_succeed
     client = build_async_redis(url=redis_url, call_budget_s=10)
     failures_before = redis_client.last_redis_failure_at()
     read = asyncio.create_task(client.xread({"killed:s": "0-0"}, block=redis_client.REDIS_BLOCK_MS))
-    killed = await _blocked_client_id(admin, command="xread")
+    killed = await _blocked_client_id(admin=admin, command="xread")
 
     await admin.client_kill_filter(_id=killed)
     # The retry reconnects and blocks again, on a new connection.
-    await _blocked_client_id(admin, command="xread", other_than=killed)
+    await _blocked_client_id(admin=admin, command="xread", other_than=killed)
     await admin.xadd("killed:s", {"k": "v"})
 
     reply = await asyncio.wait_for(read, timeout=10)
@@ -188,7 +202,7 @@ async def test_a_write_to_a_demoted_primary_is_retried_until_it_is_promoted_agai
     too: READONLY means Redis refused it."""
     client = build_async_redis(url=redis_url, call_budget_s=10)
     reader = asyncio.create_task(xread_blocking(r=client, streams={"ro:s": "0-0"}))
-    await _blocked_client_id(admin, command="xread")
+    await _blocked_client_id(admin=admin, command="xread")
 
     async def write_once():
         with send_once():
@@ -224,11 +238,11 @@ async def test_an_auth_error_on_a_reconnect_is_raised_without_retrying(redis_url
     try:
         parts = urlsplit(redis_url)
         user_url = _with_netloc(
-            redis_url, host=parts.hostname, port=parts.port or 6379, credentials=f"{ACL_USER}:first-password",
+            url=redis_url, host=parts.hostname, port=parts.port or 6379, credentials=f"{ACL_USER}:first-password",
         )
         client = build_async_redis(url=user_url, call_budget_s=5)
         read = asyncio.create_task(client.xread({"auth:s": "0-0"}, block=redis_client.REDIS_BLOCK_MS))
-        await _blocked_client_id(admin, command="xread", user=ACL_USER)
+        await _blocked_client_id(admin=admin, command="xread", user=ACL_USER)
         denied_before = int((await admin.info("stats"))["acl_access_denied_auth"])
 
         await admin.execute_command("ACL", "SETUSER", ACL_USER, "resetpass", ">second-password")
@@ -240,6 +254,72 @@ async def test_an_auth_error_on_a_reconnect_is_raised_without_retrying(redis_url
         assert time.monotonic() - killed_at < 2
         assert int((await admin.info("stats"))["acl_access_denied_auth"]) - denied_before == 1
         await client.aclose()
+    finally:
+        await admin.execute_command("ACL", "DELUSER", ACL_USER)
+
+
+@pytest.mark.parametrize("client_kind", ["async", "sync"])
+@pytest.mark.parametrize("step", [b"AUTH", b"SELECT"], ids=["auth", "select"])
+async def test_a_connection_closed_during_its_handshake_is_retried(redis_url, proxy, admin, step, client_kind):
+    """redis-py retries only the TCP connect of a new connection. Its handshake
+    (AUTH, SELECT) runs outside that loop and before the command's, so a server
+    that accepts a connection and closes it mid-handshake, as a restarting
+    Redis or a Sentinel CLIENT KILL does, would fail the call at once."""
+    credentials = None
+    if step == b"AUTH":
+        await admin.execute_command("ACL", "SETUSER", ACL_USER, "on", ">handshake-password", "~*", "&*", "+@all")
+        credentials = f"{ACL_USER}:handshake-password"
+    try:
+        url = _with_netloc(url=redis_url, host="127.0.0.1", port=proxy.port, credentials=credentials)
+        await admin.set("handshake:key", "v")
+        proxy.cut_marker = step
+        failed_after = time.monotonic()
+        if client_kind == "async":
+            client = build_async_redis(url=url, call_budget_s=5)
+            value = await client.get("handshake:key")
+            await client.aclose()
+        else:
+            client = build_sync_redis(url=url, call_budget_s=5)
+            # In a thread: the proxy runs on this event loop.
+            value = await asyncio.to_thread(client.get, "handshake:key")
+            client.close()
+    finally:
+        if step == b"AUTH":
+            await admin.execute_command("ACL", "DELUSER", ACL_USER)
+
+    assert value == "v"
+    assert proxy.connections == 2
+    assert redis_client.last_redis_failure_at() >= failed_after
+
+
+@pytest.mark.parametrize("client_kind", ["async", "sync"])
+async def test_a_wrong_password_on_a_first_connect_is_raised_without_retrying(redis_url, admin, client_kind):
+    """The pool retries a new connection's handshake, and AUTH is part of it,
+    so the auth exclusion has to hold there as well as in the command's loop."""
+    await admin.execute_command("ACL", "SETUSER", ACL_USER, "on", ">right-password", "~*", "&*", "+@all")
+    try:
+        parts = urlsplit(redis_url)
+        url = _with_netloc(
+            url=redis_url, host=parts.hostname, port=parts.port or 6379, credentials=f"{ACL_USER}:wrong-password",
+        )
+        denied_before = int((await admin.info("stats"))["acl_access_denied_auth"])
+        started = time.monotonic()
+        with pytest.raises(AuthenticationError):
+            if client_kind == "async":
+                client = build_async_redis(url=url, call_budget_s=5)
+                try:
+                    await client.get("auth:first")
+                finally:
+                    await client.aclose()
+            else:
+                client = build_sync_redis(url=url, call_budget_s=5)
+                try:
+                    await asyncio.to_thread(client.get, "auth:first")
+                finally:
+                    client.close()
+
+        assert time.monotonic() - started < 2
+        assert int((await admin.info("stats"))["acl_access_denied_auth"]) - denied_before == 1
     finally:
         await admin.execute_command("ACL", "DELUSER", ACL_USER)
 
@@ -258,7 +338,7 @@ async def test_an_append_resent_after_a_lost_reply_reaches_a_reader_once(redis_u
             live_seen.append(rec.seq)
 
     following = asyncio.create_task(follow())
-    await _blocked_client_id(admin, command="xread")
+    await _blocked_client_id(admin=admin, command="xread")
     monkeypatch.setenv("COWORK_TURN_REDIS_URL", proxy.url)
     redis_client.reset_redis()
     await redis_client.get_redis().ping()
@@ -341,6 +421,37 @@ async def test_a_call_whose_connect_retried_spends_the_same_deadline_on_its_comm
     await client.aclose()
 
 
+@pytest.mark.parametrize("send", ["execute", "watch"])
+async def test_a_pipeline_whose_connect_retried_spends_the_same_deadline_on_its_commands(proxy, send):
+    """A pipeline takes its connection from the pool before its own retry
+    loop starts, on execute and on an immediate command such as WATCH. With a
+    deadline per loop, a pipeline that connected late gets a new budget for
+    its commands."""
+    budget_s = 2.0
+    client = build_async_redis(url=proxy.url, call_budget_s=budget_s)
+    proxy.refuse()
+    proxy.drop_marker = b"deadline:pipeline"
+
+    async def run():
+        async with client.pipeline(transaction=True) as pipe:
+            if send == "watch":
+                await pipe.watch("deadline:pipeline")
+            else:
+                pipe.get("deadline:pipeline")
+                await pipe.execute()
+
+    started = time.monotonic()
+    call = asyncio.create_task(run())
+    await asyncio.sleep(0.8)
+    await proxy.listen()
+    with pytest.raises(RedisConnectionError):
+        await call
+
+    assert proxy.connections == 1
+    assert time.monotonic() - started < budget_s + 0.4
+    await client.aclose()
+
+
 async def test_callers_that_need_a_connection_do_not_wait_for_each_others_connect(proxy):
     """redis-py 5's pool connects under its lock, so five callers that each
     need a new connection connect one after another."""
@@ -355,10 +466,15 @@ async def test_callers_that_need_a_connection_do_not_wait_for_each_others_connec
     await client.aclose()
 
 
-async def test_a_conversation_delete_scan_restarts_after_its_connection_is_replaced(redis_url, monkeypatch):
+@pytest.mark.parametrize("reconnected_by", ["the walk", "another thread"])
+async def test_a_conversation_delete_scan_restarts_after_its_connection_is_replaced(
+    redis_url, monkeypatch, reconnected_by,
+):
     """A SCAN cursor means something only to the server that issued it. After
     a failover the next page can reach the new primary, so the walk starts
-    again from cursor 0 instead of skipping keys."""
+    again from cursor 0 instead of skipping keys. The blocking pool shares its
+    connections between threadpool threads, so another thread can take the
+    dropped connection and reconnect it before the walk's next page goes out."""
     admin = redis.Redis.from_url(redis_url, decode_responses=True)
     client = build_sync_redis(url=redis_url, call_budget_s=5)
     monkeypatch.setattr(backend_mod, "get_sync_redis", lambda: client)
@@ -368,19 +484,24 @@ async def test_a_conversation_delete_scan_restarts_after_its_connection_is_repla
             pipe.set(f"other:{i}", "1")
         pipe.execute()
 
-    first_connection = client.client_id()
     cursors: list[int] = []
-    real_scan = client.scan
+    real_scan = redis_client._SyncRedis.scan
 
-    def scan(*args, **kwargs):
+    def scan(self, *args, **kwargs):
         cursors.append(kwargs["cursor"])
-        reply = real_scan(*args, **kwargs)
+        reply = real_scan(self, *args, **kwargs)
         if len(cursors) == 1:
-            # The server drops the pooled connection between two pages.
-            admin.client_kill_filter(_id=first_connection)
+            # The server drops the walk's connection between two pages.
+            admin.client_kill_filter(_id=self.client_id())
+            if reconnected_by == "another thread":
+                # A request on another threadpool thread takes a connection
+                # from the pool and reconnects it in its own context.
+                other = threading.Thread(target=client.get, args=("other:0",))
+                other.start()
+                other.join()
         return reply
 
-    monkeypatch.setattr(client, "scan", scan)
+    monkeypatch.setattr(redis_client._SyncRedis, "scan", scan)
     backend_mod._remove_redis_buffers("scan-me")
 
     assert cursors[0] == 0 and cursors[1] != 0 and cursors[2] == 0

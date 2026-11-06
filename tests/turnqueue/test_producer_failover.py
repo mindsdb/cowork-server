@@ -26,7 +26,7 @@ def _stub_turn_setup(monkeypatch):
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
 
 
-def _reply(kind, data, *, n=None):
+def _reply(*, kind, data, n=None):
     payload = {"correlation_id": "r", "kind": kind, "data": data}
     if n is not None:
         payload["n"] = n
@@ -36,7 +36,7 @@ def _reply(kind, data, *, n=None):
 class _Redis:
     """One reply per XREAD, after any ``-UNBLOCKED`` reads, recording each write."""
 
-    def __init__(self, replies, *, unblocked_reads=0):
+    def __init__(self, *, replies, unblocked_reads=0):
         self.writes: list[tuple[str, bool]] = []
         self.blocks: list[int | None] = []
         self.sending_once = False
@@ -81,10 +81,10 @@ class _Redis:
 
 
 def _authorized(*, n=None):
-    return _reply("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}, n=n)
+    return _reply(kind="progress", data={"phase": "workspace_authorized", "workspace_mode": "persistent"}, n=n)
 
 
-async def _turn(monkeypatch, fake):
+async def _turn(*, monkeypatch, fake):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     return [
         item async for item in prod.stream_remote_replies(
@@ -96,7 +96,7 @@ async def _turn(monkeypatch, fake):
 
 async def test_the_job_that_queues_a_turn_is_sent_at_most_once(monkeypatch):
     """A job XADD resent after its reply was lost queues the turn twice."""
-    fake = _Redis([_authorized(), _reply("turn_completed", {})])
+    fake = _Redis(replies=[_authorized(), _reply(kind="turn_completed", data={})])
 
     @contextmanager
     def recording_send_once():
@@ -107,7 +107,7 @@ async def test_the_job_that_queues_a_turn_is_sent_at_most_once(monkeypatch):
             fake.sending_once = False
 
     monkeypatch.setattr(prod, "send_once", recording_send_once)
-    await _turn(monkeypatch, fake)
+    await _turn(monkeypatch=monkeypatch, fake=fake)
 
     assert [once for command, once in fake.writes if command == "xadd"] == [True]
     # The rest are safe to resend, and keep their retries.
@@ -117,47 +117,49 @@ async def test_the_job_that_queues_a_turn_is_sent_at_most_once(monkeypatch):
 async def test_a_reply_whose_number_is_not_above_the_last_applied_is_dropped(monkeypatch):
     """The controller resends a reply whose XADD reply it lost, and a doubled
     turn_delta would double its text in the answer."""
-    fake = _Redis([
+    fake = _Redis(replies=[
         _authorized(n=1),
-        _reply("turn_delta", {"text": "he"}, n=2),
-        _reply("turn_delta", {"text": "he"}, n=2),
-        _reply("turn_delta", {"text": "stale"}, n=1),
-        _reply("turn_delta", {"text": "llo"}, n=3),
-        _reply("turn_completed", {}, n=4),
+        _reply(kind="turn_delta", data={"text": "he"}, n=2),
+        _reply(kind="turn_delta", data={"text": "he"}, n=2),
+        _reply(kind="turn_delta", data={"text": "stale"}, n=1),
+        _reply(kind="turn_delta", data={"text": "llo"}, n=3),
+        _reply(kind="turn_completed", data={}, n=4),
     ])
 
-    items = await _turn(monkeypatch, fake)
+    items = await _turn(monkeypatch=monkeypatch, fake=fake)
 
     assert items == [("turn_delta", {"text": "he"}), ("turn_delta", {"text": "llo"}), ("turn_completed", {})]
 
 
 async def test_replies_with_no_number_are_all_applied(monkeypatch):
     """A controller that numbers nothing: two equal deltas are two deltas."""
-    fake = _Redis([
+    fake = _Redis(replies=[
         _authorized(),
-        _reply("turn_delta", {"text": "ha"}),
-        _reply("turn_delta", {"text": "ha"}),
-        _reply("turn_completed", {}),
+        _reply(kind="turn_delta", data={"text": "ha"}),
+        _reply(kind="turn_delta", data={"text": "ha"}),
+        _reply(kind="turn_completed", data={}),
     ])
 
-    items = await _turn(monkeypatch, fake)
+    items = await _turn(monkeypatch=monkeypatch, fake=fake)
 
     assert items == [("turn_delta", {"text": "ha"}), ("turn_delta", {"text": "ha"}), ("turn_completed", {})]
 
 
 async def test_the_relay_reads_again_after_an_unblocked_reply(monkeypatch):
     """Raised, ``-UNBLOCKED`` would fail a turn the worker is still running."""
-    fake = _Redis([_authorized(), _reply("turn_delta", {"text": "hi"}), _reply("turn_completed", {})],
-                  unblocked_reads=2)
+    fake = _Redis(
+        replies=[_authorized(), _reply(kind="turn_delta", data={"text": "hi"}), _reply(kind="turn_completed", data={})],
+        unblocked_reads=2,
+    )
 
-    items = await _turn(monkeypatch, fake)
+    items = await _turn(monkeypatch=monkeypatch, fake=fake)
 
     assert items == [("turn_delta", {"text": "hi"}), ("turn_completed", {})]
 
 
 async def test_the_relay_blocks_for_the_shared_block(monkeypatch):
-    fake = _Redis([_authorized(), _reply("turn_completed", {})])
+    fake = _Redis(replies=[_authorized(), _reply(kind="turn_completed", data={})])
 
-    await _turn(monkeypatch, fake)
+    await _turn(monkeypatch=monkeypatch, fake=fake)
 
     assert fake.blocks and set(fake.blocks) == {REDIS_BLOCK_MS}
