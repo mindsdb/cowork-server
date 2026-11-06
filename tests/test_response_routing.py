@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -2935,3 +2936,137 @@ async def test_only_the_latest_prompt_is_checked_for_file_names(monkeypatch):
     ]
     decision = await _route(history)
     assert decision.route == DIRECT_CONTEXT and seen
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
+    """The gate mints a turn key for a delegated turn to reuse. When the
+    router answers itself, no turn runs to revoke it, so the handler does."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: conversation,
+            message_count=lambda _conversation: 0,
+            get_recent_messages=lambda *_args, **_kwargs: [],
+        ),
+    )
+
+    async def no_secrets(_scope):
+        return None
+
+    monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+
+    async def direct(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi"), {"correlation_id": "corr-gate"}
+
+    handler._route_request = direct
+
+    async def answered(**_kwargs):
+        return "answered"
+
+    handler._handle_direct_response = answered
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+
+    assert await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id))) == "answered"
+    assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_gate_revokes_the_key_it_minted(monkeypatch):
+    """The gate falls back to the agent, which mints its own key; the gate's
+    would otherwise live out its whole window."""
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+
+    async def broken_gate(**_kwargs):
+        raise RuntimeError("router down")
+
+    monkeypatch.setattr(responses, "decide_route", broken_gate)
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    decision, turn_llm = await handler._route_request(
+        conversation_id="conv-1",
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+    assert decision.fallback is True
+    assert turn_llm is None
+    assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal,revokes", [(RuntimeError("already running"), True), (asyncio.CancelledError(), False)])
+async def test_a_refused_start_revokes_the_gate_key_but_a_dropped_connection_does_not(
+    monkeypatch, refusal, revokes,
+):
+    """A turn the registry refused never runs to revoke the key. A cancelled
+    request may leave a detached turn running on that key, so it keeps it."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: conversation,
+            message_count=lambda _conversation: 0,
+            get_recent_messages=lambda *_args, **_kwargs: [],
+        ),
+    )
+
+    async def no_secrets(_scope):
+        return None
+
+    monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+
+    async def delegated(**_kwargs):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test"), {"correlation_id": "corr-gate"}
+
+    handler._route_request = delegated
+    handler._get_harness = lambda: SimpleNamespace(id="anton")
+
+    async def refuse(**_kwargs):
+        raise refusal
+
+    monkeypatch.setattr(responses.registry, "start", refuse)
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    with pytest.raises(type(refusal)):
+        await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id), stream=True))
+    assert revoked == (["corr-gate"] if revokes else [])

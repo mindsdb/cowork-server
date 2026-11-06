@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import AsyncIterator, Iterator
 
 from cowork.turnqueue.redis_client import get_redis
+from cowork.streaming.turn_index import TURN_INDEX_TTL_SECONDS, turn_index_key
 from cowork.streaming.records import (
     REASON_TO_TYPE,
     TerminalReason,
@@ -332,6 +333,10 @@ class RedisStreamBuffer(StreamBuffer):
                     "data": json.dumps(data or {}),
                 })
                 pipe.expire(self.key, REDIS_BUFFER_TTL_SECONDS)
+                # A turn can now outlast the index's TTL (a time-limited turn
+                # runs past an hour), and reconnect, Stop and the in-flight list
+                # all find the turn through the index. A no-op once it's gone.
+                pipe.expire(turn_index_key(self._conversation_id), TURN_INDEX_TTL_SECONDS)
                 await pipe.execute()
             return seq
 

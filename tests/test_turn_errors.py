@@ -2180,6 +2180,16 @@ def test_remote_error_turn_aborted_on_hard_timeout_gets_curated_copy():
     assert "too long" in msg
 
 
+def test_remote_error_turn_aborted_on_the_wall_clock_ceiling_gets_the_same_copy():
+    """The controller's wall-clock ceiling, which also counts time a question
+    waited on the user, used to fall through to the generic error."""
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE, remote_error_label
+    code, msg = remote_turn_error("turn aborted: wall-clock limit")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "too long" in msg
+    assert remote_error_label(error="turn aborted: wall-clock limit") == "turn_aborted_timeout"
+
+
 def test_remote_error_turn_aborted_on_stall_gets_curated_copy():
     # scratchpad-controller's with_limits() no-output stall detector.
     from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE

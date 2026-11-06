@@ -40,6 +40,7 @@ from cowork.streaming.disconnect import DisconnectStreamingResponse, DisconnectW
 from cowork.streaming.buffer import RedisStreamBuffer
 from cowork.streaming.turn_index import TurnOwner, get_turn, list_turns
 from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
+from cowork.turnqueue.auth_keys import extend_turn_key
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
     get_redis,
@@ -447,6 +448,42 @@ def _answer_response(result: SubmitResult | RemoteAnswerResult):
     return JSONResponse(status_code=status_code, content=content)
 
 
+#: anton asks its "Keep going / Stop here" limit question under this id prefix
+#: (ChatSession._continue_question), with this value for Keep going.
+_LIMIT_QUESTION_PREFIX = "limit:"
+_KEEP_GOING = "continue"
+_STOP_HERE = "stop"
+
+
+def _keeps_going_past_a_limit(question_id: str, values: list[str]) -> bool:
+    return question_id.startswith(_LIMIT_QUESTION_PREFIX) and values == [_KEEP_GOING]
+
+
+async def _extend_turn_key_window(correlation_id: str) -> bool:
+    """Give a time-limited turn's key one more window before its "Keep going"
+    reaches the pod. False when auth refused twice, or couldn't be reached.
+
+    Any limit's Keep going extends it: the turn runs on either way, and auth
+    bounds each window and the key's whole life. Asked before the answer is
+    delivered, so a duplicate answer the pod rejects extends the key to the
+    same window again, which is harmless. True with no time limit: there is
+    nothing to extend.
+    """
+    settings = TurnQueueSettings()
+    if settings.time_limit_seconds <= 0:
+        return True
+    for _attempt in range(2):
+        if await extend_turn_key(
+            instance_id=correlation_id, ttl_seconds=settings.turn_key_lifetime_seconds, settings=settings,
+        ):
+            return True
+    logger.error(
+        "turn key extension failed twice; answering Stop here instead of Keep going: correlation_id=%s",
+        correlation_id,
+    )
+    return False
+
+
 @router.post("/answer", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     """Deliver the user's answer to a question a turn is blocked on.
@@ -499,6 +536,10 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
         payload["skipped"] = True
 
     if remote:
+        if _keeps_going_past_a_limit(req.question_id, values) and not await _extend_turn_key_window(correlation_id):
+            # Keep going on a key that won't last ends the turn on a model
+            # 401 later; Stop here ends it now, with the time-limit summary.
+            payload = {**payload, "values": [_STOP_HERE]}
         remote_result = await submit_remote_answer(
             conversation_id=req.conversation_id,
             correlation_id=correlation_id,

@@ -38,6 +38,11 @@ def _turn_key(conversation_id: str) -> str:
     return f"cowork:turn:{conversation_id}"
 
 
+def turn_index_key(conversation_id: str) -> str:
+    """The conversation's turn-index key, for a writer that refreshes its TTL."""
+    return _turn_key(conversation_id)
+
+
 class TurnOwner(BaseModel):
     """Who started a recorded turn: its org (a person's partition on a
     trusted-identity deployment) and its user, None where the turn had none.

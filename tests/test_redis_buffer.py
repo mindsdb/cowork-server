@@ -292,3 +292,26 @@ async def test_a_live_turn_is_not_ended_by_a_quiet_stretch(fake_redis, monkeypat
     await asyncio.wait_for(task, timeout=5)
 
     assert [r.type for r in seen] == ["sse", "Done"]
+
+
+@pytest.mark.asyncio
+async def test_every_write_keeps_the_turn_index_alive(fake_redis):
+    """A time-limited turn runs past the index's hour; reconnect, Stop and the
+    in-flight list find the turn through it, so writes keep it alive."""
+    from cowork.streaming.turn_index import TURN_INDEX_TTL_SECONDS, turn_index_key
+
+    await fake_redis.hset(turn_index_key("c1"), mapping={"turn_id": "1"})
+    await fake_redis.expire(turn_index_key("c1"), 5)
+    buf = RedisStreamBuffer(conversation_id="c1", turn_id=1)
+    await buf.append("Delta", {"text": "a"})
+    assert await fake_redis.ttl(turn_index_key("c1")) > 5
+    assert await fake_redis.ttl(turn_index_key("c1")) <= TURN_INDEX_TTL_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_write_does_not_create_a_turn_index(fake_redis):
+    from cowork.streaming.turn_index import turn_index_key
+
+    buf = RedisStreamBuffer(conversation_id="c1", turn_id=1)
+    await buf.append("Delta", {"text": "a"})
+    assert not await fake_redis.exists(turn_index_key("c1"))

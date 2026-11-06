@@ -63,7 +63,12 @@ from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.liveness import ModelWaitTicker
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.registry import RunHandle, RunIdentity
-from cowork.turnqueue.producer import RemoteWorkspace, step_stream_events, stream_remote_replies
+from cowork.turnqueue.producer import (
+    RemoteWorkspace,
+    _revoke_turn_key_quietly,
+    step_stream_events,
+    stream_remote_replies,
+)
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
     cancel_cause_key,
@@ -705,6 +710,12 @@ def _start_first_take(
         reset_trace_context(token)
 
 
+
+async def _drop_gate_key(turn_llm: dict | None) -> None:
+    """Revoke the turn key the routing gate minted, for a turn that won't run."""
+    if turn_llm and turn_llm.get("correlation_id"):
+        await _revoke_turn_key_quietly(turn_llm["correlation_id"])
+
 class ResponsesHandler:
     # Also the class default, so a producer reached without __init__ reads
     # the common case: a person watching who can answer a card.
@@ -879,14 +890,18 @@ class ResponsesHandler:
                 first_take = None
 
             if route.route == DIRECT_CONTEXT:
-                return await self._handle_direct_response(
-                    request=request,
-                    conversation_id=start.conversation_id,
-                    turn_id=start.turn_id,
-                    original_content=original_content,
-                    question=prompt_text(start.harness_input),
-                    route=route,
-                )
+                try:
+                    return await self._handle_direct_response(
+                        request=request,
+                        conversation_id=start.conversation_id,
+                        turn_id=start.turn_id,
+                        original_content=original_content,
+                        question=prompt_text(start.harness_input),
+                        route=route,
+                    )
+                finally:
+                    # The gate minted this key for a turn that now never runs.
+                    await _drop_gate_key(turn_llm)
 
             harness = self._get_harness()
 
@@ -943,9 +958,14 @@ class ResponsesHandler:
                         user_id=self.scope.user_id,
                         lifecycle=lifecycle,
                     )
-                except BaseException:
+                except BaseException as exc:
                     if first_take is not None:
                         first_take.cancel()
+                    # A refused start never runs the turn that would revoke the
+                    # gate's key. Not on cancellation: a dropped connection must
+                    # not end a turn that may already be running detached.
+                    if isinstance(exc, Exception):
+                        await _drop_gate_key(turn_llm)
                     raise
                 self.last_run_handle = handle
                 return sse_from_buffer(handle.buffer, 0)
@@ -967,6 +987,7 @@ class ResponsesHandler:
             # missing capability. `stream` defaults to False in ResponsesRequest, so
             # a client can land here by simply omitting the field.
             if not in_process_agent_allowed():
+                await _drop_gate_key(turn_llm)
                 raise HTTPException(
                     status_code=501,
                     detail=(
@@ -1214,6 +1235,9 @@ class ResponsesHandler:
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None
+        # Set once the gate mints a key; a failure after that must revoke it,
+        # since no turn will run to do so.
+        turn_llm = None
         try:
             # Scrub credentials: this history bypasses the normal turn's
             # _scrub_user_input/_stamp_message pass. Its DS_* values were
@@ -1324,14 +1348,18 @@ class ResponsesHandler:
                     reset_trace_context(trace_token)
             return decision, turn_llm
         except (ProductPermissionDenied, ProductPermissionUnavailable):
+            await _drop_gate_key(turn_llm)
             raise
         except PoolTimeoutError:
             # No database connection freed in time. The agent would meet the
             # same full pool, so the request is refused (503), not delegated.
+            await _drop_gate_key(turn_llm)
             raise
         except Exception:
-            # Non-authorization routing failures may delegate to the agent.
+            # Non-authorization routing failures may delegate to the agent,
+            # which mints its own key.
             logger.exception("[responses] routing gate failed — delegating")
+            await _drop_gate_key(turn_llm)
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None
