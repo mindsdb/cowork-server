@@ -1175,6 +1175,11 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
     engine.dispose()
 
 
+# The last revision with org_appearance: d16c08651013 drops it (auth owns the
+# org look). The revisions that built it are tested up to here.
+LAST_ORG_APPEARANCE_REVISION = "71332e7a1839"
+
+
 def _org_appearance_columns(path) -> list[str]:
     with sqlite3.connect(path) as connection:
         return [row[1] for row in connection.execute("pragma table_info(org_appearance)")]
@@ -1195,10 +1200,10 @@ def test_sidebar_title_is_added_where_the_first_org_appearance_revision_lacked_i
         connection.commit()
     assert "sidebar_title" not in _org_appearance_columns(db_path)
 
-    run_schema_migrations(engine, uri)
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
 
     assert _org_appearance_columns(db_path).count("sidebar_title") == 1
-    assert _alembic_version(db_path) == expected_head()
+    assert _alembic_version(db_path) == LAST_ORG_APPEARANCE_REVISION
 
 
 def test_sidebar_title_revision_is_a_no_op_where_the_column_already_exists(tmp_path, monkeypatch):
@@ -1211,7 +1216,7 @@ def test_sidebar_title_revision_is_a_no_op_where_the_column_already_exists(tmp_p
     _upgrade_to(engine, uri, "d4b7e2a9c1f3")
     assert "sidebar_title" in _org_appearance_columns(db_path)
 
-    run_schema_migrations(engine, uri)
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
     assert _org_appearance_columns(db_path).count("sidebar_title") == 1
 
     # Downgrade leaves the column to d4b7e2a9c1f3, whose downgrade drops the table.
@@ -1239,14 +1244,14 @@ def test_sidebar_title_mode_is_added_and_an_existing_title_becomes_custom(tmp_pa
             )
         connection.commit()
 
-    run_schema_migrations(engine, uri)
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
 
     with sqlite3.connect(db_path) as connection:
         modes = dict(connection.execute("select org_id, sidebar_title_mode from org_appearance"))
     assert modes == {"a" * 32: "custom", "b" * 32: "company", "c" * 32: "company"}
 
     # Run again on an up-to-date database: nothing to add.
-    run_schema_migrations(engine, uri)
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
     assert _org_appearance_columns(db_path).count("sidebar_title_mode") == 1
 
     _downgrade_to(engine, uri, "5b9e1c7d3a20")
@@ -1272,7 +1277,7 @@ def test_sidebar_title_mode_revision_is_a_no_op_where_the_column_already_exists(
         )
         connection.commit()
 
-    run_schema_migrations(engine, uri)
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
 
     assert _org_appearance_columns(db_path).count("sidebar_title_mode") == 1
     with sqlite3.connect(db_path) as connection:
@@ -1297,7 +1302,7 @@ def test_the_backgrounds_are_added_and_the_single_background_copied_into_both(tm
             )
         connection.commit()
 
-    run_schema_migrations(engine, uri)
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
 
     with sqlite3.connect(db_path) as connection:
         rows = {
@@ -1331,7 +1336,7 @@ def test_the_backgrounds_revision_keeps_columns_and_values_already_there(tmp_pat
         )
         connection.commit()
 
-    run_schema_migrations(engine, uri)
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
 
     columns = _org_appearance_columns(db_path)
     assert columns.count("background_light") == 1 and columns.count("background_dark") == 1
@@ -1339,3 +1344,46 @@ def test_the_backgrounds_revision_keeps_columns_and_values_already_there(tmp_pat
         light, dark = connection.execute("select background_light, background_dark from org_appearance").fetchone()
     # A value already there is kept; only the empty side takes the legacy one.
     assert (light, dark) == ("#eeeeee", "#fafafa")
+
+
+def test_org_appearance_is_dropped_now_that_auth_owns_the_look(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "drop-org-appearance.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    # A deployed database that ran every org_appearance revision, with a row.
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "insert into org_appearance (id, org_id, accent, members_can_choose) values (?, ?, ?, 1)",
+            (uuid.uuid4().hex, "e" * 32, "#0055ff"),
+        )
+        connection.commit()
+
+    run_schema_migrations(engine, uri)
+    assert not _has_table(db_path, "org_appearance")
+    assert _alembic_version(db_path) == expected_head()
+
+    # Downgrade brings the table back, empty and as 71332e7a1839 left it.
+    _downgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
+    columns = _org_appearance_columns(db_path)
+    for column in ("sidebar_title", "sidebar_title_mode", "background_light", "background_dark"):
+        assert columns.count(column) == 1, column
+    _downgrade_to(engine, uri, "c69488788ac7")
+    assert not _has_table(db_path, "org_appearance")
+
+
+def test_a_fresh_database_never_keeps_org_appearance(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "fresh-no-org-appearance.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert not _has_table(db_path, "org_appearance")
+    # Rerunning on an up-to-date database is a no-op.
+    run_schema_migrations(engine, uri)
+    assert _alembic_version(db_path) == expected_head()

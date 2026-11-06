@@ -1,28 +1,31 @@
-"""Organization branding (ENG-4020): the org's look, its images from auth,
-and its Brand guidelines skill.
+"""Organization branding (ENG-4020): a pass-through to auth, which owns the
+org look, and the Brand guidelines skill generated from auth's answer.
 
-Handlers are called directly, the suite's convention for org routes. Auth is
-stubbed at get_mindshub_reply.
+Handlers are called directly, the suite's convention for org routes. auth is
+stubbed at the two transports org_branding uses (get_mindshub_reply and
+send_mindshub), which record the credential and body each call carried.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-from pydantic import ValidationError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from cowork.api.v1.endpoints import org_branding as ep
+from cowork.api.v1.endpoints import settings as settings_ep
 from cowork.api.v1.endpoints import skill_sharing as sharing_ep
 from cowork.api.v1.endpoints import skills as skills_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
+from cowork.models.skill import Skill
 from cowork.principal import ORG_MANAGE_ROLE, Principal
-from cowork.schemas.org_branding import GUIDELINES_MAX_CHARS, OrgAppearanceUpdate
+from cowork.schemas.org_branding import OrgAppearanceUpdate
 from cowork.schemas.skills import (
     SkillCreateRequest,
     SkillEnabledForMeRequest,
@@ -33,26 +36,73 @@ from cowork.services import org_branding
 from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
 from cowork.services.skill_access import access_row
 from cowork.services.skill_sharing import SkillViewer
-from tests._org_sharing import MEMBER_BEARER
 from cowork.services.skills import (
     BRAND_GUIDELINES_REFUSAL,
     BRAND_GUIDELINES_SLUG,
     SkillService,
     build_turn_skills,
 )
+from tests._org_sharing import MEMBER_BEARER
 
 ORG_ID = "33333333-3333-4333-8333-333333333333"
 ALICE = "a1111111-1111-4111-8111-111111111111"
 ADMIN = "e5555555-5555-4555-8555-555555555555"
+# A second caller's credential, so the per-caller cache is told apart.
+OTHER_BEARER = f"{MEMBER_BEARER}-2"
+# The credential the desktop app sends with its hub calls.
+HUB_BEARER = f"{MEMBER_BEARER}-hub"
 AUTH = "https://auth.acme.com/v1/organizations/" + ORG_ID + "/branding"
+STOCK_APPEARANCE = {
+    "accent": None, "background_light": None, "background_dark": None, "font": None, "radius": None,
+    "skin": None, "default_theme": None, "greeting": None, "sidebar_title_mode": "company",
+    "sidebar_title": None, "members_can_choose": True, "guidelines": None,
+}
 BRANDING = {
     "icon_url": f"{AUTH}/icon?v=abc",
     "logo_url": f"{AUTH}/logo?v=def",
     "logo_dark_url": None,
     "updated_at": "2026-11-04T00:00:00Z",
+    "org_name": "Acme",
+    "sidebar_title": "Acme",
+    "can_edit": False,
+    "appearance": dict(STOCK_APPEARANCE),
 }
-CURRENT_ORG = {"id": ORG_ID, "name": "acme", "display_name": "Acme"}
-NO_IMAGES = {"icon_url": None, "logo_url": None, "logo_dark_url": None, "updated_at": None}
+NO_BRANDING = {
+    **BRANDING, "icon_url": None, "logo_url": None, "updated_at": None, "appearance": dict(STOCK_APPEARANCE),
+}
+
+
+class FakeAuth:
+    """auth's branding routes: GET answers ``branding`` (or ``get_answer``),
+    PATCH merges its body into the appearance as auth would, or answers
+    ``patch_reply``. Every call is recorded with its credential."""
+
+    def __init__(self) -> None:
+        self.branding = copy.deepcopy(BRANDING)
+        self.get_answer: MindsHubReply | None = None
+        self.patch_reply: MindsHubReply | None = None
+        self.calls: list[tuple[str, str, str, object]] = []
+
+    async def get(self, path, bearer):
+        self.calls.append(("GET", path, bearer, None))
+        if self.get_answer is not None:
+            return self.get_answer
+        return MindsHubReply(MindsHubAnswer.OK, payload=copy.deepcopy(self.branding), status_code=200)
+
+    async def send(self, method, path, bearer, *, json_body=None):
+        self.calls.append((method, path, bearer, json_body))
+        if self.patch_reply is not None:
+            return self.patch_reply
+        appearance = self.branding["appearance"]
+        appearance.update(json_body or {})
+        if appearance.get("sidebar_title_mode") == "custom":
+            self.branding["sidebar_title"] = appearance["sidebar_title"]
+        elif appearance.get("sidebar_title_mode") == "none":
+            self.branding["sidebar_title"] = None
+        return MindsHubReply(MindsHubAnswer.OK, payload=copy.deepcopy(self.branding), status_code=200)
+
+    def gets(self) -> list[tuple[str, str, str, object]]:
+        return [call for call in self.calls if call[0] == "GET"]
 
 
 def _principal(user: str, *, admin: bool = False) -> Principal:
@@ -74,112 +124,109 @@ def _viewer(user: str, *, admin: bool = False) -> SkillViewer:
     )
 
 
-# A second caller's credential, so the per-caller cache is told apart.
-OTHER_BEARER = f"{MEMBER_BEARER}-2"
+def _request(bearer: str | None = MEMBER_BEARER, *, hub: str | None = None) -> SimpleNamespace:
+    headers = {}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    if hub:
+        headers["X-MindsHub-Authorization"] = f"Bearer {hub}"
+    return SimpleNamespace(headers=headers, state=SimpleNamespace())
 
 
-def _request(bearer: str = MEMBER_BEARER) -> SimpleNamespace:
-    return SimpleNamespace(headers={"Authorization": f"Bearer {bearer}"}, state=SimpleNamespace())
-
-
-@pytest.fixture
-def org(org_deployment, monkeypatch, tmp_path):
+def _stores(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "skills"))
     monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
     monkeypatch.delenv("COWORK_MANAGED_DIR", raising=False)
-    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def auth(monkeypatch):
+    fake = FakeAuth()
+    monkeypatch.setattr(org_branding, "get_mindshub_reply", fake.get)
+    monkeypatch.setattr(org_branding, "send_mindshub", fake.send)
     org_branding._branding_cache.clear()
+    yield fake
+    org_branding._branding_cache.clear()
+
+
+def _engine():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
+    return engine
+
+
+@pytest.fixture
+def org(org_deployment, monkeypatch, tmp_path, auth):
+    """Hosted org mode: ``as_(user)`` is that member's request session."""
+    _stores(monkeypatch, tmp_path)
+    get_app_settings.cache_clear()
+    engine = _engine()
     sessions: list[ScopedSession] = []
-    answers = {"branding": BRANDING, "org": CURRENT_ORG}
-
-    async def reply(path, bearer):
-        payload = answers["branding"] if path == org_branding.AUTH_BRANDING_PATH else answers["org"]
-        if payload is None:
-            return MindsHubReply(MindsHubAnswer.UNREACHABLE)
-        return MindsHubReply(MindsHubAnswer.OK, payload=payload, status_code=200)
-
-    monkeypatch.setattr(org_branding, "get_mindshub_reply", reply)
 
     def as_(user: str) -> ScopedSession:
         session = ScopedSession(Session(engine), TenantScope(org_mode=True, org_id=ORG_ID, user_id=user))
         sessions.append(session)
         return session
 
-    def set_auth(branding=BRANDING, current=CURRENT_ORG):
-        answers["branding"], answers["org"] = branding, current
-        org_branding._branding_cache.clear()
-
     try:
-        yield SimpleNamespace(as_=as_, set_auth=set_auth)
+        yield SimpleNamespace(as_=as_, auth=auth)
     finally:
         for session in sessions:
             session.close()
-        org_branding._branding_cache.clear()
         get_app_settings.cache_clear()
 
 
 @pytest.fixture
-def migrated_org(org, monkeypatch, tmp_path):
-    """``org``, but over a SQLite file the real Alembic migrations built,
-    as a deployed database is, rather than over SQLModel's create_all.
-    ``build(drop_sidebar_title=True)`` gives the schema a deployed
-    environment had after running d4b7e2a9c1f3 before it gained the column;
-    ``migrate()`` then runs every pending revision."""
-    import sqlite3
+def desktop(monkeypatch, tmp_path, auth):
+    """The desktop's local server: one unpartitioned store, no principal."""
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    _stores(monkeypatch, tmp_path)
+    get_app_settings.cache_clear()
+    engine = _engine()
+    sessions: list[ScopedSession | Session] = []
 
-    from alembic import command
-    from sqlalchemy import create_engine as create_sa_engine
+    def session() -> ScopedSession:
+        scoped = ScopedSession(Session(engine), LOCAL_SCOPE)
+        sessions.append(scoped)
+        return scoped
 
-    from cowork.db.migrations import _alembic_config, run_schema_migrations
-
-    path = tmp_path / "migrated.db"
-    uri = f"sqlite:///{path}"
-    engine = create_sa_engine(uri)
-    sessions: list[ScopedSession] = []
-
-    def build(*, drop_sidebar_title: bool = False, migrate: bool = True) -> None:
-        config = _alembic_config(uri)
-        with engine.begin() as connection:
-            config.attributes["connection"] = connection
-            command.upgrade(config, "d4b7e2a9c1f3")
-        if drop_sidebar_title:
-            with sqlite3.connect(path) as connection:
-                connection.execute("alter table org_appearance drop column sidebar_title")
-                connection.commit()
-        if migrate:
-            run_schema_migrations(engine, uri)
-
-    def as_(user: str) -> ScopedSession:
-        session = ScopedSession(Session(engine), TenantScope(org_mode=True, org_id=ORG_ID, user_id=user))
-        sessions.append(session)
-        return session
+    def raw() -> Session:
+        plain = Session(engine)
+        sessions.append(plain)
+        return plain
 
     try:
-        yield SimpleNamespace(as_=as_, build=build, set_auth=org.set_auth)
+        yield SimpleNamespace(session=session, raw=raw, auth=auth)
     finally:
-        for session in sessions:
-            session.close()
-        engine.dispose()
+        for scoped in sessions:
+            scoped.close()
+        get_app_settings.cache_clear()
 
 
-def _get(org, user: str, *, admin: bool = False) -> dict:
-    return asyncio.run(ep.get_org_branding(_request(), org.as_(user), _principal(user, admin=admin)))
+def _get(org, user: str, request=None) -> dict:
+    return asyncio.run(ep.get_org_branding(request or _request(), org.as_(user)))
 
 
-def _put(org, user: str, *, admin: bool = True, **body) -> dict:
-    return asyncio.run(
-        ep.put_org_appearance(
-            OrgAppearanceUpdate(**body), _request(), org.as_(user), _principal(user, admin=admin)
-        )
-    )
+def _put(org, user: str, request=None, **body) -> dict:
+    return asyncio.run(ep.put_org_appearance(OrgAppearanceUpdate(**body), request or _request(), org.as_(user)))
 
 
-def _skill_md(org) -> str:
-    return (SkillService(org.as_(ALICE).scope).root / BRAND_GUIDELINES_SLUG / "SKILL.md").read_text()
+def _desktop_get(desktop, request) -> dict:
+    return asyncio.run(ep.get_org_branding(request, desktop.session()))
+
+
+def _skill_dir(scope):
+    return SkillService(scope).root / BRAND_GUIDELINES_SLUG
+
+
+def _skill_md(scope) -> str:
+    return (_skill_dir(scope) / "SKILL.md").read_text()
+
+
+def _org_scope(org):
+    return org.as_(ALICE).scope
 
 
 def _refused(call, status: int, detail: str | None = None) -> None:
@@ -187,30 +234,24 @@ def _refused(call, status: int, detail: str | None = None) -> None:
         call()
     assert caught.value.status_code == status
     if detail is not None:
-        assert detail in caught.value.detail
+        assert detail in str(caught.value.detail)
 
 
-# ── the read ─────────────────────────────────────────────────────────────────
+def _set_look(auth: FakeAuth, **appearance) -> None:
+    auth.branding["appearance"].update(appearance)
+    org_branding._branding_cache.clear()
 
 
-def test_outside_org_mode_branding_is_off(monkeypatch):
-    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
-    get_app_settings.cache_clear()
-    try:
-        scoped = SimpleNamespace(scope=LOCAL_SCOPE)
-        out = asyncio.run(ep.get_org_branding(_request(), scoped, None))
-    finally:
-        get_app_settings.cache_clear()
-    assert out == {
-        "enabled": False, "orgName": None, "sidebarTitle": None,
-        "iconUrl": None, "logoUrl": None, "logoDarkUrl": None,
-        "appearance": None, "canEdit": False,
-    }
+# ── the read, hosted ─────────────────────────────────────────────────────────
 
 
-def test_a_member_reads_the_images_from_auth_and_the_stock_look(org):
-    out = _get(org, ALICE)
-    assert out == {
+def test_a_member_reads_auths_branding_in_the_apps_keys(org):
+    org.auth.branding["appearance"].update(
+        accent="#0055ff", background_light="#fafafa", background_dark="#0b0b10", font="mono", radius=8,
+        skin="custom", default_theme="dark", greeting="Hi", members_can_choose=False, guidelines="Plain words.",
+    )
+    org.auth.branding["can_edit"] = True
+    assert _get(org, ALICE) == {
         "enabled": True,
         "orgName": "Acme",
         "sidebarTitle": "Acme",
@@ -218,355 +259,197 @@ def test_a_member_reads_the_images_from_auth_and_the_stock_look(org):
         "logoUrl": BRANDING["logo_url"],
         "logoDarkUrl": None,
         "appearance": {
-            "accent": None, "background": None, "backgroundLight": None, "backgroundDark": None,
-            "font": None, "radius": None, "skin": None,
-            "defaultTheme": None, "greeting": None, "sidebarTitle": None,
-            "sidebarTitleMode": "company", "membersCanChoose": True, "guidelines": None,
+            "accent": "#0055ff", "background": "#fafafa", "backgroundLight": "#fafafa",
+            "backgroundDark": "#0b0b10", "font": "mono", "radius": 8, "skin": "custom",
+            "defaultTheme": "dark", "greeting": "Hi", "sidebarTitle": None, "sidebarTitleMode": "company",
+            "membersCanChoose": False, "guidelines": "Plain words.",
         },
-        "canEdit": False,
+        # auth's can_edit, not the manage-organization role.
+        "canEdit": True,
     }
-    assert _get(org, ADMIN, admin=True)["canEdit"] is True
 
 
-def test_auth_unreachable_is_null_urls_and_still_answers(org):
-    org.set_auth(branding=None)
+def test_can_edit_is_auths_answer_whatever_the_role(org):
+    org.auth.branding["can_edit"] = False
+    out = asyncio.run(ep.get_org_branding(_request(), org.as_(ADMIN)))
+    assert out["canEdit"] is False
+
+
+def test_hosted_reads_send_the_gateway_credential_never_the_hub_header(org):
+    _get(org, ALICE, _request(MEMBER_BEARER, hub=HUB_BEARER))
+    assert {bearer for _m, _p, bearer, _b in org.auth.calls} == {MEMBER_BEARER}
+    assert org.auth.calls[0][1] == "/organizations/current/branding/"
+
+
+def test_no_org_for_the_caller_is_enabled_false(org):
+    org.auth.get_answer = MindsHubReply(MindsHubAnswer.REFUSED, status_code=403)
     out = _get(org, ALICE)
-    assert (out["enabled"], out["iconUrl"], out["logoUrl"]) == (True, None, None)
+    assert out == {
+        "enabled": False, "orgName": None, "sidebarTitle": None, "iconUrl": None, "logoUrl": None,
+        "logoDarkUrl": None, "appearance": None, "canEdit": False,
+    }
 
 
-def test_the_auth_read_is_cached_per_caller(org, monkeypatch):
-    calls = []
-    original = org_branding.get_mindshub_reply
+def test_auth_unreachable_is_the_stock_look_and_still_answers(org):
+    org.auth.get_answer = MindsHubReply(MindsHubAnswer.UNREACHABLE)
+    out = _get(org, ALICE)
+    assert (out["enabled"], out["iconUrl"], out["sidebarTitle"], out["canEdit"]) == (True, None, "MindsHub", False)
+    assert out["appearance"]["sidebarTitleMode"] == "company"
 
-    async def counted(path, bearer):
-        calls.append((path, bearer))
-        return await original(path, bearer)
 
-    monkeypatch.setattr(org_branding, "get_mindshub_reply", counted)
+def test_the_read_is_cached_per_caller(org):
     _get(org, ALICE)
     _get(org, ALICE)
-    assert len(calls) == 2  # branding and the org's name, once
-    asyncio.run(ep.get_org_branding(_request(OTHER_BEARER), org.as_(ADMIN), _principal(ADMIN)))
-    assert len(calls) == 4
-    assert {bearer for _path, bearer in calls} == {MEMBER_BEARER, OTHER_BEARER}
+    assert len(org.auth.gets()) == 1
+    asyncio.run(ep.get_org_branding(_request(OTHER_BEARER), org.as_(ADMIN)))
+    assert [bearer for _m, _p, bearer, _b in org.auth.gets()] == [MEMBER_BEARER, OTHER_BEARER]
 
 
 # ── the write ────────────────────────────────────────────────────────────────
 
 
-def test_an_admin_sets_the_look_and_a_partial_change_keeps_the_rest(org):
-    out = _put(
-        org, ADMIN, accent="#1A2B3C", background="#ffffff", font="mono", radius=10, skin="custom",
-        default_theme="light", greeting="Welcome to Acme", sidebar_title="Acme Assist",
-        members_can_choose=False, guidelines="Write in plain English.",
-    )
-    assert out["appearance"] == {
-        "accent": "#1a2b3c", "background": "#ffffff", "backgroundLight": "#ffffff",
-        "backgroundDark": "#ffffff", "font": "mono", "radius": 10, "skin": "custom",
-        "defaultTheme": "light", "greeting": "Welcome to Acme", "sidebarTitle": "Acme Assist",
-        "sidebarTitleMode": "custom", "membersCanChoose": False, "guidelines": "Write in plain English.",
-    }
-    assert out["sidebarTitle"] == "Acme Assist"
-    out = _put(org, ADMIN, greeting=None, members_can_choose=None)
-    assert out["appearance"]["accent"] == "#1a2b3c"
-    assert out["appearance"]["greeting"] is None
-    assert out["appearance"]["membersCanChoose"] is True
-    assert _get(org, ALICE)["appearance"]["font"] == "mono"
+def test_a_put_is_passed_to_auths_patch_as_sent(org):
+    out = _put(org, ADMIN, accent="#0055ff", sidebar_title_mode="custom", sidebar_title="Acme AI", radius=8)
+    method, path, bearer, body = org.auth.calls[-1]
+    assert (method, path, bearer) == ("PATCH", "/organizations/current/branding/appearance/", MEMBER_BEARER)
+    assert body == {"accent": "#0055ff", "sidebar_title_mode": "custom", "sidebar_title": "Acme AI", "radius": 8}
+    assert (out["sidebarTitle"], out["appearance"]["accent"]) == ("Acme AI", "#0055ff")
 
 
-def test_a_member_cannot_change_the_look(org):
-    _refused(lambda: _put(org, ALICE, admin=False, accent="#123456"), 403)
-    assert _get(org, ALICE)["appearance"]["accent"] is None
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        {"accent": "red"},
-        {"accent": "#12345"},
-        {"background": "#gggggg"},
-        {"background_light": "white"},
-        {"background_dark": "#12345z"},
-        {"font": "comic-sans"},
-        {"skin": "neon"},
-        {"radius": -1},
-        {"radius": 17},
-        {"default_theme": "sepia"},
-        {"greeting": "x" * 201},
-        {"sidebar_title": "x" * 41},
-        {"guidelines": "x" * (GUIDELINES_MAX_CHARS + 1)},
-    ],
-)
-def test_values_the_app_cannot_apply_are_refused(body):
-    with pytest.raises(ValidationError):
-        OrgAppearanceUpdate(**body)
-
-
-# ── light and dark backgrounds ───────────────────────────────────────────────
-
-
-def test_light_and_dark_backgrounds_are_set_apart(org):
-    out = _put(org, ADMIN, background_light="#FAFAFA", background_dark="#0B0B10")
-    appearance = out["appearance"]
-    assert (appearance["backgroundLight"], appearance["backgroundDark"], appearance["background"]) == (
-        "#fafafa", "#0b0b10", "#fafafa",
-    )
-    # One side alone keeps the other.
-    out = _put(org, ADMIN, background_dark="#101820")
-    assert (out["appearance"]["backgroundLight"], out["appearance"]["backgroundDark"]) == ("#fafafa", "#101820")
-    out = _put(org, ADMIN, background_light=None)
-    appearance = out["appearance"]
-    assert (appearance["backgroundLight"], appearance["backgroundDark"], appearance["background"]) == (
-        None, "#101820", "#101820",
-    )
-    assert _get(org, ALICE)["appearance"]["backgroundDark"] == "#101820"
+def test_the_put_takes_camel_case_and_an_explicit_null(org):
+    _put(org, ADMIN, request=None, **{"backgroundDark": "#0b0b10", "greeting": None})
+    assert org.auth.calls[-1][3] == {"background_dark": "#0b0b10", "greeting": None}
 
 
 def test_an_older_clients_single_background_sets_both(org):
-    out = _put(org, ADMIN, background="#123456")
-    appearance = out["appearance"]
-    assert (appearance["backgroundLight"], appearance["backgroundDark"], appearance["background"]) == (
-        "#123456", "#123456", "#123456",
+    _put(org, ADMIN, background="#123456")
+    assert org.auth.calls[-1][3] == {"background_light": "#123456", "background_dark": "#123456"}
+    _put(org, ADMIN, background="#123456", background_dark="#000000")
+    assert org.auth.calls[-1][3] == {"background_dark": "#000000"}
+
+
+def test_the_callers_own_next_read_sees_their_change_without_waiting(org):
+    _get(org, ADMIN)
+    _put(org, ADMIN, accent="#ff5500")
+    gets_before = len(org.auth.gets())
+    assert _get(org, ADMIN)["appearance"]["accent"] == "#ff5500"
+    assert len(org.auth.gets()) == gets_before
+
+
+@pytest.mark.parametrize(
+    ("auth_status", "route_status"), [(403, 403), (422, 422), (400, 422)],
+)
+def test_auths_refusals_keep_their_status_and_message(org, auth_status, route_status):
+    message = {403: "You don't have organization.branding.manage.", 422: "accent: not a hex color.",
+               400: "radius: must be 0 to 16."}[auth_status]
+    org.auth.patch_reply = MindsHubReply(
+        MindsHubAnswer.REFUSED, payload={"detail": message}, status_code=auth_status
     )
+    _refused(lambda: _put(org, ALICE, accent="red"), route_status, message)
 
 
-def test_the_legacy_column_is_mirrored_and_read_when_the_new_ones_are_empty(org):
-    _put(org, ADMIN, background_light="#fafafa", background_dark="#0b0b10")
-    row = org_branding.appearance_row(org.as_(ADMIN))
-    assert row.background == "#fafafa"
-    # A row only a server from before the split wrote.
-    session = org.as_(ADMIN)
-    row = org_branding.appearance_row(session)
-    row.background_light = row.background_dark = None
-    row.background = "#222222"
-    session.add(row)
-    session.commit()
-    appearance = _get(org, ALICE)["appearance"]
-    assert (appearance["backgroundLight"], appearance["backgroundDark"], appearance["background"]) == (
-        "#222222", "#222222", "#222222",
-    )
+def test_auth_unreachable_on_put_is_a_502(org, caplog):
+    org.auth.patch_reply = MindsHubReply(MindsHubAnswer.UNREACHABLE, status_code=503)
+    with caplog.at_level("WARNING", logger=ep.logger.name):
+        _refused(lambda: _put(org, ADMIN, accent="#0055ff"), 502, "Couldn't reach MindsHub")
+    assert "org_branding_appearance_save_failed" in [getattr(r, "event", None) for r in caplog.records]
 
 
-def test_the_backgrounds_take_camel_case():
-    update = OrgAppearanceUpdate(backgroundLight="#FFFFFF", backgroundDark="#000000")
-    assert (update.background_light, update.background_dark) == ("#ffffff", "#000000")
-
-
-def test_the_skill_lists_both_backgrounds_with_readable_text(org):
-    _put(org, ADMIN, accent="#0055ff", background_light="#fafafa", background_dark="#0b0b10")
-    text = _skill_md(org)
-    assert "Light background `#fafafa`" in text and "Text on it: `#111111`" in text
-    assert "Dark background `#0b0b10`" in text and "Text on it: `#ffffff`" in text
-    _put(org, ADMIN, background_light=None)
-    text = _skill_md(org)
-    assert "Light background" not in text and "Dark background `#0b0b10`" in text
-    # One color for both reads as one background.
-    _put(org, ADMIN, background="#fafafa")
-    text = _skill_md(org)
-    assert "- Background `#fafafa`" in text and "Dark background" not in text
-
-
-def test_a_low_contrast_accent_is_flagged_for_the_background_it_fails_on(org):
-    _put(org, ADMIN, accent="#fbfbfb", background_light="#ffffff", background_dark="#000000")
-    assert "low-contrast on the light background" in _skill_md(org)
-
-
-def test_the_body_accepts_camel_case_too():
-    update = OrgAppearanceUpdate(defaultTheme="dark", membersCanChoose=False, sidebarTitle="Acme AI")
-    assert (update.default_theme, update.members_can_choose, update.sidebar_title) == (
-        "dark", False, "Acme AI",
-    )
-
-
-# ── the sidebar title ────────────────────────────────────────────────────────
-
-
-def test_the_sidebar_title_is_the_admins_then_a_short_org_name_then_mindshub(org):
-    assert _get(org, ALICE)["sidebarTitle"] == "Acme"
-    org.set_auth(current={**CURRENT_ORG, "display_name": "Acme Widgets International Holdings"})
-    out = _get(org, ALICE)
-    assert (out["orgName"], out["sidebarTitle"]) == ("Acme Widgets International Holdings", "MindsHub")
-    org.set_auth(current={**CURRENT_ORG, "display_name": "x" * 24})
-    assert _get(org, ALICE)["sidebarTitle"] == "x" * 24
-    _put(org, ADMIN, sidebar_title="Acme AI")
-    out = _get(org, ALICE)
-    assert (out["sidebarTitle"], out["appearance"]["sidebarTitle"]) == ("Acme AI", "Acme AI")
-    _put(org, ADMIN, sidebar_title="  ")
-    assert _get(org, ALICE)["appearance"]["sidebarTitle"] is None
-
-
-def test_the_sidebar_title_has_three_modes(org):
-    out = _put(org, ADMIN, sidebar_title_mode="custom", sidebar_title="Acme AI")
-    assert (out["sidebarTitle"], out["appearance"]["sidebarTitleMode"], out["appearance"]["sidebarTitle"]) == (
-        "Acme AI", "custom", "Acme AI",
-    )
-    # No title, only the logo: the resolved title is null and the text is cleared.
-    out = _put(org, ADMIN, sidebar_title_mode="none")
-    assert (out["sidebarTitle"], out["appearance"]["sidebarTitleMode"], out["appearance"]["sidebarTitle"]) == (
-        None, "none", None,
-    )
-    assert _get(org, ALICE)["sidebarTitle"] is None
-    out = _put(org, ADMIN, sidebar_title_mode="company", sidebar_title="Ignored")
-    assert (out["sidebarTitle"], out["appearance"]["sidebarTitleMode"], out["appearance"]["sidebarTitle"]) == (
-        "Acme", "company", None,
-    )
-    org.set_auth(current={**CURRENT_ORG, "display_name": "Acme Widgets International Holdings"})
-    assert _get(org, ALICE)["sidebarTitle"] == "MindsHub"
-
-
-def test_a_change_without_the_mode_keeps_the_old_meaning(org):
-    out = _put(org, ADMIN, sidebar_title="Acme AI")
-    assert (out["sidebarTitle"], out["appearance"]["sidebarTitleMode"]) == ("Acme AI", "custom")
-    out = _put(org, ADMIN, sidebar_title=None)
-    assert (out["sidebarTitle"], out["appearance"]["sidebarTitleMode"]) == ("Acme", "company")
-    _put(org, ADMIN, sidebar_title_mode="none")
-    # A change to another field keeps the mode.
+def test_a_patch_that_answers_less_than_the_whole_body_is_read_again(org):
+    org.auth.patch_reply = MindsHubReply(MindsHubAnswer.OK, payload={"accent": "#0055ff"}, status_code=200)
+    org.auth.branding["appearance"]["accent"] = "#0055ff"
     out = _put(org, ADMIN, accent="#0055ff")
-    assert (out["sidebarTitle"], out["appearance"]["sidebarTitleMode"]) == (None, "none")
+    assert out["appearance"]["accent"] == "#0055ff"
+    assert org.auth.calls[-1][0] == "GET"
 
 
-@pytest.mark.parametrize("title", [None, "", "   "])
-def test_a_custom_title_needs_text(title):
-    body = {"sidebar_title_mode": "custom"}
-    if title is not None:
-        body["sidebar_title"] = title
-    with pytest.raises(ValidationError) as caught:
-        OrgAppearanceUpdate(**body)
-    assert "custom sidebar title needs sidebar_title" in str(caught.value)
+# ── the Brand guidelines skill, hosted ───────────────────────────────────────
 
 
-@pytest.mark.parametrize("body", [{"sidebar_title_mode": "logo"}, {"sidebar_title_mode": "custom", "sidebar_title": "x" * 41}])
-def test_a_bad_mode_or_a_long_custom_title_is_refused(body):
-    with pytest.raises(ValidationError):
-        OrgAppearanceUpdate(**body)
-
-
-def test_the_mode_accepts_camel_case():
-    update = OrgAppearanceUpdate(sidebarTitleMode="custom", sidebarTitle="Acme AI")
-    assert (update.sidebar_title_mode, update.sidebar_title) == ("custom", "Acme AI")
-
-
-def test_the_skill_names_a_custom_title_only_in_custom_mode(org):
-    _put(org, ADMIN, accent="#0055ff", sidebar_title_mode="custom", sidebar_title="Acme AI")
-    assert "appears as **Acme AI**" in _skill_md(org)
-    _put(org, ADMIN, sidebar_title_mode="none")
-    text = _skill_md(org)
-    assert "appears as" not in text and "Acme brand guidelines" in text
-
-
-def test_an_unknown_org_name_falls_back_to_mindshub(org):
-    org.set_auth(current=None)
-    out = _get(org, ALICE)
-    assert (out["orgName"], out["sidebarTitle"], out["logoUrl"]) == (None, "MindsHub", BRANDING["logo_url"])
-
-
-def test_the_org_name_still_names_the_sidebar_when_the_images_are_unknown(org):
-    org.set_auth(branding=None)
-    out = _get(org, ALICE)
-    assert (out["orgName"], out["sidebarTitle"], out["logoUrl"]) == ("Acme", "Acme", None)
-
-
-# ── the Brand guidelines skill ───────────────────────────────────────────────
-
-
-def test_no_branding_means_no_skill_and_its_name_stays_reserved(org):
-    org.set_auth(branding=NO_IMAGES)
-    _get(org, ALICE)
-    assert not (SkillService(org.as_(ALICE).scope).root / BRAND_GUIDELINES_SLUG).exists()
-    assert access_row(org.as_(ALICE), BRAND_GUIDELINES_SLUG) is None
-    _refused(
-        lambda: skills_ep.create_skill(
-            SkillCreateRequest(label=BRAND_GUIDELINES_SLUG, instructions="Mine."),
-            org.as_(ALICE), _principal(ALICE), _viewer(ALICE),
-        ),
-        403, BRAND_GUIDELINES_REFUSAL,
-    )
-    assert not (SkillService(org.as_(ALICE).scope).root / BRAND_GUIDELINES_SLUG).exists()
-
-
-def test_images_make_an_always_on_skill_shared_with_everyone(org):
+def test_hosted_the_skill_is_org_wide_and_always_on(org):
     _get(org, ALICE)
     row = access_row(org.as_(ALICE), BRAND_GUIDELINES_SLUG)
     assert (row.org_allowed, row.always_on, row.owner_user_id) == (True, True, None)
-    text = _skill_md(org)
-    assert text.startswith("---\n")
-    assert "name: brand-guidelines" in text
-    assert "Acme brand guidelines" in text
+    text = _skill_md(_org_scope(org))
+    assert "name: brand-guidelines" in text and "Acme brand guidelines" in text
+    assert "managed_by: org-branding" in text
     # The fixed public URLs, without ?v, so a new logo needs no regeneration.
-    assert f"- Logo (for light backgrounds): {AUTH}/logo\n" in text
-    assert f"{AUTH}/icon" in text
-    assert "?v=" not in text
+    assert f"- Logo (for light backgrounds): {AUTH}/logo\n" in text and "?v=" not in text
     turn = build_turn_skills(
         org.as_(ALICE).scope, project_name="general", viewer=_viewer(ALICE), session=org.as_(ALICE)
     )
     assert turn[BRAND_GUIDELINES_SLUG].always_on is True
-    assert list(turn)[0] == BRAND_GUIDELINES_SLUG
 
 
-def test_the_skill_follows_the_look_and_stays_compact(org):
-    _put(
-        org, ADMIN, accent="#0055ff", background="#0b0b10", font="standard", radius=8,
-        default_theme="dark", guidelines="Say 'customers', never 'users'.",
+def test_hosted_the_skill_follows_auths_look_and_stays_compact(org):
+    _set_look(
+        org.auth, accent="#0055ff", background_light="#fafafa", background_dark="#0b0b10", font="standard",
+        radius=8, default_theme="dark", guidelines="Say 'customers', never 'users'.",
     )
-    text = _skill_md(org)
-    for expected in ("#0055ff", "#0b0b10", "8px", "dark look", "Say 'customers', never 'users'."):
+    _get(org, ALICE)
+    text = _skill_md(_org_scope(org))
+    for expected in (
+        "#0055ff", "Light background `#fafafa`", "Dark background `#0b0b10`", "Text on it: `#111111`",
+        "Text on it: `#ffffff`", "8px", "dark look", "Say 'customers', never 'users'.",
+    ):
         assert expected in text
     assert len(text) < 5500
     _put(org, ADMIN, accent="#ff5500")
-    text = _skill_md(org)
+    text = _skill_md(_org_scope(org))
     assert "#ff5500" in text and "#0055ff" not in text
 
 
-def test_the_skill_names_the_admins_sidebar_title(org):
-    _put(org, ADMIN, accent="#0055ff", sidebar_title="Acme AI")
-    assert "appears as **Acme AI**" in _skill_md(org)
-    _put(org, ADMIN, sidebar_title=None)
-    assert "appears as" not in _skill_md(org)
+def test_hosted_the_skill_names_a_custom_title_only_in_custom_mode(org):
+    _put(org, ADMIN, accent="#0055ff", sidebar_title_mode="custom", sidebar_title="Acme AI")
+    assert "appears as **Acme AI**" in _skill_md(_org_scope(org))
+    _put(org, ADMIN, sidebar_title_mode="none")
+    text = _skill_md(_org_scope(org))
+    assert "appears as" not in text and "Acme brand guidelines" in text
 
 
-def test_long_guidelines_spill_into_a_file_beside_the_skill(org):
+def test_hosted_long_guidelines_spill_into_a_file_beside_the_skill(org):
     guidelines = "\n".join(f"Rule {n}: keep it short and clear, always." for n in range(180))
-    assert len(guidelines) <= GUIDELINES_MAX_CHARS
-    _put(org, ADMIN, accent="#0055ff", guidelines=guidelines)
-    skill_dir = SkillService(org.as_(ALICE).scope).root / BRAND_GUIDELINES_SLUG
-    body = _skill_md(org).split("---\n", 2)[2]
+    _set_look(org.auth, accent="#0055ff", guidelines=guidelines)
+    _get(org, ALICE)
+    skill_dir = _skill_dir(_org_scope(org))
+    body = _skill_md(_org_scope(org)).split("---\n", 2)[2]
     assert len(body) <= org_branding.BRAND_SKILL_BODY_BUDGET + 100
-    assert "guidelines.md" in body
     assert (skill_dir / "guidelines.md").read_text() == guidelines
-    _put(org, ADMIN, guidelines="Short now.")
+    _set_look(org.auth, guidelines="Short now.")
+    _get(org, ALICE)
     assert not (skill_dir / "guidelines.md").exists()
 
 
-def test_removing_all_branding_removes_the_skill(org):
-    _put(org, ADMIN, accent="#0055ff")
-    assert access_row(org.as_(ALICE), BRAND_GUIDELINES_SLUG) is not None
-    org.set_auth(branding=NO_IMAGES)
-    _put(org, ADMIN, accent=None)
-    assert not (SkillService(org.as_(ALICE).scope).root / BRAND_GUIDELINES_SLUG).exists()
+def test_hosted_no_branding_removes_the_skill(org):
+    _get(org, ALICE)
+    org.auth.branding = copy.deepcopy(NO_BRANDING)
+    org_branding._branding_cache.clear()
+    _get(org, ALICE)
+    assert not _skill_dir(_org_scope(org)).exists()
     assert access_row(org.as_(ALICE), BRAND_GUIDELINES_SLUG) is None
 
 
-def test_unknown_images_leave_the_skill_alone(org):
+def test_hosted_a_members_refused_or_unknown_read_leaves_the_org_skill(org):
     _get(org, ALICE)
-    before = _skill_md(org)
-    org.set_auth(branding=None)
-    _get(org, ALICE)
-    assert _skill_md(org) == before
-    org.set_auth(current=None)
-    _put(org, ADMIN, accent="#0055ff")
-    assert _skill_md(org) == before
+    before = _skill_md(_org_scope(org))
+    for answer in (MindsHubReply(MindsHubAnswer.REFUSED, status_code=403), MindsHubReply(MindsHubAnswer.UNREACHABLE)):
+        org.auth.get_answer = answer
+        org_branding._branding_cache.clear()
+        _get(org, ALICE)
+        assert _skill_md(_org_scope(org)) == before
+    assert access_row(org.as_(ALICE), BRAND_GUIDELINES_SLUG) is not None
 
 
-def test_an_unchanged_skill_is_not_rewritten(org):
+def test_hosted_an_unchanged_skill_is_not_rewritten(org):
     _get(org, ALICE)
-    path = SkillService(org.as_(ALICE).scope).root / BRAND_GUIDELINES_SLUG / "SKILL.md"
+    path = _skill_dir(_org_scope(org)) / "SKILL.md"
     stamp = path.stat().st_mtime_ns
     org_branding._branding_cache.clear()
     _get(org, ALICE)
     assert path.stat().st_mtime_ns == stamp
 
 
-def test_nobody_edits_renames_deletes_or_shares_the_skill_as_a_skill(org):
+def test_hosted_nobody_edits_renames_deletes_or_shares_the_skill_as_a_skill(org):
     _get(org, ALICE)
     admin = _viewer(ADMIN, admin=True)
     _refused(
@@ -577,16 +460,7 @@ def test_nobody_edits_renames_deletes_or_shares_the_skill_as_a_skill(org):
         403, BRAND_GUIDELINES_REFUSAL,
     )
     _refused(
-        lambda: skills_ep.update_skill(
-            BRAND_GUIDELINES_SLUG, SkillUpdateRequest(label="mine"),
-            org.as_(ADMIN), _principal(ADMIN, admin=True), admin,
-        ),
-        403, BRAND_GUIDELINES_REFUSAL,
-    )
-    _refused(
-        lambda: skills_ep.delete_skill(
-            BRAND_GUIDELINES_SLUG, org.as_(ADMIN), _principal(ADMIN, admin=True), admin
-        ),
+        lambda: skills_ep.delete_skill(BRAND_GUIDELINES_SLUG, org.as_(ADMIN), _principal(ADMIN, admin=True), admin),
         403, BRAND_GUIDELINES_REFUSAL,
     )
     _refused(
@@ -596,62 +470,142 @@ def test_nobody_edits_renames_deletes_or_shares_the_skill_as_a_skill(org):
         ),
         403, BRAND_GUIDELINES_REFUSAL,
     )
-    # A create under its name is a 409 while it exists.
+    listed = {
+        s["id"]: s for s in skills_ep.list_skills(org.as_(ADMIN), _principal(ADMIN, admin=True), admin)["skills"]
+    }
+    skill = listed[BRAND_GUIDELINES_SLUG]
+    assert skill["capabilities"] == {"canEdit": False, "canDelete": False, "canDisable": False, "canShare": False}
+    assert (skill["access"]["alwaysOn"], skill["name"]) == (True, "Brand guidelines")
+
+
+def test_hosted_the_name_stays_reserved_with_no_branding(org):
+    org.auth.branding = copy.deepcopy(NO_BRANDING)
+    _get(org, ALICE)
     _refused(
         lambda: skills_ep.create_skill(
             SkillCreateRequest(label=BRAND_GUIDELINES_SLUG, instructions="Mine."),
             org.as_(ALICE), _principal(ALICE), _viewer(ALICE),
         ),
-        409,
+        403, BRAND_GUIDELINES_REFUSAL,
     )
-    assert "Acme brand guidelines" in _skill_md(org)
-    listed = {
-        s["id"]: s
-        for s in skills_ep.list_skills(org.as_(ADMIN), _principal(ADMIN, admin=True), admin)["skills"]
-    }
-    skill = listed[BRAND_GUIDELINES_SLUG]
-    assert skill["canEdit"] is False
-    assert skill["capabilities"] == {
-        "canEdit": False, "canDelete": False, "canDisable": False, "canShare": False,
-    }
-    assert skill["access"]["alwaysOn"] is True
-    assert skill["name"] == "Brand guidelines"
 
 
-def test_a_member_turns_the_skill_off_for_themselves_only(org):
+def test_hosted_a_member_turns_the_skill_off_for_themselves_only(org):
     _get(org, ALICE)
     out = sharing_ep.set_skill_enabled_for_me(
         BRAND_GUIDELINES_SLUG, SkillEnabledForMeRequest(enabled=False),
         org.as_(ALICE), _principal(ALICE), _viewer(ALICE),
     )
     assert out["enabledForMe"] is False
-    alice_turn = build_turn_skills(
+    assert BRAND_GUIDELINES_SLUG not in build_turn_skills(
         org.as_(ALICE).scope, project_name="general", viewer=_viewer(ALICE), session=org.as_(ALICE)
     )
-    admin_turn = build_turn_skills(
-        org.as_(ADMIN).scope, project_name="general", viewer=_viewer(ADMIN, admin=True),
-        session=org.as_(ADMIN),
+    assert build_turn_skills(
+        org.as_(ADMIN).scope, project_name="general", viewer=_viewer(ADMIN, admin=True), session=org.as_(ADMIN)
+    )[BRAND_GUIDELINES_SLUG].always_on is True
+
+
+# ── the desktop's local server ───────────────────────────────────────────────
+
+
+def test_desktop_reads_with_the_hub_credential_and_ignores_authorization(desktop):
+    out = _desktop_get(desktop, _request("this-servers-own-token", hub=HUB_BEARER))
+    assert (out["enabled"], out["orgName"], out["logoUrl"]) == (True, "Acme", BRANDING["logo_url"])
+    assert {bearer for _m, _p, bearer, _b in desktop.auth.calls} == {HUB_BEARER}
+
+
+def test_desktop_without_a_hub_credential_is_enabled_false_and_asks_nothing(desktop):
+    out = _desktop_get(desktop, _request("this-servers-own-token"))
+    assert out["enabled"] is False
+    assert desktop.auth.calls == []
+
+
+def test_desktop_put_passes_through_with_the_hub_credential(desktop):
+    out = asyncio.run(
+        ep.put_org_appearance(OrgAppearanceUpdate(accent="#0055ff"), _request(hub=HUB_BEARER), desktop.session())
     )
-    assert BRAND_GUIDELINES_SLUG not in alice_turn
-    assert admin_turn[BRAND_GUIDELINES_SLUG].always_on is True
+    assert out["appearance"]["accent"] == "#0055ff"
+    assert desktop.auth.calls[-1][:3] == ("PATCH", "/organizations/current/branding/appearance/", HUB_BEARER)
 
 
-def test_a_skill_of_that_name_outside_org_mode_is_an_ordinary_skill():
-    service = SkillService(LOCAL_SCOPE)
-    assert service.is_brand_guidelines(BRAND_GUIDELINES_SLUG) is False
+def test_desktop_put_without_a_hub_credential_is_a_404(desktop):
+    _refused(
+        lambda: asyncio.run(
+            ep.put_org_appearance(OrgAppearanceUpdate(accent="#0055ff"), _request(), desktop.session())
+        ),
+        404, "needs a MindsHub organization",
+    )
+    assert desktop.auth.calls == []
 
 
-def test_an_org_with_no_name_still_reads_well():
-    images = org_branding.AuthBranding(logo_url=f"{AUTH}/logo?v=1", reachable=True, org_known=True)
-    description, body, extra = org_branding.render_brand_skill(images, None)
-    assert description.startswith("The organization's brand")
-    assert body.startswith("# Brand guidelines\n")
-    assert "Use the organization's brand" in body
-    assert extra is None
+def test_desktop_the_skill_is_a_local_on_demand_skill(desktop):
+    _desktop_get(desktop, _request(hub=HUB_BEARER))
+    text = _skill_md(LOCAL_SCOPE)
+    assert "Acme brand guidelines" in text and "managed_by: org-branding" in text
+    # No org rows on the desktop: nothing makes it always on.
+    assert access_row(desktop.session(), BRAND_GUIDELINES_SLUG) is None
+    turn = build_turn_skills(LOCAL_SCOPE, project_name="general", session=desktop.session())
+    assert turn[BRAND_GUIDELINES_SLUG].always_on is False
 
 
-def test_auths_json_route_ends_with_a_slash():
-    assert org_branding.AUTH_BRANDING_PATH == "/organizations/current/branding/"
+def test_desktop_the_generated_skill_cant_be_edited_or_deleted(desktop):
+    _desktop_get(desktop, _request(hub=HUB_BEARER))
+    _refused(
+        lambda: skills_ep.update_skill(
+            BRAND_GUIDELINES_SLUG, SkillUpdateRequest(instructions="Hijack."), desktop.session(), None, None
+        ),
+        403, BRAND_GUIDELINES_REFUSAL,
+    )
+    _refused(lambda: skills_ep.delete_skill(BRAND_GUIDELINES_SLUG, desktop.session(), None, None), 403,
+             BRAND_GUIDELINES_REFUSAL)
+    assert "Acme brand guidelines" in _skill_md(LOCAL_SCOPE)
+
+
+def test_desktop_the_skill_is_regenerated_when_auths_look_changes(desktop):
+    _desktop_get(desktop, _request(hub=HUB_BEARER))
+    _set_look(desktop.auth, accent="#0055ff")
+    _desktop_get(desktop, _request(hub=HUB_BEARER))
+    assert "#0055ff" in _skill_md(LOCAL_SCOPE)
+
+
+@pytest.mark.parametrize("how", ["signed out", "personal account", "no branding"])
+def test_desktop_the_skill_is_removed_without_an_org_or_branding(desktop, how):
+    _desktop_get(desktop, _request(hub=HUB_BEARER))
+    assert _skill_dir(LOCAL_SCOPE).exists()
+    org_branding._branding_cache.clear()
+    if how == "signed out":
+        _desktop_get(desktop, _request())
+    elif how == "personal account":
+        desktop.auth.get_answer = MindsHubReply(MindsHubAnswer.REFUSED, status_code=403)
+        _desktop_get(desktop, _request(hub=HUB_BEARER))
+    else:
+        desktop.auth.branding = copy.deepcopy(NO_BRANDING)
+        _desktop_get(desktop, _request(hub=HUB_BEARER))
+    assert not _skill_dir(LOCAL_SCOPE).exists()
+
+
+def test_desktop_sign_out_removes_the_skill(desktop):
+    _desktop_get(desktop, _request(hub=HUB_BEARER))
+    settings_ep.logout_clear_credentials(desktop.raw(), LOCAL_SCOPE)
+    assert not _skill_dir(LOCAL_SCOPE).exists()
+
+
+def test_desktop_a_persons_own_skill_of_that_name_is_left_alone(desktop):
+    from anton.core.tools.skill_format import dump_skill
+
+    skill_dir = _skill_dir(LOCAL_SCOPE)
+    skill_dir.mkdir(parents=True)
+    mine = Skill(name=BRAND_GUIDELINES_SLUG, description="Mine", instructions="My own rules.")
+    (skill_dir / "SKILL.md").write_text(dump_skill(mine))
+    _desktop_get(desktop, _request(hub=HUB_BEARER))
+    assert "My own rules." in _skill_md(LOCAL_SCOPE)
+    _desktop_get(desktop, _request())
+    assert "My own rules." in _skill_md(LOCAL_SCOPE)
+    # Not the generated skill, so it stays the person's to change.
+    assert SkillService(LOCAL_SCOPE).is_brand_guidelines(BRAND_GUIDELINES_SLUG) is False
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
 
 
 def test_fixed_image_url_drops_the_version():
@@ -659,37 +613,45 @@ def test_fixed_image_url_drops_the_version():
     assert org_branding.fixed_image_url(None) is None
 
 
-# ── against the migrated schema ──────────────────────────────────────────────
+def test_an_org_with_no_name_still_reads_well():
+    branding = org_branding.parse_auth_branding({**BRANDING, "org_name": None})
+    description, body, extra = org_branding.render_brand_skill(branding)
+    assert description.startswith("The organization's brand")
+    assert body.startswith("# Brand guidelines\n")
+    assert extra is None
 
 
-@pytest.mark.parametrize("drop_sidebar_title", [False, True], ids=["fresh", "deployed-before-sidebar-title"])
-def test_a_put_round_trips_on_the_migrated_schema(migrated_org, drop_sidebar_title):
-    migrated_org.build(drop_sidebar_title=drop_sidebar_title)
-    out = _put(migrated_org, ADMIN, accent="#0055ff", sidebar_title="Acme AI", members_can_choose=False)
-    assert (out["sidebarTitle"], out["appearance"]["accent"]) == ("Acme AI", "#0055ff")
-    read = _get(migrated_org, ALICE)
-    assert read["appearance"] == {
-        **out["appearance"], "accent": "#0055ff", "sidebarTitle": "Acme AI", "membersCanChoose": False,
-    }
-    assert read["sidebarTitle"] == "Acme AI"
+def test_auths_json_routes_end_with_a_slash():
+    assert org_branding.AUTH_BRANDING_PATH == "/organizations/current/branding/"
+    assert org_branding.AUTH_APPEARANCE_PATH == "/organizations/current/branding/appearance/"
 
 
-def test_a_database_error_on_put_is_a_generic_500_and_a_named_log(migrated_org, caplog):
-    # The deployed schema before 3e78d31dc845 ran: no sidebar_title column.
-    migrated_org.build(drop_sidebar_title=True, migrate=False)
-    with caplog.at_level("ERROR", logger=ep.logger.name):
-        _refused(lambda: _put(migrated_org, ADMIN, accent="#0055ff"), 500, ep.SAVE_FAILED)
-    with pytest.raises(HTTPException) as caught:
-        _put(migrated_org, ADMIN, accent="#0055ff")
-    assert caught.value.detail == ep.SAVE_FAILED
-    assert "sidebar_title" not in caught.value.detail
-    events = [getattr(record, "event", None) for record in caplog.records]
-    assert "org_branding_appearance_save_failed" in events
+def test_send_mindshub_keeps_a_refusals_body_and_sends_the_json(monkeypatch):
+    import httpx
 
+    from cowork.services import mindshub_client
 
-def test_a_database_error_on_get_is_a_generic_500(migrated_org, caplog):
-    migrated_org.build(drop_sidebar_title=True, migrate=False)
-    with caplog.at_level("ERROR", logger=ep.logger.name):
-        _refused(lambda: _get(migrated_org, ALICE), 500, ep.READ_FAILED)
-    events = [getattr(record, "event", None) for record in caplog.records]
-    assert "org_branding_appearance_read_failed" in events
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.headers["Authorization"], request.content))
+        if b"bad" in request.content:
+            return httpx.Response(422, json={"detail": "accent: not a hex color."})
+        return httpx.Response(200, json={"ok": True})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        mindshub_client.httpx, "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    monkeypatch.setattr(mindshub_client, "mindshub_v1", lambda: "https://auth.acme.com/v1")
+
+    refused = asyncio.run(
+        mindshub_client.send_mindshub("PATCH", "/x/", MEMBER_BEARER, json_body={"accent": "bad"})
+    )
+    assert (refused.answer, refused.status_code, refused.payload) == (
+        MindsHubAnswer.REFUSED, 422, {"detail": "accent: not a hex color."},
+    )
+    ok = asyncio.run(mindshub_client.send_mindshub("PATCH", "/x/", MEMBER_BEARER, json_body={"accent": "#000000"}))
+    assert (ok.answer, ok.payload) == (MindsHubAnswer.OK, {"ok": True})
+    assert seen[0][:3] == ("PATCH", "/v1/x/", f"Bearer {MEMBER_BEARER}")
