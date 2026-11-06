@@ -14,7 +14,7 @@ from cowork.schemas.schedules import (
     ScheduleRunResponse,
     ScheduleUpdateRequest,
 )
-from cowork.services.schedules import ScheduleRunService, ScheduleService
+from cowork.services.schedules import ScheduleConflict, ScheduleRunService, ScheduleService
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +27,11 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 
-def _serialize(schedule, scoped) -> dict:
-    """ScheduleResponse plus the live `running` flag (any in-flight run)."""
-    data = ScheduleResponse.serialize(schedule)
-    data["running"] = ScheduleRunService(scoped).has_active_run(schedule.id)
-    return data
+def _serialize(schedule, scoped) -> ScheduleResponse:
+    """Typed schedule state plus the live running flag."""
+    response = ScheduleResponse.model_validate(schedule)
+    response.running = ScheduleRunService(scoped).has_active_run(schedule.id)
+    return response
 
 
 @router.get("/")
@@ -76,6 +76,8 @@ def update_schedule(schedule_id: UUID, body: ScheduleUpdateRequest, scoped: Scop
         changes["project_id"] = None
     try:
         schedule = ScheduleService(scoped).update_schedule(schedule_id, **changes)
+    except ScheduleConflict as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     return _serialize(schedule, scoped)
@@ -100,6 +102,8 @@ def pause_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
 def resume_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
     try:
         return _serialize(ScheduleService(scoped).resume_schedule(schedule_id), scoped)
+    except ScheduleConflict as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 

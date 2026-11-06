@@ -11,6 +11,7 @@ from functools import partial
 from typing import TYPE_CHECKING, TypeVar
 from uuid import UUID
 
+import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
@@ -25,9 +26,15 @@ from cowork.db.scoped import (
 )
 from cowork.db.units import run_db
 from cowork.models.schedule import Schedule
-from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
+from cowork.schedule_timing import missed_slots, next_future_occurrence
 from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus, resolve_schedule_model
-from cowork.services.schedules import ScheduleBusy, ScheduleRunService, ScheduleService, SlotAlreadyClaimed
+from cowork.services.schedules import (
+    ScheduleBusy,
+    ScheduleRunService,
+    ScheduleService,
+    SlotAlreadyClaimed,
+    count_settled_slot,
+)
 from cowork.streaming.liveness import MODEL_WAIT_PHASE
 from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import request_cancel
@@ -107,19 +114,14 @@ _RECURRING_CADENCES = {
     Cadence.daily, Cadence.weekly, Cadence.weekdays,
 }
 
-# A one-off whose slot has just passed is still due this poll and must be run,
-# not disabled — the poll runs `_handle_missed_runs` before `_due_schedules`,
-# so disabling on any overdue amount kills the task before it can fire (the
-# task then shows as "Paused" and never runs; ENG-1675). Only a one-off overdue
-# by more than this catch-up window — the app was offline when its slot passed —
-# is disabled without running, so a long-stale task doesn't fire unexpectedly on
-# the next launch. Mirrors the recurring branch, which lets a single overdue slot
-# (missed == 1) run rather than fast-forwarding past it.
-#
-# Independent of `_FRESHNESS_WINDOW_SECONDS[Cadence.once]` below despite the shared
-# 1h value: this bounds how late a one-off may still run; the freshness window
-# suppresses a slot after a recent successful run. Tune them separately.
-_ONCE_CATCHUP_WINDOW_SECONDS = 60 * 60
+# A one-off may start up to this late on its own. At this lateness or more
+# (the app was not running when its time came) it is marked missed, and runs
+# only when the user presses Run now. Independent of the freshness window
+# below despite the shared hour: this bounds how late a one-off may still run.
+_ONCE_LATE_LIMIT = timedelta(hours=1)
+# A recurring schedule that fell behind runs its latest missed slot once, when
+# that slot is no older than this; every other missed slot is passed over.
+_MISSED_RUN_LOOKBACK = timedelta(days=7)
 
 # Freshness guard (ENG-688): if a successful run — typically a manual
 # "run now" — finished this recently before a due cron slot, the slot is
@@ -171,54 +173,67 @@ def _apply_success_write_back(
     schedule.last_run_at = datetime.now(timezone.utc)
     schedule.last_result_conversation_id = run_service.still_exists(conversation_id)
     schedule.last_error = None
-    schedule.missed_runs = 0
     session.add(schedule)
 
 
 def _handle_missed_runs(session) -> None:
+    """Bring every schedule that fell behind up to date (_catch_up).
+
+    A schedule with a run in flight is left alone: its slot is not done until
+    that run ends, and the next poll then sees every slot that passed
+    meanwhile.
+    """
     now = datetime.now(timezone.utc)
-    schedules = ScheduleService(session).list_schedules()
-    for schedule in schedules:
+    run_service = ScheduleRunService(session)
+    for schedule in ScheduleService(session).list_schedules():
         if not schedule.enabled:
             continue
-
         next_run = ensure_utc(schedule.next_run_at)
-
-        if next_run >= now:
+        if next_run > now:
             continue
-
-        if schedule.cadence == Cadence.once:
-            # A due one-off is left enabled so `_due_schedules` executes it on
-            # this same tick. Only disable it without running when it is overdue
-            # beyond the catch-up window — the app was offline when its slot
-            # passed — so a long-stale one-off doesn't fire on the next launch.
-            # Bump missed_runs like the recurring branch so an auto-disabled
-            # one-off carries a signal it was skipped rather than run.
-            if (now - next_run).total_seconds() > _ONCE_CATCHUP_WINDOW_SECONDS:
-                schedule.missed_runs += 1
-                schedule.enabled = False
-                session.add(schedule)
+        if run_service.has_active_run(schedule.id):
             continue
-
-        if schedule.cadence not in _RECURRING_CADENCES:
-            continue
-
-        missed, future = count_missed_occurrences(
-            schedule.cadence,
-            next_run,
-            schedule.timezone,
-            now=now,
-        )
-        # Only fast-forward when more than one occurrence was skipped (app
-        # offline for multiple cadence periods). A single overdue slot
-        # (missed == 1) is still due this poll — advancing here would skip
-        # the run entirely. 
-        if missed > 1:
-            schedule.missed_runs += missed
-            schedule.next_run_at = future
-            session.add(schedule)
-
+        _catch_up(session, schedule, now)
     session.commit()
+
+
+def _catch_up(session: ScopedSession, schedule: Schedule, now: datetime) -> None:
+    """Bring one schedule that fell behind up to date. Staged: the caller
+    commits.
+
+    A recurring schedule moves its slot to the latest missed one inside the
+    lookback, which the due-check then runs once, or past now when there is
+    none; the slots passed over are added to `missed_runs`. A one-off at or
+    past the late limit is marked missed. The write is conditional on the slot
+    this read, so another replica bringing the same schedule up to date counts
+    nothing twice.
+    """
+    seen = schedule.next_run_at
+    next_run = ensure_utc(seen)
+    if schedule.cadence == Cadence.once:
+        if now - next_run < _ONCE_LATE_LIMIT:
+            return
+        moved = dict(enabled=False, missed_at=now)
+        count = 1
+    elif schedule.cadence in _RECURRING_CADENCES:
+        missed = missed_slots(
+            schedule.cadence, next_run, schedule.timezone, now=now, lookback=_MISSED_RUN_LOOKBACK,
+        )
+        if not missed.skipped:
+            # At most one slot is overdue, and it is recent: the due-check runs it.
+            return
+        moved = dict(next_run_at=missed.run or missed.future)
+        count = missed.skipped
+    else:
+        return
+    landed = unsafe_unscoped_session(session).execute(
+        sa.update(Schedule)
+        .where(Schedule.id == schedule.id, Schedule.next_run_at == seen, Schedule.enabled == sa.true())
+        .values(missed_runs=Schedule.missed_runs + count, **moved)
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if landed:
+        logger.info("Passed over %s missed schedule slot(s)", count, extra=log_context(schedule_id=schedule.id))
 
 
 def _principal_for_schedule(schedule: Schedule) -> Principal | None:
@@ -333,6 +348,7 @@ class _TurnEvidence:
 
     reason: str | None
     acted: bool
+    shutdown_interrupted: bool = False
 
 
 def _classify(evidence: _TurnEvidence) -> AttemptOutcome:
@@ -483,6 +499,7 @@ def _delete_unstarted_conversation(
 
 def _record_turn_outcome(
     session: ScopedSession, *, schedule_id: UUID, reason: str | None, is_manual: bool, conversation_id: UUID,
+    shutdown_interrupted: bool = False,
 ) -> _RunOutcome:
     schedule_service = ScheduleService(session)
     run_service = ScheduleRunService(session)
@@ -502,13 +519,27 @@ def _record_turn_outcome(
     else:
         _apply_success_write_back(schedule, run_service, conversation_id, session)
 
-    # Always consume the cron slot: the schedule stays due otherwise and
-    # the loop would immediately restart the run the user killed (a
-    # cancelled/failed run isn't a success, so the freshness guard
-    # wouldn't block the restart).
-    if not is_manual:
-        _advance_next_run_at(schedule, session)
+    def settle(schedule: Schedule) -> None:
+        # Always consume the cron slot: the schedule stays due otherwise and
+        # the loop would immediately restart the run the user killed (a
+        # cancelled or failed run isn't a success, so the freshness guard
+        # wouldn't block the restart).
+        if not is_manual:
+            _advance_next_run_at(schedule, session)
+            if outcome.status == RunStatus.failed and not shutdown_interrupted:
+                count_settled_slot(session, schedule_id, failed=True)
+        if outcome.status is None:
+            # A success of either kind ends the failure streak.
+            count_settled_slot(session, schedule_id, failed=False)
+        if schedule.cadence == Cadence.once and (not is_manual or reason == "completed"):
+            # Cron consumes its slot, but Run now uses a one-off up only on
+            # confirmed completion. Other endings preserve its prior state.
+            schedule.enabled = False
+            schedule.missed_at = None
+            schedule.paused_at = None
+            session.add(schedule)
 
+    settle(schedule)
     try:
         session.commit()
     except IntegrityError:
@@ -520,8 +551,7 @@ def _record_turn_outcome(
         session.rollback()
         schedule = schedule_service.get_schedule(schedule_id)
         _apply_success_write_back(schedule, run_service, None, session)
-        if not is_manual:
-            _advance_next_run_at(schedule, session)
+        settle(schedule)
         session.commit()
     return outcome
 
@@ -538,6 +568,9 @@ def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: 
     consumed = consume_slot and schedule.enabled
     if consumed:
         _advance_next_run_at(schedule, session)
+        # Only a cron run consumes its slot, so this is a cron slot settling
+        # failed.
+        count_settled_slot(session, schedule_id, failed=True)
     return consumed
 
 
@@ -731,6 +764,7 @@ async def execute_schedule(
         recorded = await _until_it_lands(
             partial(
                 _record_turn_outcome, schedule_id=schedule_id, reason=evidence.reason,
+                shutdown_interrupted=evidence.shutdown_interrupted,
                 is_manual=is_manual, conversation_id=conversation_id,
             ),
             schedule_id=schedule_id,
@@ -894,9 +928,20 @@ def _frame_shows_action(event: str, data: dict) -> bool:
 async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
     """How the turn that just ended on this conversation went: its terminal
     reason (_turn_terminal_reason), and whether its agent acted."""
+    reason = await _turn_terminal_reason(conversation_id)
+    handle = registry.get(conversation_id)
+    lifecycle = getattr(handle, "lifecycle", None)
+    # Only an explicit shutdown marker excuses an interruption. A timeout
+    # still counts even if shutdown began before we read the result.
+    shutdown_interrupted = (
+        reason in ("interrupted", "restart")
+        and bool(getattr(lifecycle, "shutting_down", False))
+        and not bool(getattr(lifecycle, "timed_out", False))
+    )
     return _TurnEvidence(
-        reason=await _turn_terminal_reason(conversation_id),
+        reason=reason,
         acted=await _turn_acted(conversation_id),
+        shutdown_interrupted=shutdown_interrupted,
     )
 
 
@@ -1007,6 +1052,8 @@ def _reap_lapsed_runs(session: ScopedSession, now: datetime) -> None:
             and ensure_utc(schedule.next_run_at) == ensure_utc(run.slot_at)
         ):
             _advance_next_run_at(schedule, session)
+            # The dead run's turn may have acted, so its slot settles failed.
+            count_settled_slot(session, schedule.id, failed=True)
     session.commit()
 
 

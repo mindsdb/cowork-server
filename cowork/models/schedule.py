@@ -40,6 +40,29 @@ class Schedule(BaseSQLModel, table=True):
     )
     last_error: str | None = Field(default=None, description="Error message from last failed run")
     missed_runs: int = Field(default=0, description="Count of runs missed while the scheduler was offline")
+    consecutive_failures: int = Field(
+        default=0,
+        sa_column_kwargs={"server_default": "0"},
+        description="Cron slots in a row that settled failed; a success resets it",
+    )
+    auto_paused_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="When repeated failures paused the schedule; cleared on resume",
+    )
+    paused_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description=(
+            "When the user paused the schedule; cleared on resume. A one-off that "
+            "has run is disabled too, so `enabled` alone does not mean paused"
+        ),
+    )
+    missed_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="When a one-off was found too late to run on its own; cleared when it runs or is moved",
+    )
     org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
 

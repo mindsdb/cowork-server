@@ -334,6 +334,41 @@ async def test_a_paused_schedule_whose_run_failed_runs_the_slot_it_left_due_once
     assert ensure_utc(_schedule(schedule_id).next_run_at) == SLOT + timedelta(days=1)
 
 
+async def test_a_resumed_schedule_uses_up_a_left_due_slot_whose_run_may_have_acted(schedule_id, monkeypatch):
+    """The same pause-then-fail, driven by the poll. A turn that raises once
+    handed off may have acted, so its slot is not run again: resuming uses it
+    up and waits for the next occurrence, as the poll would have without the
+    pause. (A run that failed before acting keeps its slot and runs it again
+    once resumed: test_schedule_missed_and_pause.)"""
+    import cowork.handlers.responses as responses_mod
+
+    class PausedThenFailingHandler:
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
+            pass
+
+        async def handle(self, request):
+            async def stream():
+                _pause(schedule_id)
+                raise RuntimeError("the agent failed")
+                yield  # Fail while draining, after the turn was handed off.
+
+            return stream()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", PausedThenFailingHandler)
+
+    await scheduler.execute_schedule(schedule_id, slot_at=SLOT)
+    (failed,) = _runs(schedule_id)
+    assert failed.status == RunStatus.failed and failed.slot_at is None
+    assert failed.outcome == "uncertain"
+    assert ensure_utc(_schedule(schedule_id).next_run_at) == SLOT, "the pause left the slot due"
+    assert schedule_id not in [slot.schedule_id for slot in _poll()], "nothing runs while paused"
+
+    _resume(schedule_id)
+
+    assert ensure_utc(_schedule(schedule_id).next_run_at) == SLOT + timedelta(days=1)
+    assert schedule_id not in [slot.schedule_id for slot in _poll()]
+
+
 async def test_a_paused_schedule_whose_server_died_mid_turn_resumes_at_its_next_occurrence(schedule_id, turns):
     """The reaper uses up the dead run's slot, since its turn may have run.
     It moves a paused schedule on too: left on that slot, a resumed
