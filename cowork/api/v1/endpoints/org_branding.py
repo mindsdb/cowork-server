@@ -11,7 +11,11 @@ No credential, or auth answering that the caller has no current org, is
 passed to auth's ``PATCH /v1/organizations/current/branding/appearance/``,
 which decides who may (``organization.branding.manage``) and what is valid.
 auth's 403 and 422 keep their status and auth's message; no answer from auth
-is a 502. It answers the GET body, and the caller's next GET sees the change.
+is a 502. auth takes a write only from a console session, so the PUT
+forwards only a credential shaped like the user's session JWT
+(cowork.principal.is_session_jwt): an API key, a turn key or no credential
+at all is a 403 asking the caller to sign in, and so is auth's 401. It
+answers the GET body, and the caller's next GET sees the change.
 
 Both work in hosted org mode and on a local server (the desktop). Which
 credential is the caller's:
@@ -39,7 +43,7 @@ from starlette.concurrency import run_in_threadpool
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSession, ScopedSessionDep
-from cowork.principal import caller_bearer, mindshub_credential
+from cowork.principal import caller_bearer, is_session_jwt, mindshub_credential
 from cowork.schemas.org_branding import OrgAppearanceUpdate, OrgAppearanceView, OrgBrandingView
 from cowork.services.org_branding import (
     AuthAppearanceError,
@@ -53,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
-NO_ORG = "Organization branding needs a MindsHub organization. Sign in to MindsHub and try again."
+SIGN_IN_TO_EDIT = "Sign in to MindsHub to change branding."
 
 
 def _credential(request: Request, scoped: ScopedSession) -> str:
@@ -123,13 +127,17 @@ async def get_org_branding(request: Request, scoped: ScopedSessionDep):
 @router.put("/appearance", response_model=OrgBrandingView)
 async def put_org_appearance(body: OrgAppearanceUpdate, request: Request, scoped: ScopedSessionDep):
     credential = _credential(request, scoped)
-    if not credential:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=NO_ORG)
+    if not is_session_jwt(credential):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=SIGN_IN_TO_EDIT)
     try:
         branding = await update_auth_appearance(
             bearer_token=credential, changes=body.auth_changes(), **_who(scoped)
         )
     except AuthAppearanceError as refused:
+        if refused.status_code == status.HTTP_401_UNAUTHORIZED:
+            # auth didn't take the credential as a session: never proxy a 401,
+            # which the app would read as its own sign-out.
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=SIGN_IN_TO_EDIT)
         if refused.status_code >= 500:
             logger.warning(
                 "auth couldn't take an appearance change",

@@ -266,7 +266,14 @@ def _is_browser_jwt_request(request: Request) -> bool:
     authorization = request.headers.get("Authorization", "").strip()
     if not authorization.lower().startswith("bearer "):
         return False
-    credential = authorization[7:].strip()
+    return is_session_jwt(authorization[7:].strip())
+
+
+def is_session_jwt(credential: str) -> bool:
+    """True only for a credential shaped like a user's Keycloak session JWT:
+    three segments, the first a JOSE header. A MindsDB API key (``mdb_``), a
+    turn key and every other opaque service credential are not. Shape only:
+    the service it is forwarded to verifies it."""
     if not credential or credential.lower().startswith("mdb_"):
         return False
     parts = credential.split(".")

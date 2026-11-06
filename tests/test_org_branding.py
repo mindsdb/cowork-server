@@ -42,15 +42,30 @@ from cowork.services.skills import (
     SkillService,
     build_turn_skills,
 )
-from tests._org_sharing import MEMBER_BEARER
+
+def _session_jwt(subject: str) -> str:
+    """A credential shaped like a Keycloak session JWT (cowork.principal.
+    is_session_jwt): only auth verifies it, and these tests stub auth."""
+    import base64
+    import json
+
+    def part(value: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+    return f"{part({'alg': 'RS256', 'typ': 'JWT'})}.{part({'sub': subject})}.c2lnbmF0dXJl"
+
 
 ORG_ID = "33333333-3333-4333-8333-333333333333"
 ALICE = "a1111111-1111-4111-8111-111111111111"
 ADMIN = "e5555555-5555-4555-8555-555555555555"
+MEMBER_BEARER = _session_jwt("member")
 # A second caller's credential, so the per-caller cache is told apart.
-OTHER_BEARER = f"{MEMBER_BEARER}-2"
+OTHER_BEARER = _session_jwt("other")
 # The credential the desktop app sends with its hub calls.
-HUB_BEARER = f"{MEMBER_BEARER}-hub"
+HUB_BEARER = _session_jwt("hub")
+# Credentials that aren't a console session: auth takes no write from them.
+API_KEY = "mdb_" + "0" * 32
+TURN_KEY = "turnkey-" + "0" * 32
 AUTH = "https://auth.acme.com/v1/organizations/" + ORG_ID + "/branding"
 STOCK_APPEARANCE = {
     "accent": None, "background_light": None, "background_dark": None, "font": None, "radius": None,
@@ -618,14 +633,40 @@ def test_desktop_put_passes_through_with_the_hub_credential(desktop):
     assert desktop.auth.calls[-1][:3] == ("PATCH", "/organizations/current/branding/appearance/", HUB_BEARER)
 
 
-def test_desktop_put_without_a_hub_credential_is_a_404(desktop):
+def test_desktop_put_without_a_hub_credential_asks_to_sign_in(desktop):
     _refused(
         lambda: asyncio.run(
             ep.put_org_appearance(OrgAppearanceUpdate(accent="#0055ff"), _request(), desktop.session())
         ),
-        404, "needs a MindsHub organization",
+        403, ep.SIGN_IN_TO_EDIT,
     )
     assert desktop.auth.calls == []
+
+
+@pytest.mark.parametrize("credential", [API_KEY, TURN_KEY])
+def test_hosted_a_put_with_an_api_or_turn_key_asks_to_sign_in_and_reaches_no_one(org, credential):
+    _refused(lambda: _put(org, ADMIN, request=_request(credential), accent="#0055ff"), 403, ep.SIGN_IN_TO_EDIT)
+    assert [call for call in org.auth.calls if call[0] == "PATCH"] == []
+
+
+@pytest.mark.parametrize("credential", [API_KEY, TURN_KEY])
+def test_desktop_a_put_with_an_api_or_turn_key_asks_to_sign_in_and_reaches_no_one(desktop, credential):
+    _refused(
+        lambda: asyncio.run(
+            ep.put_org_appearance(
+                OrgAppearanceUpdate(accent="#0055ff"), _request(hub=credential), desktop.session()
+            )
+        ),
+        403, ep.SIGN_IN_TO_EDIT,
+    )
+    assert desktop.auth.calls == []
+
+
+def test_auths_401_is_a_403_asking_to_sign_in_never_a_401(org):
+    org.auth.patch_reply = MindsHubReply(
+        MindsHubAnswer.REFUSED, payload={"detail": "API keys can't change branding."}, status_code=401
+    )
+    _refused(lambda: _put(org, ADMIN, accent="#0055ff"), 403, ep.SIGN_IN_TO_EDIT)
 
 
 def test_desktop_the_skill_is_a_local_on_demand_skill(desktop):
