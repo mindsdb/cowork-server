@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
@@ -14,6 +15,8 @@ from cowork.schemas.schedules import (
     ScheduleUpdateRequest,
 )
 from cowork.services.schedules import ScheduleRunService, ScheduleService
+
+logger = logging.getLogger(__name__)
 
 # AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
 # closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
@@ -149,10 +152,14 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     except BaseException:
         release_run_place()
         try:
+            scoped.rollback()
             abandon_manual_run(scoped, run_id, "Run did not start: its conversation could not be created.")
         except Exception:
             # Its lease lapses and a poll reaps it.
-            pass
+            logger.exception(
+                "Could not abandon a scheduled run after conversation creation failed",
+                extra={"event": "schedule_abandon_failed", "schedule_id": str(schedule_id)},
+            )
         raise
     # FastAPI closes this session only after the background run ends, which
     # can take minutes. Give the request's connection back before it starts.

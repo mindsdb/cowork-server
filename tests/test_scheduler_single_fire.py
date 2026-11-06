@@ -211,6 +211,7 @@ async def test_a_dead_run_whose_turn_may_have_run_consumes_its_slot(schedule_id,
     assert schedule_id not in [slot.schedule_id for slot in due]
     (reaped,) = _runs(schedule_id)
     assert reaped.status == RunStatus.failed
+    assert reaped.outcome == "interrupted"
     assert ensure_utc(reaped.slot_at) == SLOT
     assert ensure_utc(_schedule(schedule_id).next_run_at) == SLOT + timedelta(days=1)
     assert started == []
@@ -613,6 +614,7 @@ def test_a_reap_on_postgres_leaves_a_run_whose_link_is_in_flight_and_keeps_its_s
     with Session(postgres.engine) as linking:
         run = linking.exec(select(ScheduleRun).where(ScheduleRun.id == run_id).with_for_update()).one()
         run.conversation_id = conversation_id
+        run.execution_claimed_at = datetime.now(timezone.utc)
         linking.add(run)
         linking.flush()
         reaped: list[list[ScheduleRun]] = []

@@ -114,6 +114,11 @@ class ScheduleRun(BaseSQLModel, table=True):
         sa_type=sa.DateTime(timezone=True),  # type: ignore
         description="Until when the process running it has renewed its claim; a running run past this is dead",
     )
+    execution_claimed_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="Durable claim before handing off execution; survives deletion of the run's chat",
+    )
     outcome: str | None = Field(
         default=None,
         description="What is known about the run's execution when it ended (AttemptOutcome); NULL while running and on runs from before outcomes were recorded",

@@ -671,14 +671,15 @@ async def execute_schedule(
             },
         )
         async def _drain_run() -> None:
+            nonlocal turn_started
             # The schedule-derived principal is what lets the turn (and the
             # remote backend's per-tenant key mint) run in org mode with no
             # request in flight. The handler opens its own short sessions.
             stream = await ResponsesHandler(principal=scheduled.principal, interactive=False).handle(request)
+            turn_started = True
             async for _ in stream:
                 pass
 
-        turn_started = True
         try:
             await asyncio.wait_for(_drain_run(), timeout=_MAX_RUN_DURATION_SECONDS)
         except asyncio.TimeoutError as exc:
@@ -1039,12 +1040,12 @@ async def _scheduler_loop() -> None:
             logger.exception("Scheduler loop error during poll")
             due = []
 
-        for slot in due:
+        for index, slot in enumerate(due):
             if not _admission.reserve():
                 # The rest stay due, unclaimed, for a later poll.
-                logger.info(
+                logger.warning(
                     "Scheduled runs at this process's limit; due slots wait for the next poll",
-                    extra={"event": "schedule_admission_full", "waiting": len(due)},
+                    extra={"event": "schedule_admission_full", "count": len(due) - index},
                 )
                 break
             run = asyncio.create_task(run_admitted(slot.schedule_id, is_manual=False, slot_at=slot.slot_at))

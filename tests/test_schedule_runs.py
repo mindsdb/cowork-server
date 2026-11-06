@@ -733,6 +733,7 @@ def _execute_with_terminal(
         state = {
             "schedule_id": schedule_id,
             "run_status": run.status,
+            "run_outcome": run.outcome,
             "run_error": run.error,
             "run_conversation_id": run.conversation_id,
             "last_error": fresh.last_error,
@@ -814,6 +815,7 @@ def test_execute_schedule_that_times_out_consumes_its_slot(monkeypatch):
     state = _execute_with_terminal(monkeypatch, None, turn=_hangs)
     assert state["run_status"] == RunStatus.failed
     assert "max duration" in state["last_error"]
+    assert state["run_outcome"] == "interrupted"
     assert state["next_advanced"] is True
     # The turn runs detached from the drain the timeout cancels, so it is
     # stopped explicitly or it goes on writing after the run is failed.

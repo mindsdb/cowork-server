@@ -205,10 +205,10 @@ def _utc(value: datetime) -> datetime:
 
 def _record_lost_run(run: ScheduleRun) -> None:
     """Record what is known of a run whose process died. One that never
-    linked its conversation never started its turn; one that did may have
-    acted."""
+    claimed execution never started its turn; one that did may have acted.
+    The claim survives deletion of the conversation."""
     run.outcome = (
-        AttemptOutcome.failed_before_execution if run.conversation_id is None else AttemptOutcome.interrupted
+        AttemptOutcome.failed_before_execution if run.execution_claimed_at is None else AttemptOutcome.interrupted
     )
 
 
@@ -311,13 +311,7 @@ class ScheduleRunService:
             _stmt = _stmt.where(Schedule.created_by == self.session.scope.user_id)
         if self.session.exec(_stmt).first() is None:
             return False
-        run = self.session.exec(
-            self.session.select(ScheduleRun)
-            .where(ScheduleRun.schedule_id == schedule_id)
-            .where(ScheduleRun.status == RunStatus.running)
-            .limit(1)
-        ).first()
-        return run is not None
+        return self._running_run(schedule_id) is not None
 
     def last_successful_finish(self, schedule_id: UUID) -> datetime | None:
         """When the schedule's most recent successful run (manual or cron)
@@ -366,7 +360,7 @@ class ScheduleRunService:
         ).first()
         return conversation_id if row is not None else None
 
-    def set_run_conversation(self, run_id: UUID, conversation_id: UUID) -> bool:
+    def set_run_conversation(self, run_id: UUID, conversation_id: UUID | None) -> bool:
         """Attach the run's conversation as soon as it is known — before the
         turn executes — so the UI can open a run that is still in flight.
 
@@ -384,14 +378,21 @@ class ScheduleRunService:
         if run is None or run.status != RunStatus.running:
             return False
         run.conversation_id = self.still_exists(conversation_id)
+        # Persist before handing off: a crash after this point is ambiguous,
+        # even when the user deletes the conversation. Never clear this claim.
+        run.execution_claimed_at = run.execution_claimed_at or datetime.now(timezone.utc)
         self.session.add(run)
         try:
             self.session.commit()
         except IntegrityError:
             # The delete landed between still_exists' read and this commit,
             # and its release already nulled the column in the database. The
-            # run simply has no conversation to point at.
+            # run simply has no conversation to point at. Retry the claim too:
+            # rollback discarded it, and execution must not start without it.
             self.session.rollback()
+            if conversation_id is None:
+                raise
+            return self.set_run_conversation(run_id, None)
         return True
 
     def finish_run(
@@ -482,7 +483,7 @@ class ScheduleRunService:
         """Fail every running run whose lease ran out: its process stopped
         renewing it, so it died without recording how the run ended.
 
-        A run that never linked a conversation never started its turn, so it
+        A run that never claimed execution never started its turn, so it
         gives its cron slot back and the slot fires again. A run that did may
         have done its work, so it keeps the slot, and the caller consumes it
         rather than run that work twice. Returns those runs. Staged only: the
@@ -507,7 +508,7 @@ class ScheduleRunService:
             run.error = error
             run.lease_expires_at = None
             _record_lost_run(run)
-            if run.conversation_id is None:
+            if run.execution_claimed_at is None:
                 run.slot_at = None
             elif run.slot_at is not None:
                 kept.append(run)

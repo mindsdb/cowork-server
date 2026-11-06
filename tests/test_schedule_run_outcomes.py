@@ -186,6 +186,46 @@ async def test_a_passing_outage_before_the_turn_leaves_its_slot_due(schedule_id,
     assert _poll(schedule_id) == [first]
 
 
+@pytest.mark.parametrize("failure", ["permission", "pool"])
+@pytest.mark.parametrize("after_handoff", [False, True])
+async def test_handler_outage_preserves_slot_only_before_handoff(
+    schedule_id, turns, monkeypatch, failure, after_handoff,
+):
+    import cowork.handlers.responses as responses_mod
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    error = ProductPermissionUnavailable() if failure == "permission" else scheduler.PoolTimeoutError()
+    original_handle = responses_mod.ResponsesHandler.handle
+
+    async def handle(self, request):
+        if not after_handoff:
+            raise error
+        await original_handle(self, request)
+
+        async def stream():
+            raise error
+            yield  # Make the failure occur while draining the returned stream.
+
+        return stream()
+
+    monkeypatch.setattr(responses_mod.ResponsesHandler, "handle", handle)
+    (first,) = _poll(schedule_id)
+    await _run(first)
+
+    (run,) = _runs(schedule_id)
+    assert run.status == RunStatus.failed
+    if after_handoff:
+        assert run.outcome == AttemptOutcome.uncertain
+        assert len(turns.started) == 1
+        assert ensure_utc(_schedule(schedule_id).next_run_at) > SLOT
+        assert _poll(schedule_id) == []
+    else:
+        assert run.outcome == AttemptOutcome.failed_before_execution
+        assert turns.started == []
+        assert ensure_utc(_schedule(schedule_id).next_run_at) == SLOT
+        assert _poll(schedule_id) == [first]
+
+
 async def test_a_run_whose_process_died_before_its_turn_records_it_and_fires_again(schedule_id, turns):
     session = get_open_session()
     try:
@@ -198,6 +238,70 @@ async def test_a_run_whose_process_died_before_its_turn_records_it_and_fires_aga
     assert _poll(schedule_id) == [scheduler.DueSlot(schedule_id=schedule_id, slot_at=SLOT)]
     (lost,) = _runs(schedule_id)
     assert lost.outcome == AttemptOutcome.failed_before_execution
+
+
+@pytest.mark.parametrize("reaper", ["lease", "restart"])
+async def test_deleted_chat_does_not_erase_execution_claim(schedule_id, reaper):
+    from cowork.services.conversations import ConversationService
+
+    with get_open_session() as session:
+        scoped = ScopedSession(session, SYSTEM_SCOPE)
+        runs = ScheduleRunService(scoped)
+        run = runs.create_run(schedule_id, slot_at=SLOT, lease_seconds=-60)
+        conversation = ConversationService(scoped).create_conversation(
+            topic=_schedule(schedule_id).title, project_id=GENERAL_PROJECT_ID,
+        )
+        assert runs.set_run_conversation(run.id, conversation.id)
+        ConversationService(scoped).delete_conversation(conversation.id)
+
+    (before,) = _runs(schedule_id)
+    assert before.conversation_id is None
+    assert before.execution_claimed_at is not None
+    if reaper == "lease":
+        assert _poll(schedule_id) == []
+        assert ensure_utc(_schedule(schedule_id).next_run_at) > SLOT
+    else:
+        with get_open_session() as session:
+            ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE)).reap_orphaned_runs()
+    (after,) = _runs(schedule_id)
+    assert after.status == RunStatus.failed
+    assert after.outcome == AttemptOutcome.interrupted
+    assert after.execution_claimed_at == before.execution_claimed_at
+
+
+async def test_admission_warning_counts_only_slots_left(monkeypatch, caplog):
+    import logging
+
+    slots = [scheduler.DueSlot(schedule_id=uuid4(), slot_at=SLOT) for _ in range(3)]
+    started = []
+    blocked = asyncio.Event()
+
+    async def poll(_fn, *, scope):
+        return slots
+
+    async def execute(schedule_id, **_kwargs):
+        started.append(schedule_id)
+        await blocked.wait()
+
+    monkeypatch.setattr(scheduler, "_POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(scheduler, "run_db", poll)
+    monkeypatch.setattr(scheduler, "execute_schedule", execute)
+    monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(1))
+    with caplog.at_level(logging.WARNING, logger="cowork.scheduler"):
+        scheduler.start_scheduler()
+        try:
+            async with asyncio.timeout(2):
+                while not started:
+                    await asyncio.sleep(0)
+            records = [r for r in caplog.records if getattr(r, "event", None) == "schedule_admission_full"]
+            assert records[0].levelno == logging.WARNING
+            assert records[0].count == 2
+        finally:
+            loop = scheduler.stop_scheduler()
+            if loop is not None:
+                await asyncio.gather(loop, return_exceptions=True)
+            blocked.set()
+            await asyncio.gather(*scheduler._scheduled_runs)
 
 
 async def test_due_slots_over_the_process_limit_stay_due_for_a_later_poll(monkeypatch):
@@ -256,6 +360,33 @@ def _client() -> httpx.AsyncClient:
 async def _run_now(schedule_id: UUID) -> httpx.Response:
     async with _client() as client:
         return await client.post(f"/api/v1/schedules/{schedule_id}/run-now")
+
+
+async def test_failed_conversation_commit_releases_manual_run(schedule_id, monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+
+    from cowork.services.conversations import ConversationService
+
+    with get_open_session() as session:
+        existing = ConversationService(ScopedSession(session, SYSTEM_SCOPE)).create_conversation(
+            topic=_schedule(schedule_id).title, project_id=GENERAL_PROJECT_ID,
+        ).id
+    create = ConversationService.create_conversation
+
+    def duplicate(self, **kwargs):
+        return create(self, conversation_id=existing, **kwargs)
+
+    monkeypatch.setattr(ConversationService, "create_conversation", duplicate)
+    with pytest.raises(IntegrityError):
+        await _run_now(schedule_id)
+
+    (run,) = _runs(schedule_id)
+    assert run.status == RunStatus.failed
+    assert run.outcome == AttemptOutcome.failed_before_execution
+    assert run.lease_expires_at is None
+    assert scheduler._admission.held == 0
+    with get_open_session() as session:
+        assert not ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE)).has_active_run(schedule_id)
 
 
 async def test_run_now_is_refused_while_the_task_is_running(schedule_id):
@@ -411,6 +542,7 @@ def test_the_outcomes_migration_upgrades_and_downgrades(tmp_path, monkeypatch):
 
     columns = lambda: {c["name"] for c in inspect(engine).get_columns("schedule_runs")}  # noqa: E731
     assert "outcome" in columns()
+    assert "execution_claimed_at" in columns()
     assert "uq_schedule_runs_one_running" in {i["name"] for i in inspect(engine).get_indexes("schedule_runs")}
 
     config = _alembic_config(uri)
@@ -418,6 +550,7 @@ def test_the_outcomes_migration_upgrades_and_downgrades(tmp_path, monkeypatch):
         config.attributes["connection"] = connection
         command.downgrade(config, "c69488788ac7")
     assert "outcome" not in columns()
+    assert "execution_claimed_at" not in columns()
 
     with engine.begin() as connection:
         config.attributes["connection"] = connection
@@ -425,6 +558,7 @@ def test_the_outcomes_migration_upgrades_and_downgrades(tmp_path, monkeypatch):
     with engine.connect() as connection:
         assert connection.execute(text("SELECT count(*) FROM schedule_runs")).scalar_one() == 0
     assert "outcome" in columns()
+    assert "execution_claimed_at" in columns()
 
 
 def test_the_migration_keeps_one_running_run_per_schedule(tmp_path, monkeypatch):
@@ -463,4 +597,8 @@ def test_the_migration_keeps_one_running_run_per_schedule(tmp_path, monkeypatch)
     with engine.connect() as connection:
         statuses = dict(connection.execute(text("SELECT id, status FROM schedule_runs")).all())
     assert statuses == {older: "failed", newer: "running"}
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            "SELECT count(*) FROM schedule_runs WHERE execution_claimed_at = started_at"
+        )).scalar_one() == 2
 

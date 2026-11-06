@@ -25,6 +25,12 @@ def upgrade() -> None:
     if "outcome" not in {c["name"] for c in inspector.get_columns("schedule_runs")}:
         with op.batch_alter_table("schedule_runs") as batch:
             batch.add_column(sa.Column("outcome", sa.String(), nullable=True))
+    if "execution_claimed_at" not in {c["name"] for c in sa.inspect(op.get_bind()).get_columns("schedule_runs")}:
+        with op.batch_alter_table("schedule_runs") as batch:
+            batch.add_column(sa.Column("execution_claimed_at", sa.DateTime(timezone=True), nullable=True))
+        # Older rows cannot prove execution never started: their chat may
+        # already have been deleted. Preserve their slots conservatively.
+        op.execute(sa.text("UPDATE schedule_runs SET execution_claimed_at = started_at"))
     indexes = {i["name"] for i in sa.inspect(op.get_bind()).get_indexes("schedule_runs")}
     if "uq_schedule_runs_one_running" not in indexes:
         _fail_extra_running_runs()
@@ -66,3 +72,4 @@ def downgrade() -> None:
     op.drop_index("uq_schedule_runs_one_running", table_name="schedule_runs")
     with op.batch_alter_table("schedule_runs") as batch:
         batch.drop_column("outcome")
+        batch.drop_column("execution_claimed_at")

@@ -70,7 +70,8 @@ class AttemptOutcome(str, Enum):
     interrupted = "interrupted"
     # Stopped by the user.
     cancelled = "cancelled"
-    # No terminal record says how the turn ended.
+    # No terminal record says how the turn ended, or a failure after handoff
+    # prevents determining what the turn did.
     uncertain = "uncertain"
 
 
