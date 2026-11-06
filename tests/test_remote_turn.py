@@ -1,10 +1,10 @@
 """remote_turn_events tests: verify its own dispatch logic in isolation.
-ResponsesHandler is replaced wholesale per test; its helpers have coverage elsewhere."""
+ResponsesHandler's reads are replaced per test; its helpers have coverage elsewhere."""
 from __future__ import annotations
 
 import asyncio
 import json
-from types import SimpleNamespace
+from pathlib import Path
 from typing import NamedTuple
 from uuid import UUID, uuid4
 
@@ -12,6 +12,7 @@ import pytest
 
 import cowork.handlers.responses as responses_mod
 import cowork.turnqueue.remote_turn as remote_turn_mod
+from cowork.handlers.responses import _RemoteArtifactsDir
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory
 from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
@@ -43,27 +44,26 @@ def _fake_handler(
     monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_seed_history=None,
     remote_agent_files=None, remote_workspace=None, earlier_answers=None,
 ):
-    """Replace ResponsesHandler with a stand-in exposing only the methods
-    remote_turn_events calls, resolved at call time like every other name here.
-    The earlier answers' read is replaced too, by ``earlier_answers`` or by
-    one that finds none."""
+    """Replace the reads of ResponsesHandler that the turn's input unit makes
+    (ResponsesHandler._read_remote_turn_inputs, which the channel turn shares)
+    with stand-ins. The earlier answers' read is replaced too, by
+    ``earlier_answers`` or by one that finds none."""
 
     async def no_earlier_answers(*, conversation_id, scope):
         return ()
 
     monkeypatch.setattr(remote_turn_mod, "read_earlier_answers", earlier_answers or no_earlier_answers)
-    monkeypatch.setattr(remote_turn_mod, "remote_turn_skills", lambda session, conv_id, **kw: {})
+    monkeypatch.setattr(responses_mod, "remote_turn_skills", lambda session, conv_id, **kw: {})
     # Each unit runs inline, on a session that reaches no database.
     monkeypatch.setattr(remote_turn_mod, "run_db", inline_run_db(_FakeSession()))
-    monkeypatch.setattr(remote_turn_mod, "ResponsesHandler", type(
-        "FakeResponsesHandler", (), {
-            "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
-            "_remote_seed_history": staticmethod(remote_seed_history or (lambda s, c: ([], None))),
-            "_remote_workspace": staticmethod(remote_workspace or (lambda s, c: None)),
-            "_remote_agent_files": staticmethod(remote_agent_files or (lambda s, c, *, workspace: None)),
-            "_remote_started_at": staticmethod(lambda s, c: None),
-        },
-    ))
+    for name, read in {
+        "_remote_artifacts_context": remote_artifacts_context or (lambda s, c: None),
+        "_remote_seed_history": remote_seed_history or (lambda s, c: ([], None)),
+        "_remote_workspace": remote_workspace or (lambda s, c: None),
+        "_remote_agent_files": remote_agent_files or (lambda s, c, *, workspace: None),
+        "_remote_started_at": lambda s, c: None,
+    }.items():
+        monkeypatch.setattr(responses_mod.ResponsesHandler, name, staticmethod(read))
     # The pod's memory and compaction go through the helpers the browser
     # producer shares (save_turn_memory, save_turn_compaction), which run
     # their units with cowork.handlers.responses's own run_db.
@@ -143,14 +143,15 @@ async def test_a_channel_turn_always_sends_the_fail_closed_skills_block(monkeypa
         sent.append(kwargs["skills"])
         yield "turn_completed", {}
 
-    monkeypatch.setattr(remote_turn_mod, "remote_turn_skills", remote_turn_skills)
+    monkeypatch.setattr(responses_mod, "remote_turn_skills", remote_turn_skills)
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
     conv_id = uuid4()
     await _drain(remote_turn_events(
         scope=_FakeScope(), conv_id=conv_id, org_id="org-123", user_id=None,
         input_text="hi", model="anton", turn_rows=[],
     ))
-    assert built == [(conv_id, {})]
+    # No viewer: the fail-closed set.
+    assert built == [(conv_id, {"viewer": None})]
     assert sent == [block]
 
 
@@ -586,7 +587,7 @@ async def test_only_authorized_persistent_turns_touch_saved_artifacts(monkeypatc
     from unittest.mock import AsyncMock, Mock
     from cowork.services import task_objects
 
-    context = (object(), object(), "project", "Project")
+    context = _RemoteArtifactsDir(base=Path("/project/artifacts"), project_id="project", project_name="Project", creator=None)
     _fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
     diff = Mock(return_value=task_objects.ArtifactChanges(created=[], touched=set()))
@@ -619,7 +620,7 @@ async def test_only_an_unfinished_turn_claims_unattributed_artifacts(monkeypatch
     from unittest.mock import AsyncMock, Mock
     from cowork.services import task_objects
 
-    context = (object(), object(), "project", "Project")
+    context = _RemoteArtifactsDir(base=Path("/project/artifacts"), project_id="project", project_name="Project", creator=None)
     _fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
     diff = Mock(return_value=task_objects.ArtifactChanges(created=[], touched=set()))
@@ -818,10 +819,10 @@ def _turn_with_a_new_artifact(monkeypatch, *, diff=None, snapshot=None):
     from cowork.db.units import on_efs_thread
     from cowork.services import task_objects
 
-    conversation = SimpleNamespace(created_by="user-1")
-    _fake_handler(
-        monkeypatch, remote_artifacts_context=lambda *_: (conversation, "/project/artifacts", _PROJECT_ID, "Project"),
+    context = _RemoteArtifactsDir(
+        base=Path("/project/artifacts"), project_id=_PROJECT_ID, project_name="Project", creator="user-1",
     )
+    _fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
     _real_units_after_the_inputs_read(monkeypatch)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", snapshot or (lambda *_: (set(), {})))
     monkeypatch.setattr(

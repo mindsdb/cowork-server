@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
 from functools import partial
 from uuid import UUID
 
@@ -14,61 +13,33 @@ from cowork.db.units import TurnEndRecord, note_turn_end_slugs, run_db, run_efs,
 from cowork.handlers.responses import (
     ResponsesHandler,
     _RemoteArtifactsDir,
-    remote_turn_skills,
+    _RemoteTurnInputs,
     save_turn_compaction,
     save_turn_memory,
 )
-from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
-from cowork.schemas.turn_skills import TurnSkills
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import read_earlier_answers
+from cowork.services.task_objects import ArtifactChanges
 from cowork.streaming.cancellation import stop_controller_turn
 from cowork.turnqueue import producer
-from cowork.turnqueue.producer import RemoteWorkspace, step_stream_events, stream_remote_replies
+from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class _ChannelTurnInputs:
-    """What a channel turn's pod is seeded with, read as one unit."""
+def _read_channel_turn_inputs(session: ScopedSession, *, conv_id: UUID) -> _RemoteTurnInputs:
+    """A channel turn's seed, read as one unit: a browser turn's reads
+    (ResponsesHandler._read_remote_turn_inputs), less the project memory a
+    channel turn has never sent. A channel turn has no member behind it, so
+    its skills are the fail-closed set, the skills shared with everyone, and
+    never a fallback to a mounted skills tree (remote_turn_skills).
 
-    history: list[dict]
-    seed_info: dict | None
-    workspace: RemoteWorkspace | None
-    files: AgentFiles | None
-    artifacts: _RemoteArtifactsDir | None
-    started_at: str | None
-    # A channel turn has no member behind it: the fail-closed set, the skills
-    # shared with everyone, and never a fallback to a mounted skills tree
-    # (remote_turn_skills).
-    skills: TurnSkills
-
-
-def _read_channel_turn_inputs(session: ScopedSession, *, conv_id: UUID) -> _ChannelTurnInputs:
-    """The scrubbed history, the conversation's workspace and files, where the
-    project's artifacts live and who created the conversation, when it
-    started, and its skills block. The same reads as a browser turn's
-    (_read_remote_turn_inputs), less the project memory a channel turn has
-    never sent."""
-    history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
-    workspace = ResponsesHandler._remote_workspace(session, conv_id)
-    artifacts = ResponsesHandler._remote_artifacts_context(session, conv_id)
-    return _ChannelTurnInputs(
-        history=history,
-        seed_info=seed_info,
-        workspace=workspace,
-        files=ResponsesHandler._remote_agent_files(session, conv_id, workspace=workspace),
-        artifacts=None if artifacts is None else _RemoteArtifactsDir(
-            base=artifacts[1],
-            project_id=artifacts[2],
-            project_name=artifacts[3],
-            creator=getattr(artifacts[0], "created_by", None),
-        ),
-        started_at=ResponsesHandler._remote_started_at(session, conv_id),
-        skills=remote_turn_skills(session, conv_id),
+    The settings these reads ask for come from the turn's snapshot, which
+    AntonChannelRuntime._run_anton binds before the turn starts."""
+    return ResponsesHandler._read_remote_turn_inputs(
+        session, conv_id=conv_id, viewer=None, with_memory=False,
     )
 
 
@@ -103,7 +74,15 @@ async def remote_turn_events(
     cancelling it; no registry handle covers a channel turn.
 
     Each read and write is a unit of its own, so the turn holds no pooled
-    connection while the pod runs."""
+    connection while the pod runs.
+
+    The caller binds the turn's settings snapshot (use_turn_settings) around
+    the whole stream, as AntonChannelRuntime._run_anton does: the seed read
+    and each memory save ask for settings inside a unit, and without the
+    snapshot each would check out a second connection while its unit holds
+    the first. It is not bound in here, since a context variable this
+    generator set across its yields would be reset in the wrong context when
+    a reader that abandoned it leaves the close to another task."""
     from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
     from cowork.handlers._turn_history import remote_turn_history
     from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnContext
@@ -134,8 +113,7 @@ async def remote_turn_events(
         )
         if artifacts else (set(), {})
     )
-    new_slugs: list[str] = []
-    touched_slugs: set[str] = set()
+    recorded = ArtifactChanges(created=[], touched=set())
     artifact_writes_allowed = False
     # Set only on turn_completed; see `turn_created_slugs(accept_unattributed=)`.
     completed_cleanly = False
@@ -232,7 +210,7 @@ async def remote_turn_events(
             # record, and that step logs an ERROR naming the conversation, the
             # project and the new slugs, which _record_turn_artifacts names
             # once its diff finds them (note_turn_end_slugs).
-            new_slugs, touched_slugs = await run_turn_end_record(
+            recorded = await run_turn_end_record(
                 work=_record_turn_artifacts(
                     artifacts,
                     conv_id=conv_id,
@@ -247,8 +225,8 @@ async def remote_turn_events(
     if artifacts is not None and artifact_writes_allowed:
         for card in await publish_and_card_turn_artifacts(
             artifacts.base,
-            new_slugs=new_slugs,
-            touched_slugs=touched_slugs,
+            new_slugs=recorded.created,
+            touched_slugs=recorded.touched,
             scope=scope,
             project_id=artifacts.project_id,
             project_name=artifacts.project_name,
@@ -264,7 +242,7 @@ async def _record_turn_artifacts(
     before_slugs: set[str],
     before_mtimes: dict[str, int],
     completed_cleanly: bool,
-) -> tuple[list[str], set[str]]:
+) -> ArtifactChanges:
     """The folders the turn created and touched. Those it created are indexed
     as this conversation's (and, in org mode, its creator's), in a unit.
 
@@ -300,7 +278,7 @@ async def _record_turn_artifacts(
             exc_info=True,
             extra=log_context(conversation_id=conv_id, project_id=artifacts.project_id),
         )
-        return [], set()
+        return ArtifactChanges(created=[], touched=set())
     note_turn_end_slugs(slugs=changes.created)
     if changes.created:
         try:
@@ -330,4 +308,4 @@ async def _record_turn_artifacts(
                     artifact_slugs=changes.created,
                 ),
             )
-    return changes.created, changes.touched
+    return changes

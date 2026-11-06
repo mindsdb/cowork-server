@@ -559,6 +559,8 @@ class _RemoteTurnInputs:
     # (_remote_seed_history); None when compaction is off.
     seed_info: dict | None
     artifacts: _RemoteArtifactsDir | None
+    # The project's memory slots (_remote_memory); None for a channel turn,
+    # which has never sent them.
     memory: dict | None
     # The project the turn runs in, or None when it could not be resolved
     # (_remote_workspace).
@@ -2273,21 +2275,18 @@ class ResponsesHandler:
             return None
 
     @staticmethod
-    def _remote_artifacts_context(session: ScopedSession, conv_id: UUID):
-        """`(conversation, artifacts_base, project_id, project_name)` for the
-        remote turn's end-of-turn artifact bookkeeping, or None if unavailable.
+    def _remote_artifacts_context(session: ScopedSession, conv_id: UUID) -> _RemoteArtifactsDir | None:
+        """Where the remote turn's end-of-turn artifact bookkeeping reads, or
+        None if unavailable.
 
         The pod writes artifacts into `<project>/.anton/artifacts/` on the shared
         mount, so cowork-server reads the same directory the worker just wrote —
         this is the whole reason the in-process flow transplants onto the remote
-        path unchanged. `conversation` comes back attached to `session` so its
-        caller reads the creator (`created_by`) in the same unit, which the
-        turn's end records as the owner of the artifacts the turn created:
-        `_read_remote_turn_inputs` for a browser turn and
-        `_read_channel_turn_inputs` for a channel turn. The ids and the project
-        name are read here too, while the row is attached, rather than after
-        the turn. The turn's tenant scope comes from its caller, not from this
-        row.
+        path unchanged. The project's id and name, and the conversation's
+        creator (`created_by`), which the turn's end records as the owner of the
+        artifacts the turn created, are read here, while the row is attached,
+        rather than after the turn. The turn's tenant scope comes from its
+        caller, not from this row.
 
         None on any failure: no artifact card and no autopublish is better than
         a failed turn. Outside org mode the next turn in this project
@@ -2310,12 +2309,11 @@ class ResponsesHandler:
             # in-process path bounds the same diff with the session's
             # artifacts_touched set (ENG-1933), but the remote pod reports no
             # equivalent yet, so the diff stands alone here.
-            artifacts_base = project_artifacts_base(conversation.project.path)
-            return (
-                conversation,
-                artifacts_base,
-                str(conversation.project_id) if conversation.project_id else None,
-                conversation.project.name,
+            return _RemoteArtifactsDir(
+                base=project_artifacts_base(conversation.project.path),
+                project_id=str(conversation.project_id) if conversation.project_id else None,
+                project_name=conversation.project.name,
+                creator=conversation.created_by,
             )
         except Exception:
             logger.exception(
@@ -2410,28 +2408,27 @@ class ResponsesHandler:
         except Exception:
             logger.exception("[responses] failed to apply memory", extra=log_context(conversation_id=conv_id))
 
-    def _read_remote_turn_inputs(self, session: ScopedSession, *, conv_id: UUID) -> _RemoteTurnInputs:
+    @staticmethod
+    def _read_remote_turn_inputs(
+        session: ScopedSession, *, conv_id: UUID, viewer: SkillViewer | None, with_memory: bool,
+    ) -> _RemoteTurnInputs:
         """What a remote turn's pod is seeded with, read as one unit once the
         question is saved: the scrubbed history, where the project's artifacts
-        live and who created the conversation, the project's memory, its
-        workspace, and when the conversation started."""
-        history, seed_info = self._remote_seed_history(session, conv_id)
-        artifacts = self._remote_artifacts_context(session, conv_id)
-        workspace = self._remote_workspace(session, conv_id)
+        live and who created the conversation, the project's memory when
+        ``with_memory``, its workspace, when the conversation started, and the
+        skills ``viewer`` sees (remote_turn_skills). A browser turn reads
+        memory; a channel turn never sends it, and has no viewer."""
+        history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
+        workspace = ResponsesHandler._remote_workspace(session, conv_id)
         return _RemoteTurnInputs(
             history=history,
             seed_info=seed_info,
-            artifacts=None if artifacts is None else _RemoteArtifactsDir(
-                base=artifacts[1],
-                project_id=artifacts[2],
-                project_name=artifacts[3],
-                creator=getattr(artifacts[0], "created_by", None),
-            ),
-            memory=self._remote_memory(session, conv_id),
+            artifacts=ResponsesHandler._remote_artifacts_context(session, conv_id),
+            memory=ResponsesHandler._remote_memory(session, conv_id) if with_memory else None,
             workspace=workspace,
-            started_at=self._remote_started_at(session, conv_id),
-            files=self._remote_agent_files(session, conv_id, workspace=workspace),
-            skills=remote_turn_skills(session, conv_id, viewer=self._skill_viewer),
+            started_at=ResponsesHandler._remote_started_at(session, conv_id),
+            files=ResponsesHandler._remote_agent_files(session, conv_id, workspace=workspace),
+            skills=remote_turn_skills(session, conv_id, viewer=viewer),
         )
 
     @staticmethod
@@ -2852,7 +2849,13 @@ class ResponsesHandler:
             # The caller's teams and permissions, read from MindsHub (cached
             # per caller) before the seed, which selects the skills they see.
             await self._resolve_skill_viewer(scope)
-            seed = await run_db(partial(self._read_remote_turn_inputs, conv_id=conv_id), scope=scope)
+            seed = await run_db(
+                partial(
+                    self._read_remote_turn_inputs,
+                    conv_id=conv_id, viewer=self._skill_viewer, with_memory=True,
+                ),
+                scope=scope,
+            )
             # A unit of its own, so a failed read can't abort the seed's.
             earlier = await read_earlier_answers(conversation_id=conv_id, scope=scope)
             yield TurnContext(question=input_text, files=seed.files, history=seed.history, earlier_answers=earlier)

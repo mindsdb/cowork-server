@@ -38,6 +38,7 @@ from cowork.services import memory as memory_service_module
 from cowork.services import shared_resources as shared_resource_module
 from cowork.harnesses.memory.store import ProjectMemoryStore
 from cowork.services.conversations import ConversationService
+from _fakes import stored_file
 from cowork.services.files import FileService, attachment_purpose
 from cowork.services.projects import GENERAL_PROJECT, ProjectService
 from cowork.services.shared_resources import (
@@ -3093,13 +3094,13 @@ async def test_project_delete_audits_and_cleans_protected_children(org_engine):
         project_id=project_id,
     )
     direct_purpose = attachment_purpose(str(direct_conversation.id))
-    direct_owner_attachment = FileService(alice).create_file_from_bytes(
+    direct_owner_attachment = stored_file(scoped=alice,
         filename="owner-direct.txt",
         content_type="text/plain",
         data=b"owner direct attachment",
         purpose=direct_purpose,
     )
-    direct_peer_attachment = FileService(bob).create_file_from_bytes(
+    direct_peer_attachment = stored_file(scoped=bob,
         filename="peer-direct.txt",
         content_type="text/plain",
         data=b"peer direct attachment",
@@ -3136,13 +3137,13 @@ async def test_project_delete_audits_and_cleans_protected_children(org_engine):
     )
     foreign_conversation_id = foreign_conversation.id
     foreign_attachment_purpose = attachment_purpose(str(foreign_conversation_id))
-    foreign_attachment = FileService(bob).create_file_from_bytes(
+    foreign_attachment = stored_file(scoped=bob,
         filename="foreign.txt",
         content_type="text/plain",
         data=b"foreign attachment",
         purpose=foreign_attachment_purpose,
     )
-    parent_owner_attachment = FileService(alice).create_file_from_bytes(
+    parent_owner_attachment = stored_file(scoped=alice,
         filename="owner-parent.txt",
         content_type="text/plain",
         data=b"owner attachment on peer conversation",
@@ -3212,7 +3213,7 @@ def test_project_delete_restores_row_directory_and_attribution_on_audit_failure(
         "must survive",
         project_id=project_id,
     )
-    attachment = FileService(alice).create_file_from_bytes(
+    attachment = stored_file(scoped=alice,
         filename="evidence.txt",
         content_type="text/plain",
         data=b"attachment must survive",
@@ -3629,7 +3630,7 @@ def test_generic_project_files_reject_protected_namespace_squatting_but_not_desk
 def test_compat_move_rejects_reserved_anton_without_consuming_attachment(org_engine):
     alice = _scoped(org_engine, ALICE)
     project = ProjectService(alice).create_project("reserved-compat-move")
-    attachment = FileService(alice).create_file_from_bytes(
+    attachment = stored_file(scoped=alice,
         filename=".anton",
         content_type="application/octet-stream",
         data=b"must remain an attachment",

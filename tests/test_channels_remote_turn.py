@@ -167,10 +167,59 @@ def test_a_channel_turn_whose_staging_unit_fails_to_commit_still_runs(monkeypatc
     assert record.conversation_id == str(conv_id)
 
 
+def _delete_binding_and_its_rows(channel_type: str, external_group_id: str) -> None:
+    """The test database is shared, and other tests count its bindings."""
+    from sqlmodel import select
+
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.models.channel import ChannelBinding, ChannelSession
+    from cowork.services.conversations import ConversationService
+
+    session = get_open_session()
+    try:
+        binding = session.exec(
+            select(ChannelBinding).where(
+                ChannelBinding.channel_type == channel_type,
+                ChannelBinding.external_group_id == external_group_id,
+            )
+        ).first()
+        if binding is None:
+            return
+        if binding.anton_conversation_id is not None:
+            ConversationService(ScopedSession(session, LOCAL_SCOPE)).delete_conversation(binding.anton_conversation_id)
+        for row in session.exec(select(ChannelSession).where(ChannelSession.binding_id == binding.id)).all():
+            session.delete(row)
+        session.delete(binding)
+        session.commit()
+    finally:
+        session.close()
+
+
+class _Adapter:
+    def __init__(self):
+        self.delivered: list[tuple[str, str]] = []
+
+    async def deliver(self, message):
+        self.delivered.append((message.address.platform_id, message.text))
+
+    async def shutdown(self):
+        pass
+
+
 def test_a_channel_turn_whose_staging_unit_finds_no_connection_is_refused(monkeypatch):
     """A full pool is not a missing file: the turn is refused rather than
-    run without what the user sent."""
+    run without what the user sent. The sender hears the busy notice rather
+    than nothing, and the refusal still propagates, so the event records
+    `failed`."""
+    import json
+
+    import cowork.channels.plugins.telegram as telegram_plugin
+    from cowork.channels.registry import PluginRegistry, load_first_party_plugins
+    from cowork.channels.runtime import BUSY_NOTICE
+    from cowork.db import units
     from cowork.db.units import DatabaseBusy
+
+    real_unit_session = units.unit_session
 
     def refuse(*, scope):
         raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
@@ -180,4 +229,32 @@ def test_a_channel_turn_whose_staging_unit_finds_no_connection_is_refused(monkey
     with pytest.raises(DatabaseBusy):
         asyncio.run(_stream_one_turn(uuid4()))
 
+    assert started == []
+
+    # The whole turn, with only the staging unit refused.
+    monkeypatch.setattr(units, "unit_session", real_unit_session)
+
+    async def staging_refused(fn, *, scope):
+        raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+
+    monkeypatch.setattr(responses_mod, "run_db", staging_refused)
+    registry = PluginRegistry()
+    load_first_party_plugins(registry)
+    adapters = runtime_mod.LiveAdapterRegistry(registry)
+    adapter = _Adapter()
+    adapters._cache[("telegram", None)] = adapter
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x", "secret_token": "s"})
+    update = json.dumps({"update_id": 700, "message": {
+        "message_id": 1, "from": {"id": 42, "is_bot": False}, "chat": {"id": 701, "type": "private"},
+        "date": 1700000000, "text": "chart my sales",
+    }}).encode()
+    event = asyncio.run(bridge.parse_inbound(body=update, headers={}, route_name=None))[0]
+
+    try:
+        with pytest.raises(DatabaseBusy):
+            asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
+    finally:
+        _delete_binding_and_its_rows("telegram", "701")
+
+    assert adapter.delivered == [("701", BUSY_NOTICE)]
     assert started == []

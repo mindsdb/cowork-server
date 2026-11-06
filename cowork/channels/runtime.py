@@ -4,23 +4,27 @@ import asyncio
 import base64
 import contextlib
 import logging
-import time
-from collections.abc import AsyncIterator
+import os
+import stat
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timezone
 from functools import partial
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID
 
 import re2
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from anton.core.dispatch import OutboundMessage
 from cowork.handlers._turn_history import reject_unreplayable_tool_rows
 from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.channels.sharing import shared_state
+from cowork.common.logger import log_context
+from cowork.common.paths import O_NOFOLLOW, O_NONBLOCK, dir_open, is_child_name, opened_subdir_nofollow, read_bounded
 from cowork.db.scoped import (
     LOCAL_SCOPE,
     SYSTEM_SCOPE,
@@ -30,7 +34,7 @@ from cowork.db.scoped import (
     scope_for_org,
     unsafe_unscoped_session,
 )
-from cowork.db.units import conversation_writes, run_db, run_efs
+from cowork.db.units import FilesystemBusy, conversation_writes, run_db, run_efs
 from cowork.handlers.responses import stage_remote_workspace
 from cowork.harnesses.base import ChannelContext, HarnessProvider, get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
@@ -38,13 +42,12 @@ from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
 from cowork.models.project import Project
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
-from cowork.common.settings.user_settings import use_settings_scope
-from cowork.services.artifact_roots import conversation_artifacts_base
-from cowork.services.artifacts import ProjectArtifacts, list_artifacts
+from cowork.common.settings.user_settings import UserSettings, use_settings_scope, use_turn_settings
+from cowork.services.artifact_roots import project_artifacts_base
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.channels import ChannelConfigService, resolve_installation_by_external_account
 from cowork.services.conversations import ConversationService
-from cowork.services.files import store_file
+from cowork.services.files import store_file, upload_basename
 from cowork.services.settings import unit_setting_service
 from cowork.services.skills import SkillService
 from cowork.streaming.answer_text import accumulate_answer_text
@@ -128,6 +131,19 @@ def is_new_command(text: str, *, is_mention: bool | None = None) -> bool:
 TYPING_REFRESH_S = 4.0
 
 MAX_TURN_ATTACHMENTS = 3
+#: The largest file a turn sends through an adapter that states no upload cap
+#: of its own. Each first-party bridge states its platform's cap as
+#: ``max_attachment_bytes``, and a turn never reads a file past it.
+MAX_TURN_ATTACHMENT_BYTES = 100 * 1024 * 1024
+
+#: What a sender hears when the pool or the file store refuses their message
+#: before the agent answers it.
+BUSY_NOTICE = "I'm overloaded right now and couldn't start on that. Please send it again in a minute."
+
+# An end-of-turn save tries this many times while the pool stays full, the
+# n-th retry after n times the backoff, before the conversation goes without it.
+_SAVE_TRIES = 3
+_SAVE_BACKOFF_S = 1.0
 
 # re2 logs pattern-compile/search errors to the process's raw stderr by
 # default (before absl::InitializeLog() — bypasses Python logging entirely),
@@ -137,29 +153,79 @@ _QUIET_REGEX_OPTIONS = re2.Options()
 _QUIET_REGEX_OPTIONS.log_errors = False
 
 
-def artifacts_since(project_path: str, conversation_id: UUID, since: float) -> list[tuple[str, str]]:
-    """(path, filename) of artifact primaries created/updated after ``since``
-    in this project. Time-window based: concurrent turns in the same project
-    could cross-attribute — acceptable for the single-operator v1."""
-    out: list[tuple[str, str]] = []
-    # This runs for one known project, so the root is built directly rather than
-    # resolved — the channel already holds the project it is answering for.
-    source = ProjectArtifacts(
-        base=conversation_artifacts_base(project_path, conversation_id),
-        project_id=None,
-        project_name=Path(project_path).name,
-    )
-    for card in list_artifacts([source]):
-        folder = Path(card.get("folder") or "")
-        try:
-            if (folder / "metadata.json").stat().st_mtime < since:
-                continue
-        except OSError:
+@dataclass(frozen=True)
+class TurnFile:
+    """One file a turn produced, read for an adapter's send_attachment hook."""
+
+    filename: str
+    data: bytes
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    """What one channel turn produced."""
+
+    reply: str
+    used_tools: bool
+    # The "path" of each artifact card the turn emitted
+    # (response.artifact_created): the artifact's primary file, or its folder
+    # when it has none. The card itself has no typed model; only its path is
+    # read here.
+    artifact_paths: tuple[str, ...]
+
+
+class _TurnSetup(NamedTuple):
+    """What a channel turn's first unit reads: the harness that runs the turn,
+    and the settings every later read in the turn is served from."""
+
+    harness_id: str
+    settings: UserSettings
+
+
+def read_turn_files(*, project_path: str, paths: Sequence[str], max_bytes: int) -> list[TurnFile]:
+    """The files to send for a turn's artifact paths, at most
+    MAX_TURN_ATTACHMENTS: each path that lies under the project's artifacts
+    base and is a regular file of at most ``max_bytes``, the adapter's own
+    upload cap. A file past the cap is skipped on its size alone, before any
+    of it is read.
+
+    The agent writes the artifact folders, so every folder below the project
+    and the file itself are opened without following a link: a link it
+    planted fails to open instead of sending a file from outside the folder.
+    A path whose file can't be read is skipped.
+    """
+    project = Path(project_path)
+    base = project_artifacts_base(project_path).relative_to(project).parts
+    files: list[TurnFile] = []
+    seen: set[str] = set()
+    for path in paths:
+        if len(files) == MAX_TURN_ATTACHMENTS:
+            break
+        if path in seen:
             continue
-        primary = Path(card.get("path") or "")
-        if primary.is_file():
-            out.append((str(primary), primary.name))
-    return out
+        seen.add(path)
+        try:
+            parts = Path(path).relative_to(project).parts
+        except ValueError:
+            continue
+        # Below the base's folders: one artifact folder, then the file.
+        if parts[: len(base)] != base or len(parts) < len(base) + 2 or not all(map(is_child_name, parts)):
+            continue
+        try:
+            with opened_subdir_nofollow(project, *parts[:-1]) as folder:
+                fd = dir_open(folder, parts[-1], os.O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
+                try:
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+                        continue
+                    data = b"".join(read_bounded(fd, info.st_size))
+                finally:
+                    os.close(fd)
+        except OSError:
+            log.warning("channel turn: could not read an artifact's file to send", exc_info=True)
+            continue
+        files.append(TurnFile(filename=parts[-1], data=data))
+    return files
 
 
 async def typing_loop(adapter: Any, address: Any) -> None:
@@ -363,11 +429,23 @@ class AntonChannelRuntime:
         # Every read and write below is a unit of its own, so the turn holds
         # no pooled connection while the agent runs and the event loop never
         # waits for one.
+        #
+        # A unit the pool or the file store refuses before the agent answers
+        # ends the turn with that refusal, so the event records `failed`, and
+        # the sender hears BUSY_NOTICE rather than nothing: the platform got
+        # its acknowledgement and never sends the message again. The saves
+        # after the answer retry and never raise a busy refusal (_save_turn_row).
         scope = scope_for_org(org_id) if org_id else scope_for_background_context()
-        binding = await run_db(
-            partial(self._resolve_or_create_binding, channel_type=channel_type, event=event),
-            scope=scope,
-        )
+        try:
+            binding = await run_db(
+                partial(self._resolve_or_create_binding, channel_type=channel_type, event=event),
+                scope=scope,
+            )
+        except (PoolTimeoutError, FilesystemBusy):
+            # The trigger rule is unknown here: answer only a message addressed to the bot.
+            if event.message.is_mention or not event.message.is_group:
+                await self._send_busy_notice(channel_type=channel_type, event=event, org_id=org_id)
+            raise
         log.info(
             "channel %s: binding %s → project %s (trigger=%s)",
             channel_type, binding.id, binding.anton_project_id, binding.trigger_rule,
@@ -376,7 +454,11 @@ class AntonChannelRuntime:
             log.info("channel %s: trigger rule %r skipped a message", channel_type, binding.trigger_rule)
             return
         if is_new_command(self._event_text(event), is_mention=event.message.is_mention):
-            await self._start_fresh(scope, channel_type, binding, event, org_id)
+            try:
+                await self._start_fresh(scope, channel_type, binding, event, org_id)
+            except (PoolTimeoutError, FilesystemBusy):
+                await self._send_busy_notice(channel_type=channel_type, event=event, org_id=org_id)
+                raise
             return
         # Optional hook: adapters with set_typing show a typing indicator
         # for the duration of the turn; others are untouched.
@@ -384,8 +466,6 @@ class AntonChannelRuntime:
         typing = None
         if adapter is not None and callable(getattr(adapter, "set_typing", None)):
             typing = asyncio.create_task(typing_loop(adapter, event.address))
-        # 1s slack for filesystem timestamp granularity.
-        turn_started = time.time() - 1
         try:
             conversation = await run_db(
                 partial(self._open_conversation, binding=binding, event=event), scope=scope
@@ -399,29 +479,45 @@ class AntonChannelRuntime:
             # Nested get_user_settings() reads (model/provider) must resolve
             # against this org, not fall back to local/global.
             with use_settings_scope(scope):
-                reply, used_tools = await self._run_anton(
+                outcome = await self._run_anton(
                     scope, conversation, event, adapter, channel_context=channel_context
                 )
+        except (PoolTimeoutError, FilesystemBusy):
+            await self._send_busy_notice(channel_type=channel_type, event=event, org_id=org_id)
+            raise
         finally:
             if typing is not None:
                 typing.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await typing
+        reply = outcome.reply
         log.info(
             "channel %s: turn complete (reply=%d chars, used_tools=%s)",
-            channel_type, len(reply or ""), used_tools,
+            channel_type, len(reply or ""), outcome.used_tools,
         )
+        # Outside the refusal's try above: a refusal after the reply must not
+        # send the notice as a second message.
         if reply and reply.strip():
             # The link is a channel affordance only; the stored assistant
             # message stays canonical (UI users are already in the conversation).
             outbound = reply
-            if used_tools:
+            if outcome.used_tools:
                 link = conversation_link(conversation.id)
                 if link:
                     outbound = f"{reply}\n\n{link}"
             await self._deliver(channel_type, event, outbound, org_id)
-        if used_tools:
-            await self.send_turn_artifacts(adapter, event, conversation, turn_started, scope=scope)
+        if outcome.artifact_paths:
+            await self.send_turn_artifacts(
+                adapter=adapter, event=event, conversation=conversation, paths=outcome.artifact_paths, scope=scope,
+            )
+
+    async def _send_busy_notice(self, *, channel_type: str, event: Any, org_id: str | None) -> None:
+        """Tell the sender a busy server refused their message. A notice that
+        fails to send is logged, and the refusal still propagates."""
+        try:
+            await self._deliver(channel_type, event, BUSY_NOTICE, org_id)
+        except Exception:
+            log.warning("channel turn: could not deliver the busy notice", exc_info=True)
 
     async def _start_fresh(
         self, scope: TenantScope, channel_type: str, binding: ChannelBinding, event: Any,
@@ -567,10 +663,14 @@ class AntonChannelRuntime:
         scoped.add(row)
         scoped.commit()
 
-    def resolve_turn_harness(self, scoped: ScopedSession, conversation: Conversation) -> str:
-        """Pinned harness for this conversation (whatever first served it), else
-        the configured channel agent. This is the persisted ``channels_harness``
-        setting (UI-selectable, env-seeded) — never the desktop UI harness."""
+    def _read_turn_setup(self, scoped: ScopedSession, *, conversation: Conversation) -> _TurnSetup:
+        """The turn's settings and its harness, read as one unit.
+
+        The harness is the one pinned to this conversation (whatever first
+        served it), else the configured channel agent. That is the persisted
+        ``channels_harness`` setting (UI-selectable, env-seeded), never the
+        desktop UI harness."""
+        settings = unit_setting_service(scoped).load()
         # Messages are children (no org_id): anchored on the caller's conversation.
         pinned = scoped.exec(
             scoped.select(DBMessage.harness).where(
@@ -579,10 +679,8 @@ class AntonChannelRuntime:
                 DBMessage.harness != None,  # noqa: E711
             ).limit(1)
         ).first()
-        if pinned:
-            return pinned
-        configured = unit_setting_service(scoped).load().channels_harness
-        return (configured or "").strip() or DEFAULT_CHANNEL_HARNESS
+        harness_id = pinned or (settings.channels_harness or "").strip() or DEFAULT_CHANNEL_HARNESS
+        return _TurnSetup(harness_id=harness_id, settings=settings)
 
     async def _turn_stream(
         self, harness: HarnessProvider, harness_id: str, scope: TenantScope,
@@ -612,84 +710,129 @@ class AntonChannelRuntime:
     async def _run_anton(
         self, scope: TenantScope, conversation: Conversation, event: Any, adapter: Any = None,
         *, channel_context: ChannelContext | None = None,
-    ) -> tuple[str, bool]:
-        """Run one channel turn; returns the reply text and whether tools ran."""
-        harness_id = await run_db(
-            partial(self.resolve_turn_harness, conversation=conversation), scope=scope
-        )
-        try:
-            harness = get_harness(harness_id)
-        except ValueError:
-            log.warning("harness %r is not registered; falling back to %s", harness_id, DEFAULT_CHANNEL_HARNESS)
-            harness_id = DEFAULT_CHANNEL_HARNESS
-            harness = get_harness(harness_id)
+    ) -> TurnOutcome:
+        """Run one channel turn; returns its reply, whether tools ran, and the
+        paths of the artifacts it created or touched.
 
-        text = self._event_text(event)
-        # In a group, several people share one conversation — prefix each
-        # message with the sender's name so the model (and the stored history)
-        # can tell who said what. Applied after trigger gating, so regex rules
-        # keep matching the raw text.
-        sender_name = getattr(event.message, "sender_name", None)
-        if text and event.message.is_group and sender_name:
-            text = f"{sender_name}: {text}"
-        blocks = await self.build_input_blocks(scope, adapter, event, text)
+        The turn's first unit loads its settings, and the rest of the turn
+        runs with them bound (use_turn_settings) on the event loop, as a
+        browser turn's handle() binds its own. Every later settings read, here,
+        in the worker threads of the turn's units and in the remote turn's
+        stream (its seed read and its memory save among them), is served from
+        that snapshot, so no unit asks the pool for a second connection while
+        it holds one. The binding sits here rather than in remote_turn_events:
+        a context variable an async generator sets across its yields is reset
+        in the wrong context when the generator is finalized from another
+        task, which raises."""
+        setup = await run_db(partial(self._read_turn_setup, conversation=conversation), scope=scope)
+        with use_turn_settings(scope, setup.settings):
+            harness_id = setup.harness_id
+            try:
+                harness = get_harness(harness_id)
+            except ValueError:
+                log.warning("harness %r is not registered; falling back to %s", harness_id, DEFAULT_CHANNEL_HARNESS)
+                harness_id = DEFAULT_CHANNEL_HARNESS
+                harness = get_harness(harness_id)
 
-        names = [a.filename for a in (event.message.attachments or [])]
-        content = text or (f"[attachments: {', '.join(names)}]" if names else "")
-        # Send time captured before the turn
-        sent_at = datetime.now(timezone.utc)
+            text = self._event_text(event)
+            # In a group, several people share one conversation — prefix each
+            # message with the sender's name so the model (and the stored history)
+            # can tell who said what. Applied after trigger gating, so regex rules
+            # keep matching the raw text.
+            sender_name = getattr(event.message, "sender_name", None)
+            if text and event.message.is_group and sender_name:
+                text = f"{sender_name}: {text}"
+            blocks = await self.build_input_blocks(scope, adapter, event, text)
 
-        collected: list[str] = []
-        events: list[dict] = []
-        turn_rows: list[dict] = []
+            names = [a.filename for a in (event.message.attachments or [])]
+            content = text or (f"[attachments: {', '.join(names)}]" if names else "")
+            # Send time captured before the turn
+            sent_at = datetime.now(timezone.utc)
 
-        def event_sink(event_type: str, data: dict) -> None:
-            # Tool block-rows are for LLM-history persistence, not UI replay —
-            # keep them out of the events log (mirrors handlers/responses.py).
-            if event_type == "response.turn_history":
-                # Id-checked even in-process; see handlers/responses.py (ENG-2420).
-                turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
-                return
-            events.append(data)
-            accumulate_answer_text(collected, event_type, data)
+            collected: list[str] = []
+            events: list[dict] = []
+            turn_rows: list[dict] = []
+            artifact_paths: list[str] = []
 
-        stream = await self._turn_stream(
-            harness, harness_id, scope, conversation, blocks, text, channel_context, turn_rows,
-        )
-        remote_failure: RemoteTurnFailed | None = None
-        try:
-            async for _chunk in harness.formatter(stream, harness_id, event_sink):
-                pass
-        except RemoteTurnFailed as exc:
-            remote_failure = exc
-        finally:
-            # Persist the user message only after the harness has read this
-            # turn's history (it reads via a fresh query). Persisting earlier
-            # would replay the message into this turn AND resend it as the live
-            # input. In `finally` so a crashed turn still records the inbound
-            # message, matching the pre-history-replay behaviour.
-            #
-            # Each save holds the conversation's write lock, as every message
-            # writer in this process does: a turn sent from the UI into this
-            # conversation saves from a worker thread, and two writers
-            # numbering rows at once would give them the same seq.
-            async with conversation_writes(conversation.id):
-                await run_db(
-                    lambda session: ConversationService(session).save_user_message(
+            def event_sink(event_type: str, data: dict) -> None:
+                # Tool block-rows are for LLM-history persistence, not UI replay —
+                # keep them out of the events log (mirrors handlers/responses.py).
+                if event_type == "response.turn_history":
+                    # Id-checked even in-process; see handlers/responses.py (ENG-2420).
+                    turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
+                    return
+                if event_type == "response.artifact_created":
+                    card = data.get("artifact")
+                    if isinstance(card, dict) and isinstance(card.get("path"), str):
+                        artifact_paths.append(card["path"])
+                events.append(data)
+                accumulate_answer_text(collected, event_type, data)
+
+            stream = await self._turn_stream(
+                harness, harness_id, scope, conversation, blocks, text, channel_context, turn_rows,
+            )
+            remote_failure: RemoteTurnFailed | None = None
+            try:
+                async for _chunk in harness.formatter(stream, harness_id, event_sink):
+                    pass
+            except RemoteTurnFailed as exc:
+                remote_failure = exc
+            finally:
+                # Persist the user message only after the harness has read this
+                # turn's history (it reads via a fresh query). Persisting earlier
+                # would replay the message into this turn AND resend it as the live
+                # input. In `finally` so a crashed turn still records the inbound
+                # message, matching the pre-history-replay behaviour.
+                await self._save_turn_row(
+                    conversation_id=conversation.id,
+                    save=lambda session: ConversationService(session).save_user_message(
                         conversation.id, content, created_at=sent_at
                     ),
                     scope=scope,
+                    what="question",
                 )
 
-        reply = remote_failure.message if remote_failure is not None else "".join(collected)
-        async with conversation_writes(conversation.id):
-            await run_db(
-                lambda session: ConversationService(session).save_assistant_turn(
+            reply = remote_failure.message if remote_failure is not None else "".join(collected)
+            await self._save_turn_row(
+                conversation_id=conversation.id,
+                save=lambda session: ConversationService(session).save_assistant_turn(
                     conversation.id, reply, events, harness=harness_id, tool_rows=turn_rows,
                 ),
                 scope=scope,
+                what="answer",
             )
-        return reply, turn_used_tools(events)
+        return TurnOutcome(reply=reply, used_tools=turn_used_tools(events), artifact_paths=tuple(artifact_paths))
+
+    @staticmethod
+    async def _save_turn_row(
+        *, conversation_id: UUID, save: Callable[[ScopedSession], object], scope: TenantScope, what: str,
+    ) -> None:
+        """One end-of-turn save, in a unit. A busy pool is retried; a save
+        still refused after _SAVE_TRIES is logged, and the turn goes on, so
+        the reply the agent produced is delivered anyway. No HTTP caller waits
+        on a channel turn, so the retries need not end within POOL_TIMEOUT.
+
+        Each try holds the conversation's write lock, as every message writer
+        in this process does: a turn sent from the UI into this conversation
+        saves from a worker thread, and two writers numbering rows at once
+        would give them the same seq. Nothing holds it during the backoff."""
+        for attempt in range(1, _SAVE_TRIES + 1):
+            try:
+                async with conversation_writes(conversation_id):
+                    await run_db(save, scope=scope)
+                return
+            except PoolTimeoutError:
+                if attempt == _SAVE_TRIES:
+                    log.warning(
+                        "channel turn: no database connection freed to save a message; the conversation lacks it",
+                        extra={
+                            **log_context(conversation_id=conversation_id),
+                            "step": f"save_{what}",
+                            "attempts": _SAVE_TRIES,
+                        },
+                    )
+                    return
+                await asyncio.sleep(_SAVE_BACKOFF_S * attempt)
 
     @staticmethod
     def _event_text(event: Any) -> str:
@@ -713,7 +856,7 @@ class AntonChannelRuntime:
             # The filename comes from an external platform, so keep only its basename.
             stored = await store_file(
                 scope=scope,
-                filename=Path(attachment.filename).name.strip() or "file",
+                filename=upload_basename(name=attachment.filename) or "file",
                 content_type=attachment.mime_type,
                 data=data,
                 purpose="channel",
@@ -731,25 +874,42 @@ class AntonChannelRuntime:
         return blocks
 
     async def send_turn_artifacts(
-        self, adapter: Any, event: Any, conversation: Conversation, since: float, *, scope: TenantScope
+        self, *, adapter: Any, event: Any, conversation: Conversation, paths: Sequence[str], scope: TenantScope,
     ) -> None:
-        """Send files the turn produced through the optional send_attachment
-        hook. Best-effort per file; channels without the hook are untouched.
-        ``conversation`` comes with its project loaded (_open_conversation)."""
+        """Send the files of the artifacts the turn created or touched, the
+        paths its own cards name, through the optional send_attachment hook:
+        never another conversation's, though the project's artifacts base is
+        shared. Best-effort per file; channels without the hook are untouched.
+        ``conversation`` comes with its project loaded (_open_conversation).
+
+        A file past the adapter's upload cap (its ``max_attachment_bytes``,
+        else MAX_TURN_ATTACHMENT_BYTES) is skipped before it is read, since
+        the platform would refuse it anyway. The files are read in one call
+        on the file store's threads. The reply is already delivered, so a
+        file store that frees no slot in time sends no files, with a WARNING,
+        and the turn still ends well."""
         sender = getattr(adapter, "send_attachment", None) if adapter is not None else None
         if not callable(sender):
             return
         project = conversation.project
         if project is None:
             return
-        produced = await run_efs(
-            partial(artifacts_since, project.path, conversation.id, since), scope=scope
-        )
-        for path, filename in produced[:MAX_TURN_ATTACHMENTS]:
+        max_bytes = getattr(adapter, "max_attachment_bytes", MAX_TURN_ATTACHMENT_BYTES)
+        try:
+            files = await run_efs(
+                partial(read_turn_files, project_path=project.path, paths=paths, max_bytes=max_bytes), scope=scope,
+            )
+        except FilesystemBusy:
+            log.warning(
+                "channel turn: no file store slot freed in time to send the turn's files",
+                extra=log_context(conversation_id=conversation.id),
+            )
+            return
+        for file in files:
             try:
-                await sender(address=event.address, path=path, filename=filename)
+                await sender(address=event.address, data=file.data, filename=file.filename)
             except Exception:
-                log.warning("channel %s: failed sending artifact %s", event.address.channel_type, filename)
+                log.warning("channel %s: failed sending artifact %s", event.address.channel_type, file.filename)
 
     async def _deliver(self, channel_type: str, event: Any, reply: str, org_id: str | None = None) -> None:
         adapter = self._adapters.get(channel_type, org_id)

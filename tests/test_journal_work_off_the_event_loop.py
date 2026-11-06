@@ -6,10 +6,12 @@ every request and stream on the server, every other person's included.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import cowork.services.task_objects as task_objects
+from cowork.handlers.responses import _RemoteArtifactsDir
 from cowork.services import local_artifact_comments
 
 import test_remote_turn
@@ -51,7 +53,7 @@ async def test_the_remote_turn_end_capture_runs_off_the_loop(monkeypatch):
         seen.append(on_the_event_loop())
         return task_objects.ArtifactChanges(created=[], touched=set())
 
-    context = (object(), object(), "project", "Project")
+    context = _RemoteArtifactsDir(base=Path("/project/artifacts"), project_id="project", project_name="Project", creator=None)
     test_remote_turn._fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
     monkeypatch.setattr(task_objects, "turn_artifact_changes", changes)

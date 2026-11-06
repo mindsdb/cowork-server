@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.api.v1.permissions import PlatformSignature, require
 from cowork.channels.plugin import ChannelPlugin
@@ -339,15 +340,26 @@ async def intake_events(
 async def _process_event(
     channel_type: str, event: Any, event_id: Any, sink: InboundSink, *, org_id: str | None = None
 ) -> None:
-    """Route one event to the sink and record the outcome, each write in a
-    unit of its own."""
+    """Route one event to the sink, then record the outcome in a unit.
+
+    Only the sink's own failure marks the event `failed`. The status is a
+    record for operators: dedupe ignores it (is_duplicate_inbound), so a
+    status write the pool refuses is logged and dropped, and the task never
+    ends with an exception nobody retrieves."""
     scope = scope_for_org(org_id)
     try:
         await sink(channel_type, event, org_id)
-        await run_db(partial(_set_event_status, event_id=event_id, status="routed"), scope=scope)
     except Exception as exc:
-        await run_db(
-            partial(_set_event_status, event_id=event_id, status="failed", error=type(exc).__name__),
-            scope=scope,
-        )
         log.exception("channel %s inbound sink failed", channel_type)
+        status, error = "failed", type(exc).__name__
+    else:
+        status, error = "routed", None
+    try:
+        await run_db(
+            partial(_set_event_status, event_id=event_id, status=status, error=error), scope=scope,
+        )
+    except PoolTimeoutError:
+        log.warning(
+            "channel event: no database connection freed to record its status",
+            extra={"outcome": status},
+        )

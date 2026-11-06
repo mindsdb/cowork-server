@@ -248,6 +248,63 @@ async def test_a_cancel_while_an_event_is_recorded_still_schedules_it(monkeypatc
         _delete_channel_events("evt-cancelled")
 
 
+def _status_writes_refused(monkeypatch) -> list[str]:
+    """Make every event status write meet a full pool; returns the statuses
+    it was asked to write."""
+    from cowork.db.units import DatabaseBusy
+
+    asked: list[str] = []
+
+    def refused(session, *, event_id, status, error=None):
+        asked.append(status)
+        raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+
+    monkeypatch.setattr(webhooks, "_set_event_status", refused)
+    return asked
+
+
+async def test_a_delivered_event_whose_status_write_is_refused_is_not_marked_failed(monkeypatch, caplog):
+    """The sink delivered the reply, then the pool refuses the `routed`
+    write. The event is not marked `failed` for it: the status is a record
+    that dedupe ignores, so the refusal logs one WARNING, and the task ends
+    without an exception."""
+    asked = _status_writes_refused(monkeypatch)
+    delivered: list = []
+
+    async def sink(channel_type, event, org_id=None):
+        delivered.append(event)
+
+    with caplog.at_level(logging.WARNING, logger=webhooks.log.name):
+        await webhooks._process_event("slack", {"key": "evt-routed"}, "event-1", sink)
+
+    assert delivered == [{"key": "evt-routed"}]
+    assert asked == ["routed"]
+    records = [r for r in caplog.records if r.name == webhooks.log.name]
+    assert [(r.levelname, r.getMessage(), r.outcome) for r in records] == [(
+        "WARNING", "channel event: no database connection freed to record its status", "routed",
+    )]
+
+
+async def test_a_failed_event_whose_status_write_is_refused_ends_without_an_exception(monkeypatch, caplog):
+    """The sink fails, and the pool refuses the `failed` write too. The
+    sink's failure is logged, the refusal is a WARNING, and nothing escapes
+    the background task."""
+    asked = _status_writes_refused(monkeypatch)
+
+    async def sink(channel_type, event, org_id=None):
+        raise RuntimeError("adapter send failed")
+
+    with caplog.at_level(logging.WARNING, logger=webhooks.log.name):
+        await webhooks._process_event("slack", {"key": "evt-failed"}, "event-2", sink)
+
+    assert asked == ["failed"]
+    records = [r for r in caplog.records if r.name == webhooks.log.name]
+    assert [r.levelname for r in records] == ["ERROR", "WARNING"]
+    assert (records[1].getMessage(), records[1].outcome) == (
+        "channel event: no database connection freed to record its status", "failed",
+    )
+
+
 # --- Real plugins' extractors: pulled unverified, used only as a lookup key ---
 
 def test_slack_extract_team_id():

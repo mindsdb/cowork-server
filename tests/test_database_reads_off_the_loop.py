@@ -1,5 +1,5 @@
 """Search, settings, the MindsHub workspaces and the channel ingress reconcile
-read the database in worker threads.
+read and write the database in worker threads.
 
 With the pool's only connection held elsewhere, each one waits for it without
 stopping the event loop: a heartbeat on the test's loop keeps ticking and
@@ -130,16 +130,18 @@ def one_workspace(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "path",
+    ("method", "path", "body"),
     [
-        "/api/v1/search?q=quarterly",
-        "/api/v1/settings/",
-        "/api/v1/settings/recommended-models",
-        "/api/v1/hub/workspaces/",
+        ("GET", "/api/v1/search?q=quarterly", None),
+        # A coroutine route: the settings list is a sync route, which waits in
+        # a worker thread whether or not its reads are units.
+        ("PUT", "/api/v1/settings/tone", {"value": "concise"}),
+        ("GET", "/api/v1/settings/recommended-models", None),
+        ("GET", "/api/v1/hub/workspaces/", None),
     ],
 )
-async def test_a_read_that_finds_the_pool_held_waits_off_the_loop(held_pool, client, one_workspace, path):
-    measured = await _while_others_are_served(client, lambda: client.get(path))
+async def test_a_read_that_finds_the_pool_held_waits_off_the_loop(held_pool, client, one_workspace, method, path, body):
+    measured = await _while_others_are_served(client, lambda: client.request(method, path, json=body))
 
     response = measured.outcome
     assert response.status_code == 503, response.text[:300]

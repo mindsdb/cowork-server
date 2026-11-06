@@ -299,6 +299,19 @@ def _prune_staged_attachments(attach: PinnedDir, keep: set[str]) -> None:
             )
 
 
+def upload_basename(*, name: str | None) -> str | None:
+    """The last component of an untrusted file name, stripped, or None when
+    nothing usable is left (``''``, ``.`` or ``..``).
+
+    Keeping only the last component stops ``../`` or an absolute path from
+    leaving the file's own folder; ``.`` and ``..`` would name that folder or
+    the files root itself. Uploads and channel attachments both go through
+    here before store_file.
+    """
+    basename = Path(name or "").name.strip()
+    return None if basename in ("", ".", "..") else basename
+
+
 def _write_upload(file_dir: Path, name: str, contents: bytes) -> Path:
     """Write an upload into its own new folder, or leave no folder behind."""
     try:
@@ -329,7 +342,8 @@ async def store_file(
     *, scope: TenantScope, filename: str, content_type: str, data: bytes, purpose: str
 ) -> File:
     """Save ``data`` as a new file named ``filename``, which the caller has
-    already reduced to a safe basename, and return its loaded row.
+    already reduced to a safe basename (upload_basename), and return its
+    loaded row.
 
     The storage root refuses a scope with no organization where files are
     partitioned (scoped_storage_root), so a missing principal fails before any
@@ -360,15 +374,9 @@ async def store_file(
 async def save_upload(upload: UploadFile, *, purpose: str, scope: TenantScope) -> File:
     """Save an uploaded file in ``scope`` (store_file) and return its row."""
     contents = await upload.read()
-    # Untrusted filename: keep the basename only so `../` or an absolute
-    # path can't escape the per-file dir. `.name` also leaves bare "."/".." —
-    # reject those.
-    safe_name = Path(upload.filename or "upload").name.strip()
-    if safe_name in ("", ".", ".."):
-        safe_name = "upload"
     return await store_file(
         scope=scope,
-        filename=safe_name,
+        filename=upload_basename(name=upload.filename) or "upload",
         content_type=upload.content_type,
         data=contents,
         purpose=purpose,
@@ -445,35 +453,6 @@ class FileService:
         if file is None:
             raise ValueError("File not found")
         return self._to_response(file)
-
-    def create_file_from_bytes(
-        self, *, filename: str, content_type: str, data: bytes, purpose: str
-    ) -> File:
-        """Server-side ingestion (e.g. channel media); returns the model.
-        The filename comes from an external platform, so keep only its basename."""
-        safe_name = Path(filename).name.strip() or "file"
-        file = File(
-            filename=safe_name,
-            content_type=content_type or "application/octet-stream",
-            size=len(data),
-            purpose=purpose,
-            path="",
-        )
-        # Row staged first — scope failure must precede any filesystem write.
-        self.session.add(file)
-        file_dir = self._root_dir() / str(file.id)
-        try:
-            file_dir.mkdir(parents=True)
-            dest = file_dir / safe_name
-            dest.write_bytes(data)
-        except Exception:
-            self.session.rollback()
-            shutil.rmtree(file_dir, ignore_errors=True)
-            raise
-        file.path = str(dest)
-        self.session.commit()
-        self.session.refresh(file)
-        return file
 
     def _get_file_model(self, file_id: UUID) -> File:
         file = self._owned(file_id)

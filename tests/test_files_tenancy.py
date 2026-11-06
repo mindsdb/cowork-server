@@ -16,6 +16,7 @@ from fastapi import UploadFile
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from _fakes import stored_file
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.harnesses.anton_harness.harness import _conversation_attachment_context
@@ -52,7 +53,7 @@ def _svc(engine, scope: TenantScope) -> FileService:
 
 
 def _mkfile(svc: FileService, purpose: str = "assistants") -> File:
-    return svc.create_file_from_bytes(
+    return stored_file(scoped=svc.session,
         filename="report.csv", content_type="text/csv", data=b"a,b\n1,2\n", purpose=purpose
     )
 
@@ -201,7 +202,7 @@ def _conversation_with_file(engine, scope: TenantScope):
     scoped.add(conv)
     scoped.commit()
     scoped.refresh(conv)
-    FileService(scoped).create_file_from_bytes(
+    stored_file(scoped=scoped,
         filename="doc.txt", content_type="text/plain", data=b"hi",
         purpose=attachment_purpose(str(conv.id)),
     )
@@ -399,6 +400,19 @@ async def test_upload_filename_cannot_escape_root(units_read_engine, tmp_path, n
     assert not (tmp_path / "etc").exists()
 
 
+@pytest.mark.parametrize(
+    ("name", "basename"),
+    [
+        (None, None), ("", None), (".", None), ("..", None), (" .. ", None), ("a/..", None),
+        ("../../etc/pwned", "pwned"), ("/etc/cron.d/pwned", "pwned"), (" report.csv ", "report.csv"),
+    ],
+)
+def test_an_untrusted_name_keeps_its_last_component_or_nothing(name, basename):
+    from cowork.services.files import upload_basename
+
+    assert upload_basename(name=name) == basename
+
+
 async def test_a_cancel_while_the_uploads_row_commits_keeps_its_bytes(units_read_engine, monkeypatch):
     """A cancel lands while the row's unit runs, as at process exit for a
     channel turn's attachment. run_db lets the unit commit before the cancel
@@ -553,9 +567,9 @@ def test_delete_after_root_move_still_ignores_escaped_paths(engine, tmp_path, mo
 def test_stage_conversation_attachments_copies_into_workspace(engine, tmp_path):
     svc = _svc(engine, _scope(ORG_A))
     conv = str(uuid4())
-    a = svc.create_file_from_bytes(filename="shot.png", content_type="image/png",
+    a = stored_file(scoped=svc.session, filename="shot.png", content_type="image/png",
                                    data=b"img", purpose=attachment_purpose(conv))
-    b = svc.create_file_from_bytes(filename="notes.txt", content_type="text/plain",
+    b = stored_file(scoped=svc.session, filename="notes.txt", content_type="text/plain",
                                    data=b"hi", purpose=attachment_purpose(conv))
     proj = tmp_path / "proj"
     assert svc.stage_conversation_attachments(conv, proj) == 2
@@ -567,9 +581,9 @@ def test_stage_conversation_attachments_copies_into_workspace(engine, tmp_path):
 def test_stage_is_idempotent_and_conversation_scoped(engine, tmp_path):
     svc = _svc(engine, _scope(ORG_A))
     conv, other = str(uuid4()), str(uuid4())
-    svc.create_file_from_bytes(filename="a.txt", content_type="text/plain",
+    stored_file(scoped=svc.session, filename="a.txt", content_type="text/plain",
                                data=b"x", purpose=attachment_purpose(conv))
-    svc.create_file_from_bytes(filename="b.txt", content_type="text/plain",
+    stored_file(scoped=svc.session, filename="b.txt", content_type="text/plain",
                                data=b"y", purpose=attachment_purpose(other))
     proj = tmp_path / "proj"
     assert svc.stage_conversation_attachments(conv, proj) == 1      # only this conv's
@@ -617,9 +631,9 @@ def test_clearing_staged_instructions_works_without_os_o_nofollow(tmp_path, monk
 def test_stage_prunes_a_deleted_attachment(engine, tmp_path):
     svc = _svc(engine, _scope(ORG_A))
     conv = str(uuid4())
-    a = svc.create_file_from_bytes(filename="keep.txt", content_type="text/plain",
+    a = stored_file(scoped=svc.session, filename="keep.txt", content_type="text/plain",
                                    data=b"k", purpose=attachment_purpose(conv))
-    b = svc.create_file_from_bytes(filename="gone.txt", content_type="text/plain",
+    b = stored_file(scoped=svc.session, filename="gone.txt", content_type="text/plain",
                                    data=b"g", purpose=attachment_purpose(conv))
     proj = tmp_path / "proj"
     assert svc.stage_conversation_attachments(conv, proj) == 2
@@ -639,7 +653,7 @@ def test_stage_refuses_symlinked_attachments_dir(engine, tmp_path):
     # the victim's data. The staging path must never follow it.
     svc = _svc(engine, _scope(ORG_A))
     conv = str(uuid4())
-    a = svc.create_file_from_bytes(filename="keep.txt", content_type="text/plain",
+    a = stored_file(scoped=svc.session, filename="keep.txt", content_type="text/plain",
                                    data=b"k", purpose=attachment_purpose(conv))
 
     # Stand-in for another org's tree, and the pod-planted symlink over `attachments`.

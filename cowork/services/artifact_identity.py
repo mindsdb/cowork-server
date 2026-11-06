@@ -299,12 +299,11 @@ def _ensure_full_id(
         return resolved, latest
     updated = {key: value for key, value in latest.items() if key != "stableId"}
     updated["id"] = resolved
-    # metadata.json's mtime is a turn-recency signal: channel delivery
-    # (artifacts_since) treats a fresh mtime as "this turn touched the
-    # artifact". Widening an id changes no user-visible content, so restore the
+    # metadata.json's mtime is a recency signal: the artifacts list
+    # (cowork.services.artifacts.list_artifacts) orders folders by it, newest
+    # first. Widening an id changes no user-visible content, so restore the
     # original timestamps or the first card/index build after an upgrade
-    # would mark every legacy artifact as just-updated and deliver stale
-    # attachments to the chat.
+    # would move every legacy artifact to the top as just updated.
     try:
         before = dir_stat(folder, name, follow_symlinks=False)
     except OSError:

@@ -112,13 +112,14 @@ from pathlib import Path  # noqa: E402
 
 from cowork.models.conversation import Conversation  # noqa: E402
 from cowork.models.project import Project  # noqa: E402
+from _fakes import stored_file  # noqa: E402
 from cowork.services.files import FileService, attachment_purpose, unlink_file_dirs  # noqa: E402
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession  # noqa: E402
 from cowork.services.projects import ProjectService  # noqa: E402
 
 
 def _attach(session, conversation_id, name="doc.txt"):
-    return FileService(ScopedSession(session, LOCAL_SCOPE)).create_file_from_bytes(
+    return stored_file(scoped=ScopedSession(session, LOCAL_SCOPE),
         filename=name,
         content_type="text/plain",
         data=b"hello",
@@ -151,7 +152,7 @@ def test_delete_conversation_leaves_other_conversations_and_purposes(session):
     keep_file = _attach(session, keep.id)
     _attach(session, doomed.id)
     # A non-attachment purpose must never be touched.
-    other = FileService(ScopedSession(session, LOCAL_SCOPE)).create_file_from_bytes(
+    other = stored_file(scoped=ScopedSession(session, LOCAL_SCOPE),
         filename="c.bin",
         content_type="application/octet-stream",
         data=b"x",

@@ -675,9 +675,11 @@ def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -
     return ArtifactStatusView()
 
 
-# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
-# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
-# whenever org mode has no org in scope.
+# require(AuthenticatedInOrgMode), declared explicitly, refuses a caller with
+# no org in scope in org mode before the route runs. Without it the route
+# still fails closed: the ScopedSession each run_db unit builds (unit_session
+# in cowork/db/units.py) raises MissingTenantScopeError (401,
+# cowork/db/scoped.py) at its first partitioned query.
 @router.get("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def list_artifacts(
     scope: ScopeDep,
@@ -727,8 +729,8 @@ async def list_artifacts(
 
 
 
-# AuthenticatedInOrgMode, declared explicitly: same ScopedSessionDep
-# fail-closed reasoning as list_artifacts above.
+# AuthenticatedInOrgMode, declared explicitly: same reasoning as
+# list_artifacts above.
 @router.delete(
     "/{slug}", status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require(AuthenticatedInOrgMode))],
