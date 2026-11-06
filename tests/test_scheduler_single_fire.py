@@ -347,14 +347,19 @@ async def test_a_resumed_schedule_uses_up_a_left_due_slot_whose_run_may_have_act
             pass
 
         async def handle(self, request):
-            _pause(schedule_id)
-            raise RuntimeError("the agent failed")
+            async def stream():
+                _pause(schedule_id)
+                raise RuntimeError("the agent failed")
+                yield  # Fail while draining, after the turn was handed off.
+
+            return stream()
 
     monkeypatch.setattr(responses_mod, "ResponsesHandler", PausedThenFailingHandler)
 
     await scheduler.execute_schedule(schedule_id, slot_at=SLOT)
     (failed,) = _runs(schedule_id)
     assert failed.status == RunStatus.failed and failed.slot_at is None
+    assert failed.outcome == "uncertain"
     assert ensure_utc(_schedule(schedule_id).next_run_at) == SLOT, "the pause left the slot due"
     assert schedule_id not in [slot.schedule_id for slot in _poll()], "nothing runs while paused"
 

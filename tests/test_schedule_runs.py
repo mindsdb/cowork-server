@@ -181,10 +181,10 @@ def test_a_short_cadence_runs_the_slot_right_after_a_manual_run(cadence):
 
 
 @pytest.mark.parametrize(("cadence", "step", "missed"), [
-    ("every_15_minutes", timedelta(minutes=15), 9),
-    ("every_30_minutes", timedelta(minutes=30), 5),
+    ("every_15_minutes", timedelta(minutes=15), 8),
+    ("every_30_minutes", timedelta(minutes=30), 4),
 ])
-def test_a_short_cadence_back_from_downtime_moves_to_its_next_slot(cadence, step, missed):
+def test_a_short_cadence_back_from_downtime_keeps_its_latest_slot_due(cadence, step, missed):
     from cowork.scheduler import _handle_missed_runs
 
     session = _session()
@@ -197,7 +197,8 @@ def test_a_short_cadence_back_from_downtime_moves_to_its_next_slot(cadence, step
     session.refresh(schedule)
     next_run = schedule.next_run_at.replace(tzinfo=timezone.utc)
     assert schedule.missed_runs == missed
-    assert now < next_run <= now + step
+    assert now - step < next_run <= now
+    assert next_run == overdue + step * missed
     # Still on the task's own grid, counted from its original start.
     assert (next_run - overdue) % step == timedelta(0)
 
