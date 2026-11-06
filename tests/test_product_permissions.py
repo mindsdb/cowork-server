@@ -469,6 +469,7 @@ def test_artifact_delete_checks_role_before_resolving_a_slug(monkeypatch):
 async def test_schedules_recheck_stored_owner_before_creating_a_conversation(
     monkeypatch, is_manual
 ):
+    import json
     from datetime import datetime, timezone
     from uuid import uuid4
     from sqlmodel import Session, select
@@ -478,7 +479,7 @@ async def test_schedules_recheck_stored_owner_before_creating_a_conversation(
     from cowork.db.session import get_engine
     from cowork.models.project import Project
     from cowork.models.schedule import ScheduleRun
-    from cowork.schemas.schedules import RunStatus
+    from cowork.schemas.schedules import AttemptOutcome, RunStatus
     from cowork.services.schedules import ScheduleService
     from cowork.services.conversations import ConversationService
     from cowork.handlers import responses
@@ -515,9 +516,15 @@ async def test_schedules_recheck_stored_owner_before_creating_a_conversation(
                 select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)
             ).all()
             assert len(runs) == 1 and runs[0].status == RunStatus.failed
-            assert "permission_denied" in runs[0].error
+            assert runs[0].outcome == AttemptOutcome.failed_before_execution
+            assert runs[0].error == scheduler._FAILED_BEFORE_ERROR
             assert runs[0].conversation_id is None
         assert len(requests) == 1
+        assert json.loads(requests[0].content) == {
+            "user_id": ORG.user_id,
+            "organization_id": ORG.org_id,
+            "permission": "product.execute",
+        }
         create.assert_not_called()
         handler.assert_not_called()
     finally:
