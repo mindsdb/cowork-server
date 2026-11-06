@@ -6,21 +6,21 @@ name: CodeQL
 # staging -> main release PR. Same languages, query suite and categories as
 # default setup, so existing alerts carry over. Default setup must be off for
 # this workflow's uploads to be accepted.
+#
+# Called from each event's own pipeline (dev-build-deploy.yml on a pull
+# request, publish-staging.yml on a push to staging, publish.yml on a push to
+# main), so each event keeps one run tree. The weekly schedule runs on main and
+# scans with the latest queries even when nothing was pushed. No concurrency
+# block: a called workflow's group is evaluated in its caller's context and
+# would collide with the caller's own.
 
 on:
-  push:
-    branches: [main, staging]
-  pull_request:
-    branches: [main, staging]
+  workflow_call:
   schedule:
     - cron: "17 4 * * 1"
 
 permissions:
   contents: read
-
-concurrency:
-  group: codeql-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   analyze:

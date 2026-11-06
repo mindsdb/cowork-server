@@ -280,7 +280,7 @@ publish, release, or deployment.
 
 ### Code scanning
 
-[`codeql.yml`](.github/workflows/codeql.yml) runs CodeQL on every pull request and push to `staging` and `main`, and weekly on `main`. It scans Python, JavaScript/TypeScript and the workflows themselves with the default query suite, and needs no build. It replaces CodeQL's default setup, which scans only the default branch and branches under classic branch protection. `staging` is protected by rulesets, so default setup never scanned a pull request onto it. Default setup must stay off in the repository's code scanning settings, since GitHub refuses a workflow's results while it is on.
+[`codeql.yml`](.github/workflows/codeql.yml) runs CodeQL on every pull request and push to `staging` and `main`, and weekly on `main`. Each event's pipeline calls it as a job (`dev-build-deploy.yml`, `publish-staging.yml`, `publish.yml`), so its results sit in that event's one run. It scans Python, JavaScript/TypeScript and the workflows themselves with the default query suite, and needs no build. It replaces CodeQL's default setup, which scans only the default branch and branches under classic branch protection. `staging` is protected by rulesets, so default setup never scanned a pull request onto it. Default setup must stay off in the repository's code scanning settings, since GitHub refuses a workflow's results while it is on.
 
 The suite may create and delete test conversations, schedules, files, and agent
 turns in staging. The fixed test tenant is reserved for the `cowork` suite, and
