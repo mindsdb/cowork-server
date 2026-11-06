@@ -30,6 +30,7 @@ from cowork.common.paths import (
     read_bounded,
 )
 from cowork.services.artifact_journal import (
+    COMMENTS_JOURNAL_NAME,
     JOURNAL_DIRNAME,
     MAX_JOURNAL_RECORD_BYTES,
     JournalFileRefused,
@@ -476,8 +477,11 @@ def _new_revision(
     base_revision_id: str | None,
     conversation_id: str | None = None,
     comment_thread_ids: list[str] | None = None,
+    schedule_id: str | None = None,
 ) -> RevisionEntry:
     revisions = manifest.revisions
+    # Set only when present, so other revisions keep writing no scheduleId.
+    extra = {"schedule_id": schedule_id} if schedule_id else {}
     return RevisionEntry(
         id=str(uuid.uuid4()),
         number=revisions[-1].number + 1 if revisions else 1,
@@ -491,7 +495,17 @@ def _new_revision(
         size=len(content),
         conversation_id=conversation_id,
         comment_thread_ids=list(dict.fromkeys(comment_thread_ids or [])),
+        **extra,
     )
+
+
+def _prune_orphan_blobs(folder: Path, revisions: list[RevisionEntry]) -> None:
+    retained_hashes = {item.content_hash for item in revisions}
+    try:
+        prune_journal_folder(folder, _BLOBS, keep=retained_hashes)
+    except OSError:
+        # The manifest is already durable; orphan cleanup is best-effort.
+        pass
 
 
 def _persist_revision(
@@ -513,12 +527,72 @@ def _persist_revision(
         del revisions[:-MAX_REVISIONS]
     _write_manifest(folder, manifest)
     if pruned:
-        retained_hashes = {item.content_hash for item in revisions}
-        try:
-            prune_journal_folder(folder, _BLOBS, keep=retained_hashes)
-        except OSError:
-            # The manifest is already durable; orphan cleanup is best-effort.
-            pass
+        _prune_orphan_blobs(folder, revisions)
+    return entry
+
+
+def _has_comment_on(folder: Path, revision_id: str | None) -> bool:
+    """Whether a desktop comment thread was left on this revision.
+
+    An unreadable journal answers yes: keeping one revision too many is
+    cheaper than overwriting the content someone commented on.
+    """
+    try:
+        threads = read_journal_json(folder, COMMENTS_JOURNAL_NAME)
+    except (OSError, ValueError):
+        return True
+    if threads is None:
+        return False
+    if not isinstance(threads, list):
+        return True
+    return any(
+        isinstance(thread, dict)
+        and isinstance(thread.get("payload"), dict)
+        and thread["payload"].get("revision_id") == revision_id
+        for thread in threads
+    )
+
+
+def _refresh_replaces_head(
+    folder: Path, head: RevisionEntry | None, rel_path: str, schedule_id: str | None
+) -> bool:
+    """Whether a scheduled refresh may overwrite the head instead of adding a
+    revision.
+
+    Only the same schedule's own previous refresh qualifies, so a person's
+    save, a chat edit or another schedule in between always keeps its
+    revision. A head that comments or a pending repair point at is kept too,
+    since replacing it would leave them referring to content that is gone.
+    """
+    if not schedule_id or head is None:
+        return False
+    if head.actor is None or head.actor.kind != "agent" or head.schedule_id != schedule_id:
+        return False
+    if head.comment_thread_ids:
+        return False
+    if any(
+        head.id in (repair.base_revision_id, repair.revision_id)
+        for repair in _actionable_repairs_for_path(folder, rel_path)
+    ):
+        return False
+    return not _has_comment_on(folder, head.id)
+
+
+def _replace_head_revision(
+    folder: Path, manifest: Manifest, head: RevisionEntry, entry: RevisionEntry, content: bytes
+) -> RevisionEntry:
+    """Swap the head revision for `entry`, keeping its place in history.
+
+    The replacement gets a new id, so an editor still holding the old head
+    as its save token gets a conflict instead of overwriting fresher data.
+    """
+    _store_blob(folder, entry.content_hash, content)
+    entry = entry.model_copy(update={"number": head.number, "base_revision_id": head.base_revision_id})
+    revisions = manifest.revisions
+    index = next(i for i, item in enumerate(revisions) if item is head)
+    revisions[index] = entry
+    _write_manifest(folder, manifest)
+    _prune_orphan_blobs(folder, revisions)
     return entry
 
 
@@ -847,8 +921,16 @@ def revision_with_content(folder: Path, revision_id: str) -> dict:
         return _revision_with_content_locked(folder, revision_id).to_json()
 
 
-def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) -> dict | None:
-    """Record an agent edit and finish repair handoffs attributed to this turn."""
+def capture_agent_revision(
+    folder: Path, *, conversation_id: str | None = None, schedule_id: str | None = None
+) -> dict | None:
+    """Record an agent edit and finish repair handoffs attributed to this turn.
+
+    `schedule_id` is set only for a turn the scheduler started. Its edit is
+    recorded against that schedule, and replaces the schedule's own previous
+    refresh rather than adding to history, so a frequent refresh cannot push
+    real edits out of the bounded revision list.
+    """
     from cowork.services.artifact_identity import ensure_full_id
 
     try:
@@ -885,15 +967,14 @@ def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) 
                 )
                 return latest.to_json()
             matching = [repair for repair in queued if repair.base_revision_id == latest_id]
-            entry = _append_revision(
-                folder,
+            entry = _new_revision(
                 manifest,
                 artifact_id=artifact_id,
                 rel_path=relative,
                 content=content,
                 actor_kind="agent",
                 actor_id=None,
-                summary="Agent updated artifact",
+                summary="Scheduled task updated artifact" if schedule_id else "Agent updated artifact",
                 base_revision_id=latest_id,
                 conversation_id=conversation_id,
                 comment_thread_ids=[
@@ -901,7 +982,11 @@ def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) 
                     for repair in matching
                     if repair.comment_thread_id
                 ],
+                schedule_id=schedule_id,
             )
+            if not queued and _refresh_replaces_head(folder, latest, relative, schedule_id):
+                return _replace_head_revision(folder, manifest, latest, entry, content).to_json()
+            entry = _persist_revision(folder, manifest, entry, content)
             _finish_queued_repairs(
                 folder,
                 queued,
