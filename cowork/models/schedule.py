@@ -66,6 +66,16 @@ class ScheduleRun(BaseSQLModel, table=True):
             sqlite_where=sa.text("slot_at IS NOT NULL"),
             postgresql_where=sa.text("slot_at IS NOT NULL"),
         ),
+        # One run going per schedule, manual or cron: inserting a second
+        # `running` row fails, so two Run now presses, or Run now racing a
+        # cron claim, start one run.
+        sa.Index(
+            "uq_schedule_runs_one_running",
+            "schedule_id",
+            unique=True,
+            sqlite_where=sa.text("status = 'running'"),
+            postgresql_where=sa.text("status = 'running'"),
+        ),
     )
 
     schedule_id: UUID = Field(
@@ -103,4 +113,13 @@ class ScheduleRun(BaseSQLModel, table=True):
         default=None,
         sa_type=sa.DateTime(timezone=True),  # type: ignore
         description="Until when the process running it has renewed its claim; a running run past this is dead",
+    )
+    execution_claimed_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="Durable claim before handing off execution; survives deletion of the run's chat",
+    )
+    outcome: str | None = Field(
+        default=None,
+        description="What is known about the run's execution when it ended (AttemptOutcome); NULL while running and on runs from before outcomes were recorded",
     )

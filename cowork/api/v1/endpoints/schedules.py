@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
@@ -14,6 +15,8 @@ from cowork.schemas.schedules import (
     ScheduleUpdateRequest,
 )
 from cowork.services.schedules import ScheduleRunService, ScheduleService
+
+logger = logging.getLogger(__name__)
 
 # AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
 # closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
@@ -108,20 +111,63 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
-    from cowork.scheduler import execute_schedule, schedule_conversation_topic
-    from cowork.services.conversations import ConversationService
-
-    conversation = ConversationService(scoped).create_conversation(
-        topic=schedule_conversation_topic(schedule.title),
-        project_id=schedule.project_id,
+    from cowork.scheduler import (
+        abandon_manual_run,
+        claim_manual_run,
+        release_run_place,
+        reserve_run_place,
+        run_admitted,
+        schedule_conversation_topic,
     )
+    from cowork.services.conversations import ConversationService
+    from cowork.services.schedules import ScheduleBusy
+
+    already_running = HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This task is already running.")
+
+    # Refused with a reason rather than queued: the user is watching and can
+    # press Run again.
+    if ScheduleRunService(scoped).has_active_run(schedule_id):
+        raise already_running
+    if not reserve_run_place():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Too many scheduled tasks are running right now. Try again in a few minutes.",
+        )
+    # The run row is the claim: inserting it before answering means two
+    # presses at once, or a press racing a cron claim, start one run (the
+    # schedule allows one `running` run).
+    try:
+        run_id = claim_manual_run(scoped, schedule_id)
+    except ScheduleBusy:
+        release_run_place()
+        raise already_running
+    except BaseException:
+        release_run_place()
+        raise
+    try:
+        conversation = ConversationService(scoped).create_conversation(
+            topic=schedule_conversation_topic(schedule.title),
+            project_id=schedule.project_id,
+        )
+    except BaseException:
+        release_run_place()
+        try:
+            scoped.rollback()
+            abandon_manual_run(scoped, run_id, "Run did not start: its conversation could not be created.")
+        except Exception:
+            # Its lease lapses and a poll reaps it.
+            logger.exception(
+                "Could not abandon a scheduled run after conversation creation failed",
+                extra={"event": "schedule_abandon_failed", "schedule_id": str(schedule_id)},
+            )
+        raise
     # FastAPI closes this session only after the background run ends, which
     # can take minutes. Give the request's connection back before it starts.
     scoped.close()
 
     background_tasks.add_task(
-        execute_schedule, schedule_id, is_manual=True,
-        conversation_id=conversation.id,
+        run_admitted, schedule_id, is_manual=True,
+        conversation_id=conversation.id, run_id=run_id,
     )
     return {"detail": "Run triggered", "conversation_id": str(conversation.id)}
 

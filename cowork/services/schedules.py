@@ -11,7 +11,7 @@ from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
-from cowork.schemas.schedules import RunStatus
+from cowork.schemas.schedules import AttemptOutcome, RunStatus
 
 
 class ScheduleService:
@@ -191,12 +191,25 @@ class ScheduleService:
         return schedule
 
 
+class ScheduleBusy(Exception):
+    """The schedule already has a run going, manual or cron."""
+
+
 class SlotAlreadyClaimed(Exception):
     """Another run already holds this schedule's cron slot."""
 
 
 def _utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _record_lost_run(run: ScheduleRun) -> None:
+    """Record what is known of a run whose process died. One that never
+    claimed execution never started its turn; one that did may have acted.
+    The claim survives deletion of the conversation."""
+    run.outcome = (
+        AttemptOutcome.failed_before_execution if run.execution_claimed_at is None else AttemptOutcome.interrupted
+    )
 
 
 class ScheduleRunService:
@@ -213,7 +226,9 @@ class ScheduleRunService:
     ) -> ScheduleRun:
         """Insert the run. With ``slot_at``, the insert claims that cron slot:
         the unique index on (schedule_id, slot_at) refuses a second run for it,
-        and that refusal raises SlotAlreadyClaimed. With ``lease_seconds``, the
+        and that refusal raises SlotAlreadyClaimed. A schedule holds one
+        `running` run at a time (uq_schedule_runs_one_running), so an insert
+        while another run is going raises ScheduleBusy. With ``lease_seconds``, the
         run counts as alive until then unless renew_lease extends it."""
         now = datetime.now(timezone.utc)
         run = ScheduleRun(
@@ -231,9 +246,19 @@ class ScheduleRunService:
             self.session.rollback()
             if slot_at is not None and self._slot_holder(schedule_id, slot_at) is not None:
                 raise SlotAlreadyClaimed(f"schedule {schedule_id} slot {slot_at.isoformat()} already has a run")
+            if self._running_run(schedule_id) is not None:
+                raise ScheduleBusy(f"schedule {schedule_id} already has a run going")
             raise
         self.session.refresh(run)
         return run
+
+    def _running_run(self, schedule_id: UUID) -> ScheduleRun | None:
+        return self.session.exec(
+            self.session.select(ScheduleRun)
+            .where(ScheduleRun.schedule_id == schedule_id)
+            .where(ScheduleRun.status == RunStatus.running)
+            .limit(1)
+        ).first()
 
     def _slot_holder(self, schedule_id: UUID, slot_at: datetime) -> ScheduleRun | None:
         return self.session.exec(
@@ -286,13 +311,7 @@ class ScheduleRunService:
             _stmt = _stmt.where(Schedule.created_by == self.session.scope.user_id)
         if self.session.exec(_stmt).first() is None:
             return False
-        run = self.session.exec(
-            self.session.select(ScheduleRun)
-            .where(ScheduleRun.schedule_id == schedule_id)
-            .where(ScheduleRun.status == RunStatus.running)
-            .limit(1)
-        ).first()
-        return run is not None
+        return self._running_run(schedule_id) is not None
 
     def last_successful_finish(self, schedule_id: UUID) -> datetime | None:
         """When the schedule's most recent successful run (manual or cron)
@@ -341,7 +360,7 @@ class ScheduleRunService:
         ).first()
         return conversation_id if row is not None else None
 
-    def set_run_conversation(self, run_id: UUID, conversation_id: UUID) -> bool:
+    def set_run_conversation(self, run_id: UUID, conversation_id: UUID | None) -> bool:
         """Attach the run's conversation as soon as it is known — before the
         turn executes — so the UI can open a run that is still in flight.
 
@@ -359,14 +378,21 @@ class ScheduleRunService:
         if run is None or run.status != RunStatus.running:
             return False
         run.conversation_id = self.still_exists(conversation_id)
+        # Persist before handing off: a crash after this point is ambiguous,
+        # even when the user deletes the conversation. Never clear this claim.
+        run.execution_claimed_at = run.execution_claimed_at or datetime.now(timezone.utc)
         self.session.add(run)
         try:
             self.session.commit()
         except IntegrityError:
             # The delete landed between still_exists' read and this commit,
             # and its release already nulled the column in the database. The
-            # run simply has no conversation to point at.
+            # run simply has no conversation to point at. Retry the claim too:
+            # rollback discarded it, and execution must not start without it.
             self.session.rollback()
+            if conversation_id is None:
+                raise
+            return self.set_run_conversation(run_id, None)
         return True
 
     def finish_run(
@@ -376,6 +402,7 @@ class ScheduleRunService:
         error: str | None = None,
         status: RunStatus | None = None,
         release_slot: bool = False,
+        outcome: AttemptOutcome | None = None,
     ) -> ScheduleRun:
         """Record how the run ended. ``release_slot`` gives its cron slot back,
         for a run that left the slot due: the next poll can then claim it."""
@@ -389,6 +416,8 @@ class ScheduleRunService:
         run.status = status or (RunStatus.failed if error else RunStatus.success)
         run.error = error
         run.lease_expires_at = None
+        if outcome is not None:
+            run.outcome = outcome
         if release_slot:
             run.slot_at = None
         if conversation_id is not None:
@@ -402,7 +431,9 @@ class ScheduleRunService:
             # Rewrite without the pointer rather than stranding the run at
             # `running`, which would wedge the schedule until a restart.
             self.session.rollback()
-            return self.finish_run(run_id, error=error, status=status, release_slot=release_slot)
+            return self.finish_run(
+                run_id, error=error, status=status, release_slot=release_slot, outcome=outcome,
+            )
         self.session.refresh(run)
         return run
 
@@ -443,6 +474,7 @@ class ScheduleRunService:
             run.error = error
             run.slot_at = None
             run.lease_expires_at = None
+            _record_lost_run(run)
             self.session.add(run)
         self.session.commit()
         return len(runs)
@@ -451,7 +483,7 @@ class ScheduleRunService:
         """Fail every running run whose lease ran out: its process stopped
         renewing it, so it died without recording how the run ended.
 
-        A run that never linked a conversation never started its turn, so it
+        A run that never claimed execution never started its turn, so it
         gives its cron slot back and the slot fires again. A run that did may
         have done its work, so it keeps the slot, and the caller consumes it
         rather than run that work twice. Returns those runs. Staged only: the
@@ -475,7 +507,8 @@ class ScheduleRunService:
             run.status = RunStatus.failed
             run.error = error
             run.lease_expires_at = None
-            if run.conversation_id is None:
+            _record_lost_run(run)
+            if run.execution_claimed_at is None:
                 run.slot_at = None
             elif run.slot_at is not None:
                 kept.append(run)

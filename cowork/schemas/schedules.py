@@ -55,6 +55,26 @@ class RunStatus(str, Enum):
     cancelled = "cancelled"
 
 
+class AttemptOutcome(str, Enum):
+    """What is known about a run's execution when it ended. Only
+    ``failed_before_execution`` shows the agent did nothing."""
+
+    completed = "completed"
+    # Failed before the agent could act: setup or permission, or a turn whose
+    # stream shows nothing but its start, its memory read and its failure.
+    failed_before_execution = "failed_before_execution"
+    # Failed after the agent may have acted.
+    failed_during_execution = "failed_during_execution"
+    # Stopped by the run's time limit, or its process went away, after the
+    # agent may have acted.
+    interrupted = "interrupted"
+    # Stopped by the user.
+    cancelled = "cancelled"
+    # No terminal record says how the turn ended, or a failure after handoff
+    # prevents determining what the turn did.
+    uncertain = "uncertain"
+
+
 def _utc_next_run(value: datetime | None) -> datetime | None:
     # SQLite stores a datetime's clock time without its offset and reads it
     # back as UTC, so 09:00-07:00 would come back as 09:00 UTC. A naive time
@@ -121,4 +141,5 @@ class ScheduleRunResponse(CamelResponse):
     error: str | None
     conversation_id: UUID | None
     is_manual: bool
+    outcome: AttemptOutcome | None = None
     created_at: datetime | None

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -24,8 +26,9 @@ from cowork.db.scoped import (
 from cowork.db.units import run_db
 from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
-from cowork.schemas.schedules import Cadence, RunStatus, resolve_schedule_model
-from cowork.services.schedules import ScheduleRunService, ScheduleService, SlotAlreadyClaimed
+from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus, resolve_schedule_model
+from cowork.services.schedules import ScheduleBusy, ScheduleRunService, ScheduleService, SlotAlreadyClaimed
+from cowork.streaming.liveness import MODEL_WAIT_PHASE
 from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import request_cancel
 from cowork.streaming.registry import ServerShuttingDown, registry
@@ -71,6 +74,14 @@ _RUN_LEASE_SECONDS = 120
 _LEASE_RENEW_SECONDS = 30
 _LAPSED_RUN_ERROR = "Run was interrupted: the server running it stopped before it finished."
 _scheduler_task: asyncio.Task | None = None
+# Scheduled runs this process executes at once, cron and run-now alike
+# (_Admission). A due slot over the limit stays due for a later poll.
+_MAX_CONCURRENT_RUNS = 3
+# The frames a turn writes before its agent can act, besides its failure: its
+# start, and the learned memory it read while building the prompt. A failed
+# turn whose stream holds nothing else failed before it acted. A progress
+# frame counts only when it is the wait for the model's first answer.
+_PRE_EXECUTION_EVENTS = frozenset({"response.created", "response.memory_read", "response.failed"})
 
 
 def schedule_conversation_topic(title: str) -> str:
@@ -248,6 +259,60 @@ class DueSlot:
     slot_at: datetime
 
 
+class _Admission:
+    """Scheduled runs this process executes at once, cron and run-now alike.
+
+    Each process keeps its own count, so this bounds one process's load, not
+    the fleet's. Run-now reserves its place from a request thread, so the
+    count is guarded by a lock.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._lock = threading.Lock()
+        self._held = 0
+
+    def reserve(self) -> bool:
+        """Take a place, or False when every place is taken."""
+        with self._lock:
+            if self._held >= self._limit:
+                return False
+            self._held += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            self._held = max(self._held - 1, 0)
+
+    @property
+    def held(self) -> int:
+        with self._lock:
+            return self._held
+
+
+_admission = _Admission(_MAX_CONCURRENT_RUNS)
+
+
+async def run_admitted(schedule_id: UUID, **kwargs) -> None:
+    """execute_schedule for a run that already reserved its place, giving the
+    place back when the run ends."""
+    try:
+        await execute_schedule(schedule_id, **kwargs)
+    finally:
+        _admission.release()
+
+
+def reserve_run_place() -> bool:
+    """Reserve a place for a run-now, or False when this process is already
+    running as many scheduled runs as it allows. A True must be followed by
+    run_admitted, or by release_run_place when the run is not started."""
+    return _admission.reserve()
+
+
+def release_run_place() -> None:
+    _admission.release()
+
+
 class RunClaimLost(Exception):
     """Another replica reaped this run before its turn started, so the slot
     may run there; this run must not start its turn."""
@@ -261,12 +326,56 @@ class _RunOutcome:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class _TurnEvidence:
+    """How the turn that just ended went: its terminal reason, and whether its
+    stream shows anything the agent did."""
+
+    reason: str | None
+    acted: bool
+
+
+def _classify(evidence: _TurnEvidence) -> AttemptOutcome:
+    """What the turn's ending says about whether its agent acted. When in
+    doubt it says the agent may have."""
+    reason = evidence.reason
+    if reason == "completed":
+        return AttemptOutcome.completed
+    if reason == "cancelled":
+        return AttemptOutcome.cancelled
+    if reason in ("interrupted", "restart"):
+        return AttemptOutcome.interrupted
+    if reason is None:
+        return AttemptOutcome.uncertain
+    if not evidence.acted:
+        return AttemptOutcome.failed_before_execution
+    return AttemptOutcome.failed_during_execution
+
+
 def _create_run(
     session: ScopedSession, *, schedule_id: UUID, is_manual: bool, slot_at: datetime | None,
 ) -> UUID:
     return ScheduleRunService(session).create_run(
         schedule_id, is_manual=is_manual, slot_at=slot_at, lease_seconds=_RUN_LEASE_SECONDS,
     ).id
+
+
+def claim_manual_run(session: ScopedSession, schedule_id: UUID) -> UUID:
+    """Insert a Run now's run row, leased, before the request answers. Raises
+    ScheduleBusy when the schedule already has a run going, so two presses,
+    or a press racing a cron claim, start one run. The run is then executed
+    with ``execute_schedule(run_id=...)``; if that never starts, the lease
+    lapses and a poll reaps it."""
+    return ScheduleRunService(session).create_run(
+        schedule_id, is_manual=True, lease_seconds=_RUN_LEASE_SECONDS,
+    ).id
+
+
+def abandon_manual_run(session: ScopedSession, run_id: UUID, error: str) -> None:
+    """Finish a claimed Run now whose request failed before handing it off."""
+    ScheduleRunService(session).finish_run(
+        run_id, status=RunStatus.failed, error=error, outcome=AttemptOutcome.failed_before_execution,
+    )
 
 
 def _renew_run_lease(session: ScopedSession, *, run_id: UUID) -> bool:
@@ -435,9 +544,11 @@ def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: 
 def _finish_run(
     session: ScopedSession, *, run_id: UUID, conversation_id: UUID | None, error: str | None,
     status: RunStatus | None, release_slot: bool = False,
+    outcome: AttemptOutcome | None = None,
 ) -> None:
     ScheduleRunService(session).finish_run(
         run_id, conversation_id=conversation_id, error=error, status=status, release_slot=release_slot,
+        outcome=outcome,
     )
 
 
@@ -469,6 +580,7 @@ async def execute_schedule(
     conversation_id: UUID | None = None,
     *,
     slot_at: datetime | None = None,
+    run_id: UUID | None = None,
 ) -> None:
     """Run one schedule's turn and record how it went.
 
@@ -484,13 +596,16 @@ async def execute_schedule(
     returns without doing anything. A run that leaves its slot due, because
     its turn never started or a shutdown cut it, gives the slot back, so the
     next poll can claim it again.
+
+    A Run now passes the ``run_id`` its request already claimed
+    (claim_manual_run), so the press and its run are one claim.
     """
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
     from cowork.services.product_permissions import ProductPermissionUnavailable, require_product_permission
 
     try:
-        run_id = await run_db(
+        run_id = run_id or await run_db(
             partial(_create_run, schedule_id=schedule_id, is_manual=is_manual, slot_at=slot_at),
             scope=SYSTEM_SCOPE,
         )
@@ -508,13 +623,23 @@ async def execute_schedule(
             extra=log_context(schedule_id=schedule_id),
         )
         return
+    except ScheduleBusy:
+        # A Run now (or another replica's run) holds the schedule. Nothing
+        # was written, so a cron slot stays due for a later poll.
+        logger.info(
+            "Schedule already has a run going; not starting another",
+            extra=log_context(schedule_id=schedule_id),
+        )
+        return
 
     lease = asyncio.create_task(_renew_lease(run_id, schedule_id=schedule_id))
     slot_consumed = False
     error: str | None = None
     final_status: RunStatus | None = None
+    outcome: AttemptOutcome | None = None
     created_conversation = conversation_id is None
     turn_started = False
+    timed_out = False
     try:
         scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
 
@@ -546,19 +671,21 @@ async def execute_schedule(
             },
         )
         async def _drain_run() -> None:
+            nonlocal turn_started
             # The schedule-derived principal is what lets the turn (and the
             # remote backend's per-tenant key mint) run in org mode with no
             # request in flight. The handler opens its own short sessions.
             stream = await ResponsesHandler(principal=scheduled.principal, interactive=False).handle(request)
+            turn_started = True
             async for _ in stream:
                 pass
 
-        turn_started = True
         try:
             await asyncio.wait_for(_drain_run(), timeout=_MAX_RUN_DURATION_SECONDS)
         except asyncio.TimeoutError as exc:
             # The timeout cancels only this drain. The turn runs detached in
             # the registry and would go on writing and publishing, so stop it.
+            timed_out = True
             await _stop_timed_out_turn(str(conversation_id))
             raise RuntimeError(
                 f"Run exceeded max duration of {_MAX_RUN_DURATION_SECONDS}s and was aborted."
@@ -570,6 +697,7 @@ async def execute_schedule(
             # slot: it stays due for the next poll, on a replica still
             # serving. The finally below finishes the run row.
             error = _SHUTDOWN_RUN_ERROR
+            outcome = AttemptOutcome.failed_before_execution
             logger.info(
                 "Schedule run did not start; the server is shutting down",
                 extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
@@ -595,17 +723,19 @@ async def execute_schedule(
         # A cancel or a producer failure closes the stream normally from the
         # consumer's side (the producer runs detached and even swallows its
         # own CancelledError, so handle.task.cancelled() stays False). The
-        # buffer's terminal record is the only truthful signal of how the
-        # turn ended — without it every run is recorded as success.
-        reason = await _turn_terminal_reason(str(conversation_id))
-        outcome = await _until_it_lands(
+        # buffer's records are the only truthful signal of how the turn ended
+        # and whether its agent acted — without them every run is recorded as
+        # success.
+        evidence = await _turn_evidence(str(conversation_id))
+        outcome = _classify(evidence)
+        recorded = await _until_it_lands(
             partial(
-                _record_turn_outcome, schedule_id=schedule_id, reason=reason,
+                _record_turn_outcome, schedule_id=schedule_id, reason=evidence.reason,
                 is_manual=is_manual, conversation_id=conversation_id,
             ),
             schedule_id=schedule_id,
         )
-        final_status, error = outcome.status, outcome.error
+        final_status, error = recorded.status, recorded.error
         slot_consumed = not is_manual
 
     except RunClaimLost:
@@ -613,6 +743,7 @@ async def execute_schedule(
         # reaped the run and gave its slot back. The slot belongs to whichever
         # poll claims it next, so this run records nothing on the schedule.
         error = _LAPSED_RUN_ERROR
+        outcome = AttemptOutcome.failed_before_execution
         logger.warning(
             "Scheduled run lost its claim before its turn started",
             extra=log_context(schedule_id=schedule_id),
@@ -622,6 +753,7 @@ async def execute_schedule(
         # run's request at its bound, and the event loop's close cancels a
         # cron run still going. The finally saves it as failed.
         error = _INTERRUPTED_RUN_ERROR
+        outcome = AttemptOutcome.interrupted if turn_started else AttemptOutcome.failed_before_execution
         raise
     except Exception as exc:
         error = str(exc)
@@ -631,6 +763,14 @@ async def execute_schedule(
             "Schedule run failed: %s", error,
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
+        if timed_out:
+            outcome = AttemptOutcome.interrupted
+        elif not turn_started:
+            outcome = AttemptOutcome.failed_before_execution
+        else:
+            # The turn was handed off and something failed around it: it may
+            # have acted.
+            outcome = AttemptOutcome.uncertain
         # A run that raised consumes its cron slot like one that failed inside
         # its turn. Left due, the next poll starts it again, and a failure that
         # repeats (a timeout, a revoked permission) re-fires every poll. A busy
@@ -663,6 +803,7 @@ async def execute_schedule(
                     _finish_run, run_id=run_id, conversation_id=conversation_id,
                     error=error, status=final_status,
                     release_slot=slot_at is not None and not slot_consumed,
+                    outcome=outcome,
                 ),
                 schedule_id=schedule_id,
             )
@@ -719,6 +860,70 @@ async def _turn_terminal_reason(conversation_id: str) -> str | None:
             extra=log_context(conversation_id=conversation_id)
         )
     return None
+
+
+def _sse_frames(record) -> list[tuple[str, dict]]:
+    """The event name and data of each frame in an SSE record."""
+    sse = record.data.get("sse") if isinstance(record.data, dict) else None
+    if not isinstance(sse, str):
+        return []
+    frames: list[tuple[str, dict]] = []
+    for block in sse.split("\n\n"):
+        event, data = None, {}
+        for line in block.splitlines():
+            if line.startswith("event:"):
+                event = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                try:
+                    parsed = json.loads(line[len("data:"):].strip())
+                except ValueError:
+                    parsed = None
+                data = parsed if isinstance(parsed, dict) else {}
+        if event:
+            frames.append((event, data))
+    return frames
+
+
+def _frame_shows_action(event: str, data: dict) -> bool:
+    if event in _PRE_EXECUTION_EVENTS:
+        return False
+    # The wait for the model's first answer, not anything the agent did.
+    return not (event == "response.in_progress" and data.get("phase") == MODEL_WAIT_PHASE)
+
+
+async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
+    """How the turn that just ended on this conversation went: its terminal
+    reason (_turn_terminal_reason), and whether its agent acted."""
+    return _TurnEvidence(
+        reason=await _turn_terminal_reason(conversation_id),
+        acted=await _turn_acted(conversation_id),
+    )
+
+
+async def _turn_acted(conversation_id: str) -> bool:
+    """Whether the turn's buffer holds anything beyond its start, its memory
+    read, a wait for the model and its failure. True when the buffer is
+    unavailable, and a record that is not a stream frame counts as action, so
+    a doubt never reads as the agent having done nothing.
+
+    Only call after the turn's stream has been fully drained: the buffer is
+    closed then, so reading it returns at the terminal record."""
+    handle = registry.get(conversation_id)
+    if handle is None or not handle.buffer.is_closed:
+        return True
+    try:
+        async for rec in handle.buffer.tail(0):
+            if rec.is_terminal:
+                return False
+            frames = _sse_frames(rec)
+            if not frames or any(_frame_shows_action(event, data) for event, data in frames):
+                return True
+    except Exception:
+        logger.exception(
+            "Could not read the turn's records",
+            extra=log_context(conversation_id=conversation_id)
+        )
+    return True
 
 
 def _ran_recently(schedule: Schedule, run_service: ScheduleRunService, now: datetime) -> bool:
@@ -835,8 +1040,15 @@ async def _scheduler_loop() -> None:
             logger.exception("Scheduler loop error during poll")
             due = []
 
-        for slot in due:
-            run = asyncio.create_task(execute_schedule(slot.schedule_id, is_manual=False, slot_at=slot.slot_at))
+        for index, slot in enumerate(due):
+            if not _admission.reserve():
+                # The rest stay due, unclaimed, for a later poll.
+                logger.warning(
+                    "Scheduled runs at this process's limit; due slots wait for the next poll",
+                    extra={"event": "schedule_admission_full", "count": len(due) - index},
+                )
+                break
+            run = asyncio.create_task(run_admitted(slot.schedule_id, is_manual=False, slot_at=slot.slot_at))
             _scheduled_runs.add(run)
             run.add_done_callback(_scheduled_runs.discard)
 

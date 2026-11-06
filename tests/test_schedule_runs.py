@@ -98,8 +98,10 @@ def test_last_successful_finish_ignores_failures_and_running():
 
     failed = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(failed.id, error="boom")
-    run_service.create_run(schedule.id, is_manual=False)  # still running
+    running = run_service.create_run(schedule.id, is_manual=False)
     assert run_service.last_successful_finish(schedule.id) is None
+    # A schedule holds one running run at a time.
+    run_service.finish_run(running.id, error="ended")
 
     ok = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(ok.id)
@@ -731,6 +733,7 @@ def _execute_with_terminal(
         state = {
             "schedule_id": schedule_id,
             "run_status": run.status,
+            "run_outcome": run.outcome,
             "run_error": run.error,
             "run_conversation_id": run.conversation_id,
             "last_error": fresh.last_error,
@@ -812,6 +815,7 @@ def test_execute_schedule_that_times_out_consumes_its_slot(monkeypatch):
     state = _execute_with_terminal(monkeypatch, None, turn=_hangs)
     assert state["run_status"] == RunStatus.failed
     assert "max duration" in state["last_error"]
+    assert state["run_outcome"] == "interrupted"
     assert state["next_advanced"] is True
     # The turn runs detached from the drain the timeout cancels, so it is
     # stopped explicitly or it goes on writing after the run is failed.
@@ -1482,7 +1486,8 @@ def test_delete_schedule_with_runs_under_enforced_foreign_keys():
     schedule = _schedule(session)
     run_service = ScheduleRunService(scoped)
     for _ in range(3):
-        run_service.create_run(schedule.id, is_manual=False)
+        # One running run at a time: finish each before the next.
+        run_service.finish_run(run_service.create_run(schedule.id, is_manual=False).id, error="ended")
 
     assert ScheduleService(scoped).delete_schedule(schedule.id) is True
 
