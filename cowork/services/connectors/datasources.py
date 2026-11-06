@@ -15,6 +15,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
+import string
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit
 
@@ -44,12 +45,34 @@ _STRUCTURED_FIELDS = ("host", "port", "database", "username", "password", "tls")
 #: What a DSN replaces. The schema is spelled `schema` on the wire and carries
 #: its model attribute's name here.
 _STRUCTURED_ATTRIBUTES = (*_STRUCTURED_FIELDS, "db_schema")
-#: A bundle of one or more PEM certificates and nothing else. A block's body
-#: holds only base64 and whitespace, which never contain the "-" that starts
-#: the END marker, so a fullmatch runs in linear time on any input.
-_CA_BUNDLE_RE = re.compile(
-    r"(?:-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*)+"
-)
+_PEM_BEGIN = "-----BEGIN CERTIFICATE-----"
+_PEM_END = "-----END CERTIFICATE-----"
+_BASE64_CHARACTERS = frozenset(string.ascii_letters + string.digits + "+/=")
+
+
+def _is_certificate_bundle(text: str) -> bool:
+    """True when text is one or more PEM certificate blocks and nothing else.
+
+    Each block's body holds only base64 and whitespace, and only whitespace
+    sits between blocks. A forward scan reads each character a bounded number
+    of times, so a hostile bundle up to MAX_CA_PEM_BYTES costs linear time;
+    a regex for the same shape is one CodeQL's polynomial-ReDoS check flags.
+    """
+    position = 0
+    while position < len(text):
+        if not text.startswith(_PEM_BEGIN, position):
+            return False
+        body_start = position + len(_PEM_BEGIN)
+        body_end = text.find(_PEM_END, body_start)
+        # -1 is a BEGIN with no END; body_start itself is an empty body.
+        if body_end <= body_start:
+            return False
+        if not all(c in _BASE64_CHARACTERS or c.isspace() for c in text[body_start:body_end]):
+            return False
+        position = body_end + len(_PEM_END)
+        while position < len(text) and text[position].isspace():
+            position += 1
+    return position > 0
 
 
 class InvalidDatasourceInput(HTTPException):
@@ -188,7 +211,7 @@ def _canonical_tls(tls: Any) -> dict[str, Any]:
     ca_pem = ca_pem.strip()
     if len(ca_pem.encode()) > MAX_CA_PEM_BYTES:
         raise InvalidDatasourceInput("the CA certificate exceeds the 64 KiB limit")
-    if _CA_BUNDLE_RE.fullmatch(ca_pem) is None:
+    if not _is_certificate_bundle(ca_pem):
         raise InvalidDatasourceInput("the CA certificate must contain only X.509 certificate blocks")
     return {"mode": "custom_ca", "ca_pem": ca_pem}
 
