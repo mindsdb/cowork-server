@@ -147,7 +147,7 @@ def test_a_page_of_conversations_does_not_load_a_long_history(monkeypatch):
 
     body = list_schedules(ScopedSession(session, SYSTEM_SCOPE))
     [listed] = body["schedules"]
-    assert listed["runCount"] == 3000
+    assert listed.model_dump(by_alias=True)["runCount"] == 3000
     assert "runs_index" not in body
 
 
