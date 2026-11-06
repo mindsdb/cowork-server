@@ -158,6 +158,7 @@ class ScheduleResponse(CamelResponse):
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False
+    run_count: int = 0
     # Filled by the endpoints: the latest finished run (ScheduleRunResponse
     # shape), so a failure shows on the schedule before any auto-pause.
     last_run: ScheduleRunResponse | None = None
