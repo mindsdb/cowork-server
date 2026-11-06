@@ -50,6 +50,9 @@ class _Redis:
     async def xrevrange(self, key, count=None):
         return []
 
+    async def exists(self, *keys):
+        return 0
+
     async def sadd(self, key, member):
         self.writes.append(("sadd", self.sending_once))
         return 1
