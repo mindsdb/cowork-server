@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import io
 import os
 import shutil
 import subprocess
 import sys
 import sysconfig
-from collections.abc import Callable
+from asyncio import to_thread as to_thread_bound_at_import
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import anyio
@@ -29,7 +31,7 @@ from cowork.common.paths import cowork_home, safe_join
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.db.session import get_open_session
-from cowork.db.units import run_efs
+from cowork.db.units import run_efs, run_to_completion
 
 _THIS_FILE = os.path.abspath(__file__)
 _THIS_PATH = "tests/test_blocking_guard.py"
@@ -57,16 +59,24 @@ def _stat_it(path: Path) -> bool:
     return path.exists()
 
 
-def _list_it_by_descriptor(path: Path) -> list[str]:
-    fd = os.open(path.parent, os.O_RDONLY)
+@pytest.fixture
+def note_folder_fd(note) -> Iterator[int]:
+    """A descriptor of the note's folder, opened before the test's own watch opens."""
+    fd = os.open(note.parent, os.O_RDONLY)
     try:
-        with os.scandir(fd) as entries:
-            return [entry.name for entry in entries]
+        yield fd
     finally:
         os.close(fd)
 
 
-def _app() -> FastAPI:
+def _list_it_by_descriptor(fd: int) -> list[str]:
+    with os.scandir(fd) as entries:
+        return [entry.name for entry in entries]
+
+
+def _app(*, folder_fd: int | None = None) -> FastAPI:
+    """The test routes. ``folder_fd`` is the descriptor the directory route
+    lists, bound here rather than read from the request."""
     app = FastAPI()
 
     @app.get("/stat-on-the-loop")
@@ -75,7 +85,7 @@ def _app() -> FastAPI:
 
     @app.get("/scandir-a-descriptor-on-the-loop")
     async def scandir_a_descriptor_on_the_loop():
-        return {"names": _list_it_by_descriptor(_note())}
+        return {"names": _list_it_by_descriptor(folder_fd)}
 
     @app.get("/read-in-a-sync-route")
     def read_in_a_sync_route():
@@ -109,11 +119,28 @@ def _app() -> FastAPI:
     async def stat_a_library_hands_to_a_thread():
         return {"size": (await _LIBRARY["stat_on_a_thread"](_note())).st_size}
 
+    @app.get("/stats-gathered")
+    async def stats_gathered():
+        stats = await asyncio.gather(asyncio.to_thread(os.stat, _note()), asyncio.to_thread(os.stat, _note()))
+        return {"sizes": [stat.st_size for stat in stats]}
+
+    @app.get("/stat-run-to-completion")
+    async def stat_run_to_completion():
+        return {"size": (await run_to_completion(asyncio.to_thread(os.stat, _note()))).st_size}
+
+    @app.get("/stat-in-the-default-executor")
+    async def stat_in_the_default_executor():
+        return {"size": (await asyncio.get_running_loop().run_in_executor(None, os.stat, _note())).st_size}
+
+    @app.get("/stat-handed-to-to-thread-bound-at-import")
+    async def stat_handed_to_to_thread_bound_at_import():
+        return {"size": (await to_thread_bound_at_import(os.stat, _note())).st_size}
+
     return app
 
 
-async def _sites_of(path: str) -> set[guard.Site]:
-    transport = httpx.ASGITransport(app=_app())
+async def _sites_of(path: str, *, folder_fd: int | None = None) -> set[guard.Site]:
+    transport = httpx.ASGITransport(app=_app(folder_fd=folder_fd))
     with guard.watching(roots=(_THIS_FILE,)) as found:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(path)
@@ -127,8 +154,10 @@ async def test_a_coroutine_route_that_stats_under_cowork_home_is_found(org_deplo
     }
 
 
-async def test_a_coroutine_route_that_lists_a_directory_descriptor_is_found(org_deployment, note):
-    assert await _sites_of("/scandir-a-descriptor-on-the-loop") == {
+async def test_a_coroutine_route_that_lists_a_directory_descriptor_is_found(org_deployment, note_folder_fd):
+    """The descriptor is opened before the watch, so only os.scandir(fd) can
+    find the site."""
+    assert await _sites_of("/scandir-a-descriptor-on-the-loop", folder_fd=note_folder_fd) == {
         guard.Site(
             _THIS_PATH, "_app.<locals>.scandir_a_descriptor_on_the_loop", guard.LOOP_FILE_STORE, _leaf("_list_it_by_descriptor")
         )
@@ -324,9 +353,15 @@ def test_every_allowlist_entry_gives_its_reason():
 # ── Every call that reads or changes the file system ──
 
 
-def _calls(*, home: Path, outside: Path, fd: int) -> dict[str, Callable[[], object]]:
+def _calls(
+    *, home: Path, outside: Path, fd: int, outside_fd: int, opened: list[int]
+) -> dict[str, Callable[[], object]]:
     """One call per kind: each touches COWORK_HOME through one argument only,
-    a path under it or ``fd``, a descriptor of a file there."""
+    a path under it or ``fd``, a descriptor of a file there. Each name starts
+    with the call it makes. ``outside_fd`` is a descriptor of ``outside``,
+    opened before the watch, so a call that names it as a dir_fd makes no
+    other wrapped call. A descriptor a call opens goes in ``opened``, for the
+    test to close after its watch."""
     target = home / "target"
     calls: dict[str, Callable[[], object]] = {
         "unlink": lambda: os.unlink(home / "file"),
@@ -347,10 +382,18 @@ def _calls(*, home: Path, outside: Path, fd: int) -> dict[str, Callable[[], obje
         "truncate": lambda: os.truncate(home / "file", 0),
         "statvfs": lambda: os.statvfs(home),
         "stat by keyword": lambda: os.stat(path=home / "file"),
+        "lstat": lambda: os.lstat(home / "link"),
         "scandir by keyword": lambda: list(os.scandir(path=home)),
         "listdir by keyword": lambda: os.listdir(path=home),
-        "open by keyword": lambda: open(file=home / "file").close(),
-        "rename by its directory descriptors": lambda: _rename_by_directory_descriptors(outside),
+        "open": lambda: opened.append(os.open(home / "file", os.O_RDONLY)),
+        "io.open": lambda: io.open(home / "file").close(),
+        "builtins.open by keyword": lambda: open(file=home / "file").close(),
+        "chown": lambda: os.chown(home / "file", -1, -1),
+        "lchown": lambda: os.lchown(home / "link", -1, -1),
+        "rename by its directory descriptors": lambda: os.rename(
+            "file", "moved", src_dir_fd=outside_fd, dst_dir_fd=outside_fd
+        ),
+        "fstat": lambda: os.fstat(fd),
         "read": lambda: os.read(fd, 1),
         "write": lambda: os.write(fd, b"x"),
         "pread": lambda: os.pread(fd, 1, 0),
@@ -359,6 +402,8 @@ def _calls(*, home: Path, outside: Path, fd: int) -> dict[str, Callable[[], obje
         "ftruncate": lambda: os.ftruncate(fd, 0),
         "fchmod": lambda: os.fchmod(fd, 0o600),
         "fchown": lambda: os.fchown(fd, -1, -1),
+        # os.dup isn't wrapped, so only the close can find the site.
+        "close": lambda: os.close(os.dup(fd)),
     }
     # macOS has no os.fdatasync.
     if hasattr(os, "fdatasync"):
@@ -366,19 +411,18 @@ def _calls(*, home: Path, outside: Path, fd: int) -> dict[str, Callable[[], obje
     return calls
 
 
-def _rename_by_directory_descriptors(outside: Path) -> None:
-    fd = os.open(outside, os.O_RDONLY)
-    try:
-        os.rename("file", "moved", src_dir_fd=fd, dst_dir_fd=fd)
-    finally:
-        os.close(fd)
-
-
 async def _blocks_the_loop(call: Callable[[], object]) -> None:
     call()
 
 
-_CALL_NAMES = list(_calls(home=Path("home"), outside=Path("outside"), fd=-1))
+_CALL_NAMES = list(_calls(home=Path("home"), outside=Path("outside"), fd=-1, outside_fd=-1, opened=[]))
+
+
+def test_every_wrapped_call_has_a_case():
+    """A wrapped call with no case could stop being wrapped and leave every
+    test green."""
+    wrapped = {name for name in guard._PATH_PARAMETERS if hasattr(os, name)}  # os.fdatasync on macOS
+    assert wrapped <= {name.split()[0] for name in _CALL_NAMES}
 
 
 @pytest.mark.parametrize("name", _CALL_NAMES)
@@ -391,12 +435,16 @@ async def test_every_call_that_touches_the_file_store_is_found(org_deployment, t
         file.write_text("hello")
     (home / "link").symlink_to(home / "file")
     fd = os.open(home / "file", os.O_RDWR)
+    outside_fd = os.open(outside, os.O_RDONLY)
+    opened: list[int] = []
 
     try:
         with guard.watching(roots=(_THIS_FILE,)) as found:
-            await _blocks_the_loop(_calls(home=home, outside=outside, fd=fd)[name])
+            call = _calls(home=home, outside=outside, fd=fd, outside_fd=outside_fd, opened=opened)[name]
+            await _blocks_the_loop(call)
     finally:
-        os.close(fd)
+        for each in (fd, outside_fd, *opened):
+            os.close(each)
 
     assert {(site.function, site.kind) for site in found} == {("_blocks_the_loop", guard.LOOP_FILE_STORE)}
 
@@ -568,10 +616,32 @@ async def test_a_library_hand_over_outside_a_request_is_blamed_on_the_coroutine_
     }
 
 
-@pytest.mark.parametrize("route", ["stat_handed_to_anyio", "stat_handed_to_asyncio"])
+@pytest.mark.parametrize(
+    "route",
+    [
+        "stat_handed_to_anyio",
+        "stat_handed_to_asyncio",
+        "stats_gathered",
+        "stat_run_to_completion",
+        "stat_in_the_default_executor",
+    ],
+)
 async def test_a_bare_call_a_cowork_coroutine_hands_to_a_thread_is_found(org_deployment, note, route):
+    """The caller is read when it hands the call over: gather and
+    run_to_completion start the hand-over in a task of its own, and
+    run_in_executor runs it in no copy of the caller's context."""
     function = f"_app.<locals>.{route}"
     assert await _sites_of(f"/{route.replace('_', '-')}") == {
+        guard.Site(_THIS_PATH, function, guard.THREAD_FILE_STORE, _leaf(function))
+    }
+
+
+async def test_a_module_that_binds_to_thread_by_name_holds_the_wrapper(org_deployment, note):
+    """This module binds asyncio.to_thread by name when collection imports
+    it. conftest.py installs the guard before collection, so the name is the
+    guard's wrapper and the route's hand-over is found."""
+    function = "_app.<locals>.stat_handed_to_to_thread_bound_at_import"
+    assert await _sites_of("/stat-handed-to-to-thread-bound-at-import") == {
         guard.Site(_THIS_PATH, function, guard.THREAD_FILE_STORE, _leaf(function))
     }
 
@@ -614,7 +684,7 @@ def _run_the_stale_check(tmp_path: Path, *args: str, env: dict[str, str] | None 
     tests = tmp_path / "tests"
     tests.mkdir(exist_ok=True)
     (tests / "conftest.py").write_text(_STALE_CONFTEST)
-    (tests / "test_runs.py").write_text("def test_runs():\n    pass\n")
+    (tests / "test_runs.py").write_text("def test_runs():\n    pass\n\n\ndef test_runs_too():\n    pass\n")
     (tests / "test_skips_itself.py").write_text(
         "import pytest\n\npytest.skip('needs what this machine lacks', allow_module_level=True)\n"
     )
@@ -659,9 +729,13 @@ def test_a_test_file_that_skips_itself_leaves_the_stale_check_on(tmp_path):
     [
         (["tests/test_runs.py"], {}, "it collected 1 of 2 test files"),
         (["--setup-only", "tests"], {}, "--setup-only runs no test bodies"),
+        (["--setup-plan", "tests"], {}, "--setup-only runs no test bodies"),
         (["tests"], {"FAKE_XDIST_WORKER": "1"}, "pytest-xdist splits the tests between workers"),
+        (["-k", "runs", "tests"], {}, "tests were deselected"),
+        (["-m", "not slow", "tests"], {}, "tests were deselected"),
+        (["--deselect", "tests/test_runs.py::test_runs_too", "tests"], {}, "tests were deselected"),
     ],
-    ids=["one file", "setup only", "xdist worker"],
+    ids=["one file", "setup only", "setup plan", "xdist worker", "keyword", "marker", "deselect"],
 )
 def test_a_run_that_is_not_full_skips_the_stale_check_in_one_line(tmp_path, args, env, reason):
     result = _run_the_stale_check(tmp_path, *args, env=env)

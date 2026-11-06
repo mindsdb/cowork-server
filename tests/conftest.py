@@ -13,7 +13,7 @@ import pkgutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 # Resolved: macOS links /var to /private/var, and a COWORK_HOME under that
 # link takes branches a Linux run doesn't, so the blocking guard
@@ -52,6 +52,18 @@ from sqlmodel import Session, SQLModel
 # Lists every skipped test in CI and fails a run that requires every
 # prerequisite when one is left out without a reason (tests/skip_guard.py).
 from tests.skip_guard import pytest_addoption, pytest_configure  # noqa: E402,F401
+
+# The blocking guard (tests/_blocking_guard.py) wraps its calls before
+# collection imports the test modules and the rest of cowork, so a module
+# loaded after this that binds one by name, as ``from asyncio import
+# to_thread`` or ``from os import scandir`` does, holds the wrapper. The
+# modules the guard imports itself load before it wraps anything:
+# cowork.common.paths, cowork.db.units, the settings and their imports. Those
+# must call os, io and asyncio by attribute, or they keep the real function.
+# The wrappers pass straight through while no watch is open.
+import _blocking_guard  # noqa: E402
+
+_blocking_guard.install()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -555,19 +567,12 @@ def owned_logger(monkeypatch, caplog, tmp_path):
 
 # ── Blocking work where it stops other requests (tests/_blocking_guard.py) ──
 
-# For the annotation alone. The guard imports cowork, so the fixture and the
-# hook below import it when they run.
-if TYPE_CHECKING:
-    import _blocking_guard
-
-_GUARD_REACHED: set["_blocking_guard.Site"] = set()
+_GUARD_REACHED: set[_blocking_guard.Site] = set()
 
 
 @pytest.fixture(autouse=True)
 def blocking_work_guard():
     """Fail a test that reaches a blocking site the guard's allowlist lacks."""
-    import _blocking_guard
-
     with _blocking_guard.watching() as found:
         yield
     _GUARD_REACHED.update(found)
@@ -582,8 +587,6 @@ def blocking_work_guard():
 
 
 def pytest_sessionstart(session):
-    import _blocking_guard
-
     session.config.pluginmanager.register(
         _blocking_guard.StaleEntryCheck(tests_dir=Path(__file__).parent, reached=_GUARD_REACHED),
         "cowork-blocking-guard-stale-entries",

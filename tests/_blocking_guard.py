@@ -9,7 +9,7 @@ thread it holds a pooled connection while it waits. A pool checkout on the
 loop stops the loop for up to POOL_TIMEOUT when the pool is full. File store
 work belongs in ``run_efs`` and database work in ``run_db`` (cowork/db/units.py).
 
-The guard wraps the ``os`` calls that read or change the file system
+The guard wraps the ``os`` calls that read, change or close a file or folder
 (``_PATH_PARAMETERS``), ``open`` and ``io.open``, and listens for SQLAlchemy
 pool checkouts. A call is file store work when a path it names, by position
 or by keyword, is under COWORK_HOME, or when it names a file descriptor. The
@@ -29,10 +29,12 @@ guard records a site:
   ``lambda session: _list_projects(session, principal)`` is
   ``_list_projects``. When the thread runs no cowork function, as when a
   bare ``os.stat`` is handed over, the site is the coroutine that called
-  ``anyio.to_thread.run_sync`` or ``asyncio.to_thread``. When that coroutine
-  is a library's, the site is the route whose request it answers, as
-  Starlette's ``FileResponse`` stats and opens its file after its route
-  returned, or else the cowork coroutine that awaits it.
+  ``anyio.to_thread.run_sync``, ``asyncio.to_thread`` or
+  ``loop.run_in_executor``, read when it made that call, since ``gather``,
+  ``run_to_completion`` and task groups start the hand-over in a task of its
+  own. When that coroutine is a library's, the site is the route whose
+  request it answers, as Starlette's ``FileResponse`` stats and opens its
+  file after its route returned, or else the cowork coroutine that awaits it.
 
 A site also names its leaf: ``path:qualname`` of the cowork function nearest
 the call, past the file helpers in cowork/common/paths.py, or the helper
@@ -40,7 +42,9 @@ itself when the site's own function called it. For a call a library handed
 over it is the library's coroutine that handed it over, and when nothing
 nearer is cowork's it is the site's own function. So new work below a listed
 function is a new site, even when it goes through a listed helper, and so is
-a new caller of a listed function.
+a new outermost function that calls a listed leaf. On a worker thread the
+site is the function handed over, so a new coroutine that hands a listed
+function to a thread is the listed site, not a new one.
 
 File store work counts only in org tenancy, where COWORK_HOME is the shared
 file store: when the environment names it, as ``org_deployment`` does, or
@@ -78,7 +82,7 @@ import sysconfig
 import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from inspect import CO_ASYNC_GENERATOR, CO_COROUTINE
 from pathlib import Path
 from types import CodeType, FrameType
@@ -156,6 +160,9 @@ _PATH_PARAMETERS: dict[str, tuple[str | None, ...]] = {
     "ftruncate": ("fd",),
     "fchmod": ("fd",),
     "fchown": ("fd",),
+    "chown": ("path",),
+    "lchown": ("path",),
+    "close": ("fd",),
 }
 _OPEN_PARAMETERS = ("file",)
 _DIR_FD_KEYWORDS = ("dir_fd", "src_dir_fd", "dst_dir_fd")
@@ -249,7 +256,12 @@ ALLOWLIST: tuple[Allowed, ...] = (
         'cowork/services/projects.py:ProjectService.ensure_dir_exists',
     ), 'opens every project folder for its pinned-directory inventory, and writes the uploads, on the loop'),
     Allowed('cowork/services/artifacts.py', 'mount_preview', LOOP_FILE_STORE, (ANY_LEAF,), 'desktop only (DesktopOnly on POST /api/v1/artifacts/preview-mount)'),
-    Allowed('cowork/api/v1/endpoints/artifact_workspace.py', '_draft_stream.<locals>.chunks', THREAD_FILE_STORE, ('cowork/common/paths.py:read_bounded',), "streams the draft file's bytes from a sync generator's body, which Starlette's StreamingResponse reads on anyio's default threads"),
+    Allowed('cowork/api/v1/endpoints/artifact_workspace.py', '_draft_stream.<locals>.chunks', THREAD_FILE_STORE, (
+        'cowork/api/v1/endpoints/artifact_workspace.py:_draft_stream.<locals>.chunks',
+        'cowork/common/paths.py:read_bounded',
+        'cowork/services/artifact_identity.py:_opened_child_directory',
+        'cowork/services/artifact_identity.py:_opened_from_trusted_root',
+    ), "streams the draft file's bytes from a sync generator's body, and closes the pinned file and folders when the body ends, which Starlette's StreamingResponse runs on anyio's default threads"),
     Allowed('cowork/api/v1/endpoints/files.py', 'retrieve_file_content', THREAD_FILE_STORE, (
         'cowork/services/files.py:FileService.get_file_content',
         'starlette/responses.py:FileResponse.__call__',
@@ -288,7 +300,10 @@ ALLOWLIST: tuple[Allowed, ...] = (
         'cowork/api/v1/endpoints/project_files.py:_write_bytes_at_project_root',
         'cowork/services/projects.py:ProjectService.ensure_dir_exists',
     ), "sync route: creates the project folder and writes the file on anyio's default threads"),
-    Allowed('cowork/api/v1/endpoints/project_files.py', '_pinned_stream.<locals>._chunks', THREAD_FILE_STORE, ('cowork/common/paths.py:read_bounded',), "streams the project file's bytes from a sync generator's body, which Starlette's StreamingResponse reads on anyio's default threads"),
+    Allowed('cowork/api/v1/endpoints/project_files.py', '_pinned_stream.<locals>._chunks', THREAD_FILE_STORE, (
+        'cowork/api/v1/endpoints/project_files.py:_pinned_fd',
+        'cowork/common/paths.py:read_bounded',
+    ), "streams the project file's bytes from a sync generator's body, and closes the pinned file when the body ends, which Starlette's StreamingResponse runs on anyio's default threads"),
     Allowed('cowork/api/v1/endpoints/projects.py', 'create_project', THREAD_FILE_STORE, (
         'cowork/services/projects.py:ProjectService._mkdir_in_root',
         'cowork/services/projects.py:ProjectService._project_path',
@@ -387,13 +402,15 @@ ALLOWLIST: tuple[Allowed, ...] = (
     Allowed('cowork/api/v1/endpoints/artifacts.py', '_plan_scoped_project', THREAD_FILE_STORE, ('cowork/services/projects.py:ProjectService.resolved_shared_root',), "a run_db unit whose roots plan resolves the shared root to leave out a project in another person's partition"),
     Allowed('cowork/services/artifact_roots.py', 'plan_scope_roots', THREAD_FILE_STORE, ('cowork/services/projects.py:ProjectService.resolved_shared_root',), "a run_db unit whose roots plan resolves the shared root to leave out a project in another person's partition"),
     Allowed('cowork/services/connectors/vault_secrets.py', '_restore_from_vault', THREAD_FILE_STORE, ('cowork/services/connectors/vault_secrets.py:_restore_from_vault',), "reads the organization's connection vault through asyncio.to_thread"),
-    Allowed('cowork/services/publish.py', 'publish_artifact', THREAD_FILE_STORE, (ANY_LEAF,), "the agent's publish tool reads the artifact in its tool thread"),
+    Allowed('cowork/services/publish.py', 'publish_artifact', THREAD_FILE_STORE, (ANY_LEAF,), "the three publish uploads (live sync, publish after an access change, autopublish) run it on the loop's default executor threads through asyncio.to_thread: mostly network time, and a burst of turn-end uploads must not take the file store slots (EFS_SLOTS)"),
     Allowed('cowork/services/publish.py', 'stored_artifact_rule', THREAD_FILE_STORE, (
         'cowork/services/artifact_identity.py:_read_no_follow',
+        'cowork/services/artifact_identity.py:ensure_full_id',
         'cowork/services/projects.py:ProjectService.resolved_shared_root',
     ), "the access routes read the published entry and the artifact's authorization key on anyio's default threads, then ask MindsHub for its stored rule"),
     Allowed('cowork/services/publish.py', 'rule_held_over_entry', THREAD_FILE_STORE, (
         'cowork/services/artifact_identity.py:_read_no_follow',
+        'cowork/services/artifact_identity.py:ensure_full_id',
         'cowork/services/projects.py:ProjectService.resolved_shared_root',
     ), "the access route reads the published entry and the artifact's authorization key on anyio's default threads, then asks MindsHub for a rule it still holds"),
     Allowed('cowork/turnqueue/remote_turn.py', '_read_channel_turn_inputs', THREAD_FILE_STORE, (
@@ -469,8 +486,9 @@ class _HandedOver(NamedTuple):
     leaf: CodeType
 
 
-#: Set by anyio.to_thread.run_sync and asyncio.to_thread, both of which copy
-#: the caller's context into the thread.
+#: Set by the wrappers of anyio.to_thread.run_sync and asyncio.to_thread,
+#: both of which copy the caller's context into the thread, and of
+#: loop.run_in_executor, which runs its call in a copy it sets.
 _handed_over: ContextVar[_HandedOver | None] = ContextVar("blocking_guard_handed_over", default=None)
 
 
@@ -708,20 +726,45 @@ def _handing_coroutine(frame: FrameType | None) -> _HandedOver | None:
 
 
 def _handing_over(real):
-    """Wrap a coroutine that runs a call in a thread, so the thread knows who
-    handed it the call."""
+    """Wrap a coroutine function that runs a call in a thread, so the thread
+    knows who handed it the call. The caller is read at call time, because
+    gather, run_to_completion and task groups start the coroutine in a task
+    of its own."""
 
-    async def hand_over(*args, **kwargs):
+    def hand_over(*args, **kwargs):
         if not _watches:
-            return await real(*args, **kwargs)
-        token = _handed_over.set(_handing_coroutine(sys._getframe(1)))
-        try:
-            return await real(*args, **kwargs)
-        finally:
-            _handed_over.reset(token)
+            return real(*args, **kwargs)
+        handed = _handing_coroutine(sys._getframe(1))
 
+        async def run():
+            token = _handed_over.set(handed)
+            try:
+                return await real(*args, **kwargs)
+            finally:
+                _handed_over.reset(token)
+
+        return run()
+
+    inspect.markcoroutinefunction(hand_over)
     hand_over.__wrapped__ = real
     return hand_over
+
+
+def _handing_to_the_executor(real):
+    """Wrap BaseEventLoop.run_in_executor, so the thread knows who handed it
+    the call. run_in_executor runs the call in no copy of the caller's
+    context, so the wrapper runs it in a copy that names the caller. A call
+    asyncio.to_thread makes already names its caller and passes through."""
+
+    def run_in_executor(self, executor, func, *args):
+        if not _watches or _handed_over.get() is not None:
+            return real(self, executor, func, *args)
+        context = copy_context()
+        context.run(_handed_over.set, _handing_coroutine(sys._getframe(1)))
+        return real(self, executor, context.run, func, *args)
+
+    run_in_executor.__wrapped__ = real
+    return run_in_executor
 
 
 def _on_checkout(_dbapi_connection, _record_, _proxy) -> None:
@@ -761,6 +804,11 @@ def install() -> None:
     _replace(builtins, name="open", wrapper=guarded_open)
     _replace(anyio.to_thread, name="run_sync", wrapper=_handing_over(anyio.to_thread.run_sync))
     _replace(asyncio, name="to_thread", wrapper=_handing_over(asyncio.to_thread))
+    _replace(
+        asyncio.BaseEventLoop,
+        name="run_in_executor",
+        wrapper=_handing_to_the_executor(asyncio.BaseEventLoop.run_in_executor),
+    )
     event.listen(Pool, "checkout", _on_checkout)
 
 
@@ -815,10 +863,9 @@ class StaleEntryCheck:
         option = config.option
         if exitstatus not in (pytest.ExitCode.OK, pytest.ExitCode.TESTS_FAILED):
             return f"the run ended with exit status {int(exitstatus)}"
+        # pytest sets setuponly for --setup-plan too.
         if option.setuponly:
             return "--setup-only runs no test bodies"
-        if option.setupplan:
-            return "--setup-plan runs no test bodies"
         if hasattr(config, "workerinput") or config.pluginmanager.hasplugin("dsession"):
             return "pytest-xdist splits the tests between workers"
         if self.deselected or option.keyword or option.markexpr:

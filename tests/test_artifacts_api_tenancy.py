@@ -559,6 +559,9 @@ async def test_fullstack_draft_preview_cannot_read_backend_source(
             str(row.id), card["id"], "static/app.js", MagicMock(query_params={}), reviewer.scope
         )
         assert asset.status_code == 200
+        # Read the body as the server sends it: its end closes the pinned file
+        # and folders the response holds, rather than leaving them to the GC.
+        assert b"".join([chunk async for chunk in asset.body_iterator]) == b"console.log('safe')"
 
         with pytest.raises(HTTPException) as err:
             await workspace_ep.serve_private_draft(
