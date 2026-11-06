@@ -70,9 +70,9 @@ class _Proxy:
 
     ``lose_next_reply`` drops the next reply Redis sends and closes that
     connection, after Redis has applied the command. ``connect_delay_s`` holds
-    each new connection that long before it reaches Redis. ``drop_marker``
-    holds the next command whose bytes hold it for ``drop_after_s``, then stops
-    accepting connections and closes that one without sending the command.
+    each new connection that long before it reaches Redis. The next command
+    whose bytes contain ``drop_marker`` is held for ``drop_after_s``, then the
+    proxy stops accepting connections and closes that one without sending it.
     ``refuse`` stops accepting connections, and ``listen`` starts again on the
     same port.
     """
@@ -115,7 +115,7 @@ class _Proxy:
                 self._to_client(upstream_reader, client_writer),
             )
         except (ConnectionError, OSError):
-            pass
+            pass  # Either side closed, or a pump ended the connection on purpose.
         finally:
             client_writer.close()
             if upstream_writer is not None:

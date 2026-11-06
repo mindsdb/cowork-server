@@ -66,9 +66,9 @@ REDIS_BLOCK_MS = 2000
 #: A pooled connection idle this long is PINGed before its next command, so a
 #: connection a failover left half-open is replaced before a write goes out on it.
 HEALTH_CHECK_INTERVAL_S = 15
-#: How long one call on the async client keeps retrying: long enough for a
-#: Sentinel failover to notice the primary is gone, promote a replica and move
-#: the Service to it.
+#: How long one call on the async client keeps retrying. Sized for a Sentinel
+#: failover that notices a lost primary within about 10 s, then promotes a
+#: replica and moves the Service to it; a slower failover outlasts it.
 ASYNC_CALL_BUDGET_S = 30.0
 #: The same for the blocking client, whose callers each hold a threadpool thread.
 SYNC_CALL_BUDGET_S = 10.0
