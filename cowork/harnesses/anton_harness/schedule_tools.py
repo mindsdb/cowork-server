@@ -163,6 +163,13 @@ def _pause_unit(session: ScopedSession, *, schedule_id: UUID) -> dict:
     return _summary(ScheduleService(session).pause_schedule(schedule_id))
 
 
+def _resume_plan_unit(session: ScopedSession, *, schedule_id: UUID) -> bool:
+    """Whether resuming now runs a slot left due right away (see
+    ScheduleService.resume_plan)."""
+    _next_run_at, runs_now = ScheduleService(session).resume_plan(schedule_id)
+    return runs_now
+
+
 def _resume_unit(session: ScopedSession, *, schedule_id: UUID) -> dict:
     return _summary(ScheduleService(session).resume_schedule(schedule_id))
 
@@ -348,13 +355,14 @@ _CHANGE_LABELS = {
 }
 
 
-def _show_resume_catch_up(preview: dict) -> None:
-    """Make a resume card show what the scheduler will really do.
+def _show_resume_catch_up(preview: dict, *, runs_now: bool) -> None:
+    """Make a resume card show what resuming will really do.
 
-    Resuming only re-enables the task, and its next run time may have passed
-    while it was paused. The scheduler then runs one missed slot right away,
-    or skips several and waits for the next one (scheduler._handle_missed_runs),
-    so the card shows that next slot and says which of the two happens.
+    The task's next run time may have passed while it was paused. Resuming
+    skips the slots missed while paused and waits for the next one, except a
+    slot left due by a run whose agent never acted, which runs right away
+    (ScheduleService.resume_plan). The card shows the next slot and says which
+    of the two happens.
     """
     from cowork.schedule_timing import count_missed_occurrences
 
@@ -365,11 +373,12 @@ def _show_resume_catch_up(preview: dict) -> None:
     if missed == 0:
         return
     preview["next_run_at"] = ensure_utc(future).isoformat()
-    preview["catch_up"] = (
-        "It runs once right away for the run it missed while paused."
-        if missed == 1
-        else f"The {missed} runs it missed while paused are skipped."
-    )
+    if runs_now:
+        preview["catch_up"] = "It runs once right away for the run it missed while paused."
+    elif missed == 1:
+        preview["catch_up"] = "The run it missed while paused is skipped."
+    else:
+        preview["catch_up"] = f"The {missed} runs it missed while paused are skipped."
 
 
 def card_prompt(action: str, task: dict, *, before: dict | None = None) -> str:
@@ -522,7 +531,8 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
                         "This one-off task's run time has passed. Update `next_run_at` to a future "
                         "time first, then resume it.", before,
                     )
-                _show_resume_catch_up(preview)
+                runs_now = await run_db(partial(_resume_plan_unit, schedule_id=schedule_id), scope=scope)
+                _show_resume_catch_up(preview, runs_now=runs_now)
                 apply = partial(_resume_unit, schedule_id=schedule_id)
             else:
                 apply = partial(_delete_unit, schedule_id=schedule_id)
@@ -552,9 +562,11 @@ async def _manage_task(session: Any, tc_input: dict, *, project_id: UUID | None)
             return _result("Nothing was deleted: the task was already gone.")
         return _result(f"Deleted “{preview['title']}”.")
     if action == "resume":
-        # The stored time stays in the past until the scheduler's next poll;
-        # report the run the card promised instead.
-        _show_resume_catch_up(outcome)
+        # A slot left due keeps its past time until it runs; report the run
+        # the card promised instead.
+        outcome["next_run_at"] = preview["next_run_at"]
+        if "catch_up" in preview:
+            outcome["catch_up"] = preview["catch_up"]
     verb = {"create": "Scheduled", "update": "Updated", "pause": "Paused", "resume": "Resumed"}[action]
     return _result(f"{verb} “{outcome['title']}”. It's on the Scheduled Tasks page.", outcome)
 

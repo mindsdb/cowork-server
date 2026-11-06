@@ -242,14 +242,21 @@ class ScheduleService:
         schedule.auto_paused_at = None
         schedule.missed_at = None
         schedule.consecutive_failures = 0
-        if not self._slot_left_due(schedule, now):
-            schedule.next_run_at = normalize_next_run(
-                schedule.cadence, schedule.next_run_at, schedule.timezone, now=now,
-            )
+        schedule.next_run_at, _ = self._resumed_next_run(schedule, now)
         self.session.add(schedule)
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
+
+    def resume_plan(self, schedule_id: UUID) -> tuple[datetime, bool]:
+        """What resuming now would do, without doing it: the time the task
+        will next run, and whether that is a slot left due running right away."""
+        return self._resumed_next_run(self.get_schedule(schedule_id), datetime.now(timezone.utc))
+
+    def _resumed_next_run(self, schedule: Schedule, now: datetime) -> tuple[datetime, bool]:
+        if self._slot_left_due(schedule, now):
+            return _utc(schedule.next_run_at), True
+        return normalize_next_run(schedule.cadence, schedule.next_run_at, schedule.timezone, now=now), False
 
     def _slot_left_due(self, schedule: Schedule, now: datetime) -> bool:
         """Whether a resumed recurring schedule keeps its due slot: the last
