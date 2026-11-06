@@ -40,6 +40,8 @@ def resolve_schedule_model(stored: str | None) -> str | None:
 
 class Cadence(str, Enum):
     once = "once"
+    every_15_minutes = "every_15_minutes"
+    every_30_minutes = "every_30_minutes"
     hourly = "hourly"
     daily = "daily"
     weekdays = "weekdays"
