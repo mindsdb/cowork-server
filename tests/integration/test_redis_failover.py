@@ -70,9 +70,11 @@ class _Proxy:
 
     ``lose_next_reply`` drops the next reply Redis sends and closes that
     connection, after Redis has applied the command. ``connect_delay_s`` holds
-    each new connection that long before it reaches Redis.
-    ``hold_next_command_s`` holds the next command that long, then closes the
-    connection without sending it. ``refuse`` stops accepting connections.
+    each new connection that long before it reaches Redis. ``drop_marker``
+    holds the next command whose bytes hold it for ``drop_after_s``, then stops
+    accepting connections and closes that one without sending the command.
+    ``refuse`` stops accepting connections, and ``listen`` starts again on the
+    same port.
     """
 
     def __init__(self, *, upstream_url: str) -> None:
@@ -80,14 +82,16 @@ class _Proxy:
         self._upstream = (parts.hostname or "localhost", parts.port or 6379)
         self.lose_next_reply = False
         self.connect_delay_s = 0.0
-        self.hold_next_command_s: float | None = None
+        self.drop_marker: bytes | None = None
+        self.drop_after_s = 0.0
         self.connections = 0
+        self.port = 0
         self._server: asyncio.Server | None = None
         self._handlers: set[asyncio.Task] = set()
 
-    async def start(self) -> int:
-        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
-        return self._server.sockets[0].getsockname()[1]
+    async def listen(self) -> None:
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", self.port)
+        self.port = self._server.sockets[0].getsockname()[1]
 
     def refuse(self) -> None:
         self._server.close()
@@ -119,10 +123,11 @@ class _Proxy:
 
     async def _to_redis(self, client_reader, upstream_writer) -> None:
         while data := await client_reader.read(65536):
-            if self.hold_next_command_s is not None:
-                hold, self.hold_next_command_s = self.hold_next_command_s, None
-                await asyncio.sleep(hold)
-                raise ConnectionResetError("held, then dropped")
+            if self.drop_marker is not None and self.drop_marker in data:
+                self.drop_marker = None
+                await asyncio.sleep(self.drop_after_s)
+                self.refuse()
+                raise ConnectionResetError("command dropped")
             upstream_writer.write(data)
             await upstream_writer.drain()
         raise ConnectionResetError("client closed")
@@ -140,8 +145,8 @@ class _Proxy:
 @pytest.fixture
 async def proxy(redis_url):
     proxy = _Proxy(upstream_url=redis_url)
-    port = await proxy.start()
-    proxy.url = _with_netloc(redis_url, host="127.0.0.1", port=port)
+    await proxy.listen()
+    proxy.url = _with_netloc(redis_url, host="127.0.0.1", port=proxy.port)
     yield proxy
     await proxy.close()
 
@@ -304,15 +309,34 @@ async def test_a_reconnect_inside_a_retry_spends_what_is_left_of_the_calls_deadl
     budget_s = 2.0
     client = build_async_redis(url=proxy.url, call_budget_s=budget_s)
     await client.ping()
-    proxy.hold_next_command_s = 0.7
+    proxy.drop_marker = b"deadline:nested"
+    proxy.drop_after_s = 0.7
 
     started = time.monotonic()
-    call = asyncio.create_task(client.get("deadline:key"))
-    await asyncio.sleep(0.2)
+    with pytest.raises(RedisConnectionError):
+        await client.get("deadline:nested")
+
+    assert time.monotonic() - started < budget_s + 0.4
+    await client.aclose()
+
+
+async def test_a_call_whose_connect_retried_spends_the_same_deadline_on_its_command(proxy):
+    """Taking a connection from the pool retries its connect before the
+    command's own retry loop starts. With a deadline per loop, a call that
+    connected late gets a new budget for its command."""
+    budget_s = 2.0
+    client = build_async_redis(url=proxy.url, call_budget_s=budget_s)
     proxy.refuse()
+    proxy.drop_marker = b"deadline:late"
+
+    started = time.monotonic()
+    call = asyncio.create_task(client.get("deadline:late"))
+    await asyncio.sleep(0.8)
+    await proxy.listen()
     with pytest.raises(RedisConnectionError):
         await call
 
+    assert proxy.connections == 1
     assert time.monotonic() - started < budget_s + 0.4
     await client.aclose()
 
