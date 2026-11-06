@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from cowork.schemas.base import CamelRequest, CamelResponse
 
@@ -53,6 +53,15 @@ class RunStatus(str, Enum):
     cancelled = "cancelled"
 
 
+def _utc_next_run(value: datetime | None) -> datetime | None:
+    # SQLite stores a datetime's clock time without its offset and reads it
+    # back as UTC, so 09:00-07:00 would come back as 09:00 UTC. A naive time
+    # already means UTC.
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc)
+
+
 class ScheduleCreateRequest(CamelRequest):
     title: str
     prompt: str
@@ -62,6 +71,8 @@ class ScheduleCreateRequest(CamelRequest):
     timezone: str = "UTC"
     project_id: UUID | None = None
     enabled: bool = True
+
+    _next_run_utc = field_validator("next_run_at")(_utc_next_run)
 
 
 class ScheduleUpdateRequest(CamelRequest):
@@ -73,6 +84,8 @@ class ScheduleUpdateRequest(CamelRequest):
     timezone: str | None = None
     project_id: UUID | None = None
     enabled: bool | None = None
+
+    _next_run_utc = field_validator("next_run_at")(_utc_next_run)
 
 
 class ScheduleResponse(CamelResponse):

@@ -706,6 +706,10 @@ def _start_first_take(
 
 
 class ResponsesHandler:
+    # Also the class default, so a producer reached without __init__ reads
+    # the common case: a person watching who can answer a card.
+    interactive: bool = True
+
     def __init__(
         self,
         *,
@@ -2904,6 +2908,7 @@ class ResponsesHandler:
                 # tool's message to the user, as on the remote path.
                 tool_messages=True,
                 model_wait=model_wait,
+                interactive=self.interactive,
             )
             event_count = 0
             completed_frame: str | None = None
