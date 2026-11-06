@@ -296,6 +296,56 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
     }
 
 
+#: Engines connected through MCP on web. The auth service hands their tokens
+#: only to a connector-token key, which anton alone holds; the scratchpad
+#: keeps the turn key, so cell code can't fetch the token and skip the
+#: connection's access mode.
+MCP_ENGINES = frozenset({"hubspot", "notion"})
+
+
+async def _mint_connector_key(*, org_id: str, user_id: str, correlation_id: str,
+                              settings: TurnQueueSettings, workspace_id: str | None) -> str | None:
+    """A connector-token key for anton's own token fetches, or None.
+
+    None falls back to the turn key: until the auth service requires this key
+    for MCP tokens, the turn key still works, so a failed mint must not fail
+    the turn.
+    """
+    try:
+        return await mint_turn_key(
+            user_id=user_id, org_id=org_id, correlation_id=correlation_id,
+            ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
+            purpose="connector_token", workspace_id=workspace_id,
+        )
+    except Exception:
+        logger.warning(
+            "[producer] connector key mint failed correlation_id=%s; using the turn key", correlation_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def _oauth_block_and_connector_key(*, org_id: str | None, user_id: str | None,
+                                         disabled: list[dict] | None, correlation_id: str,
+                                         settings: TurnQueueSettings,
+                                         workspace_id: str | None) -> tuple[dict | None, str | None]:
+    """The oauth connections, then a connector key when one of them is MCP.
+
+    Chained so the key is minted only for turns that need it, while the pair
+    still runs alongside the turn-key mint."""
+    oauth_connections = await _mint_oauth_block(
+        org_id=org_id, user_id=user_id, disabled=disabled, settings=settings,
+    )
+    connections = (oauth_connections or {}).get("connections") or []
+    if not any(c.get("engine") in MCP_ENGINES for c in connections):
+        return oauth_connections, None
+    connector_key = await _mint_connector_key(
+        org_id=org_id, user_id=user_id, correlation_id=correlation_id,
+        settings=settings, workspace_id=workspace_id,
+    )
+    return oauth_connections, connector_key
+
+
 def _connectors_block(oauth_connections: dict | None, project_name: str | None = None) -> dict | None:
     """The turn's `connectors` block: {engine: {"usage_notes": ...}} for the
     engines of this turn's connections whose spec declares usage notes. None
@@ -656,17 +706,18 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # An outage here happens before anything is queued. Reported as a
     # turn_failed so both callers stream permission_unavailable, not a generic error.
     try:
-        oauth_connections_coro = _mint_oauth_block(
-            org_id=org_id, user_id=user_id, disabled=disabled, settings=settings,
+        from cowork.common.settings.user_settings import get_user_settings
+        workspace_id = getattr(get_user_settings(scope), "hub_workspace_id", "") or None
+        oauth_connections_coro = _oauth_block_and_connector_key(
+            org_id=org_id, user_id=user_id, disabled=disabled, correlation_id=corr,
+            settings=settings, workspace_id=workspace_id,
         )
         if llm:
             llm_block = llm
-            oauth_connections = await oauth_connections_coro
+            oauth_connections, connector_key = await oauth_connections_coro
         else:
-            from cowork.common.settings.user_settings import get_user_settings
-            workspace_id = getattr(get_user_settings(scope), "hub_workspace_id", "") or None
             if settings.datasource_enabled:
-                (llm_block, turn_key_id), oauth_connections = await asyncio.gather(
+                (llm_block, turn_key_id), (oauth_connections, connector_key) = await asyncio.gather(
                     _mint_llm_block_with_turn_key_id(
                         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
                         workspace_id=workspace_id,
@@ -674,7 +725,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                     oauth_connections_coro,
                 )
             else:
-                llm_block, oauth_connections = await asyncio.gather(
+                llm_block, (oauth_connections, connector_key) = await asyncio.gather(
                     _mint_llm_block(
                         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
                         workspace_id=workspace_id,
@@ -697,14 +748,15 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         yield "turn_failed", _setup_permission_failure()
         return
 
-    # Reuses the turn key already minted for llm_block — never mints a
-    # second one. Org/cloud mode only: local-mode turns build in-process
-    # and never reach this function at all.
+    # anton fetches connector tokens with the connector key when the turn has
+    # an MCP connection, else with the turn key llm_block already carries. The
+    # connector key goes only here, never into llm_block or the scratchpad.
+    # Org/cloud mode only: local-mode turns never reach this function.
     oauth_block = (
         {
             **oauth_connections,
             "connections": _oauth_connections_wire(oauth_connections.get("connections") or []),
-            "turn_key": llm_block.get("api_key", ""),
+            "turn_key": connector_key or llm_block.get("api_key", ""),
         }
         if oauth_connections
         else None
