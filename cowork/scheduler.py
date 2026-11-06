@@ -25,13 +25,15 @@ from cowork.db.scoped import (
     unsafe_unscoped_session,
 )
 from cowork.db.units import run_db
-from cowork.models.schedule import Schedule
+from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schedule_timing import missed_slots, next_future_occurrence
-from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus, resolve_schedule_model
+from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus, RunTrigger, resolve_schedule_model
 from cowork.services.schedules import (
+    AbandonedTurn,
     ScheduleBusy,
     ScheduleRunService,
     ScheduleService,
+    OrgRunsAtLimit,
     SlotAlreadyClaimed,
     count_settled_slot,
 )
@@ -48,11 +50,14 @@ logger = get_logger(__name__)
 T = TypeVar("T")
 
 _POLL_INTERVAL_SECONDS = 30
-# Upper bound on a single run. A hung agent (stuck tool call, wedged stream)
-# must not keep its ScheduleRun in `running` forever — that would block the
-# schedule from ever firing again. On timeout the turn is stopped and the run
-# is recorded as failed.
-_MAX_RUN_DURATION_SECONDS = 600
+# A turn that runs in a pod is already bounded by scratchpad-controller's
+# hard_turn_timeout_seconds, counted from when the controller takes the job
+# and including the pod's start. On that backend the run's own bound sits above
+# it by the time spent before the controller takes it: the gate, key mints and
+# the queue wait. The two services share no config, so keep this in step with
+# that setting by hand.
+_REMOTE_TURN_BUDGET_SECONDS = 600
+_REMOTE_SETUP_MARGIN_SECONDS = 300
 # The width of Conversation.topic. A schedule's title has no limit, and a run's
 # conversation is named after it.
 _TOPIC_MAX_LENGTH = 255
@@ -61,18 +66,14 @@ _TOPIC_MAX_LENGTH = 255
 # `running` stops its schedule firing until a restart, and an outcome never
 # recorded leaves its slot due, so the slot would run a second time. Each try
 # already waits POOL_TIMEOUT for a connection; the pause between tries only
-# keeps a refusal that comes back at once from spinning.
-_BOOKKEEPING_DEADLINE_SECONDS = _MAX_RUN_DURATION_SECONDS
+# keeps a refusal that comes back at once from spinning. Its own value, not
+# the run's time limit: how long a busy pool may hold the last writes has
+# nothing to do with how long a turn may take.
+_BOOKKEEPING_DEADLINE_SECONDS = 600
 _BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
-# How old a run still at `running` must be before a booting replica may reap
-# it: its turn is cut off at _MAX_RUN_DURATION_SECONDS and its last writes
-# (the outcome, then the finish) each give up after
-# _BOOKKEEPING_DEADLINE_SECONDS, plus slack for the units before the turn
-# starts. An error path with a third last write can use up that slack, which
-# is harmless: the run's own finish overwrites a reaped status. Age is only a
-# heuristic, since a database unit that stalls holds a run past any deadline,
-# so only boot uses it, not every poll.
-_ORPHANED_RUN_AGE_SECONDS = _MAX_RUN_DURATION_SECONDS + 2 * _BOOKKEEPING_DEADLINE_SECONDS + 10 * 60
+# Slack, on top of a run's time limit and its last writes, before a booting
+# replica may presume a run still at `running` dead (_orphaned_run_age_seconds).
+_ORPHANED_RUN_SLACK_SECONDS = 10 * 60
 # A run holds its claim this long unless its process renews it, which it does
 # every _LEASE_RENEW_SECONDS for as long as the run lives. A run past its lease
 # belongs to a process that died without recording how the run ended, so any
@@ -82,8 +83,13 @@ _LEASE_RENEW_SECONDS = 30
 _LAPSED_RUN_ERROR = "Run was interrupted: the server running it stopped before it finished."
 _scheduler_task: asyncio.Task | None = None
 # Scheduled runs this process executes at once, cron and run-now alike
-# (_Admission). A due slot over the limit stays due for a later poll.
-_MAX_CONCURRENT_RUNS = 3
+# (_Admission), when COWORK_SCHEDULED_RUNS_PER_PROCESS is unset. A due slot
+# over the limit stays due for a later poll. On the desktop each run is an
+# agent on the user's own machine, so the limit stays small. When turns run in
+# sandbox pods the process only streams them; the controller runs 64 turns per
+# replica, shared with interactive chat, and 2-4 server replicas each take 16.
+_DESKTOP_RUNS_PER_PROCESS = 3
+_HOSTED_RUNS_PER_PROCESS = 16
 # The frames a turn writes before its agent can act, besides its failure: its
 # start, and the learned memory it read while building the prompt. A failed
 # turn whose stream holds nothing else failed before it acted. A progress
@@ -274,23 +280,45 @@ class DueSlot:
     slot_at: datetime
 
 
+def _runs_per_process() -> int:
+    """How many scheduled runs this process executes at once: the setting
+    when one is given, otherwise by where turns run."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    configured = get_app_settings().scheduled_runs_per_process
+    if configured is not None:
+        return configured
+    return _HOSTED_RUNS_PER_PROCESS if get_backend() == "redis" else _DESKTOP_RUNS_PER_PROCESS
+
+
+def _org_run_limit() -> int | None:
+    """How many scheduled runs one organization may have going at once,
+    across every replica (ScheduleRunService.org_runs_in_flight).
+    The process limit bounds one pod's load across all organizations; this
+    keeps one organization's burst from taking every replica's places."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    return get_app_settings().scheduled_runs_per_org
+
+
 class _Admission:
     """Scheduled runs this process executes at once, cron and run-now alike.
 
     Each process keeps its own count, so this bounds one process's load, not
     the fleet's. Run-now reserves its place from a request thread, so the
-    count is guarded by a lock.
+    count is guarded by a lock. ``limit`` is read at each reservation.
     """
 
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: Callable[[], int]) -> None:
         self._limit = limit
         self._lock = threading.Lock()
         self._held = 0
 
     def reserve(self) -> bool:
         """Take a place, or False when every place is taken."""
+        limit = self._limit()
         with self._lock:
-            if self._held >= self._limit:
+            if self._held >= limit:
                 return False
             self._held += 1
             return True
@@ -305,7 +333,9 @@ class _Admission:
             return self._held
 
 
-_admission = _Admission(_MAX_CONCURRENT_RUNS)
+_admission = _Admission(_runs_per_process)
+_active_run_ids: set[UUID] = set()
+_active_run_lock = threading.Lock()
 
 
 async def run_admitted(schedule_id: UUID, **kwargs) -> None:
@@ -397,20 +427,27 @@ def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
 
 def _create_run(
     session: ScopedSession, *, schedule_id: UUID, is_manual: bool, slot_at: datetime | None,
+    trial: bool = False,
 ) -> UUID:
+    # A cron run waits for its organization's place, counted in the insert's
+    # transaction so replicas can't overshoot together. Run now is checked by
+    # its request instead (org_runs_full), and refused with a reason.
     return ScheduleRunService(session).create_run(
         schedule_id, is_manual=is_manual, slot_at=slot_at, lease_seconds=_RUN_LEASE_SECONDS,
+        org_limit=None if is_manual else _org_run_limit(), trial=trial,
     ).id
 
 
-def claim_manual_run(session: ScopedSession, schedule_id: UUID) -> UUID:
+def claim_manual_run(session: ScopedSession, schedule_id: UUID, *, trial: bool = False) -> UUID:
     """Insert a Run now's run row, leased, before the request answers. Raises
     ScheduleBusy when the schedule already has a run going, so two presses,
     or a press racing a cron claim, start one run. The run is then executed
     with ``execute_schedule(run_id=...)``; if that never starts, the lease
-    lapses and a poll reaps it."""
+    lapses and a poll reaps it. Raises OrgRunsAtLimit when the schedule's
+    organization is at its limit, counted in the same transaction."""
     return ScheduleRunService(session).create_run(
         schedule_id, is_manual=True, lease_seconds=_RUN_LEASE_SECONDS,
+        org_limit=_org_run_limit(), trial=trial,
     ).id
 
 
@@ -421,15 +458,26 @@ def abandon_manual_run(session: ScopedSession, run_id: UUID, error: str) -> None
     )
 
 
-def _renew_run_lease(session: ScopedSession, *, run_id: UUID) -> bool:
+def org_runs_full(session: ScopedSession, schedule: Schedule) -> bool:
+    """Whether the schedule's organization already has as many scheduled runs
+    going as it may. Always False for a desktop schedule, which has none."""
+    limit = _org_run_limit()
+    if schedule.org_id is None or limit is None:
+        return False
+    return ScheduleRunService(session).org_runs_in_flight(schedule.org_id) >= limit
+
+
+def _renew_run_lease(session: ScopedSession, *, run_id: UUID) -> bool | None:
+    if session.get(ScheduleRun, run_id) is None:
+        return None
     return ScheduleRunService(session).renew_lease(run_id, _RUN_LEASE_SECONDS)
 
 
-async def _renew_lease(run_id: UUID, *, schedule_id: UUID) -> None:
+async def _renew_lease(run_id: UUID, *, schedule_id: UUID, lost: asyncio.Event | None = None) -> None:
     """Renew the run's lease until cancelled, so no replica reaps it while it
     lives. A renewal the pool refuses is tried again at the next interval. A
     run that is no longer `running` was reaped by another replica, so renewing
-    stops there."""
+    stops there and ``lost`` is set."""
     while True:
         await asyncio.sleep(_LEASE_RENEW_SECONDS)
         try:
@@ -443,9 +491,12 @@ async def _renew_lease(run_id: UUID, *, schedule_id: UUID) -> None:
             continue
         if not renewed:
             logger.warning(
-                "A scheduled run lost its lease to another replica",
+                ("A scheduled task was deleted; stopping its active run" if renewed is None
+                 else "A scheduled run was finalized by another replica; stopping its turn"),
                 extra=log_context(schedule_id=schedule_id),
             )
+            if lost is not None:
+                lost.set()
             return
 
 
@@ -527,9 +578,13 @@ def _delete_unstarted_conversation(
 def _record_turn_outcome(
     session: ScopedSession, *, schedule_id: UUID, end: _AttemptEnd, is_manual: bool, conversation_id: UUID,
     shutdown_interrupted: bool = False,
+    trial: bool = False,
+    run_id: UUID,
 ) -> _RunOutcome:
     schedule_service = ScheduleService(session)
     run_service = ScheduleRunService(session)
+    if run_service.lock_running_run(run_id) is None:
+        raise _LeaseLost()
     # Read again: the schedule may have changed while the turn ran.
     schedule = schedule_service.get_schedule(schedule_id)
     outcome = _RunOutcome()
@@ -558,6 +613,10 @@ def _record_turn_outcome(
             _advance_next_run_at(schedule, session)
             if outcome.status == RunStatus.failed and end.outcome != AttemptOutcome.uncertain and not shutdown_interrupted:
                 count_settled_slot(session, schedule_id, failed=True)
+        if trial:
+            # A trial tries the task out: it leaves the streak and a one-off's
+            # own time as they were.
+            return
         if outcome.status is None:
             # A success of either kind ends the failure streak.
             count_settled_slot(session, schedule_id, failed=False)
@@ -570,28 +629,34 @@ def _record_turn_outcome(
             session.add(schedule)
 
     settle(schedule)
+    run_service.finish_run(
+        run_id, conversation_id=conversation_id, error=outcome.error, status=outcome.status,
+        outcome=end.outcome, commit=False,
+    )
     try:
         session.commit()
     except IntegrityError:
-        # Only the success write-back stages a foreign-key write (the
-        # last_result pointer), so this is the user's delete landing
-        # between still_exists' read and this commit — the delete's
-        # release already nulled the column. Redo the write-back without
-        # the pointer so the bookkeeping and the consumed slot survive.
         session.rollback()
-        schedule = schedule_service.get_schedule(schedule_id)
-        _apply_success_write_back(schedule, run_service, None, session)
-        settle(schedule)
-        session.commit()
+        if conversation_id is None:
+            raise
+        # Reacquire the run lock after rollback; a reaper may have won it.
+        return _record_turn_outcome(
+            session, schedule_id=schedule_id, end=end, is_manual=is_manual,
+            conversation_id=None, trial=trial, shutdown_interrupted=shutdown_interrupted, run_id=run_id,
+        )
     return outcome
 
 
 def _record_schedule_error(
     session: ScopedSession, *, schedule_id: UUID, error: str, consume_slot: bool, counts_toward_streak: bool = True,
+    run_id: UUID, outcome: AttemptOutcome | None = None,
 ) -> bool:
     """Record a run's error on its schedule. Returns whether it consumed the
     cron slot. ``counts_toward_streak`` False (an uncertain ending) uses the
     slot up without extending the failure streak."""
+    service = ScheduleRunService(session)
+    if service.lock_running_run(run_id) is None:
+        raise _LeaseLost()
     schedule = ScheduleService(session).get_schedule(schedule_id)
     schedule.last_error = error
     session.add(schedule)
@@ -605,6 +670,10 @@ def _record_schedule_error(
         # failed.
         if counts_toward_streak:
             count_settled_slot(session, schedule_id, failed=True)
+    service.finish_run(
+        run_id, error=error, status=RunStatus.failed, outcome=outcome,
+        release_slot=not consumed, commit=False,
+    )
     return consumed
 
 
@@ -642,12 +711,25 @@ async def _until_it_lands(unit: Callable[[ScopedSession], T], *, schedule_id: UU
 
 
 async def execute_schedule(
-    schedule_id: UUID,
-    is_manual: bool = False,
-    conversation_id: UUID | None = None,
-    *,
-    slot_at: datetime | None = None,
-    run_id: UUID | None = None,
+    schedule_id: UUID, *, is_manual: bool = False, conversation_id: UUID | None = None,
+    slot_at: datetime | None = None, run_id: UUID | None = None, trial: bool = False,
+    trigger: RunTrigger | None = None,
+) -> None:
+    if trigger is None:
+        if trial and not is_manual:
+            raise ValueError("A cron run cannot be a trial")
+        trigger = RunTrigger.trial if trial else (RunTrigger.manual if is_manual else RunTrigger.cron)
+    else:
+        trigger = RunTrigger(trigger)
+        if (is_manual and trigger == RunTrigger.cron) or (trial and trigger != RunTrigger.trial):
+            raise ValueError("Conflicting run trigger")
+    await _execute_schedule(schedule_id, trigger=trigger, conversation_id=conversation_id,
+                            slot_at=slot_at, run_id=run_id)
+
+
+async def _execute_schedule(
+    schedule_id: UUID, *, trigger: RunTrigger, conversation_id: UUID | None = None,
+    slot_at: datetime | None = None, run_id: UUID | None = None,
 ) -> None:
     """Run one schedule's turn and record how it went.
 
@@ -655,8 +737,9 @@ async def execute_schedule(
     connection across the permission check or while its turn runs, and a
     wait for a connection never stalls the event loop. A unit commits when
     it ends, so a failure in one leaves the earlier ones written. The last
-    two, the turn's outcome and the run's finish, try again while the pool is
-    full (_until_it_lands).
+    outcome write finalizes the run in the same locked transaction. The
+    final cleanup write is idempotent. Both retry while the pool is full
+    (_until_it_lands).
 
     A cron run names its slot (``slot_at``), and inserting its run row claims
     that slot: when another replica's poll already started it, this run
@@ -666,14 +749,23 @@ async def execute_schedule(
 
     A Run now passes the ``run_id`` its request already claimed
     (claim_manual_run), so the press and its run are one claim.
+
+    A ``trial`` run is a run-now that tries the task out. It doesn't use a
+    one-off up, and neither the freshness guard nor the failure streak counts
+    it.
     """
+    is_manual = trigger != RunTrigger.cron
+    trial = trigger == RunTrigger.trial
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
     from cowork.services.product_permissions import ProductPermissionUnavailable, require_product_permission
 
     try:
         run_id = run_id or await run_db(
-            partial(_create_run, schedule_id=schedule_id, is_manual=is_manual, slot_at=slot_at),
+            partial(
+                _create_run, schedule_id=schedule_id, is_manual=is_manual, slot_at=slot_at,
+                trial=trial,
+            ),
             scope=SYSTEM_SCOPE,
         )
     except PoolTimeoutError:
@@ -698,8 +790,18 @@ async def execute_schedule(
             extra=log_context(schedule_id=schedule_id),
         )
         return
+    except OrgRunsAtLimit:
+        # Nothing was written: the slot stays due, unclaimed, for a later poll.
+        logger.info(
+            "Organization at its scheduled-run limit; the slot waits for a later poll",
+            extra=log_context(schedule_id=schedule_id),
+        )
+        return
 
-    lease = asyncio.create_task(_renew_lease(run_id, schedule_id=schedule_id))
+    with _active_run_lock:
+        _active_run_ids.add(run_id)
+    lease_lost = asyncio.Event()
+    lease = asyncio.create_task(_renew_lease(run_id, schedule_id=schedule_id, lost=lease_lost))
     slot_consumed = False
     error: str | None = None
     final_status: RunStatus | None = None
@@ -722,7 +824,6 @@ async def execute_schedule(
         # Stamp the run's identity on the Langfuse trace (existing pass-through
         # seam) so incident forensics don't have to reconstruct which schedule/
         # trigger produced a turn from timestamps.
-        trigger = "manual" if is_manual else "cron"
         request = ResponsesRequest(
             # `schedule.model` is the "default" sentinel for every task the UI
             # creates, not a servable id. Resolve it to None so the harness
@@ -732,11 +833,11 @@ async def execute_schedule(
             model=resolve_schedule_model(scheduled.model),
             stream=True,
             conversation=str(conversation_id),
-            trace_tags=["scheduled_task", f"trigger:{trigger}"],
+            trace_tags=["scheduled_task", f"trigger:{trigger.value}"],
             trace_metadata={
                 "schedule_id": str(schedule_id),
                 "schedule_run_id": str(run_id),
-                "trigger_type": trigger,
+                "trigger_type": trigger.value,
             },
         )
         async def _drain_run() -> None:
@@ -749,16 +850,15 @@ async def execute_schedule(
             async for _ in stream:
                 pass
 
+        limit = _run_duration_limit()
         try:
-            await asyncio.wait_for(_drain_run(), timeout=_MAX_RUN_DURATION_SECONDS)
+            lease_lost_first = await asyncio.wait_for(_drain_unless_lost(_drain_run(), lease_lost), timeout=limit)
         except asyncio.TimeoutError as exc:
             # The timeout cancels only this drain. The turn runs detached in
             # the registry and would go on writing and publishing, so stop it.
             timed_out = True
             await _stop_timed_out_turn(str(conversation_id))
-            raise RuntimeError(
-                f"Run exceeded max duration of {_MAX_RUN_DURATION_SECONDS}s and was aborted."
-            ) from exc
+            raise RuntimeError(_duration_error(limit)) from exc
         except ServerShuttingDown:
             # This replica is ending its turns for a shutdown and refused the
             # run's turn before it started. Nothing ran, so the schedule keeps
@@ -789,6 +889,15 @@ async def execute_schedule(
                     )
             return
 
+        if lease_lost_first:
+            # Another replica reaped this run while its turn went on: it
+            # presumed this process dead, failed the run and settled its slot.
+            # Stop the turn, here and in its pod, and leave the run as the
+            # reaper recorded it; recording it again would settle the slot a
+            # second time.
+            await _stop_reaped_turn(str(conversation_id))
+            raise _LeaseLost()
+
         # A cancel or a producer failure closes the stream normally from the
         # consumer's side (the producer runs detached and even swallows its
         # own CancelledError, so handle.task.cancelled() stays False). The
@@ -801,15 +910,18 @@ async def execute_schedule(
         outcome = end.outcome
         recorded = await _until_it_lands(
             partial(
-                _record_turn_outcome, schedule_id=schedule_id, end=end,
+                _record_turn_outcome, schedule_id=schedule_id, run_id=run_id, end=end,
                 shutdown_interrupted=evidence.shutdown_interrupted,
-                is_manual=is_manual, conversation_id=conversation_id,
+                is_manual=is_manual, conversation_id=conversation_id, trial=trial,
             ),
             schedule_id=schedule_id,
         )
         final_status, error = recorded.status, recorded.error
         slot_consumed = not is_manual
 
+    except _LeaseLost:
+        # Recorded by the reaper; the finally leaves the run row alone.
+        pass
     except RunClaimLost:
         # The lease ran out before the turn started, and another replica
         # reaped the run and gave its slot back. The slot belongs to whichever
@@ -862,7 +974,7 @@ async def execute_schedule(
         try:
             slot_consumed = await _until_it_lands(
                 partial(
-                    _record_schedule_error, schedule_id=schedule_id, error=error,
+                    _record_schedule_error, schedule_id=schedule_id, run_id=run_id, outcome=outcome, error=error,
                     consume_slot=not is_manual and not transient,
                     counts_toward_streak=(
                         outcome in {
@@ -875,6 +987,8 @@ async def execute_schedule(
                 ),
                 schedule_id=schedule_id,
             )
+        except _LeaseLost:
+            lease_lost.set()
         except Exception:
             logger.exception(
                 "Failed to record the scheduled run's error",
@@ -886,30 +1000,60 @@ async def execute_schedule(
         try:
             # This write must always land or the run strands at `running` and
             # wedges the schedule. Its own unit starts clean, whatever failed
-            # above.
-            await _until_it_lands(
-                partial(
-                    _finish_run, run_id=run_id, conversation_id=conversation_id,
-                    error=error, status=final_status,
-                    release_slot=slot_at is not None and not slot_consumed,
-                    outcome=outcome,
-                ),
-                schedule_id=schedule_id,
-            )
+            # above. Skipped when another replica reaped the run: it recorded
+            # how the run ended, and finishing it again could hand back a slot
+            # the reaper settled.
+            if not lease_lost.is_set():
+                await _until_it_lands(
+                    partial(
+                        _finish_run, run_id=run_id, conversation_id=conversation_id,
+                        error=error, status=final_status,
+                        release_slot=slot_at is not None and not slot_consumed,
+                        outcome=outcome,
+                    ),
+                    schedule_id=schedule_id,
+                )
         except Exception:
             logger.exception(
                 "Failed to finish the run record",
                 extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
             )
+        finally:
+            with _active_run_lock:
+                _active_run_ids.discard(run_id)
 
 
-async def _stop_timed_out_turn(conversation_id: str) -> None:
-    """Stop a turn its run gave up on, the way the Stop button does.
+class _LeaseLost(Exception):
+    """Another replica reaped this run while its turn was going."""
+
+
+async def _drain_unless_lost(drain, lost: asyncio.Event) -> bool:
+    """Follow the turn to its end, unless the run loses its lease first.
+    Returns True when the lease went first; the turn is then still going and
+    the caller stops it."""
+    drain_task = asyncio.ensure_future(drain)
+    lost_task = asyncio.ensure_future(lost.wait())
+    try:
+        done, _ = await asyncio.wait({drain_task, lost_task}, return_when=asyncio.FIRST_COMPLETED)
+        if drain_task in done:
+            drain_task.result()
+            return False
+        return True
+    finally:
+        for task in (drain_task, lost_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(drain_task, lost_task, return_exceptions=True)
+
+
+async def _stop_scheduled_turn(conversation_id: str, *, why: str) -> None:
+    """Stop a run's turn the way the Stop button does, saved as interrupted.
 
     A turn in a sandbox pod only stops when the controller sees its cancel
     flag; cancelling the local producer alone ends just our tail of it. The
     turn is marked timed out first, so it saves as interrupted, not as the
-    user's own Stop.
+    user's own Stop. A failed flag write is logged, and the local cancel
+    still runs; a pod turn then ends at the controller's own turn limit.
     """
     handle = registry.get(conversation_id)
     if handle is None or not handle.is_running:
@@ -919,14 +1063,64 @@ async def _stop_timed_out_turn(conversation_id: str) -> None:
         try:
             await request_cancel(handle.lifecycle.identity.correlation_id)
         except Exception:
-            # The local cancel below still runs; a pod turn then ends at the
-            # controller's own turn limit.
             logger.warning(
-                "Could not flag a timed-out scheduled turn for cancellation",
+                "Could not flag a %s scheduled turn for cancellation", why,
                 exc_info=True,
                 extra=log_context(conversation_id=conversation_id),
             )
     await handle.cancel()
+
+
+async def _stop_timed_out_turn(conversation_id: str) -> None:
+    """Stop a turn its run gave up on at the run's time limit."""
+    await _stop_scheduled_turn(conversation_id, why="timed-out")
+
+
+async def _stop_reaped_turn(conversation_id: str) -> None:
+    """Stop a turn whose run another replica reaped while it was going."""
+    await _stop_scheduled_turn(conversation_id, why="reaped")
+
+
+async def _cancel_abandoned_turn(abandoned: AbandonedTurn) -> None:
+    """Ask the pod still running a reaped run's turn to stop, from any
+    replica: the process that ran it died, so no local producer is left to
+    cancel. A no-op on the in-process backend, where the turn died with its
+    process.
+
+    The turn index names a conversation's current turn, which is the run's
+    only if it began while the run's process was alive. One that began before
+    the run did is an older turn, already over. One that began after the
+    process stopped renewing the run's lease, such as a person's own turn in
+    the run's conversation, is not the run's. Both are left alone."""
+    if get_backend() != "redis":
+        return
+    from cowork.streaming.turn_index import get_turn
+
+    conversation_id = abandoned.conversation_id
+    try:
+        turn = await get_turn(conversation_id)
+        if turn is None:
+            return
+        started = float(turn.get("started_at") or 0)
+        if started:
+            if started < abandoned.run_started_at.timestamp() - _LEASE_RENEW_SECONDS:
+                return
+            # The process renewed the lease every _LEASE_RENEW_SECONDS while it
+            # lived, so it was gone soon after its last renewal.
+            last_renewed = abandoned.lease_expired_at.timestamp() - _RUN_LEASE_SECONDS
+            if started > last_renewed + _LEASE_RENEW_SECONDS:
+                return
+        await request_cancel(turn["correlation_id"])
+        logger.warning(
+            "Asked the pod running an abandoned scheduled turn to stop",
+            extra=log_context(conversation_id=conversation_id),
+        )
+    except Exception:
+        logger.warning(
+            "Could not ask the pod running an abandoned scheduled turn to stop",
+            exc_info=True,
+            extra=log_context(conversation_id=conversation_id),
+        )
 
 
 async def _turn_terminal_reason(conversation_id: str) -> str | None:
@@ -1102,19 +1296,65 @@ def boot_reap_cutoff(now: datetime | None = None) -> datetime | None:
 
     if get_app_settings().tenancy_mode != "org":
         return None
-    return (now or datetime.now(timezone.utc)) - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS)
+    return (now or datetime.now(timezone.utc)) - timedelta(seconds=_orphaned_run_age_seconds())
 
 
-def _reap_lapsed_runs(session: ScopedSession, now: datetime) -> None:
+def _orphaned_run_age_seconds() -> int:
+    """How old a run still at `running` must be before a booting replica may
+    reap it: its turn is cut off at the run's time limit and its last writes
+    (the outcome, then the finish) each give up after
+    _BOOKKEEPING_DEADLINE_SECONDS, plus slack for the units before the turn
+    starts. It follows the time limit, so a deployment that lets runs go
+    longer doesn't have them reaped while they run. Age is only a heuristic,
+    since a database unit that stalls holds a run past any deadline, so only
+    boot uses it, not every poll."""
+    return int(_run_duration_limit()) + 2 * _BOOKKEEPING_DEADLINE_SECONDS + _ORPHANED_RUN_SLACK_SECONDS
+
+
+def _run_duration_limit() -> float:
+    """How long a run may take before its turn is stopped, in seconds.
+
+    A hung agent (stuck tool call, wedged stream) must not keep its run going
+    forever: the step and token budgets bound how much work a turn does, and
+    this catches one that keeps going without finishing. Set by
+    COWORK_SCHEDULED_RUN_MAX_SECONDS. When turns run in pods, never shorter
+    than the controller's own bound on a turn plus the setup before it, so a
+    turn that used its whole budget ends on the controller's terms.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    limit = get_app_settings().scheduled_run_max_seconds
+    if get_backend() == "redis":
+        return max(limit, _REMOTE_TURN_BUDGET_SECONDS + _REMOTE_SETUP_MARGIN_SECONDS)
+    return limit
+
+
+def _duration_error(limit: float) -> str:
+    """A timed-out run's error, naming the limit it ran into."""
+    minutes = int(limit // 60)
+    if minutes >= 1:
+        return f"Run exceeded the {minutes}-minute limit and was stopped."
+    return f"Run exceeded the {int(limit)}-second limit and was stopped."
+
+
+def _reap_lapsed_runs(
+    session: ScopedSession, now: datetime, abandoned: list[AbandonedTurn] | None = None,
+) -> None:
     """Fail the runs whose process stopped renewing their lease.
 
     A run that never started its turn gave its slot back, so the slot fires
     again (ScheduleRunService.reap_lapsed_runs). A run whose turn may have
     started consumes its slot here instead, so the work isn't done twice. A
     paused schedule moves on too, so it resumes at its next occurrence rather
-    than on a slot this run still holds.
+    than on a slot this run still holds. Every reaped run whose turn may have
+    started goes on ``abandoned``, so the poll can ask its pod to stop.
     """
-    for run in ScheduleRunService(session).reap_lapsed_runs(now=now, error=_LAPSED_RUN_ERROR):
+    with _active_run_lock:
+        active = frozenset(_active_run_ids)
+    committed_abandoned: list[AbandonedTurn] = []
+    for run in ScheduleRunService(session).reap_lapsed_runs(
+        now=now, error=_LAPSED_RUN_ERROR, abandoned=committed_abandoned, exclude_run_ids=active,
+    ):
         logger.warning(
             "Reaped a scheduled run whose server stopped renewing it",
             extra=log_context(schedule_id=run.schedule_id, conversation_id=run.conversation_id),
@@ -1129,17 +1369,30 @@ def _reap_lapsed_runs(session: ScopedSession, now: datetime) -> None:
             # The dead run's turn may have acted, so its slot settles failed.
             count_settled_slot(session, schedule.id, failed=True)
     session.commit()
+    if abandoned is not None:
+        abandoned.extend(committed_abandoned)
 
 
-def _poll(session: ScopedSession) -> list[DueSlot]:
+def _poll(session: ScopedSession, abandoned: list[AbandonedTurn] | None = None) -> list[DueSlot]:
     """One poll's unit: reap runs whose server died, settle missed runs, then
-    the schedules due now with the slot each one's run claims."""
-    _reap_lapsed_runs(session, datetime.now(timezone.utc))
+    the schedules due now with the slot each one's run claims. Reaped runs
+    whose turns may still be going in a pod go on ``abandoned``."""
+    _reap_lapsed_runs(session, datetime.now(timezone.utc), abandoned)
     _handle_missed_runs(session)
-    return [
-        DueSlot(schedule_id=schedule.id, slot_at=ensure_utc(schedule.next_run_at))
-        for schedule in _due_schedules(session, datetime.now(timezone.utc))
-    ]
+    due: list[DueSlot] = []
+    limit = _org_run_limit()
+    remaining: dict[str, int] = {}
+    service = ScheduleRunService(session)
+    for schedule in _due_schedules(session, datetime.now(timezone.utc)):
+        if limit is not None and schedule.org_id is not None:
+            org = schedule.org_id
+            if org not in remaining:
+                remaining[org] = max(0, limit - service.org_runs_in_flight(org))
+            if remaining[org] == 0:
+                continue
+            remaining[org] -= 1
+        due.append(DueSlot(schedule_id=schedule.id, slot_at=ensure_utc(schedule.next_run_at)))
+    return due
 
 
 async def _scheduler_loop() -> None:
@@ -1149,17 +1402,21 @@ async def _scheduler_loop() -> None:
     await asyncio.sleep(random.uniform(0, _POLL_INTERVAL_SECONDS))
     while True:
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+        abandoned: list[AbandonedTurn] = []
         try:
             # A unit in a worker thread: when the pool has no connection to
             # give, the poll is refused after POOL_TIMEOUT instead of stalling
             # the event loop, and the next poll tries again.
-            due = await run_db(_poll, scope=SYSTEM_SCOPE)
+            due = await run_db(partial(_poll, abandoned=abandoned), scope=SYSTEM_SCOPE)
         except PoolTimeoutError:
             logger.warning("Scheduler poll found no free database connection; the next poll retries")
             due = []
         except Exception:
             logger.exception("Scheduler loop error during poll")
             due = []
+        finally:
+            for turn in {turn.conversation_id: turn for turn in abandoned}.values():
+                asyncio.create_task(_cancel_abandoned_turn(turn))
 
         for index, slot in enumerate(due):
             if not _admission.reserve():

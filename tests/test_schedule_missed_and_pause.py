@@ -54,7 +54,7 @@ def _now_at_test_start():
 def _fresh_scheduler(monkeypatch):
     monkeypatch.setattr(scheduler, "_scheduler_task", None)
     monkeypatch.setattr(scheduler, "_scheduled_runs", set())
-    monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(scheduler._MAX_CONCURRENT_RUNS))
+    monkeypatch.setattr(scheduler, "_admission", scheduler._Admission(scheduler._runs_per_process))
 
 
 def _make_schedule(*, cadence: str = "daily", next_run_at: datetime | None = None, enabled: bool = True) -> UUID:

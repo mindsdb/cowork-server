@@ -116,7 +116,12 @@ def resume_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
 
 
 @router.post("/{schedule_id}/run-now", status_code=status.HTTP_202_ACCEPTED)
-def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tasks: BackgroundTasks):
+def run_schedule_now(
+    schedule_id: UUID, scoped: ScopedSessionDep, background_tasks: BackgroundTasks, trial: bool = False,
+):
+    """Start a run now. ``trial=true`` tries the task out: the run leaves a
+    one-off scheduled for its own time, and neither the freshness guard nor
+    the failure streak counts it."""
     try:
         schedule = ScheduleService(scoped).get_schedule(schedule_id)
     except ValueError as e:
@@ -125,20 +130,27 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     from cowork.scheduler import (
         abandon_manual_run,
         claim_manual_run,
+        org_runs_full,
         release_run_place,
         reserve_run_place,
         run_admitted,
         schedule_conversation_topic,
     )
     from cowork.services.conversations import ConversationService
-    from cowork.services.schedules import ScheduleBusy
+    from cowork.services.schedules import OrgRunsAtLimit, ScheduleBusy
 
     already_running = HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This task is already running.")
+    org_full = HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Too many scheduled tasks are running for this account right now. Try again in a few minutes.",
+    )
 
     # Refused with a reason rather than queued: the user is watching and can
     # press Run again.
     if ScheduleRunService(scoped).has_active_run(schedule_id):
         raise already_running
+    if org_runs_full(scoped, schedule):
+        raise org_full
     if not reserve_run_place():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -148,10 +160,15 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     # presses at once, or a press racing a cron claim, start one run (the
     # schedule allows one `running` run).
     try:
-        run_id = claim_manual_run(scoped, schedule_id)
+        run_id = claim_manual_run(scoped, schedule_id, trial=trial)
     except ScheduleBusy:
         release_run_place()
         raise already_running
+    except OrgRunsAtLimit:
+        # Counted in the claim's transaction, under the organization's lock, so
+        # two presses can't both take its last place.
+        release_run_place()
+        raise org_full
     except BaseException:
         release_run_place()
         raise
@@ -178,7 +195,7 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
 
     background_tasks.add_task(
         run_admitted, schedule_id, is_manual=True,
-        conversation_id=conversation.id, run_id=run_id,
+        conversation_id=conversation.id, run_id=run_id, trial=trial,
     )
     return {"detail": "Run triggered", "conversation_id": str(conversation.id)}
 

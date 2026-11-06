@@ -33,7 +33,13 @@ from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schemas.schedules import RunStatus
 from cowork.services.projects import GENERAL_PROJECT_ID
-from cowork.services.schedules import ScheduleBusy, ScheduleRunService, ScheduleService, SlotAlreadyClaimed
+from cowork.services.schedules import (
+    OrgRunsAtLimit,
+    ScheduleBusy,
+    ScheduleRunService,
+    ScheduleService,
+    SlotAlreadyClaimed,
+)
 from tests.integration.prereq import missing_prerequisite
 
 # A slot that came due a minute ago: one missed occurrence stays due, where
@@ -458,7 +464,7 @@ async def test_a_run_another_replica_reaped_stops_renewing_and_says_so_once(sche
         record for record in caplog.records
         if record.name == scheduler.logger.name
         and record.levelno == logging.WARNING
-        and record.getMessage() == "A scheduled run lost its lease to another replica"
+        and record.getMessage() == "A scheduled run was finalized by another replica; stopping its turn"
     ]
     assert len(lost) == 1
 
@@ -706,3 +712,114 @@ def test_a_link_on_postgres_that_waits_on_a_reap_refuses_the_run(postgres):
     assert row.status == RunStatus.failed
     assert row.conversation_id is None
     assert row.slot_at is None
+
+
+@pytest.mark.postgres_service
+def test_replicas_claiming_one_organizations_slots_at_once_stay_within_its_limit(postgres):
+    """The per-organization cap on the database hosted Cowork runs: eight
+    connections claim slots for eight schedules of one organization at the
+    same moment, and only the limit's worth start. Without the organization's
+    advisory lock each would count the others' runs as not there yet."""
+    org_id = f"org-{uuid4().hex[:8]}"
+    count, limit = 8, 3
+    with Session(postgres.engine) as session:
+        scoped = ScopedSession(session, SYSTEM_SCOPE)
+        schedule_ids = [
+            ScheduleService(scoped).create_schedule(
+                title=f"org {i}", prompt="p", cadence="daily", next_run_at=SLOT,
+                model="default", timezone="UTC", project_id=postgres.project_id, enabled=True,
+            ).id
+            for i in range(count)
+        ]
+        for schedule_id in schedule_ids:
+            schedule = session.get(Schedule, schedule_id)
+            schedule.org_id = org_id
+            session.add(schedule)
+        session.commit()
+
+    barrier = threading.Barrier(count)
+    outcomes: list[str] = []
+    outcomes_lock = threading.Lock()
+
+    def claim(schedule_id: UUID) -> None:
+        with Session(postgres.engine) as session:
+            runs = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+            barrier.wait()
+            try:
+                runs.create_run(schedule_id, slot_at=SLOT, lease_seconds=60, org_limit=limit)
+                session.commit()
+                outcome = "claimed"
+            except OrgRunsAtLimit:
+                outcome = "refused"
+            with outcomes_lock:
+                outcomes.append(outcome)
+
+    threads = [threading.Thread(target=claim, args=(schedule_id,)) for schedule_id in schedule_ids]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert sorted(outcomes) == ["claimed"] * limit + ["refused"] * (count - limit)
+    with Session(postgres.engine) as session:
+        running = session.exec(
+            select(ScheduleRun).join(Schedule, Schedule.id == ScheduleRun.schedule_id)
+            .where(Schedule.org_id == org_id, ScheduleRun.status == RunStatus.running)
+        ).all()
+    assert len(running) == limit
+
+
+@pytest.mark.postgres_service
+@pytest.mark.parametrize("ending", ["outcome", "exception"])
+def test_postgres_reaper_cannot_split_settlement_from_finalization(postgres, monkeypatch, ending):
+    """Hold the finalizer between its schedule update and run finish. The
+    reaper must skip its lock, then see a terminal run after the commit."""
+    from concurrent.futures import ThreadPoolExecutor
+    from cowork.schemas.schedules import AttemptOutcome
+
+    claim = _lapsed_run_and_conversation(postgres)
+    with Session(postgres.engine) as session:
+        assert ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE)).set_run_conversation(
+            claim.run_id, claim.conversation_id,
+        )
+    held, release = threading.Event(), threading.Event()
+    original = ScheduleRunService.finish_run
+
+    def pause_before_finish(self, *args, **kwargs):
+        if kwargs.get("commit") is False:
+            held.set()
+            assert release.wait(5)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ScheduleRunService, "finish_run", pause_before_finish)
+
+    def finalize():
+        with Session(postgres.engine) as session:
+            scoped = ScopedSession(session, SYSTEM_SCOPE)
+            if ending == "outcome":
+                scheduler._record_turn_outcome(
+                    scoped, schedule_id=postgres.schedule_id, run_id=claim.run_id,
+                    end=scheduler._AttemptEnd(AttemptOutcome.failed_during_execution, "task failed"),
+                    is_manual=False, conversation_id=claim.conversation_id,
+                )
+            else:
+                scheduler._record_schedule_error(
+                    scoped, schedule_id=postgres.schedule_id, run_id=claim.run_id,
+                    error="task failed", consume_slot=True, outcome=AttemptOutcome.failed_during_execution,
+                )
+                session.commit()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(finalize)
+        try:
+            assert held.wait(5)
+            assert _reap(postgres) == []
+            assert _run_row(postgres, claim.run_id).status == RunStatus.running
+        finally:
+            release.set()
+        future.result(timeout=5)
+    assert _reap(postgres) == []
+    assert _run_row(postgres, claim.run_id).error == "task failed"
+    assert _run_row(postgres, claim.run_id).status == RunStatus.failed
+    with Session(postgres.engine) as session:
+        assert session.get(Schedule, postgres.schedule_id).consecutive_failures == 1

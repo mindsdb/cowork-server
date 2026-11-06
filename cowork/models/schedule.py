@@ -128,6 +128,11 @@ class ScheduleRun(BaseSQLModel, table=True):
         description="Conversation created during this run",
     )
     is_manual: bool = Field(default=False, description="True if triggered via run-now endpoint")
+    trial: bool = Field(
+        default=False,
+        sa_column_kwargs={"server_default": sa.false()},
+        description="A run-now that tries the task out: it leaves a one-off scheduled, and neither the freshness guard nor the failure streak counts it",
+    )
     slot_at: datetime | None = Field(
         default=None,
         sa_type=sa.DateTime(timezone=True),  # type: ignore

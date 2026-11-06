@@ -171,6 +171,7 @@ class ScheduleResponse(CamelResponse):
 
 
 class RunTrigger(str, Enum):
+    trial = "trial"
     manual = "manual"
     cron = "cron"
 
@@ -185,10 +186,12 @@ class ScheduleRunResponse(CamelResponse):
     error: str | None
     conversation_id: UUID | None
     is_manual: bool
+    # A run-now that tried the task out (POST .../run-now?trial=true).
+    trial: bool = False
     outcome: AttemptOutcome | None = None
     created_at: datetime | None
 
     @computed_field
     @property
     def trigger(self) -> RunTrigger:
-        return RunTrigger.manual if self.is_manual else RunTrigger.cron
+        return RunTrigger.trial if self.trial else (RunTrigger.manual if self.is_manual else RunTrigger.cron)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import NamedTuple
 from datetime import datetime, timedelta, timezone
 from datetime import timezone as timezone_
 from uuid import UUID
@@ -334,6 +335,11 @@ class SlotAlreadyClaimed(Exception):
     """Another run already holds this schedule's cron slot."""
 
 
+class OrgRunsAtLimit(Exception):
+    """The schedule's organization already has as many scheduled runs going,
+    across every replica, as it may."""
+
+
 def _utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
@@ -347,6 +353,16 @@ def _record_lost_run(run: ScheduleRun) -> None:
     )
 
 
+class AbandonedTurn(NamedTuple):
+    """A reaped run whose turn may still be going in a pod."""
+
+    conversation_id: str
+    run_started_at: datetime
+    # When the run's lease ran out: its process stopped renewing it about one
+    # lease earlier.
+    lease_expired_at: datetime
+
+
 class ScheduleRunService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
@@ -358,19 +374,32 @@ class ScheduleRunService:
         *,
         slot_at: datetime | None = None,
         lease_seconds: float | None = None,
+        org_limit: int | None = None,
+        trial: bool = False,
     ) -> ScheduleRun:
-        """Insert the run. With ``slot_at``, the insert claims that cron slot:
+        """Insert the run. With ``org_limit``, raises OrgRunsAtLimit instead when
+        the schedule's organization already has that many runs going; counted
+        in the insert's transaction (org_runs_in_flight). With ``slot_at``, the
+        insert claims that cron slot:
         the unique index on (schedule_id, slot_at) refuses a second run for it,
         and that refusal raises SlotAlreadyClaimed. A schedule holds one
         `running` run at a time (uq_schedule_runs_one_running), so an insert
         while another run is going raises ScheduleBusy. With ``lease_seconds``, the
         run counts as alive until then unless renew_lease extends it."""
         now = datetime.now(timezone.utc)
+        if org_limit is not None:
+            schedule = self.session.get(Schedule, schedule_id)
+            org_id = schedule.org_id if schedule is not None else None
+            if org_id is not None and self.org_runs_in_flight(org_id, lock=True) >= org_limit:
+                # Ends the transaction, and with it the organization's lock.
+                self.session.rollback()
+                raise OrgRunsAtLimit(f"organization {org_id} is at its limit of {org_limit} scheduled runs")
         run = ScheduleRun(
             schedule_id=schedule_id,
             started_at=now,
             status=RunStatus.running,
             is_manual=is_manual,
+            trial=trial,
             slot_at=slot_at,
             lease_expires_at=now + timedelta(seconds=lease_seconds) if lease_seconds is not None else None,
         )
@@ -451,12 +480,15 @@ class ScheduleRunService:
     def last_successful_finish(self, schedule_id: UUID) -> datetime | None:
         """When the schedule's most recent successful run (manual or cron)
         finished, or None if it never succeeded. Used by the scheduler's
-        freshness guard to skip a due slot right after e.g. a manual run.
+        freshness guard to skip a due slot right after e.g. a manual run. A
+        trial run doesn't count: it tries the task out, so the slot after it
+        still runs.
         """
         run = self.session.exec(
             self.session.select(ScheduleRun)
             .where(ScheduleRun.schedule_id == schedule_id)
             .where(ScheduleRun.status == RunStatus.success)
+            .where(ScheduleRun.trial.is_(False))  # type: ignore[attr-defined]
             .order_by(ScheduleRun.finished_at.desc())  # type: ignore[union-attr]
             .limit(1)
         ).first()
@@ -530,6 +562,16 @@ class ScheduleRunService:
             return self.set_run_conversation(run_id, None)
         return True
 
+    def lock_running_run(self, run_id: UUID) -> ScheduleRun | None:
+        """Read the claim under lock; finalized or deleted runs cannot write again."""
+        run = self.session.exec(
+            self.session.select(ScheduleRun)
+            .where(ScheduleRun.id == run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        return run if run is not None and run.status == RunStatus.running else None
+
     def finish_run(
         self,
         run_id: UUID,
@@ -538,12 +580,13 @@ class ScheduleRunService:
         status: RunStatus | None = None,
         release_slot: bool = False,
         outcome: AttemptOutcome | None = None,
-    ) -> ScheduleRun:
+        commit: bool = True,
+    ) -> ScheduleRun | None:
         """Record how the run ended. ``release_slot`` gives its cron slot back,
         for a run that left the slot due: the next poll can then claim it."""
-        run = self.session.get(ScheduleRun, run_id)
+        run = self.lock_running_run(run_id)
         if run is None:
-            raise ValueError("ScheduleRun not found")
+            return None
         now = datetime.now(timezone.utc)
         run.finished_at = now
         started_at = run.started_at if run.started_at.tzinfo else run.started_at.replace(tzinfo=timezone.utc)
@@ -558,6 +601,8 @@ class ScheduleRunService:
         if conversation_id is not None:
             run.conversation_id = self.still_exists(conversation_id)
         self.session.add(run)
+        if not commit:
+            return run
         try:
             self.session.commit()
         except IntegrityError:
@@ -614,7 +659,36 @@ class ScheduleRunService:
         self.session.commit()
         return len(runs)
 
-    def reap_lapsed_runs(self, *, now: datetime, error: str) -> list[ScheduleRun]:
+    def org_runs_in_flight(self, org_id: str, *, lock: bool = False) -> int:
+        """How many of the organization's scheduled runs are going now, on any
+        replica.
+
+        With ``lock`` on PostgreSQL, first takes the organization's advisory
+        lock for the rest of the transaction, so two replicas claiming runs
+        for one organization at once count one after the other, and the later
+        one sees the earlier one's run. SQLite needs no lock: it lets one
+        writer in at a time, and it only backs a single server.
+        """
+        raw = unsafe_unscoped_session(self.session)
+        if lock and raw.get_bind().dialect.name == "postgresql":
+            from cowork.services.shared_resources import advisory_lock_key
+
+            raw.execute(
+                sa.text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": advisory_lock_key(b"cowork\0schedule_org_runs\0" + org_id.encode())},
+            )
+        return raw.execute(
+            sa.select(sa.func.count())
+            .select_from(ScheduleRun)
+            .join(Schedule, Schedule.id == ScheduleRun.schedule_id)
+            .where(Schedule.org_id == org_id)
+            .where(ScheduleRun.status == RunStatus.running)
+        ).scalar_one()
+
+    def reap_lapsed_runs(
+        self, *, now: datetime, error: str, abandoned: list[AbandonedTurn] | None = None,
+        exclude_run_ids: frozenset[UUID] = frozenset(),
+    ) -> list[ScheduleRun]:
         """Fail every running run whose lease ran out: its process stopped
         renewing it, so it died without recording how the run ended.
 
@@ -627,12 +701,17 @@ class ScheduleRunService:
         Rows are locked as they are read, skipping any row already locked: a
         run linking its conversation (set_run_conversation) or another
         replica's reap holds it, and the next poll reads it as committed.
+
+        Each reaped run that linked a conversation, manual runs included, goes
+        on ``abandoned`` (AbandonedTurn): its turn may still be running in a
+        pod that nobody is recording.
         """
         runs = self.session.exec(
             self.session.select(ScheduleRun)
             .where(ScheduleRun.status == RunStatus.running)
             .where(ScheduleRun.lease_expires_at.is_not(None))  # type: ignore[union-attr]
             .where(ScheduleRun.lease_expires_at < now)  # type: ignore[operator]
+            .where(ScheduleRun.id.not_in(exclude_run_ids))
             .with_for_update(skip_locked=True)
         ).all()
         kept: list[ScheduleRun] = []
@@ -641,8 +720,15 @@ class ScheduleRunService:
             run.duration_ms = int((now - _utc(run.started_at)).total_seconds() * 1000)
             run.status = RunStatus.failed
             run.error = error
+            lease_expired_at = _utc(run.lease_expires_at)
             run.lease_expires_at = None
             _record_lost_run(run)
+            if run.conversation_id is not None and abandoned is not None:
+                abandoned.append(AbandonedTurn(
+                    conversation_id=str(run.conversation_id),
+                    run_started_at=_utc(run.started_at),
+                    lease_expired_at=lease_expired_at,
+                ))
             if run.execution_claimed_at is None:
                 run.slot_at = None
             elif run.slot_at is not None:
