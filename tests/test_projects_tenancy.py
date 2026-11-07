@@ -942,3 +942,31 @@ def test_operator_rename_leaves_a_shared_skill_store_alone(db, personal_deployme
 
     assert renamed.name == "q4"
     assert SkillService(alice_scope).get_skill("sales").projects == ["reports"]
+
+
+@pytest.mark.parametrize(
+    ("below_root", "expected"),
+    [
+        (f"{ORG_B}/projects/theirs", True),  # another partition's folder
+        (f"{ORG_A}/projects/mine", False),  # the caller's own partition
+        ("not-a-partition/projects/x", False),  # a first folder that isn't a UUID
+        (ORG_B.upper() + "/projects/x", False),  # a UUID not written as one is stored
+        ("", False),  # the shared root itself
+        (None, False),  # outside the shared root
+    ],
+)
+def test_a_project_in_another_partition_is_told_by_its_first_folder(db, tmp_path, below_root, expected):
+    """sits_in_another_partition reads the first folder below the shared root,
+    whether the root is resolved per call or passed in once by a listing."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    shared_root = Path(get_app_settings().storage.shared_root).resolve()
+    path = tmp_path.parent / "elsewhere" / "x" if below_root is None else shared_root / below_root
+    project = Project(name="p", path=str(path), org_id=ORG_A)
+    service = _svc(db, _scope(ORG_A))
+
+    assert service.sits_in_another_partition(project) is expected
+    assert (
+        service.sits_in_another_partition(project, shared_root=service.resolved_shared_root())
+        is expected
+    )
