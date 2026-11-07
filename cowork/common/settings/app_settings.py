@@ -1297,6 +1297,17 @@ class AppSettings(Settings):
         ),
     )  # COWORK_SERVER_OWNER
 
+    health_proof_key: SecretStr = Field(
+        default=SecretStr(os.environ.get("COWORK_SERVER_HEALTH_PROOF_KEY", "")),
+        description=(
+            "Per-install secret the desktop app passes at spawn and keeps in a file only its OS "
+            "user can read. /health answers an HMAC of the app's nonce and the port it answered "
+            "on, keyed by this, so the app can tell its own server from a listener another OS "
+            "user put on its port, which can replay the owner token /health echoes but can't "
+            "compute this. Empty means /health proves nothing."
+        ),
+    )  # COWORK_SERVER_HEALTH_PROOF_KEY
+
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
     # The same switch that turns on anton's per-call usage log. Set by evals only.
     usage_log: bool = Field(
