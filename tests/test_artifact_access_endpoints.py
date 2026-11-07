@@ -96,7 +96,7 @@ def publish_calls(monkeypatch):
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url,
                      password=None, access=None, scope=None, project_id=None,
-                     notify=None, stored=None, owner_save=False):
+                     notify=None, stored=None, owner_save=False, notices=None):
         # publish_artifact takes the model; what it hands anton is its
         # publisher_access.
         assert isinstance(access, ArtifactAccessRequest)
@@ -106,6 +106,13 @@ def publish_calls(monkeypatch):
             "project_id": project_id, "notify": notify, "stored": stored,
             "owner_save": owner_save,
         })
+        if notify and notices is not None:
+            # What publish_artifact collects once it asked MindsHub to email them.
+            from cowork.services.artifact_audience import ShareNotice
+
+            notices.append(ShareNotice(
+                artifact_title="Q3 report", artifact_url="https://view.example/r/1", recipients=notify,
+            ))
         return {"status": "ok", "url": "https://view.example/r/1"}
 
     monkeypatch.setattr("cowork.services.publish.publish_artifact", fake_publish)
@@ -1112,3 +1119,55 @@ async def test_the_turn_key_is_kept_while_a_timed_out_publish_still_runs(
         finish.set()
     assert error.value.detail == "Publishing timed out. Try again in a moment."
     assert publish_context == []
+
+
+@pytest.fixture
+def share_pushes(monkeypatch):
+    """What the access route hands the push hook (cowork.services.push.hooks)."""
+    pushes: list[dict] = []
+    monkeypatch.setattr(
+        "cowork.services.push.hooks.artifact_shared", lambda **kwargs: pushes.append(kwargs),
+    )
+    return pushes
+
+
+async def test_a_save_that_notifies_people_pushes_exactly_those_people(
+    as_owner, publish_calls, publish_context, share_pushes,
+):
+    person = "aaaaaaaa-1111-1111-1111-111111111111"
+    sharer = Principal(user_id=ORG_SCOPE.user_id, org_id=ORG_SCOPE.org_id, email="owner@example.com")
+    request = SimpleNamespace(headers={}, state=SimpleNamespace(principal=sharer))
+    access = {
+        "mode": "restricted", "allowed_emails": ["a@example.com"], "org_allowed": False,
+        "notify": {"user_ids": [person], "emails": ["a@example.com"]},
+    }
+
+    await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), _Session(), request)
+
+    assert share_pushes == [{
+        "org_id": ORG_SCOPE.org_id,
+        "sharer_id": ORG_SCOPE.user_id,
+        "sharer_name": "owner@example.com",
+        "recipient_ids": (person,),
+        "artifact_title": "Q3 report",
+        "url": "https://view.example/r/1",
+    }]
+
+
+async def test_a_save_without_notify_pushes_no_one(as_owner, publish_calls, publish_context, share_pushes):
+    access = {"mode": "restricted", "allowed_emails": ["a@example.com"], "org_allowed": False}
+    await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), _Session(), _REQUEST)
+    assert share_pushes == []
+
+
+async def test_a_failing_push_never_fails_the_save(as_owner, publish_calls, publish_context, monkeypatch):
+    def broken(**_kwargs):
+        raise RuntimeError("push down")
+
+    monkeypatch.setattr("cowork.services.push.hooks.artifact_shared", broken)
+    access = {
+        "mode": "restricted", "allowed_emails": ["a@example.com"], "org_allowed": False,
+        "notify": {"user_ids": ["aaaaaaaa-1111-1111-1111-111111111111"]},
+    }
+    out = await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), _Session(), _REQUEST)
+    assert out["url"] == "https://view.example/r/1"
