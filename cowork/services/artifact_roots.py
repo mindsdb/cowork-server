@@ -152,8 +152,10 @@ def _project_artifact_bases(
     isolation still holds because `project_path` comes from a scoped DB read
     that never returns another organization's project) — followed by one legacy
     per-conversation base for each conversation of the caller's own that wrote
-    something before the layout change. An absent legacy directory means no
-    pre-change artifacts and is not an error.
+    something before the layout change. A workspace with no `.anton/artifacts`
+    folder holds no artifact and yields no base: new artifacts never land in a
+    legacy root, and a list would otherwise reopen every empty workspace from
+    the trusted root.
 
     The legacy bases keep the owner filter: a conversation workspace is private
     to whoever created it, so a member's workspaces must not appear in another
@@ -206,15 +208,16 @@ def _project_artifact_bases(
         child
         for child in children
         if _is_real_directory(child)
-        and _storage_components_are_safe(child, may_be_absent=True)
+        and _storage_components_are_safe(child, may_be_absent=False)
     ]
     return bases + [child.joinpath(*_ARTIFACTS_SUBPATH) for child in children]
 
 
 def _parts_below(path: Path, anchor: Path) -> tuple[str, ...]:
-    """``path.relative_to(anchor).parts``, compared by parts: the same answer,
-    and the same ValueError for a path outside ``anchor``, without its walk
-    over every parent, which a listing pays once per project."""
+    """``path.relative_to(anchor).parts``, compared by parts, case-sensitive:
+    on POSIX paths the same answer, and the same ValueError for a path outside
+    ``anchor``, without its walk over every parent, which a listing pays once
+    per project. Every caller passes a base built under ``anchor``."""
     parts, anchor_parts = path.parts, anchor.parts
     if parts[: len(anchor_parts)] != anchor_parts:
         raise ValueError(f"{path} is not below {anchor}")

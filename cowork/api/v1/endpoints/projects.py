@@ -223,12 +223,7 @@ def _project_response(
     once (SharedResourceAccess.snapshots); without it, this reads the one row.
     """
     key = project_resource_key(project.id)
-    if not access.org_mode:
-        snapshot = None
-    elif snapshots is not None:
-        snapshot = snapshots.get(key)
-    else:
-        snapshot = access.snapshot(PROJECT, key)
+    snapshot = access.listed_snapshot(PROJECT, key, snapshots)
     if (
         access.org_mode
         and access.has_trusted_actor
@@ -275,8 +270,9 @@ def list_projects(
     service.ensure_general_for_scope()
     access = SharedResourceAccess(session, principal)
     projects = service.list_visible_projects()
-    # Read after the projects: a create commits its claim row before its
-    # project row, so every listed project's claim is already in this read.
+    # Read after the projects: create_project commits its claim
+    # (SharedResourceAccess.reserve_claim) before ProjectService.create_project
+    # commits the project row, so every listed project's claim is in this read.
     snapshots = access.snapshots(PROJECT)
     owned = [
         _project_response(project, access, snapshots=snapshots) for project in projects

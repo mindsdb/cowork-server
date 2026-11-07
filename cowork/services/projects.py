@@ -772,8 +772,10 @@ class ProjectService:
         if not scope.partitioned_for(PersonalResource.PROJECTS) or scope.org_id is None:
             return False
         root_parts = (shared_root or self.resolved_shared_root()).parts
-        # The first folder below the shared root, compared by parts: the same
-        # answer as Path.relative_to, without its walk over every parent.
+        # The first folder below the shared root, compared by parts,
+        # case-sensitive: on POSIX paths the same answer as Path.relative_to,
+        # without its walk over every parent. A partition needs an org, so
+        # this runs only in MindsHub mode, never on the desktop.
         parts = Path(project.path).parts
         if len(parts) <= len(root_parts) or parts[: len(root_parts)] != root_parts:
             return False

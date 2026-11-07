@@ -179,12 +179,7 @@ def _skill_response(
     shared = visible.shared
     viewer = service.viewer if service.org_sharing else None
     rule: SkillAccessRule | None = None
-    if not access.org_mode:
-        snapshot = None
-    elif snapshots is not None:
-        snapshot = snapshots.get(skill.name)
-    else:
-        snapshot = access.snapshot(SKILL, skill.name)
+    snapshot = access.listed_snapshot(SKILL, skill.name, snapshots)
     if visible.origin is SkillOrigin.MANAGED:
         # The operator's managed skill: built-in and read-only for every
         # caller, and authored by nobody here.
@@ -494,8 +489,11 @@ def list_skills(
     skill_service.ensure_builtin_skills()
     access = SharedResourceAccess(scoped, principal)
     visible_skills = skill_service.list_visible_skills()
-    # Read after the skills: a create commits its claim row before its
-    # folder, so every listed skill's claim is already in this read.
+    # Read after the skills: a create or upload commits its claim
+    # (_reserve_free_slug) before it writes the folder, so every listed skill's
+    # claim is in this read. A rename moves the folder first and its
+    # attribution row in a later commit (update_skill), so a listing in between
+    # shows the new name with no attribution until the rename commits.
     snapshots = access.snapshots(SKILL)
     # The typed response carries can_share's "canShare" alias from the model.
     return SkillListResponse(

@@ -8,7 +8,7 @@ behavior and does not write audit rows.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -61,9 +61,8 @@ class AttributionSnapshot:
     """One attribution row's values, copied out of the ORM row.
 
     A listing reads every row of a kind at once and keeps these values, not
-    the rows, so no row it holds stays in the session's identity map. A held
-    row would keep its stale claim token through a recovery's reads under the
-    lock (production sessions don't expire rows on commit).
+    the rows, so the listing leaves no row in the session's identity map and
+    every later read in the request (``_find``) asks the database.
     """
 
     created_by_id: str | None
@@ -474,6 +473,20 @@ class SharedResourceAccess:
         snapshot = self.snapshot(kind, key) if self.org_mode else None
         return snapshot is not None and snapshot.pending
 
+    def listed_snapshot(
+        self,
+        kind: str,
+        key: str,
+        snapshots: Mapping[str, AttributionSnapshot] | None,
+    ) -> AttributionSnapshot | None:
+        """The row of ``key`` as a listing read it (``snapshots``), or read
+        now without one. None outside org mode, where no row exists."""
+        if not self.org_mode:
+            return None
+        if snapshots is not None:
+            return snapshots.get(key)
+        return self.snapshot(kind, key)
+
     def snapshot(self, kind: str, key: str) -> AttributionSnapshot | None:
         """The attribution row of ``key``, copied out of the session."""
         row = self._find(kind, key)
@@ -537,20 +550,15 @@ class SharedResourceAccess:
         # writer, otherwise an expired empty claim can be released from a stale
         # pre-lock snapshot while its original writer is still finalizing bytes.
         with self.coordination_lock(kind, key):
-            # Both reads refresh from the database. A row this session loaded
-            # before the lock (a listing's own read, or the hint above) stays in
-            # the identity map with its old claim, since production sessions
-            # don't expire rows on commit, and another replica may have
-            # recovered or replaced that claim meanwhile.
+            # Both reads refresh from the database. A row this session still
+            # references (a caller's claim or attribution variable) keeps the
+            # values it was read with, since production sessions don't expire
+            # rows on commit, and another replica may have recovered or
+            # replaced that claim meanwhile.
             row = self._find(kind, key, refresh=True)
-            if row is None or not row.pending_claim_token:
+            if row is None or not AttributionSnapshot.of(row).may_be_recoverable():
                 return False
             claim_token = row.pending_claim_token
-            expires_at = row.pending_claim_expires_at
-            if expires_at is not None and expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-            if expires_at is not None and expires_at > datetime.now(timezone.utc):
-                return False
             current = self._find_for_update(row.id)
             if current is None or current.pending_claim_token != claim_token:
                 self.session.rollback()
@@ -1165,6 +1173,14 @@ class SharedResourceAccess:
         self,
         attribution_id: UUID,
     ) -> SharedResourceAttribution | None:
+        """The row locked for update, as the database holds it now.
+
+        ``populate_existing`` refreshes a copy this session already holds, so
+        every token check under the lock (finalize_claim, release_claim,
+        release_pristine_identity, mutation_lock, recover_stale_claim) sees a
+        claim another replica recovered or replaced, not the token this
+        session read earlier: production sessions don't expire rows on commit.
+        """
         return self.session.exec(
             self.session.select(SharedResourceAttribution)
             .where(SharedResourceAttribution.id == attribution_id)

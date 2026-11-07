@@ -179,13 +179,17 @@ def _artifact_cards(session, sources) -> list[dict]:
     # password.
     cards = _list_artifacts(sources)
     from cowork.services.artifact_export import card_export_source
-    from cowork.services.artifact_ownership import resolve_artifact_owners_by_source
+    from cowork.services.artifact_ownership import (
+        OwnerRequest,
+        resolve_artifact_owners_by_source,
+    )
     from cowork.services.artifact_permissions import artifact_capabilities
 
     # Capabilities are a property of each ARTIFACT: in org mode a project root is
     # shared by every member (ENG-2056), so each card's owner is resolved on its
-    # own. Owners are read in one query for every root together (the unfiltered
-    # listing spans every project of the organization).
+    # own. Project roots' owners are read in one query for every root together,
+    # and legacy roots' in one more (the unfiltered listing spans every project
+    # of the organization).
     by_base = {Path(source.base): source for source in sources}
     cards_by_base: dict[Path, list[tuple[str, dict]]] = {}
     for card in cards:
@@ -194,7 +198,11 @@ def _artifact_cards(session, sources) -> list[dict]:
             cards_by_base.setdefault(folder.parent, []).append((folder.name, card))
     roots = list(cards_by_base.items())
     owners_by_root = resolve_artifact_owners_by_source(
-        session, [(by_base[base], [slug for slug, _ in entries]) for base, entries in roots]
+        session,
+        [
+            OwnerRequest(source=by_base[base], slugs=tuple(slug for slug, _ in entries))
+            for base, entries in roots
+        ],
     )
     for (base, entries), resolutions in zip(roots, owners_by_root, strict=True):
         source = by_base[base]

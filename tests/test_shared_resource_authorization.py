@@ -2074,6 +2074,48 @@ def test_a_claim_another_replica_recovered_is_not_recovered_again(org_engine):
         session.close()
 
 
+def test_a_finalize_after_another_replica_recovered_the_claim_does_nothing(org_engine):
+    """The locked re-read in finalize_claim comes from the database, so a
+    writer whose claim another replica already recovered finalizes nothing.
+
+    Its own row still holds the token in its identity map (production
+    sessions don't expire rows on commit); judged from that copy, the token
+    check would pass and write a second event over the recovery.
+    """
+    from cowork.db.session import get_session_factory
+
+    def production_session(user_id: str) -> ScopedSession:
+        return ScopedSession(
+            get_session_factory(org_engine)(),
+            TenantScope(org_mode=True, org_id=ORG, user_id=user_id),
+        )
+
+    key = project_resource_key(uuid4())
+    writer = production_session(ALICE)
+    writer_access = SharedResourceAccess(writer, _principal(ALICE))
+    claim, token = writer_access.reserve_claim(PROJECT, key)
+    assert claim is not None and token is not None
+    claim.pending_claim_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    writer.add(claim)
+    writer.commit()
+
+    replica = production_session(ALICE)
+    assert (
+        SharedResourceAccess(replica, _principal(ALICE)).recover_stale_claim(
+            PROJECT, key, resource_exists=lambda: True
+        )
+        is True
+    )
+
+    assert writer_access.finalize_claim(claim, token, action="create") is None
+
+    check = production_session(ALICE)
+    events = check.exec(check.select(SharedResourceMutation)).all()
+    assert [(event.action, event.actor_id) for event in events] == [("recover", ALICE)]
+    for session in (writer, replica, check):
+        session.close()
+
+
 @pytest.mark.asyncio
 async def test_first_memory_finalize_failure_restores_bytes_and_metadata(
     org_engine,

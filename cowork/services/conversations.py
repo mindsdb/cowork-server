@@ -15,7 +15,7 @@ from uuid import UUID
 from pydantic import ValidationError
 from sqlalchemy import Text, case, cast, func, or_, tuple_
 from sqlalchemy import select as sa_select
-from sqlalchemy.orm import load_only, selectinload
+from sqlalchemy.orm import Bundle, selectinload
 
 from cowork.common.logger import log_context
 from cowork.common.paths import (
@@ -95,6 +95,18 @@ _MESSAGE_ORDER = (
 # The exact reverse of _MESSAGE_ORDER, for reads that walk back from the newest
 # row: id is unique, so every row has one place in either direction.
 _MESSAGE_ORDER_NEWEST_FIRST = tuple(column.desc() for column in _MESSAGE_ORDER)
+
+
+def _last_message_at():
+    """Each conversation's newest message time, as a subquery correlated to
+    the Conversation row. Without a GROUP BY, Postgres and SQLite answer each
+    row with one seek on `ix_messages_conversation_created`."""
+    return (
+        sa_select(func.max(Message.created_at))
+        .where(Message.conversation_id == Conversation.id)
+        .correlate(Conversation)
+        .scalar_subquery()
+    )
 
 
 def _message_cursor_key(message: Message) -> tuple[int, int, UUID]:
@@ -458,13 +470,7 @@ class ConversationService:
         clean Conversation rows. Empty conversations coalesce to their own
         `created_at` so a NULL max can't sort them to the end.
         """
-        last_activity = func.coalesce(
-            sa_select(func.max(Message.created_at))
-            .where(Message.conversation_id == Conversation.id)
-            .correlate(Conversation)
-            .scalar_subquery(),
-            Conversation.created_at,
-        )
+        last_activity = func.coalesce(_last_message_at(), Conversation.created_at)
         stmt = self.session.select(Conversation)
         # Conversations are personal: the scoped session enforces the org, but
         # user_id has no automatic scoping (see PinService), so without this
@@ -506,9 +512,9 @@ class ConversationService:
         all_projects: bool = False,
     ) -> list[tuple[Conversation, datetime]]:
         """`list_conversations` paired with each row's last-activity timestamp
-        for serialization: `last_message_at` for the whole page in one grouped
-        query on `ix_messages_conversation_created`. Callers that don't need the
-        value (e.g. search indexing) use `list_conversations` and skip it.
+        for serialization: `last_message_at` for the whole page in one query
+        (`last_messages_at`). Callers that don't need the value (e.g. search
+        indexing) use `list_conversations` and skip it.
         """
         convs = self.list_conversations(
             project_id=project_id, limit=limit, all_projects=all_projects
@@ -518,29 +524,25 @@ class ConversationService:
 
     def last_messages_at(self, conversation_ids: list[UUID]) -> dict[UUID, datetime]:
         """`last_message_at` for many conversations in one query; a
-        conversation with no message has no entry."""
+        conversation with no message has no entry.
+
+        One row per conversation, from the same correlated MAX that
+        `list_conversations` orders by. A join back to `messages` on the max
+        `created_at` would return every row of a turn's commit, since a
+        turn's tool rows and answer share one `created_at`
+        (`save_assistant_turn`). The Bundle keeps both columns through the
+        scoped select, which runs as scalars.
+        """
         if not conversation_ids:
             return {}
-        latest = (
-            sa_select(
-                Message.conversation_id,
-                func.max(Message.created_at).label("created_at"),
-            )
-            .where(Message.conversation_id.in_(conversation_ids))
-            .group_by(Message.conversation_id)
-            .subquery()
-        )
-        # Each conversation's newest message, with only the two columns read.
         rows = self.session.exec(
-            self.session.select(Message)
-            .join(
-                latest,
-                (Message.conversation_id == latest.c.conversation_id)
-                & (Message.created_at == latest.c.created_at),
+            self.session.select(Conversation)
+            .with_only_columns(
+                Bundle("last", Conversation.id, _last_message_at().label("created_at"))
             )
-            .options(load_only(Message.conversation_id, Message.created_at))
+            .where(Conversation.id.in_(conversation_ids))
         ).all()
-        return {row.conversation_id: row.created_at for row in rows}
+        return {row.id: row.created_at for row in rows if row.created_at is not None}
 
     def _owned(self, conversation_id: UUID) -> Conversation | None:
         """Fetch a conversation only if it belongs to the caller.
