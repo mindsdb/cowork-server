@@ -26,6 +26,7 @@ from cowork.api.v1.endpoints import (
     mindshub_workspaces,
     live_apps,
     memory,
+    org_branding,
     pins,
     project_files,
     projects,
@@ -111,6 +112,7 @@ api_router.include_router(mindshub_workspaces.router, prefix="/hub/workspaces", 
 api_router.include_router(mindshub_usage.router, prefix="/hub/usage", tags=["mindshub-usage"])
 api_router.include_router(mindshub_teams.router, prefix="/hub/teams", tags=["mindshub-teams"])
 api_router.include_router(mindshub_people.router, prefix="/hub/people", tags=["mindshub-people"])
+api_router.include_router(org_branding.router, prefix="/org-branding", tags=["org-branding"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────
 api_router.include_router(integrations_router, prefix="/integrations", tags=["compat"])
