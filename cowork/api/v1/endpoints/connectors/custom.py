@@ -2,17 +2,21 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 
-from cowork.api.v1.permissions import AuthenticatedOrgAdmin, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.connectors import ConnectorMetadataResponse, CustomConnectorUpdate
 from cowork.services.connectors.catalog import custom_connector_spec
 from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError
 from cowork.services.connectors.specs._registry import connector_metadata
 
-# AuthenticatedOrgAdmin: a custom connector is listed for everyone in the
-# organization, so changing or removing one is an admin decision. A no-op on a
+# In org mode a custom connector is visible to its builder only (see
+# scope_definitions), so the member who built it manages it. A no-op on a
 # local install, where the one user owns every definition.
-router = APIRouter(dependencies=[Depends(require(AuthenticatedOrgAdmin))])
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+#: What a member may change on their own connector in org mode. Its form came
+#: from a checked draft and stays as saved; featured is a directory setting.
+_ORG_MODE_CHANGES = frozenset({"label", "description", "category"})
 
 
 @router.patch("/{connector_id}", response_model=ConnectorMetadataResponse)
@@ -23,8 +27,14 @@ def update_custom_connector(
 
     Raises:
         HTTPException: 404 when the scope has no such custom connector, 422
-            when ``spec`` is invalid or unsafe to keep.
+            when ``spec`` is invalid or unsafe to keep, or in org mode when
+            anything but label, description or category is sent.
     """
+    if session.scope.org_mode and not body.model_fields_set <= _ORG_MODE_CHANGES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Only label, description and category can be changed here.",
+        )
     try:
         row = CustomConnectorService(session).update(connector_id, body)
     except UnstorableFormError as e:

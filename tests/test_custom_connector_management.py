@@ -1,4 +1,8 @@
-"""Admins can rename, unfeature, re-form and delete a custom connector, in their own scope only."""
+"""A custom connector's owner can change and delete it, in their own scope only.
+
+Locally the one user owns every definition. In org mode only the member who
+built a definition sees it, and may change only its label, description and
+category."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,7 +18,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from cowork.api.v1.endpoints.connectors import connections as connections_endpoints
 from cowork.api.v1.endpoints.connectors.custom import delete_custom_connector, update_custom_connector
 from cowork.api.v1.endpoints.connectors.custom import router as custom_router
-from cowork.api.v1.permissions import AuthenticatedOrgAdmin
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin
 from cowork.api.v1.route_walker import declared_permissions
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, get_scoped_session
@@ -25,8 +29,9 @@ from cowork.server import create_app
 from cowork.services.connectors.catalog import ConnectorCatalog
 from tests._fakes import FakeRequest
 
-ORG_A = TenantScope(org_mode=True, org_id="org-a", user_id="admin-a")
-ORG_B = TenantScope(org_mode=True, org_id="org-b", user_id="admin-b")
+ORG_A = TenantScope(org_mode=True, org_id="org-a", user_id="builder-a")
+ORG_A_OTHER = TenantScope(org_mode=True, org_id="org-a", user_id="member-a2")
+ORG_B = TenantScope(org_mode=True, org_id="org-b", user_id="member-b")
 
 FORM = {
     "form_id": "httpbin-connector",
@@ -41,7 +46,10 @@ def engine():
     SQLModel.metadata.create_all(eng)
     with Session(eng) as session:
         session.add(CustomConnector(connector_id="httpbin", label="httpbin", description="", spec=FORM))
-        session.add(CustomConnector(connector_id="httpbin", label="httpbin", description="", spec=FORM, org_id="org-a"))
+        session.add(CustomConnector(
+            connector_id="httpbin", label="httpbin", description="", spec=FORM,
+            org_id="org-a", created_by=ORG_A.user_id,
+        ))
         session.commit()
     return eng
 
@@ -169,56 +177,65 @@ async def test_delete_removes_the_definition_but_keeps_connections(engine, tmp_p
     assert after.custom is False
 
 
-def test_another_orgs_connector_is_a_404(engine):
+@pytest.mark.parametrize("scope", [ORG_B, ORG_A_OTHER], ids=["another org", "another member"])
+def test_someone_elses_connector_is_a_404(engine, scope):
     with pytest.raises(HTTPException) as exc:
-        update_custom_connector("httpbin", CustomConnectorUpdate(featured=False), _scoped(engine, ORG_B))
+        update_custom_connector("httpbin", CustomConnectorUpdate(label="Mine now"), _scoped(engine, scope))
     assert exc.value.status_code == 404
     with pytest.raises(HTTPException) as exc:
-        delete_custom_connector("httpbin", _scoped(engine, ORG_B))
+        delete_custom_connector("httpbin", _scoped(engine, scope))
     assert exc.value.status_code == 404
+    assert ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("httpbin").label == "httpbin"
 
 
-def test_an_org_admin_changes_only_their_own_orgs_row(engine):
+def test_the_builder_renames_only_their_own_row(engine):
     update_custom_connector("httpbin", CustomConnectorUpdate(label="Org copy"), _scoped(engine, ORG_A))
 
     assert ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("httpbin").label == "Org copy"
     assert ConnectorCatalog(_scoped(engine)).get_connector("httpbin").label == "httpbin"
 
 
-def test_org_mode_keeps_no_usage_notes_from_a_new_form(engine):
-    new_form = {**FORM, "connector": {"usage_notes": "Send the team token in X-Team-Key."}}
-
-    update_custom_connector("httpbin", CustomConnectorUpdate(spec=new_form), _scoped(engine, ORG_A))
+@pytest.mark.parametrize("body", [
+    {"spec": {**FORM, "connector": {"usage_notes": "Send the team token in X-Team-Key."}}},
+    {"featured": False},
+    {"featured": None},
+    {"label": "Renamed", "spec": FORM},
+], ids=["form", "featured", "featured null", "label with form"])
+def test_org_mode_changes_nothing_but_label_description_and_category(engine, body):
+    with pytest.raises(HTTPException) as exc:
+        update_custom_connector("httpbin", CustomConnectorUpdate.model_validate(body), _scoped(engine, ORG_A))
+    assert exc.value.status_code == 422
 
     with Session(engine) as session:
-        rows = session.exec(select(CustomConnector).where(CustomConnector.org_id == "org-a")).all()
-    assert [r.usage_notes for r in rows] == [None]
+        [row] = session.exec(select(CustomConnector).where(CustomConnector.org_id == "org-a")).all()
+    assert (row.label, row.featured, row.spec, row.usage_notes) == ("httpbin", True, FORM, None)
 
 
-def _org_client(engine, principal) -> TestClient:
+def _org_client(engine, principal, scope) -> TestClient:
     app = FastAPI()
     app.include_router(custom_router, prefix="/custom")
     app.dependency_overrides[get_principal] = lambda: principal
-    app.dependency_overrides[get_scoped_session] = lambda: _scoped(engine, ORG_A)
+    app.dependency_overrides[get_scoped_session] = lambda: _scoped(engine, scope)
     return TestClient(app)
 
 
-def test_a_member_who_is_not_an_admin_gets_a_403_in_org_mode(engine, monkeypatch):
+def test_in_org_mode_the_builder_manages_their_connector_and_no_one_else(engine, monkeypatch):
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
     try:
-        member = Principal(user_id="member-a", org_id="org-a")
-        admin = Principal(user_id="admin-a", org_id="org-a", roles=frozenset({ORG_MANAGE_ROLE}))
+        builder = Principal(user_id=ORG_A.user_id, org_id="org-a")
+        admin = Principal(user_id=ORG_A_OTHER.user_id, org_id="org-a", roles=frozenset({ORG_MANAGE_ROLE}))
 
-        assert _org_client(engine, member).patch("/custom/httpbin", json={"featured": False}).status_code == 403
-        assert _org_client(engine, member).delete("/custom/httpbin").status_code == 403
-        assert _org_client(engine, admin).patch("/custom/httpbin", json={"featured": False}).status_code == 200
+        assert _org_client(engine, admin, ORG_A_OTHER).patch("/custom/httpbin", json={"label": "x"}).status_code == 404
+        assert _org_client(engine, admin, ORG_A_OTHER).delete("/custom/httpbin").status_code == 404
+        renamed = _org_client(engine, builder, ORG_A).patch("/custom/httpbin", json={"label": "Acme"})
+        assert renamed.status_code == 200 and renamed.json()["label"] == "Acme"
+        assert _org_client(engine, builder, ORG_A).delete("/custom/httpbin").status_code == 204
     finally:
         get_app_settings.cache_clear()
 
 
-def test_both_routes_require_an_org_admin():
-    # AuthenticatedOrgAdmin's own 403 for a non-admin is covered in test_permissions.py.
+def test_both_routes_require_an_authenticated_member_not_an_admin():
     routes = [
         r for r in create_app().routes
         if getattr(r, "path", "").startswith("/api/v1/connectors/custom/")
@@ -226,4 +243,5 @@ def test_both_routes_require_an_org_admin():
 
     assert {tuple(sorted(r.methods)) for r in routes} == {("PATCH",), ("DELETE",)}
     for route in routes:
-        assert AuthenticatedOrgAdmin in declared_permissions(route)
+        assert AuthenticatedInOrgMode in declared_permissions(route)
+        assert AuthenticatedOrgAdmin not in declared_permissions(route)

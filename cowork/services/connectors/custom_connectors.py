@@ -153,12 +153,18 @@ def scope_definitions(session: ScopedSession) -> ScopedSelect:
     connections are personal), the scoped session already keys rows by the
     scope's org_id. Elsewhere the session adds no filter, so only the shared
     rows (org_id NULL) are the scope's; another scope's rows are left out.
-    Outside org mode, a scope that is not one person's sees none
-    (scope_is_one_persons), rows written before that rule included.
+    In org mode a definition is its builder's alone: the scope sees only rows
+    its user created, and a scope with no user sees none. Outside org mode, a
+    scope that is not one person's sees none (scope_is_one_persons), rows
+    written before that rule included.
     """
     scope = session.scope
     stmt = session.select(CustomConnector)
-    if not scope.org_mode and not scope_is_one_persons(scope):
+    if scope.org_mode:
+        if not scope.user_id:
+            return stmt.where(false())
+        return stmt.where(CustomConnector.created_by == scope.user_id)
+    if not scope_is_one_persons(scope):
         return stmt.where(false())
     if not scope.partitioned_for(PersonalResource.CONNECTIONS):
         stmt = stmt.where(CustomConnector.org_id.is_(None))
