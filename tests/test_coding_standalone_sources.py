@@ -83,7 +83,7 @@ def test_folder_task_persists_linked_context_and_delivers_it_to_the_agent(tmp_pa
     engine = FakeEngine()
     service = service_with(tmp_path, engine)
     session = service.create_session(SessionCreateRequest(
-        path=str(folder), allow_direct_folder=True, prompt="Fix this issue", engine_id="fake",
+        path=str(folder), allow_folder_copy=True, prompt="Fix this issue", engine_id="fake",
         source_contexts=[SOURCE],
     ), CREDS, default_engine="fake", default_model="fake-model")
     session = wait_for_workspace(service, session.id)
