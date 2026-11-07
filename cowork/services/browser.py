@@ -77,8 +77,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 #: The longest any call here waits on the router. A slower answer, the
-#: router's own 504 at its 105 s deadline included, reaches the app as 424
-#: browser_unreachable.
+#: router's own browser_starting at its 105 s deadline included, reaches the
+#: app as 424 browser_unreachable.
 _TIMEOUT_S = 15.0
 
 #: Status for "the browser router failed us". Not 502: Cloudflare, in front of

@@ -1,5 +1,5 @@
 {
-  "description": "The router's error body, {error, message}. A 401, 403 or 429 reaches the app with its own status; any other reaches it as 424, since the ingress replaces a 5xx body. The code always passes on. daily_limit comes only from the agent's POST /sessions, which no /browse route calls.",
+  "description": "The router's error body, {error, message}. A 401, 403 or 429 reaches the app with its own status; any other reaches it as 424, since Cloudflare, in front of the cowork host, swaps a 502 or 504 body for its own page. The router sends browser_unavailable and browser_starting as 503 for the same reason. The code always passes on. daily_limit comes only from the agent's POST /sessions, which no /browse route calls.",
   "examples": {
     "a stale sign-in": {
       "where": "any",
@@ -85,7 +85,7 @@
     "a sign-out while the browser starts": {
       "where": "DELETE /logins",
       "kind": "response",
-      "status": 504,
+      "status": 503,
       "body": {
         "error": "browser_starting",
         "message": "Your browser is still starting. Nothing changed; try again in a moment."
@@ -94,7 +94,7 @@
     "a sign-out the running browser didn't answer": {
       "where": "DELETE /logins",
       "kind": "response",
-      "status": 502,
+      "status": 503,
       "body": {
         "error": "browser_unavailable",
         "message": "Your browser didn't answer. Nothing changed; try again in a moment."
