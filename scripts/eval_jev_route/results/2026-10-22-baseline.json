@@ -1,0 +1,2246 @@
+[
+  {
+    "id": "hello",
+    "category": "small_talk",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_timeout",
+      "ms": 2002
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1432,
+      "choice": "answer_directly",
+      "p_direct": 0.96
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 985,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "thanks_after_work",
+    "category": "small_talk",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1176,
+      "choice": "answer_directly",
+      "p_direct": 0.97
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 811,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "define_ebitda",
+    "category": "general",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "direct",
+      "reason": "router_direct_response",
+      "ms": 1927
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1681,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 745,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "explain_pvalue",
+    "category": "general",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "direct",
+      "reason": "router_direct_response",
+      "ms": 2310
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1487,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 837,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "tier_names",
+    "category": "general",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_timeout",
+      "ms": 2002
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1061,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 862,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "headline_again",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 909,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 948,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "top_region_again",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 811,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 851,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "churn_recall",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 792,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 919,
+      "choice": "answer_directly",
+      "p_direct": 0.97
+    }
+  },
+  {
+    "id": "summarize_findings",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1026,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 777,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "rephrase_for_exec",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 892,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 847,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "recall_after_chat",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "direct",
+      "reason": "router_direct_response",
+      "ms": 2331
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 712,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1112,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "recall_spanish",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 850,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 901,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "derive_revenue_2024",
+    "category": "derive_visible",
+    "expect": "either",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 816,
+      "choice": "answer_directly",
+      "p_direct": 0.73
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 738,
+      "choice": "needs_agent",
+      "p_direct": 0.13
+    }
+  },
+  {
+    "id": "derive_churn_ratio",
+    "category": "derive_visible",
+    "expect": "either",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 793,
+      "choice": "answer_directly",
+      "p_direct": 0.84
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 824,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "hidden_headline",
+    "category": "recall_hidden",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 747,
+      "choice": "needs_agent",
+      "p_direct": 0.02
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 958,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "hidden_top_region",
+    "category": "recall_hidden",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 852,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1115,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "hidden_new_customers",
+    "category": "recall_hidden",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1015,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1201,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    }
+  },
+  {
+    "id": "hidden_spanish",
+    "category": "recall_hidden",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 954,
+      "choice": "needs_agent",
+      "p_direct": 0.02
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 919,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "add_chart",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1093,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 791,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "exclude_month",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 871,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1377,
+      "choice": "needs_agent",
+      "p_direct": 0.04
+    }
+  },
+  {
+    "id": "refresh_data",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 934,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1035,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "export_csv",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1148,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1293,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "fresh_query",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1487
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1060,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 826,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "new_work_french",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1193,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 859,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "which_model",
+    "category": "identity_product",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1685
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1080,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1088,
+      "choice": "answer_directly",
+      "p_direct": 0.96
+    }
+  },
+  {
+    "id": "who_made_you",
+    "category": "identity_product",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1439
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1221,
+      "choice": "needs_agent",
+      "p_direct": 0.08
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1118,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "update_app",
+    "category": "identity_product",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1820
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1045,
+      "choice": "needs_agent",
+      "p_direct": 0.04
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1367,
+      "choice": "answer_directly",
+      "p_direct": 0.91
+    }
+  },
+  {
+    "id": "pricing",
+    "category": "identity_product",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_timeout",
+      "ms": 2002
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1131,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1251,
+      "choice": "answer_directly",
+      "p_direct": 0.55
+    }
+  },
+  {
+    "id": "my_connections",
+    "category": "identity_product",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_timeout",
+      "ms": 2002
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1299,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1140,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "stock_price",
+    "category": "time_sensitive",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_timeout",
+      "ms": 2002
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1351,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1149,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "latest_news",
+    "category": "time_sensitive",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1711
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 966,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1239,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "weather",
+    "category": "time_sensitive",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1262,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1145,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "research_report",
+    "category": "time_sensitive",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_timeout",
+      "ms": 2002
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1239,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 971,
+      "choice": "needs_agent",
+      "p_direct": 0.1
+    }
+  },
+  {
+    "id": "file_mention",
+    "category": "file",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "explicit_file_context",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "explicit_file_context",
+      "ms": 1236,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": "explicit_file_context",
+      "ms": 1274,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "hello",
+    "category": "small_talk",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_timeout",
+      "ms": 2001
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1233,
+      "choice": "answer_directly",
+      "p_direct": 0.97
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 930,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "thanks_after_work",
+    "category": "small_talk",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1125,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1046,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "define_ebitda",
+    "category": "general",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "direct",
+      "reason": "router_direct_response",
+      "ms": 1865
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1054,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 847,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "explain_pvalue",
+    "category": "general",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "direct",
+      "reason": "router_direct_response",
+      "ms": 2007
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 988,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 944,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "tier_names",
+    "category": "general",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "direct",
+      "reason": "router_direct_response",
+      "ms": 1839
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 815,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 934,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "headline_again",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1162,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 838,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "top_region_again",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 968,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 831,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "churn_recall",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 843,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 825,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "summarize_findings",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 886,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 830,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "rephrase_for_exec",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 906,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 885,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "recall_after_chat",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1547
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 974,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1063,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "recall_spanish",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 841,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 940,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "derive_revenue_2024",
+    "category": "derive_visible",
+    "expect": "either",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 836,
+      "choice": "answer_directly",
+      "p_direct": 0.79
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1120,
+      "choice": "needs_agent",
+      "p_direct": 0.15
+    }
+  },
+  {
+    "id": "derive_churn_ratio",
+    "category": "derive_visible",
+    "expect": "either",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 797,
+      "choice": "answer_directly",
+      "p_direct": 0.83
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1220,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "hidden_headline",
+    "category": "recall_hidden",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1194,
+      "choice": "needs_agent",
+      "p_direct": 0.02
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 838,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "hidden_top_region",
+    "category": "recall_hidden",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 864,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 779,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "hidden_new_customers",
+    "category": "recall_hidden",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 874,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 910,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    }
+  },
+  {
+    "id": "hidden_spanish",
+    "category": "recall_hidden",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 841,
+      "choice": "needs_agent",
+      "p_direct": 0.02
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 829,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "add_chart",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 830,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1164,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "exclude_month",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 936,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 975,
+      "choice": "needs_agent",
+      "p_direct": 0.04
+    }
+  },
+  {
+    "id": "refresh_data",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1018,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 833,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "export_csv",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1398,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 879,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "fresh_query",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1314
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 835,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 636,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "new_work_french",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 887,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 751,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "which_model",
+    "category": "identity_product",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1540
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 780,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 687,
+      "choice": "answer_directly",
+      "p_direct": 0.94
+    }
+  },
+  {
+    "id": "who_made_you",
+    "category": "identity_product",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1273
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 761,
+      "choice": "needs_agent",
+      "p_direct": 0.07
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 710,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "update_app",
+    "category": "identity_product",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1329
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 741,
+      "choice": "needs_agent",
+      "p_direct": 0.03
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 910,
+      "choice": "answer_directly",
+      "p_direct": 0.92
+    }
+  },
+  {
+    "id": "pricing",
+    "category": "identity_product",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1304
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 831,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 743,
+      "choice": "answer_directly",
+      "p_direct": 0.57
+    }
+  },
+  {
+    "id": "my_connections",
+    "category": "identity_product",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1328
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 790,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1005,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "stock_price",
+    "category": "time_sensitive",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1410
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 786,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 793,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "latest_news",
+    "category": "time_sensitive",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1376
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 845,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 777,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "weather",
+    "category": "time_sensitive",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 719,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 818,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "research_report",
+    "category": "time_sensitive",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1735
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 824,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 785,
+      "choice": "needs_agent",
+      "p_direct": 0.09
+    }
+  },
+  {
+    "id": "file_mention",
+    "category": "file",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "explicit_file_context",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "explicit_file_context",
+      "ms": 757,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": "explicit_file_context",
+      "ms": 1106,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "hello",
+    "category": "small_talk",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "direct",
+      "reason": "router_direct_response",
+      "ms": 1801
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 766,
+      "choice": "answer_directly",
+      "p_direct": 0.95
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 673,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "thanks_after_work",
+    "category": "small_talk",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 707,
+      "choice": "answer_directly",
+      "p_direct": 0.97
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 826,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "define_ebitda",
+    "category": "general",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "direct",
+      "reason": "router_direct_response",
+      "ms": 1894
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 759,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 788,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "explain_pvalue",
+    "category": "general",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "direct",
+      "reason": "router_direct_response",
+      "ms": 1873
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 679,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 929,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "tier_names",
+    "category": "general",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "direct",
+      "reason": "router_direct_response",
+      "ms": 1711
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 778,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 877,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "headline_again",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 854,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 708,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "top_region_again",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 941,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 865,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "churn_recall",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 997,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 677,
+      "choice": "answer_directly",
+      "p_direct": 0.97
+    }
+  },
+  {
+    "id": "summarize_findings",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 748,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 720,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "rephrase_for_exec",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 691,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 770,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "recall_after_chat",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1347
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 746,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 792,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "recall_spanish",
+    "category": "recall_visible",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 719,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 841,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "derive_revenue_2024",
+    "category": "derive_visible",
+    "expect": "either",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 778,
+      "choice": "answer_directly",
+      "p_direct": 0.78
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 746,
+      "choice": "needs_agent",
+      "p_direct": 0.08
+    }
+  },
+  {
+    "id": "derive_churn_ratio",
+    "category": "derive_visible",
+    "expect": "either",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 841,
+      "choice": "answer_directly",
+      "p_direct": 0.84
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 696,
+      "choice": "answer_directly",
+      "p_direct": 1.0
+    }
+  },
+  {
+    "id": "hidden_headline",
+    "category": "recall_hidden",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 867,
+      "choice": "needs_agent",
+      "p_direct": 0.02
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 766,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "hidden_top_region",
+    "category": "recall_hidden",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 771,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1292,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "hidden_new_customers",
+    "category": "recall_hidden",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 838,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 998,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    }
+  },
+  {
+    "id": "hidden_spanish",
+    "category": "recall_hidden",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1030,
+      "choice": "needs_agent",
+      "p_direct": 0.02
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 950,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "add_chart",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1204,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 853,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "exclude_month",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 789,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 761,
+      "choice": "needs_agent",
+      "p_direct": 0.04
+    }
+  },
+  {
+    "id": "refresh_data",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 808,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 788,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "export_csv",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 778,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 826,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "fresh_query",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1456
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1592,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 872,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "new_work_french",
+    "category": "new_work",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 966,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 746,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "which_model",
+    "category": "identity_product",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1904
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 782,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 947,
+      "choice": "answer_directly",
+      "p_direct": 0.94
+    }
+  },
+  {
+    "id": "who_made_you",
+    "category": "identity_product",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1630
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 765,
+      "choice": "needs_agent",
+      "p_direct": 0.07
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1010,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "update_app",
+    "category": "identity_product",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1555
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 871,
+      "choice": "needs_agent",
+      "p_direct": 0.03
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 826,
+      "choice": "answer_directly",
+      "p_direct": 0.9
+    }
+  },
+  {
+    "id": "pricing",
+    "category": "identity_product",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1676
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1864,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 943,
+      "choice": "answer_directly",
+      "p_direct": 0.55
+    }
+  },
+  {
+    "id": "my_connections",
+    "category": "identity_product",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_timeout",
+      "ms": 2002
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1079,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 913,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  },
+  {
+    "id": "stock_price",
+    "category": "time_sensitive",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1348
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 995,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 971,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "latest_news",
+    "category": "time_sensitive",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_declined_direct_response",
+      "ms": 1654
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1719,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1641,
+      "choice": "answer_directly",
+      "p_direct": 0.98
+    }
+  },
+  {
+    "id": "weather",
+    "category": "time_sensitive",
+    "expect": "direct",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "prior_turn_ran_tools",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "prior_turn_ran_tools",
+      "ms": 1050,
+      "choice": "needs_agent",
+      "p_direct": 0.01
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1408,
+      "choice": "answer_directly",
+      "p_direct": 0.99
+    }
+  },
+  {
+    "id": "research_report",
+    "category": "time_sensitive",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "router_timeout",
+      "ms": 2002
+    },
+    "jev_current": {
+      "check": null,
+      "ms": 1369,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": null,
+      "ms": 1636,
+      "choice": "needs_agent",
+      "p_direct": 0.1
+    }
+  },
+  {
+    "id": "file_mention",
+    "category": "file",
+    "expect": "agent",
+    "llm_gate": {
+      "route": "agent",
+      "reason": "explicit_file_context",
+      "ms": 0
+    },
+    "jev_current": {
+      "check": "explicit_file_context",
+      "ms": 1237,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    },
+    "jev_proposed": {
+      "check": "explicit_file_context",
+      "ms": 1371,
+      "choice": "needs_agent",
+      "p_direct": 0.0
+    }
+  }
+]

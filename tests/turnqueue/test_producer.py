@@ -1766,3 +1766,22 @@ async def test_stream_remote_replies_gives_the_task_its_router_session_and_warms
         "project": browser.project_key("u1", "proj-1"),
     }
     assert warmed == [(settings, "mdb_turnkey")]
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_the_job_carries_the_organizations_jev_opt_out(monkeypatch, enabled):
+    """Every remote turn carries the switch, so the pod's completion check
+    honors the opt-out whichever caller queued the turn."""
+    from cowork.common.settings import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id="", jev_decisions_enabled=enabled),
+    )
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+
+    assert json.loads(fake.added[0][1]["payload"])["params"]["jev_decisions"] is enabled

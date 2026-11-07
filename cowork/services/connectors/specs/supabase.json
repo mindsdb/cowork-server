@@ -152,7 +152,7 @@
           }
         ],
         "cloud": {
-          "available": false,
+          "available": true,
           "engine": "postgres:host-port",
           "description": "Enter the host, port, database, username and password. Saved and read as a PostgreSQL connection.",
           "how_to": "## Connect Supabase\n\nCloud saves this connection in your encrypted connection store and reads it through the hosted gateway.\n\n### Where to find each value\n\n1. In your Supabase project, choose **Connect** and pick the **Session pooler**. The direct connection host answers over IPv6 only unless your project has the IPv4 add-on.\n2. **Host**: the session pooler host, such as `aws-0-<region>.pooler.supabase.com`.\n3. **Port**: `5432`.\n4. **Database**: `postgres` unless you created another.\n5. **Username**: `postgres.<project-ref>`, the user the session pooler shows.\n6. **Password**: your database password.\n\nUse a database user that can read only the data you want to query.",

@@ -160,6 +160,46 @@ def test_due_slot_deferred_while_manual_run_in_flight():
     )
 
 
+@pytest.mark.parametrize("cadence", ["every_15_minutes", "every_30_minutes"])
+def test_a_short_cadence_runs_the_slot_right_after_a_manual_run(cadence):
+    # A freshness window would skip every other slot after a Run now at
+    # these cadences, so they have none.
+    from cowork.scheduler import _due_schedules
+
+    session = _session()
+    schedule = _schedule(session, cadence=cadence)  # due at 2026-06-25 09:00 UTC
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+
+    now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
+    run = run_service.create_run(schedule.id, is_manual=True)
+    run_service.finish_run(run.id)
+    _finish_at(session, run.id, now - timedelta(minutes=2))
+
+    assert [s.id for s in _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now)] == [schedule.id]
+
+
+@pytest.mark.parametrize(("cadence", "step", "missed"), [
+    ("every_15_minutes", timedelta(minutes=15), 9),
+    ("every_30_minutes", timedelta(minutes=30), 5),
+])
+def test_a_short_cadence_back_from_downtime_moves_to_its_next_slot(cadence, step, missed):
+    from cowork.scheduler import _handle_missed_runs
+
+    session = _session()
+    now = datetime.now(timezone.utc)
+    overdue = (now - timedelta(hours=2, minutes=5)).replace(microsecond=0)
+    schedule = _schedule(session, cadence=cadence, next_run_at=overdue)
+
+    _handle_missed_runs(ScopedSession(session, SYSTEM_SCOPE))
+
+    session.refresh(schedule)
+    next_run = schedule.next_run_at.replace(tzinfo=timezone.utc)
+    assert schedule.missed_runs == missed
+    assert now < next_run <= now + step
+    # Still on the task's own grid, counted from its original start.
+    assert (next_run - overdue) % step == timedelta(0)
+
+
 def test_due_slot_runs_when_recent_run_failed():
     from cowork.scheduler import _due_schedules
 

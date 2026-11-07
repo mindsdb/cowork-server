@@ -25,7 +25,7 @@ from cowork.services.connectors.custom_connectors import (
 )
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
-from cowork.services.connectors.persist import vault_for_scope
+from cowork.services.connectors.persist import connection_a_new_save_replaces, vault_for_scope
 from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import missing_required_fields, store
@@ -114,6 +114,35 @@ async def submit_form_route(req: SubmitFormRequest, request: Request, scope: Ten
         if _relayed_in_org_mode(connector_id):
             return await relay_cloud_submission(req, connector_id, req.resolve_method(), scope, request)
     return await submit_form(req, scope)
+
+
+@router.post("/replaces", name="submission_replaces")
+async def submission_replaces_route(req: SubmitFormRequest, scope: TenantScopeDep) -> dict:
+    """The saved connection this submission would overwrite, so the form can ask first.
+
+    ``{"replaces": {"name", "label"}}``, or ``{"replaces": null}`` when submitting
+    would create a new connection. A named submission already targets its
+    connection, so it never counts as a replacement.
+    """
+    connector_id = _connector_id(req)
+    form_spec = req.form_spec or {}
+    if (
+        req.name.strip()
+        or form_spec.get("_extends_connection") is not None
+        or connector_id == SHAREPOINT
+        or (scope.org_mode and _relayed_in_org_mode(connector_id))
+    ):
+        return {"replaces": None}
+    credentials = {
+        k: v for k, v in req.values.items()
+        if k not in req.skipped and v is not None and v != ""
+    }
+    builtin = registry.get_connector(connector_id) is not None
+    replaces = connection_a_new_save_replaces(
+        connector_id, req.resolve_method(), credentials,
+        vault=vault_for_scope(scope), spec_form=None if builtin else form_spec,
+    )
+    return {"replaces": replaces}
 
 
 async def submit_form(req: SubmitFormRequest, scope: TenantScope) -> StreamingResponse:

@@ -91,7 +91,10 @@ _INTERRUPTED_RUN_ERROR = "Run was interrupted: the server shut down before it fi
 # it, and the run is saved as interrupted (_INTERRUPTED_RUN_ERROR).
 _scheduled_runs: set[asyncio.Task] = set()
 
-_RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
+_RECURRING_CADENCES = {
+    Cadence.every_15_minutes, Cadence.every_30_minutes, Cadence.hourly,
+    Cadence.daily, Cadence.weekly, Cadence.weekdays,
+}
 
 # A one-off whose slot has just passed is still due this poll and must be run,
 # not disabled — the poll runs `_handle_missed_runs` before `_due_schedules`,
@@ -111,7 +114,9 @@ _ONCE_CATCHUP_WINDOW_SECONDS = 60 * 60
 # "run now" — finished this recently before a due cron slot, the slot is
 # skipped instead of executed, so both runs don't publish the same output
 # twice. Hourly gets a tighter window so consecutive slots never suppress
-# each other even when a run finishes mid-hour.
+# each other even when a run finishes mid-hour. Shorter
+# cadences get none: at every 15 or 30 minutes, a slot right after a manual
+# run is wanted.
 _FRESHNESS_WINDOW_SECONDS = {
     Cadence.once: 60 * 60,
     Cadence.hourly: 30 * 60,
