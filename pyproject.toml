@@ -217,7 +217,7 @@ packages = ["cowork"]
 # Temporary: the browser tool's anton fix, pinned by commit so tests run
 # against exactly it. Removed once that fix reaches anton's staging and its
 # release candidate publishes: the floor above then rises to that candidate.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "03b06cfe76ebd13163ca734b3e6bd02075197e6e" }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "dc8b21205dd2707215b96749f31b83dfbfc06c38" }
 
 [dependency-groups]
 dev = [

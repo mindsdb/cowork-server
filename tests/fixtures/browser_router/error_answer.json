@@ -72,6 +72,33 @@
         "error": "entitlements_unavailable",
         "message": "Browser access can't be checked right now. Try again in a moment."
       }
+    },
+    "an approval with no running browser": {
+      "where": "POST /sessions/{id}/approve",
+      "kind": "response",
+      "status": 404,
+      "body": {
+        "error": "session_not_found",
+        "message": "That browser session isn't running."
+      }
+    },
+    "a sign-out while the browser starts": {
+      "where": "DELETE /logins",
+      "kind": "response",
+      "status": 504,
+      "body": {
+        "error": "browser_starting",
+        "message": "Your browser is still starting. Nothing changed; try again in a moment."
+      }
+    },
+    "a sign-out the running browser didn't answer": {
+      "where": "DELETE /logins",
+      "kind": "response",
+      "status": 502,
+      "body": {
+        "error": "browser_unavailable",
+        "message": "Your browser didn't answer. Nothing changed; try again in a moment."
+      }
     }
   }
 }

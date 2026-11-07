@@ -725,11 +725,15 @@ def test_approve_checks_its_ids_and_the_routers_answer(web_client, router, minds
     assert _detail(other) == (svc.UPSTREAM_FAILED, "bad_response")
 
 
-def test_a_lapsed_approval_reaches_the_app_with_its_code(web_client, router, mindshub):
-    lapsed = _fixture("browser_router", "error_answer.json").examples["an approval that lapsed"]
-    router.answers["/browser/sessions/t-abc/approve"] = httpx.Response(lapsed.status, json=lapsed.body)
+@pytest.mark.parametrize(("name", "code"), [
+    ("an approval that lapsed", "approval_lapsed"),
+    ("an approval with no running browser", "session_not_found"),
+])
+def test_a_refused_approval_reaches_the_app_with_its_code(web_client, router, mindshub, name, code):
+    refusal = _fixture("browser_router", "error_answer.json").examples[name]
+    router.answers["/browser/sessions/t-abc/approve"] = httpx.Response(refusal.status, json=refusal.body)
     answer = web_client.post("/api/v1/browse/approve", headers=_as("alice"), json={"session_id": "t-abc", "pending_id": "pa-1"})
-    assert _detail(answer) == (svc.UPSTREAM_FAILED, "approval_lapsed")
+    assert _detail(answer) == (svc.UPSTREAM_FAILED, code)
 
 
 def test_sign_out_of_every_site_goes_to_the_router_as_the_person(web_client, router, mindshub):
