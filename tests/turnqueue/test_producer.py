@@ -2007,6 +2007,23 @@ async def test_a_failed_revoke_is_logged_and_the_turn_still_ends(monkeypatch, re
     assert "mdb_turnkey" not in repr(warnings)
 
 
+@pytest.mark.asyncio
+async def test_a_second_run_that_fails_the_turn_revokes_its_key(monkeypatch, revokes):
+    """A second run of the turn's job fails the turn, which ends it, so its key
+    goes with it as with any other failure."""
+    def numbered(kind, data, n):
+        return {"payload": json.dumps({"correlation_id": "r", "kind": kind, "data": data, "n": n})}
+
+    authorized = {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+    items = await _drain(_turn_with_key(monkeypatch, [
+        numbered("progress", authorized, 1),
+        numbered("turn_delta", {"text": "first"}, 2),
+        numbered("progress", authorized, 1),
+    ]))
+    assert (items[-1][0], items[-1][1]["error"]) == ("turn_failed", prod.SECOND_RUN_ERROR)
+    assert revokes == ["r"]
+
+
 async def test_a_channel_turn_leaves_the_index_entry_of_a_claimed_turn_alone(monkeypatch):
     """A channel turn has no registry handle, so the producer records its
     index entry itself. While a run holds the conversation's turn claim,
