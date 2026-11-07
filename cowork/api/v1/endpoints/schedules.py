@@ -31,9 +31,10 @@ def _serialize_run(run) -> ScheduleRunResponse:
     return ScheduleRunResponse.model_validate(run)
 
 
-def _serialize(schedule, scoped) -> ScheduleResponse:
+def _serialize(schedule, scoped, *, run_count: int | None = None) -> ScheduleResponse:
     run_service = ScheduleRunService(scoped)
     response = ScheduleResponse.model_validate(schedule)
+    response.run_count = run_count if run_count is not None else run_service.run_counts([schedule.id]).get(schedule.id, 0)
     response.running = run_service.has_active_run(schedule.id)
     last = run_service.last_finished_run(schedule.id)
     response.last_run = _serialize_run(last) if last is not None else None
@@ -44,7 +45,10 @@ def _serialize(schedule, scoped) -> ScheduleResponse:
 @router.get("/", response_model=dict[str, list[ScheduleResponse]])
 def list_schedules(scoped: ScopedSessionDep, project_id: UUID | None = None):
     schedules = ScheduleService(scoped).list_schedules(project_id=project_id)
-    return {"schedules": [_serialize(s, scoped) for s in schedules]}
+    # Which conversations are a schedule's runs comes with the conversations
+    # (scheduled_id), so this poll does not grow with each schedule's history.
+    counts = ScheduleRunService(scoped).run_counts([s.id for s in schedules])
+    return {"schedules": [_serialize(s, scoped, run_count=counts.get(s.id, 0)) for s in schedules]}
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED, response_model=ScheduleResponse)

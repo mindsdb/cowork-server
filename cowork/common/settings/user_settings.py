@@ -697,6 +697,14 @@ class UserSettings(Settings):
         title="Show Figure Sources",
         description="Mark each figure in an answer with the steps it came from, and flag figures with no source.",
     )
+    schedule_keep_awake: bool = Field(
+        default=True,
+        title="Keep Awake For Scheduled Tasks",
+        description=(
+            "Keep the desktop from idle-sleeping while a scheduled task is running "
+            "or about to run."
+        ),
+    )
     nav_title: str = Field(
         default="",
         title="Nav Title",
