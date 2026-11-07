@@ -4,6 +4,7 @@ Isolates the app onto a throwaway SQLite DB + master key BEFORE any cowork
 module is imported (settings/engine are read at import time), then builds the
 schema directly and seeds the ``general`` project the runtime depends on.
 """
+import copy
 import importlib
 import io
 import logging
@@ -333,6 +334,86 @@ def granted_product_permissions(monkeypatch):
 
     monkeypatch.setattr(product_permissions, "has_product_permission", allowed)
     monkeypatch.setattr(artifact_workspace, "has_product_permission", allowed)
+
+
+def _set_datasource_adapter_flag(available: bool):
+    """Set `cloud.available` on the database and managed service specs, restoring it afterwards.
+
+    Mutates the registry's cached spec data, because that is what a release
+    flipping the flag looks like from the policy's side.
+    """
+    from cowork.services.connectors.specs._registry import registry
+
+    raw = registry.get_connectors()
+    restore: list[tuple[dict, bool]] = []
+    for connector_id, spec in raw.items():
+        for method in spec.get("form", {}).get("methods", []):
+            cloud = method.get("cloud")
+            if cloud is None:
+                continue
+            # The engines, and every managed service that runs as one of them.
+            if connector_id in ("postgres", "mysql") or cloud.get("engine"):
+                restore.append((cloud, cloud.get("available", False)))
+                cloud["available"] = available
+    yield
+    for cloud, previous in restore:
+        cloud["available"] = previous
+
+
+@pytest.fixture
+def adapter_verified_datasources():
+    """The database methods report that the hosted path can execute them.
+
+    The capability policy's first gate; a test about the deployment's own
+    enable list has to lift it.
+    """
+    yield from _set_datasource_adapter_flag(True)
+
+
+@pytest.fixture
+def adapter_unverified_datasources():
+    """The database methods report that the hosted path cannot execute them.
+
+    Set rather than assumed, so a test of that gate keeps its meaning on a
+    branch that ships the flag the other way round.
+    """
+    yield from _set_datasource_adapter_flag(False)
+
+
+@pytest.fixture
+def managed_postgres_service():
+    """A managed service spec, ``managed_pg``, that runs as postgres:host-port.
+
+    Its one cloud method copies postgres's cloud fields and is adapter-verified.
+    Added to the registry's cached spec data and removed afterwards.
+    """
+    from cowork.services.connectors.specs._registry import registry
+
+    raw = registry.get_connectors()
+    postgres_cloud = next(
+        m["cloud"] for m in raw["postgres"]["form"]["methods"] if m.get("cloud") is not None
+    )
+    raw["managed_pg"] = {
+        "id": "managed_pg",
+        "label": "Managed PostgreSQL",
+        "category": "database",
+        "form": {
+            "form_id": "managed-pg-connector",
+            "title": "Connect Managed PostgreSQL",
+            "methods": [{
+                "id": "direct",
+                "label": "Direct",
+                "fields": [{"name": "host", "label": "Host", "type": "text"}],
+                "cloud": {
+                    **copy.deepcopy(postgres_cloud),
+                    "available": True,
+                    "engine": "postgres:host-port",
+                },
+            }],
+        },
+    }
+    yield "managed_pg", "direct"
+    raw.pop("managed_pg", None)
 
 
 @pytest.fixture

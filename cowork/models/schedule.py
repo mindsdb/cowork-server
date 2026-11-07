@@ -12,7 +12,7 @@ class Schedule(BaseSQLModel, table=True):
 
     title: str = Field(description="Display name for the schedule")
     prompt: str = Field(description="The prompt to run on each execution")
-    cadence: str = Field(description="Execution cadence: once | hourly | daily | weekly")
+    cadence: str = Field(description="Execution cadence: once | every_15_minutes | every_30_minutes | hourly | daily | weekdays | weekly")
     timezone: str = Field(default="UTC", description="IANA timezone name")
     next_run_at: datetime = Field(
         sa_type=sa.DateTime(timezone=True),  # type: ignore
@@ -40,6 +40,29 @@ class Schedule(BaseSQLModel, table=True):
     )
     last_error: str | None = Field(default=None, description="Error message from last failed run")
     missed_runs: int = Field(default=0, description="Count of runs missed while the scheduler was offline")
+    consecutive_failures: int = Field(
+        default=0,
+        sa_column_kwargs={"server_default": "0"},
+        description="Cron slots in a row that settled failed; a success resets it",
+    )
+    auto_paused_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="When repeated failures paused the schedule; cleared on resume",
+    )
+    paused_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description=(
+            "When the user paused the schedule; cleared on resume. A one-off that "
+            "has run is disabled too, so `enabled` alone does not mean paused"
+        ),
+    )
+    missed_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="When a one-off was found too late to run on its own; cleared when it runs or is moved",
+    )
     org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
 
@@ -58,6 +81,7 @@ class ScheduleRun(BaseSQLModel, table=True):
     # insert that names a slot is the claim: a second replica's insert for
     # that slot fails here, so the slot starts one run (cowork.scheduler).
     __table_args__ = (
+        sa.Index("ix_schedule_runs_schedule_finished", "schedule_id", "finished_at", "started_at"),
         sa.Index(
             "uq_schedule_runs_slot",
             "schedule_id",
@@ -65,6 +89,16 @@ class ScheduleRun(BaseSQLModel, table=True):
             unique=True,
             sqlite_where=sa.text("slot_at IS NOT NULL"),
             postgresql_where=sa.text("slot_at IS NOT NULL"),
+        ),
+        # One run going per schedule, manual or cron: inserting a second
+        # `running` row fails, so two Run now presses, or Run now racing a
+        # cron claim, start one run.
+        sa.Index(
+            "uq_schedule_runs_one_running",
+            "schedule_id",
+            unique=True,
+            sqlite_where=sa.text("status = 'running'"),
+            postgresql_where=sa.text("status = 'running'"),
         ),
     )
 
@@ -94,6 +128,11 @@ class ScheduleRun(BaseSQLModel, table=True):
         description="Conversation created during this run",
     )
     is_manual: bool = Field(default=False, description="True if triggered via run-now endpoint")
+    trial: bool = Field(
+        default=False,
+        sa_column_kwargs={"server_default": sa.false()},
+        description="A run-now that tries the task out: it leaves a one-off scheduled, and neither the freshness guard nor the failure streak counts it",
+    )
     slot_at: datetime | None = Field(
         default=None,
         sa_type=sa.DateTime(timezone=True),  # type: ignore
@@ -103,4 +142,13 @@ class ScheduleRun(BaseSQLModel, table=True):
         default=None,
         sa_type=sa.DateTime(timezone=True),  # type: ignore
         description="Until when the process running it has renewed its claim; a running run past this is dead",
+    )
+    execution_claimed_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="Durable claim before handing off execution; survives deletion of the run's chat",
+    )
+    outcome: str | None = Field(
+        default=None,
+        description="What is known about the run's execution when it ended (AttemptOutcome); NULL while running and on runs from before outcomes were recorded",
     )

@@ -33,6 +33,11 @@ deployment:
     maxReplicas: 4
     targetCPUUtilizationPercentage: 70
 
+  # Cloud datasource turns and the methods offered, on for staging by the
+  # release gate. Rollback removes both lines; see the chart README.
+  datasourceTurnsEnabled: "true"
+  datasourceCapabilities: '{"manifest_version": 1, "enabled": ["mysql:host-password", "postgres:host-port"]}'
+
   ingress:
     enabled: true
     name: cowork-server
@@ -90,6 +95,8 @@ deployment:
     # conservatively. Changing these requires a pod restart (env is read once
     # per process).
     # - name: COWORK_DEFAULT_MAX_TOOL_ROUNDS
-    #   value: "50"
+    #   value: "250"
     # - name: COWORK_DEFAULT_MAX_CONTINUATIONS
-    #   value: "5"
+    #   value: "10"
+    # - name: COWORK_DEFAULT_MAX_TURN_TOKENS
+    #   value: "25000000"

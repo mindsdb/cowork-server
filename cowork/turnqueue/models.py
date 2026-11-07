@@ -128,3 +128,15 @@ class TurnReply(BaseModel):
                   "turn_memory", "turn_skill", "turn_history", "turn_compaction",
                   "turn_completed", "turn_failed"]
     data: dict[str, Any] = Field(default_factory=dict)
+    # The reply's number within its turn, counting up by one. The controller
+    # resends a reply whose XADD reply it lost, and the relay drops a reply
+    # whose number repeats the last one it applied (producer.py). A
+    # controller that numbers nothing sends none, and every reply is applied.
+    n: int | None = None
+
+
+class TurnJobHeader(BaseModel):
+    """The field of a queued job the producer reads back after a job XADD
+    whose reply it lost: the turn it queues."""
+
+    correlation_id: str

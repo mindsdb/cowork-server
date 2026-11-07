@@ -17,6 +17,7 @@ from pathlib import Path
 from types import FrameType
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.datastructures import MutableHeaders
@@ -53,6 +54,7 @@ from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import ServerShuttingDown, TurnInProgress, registry
 from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
+from cowork.streaming.turn_claim import TurnClaimUnavailable
 from cowork.common.request_logging import RequestLoggingApp
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import O_NONBLOCK, dir_open, dir_scandir, dir_stat, pinned_dir
@@ -198,6 +200,46 @@ def _server_busy(*, retry_after: int, status_code: int) -> JSONResponse:
 # Another replica already serves while this one shuts down, so the retry needs
 # no longer than the client's own round trip.
 _SHUTDOWN_RETRY_AFTER_SECONDS = 1
+
+# A Redis call that failed or timed out; a failover or a dropped connection
+# usually settles within a couple of seconds.
+_TURN_CLAIM_RETRY_AFTER_SECONDS = 2
+
+
+async def _release_own_turn_claims() -> None:
+    """On the Redis stream backend, release the turn claims a process of this
+    pod left behind (turn_claim.release_pod_claims): one whose container was
+    restarted in place, by an OOM kill or a crash, whose claims would
+    otherwise refuse a send to each of its conversations until the claim's
+    TTL passed, and whose sandbox turns would run on. The same pass removes
+    the listings of claims that lapsed on pods that are gone. Bounded and
+    fail-open; a claim it cannot release lapses with its TTL."""
+    from cowork.streaming.backend import get_backend
+    from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, pod_name, release_pod_claims
+
+    if get_backend() != "redis":
+        return
+    pod = pod_name()
+    try:
+        async with asyncio.timeout(REDIS_CALL_SECONDS):
+            result = await release_pod_claims(pod=pod)
+    except Exception:
+        logger.warning(
+            "Could not release the turn claims an earlier process of this pod left; they lapse with their TTL.",
+            exc_info=True,
+            extra={"event": "turn_claims_boot_release_failed", "pod": pod},
+        )
+        return
+    if result.released:
+        logger.warning(
+            "Released turn claims an earlier process of this pod left behind.",
+            extra={"event": "turn_claims_released_at_boot", "pod": pod, "count": result.released},
+        )
+    if result.pruned:
+        logger.warning(
+            "Removed the listings of turn claims that lapsed without a release.",
+            extra={"event": "turn_claim_listings_pruned_at_boot", "pod": pod, "count": result.pruned},
+        )
 
 
 def _end_remote_turns_on_sigterm() -> None:
@@ -359,6 +401,8 @@ async def lifespan(app: FastAPI):
         gc_old_buffers(get_streams_dir(), max_age_days=7)
     except Exception:
         logger.exception("turn-buffer boot recovery failed (non-fatal)")
+    # Before the port takes requests, so no turn of this process holds a claim yet.
+    await _release_own_turn_claims()
     # Reclaim scratchpad namespace snapshots whose conversation is gone (ENG-1124).
     # `delete_conversation` prunes its own from now on; this catches everything
     # deleted before that shipped, plus any path that drops a conversation row
@@ -446,6 +490,7 @@ async def lifespan(app: FastAPI):
         from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
         from cowork.coding.inference_proxy import close_inference_client
+        from cowork.handlers.jev_route import close_client as close_jev_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
@@ -476,6 +521,7 @@ async def lifespan(app: FastAPI):
         await close_scratchpads()
         await close_proxy_client()
         await close_inference_client()
+        await close_jev_client()
 
 
 @asynccontextmanager
@@ -642,6 +688,18 @@ def create_app() -> FastAPI:
     async def _missing_tenant_scope(request, exc):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
+    # Connector submissions and datasource management take passwords, DSNs and
+    # CA material in the body, and FastAPI's default 422 hands the offending
+    # value straight back in `input`. Answer with the location and the reason
+    # only; that is enough to fix a malformed request.
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request, exc):
+        detail = [
+            {"loc": error.get("loc", ()), "msg": error.get("msg", ""), "type": error.get("type", "")}
+            for error in exc.errors()
+        ]
+        return JSONResponse({"detail": detail}, status_code=422)
+
     # No database connection freed within POOL_TIMEOUT. DatabaseBusy, a unit
     # that waited for its slot or its connection, subclasses the pool timeout,
     # so this answers both. The web UI waits for Retry-After before it offers
@@ -661,6 +719,18 @@ def create_app() -> FastAPI:
     @app.exception_handler(ServerShuttingDown)
     async def _shutting_down(request, exc: ServerShuttingDown):
         return _server_busy(retry_after=_SHUTDOWN_RETRY_AFTER_SECONDS, status_code=exc.status_code)
+
+    # Redis could not say whether another replica's run holds the
+    # conversation (turn_claim). Refused as a busy server is, so the client
+    # waits Retry-After and sends again.
+    @app.exception_handler(TurnClaimUnavailable)
+    async def _turn_claim_unavailable(request, exc: TurnClaimUnavailable):
+        logger.warning(
+            "Refused a turn; Redis could not say whether another run holds the conversation.",
+            exc_info=exc,
+            extra={"event": "turn_claim_unavailable", "conversation_id": exc.conversation_id},
+        )
+        return _server_busy(retry_after=_TURN_CLAIM_RETRY_AFTER_SECONDS, status_code=exc.status_code)
 
     # A second question into a conversation whose turn is still answering.
     @app.exception_handler(TurnInProgress)

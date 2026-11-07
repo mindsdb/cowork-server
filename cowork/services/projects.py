@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import logging
 import os
 import re
+import secrets
 import threading
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -34,6 +35,7 @@ from cowork.db.scoped import (
 )
 from cowork.models.project import Project
 from cowork.services.shared_resources import RESOURCE_LOCK_TIMEOUT_SECONDS
+from cowork.turnqueue.redis_client import SYNC_CALL_BUDGET_S, redis_deadline
 
 if TYPE_CHECKING:
     from cowork.services.skills import ProjectReferenceRewrite
@@ -43,6 +45,32 @@ logger = logging.getLogger(__name__)
 
 GENERAL_PROJECT = "general"
 GENERAL_PROJECT_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+# Name prefix of the hidden project each side of a model comparison runs in.
+# Reserved by construction: `_sanitize_name` strips leading `-._`, so no
+# project a person names can start with it, and only
+# `create_comparison_sandbox` bypasses the sanitizer. The prefix is the whole
+# marker -- no column -- because every reader that must tell a sandbox apart
+# (the filesystem artifact scan, the publish path) sees a directory name, not
+# a row.
+COMPARISON_SANDBOX_PREFIX = "_comparison-"
+
+
+def is_comparison_sandbox(name: str | None) -> bool:
+    """Whether a project name belongs to a model-comparison side."""
+    return bool(name) and name.startswith(COMPARISON_SANDBOX_PREFIX)
+
+
+def path_in_comparison_sandbox(path: Path | str) -> bool:
+    """Whether any component of `path` is a comparison sandbox's directory.
+
+    Any component rather than a fixed depth: artifacts sit at
+    `<project>/.anton/artifacts` for a project and deeper for a legacy
+    conversation workspace, and callers hand in either. A folder the user chose
+    that happens to be named like a sandbox reads as one, which only ever
+    refuses something (publishing); it never grants anything.
+    """
+    return any(part.startswith(COMPARISON_SANDBOX_PREFIX) for part in Path(path).parts)
 
 # The local deployment's project-name namespace, mirroring the distributed
 # lock an org create takes on `SKILL_PROJECT_REFERENCES`. `projects.name` has
@@ -591,7 +619,41 @@ class ProjectService:
         return cleaned
 
     def list_projects(self) -> list[Project]:
+        """Every project in scope, comparison sandboxes included.
+
+        Lookups and filesystem inventories need the sandboxes. Anything that
+        shows projects to a person uses `list_visible_projects`.
+        """
         return list(self.session.exec(self.session.select(Project)).all())
+
+    def list_visible_projects(self) -> list[Project]:
+        """The projects a person sees in lists: everything but comparison sandboxes."""
+        return [p for p in self.list_projects() if not is_comparison_sandbox(p.name)]
+
+    def create_comparison_sandbox(self, label: str) -> Project:
+        """A hidden project for one side of a model comparison.
+
+        Named `_comparison-<hex>` so the name is collision-free without the
+        name-allocation lock and reads as a sandbox wherever only the
+        directory is visible. `label` is what the Compare screen shows.
+        """
+        name = f"{COMPARISON_SANDBOX_PREFIX}{secrets.token_hex(12)}"
+        path = self._project_path(name)
+        self._mkdir_in_root(path)
+        project = Project(
+            name=name,
+            display_name=(label.strip() or name)[:_DISPLAY_NAME_MAX_LEN],
+            path=str(path),
+            is_active=False,
+        )
+        self.session.add(project)
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            self._rmtree_in_root(path)
+            raise
+        return project
 
     def get_project(self, project_id: UUID) -> Project:
         project = self.session.get(Project, project_id)
@@ -689,7 +751,15 @@ class ProjectService:
             return False
         return parent != root
 
-    def sits_in_another_partition(self, project: Project) -> bool:
+    @staticmethod
+    def resolved_shared_root() -> Path:
+        """The shared root as `sits_in_another_partition` compares against it.
+        A check over every project resolves it once and passes it in."""
+        return Path(os.path.realpath(get_app_settings().storage.shared_root))
+
+    def sits_in_another_partition(
+        self, project: Project, *, shared_root: Path | None = None
+    ) -> bool:
         """Whether a person's project names a folder in another person's
         partition in the shared root.
 
@@ -702,11 +772,18 @@ class ProjectService:
         scope = self.session.scope
         if not scope.partitioned_for(PersonalResource.PROJECTS) or scope.org_id is None:
             return False
-        shared_root = Path(os.path.realpath(get_app_settings().storage.shared_root))
+        root_parts = (shared_root or self.resolved_shared_root()).parts
+        # The first folder below the shared root, compared by parts,
+        # case-sensitive: on POSIX paths the same answer as Path.relative_to,
+        # without its walk over every parent. A partition needs an org, so
+        # this runs only in MindsHub mode, never on the desktop.
+        parts = Path(project.path).parts
+        if len(parts) <= len(root_parts) or parts[: len(root_parts)] != root_parts:
+            return False
+        name = parts[len(root_parts)]
         try:
-            name = Path(project.path).relative_to(shared_root).parts[0]
             is_partition = str(UUID(name)) == name
-        except (ValueError, IndexError):
+        except ValueError:
             return False
         return is_partition and name != str(scope.org_id)
 
@@ -1161,6 +1238,7 @@ class ProjectService:
         # it while the conversation still exists so the cleanup is safe.
         from cowork.models.conversation import Conversation
         from cowork.services.conversations import ConversationService
+        from cowork.services.task_objects import TaskObjectService
 
         conv_svc = ConversationService(self.session)
         conv_ids = [
@@ -1173,6 +1251,7 @@ class ProjectService:
         ]
         conversation_stages = []
         try:
+            TaskObjectService(self.session).delete_for_project(project_id)
             for cid in conv_ids:
                 # Owner-agnostic: a project is org-shared and may hold several
                 # members' conversations. Fetch org-scoped (session.get validates
@@ -1252,11 +1331,17 @@ class ProjectService:
                         extra=log_context(project_id=project_id),
                     )
             raise
-        for conversation_stage in conversation_stages:
-            conv_svc.finalize_staged_conversation_delete(
-                conversation_stage,
-                cleanup_project_files=staged_path is None,
-            )
+        # On the Redis stream backend each conversation's stream cleanup calls
+        # Redis (streaming.discard_conversation). One deadline for them all
+        # holds the delete for one call budget while Redis does not answer,
+        # not one per conversation. Once it passes, each later call fails at
+        # once without reaching Redis (redis_client._refuse_a_passed_deadline).
+        with redis_deadline(budget_s=SYNC_CALL_BUDGET_S):
+            for conversation_stage in conversation_stages:
+                conv_svc.finalize_staged_conversation_delete(
+                    conversation_stage,
+                    cleanup_project_files=staged_path is None,
+                )
         try:
             from cowork.services.memory import remove_project_memory_tiers
 

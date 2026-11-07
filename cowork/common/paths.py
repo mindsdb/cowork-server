@@ -14,6 +14,7 @@ silently leak across builds and defeat the isolation.
 
 import os
 import shutil
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -254,6 +255,25 @@ def dir_rename(
         )
 
 
+def dir_link(d: PinnedDir, source_name: str, destination_name: str) -> None:
+    """Give a pinned direct child a second name, refusing one that exists.
+
+    Unlike ``rename``, which on POSIX replaces whatever holds the destination
+    name, a link to an existing name fails with ``FileExistsError``: publishing
+    a finished temporary file this way can never overwrite a file that
+    appeared meanwhile. Raises ``OSError`` where the filesystem has no hard
+    links."""
+    for name in (source_name, destination_name):
+        safe = os.path.basename(name)
+        if safe != name or safe in {"", ".", ".."} or "\\" in safe or "\0" in safe:
+            raise ValueError("Link paths must be direct-child names")
+    if d.fd is not None:
+        follow = {"follow_symlinks": False} if os.link in os.supports_follow_symlinks else {}
+        os.link(source_name, destination_name, src_dir_fd=d.fd, dst_dir_fd=d.fd, **follow)
+    else:
+        os.link(d.path / source_name, d.path / destination_name)
+
+
 def dir_scandir(d: PinnedDir) -> "Iterator[os.DirEntry[str]]":
     """Scan the direct entries of *d*. Entries expose ``.name``,
     ``.is_symlink()`` and ``.is_dir(follow_symlinks=False)`` on both platforms."""
@@ -267,6 +287,46 @@ def dir_fsync(d: PinnedDir) -> None:
     directory descriptor to sync, and keeps the atomic rename without it."""
     if d.fd is not None:
         os.fsync(d.fd)
+
+
+def dir_atomic_write(d: PinnedDir, name: str, *, content: bytes, mode: int | None = None) -> None:
+    """Replace the child *name* of *d* with *content* in one durable step.
+
+    The bytes go to a new file beside *name*, created with ``O_EXCL |
+    O_NOFOLLOW`` so nothing planted at that name is written through, synced,
+    and renamed over *name*. The rename acts on the name itself, so a link or a
+    second name already there is replaced, never written through. The new file
+    takes *mode* as its permission bits, and is private (0o600) without it.
+    """
+    if not is_child_name(name):
+        raise ValueError("Write path must be a direct-child name")
+    tmp = f".{name}.{uuid.uuid4().hex}.tmp"
+    try:
+        fd = dir_open(d, tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            # Windows keeps no permission bits beyond read-only.
+            if mode is not None and d.fd is not None:
+                try:
+                    os.fchmod(stream.fileno(), mode)
+                except OSError:
+                    # A volume that keeps no modes, such as vfat, refuses the
+                    # change; the file is written all the same.
+                    pass
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        dir_replace(d, tmp, name)
+        try:
+            dir_fsync(d)
+        except OSError:
+            # The file is durable and the rename atomic; a filesystem that
+            # can't sync a folder only loses the rename's durability.
+            pass
+    finally:
+        try:
+            dir_unlink(d, tmp)
+        except OSError:
+            pass
 
 
 def open_pinned_child(d: PinnedDir, name: str, *, nofollow: bool = True) -> PinnedDir:

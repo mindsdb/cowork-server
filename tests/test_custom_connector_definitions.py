@@ -281,6 +281,32 @@ class TestProbeStream:
 
         assert _Probe.built[-1]["usage_notes"] == "Call /bearer."
 
+    @pytest.mark.asyncio
+    async def test_a_custom_connectors_notes_never_define_a_pass(self, engine, vault):
+        # They are model-written, so they reach the probe without the rule that
+        # lets a built-in spec's notes say what counts as a pass.
+        _Probe.verdict = "success"
+        await _probe(HTTPBIN_FORM, {"token": "a"})
+
+        await _probe(HTTPBIN_FORM, {"token": "b"})
+
+        assert _Probe.built[-1]["usage_notes"] == "Call /bearer."
+        assert _Probe.built[-1]["notes_define_pass"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("connector_id", "defines_pass"), [("roam_research", True), ("airtable", False)])
+    async def test_only_a_built_in_specs_notes_define_a_pass(self, engine, vault, connector_id, defines_pass):
+        _Probe.verdict = "failure"
+        submission_id = store.stage(
+            form_id=f"{connector_id}-connector", connector_id=connector_id, conversation_id=None,
+            values={"api_token": "t"},
+        )
+
+        _ = [e async for e in probe_handler.ProbeHandler(scope=LOCAL_SCOPE).run(submission_id, connector_id, None, "", None)]
+
+        assert bool(_Probe.built[-1]["usage_notes"]) is defines_pass
+        assert _Probe.built[-1]["notes_define_pass"] is defines_pass
+
 
 class TestProbeIsNotSkippedByAModelFlag:
     """Only a real OAuth grant on the selected method skips the live test."""

@@ -9,7 +9,7 @@ from cowork.services.artifact_roots import artifacts_sources_for_scan as _source
 from cowork.services.artifacts import list_artifacts as _list_artifacts
 from cowork.services.conversations import ConversationService
 from cowork.services.pins import PinService
-from cowork.services.projects import ProjectService
+from cowork.services.projects import ProjectService, is_comparison_sandbox
 from cowork.services.schedules import ScheduleService
 
 # AuthenticatedInOrgMode, declared explicitly: the conversation/project/
@@ -65,7 +65,7 @@ async def search_cowork(
             })
 
     # Projects
-    for project in ProjectService(scoped).list_projects():
+    for project in ProjectService(scoped).list_visible_projects():
         text = " ".join([project.name or "", project.path or ""])
         score = _score(text, query)
         if score:
@@ -81,9 +81,15 @@ async def search_cowork(
     # Artifacts: the scan of the caller's own projects root (a person's
     # partition where projects are personal). Hosted search has never listed
     # artifacts, and the scan of an org's projects root would start to, so org
-    # mode skips it.
+    # mode skips it. Comparison sandboxes are never listed.
     artifacts = (
-        [] if scoped.scope.org_mode else _list_artifacts(_sources_for_scan(scope=scoped.scope))
+        []
+        if scoped.scope.org_mode
+        else _list_artifacts([
+            source
+            for source in _sources_for_scan(scope=scoped.scope)
+            if not is_comparison_sandbox(source.project_name)
+        ])
     )
     for artifact in artifacts:
         text = " ".join([

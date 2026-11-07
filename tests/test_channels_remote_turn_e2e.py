@@ -296,6 +296,7 @@ class _ReplyOnlyRedis:
         ]
 
     async def delete(self, *keys): return len(keys)
+    async def exists(self, *keys): return 0
     async def sadd(self, key, member): return 1
     async def hset(self, key, mapping=None): return 1
     async def expire(self, key, seconds): return 1

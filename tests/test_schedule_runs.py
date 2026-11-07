@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlmodel import Session, SQLModel
 
+from cowork import scheduler
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule
 from cowork.schemas.schedules import RunStatus
@@ -98,8 +99,10 @@ def test_last_successful_finish_ignores_failures_and_running():
 
     failed = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(failed.id, error="boom")
-    run_service.create_run(schedule.id, is_manual=False)  # still running
+    running = run_service.create_run(schedule.id, is_manual=False)
     assert run_service.last_successful_finish(schedule.id) is None
+    # A schedule holds one running run at a time.
+    run_service.finish_run(running.id, error="ended")
 
     ok = run_service.create_run(schedule.id, is_manual=True)
     run_service.finish_run(ok.id)
@@ -158,6 +161,47 @@ def test_due_slot_deferred_while_manual_run_in_flight():
     assert schedule.next_run_at.replace(tzinfo=timezone.utc) == datetime(
         2026, 6, 25, 9, 0, tzinfo=timezone.utc
     )
+
+
+@pytest.mark.parametrize("cadence", ["every_15_minutes", "every_30_minutes"])
+def test_a_short_cadence_runs_the_slot_right_after_a_manual_run(cadence):
+    # A freshness window would skip every other slot after a Run now at
+    # these cadences, so they have none.
+    from cowork.scheduler import _due_schedules
+
+    session = _session()
+    schedule = _schedule(session, cadence=cadence)  # due at 2026-06-25 09:00 UTC
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+
+    now = datetime(2026, 6, 25, 9, 0, 30, tzinfo=timezone.utc)
+    run = run_service.create_run(schedule.id, is_manual=True)
+    run_service.finish_run(run.id)
+    _finish_at(session, run.id, now - timedelta(minutes=2))
+
+    assert [s.id for s in _due_schedules(ScopedSession(session, SYSTEM_SCOPE), now)] == [schedule.id]
+
+
+@pytest.mark.parametrize(("cadence", "step", "missed"), [
+    ("every_15_minutes", timedelta(minutes=15), 8),
+    ("every_30_minutes", timedelta(minutes=30), 4),
+])
+def test_a_short_cadence_back_from_downtime_keeps_its_latest_slot_due(cadence, step, missed):
+    from cowork.scheduler import _handle_missed_runs
+
+    session = _session()
+    now = datetime.now(timezone.utc)
+    overdue = (now - timedelta(hours=2, minutes=5)).replace(microsecond=0)
+    schedule = _schedule(session, cadence=cadence, next_run_at=overdue)
+
+    _handle_missed_runs(ScopedSession(session, SYSTEM_SCOPE))
+
+    session.refresh(schedule)
+    next_run = schedule.next_run_at.replace(tzinfo=timezone.utc)
+    assert schedule.missed_runs == missed
+    assert now - step < next_run <= now
+    assert next_run == overdue + step * missed
+    # Still on the task's own grid, counted from its original start.
+    assert (next_run - overdue) % step == timedelta(0)
 
 
 def test_due_slot_runs_when_recent_run_failed():
@@ -633,7 +677,9 @@ def test_turn_terminal_reason_none_without_handle(monkeypatch):
     assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) is None
 
 
-def _execute_with_terminal(monkeypatch, reason, *, is_manual=False, turn=None):
+def _execute_with_terminal(
+    monkeypatch, reason, *, is_manual=False, turn=None, title="terminal mapping test"
+):
     """Run execute_schedule with a no-op turn and a forced terminal reason;
     return the resulting run/schedule state as plain values. ``turn``, when
     given, is awaited inside the turn's stream in place of the no-op."""
@@ -668,7 +714,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False, turn=None):
 
     session = get_open_session()
     schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
-        title="terminal mapping test",
+        title=title,
         prompt="do the thing",
         cadence="daily",
         next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
@@ -689,6 +735,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False, turn=None):
         state = {
             "schedule_id": schedule_id,
             "run_status": run.status,
+            "run_outcome": run.outcome,
             "run_error": run.error,
             "run_conversation_id": run.conversation_id,
             "last_error": fresh.last_error,
@@ -745,7 +792,7 @@ async def _turn_raises():
 def test_execute_schedule_that_raises_consumes_its_slot(monkeypatch):
     state = _execute_with_terminal(monkeypatch, None, turn=_turn_raises)
     assert state["run_status"] == RunStatus.failed
-    assert state["last_error"] == "turn blew up"
+    assert state["last_error"] == scheduler._UNCERTAIN_ERROR
     # Left due, the next poll would start the failing run again.
     assert state["next_advanced"] is True
 
@@ -755,15 +802,121 @@ def test_execute_schedule_that_times_out_consumes_its_slot(monkeypatch):
 
     import cowork.scheduler as scheduler_mod
 
-    monkeypatch.setattr(scheduler_mod, "_MAX_RUN_DURATION_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler_mod, "_run_duration_limit", lambda: 0.01)
 
     async def _hangs():
         await asyncio.sleep(5)
 
+    cancelled = []
+
+    async def _stop(conversation_id):
+        cancelled.append(conversation_id)
+
+    monkeypatch.setattr(scheduler_mod, "_stop_timed_out_turn", _stop)
+
     state = _execute_with_terminal(monkeypatch, None, turn=_hangs)
     assert state["run_status"] == RunStatus.failed
-    assert "max duration" in state["last_error"]
+    assert state["last_error"] == scheduler._INTERRUPTED_TURN_ERROR
+    assert state["run_outcome"] == "interrupted"
     assert state["next_advanced"] is True
+    # The turn runs detached from the drain the timeout cancels, so it is
+    # stopped explicitly or it goes on writing after the run is failed.
+    assert cancelled == [str(state["run_conversation_id"])]
+
+
+class _FakeRunHandle:
+    def __init__(self, *, remote: bool):
+        from cowork.streaming.registry import RunIdentity, TurnLifecycle
+
+        self.lifecycle = TurnLifecycle(identity=RunIdentity(remote=remote))
+        self.is_running = True
+        self.cancelled_after_timed_out = None
+
+    async def cancel(self):
+        self.cancelled_after_timed_out = self.lifecycle.timed_out
+        return True
+
+
+@pytest.mark.parametrize(("remote", "backend", "flags"), [
+    (False, "memory", False),
+    (True, "memory", True),
+    (False, "redis", True),
+])
+def test_a_timed_out_turn_is_stopped_like_a_stop_press(monkeypatch, remote, backend, flags):
+    import asyncio
+
+    import cowork.scheduler as scheduler_mod
+
+    handle = _FakeRunHandle(remote=remote)
+    monkeypatch.setattr(scheduler_mod.registry, "get", lambda cid: handle if cid == "c1" else None)
+    monkeypatch.setattr(scheduler_mod, "get_backend", lambda: backend)
+    requested = []
+
+    async def _request_cancel(correlation_id, **_):
+        requested.append(correlation_id)
+
+    monkeypatch.setattr(scheduler_mod, "request_cancel", _request_cancel)
+
+    asyncio.run(scheduler_mod._stop_timed_out_turn("c1"))
+
+    # A pod's turn stops only on the controller's flag; a local cancel alone
+    # would end just our tail of it.
+    assert requested == ([handle.lifecycle.identity.correlation_id] if flags else [])
+    # Marked before the cancel, so the turn saves as interrupted, not a Stop.
+    assert handle.cancelled_after_timed_out is True
+
+
+def test_a_failed_cancel_flag_still_stops_the_local_turn(monkeypatch):
+    import asyncio
+
+    import cowork.scheduler as scheduler_mod
+
+    handle = _FakeRunHandle(remote=True)
+    monkeypatch.setattr(scheduler_mod.registry, "get", lambda cid: handle)
+
+    async def _request_cancel(correlation_id, **_):
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(scheduler_mod, "request_cancel", _request_cancel)
+
+    asyncio.run(scheduler_mod._stop_timed_out_turn("c1"))
+
+    assert handle.cancelled_after_timed_out is True
+
+
+def test_a_turn_that_already_ended_is_left_alone(monkeypatch):
+    import asyncio
+
+    import cowork.scheduler as scheduler_mod
+
+    handle = _FakeRunHandle(remote=True)
+    handle.is_running = False
+    monkeypatch.setattr(scheduler_mod.registry, "get", lambda cid: handle)
+
+    async def _request_cancel(correlation_id, **_):
+        raise AssertionError("no flag for a finished turn")
+
+    monkeypatch.setattr(scheduler_mod, "request_cancel", _request_cancel)
+
+    asyncio.run(scheduler_mod._stop_timed_out_turn("c1"))
+
+    assert handle.cancelled_after_timed_out is None
+    assert handle.lifecycle.timed_out is False
+
+
+def test_execute_schedule_with_a_title_longer_than_a_topic_runs(monkeypatch):
+    from cowork.db.session import get_open_session
+    from cowork.services.conversations import ConversationService
+
+    state = _execute_with_terminal(monkeypatch, "completed", title="t" * 300)
+    assert state["run_status"] == RunStatus.success
+    assert state["last_error"] is None
+    session = get_open_session()
+    conversation = ConversationService(ScopedSession(session, SYSTEM_SCOPE)).get_conversation(
+        state["run_conversation_id"]
+    )
+    session.close()
+    assert conversation.topic == "t" * 255
 
 
 def test_manual_run_that_raises_leaves_the_cron_slot(monkeypatch):
@@ -856,7 +1009,7 @@ def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversati
     for record in errors:
         assert record.getMessage() == (
             "Database operation failed: error_type=OperationalError sqlstate=unknown "
-            f"site=scheduler.execute_schedule:{record.lineno}"
+            f"site=scheduler._execute_schedule:{record.lineno}"
         )
         assert (record.schedule_id, record.conversation_id) == (str(schedule_id), str(conversation_id))
         assert record.exc_info is None
@@ -1054,14 +1207,14 @@ def test_missed_runs_disables_stale_once_overdue_beyond_window():
 
 def test_missed_runs_once_near_catchup_boundary():
     from cowork.scheduler import (
-        _ONCE_CATCHUP_WINDOW_SECONDS,
+        _ONCE_LATE_LIMIT,
         _due_schedules,
         _handle_missed_runs,
     )
 
     session = _session()
     now = datetime.now(timezone.utc)
-    window = _ONCE_CATCHUP_WINDOW_SECONDS
+    window = _ONCE_LATE_LIMIT.total_seconds()
     # Straddle the catch-up boundary: just inside stays enabled and runs, just
     # outside is disabled. `_handle_missed_runs` reads its own wall clock, so a
     # small margin keeps each case on its intended side without flaking.
@@ -1100,7 +1253,7 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
     schedule and before the poll asks whether a run is active. The poll then
     sees the slot as used: a Stopped daily run does not start again, and
     neither does a one-off its failed run disabled."""
-    from cowork.scheduler import _finish_run, _poll, _record_turn_outcome
+    from cowork.scheduler import _classify, _finish_run, _poll, _record_turn_outcome, _TurnEvidence
 
     engine = _file_engine(tmp_path)
     with Session(engine) as session:
@@ -1120,7 +1273,8 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
             with Session(engine) as run_session:
                 scoped = ScopedSession(run_session, SYSTEM_SCOPE)
                 outcome = _record_turn_outcome(
-                    scoped, schedule_id=schedule_id, reason=reason, is_manual=False, conversation_id=None,
+                    scoped, schedule_id=schedule_id, run_id=run_id, end=_classify(_TurnEvidence(reason=reason, acted=True)),
+                    is_manual=False, conversation_id=None,
                 )
                 _finish_run(scoped, run_id=run_id, conversation_id=None, error=outcome.error, status=outcome.status)
         return has_active_run(self, asked_id)
@@ -1246,21 +1400,25 @@ def test_reap_orphaned_runs_started_before_leaves_younger_runs():
 def test_boot_reap_cutoff_reaps_everything_only_on_the_desktop(monkeypatch):
     from types import SimpleNamespace
 
-    from cowork.scheduler import _ORPHANED_RUN_AGE_SECONDS, boot_reap_cutoff
+    from cowork.scheduler import boot_reap_cutoff
 
     now = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
 
-    def _tenancy(mode):
+    def _tenancy(mode, run_limit=1800):
         monkeypatch.setattr(
-            "cowork.common.settings.app_settings.get_app_settings", lambda: SimpleNamespace(tenancy_mode=mode),
+            "cowork.common.settings.app_settings.get_app_settings",
+            lambda: SimpleNamespace(tenancy_mode=mode, scheduled_run_max_seconds=run_limit),
         )
 
     _tenancy("local")
     assert boot_reap_cutoff(now=now) is None
-    # A replica booting next to one mid-run must leave that run alone.
+    # A replica booting next to one mid-run must leave that run alone: the
+    # cutoff sits past the run's time limit and both of its last writes.
     _tenancy("org")
-    assert boot_reap_cutoff(now=now) == now - timedelta(seconds=_ORPHANED_RUN_AGE_SECONDS)
-    assert _ORPHANED_RUN_AGE_SECONDS > 600
+    assert boot_reap_cutoff(now=now) == now - timedelta(seconds=1800 + 2 * 600 + 600)
+    # A deployment that lets runs go longer reaps them later too.
+    _tenancy("org", run_limit=7200)
+    assert boot_reap_cutoff(now=now) == now - timedelta(seconds=7200 + 2 * 600 + 600)
 
 
 def test_same_org_users_cannot_see_each_others_schedules(tmp_path, monkeypatch):
@@ -1335,7 +1493,8 @@ def test_delete_schedule_with_runs_under_enforced_foreign_keys():
     schedule = _schedule(session)
     run_service = ScheduleRunService(scoped)
     for _ in range(3):
-        run_service.create_run(schedule.id, is_manual=False)
+        # One running run at a time: finish each before the next.
+        run_service.finish_run(run_service.create_run(schedule.id, is_manual=False).id, error="ended")
 
     assert ScheduleService(scoped).delete_schedule(schedule.id) is True
 

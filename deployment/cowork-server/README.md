@@ -113,9 +113,17 @@ inference Service by name, and the same in every environment.
 Turn the switches on only after auth serves the datasource endpoints with the
 bundle above, mindshub_inference serves `/v1/datasources/`, and a scratchpad
 image with the datasource helper is deployed and older pods are recycled.
-Rollback is `datasourceTurnsEnabled` off: no new grants are registered and no
-datasource block is queued; encrypted records stay in auth and OAuth
-connections are unaffected.
+Rollback removes both `datasourceTurnsEnabled` and `datasourceCapabilities`
+from the environment's values file, and drops the environment from both
+`ENABLED_ENVIRONMENTS` and `OFFERED_METHODS` in `tests/test_chart_values.py`
+in the same change; the test expects both keys absent, not `"false"`, outside
+enabled environments. Rolling back one engine instead drops only its pair
+(`mysql:host-password` or `postgres:host-port`) from `datasourceCapabilities`
+and from that environment's `OFFERED_METHODS` entry.
+Without grants no datasource block is queued, and without the capability list
+no new connection is accepted or edited through this server. Encrypted records
+stay in auth, where users can still delete them, and OAuth connections are
+unaffected.
 
 ## Required cluster permissions
 
@@ -167,6 +175,30 @@ over: another replica can replay what the stopping one already wrote, but it
 reads no reply the controller sends after that and saves nothing. Ending the
 answer, saving it and stopping its sandbox turn leaves the user a saved answer
 to retry from instead of one that never ends.
+
+Each answer holds its conversation's turn claim in Redis while it runs, so a
+second question that reaches another pod is refused with `409` (README.md, the
+`turn_in_progress` refusal). A pod that stops this way releases each claim once
+the answer's stream has its last frame. A pod that never runs the steps above
+(a SIGKILL, an OOM kill, a lost node) releases nothing, so a question sent into
+one of its conversations is refused with `409` until that claim lapses, 90 s
+after the pod's last renewal. A container restarted in place (an OOM kill or a
+crash) keeps the pod's name, and the new process releases the claims its pod
+left as it starts, and writes the controller's cancel flag for each of their
+turns, so their sandbox turns stop. That relies on one uvicorn process per pod,
+which `tests/test_turn_claim.py` pins for the image's command. The claims are
+still held only when the container starts again within 90 s. A liveness
+restart kills a stalled process only after its claims lapsed (the probe gives
+up after about 60 s, then the 60 s grace runs out), so it frees nothing sooner,
+but the new process still stops those sandbox turns.
+
+The first rollout of the claim mixes pods that take it with pods that predate
+it, for the readiness spread of the new pods plus about 20 s, and longer while
+a new pod waits for a node (the rollout timing above). Until the last older pod
+stops, an older pod admits a duplicate question as it always did, also one sent
+during a newer pod's turn, and its turn index write replaces the newer turn's
+entry. A Stop for that newer turn that reaches a pod other than the one running
+it then answers `404`, and a stale question at its number is not refused.
 
 Desktop and other non-hosted deployments are unchanged. They run turns in the
 server's own process, keep uvicorn's SIGTERM handling, and end their turns in

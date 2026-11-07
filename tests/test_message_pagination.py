@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import base64
 import json
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -224,21 +223,15 @@ class TestPagedAndUnboundedReadsAgree:
     """
 
     def _conversation_via_the_real_write_path(self, session, conversation):
-        """One turn persisted exactly the way a live turn persists it.
+        """One turn persisted the way a live turn persists it, inside one second.
 
-        Asserts the two rows really did land in different timestamp formats.
-        Without that check these tests would quietly stop guarding anything the
-        moment the writes straddled a second boundary — the old created_at-led
-        order sorts them correctly then, so a revert would pass.
+        Both rows go through the real write paths, so each keeps the format
+        its path stores. The question's instant is then moved into the
+        answer's second. Left to the clock, a slow runner writes the two rows
+        a second apart, and a straddled pair sorts correctly even under the
+        old created_at-led order, so a revert would pass. The assertions below
+        check that the pair really shares a second in two formats.
         """
-        # Arrange the same-second condition rather than assert it: the two
-        # writes are a few milliseconds apart, so left to chance they straddle
-        # a second boundary often enough to redden CI, and a straddled pair
-        # sorts correctly even under the old order — the test would fail for a
-        # reason that has nothing to do with the code.
-        while datetime.now(timezone.utc).microsecond > 500_000:
-            time.sleep(0.01)
-
         svc = ConversationService(session)
         svc.save_user_message(
             conversation.id, "question", created_at=datetime.now(timezone.utc)
@@ -251,6 +244,15 @@ class TestPagedAndUnboundedReadsAgree:
         # Keyed by content, and counted: keying by role would silently collapse
         # duplicates if this fixture ever grows tool rows.
         assert len(rows) == 2, f"expected exactly one turn, got {len(rows)} rows"
+        by_content = {m.content: m for m in rows}
+        question, answer = by_content["question"], by_content["answer"]
+        # Bound as a Python datetime, as save_user_message binds it, so the
+        # stored value keeps its microseconds while the answer's has none.
+        question.created_at = answer.created_at.replace(microsecond=500_000)
+        session.add(question)
+        session.commit()
+        session.refresh(question)
+
         stored = {m.content: str(m.created_at) for m in rows}
         user_at, assistant_at = stored["question"], stored["answer"]
         assert user_at[:19] == assistant_at[:19], (

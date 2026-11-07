@@ -179,22 +179,33 @@ def _artifact_cards(session, sources) -> list[dict]:
     # password.
     cards = _list_artifacts(sources)
     from cowork.services.artifact_export import card_export_source
-    from cowork.services.artifact_ownership import resolve_artifact_owners
+    from cowork.services.artifact_ownership import (
+        OwnerRequest,
+        resolve_artifact_owners_by_source,
+    )
     from cowork.services.artifact_permissions import artifact_capabilities
 
     # Capabilities are a property of each ARTIFACT: in org mode a project root is
     # shared by every member (ENG-2056), so each card's owner is resolved on its
-    # own. Owners are read in one query per root (the unfiltered listing spans
-    # every project of the organization, so one query per project root).
+    # own. Project roots' owners are read in one query for every root together,
+    # and legacy roots' in one more (the unfiltered listing spans every project
+    # of the organization).
     by_base = {Path(source.base): source for source in sources}
     cards_by_base: dict[Path, list[tuple[str, dict]]] = {}
     for card in cards:
         folder = Path(str(card.get("folder") or ""))
         if folder.parent in by_base:
             cards_by_base.setdefault(folder.parent, []).append((folder.name, card))
-    for base, entries in cards_by_base.items():
+    roots = list(cards_by_base.items())
+    owners_by_root = resolve_artifact_owners_by_source(
+        session,
+        [
+            OwnerRequest(source=by_base[base], slugs=tuple(slug for slug, _ in entries))
+            for base, entries in roots
+        ],
+    )
+    for (base, entries), resolutions in zip(roots, owners_by_root, strict=True):
         source = by_base[base]
-        resolutions = resolve_artifact_owners(session, source, [slug for slug, _ in entries])
         for slug, card in entries:
             card["capabilities"] = artifact_capabilities(
                 session,
@@ -278,8 +289,19 @@ def _scoped_project_cards(session, project_ref: str) -> list[dict]:
 
 
 def _all_artifact_cards(session) -> list[dict]:
-    """Build the unfiltered scoped list without accepting any HTTP selector."""
-    sources = artifact_sources_for_request(session, None, None)
+    """Build the unfiltered scoped list without accepting any HTTP selector.
+
+    Unfiltered means every project a person browses, so the model-comparison
+    sides are left out here -- and only here: the same sources also resolve
+    artifacts by id, and a comparison's own artifacts must keep resolving.
+    """
+    from cowork.services.projects import is_comparison_sandbox
+
+    sources = [
+        source
+        for source in artifact_sources_for_request(session, None, None)
+        if not is_comparison_sandbox(source.project_name)
+    ]
     return _artifact_cards(session, sources)
 
 
@@ -932,7 +954,8 @@ async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     _refuse_a_second_name(artifact)
     try:
-        return _preview_artifact(artifact)
+        # Reading and counting a large file would stall every other request.
+        return await run_in_threadpool(_preview_artifact, artifact)
     except ValueError as e:
         raise HTTPException(status_code=415, detail=str(e))
     except Exception as e:
