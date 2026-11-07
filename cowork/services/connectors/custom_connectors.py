@@ -5,9 +5,11 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 
+from anton.core.tools.connector_draft import ConnectorDraft
 from anton.utils.datasources import scrub_output
 from pydantic import ValidationError
-from sqlalchemy import false
+from sqlalchemy import false, func
+from sqlalchemy.exc import IntegrityError
 
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope, tenant_scope_required
@@ -20,10 +22,16 @@ _KEPT_FORM_KEYS = ("how_to", "help_url")
 _COLOR_PATTERN = re.compile(r"#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?")
 # Matches the cap agent-facing usage notes have on built-in specs.
 USAGE_NOTES_MAX = 1600
+#: Custom connectors one member may keep in an organization.
+MEMBER_CONNECTORS_MAX = 25
 
 
 class UnstorableFormError(ValueError):
     """A handcrafted form that cannot be kept as a custom connector."""
+
+
+class MemberConnectorLimitError(ValueError):
+    """A member already keeps the most custom connectors allowed."""
 
 
 def handcrafted_form_allowed(*, known: bool, custom: bool, extends: bool) -> bool:
@@ -146,6 +154,33 @@ def stored_form(connector_id: str, form_spec: dict[str, Any]) -> dict[str, Any]:
     return form
 
 
+def draft_form(draft: ConnectorDraft) -> dict[str, Any]:
+    """Build the connection form for a checked connector draft.
+
+    One method of plain fields: no OAuth and nothing the draft did not
+    describe, so a draft can only ever ask for typed values.
+    """
+    form: dict[str, Any] = {
+        "form_id": f"{draft.connector_id}-connector",
+        "title": f"Connect {draft.label}",
+        "fields": [
+            {
+                "name": f.name,
+                "label": f.label,
+                "type": "password" if f.secret else "text",
+                "secret": f.secret,
+                "required": f.required,
+                "placeholder": f.placeholder,
+                "description": f.help,
+            }
+            for f in draft.fields
+        ],
+    }
+    if draft.help_url:
+        form["help_url"] = draft.help_url
+    return form
+
+
 def scope_definitions(session: ScopedSession) -> ScopedSelect:
     """Select the custom connector definitions ``session``'s scope sees.
 
@@ -233,6 +268,63 @@ class CustomConnectorService:
         else:
             for key, value in values.items():
                 setattr(row, key, value)
+        self.session.add(row)
+        self.session.commit()
+        self.session.refresh(row)
+        return row
+
+    def save_member_draft(self, draft: ConnectorDraft) -> CustomConnector:
+        """Save a checked draft as the org-mode member's own definition.
+
+        Args:
+            draft: The draft, already parsed by ``parse_connector_draft`` and
+                checked against the built-in ids.
+
+        Returns:
+            The stored row. The member's definition with the same id is
+            updated in place, featured flag included.
+
+        Raises:
+            UnstorableFormError: when the scope is not one member's in org
+                mode, or the built form is invalid.
+            MemberConnectorLimitError: when this would be a new definition
+                past MEMBER_CONNECTORS_MAX. Two saves racing can each pass
+                the count and reach one over.
+
+        Side effects:
+            Commits the session.
+        """
+        scope = self.session.scope
+        if not scope.org_mode or not scope.user_id:
+            raise UnstorableFormError("connector drafts are saved only for a member of an organization.")
+        values = {
+            "label": draft.label,
+            "description": draft.description or "",
+            "category": draft.category,
+            "usage_notes": draft.usage_notes,
+            "spec": stored_form(draft.connector_id, draft_form(draft)),
+        }
+        row = self.get(draft.connector_id)
+        if row is None:
+            count_stmt = scope_definitions(self.session).with_only_columns(func.count(), maintain_column_froms=True)
+            if self.session.exec(count_stmt).one() >= MEMBER_CONNECTORS_MAX:
+                raise MemberConnectorLimitError(
+                    f"You can keep at most {MEMBER_CONNECTORS_MAX} custom connectors; delete one first."
+                )
+            try:
+                return self._commit(CustomConnector(connector_id=draft.connector_id, **values))
+            except IntegrityError:
+                # The same member saved this id at the same moment: update theirs.
+                self.session.rollback()
+                row = self.get(draft.connector_id)
+                if row is None:
+                    raise
+        for key, value in values.items():
+            setattr(row, key, value)
+        return self._commit(row)
+
+    def _commit(self, row: CustomConnector) -> CustomConnector:
+        """Add, commit and refresh ``row``."""
         self.session.add(row)
         self.session.commit()
         self.session.refresh(row)
