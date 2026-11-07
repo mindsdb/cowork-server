@@ -858,6 +858,7 @@ def test_run_writes_converge_when_the_delete_wins_the_race(tmp_path, monkeypatch
         runs.set_run_conversation(run.id, conv.id)
         s.expire_all()
         assert s.get(ScheduleRun, run.id).conversation_id is None
+        assert s.get(ScheduleRun, run.id).execution_claimed_at is not None
 
         finished = runs.finish_run(run.id, conversation_id=conv.id)
         assert finished.status == RunStatus.success

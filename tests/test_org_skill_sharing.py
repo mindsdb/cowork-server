@@ -33,7 +33,7 @@ import httpx
 import pytest
 from anton.core.tools.skill_format import dump_skill
 from fastapi import HTTPException
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.pool import StaticPool
@@ -61,10 +61,10 @@ from cowork.schemas.skills import (
     SkillSharingRequest,
     SkillUpdateRequest,
 )
-from cowork.models.shared_resource import SharedResourceAttribution
+from cowork.models.shared_resource import SharedResourceAttribution, SharedResourceMutation
 from cowork.services import mindshub_people, mindshub_teams
 from cowork.services.publish import ARTIFACT_ORG_REFUSAL, ShareOrgRequired
-from cowork.services.shared_resources import SKILL, SharedResourceAccess
+from cowork.services.shared_resources import SKILL, SKILL_PROJECT_REFERENCES, SharedResourceAccess
 from cowork.services.skill_access import (
     access_row,
     access_rows,
@@ -536,6 +536,165 @@ def test_a_create_a_crash_cut_short_is_its_creators_and_recovery_gives_it_its_ro
     row = _row(org, "crashed")
     assert (row.owner_user_id, row.org_allowed, row.allowed_team_ids, row.allowed_user_ids) == (UUID(ALICE), False, [], [])
     assert "crashed" not in _listed(org, BOB, _viewer(BOB, write_org=True))
+
+
+def _record_coordination_locks(
+    monkeypatch, held: list[tuple[str, str]] | None = None
+) -> list[tuple[str, str]]:
+    """Every coordination lock a call takes, in the order it takes them.
+    ``held``, when given, holds the locks taken and not yet released."""
+    taken: list[tuple[str, str]] = []
+    real = SharedResourceAccess.coordination_lock
+
+    @contextmanager
+    def recording(self, namespace, key):
+        taken.append((namespace, key))
+        with real(self, namespace, key):
+            if held is not None:
+                held.append((namespace, key))
+            try:
+                yield
+            finally:
+                if held is not None:
+                    held.pop()
+
+    monkeypatch.setattr(SharedResourceAccess, "coordination_lock", recording)
+    return taken
+
+
+def test_a_listing_with_no_expired_claim_takes_no_coordination_lock(org, monkeypatch):
+    """Project creates hold the org-wide project-references lock, so a
+    listing that took it for every skill waited behind each of them. Only a
+    claim whose lease ran out can need recovery, and a live one stays read-only."""
+    for label in ("one", "two", "three"):
+        _create(org, ALICE, label)
+    _legacy_skill(org.as_(ALICE).scope, "being-made")
+    _attributed(org, "being-made", ALICE, pending=True)
+    taken = _record_coordination_locks(monkeypatch)
+
+    for user, viewer in ((ALICE, _viewer(ALICE)), (BOB, _viewer(BOB)), (ADMIN, _viewer(ADMIN, admin=True))):
+        listed = _listed(org, user, viewer)
+        if user != BOB:
+            assert {"one", "two", "three"} <= set(listed)
+    assert _listed(org, ALICE, _viewer(ALICE))["being-made"]["canEdit"] is False
+
+    assert taken == []
+
+
+def test_a_listing_recovers_an_expired_claim_under_both_locks_in_order(org, monkeypatch):
+    """The project-references lock comes first and the skill's second, the
+    order every skill writer takes them in."""
+    _create(org, ALICE, "steady")
+    _legacy_skill(org.as_(ALICE).scope, "crashed")
+    _attributed(org, "crashed", ALICE, pending=True, expired=True)
+    held: list[tuple[str, str]] = []
+    taken = _record_coordination_locks(monkeypatch, held)
+    held_at_recovery: list[list[tuple[str, str]]] = []
+    real_recover = SharedResourceAccess.recover_stale_claim
+
+    def recover(self, kind, key, **kwargs):
+        held_at_recovery.append(list(held))
+        return real_recover(self, kind, key, **kwargs)
+
+    monkeypatch.setattr(SharedResourceAccess, "recover_stale_claim", recover)
+
+    seen = _listed(org, ALICE, _viewer(ALICE))["crashed"]
+
+    # recover_stale_claim takes the skill's lock again inside, reentrantly.
+    assert list(dict.fromkeys(taken)) == [(SKILL_PROJECT_REFERENCES, "all"), (SKILL, "crashed")]
+    assert held_at_recovery == [[(SKILL_PROJECT_REFERENCES, "all"), (SKILL, "crashed")]]
+    assert (seen["canEdit"], seen["attribution"]["createdBy"]["userId"]) == (True, ALICE)
+
+
+@pytest.mark.parametrize("access_rows", [True, False], ids=["with-access-rows", "with-no-access-row"])
+def test_the_skill_list_runs_the_same_statements_at_3_and_30_skills(org, access_rows):
+    """A skill with no skill_access row, as one written after the one-time
+    backfill by a server from before sharing has, takes its owner from the
+    attribution rows, which the list reads once for every such skill."""
+
+    def add(start: int, count: int) -> None:
+        session = org.as_(ALICE)
+        for i in range(start, start + count):
+            slug = f"skill-{i:03d}"
+            _legacy_skill(session.scope, slug)
+            if access_rows:
+                stage_only_owner(session, slug=slug, owner_user_id=ALICE)
+            session.add(SharedResourceAttribution(
+                resource_kind=SKILL, resource_key=slug, created_by_id=ALICE, updated_by_id=ALICE,
+            ))
+        session.commit()
+
+    def counted() -> tuple[int, int]:
+        session = org.as_(ALICE)
+        statements: list[str] = []
+
+        def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(statement)
+
+        engine = session.get_bind()
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            listing = skills_ep.list_skills(session, _principal(ALICE), _viewer(ALICE))
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+        return len(listing["skills"]), len(statements)
+
+    # Warm-up: seeds the built-ins and, with a skill of the org's own to read,
+    # runs the one-time backfill, so the skills added after it keep no row.
+    _create(org, BOB, "bobs-first")
+    counted()
+    add(0, 3)
+    small_skills, small = counted()
+    add(3, 27)
+    large_skills, large = counted()
+
+    assert large_skills - small_skills == 27
+    assert large == small, f"{small} statements at 3 skills, {large} at 30"
+
+
+def test_a_claim_another_replica_recovered_keeps_the_sharing_set_since(org):
+    """A recovery under production's session settings (rows outlive a
+    commit) must judge the claim as the database holds it now. Judged from a
+    row this session read earlier, it would finalize the skill a second time
+    and put its sharing back to its creator alone."""
+    from cowork.db.session import get_session_factory
+
+    engine = org.as_(ALICE).get_bind()
+
+    def production_session() -> ScopedSession:
+        return ScopedSession(
+            get_session_factory(engine)(),
+            TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE),
+        )
+
+    _legacy_skill(org.as_(ALICE).scope, "crashed")
+    _attributed(org, "crashed", ALICE, pending=True, expired=True)
+    listing = production_session()
+    listing_access = SharedResourceAccess(listing, _principal(ALICE))
+    held = listing_access._find(SKILL, "crashed")
+    assert held is not None and held.pending_claim_token
+
+    replica = production_session()
+    assert skills_ep._recover_skill_claim(
+        SharedResourceAccess(replica, _principal(ALICE)),
+        SkillService(replica.scope, viewer=_viewer(ALICE), session=replica),
+        "crashed",
+    )
+    _share(org, ALICE, "crashed", _viewer(ALICE, share_org=True), org_allowed=True)
+
+    again = skills_ep._recover_skill_claim(
+        listing_access,
+        SkillService(listing.scope, viewer=_viewer(ALICE), session=listing),
+        "crashed",
+    )
+
+    assert again is False
+    assert _row(org, "crashed").org_allowed is True
+    check = org.as_(ALICE)
+    events = check.exec(check.select(SharedResourceMutation)).all()
+    assert [e.action for e in events if e.resource_key == "crashed"].count("recover") == 1
+    for session in (listing, replica):
+        session.close()
 
 
 def test_a_skill_made_after_the_backfill_with_no_row_is_its_creators(org):
@@ -1071,8 +1230,11 @@ def test_the_turn_reads_the_callers_teams_with_the_gateway_credential(monkeypatc
             built.append(mindshub_bearer)
             raise RuntimeError("stop here")
 
+    async def _admit(**_kwargs) -> None:
+        return None
+
     monkeypatch.setattr(responses_ep, "ResponsesHandler", _Handler)
-    monkeypatch.setattr(responses_ep, "_refuse_while_answering", lambda **kwargs: None)
+    monkeypatch.setattr(responses_ep, "_refuse_while_answering", _admit)
     with pytest.raises(RuntimeError):
         asyncio.run(responses_ep.responses(SimpleNamespace(conversation=None), member_request(), None))
     assert built == [MEMBER_BEARER]

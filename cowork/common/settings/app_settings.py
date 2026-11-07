@@ -1421,6 +1421,39 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TURN_TOKENS"),
         description="Default for the per-user 'Max Tokens per Task' agent budget.",
     )  # COWORK_DEFAULT_MAX_TURN_TOKENS
+    # Wall-clock cap on one scheduled run, past which the scheduler stops its
+    # turn. The step and token budgets above bound how much work a run does;
+    # this only catches a run that keeps going without ever finishing, so it
+    # sits well above how long real runs take.
+    scheduled_run_max_seconds: int = Field(
+        default=1800,
+        ge=300,
+        le=86_400,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUN_MAX_SECONDS"),
+        description="Longest a scheduled run may take before it is stopped.",
+    )  # COWORK_SCHEDULED_RUN_MAX_SECONDS
+    # Scheduled runs one server process drives at once, across every
+    # organization. Unset, it follows where turns run: 3 on the desktop, where
+    # each run is an agent on the user's own machine, and 16 when turns run in
+    # sandbox pods, where the process only streams them (scheduler).
+    scheduled_runs_per_process: int | None = Field(
+        default=None,
+        ge=1,
+        le=64,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUNS_PER_PROCESS"),
+        description="Scheduled runs one server process drives at once; unset follows the backend.",
+    )  # COWORK_SCHEDULED_RUNS_PER_PROCESS
+    # Scheduled runs one organization may have going at once, counted across
+    # every replica, only when explicitly configured. Hosted policy will come
+    # from auth; no deployment-wide default is imposed. A
+    # desktop schedule has no organization, so this doesn't apply there.
+    scheduled_runs_per_org: int | None = Field(
+        default=None,
+        ge=1,
+        le=256,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUNS_PER_ORG"),
+        description="Scheduled runs one organization may have going at once, across all replicas.",
+    )  # COWORK_SCHEDULED_RUNS_PER_ORG
 
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_URI; the other fields read their bare names
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*

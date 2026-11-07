@@ -138,7 +138,11 @@ def _conversation_id(child: Path) -> UUID | None:
 
 
 def _project_artifact_bases(
-    project_path: str, session: ScopedSession, *, include_other_members: bool = False
+    project_path: str,
+    session: ScopedSession,
+    *,
+    include_other_members: bool = False,
+    owned: frozenset[UUID] | None = None,
 ) -> list[Path]:
     """Every artifacts root of one project the caller is allowed to read.
 
@@ -148,8 +152,10 @@ def _project_artifact_bases(
     isolation still holds because `project_path` comes from a scoped DB read
     that never returns another organization's project) — followed by one legacy
     per-conversation base for each conversation of the caller's own that wrote
-    something before the layout change. An absent legacy directory means no
-    pre-change artifacts and is not an error.
+    something before the layout change. A workspace with no `.anton/artifacts`
+    folder holds no artifact and yields no base: new artifacts never land in a
+    legacy root, and a list would otherwise reopen every empty workspace from
+    the trusted root.
 
     The legacy bases keep the owner filter: a conversation workspace is private
     to whoever created it, so a member's workspaces must not appear in another
@@ -172,10 +178,18 @@ def _project_artifact_bases(
     route receives an artifact id and no conversation id, so there is nothing
     else to look the folder up by. Never reachable from the artifacts list or
     from any mutation.
+
+    `owned` is the caller's conversation ids (`owned_conversation_ids`) when a
+    listing over every project has read them once; without it, one project's
+    lookup reads them only once it finds a workspace to check.
     """
     if not _org_mode():
         return [_artifacts_base(project_path)]
     bases = [_artifacts_base(project_path)]
+    owner_filter = not include_other_members and session.scope.org_mode
+    if owner_filter and owned is not None and not owned:
+        # No workspace can pass the owner filter.
+        return bases
     conversations = Path(project_path) / CONVERSATIONS_DIRNAME
     if not _is_real_directory(conversations):
         # No legacy per-conversation dir at all is common and not an error —
@@ -185,25 +199,46 @@ def _project_artifact_bases(
         children = sorted(conversations.iterdir())
     except OSError:
         return bases
+    if owner_filter and children:
+        if owned is None:
+            owned = owned_conversation_ids(session)
+        # By name first, so a co-member's workspace is never statted.
+        children = [child for child in children if _conversation_id(child) in owned]
     children = [
         child
         for child in children
         if _is_real_directory(child)
-        and _storage_components_are_safe(child, may_be_absent=True)
+        and _storage_components_are_safe(child, may_be_absent=False)
     ]
-    if not include_other_members and session.scope.org_mode:
-        from cowork.services.conversations import ConversationService
-
-        candidates = {child: _conversation_id(child) for child in children}
-        owned = ConversationService(session).owned_ids(
-            cid for cid in candidates.values() if cid is not None
-        )
-        children = [child for child, cid in candidates.items() if cid in owned]
     return bases + [child.joinpath(*_ARTIFACTS_SUBPATH) for child in children]
 
 
+def _parts_below(path: Path, anchor: Path) -> tuple[str, ...]:
+    """``path.relative_to(anchor).parts``, compared by parts, case-sensitive:
+    on POSIX paths the same answer, and the same ValueError for a path outside
+    ``anchor``, without its walk over every parent, which a listing pays once
+    per project. Every caller passes a base built under ``anchor``."""
+    parts, anchor_parts = path.parts, anchor.parts
+    if parts[: len(anchor_parts)] != anchor_parts:
+        raise ValueError(f"{path} is not below {anchor}")
+    return parts[len(anchor_parts) :]
+
+
+def owned_conversation_ids(session: ScopedSession) -> frozenset[UUID]:
+    """Every conversation the caller owns, in one query, for the legacy
+    workspaces' owner filter."""
+    from cowork.services.conversations import ConversationService
+
+    return frozenset(ConversationService(session).owned_ids())
+
+
 def _sources_for(
-    session: ScopedSession, project, *, include_other_members: bool = False
+    session: ScopedSession,
+    project,
+    *,
+    include_other_members: bool = False,
+    owned: frozenset[UUID] | None = None,
+    shared_root: Path | None = None,
 ) -> list[ProjectArtifacts]:
     """One `ProjectArtifacts` per root. They all carry the SAME project identity:
     a conversation is where the bytes happen to live, not a thing the client
@@ -211,7 +246,7 @@ def _sources_for(
     from cowork.services.projects import ProjectService
 
     service = ProjectService(session)
-    if service.sits_in_another_partition(project):
+    if service.sits_in_another_partition(project, shared_root=shared_root):
         logger.warning(
             "artifacts: a project names a folder in another person's partition, so its "
             "artifacts are left out",
@@ -229,7 +264,7 @@ def _sources_for(
     external = service.directory_is_external(project)
     sources: list[ProjectArtifacts] = []
     for base in _project_artifact_bases(
-        project.path, session, include_other_members=include_other_members
+        project.path, session, include_other_members=include_other_members, owned=owned
     ):
         sources.append(
             ProjectArtifacts(
@@ -237,7 +272,7 @@ def _sources_for(
                 project_id=str(project.id),
                 project_name=project.name,
                 trusted_anchor=project_path,
-                root_parts=base.relative_to(project_path).parts,
+                root_parts=_parts_below(base, project_path),
                 external=external,
             )
         )
@@ -263,10 +298,13 @@ def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts
 
     from cowork.services.projects import ProjectService
 
+    projects = ProjectService(session).list_projects()
+    owned = owned_conversation_ids(session) if session.scope.org_mode else None
+    shared_root = ProjectService.resolved_shared_root()
     return [
         source
-        for project in ProjectService(session).list_projects()
-        for source in _sources_for(session, project)
+        for project in projects
+        for source in _sources_for(session, project, owned=owned, shared_root=shared_root)
     ]
 
 
