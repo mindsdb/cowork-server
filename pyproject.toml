@@ -139,7 +139,7 @@ dependencies = [
     # `postgresql://`. SQLAlchemy maps that scheme to the psycopg2 dialect, so
     # the driver has to be present or `db-migrate` dies on import.
     "psycopg2-binary>=2.9",
-    "redis>=5,<6",
+    "redis>=5.3.1,<6",
     # Org-controlled channel-binding trigger patterns (channel_bindings.py)
     # are matched against every inbound message at runtime (channels/runtime.py).
     # stdlib `re` has no backtracking bound, so a syntactically-valid but

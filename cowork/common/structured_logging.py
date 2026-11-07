@@ -58,6 +58,10 @@ EVENT_FIELDS = frozenset(
         # (cowork.turnqueue.producer._fit_request).
         "request_bytes",
         "cap_bytes",
+        # A remote turn reply's number and the last one the relay applied
+        # (cowork.turnqueue.producer.stream_remote_replies).
+        "reply_n",
+        "last_reply_n",
         "slot",
         "model_alias",
         "managed_connection_file",

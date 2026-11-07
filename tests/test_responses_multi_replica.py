@@ -313,6 +313,42 @@ async def test_the_owner_saves_a_stall_another_replica_reported(monkeypatch, fak
 
 
 
+@pytest.mark.asyncio
+async def test_the_owner_drops_a_remote_turn_another_replica_deleted(monkeypatch, fake_redis):
+    """A delete served by a replica that does not own the turn reaches it only
+    through the cancel flag, which the controller answers with its cancel
+    reply. The cause key says the conversation was deleted, so the owner
+    saves nothing into it and writes no terminal record, which would
+    recreate the stream the delete removed. Read as a Stop, the partial
+    answer used to land in the deleted history."""
+    import cowork.handlers.responses as responses_mod
+    from cowork.streaming.registry import RunIdentity
+    from test_responses_remote_backend import _RecBuffer, _remote_handler
+
+    monkeypatch.setattr(responses_mod, "get_redis", lambda: fake_redis)
+    await fake_redis.set("cowork:cancel_cause:corr-14", "discarded", ex=300)
+    saved: dict = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "partial"}
+        yield "turn_failed", {"error": "cancelled"}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
+    buffer = _RecBuffer()
+    lifecycle = TurnLifecycle(identity=RunIdentity(correlation_id="corr-14", remote=True))
+
+    await handler._produce_remote(
+        conv_id="c14", input_text="hi", original_content="hi", model="anton",
+        harness_id="anton", buffer=buffer, turn_llm={"correlation_id": "corr-14"}, lifecycle=lifecycle,
+    )
+
+    assert (lifecycle.discarded, lifecycle.discarded_elsewhere) == (True, True)
+    assert "assistant" not in saved and "events" not in saved
+    assert not any(frame.startswith("CLOSE:") for frame in buffer.frames)
+
+
 # ── admission across replicas ────────────────────────────────────────
 #
 # Two RunRegistry objects on one Redis are two replicas: each knows only the

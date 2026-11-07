@@ -479,7 +479,7 @@ requires-dist = [
     { name = "python-docx", specifier = "==1.2.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "python-multipart", specifier = ">=0.0.28" },
-    { name = "redis", specifier = ">=5,<6" },
+    { name = "redis", specifier = ">=5.3.1,<6" },
     { name = "reportlab", specifier = "==5.0.1" },
     { name = "slack-sdk", marker = "extra == 'channels'", specifier = ">=3.27.0" },
     { name = "sqlmodel", specifier = ">=0.0.38" },

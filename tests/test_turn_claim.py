@@ -59,7 +59,7 @@ def redis(monkeypatch, server):
     for module in (turn_claim, turn_index, buffer_mod, cancellation):
         monkeypatch.setattr(module, "get_redis", lambda: client)
     sync_client = fakeredis.FakeRedis(server=server, decode_responses=True)
-    for module in (turn_claim, turn_index, backend_mod):
+    for module in (turn_claim, turn_index, backend_mod, cancellation):
         monkeypatch.setattr(module, "get_sync_redis", lambda: sync_client)
     monkeypatch.setattr(cancellation, "CANCEL_POLL_SECONDS", 0.01)
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")

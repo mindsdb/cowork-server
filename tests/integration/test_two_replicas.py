@@ -22,13 +22,13 @@ from cowork.streaming.buffer import RedisStreamBuffer
 from cowork.streaming.registry import RunRegistry, TurnInProgress, TurnLifecycle
 from cowork.streaming.turn_claim import CLAIMS_KEY, BootPassResult, TurnClaim, claim_key
 from cowork.turnqueue.redis_client import cancel_flag_key
-from tests.integration.prereq import missing_prerequisite
+from tests.integration.prereq import missing_prerequisite, report_redis_version
 
 pytestmark = [pytest.mark.integration, pytest.mark.redis_service]
 
 
 @pytest.fixture
-async def redis_url(monkeypatch):
+async def redis_url(monkeypatch, pytestconfig):
     url = os.environ.get("COWORK_TEST_REDIS_URL", "redis://localhost:6379/1")
     client = aioredis.from_url(url, decode_responses=True)
     try:
@@ -36,6 +36,7 @@ async def redis_url(monkeypatch):
     except Exception:
         missing_prerequisite(
             f"no Redis reachable at {url}", required_by="COWORK_REQUIRE_SERVICES")
+    await report_redis_version(client=client, config=pytestconfig)
     await client.flushdb()
     monkeypatch.setenv("COWORK_TURN_REDIS_URL", url)
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
