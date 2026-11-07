@@ -14,9 +14,9 @@ from cowork.services.connectors.custom_connectors import (
     CustomConnectorService,
     MemberConnectorLimitError,
     UnstorableFormError,
+    is_builtin_connector_id,
 )
-from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
-from cowork.services.connectors.specs._registry import connector_metadata, registry
+from cowork.services.connectors.specs._registry import connector_metadata
 
 # In org mode a custom connector is visible to its builder only (see
 # scope_definitions), so the member who built it manages it. A no-op on a
@@ -77,7 +77,7 @@ def save_connector_draft(
     except ConnectorDraftError as e:
         raise _unprocessable(str(e)) from e
     connector_id = parsed.connector_id
-    if registry.get_connector(connector_id) or load_datasource_capabilities().is_cloud_datasource(connector_id):
+    if is_builtin_connector_id(connector_id):
         raise _unprocessable(f"{connector_id!r} is already a built-in connector.")
     try:
         row = CustomConnectorService(session).save_member_draft(parsed)

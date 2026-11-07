@@ -573,7 +573,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 disabled: list[dict] | None = None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
-                                tool_messages: bool = False):
+                                tool_messages: bool = False,
+                                connector_drafts: bool = False):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -585,6 +586,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
     user (the cowork UI does; channel turns never).
+    `connector_drafts` asks for the pod's connector template tool. It reaches
+    the job only with the deployment setting on, in org mode, for a turn with
+    a user; the caller passes it only where a member sees and saves the card.
     `workspace` is the project the turn runs in; None runs it in the org's
     default project with no project on the job.
     `skills` is the caller's visible skills, each with `always_on` set on the
@@ -696,6 +700,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # The cowork UI renders a tool's message to the user as an
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
+              **({"connector_drafts": True} if (
+                  connector_drafts and settings.connector_drafts_enabled and scope.org_mode and user_id
+              ) else {}),
               **({"memory": memory_block} if memory_block else {}),
               # Only the skills the caller sees, and the pod's whole
               # recallable set, so always present, even empty.
@@ -800,8 +807,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                     yield "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
                     continue
                 if kind == "error" or (
-                    kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_history",
-                             "turn_compaction", "turn_completed")
+                    kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_connector",
+                             "turn_history", "turn_compaction", "turn_completed")
                     and authorized_workspace_mode is None
                 ):
                     # Unsupported v2 operations and missing mount-policy
@@ -825,7 +832,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         "Remote turn failed conversation=%s correlation_id=%s error_type=%s error_code=%s",
                         conversation_id, corr, remote_error_label(error=data.get("error")), code,
                     )
-                if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill",
+                if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_connector",
                             "turn_history", "turn_compaction", "turn_completed", "turn_failed"):
                     yield kind, data
                 if kind in ("turn_completed", "turn_failed"):

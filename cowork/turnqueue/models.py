@@ -125,6 +125,6 @@ class TurnReply(BaseModel):
     # rather than being ignored. Kinds this build does nothing with are dropped
     # further down.
     kind: Literal["progress", "cell", "error", "turn_delta", "turn_step",
-                  "turn_memory", "turn_skill", "turn_history", "turn_compaction",
+                  "turn_memory", "turn_skill", "turn_connector", "turn_history", "turn_compaction",
                   "turn_completed", "turn_failed"]
     data: dict[str, Any] = Field(default_factory=dict)

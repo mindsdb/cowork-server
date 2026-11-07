@@ -49,6 +49,7 @@ from cowork.harnesses.anton_harness.figure_sources import has_figures
 from cowork.harnesses.memory.policy import memory_policy
 from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
 from cowork.harnesses.anton_harness.stream_formatter import (
+    ConnectorDrafted,
     SkillCreated,
     TurnContext,
     TurnEvidence,
@@ -120,6 +121,7 @@ from cowork.db.scoped import (
     unsafe_unscoped_session,
 )
 from cowork.principal import Principal, identity_trace_metadata
+from cowork.services.connectors.custom_connectors import turn_connector_cards
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
 from cowork.services.files import FileService
@@ -2413,6 +2415,8 @@ class ResponsesHandler:
                 # not it can answer questions. Channel turns build their
                 # own request in turnqueue/remote_turn.py and leave it off.
                 tool_messages=True,
+                # A member's turn in the cowork UI, where the card is saved.
+                connector_drafts=True,
             ):
                 if kind == "progress" and data.get("phase") == "workspace_authorized":
                     if turn_artifacts is not None:
@@ -2456,6 +2460,14 @@ class ResponsesHandler:
                             yield SkillCreated(payload)
                         for reason in reasons:
                             yield StreamTaskProgress(phase="skill_draft_dropped", message=reason)
+                elif kind == "turn_connector":
+                    # Shown as cards, never stored: the member saves one
+                    # through POST /connectors/custom, which checks it again.
+                    cards, notices = turn_connector_cards(data.get("entries"))
+                    for card in cards:
+                        yield ConnectorDrafted(card)
+                    for notice in notices:
+                        yield StreamTaskProgress(phase="connector_draft_dropped", message=notice)
                 elif kind == "turn_completed":
                     # `break`, not `return`: the record/publish/card block
                     # below must still run on a clean finish.

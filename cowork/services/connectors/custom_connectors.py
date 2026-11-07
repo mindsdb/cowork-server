@@ -5,7 +5,12 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 
-from anton.core.tools.connector_draft import ConnectorDraft
+from anton.core.tools.connector_draft import (
+    MAX_DRAFTS_PER_TURN,
+    ConnectorDraft,
+    ConnectorDraftError,
+    parse_connector_draft,
+)
 from anton.utils.datasources import scrub_output
 from pydantic import ValidationError
 from sqlalchemy import false, func
@@ -15,6 +20,8 @@ from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope, tenant_scope_required
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorForm, CustomConnectorUpdate
+from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
+from cowork.services.connectors.specs._registry import registry
 
 # Top-level keys a handcrafted form may carry that ConnectorForm doesn't model
 # but the connect form still renders.
@@ -152,6 +159,42 @@ def stored_form(connector_id: str, form_spec: dict[str, Any]) -> dict[str, Any]:
         if isinstance(form_spec.get(key), str):
             form[key] = form_spec[key]
     return form
+
+
+def is_builtin_connector_id(connector_id: str) -> bool:
+    """Whether ``connector_id`` names a built-in connector or cloud datasource."""
+    return bool(
+        registry.get_connector(connector_id)
+        or load_datasource_capabilities().is_cloud_datasource(connector_id)
+    )
+
+
+def turn_connector_cards(entries: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    """Check one ``turn_connector`` reply's drafts again before they are shown.
+
+    The pod is semi-trusted, so each entry goes through the same parser as the
+    save endpoint. Only the first MAX_DRAFTS_PER_TURN entries are read.
+
+    Returns:
+        The drafts to show as cards, and one notice per refused entry plus one
+        for any entries past the cap. Notices name the field, never a value.
+    """
+    items = entries if isinstance(entries, list) else []
+    cards: list[dict[str, Any]] = []
+    notices: list[str] = []
+    for entry in items[:MAX_DRAFTS_PER_TURN]:
+        try:
+            draft = parse_connector_draft(entry)
+        except ConnectorDraftError as e:
+            notices.append(f"A connector template was not shown: {e}")
+            continue
+        if is_builtin_connector_id(draft.connector_id):
+            notices.append(f"A connector template was not shown: {draft.connector_id!r} is a built-in connector.")
+            continue
+        cards.append(draft.to_dict())
+    if len(items) > MAX_DRAFTS_PER_TURN:
+        notices.append(f"{len(items) - MAX_DRAFTS_PER_TURN} more connector template(s) from this turn were not shown.")
+    return cards, notices
 
 
 def draft_form(draft: ConnectorDraft) -> dict[str, Any]:

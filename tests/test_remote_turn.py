@@ -651,3 +651,26 @@ async def test_a_cancelled_channel_turn_stays_cancelled_when_the_flag_cannot_be_
     assert [{name: getattr(r, name) for name in fields} for r in records] == [fields]
     assert isinstance(records[0].exc_info[1], ConnectionError)
     assert_log_fields(logged.output(), **fields)
+
+
+@pytest.mark.asyncio
+async def test_a_channel_turn_drops_connector_drafts(monkeypatch):
+    """A channel member cannot save a card, so the kind is accepted and ignored."""
+    _fake_handler(monkeypatch)
+
+    async def fake_replies(**kwargs):
+        assert "connector_drafts" not in kwargs
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_connector", {"entries": [{"connector_id": "acme", "label": "Acme", "fields": []}]}
+        yield "turn_delta", {"text": "hi"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    events, failure = await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
+
+    assert failure is None
+    assert [type(e).__name__ for e in events] == ["StreamTextDelta"]

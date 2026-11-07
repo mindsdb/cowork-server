@@ -732,6 +732,13 @@ class TurnQueueSettings(Settings):
             "until the controller and pod support the datasource block."
         ),
     )  # COWORK_TURN_DATASOURCE_ENABLED
+    connector_drafts_enabled: bool = Field(
+        default=False,
+        description=(
+            "Let cloud turns build custom connector templates a member saves "
+            "from a card. Keep false until members can connect what they save."
+        ),
+    )  # COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
     datasource_producer_key_id: str = Field(
         default="",
         description="Key id for the dedicated datasource producer service role.",
