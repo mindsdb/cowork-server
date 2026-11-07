@@ -14,7 +14,8 @@ present, so nothing here holds a credential of its own:
   (``mindshub_credential``): the browser's state (``router_status``), a warm-up
   that carries the person's time zone and language (``warm``,
   ``RouterPrefs``), a viewer link for one session (``embed``), the person's
-  approval of a step the browser held (``approve``) and signing out of every
+  approval of a step the browser held (``approve``), their Skip of one
+  (``decline``) and signing out of every
   site (``clear_logins``). A viewer link opens once; the app mints a new one
   whenever it shows the viewer, and nothing here stores one.
 - A web turn gets a router block with no credential (``turn_block``), which
@@ -75,11 +76,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: The longest any call here waits on the router. A slower answer, the
+#: router's own 504 at its 105 s deadline included, reaches the app as 424
+#: browser_unreachable.
 _TIMEOUT_S = 15.0
 
-#: Status for "the browser router failed us". Not 502: the cluster's ingress
-#: swaps a 5xx body for its own page, and the reason is what the person needs
-#: to see.
+#: Status for "the browser router failed us". Not 502: Cloudflare, in front of
+#: the cowork host, swaps a 502 or 504 body for its own page, and the reason is
+#: what the person needs to see.
 UPSTREAM_FAILED = 424
 
 #: What a warm-up sends for a time zone and a language: an IANA zone and a
@@ -208,6 +212,20 @@ class BrowserApproval(BaseModel):
     expires_at: int
 
 
+class DeclineRequest(ApproveRequest):
+    """``POST /browse/decline``: the person skips one step the browser held
+    in one of their sessions."""
+
+
+class BrowserDecline(BaseModel):
+    """The router's answer to a decline: the held step, and any approval
+    recorded for it, are gone. Also the answer for an id it no longer holds."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    declined: Literal[True]
+
+
 class LoginsCleared(BaseModel):
     """The router's answer to signing out of every site."""
 
@@ -269,7 +287,7 @@ async def _call(
     A 401, 403 or 429 passes on with the router's code and sentence: they are
     its answer about the caller (a stale sign-in, ``not_entitled``,
     ``daily_limit``). Any other failure is UPSTREAM_FAILED with the router's
-    code, since the ingress would swap a 5xx body for its own page.
+    code, since Cloudflare would swap a 502 or 504 body for its own page.
     """
     if not bearer:
         raise BrowserServiceError(401, "unauthorized", "Sign in to MindsHub to use the browser.")
@@ -370,6 +388,17 @@ async def approve(bearer: str, request: ApproveRequest) -> BrowserApproval:
     if answer.pending_id != request.pending_id:
         raise BrowserServiceError(UPSTREAM_FAILED, "bad_response", "The browser approved a different step.")
     return answer
+
+
+async def decline(bearer: str, request: DeclineRequest) -> BrowserDecline:
+    """Record the caller's Skip of a step the browser held: the router drops
+    the step and any approval already recorded for it, so an approval that
+    landed after this server stopped waiting on it can't let a resend run."""
+    router = _require_router()
+    return _parsed(BrowserDecline, await _call(
+        "POST", f"{router}/sessions/{request.session_id}/decline", bearer,
+        json={"pending_id": request.pending_id},
+    ))
 
 
 async def clear_logins(bearer: str) -> LoginsCleared:

@@ -153,6 +153,8 @@ def router(monkeypatch, web):
             return httpx.Response(200, json=body)
         if path.startswith("/browser/sessions/") and path.endswith("/approve"):
             return httpx.Response(200, json={**body, "approved": True, "expires_at": 1999999300})
+        if path.startswith("/browser/sessions/") and path.endswith("/decline"):
+            return httpx.Response(200, json={"declined": True})
         if path == "/browser/logins" and request.method == "DELETE":
             return httpx.Response(200, json={"cleared": True})
         return httpx.Response(404, json={"error": "not_found", "message": "Not found."})
@@ -513,6 +515,8 @@ def test_desktop_routes_answer_from_the_app_and_call_nothing(client, nothing_goe
     assert _detail(client.post("/api/v1/browse/embed", json={"session_id": "t-abc"})) == (409, "unavailable")
     approve = client.post("/api/v1/browse/approve", json={"session_id": "t-abc", "pending_id": "pa-1"})
     assert _detail(approve) == (409, "unavailable")
+    decline = client.post("/api/v1/browse/decline", json={"session_id": "t-abc", "pending_id": "pa-1"})
+    assert _detail(decline) == (409, "unavailable")
     assert _detail(client.delete("/api/v1/browse/logins")) == (409, "unavailable")
     assert nothing_goes_out == []
 
@@ -672,6 +676,7 @@ def test_org_routes_refuse_no_principal(web_client, router, mindshub):
         ("GET", "/api/v1/browse/status", None), ("POST", "/api/v1/browse/provision", None),
         ("POST", "/api/v1/browse/embed", {"session_id": "t-abc"}),
         ("POST", "/api/v1/browse/approve", {"session_id": "t-abc", "pending_id": "pa-1"}),
+        ("POST", "/api/v1/browse/decline", {"session_id": "t-abc", "pending_id": "pa-1"}),
         ("DELETE", "/api/v1/browse/logins", None),
     ]:
         response = web_client.request(method, path, json=body, headers={"Authorization": "Bearer jwt-x"})
@@ -734,6 +739,28 @@ def test_a_refused_approval_reaches_the_app_with_its_code(web_client, router, mi
     router.answers["/browser/sessions/t-abc/approve"] = httpx.Response(refusal.status, json=refusal.body)
     answer = web_client.post("/api/v1/browse/approve", headers=_as("alice"), json={"session_id": "t-abc", "pending_id": "pa-1"})
     assert _detail(answer) == (svc.UPSTREAM_FAILED, code)
+
+
+def test_decline_forwards_the_persons_skip_as_them(web_client, router, mindshub):
+    """The card's Skip drops the held step and any approval that landed late,
+    so a resend after it stays held."""
+    sid = "t-abc"
+    declined = web_client.post(
+        "/api/v1/browse/decline", headers=_as("alice"), json={"session_id": sid, "pending_id": "pa-7"},
+    )
+    assert declined.status_code == 200 and declined.json() == {"declined": True}
+    assert router.calls == [Call("POST", f"{ROUTER}/sessions/{sid}/decline", {"pending_id": "pa-7"}, "Bearer jwt-alice")]
+
+
+def test_decline_checks_its_ids_and_passes_the_routers_refusal_on(web_client, router, mindshub):
+    for body in ({"session_id": "t abc", "pending_id": "pa-1"}, {"session_id": "t-abc", "pending_id": "pa:1"},
+                 {"session_id": "t-abc", "pending_id": "pa-1", "extra": 1}):
+        assert web_client.post("/api/v1/browse/decline", headers=_as("alice"), json=body).status_code == 422, body
+    assert router.calls == []
+    refusal = _fixture("browser_router", "error_answer.json").examples["an approval with no running browser"]
+    router.answers["/browser/sessions/t-abc/decline"] = httpx.Response(refusal.status, json=refusal.body)
+    answer = web_client.post("/api/v1/browse/decline", headers=_as("alice"), json={"session_id": "t-abc", "pending_id": "pa-1"})
+    assert _detail(answer) == (svc.UPSTREAM_FAILED, "session_not_found")
 
 
 def test_sign_out_of_every_site_goes_to_the_router_as_the_person(web_client, router, mindshub):
@@ -878,6 +905,10 @@ def test_router_contract_fixtures(router):
     asyncio.run(svc.approve("jwt", svc.ApproveRequest(session_id="t-abc", pending_id="pa-0123456789abcdef01234567")))
     assert router.calls[-1].body == approve["approve a held step"].body
     svc.BrowserApproval.model_validate(approve["approved"].body)
+    decline = _fixture("browser_router", "decline.json").examples
+    asyncio.run(svc.decline("jwt", svc.DeclineRequest(session_id="t-abc", pending_id="pa-0123456789abcdef01234567")))
+    assert router.calls[-1].body == decline["decline a held step"].body
+    svc.BrowserDecline.model_validate(decline["declined"].body)
     for example in _fixture("browser_router", "logins_answer.json").examples.values():
         svc.LoginsCleared.model_validate(example.body)
     for example in _fixture("browser_router", "status_answer.json").examples.values():

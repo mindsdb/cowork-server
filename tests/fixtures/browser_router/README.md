@@ -13,5 +13,6 @@ Each file is `{description, examples: {<name>: {where, kind, status?, body}}}`, 
 | `status_answer.json` | `_status` and `_warm` answers |
 | `embed_answer.json` | `_embed`, a single-use viewer link |
 | `approve.json` | `POST sessions/{id}/approve`, the person's approval of a held step, and its answer |
+| `decline.json` | `POST sessions/{id}/decline`, the person's Skip of a held step, and its answer |
 | `logins_answer.json` | `DELETE logins`, signing the person out of every site |
 | `error_answer.json` | The error body, and the status each one reaches the app with |

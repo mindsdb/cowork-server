@@ -4,6 +4,7 @@ GET    /browse/status     whether this deployment offers the caller a browser, a
 POST   /browse/provision  web: start the caller's browser early, with their time zone and language
 POST   /browse/embed      web: a viewer link for one of the caller's sessions
 POST   /browse/approve    web: the person approves one step the browser held for them
+POST   /browse/decline    web: the person skips one step the browser held for them
 DELETE /browse/logins     web: sign the person out of every site in their browser
 
 On the web the routes go to the browser router as the caller, with their own
@@ -15,7 +16,8 @@ the router. A refusal from the router keeps its 401, 403 or 429 and its code in
 answers a turn key ``person_only`` on every route here.
 
 Approve doesn't answer the chat card: the web app calls it first and answers
-the card only once the browser recorded the approval.
+the card only once the browser recorded the approval. The card's Skip, and any
+answer but Approve, sends decline, best effort: the step stays held either way.
 
 On the desktop the browser is the app's own, registered through
 ``PUT /runtime-credential/browser``. Status says whether one is registered,
@@ -111,6 +113,17 @@ async def browse_embed(body: EmbedRequest, request: Request) -> browser_service.
 async def browse_approve(body: browser_service.ApproveRequest, request: Request) -> browser_service.BrowserApproval:
     try:
         return await browser_service.approve(mindshub_credential(request), body)
+    except browser_service.BrowserServiceError as exc:
+        _raise(exc)
+
+
+@router.post(
+    "/decline", response_model=browser_service.BrowserDecline,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def browse_decline(body: browser_service.DeclineRequest, request: Request) -> browser_service.BrowserDecline:
+    try:
+        return await browser_service.decline(mindshub_credential(request), body)
     except browser_service.BrowserServiceError as exc:
         _raise(exc)
 
