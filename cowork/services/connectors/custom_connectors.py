@@ -113,15 +113,16 @@ def scope_is_one_persons(scope: TenantScope) -> bool:
     """Whether ``scope``'s custom connector definitions belong to one person.
 
     True on a single-user install, and in a personal scope whose connections
-    are personal. False in org mode, where an organization shares them, in a
-    personal scope with shared connections, and in the operator view of a
-    deployment that trusts identity headers.
+    are personal. False in org mode, in a personal scope with shared
+    connections, and in the operator view of a deployment that trusts
+    identity headers.
 
     Everything in a definition (label, description, help text, the form,
     usage notes) is model-written and may hold what its builder typed, in
-    any encoding. Custom connectors are therefore built only where this is
-    True, and served outside org mode only there, so none reaches another
-    person. Sharing them across people (org mode included) is not built yet.
+    any encoding. A handcrafted form is therefore kept only where this is
+    True. In org mode a member keeps only checked drafts
+    (save_member_draft), seen by that member alone (scope_definitions).
+    Sharing definitions across people is not built yet.
     """
     if scope.personal:
         return scope.partitioned_for(PersonalResource.CONNECTIONS)
@@ -261,9 +262,9 @@ class CustomConnectorService:
         self.session = session
 
     def _kept_notes(self, notes: Any) -> str | None:
-        """``notes`` as stored: the text in one person's scope, else None.
-        In org mode a definition is served to every member, and its notes
-        were typed by one of them."""
+        """``notes`` as stored from a form: the text in one person's scope,
+        else None. Org mode takes no form here; save_member_draft keeps a
+        checked draft's notes itself."""
         return _text(notes) if scope_is_one_persons(self.session.scope) else None
 
     def get(self, connector_id: str) -> CustomConnector | None:
@@ -285,8 +286,9 @@ class CustomConnectorService:
 
         Raises:
             UnstorableFormError: when the form is invalid or unsafe to keep,
-                or the scope is shared by several people, org mode included
-                (scope_is_one_persons), where a definition would reach them all.
+                or the scope is not one person's (scope_is_one_persons). In
+                org mode a member saves a checked draft instead
+                (save_member_draft).
 
         Side effects:
             Commits the session.

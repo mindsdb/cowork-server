@@ -6,6 +6,7 @@ from anton.core.tools.connector_draft import ConnectorDraftError, parse_connecto
 from fastapi import APIRouter, Body, Depends, HTTPException, Response, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.db.scoped import ScopedSessionDep
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorMetadataResponse, CustomConnectorUpdate
@@ -63,14 +64,16 @@ def save_connector_draft(
 ) -> ConnectorMetadataResponse:
     """Save a connector draft from a chat card as the member's own connector.
 
-    Org mode only, for an authenticated member; the draft is untrusted client
+    Org mode only, for an authenticated member, and only while the setting
+    that lets cloud turns build drafts is on. The draft is untrusted client
     data and is checked again here with the parser the pod used.
 
     Raises:
-        HTTPException: 404 outside org mode, 422 for a draft outside the
-            allowlist or a built-in id, 409 at the member's connector limit.
+        HTTPException: 404 outside org mode or with the setting off, 422 for
+            a draft outside the allowlist or a built-in id, 409 at the
+            member's connector limit.
     """
-    if not session.scope.org_mode:
+    if not session.scope.org_mode or not TurnQueueSettings().connector_drafts_enabled:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
     try:
         parsed = parse_connector_draft(draft)
@@ -106,6 +109,9 @@ def update_custom_connector(
         if row is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom connector not found.")
         _check_member_edit(row, body)
+        for key in ("label", "description", "category"):
+            if isinstance(getattr(body, key), str):
+                setattr(body, key, getattr(body, key).strip())
     try:
         row = CustomConnectorService(session).update(connector_id, body)
     except UnstorableFormError as e:

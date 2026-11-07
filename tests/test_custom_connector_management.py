@@ -278,6 +278,7 @@ def _anton_draft(**overrides) -> dict:
 @pytest.fixture()
 def org_tenancy(monkeypatch):
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.setenv("COWORK_TURN_CONNECTOR_DRAFTS_ENABLED", "true")
     get_app_settings.cache_clear()
     yield
     get_app_settings.cache_clear()
@@ -343,6 +344,14 @@ class TestSaveConnectorDraft:
         assert resp.status_code == 422 and "built-in" in resp.text
         assert _org_rows(engine, connector_id) == []
 
+    def test_with_the_setting_off_there_is_no_save(self, engine, org_tenancy, monkeypatch):
+        monkeypatch.setenv("COWORK_TURN_CONNECTOR_DRAFTS_ENABLED", "false")
+
+        resp = _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=_anton_draft())
+
+        assert resp.status_code == 404
+        assert _org_rows(engine) == []
+
     def test_outside_org_mode_there_is_no_save(self, engine):
         app = FastAPI()
         app.include_router(custom_router, prefix="/custom")
@@ -407,7 +416,9 @@ class TestOrgModeEditUsesTheDraftRules:
 
     def test_a_plain_rename_and_recategorize_pass(self, engine, org_tenancy):
         resp = _org_client(engine, _member(ORG_A), ORG_A).patch(
-            "/custom/httpbin", json={"label": "Acme", "description": "Contacts.", "category": None},
+            "/custom/httpbin", json={"label": "  Acme  ", "description": " Contacts. ", "category": None},
         )
 
         assert resp.status_code == 200 and resp.json()["label"] == "Acme"
+        [row] = _org_rows(engine, "httpbin")
+        assert (row.label, row.description, row.category) == ("Acme", "Contacts.", None)
