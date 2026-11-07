@@ -63,7 +63,7 @@ from cowork.streaming import StreamBuffer, TurnLifecycle, new_buffer, registry, 
 from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.liveness import ModelWaitTicker
 from cowork.streaming.records import TerminalReason
-from cowork.streaming.registry import RunHandle, RunIdentity
+from cowork.streaming.registry import RunHandle, RunIdentity, mark_question_saved
 from cowork.turnqueue.producer import RemoteWorkspace, step_stream_events, stream_remote_replies
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
@@ -1715,7 +1715,7 @@ class ResponsesHandler:
                     partial(save_turn, events=saved_events), scope=scope_from_principal(self.principal),
                 )
             if saved is not None:
-                lifecycle.saved_question = True
+                await mark_question_saved(lifecycle=lifecycle, conversation_id=str(conv_id))
             if saved is None or lifecycle.discarded:
                 # Deleted while it saved: its buffer is gone, and writing a
                 # terminal record would recreate it for the next turn to tail.
@@ -1866,7 +1866,7 @@ class ResponsesHandler:
             if started is None:
                 return None
             question_id = started.question_id
-            lifecycle.saved_question = True
+            await mark_question_saved(lifecycle=lifecycle, conversation_id=str(conv_id))
             return question_id
 
         async def persist(events: list[dict]) -> _SavedAnswer:
@@ -2844,7 +2844,7 @@ class ResponsesHandler:
                     scope=scope,
                 )
             if question_id is not None:
-                lifecycle.saved_question = True
+                await mark_question_saved(lifecycle=lifecycle, conversation_id=str(conv_id))
 
         async def replies_as_stream_events():
             nonlocal turn_artifacts
@@ -3328,7 +3328,7 @@ class ResponsesHandler:
             if started is None:
                 return None
             question_id = started.question_id
-            lifecycle.saved_question = True
+            await mark_question_saved(lifecycle=lifecycle, conversation_id=str(conv_id))
             return started.conversation
 
         try:

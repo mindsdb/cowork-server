@@ -1230,8 +1230,11 @@ def test_the_turn_reads_the_callers_teams_with_the_gateway_credential(monkeypatc
             built.append(mindshub_bearer)
             raise RuntimeError("stop here")
 
+    async def _admit(**_kwargs) -> None:
+        return None
+
     monkeypatch.setattr(responses_ep, "ResponsesHandler", _Handler)
-    monkeypatch.setattr(responses_ep, "_refuse_while_answering", lambda **kwargs: None)
+    monkeypatch.setattr(responses_ep, "_refuse_while_answering", _admit)
     with pytest.raises(RuntimeError):
         asyncio.run(responses_ep.responses(SimpleNamespace(conversation=None), member_request(), None))
     assert built == [MEMBER_BEARER]

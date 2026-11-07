@@ -1385,11 +1385,11 @@ def shared_redis(monkeypatch):
     import fakeredis.aioredis
 
     from cowork.streaming import buffer as buffer_mod
-    from cowork.streaming import turn_index
+    from cowork.streaming import turn_claim, turn_index
     from cowork.streaming.registry import registry
 
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    for mod in (turn_index, buffer_mod):
+    for mod in (turn_claim, turn_index, buffer_mod):
         monkeypatch.setattr(mod, "get_redis", lambda: redis)
     monkeypatch.setattr("cowork.api.v1.endpoints.responses.get_redis", lambda: redis)
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
