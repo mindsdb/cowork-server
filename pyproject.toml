@@ -213,6 +213,12 @@ fallback-version = "0.0.0-dev"
 [tool.hatch.build.targets.wheel]
 packages = ["cowork"]
 
+[tool.uv.sources]
+# TEMPORARY (ENG-3298): the browser tool's anton branch (mindsdb/anton#540),
+# so this PR's environment and tests run with it. Remove before merge, which
+# puts anton back on the PyPI release above.
+anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "jorge/eng-3296-browser-anton-browser-tool-skill-and-login-memory-anton" }
+
 [dependency-groups]
 dev = [
     "alembic>=1.18.4",

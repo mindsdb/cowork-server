@@ -1988,6 +1988,12 @@ class AntonHarness:
                 # brief when the agent acts first); without it the tool hands
                 # the content to the agent. Dropped by an anton without the field.
                 **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
+                # The user's MindsHub browser, when they turned it on (ENG-3298):
+                # anton registers its `browser` tool only then. None, or dropped
+                # by an anton without the field, means no browser this turn.
+                **supported_kwargs(ChatSessionConfig, browser=_browser_config(
+                    user, conversation_id=str(conversation.id), project_id=conversation.project_id,
+                )),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
@@ -2061,3 +2067,31 @@ class AntonHarness:
     def _build_llm_client(effort: str | None = None, *, model: str | None = None, settings=None):
         from cowork.services.providers import build_llm_client
         return build_llm_client(effort_override=effort, model_override=model, settings=settings)
+
+
+def _browser_config(user, *, conversation_id=None, project_id=None):
+    """anton's BrowserConfig for this user and task, or None (ENG-3298). Never
+    raises: a turn must not fail over the browser.
+
+    With the shared browser router (ENG-3188) this is also where the turn
+    starts the user's pod warming, as the desktop's signed-in user: the
+    server's held MindsHub credential. None of that in org mode, which holds
+    none; the router then starts the pod on anton's first call.
+    """
+    try:
+        from cowork.common.settings import runtime_credential
+        from cowork.common.settings.user_settings import current_settings_scope
+        from cowork.services.browser import anton_browser_config, start_early
+
+        # The turn's ambient scope says who this is, for their own sessions on
+        # a shared standalone service; None (desktop) means the one person.
+        scope = current_settings_scope()
+        config = anton_browser_config(
+            user, getattr(scope, "user_id", None), conversation_id=conversation_id, project_id=project_id,
+        )
+        if config is not None:
+            start_early(user, runtime_credential.get_minds_credential())
+        return config
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("could not resolve the browser for this turn", exc_info=True)
+        return None

@@ -841,11 +841,14 @@ class ResponsesHandler:
         # the snapshot the unit loaded. A question with "memory": "off" gets a
         # copy with memory off, so AntonHarness._build_chat_session gives it
         # two empty tiers in its scratch folder and no background passes.
-        turn_settings = (
-            start.settings.model_copy(update={"memory_enabled": False})
-            if request.memory == "off"
-            else start.settings
-        )
+        # A task with its browser switched off gets a copy with it off, so the
+        # turn neither offers anton the browser nor starts it early.
+        off: dict = {}
+        if request.memory == "off":
+            off["memory_enabled"] = False
+        if request.browser == "off":
+            off["browser_enabled"] = False
+        turn_settings = start.settings.model_copy(update=off) if off else start.settings
         with use_turn_settings(self.scope, turn_settings):
             try:
                 route, turn_llm = await self._route_request(

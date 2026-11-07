@@ -74,7 +74,6 @@ OPEN_BY_DESIGN_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
         "a hardcoded stub that ignores its input and answers 'not yet available'"
     ),
     ("/api/v1/scratchpad/cancel", ("POST",)): "a hardcoded stub",
-    ("/api/v1/browse/status", ("GET",)): "a hardcoded stub reporting the feature is off",
     ("/api/v1/live-apps/{slot}/access", ("GET",)): (
         "the credential is the visitor's viewer sign-in cookie, which the route "
         "checks itself against the viewer sign-in and the slot's recorded launcher; "

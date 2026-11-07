@@ -3,10 +3,11 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 import json
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
-from typing import TYPE_CHECKING, Annotated, Any, Callable, NamedTuple, get_args
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Literal, NamedTuple, get_args, get_origin
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
@@ -25,6 +26,9 @@ from cowork.common.settings.app_settings import (
     get_app_settings,
 )
 from cowork.common.settings.runtime_credential import get_minds_credential
+
+#: A shared browser router city id (`browser_city`): country code, a dash, the city.
+_BROWSER_CITY = re.compile(r"[a-z]{2}-[a-z_]{1,40}")
 
 
 class Provider(str, Enum):
@@ -742,6 +746,69 @@ class UserSettings(Settings):
         title="Memory Enabled",
         description="Enable conversation memory.",
     )
+    # The shared browser (ENG-3298). Untagged, so per-user in org mode and the
+    # single global row on desktop, like `hub_workspace_id`: it is the person's
+    # own MindsHub browser instance, not org configuration.
+    # On by default: it only does something where a browser is available
+    # (the router, a provisioned instance, or a configured standalone
+    # service); `services.browser.turn_block` returns None otherwise.
+    browser_enabled: bool = Field(
+        default=True,
+        title="Browser Enabled",
+        description="Let the agent use your MindsHub browser, shown beside the chat.",
+    )
+    # The shared browser router's residential proxy (ENG-3188). Per-user like
+    # the toggle above: where the person's browser appears to browse from is
+    # theirs to choose. The router stores both with the person's logins.
+    browser_proxy: bool = Field(
+        default=True,
+        title="Browse Through a Home Connection",
+        description=(
+            "The cloud browser reaches websites through a residential connection in your city, "
+            "so sites don't block it as a data center."
+        ),
+    )
+    # A router city id ("us-los_angeles"), or "" for the city that matches
+    # the person's time zone. The router lists the ids (GET /browse/locations).
+    browser_city: str = Field(
+        default="",
+        title="Browser City",
+        description="Which city the browser connects from. Empty picks one from your time zone.",
+    )
+    # Written by POST /browse/provision from MindsHub's answer, never typed by
+    # the user; `services.browser.valid_endpoint` refuses anything but a
+    # hosted br- instance before it reaches anton.
+    browser_url: str = Field(
+        default="",
+        title="Browser Instance",
+        description="Your MindsHub browser instance, set when it is provisioned.",
+    )
+    # Where the browser comes from (ENG-3298). `mindshub` provisions the
+    # caller's own instance through MindsHub; `standalone` points at a browser
+    # service someone runs themselves (the same Node service with a static
+    # bearer token), shared by the whole org with one profile per user. ORG,
+    # like the key below (a SecretStr, so org + encrypted on its own): the
+    # standalone service is admin-owned org config, all or nothing.
+    browser_mode: Annotated[Literal["mindshub", "standalone"], ORG] = Field(
+        default="mindshub",
+        title="Browser Mode",
+        description=(
+            "Where the agent's browser runs: your MindsHub browser, or a "
+            "standalone browser service at the URL below."
+        ),
+    )
+    # Checked by `services.browser.standalone_service` before any use: https,
+    # or http on localhost only, and an origin with no path.
+    browser_service_url: Annotated[str, ORG] = Field(
+        default="",
+        title="Browser Service URL",
+        description="Origin of the standalone browser service, e.g. https://browser.example.com.",
+    )
+    browser_service_api_key: SecretStr | None = Field(
+        default=None,
+        title="Browser Service API Key",
+        description="The standalone browser service's token (its BROWSER_SERVICE_TOKEN).",
+    )
     # `hub_workspace_id`, not `workspace_id`: in this repo `workspace` already
     # means a filesystem location (the per-conversation private directory, the
     # project tree, the paths on AntonSettings), and that meaning is load-bearing
@@ -1086,6 +1153,14 @@ class UserSettings(Settings):
                 raise ValueError(f"Unknown harness '{v}'. Available: {', '.join(options) or 'none'}")
             return v
         return _known_harness_or_anton(v, info.field_name)
+
+    @field_validator("browser_city")
+    @classmethod
+    def _browser_city_is_a_router_id(cls, value: str) -> str:
+        value = (value or "").strip()
+        if value and not _BROWSER_CITY.fullmatch(value):
+            raise ValueError("browser_city must be empty or a city id like us-los_angeles")
+        return value
 
     @field_validator("coding_agent_model")
     @classmethod
@@ -1448,6 +1523,8 @@ class UserSettings(Settings):
             if isinstance(meta, _DynamicOptions):
                 return meta.get()
         annotation = field_info.annotation
+        if get_origin(annotation) is Literal:
+            return [str(v) for v in get_args(annotation)]
         if isinstance(annotation, type) and issubclass(annotation, Enum):
             return [e.value for e in annotation]
         for arg in get_args(annotation):
