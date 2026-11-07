@@ -80,6 +80,11 @@ def test_artifact_shared_payload_without_names_or_url():
     assert payload.data() == {"kind": "artifact_shared"}
 
 
+def test_a_url_that_isnt_https_is_left_out():
+    payload = payloads.artifact_shared(sharer="a", artifact_title="b", url="http://view.example/r/1")
+    assert "url" not in payload.data()
+
+
 def test_long_titles_are_clipped():
     payload = payloads.task_finished(conversation_id=CONVERSATION, title="x" * 500, succeeded=True)
     assert len(payload.title) <= 120 and payload.title.endswith("…")
@@ -96,7 +101,7 @@ def test_platform_shapes():
         "token": "fcm-token",
         "notification": {"title": "T", "body": "Finished."},
         "data": {"kind": "task_finished", "path": f"/c/{CONVERSATION}"},
-        "android": {"priority": "HIGH"},
+        "android": {"priority": "HIGH", "notification": {"channel_id": "cowork_updates"}},
     }}
 
 

@@ -15,6 +15,8 @@ from typing import Any
 # Long enough for any title a lock screen shows, short enough that no request
 # comes near APNs' 4 KB payload limit.
 _MAX_TITLE_CHARS = 120
+# The Android notification channel the app creates for these pushes.
+ANDROID_CHANNEL_ID = "cowork_updates"
 
 
 class PushKind(StrEnum):
@@ -52,7 +54,7 @@ class PushPayload:
                 "token": token,
                 "notification": {"title": self.title, "body": self.body},
                 "data": self.data(),
-                "android": {"priority": "HIGH"},
+                "android": {"priority": "HIGH", "notification": {"channel_id": ANDROID_CHANNEL_ID}},
             }
         }
 
@@ -92,5 +94,5 @@ def artifact_shared(*, sharer: str | None, artifact_title: str | None, url: str 
         kind=PushKind.ARTIFACT_SHARED,
         title=_clip(f"{who} shared {shared} with you", _MAX_TITLE_CHARS),
         body="Tap to open.",
-        url=url or None,
+        url=url if url and url.startswith("https://") else None,
     )
