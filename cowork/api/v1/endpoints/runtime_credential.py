@@ -92,9 +92,14 @@ class BrowserHostBody(BaseModel):
 
 
 @router.put("/browser")
-def put_browser_host(body: BrowserHostBody) -> dict[str, bool]:
+async def put_browser_host(body: BrowserHostBody) -> dict[str, bool]:
     if body.url:
         set_browser_host(LocalBrowserHost(url=body.url, token=body.token))
+        # Read the organization's switch now, so a MindsHub outage at the
+        # first turn keeps this answer rather than offering the browser.
+        from cowork.services.browser import desktop_organization_off
+
+        await desktop_organization_off()
     else:
         clear_browser_host()
     return {"ok": True}

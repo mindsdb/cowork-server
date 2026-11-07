@@ -570,6 +570,10 @@ def step_stream_events(data: dict) -> list:
     return []
 
 
+#: A scope that takes longer than this is logged: every web turn waits on it.
+_SLOW_SCOPE_MS = 1000
+
+
 async def _scoped_browser_block(
     *, scope, conversation_id: str, turn_key: str, project_id: str | None,
 ) -> dict | None:
@@ -584,10 +588,11 @@ async def _scoped_browser_block(
     stands behind the turn) is scoped to no session, so code in the turn that
     holds its key can't scope it to a session of its own. A refused or failed
     scope leaves the turn without a browser rather than failing it, and logs
-    ``browser_scope_failed``, the event the scope-failure alert counts.
+    ``browser_scope_failed``, or ``browser_scope_not_entitled`` at info for a
+    person the browser isn't for. No alert reads either yet.
     """
     from cowork.common.settings.user_settings import get_user_settings
-    from cowork.services import browser
+    from cowork.services import browser, browser_contract
 
     router = browser.router_url()
     if not router or not turn_key:
@@ -595,15 +600,42 @@ async def _scoped_browser_block(
     config = browser.turn_block(
         get_user_settings(scope), user_id=scope.user_id, conversation_id=conversation_id, project_id=project_id,
     )
+    started = time.monotonic()
     try:
         await browser.scope_turn(turn_key=turn_key, router=router, config=config)
     except browser.BrowserServiceError as exc:
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        if exc.detail.code == browser_contract.NOT_ENTITLED:
+            # The router reads the person's entitlement on every scope, so an
+            # organization that switched the browser off answers this on each
+            # of its members' turns: expected, not a failure.
+            logger.info(
+                "[producer] the person may not use the browser; the turn runs without one",
+                extra={"event": "browser_scope_not_entitled", "conversation_id": conversation_id,
+                       "elapsed_ms": elapsed_ms},
+            )
+        else:
+            logger.warning(
+                "[producer] the browser router did not scope the turn; it runs without a browser",
+                extra={"event": "browser_scope_failed", "conversation_id": conversation_id,
+                       "status_code": exc.status, "reason": exc.detail.code, "with_browser": config is not None,
+                       "elapsed_ms": elapsed_ms},
+            )
+        return None
+    except Exception as exc:
+        # A turn must not fail over the browser.
         logger.warning(
-            "[producer] the browser router did not scope the turn; it runs without a browser",
+            "[producer] scoping the turn failed; it runs without a browser",
             extra={"event": "browser_scope_failed", "conversation_id": conversation_id,
-                   "status_code": exc.status, "reason": exc.detail.code, "with_browser": config is not None},
+                   "reason": type(exc).__name__, "with_browser": config is not None},
         )
         return None
+    elapsed_ms = round((time.monotonic() - started) * 1000)
+    if elapsed_ms > _SLOW_SCOPE_MS:
+        logger.info(
+            "[producer] the browser router took a while to scope the turn",
+            extra={"event": "browser_scope_slow", "conversation_id": conversation_id, "elapsed_ms": elapsed_ms},
+        )
     return config.to_dict() if config is not None else None
 
 
@@ -822,9 +854,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds
     last_reply_at = time.monotonic()
-    # Set once the turn has ended: finished, failed, stopped or abandoned. A
-    # generator closed before then (the client went away) leaves the turn
-    # running on the worker, and its key with it.
+    # Set once a reply ends the turn: finished, failed or abandoned. A Stop
+    # cancels this generator before any reply comes, and shows as the turn's
+    # cancel flag instead (_stopped). A generator closed before either (the
+    # client went away) leaves the turn running on the worker, and its key
+    # with it.
     ended = False
     try:
         while True:
@@ -908,8 +942,23 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                     if kind in ("turn_completed", "turn_failed"):
                         return
     finally:
-        if ended and llm_block.get("api_key"):
+        if llm_block.get("api_key") and (ended or await _stopped(r, corr)):
             await _revoke_turn_key_at_turn_end(corr, settings)
+
+
+async def _stopped(r, corr: str) -> bool:
+    """Whether the turn was stopped. The cancel route writes the turn's cancel
+    flag before it cancels this generator, and the worker stops the turn when
+    it reads the flag, so the turn is over though no reply said so. A failed
+    read leaves the key to its own expiry."""
+    try:
+        return bool(await r.exists(cancel_flag_key(corr)))
+    except Exception as exc:
+        logger.warning(
+            "[producer] could not read the turn's cancel flag; its key lives to its expiry",
+            extra={"event": "turn_key_revoke_failed", "correlation_id": corr, "error_type": type(exc).__name__},
+        )
+        return False
 
 
 async def _revoke_turn_key_at_turn_end(corr: str, settings: TurnQueueSettings) -> None:

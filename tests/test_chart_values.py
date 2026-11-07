@@ -415,3 +415,18 @@ def test_an_environment_names_its_own_browser_router(base, env_values, monkeypat
     assert entry.value == expected == f"https://{primary[0]}/browser", env_values.name
     monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", entry.value)
     assert AppSettings().browser_router_url == expected
+
+
+def test_the_scope_key_file_is_the_routers_secret_mounted_where_the_server_reads_it(base):
+    """The producer reads COWORK_BROWSER_SCOPE_KEY_FILE on every scope. If the
+    path, the mount and the Secret's item drift apart the file is missing,
+    every _scope gets 403 scope_key_invalid, and only a log line shows it. The
+    volume is optional, so a namespace with no router starts as usual."""
+    deployment = _deployment(BASE)
+    path = Path(_entry(base, "COWORK_BROWSER_SCOPE_KEY_FILE").value)
+    [volume] = [v for v in deployment.get("volumes") or [] if (v.get("secret") or {}).get("secretName") == "browser-proxy"]
+    assert volume["secret"]["optional"] is True
+    [mount] = [m for m in deployment.get("volumeMounts") or [] if m["name"] == volume["name"]]
+    assert mount.get("readOnly") is True
+    [item] = [i for i in volume["secret"]["items"] if i["key"] == "scope_key"]
+    assert path == Path(mount["mountPath"]) / item["path"]

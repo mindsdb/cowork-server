@@ -455,7 +455,7 @@ deployment:
 
     # The browser router's scope key, sent beside each web turn's key when the
     # producer scopes it, so only this server can scope a turn key. The file
-    # is the browser-scope-key volume below, read on every scope.
+    # is the browser-scope-key volume above, read on every scope.
     - name: COWORK_BROWSER_SCOPE_KEY_FILE
       value: /etc/cowork/browser-scope/scope_key
 

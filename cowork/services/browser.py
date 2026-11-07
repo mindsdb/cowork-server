@@ -53,7 +53,7 @@ import hashlib
 import logging
 import re
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import httpx
 from anton.core.browser.config import BrowserConfig
@@ -62,12 +62,16 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.runtime_credential import get_browser_host, get_minds_credential
 from cowork.services.browser_contract import (
+    NOT_ENTITLED,
     ORGANIZATION_OFF,
     SCOPE_KEY_HEADER,
     SESSION_ID,
     BrowserDisabledReason,
     BrowserEntitlement,
 )
+
+if TYPE_CHECKING:
+    from cowork.common.settings.user_settings import UserSettings
 
 logger = logging.getLogger(__name__)
 
@@ -417,6 +421,8 @@ async def browser_entitlement(*, bearer: str, org_id: str, user_id: str) -> Brow
     if not bearer:
         raise BrowserServiceError(401, "unauthorized", "Sign in to MindsHub to use the browser.")
     permissions = await fetch_mindshub_permissions(bearer_token=bearer, org_id=org_id, user_id=user_id)
+    if permissions.signed_out:
+        raise BrowserServiceError(401, "unauthorized", "Sign in to MindsHub again to use the browser.")
     if not permissions.reachable or permissions.browser is None:
         raise MindsHubUnreachable("Couldn't reach MindsHub to confirm your browser access. Try again in a moment.")
     return permissions.browser
@@ -450,12 +456,19 @@ async def desktop_organization_off() -> bool:
             extra={"event": "desktop_browser_switch_unread", "error_type": type(exc).__name__},
         )
         return _desktop_organization_off
-    if permissions.reachable and permissions.browser is not None:
-        _desktop_organization_off = permissions.browser.disabled_reason == BrowserDisabledReason.ORGANIZATION_OFF
+    if not permissions.reachable or permissions.browser is None or permissions.signed_out:
+        # MindsHub couldn't say, or refused the credential itself: neither is
+        # the switch's answer.
+        logger.warning(
+            "could not read the desktop's organization browser switch; the last answer stands",
+            extra={"event": "desktop_browser_switch_unread", "signed_out": permissions.signed_out},
+        )
+        return _desktop_organization_off
+    _desktop_organization_off = permissions.browser.disabled_reason == BrowserDisabledReason.ORGANIZATION_OFF
     return _desktop_organization_off
 
 
-async def browse_status(user_settings: Any, *, bearer: str, org_id: str, user_id: str) -> BrowseStatus:
+async def browse_status(user_settings: UserSettings, *, bearer: str, org_id: str, user_id: str) -> BrowseStatus:
     """``GET /browse/status`` for the caller.
 
     The desktop answers from the browser the app registered, and a signed-in
@@ -466,7 +479,7 @@ async def browse_status(user_settings: Any, *, bearer: str, org_id: str, user_id
     MindsHub before the router is asked. Otherwise the router says how the
     caller's browser is.
     """
-    enabled = bool(getattr(user_settings, "browser_enabled", False))
+    enabled = user_settings.browser_enabled
     if not on_web():
         if get_browser_host() is None:
             return BrowseStatus(enabled=enabled, available=False, status="unavailable")
@@ -479,7 +492,7 @@ async def browse_status(user_settings: Any, *, bearer: str, org_id: str, user_id
     if entitlement.disabled_reason == BrowserDisabledReason.ORGANIZATION_OFF:
         return BrowseStatus(enabled=enabled, available=False, status=ORGANIZATION_OFF)
     if not entitlement.enabled:
-        return BrowseStatus(enabled=enabled, available=False, status="not_entitled")
+        return BrowseStatus(enabled=enabled, available=False, status=NOT_ENTITLED)
     return BrowseStatus(enabled=enabled, available=True, status=(await router_status(bearer)).status)
 
 
@@ -487,7 +500,7 @@ async def browse_status(user_settings: Any, *, bearer: str, org_id: str, user_id
 
 
 def turn_block(
-    user_settings: Any, *, user_id: str | None, conversation_id: str, project_id: Any,
+    user_settings: UserSettings, *, user_id: str | None, conversation_id: str, project_id: Any,
 ) -> BrowserConfig | None:
     """A web turn's browser: the router, the task's own session, and the
     project's saved-tabs key. No credential: anton reaches the router with the
@@ -500,7 +513,7 @@ def turn_block(
     browser holds one person's sign-ins.
     """
     router = router_url()
-    if not router or not user_id or not getattr(user_settings, "browser_enabled", False):
+    if not router or not user_id or not user_settings.browser_enabled:
         return None
     return BrowserConfig(
         base_url=router,

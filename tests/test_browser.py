@@ -942,3 +942,63 @@ def test_the_cloud_turns_browser_line_becomes_the_event():
         line = dict(example.body)
         step = {"step": line.pop("kind"), **line}
         assert step_stream_events(step) == [StreamBrowserSession(session_id=example.body["session_id"])]
+
+
+def test_a_mindshub_401_asks_the_person_to_sign_in_again(web_client, router, mindshub):
+    """A credential MindsHub refused says nothing about the browser."""
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    mindshub.replies["jwt-alice"] = MindsHubReply(MindsHubAnswer.REFUSED, status_code=401)
+    status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
+    assert _detail(status) == (401, "unauthorized")
+    assert router.calls == []
+
+
+def test_auths_outage_answer_is_kept_only_as_long_as_a_failure(mindshub):
+    """auth answers no permissions and no browser block when it can't read
+    membership. Kept the good answer's 60 s, /browse/status would stay 503
+    for a minute after auth recovers."""
+    from cowork.services import mindshub_teams
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    mindshub.replies["jwt-alice"] = MindsHubReply(MindsHubAnswer.OK, payload={"permissions": [], "browser": None})
+    first = asyncio.run(mindshub_teams.fetch_mindshub_permissions(bearer_token="jwt-alice", org_id="o", user_id="u"))
+    assert first.is_outage_answer()
+    key = mindshub_teams.CallerCacheKey.for_caller(org_id="o", user_id="u", bearer_token="jwt-alice")
+    cache = mindshub_teams._permissions_cache
+    entry = cache._entries[key]
+    assert entry.fresh_until - entry.stored_at == pytest.approx(cache.ttl_fail_s)
+
+
+def test_a_desktop_keeps_its_switch_answer_when_mindshub_refuses_the_credential(client, signed_in_desktop, monkeypatch):
+    from cowork.services import mindshub_teams
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    replies = signed_in_desktop.replies
+    replies["desktop-jwt"] = MindsHubReply(MindsHubAnswer.OK, payload=_entitlements(False, reason="organization_off"))
+    assert asyncio.run(svc.desktop_organization_off()) is True
+    mindshub_teams.reset_caches_for_tests()
+    logged = []
+    monkeypatch.setattr(svc.logger, "warning", lambda msg, *a, **kw: logged.append(kw.get("extra", {}).get("event")))
+    replies["desktop-jwt"] = MindsHubReply(MindsHubAnswer.REFUSED, status_code=401)
+    assert asyncio.run(svc.desktop_organization_off()) is True
+    replies["desktop-jwt"] = MindsHubReply(MindsHubAnswer.UNREACHABLE)
+    mindshub_teams.reset_caches_for_tests()
+    assert asyncio.run(svc.desktop_organization_off()) is True
+    assert logged == ["desktop_browser_switch_unread", "desktop_browser_switch_unread"]
+
+
+def test_handing_over_the_desktop_browser_reads_the_organizations_switch(signed_in_desktop):
+    from fastapi.testclient import TestClient
+
+    from cowork.server import create_app
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    signed_in_desktop.replies["desktop-jwt"] = MindsHubReply(
+        MindsHubAnswer.OK, payload=_entitlements(False, reason="organization_off"),
+    )
+    # The app hands its browser over from the same machine.
+    loopback = TestClient(create_app(), client=("127.0.0.1", 40000))
+    answer = loopback.put("/api/v1/runtime-credential/browser", json={"url": APP_BROWSER.url, "token": APP_BROWSER.token.get_secret_value()})
+    assert answer.status_code == 200
+    assert svc._desktop_organization_off is True

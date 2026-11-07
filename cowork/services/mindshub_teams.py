@@ -104,12 +104,21 @@ class MindsHubPermissions(BaseModel):
     permissions: frozenset[str] = frozenset()
     reachable: bool = False
     browser: BrowserEntitlement | None = None
+    #: MindsHub refused the credential itself (401): the caller signs in again,
+    #: which says nothing about their browser access.
+    signed_out: bool = False
+
+    def is_outage_answer(self) -> bool:
+        """Auth's own answer when it couldn't read membership: no permissions
+        and no browser block. Kept only as long as a failure."""
+        return self.reachable and self.browser is None and not self.permissions
 
 
-def _refused_permissions() -> MindsHubPermissions:
+def _refused_permissions(status_code: int | None) -> MindsHubPermissions:
     """What a refused entitlements read grants: nothing, the browser included."""
     return MindsHubPermissions(
         reachable=True, browser=BrowserEntitlement.for_caller(permitted=False, daily_bytes=0),
+        signed_out=status_code == 401,
     )
 
 
@@ -170,20 +179,22 @@ async def _cached_read(
     user_id: str,
     parse: Callable[[Any], _Read],
     unknown: Callable[[], _Read],
-    none_granted: Callable[[], _Read],
+    none_granted: Callable[[int | None], _Read],
+    failed: Callable[[_Read], bool] = lambda _value: False,
 ) -> _Read:
     """``path`` read for this caller through ``cache``, by how MindsHub
     answered (the module docstring). ``parse`` reads an answer; ``unknown``
-    is what couldn't be asked; ``none_granted`` is MindsHub's refusal, kept
-    only the short TTL, since a credential that expired a moment ago is
-    refused too."""
+    is what couldn't be asked; ``none_granted`` is MindsHub's refusal, given
+    its status, and kept only the short TTL, since a credential that expired
+    a moment ago is refused too; ``failed`` says which parsed answers report
+    a failure, kept as briefly."""
     key = CallerCacheKey.for_caller(org_id=org_id, user_id=user_id, bearer_token=bearer_token)
     fresh = cache.fresh(key)
     if fresh is not None:
         return fresh
     reply = await get_mindshub_reply(path, bearer_token)
     if reply.answer is not MindsHubAnswer.THROTTLED:
-        return _cache_answer(cache, key, reply, parse=parse, unknown=unknown, none_granted=none_granted)
+        return _cache_answer(cache, key, reply, parse=parse, unknown=unknown, none_granted=none_granted, failed=failed)
     last_known = cache.answered_within(key, max_age_s=_MAX_THROTTLED_AGE_S)
     _log_throttled(
         path,
@@ -221,14 +232,17 @@ def _cache_answer(
     *,
     parse: Callable[[Any], _Read],
     unknown: Callable[[], _Read],
-    none_granted: Callable[[], _Read],
+    none_granted: Callable[[int | None], _Read],
+    failed: Callable[[_Read], bool] = lambda _value: False,
 ) -> _Read:
     """What ``reply``, any answer but a throttle, says for the caller,
-    cached under ``key``: a refusal for the short TTL only."""
+    cached under ``key``: a refusal, or an answer that reports a failure,
+    for the short TTL only."""
     if reply.answer is MindsHubAnswer.REFUSED:
-        value, ttl_s = none_granted(), cache.ttl_fail_s
+        value, ttl_s = none_granted(reply.status_code), cache.ttl_fail_s
     elif reply.answer is MindsHubAnswer.OK:
-        value, ttl_s = parse(reply.payload), None
+        value = parse(reply.payload)
+        ttl_s = cache.ttl_fail_s if failed(value) else None
     else:
         value, ttl_s = unknown(), None
     cache.put(key, value, ttl_s=ttl_s)
@@ -242,7 +256,7 @@ async def fetch_mindshub_teams(*, bearer_token: str, org_id: str, user_id: str) 
     return await _cached_read(
         _teams_cache, path=TEAMS_PATH, bearer_token=bearer_token, org_id=org_id, user_id=user_id,
         parse=_parse_teams, unknown=MindsHubTeamListing,
-        none_granted=lambda: MindsHubTeamListing(reachable=True),
+        none_granted=lambda _status: MindsHubTeamListing(reachable=True),
     )
 
 
@@ -262,7 +276,7 @@ async def read_mindshub_teams_now(*, bearer_token: str, org_id: str, user_id: st
     key = CallerCacheKey.for_caller(org_id=org_id, user_id=user_id, bearer_token=bearer_token)
     return _cache_answer(
         _teams_cache, key, reply, parse=_parse_teams, unknown=MindsHubTeamListing,
-        none_granted=lambda: MindsHubTeamListing(reachable=True),
+        none_granted=lambda _status: MindsHubTeamListing(reachable=True),
     )
 
 
@@ -273,7 +287,7 @@ async def fetch_mindshub_permissions(*, bearer_token: str, org_id: str, user_id:
     return await _cached_read(
         _permissions_cache, path=ENTITLEMENTS_PATH, bearer_token=bearer_token, org_id=org_id,
         user_id=user_id, parse=_parse_permissions, unknown=MindsHubPermissions,
-        none_granted=_refused_permissions,
+        none_granted=_refused_permissions, failed=MindsHubPermissions.is_outage_answer,
     )
 
 

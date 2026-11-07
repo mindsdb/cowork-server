@@ -57,6 +57,17 @@ from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
 logger = logging.getLogger(__name__)
 
 
+class BrowserSessionOpened(BaseModel):
+    """The ``response.browser_session_opened`` event's body: the session id
+    only, never a viewer link (a stored event opens nothing)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["response.browser_session_opened"] = "response.browser_session_opened"
+    sequence_number: int
+    session_id: str
+
+
 @dataclass
 class ArtifactCreated:
     """Synthetic post-turn event: an artifact folder appeared during the
@@ -1193,11 +1204,9 @@ async def format_responses_stream(
             # web, whoever opens the pane mints their own link with their own
             # credential (POST /browse/embed), so a stored event opens nothing.
             seq += 1
-            yield _event("response.browser_session_opened", {
-                "type": "response.browser_session_opened",
-                "sequence_number": seq,
-                "session_id": event.session_id,
-            })
+            yield _event("response.browser_session_opened", BrowserSessionOpened(
+                sequence_number=seq, session_id=event.session_id,
+            ).model_dump())
 
         elif isinstance(event, ArtifactCreated):
             seq += 1

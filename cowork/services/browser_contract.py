@@ -34,12 +34,6 @@ NOT_ENTITLED = "not_entitled"
 #: turned the browser off: MindsHub's ``disabled_reason`` of the same name.
 ORGANIZATION_OFF = "organization_off"
 
-#: The code the browser router answers with HTTP 429 on the agent's
-#: ``POST /sessions`` once a person's browser has carried their ``daily_bytes``
-#: today. No ``/browse`` route reaches that route; ``/browse/*`` would pass a
-#: 429 on unchanged.
-DAILY_LIMIT = "daily_limit"
-
 #: The header that carries ``scope_key`` on the router's ``_scope``, beside the
 #: turn key: the router scopes a turn key only for a caller holding it, and
 #: only this server does.

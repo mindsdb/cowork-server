@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from cowork.turnqueue.redis_client import cancel_flag_key
+
 from cowork.handlers import turn_errors as te
 from cowork.turnqueue import producer as prod
 
@@ -1810,6 +1812,36 @@ async def test_a_refused_scope_queues_the_turn_without_a_browser(browser_router)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("refusal", "event", "level"), [
+    (("scope_key_invalid", 403), "browser_scope_failed", "warning"),
+    (("not_entitled", 403), "browser_scope_not_entitled", "info"),
+])
+async def test_a_refused_scope_logs_a_failure_or_a_policy_refusal_apart(browser_router, monkeypatch, refusal, event, level):
+    """An organization that switched the browser off is refused on every one
+    of its members' turns: expected, so it isn't logged as a failure."""
+    from cowork.services import browser
+
+    code, status = refusal
+    browser_router.refuse = browser.BrowserServiceError(status, code, "refused")
+    logged: list[tuple[str, dict]] = []
+    for name in ("info", "warning"):
+        monkeypatch.setattr(prod.logger, name, lambda msg, *a, _n=name, **kw: logged.append((_n, kw.get("extra", {}))))
+    await _web_turn()
+    scope_lines = [(lvl, extra) for lvl, extra in logged if str(extra.get("event", "")).startswith("browser_scope")]
+    assert [(lvl, extra["event"]) for lvl, extra in scope_lines] == [(level, event)]
+    assert isinstance(scope_lines[0][1]["elapsed_ms"], int)
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_scope_error_still_queues_the_turn_without_a_browser(browser_router):
+    """A turn must not fail over the browser, whatever the scope raises."""
+    browser_router.refuse = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    await _web_turn()
+    params = json.loads(browser_router.fake.added[0][1]["payload"])["params"]
+    assert "browser" not in params
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["no person", "browser off"])
 async def test_a_turn_without_a_browser_scopes_its_key_to_nothing(browser_router, case):
     """A channel turn has no person behind it, and a person can turn the
@@ -1901,6 +1933,57 @@ async def test_a_turn_left_before_it_ends_keeps_its_key(monkeypatch, revokes):
         if kind == "turn_delta":
             break
     await gen.aclose()
+    assert revokes == []
+
+
+class _ReadingRedis(FakeRedis):
+    """A Redis whose reply stream waits once its replies run out, as a turn
+    still running does, and that holds the cancel flags a Stop writes."""
+
+    def __init__(self, replies):
+        super().__init__(replies)
+        self.flags: set[str] = set()
+        self.waiting = asyncio.Event()
+
+    async def exists(self, *keys):
+        return sum(key in self.flags for key in keys)
+
+    async def xread(self, streams, count=None, block=None):
+        if self._replies:
+            return await super().xread(streams, count=count, block=block)
+        self.waiting.set()
+        await asyncio.Event().wait()
+
+
+async def _cancel_mid_turn(monkeypatch, *, stopped: bool) -> None:
+    fake = _ReadingRedis([("scratchpad:reply:conv-1", _reply("turn_delta", {"text": "hi"}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    task = asyncio.create_task(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        llm={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
+    )))
+    await fake.waiting.wait()
+    if stopped:
+        # The cancel route writes the flag, then cancels the run.
+        fake.flags.add(cancel_flag_key("r"))
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_a_stop_revokes_the_turn_key(monkeypatch, revokes):
+    """A Stop ends the turn before any reply says so, and the key goes with it."""
+    await _cancel_mid_turn(monkeypatch, stopped=True)
+    assert revokes == ["r"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_with_no_stop_keeps_the_turn_key(monkeypatch, revokes):
+    """A relay cancelled for another reason (a replica shutting down) leaves
+    the turn running on the worker, so its key keeps working."""
+    await _cancel_mid_turn(monkeypatch, stopped=False)
     assert revokes == []
 
 
