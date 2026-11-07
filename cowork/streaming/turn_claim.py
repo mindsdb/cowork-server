@@ -256,6 +256,12 @@ async def read_claim(*, conversation_id: str, client=None) -> TurnClaim | None:
     return _parse(await r.get(claim_key(conversation_id)))
 
 
+def read_claim_sync(*, conversation_id: str) -> TurnClaim | None:
+    """Blocking ``read_claim``, for conversation delete, which runs in a
+    threadpool thread with no event loop. Unbounded; the caller bounds it."""
+    return _parse(get_sync_redis().get(claim_key(conversation_id)))
+
+
 async def acquire(*, claim: TurnClaim, conversation_id: str) -> AcquireResult:
     """Take the conversation's claim for ``claim`` unless another run holds it
     or the start is stale.

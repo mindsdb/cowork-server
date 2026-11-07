@@ -19,6 +19,12 @@ failover without failing the call in flight:
 - The deadline lives in a context variable (``redis_deadline``). redis-py runs
   retry loops inside a command's own loop (a reconnect, a health-check PING),
   and those spend what is left of the call's budget instead of a new one.
+- No connect, write or read waits past the deadline: each runs with the
+  connection's timeout cut to the time left, never below ``ATTEMPT_FLOOR_S``.
+  So a call ends at most a few ``ATTEMPT_FLOOR_S`` past its deadline, one for
+  each wait of its last attempt, and a group of calls under one
+  ``redis_deadline`` ends with it: a call that starts after that deadline has
+  passed raises TimeoutError at once, with no socket operation.
 - Taking a connection from the pool retries the whole connect, its handshake
   (AUTH, SELECT) included, so a connection the server closes mid-handshake is
   replaced instead of failing the call.
@@ -32,7 +38,6 @@ failover without failing the call in flight:
 - Blocking reads use ``REDIS_BLOCK_MS``, below ``SOCKET_TIMEOUT_S``, so a block
   never reads as a dead socket. ``xread_blocking`` reads the ``-UNBLOCKED``
   reply a demoted primary sends its blocked readers as an empty read.
-- ``last_redis_failure_at`` says when this process last saw a Redis error.
 """
 from __future__ import annotations
 
@@ -80,6 +85,10 @@ HEALTH_CHECK_INTERVAL_S = 15
 ASYNC_CALL_BUDGET_S = 30.0
 #: The same for the blocking client, whose callers each hold a threadpool thread.
 SYNC_CALL_BUDGET_S = 10.0
+#: The shortest wait a connect, write or read gets once its call's deadline is
+#: near or past, so the attempt a retry makes at the deadline still reaches a
+#: Redis that answers at once.
+ATTEMPT_FLOOR_S = 0.05
 
 #: The errors a call retries. OSError is the refused or timed-out connect, which
 #: redis-py's connect loop sees raw before it wraps it in a ConnectionError.
@@ -93,7 +102,6 @@ _sync_client: syncredis.Redis | None = None
 _deadline: ContextVar[float | None] = ContextVar("cowork_redis_deadline", default=None)
 _send_once: ContextVar[bool] = ContextVar("cowork_redis_send_once", default=False)
 _sync_connections_opened: ContextVar[int] = ContextVar("cowork_redis_sync_connections_opened", default=0)
-_last_failure_at: float | None = None
 
 
 def _url() -> str:
@@ -111,9 +119,13 @@ def cancel_flag_key(correlation_id: str) -> str:
     return f"cowork:cancel:{correlation_id}"
 
 
-# The one cancel reason that changes what a turn saves: the UI cancelled it
-# after hearing nothing for its idle window, so it saves as a stall, not a Stop.
+# The cancel reasons that change what a turn saves. The UI canceled it after
+# hearing nothing for its idle window, so it saves as a stall, not a Stop.
 STALLED_CANCEL_REASON = "stalled"
+# Its conversation was deleted on a replica that does not run it
+# (registry.discard_conversation), so it saves nothing, as a turn a local
+# delete stops does.
+DISCARDED_CANCEL_REASON = "discarded"
 
 
 def cancel_cause_key(correlation_id: str) -> str:
@@ -186,24 +198,66 @@ def send_once() -> Iterator[None]:
         _send_once.reset(token)
 
 
-def last_redis_failure_at() -> float | None:
-    """``time.monotonic()`` when this process last saw a Redis call fail, or None.
-
-    Set by every error a retry loop catches, whether it retried or raised, and
-    by an ``-UNBLOCKED`` read. Something that would infer a lost turn from a
-    missing key can hold off while this is recent.
-    """
-    return _last_failure_at
-
-
 def sync_connections_opened() -> int:
     """How many connections the blocking client opened for calls in this context."""
     return _sync_connections_opened.get()
 
 
-def _note_failure() -> None:
-    global _last_failure_at
-    _last_failure_at = time.monotonic()
+def _refuse_a_passed_deadline() -> None:
+    """Raise TimeoutError, before any socket operation, when the deadline in
+    force has passed.
+
+    Run where a call starts, before it opens its own deadline, and where a
+    connection is taken from a pool. So once a group's ``redis_deadline`` has
+    passed, as a project delete's can while Redis hangs, each of its later
+    calls fails at once instead of waiting out a connect or a read. Inside a
+    call, the attempts it has started run on, each cut to the time left.
+    """
+    deadline = _deadline.get()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RedisTimeoutError("the Redis deadline passed before this call started")
+
+
+def _within_deadline(timeout_s: float | None) -> float | None:
+    """``timeout_s`` cut to the time left before the enclosing deadline, and
+    never below ATTEMPT_FLOOR_S. ``timeout_s`` itself outside any deadline."""
+    deadline = _deadline.get()
+    if deadline is None:
+        return timeout_s
+    left = max(deadline - time.monotonic(), ATTEMPT_FLOOR_S)
+    return left if timeout_s is None else min(timeout_s, left)
+
+
+@contextmanager
+def _timeout_cut_to_deadline(connection: Any, attribute: str) -> Iterator[None]:
+    """Run the block with ``connection``'s timeout ``attribute``
+    (``socket_timeout`` or ``socket_connect_timeout``) cut to the time left
+    before the deadline, then put the configured value back."""
+    configured = getattr(connection, attribute)
+    setattr(connection, attribute, _within_deadline(configured))
+    try:
+        yield
+    finally:
+        setattr(connection, attribute, configured)
+
+
+@contextmanager
+def _socket_cut_to_deadline(connection: syncredis.Connection) -> Iterator[None]:
+    """``_timeout_cut_to_deadline`` for a blocking connection's ``socket_timeout``.
+
+    A blocking socket keeps the timeout it was given when it connected, so the
+    cut value is set on the socket too, and the configured one again after.
+    """
+    configured = connection.socket_timeout
+    connection.socket_timeout = _within_deadline(configured)
+    if connection._sock is not None:
+        connection._sock.settimeout(connection.socket_timeout)
+    try:
+        yield
+    finally:
+        connection.socket_timeout = configured
+        if connection._sock is not None:
+            connection._sock.settimeout(configured)
 
 
 def _backoff() -> ExponentialWithJitterBackoff:
@@ -244,7 +298,6 @@ class _AsyncDeadlineRetry(AsyncRetry):
                 try:
                     return await do()
                 except self._supported_errors as error:
-                    _note_failure()
                     if isinstance(error, NEVER_RETRIED_ERRORS):
                         raise
                     failures += 1
@@ -252,7 +305,8 @@ class _AsyncDeadlineRetry(AsyncRetry):
                     left = deadline - time.monotonic()
                     if left <= 0:
                         raise error
-                    # Capped at what is left, so the last attempt runs at the deadline.
+                    # Capped at what is left, so the last attempt runs at the deadline,
+                    # with each of its waits cut to ATTEMPT_FLOOR_S.
                     await asyncio.sleep(min(self._backoff.compute(failures), left))
 
 
@@ -271,7 +325,6 @@ class _SyncDeadlineRetry(SyncRetry):
                 try:
                     return do()
                 except self._supported_errors as error:
-                    _note_failure()
                     if isinstance(error, NEVER_RETRIED_ERRORS):
                         raise
                     failures += 1
@@ -282,9 +335,88 @@ class _SyncDeadlineRetry(SyncRetry):
                     time.sleep(min(self._backoff.compute(failures), left))
 
 
+class _AsyncWithinDeadline:
+    """Mixin for an async connection class: no connect, write or read waits
+    past the call's deadline.
+
+    redis-py reads the connection's ``socket_connect_timeout`` and
+    ``socket_timeout`` as each one starts, so each runs with the timeout cut
+    to the time left (``_within_deadline``). A read's own ``timeout=``
+    argument would not do: on a timeout that read returns None, which reads
+    as a nil reply.
+    """
+
+    async def _connect(self):
+        with _timeout_cut_to_deadline(self, "socket_connect_timeout"):
+            await super()._connect()
+
+    async def send_packed_command(self, command, check_health=True):
+        with _timeout_cut_to_deadline(self, "socket_timeout"):
+            await super().send_packed_command(command, check_health)
+
+    async def read_response(self, *args, **kwargs):
+        with _timeout_cut_to_deadline(self, "socket_timeout"):
+            return await super().read_response(*args, **kwargs)
+
+
+class _SyncWithinDeadline:
+    """The blocking client's ``_AsyncWithinDeadline``."""
+
+    def _connect(self):
+        with _timeout_cut_to_deadline(self, "socket_connect_timeout"):
+            return super()._connect()
+
+    def send_packed_command(self, command, check_health=True):
+        with _socket_cut_to_deadline(self):
+            super().send_packed_command(command, check_health)
+
+    def read_response(self, *args, **kwargs):
+        with _socket_cut_to_deadline(self):
+            return super().read_response(*args, **kwargs)
+
+
+# One for each connection class a URL can name (redis://, rediss://, unix://).
+class _AsyncTCPConnection(_AsyncWithinDeadline, aioredis.Connection):
+    pass
+
+
+class _AsyncSSLConnection(_AsyncWithinDeadline, aioredis.SSLConnection):
+    pass
+
+
+class _AsyncUnixConnection(_AsyncWithinDeadline, aioredis.UnixDomainSocketConnection):
+    pass
+
+
+class _SyncTCPConnection(_SyncWithinDeadline, syncredis.Connection):
+    pass
+
+
+class _SyncSSLConnection(_SyncWithinDeadline, syncredis.SSLConnection):
+    pass
+
+
+class _SyncUnixConnection(_SyncWithinDeadline, syncredis.UnixDomainSocketConnection):
+    pass
+
+
+#: The connection class each pool uses for the one its URL names.
+_ASYNC_CONNECTION_CLASSES: dict[type, type] = {
+    aioredis.Connection: _AsyncTCPConnection,
+    aioredis.SSLConnection: _AsyncSSLConnection,
+    aioredis.UnixDomainSocketConnection: _AsyncUnixConnection,
+}
+_SYNC_CONNECTION_CLASSES: dict[type, type] = {
+    syncredis.Connection: _SyncTCPConnection,
+    syncredis.SSLConnection: _SyncSSLConnection,
+    syncredis.UnixDomainSocketConnection: _SyncUnixConnection,
+}
+
+
 class _AsyncPool(aioredis.ConnectionPool):
     """An async pool that connects outside its lock, retries a connect's handshake,
-    and holds its clients' call budget.
+    holds its clients' call budget, and makes connections that wait no longer
+    than a call's deadline (``_AsyncWithinDeadline``).
 
     redis-py 5's pool holds its lock while a new connection connects, retries
     included, so every caller that needs a connection, even one an idle pooled
@@ -298,12 +430,20 @@ class _AsyncPool(aioredis.ConnectionPool):
 
     def __init__(self, *, call_budget_s: float, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self.connection_class = _ASYNC_CONNECTION_CLASSES[self.connection_class]
         self.call_budget_s = call_budget_s
 
     async def get_connection(self, command_name=None, *keys, **options):
+        _refuse_a_passed_deadline()
         async with self._lock:
             connection = self.get_available_connection()
         try:
+            if connection.is_connected and connection._writer.is_closing():
+                # A peer reset (RST) closed this idle connection's transport,
+                # which redis-py 5's readiness check still reads as open, and
+                # the next write on it raises a TypeError no retry covers.
+                # Dropped here, the connect below opens a new one.
+                await connection.disconnect(nowait=True)
             await connection.retry.call_with_retry(
                 lambda: self.ensure_connection(connection), lambda _error: connection.disconnect(),
             )
@@ -314,8 +454,9 @@ class _AsyncPool(aioredis.ConnectionPool):
 
 
 class _SyncPool(syncredis.ConnectionPool):
-    """A blocking pool that retries a connect's handshake and counts, per
-    context, the connections it opens.
+    """A blocking pool that retries a connect's handshake, counts, per
+    context, the connections it opens, and makes connections that wait no
+    longer than a call's deadline (``_SyncWithinDeadline``).
 
     redis-py 5's blocking pool already connects outside its lock, and retries
     only a connect's TCP step, as the async pool does.
@@ -323,12 +464,14 @@ class _SyncPool(syncredis.ConnectionPool):
 
     def __init__(self, *, call_budget_s: float, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self.connection_class = _SYNC_CONNECTION_CLASSES[self.connection_class]
         self.call_budget_s = call_budget_s
 
     def get_connection(self, command_name=None, *keys, **options):
         # A failed take releases its connection to the pool, and a failed
         # handshake disconnects it, so the next attempt reconnects whichever
         # connection it takes.
+        _refuse_a_passed_deadline()
         take = super().get_connection
         retry: _SyncDeadlineRetry = self.connection_kwargs["retry"]
         return retry.call_with_retry(take, lambda _error: None)
@@ -354,22 +497,38 @@ class _AsyncPipeline(AsyncPipeline):
     pipeline watching, so the second reconnects outside the call's deadline
     and spends a whole budget of its own. A WATCH ends with the connection
     that sent it, so a closed connection has nothing to unwatch.
+
+    redis-py 5's reset also catches only a ConnectionError around that
+    UNWATCH. An UNWATCH whose reply times out, or that a caller's cancel cuts
+    short, left the pipeline watching and its connection out of the pool for
+    good, so this drops that connection back into the pool, closed.
     """
 
     connection_pool: _AsyncPool
 
     async def execute(self, raise_on_error: bool = True):
+        _refuse_a_passed_deadline()
         with redis_deadline(budget_s=self.connection_pool.call_budget_s):
             return await super().execute(raise_on_error)
 
     async def immediate_execute_command(self, *args, **options):
+        _refuse_a_passed_deadline()
         with redis_deadline(budget_s=self.connection_pool.call_budget_s):
             return await super().immediate_execute_command(*args, **options)
 
     async def reset(self):
         if self.watching and self.connection is not None and not self.connection.is_connected:
             self.watching = False
-        await super().reset()
+        try:
+            await super().reset()
+        except (RedisTimeoutError, asyncio.CancelledError):
+            connection, self.connection = self.connection, None
+            self.watching = False
+            self.explicit_transaction = False
+            if connection is not None:
+                await connection.disconnect(nowait=True)
+                await self.connection_pool.release(connection)
+            raise
 
     async def _disconnect_raise_reset(self, conn, error):
         await super()._disconnect_raise_reset(conn, error)
@@ -388,6 +547,7 @@ class _AsyncRedis(aioredis.Redis):
     connection_pool: _AsyncPool
 
     async def execute_command(self, *args, **options):
+        _refuse_a_passed_deadline()
         with redis_deadline(budget_s=self.connection_pool.call_budget_s):
             return await super().execute_command(*args, **options)
 
@@ -408,10 +568,12 @@ class _SyncPipeline(SyncPipeline):
     connection_pool: _SyncPool
 
     def execute(self, raise_on_error: bool = True):
+        _refuse_a_passed_deadline()
         with redis_deadline(budget_s=self.connection_pool.call_budget_s):
             return super().execute(raise_on_error)
 
     def immediate_execute_command(self, *args, **options):
+        _refuse_a_passed_deadline()
         with redis_deadline(budget_s=self.connection_pool.call_budget_s):
             return super().immediate_execute_command(*args, **options)
 
@@ -419,7 +581,17 @@ class _SyncPipeline(SyncPipeline):
         # redis-py's blocking connection marks a closed connection by its socket.
         if self.watching and self.connection is not None and self.connection._sock is None:
             self.watching = False
-        super().reset()
+        try:
+            super().reset()
+        except RedisTimeoutError:
+            # As _AsyncPipeline.reset: an UNWATCH whose reply timed out.
+            connection, self.connection = self.connection, None
+            self.watching = False
+            self.explicit_transaction = False
+            if connection is not None:
+                connection.disconnect()
+                self.connection_pool.release(connection)
+            raise
 
 
 class _SyncRedis(syncredis.Redis):
@@ -429,6 +601,7 @@ class _SyncRedis(syncredis.Redis):
     connection_pool: _SyncPool
 
     def execute_command(self, *args, **options):
+        _refuse_a_passed_deadline()
         with redis_deadline(budget_s=self.connection_pool.call_budget_s):
             return super().execute_command(*args, **options)
 
@@ -478,7 +651,6 @@ async def xread_blocking(
     except ResponseError as error:
         if not str(error).startswith("UNBLOCKED"):
             raise
-        _note_failure()
         return []
 
 

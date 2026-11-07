@@ -30,10 +30,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
-      # The versions hosted runs: Redis 8.2.3 (Bitnami's image in staging and
-      # prod) and PostgreSQL 16.13 (RDS in newdev and newprod).
+      # The versions hosted runs: Redis 8.10.2 (one image in staging and prod)
+      # and PostgreSQL 16.13 (RDS in newdev and newprod). The Redis tests log
+      # the version they reached (tests/integration/prereq.py).
       redis:
-        image: redis:8.2.3-alpine@sha256:08ad0b1d280850169a790dba1393ff7a90aef951fc19632cf4d3ce4f78e679ba
+        image: redis:8.10.2-alpine@sha256:9f8d2d789b9a1d1e3f283f979aa9cbf393373806472e1ccd460e2f9c869b833b
         ports:
           - 6379:6379
         options: >-

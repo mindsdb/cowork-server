@@ -187,7 +187,7 @@ def test_a_redis_backend_conversation_delete_spends_one_deadline_on_all_its_redi
         monkeypatch.setattr(module, "get_sync_redis", lambda: client)
     delete_budget_s = 0.5
     monkeypatch.setattr(registry_mod, "SYNC_CALL_BUDGET_S", delete_budget_s)
-    claim = turn_claim.new_claim(run_id="run-c12", turn_id=1, correlation_id=None, question_id=None)
+    claim = turn_claim.new_claim(run_id="run-c12", turn_id=1, correlation_id=None)
 
     class _OneTurn:
         def get(self, _conversation_id):

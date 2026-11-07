@@ -1334,7 +1334,8 @@ class ProjectService:
         # On the Redis stream backend each conversation's stream cleanup calls
         # Redis (streaming.discard_conversation). One deadline for them all
         # holds the delete for one call budget while Redis does not answer,
-        # not one per conversation. Once it passes, each call is tried once.
+        # not one per conversation. Once it passes, each later call fails at
+        # once without reaching Redis (redis_client._refuse_a_passed_deadline).
         with redis_deadline(budget_s=SYNC_CALL_BUDGET_S):
             for conversation_stage in conversation_stages:
                 conv_svc.finalize_staged_conversation_delete(

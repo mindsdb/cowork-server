@@ -30,9 +30,9 @@ from uuid import UUID, uuid4
 
 from cowork.common.logger import log_context
 from cowork.streaming import turn_claim
-from cowork.streaming.buffer import StreamBuffer
+from cowork.streaming.buffer import RedisStreamBuffer, StreamBuffer
 from cowork.streaming.turn_claim import TurnClaim, TurnClaimUnavailable
-from cowork.turnqueue.redis_client import SYNC_CALL_BUDGET_S, redis_deadline
+from cowork.turnqueue.redis_client import DISCARDED_CANCEL_REASON, SYNC_CALL_BUDGET_S, redis_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,11 @@ class TurnLifecycle:
     thread (the delete endpoint is a sync ``def``); a plain attribute write is
     safe there, unlike ``Task.cancel()``.
 
+    ``discarded_elsewhere`` means the delete ran on another replica, which
+    reached this turn only through its cancel flag (``note_discarded_elsewhere``).
+    That delete removed the turn's stream before this turn heard of it, so
+    the turn deletes its stream again before it releases its claim.
+
     ``shutting_down`` means "the server is exiting, not the user's own Stop".
     Set BEFORE the cancel, same ordering as ``discarded``: a producer's
     ``CancelledError`` handler checks it to persist an interrupted turn.
@@ -170,6 +175,7 @@ class TurnLifecycle:
     """
 
     discarded: bool = False
+    discarded_elsewhere: bool = False
     shutting_down: bool = False
     shutdown_frame_deadline: float | None = None
     # Watchdog expiry is an interruption, separate from deliberate user Stop.
@@ -179,6 +185,13 @@ class TurnLifecycle:
     stalled: bool = False
     cancel_requested: bool = False
     identity: RunIdentity = field(default_factory=RunIdentity)
+
+    def note_discarded_elsewhere(self) -> None:
+        """Mark the turn discarded by a delete another replica served: a
+        cancel whose cause is ``discarded``. Set before the cancel lands, as
+        ``discarded`` is."""
+        self.discarded = True
+        self.discarded_elsewhere = True
 
 
 @dataclass
@@ -490,6 +503,28 @@ async def _end_claim(*, conversation_id: str, claim: TurnClaim, lifecycle: TurnL
     await turn_claim.release_quietly(conversation_id=conversation_id, run_id=claim.run_id)
 
 
+async def _remove_stream_deleted_elsewhere(buffer: StreamBuffer, *, conversation_id: str) -> None:
+    """Delete the stream of a turn whose conversation another replica deleted.
+
+    That delete removed the stream before this turn heard of it, so a record
+    the turn wrote in between recreated the stream with no terminal record,
+    and the next turn at this number would keep it. Run before the turn's
+    claim is released, which keeps every other run off the stream until then.
+    Bounded; a failure is logged, and the stream expires with its TTL.
+    """
+    if not isinstance(buffer, RedisStreamBuffer):
+        return
+    try:
+        async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
+            await buffer.remove()
+    except Exception:
+        logger.warning(
+            "Could not remove the stream of a turn whose conversation another replica deleted.",
+            exc_info=True,
+            extra={"event": "turn_buffers_remove_failed", **log_context(conversation_id=conversation_id)},
+        )
+
+
 async def _seal_interrupted(handle: RunHandle) -> None:
     """End the stream of a turn whose task ended at shutdown without a
     terminal record, as a producer cancelled before its first step does: the
@@ -790,6 +825,8 @@ class RunRegistry:
                     # The keeper ends before the release, so no renewal of
                     # its lands after it.
                     await asyncio.gather(*watchers, return_exceptions=True)
+                    if lifecycle.discarded_elsewhere:
+                        await _remove_stream_deleted_elsewhere(buffer, conversation_id=conversation_id)
                     if buffer.is_closed or lifecycle.discarded:
                         await _end_claim(conversation_id=conversation_id, claim=claim, lifecycle=lifecycle)
 
@@ -990,6 +1027,11 @@ def discard_conversation(conversation_id: str) -> None:
     which is precisely when a delete looks safe to the user — so the race is
     now normal, and `registry.discard` handles it by cancelling the producer
     and marking it discarded (see its docstring) before these files go away.
+
+    On the Redis backend the turn may run on another replica, which
+    `registry.discard` cannot reach. While the claim still names that run,
+    before the index entry is forgotten, this writes its cancel flag with the
+    `discarded` cause (_stop_the_turn_another_replica_runs).
     """
     from cowork.streaming.backend import get_backend, remove_conversation_buffers
     from cowork.streaming.turn_index import forget_turn_sync
@@ -1010,6 +1052,7 @@ def discard_conversation(conversation_id: str) -> None:
         # failure. Only the Redis backend reads the index, so the file
         # backend has nothing to forget and reaches no Redis here.
         if get_backend() == "redis":
+            _stop_the_turn_another_replica_runs(conversation_id=cid, handle=handle)
             forget_turn_sync(cid)
         try:
             remove_conversation_buffers(cid)
@@ -1023,6 +1066,37 @@ def discard_conversation(conversation_id: str) -> None:
             # Its stream is gone, so another replica would read the claim of
             # a finished turn as one whose first record has not landed yet.
             _release_claim_sync(conversation_id=cid, claim=handle.claim)
+
+
+def _stop_the_turn_another_replica_runs(*, conversation_id: str, handle: RunHandle | None) -> None:
+    """Write the cancel flag, with the ``discarded`` cause, of the run that
+    holds a deleted conversation's claim when this process does not run it.
+
+    That run reads the cause when the cancel reaches it, from its cancel
+    watch (cancellation.watch_cancel) or, for a remote turn, from the
+    controller's cancel reply. It then stops as a local delete stops a turn:
+    it saves nothing into the deleted history, writes no terminal record,
+    deletes the stream records it wrote after the delete, and releases its
+    claim, so the next send is admitted. Its sandbox turn stops
+    on the same flag. A failure is logged: that run then answers on, and every
+    replica refuses a send into the conversation until it ends.
+    """
+    from cowork.streaming.cancellation import request_cancel_sync
+
+    try:
+        holder = turn_claim.read_claim_sync(conversation_id=conversation_id)
+        if holder is None or holder.correlation_id is None:
+            return
+        if handle is not None and handle.claim is not None and handle.claim.run_id == holder.run_id:
+            return  # registry.discard stopped it
+        request_cancel_sync(holder.correlation_id, reason=DISCARDED_CANCEL_REASON)
+    except Exception:
+        logger.warning(
+            "Could not stop the turn another replica runs in a deleted conversation; "
+            "sends into it are refused until that turn ends.",
+            exc_info=True,
+            extra={"event": "turn_discard_cancel_failed", **log_context(conversation_id=conversation_id)},
+        )
 
 
 def _release_claim_sync(*, conversation_id: str, claim: TurnClaim) -> None:

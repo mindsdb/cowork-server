@@ -16,6 +16,7 @@ one Redis.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import threading
 import time
@@ -31,7 +32,7 @@ from cowork.streaming import backend as backend_mod
 from cowork.streaming.buffer import RedisStreamBuffer, stream_key
 from cowork.turnqueue import redis_client
 from cowork.turnqueue.redis_client import build_async_redis, build_sync_redis, send_once, xread_blocking
-from tests.integration.prereq import missing_prerequisite
+from tests.integration.prereq import missing_prerequisite, report_redis_version
 
 pytestmark = [pytest.mark.integration, pytest.mark.redis_service]
 
@@ -39,7 +40,7 @@ ACL_USER = "cowork-failover-test"
 
 
 @pytest.fixture
-async def redis_url(monkeypatch):
+async def redis_url(monkeypatch, pytestconfig):
     url = os.environ.get("COWORK_TEST_REDIS_URL")
     if not url:
         missing_prerequisite(
@@ -51,6 +52,7 @@ async def redis_url(monkeypatch):
         await admin.ping()
     except Exception:
         missing_prerequisite(f"no Redis reachable at {url}", required_by="COWORK_REQUIRE_SERVICES")
+    await report_redis_version(client=admin, config=pytestconfig)
     await admin.flushdb()
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
     monkeypatch.setenv("COWORK_TURN_REDIS_URL", url)
@@ -180,7 +182,6 @@ async def _blocked_client_id(*, admin, command: str, other_than: str | None = No
 
 async def test_a_call_whose_connection_is_killed_mid_call_is_retried_and_succeeds(redis_url, admin):
     client = build_async_redis(url=redis_url, call_budget_s=10)
-    failures_before = redis_client.last_redis_failure_at()
     read = asyncio.create_task(client.xread({"killed:s": "0-0"}, block=redis_client.REDIS_BLOCK_MS))
     killed = await _blocked_client_id(admin=admin, command="xread")
 
@@ -191,7 +192,6 @@ async def test_a_call_whose_connection_is_killed_mid_call_is_retried_and_succeed
 
     reply = await asyncio.wait_for(read, timeout=10)
     assert reply[0][1][0][1] == {"k": "v"}
-    assert redis_client.last_redis_failure_at() != failures_before
     await client.aclose()
 
 
@@ -273,7 +273,6 @@ async def test_a_connection_closed_during_its_handshake_is_retried(redis_url, pr
         url = _with_netloc(url=redis_url, host="127.0.0.1", port=proxy.port, credentials=credentials)
         await admin.set("handshake:key", "v")
         proxy.cut_marker = step
-        failed_after = time.monotonic()
         if client_kind == "async":
             client = build_async_redis(url=url, call_budget_s=5)
             value = await client.get("handshake:key")
@@ -289,7 +288,6 @@ async def test_a_connection_closed_during_its_handshake_is_retried(redis_url, pr
 
     assert value == "v"
     assert proxy.connections == 2
-    assert redis_client.last_redis_failure_at() >= failed_after
 
 
 @pytest.mark.parametrize("client_kind", ["async", "sync"])
@@ -356,8 +354,9 @@ async def test_an_append_resent_after_a_lost_reply_reaches_a_reader_once(redis_u
 
 
 async def test_a_write_sent_once_is_not_resent_after_a_lost_reply(proxy, admin):
-    """The job XADD and the answer RPUSH duplicate when resent. Without
-    send_once the client resends them, which the first case shows."""
+    """The job XADD duplicates when resent. Without send_once the client
+    resends it, which the first case shows. A transaction sent under
+    send_once is not resent either."""
     client = build_async_redis(url=proxy.url, call_budget_s=5)
 
     await client.ping()
@@ -375,10 +374,10 @@ async def test_a_write_sent_once_is_not_resent_after_a_lost_reply(proxy, admin):
     proxy.lose_next_reply = True
     with pytest.raises(RedisConnectionError), send_once():
         async with client.pipeline(transaction=True) as pipe:
-            pipe.rpush("once:answers", "answer")
-            pipe.expire("once:answers", 60)
+            pipe.rpush("once:transaction", "entry")
+            pipe.expire("once:transaction", 60)
             await pipe.execute()
-    assert await admin.llen("once:answers") == 1
+    assert await admin.llen("once:transaction") == 1
     await client.aclose()
 
 
@@ -400,17 +399,25 @@ async def test_a_reconnect_inside_a_retry_spends_what_is_left_of_the_calls_deadl
     await client.aclose()
 
 
-async def test_a_call_whose_connect_retried_spends_the_same_deadline_on_its_command(proxy):
+@pytest.mark.parametrize("client_kind", ["async", "sync"])
+async def test_a_call_whose_connect_retried_spends_the_same_deadline_on_its_command(proxy, client_kind):
     """Taking a connection from the pool retries its connect before the
     command's own retry loop starts. With a deadline per loop, a call that
-    connected late gets a new budget for its command."""
+    connected late gets a new budget for its command. The blocking client
+    opens the call's deadline around both (_SyncRedis.execute_command)."""
     budget_s = 2.0
-    client = build_async_redis(url=proxy.url, call_budget_s=budget_s)
     proxy.refuse()
     proxy.drop_marker = b"deadline:late"
+    if client_kind == "async":
+        client = build_async_redis(url=proxy.url, call_budget_s=budget_s)
+        call_coro = client.get("deadline:late")
+    else:
+        client = build_sync_redis(url=proxy.url, call_budget_s=budget_s)
+        # In a thread: the proxy runs on this event loop.
+        call_coro = asyncio.to_thread(client.get, "deadline:late")
 
     started = time.monotonic()
-    call = asyncio.create_task(client.get("deadline:late"))
+    call = asyncio.create_task(call_coro)
     await asyncio.sleep(0.8)
     await proxy.listen()
     with pytest.raises(RedisConnectionError):
@@ -418,7 +425,10 @@ async def test_a_call_whose_connect_retried_spends_the_same_deadline_on_its_comm
 
     assert proxy.connections == 1
     assert time.monotonic() - started < budget_s + 0.4
-    await client.aclose()
+    if client_kind == "async":
+        await client.aclose()
+    else:
+        client.close()
 
 
 @pytest.mark.parametrize("client_kind", ["async", "sync"])
@@ -473,6 +483,33 @@ async def test_a_pipeline_whose_connect_retried_spends_the_same_deadline_on_its_
         client.close()
 
 
+async def test_an_ack_wait_that_hears_no_verdict_ends_unconfirmed_not_on_a_redis_error(
+    redis_url, caplog, owned_logger,
+):
+    """The client cuts each read's wait to the time left before its deadline,
+    and the verdict wait's last read blocks until the wait ends. With its
+    deadline at the end of its BLOCK, that read timed out just as Redis
+    answered its empty read, and every unconfirmed answer logged a Redis
+    error."""
+    from cowork.turnqueue import answers
+
+    owned_logger(answers.logger.name, level=logging.WARNING)
+    client = build_async_redis(url=redis_url)
+
+    result = await answers.submit_remote_answer(
+        conversation_id="ack-quiet", correlation_id="corr-ack-quiet", question_id="ask:1",
+        payload={"values": ["pg"]}, r=client, ack_timeout_s=1.0,
+    )
+
+    assert result is answers.RemoteAnswerResult.ACCEPTED
+    warnings = [
+        record.msg for record in caplog.records
+        if record.name == answers.logger.name and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1 and warnings[0].startswith("ask_user answer not confirmed")
+    await client.aclose()
+
+
 async def test_a_turn_claim_whose_connection_drops_inside_its_watch_stops_at_its_bound(redis_url, proxy, monkeypatch):
     """The connection drops on the GET after the claim's WATCH, and Redis then
     refuses every connect, as when the primary's pod dies mid-transaction.
@@ -486,7 +523,7 @@ async def test_a_turn_claim_whose_connection_drops_inside_its_watch_stops_at_its
     monkeypatch.setenv("COWORK_TURN_REDIS_URL", proxy.url)
     redis_client.reset_redis()
     await redis_client.get_redis().ping()
-    claim = turn_claim.new_claim(run_id="drop-run", turn_id=1, correlation_id=None, question_id=None)
+    claim = turn_claim.new_claim(run_id="drop-run", turn_id=1, correlation_id=None)
     proxy.drop_marker = b"$3\r\nGET\r\n"
 
     started = time.monotonic()

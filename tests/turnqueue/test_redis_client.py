@@ -4,9 +4,16 @@ tests/integration/test_redis_failover.py drives the same clients against a real
 Redis: a dropped connection, a READONLY primary, a lost reply.
 """
 import asyncio
+import socket
+import struct
+import threading
 import time
+import tomllib
+from pathlib import Path
 
 import pytest
+import redis.asyncio as aioredis
+from packaging.requirements import Requirement
 from redis.exceptions import (
     AuthenticationError,
     AuthorizationError,
@@ -27,6 +34,21 @@ def test_get_redis_is_singleton(monkeypatch):
     a = get_redis()
     b = get_redis()
     assert a is b
+
+
+def test_the_redis_floor_admits_no_release_without_the_apis_the_client_uses():
+    """redis-py 5.0 to 5.2 lack ``redis.backoff.ExponentialWithJitterBackoff``,
+    which this module imports at load, and 5.0's async pool has no
+    ``get_available_connection``. pip keeps an installed redis that meets the
+    range, so a desktop on one of those could not start the server."""
+    pyproject = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text())
+    redis_requirement = next(
+        requirement for requirement in map(Requirement, pyproject["project"]["dependencies"])
+        if requirement.name == "redis"
+    )
+
+    assert not redis_requirement.specifier.contains("5.2.1")
+    assert redis_requirement.specifier.contains("5.3.1")
 
 
 def test_every_blocking_read_blocks_for_less_than_the_socket_timeout():
@@ -137,20 +159,6 @@ def test_a_retry_loop_inside_another_spends_the_outer_deadline_on_the_blocking_c
     assert time.monotonic() - started < 0.6 + 0.2
 
 
-@RETRY_CLASSES
-async def test_a_failure_records_when_it_happened(retry_class):
-    retry = retry_class(budget_s=0.2)
-    before = time.monotonic()
-
-    def do():
-        raise RedisConnectionError("gone")
-
-    with pytest.raises(RedisConnectionError):
-        await _call_with_retry(retry=retry, do=do)
-
-    assert redis_client.last_redis_failure_at() >= before
-
-
 @pytest.mark.parametrize(
     "error, resent",
     [
@@ -216,11 +224,9 @@ class _UnblockedOnce:
 
 async def test_an_unblocked_reply_reads_as_an_empty_read():
     client = _UnblockedOnce(message="UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)")
-    before = time.monotonic()
 
     assert await redis_client.xread_blocking(r=client, streams={"s": "0-0"}) == []
     assert await redis_client.xread_blocking(r=client, streams={"s": "0-0"}) == [["s", [["1-0", {"k": "v"}]]]]
-    assert redis_client.last_redis_failure_at() >= before
 
 
 async def test_any_other_error_reply_is_raised():
@@ -317,3 +323,225 @@ async def test_a_pipeline_whose_connection_is_open_still_unwatches_on_reset(monk
     assert sent == [("UNWATCH",)]
     assert pipe.watching is False
     assert pipe.connection is None
+
+
+@pytest.mark.parametrize(
+    "client_kind, ending",
+    [("async", "timeout"), ("async", "cancel"), ("sync", "timeout")],
+    ids=["async-timeout", "async-cancel", "sync-timeout"],
+)
+async def test_a_watching_pipeline_whose_unwatch_hangs_hands_its_connection_back(monkeypatch, client_kind, ending):
+    """redis-py 5's reset catches only a ConnectionError around the UNWATCH it
+    sends on exit. An UNWATCH whose reply timed out, or that a caller's
+    timeout canceled, raised past the release, and the connection stayed out
+    of the pool for good."""
+    pipe, connection = _pipeline_on_a_pooled_connection(client_kind=client_kind)
+    disconnects: list[bool] = []
+
+    async def send_command_async(*_args, **_kwargs):
+        return None
+
+    async def unwatch_reply_async(*_args, **_kwargs):
+        if ending == "timeout":
+            raise RedisTimeoutError("Timeout reading from socket")
+        await asyncio.Event().wait()
+
+    async def disconnect_async(*_args, **_kwargs):
+        disconnects.append(True)
+
+    def send_command_sync(*_args, **_kwargs):
+        return None
+
+    def unwatch_reply_sync(*_args, **_kwargs):
+        raise RedisTimeoutError("Timeout reading from socket")
+
+    def disconnect_sync(*_args, **_kwargs):
+        disconnects.append(True)
+
+    if client_kind == "async":
+        monkeypatch.setattr(connection, "_reader", object())
+        monkeypatch.setattr(connection, "_writer", object())
+        monkeypatch.setattr(connection, "send_command", send_command_async)
+        monkeypatch.setattr(connection, "read_response", unwatch_reply_async)
+        monkeypatch.setattr(connection, "disconnect", disconnect_async)
+
+        async def exit_the_pipeline():
+            async with pipe:
+                pass
+
+        exiting = exit_the_pipeline() if ending == "timeout" else asyncio.wait_for(exit_the_pipeline(), timeout=0.1)
+        with pytest.raises(RedisTimeoutError if ending == "timeout" else TimeoutError):
+            await exiting
+    else:
+        monkeypatch.setattr(connection, "_sock", object())
+        monkeypatch.setattr(connection, "send_command", send_command_sync)
+        monkeypatch.setattr(connection, "read_response", unwatch_reply_sync)
+        monkeypatch.setattr(connection, "disconnect", disconnect_sync)
+        with pytest.raises(RedisTimeoutError):
+            with pipe:
+                pass
+
+    assert disconnects
+    assert pipe.watching is False
+    assert pipe.connection is None
+    assert connection in pipe.connection_pool._available_connections
+    assert connection not in pipe.connection_pool._in_use_connections
+
+
+class _SilentListener:
+    """A TCP listener that accepts every connection and never replies: a
+    Redis whose node is wedged."""
+
+    def __init__(self) -> None:
+        self._server = socket.create_server(("127.0.0.1", 0))
+        self._server.settimeout(0.05)
+        self.url = f"redis://127.0.0.1:{self._server.getsockname()[1]}/0"
+        self._accepted: list[socket.socket] = []
+        self._stopping = threading.Event()
+        self._thread = threading.Thread(target=self._accept, daemon=True)
+
+    def __enter__(self) -> "_SilentListener":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._stopping.set()
+        self._thread.join()
+        self._server.close()
+        for connection in self._accepted:
+            connection.close()
+
+    def _accept(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                connection, _address = self._server.accept()
+            except TimeoutError:
+                continue
+            self._accepted.append(connection)
+
+    def connections(self) -> int:
+        """How many connections it accepted, once those already made are accepted."""
+        time.sleep(0.2)
+        return len(self._accepted)
+
+
+def _client(*, client_kind: str, url: str, call_budget_s: float):
+    if client_kind == "async":
+        return redis_client.build_async_redis(url=url, call_budget_s=call_budget_s)
+    return redis_client.build_sync_redis(url=url, call_budget_s=call_budget_s)
+
+
+async def _get(client, key: str):
+    if isinstance(client, aioredis.Redis):
+        return await client.get(key)
+    return client.get(key)
+
+
+@pytest.mark.parametrize("client_kind", ["async", "sync"])
+async def test_calls_made_after_a_spent_deadline_fail_at_once_without_reaching_redis(client_kind):
+    """A project delete runs every Redis call of its conversations under one
+    deadline. Against a Redis that accepts and never answers, the call that
+    spent it ran a whole 5 s read past it, and each call after it made one
+    full attempt anyway: a reconnect and a read that waited out its timeout."""
+    with _SilentListener() as listener:
+        client = _client(client_kind=client_kind, url=listener.url, call_budget_s=30)
+        with redis_client.redis_deadline(budget_s=0.5):
+            started = time.monotonic()
+            with pytest.raises(RedisTimeoutError):
+                await _get(client, "spends-the-deadline")
+            spent_s = time.monotonic() - started
+            opened = listener.connections()
+            started = time.monotonic()
+            for _ in range(2):
+                with pytest.raises(RedisTimeoutError):
+                    await _get(client, "after-the-deadline")
+            later_s = time.monotonic() - started
+            reached = listener.connections()
+
+    assert spent_s < 0.5 + 0.3
+    assert later_s < 1
+    assert reached == opened
+
+
+def _refused_url() -> str:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return f"redis://127.0.0.1:{probe.getsockname()[1]}/0"
+
+
+@pytest.mark.parametrize("ending", ["refused", "canceled"])
+async def test_a_call_whose_connect_never_lands_hands_its_connection_back_to_the_pool(ending):
+    """A call takes a connection from the pool before it connects. One whose
+    connect ran out of budget, or that its caller canceled while it
+    retried, as the turn claim's 5 s bound does, left that connection marked
+    in use for good."""
+    client = redis_client.build_async_redis(url=_refused_url(), call_budget_s=0.5 if ending == "refused" else 5)
+
+    if ending == "refused":
+        with pytest.raises(RedisConnectionError):
+            await client.get("never-connects")
+    else:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(client.get("never-connects"), timeout=0.3)
+
+    assert len(client.connection_pool._in_use_connections) == 0
+    assert len(client.connection_pool._available_connections) == 1
+
+
+class _RespStandIn:
+    """Just enough of a Redis for one client: PING answers PONG, GET answers
+    nil and anything else OK. ``reset_connections`` closes each connection
+    with SO_LINGER 0, so the close sends a reset (RST), not a FIN."""
+
+    def __init__(self) -> None:
+        self._server: asyncio.Server | None = None
+        self._writers: list[asyncio.StreamWriter] = []
+        self.url = ""
+
+    async def __aenter__(self) -> "_RespStandIn":
+        self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
+        self.url = f"redis://127.0.0.1:{self._server.sockets[0].getsockname()[1]}/0"
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        self._server.close()
+        for writer in self._writers:
+            writer.transport.abort()
+
+    def reset_connections(self) -> None:
+        for writer in self._writers:
+            writer.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            writer.transport.abort()
+        self._writers.clear()
+
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._writers.append(writer)
+        try:
+            while header := await reader.readline():
+                words = []
+                for _ in range(int(header[1:])):
+                    size = int((await reader.readline())[1:])
+                    words.append((await reader.readexactly(size + 2))[:-2].upper())
+                if words[0] == b"PING":
+                    writer.write(b"+PONG\r\n")
+                elif words[0] == b"GET":
+                    writer.write(b"$-1\r\n")
+                else:
+                    writer.write(b"+OK\r\n")
+                await writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            return
+
+
+async def test_a_pooled_connection_the_server_reset_while_idle_is_replaced_before_the_next_call():
+    """A reset (RST) closes an idle pooled connection's transport, but redis-py
+    5 reads a closed transport with no EOF as ready, so the next call wrote
+    to it and failed with a TypeError that no retry covers."""
+    async with _RespStandIn() as server:
+        client = redis_client.build_async_redis(url=server.url, call_budget_s=2)
+        assert await client.get("idle") is None
+        server.reset_connections()
+        await asyncio.sleep(0.1)
+
+        assert await client.get("idle") is None
+        await client.aclose()

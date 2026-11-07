@@ -422,6 +422,10 @@ class RedisStreamBuffer(StreamBuffer):
         if entries and self._record(entries[0][1]).is_terminal:
             await r.delete(self.key)
 
+    async def remove(self) -> None:
+        """Delete this turn's stream. Unbounded; the caller bounds it."""
+        await get_redis().delete(self.key)
+
     async def refresh(self) -> None:
         """Load latest_seq and is_closed from Redis.
 

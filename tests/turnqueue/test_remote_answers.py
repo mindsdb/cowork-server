@@ -224,43 +224,56 @@ async def test_an_unblocked_read_during_the_ack_wait_reads_again(r, monkeypatch)
     assert reads >= 2
 
 
-async def test_the_answer_is_queued_at_most_once(r, monkeypatch):
-    """An RPUSH resent after its reply was lost queues the answer twice."""
-    from cowork.turnqueue import answers
+async def test_an_answer_whose_reply_was_lost_is_sent_again_as_the_same_entry(r, monkeypatch):
+    """Redis applies the answer's transaction and the connection drops before
+    its reply. Sent at most once, that failed /answer with a 500 although the
+    pod got the answer, and the client then resent the typed text as a new
+    message. Sent again, the same entry, with the same answer_id, is queued a
+    second time, and /answer reports the pod's verdict."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
 
-    sending_once = False
-    sent: list[bool] = []
+    from cowork.turnqueue.redis_client import build_async_redis
 
-    @contextmanager
-    def recording_send_once():
-        nonlocal sending_once
-        sending_once = True
-        try:
-            yield
-        finally:
-            sending_once = False
+    client = build_async_redis(url="redis://127.0.0.1:1/0", call_budget_s=2)
+    pool = client.connection_pool
+    connection = pool.make_connection()
+    sent: list[str] = []
 
-    real_pipeline = r.pipeline
+    async def get_connection(*_args, **_kwargs):
+        return connection
 
-    def pipeline(*args, **kwargs):
-        pipe = real_pipeline(*args, **kwargs)
-        real_execute = pipe.execute
+    async def release(_connection):
+        return None
 
-        async def execute(*a, **kw):
-            sent.append(sending_once)
-            return await real_execute(*a, **kw)
+    async def disconnect(*_args, **_kwargs):
+        return None
 
-        pipe.execute = execute
+    async def applied_then_lost_once(_connection, commands, _raise_on_error):
+        """Run the transaction on the fake Redis, and lose the reply to the first."""
+        (_rpush, key, entry), _options = commands[0]
+        sent.append(entry)
+        await r.rpush(key, entry)
+        await r.expire(key, 60)
+        if len(sent) == 1:
+            raise RedisConnectionError("Connection closed by server.")
+        return [len(sent), True]
+
+    def pipeline(*_args, **_kwargs):
+        pipe = client.pipeline(transaction=True)
+        monkeypatch.setattr(pipe, "_execute_transaction", applied_then_lost_once)
         return pipe
 
-    monkeypatch.setattr(answers, "send_once", recording_send_once)
+    monkeypatch.setattr(pool, "get_connection", get_connection)
+    monkeypatch.setattr(pool, "release", release)
+    monkeypatch.setattr(connection, "disconnect", disconnect)
     monkeypatch.setattr(r, "pipeline", pipeline)
     pod = asyncio.create_task(_pod_says(r, "ask_user_answered", status="answered"))
+
     assert await _submit(r) is RemoteAnswerResult.ACCEPTED
     await pod
 
-    assert sent == [True]
-    assert await r.llen(KEY) == 1
+    assert len(sent) == 2 and sent[0] == sent[1]
+    assert await r.lrange(KEY, 0, -1) == sent
 
 
 async def test_the_ack_wait_blocks_for_no_longer_than_the_shared_block(r, monkeypatch):
