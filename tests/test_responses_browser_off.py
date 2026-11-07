@@ -1,9 +1,10 @@
-"""A turn with "browser": "off" runs without the shared browser (ENG-3188).
+"""A turn with "browser": "off" runs without the agent's browser.
 
 The composer's Browser switch turns the browser off for one task. The handler
 runs the turn on a copy of its settings snapshot with browser_enabled off, so
-turn_block, _browser_config and start_early all see it off: no browser tool
-for anton and no early start of the user's browser.
+the harness's _browser_config and the producer's turn_block both see it off:
+no browser tool for anton, and on the web no scope call that would start the
+person's browser.
 """
 from __future__ import annotations
 

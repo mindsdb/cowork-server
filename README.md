@@ -465,6 +465,8 @@ Electron app hands it over at runtime through `PUT /api/v1/runtime-credential/mi
 and this process keeps it in memory. `SettingService._raw_data` overlays it onto
 the stored rows, so every reader of `get_user_settings()` sees it without
 knowing where it came from, and a value handed over beats any stored row.
+The desktop app's own browser is handed over the same way, through
+`PUT /api/v1/runtime-credential/browser` ([The agent's browser](#the-agents-browser)).
 
 Two properties follow. **Nothing survives a restart**, so the desktop app re-pushes on every start of this process. And a key the user supplied by hand travels the same way, which is what keeps a long-lived `mdb_` key out of both `.env` and the settings table. The route is loopback-only and refuses in MindsHub mode: there the turn producer mints a per-turn credential and the pods are never handed one.
 
@@ -492,7 +494,8 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/publish` | Publish artifacts to MindsHub (view.mindshub.ai in prod) |
 | `/connectors` | Third-party service connections and OAuth |
 | `/settings` | User preferences and API keys |
-| `/runtime-credential` | Desktop hand-over of the MindsHub credential (write-only, loopback, outside MindsHub mode) |
+| `/runtime-credential` | Desktop hand-overs, held in memory: the MindsHub credential, and the address and launch key of the app's own browser (write-only, loopback, outside MindsHub mode) |
+| `/browse` | The agent's browser: whether this deployment offers it to the caller and, on the web, a warm-up, viewer links, the person's approval of a held step and signing out of every site. See [The agent's browser](#the-agents-browser) |
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
 | `/hub/usage` | The caller's free Air allowance (as a proportion), balance, auto top up and credit spend, for the desktop's usage warnings. An organization with no free grant reads `freeTokens.limit` 0 and `freeTokens.resetsAt` null, since nothing refills |
 
@@ -526,6 +529,29 @@ Every other class refuses, so inheriting one is safe.
 
 `COWORK_TENANCY_MODE=org python -m scripts.dump_routes` prints the current
 surface with each route's declaration.
+
+### The agent's browser
+
+The agent drives a browser the person can watch beside the chat and take over. Which browser depends on the deployment, and this server holds no browser credential of its own (`cowork/services/browser.py`).
+
+- **On the web (MindsHub mode)** the browser is the browser router at `COWORK_BROWSER_ROUTER_URL`, which starts one browser per person. Each `/browse` route calls it as the caller, with their own MindsHub credential. Before the producer queues any web turn, it scopes the turn's key with the router (`POST {router}/_scope`): to the task's session and the project's saved tabs, which also starts the person's browser, or, for a turn with no browser, to no session (`{"session_id": null}`), so code in the turn that holds the key can't scope it to a session of its own. The router refuses a key it hasn't scoped, and takes a scope only with `X-Browser-Scope-Key`, read on every scope from the file `COWORK_BROWSER_SCOPE_KEY_FILE` names, where the chart mounts the router's own Secret, `browser-proxy`, key `scope_key`. The job's `params.browser` is `{base_url, profile, project?}` and carries no credential: the pod reaches the router with the turn key. A turn whose scope fails runs without a browser and logs `browser_scope_failed` with the router's code and the wait in `elapsed_ms`; a person the browser isn't for (their organization switched it off, or their role lacks it) logs `browser_scope_not_entitled` at info instead. No alert reads either yet.
+- **On the desktop** the browser runs inside the Cowork app. The app hands over its loopback address and per-launch key through `PUT /api/v1/runtime-credential/browser`, with the body `{"url": "http://127.0.0.1:<port>", "token": "<43 base64url characters>"}`, or both blank to clear it. This process keeps them in memory and hands an in-process turn's anton that browser. The route is loopback-only and refuses MindsHub mode, and a deployment that trusts identity headers ignores the hand-over, so one person's browser never answers another person's turn.
+- **No browser** for a channel turn, which comes from a chat others can write to while the browser holds one person's sign-ins; for a person who turned `browser_enabled` off; for a task whose Browser switch is off (`"browser": "off"` on `/responses`); and on a MindsHub-signed-in desktop whose organization's admin turned the browser off. That desktop reads the switch from its MindsHub entitlements before each turn and keeps the last answer when MindsHub can't answer; a desktop on the person's own model key asks nothing.
+
+`GET /browse/status` answers `{enabled, available, status}`. `enabled` is the person's switch. `available` says whether the deployment offers them a browser, whatever the switch says, so they can turn it back on. `status` is one of these:
+
+- `none`, `starting` or `running`: the router's answer for the caller's own browser on the web, or `running` for a registered browser on the desktop;
+- `unavailable`: no router on the web, or no registered browser on the desktop;
+- `organization_off`: an admin of the caller's organization turned the browser off, on the web or on a signed-in desktop;
+- `not_entitled`: the `browser` block of the caller's MindsHub entitlements (`GET /v1/entitlements/me/`, read through the same cache as their permissions) says their account may not use it. That read fails closed: when MindsHub can't say, status answers 503 `mindshub_unreachable`.
+
+`POST /browse/provision` warms the caller's browser with their time zone and language, and answers like status. `POST /browse/embed` takes `{session_id}` and answers a single-use viewer link, `{session_id, view_url, ticket_expires_at, lease_expires_at}`, which is never stored. `POST /browse/approve` takes `{session_id, pending_id}` from the commit-hold card and records the person's approval in the browser, so the agent's one resend of that step runs; it doesn't answer the card, which the app answers after a 200. `POST /browse/decline` takes the same body when the person skips that card, and the browser drops the step and any approval already recorded for it, so a late approval can't let the resend run. `DELETE /browse/logins` signs the person out of every site in their browser. These five are web-only and answer 409 elsewhere. A refusal from the router keeps its 401, 403 or 429 and its code in `detail`; any other router failure is 424 with the router's code, since the ingress swaps a 5xx body for its own page.
+
+The `response.browser_session_opened` event carries the session id only. Whoever opens the pane mints their own viewer link, so a stored event opens nothing.
+
+On the web, sites see the browser's traffic come from MindsDB's own addresses; the desktop app's browser goes out on the person's own connection.
+
+`tests/fixtures/browser_router/` pins what this server sends the router and reads back, and `tests/fixtures/browser_contract/` holds anton's fixtures for the turn block and the session event.
 
 ### The MindsHub workspace selector
 
@@ -1034,6 +1060,7 @@ Environment variables fall into these groups:
 | `COWORK_DRAFT_LINK_KEYS` | unset | Draft-link signing keys as JSON `{kid: secret}`, from the `mindsdb-secrets` Secret. Two kids can be live during a rotation. A secret shorter than 32 characters is ignored. A pod reads it at start. |
 | `COWORK_DRAFT_LINK_KID` | unset | The kid in `COWORK_DRAFT_LINK_KEYS` that signs new draft links. |
 | `COWORK_WEB_ORIGIN` | unset | Origin of the cowork web app, e.g. `https://cowork.mindshub.ai`: the only page allowed to frame a draft (CSP `frame-ancestors`). |
+| `COWORK_BROWSER_ROUTER_URL` | unset | MindsHub mode only. The browser router's base URL, `https://` with an optional path, for example `https://cowork.mindshub.ai/browser`; the trailing slash is dropped. Unset, the web app offers no browser and makes no browser call. Ignored outside MindsHub mode, where the desktop app runs its own browser. See [The agent's browser](#the-agents-browser). |
 | `COWORK_TENANCY_MODE` | `local` | `local` is single-user mode, the desktop sidecar (one person, no organization, no identity headers), or single-tenant mode with `COWORK_TRUST_IDENTITY_HEADERS` ([Server modes and terms](#server-modes-and-terms)). `org` is MindsHub mode, the cloud deployment, and turns on everything in [Who can read what in MindsHub mode](#who-can-read-what-in-mindshub-mode) above. |
 | `COWORK_DEPLOYMENT_KIND` | unset | `self-hosted` tells the agent this installation runs in the operator's environment. Requires local, in-process turns and a branding pack. Unset keeps desktop and hosted identity and installation guidance. |
 | `COWORK_DEPLOYMENT_BRAND_FILE` | unset | Absolute path to the selected, read-only `pack.json`. With `COWORK_DEPLOYMENT_KIND=self-hosted`, its `name` becomes the agent's product name. Startup accepts the branding pack loader's JSON encodings, including a UTF-8 BOM and UTF-16/32. It refuses missing, malformed or linked files, duplicate JSON keys and invalid names. The name is fixed until restart; member settings cannot change it. |

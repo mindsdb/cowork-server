@@ -1,0 +1,27 @@
+{
+  "description": "POST {router}/_scope, sent with a web turn's own key and X-Browser-Scope-Key before the turn is queued. It binds the key to the task's session and the project's saved tabs, and starts the person's browser. project is left out for a turn with no project. A turn with no browser binds session_id null: the key then reaches nothing, and no code holding it can scope it again.",
+  "examples": {
+    "a turn in a project": {
+      "where": "POST /_scope",
+      "kind": "request",
+      "body": {
+        "session_id": "t-0123456789abcdef01234567",
+        "project": "p-89abcdef0123456789abcdef"
+      }
+    },
+    "a turn with no project": {
+      "where": "POST /_scope",
+      "kind": "request",
+      "body": {
+        "session_id": "t-0123456789abcdef01234567"
+      }
+    },
+    "a turn with no browser": {
+      "where": "POST /_scope",
+      "kind": "request",
+      "body": {
+        "session_id": null
+      }
+    }
+  }
+}
