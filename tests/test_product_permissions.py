@@ -288,6 +288,8 @@ async def test_model_selection_cannot_bypass_admission(monkeypatch, model):
     [
         ("", "put", {"content": "changed", "expectedRevisionId": "rev"}),
         ("/access", "put", {"access": {"mode": "public"}}),
+        ("/stats", "get", None),
+        ("/stats/tracking", "put", {"enabled": True}),
         ("/comments-access", "post", None),
         ("/revisions/rev/restore", "post", {"expectedRevisionId": "rev"}),
         (
