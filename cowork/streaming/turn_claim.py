@@ -48,7 +48,6 @@ import time
 from collections.abc import Awaitable
 from enum import StrEnum
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
-from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from redis.exceptions import WatchError
@@ -107,9 +106,9 @@ def pod_name() -> str:
 class TurnClaim(BaseModel):
     """The run holding a conversation's claim, as its key stores it.
 
-    ``question_id`` is the turn's saved question, filled in by a renewal once
-    the producer has saved it. ``pod`` names the process that took it, for a
-    boot pass that releases the claims its own pod left behind.
+    ``pod`` names the process that took it, for a boot pass that releases the
+    claims its own pod left behind. ``correlation_id`` is the turn's, which
+    that boot pass uses to stop the turn's sandbox turn.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -117,24 +116,22 @@ class TurnClaim(BaseModel):
     run_id: str
     turn_id: int
     correlation_id: str | None = None
-    question_id: UUID | None = None
     pod: str
     started_at: float
 
 
-def new_claim(
-    *, run_id: str, turn_id: int, correlation_id: str | None, question_id: UUID | None,
-) -> TurnClaim:
+def new_claim(*, run_id: str, turn_id: int, correlation_id: str | None) -> TurnClaim:
     """A claim for a run this process is starting now."""
     return TurnClaim(
-        run_id=run_id, turn_id=turn_id, correlation_id=correlation_id,
-        question_id=question_id, pod=pod_name(), started_at=time.time(),
+        run_id=run_id, turn_id=turn_id, correlation_id=correlation_id, pod=pod_name(), started_at=time.time(),
     )
 
 
 class TurnClaimUnavailable(Exception):
     """Redis could not say whether another run holds the conversation, so the
-    turn is refused rather than admitted on a guess.
+    turn is refused rather than admitted on a guess. RunRegistry.start also
+    raises it for a Redis error after it took the claim, once it has released
+    the claim again: the turn did not start, and a retry can.
 
     The app answers it with 503 and Retry-After (cowork.server), which reads
     ``status_code``.
@@ -612,22 +609,16 @@ async def keep_claim(
     releases the claim while this turn's stream has no terminal record, the
     next renewal takes it back. A Redis error is tried again at the next
     interval.
-
-    Once the producer has saved the question, each renewal writes the claim
-    with its id.
     """
-    current = claim
     lost = False
     while True:
         await asyncio.sleep(RENEW_INTERVAL_SECONDS)
         if buffer.is_closed or buffer.is_finishing or lifecycle.discarded:
             return
-        if lifecycle.question_id is not None and current.question_id != lifecycle.question_id:
-            current = current.model_copy(update={"question_id": lifecycle.question_id})
-        result = await renew(claim=current, conversation_id=conversation_id)
+        result = await renew(claim=claim, conversation_id=conversation_id)
         if lifecycle.discarded:
             if result.outcome in (RenewOutcome.RENEWED, RenewOutcome.REACQUIRED):
-                await release_quietly(conversation_id=conversation_id, run_id=current.run_id)
+                await release_quietly(conversation_id=conversation_id, run_id=claim.run_id)
             return
         if result.outcome is RenewOutcome.ERROR:
             continue
@@ -644,11 +635,11 @@ async def keep_claim(
             "A running turn lost its claim on the conversation to another run or reader.",
             extra={
                 "event": "turn_claim_lost",
-                "run_id": current.run_id,
+                "run_id": claim.run_id,
                 "holder_run_id": result.holder.run_id if result.holder is not None else None,
                 "holder_pod": result.holder.pod if result.holder is not None else None,
                 **log_context(
-                    conversation_id=conversation_id, request_id=current.correlation_id,
+                    conversation_id=conversation_id, request_id=claim.correlation_id,
                 ),
             },
         )
@@ -667,9 +658,18 @@ async def release_pod_claims(*, pod: str) -> BootPassResult:
 
     For a process that has just started: it holds no turn yet, so a claim
     carrying its pod's name was left by an earlier process in the same pod,
-    such as one a liveness restart replaced. That holds only while a pod runs
-    one server process, which tests/test_turn_claim.py pins for the hosted
-    command.
+    one whose container was restarted in place (an OOM kill or a crash). That
+    holds only while a pod runs one server process, which
+    tests/test_turn_claim.py pins for the hosted command. The claim is still
+    held only when the new process boots within CLAIM_TTL_SECONDS of the last
+    renewal. A liveness restart kills a stalled process after its claims
+    lapsed, so the pass finds only their listings.
+
+    Each of this pod's listings, held or lapsed, also gets the controller's
+    cancel flag for its turn (cancellation.stop_controller_turn), right after
+    its release: the process that relayed the turn is gone, and the sandbox
+    turn would otherwise run on and keep the conversation's next turn
+    waiting behind it.
 
     Only a release removes a listing, so a pod killed mid-turn (a SIGKILL, an
     OOM kill, a lost node) leaves the listings of its claims behind once they
@@ -690,12 +690,16 @@ async def release_pod_claims(*, pod: str) -> BootPassResult:
             )
     if not listed:
         return BootPassResult(released=0, pruned=0)
+    from cowork.streaming.cancellation import stop_controller_turn
+
     keys = await r.mget([claim_key(conversation_id) for conversation_id in listed])
     released = pruned = 0
     for (conversation_id, claim), raw_key in zip(listed.items(), keys, strict=True):
         if claim.pod == pod:
             if await release(conversation_id=conversation_id, run_id=claim.run_id):
                 released += 1
+            if claim.correlation_id is not None:
+                await stop_controller_turn(claim.correlation_id, turn_id=claim.run_id, reason="boot_release")
         elif not _held_by(raw=raw_key, run_id=claim.run_id):
             if await _unlist_lapsed(conversation_id=conversation_id, run_id=claim.run_id):
                 pruned += 1

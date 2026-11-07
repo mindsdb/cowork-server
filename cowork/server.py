@@ -208,10 +208,11 @@ _TURN_CLAIM_RETRY_AFTER_SECONDS = 2
 
 async def _release_own_turn_claims() -> None:
     """On the Redis stream backend, release the turn claims a process of this
-    pod left behind (turn_claim.release_pod_claims): one a liveness restart
-    replaced, whose claims would otherwise refuse a send to each of its
-    conversations until the claim's TTL passed. The same pass removes the
-    listings of claims that lapsed on pods that are gone. Bounded and
+    pod left behind (turn_claim.release_pod_claims): one whose container was
+    restarted in place, by an OOM kill or a crash, whose claims would
+    otherwise refuse a send to each of its conversations until the claim's
+    TTL passed, and whose sandbox turns would run on. The same pass removes
+    the listings of claims that lapsed on pods that are gone. Bounded and
     fail-open; a claim it cannot release lapses with its TTL."""
     from cowork.streaming.backend import get_backend
     from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, pod_name, release_pod_claims

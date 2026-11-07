@@ -122,7 +122,7 @@ class SharedTurn(NamedTuple):
     enqueued moments ago.
     """
 
-    index: dict
+    index: TurnIndexEntry
     buffer: RedisStreamBuffer
     in_flight: bool
 
@@ -141,9 +141,9 @@ async def _shared_turn(
     if not conversation_id or get_backend() != "redis":
         return None
     turn = await get_turn(conversation_id)
-    if turn is None or not _owner_matches(TurnOwner.from_index(turn), scope):
+    if turn is None or not _owner_matches(turn.owner, scope):
         return None
-    buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=int(turn["turn_id"]))
+    buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=turn.turn_id)
     await buf.refresh()
     # Admission publishes the index before starting the producer. Until the
     # grace period is up, an empty stream means "not started yet" rather than
@@ -152,13 +152,10 @@ async def _shared_turn(
     return SharedTurn(index=turn, buffer=buf, in_flight=(not buf.is_closed) or starting)
 
 
-def _just_started(turn: dict) -> bool:
+def _just_started(turn: TurnIndexEntry) -> bool:
     """Whether the turn was recorded too recently for an empty stream to mean
     anything. Enqueue to first record covers pod startup, so this is generous."""
-    try:
-        return (time.time() - float(turn.get("started_at") or 0)) < TURN_START_GRACE_SECONDS
-    except (TypeError, ValueError):
-        return False
+    return (time.time() - (turn.started_at or 0)) < TURN_START_GRACE_SECONDS
 
 
 # Enqueue to first record: the controller has to lock the conversation, find or
@@ -250,10 +247,7 @@ async def _refuse_while_answering(*, conversation: str | None, scope: TenantScop
                 turn = await get_turn(conversation_id)
         except Exception as exc:
             raise TurnClaimUnavailable(conversation_id=conversation_id) from exc
-        if (
-            turn is None or TurnIndexEntry.from_index(turn).run_id != holder.run_id
-            or not _owner_matches(TurnOwner.from_index(turn), scope)
-        ):
+        if turn is None or turn.run_id != holder.run_id or not _owner_matches(turn.owner, scope):
             return
     raise claim_held_refusal(conversation_id=conversation_id, holder=holder)
 
@@ -313,17 +307,16 @@ async def in_flight_list(scope: TenantScopeDep):
     ]
     if get_backend() == "redis":
         seen = {row["conversation_id"] for row in out}
-        for turn in await list_turns():
-            cid = turn["conversation_id"]
-            if cid in seen or not _owner_matches(TurnOwner.from_index(turn), scope):
+        for cid, turn in await list_turns():
+            if cid in seen or not _owner_matches(turn.owner, scope):
                 continue
-            buf = RedisStreamBuffer(conversation_id=cid, turn_id=int(turn["turn_id"]))
+            buf = RedisStreamBuffer(conversation_id=cid, turn_id=turn.turn_id)
             await buf.refresh()
             if buf.is_closed:
                 continue   # finished; only the replay buffer is left
             out.append({
                 "conversation_id": cid,
-                "turn_id": int(turn["turn_id"]),
+                "turn_id": turn.turn_id,
                 "latest_seq": buf.latest_seq,
             })
     return {"in_flight": out}
@@ -350,7 +343,7 @@ async def in_flight(scope: TenantScopeDep, conversation_id: str | None = None):
             "in_flight": found.in_flight,
             "has_buffer": True,
             "latest_seq": found.buffer.latest_seq,
-            "turn_id": int(found.index["turn_id"]),
+            "turn_id": found.index.turn_id,
         }
     return {
         "in_flight": handle.is_running,
@@ -396,15 +389,15 @@ async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
             cancelled = await cancel_run(handle, reason=req.reason)
             return {"cancelled": cancelled, "conversation_id": req.conversation_id}
         found = await _shared_turn(req.conversation_id, scope)
-        if found is None or found.index.get("run_id") != expected:
+        if found is None or found.index.run_id != expected:
             return JSONResponse(status_code=404, content={"status": "not_found"})
         if not found.in_flight or found.buffer.is_finishing:
             return {"cancelled": False, "conversation_id": req.conversation_id}
-        await request_cancel(found.index["correlation_id"], reason=req.reason, client=get_redis())
+        await request_cancel(found.index.correlation_id, reason=req.reason, client=get_redis())
         return {"cancelled": True, "conversation_id": req.conversation_id}
     if handle is not None and get_backend() == "redis":
         turn = await get_turn(req.conversation_id)
-        if turn is not None and turn["correlation_id"] != handle.lifecycle.identity.correlation_id:
+        if turn is not None and turn.correlation_id != handle.lifecycle.identity.correlation_id:
             # RunRegistry retains finished handles for replay. A successor may
             # run on another replica; _shared_turn below authorizes its owner.
             handle = None
@@ -422,7 +415,7 @@ async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
     found = await _shared_turn(req.conversation_id, scope)
     if found is None or not found.in_flight:
         return JSONResponse(status_code=404, content={"status": "not_found"})
-    await _request_cancel(found.index["correlation_id"], stalled=stalled)
+    await _request_cancel(found.index.correlation_id, stalled=stalled)
     return {"cancelled": True, "conversation_id": req.conversation_id}
 
 
@@ -507,7 +500,7 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
         found = await _shared_turn(req.conversation_id, scope)
         if found is None or not found.in_flight:
             return JSONResponse(status_code=404, content={"status": "not_found"})
-        correlation_id = found.index["correlation_id"]
+        correlation_id = found.index.correlation_id
     else:
         handle = _authorized_handle(registry.get(req.conversation_id), scope)
         if handle is None:

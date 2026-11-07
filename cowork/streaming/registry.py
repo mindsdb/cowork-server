@@ -205,10 +205,16 @@ class RunHandle:
     lifecycle: TurnLifecycle = field(default_factory=TurnLifecycle)
     # The cross-replica claim start() took, on the Redis backend only.
     claim: TurnClaim | None = None
+    # The loop time the task ended at, set by start() when it ends.
+    ended_at_monotonic: float | None = None
 
     @property
     def run_id(self) -> str:
         return self.lifecycle.identity.run_id
+
+    def note_ended(self, task: asyncio.Task) -> None:
+        """Done callback of ``task``: note when it ended."""
+        self.ended_at_monotonic = task.get_loop().time()
 
     def request_cancel(self) -> bool:
         """Signal this captured task, without waiting for its persistence to finish."""
@@ -347,35 +353,58 @@ async def _stale_turn(
     turn_claim.acquire, which reads the stamp in the transaction that takes
     the claim.
 
-    The local handle still counts there, unless the index shows another
-    replica truncated the conversation since: discard_conversation forgets
-    the index entry, and a turn started after that carries a lower number
-    than the handle. Refusing on such a handle would refuse every send at its
-    number for as long as this process lives. A channel turn's entry carries
-    no run and no turn number of its own, so it shows nothing either way.
+    There the index entry decides. The local handle counts only where the
+    entry cannot say: when it names the handle's run with no saved-question
+    stamp (both of the run's stamps failed), or when it is a channel turn's,
+    which names no run. Even then it counts only until
+    STALE_START_WINDOW_SECONDS after the handle's task ended, the bound the
+    stamp would have set. An entry that names another run decides for that
+    run: another replica truncated the conversation, or ran a turn at this
+    number that saved nothing, and every replica admits the start. No entry
+    (a delete forgot it) refuses nothing. Refusing on the handle in those
+    cases would refuse sends at its number on this replica alone.
     """
     local = existing is not None and existing.lifecycle.saved_question and turn_id <= existing.turn_id
     if not shared:
         return existing.turn_id if local else None
-    from cowork.streaming.turn_index import TurnIndexEntry, get_turn
+    from cowork.streaming import turn_index
 
     try:
         async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
-            turn = await get_turn(conversation_id)
+            entry = await turn_index.get_turn(conversation_id)
     except Exception as exc:
         raise TurnClaimUnavailable(conversation_id=conversation_id) from exc
-    if turn is None:
+    if entry is None:
         return None
-    entry = TurnIndexEntry.from_index(turn)
     if entry.makes_stale(turn_id=turn_id, now=time.time()):
         return entry.turn_id
-    if local and (entry.run_id in (None, existing.run_id) or entry.turn_id >= existing.turn_id):
+    if (
+        local and entry.run_id in (None, existing.run_id) and not entry.saved_question
+        and _within_stale_window(existing)
+    ):
         return existing.turn_id
     return None
 
 
-def _stale_refusal(*, conversation_id: str, turn_id: int, saved_turn_id: int) -> TurnInProgress:
-    logger.warning(
+def _within_stale_window(handle: RunHandle) -> bool:
+    """Whether ``handle``'s task is running or ended less than
+    STALE_START_WINDOW_SECONDS ago. A task that has ended before its done
+    callback ran counts as just ended."""
+    from cowork.streaming import turn_index
+
+    ended = handle.ended_at_monotonic
+    if handle.is_running or ended is None:
+        return True
+    return handle.task.get_loop().time() < ended + turn_index.STALE_START_WINDOW_SECONDS
+
+
+def _stale_refusal(*, conversation_id: str, turn_id: int, saved_turn_id: int, shared: bool) -> TurnInProgress:
+    """The refusal of a stale start, logged once: at WARNING on the Redis
+    backend (``shared``), where another replica's turn can be what refuses
+    it, and at INFO on the file backend, where only this process's own turn
+    can."""
+    logger.log(
+        logging.WARNING if shared else logging.INFO,
         "Refused a turn; it read the history before an earlier turn saved its question.",
         extra={
             "event": "turn_stale_refused", "turn_id": turn_id, "saved_turn_id": saved_turn_id,
@@ -401,18 +430,14 @@ def claim_held_refusal(*, conversation_id: str, holder: TurnClaim) -> TurnInProg
     return TurnInProgress(conversation_id=conversation_id, turn_id=holder.turn_id)
 
 
-async def _stamp_saved_question(
-    *, conversation_id: str, run_id: str, question_id: UUID | None, released: bool,
-) -> None:
+async def _stamp_saved_question(*, conversation_id: str, run_id: str, released: bool) -> None:
     """Note in ``run_id``'s turn index entry that its turn saved its
     question (turn_index.stamp_question). Bounded; a failure is logged."""
     from cowork.streaming.turn_index import stamp_question
 
     try:
         async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
-            await stamp_question(
-                conversation_id=conversation_id, run_id=run_id, question_id=question_id, released=released,
-            )
+            await stamp_question(conversation_id=conversation_id, run_id=run_id, released=released)
     except Exception:
         logger.warning(
             "Could not note a turn's saved question in the turn index.",
@@ -440,10 +465,7 @@ async def mark_question_saved(*, lifecycle: TurnLifecycle, conversation_id: str)
 
     if get_backend() != "redis" or lifecycle.discarded:
         return
-    await _stamp_saved_question(
-        conversation_id=conversation_id, run_id=lifecycle.identity.run_id, question_id=lifecycle.question_id,
-        released=False,
-    )
+    await _stamp_saved_question(conversation_id=conversation_id, run_id=lifecycle.identity.run_id, released=False)
 
 
 async def _end_claim(*, conversation_id: str, claim: TurnClaim, lifecycle: TurnLifecycle) -> None:
@@ -463,10 +485,7 @@ async def _end_claim(*, conversation_id: str, claim: TurnClaim, lifecycle: TurnL
     lapses (turn_claim.release_quietly).
     """
     if lifecycle.saved_question:
-        await _stamp_saved_question(
-            conversation_id=conversation_id, run_id=claim.run_id, question_id=lifecycle.question_id,
-            released=True,
-        )
+        await _stamp_saved_question(conversation_id=conversation_id, run_id=claim.run_id, released=True)
     await turn_claim.release_quietly(conversation_id=conversation_id, run_id=claim.run_id)
 
 
@@ -575,10 +594,12 @@ class RunRegistry:
         reads it again in the transaction that takes the claim, so a start
         that waited for another replica's turn to end is still refused when
         that turn saved its question. Raises TurnClaimUnavailable when Redis
-        cannot answer either. Only the claim's winner writes the turn index,
-        and every start refused after taking the claim releases it. A claim
-        this process's own last turn still holds after its task ended is
-        released here at once (turn_claim.claim_turn's ``ended_here``).
+        cannot answer either, and when a Redis call fails or times out after
+        the claim was taken (the buffer's open, the turn index write). Only
+        the claim's winner writes the turn index, and every start refused
+        after taking the claim releases it. A claim this process's own last
+        turn still holds after its task ended is released here at once
+        (turn_claim.claim_turn's ``ended_here``).
         """
         loop = asyncio.get_running_loop()
         lock = self._start_locks.get(conversation_id)
@@ -601,7 +622,9 @@ class RunRegistry:
                 conversation_id=conversation_id, turn_id=turn_id, existing=existing, shared=published,
             )
             if stale is not None:
-                raise _stale_refusal(conversation_id=conversation_id, turn_id=turn_id, saved_turn_id=stale)
+                raise _stale_refusal(
+                    conversation_id=conversation_id, turn_id=turn_id, saved_turn_id=stale, shared=published,
+                )
             if existing is not None and existing.is_running and not existing.buffer.is_closed:
                 # A final client frame is being written. Its reader can send
                 # the next question before the separate terminal record lands.
@@ -614,7 +637,6 @@ class RunRegistry:
                 claim = turn_claim.new_claim(
                     run_id=lifecycle.identity.run_id, turn_id=turn_id,
                     correlation_id=lifecycle.identity.correlation_id,
-                    question_id=lifecycle.question_id,
                 )
                 claimed = await turn_claim.claim_turn(
                     claim=claim, conversation_id=conversation_id,
@@ -623,6 +645,7 @@ class RunRegistry:
                 if claimed.outcome is turn_claim.AcquireOutcome.STALE:
                     raise _stale_refusal(
                         conversation_id=conversation_id, turn_id=turn_id, saved_turn_id=claimed.saved_turn_id,
+                        shared=True,
                     )
                 if claimed.outcome is turn_claim.AcquireOutcome.HELD:
                     raise claim_held_refusal(conversation_id=conversation_id, holder=claimed.holder)
@@ -640,9 +663,14 @@ class RunRegistry:
                     if published:
                         await _forget_unstarted_run(conversation_id, lifecycle.identity.run_id)
                     raise self._shutdown_refusal(conversation_id)
-            except BaseException:
-                if claim is not None:
-                    await turn_claim.release_quietly(conversation_id=conversation_id, run_id=claim.run_id)
+            except BaseException as exc:
+                if claim is None:
+                    raise
+                await turn_claim.release_quietly(conversation_id=conversation_id, run_id=claim.run_id)
+                from redis.exceptions import RedisError
+
+                if isinstance(exc, (RedisError, TimeoutError)):
+                    raise TurnClaimUnavailable(conversation_id=conversation_id) from exc
                 raise
             task = asyncio.create_task(
                 self._run_bounded(produce(buffer), buffer, conversation_id, turn_id, lifecycle, claim=claim),
@@ -661,6 +689,7 @@ class RunRegistry:
                 lifecycle=lifecycle,
                 claim=claim,
             )
+            task.add_done_callback(handle.note_ended)
             self._by_cid[conversation_id] = handle
             return handle
 

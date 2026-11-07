@@ -58,6 +58,18 @@ class QueuedPipeline:
         return [await getattr(self._client, name)(*args, **kwargs) for name, args, kwargs in self._commands]
 
 
+class UnreachableRedis:
+    """A Redis client every command of which fails as a dropped connection does."""
+
+    def __getattr__(self, name):
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        def fail(*_args, **_kwargs):
+            raise RedisConnectionError("Redis is unreachable")
+
+        return fail
+
+
 class PausedHarness:
     """get_harness() stand-in whose answer waits on ``release`` mid-stream.
 

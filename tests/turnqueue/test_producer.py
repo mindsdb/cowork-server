@@ -1788,4 +1788,4 @@ async def test_a_channel_turn_leaves_the_index_entry_of_a_claimed_turn_alone(mon
     await asyncio.wait_for(replies, timeout=10)
 
     entry = await turn_index.get_turn("conv-1")
-    assert (entry["run_id"], entry["correlation_id"]) == ("run-web", "corr-web")
+    assert (entry.run_id, entry.correlation_id) == ("run-web", "corr-web")

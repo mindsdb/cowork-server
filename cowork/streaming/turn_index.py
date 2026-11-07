@@ -7,16 +7,17 @@ is answered by its buffer, whose terminal record any replica can read.
 
 This exists so a replica that did not start a turn can still find its turn_id,
 to open the right buffer, its correlation_id, to cancel it, and its org, to
-authorize the caller. ``saved_question`` and ``question_id`` say the turn saved
-its question, and which row. The run stamps them as soon as it saves the
-question (registry.mark_question_saved) and again, with ``released_at``,
-before it releases its claim. RunRegistry.start and turn_claim.acquire read
-the stamp to refuse a start whose history read predates that save
-(TurnIndexEntry.makes_stale).
+authorize the caller. ``saved_question`` says the turn saved its question. The
+run stamps it as soon as it saves the question (registry.mark_question_saved)
+and again, with ``released_at``, before it releases its claim.
+RunRegistry.start and turn_claim.acquire read the stamp to refuse a start
+whose history read predates that save (TurnIndexEntry.makes_stale).
+
+Every reader gets the hash as a TurnIndexEntry (get_turn, list_turns).
 
 Keys:
     cowork:turn:{conversation_id}   HASH turn_id, run_id, correlation_id, org_id, user_id, started_at,
-                                         saved_question, question_id, released_at
+                                         saved_question, released_at
     cowork:turns                    SET of conversation ids with a recorded turn
 """
 from __future__ import annotations
@@ -24,7 +25,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Mapping
-from uuid import UUID
+from typing import NamedTuple
 
 from pydantic import BaseModel, ConfigDict
 from redis.asyncio import Redis
@@ -48,7 +49,10 @@ TURN_INDEX_TTL_SECONDS = 3600
 # TurnQueueSettings.jev_route_timeout_seconds). A request slower than this
 # past the release is admitted at the stale number. Bounded so that an entry
 # a conversation delete could not forget refuses sends at its number for this
-# long after its turn ended, not until the entry expires.
+# long after its turn released its claim, not until the entry expires. A turn
+# whose release wrote no stamp (its process died, or Redis did not answer)
+# has no release time, so its entry refuses them until it expires
+# (TURN_INDEX_TTL_SECONDS after the turn started).
 STALE_START_WINDOW_SECONDS = 300
 
 _TURNS_SET = "cowork:turns"
@@ -62,8 +66,8 @@ class TurnOwner(BaseModel):
     """Who started a recorded turn: its org (a person's partition on a
     trusted-identity deployment) and its user, None where the turn had none.
 
-    Built from a turn's hash in one place (``from_index``), so the owner check
-    never reads the hash's keys itself.
+    A recorded turn's comes from its entry (TurnIndexEntry.owner), so the
+    owner check never reads the hash's keys itself.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -71,22 +75,21 @@ class TurnOwner(BaseModel):
     org_id: str | None
     user_id: str | None
 
-    @classmethod
-    def from_index(cls, turn: Mapping[str, str]) -> TurnOwner:
-        # record_turn writes "" for a missing id.
-        return cls(org_id=turn.get("org_id") or None, user_id=turn.get("user_id") or None)
-
 
 class TurnIndexEntry(BaseModel):
-    """What admission reads from a turn's hash. A channel turn's entry has
-    no ``run_id``: no registry handle covers it."""
+    """A conversation's turn index entry, every field its hash holds. A
+    channel turn's entry has no ``run_id``: no registry handle covers it."""
 
     model_config = ConfigDict(frozen=True)
 
     turn_id: int
     run_id: str | None
-    saved_question: bool
-    question_id: UUID | None
+    correlation_id: str
+    org_id: str | None = None
+    user_id: str | None = None
+    # When the entry was recorded, as a Unix time.
+    started_at: float | None = None
+    saved_question: bool = False
     # When the run released its claim, as a Unix time. None while it holds
     # it, and when its release wrote no stamp (its process died, or Redis
     # did not answer).
@@ -94,13 +97,21 @@ class TurnIndexEntry(BaseModel):
 
     @classmethod
     def from_index(cls, turn: Mapping[str, str]) -> TurnIndexEntry:
+        # _queue_record writes "" for a missing org or user id.
         return cls(
             turn_id=int(turn["turn_id"]),
             run_id=turn.get("run_id") or None,
+            correlation_id=turn["correlation_id"],
+            org_id=turn.get("org_id") or None,
+            user_id=turn.get("user_id") or None,
+            started_at=turn.get("started_at") or None,
             saved_question=turn.get("saved_question") == "1",
-            question_id=turn.get("question_id") or None,
             released_at=turn.get("released_at") or None,
         )
+
+    @property
+    def owner(self) -> TurnOwner:
+        return TurnOwner(org_id=self.org_id, user_id=self.user_id)
 
     def makes_stale(self, *, turn_id: int, now: float) -> bool:
         """Whether a start at ``turn_id`` read the history before this
@@ -204,18 +215,15 @@ async def record_channel_turn(
     raise WatchError(f"the turn index entry of {conversation_id} kept changing while it was recorded")
 
 
-async def stamp_question(
-    *, conversation_id: str, run_id: str, question_id: UUID | None, released: bool, client=None,
-) -> bool:
-    """Note in ``run_id``'s entry that its turn saved its question, and which
-    row when known. ``released`` also notes the time as ``released_at``, for
-    a run about to release its claim. Leaves another run's entry alone, and
-    writes no entry that is gone. True when it wrote."""
+async def stamp_question(*, conversation_id: str, run_id: str, released: bool, client=None) -> bool:
+    """Note in ``run_id``'s entry that its turn saved its question.
+    ``released`` also notes the time as ``released_at``, for a run about to
+    release its claim. Leaves another run's entry alone, and writes no entry
+    that is gone. True when it wrote."""
     r = client or get_redis()
     key = turn_key(conversation_id)
     fields = {
         "saved_question": "1",
-        **({"question_id": str(question_id)} if question_id is not None else {}),
         **({"released_at": str(time.time())} if released else {}),
     }
     for _attempt in range(3):
@@ -233,9 +241,10 @@ async def stamp_question(
     raise WatchError(f"the turn index entry of {conversation_id} kept changing while it was stamped")
 
 
-async def get_turn(conversation_id: str) -> dict | None:
+async def get_turn(conversation_id: str) -> TurnIndexEntry | None:
+    """The conversation's entry, or None when it has none."""
     turn = await get_redis().hgetall(turn_key(conversation_id))
-    return dict(turn) if turn else None
+    return TurnIndexEntry.from_index(turn) if turn else None
 
 
 async def forget_turn(conversation_id: str) -> None:
@@ -275,7 +284,8 @@ def forget_turn_sync(conversation_id: str) -> None:
     except Exception:
         # The entry stays until its TTL. One its turn stamped with a saved
         # question refuses sends at or below its turn number until
-        # STALE_START_WINDOW_SECONDS after that turn released its claim
+        # STALE_START_WINDOW_SECONDS after that turn released its claim, or
+        # until the TTL when the release wrote no stamp
         # (TurnIndexEntry.makes_stale); deleting the key clears it.
         logger.warning(
             "Could not forget a deleted conversation's turn index entry.",
@@ -284,7 +294,12 @@ def forget_turn_sync(conversation_id: str) -> None:
         )
 
 
-async def list_turns() -> list[dict]:
+class RecordedTurn(NamedTuple):
+    conversation_id: str
+    entry: TurnIndexEntry
+
+
+async def list_turns() -> list[RecordedTurn]:
     """Every recorded turn, pruning set members whose hash has expired.
 
     Every member's hash is read in one pipelined round trip rather than one
@@ -298,13 +313,13 @@ async def list_turns() -> list[dict]:
         for conversation_id in members:
             pipe.hgetall(turn_key(conversation_id))
         turns = await pipe.execute()
-    out: list[dict] = []
+    out: list[RecordedTurn] = []
     expired: list[str] = []
     for conversation_id, turn in zip(members, turns, strict=True):
         if not turn:
             expired.append(conversation_id)
             continue
-        out.append({"conversation_id": conversation_id, **turn})
+        out.append(RecordedTurn(conversation_id=conversation_id, entry=TurnIndexEntry.from_index(turn)))
     if expired:
         await _prune(r, expired)
     return out

@@ -274,7 +274,7 @@ async def test_abandoned_admission_cleanup_does_not_remove_a_successor(redis):
     old, new = str(uuid4()), str(uuid4())
     await turn_index.record_turn("c", turn_id=0, correlation_id="new", run_id=new, org_id=None, user_id=None)
     await turn_index.forget_run("c", old)
-    assert (await turn_index.get_turn("c"))["run_id"] == new
+    assert (await turn_index.get_turn("c")).run_id == new
 
 
 async def test_remote_cancellation_signals_its_worker_with_a_file_buffer(redis, monkeypatch, tmp_path):

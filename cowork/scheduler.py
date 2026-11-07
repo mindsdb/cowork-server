@@ -41,6 +41,7 @@ from cowork.streaming.liveness import MODEL_WAIT_PHASE
 from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import request_cancel
 from cowork.streaming.registry import ServerShuttingDown, registry
+from cowork.streaming.turn_claim import TurnClaimUnavailable
 
 if TYPE_CHECKING:
     from cowork.principal import Principal
@@ -104,6 +105,10 @@ def schedule_conversation_topic(title: str) -> str:
 # A run's error when its turn was refused because the server was shutting
 # down. The run never started, so the schedule's own last_error is left alone.
 _SHUTDOWN_RUN_ERROR = "Run did not start: the server was shutting down."
+# A run's error when Redis could not say whether another run holds the turn's
+# conversation (turn_claim.TurnClaimUnavailable), the 503 a client retries.
+# The run never started either.
+_CLAIM_UNAVAILABLE_RUN_ERROR = "Run did not start: Cowork was busy."
 # A run's error when a shutdown cancelled it before it recorded its turn's
 # outcome. Saved as failed, not success, so a cron slot it did not consume
 # stays due, and the freshness guard skips no slot because of it.
@@ -859,18 +864,31 @@ async def _execute_schedule(
             timed_out = True
             await _stop_timed_out_turn(str(conversation_id))
             raise RuntimeError(_duration_error(limit)) from exc
-        except ServerShuttingDown:
-            # This replica is ending its turns for a shutdown and refused the
-            # run's turn before it started. Nothing ran, so the schedule keeps
-            # its last_error, and _record_turn_outcome never consumes the cron
+        except (ServerShuttingDown, TurnClaimUnavailable) as refused:
+            # This replica is ending its turns for a shutdown, or Redis could
+            # not answer the turn's claim, and the run's turn was refused
+            # before it started: the 503 an HTTP client waits out and sends
+            # again. Nothing ran, so the schedule keeps its last_error and its
+            # failure streak, and _record_turn_outcome never consumes the cron
             # slot: it stays due for the next poll, on a replica still
             # serving. The finally below finishes the run row.
-            error = _SHUTDOWN_RUN_ERROR
             outcome = AttemptOutcome.failed_before_execution
-            logger.info(
-                "Schedule run did not start; the server is shutting down",
-                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
-            )
+            if isinstance(refused, ServerShuttingDown):
+                error = _SHUTDOWN_RUN_ERROR
+                logger.info(
+                    "Schedule run did not start; the server is shutting down",
+                    extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+                )
+            else:
+                error = _CLAIM_UNAVAILABLE_RUN_ERROR
+                logger.warning(
+                    "Schedule run did not start; Redis could not answer its turn's claim",
+                    exc_info=refused,
+                    extra={
+                        "event": "schedule_run_claim_unavailable",
+                        **log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+                    },
+                )
             if created_conversation:
                 try:
                     await run_db(
@@ -1101,7 +1119,7 @@ async def _cancel_abandoned_turn(abandoned: AbandonedTurn) -> None:
         turn = await get_turn(conversation_id)
         if turn is None:
             return
-        started = float(turn.get("started_at") or 0)
+        started = turn.started_at
         if started:
             if started < abandoned.run_started_at.timestamp() - _LEASE_RENEW_SECONDS:
                 return
@@ -1110,7 +1128,7 @@ async def _cancel_abandoned_turn(abandoned: AbandonedTurn) -> None:
             last_renewed = abandoned.lease_expired_at.timestamp() - _RUN_LEASE_SECONDS
             if started > last_renewed + _LEASE_RENEW_SECONDS:
                 return
-        await request_cancel(turn["correlation_id"])
+        await request_cancel(turn.correlation_id)
         logger.warning(
             "Asked the pod running an abandoned scheduled turn to stop",
             extra=log_context(conversation_id=conversation_id),

@@ -28,6 +28,8 @@ from cowork.streaming.registry import RunRegistry, TurnInProgress, TurnLifecycle
 from cowork.streaming.turn_claim import TurnClaim, TurnClaimUnavailable, claim_key, pod_name
 from tests._logging_assertions import assert_log_fields
 
+from _fakes import UnreachableRedis
+
 REGISTRY_LOGGER = "cowork.streaming.registry"
 REFUSAL = {
     "detail": (
@@ -344,16 +346,6 @@ def _opens(conversation_id: str, turn_id: int, opened: list[int] | None = None):
     return open_buffer
 
 
-class _Unreachable:
-    """A Redis client every command of which fails as a dropped connection does."""
-
-    def __getattr__(self, name):
-        def fail(*_args, **_kwargs):
-            raise RedisConnectionError("Redis is unreachable")
-
-        return fail
-
-
 def _foreign_claim(*, turn_id: int, run_id: str = "run-elsewhere") -> str:
     return TurnClaim(
         run_id=run_id, turn_id=turn_id, correlation_id="corr-elsewhere", pod="other-pod", started_at=1.0,
@@ -399,7 +391,7 @@ async def test_a_duplicate_send_on_another_replica_is_refused(fake_redis, caplog
     assert_log_fields(logged.output(), **fields)
     assert opened == []
     assert replica_b.get("dup") is None
-    assert (await turn_index.get_turn("dup"))["run_id"] == first.run_id
+    assert (await turn_index.get_turn("dup")).run_id == first.run_id
     assert first.is_answering
     assert await fake_redis.xlen("cowork:stream:dup:1") == 1
     release.set()
@@ -424,7 +416,7 @@ async def test_an_absent_claim_admits_and_the_winner_writes_the_index(fake_redis
     stored = TurnClaim.model_validate_json(await fake_redis.get(claim_key("fresh")))
     assert (stored.run_id, stored.turn_id) == (handle.run_id, 0)
     assert stored.correlation_id == handle.lifecycle.identity.correlation_id
-    assert (await turn_index.get_turn("fresh"))["run_id"] == handle.run_id
+    assert (await turn_index.get_turn("fresh")).run_id == handle.run_id
     release.set()
     await asyncio.wait_for(handle.task, timeout=2)
     assert await fake_redis.exists(claim_key("fresh")) == 0
@@ -497,7 +489,7 @@ async def test_a_claim_left_over_an_ended_turn_is_cleared_and_the_send_admitted(
 
 @pytest.mark.asyncio
 async def test_a_redis_error_at_admission_refuses_the_turn_before_it_opens(fake_redis, monkeypatch):
-    monkeypatch.setattr(turn_claim, "get_redis", lambda: _Unreachable())
+    monkeypatch.setattr(turn_claim, "get_redis", lambda: UnreachableRedis())
     opened: list[int] = []
 
     with pytest.raises(TurnClaimUnavailable):
@@ -510,20 +502,30 @@ async def test_a_redis_error_at_admission_refuses_the_turn_before_it_opens(fake_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failing", ["open_buffer", "turn_index"])
-async def test_a_start_that_fails_after_taking_the_claim_releases_it(fake_redis, monkeypatch, failing):
+@pytest.mark.parametrize(
+    "failing,refusal",
+    [("open_buffer", OSError), ("open_buffer_redis", TurnClaimUnavailable), ("turn_index", TurnClaimUnavailable)],
+)
+async def test_a_start_that_fails_after_taking_the_claim_releases_it(fake_redis, monkeypatch, failing, refusal):
+    """The claim is released whatever failed. A Redis error or timeout there
+    is refused as one before the claim is: TurnClaimUnavailable, which
+    answers 503 with Retry-After, so the client sends again. It used to
+    surface as the raw Redis error, a 500 no client retries."""
     async def failing_open():
         raise OSError("no buffer")
+
+    async def redis_failing_open():
+        raise RedisConnectionError("Redis is unreachable")
 
     async def failing_record(*_args, **_kwargs):
         raise RedisConnectionError("Redis is unreachable")
 
+    opens = {"open_buffer": failing_open, "open_buffer_redis": redis_failing_open}
     if failing == "turn_index":
         monkeypatch.setattr(turn_index, "record_turn", failing_record)
-    with pytest.raises((OSError, RedisConnectionError)):
+    with pytest.raises(refusal):
         await RunRegistry().start(
-            conversation_id="failed", turn_id=0,
-            open_buffer=failing_open if failing == "open_buffer" else _opens("failed", 0),
+            conversation_id="failed", turn_id=0, open_buffer=opens.get(failing, _opens("failed", 0)),
             produce=_answered,
         )
 
@@ -573,7 +575,7 @@ async def test_a_send_into_a_turn_another_replica_runs_is_refused_before_the_rou
 
 @pytest.mark.asyncio
 async def test_a_send_redis_cannot_answer_for_is_a_503_with_retry_after(client, fake_redis, monkeypatch):
-    monkeypatch.setattr(turn_claim, "get_redis", lambda: _Unreachable())
+    monkeypatch.setattr(turn_claim, "get_redis", lambda: UnreachableRedis())
     built = _built_handlers(monkeypatch)
 
     resp = client.post(
@@ -649,38 +651,46 @@ async def test_a_stale_local_handle_after_a_truncation_elsewhere_does_not_refuse
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("elsewhere_turn,refused", [(1, False), (5, True)], ids=["truncated", "moved-on"])
-async def test_a_stale_local_handle_counts_unless_the_index_shows_a_truncation(
-    fake_redis, elsewhere_turn, refused,
+@pytest.mark.parametrize(
+    "elsewhere_turn,elsewhere_saved,refused_at",
+    [(1, False, None), (3, False, None), (5, True, 5)],
+    ids=["truncated", "same-number-saved-nothing", "moved-on"],
+)
+async def test_a_stale_local_handle_defers_to_the_entry_another_replicas_run_wrote(
+    fake_redis, elsewhere_turn, elsewhere_saved, refused_at,
 ):
-    """After a truncation on replica B, B's next turn carries a lower number
-    than the handle replica A kept, so that handle no longer counts. A later
-    number on B shows no truncation, and A's handle still refuses a start
-    that read the history before its turn saved the question."""
+    """Replica A keeps the finished handle of its turn 3, which saved its
+    question. Once replica B's run writes the conversation's index entry,
+    that entry decides on every replica, A included. After a truncation on
+    B, B's next turn carries a lower number than A's handle, or the same
+    number with nothing saved, and every replica admits a start at 3; A's
+    handle used to refuse it there alone. A later turn on B that saved its
+    question refuses a start at 3 everywhere, by its own stamp."""
     replica_a, replica_b = RunRegistry(), RunRegistry()
     ended = await replica_a.start(
         conversation_id="moved", turn_id=3, open_buffer=_opens("moved", 3), produce=_answered,
         lifecycle=TurnLifecycle(saved_question=True, question_id=uuid4()),
     )
     await asyncio.wait_for(ended.task, timeout=2)
-    if elsewhere_turn < 3:
+    if elsewhere_turn <= 3:
         await turn_index.forget_turn("moved")
     elsewhere = await replica_b.start(
         conversation_id="moved", turn_id=elsewhere_turn, open_buffer=_opens("moved", elsewhere_turn),
-        produce=_answered,
+        produce=_answered, lifecycle=TurnLifecycle(saved_question=elsewhere_saved),
     )
     await asyncio.wait_for(elsewhere.task, timeout=2)
 
-    start = replica_a.start(
-        conversation_id="moved", turn_id=3, open_buffer=_opens("moved", 3), produce=_answered,
-    )
-    if refused:
-        with pytest.raises(TurnInProgress) as caught:
-            await start
-        assert caught.value.turn_id == 3
-        return
-    admitted = await start
-    await asyncio.wait_for(admitted.task, timeout=2)
+    for runs in (replica_a, replica_b):
+        start = runs.start(
+            conversation_id="moved", turn_id=3, open_buffer=_opens("moved", 3), produce=_answered,
+        )
+        if refused_at is not None:
+            with pytest.raises(TurnInProgress) as caught:
+                await start
+            assert caught.value.turn_id == refused_at
+            continue
+        admitted = await start
+        await asyncio.wait_for(admitted.task, timeout=2)
 
 
 @pytest.mark.asyncio
@@ -700,13 +710,13 @@ async def test_a_channel_turn_does_not_replace_a_claimed_turns_index_entry(fake_
     )
 
     assert wrote is False
-    assert (await turn_index.get_turn("chan"))["run_id"] == handle.run_id
+    assert (await turn_index.get_turn("chan")).run_id == handle.run_id
     release.set()
     await asyncio.wait_for(handle.task, timeout=2)
     assert await turn_index.record_channel_turn(
         conversation_id="chan", turn_id=0, correlation_id="corr-channel", org_id=None, user_id=None,
     ) is True
-    assert (await turn_index.get_turn("chan"))["correlation_id"] == "corr-channel"
+    assert (await turn_index.get_turn("chan")).correlation_id == "corr-channel"
 
 
 # ── the stale-number rule across replicas ────────────────────────────
@@ -860,9 +870,7 @@ async def test_a_turn_stamps_its_saved_question_when_it_saves_it(fake_redis, mon
     await asyncio.wait_for(final_written.wait(), timeout=2)
 
     entry = await turn_index.get_turn("early")
-    assert (entry["run_id"], entry["saved_question"], entry["question_id"]) == (
-        first.run_id, "1", str(lifecycle.question_id),
-    )
+    assert (entry.run_id, entry.saved_question, entry.released_at) == (first.run_id, True, None)
 
     async def failing_stamp(**_kwargs):
         raise RedisConnectionError("Redis is unreachable")
@@ -885,11 +893,49 @@ async def test_a_turn_stamps_its_saved_question_when_it_saves_it(fake_redis, mon
 
 
 @pytest.mark.asyncio
+async def test_a_remote_turns_producer_stamps_the_turn_index_as_it_saves_the_question(fake_redis, monkeypatch):
+    """The handler's own save, not a test producer's: the remote producer
+    saves the question in its first write, and the stamp lands then, while
+    the turn still answers. Set only in this process's memory, a release
+    whose stamp failed would leave every other replica admitting a start
+    that read the history before the save."""
+    import cowork.handlers.responses as handlers_mod
+    from test_responses_remote_backend import _FakeBuffer, _remote_handler
+
+    handler = _remote_handler(monkeypatch, {})
+    asked, release = asyncio.Event(), asyncio.Event()
+
+    async def replies_once_released(**_kwargs):
+        asked.set()
+        await release.wait()
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(handlers_mod, "stream_remote_replies", replies_once_released)
+    conversation_id = uuid4()
+    lifecycle = TurnLifecycle()
+    await turn_index.record_turn(
+        str(conversation_id), turn_id=2, correlation_id=lifecycle.identity.correlation_id,
+        org_id=None, user_id=None, run_id=lifecycle.identity.run_id,
+    )
+    producing = asyncio.create_task(handler._produce_remote(
+        conv_id=conversation_id, input_text="hi", original_content="hi", model="anton", harness_id="anton",
+        buffer=_FakeBuffer(), turn_id=2, lifecycle=lifecycle,
+    ))
+    try:
+        await asyncio.wait_for(asked.wait(), timeout=5)
+        entry = await turn_index.get_turn(str(conversation_id))
+        assert (entry.run_id, entry.saved_question, entry.released_at) == (lifecycle.identity.run_id, True, None)
+    finally:
+        release.set()
+        await asyncio.wait_for(producing, timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_an_unreadable_turn_index_refuses_the_start_as_unavailable(fake_redis, monkeypatch):
     """Could not read the turn index is not "no entry": read as none, a
     stale start would be admitted at the number of a turn that saved its
     question. Only the index is unreachable here; the claim reads fine."""
-    monkeypatch.setattr(turn_index, "get_redis", lambda: _Unreachable())
+    monkeypatch.setattr(turn_index, "get_redis", lambda: UnreachableRedis())
     opened: list[int] = []
 
     with pytest.raises(TurnClaimUnavailable):
@@ -900,3 +946,20 @@ async def test_an_unreadable_turn_index_refuses_the_start_as_unavailable(fake_re
 
     assert opened == []
     assert await fake_redis.exists(claim_key("index-down"), turn_claim.CLAIMS_KEY) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_turn_index_entry_no_reader_can_parse_refuses_the_start_as_unavailable(fake_redis):
+    """An entry missing its turn number is parsed in the same bounded step
+    that reads the hash, so it refuses the start with 503 and Retry-After, as
+    an unreadable index does. Parsed after that step, it raised a KeyError: a
+    500."""
+    await fake_redis.hset(turn_index.turn_key("torn"), mapping={"correlation_id": "corr-torn"})
+    opened: list[int] = []
+
+    with pytest.raises(TurnClaimUnavailable):
+        await RunRegistry().start(
+            conversation_id="torn", turn_id=2, open_buffer=_opens("torn", 2, opened), produce=_answered,
+        )
+
+    assert opened == []
