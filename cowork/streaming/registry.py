@@ -163,6 +163,10 @@ class TurnLifecycle:
     ``question_id`` is that row, once saved. A producer the turn is handed to
     (a direct answer that delegates to the agent) reuses it rather than saving
     the question a second time.
+
+    ``interactive`` is False for a turn no person started in the app (a
+    scheduled run). Such a turn gets no "task finished" push from the
+    registry; the scheduler sends its own.
     """
 
     discarded: bool = False
@@ -174,6 +178,7 @@ class TurnLifecycle:
     question_id: UUID | None = None
     stalled: bool = False
     cancel_requested: bool = False
+    interactive: bool = True
     identity: RunIdentity = field(default_factory=RunIdentity)
 
 
@@ -322,6 +327,21 @@ async def _seal_interrupted(handle: RunHandle) -> None:
         await handle.buffer.close("interrupted")
     except Exception:
         logger.exception("Could not seal the stream of a turn ended at shutdown", extra=context)
+
+
+def _turn_ended(handle: RunHandle) -> None:
+    """Hand a finished turn to the push hook, which decides on its own task
+    whether the turn's owner gets a "task finished" push. Never raises: a
+    done callback that did would only reach the event loop's handler."""
+    try:
+        from cowork.services.push.hooks import turn_ended
+
+        turn_ended(handle)
+    except Exception:
+        logger.exception(
+            "Could not hand a finished turn to the push hook",
+            extra=log_context(conversation_id=handle.conversation_id),
+        )
 
 
 class RunRegistry:
@@ -474,6 +494,7 @@ class RunRegistry:
                 lifecycle=lifecycle,
             )
             self._by_cid[conversation_id] = handle
+            task.add_done_callback(lambda _task: _turn_ended(handle))
             return handle
 
     async def _run_bounded(

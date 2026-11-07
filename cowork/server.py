@@ -444,6 +444,7 @@ async def lifespan(app: FastAPI):
         # while the steps below close them.
         await stop_draft_listener(draft_listener)
         from cowork.channels.webhooks import drain_background_tasks
+        from cowork.services.push.dispatch import drain_background_tasks as drain_push_notifications
         from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
         from cowork.coding.inference_proxy import close_inference_client
@@ -468,6 +469,9 @@ async def lifespan(app: FastAPI):
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
+        # After the turn drains above, whose endings may each have started a
+        # push, and the scheduled runs, which push when they finish.
+        await drain_push_notifications()
         # After both turn drains above: each turn they unwound has queued the
         # close of its scratchpad processes, and those must finish before the
         # event loop stops.

@@ -520,6 +520,42 @@ deployment:
           optional: true
 
     # ====================================
+    # MOBILE PUSH
+    # ====================================
+
+    # Push notifications to the MindsHub Cowork mobile app (cowork.services.push).
+    # All optional: a platform whose keys are missing from the cowork-push
+    # Secret sends nothing, and a namespace without the Secret still deploys.
+    # APNs: the .p8 auth key (PEM or base64 of it) from Apple Developer > Keys,
+    # its Key ID and the team ID. FCM: a Firebase service-account JSON (or
+    # base64 of it) allowed to send through FCM HTTP v1.
+    # COWORK_PUSH_ENABLED=false is the kill switch.
+    - name: COWORK_PUSH_APNS_KEY_P8
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_APNS_KEY_P8
+          optional: true
+    - name: COWORK_PUSH_APNS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_APNS_KEY_ID
+          optional: true
+    - name: COWORK_PUSH_APNS_TEAM_ID
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_APNS_TEAM_ID
+          optional: true
+    - name: COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON
+          optional: true
+
+    # ====================================
     # PROVIDER API KEYS
     # ====================================
 

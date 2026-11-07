@@ -811,6 +811,10 @@ async def _execute_schedule(
     timed_out = False
     end: _AttemptEnd | None = None
     shutdown_interrupted = False
+    scheduled: _ScheduledTurn | None = None
+    # Set once the run's ending is recorded: True finished, False didn't, and
+    # None sends no push (_push_run_ending).
+    push_succeeded: bool | None = None
     try:
         scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
 
@@ -918,6 +922,10 @@ async def _execute_schedule(
         )
         final_status, error = recorded.status, recorded.error
         slot_consumed = not is_manual
+        if end.outcome == AttemptOutcome.completed:
+            push_succeeded = True
+        elif end.outcome != AttemptOutcome.cancelled:
+            push_succeeded = False
 
     except _LeaseLost:
         # Recorded by the reaper; the finally leaves the run row alone.
@@ -987,6 +995,10 @@ async def _execute_schedule(
                 ),
                 schedule_id=schedule_id,
             )
+            # A blip before the turn started leaves a cron slot due for the
+            # next poll, which runs it again: nothing to tell anyone yet.
+            if not (transient and not is_manual):
+                push_succeeded = False
         except _LeaseLost:
             lease_lost.set()
         except Exception:
@@ -1021,6 +1033,48 @@ async def _execute_schedule(
         finally:
             with _active_run_lock:
                 _active_run_ids.discard(run_id)
+            if push_succeeded is not None and not lease_lost.is_set() and trigger != RunTrigger.trial:
+                _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
+
+
+def _push_run_ending(
+    scheduled: _ScheduledTurn | None, *, conversation_id: UUID | None, succeeded: bool,
+) -> None:
+    """Tell the schedule's owner on their phone how its run ended. Fire and
+    forget: push never holds up or fails a run.
+
+    Not for a trial: whoever tried the task out is watching it in the
+    editor. Not for a run the user cancelled, one a shutdown cut (the process
+    is going away; the run is reaped or retried elsewhere), one that lost its
+    claim before its turn started (its slot runs again), or one another
+    replica reaped (the reaper pushes, _reap_lapsed_runs). The callers leave
+    ``succeeded`` None for those.
+    """
+    principal = scheduled.principal if scheduled is not None else None
+    if principal is None:
+        return
+    try:
+        from cowork.services.push.hooks import scheduled_run_ended
+
+        scheduled_run_ended(
+            org_id=principal.org_id, user_id=principal.user_id, schedule_name=scheduled.title,
+            conversation_id=str(conversation_id) if conversation_id else None, succeeded=succeeded,
+        )
+    except Exception:
+        logger.warning("Could not push a scheduled run's ending", exc_info=True, extra={"event": "push_schedule_failed"})
+
+
+def _push_reaped_run(push: ReapedRunPush) -> None:
+    """Tell a reaped run's owner it didn't finish. Fire and forget."""
+    try:
+        from cowork.services.push.hooks import scheduled_run_ended
+
+        scheduled_run_ended(
+            org_id=push.org_id, user_id=push.user_id, schedule_name=push.schedule_name,
+            conversation_id=push.conversation_id, succeeded=False,
+        )
+    except Exception:
+        logger.warning("Could not push a reaped run's ending", exc_info=True, extra={"event": "push_schedule_failed"})
 
 
 class _LeaseLost(Exception):
@@ -1337,8 +1391,20 @@ def _duration_error(limit: float) -> str:
     return f"Run exceeded the {int(limit)}-second limit and was stopped."
 
 
+@dataclass(frozen=True)
+class ReapedRunPush:
+    """A reaped run's push to its schedule's owner, sent once the reap
+    commits (_reap_lapsed_runs runs in a database unit's thread)."""
+
+    org_id: str | None
+    user_id: str | None
+    schedule_name: str
+    conversation_id: str | None
+
+
 def _reap_lapsed_runs(
     session: ScopedSession, now: datetime, abandoned: list[AbandonedTurn] | None = None,
+    pushes: list[ReapedRunPush] | None = None,
 ) -> None:
     """Fail the runs whose process stopped renewing their lease.
 
@@ -1348,12 +1414,19 @@ def _reap_lapsed_runs(
     paused schedule moves on too, so it resumes at its next occurrence rather
     than on a slot this run still holds. Every reaped run whose turn may have
     started goes on ``abandoned``, so the poll can ask its pod to stop.
+
+    Every reaped run that claimed execution, other than a trial, goes on
+    ``pushes``: it ended without finishing, and its slot doesn't run again,
+    so its schedule's owner hears it didn't finish. The replica that ran it
+    stopped renewing it and pushes nothing (_push_run_ending).
     """
     with _active_run_lock:
         active = frozenset(_active_run_ids)
     committed_abandoned: list[AbandonedTurn] = []
+    executed: list[ScheduleRun] = []
     for run in ScheduleRunService(session).reap_lapsed_runs(
         now=now, error=_LAPSED_RUN_ERROR, abandoned=committed_abandoned, exclude_run_ids=active,
+        executed=executed,
     ):
         logger.warning(
             "Reaped a scheduled run whose server stopped renewing it",
@@ -1368,16 +1441,30 @@ def _reap_lapsed_runs(
             _advance_next_run_at(schedule, session)
             # The dead run's turn may have acted, so its slot settles failed.
             count_settled_slot(session, schedule.id, failed=True)
+    committed_pushes: list[ReapedRunPush] = []
+    for run in executed:
+        schedule = session.get(Schedule, run.schedule_id)
+        if schedule is not None and not run.trial:
+            committed_pushes.append(ReapedRunPush(
+                org_id=schedule.org_id, user_id=schedule.created_by, schedule_name=schedule.title,
+                conversation_id=str(run.conversation_id) if run.conversation_id else None,
+            ))
     session.commit()
     if abandoned is not None:
         abandoned.extend(committed_abandoned)
+    if pushes is not None:
+        pushes.extend(committed_pushes)
 
 
-def _poll(session: ScopedSession, abandoned: list[AbandonedTurn] | None = None) -> list[DueSlot]:
+def _poll(
+    session: ScopedSession, abandoned: list[AbandonedTurn] | None = None,
+    pushes: list[ReapedRunPush] | None = None,
+) -> list[DueSlot]:
     """One poll's unit: reap runs whose server died, settle missed runs, then
     the schedules due now with the slot each one's run claims. Reaped runs
-    whose turns may still be going in a pod go on ``abandoned``."""
-    _reap_lapsed_runs(session, datetime.now(timezone.utc), abandoned)
+    whose turns may still be going in a pod go on ``abandoned``, and the
+    pushes their endings send on ``pushes``."""
+    _reap_lapsed_runs(session, datetime.now(timezone.utc), abandoned, pushes)
     _handle_missed_runs(session)
     due: list[DueSlot] = []
     limit = _org_run_limit()
@@ -1403,11 +1490,12 @@ async def _scheduler_loop() -> None:
     while True:
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
         abandoned: list[AbandonedTurn] = []
+        pushes: list[ReapedRunPush] = []
         try:
             # A unit in a worker thread: when the pool has no connection to
             # give, the poll is refused after POOL_TIMEOUT instead of stalling
             # the event loop, and the next poll tries again.
-            due = await run_db(partial(_poll, abandoned=abandoned), scope=SYSTEM_SCOPE)
+            due = await run_db(partial(_poll, abandoned=abandoned, pushes=pushes), scope=SYSTEM_SCOPE)
         except PoolTimeoutError:
             logger.warning("Scheduler poll found no free database connection; the next poll retries")
             due = []
@@ -1417,6 +1505,8 @@ async def _scheduler_loop() -> None:
         finally:
             for turn in {turn.conversation_id: turn for turn in abandoned}.values():
                 asyncio.create_task(_cancel_abandoned_turn(turn))
+            for push in pushes:
+                _push_reaped_run(push)
 
         for index, slot in enumerate(due):
             if not _admission.reserve():

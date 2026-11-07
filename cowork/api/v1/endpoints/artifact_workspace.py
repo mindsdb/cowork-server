@@ -1138,6 +1138,29 @@ async def artifact_access(
     return state if rule is None else state.restricted_to(rule)
 
 
+def _push_share(request: Request, scope, notices: list) -> None:
+    """Push the people the save asked to notify, the ones MindsHub emails:
+    individuals by id only. People named by address alone, and the members
+    of a team or the whole organization a share opens to, get no push, as
+    they get no email. Never raises."""
+    try:
+        from cowork.principal import get_principal
+        from cowork.services.push.hooks import artifact_shared
+
+        principal = get_principal(request)
+        for notice in notices:
+            artifact_shared(
+                org_id=scope.org_id if scope.org_mode else None,
+                sharer_id=principal.user_id if principal else None,
+                sharer_name=principal.email if principal else None,
+                recipient_ids=notice.recipients.user_ids,
+                artifact_title=notice.artifact_title,
+                url=notice.artifact_url,
+            )
+    except Exception:
+        logger.warning("Could not push an artifact share", exc_info=True, extra={"event": "push_share_failed"})
+
+
 async def set_artifact_access(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -1208,8 +1231,9 @@ async def set_artifact_access(
                 detail="Publishing is unavailable right now. Try again in a moment.",
             )
         publish_started = True
+        notices: list = []
         try:
-            return await asyncio.wait_for(
+            published = await asyncio.wait_for(
                 asyncio.to_thread(
                     _publish_bundle,
                     folder,
@@ -1222,9 +1246,12 @@ async def set_artifact_access(
                     notify=notify or None,
                     stored=checked.stored,
                     owner_save=True,
+                    notices=notices,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
+            _push_share(request, session.scope, notices)
+            return published
         except asyncio.TimeoutError as exc:
             publish_abandoned = True
             raise HTTPException(

@@ -401,6 +401,20 @@ Schedule responses include `lastRun`, the latest finished manual run or cron run
 
 Run now accepts `?trial=true` to try a task without consuming its scheduled occurrence or changing its failure streak. Runs report `trigger` as `cron`, `manual`, or `trial`; the existing `isManual` and `trial` fields remain available. Trial migration `6f1b8d3a5c27` follows the last-run index migration `a9e2b6c4d810`.
 
+## Mobile push notifications
+
+In org mode (`COWORK_TENANCY_MODE=org`) the server pushes to the MindsHub Cowork mobile app through APNs (iOS) and FCM HTTP v1 (Android); everywhere else push does nothing. The app registers each phone with `POST /api/v1/push/devices` (`{"token", "platform": "ios"|"android", "app_version", "environment": "production"|"sandbox"|null}`, 204) and removes it on sign-out with `DELETE /api/v1/push/devices` (`{"token"}`, 204, only the caller's own token). Outside org mode both answer 404. A token names one phone, so registering it again moves it to whoever registered it last. Rows live in `push_devices`.
+
+Three events push, each carrying `kind`, and `path` (an in-app route, `/c/<conversation_id>`) or `url` (the artifact's shared view):
+
+- `task_finished`: a task someone started in the app ends, to its owner: "Finished.", or "Didn't finish." on an error, an interruption, a stall or the idle reaper. A Stop, a server restart and a deleted conversation send nothing, and neither does a turn someone was watching live when it ended: a reader of its stream (the POST that started it or `GET /responses/tail`, on any replica) holds it back, for 15 seconds after it streamed the end (`cowork/streaming/watchers.py`).
+- `scheduled_run_finished`: a scheduled run ends, to the schedule's owner, finished or not. A trial run (`?trial=true`), a cancelled run and a run whose slot fires again send nothing. A run another replica reaped is pushed by the reaper.
+- `artifact_shared`: someone saves an artifact's sharing with "Notify people", to each person they named by id, the same people MindsHub emails. Members of a team or organization the share opens to get no push.
+
+Every push is sent off the path of the work that caused it, with short timeouts, and a failure is logged (`push_*` events) and dropped. A token APNs or FCM reports as gone (410, `Unregistered`, `BadDeviceToken` in both environments, FCM `UNREGISTERED` or 404) is deleted. An iOS token production refuses as `BadDeviceToken` is tried once in sandbox, and the environment that took it is kept.
+
+Settings, all optional, from the `cowork-push` Secret in the chart: `COWORK_PUSH_APNS_KEY_P8` (the `.p8` auth key from Apple Developer > Keys, PEM or base64), `COWORK_PUSH_APNS_KEY_ID`, `COWORK_PUSH_APNS_TEAM_ID`, `COWORK_PUSH_APNS_TOPIC` (default `ai.mindshub.cowork`), and `COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON` (a Firebase service account allowed to send messages, JSON or base64). A platform whose settings are missing sends nothing. `COWORK_PUSH_ENABLED=false` turns push off.
+
 ## Data Layer
 
 Data lives in two places: a **SQLite database** for structured records and the **filesystem** for project files and agent workspaces. Understanding both is essential.
@@ -425,6 +439,7 @@ Key tables:
 | `schedules` / `schedule_runs` | Recurring prompts and their execution history |
 | `settings` | Key-value user settings; sensitive values Fernet-encrypted |
 | `pins` | User-pinned items (conversations, artifacts, etc.) |
+| `push_devices` | Phones the mobile app registered for push (org mode) |
 | `channel_*` | Channel installations, bindings, sessions, and events |
 | `shared_resource_attributions` | Creator and latest-editor user IDs for org-shared filesystem resources |
 | `shared_resource_mutations` | Append-only actor trail for allowed org-shared mutations, including deletes |
