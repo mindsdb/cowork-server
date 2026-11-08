@@ -103,17 +103,22 @@ def test_remote_producer_publishes_only_after_the_reply_stream_ends_cleanly():
 
 def test_remote_producer_records_artifacts_on_every_other_exit():
     """Every exit that is not a clean finish ends through end_turn, whose
-    save records the artifacts before it saves the answer, and a deleted turn
-    still records them before it drops the rest."""
+    save records the artifacts before it saves the answer, and saves the
+    answer even when the record is cut. A deleted turn still records them
+    before it drops the rest."""
     src = _norm(r.ResponsesHandler._run_remote_turn)
-    assert "await record_artifacts(completed_cleanly=False) return await persist(clean=False)" in src
+    assert (
+        "try: await record_artifacts(completed_cleanly=False) "
+        "finally: saved = await persist(clean=False) return saved"
+    ) in src
     assert "await record_artifacts(completed_cleanly=False) return" in src
 
 
 @pytest.mark.parametrize("producer", PRODUCERS)
 def test_pre_turn_snapshot_captures_content_mtimes(producer):
     src = _norm(producer)
-    assert "snapshot_artifact_state(" in src
+    # On a file store thread (run_efs), so it's named in a partial, not called.
+    assert "partial(snapshot_artifact_state," in src
     assert "before_mtimes" in src
 
 
@@ -131,7 +136,7 @@ def test_remote_producer_breaks_rather_than_returns_on_completion():
 
 def test_cards_exclude_self_heal_publishes():
     src = _norm(t.publish_and_card_turn_artifacts)
-    assert "cards_for_slugs(" in src
+    assert "partial( cards_for_slugs," in src
     # An edited (not new) artifact must get a card so its URL reaches the UI
     # without waiting for the next list fetch — hence the union with
     # `republished`. But INTERSECTED with the touched set: `republished` also holds

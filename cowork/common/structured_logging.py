@@ -28,6 +28,9 @@ EVENT_FIELDS = frozenset(
         "turn_request_id",
         "artifact_slug",
         "artifact_slugs",
+        # The slugs a turn-end artifact record writes rows for
+        # (cowork.db.units.drain_turn_end_records).
+        "touched",
         "sqlstate",
         "provider_error",
         "conversation_id",
@@ -54,10 +57,22 @@ EVENT_FIELDS = frozenset(
         "managed_connection_file",
         "retryable",
         "statement_fingerprint",
+        # cowork.common.loop_watchdog and the lifespan's step timings.
+        "stack",
+        "in_flight",
+        "limiter",
+        "step",
+        "steps",
     ]
 )
 HEALTH_PATHS = frozenset(
-    ["/health", "/api/v1/health", "/api/v1/health/", "/api/v1/health/live"]
+    [
+        "/health",
+        "/api/v1/health",
+        "/api/v1/health/",
+        "/api/v1/health/live",
+        "/api/v1/health/ready",
+    ]
 )
 
 
@@ -172,7 +187,7 @@ def _event_schema(logger, method_name, event_dict):
     for field in EVENT_FIELDS:
         value = event_dict.get(field)
         if (
-            field == "artifact_slugs"
+            field in ("artifact_slugs", "touched")
             and isinstance(value, (list, tuple))
             and all(type(slug) is str for slug in value)
         ):

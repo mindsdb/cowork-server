@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from pathlib import Path
 
 import pytest
@@ -64,9 +65,16 @@ def test_org_discovery_drops_a_symlinked_conversation_root(tmp_path, monkeypatch
     # ENG-2056: the project-level base is always a candidate root regardless of
     # any conversation's safety — only the symlinked conversation entry itself
     # is dropped.
-    assert artifact_roots._project_artifact_bases(
-        str(project), object(), include_other_members=True
-    ) == [artifact_roots._artifacts_base(str(project))]
+    row = artifact_roots.ProjectRow(
+        id=uuid.UUID("11111111-1111-4111-8111-111111111111"),
+        name="project",
+        path=str(project),
+        external=False,
+    )
+    found = artifact_roots.discover_roots(artifact_roots.RootsPlan(projects=(row,)))
+    assert [source.base for source in found.unfiltered()] == [
+        artifact_roots._artifacts_base(str(project))
+    ]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="directory-link threat is POSIX org storage")
@@ -215,7 +223,7 @@ def test_root_swapped_after_index_build_is_refused(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="directory-link threat is POSIX org storage")
-def test_delete_refuses_a_folder_swap_before_removal(tmp_path, monkeypatch):
+async def test_delete_refuses_a_folder_swap_before_removal(tmp_path, monkeypatch):
     project = tmp_path / "project"
     folder = project / ".anton" / "artifacts" / "draft"
     _write_metadata(folder)
@@ -228,15 +236,16 @@ def test_delete_refuses_a_folder_swap_before_removal(tmp_path, monkeypatch):
         folder.rename(parked)
         folder.symlink_to(outside, target_is_directory=True)
 
-    monkeypatch.setattr(artifacts, "_unpublish_pinned_folder", swap_during_unpublish)
+    monkeypatch.setattr(artifacts, "_take_down_pages", swap_during_unpublish)
 
     with pytest.raises(FileNotFoundError, match="changed before deletion"):
-        artifacts.delete_artifact_from_source(
-            _source(project),
-            "draft",
+        await artifacts.delete_artifact_from_source(
+            source=_source(project),
+            folder_name="draft",
             expected_artifact_id=FULL_ID,
             api_key="key",
             publish_url="https://publish.example",
+            scope=LOCAL_SCOPE,
         )
 
     assert (outside / "keep.txt").read_text(encoding="utf-8") == "private"
@@ -244,7 +253,7 @@ def test_delete_refuses_a_folder_swap_before_removal(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="file-link threat is POSIX org storage")
-def test_delete_does_not_read_or_write_a_symlinked_publish_record(tmp_path):
+async def test_delete_does_not_read_or_write_a_symlinked_publish_record(tmp_path):
     project = tmp_path / "project"
     folder = project / ".anton" / "artifacts" / "draft"
     _write_metadata(folder)
@@ -256,19 +265,20 @@ def test_delete_does_not_read_or_write_a_symlinked_publish_record(tmp_path):
     outside.write_text(outside_payload, encoding="utf-8")
     (folder / ".published.json").symlink_to(outside)
 
-    artifacts.delete_artifact_from_source(
-        _source(project),
-        "draft",
+    await artifacts.delete_artifact_from_source(
+        source=_source(project),
+        folder_name="draft",
         expected_artifact_id=FULL_ID,
         api_key="key",
         publish_url="https://publish.example",
+        scope=LOCAL_SCOPE,
     )
 
     assert not folder.exists()
     assert outside.read_text(encoding="utf-8") == outside_payload
 
 
-def test_pinned_delete_unpublishes_before_removing_the_folder(tmp_path, monkeypatch):
+async def test_pinned_delete_unpublishes_before_removing_the_folder(tmp_path, monkeypatch):
     project = tmp_path / "project"
     folder = project / ".anton" / "artifacts" / "draft"
     _write_metadata(folder)
@@ -292,19 +302,20 @@ def test_pinned_delete_unpublishes_before_removing_the_folder(tmp_path, monkeypa
         lambda identifier, _entry, **_kwargs: revoked.append(identifier),
     )
 
-    artifacts.delete_artifact_from_source(
-        _source(project),
-        "draft",
+    await artifacts.delete_artifact_from_source(
+        source=_source(project),
+        folder_name="draft",
         expected_artifact_id=FULL_ID,
         api_key="key",
         publish_url="https://publish.example",
+        scope=LOCAL_SCOPE,
     )
 
     assert revoked == ["remote-id"]
     assert not folder.exists()
 
 
-def test_pinned_delete_keeps_the_folder_when_unpublish_fails(tmp_path, monkeypatch):
+async def test_pinned_delete_keeps_the_folder_when_unpublish_fails(tmp_path, monkeypatch):
     project = tmp_path / "project"
     folder = project / ".anton" / "artifacts" / "draft"
     _write_metadata(folder)
@@ -322,12 +333,13 @@ def test_pinned_delete_keeps_the_folder_when_unpublish_fails(tmp_path, monkeypat
     monkeypatch.setattr(artifacts, "_unpublish_identifier", fail)
 
     with pytest.raises(RuntimeError, match="remote unavailable"):
-        artifacts.delete_artifact_from_source(
-            _source(project),
-            "draft",
+        await artifacts.delete_artifact_from_source(
+            source=_source(project),
+            folder_name="draft",
             expected_artifact_id=FULL_ID,
             api_key="key",
             publish_url="https://publish.example",
+            scope=LOCAL_SCOPE,
         )
 
     assert folder.is_dir()

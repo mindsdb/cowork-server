@@ -124,6 +124,18 @@ def trust_test_client_host():
     guards._TRUSTED_LOOPBACK_HOSTS = production
 
 
+@pytest.fixture(scope="session", autouse=True)
+def shared_root_resolved_at_startup():
+    """The lifespan's step before the port binds (cowork.server.lifespan),
+    which tests that drive the app without it skip: resolve the shared root,
+    so a database unit's partition check reads that answer and makes no file
+    store call (cowork.services.projects.resolved_shared_root). A test that
+    points COWORK_SHARED_DIR under COWORK_HOME elsewhere resolves it again."""
+    from cowork.services.projects import resolve_shared_root
+
+    resolve_shared_root()
+
+
 @pytest.fixture
 def cleanup_tmp_projects(tmp_path):
     """Delete Project rows created under this test's `tmp_path`, plus their

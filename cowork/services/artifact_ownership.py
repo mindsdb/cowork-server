@@ -104,7 +104,7 @@ def project_root_source(project) -> ProjectArtifacts:
     Built directly rather than picked out of `artifacts_sources_for_project`,
     which also lists every legacy conversation root on the shared mount: a
     caller that already knows its base is the project root has nothing to
-    discover. It is the same shape `artifact_roots._sources_for` gives that
+    discover. It is the same shape `artifact_roots._project_roots` gives that
     root, so `is_project_root` holds for it.
     """
     return ProjectArtifacts(
@@ -206,7 +206,7 @@ def resolve_artifact_owners(session, source, slugs: Iterable[str]) -> dict[str, 
 
     if not source.project_id or not is_project_root(source):
         if source.project_id and getattr(source, "trusted_anchor", None) is None:
-            # Every org root built by `artifact_roots._sources_for` carries an
+            # Every org root built by `artifact_roots._project_roots` carries an
             # anchor; one without it resolves `unknown` for every artifact.
             logger.error(
                 "artifact_owner source without trusted_anchor project=%s base=%s",

@@ -41,12 +41,16 @@ from cowork.server import create_app
 #: that middleware were removed, it does not belong here.
 OPEN_BY_DESIGN_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
     ("/api/v1/health/", ("GET",)): (
-        "the pre-auth readiness probe every client and the kubelet polls before "
-        "anything can authenticate"
+        "the pre-auth status probe every client polls before anything can "
+        "authenticate"
     ),
     ("/api/v1/health/live", ("GET",)): (
         "the kubelet's liveness probe, which has no identity headers to send "
         "and nowhere to get them; refusing it kills the pod"
+    ),
+    ("/api/v1/health/ready", ("GET",)): (
+        "the kubelet's readiness probe, which has no identity headers to send "
+        "either; refusing it pulls every pod out of the service"
     ),
     ("/api/v1/connectors/oauth/{service}/callback", ("GET",)): (
         "the OAuth provider's own redirect target; the browser arrives with "

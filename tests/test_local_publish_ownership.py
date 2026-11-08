@@ -97,10 +97,10 @@ def _source(root: Path) -> ProjectArtifacts:
 def _delete(publisher, page, scope, route):
     """Delete the page's whole artifact folder through one of the two delete routes."""
     if route == "slug":
-        artifacts.delete_artifact_from_source(
-            _source(publisher.root), page.parent.name, expected_artifact_id=None,
+        asyncio.run(artifacts.delete_artifact_from_source(
+            source=_source(publisher.root), folder_name=page.parent.name, expected_artifact_id=None,
             api_key="test-key", publish_url=publisher.endpoint, scope=scope,
-        )
+        ))
     else:
         artifacts.delete_artifact(
             page.parent, artifacts_base=publisher.root, api_key="test-key",
