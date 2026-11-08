@@ -1073,7 +1073,10 @@ async def test_with_every_file_store_call_stuck_the_projects_list_answers(
     its lookup. Liveness and a member's projects list answer within budget,
     and no more threads block than the file store has slots: the list reads
     rows only once the organization's general project exists."""
-    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    # Every review's database units share the pool before they reach the
+    # store, so on a loaded runner 1 s refused most of them there and few
+    # filled a slot. The reviews past the slots still wait this long, then 503.
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 10)
     storage = db_session.settings.storage
     members = [f"5c0a1e5e-0000-4000-8000-0000000001{n:02d}" for n in range(storage.efs_slots // storage.efs_share + 1)]
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
