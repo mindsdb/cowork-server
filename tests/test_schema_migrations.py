@@ -47,6 +47,20 @@ def _alembic_version(path) -> str:
         return connection.execute("select version_num from alembic_version").fetchone()[0]
 
 
+def _alembic_versions(path) -> set[str]:
+    """Every revision stamped, one per branch applied: a downgrade to a
+    revision that is not an ancestor of every head leaves the other branch's
+    head stamped beside it."""
+    with sqlite3.connect(path) as connection:
+        return {row[0] for row in connection.execute("select version_num from alembic_version")}
+
+
+# main's twin of dce94d4bafc0 (the conversations owner index), on its own
+# branch off 2a366c1f4b9f until f93151b5bad1 merges it. A downgrade to a
+# staging revision after 2a366c1f4b9f leaves it stamped.
+MAINS_OWNER_INDEX = "599bf4bf0370"
+
+
 def _set_alembic_version(path, revision: str) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("update alembic_version set version_num = ?", (revision,))
@@ -330,7 +344,7 @@ def test_the_conversations_owner_index_is_added_by_its_migration_and_dropped_on_
 
     assert "ix_conversations_org_id_created_by" not in _conversation_indexes(path=db_path)
     assert "ix_conversations_org_id" in _conversation_indexes(path=db_path)
-    assert _alembic_version(db_path) == "6f1b8d3a5c27"
+    assert _alembic_versions(db_path) == {"6f1b8d3a5c27", MAINS_OWNER_INDEX}
 
 
 def test_task_objects_downgrade_drops_table(tmp_path, monkeypatch):
@@ -1266,4 +1280,4 @@ def test_artifact_locations_downgrade_guards_missing_table(tmp_path, monkeypatch
 
     _downgrade_to(engine, uri, "dce94d4bafc0")  # must not raise
 
-    assert _alembic_version(db_path) == "dce94d4bafc0"
+    assert _alembic_versions(db_path) == {"dce94d4bafc0", MAINS_OWNER_INDEX}
