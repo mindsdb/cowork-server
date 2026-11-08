@@ -18,8 +18,18 @@ lookup's, at most once per id every 15 minutes on each replica
 (cowork.api.v1.artifact_scope._open_or_scan), or the backfill's walk while
 its pass runs. A turn end sees only the folders it made, so it writes no
 row; it marks an id conflicted when the id's row names another folder of
-the project (record_made_folder). A folder whose name is not valid UTF-8
-counts toward a conflict, but no row names it, since no row can store it.
+the project (record_made_folder). A full listing of the project's shared
+root (a turn end with no list of the folders its tools touched, the
+scheduled self-heal) marks an id the same way for every folder it lists
+(record_listed_folders), so a copy no turn end claims is caught too,
+except that a row naming a folder of that shared root which the listing
+read and found gone or holding another id (a rename) is stale, not a
+second folder, and is left for the id's next lookup to move. A listing that
+could not read a folder, or the root itself, asks for the project's
+location check, which lists it again
+(artifact_autopublish.request_self_heal_for_unread_folders). A folder
+whose name is not valid UTF-8 counts toward a conflict, but no row names
+it, since no row can store it.
 """
 from __future__ import annotations
 
@@ -34,6 +44,7 @@ from sqlalchemy.exc import IntegrityError
 from cowork.common.logger import log_context
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.models.artifact_location import ArtifactLocation
+from cowork.services.artifact_identity import ListedIds
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +169,54 @@ def record_made_folder(session: ScopedSession, *, artifact_id: str, location: Lo
     if not keeps_locations(session.scope):
         return
     row = _row(session, artifact_id)
-    if row is None or row.conflicted:
+    if row is not None:
+        _mark_if_held_elsewhere(session, row, location=location)
+
+
+def record_listed_folders(session: ScopedSession, *, project_id: UUID, listing: ListedIds) -> None:
+    """Note what a full listing of `project_id`'s shared artifacts root found:
+    each folder named in `listing.ids`, holding the id it maps to. As for a
+    folder a turn made (record_made_folder), a listed folder whose id has a
+    row naming another folder of the project marks the id conflicted, and no
+    row is written. So a copy no turn end claims, such as one a shell `cp -r`
+    makes, still makes the id's lookups answer 409. One query reads every
+    id's row.
+
+    A row naming a folder of this shared root is left unmarked only when the
+    listing read that folder and shows it gone or holding another id. After
+    a rename, such as a shell `mv brief brief-renamed`, the row is stale
+    rather than one of two folders, and the id's next lookup moves it. A
+    folder the listing could not stat or read (`listing.unreadable`) may
+    still hold the id, so its row is marked as before, and so is a row
+    naming a legacy conversation root, which this listing cannot see. The
+    caller asks for the project's location check when the listing could not
+    read a folder (artifact_autopublish.request_self_heal_for_unread_folders),
+    since an unread copy marks nothing here.
+    """
+    if not keeps_locations(session.scope) or not listing.ids:
+        return
+    rows = session.exec(
+        session.select(ArtifactLocation).where(ArtifactLocation.artifact_id.in_(set(listing.ids.values())))
+    ).all()
+    by_id = {row.artifact_id: row for row in rows}
+    for slug, artifact_id in listing.ids.items():
+        row = by_id.get(artifact_id)
+        if row is None:
+            continue
+        if (
+            row.conversation_id is None
+            and row.project_id == project_id
+            and row.slug not in listing.unreadable
+            and listing.ids.get(row.slug) != artifact_id
+        ):
+            continue
+        _mark_if_held_elsewhere(session, row, location=Location(project_id, None, slug))
+
+
+def _mark_if_held_elsewhere(session: ScopedSession, row: ArtifactLocation, *, location: Location) -> None:
+    """Mark `row`'s id conflicted when `location`, a folder holding the id,
+    is another folder of the project the row names."""
+    if row.conflicted:
         return
     current = _location(row)
     if current != location and current.project_id == location.project_id:

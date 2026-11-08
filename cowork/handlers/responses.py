@@ -150,11 +150,12 @@ from cowork.services.product_permissions import (
 )
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectNotFoundError, ProjectService, is_comparison_sandbox
+from cowork.services.queued_repairs import QueuedRepairs
 from cowork.services.settings import SettingService
 from cowork.schemas.turn_skills import TurnSkills
 from cowork.services.skill_sharing import SkillViewer, sharing_applies
 from cowork.services.skills import SkillService, has_always_on_rows, has_always_on_skills
-from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result
+from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result, tracked_artifacts_from_reply
 
 
 import logging
@@ -621,6 +622,10 @@ class _RemoteTurnArtifacts:
     directory: _RemoteArtifactsDir
     before_slugs: set[str]
     before_mtimes: dict[str, int]
+    # The rows of the folders holding an agent repair queued to the
+    # conversation (queued_agent_repairs), read before the pod runs: the
+    # repair is queued before its turn starts. None when they couldn't be read.
+    repairs: QueuedRepairs | None = None
     writes_allowed: bool = False
     recorded: bool = False
 
@@ -2364,19 +2369,20 @@ class ResponsesHandler:
 
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            # ENG-2056: project-scoped in BOTH modes. The pod mounts the
-            # PROJECT-level base at /project-artifacts and anton writes there
+            # Project-scoped in BOTH modes. The pod mounts the PROJECT-level
+            # base at /project-artifacts and anton writes there
             # (ANTON_CLOUD_ARTIFACTS_ROOT), so that is where the worker's
             # artifacts land — no longer under conversations/<id>/. Resolved
             # through artifact_roots so this and the artifacts list agree on
             # the layout.
             #
-            # The base is now shared by every task in the project, so the raw
-            # before/after diff below can attribute a concurrent sibling turn's
-            # artifact to this turn. Pre-existing caveat, not new machinery: the
-            # in-process path bounds the same diff with the session's
-            # artifacts_touched set (ENG-1933), but the remote pod reports no
-            # equivalent yet, so the diff stands alone here.
+            # The base is shared by every task in the project, so a raw
+            # before/after diff could attribute a concurrent sibling turn's
+            # artifact to this turn. A pod that sends its artifacts_touched
+            # list on turn_completed bounds the turn end's diff to those
+            # folders, as the in-process path's session list does. An older
+            # pod, or any exit other than turn_completed, still diffs the
+            # whole folder, with provenance deciding what the turn created.
             return _RemoteArtifactsDir(
                 base=project_artifacts_base(conversation.project.path),
                 project_id=str(conversation.project_id) if conversation.project_id else None,
@@ -2689,7 +2695,9 @@ class ResponsesHandler:
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
 
-        async def record_artifacts(*, completed_cleanly: bool) -> ArtifactChanges | None:
+        async def record_artifacts(
+            *, completed_cleanly: bool, touched: set[str] | None = None,
+        ) -> ArtifactChanges | None:
             """Record what the pod did to the project's artifacts, once per
             turn, whichever way the turn ends, as the in-process harness's
             `finally` does: the folders it created are indexed as this
@@ -2698,13 +2706,39 @@ class ResponsesHandler:
             turn may not keep what the pod wrote (its workspace was not
             persistent), when it recorded them already, or when the diff
             failed. Outside org mode the next turn in the project reconciles
-            them; in org mode nothing does."""
-            from cowork.services.task_objects import record_new_artifacts, turn_artifact_changes
+            them; in org mode nothing does. `touched` is the pod's own list of
+            the artifacts its tools touched: with it, the diff claims and
+            checks only those, less any whose provenance names another
+            conversation; without it, provenance decides what the turn
+            created, and every folder is checked for edits. With it, the
+            project's self-heal is asked for before the diff starts
+            (request_turn_end_self_heal), so a turn end whose diff fails, or
+            that a Stop cuts, still asks: neither its diff nor its publish
+            lists the project. Without it, the diff's listing is the
+            project's location check, so a diff whose listing could not read
+            a folder, or the project's folder itself, asks for that check
+            again once it returns (request_self_heal_for_unread_folders), and
+            a diff or a record that fails asks for the project's self-heal
+            (request_turn_end_self_heal). The caller drops the rows of the
+            repair folders the diff checked once the turn's cards are out
+            (forget_checked_repairs)."""
+            from cowork.services.artifact_autopublish import (
+                request_self_heal_for_unread_folders,
+                request_turn_end_self_heal,
+            )
+            from cowork.services.task_objects import (
+                ListedLocationsUnchecked,
+                record_new_artifacts,
+                turn_artifact_changes,
+            )
 
             if turn_artifacts is None or not turn_artifacts.writes_allowed or turn_artifacts.recorded:
                 return None
             turn_artifacts.recorded = True
             directory = turn_artifacts.directory
+            # With the pod's list, the folders holding a repair queued to this
+            # conversation are all the diff needs besides the touched ones.
+            repairs = turn_artifacts.repairs if touched is not None else None
 
             async def record() -> ArtifactChanges | None:
                 try:
@@ -2719,10 +2753,18 @@ class ResponsesHandler:
                             artifacts_base=directory.base,
                             before=turn_artifacts.before_slugs,
                             before_mtimes=turn_artifacts.before_mtimes,
-                            # ENG-2961: the project base is shared, so only folders
-                            # whose provenance names this conversation are its own.
+                            # The project base is shared, so a folder whose
+                            # provenance names another conversation is never
+                            # this turn's, even one the pod named: anton also
+                            # names a sibling's folder that changed during one
+                            # of this turn's cells. Without the pod's list, only
+                            # a folder whose provenance names this conversation
+                            # is its own.
                             attribute_by_provenance=True,
+                            tracked_new=touched,
+                            tracked_edits=touched,
                             completed_cleanly=completed_cleanly,
+                            repair_slugs=repairs.slugs if repairs is not None else None,
                         ),
                         scope=scope,
                         deadline=False,
@@ -2732,8 +2774,21 @@ class ResponsesHandler:
                         "[responses] could not diff the artifacts of remote turn %s", conv_id,
                         exc_info=True, extra={"request_id": corr},
                     )
+                    if touched is None:
+                        # This listing was the project's location check, so
+                        # its self-heal checks instead. With the pod's list
+                        # it was asked for before the diff.
+                        request_turn_end_self_heal(
+                            artifacts_base=directory.base, scope=scope, project_id=directory.project_id,
+                        )
                     return None
-                if not changes.created:
+                # Even when the listing found no id: the self-heal lists the
+                # folders it could not read again.
+                request_self_heal_for_unread_folders(
+                    listing=changes.listed_ids, artifacts_base=directory.base, scope=scope,
+                    project_id=directory.project_id,
+                )
+                if not (changes.created or changes.listed_ids.ids):
                     return changes
                 note_turn_end_slugs(slugs=changes.created)
                 try:
@@ -2745,19 +2800,32 @@ class ResponsesHandler:
                             slugs=changes.created,
                             creator=directory.creator,
                             artifact_ids=changes.created_ids,
+                            listed_ids=changes.listed_ids,
                         ),
                         scope=scope,
                     )
-                except Exception:
+                except Exception as exc:
                     # record_new_artifacts logs each slug whose index or
                     # owner write fails itself; this covers the unit's own
-                    # refusal (a busy pool) or a failed commit. In org mode
+                    # refusal (a busy pool), a failed commit, or a failed
+                    # check of the folders the diff listed, which it raises
+                    # once its other writes have committed. In org mode
                     # nothing records these folders later:
                     # reconcile_conversation skips org roots and the owner
                     # backfill runs once, at startup, so they keep no
-                    # index row and their owner stays unknown.
+                    # index row and their owner stays unknown. A turn that
+                    # created nothing, or whose record failed only at that
+                    # check, lost only the check, so its line says that.
+                    # Without the pod's list nothing else checks the listed
+                    # folders, so the project's self-heal does.
+                    if touched is None:
+                        request_turn_end_self_heal(
+                            artifacts_base=directory.base, scope=scope, project_id=directory.project_id,
+                        )
                     logger.error(
-                        "[responses] could not record the artifacts a remote turn created",
+                        "[responses] could not record the artifacts a remote turn created"
+                        if changes.created and not isinstance(exc, ListedLocationsUnchecked)
+                        else "[responses] could not check the locations of the artifacts a remote turn listed",
                         exc_info=True,
                         extra=log_context(
                             request_id=corr,
@@ -2774,11 +2842,17 @@ class ResponsesHandler:
             # both and the record's error log, so the rows are written once
             # and a refusal still names the slugs it left unrecorded. A
             # shutdown's last step waits for it too (drain_turn_end_records).
+            if touched is not None:
+                request_turn_end_self_heal(
+                    artifacts_base=directory.base, scope=scope, project_id=directory.project_id,
+                )
             return await run_turn_end_record(
                 work=record(),
-                # record names the slugs once its diff finds them
-                # (note_turn_end_slugs).
-                record=TurnEndRecord(conversation_id=conv_id, project_id=directory.project_id, touched=()),
+                # The pod's list until the diff returns; record then names
+                # the new slugs it found (note_turn_end_slugs).
+                record=TurnEndRecord(
+                    conversation_id=conv_id, project_id=directory.project_id, touched=tuple(sorted(touched or ())),
+                ),
             )
 
         async def persist(*, clean: bool) -> _SavedAnswer:
@@ -2945,13 +3019,19 @@ class ResponsesHandler:
                 before_slugs, before_mtimes = await run_efs(
                     partial(snapshot_artifact_state, seed.artifacts.base), scope=scope, deadline=False
                 )
+                from cowork.services.queued_repairs import queued_repair_folders
+
                 turn_artifacts = _RemoteTurnArtifacts(
                     directory=seed.artifacts, before_slugs=before_slugs, before_mtimes=before_mtimes,
+                    repairs=await queued_repair_folders(conversation_id=conv_id, scope=scope),
                 )
             # Set only on turn_completed: any other exit (Stop, cancel, failure)
             # may have cut anton off between writing an artifact's metadata and
             # appending its provenance, see `turn_created_slugs`.
             completed_cleanly = False
+            # The artifacts the pod's tools touched, from turn_completed; None
+            # for a pod that sends no list, and for every other exit.
+            pod_touched: set[str] | None = None
             # Whether the pod compacted or hard-truncated the turn's context:
             # its compacted step comes for both, its compaction reply for a
             # summary. Both arrive before the history frame.
@@ -3041,6 +3121,7 @@ class ResponsesHandler:
                     # `break`, not `return`: the record/publish/card block
                     # below must still run on a clean finish.
                     completed_cleanly = True
+                    pod_touched = tracked_artifacts_from_reply(data)
                     break
                 elif kind == "turn_failed":
                     if await _remote_cancel_confirmed(data.get("error"), corr):
@@ -3069,7 +3150,7 @@ class ResponsesHandler:
             # the artifacts in end_turn, with no publish and no cards, matching
             # the in-process path, where Stop/error produce no cards. Outside
             # org mode the next turn in the project reconciles the publish.
-            changes = await record_artifacts(completed_cleanly=completed_cleanly)
+            changes = await record_artifacts(completed_cleanly=completed_cleanly, touched=pod_touched)
             if changes is not None:
                 for card in await publish_and_card_turn_artifacts(
                     turn_artifacts.directory.base,
@@ -3078,8 +3159,21 @@ class ResponsesHandler:
                     scope=scope,
                     project_id=turn_artifacts.directory.project_id,
                     project_name=turn_artifacts.directory.project_name,
+                    # With the pod's list the publish opens only this turn's
+                    # folders too; record_artifacts asked for the project's
+                    # self-heal.
+                    only_touched=pod_touched is not None,
                 ):
                     yield ArtifactCreated(card)
+                # Last, once the cards are out: the rows only spare the next
+                # turn end a folder check, so a full pool delays nothing the
+                # person waits for.
+                from cowork.services.queued_repairs import forget_checked_repairs
+
+                await forget_checked_repairs(
+                    conversation_id=conv_id, repairs=turn_artifacts.repairs, checked=changes.checked_repairs,
+                    scope=scope,
+                )
 
         try:
             # Stage attachments + project instructions before the pod runs.

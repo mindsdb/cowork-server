@@ -15,6 +15,7 @@ import cowork.turnqueue.remote_turn as remote_turn_mod
 from cowork.handlers.responses import _RemoteArtifactsDir
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory
+from cowork.services.artifact_identity import ListedIds
 from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
 from cowork.turnqueue.producer import RemoteWorkspace
 from cowork.turnqueue.redis_client import cancel_flag_key
@@ -683,6 +684,94 @@ async def test_a_channel_turn_records_the_ids_of_the_folders_it_made(monkeypatch
     assert recorded["artifact_ids"] == {"made": artifact_id}
 
 
+@pytest.mark.parametrize(
+    ("completed", "tracked"),
+    [({"artifacts_touched": ["mine"]}, {"mine"}), ({}, None)],
+    ids=["pod-list", "older-pod"],
+)
+async def test_the_pods_list_bounds_a_channel_turns_diff(monkeypatch, completed, tracked):
+    """With the pod's list, the folders of the repairs queued to the
+    conversation, read when the turn starts, are the only others the diff
+    opens. An older pod's diff lists every folder, so it gets none."""
+    from unittest.mock import AsyncMock, Mock
+    from cowork.services import queued_repairs, task_objects
+    from cowork.services.queued_repairs import QueuedRepairs
+
+    context = _RemoteArtifactsDir(base=Path("/project/artifacts"), project_id="project", project_name="Project", creator=None)
+    _fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
+    monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
+
+    async def queued(*, conversation_id, scope):
+        return QueuedRepairs(row_ids={"fixme": uuid4()})
+
+    monkeypatch.setattr(queued_repairs, "queued_repair_folders", queued)
+    diff = Mock(return_value=task_objects.ArtifactChanges(created=[], touched=set()))
+    publish = AsyncMock(return_value=[])
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", diff)
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", publish)
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_completed", completed
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+    await _drain(remote_turn_events(
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org", user_id="user",
+        input_text="run", model="m", turn_rows=[],
+    ))
+    assert diff.call_args.kwargs["tracked_new"] == tracked
+    assert diff.call_args.kwargs["tracked_edits"] == tracked
+    assert diff.call_args.kwargs["repair_slugs"] == ({"fixme"} if tracked is not None else None)
+    # With the list the publish opens only the turn's folders too.
+    assert publish.call_args.kwargs["only_touched"] is (tracked is not None)
+
+
+async def test_a_channel_turn_drops_its_checked_repair_rows_once_its_cards_are_out(monkeypatch):
+    """The drop of the checked repair rows waits for a database connection,
+    up to POOL_TIMEOUT when the pool is full, and the rows only spare the
+    next turn end a folder check. So it runs after the turn's cards, and
+    drops the rows of the folders the diff ruled on, as read at turn start."""
+    from unittest.mock import AsyncMock, Mock
+
+    from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
+    from cowork.services import queued_repairs, task_objects
+    from cowork.services.queued_repairs import QueuedRepairs
+
+    context = _RemoteArtifactsDir(base=Path("/project/artifacts"), project_id="project", project_name="Project", creator=None)
+    _fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
+    monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
+    repairs = QueuedRepairs(row_ids={"fixme": uuid4(), "held": uuid4()})
+
+    async def queued(*, conversation_id, scope):
+        return repairs
+
+    monkeypatch.setattr(queued_repairs, "queued_repair_folders", queued)
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", Mock(return_value=task_objects.ArtifactChanges(
+        created=[], touched={"made"}, checked_repairs={"fixme"},
+    )))
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[{"slug": "made"}]))
+    happened: list[tuple] = []
+
+    async def drop_behind_a_full_pool(*, conversation_id, repairs, checked, scope):
+        happened.append(("drop", repairs, checked))
+
+    monkeypatch.setattr(queued_repairs, "forget_checked_repairs", drop_behind_a_full_pool)
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_completed", {"artifacts_touched": ["made"]}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+    async for event in remote_turn_events(
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org", user_id="user",
+        input_text="run", model="m", turn_rows=[],
+    ):
+        if isinstance(event, ArtifactCreated):
+            happened.append(("card", event.artifact["slug"]))
+
+    assert happened == [("card", "made"), ("drop", repairs, {"fixme"})]
+
+
 @pytest.fixture
 def controller_flags(monkeypatch):
     """The Redis the controller's cancel flags are written to."""
@@ -875,22 +964,26 @@ def _turn_with_a_new_artifact(monkeypatch, *, diff=None, snapshot=None):
     monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
     recorded: list[_Recorded] = []
 
-    def record_new_artifacts(session, *, conversation_id, project_id, slugs, creator, artifact_ids=None):
+    def record_new_artifacts(
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+    ):
         recorded.append(_Recorded(slugs, project_id, creator, session.scope, on_efs_thread()))
 
     monkeypatch.setattr(task_objects, "record_new_artifacts", record_new_artifacts)
     return recorded
 
 
-def _completed_persistent_turn(monkeypatch, *, before_completed=None):
+def _completed_persistent_turn(monkeypatch, *, before_completed=None, completed: dict | None = None):
     """A controller that authorizes a persistent workspace and completes the
-    turn, after awaiting ``before_completed`` when one is given."""
+    turn, after awaiting ``before_completed`` when one is given. The
+    ``turn_completed`` reply carries ``completed``, by default nothing: a pod
+    that sends no list of the artifacts its tools touched."""
 
     async def replies(**kwargs):
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
         if before_completed is not None:
             await before_completed()
-        yield "turn_completed", {}
+        yield "turn_completed", completed or {}
 
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
 
@@ -1003,6 +1096,50 @@ async def test_a_channel_turn_whose_artifact_record_fails_still_finishes_and_car
         logged.output(), log_level="ERROR",
         conversation_id=str(conv_id), project_id=_PROJECT_ID, artifact_slugs=["report"],
     )
+
+
+@pytest.mark.parametrize("lost", ["created_nothing", "check_after_the_created_rows"])
+async def test_a_record_that_lost_only_the_listed_check_says_so(monkeypatch, caplog, owned_logger, lost):
+    """The pod sent no list, so the record's unit also checks the folders
+    the diff listed. Either the turn created nothing, so the unit's failure
+    lost only that check, or it created a folder and record_new_artifacts
+    raised at the check, once that folder's rows were written
+    (ListedLocationsUnchecked). The line says the check failed, not that
+    created folders went unrecorded."""
+    import logging
+
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.services import task_objects
+
+    created = [] if lost == "created_nothing" else ["report"]
+    _turn_with_a_new_artifact(
+        monkeypatch,
+        diff=lambda **_: task_objects.ArtifactChanges(
+            created=created, touched=set(created),
+            listed_ids=ListedIds(ids={"brief": "id-of-brief"}, unreadable=frozenset()),
+        ),
+    )
+    error = (
+        RuntimeError("the listed folders could not be checked")
+        if lost == "created_nothing"
+        else task_objects.ListedLocationsUnchecked()
+    )
+
+    def failing_record(session, **kwargs):
+        raise error
+
+    monkeypatch.setattr(task_objects, "record_new_artifacts", failing_record)
+    _completed_persistent_turn(monkeypatch)
+    owned_logger(remote_turn_mod.logger.name, level=logging.WARNING)
+
+    _, failure = await _drain(_channel_turn(scope=LOCAL_SCOPE, conv_id=uuid4()))
+
+    assert failure is None
+    record = _artifact_record_log(caplog)
+    assert (record.levelname, record.getMessage()) == (
+        "ERROR", "Could not check the locations of the artifacts a channel turn listed",
+    )
+    assert record.exc_info[1] is error
 
 
 async def test_a_refused_artifact_record_names_the_conversation_project_and_slugs(
@@ -1309,10 +1446,19 @@ def test_a_shutdown_waits_at_its_end_for_a_turn_record_a_stall_held_and_keeps_it
     assert (len(indexed), owner) == (1, ownership.OwnerResolution(creator, "recorded"))
 
 
-def test_a_turn_record_a_stall_holds_past_the_last_wait_is_named_at_error(monkeypatch, caplog):
+@pytest.mark.parametrize(
+    ("completed", "named"),
+    [({}, []), ({"artifacts_touched": ["report", "chart"]}, ["chart", "report"])],
+    ids=["no-pod-list", "pod-list"],
+)
+def test_a_turn_record_a_stall_holds_past_the_last_wait_is_named_at_error(
+    monkeypatch, caplog, owned_logger, completed, named,
+):
     """The stall outlasts the teardown's last wait, so the event loop's close
-    cuts the turn's record. The ERROR names its conversation and project, and
-    no slug, since the diff still waits for the file store."""
+    cuts the turn's record while its diff still waits for the file store.
+    The ERROR names its conversation and project, and the artifacts the
+    pod's list named, none for a pod that sends no list, on the record and
+    in the line the console prints."""
     import logging
     import threading
 
@@ -1322,6 +1468,7 @@ def test_a_turn_record_a_stall_holds_past_the_last_wait_is_named_at_error(monkey
     from cowork.db.scoped import TenantScope
 
     recorded = _turn_with_a_new_artifact(monkeypatch)
+    logged = owned_logger(units.logger.name)
     # The channel's scope: the organization's share, keyed by no person.
     organization = TenantScope(org_mode=True, org_id=_FakeScope.org_id)
     stall = threading.Event()
@@ -1330,7 +1477,7 @@ def test_a_turn_record_a_stall_holds_past_the_last_wait_is_named_at_error(monkey
     async def take_the_share():
         held.extend(await _hold_a_share(scope=organization, share=db_session.settings.storage.efs_share, stall=stall))
 
-    _completed_persistent_turn(monkeypatch, before_completed=take_the_share)
+    _completed_persistent_turn(monkeypatch, before_completed=take_the_share, completed=completed)
     conv_id = uuid4()
 
     async def shut_down_during_a_stall():
@@ -1342,15 +1489,18 @@ def test_a_turn_record_a_stall_holds_past_the_last_wait_is_named_at_error(monkey
         finally:
             stall.set()
 
-    with caplog.at_level(logging.ERROR, logger=units.logger.name):
-        asyncio.run(shut_down_during_a_stall())
+    asyncio.run(shut_down_during_a_stall())
 
     [lost] = [
         record for record in caplog.records
         if record.name == units.logger.name and getattr(record, "event", None) == "shutdown_turn_record_lost"
     ]
-    assert lost.levelname == "ERROR"
-    assert (lost.conversation_id, lost.project_id, lost.touched) == (str(conv_id), _PROJECT_ID, [])
+    assert lost.levelno == logging.ERROR
+    assert (lost.conversation_id, lost.project_id, lost.touched) == (str(conv_id), _PROJECT_ID, named)
+    assert_log_fields(
+        logged.output(), event="shutdown_turn_record_lost", conversation_id=str(conv_id),
+        project_id=_PROJECT_ID, touched=named,
+    )
     assert recorded == []
 
 
@@ -1401,6 +1551,82 @@ async def test_a_turn_record_that_waits_for_the_database_at_the_last_wait_names_
         logged.output(), event="shutdown_turn_record_lost", conversation_id=str(conv_id), touched=["report"],
     )
     assert [call.slugs for call in recorded] == [["report"]]
+
+
+def _encoded_size(text: str) -> int:
+    """How many bytes the console writes for ``text``: UTF-8, with a lone
+    surrogate, such as a folder name's byte that is not UTF-8, escaped."""
+    return len(text.encode("utf-8", "backslashreplace"))
+
+
+@pytest.mark.parametrize(
+    "fill", ["x", "漢", "😀", "\x01", "\udcff"], ids=["ascii", "cjk", "emoji", "control", "not_utf8"],
+)
+async def test_the_line_for_a_cut_record_stays_bounded_whatever_the_pod_named(caplog, owned_logger, fill):
+    """A record holds 1,000 names of 255 characters, the most a pod's list
+    may carry (TurnCompleted), and one 5 MB name besides. Past its 4-digit
+    prefix each name repeats one character: ASCII, a 3-byte CJK one, a
+    4-byte emoji, a control character JSON escapes to 6 bytes, or a byte
+    that is not UTF-8, as a folder name the diff found may hold, which the
+    console writes escaped. The shutdown cuts the record at its last wait.
+    The record and the line the console prints keep the conversation and
+    the project, `count`, how many names the record held, and the first
+    names in sorted order, none longer than 255 characters: at most
+    TURN_END_RECORD_NAMES_LOGGED, and only as many as fit in
+    TURN_END_RECORD_TOUCHED_BYTES as the line encodes them. The line stays
+    under the 16 KiB a container runtime splits a line at."""
+    import logging
+
+    from cowork.db import units
+    from cowork.turnqueue.models import MAX_ARTIFACT_NAME_CHARS, MAX_ARTIFACTS_TOUCHED
+
+    logged = owned_logger(units.logger.name)
+    names = [f"{n:04d}".ljust(MAX_ARTIFACT_NAME_CHARS, fill) for n in range(MAX_ARTIFACTS_TOUCHED)]
+    huge = "0" * 5_000_000
+    conv_id, project_id = uuid4(), str(uuid4())
+    release = asyncio.Event()
+
+    async def stuck() -> None:
+        await release.wait()
+
+    turn = asyncio.create_task(units.run_turn_end_record(
+        work=stuck(),
+        record=units.TurnEndRecord(
+            conversation_id=conv_id, project_id=project_id, touched=tuple(sorted([*names, huge])),
+        ),
+    ))
+    try:
+        await asyncio.sleep(0)
+        await units.drain_turn_end_records(timeout=0.1)
+    finally:
+        release.set()
+        await turn
+
+    [lost] = [
+        record for record in caplog.records
+        if record.name == units.logger.name and getattr(record, "event", None) == "shutdown_turn_record_lost"
+    ]
+    [line] = [line for line in logged.output().splitlines() if "shutdown_turn_record_lost" in line]
+    assert _encoded_size(line) < 16 * 1024
+    assert lost.levelno == logging.ERROR
+    assert (lost.conversation_id, lost.project_id, lost.count) == (str(conv_id), project_id, len(names) + 1)
+
+    def logged_size(kept: list[str]) -> int:
+        return sum(_encoded_size(json.dumps(name, ensure_ascii=False)) + 1 for name in kept)
+
+    ordered = sorted(names)
+    kept = lost.touched
+    assert 0 < len(kept) <= units.TURN_END_RECORD_NAMES_LOGGED
+    assert kept == ordered[:len(kept)]
+    assert logged_size(kept) <= units.TURN_END_RECORD_TOUCHED_BYTES
+    assert (
+        len(kept) == units.TURN_END_RECORD_NAMES_LOGGED
+        or logged_size(ordered[:len(kept) + 1]) > units.TURN_END_RECORD_TOUCHED_BYTES
+    )
+    assert_log_fields(
+        line, event="shutdown_turn_record_lost", conversation_id=str(conv_id), project_id=project_id,
+        touched=kept, count=len(names) + 1,
+    )
 
 
 @pytest.mark.asyncio

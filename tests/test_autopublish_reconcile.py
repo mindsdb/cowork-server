@@ -721,10 +721,10 @@ async def test_reconciliation_reads_the_file_store_off_the_event_loop(
     real_candidates, real_plan = ap._candidate_slugs, ap._plan
     steps = []
 
-    def slow_candidates(artifacts_base):
+    def slow_candidates(*, artifacts_base):
         steps.append("candidates")
         time.sleep(0.5)
-        return real_candidates(artifacts_base)
+        return real_candidates(artifacts_base=artifacts_base)
 
     def slow_plan(artifacts_base, slugs):
         steps.append("plan")

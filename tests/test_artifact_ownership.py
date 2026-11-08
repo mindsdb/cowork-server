@@ -20,6 +20,7 @@ from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
+from cowork.services import artifact_identity
 from cowork.services import artifact_ownership as ownership
 from cowork.services import task_objects
 from cowork.services.artifacts import ProjectArtifacts
@@ -324,10 +325,10 @@ def test_turn_created_slugs_uses_the_given_after_listing(tmp_path, monkeypatch):
     write_artifact(tmp_path, "mine", conversation)
     write_artifact(tmp_path, "unlisted", conversation)
 
-    def _no_listing(_base):
+    def _no_listing(*, base):
         raise AssertionError("the caller's listing must be reused")
 
-    monkeypatch.setattr(task_objects, "snapshot_artifact_slugs", _no_listing)
+    monkeypatch.setattr(artifact_identity, "artifact_folders_below", _no_listing)
     assert ownership.turn_created_slugs(
         tmp_path, set(), conversation, after={"mine"}
     ) == {"mine"}
@@ -360,13 +361,13 @@ def test_turn_artifact_changes_attribute_by_provenance_with_one_listing(
     write_artifact(tmp_path, "sibling", uuid4())
     write_artifact(tmp_path, "handmade")
     listings = []
-    real_listing = task_objects.snapshot_artifact_slugs
+    real_listing = artifact_identity.artifact_folders_below
 
-    def _counted(base):
+    def _counted(*, base):
         listings.append(base)
-        return real_listing(base)
+        return real_listing(base=base)
 
-    monkeypatch.setattr(task_objects, "snapshot_artifact_slugs", _counted)
+    monkeypatch.setattr(artifact_identity, "artifact_folders_below", _counted)
     changes = task_objects.turn_artifact_changes(
         conversation_id=conversation_id, artifacts_base=tmp_path, before=set(), before_mtimes={},
         attribute_by_provenance=True, completed_cleanly=completed_cleanly,

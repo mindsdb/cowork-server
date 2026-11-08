@@ -21,9 +21,10 @@ import logging
 import os
 import shutil
 import threading
+from collections.abc import Callable, Coroutine
 from contextlib import nullcontext
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 from uuid import UUID, uuid4
 
 import pytest
@@ -1129,6 +1130,1085 @@ async def test_the_backfill_marks_a_row_left_at_one_of_two_folders_conflicted(
 
     assert _conflicted(plant.org_id, plant.artifact_id)
     assert await _refused(plant.org_id, plant.owner, plant.project, plant.artifact_id, entry=entry_point) == 409
+
+
+class _Brief(NamedTuple):
+    """The owner's artifact `brief` in the project's shared root, with the
+    row its first lookup recorded."""
+
+    org_id: str
+    owner: str
+    member: str
+    project: Project
+    artifact_id: str
+    folder: Path
+
+
+async def _owners_brief(tmp_path, *, entry) -> _Brief:
+    org_id, owner, member = str(uuid4()), str(uuid4()), str(uuid4())
+    project = make_project(tmp_path, org_id)
+    artifact_id, folder = _write(project_root(project), "brief")
+    first = await _review(org_id, owner, project, artifact_id, entry=entry)
+    assert first.folder == folder and _row(org_id, artifact_id) == Location(project.id, None, "brief")
+    return _Brief(org_id, owner, member, project, artifact_id, folder)
+
+
+async def _copy_no_turn_end_claims(brief: _Brief, *, entry) -> None:
+    """A shell `cp -r` of `brief` to `brief-copy`. The shared root is every
+    member's own, so the row still serves `brief` to everyone and no lookup
+    scans: nothing marks the id."""
+    shutil.copytree(brief.folder, brief.folder.with_name("brief-copy"))
+    artifact_identity._clear_identity_indexes()
+    seen = await _review(brief.org_id, brief.member, brief.project, brief.artifact_id, entry=entry)
+    assert seen.folder == brief.folder
+    assert not _conflicted(brief.org_id, brief.artifact_id)
+
+
+async def test_the_self_heal_marks_the_id_of_a_copy_no_turn_end_claimed_conflicted(
+    tmp_path, org_deployment, monkeypatch, entry_point,
+):
+    """A turn end with the pod's list opens only the turn's own folders, so
+    it never sees the copy. The project's scheduled self-heal lists the
+    shared root, reads each folder's id, and marks the id conflicted, so the
+    owner's and a co-member's lookups answer 409."""
+    from cowork.services import artifact_autopublish
+
+    brief = await _owners_brief(tmp_path, entry=entry_point)
+    await _copy_no_turn_end_claims(brief, entry=entry_point)
+
+    async def no_publish(base, scope, *, touched, project_id, **kwargs):
+        return set()
+
+    monkeypatch.setattr(artifact_autopublish, "autopublish_project_artifacts", no_publish)
+    with scoped(brief.org_id, brief.owner) as session:
+        scope = session.scope
+    await artifact_autopublish._run_self_heal(artifact_autopublish.SelfHeal(
+        artifacts_base=project_root(brief.project).base, scope=scope, project_id=str(brief.project.id),
+    ))
+
+    assert _row(brief.org_id, brief.artifact_id) == Location(brief.project.id, None, "brief")
+    assert _conflicted(brief.org_id, brief.artifact_id)
+    for caller in (brief.owner, brief.member):
+        assert await _refused(brief.org_id, caller, brief.project, brief.artifact_id, entry=entry_point) == 409
+
+
+def _autopublish_off(org_id: str) -> None:
+    """The organization turns autopublish off, an org setting on by default."""
+    from cowork.db.scoped import TenantScope
+    from cowork.services.settings import SettingService
+
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        SettingService(raw, TenantScope(org_mode=True, org_id=org_id)).upsert_setting(
+            "artifact_autopublish_enabled", "false",
+        )
+
+
+def _pod_copying(brief: _Brief, *, sends_list: bool = True, after_copy: Callable[[], object] = lambda: None):
+    """The replies of a pod whose agent runs `cp -r brief brief-copy` from a
+    shell, so its tools touched no artifact: its list names none, or, without
+    `sends_list`, it sends no list. `after_copy` runs once the copy is made."""
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        shutil.copytree(brief.folder, brief.folder.with_name("brief-copy"))
+        after_copy()
+        yield "turn_completed", {"artifacts_touched": []} if sends_list else {}
+
+    return replies
+
+
+class _CopyingTurn(NamedTuple):
+    """A turn whose pod copies `brief`, ready to run, and the scope it runs
+    in."""
+
+    scope: object
+    run: Coroutine[Any, Any, None]
+
+
+def _browser_turn_copying(
+    brief: _Brief, *, monkeypatch, sends_list: bool = True, after_copy: Callable[[], object] = lambda: None,
+) -> _CopyingTurn:
+    """A co-member's browser turn in the project whose pod copies `brief`
+    (_pod_copying). The turn end's record of what its diff found runs as a
+    real unit in the turn's scope; the turn's other units run on the
+    handler's fakes."""
+    from cowork.db import units
+    from cowork.db.scoped import TenantScope
+    from test_responses_remote_backend import _FakeBuffer, _remote_handler, responses_mod
+
+    handler = _remote_handler(monkeypatch, {})
+    faked_run_db = responses_mod.run_db
+
+    async def run_db(fn, *, scope):
+        if getattr(fn, "func", None) is task_objects.record_new_artifacts:
+            return await units.run_db(fn, scope=scope)
+        return await faked_run_db(fn, scope=scope)
+
+    monkeypatch.setattr(responses_mod, "run_db", run_db)
+    scope = TenantScope(org_mode=True, org_id=brief.org_id, user_id=brief.member)
+    monkeypatch.setattr(responses_mod, "scope_from_principal", lambda principal: scope)
+    base = project_root(brief.project).base
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: responses_mod._RemoteArtifactsDir(
+            base=base, project_id=str(brief.project.id), project_name=brief.project.name, creator=brief.member,
+        )),
+    )
+    monkeypatch.setattr(
+        responses_mod, "stream_remote_replies", _pod_copying(brief, sends_list=sends_list, after_copy=after_copy),
+    )
+    conv_id = make_conversation(brief.project, brief.member)
+
+    async def run() -> None:
+        await handler._produce_remote(
+            conv_id=conv_id, input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=_FakeBuffer(),
+        )
+
+    return _CopyingTurn(scope, run())
+
+
+def _channel_turn_copying(
+    brief: _Brief, *, monkeypatch, sends_list: bool = True, after_copy: Callable[[], object] = lambda: None,
+) -> _CopyingTurn:
+    """A channel turn in the project whose pod copies `brief`
+    (_pod_copying). It runs in its organization's scope, with no member, and
+    its inputs are read in a real unit."""
+    import cowork.turnqueue.remote_turn as remote_turn_mod
+    from cowork.db import units
+    from cowork.db.scoped import TenantScope
+    from cowork.handlers.responses import ResponsesHandler
+    from test_remote_turn import _drain as drain_channel_turn
+    from test_remote_turn import _fake_handler
+
+    scope = TenantScope(org_mode=True, org_id=brief.org_id)
+    _fake_handler(monkeypatch, remote_artifacts_context=ResponsesHandler._remote_artifacts_context)
+    monkeypatch.setattr(remote_turn_mod, "run_db", units.run_db)
+    monkeypatch.setattr(
+        remote_turn_mod, "stream_remote_replies", _pod_copying(brief, sends_list=sends_list, after_copy=after_copy),
+    )
+    conv_id = make_conversation(brief.project, None)
+
+    async def run() -> None:
+        _, failure = await drain_channel_turn(remote_turn_mod.remote_turn_events(
+            scope=scope, conv_id=conv_id, org_id=brief.org_id, user_id=None,
+            input_text="hi", model="anton", turn_rows=[],
+        ))
+        assert failure is None
+
+    return _CopyingTurn(scope, run())
+
+
+def _no_self_heals_yet(monkeypatch) -> list[Path]:
+    """Self-heal state of the test's own, and a spy on every publish.
+    Returns the folders published."""
+    from cowork.services import artifact_autopublish
+
+    monkeypatch.setattr(artifact_autopublish, "_self_heals_requested", set())
+    monkeypatch.setattr(artifact_autopublish, "_self_heal_publishes_requested", set())
+    monkeypatch.setattr(artifact_autopublish, "_self_heals_started_at", {})
+    monkeypatch.setattr(artifact_autopublish, "_self_heal_tasks", {})
+    published: list[Path] = []
+    monkeypatch.setattr(
+        artifact_autopublish, "publish_artifact", lambda folder, **kwargs: published.append(folder),
+    )
+    return published
+
+
+def _autopublish_skips(caplog) -> list[str]:
+    from cowork.services import artifact_autopublish
+
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == artifact_autopublish.logger.name
+        and record.getMessage().startswith("artifact_autopublish result=skipped")
+    ]
+
+
+@pytest.mark.parametrize("copy_in", [_browser_turn_copying, _channel_turn_copying], ids=["browser", "channel"])
+async def test_with_autopublish_off_a_pod_list_turns_self_heal_marks_its_unclaimed_copy_conflicted(
+    tmp_path, org_deployment, monkeypatch, entry_point, copy_in, caplog,
+):
+    """The organization turns autopublish off. A turn's agent copies the
+    owner's `brief` with a shell `cp -r`, and its pod's list names nothing,
+    so the turn end opens no folder and leaves the id unmarked. The turn
+    end still asks for the project's self-heal, and one poll runs its
+    location check: the id is marked conflicted, and the owner's and a
+    co-member's lookups answer 409. Nothing is published, and the poll logs
+    no refused publish: a channel's self-heal, whose scope names no user,
+    runs no publish half at all."""
+    from cowork.services import artifact_autopublish
+
+    published = _no_self_heals_yet(monkeypatch)
+    brief = await _owners_brief(tmp_path, entry=entry_point)
+    _autopublish_off(brief.org_id)
+
+    turn = copy_in(brief, monkeypatch=monkeypatch)
+    await turn.run
+    artifact_identity._clear_identity_indexes()
+
+    assert not artifact_autopublish._is_enabled(turn.scope)
+    assert brief.folder.with_name("brief-copy").is_dir()
+    assert not _conflicted(brief.org_id, brief.artifact_id)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=artifact_autopublish.logger.name):
+        started = artifact_autopublish.start_due_self_heals()
+        await asyncio.gather(*started)
+
+    assert len(started) == 1
+    assert _autopublish_skips(caplog) == []
+    assert _row(brief.org_id, brief.artifact_id) == Location(brief.project.id, None, "brief")
+    assert _conflicted(brief.org_id, brief.artifact_id)
+    for caller in (brief.owner, brief.member):
+        assert await _refused(brief.org_id, caller, brief.project, brief.artifact_id, entry=entry_point) == 409
+    assert published == []
+
+
+@pytest.mark.parametrize("ending", ["stopped", "diff_failed"])
+@pytest.mark.parametrize("copy_in", [_browser_turn_copying, _channel_turn_copying], ids=["browser", "channel"])
+async def test_a_pod_list_turn_end_that_never_reaches_its_publish_still_asks_for_the_self_heal(
+    tmp_path, org_deployment, monkeypatch, entry_point, copy_in, ending,
+):
+    """A turn's agent copies the owner's `brief` with a shell `cp -r`, and
+    its pod's list names nothing. Its turn end never reaches the publish: a
+    Stop lands while the diff is held on its file store thread, or the diff
+    raises. The turn end asked for the project's self-heal as its record
+    started, so exactly one waits, for the turn's scope and project, and one
+    poll marks the id conflicted: the owner's and a co-member's lookups
+    answer 409. Nothing is published."""
+    from cowork.services import artifact_autopublish
+
+    published = _no_self_heals_yet(monkeypatch)
+    brief = await _owners_brief(tmp_path, entry=entry_point)
+    _autopublish_off(brief.org_id)
+    diffing, finish = threading.Event(), threading.Event()
+    real_changes = task_objects.turn_artifact_changes
+
+    def diff(**kwargs):
+        if ending == "diff_failed":
+            raise OSError(errno.EIO, "the file server stopped answering")
+        diffing.set()
+        finish.wait(timeout=5)
+        return real_changes(**kwargs)
+
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", diff)
+    turn = copy_in(brief, monkeypatch=monkeypatch)
+    task = asyncio.create_task(turn.run)
+    if ending == "stopped":
+        try:
+            assert await asyncio.to_thread(diffing.wait, 5), "the turn end never started its diff"
+            task.cancel()
+            await asyncio.sleep(0.2)
+            assert not task.done(), "the Stop did not wait for the diff"
+        finally:
+            finish.set()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=10)
+    artifact_identity._clear_identity_indexes()
+
+    assert brief.folder.with_name("brief-copy").is_dir()
+    assert [(heal.scope, heal.project_id) for heal in artifact_autopublish._self_heals_requested] == [
+        (turn.scope, str(brief.project.id)),
+    ]
+    assert not _conflicted(brief.org_id, brief.artifact_id)
+    started = artifact_autopublish.start_due_self_heals()
+    await asyncio.gather(*started)
+
+    assert len(started) == 1
+    assert _conflicted(brief.org_id, brief.artifact_id)
+    for caller in (brief.owner, brief.member):
+        assert await _refused(brief.org_id, caller, brief.project, brief.artifact_id, entry=entry_point) == 409
+    assert published == []
+
+
+def _producer_module(copy_in):
+    """The module whose turn end `copy_in`'s turn runs: the browser
+    producer's, or the channel turn's."""
+    import cowork.turnqueue.remote_turn as remote_turn_mod
+    from test_responses_remote_backend import responses_mod
+
+    return responses_mod if copy_in is _browser_turn_copying else remote_turn_mod
+
+
+def _failing_location_check(monkeypatch, *, failure: str, copy_in, failing: threading.Event) -> None:
+    """Make one step of a no-list turn end's location check fail while
+    ``failing`` is set: its diff raises EIO (``diff_raises``), the database
+    refuses the unit that records what the diff found, as a full pool does
+    (``record_refused``), or the check of the listed folders inside that
+    unit fails (``listed_check_fails``). Called once ``copy_in`` has wired
+    the turn's units."""
+    from cowork.db.units import DatabaseBusy
+
+    if failure == "diff_raises":
+        real_changes = task_objects.turn_artifact_changes
+
+        def diff(**kwargs):
+            if failing.is_set():
+                raise OSError(errno.EIO, "the file server stopped answering")
+            return real_changes(**kwargs)
+
+        monkeypatch.setattr(task_objects, "turn_artifact_changes", diff)
+    elif failure == "record_refused":
+        module = _producer_module(copy_in)
+        real_run_db = module.run_db
+
+        async def run_db(fn, *, scope):
+            if failing.is_set() and getattr(fn, "func", None) is task_objects.record_new_artifacts:
+                raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+            return await real_run_db(fn, scope=scope)
+
+        monkeypatch.setattr(module, "run_db", run_db)
+    else:
+        real_check = artifact_locations.record_listed_folders
+
+        def check(session, **kwargs):
+            if failing.is_set():
+                raise OperationalError("SELECT", {}, Exception("server closed the connection unexpectedly"))
+            return real_check(session, **kwargs)
+
+        monkeypatch.setattr(artifact_locations, "record_listed_folders", check)
+
+
+@pytest.mark.parametrize("failure", ["diff_raises", "record_refused", "listed_check_fails"])
+@pytest.mark.parametrize("copy_in", [_browser_turn_copying, _channel_turn_copying], ids=["browser", "channel"])
+async def test_a_no_list_turn_end_whose_location_check_fails_asks_for_the_self_heal(
+    tmp_path, org_deployment, monkeypatch, entry_point, copy_in, failure,
+):
+    """A turn's agent copies the owner's `brief` with a shell `cp -r`, and
+    its pod sends no list, so its turn end's own listing is the project's
+    location check. That check never lands: the diff raises, the database
+    refuses the record's unit, or the check of the listed folders fails
+    inside that unit. The turn still finishes and asks for the project's
+    whole self-heal, its publish included, for the turn's scope and project.
+    Once the database and the file store recover, one poll marks the id
+    conflicted: the owner's and a co-member's lookups answer 409. Nothing is
+    published, since autopublish is off."""
+    from cowork.services import artifact_autopublish
+
+    published = _no_self_heals_yet(monkeypatch)
+    brief = await _owners_brief(tmp_path, entry=entry_point)
+    _autopublish_off(brief.org_id)
+    failing = threading.Event()
+    failing.set()
+    turn = copy_in(brief, monkeypatch=monkeypatch, sends_list=False)
+    _failing_location_check(monkeypatch, failure=failure, copy_in=copy_in, failing=failing)
+
+    try:
+        await turn.run
+    finally:
+        failing.clear()
+    artifact_identity._clear_identity_indexes()
+
+    assert brief.folder.with_name("brief-copy").is_dir()
+    assert not _conflicted(brief.org_id, brief.artifact_id)
+    assert [(heal.scope, heal.project_id) for heal in artifact_autopublish._self_heals_requested] == [
+        (turn.scope, str(brief.project.id)),
+    ]
+    assert artifact_autopublish._self_heal_publishes_requested == artifact_autopublish._self_heals_requested
+    started = artifact_autopublish.start_due_self_heals()
+    await asyncio.gather(*started)
+
+    assert len(started) == 1
+    assert _conflicted(brief.org_id, brief.artifact_id)
+    for caller in (brief.owner, brief.member):
+        assert await _refused(brief.org_id, caller, brief.project, brief.artifact_id, entry=entry_point) == 409
+    assert published == []
+
+
+@pytest.mark.parametrize("copy_in", [_browser_turn_copying, _channel_turn_copying], ids=["browser", "channel"])
+async def test_a_stop_during_a_no_list_turn_ends_diff_still_checks_the_listed_folders(
+    tmp_path, org_deployment, monkeypatch, entry_point, copy_in,
+):
+    """A turn's agent copies the owner's `brief` with a shell `cp -r`, and
+    its pod sends no list. A Stop lands while the turn end's diff is held on
+    its file store thread. The Stop waits for the diff and the record of
+    what it found (run_turn_end_record), so the turn end's own location
+    check marks the id conflicted, with no self-heal asked for: the owner's
+    and a co-member's lookups answer 409."""
+    from cowork.services import artifact_autopublish
+
+    _no_self_heals_yet(monkeypatch)
+    brief = await _owners_brief(tmp_path, entry=entry_point)
+    diffing, finish = threading.Event(), threading.Event()
+    real_changes = task_objects.turn_artifact_changes
+
+    def diff(**kwargs):
+        diffing.set()
+        finish.wait(timeout=5)
+        return real_changes(**kwargs)
+
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", diff)
+    turn = copy_in(brief, monkeypatch=monkeypatch, sends_list=False)
+    task = asyncio.create_task(turn.run)
+    try:
+        assert await asyncio.to_thread(diffing.wait, 5), "the turn end never started its diff"
+        task.cancel()
+        await asyncio.sleep(0.2)
+        assert not task.done(), "the Stop did not wait for the diff"
+    finally:
+        finish.set()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=10)
+    artifact_identity._clear_identity_indexes()
+
+    assert artifact_autopublish._self_heals_requested == set()
+    assert _conflicted(brief.org_id, brief.artifact_id)
+    for caller in (brief.owner, brief.member):
+        assert await _refused(brief.org_id, caller, brief.project, brief.artifact_id, entry=entry_point) == 409
+
+
+async def _full_listing(
+    brief: _Brief, *, listing: str, monkeypatch, before: set[str], before_mtimes: dict[str, int],
+) -> task_objects.ArtifactChanges | None:
+    """List `brief`'s shared root in full: the project's scheduled self-heal,
+    with its publish left out, or the end of a channel turn whose pod sent
+    no list, diffed against `before`. The turn end's changes are returned;
+    the self-heal returns None."""
+    from cowork.db.scoped import TenantScope
+    from cowork.handlers.responses import _RemoteArtifactsDir
+    from cowork.services import artifact_autopublish
+    from cowork.turnqueue.remote_turn import _record_turn_artifacts
+
+    base = project_root(brief.project).base
+    if listing == "self_heal":
+        async def no_publish(base, scope, *, touched, project_id, **kwargs):
+            return set()
+
+        monkeypatch.setattr(artifact_autopublish, "autopublish_project_artifacts", no_publish)
+        with scoped(brief.org_id, brief.owner) as session:
+            scope = session.scope
+        await artifact_autopublish._run_self_heal(artifact_autopublish.SelfHeal(
+            artifacts_base=base, scope=scope, project_id=str(brief.project.id),
+        ))
+        return None
+    return await _record_turn_artifacts(
+        _RemoteArtifactsDir(
+            base=base, project_id=str(brief.project.id), project_name=brief.project.name, creator=None,
+        ),
+        conv_id=make_conversation(brief.project, None),
+        scope=TenantScope(org_mode=True, org_id=brief.org_id, user_id=None),
+        before_slugs=before, before_mtimes=before_mtimes, completed_cleanly=True,
+    )
+
+
+@pytest.mark.parametrize("listing", ["self_heal", "no_list_turn_end"])
+async def test_a_full_listing_after_a_rename_marks_no_conflict(
+    tmp_path, org_deployment, monkeypatch, entry_point, caplog, listing,
+):
+    """A shell `mv brief brief-renamed`: one folder holds the id, under a
+    name its row no longer names. A full listing of the shared root, the
+    self-heal's or a turn end's with no pod list, shows the row's folder
+    gone, so the row is stale, not one of two folders: the id is not
+    conflicted and no conflict is logged. The owner's and a co-member's
+    lookups answer with the renamed folder."""
+    from cowork.services.task_objects import snapshot_artifact_state
+
+    brief = await _owners_brief(tmp_path, entry=entry_point)
+    before, before_mtimes = snapshot_artifact_state(project_root(brief.project).base)
+    renamed = brief.folder.rename(brief.folder.with_name("brief-renamed"))
+    artifact_identity._clear_identity_indexes()
+
+    with caplog.at_level(logging.WARNING, logger=artifact_locations.logger.name):
+        changes = await _full_listing(
+            brief, listing=listing, monkeypatch=monkeypatch, before=before, before_mtimes=before_mtimes,
+        )
+    if changes is not None:
+        assert changes.listed_ids == artifact_identity.ListedIds(
+            ids={"brief-renamed": brief.artifact_id}, unreadable=frozenset(),
+        )
+
+    assert not _conflicted(brief.org_id, brief.artifact_id)
+    conflicts = [
+        record for record in caplog.records
+        if record.name == artifact_locations.logger.name
+        and record.getMessage().startswith("an artifact id is held by two folders")
+    ]
+    assert conflicts == []
+    for caller in (brief.owner, brief.member):
+        found = await _review(brief.org_id, caller, brief.project, brief.artifact_id, entry=entry_point)
+        assert found.folder == renamed
+    assert _row(brief.org_id, brief.artifact_id) == Location(brief.project.id, None, "brief-renamed")
+
+
+async def test_a_turn_end_with_no_pod_list_marks_the_id_of_a_copy_no_turn_end_claimed_conflicted(
+    tmp_path, org_deployment, entry_point, caplog, owned_logger,
+):
+    """A channel turn copies the folder, and its pod sends no list. The
+    runtime's conversation has no creator, and the turn runs in the
+    organization's scope with no user. Provenance keeps the copy out of what
+    the turn created, but the turn end lists the shared root and reads every
+    folder's id, so it marks the id conflicted though the turn made nothing.
+    It made no folder that needs an owner, so it logs no missing owner."""
+    from cowork.db.scoped import TenantScope
+    from cowork.handlers.responses import _RemoteArtifactsDir
+    from cowork.services.task_objects import snapshot_artifact_state
+    from cowork.turnqueue.remote_turn import _record_turn_artifacts
+
+    brief = await _owners_brief(tmp_path, entry=entry_point)
+    base = project_root(brief.project).base
+    before, before_mtimes = snapshot_artifact_state(base)
+    await _copy_no_turn_end_claims(brief, entry=entry_point)
+    owned_logger(task_objects.logger.name, level=logging.WARNING)
+
+    changes = await _record_turn_artifacts(
+        _RemoteArtifactsDir(
+            base=base, project_id=str(brief.project.id), project_name=brief.project.name, creator=None,
+        ),
+        conv_id=make_conversation(brief.project, None),
+        scope=TenantScope(org_mode=True, org_id=brief.org_id, user_id=None),
+        before_slugs=before, before_mtimes=before_mtimes, completed_cleanly=True,
+    )
+
+    assert changes.created == []
+    assert _conflicted(brief.org_id, brief.artifact_id)
+    for caller in (brief.owner, brief.member):
+        assert await _refused(brief.org_id, caller, brief.project, brief.artifact_id, entry=entry_point) == 409
+    missing_owner = [
+        record.getMessage() for record in caplog.records
+        if record.name == task_objects.logger.name and record.levelno == logging.WARNING
+        and record.getMessage().startswith("artifact owner not recorded")
+    ]
+    assert missing_owner == []
+
+
+def _unopenable(monkeypatch, folder_name: str) -> threading.Event:
+    """Make every open of the folder named ``folder_name`` below its parent
+    raise EIO while the returned event is set."""
+    failing = threading.Event()
+    failing.set()
+    real = artifact_identity._opened_child_directory
+
+    def opened(parent, name):
+        if failing.is_set() and name == folder_name:
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return real(parent, name)
+
+    monkeypatch.setattr(artifact_identity, "_opened_child_directory", opened)
+    return failing
+
+
+def _failing_os_call(monkeypatch, name: str, *, path: Path, error: int, failing: threading.Event) -> None:
+    """Make ``os.<name>`` of exactly ``path``, named by its path rather than
+    relative to a descriptor, raise ``error`` while ``failing`` is set: the
+    stat a listing makes of each entry, or the listing of a folder."""
+    real = getattr(os, name)
+    targets = {os.fspath(path), os.path.realpath(path)}
+
+    def call(*args, **kwargs):
+        named = args[0] if args else None
+        if (
+            failing.is_set()
+            and kwargs.get("dir_fd") is None
+            and isinstance(named, (str, os.PathLike))
+            and os.fspath(named) in targets
+        ):
+            raise OSError(error, os.strerror(error), os.fspath(named))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(os, name, call)
+
+
+def _unstattable(monkeypatch, path: Path, *, error: int = errno.EIO) -> threading.Event:
+    """Make every stat of ``path`` by its path raise ``error`` while the
+    returned event is set, as on a file server that fails one entry: the
+    listing's own check that an entry is a folder."""
+    failing = threading.Event()
+    failing.set()
+    _failing_os_call(monkeypatch, "stat", path=path, error=error, failing=failing)
+    return failing
+
+
+@pytest.mark.parametrize("failure", ["open", "id_read", "stat"])
+@pytest.mark.parametrize("listing", ["self_heal", "no_list_turn_end"])
+async def test_a_full_listing_that_cannot_read_the_rows_folder_still_marks_a_copy_conflicted(
+    tmp_path, org_deployment, monkeypatch, entry_point, listing, failure,
+):
+    """A shell `cp -r brief brief-copy`, then a full listing of the shared
+    root, the self-heal's or a turn end's with no pod list, during which
+    `brief`, the folder the id's row names, fails with EIO to open, to give
+    its id, or to the listing's stat of it. A folder the listing could not
+    read is not one it shows gone, so the row is not stale and the copy
+    marks the id conflicted. Once the reads recover, the owner's and a
+    co-member's lookups answer 409."""
+    from cowork.services.task_objects import snapshot_artifact_state
+
+    brief = await _owners_brief(tmp_path, entry=entry_point)
+    before, before_mtimes = snapshot_artifact_state(project_root(brief.project).base)
+    await _copy_no_turn_end_claims(brief, entry=entry_point)
+    if failure == "open":
+        failing = _unopenable(monkeypatch, "brief")
+    elif failure == "stat":
+        failing = _unstattable(monkeypatch, brief.folder)
+    else:
+        failing = _unreadable(monkeypatch, "brief", strict_too=True)
+
+    changes = await _full_listing(
+        brief, listing=listing, monkeypatch=monkeypatch, before=before, before_mtimes=before_mtimes,
+    )
+    failing.clear()
+
+    assert _row(brief.org_id, brief.artifact_id) == Location(brief.project.id, None, "brief")
+    assert _conflicted(brief.org_id, brief.artifact_id)
+    for caller in (brief.owner, brief.member):
+        assert await _refused(brief.org_id, caller, brief.project, brief.artifact_id, entry=entry_point) == 409
+    if changes is not None:
+        assert changes.created == []
+        assert changes.listed_ids == artifact_identity.ListedIds(
+            ids={"brief-copy": brief.artifact_id}, unreadable=frozenset({"brief"}),
+        )
+
+
+_UNREAD_LISTING_EVENT = "artifact_location_listing_unreadable"
+
+
+def _failing_listing_reads(monkeypatch, brief: _Brief, *, failure: str, error: int) -> threading.Event:
+    """Make one read of a full listing of `brief`'s shared root raise
+    ``error`` while the returned event is set, which it is not yet: the open
+    of the copy `brief-copy` (``copy_open``), the listing's stat of the copy
+    (``copy_stat``), or the listing of the shared root itself
+    (``root_listing``)."""
+    failing = threading.Event()
+    if failure == "copy_open":
+        real = artifact_identity._opened_child_directory
+
+        def opened(parent, name):
+            if failing.is_set() and name == "brief-copy":
+                raise OSError(error, os.strerror(error))
+            return real(parent, name)
+
+        monkeypatch.setattr(artifact_identity, "_opened_child_directory", opened)
+    elif failure == "copy_stat":
+        _failing_os_call(monkeypatch, "stat", path=brief.folder.with_name("brief-copy"), error=error, failing=failing)
+    else:
+        for name in ("scandir", "listdir"):
+            _failing_os_call(monkeypatch, name, path=project_root(brief.project).base, error=error, failing=failing)
+    return failing
+
+
+def _unread_listing_warnings(caplog) -> list[logging.LogRecord]:
+    from cowork.services import artifact_autopublish
+
+    return [
+        record for record in caplog.records
+        if record.name == artifact_autopublish.logger.name and record.levelno == logging.WARNING
+        and getattr(record, "event", None) == _UNREAD_LISTING_EVENT
+    ]
+
+
+async def _first_listing_of_the_copy(brief: _Brief, *, listing: str, monkeypatch, failing: threading.Event):
+    """A shell `cp -r brief brief-copy`, then the first full listing of the
+    shared root, with ``failing`` set for that listing only: the project's
+    scheduled self-heal for the owner, or the end of a turn whose agent made
+    the copy and whose pod sends no list (a co-member's browser turn, or a
+    channel turn). Returns the scope the listing ran in."""
+    from cowork.services import artifact_autopublish
+
+    if listing == "self_heal":
+        await _copy_no_turn_end_claims(brief, entry=_for_request)
+        with scoped(brief.org_id, brief.owner) as session:
+            scope = session.scope
+        artifact_autopublish.request_self_heal(artifact_autopublish.SelfHeal(
+            artifacts_base=project_root(brief.project).base, scope=scope, project_id=str(brief.project.id),
+        ))
+        failing.set()
+        try:
+            started = artifact_autopublish.start_due_self_heals()
+            await asyncio.gather(*started)
+        finally:
+            failing.clear()
+        assert len(started) == 1
+        return scope
+    copy_in = _browser_turn_copying if listing == "browser_turn_end" else _channel_turn_copying
+    turn = copy_in(brief, monkeypatch=monkeypatch, sends_list=False, after_copy=failing.set)
+    try:
+        await turn.run
+    finally:
+        failing.clear()
+    assert brief.folder.with_name("brief-copy").is_dir()
+    return turn.scope
+
+
+@pytest.mark.parametrize("error", [errno.EIO, errno.EMFILE], ids=["EIO", "EMFILE"])
+@pytest.mark.parametrize("failure", ["copy_open", "copy_stat", "root_listing"])
+@pytest.mark.parametrize("listing", ["self_heal", "browser_turn_end", "channel_turn_end"])
+async def test_a_full_listing_that_could_not_read_the_copy_asks_for_the_self_heal_again(
+    tmp_path, org_deployment, monkeypatch, entry_point, caplog, owned_logger, listing, failure, error,
+):
+    """A shell `cp -r brief brief-copy`, then the first full listing of the
+    shared root, the self-heal's or a turn end's with no pod list (browser
+    or channel), during which the copy fails to open, the listing's stat of
+    the copy fails, or the listing of the shared root itself fails, with EIO
+    or EMFILE. That listing cannot mark the id, but it does not end
+    silently: it logs one WARNING with the project and a reason, with the
+    number of folders it could not read when it read the shared root, and
+    asks for the project's location check again, which the poll starts once
+    SELF_HEAL_INTERVAL_S has passed since the last self-heal. Once the reads
+    recover, that check lists the copy, marks the id conflicted, and asks
+    for nothing more: the owner's and a co-member's lookups answer 409.
+    Nothing is published."""
+    from _logging_assertions import assert_log_fields
+
+    from cowork.services import artifact_autopublish
+
+    published = _no_self_heals_yet(monkeypatch)
+    brief = await _owners_brief(tmp_path, entry=entry_point)
+    _autopublish_off(brief.org_id)
+    failing = _failing_listing_reads(monkeypatch, brief, failure=failure, error=error)
+    logged = owned_logger(artifact_autopublish.logger.name, level=logging.WARNING)
+    project_id = str(brief.project.id)
+
+    scope = await _first_listing_of_the_copy(brief, listing=listing, monkeypatch=monkeypatch, failing=failing)
+    artifact_identity._clear_identity_indexes()
+
+    assert not _conflicted(brief.org_id, brief.artifact_id)
+    [warning] = _unread_listing_warnings(caplog)
+    assert warning.getMessage() == (
+        "a full listing of a project's artifacts could not read every folder, so the project's self-heal lists it again"
+    )
+    if failure == "root_listing":
+        # It read no folder below the root, so it counts none.
+        unread = {"reason": "artifacts_folder_unreadable"}
+        assert not hasattr(warning, "count")
+    else:
+        unread = {"reason": "folders_unreadable", "count": 1}
+    assert {"project_id": warning.project_id, **{name: getattr(warning, name) for name in unread}} == {
+        "project_id": project_id, **unread,
+    }
+    assert_log_fields(
+        logged.output(), log_level="WARNING", event=_UNREAD_LISTING_EVENT, project_id=project_id, **unread,
+    )
+    heal = artifact_autopublish.SelfHeal(
+        artifacts_base=project_root(brief.project).base, scope=scope, project_id=project_id,
+    )
+    assert artifact_autopublish._self_heals_requested == {heal}
+    if listing == "self_heal":
+        # The first ran from this request's poll, so the next waits out the
+        # interval.
+        assert artifact_autopublish.start_due_self_heals() == []
+        monkeypatch.setattr(artifact_autopublish, "SELF_HEAL_INTERVAL_S", 0.0)
+
+    started = artifact_autopublish.start_due_self_heals()
+    await asyncio.gather(*started)
+
+    assert len(started) == 1
+    assert artifact_autopublish._self_heals_requested == set()
+    assert len(_unread_listing_warnings(caplog)) == 1
+    assert _row(brief.org_id, brief.artifact_id) == Location(brief.project.id, None, "brief")
+    assert _conflicted(brief.org_id, brief.artifact_id)
+    for caller in (brief.owner, brief.member):
+        assert await _refused(brief.org_id, caller, brief.project, brief.artifact_id, entry=entry_point) == 409
+    assert published == []
+
+
+def _bare_artifacts(base: Path) -> artifact_roots.ProjectArtifacts:
+    """An artifacts folder at ``base`` that belongs to no project."""
+    return artifact_roots.ProjectArtifacts(base=base, project_id=None, project_name="")
+
+
+def _listed_ids(
+    *, listing: str, base: Path, before: set[str], before_mtimes: dict[str, int],
+) -> artifact_identity.ListedIds:
+    """What a full listing of ``base`` read: the project's scheduled
+    self-heal's, or the end of a turn whose pod sent no list, diffed against
+    ``before``."""
+    from cowork.services import artifact_autopublish
+
+    if listing == "self_heal":
+        return artifact_autopublish._listed_artifact_ids(artifacts_base=base)
+    return turn_artifact_changes(
+        conversation_id=uuid4(), artifacts_base=base, before=before, before_mtimes=before_mtimes,
+    ).listed_ids
+
+
+@pytest.mark.parametrize(
+    ("error", "unreadable"),
+    [
+        (errno.EIO, True),
+        (errno.EMFILE, True),
+        (errno.EACCES, True),
+        (errno.ESTALE, True),
+        (errno.ENOENT, False),
+        (errno.ENOTDIR, False),
+        (errno.ELOOP, False),
+    ],
+    ids=["EIO", "EMFILE", "EACCES", "ESTALE", "ENOENT", "ENOTDIR", "ELOOP"],
+)
+@pytest.mark.parametrize("stat_of", ["folder", "metadata"])
+@pytest.mark.parametrize("listing", ["self_heal", "no_list_turn_end"])
+def test_a_full_listing_reports_an_entry_it_could_not_stat_as_unreadable_not_gone(
+    tmp_path, monkeypatch, listing, stat_of, error, unreadable,
+):
+    """The stat a full listing makes of each entry, the folder's own or its
+    `metadata.json`'s, fails. A missing entry, one that is not a folder, or
+    a link loop (ENOENT, ENOTDIR, ELOOP) holds no artifact folder. Any other
+    error leaves the entry unreadable, never gone, whatever the Python
+    version's own `is_dir` would answer."""
+    from cowork.services.task_objects import snapshot_artifact_state
+
+    source = _bare_artifacts(tmp_path / "artifacts")
+    brief_id, _brief = _write(source, "brief")
+    _copy_id, copy = _write(source, "brief-copy")
+    before, before_mtimes = snapshot_artifact_state(source.base)
+    _unstattable(monkeypatch, copy if stat_of == "folder" else copy / "metadata.json", error=error)
+
+    listed = _listed_ids(listing=listing, base=source.base, before=before, before_mtimes=before_mtimes)
+
+    assert listed.ids == {"brief": brief_id}
+    assert listed.unreadable == (frozenset({"brief-copy"}) if unreadable else frozenset())
+
+
+@pytest.mark.parametrize("linked", ["folder", "metadata"])
+@pytest.mark.parametrize("listing", ["self_heal", "no_list_turn_end"])
+def test_a_full_listing_leaves_out_a_link_it_could_not_stat(tmp_path, monkeypatch, listing, linked):
+    """Agent code makes `brief-link` a link, or gives it a `metadata.json`
+    that is one, to a folder the server cannot read, so the listing's stat,
+    which follows links, fails with EIO. The id reader never follows a link,
+    so the entry can never give an id: the listing leaves it out of the
+    folders it could not read, and asks for no self-heal over it. A plain
+    folder whose stat fails stays one it could not read."""
+    from cowork.services.task_objects import snapshot_artifact_state
+
+    source = _bare_artifacts(tmp_path / "artifacts")
+    brief_id, _brief = _write(source, "brief")
+    _plain_id, plain = _write(source, "plain")
+    _inner_id, inner = _write(_bare_artifacts(tmp_path / "elsewhere"), "inner")
+    entry = source.base / "brief-link"
+    if linked == "folder":
+        entry.symlink_to(inner, target_is_directory=True)
+        followed = entry
+    else:
+        entry.mkdir()
+        (entry / "metadata.json").symlink_to(inner / "metadata.json")
+        followed = entry / "metadata.json"
+    before, before_mtimes = snapshot_artifact_state(source.base)
+    _unstattable(monkeypatch, followed)
+    _unstattable(monkeypatch, plain)
+
+    listed = _listed_ids(listing=listing, base=source.base, before=before, before_mtimes=before_mtimes)
+
+    assert artifact_identity.artifact_folders_below(base=source.base).unreadable == {"brief-link", "plain"}
+    assert listed == artifact_identity.ListedIds(ids={"brief": brief_id}, unreadable=frozenset({"plain"}))
+
+
+@pytest.mark.parametrize("listing", ["self_heal", "no_list_turn_end"])
+def test_a_full_listing_of_a_linked_artifacts_folder_reads_no_folder_as_unreadable(tmp_path, monkeypatch, listing):
+    """Agent code replaces the project's artifacts folder with a link to a
+    folder elsewhere. The listing follows the link and fails to stat one
+    folder there, but the id reader refuses the linked folder itself, so no
+    folder below it holds an id: the listing names no id and no folder it
+    could not read, so it logs nothing and asks for no self-heal."""
+    from cowork.services.task_objects import snapshot_artifact_state
+
+    elsewhere = _bare_artifacts(tmp_path / "elsewhere")
+    _write(elsewhere, "readable")
+    _write(elsewhere, "theirs")
+    base = tmp_path / "artifacts"
+    base.symlink_to(elsewhere.base, target_is_directory=True)
+    before, before_mtimes = snapshot_artifact_state(base)
+    _unstattable(monkeypatch, base / "theirs")
+
+    listed = _listed_ids(listing=listing, base=base, before=before, before_mtimes=before_mtimes)
+
+    assert artifact_identity.artifact_folders_below(base=base).unreadable == {"theirs"}
+    assert listed == artifact_identity.ListedIds(ids={}, unreadable=frozenset())
+
+
+def _unlistable_artifacts_folder(monkeypatch, base: Path, *, root: str) -> Callable[[], object]:
+    """Make ``base``, a project's artifacts folder, one the server cannot
+    list: a link to a folder whose mode is 000 (``linked_mode_000``) or whose
+    listing fails with EIO (``linked_listing_EIO``), or a plain folder whose
+    listing fails with EIO (``plain_listing_EIO``). Returns the call that
+    makes it listable again."""
+    if root != "plain_listing_EIO":
+        elsewhere = base.with_name("elsewhere")
+        base.rename(elsewhere)
+        base.symlink_to(elsewhere, target_is_directory=True)
+    if root == "linked_mode_000":
+        elsewhere.chmod(0)
+        return lambda: elsewhere.chmod(0o755)
+    failing = threading.Event()
+    failing.set()
+    for name in ("scandir", "listdir"):
+        _failing_os_call(monkeypatch, name, path=base, error=errno.EIO, failing=failing)
+    return failing.clear
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        pytest.param(
+            "linked_mode_000",
+            marks=pytest.mark.skipif(
+                os.name == "nt" or os.geteuid() == 0, reason="root lists a folder whatever its mode",
+            ),
+        ),
+        "linked_listing_EIO",
+        "plain_listing_EIO",
+    ],
+)
+@pytest.mark.parametrize("listing", ["self_heal", "no_list_turn_end"])
+async def test_only_a_plain_artifacts_folder_the_server_cannot_list_asks_for_the_location_check_again(
+    tmp_path, org_deployment, monkeypatch, caplog, owned_logger, listing, root,
+):
+    """Agent code replaces the project's artifacts folder with a link to a
+    folder the server cannot list: one whose mode is 000, or one whose
+    listing fails with EIO. The id reader refuses the linked folder itself,
+    so no listing of it can ever find an id. A full listing, the self-heal's
+    or a turn end's with no pod list, then reports no id, no folder it could
+    not read and no artifacts folder it could not read, logs no WARNING and
+    asks for no location check, so no interval lists it again. A plain
+    artifacts folder whose listing fails with EIO may read at a later
+    listing, so that listing still reports the artifacts folder unreadable,
+    logs the WARNING and asks for the location check again."""
+    from cowork.services import artifact_autopublish
+    from cowork.services.task_objects import snapshot_artifact_state
+
+    _no_self_heals_yet(monkeypatch)
+    brief = await _owners_brief(tmp_path, entry=_for_request)
+    base = project_root(brief.project).base
+    before, before_mtimes = snapshot_artifact_state(base)
+    owned_logger(artifact_autopublish.logger.name, level=logging.WARNING)
+    listable_again = _unlistable_artifacts_folder(monkeypatch, base, root=root)
+    try:
+        assert artifact_identity.artifact_folders_below(base=base).base_error is not None
+        listed = _listed_ids(listing=listing, base=base, before=before, before_mtimes=before_mtimes)
+        await _full_listing(brief, listing=listing, monkeypatch=monkeypatch, before=before, before_mtimes=before_mtimes)
+    finally:
+        listable_again()
+
+    plain = root == "plain_listing_EIO"
+    assert [warning.reason for warning in _unread_listing_warnings(caplog)] == (
+        ["artifacts_folder_unreadable"] if plain else []
+    )
+    assert [heal.project_id for heal in artifact_autopublish._self_heals_requested] == (
+        [str(brief.project.id)] if plain else []
+    )
+    assert artifact_autopublish._self_heal_publishes_requested == set()
+    assert listed == artifact_identity.ListedIds(ids={}, unreadable=frozenset(), base_unreadable=plain)
+
+
+@pytest.mark.parametrize("lock_folder", ["readable", "unstattable"])
+@pytest.mark.parametrize("listing", ["self_heal", "no_list_turn_end"])
+def test_a_full_listing_never_lists_the_lock_folder(tmp_path, monkeypatch, listing, lock_folder):
+    """Agent code writes a `metadata.json` into the project's lock folder
+    (`.locks`) during the turn, and its stat may fail. Every full listing
+    leaves that folder out, as the reconciler's always has: a turn end with
+    no pod list neither claims it nor reads its id, and no listing counts it
+    among the folders it could not read."""
+    from cowork.services.artifact_locks import LOCKS_DIRNAME
+    from cowork.services.task_objects import snapshot_artifact_state
+
+    source = _bare_artifacts(tmp_path / "artifacts")
+    brief_id, _brief = _write(source, "brief")
+    before, before_mtimes = snapshot_artifact_state(source.base)
+    _lock_id, locks = _write(source, LOCKS_DIRNAME)
+    if lock_folder == "unstattable":
+        _unstattable(monkeypatch, locks / "metadata.json")
+
+    if listing == "no_list_turn_end":
+        changes = turn_artifact_changes(
+            conversation_id=uuid4(), artifacts_base=source.base, before=before, before_mtimes=before_mtimes,
+        )
+        assert (changes.created, changes.touched) == ([], set())
+    listed = _listed_ids(listing=listing, base=source.base, before=before, before_mtimes=before_mtimes)
+
+    assert listed == artifact_identity.ListedIds(ids={"brief": brief_id}, unreadable=frozenset())
+
+
+def test_a_folder_the_turn_start_could_not_stat_is_never_one_the_turn_made(tmp_path, monkeypatch):
+    """The turn start's listing fails to stat `brief` with EIO. The folder
+    existed before the turn, so the snapshot keeps it, with an unknown
+    mtime, 0. Once the reads recover, a turn end with no pod list never
+    claims it as created, but counts it as edited, so the turn records a
+    revision of it rather than missing an edit."""
+    from cowork.services.task_objects import snapshot_artifact_state
+
+    source = _bare_artifacts(tmp_path / "artifacts")
+    _write(source, "brief")
+    failing = _unstattable(monkeypatch, source.base / "brief")
+    before, before_mtimes = snapshot_artifact_state(source.base)
+    failing.clear()
+
+    changes = turn_artifact_changes(
+        conversation_id=uuid4(), artifacts_base=source.base, before=before, before_mtimes=before_mtimes,
+    )
+
+    assert (before, before_mtimes) == ({"brief"}, {"brief": 0})
+    assert changes.created == []
+    assert changes.touched == {"brief"}
+
+
+@pytest.mark.parametrize(
+    ("error", "stat_fails"),
+    [(errno.EIO, False), (errno.EMFILE, False), (errno.EIO, True)],
+    ids=["EIO", "EMFILE", "EIO_stat_too"],
+)
+def test_a_turn_start_that_cannot_list_the_artifacts_folder_raises(tmp_path, monkeypatch, error, stat_fails):
+    """The turn start's listing of the artifacts folder itself fails. An
+    empty snapshot would let the turn end take every folder for one the turn
+    made, so the snapshot raises the listing's error instead. In the last
+    case the stat of the folder itself fails with EIO too, which
+    `Path.is_dir` answers False for from Python 3.14, so a snapshot that
+    asked it first would take the folder for a missing one and return an
+    empty snapshot."""
+    from cowork.services.task_objects import snapshot_artifact_state
+
+    source = _bare_artifacts(tmp_path / "artifacts")
+    _write(source, "brief")
+    failing = threading.Event()
+    failing.set()
+    for name in ("scandir", "listdir", *(("stat",) if stat_fails else ())):
+        _failing_os_call(monkeypatch, name, path=source.base, error=error, failing=failing)
+
+    with pytest.raises(OSError) as raised:
+        snapshot_artifact_state(source.base)
+
+    assert raised.value.errno == error
+
+
+async def test_a_no_list_turn_end_reads_a_row_naming_a_folder_it_created_as_one_holding_the_id(
+    tmp_path, org_deployment, entry_point,
+):
+    """The turn made `brief`, whose provenance names its conversation, and a
+    lookup during the turn recorded its row. A copy without provenance is
+    not the turn's, so only `brief` is created. The turn end's listing of
+    the whole folder reads the created folder's id too, so the row is not
+    taken for one whose folder is gone, and the copy marks the id
+    conflicted: both lookups answer 409."""
+    from cowork.db.scoped import TenantScope
+    from cowork.handlers.responses import _RemoteArtifactsDir
+    from cowork.services.task_objects import snapshot_artifact_state
+    from cowork.turnqueue.remote_turn import _record_turn_artifacts
+
+    org_id, owner, member = str(uuid4()), str(uuid4()), str(uuid4())
+    project = make_project(tmp_path, org_id)
+    conversation = make_conversation(project, None)
+    base = project_root(project).base
+    base.mkdir(parents=True, exist_ok=True)
+    before, before_mtimes = snapshot_artifact_state(base)
+    artifact_id, folder = _write(project_root(project), "brief")
+    metadata = json.loads((folder / "metadata.json").read_text())
+    (folder / "metadata.json").write_text(
+        json.dumps({**metadata, "provenance": [{"conversation": str(conversation)}]})
+    )
+    assert (await _review(org_id, owner, project, artifact_id, entry=entry_point)).folder == folder
+    copy = folder.with_name("brief-copy")
+    copy.mkdir()
+    (copy / "index.html").write_text("<html></html>")
+    (copy / "metadata.json").write_text(json.dumps(metadata))
+    artifact_identity._clear_identity_indexes()
+
+    changes = await _record_turn_artifacts(
+        _RemoteArtifactsDir(base=base, project_id=str(project.id), project_name=project.name, creator=None),
+        conv_id=conversation,
+        scope=TenantScope(org_mode=True, org_id=org_id, user_id=None),
+        before_slugs=before, before_mtimes=before_mtimes, completed_cleanly=True,
+    )
+
+    assert changes.created == ["brief"]
+    assert _row(org_id, artifact_id) == Location(project.id, None, "brief")
+    assert _conflicted(org_id, artifact_id)
+    for caller in (owner, member):
+        assert await _refused(org_id, caller, project, artifact_id, entry=entry_point) == 409
+    assert changes.listed_ids.ids == {"brief": artifact_id, "brief-copy": artifact_id}
 
 
 async def test_a_granted_copy_in_a_co_members_workspace_never_replaces_the_owners_folder(
