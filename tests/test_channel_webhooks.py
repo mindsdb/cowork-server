@@ -156,7 +156,7 @@ def _delete_channel_events(*dedupe_keys: str) -> None:
 async def test_intake_events_stamps_the_resolved_org(monkeypatch, org_deployment):
     captured = []
     try:
-        intake_events(
+        await intake_events(
             "slack", _FakeBridge(), [{"key": "evt-a"}],
             sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured), org_id=ORG_A,
         )
@@ -181,14 +181,14 @@ async def test_intake_events_isolates_dedupe_across_orgs(org_deployment):
     captured_a: list = []
     captured_b: list = []
     try:
-        intake_events(
+        await intake_events(
             "slack", _FakeBridge(), [{"key": "evt-shared"}],
             sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured_a), org_id=ORG_A,
         )
         for coro in captured_a:
             await coro
 
-        intake_events(
+        await intake_events(
             "slack", _FakeBridge(), [{"key": "evt-shared"}],
             sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured_b), org_id=ORG_B,
         )
@@ -199,6 +199,110 @@ async def test_intake_events_isolates_dedupe_across_orgs(org_deployment):
             await coro
     finally:
         _delete_channel_events("evt-shared")
+
+
+async def test_a_cancel_while_an_event_is_recorded_still_schedules_it(monkeypatch, org_deployment):
+    """A cancel of the intake (a credentials change, a lost lease, shutdown)
+    lands while an event's record unit runs. The unit commits the row, and
+    the cancel waits for the event's schedule too: a recorded event left
+    unscheduled would have its redelivery dropped as a duplicate, and the
+    message would never get a reply."""
+    import threading
+
+    inside = threading.Event()
+    release = threading.Event()
+    real_record = webhooks._record_inbound
+
+    def slow_record(session, **kwargs):
+        inside.set()
+        release.wait(timeout=5)
+        return real_record(session, **kwargs)
+
+    monkeypatch.setattr(webhooks, "_record_inbound", slow_record)
+    captured: list = []
+    try:
+        intake = asyncio.create_task(intake_events(
+            "slack", _FakeBridge(), [{"key": "evt-cancelled"}],
+            sink=lambda ct, evt, org_id=None: None, scheduler=_capturing_scheduler(captured), org_id=ORG_A,
+        ))
+        deadline = time.monotonic() + 5
+        while not inside.is_set():
+            assert time.monotonic() < deadline, "the record unit never ran"
+            await asyncio.sleep(0.01)
+        intake.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await intake
+
+        session = get_open_session()
+        try:
+            svc = ChannelEventService(ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A)))
+            recorded = svc.is_duplicate_inbound("slack", "evt-cancelled")
+        finally:
+            session.close()
+        assert (recorded, len(captured)) == (True, 1)
+    finally:
+        release.set()
+        for coro in captured:
+            coro.close()
+        _delete_channel_events("evt-cancelled")
+
+
+def _status_writes_refused(monkeypatch) -> list[str]:
+    """Make every event status write meet a full pool; returns the statuses
+    it was asked to write."""
+    from cowork.db.units import DatabaseBusy
+
+    asked: list[str] = []
+
+    def refused(session, *, event_id, status, error=None):
+        asked.append(status)
+        raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+
+    monkeypatch.setattr(webhooks, "_set_event_status", refused)
+    return asked
+
+
+async def test_a_delivered_event_whose_status_write_is_refused_is_not_marked_failed(monkeypatch, caplog):
+    """The sink delivered the reply, then the pool refuses the `routed`
+    write. The event is not marked `failed` for it: the status is a record
+    that dedupe ignores, so the refusal logs one WARNING, and the task ends
+    without an exception."""
+    asked = _status_writes_refused(monkeypatch)
+    delivered: list = []
+
+    async def sink(channel_type, event, org_id=None):
+        delivered.append(event)
+
+    with caplog.at_level(logging.WARNING, logger=webhooks.log.name):
+        await webhooks._process_event("slack", {"key": "evt-routed"}, "event-1", sink)
+
+    assert delivered == [{"key": "evt-routed"}]
+    assert asked == ["routed"]
+    records = [r for r in caplog.records if r.name == webhooks.log.name]
+    assert [(r.levelname, r.getMessage(), r.outcome) for r in records] == [(
+        "WARNING", "channel event: no database connection freed to record its status", "routed",
+    )]
+
+
+async def test_a_failed_event_whose_status_write_is_refused_ends_without_an_exception(monkeypatch, caplog):
+    """The sink fails, and the pool refuses the `failed` write too. The
+    sink's failure is logged, the refusal is a WARNING, and nothing escapes
+    the background task."""
+    asked = _status_writes_refused(monkeypatch)
+
+    async def sink(channel_type, event, org_id=None):
+        raise RuntimeError("adapter send failed")
+
+    with caplog.at_level(logging.WARNING, logger=webhooks.log.name):
+        await webhooks._process_event("slack", {"key": "evt-failed"}, "event-2", sink)
+
+    assert asked == ["failed"]
+    records = [r for r in caplog.records if r.name == webhooks.log.name]
+    assert [r.levelname for r in records] == ["ERROR", "WARNING"]
+    assert (records[1].getMessage(), records[1].outcome) == (
+        "channel event: no database connection freed to record its status", "failed",
+    )
 
 
 # --- Real plugins' extractors: pulled unverified, used only as a lookup key ---

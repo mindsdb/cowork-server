@@ -21,7 +21,6 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.exc import IntegrityError
-from starlette.concurrency import run_in_threadpool
 
 from cowork.api.v1.endpoints.skills import (
     SkillViewerDep,
@@ -29,7 +28,8 @@ from cowork.api.v1.endpoints.skills import (
     _skill_response,
 )
 from cowork.api.v1.permissions import Authenticated, AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSession, ScopedSessionDep
+from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_tenant_scope
+from cowork.db.units import run_db
 from cowork.principal import Principal, get_principal
 from cowork.schemas.skills import (
     SkillEnabledForMeRequest,
@@ -67,6 +67,7 @@ from cowork.services.skills import (
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 OrgMemberLookupDep = Annotated[OrgMemberLookup, Depends(get_org_member_lookup)]
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 @router.get("/sharing-capabilities", response_model=SkillSharingCapabilities)
@@ -141,7 +142,7 @@ SHARING_RACED_REFUSAL = "This skill's sharing changed while saving. Reload it an
 
 
 async def stored_sharing_rule(
-    skill_id: str, scoped: ScopedSessionDep, viewer: SkillViewerDep
+    skill_id: str, scope: ScopeDep, viewer: SkillViewerDep
 ) -> SkillAccessRule | None:
     """The skill's stored access as ``viewer`` reads it (the default team as
     everyone), for the check PUT /{skill_id}/sharing asks MindsHub
@@ -151,19 +152,20 @@ async def stored_sharing_rule(
     name is refused (SkillNotFoundError, a ValueError), which the route
     refuses itself. Any other failure, a database error included, raises:
     read as "no stored rule" it would ask MindsHub about every person kept
-    and answer 503 for an edit that adds nobody."""
+    and answer 503 for an edit that adds nobody. Read as a unit of its own,
+    so the event loop never waits for a pooled connection."""
     if viewer is None:
         return None
 
-    def read() -> SkillAccessRule | None:
-        service = SkillService(scoped.scope, viewer=viewer, session=scoped)
+    def read(session: ScopedSession) -> SkillAccessRule | None:
+        service = SkillService(session.scope, viewer=viewer, session=session)
         try:
             skill = service.get_seen_skill(skill_id)
         except ValueError:
             return None
         return viewer.effective(service.access_rule(skill))
 
-    return await run_in_threadpool(read)
+    return await run_db(read, scope=scope)
 
 
 StoredRuleDep = Annotated[SkillAccessRule | None, Depends(stored_sharing_rule)]

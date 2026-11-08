@@ -164,6 +164,11 @@ def org(org_deployment, monkeypatch, tmp_path):
         sessions.append(session)
         return session
 
+    async def unit(work, *, scope):
+        # A unit on this org's database, as the member the scope names.
+        return work(as_(scope.user_id, scope.org_id))
+
+    monkeypatch.setattr(sharing_ep, "run_db", unit)
     try:
         yield SimpleNamespace(as_=as_)
     finally:
@@ -202,7 +207,7 @@ def _share(
     request = SkillSharingRequest(**body)
     scoped = ctx.as_(user)
     viewer = viewer or _viewer(user, teams=(TEAM_ENG,), admin=admin)
-    stored = asyncio.run(sharing_ep.stored_sharing_rule(slug, scoped, viewer))
+    stored = asyncio.run(sharing_ep.stored_sharing_rule(slug, scoped.scope, viewer))
     verified = asyncio.run(
         sharing_ep.verify_people_in_org(request, viewer, stored, members or _members())
     )
@@ -2054,18 +2059,18 @@ def test_the_stored_rule_read_lets_a_database_failure_through(org, monkeypatch):
 
     _create(org, ALICE, "shared")
     viewer = _viewer(ALICE)
-    assert asyncio.run(sharing_ep.stored_sharing_rule("shared", org.as_(ALICE), viewer)) == SkillAccessRule(
+    assert asyncio.run(sharing_ep.stored_sharing_rule("shared", org.as_(ALICE).scope, viewer)) == SkillAccessRule(
         owner_user_id=ALICE,
     )
-    assert asyncio.run(sharing_ep.stored_sharing_rule("missing", org.as_(ALICE), viewer)) is None
-    assert asyncio.run(sharing_ep.stored_sharing_rule("Not A Slug", org.as_(ALICE), viewer)) is None
+    assert asyncio.run(sharing_ep.stored_sharing_rule("missing", org.as_(ALICE).scope, viewer)) is None
+    assert asyncio.run(sharing_ep.stored_sharing_rule("Not A Slug", org.as_(ALICE).scope, viewer)) is None
 
     def database_down(self, skill):
         raise OperationalError("SELECT", {}, Exception("database is down"))
 
     monkeypatch.setattr(SkillService, "access_rule", database_down)
     with pytest.raises(OperationalError):
-        asyncio.run(sharing_ep.stored_sharing_rule("shared", org.as_(ALICE), viewer))
+        asyncio.run(sharing_ep.stored_sharing_rule("shared", org.as_(ALICE).scope, viewer))
 
 
 def test_the_route_lookup_asks_mindshub_by_id(monkeypatch):
@@ -3018,9 +3023,8 @@ def _check(access, *, principal=None, stored=None, scope=None, reads=None):
         parsed = ArtifactAccessRequest.model_validate(access)
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail=access_refusal(exc.errors(include_url=False))) from exc
-    session = SimpleNamespace(scope=scope or _ORG_SCOPE)
     return asyncio.run(aw._checked_team_audience(
-        parsed, request=member_request(principal or _principal(ALICE)), session=session, stored_rule=stored_rule,
+        parsed, request=member_request(principal or _principal(ALICE)), scope=scope or _ORG_SCOPE, stored_rule=stored_rule,
     )).access.publisher_access()
 
 

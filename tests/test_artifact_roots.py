@@ -582,14 +582,12 @@ async def test_a_review_lookup_waits_for_the_database_once_and_the_file_store_on
 async def test_a_project_list_reads_its_roots_and_cards_in_one_file_store_call(
     owners_legacy_artifact, monkeypatch,
 ):
-    from types import SimpleNamespace
-
     from cowork.api.v1 import artifact_scope
     from cowork.api.v1.endpoints import artifacts
 
     row, _folder = owners_legacy_artifact
     hops = _count_hops(monkeypatch, artifact_scope, artifacts)
-    caller = SimpleNamespace(scope=TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A))
+    caller = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
 
     cards = await artifacts.list_artifacts(caller, project_id=row.id, project_path=None)
 

@@ -719,7 +719,7 @@ async def _serve_draft(*, monkeypatch, source, folder, rel_path):
         "0123456789abcdef0123456789abcdef",
         rel_path,
         SimpleNamespace(query_params={}),
-        SimpleNamespace(scope=LOCAL_SCOPE),
+        LOCAL_SCOPE,
         download=False,
     )
 
