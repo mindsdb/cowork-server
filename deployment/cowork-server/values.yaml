@@ -167,16 +167,18 @@ deployment:
   #           remaining answer as interrupted on its open stream
   #           (TURN_SHUTDOWN_GRACE_SECONDS).
   #   2 s     uvicorn's own drain (--timeout-graceful-shutdown in the image).
-  #   about 20 s  the lifespan teardown's bounded waits: the draft listener's
+  #   about 22 s  the lifespan teardown's bounded waits: the draft listener's
   #           own drain when COWORK_DRAFT_PORT is set (2 s,
   #           cowork/draft_host/listener.py), another pass over turns (5 s),
+  #           the artifact location backfill's stop (2 s,
+  #           LOCATION_BACKFILL_SHUTDOWN_SECONDS in cowork/server.py),
   #           channel tasks (3 s, then up to 5 s more while each one
   #           cancelled writes its sandbox turn's cancel flag and records its
   #           artifacts) and scratchpad closes (5 s).
   #   up to 8 s  last, only while a turn's artifact diff or record is still
   #           running, as during a file store stall: the wait for those
   #           (TURN_END_RECORD_DRAIN_SECONDS, cowork/db/units.py).
-  # About 42 s in all, or about 50 s during a stall, so 60 s leaves room for
+  # About 44 s in all, or about 52 s during a stall, so 62 s leaves room for
   # the unbounded closes at the end of teardown before the kubelet's SIGKILL.
   # A stall that clears within the last wait keeps the turn's artifact rows.
   # A record still running after it is cut by the event loop's close, so that
@@ -187,7 +189,7 @@ deployment:
   # save once its record ends, and a save that starts as the loop closes may
   # not finish. A file store call already running on the stuck mount keeps
   # the process alive until the SIGKILL.
-  terminationGracePeriodSeconds: 60
+  terminationGracePeriodSeconds: 62
 
   lifecycle:
     preStop:

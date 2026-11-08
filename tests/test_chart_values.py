@@ -342,9 +342,9 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     """Counted from the pod's deletion: the preStop sleep, the pre-drain that
     ends remote turns before uvicorn sees SIGTERM, uvicorn's drain bound, then
     the lifespan teardown's bounded waits (the draft listener's own drain,
-    another pass over turns, channel tasks, scratchpad closes, and last the
-    turn-end artifact records a file store stall left waiting), and a margin
-    for its unbounded closes.
+    another pass over turns, the location backfill's stop, channel tasks,
+    scratchpad closes, and last the turn-end artifact records a file store
+    stall left waiting), and a margin for its unbounded closes.
 
     The channel drain cancels the tasks still running at its timeout, then
     waits up to its cancel_timeout for them to unwind: a cancelled channel turn
@@ -356,6 +356,7 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     from cowork.draft_host.listener import (
         _GRACEFUL_SHUTDOWN_SECONDS as DRAFT_LISTENER_DRAIN_SECONDS,
     )
+    from cowork.server import LOCATION_BACKFILL_SHUTDOWN_SECONDS
     from cowork.streaming.cancellation import CANCEL_REQUEST_SECONDS
     from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
 
@@ -367,6 +368,7 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     teardown = (
         DRAFT_LISTENER_DRAIN_SECONDS
         + TURN_SHUTDOWN_GRACE_SECONDS
+        + LOCATION_BACKFILL_SHUTDOWN_SECONDS
         + _timeout_default(drain_background_tasks) + channel_cancel_wait
         + _timeout_default(drain_scratchpad_closes)
         + TURN_END_RECORD_DRAIN_SECONDS

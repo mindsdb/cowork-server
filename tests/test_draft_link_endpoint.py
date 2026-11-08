@@ -42,6 +42,10 @@ from draft_host_support import (
 )
 from test_artifacts_api_tenancy import session  # noqa: F401  (fixture)
 
+# Every project row a test makes goes with the test, so its artifact's
+# location row cannot answer another module's lookup of the same id.
+pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
+
 IDENTITY = {"X-User-Id": USER, "X-Organization-Id": ORG}
 DASHED_ARTIFACT = str(UUID(ARTIFACT))
 LINK = f"/api/v1/artifacts/drafts/{PROJECT}/{DASHED_ARTIFACT}/link"

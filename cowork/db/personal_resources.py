@@ -84,6 +84,9 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     # every resource is partitioned, so this entry decides nothing in
     # single-tenant mode.
     "artifact_owner_choices": PersonalResource.PROJECTS,
+    # Written and read only in org mode, where every resource is partitioned,
+    # so this entry decides nothing in a personal scope.
+    "artifact_locations": PersonalResource.PROJECTS,
     # Authorship claims for skills, project memory and project instructions.
     # SharedResourceAccess reads and writes them only in org mode, where every
     # resource is partitioned, so this entry decides nothing in a personal scope.

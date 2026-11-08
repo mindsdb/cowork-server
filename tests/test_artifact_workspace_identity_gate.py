@@ -43,7 +43,7 @@ def no_resolution(monkeypatch):
     def explode(*_args, **_kwargs):
         raise AssertionError("resolution reached with an unvalidated identity")
 
-    monkeypatch.setattr("cowork.api.v1.artifact_scope._resolve_in", explode)
+    monkeypatch.setattr("cowork.api.v1.artifact_scope.artifact_folders_holding", explode)
 
 
 @pytest.mark.parametrize(
@@ -68,11 +68,11 @@ def test_both_uuid_spellings_address_the_same_artifact(client, monkeypatch):
     the canonical 32-hex spelling either way — that is what metadata carries."""
     seen: list[str] = []
 
-    def capture(_sources, artifact_id):
+    def capture(_sources, *, artifact_id):
         seen.append(artifact_id)
         raise AssertionError("stop here; the id is what this test is about")
 
-    monkeypatch.setattr("cowork.api.v1.artifact_scope._resolve_in", capture)
+    monkeypatch.setattr("cowork.api.v1.artifact_scope.artifact_folders_holding", capture)
 
     dashed = "0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b"
     undashed = dashed.replace("-", "")

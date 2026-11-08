@@ -1,7 +1,11 @@
 """Project-scoped artifact resolution shared by artifact HTTP endpoints."""
 from __future__ import annotations
 
+import logging
 import secrets
+import threading
+import time
+from collections import OrderedDict
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -12,17 +16,36 @@ from fastapi import HTTPException, status
 
 from cowork.db.scoped import ScopedSession, TenantScope, tenant_scope_required
 from cowork.db.units import run_db, run_efs
+from cowork.services.artifact_identity import (
+    FolderCheck,
+    FolderInRoot,
+    HeldFolder,
+    artifact_folders_holding,
+    folders_holding_strictly,
+    resolve_recorded_folder,
+)
+from cowork.services.artifact_locations import (
+    Location,
+    LocationRow,
+    find_location,
+    keeps_locations,
+    record_checked_folders,
+)
 from cowork.services.artifact_roots import (
     RootsPlan,
     discover_roots,
     plan_project_roots,
     plan_scope_roots,
-    readable_sources,
+    recorded_location,
+    recorded_source,
+    scoped_project_row,
 )
 from cowork.services.artifacts import ProjectArtifacts, _org_mode
 
 if TYPE_CHECKING:
     from cowork.services.projects import ProjectService
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -110,35 +133,20 @@ def _plan_for_project_ref(session: ScopedSession, *, project_ref: str) -> RootsP
         ) from exc
 
 
-def _resolve_in(sources, artifact_id: str):
-    from cowork.services.artifact_identity import (
-        ArtifactIdentityConflict,
-        canonical_artifact_id,
-        resolve_artifact_folder,
-    )
+def _canonical_or_400(artifact_id: str) -> str:
+    from cowork.services.artifact_identity import canonical_artifact_id
 
     # Normalized here, at the edge of the service layer, and not only inside
-    # `resolve_artifact_folder`: everything downstream — the identity index, the
-    # revision journal, the draft preview — takes this value, and every caller
-    # of this module should be able to see that the string was rejected unless
-    # it parses as a UUID. Callers over HTTP are already gated by the route's
-    # `UUID` path type; the desktop delete path reaches here with its own
-    # `UUID(slug)` check, and a future caller gets the same guarantee for free.
+    # `resolve_artifact_folder`: everything downstream — the location row, the
+    # identity index, the revision journal, the draft preview — takes this
+    # value, and every caller of this module should be able to see that the
+    # string was rejected unless it parses as a UUID. Callers over HTTP are
+    # already gated by the route's `UUID` path type; the desktop delete path
+    # reaches here with its own `UUID(slug)` check, and a future caller gets
+    # the same guarantee for free.
     try:
-        artifact_id = canonical_artifact_id(artifact_id)
+        return canonical_artifact_id(artifact_id)
     except (ValueError, TypeError, AttributeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid artifact identity",
-        ) from exc
-
-    try:
-        return resolve_artifact_folder(sources, artifact_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except ArtifactIdentityConflict as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid artifact identity",
@@ -160,44 +168,6 @@ class ResolvedArtifact(NamedTuple):
     is_own: bool
 
 
-def _reviewable_in(plan: RootsPlan, artifact_id: str, *, org_id: str | None) -> ResolvedArtifact:
-    """The file store half of `review_artifact_for_request`, all on the
-    calling thread: the caller's own roots (`readable_sources`, which skips
-    another member's workspaces by name before any stat), then, in org mode
-    and only when those hold no folder, every root and the owner's grant for
-    a reviewer."""
-    try:
-        return ResolvedArtifact(*_resolve_in(readable_sources(plan), artifact_id), True)
-    except HTTPException as exc:
-        if exc.status_code != status.HTTP_404_NOT_FOUND or not _org_mode():
-            raise
-
-    from cowork.services.artifact_draft_review import draft_review_allows
-
-    source, folder, metadata = _resolve_in(discover_roots(plan).unfiltered(), artifact_id)
-    if not draft_review_allows(folder, org_id):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
-    return ResolvedArtifact(source, folder, metadata, False)
-
-
-async def review_artifact_for_request(
-    scope: TenantScope, project_ref: str, artifact_id: str
-) -> ResolvedArtifact:
-    """Resolve an artifact the caller may at least review, and say which it is.
-
-    Own roots are tried first, so an owner never pays for the wider scan, and an
-    artifact without a grant is a 404 rather than a 403: the private case must
-    not be distinguishable from a missing artifact.
-
-    One database unit reads the project row and the conversations the caller
-    owns (run_db), then one file store call does the rest (run_efs): no pooled
-    connection is held while a stat waits on the file server, the event loop
-    never waits for either, and the lookup waits for a file store slot once.
-    """
-    plan = await run_db(partial(_plan_for_project_ref, project_ref=project_ref), scope=scope)
-    return await run_efs(partial(_reviewable_in, plan, artifact_id, org_id=scope.org_id), scope=scope)
-
-
 class ReviewedRead(NamedTuple, Generic[T]):
     """An artifact the caller may at least review, and what a route's read of
     it returned."""
@@ -206,18 +176,423 @@ class ReviewedRead(NamedTuple, Generic[T]):
     value: T
 
 
-def _reviewable_and_read(
+def _read_nothing(_artifact: ResolvedArtifact) -> None:
+    return None
+
+
+class _Lookup(NamedTuple):
+    """The database half of one artifact lookup: the request's roots plan,
+    and the artifact's location row, if any, with the one root that row
+    names, whether the caller reads that root as their own, and whether the
+    row's project is the one the request names."""
+
+    plan: RootsPlan
+    row: LocationRow | None = None
+    source: ProjectArtifacts | None = None
+    own: bool = False
+    in_plan: bool = False
+
+    @property
+    def serves(self) -> bool:
+        """Whether the row's folder may answer the request: it is in the
+        request's project, and the id is not conflicted."""
+        return self.in_plan and not self.row.conflicted
+
+
+def _lookup_for_request(session: ScopedSession, *, project_ref: str, artifact_id: str) -> _Lookup:
+    """Read the plan and the location row as one unit (cowork.db.units.run_db).
+
+    The row is only a hint. It answers the request only when its project is
+    the one the request names and the id is not conflicted. Its root is
+    rebuilt from that project's row, and a legacy conversation root counts as
+    the caller's own only when the conversation is theirs; otherwise the
+    folder is a co-member's and needs the owner's review grant, the same as a
+    scan that finds it. A row naming another project of the organization is
+    opened too, never served, so the lookup learns whether its folder still
+    holds the id."""
+    plan = _plan_for_project_ref(session, project_ref=project_ref)
+    row = find_location(session, artifact_id)
+    if row is None:
+        return _Lookup(plan)
+    location = row.location
+    project = next((p for p in plan.projects if p.id == location.project_id), None)
+    in_plan = project is not None
+    if project is None:
+        project = scoped_project_row(session, project_id=location.project_id)
+        if project is None:
+            return _Lookup(plan, row)
+    own = (
+        location.conversation_id is None
+        or not plan.owner_filter
+        or location.conversation_id in plan.owned
+    )
+    return _Lookup(plan, row, recorded_source(project, location.conversation_id), own, in_plan)
+
+
+class _Opened(NamedTuple):
+    """What opening a location row's folder found, and the route's read when
+    that folder answers the request."""
+
+    check: FolderCheck
+    reviewed: ReviewedRead | None = None
+
+
+def _open_recorded(
+    lookup: _Lookup, *, artifact_id: str, org_id: str | None, read: Callable[[ResolvedArtifact], T],
+) -> _Opened:
+    """The file store half of a lookup by its location row: one root, one
+    folder, its metadata, then `read` when that folder answers the request.
+    Runs on a file store thread (run_efs)."""
+    from cowork.services.artifact_draft_review import draft_review_allows
+
+    recorded = resolve_recorded_folder(lookup.source, lookup.row.location.slug, artifact_id)
+    if recorded.check is not FolderCheck.HOLDS or not lookup.serves:
+        return _Opened(recorded.check)
+    if lookup.own:
+        artifact = ResolvedArtifact(lookup.source, recorded.folder, recorded.metadata, True)
+    elif draft_review_allows(recorded.folder, org_id):
+        artifact = ResolvedArtifact(lookup.source, recorded.folder, recorded.metadata, False)
+    else:
+        # No grant on a co-member's folder: the scan decides, as it did
+        # before rows existed, so a refusal reads as a missing artifact.
+        return _Opened(recorded.check)
+    return _Opened(recorded.check, ReviewedRead(artifact, read(artifact)))
+
+
+class _Scanned(NamedTuple):
+    """What a scan found: every folder of the plan's roots that holds the id,
+    or None when a root or folder could not be read and nothing may be
+    recorded, then the caller's answer, the route's read or the refusal to
+    raise once those folders are recorded."""
+
+    folders: tuple[Location, ...] | None
+    reviewed: ReviewedRead | None = None
+    refusal: HTTPException | None = None
+
+
+def _not_found() -> HTTPException:
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
+
+
+def _duplicated() -> HTTPException:
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Artifact identity is duplicated")
+
+
+def _reviewable_among(
+    matches: list[HeldFolder], *, own: list[ProjectArtifacts], org_id: str | None,
+) -> ResolvedArtifact:
+    """What a scan answers from `matches`, every folder of the plan's roots
+    that holds the id: the one in the caller's own roots; else, in org mode,
+    a co-member's behind the owner's review grant. Two folders in the roots
+    that decide are a 409, and none the caller may read a 404."""
+    mine = [match for match in matches if match.source in own]
+    if len(mine) > 1:
+        raise _duplicated()
+    if mine:
+        return ResolvedArtifact(mine[0].source, mine[0].folder, mine[0].metadata, True)
+    if not _org_mode() or not matches:
+        raise _not_found()
+    if len(matches) > 1:
+        raise _duplicated()
+
+    from cowork.services.artifact_draft_review import draft_review_allows
+
+    held = matches[0]
+    if not draft_review_allows(held.folder, org_id):
+        raise _not_found()
+    return ResolvedArtifact(held.source, held.folder, held.metadata, False)
+
+
+def _scan_found(
     plan: RootsPlan,
-    artifact_id: str,
     *,
+    artifact_id: str,
     org_id: str | None,
     read: Callable[[ResolvedArtifact], T],
+    own_first: bool = False,
+) -> _Scanned:
+    """A scan of the plan's roots: every folder there that holds the id, a
+    co-member's legacy roots included, the caller's answer from those, then
+    `read` on it.
+
+    A scan whose folders may change the row reads every root, an owner's
+    scan too: those folders become the id's location row, which every
+    member's lookup reads. Counted from one member's roots alone, the row
+    would serve the shared folder to a co-member whose own workspace holds a
+    copy, where their own roots answer 409. The scan runs only when no row
+    answers, so a lookup by its row stats no co-member's workspace.
+
+    With `own_first`, the caller's own roots are found and read first
+    (discover_roots' `own_only`, which skips another member's workspaces by
+    name before any stat), and every root only when those hold no folder.
+    The answer is the same, since _reviewable_among answers from the
+    caller's own folders first, but the folders found are then only the
+    caller's own, so they may not change the row (_open_or_scan)."""
+    found = discover_roots(plan, own_only=own_first)
+    matches = artifact_folders_holding(found.sources(), artifact_id=artifact_id) if own_first else []
+    if not matches:
+        if own_first:
+            found = discover_roots(plan)
+        matches = artifact_folders_holding(found.unfiltered(), artifact_id=artifact_id)
+    folders = _locations(matches)
+    try:
+        artifact = _reviewable_among(matches, own=found.sources(), org_id=org_id)
+    except HTTPException as refusal:
+        return _Scanned(folders, refusal=refusal)
+    return _Scanned(folders, reviewed=ReviewedRead(artifact, read(artifact)))
+
+
+def _locations(held: list[HeldFolder] | list[FolderInRoot]) -> tuple[Location, ...]:
+    """The location rows for folders found below the lookup's roots, without
+    the folders of roots no row describes."""
+    return tuple(
+        location for item in held
+        if (location := recorded_location(item.source, item.folder)) is not None
+    )
+
+
+def _strictly_held(plan: RootsPlan, *, artifact_id: str) -> tuple[Location, ...] | None:
+    """The folders holding the id, found again past every cache before a lone
+    folder gets an unconflicted row. The scan's discovery leaves out a root
+    that fails to list or stat, and its identity cache a folder that fails to
+    read, so a second folder holding the id can be missing from the scan,
+    and the row would then serve one of two folders. None when a root or
+    folder fails to read again: the lookup records nothing, and the next one
+    scans."""
+    try:
+        roots = discover_roots(plan, strict=True).unfiltered()
+        return _locations(folders_holding_strictly(roots, artifact_id=artifact_id))
+    except OSError:
+        return None
+
+
+#: How long one replica waits before it counts a conflicted id's folders
+#: strictly again, and how many ids it remembers that for. The count reads
+#: every root of the project, each co-member's legacy roots included, so a
+#: lookup that otherwise reads only the caller's own roots pays for it at
+#: most once per id in that time.
+_RECOUNT_SECONDS = 15 * 60
+_RECOUNT_IDS = 4096
+
+
+class _RecountTimes:
+    """When this replica last counted a conflicted id's folders strictly, per
+    organization and id, oldest first. Lookups run on file store threads, so
+    a lock guards the map; an entry leaves once its time is up, or once the
+    map holds `limit` newer ones."""
+
+    def __init__(self, *, seconds: float, limit: int, clock: Callable[[], float] = time.monotonic) -> None:
+        self._seconds = seconds
+        self._limit = limit
+        self._clock = clock
+        self._times: OrderedDict[tuple[str | None, str], float] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def take(self, *, org_id: str | None, artifact_id: str) -> bool:
+        """Whether the id may be counted now. When it may, now is its last
+        count, so the next lookup inside the window is told no."""
+        now = self._clock()
+        key = (org_id, artifact_id)
+        with self._lock:
+            while self._times and next(iter(self._times.values())) <= now - self._seconds:
+                self._times.popitem(last=False)
+            if key in self._times:
+                return False
+            self._times[key] = now
+            while len(self._times) > self._limit:
+                self._times.popitem(last=False)
+            return True
+
+
+_recount_times = _RecountTimes(seconds=_RECOUNT_SECONDS, limit=_RECOUNT_IDS)
+
+
+def _replaced_row(lookup: _Lookup, opened: _Opened | None) -> Location | None:
+    """The row a scan may move or drop: one whose folder is stale, and only
+    for a caller who reads the row's root as their own."""
+    if opened is not None and opened.check is FolderCheck.STALE and lookup.own:
+        return lookup.row.location
+    return None
+
+
+class _Found(NamedTuple):
+    """What a lookup's file store call found: what opening the row's folder
+    found, when the lookup had a row to open, and the scan, which ran unless
+    that folder answered the request (`opened.reviewed`).
+
+    `records` is False when the scan read the caller's own roots first
+    (_scan_found's `own_first`), so what it found may not change the row.
+    `clears` is True when a strict count of every root found the conflicted
+    row's folder alone, so recording it clears the mark
+    (record_checked_folders)."""
+
+    opened: _Opened | None
+    scanned: _Scanned | None = None
+    records: bool = True
+    clears: bool = False
+
+
+def _in_another_partition(lookup: _Lookup) -> bool:
+    """Whether the row's project names a folder in another partition of the
+    shared root (projects.sits_in_another_partition). The lookup never opens
+    it, the same as root discovery leaves that project out, and treats the
+    row as stale."""
+    from cowork.services.projects import sits_in_another_partition
+
+    return sits_in_another_partition(str(lookup.source.trusted_anchor), partition=lookup.plan.partition)
+
+
+def _open_or_scan(
+    lookup: _Lookup,
+    *,
+    artifact_id: str,
+    org_id: str | None,
+    read: Callable[[ResolvedArtifact], T],
+    keeps_rows: bool,
+) -> _Found:
+    """The file store half of a lookup: the row's folder (_open_recorded),
+    then, unless it answered, the plan's roots (_scan_found). When rows are
+    kept and the scan found one folder that would get a fresh unconflicted
+    row, because the id has no row or the caller replaces a stale one, the
+    folders are counted again strictly (_strictly_held). Runs on a file store
+    thread (run_efs), so the lookup waits for a file store slot once.
+
+    When the row's folder holds the id but the row cannot answer, because
+    the id is conflicted or the row names another project, the scan reads the
+    caller's own roots first and records nothing: no row moves while its
+    folder holds the id, and a co-member's legacy roots are neither statted
+    nor indexed on every lookup. One exception clears a conflicted mark: when that scan
+    found the row's folder alone and a strict count of every root of the
+    project (_strictly_held) finds it alone too. That count reads each
+    co-member's legacy roots as well, so it runs at most once per id every
+    _RECOUNT_SECONDS on this replica (_RecountTimes)."""
+    opened = None
+    if lookup.source is not None:
+        if _in_another_partition(lookup):
+            # Never opened, and stale: the scan moves the row or drops it.
+            opened = _Opened(FolderCheck.STALE)
+        else:
+            opened = _open_recorded(lookup, artifact_id=artifact_id, org_id=org_id, read=read)
+            if opened.reviewed is not None:
+                return _Found(opened)
+    settled = opened is not None and opened.check is FolderCheck.HOLDS and not lookup.serves
+    scanned = _scan_found(
+        lookup.plan, artifact_id=artifact_id, org_id=org_id, read=read, own_first=settled,
+    )
+    if settled:
+        row = lookup.row
+        clears = (
+            keeps_rows
+            and lookup.in_plan
+            and row.conflicted
+            and scanned.folders == (row.location,)
+            and _recount_times.take(org_id=org_id, artifact_id=artifact_id)
+            and _strictly_held(lookup.plan, artifact_id=artifact_id) == (row.location,)
+        )
+        return _Found(opened, scanned, records=False, clears=clears)
+    writes_a_fresh_row = keeps_rows and (lookup.row is None or _replaced_row(lookup, opened) is not None)
+    if writes_a_fresh_row and len(scanned.folders) == 1:
+        scanned = scanned._replace(folders=_strictly_held(lookup.plan, artifact_id=artifact_id))
+    return _Found(opened, scanned)
+
+
+async def _record(
+    artifact_id: str, *, folders: tuple[Location, ...], replaces: Location | None, scope: TenantScope,
+) -> None:
+    """Record the folders a scan found holding the artifact
+    (record_checked_folders). Best-effort: the request already has its
+    answer, and the next lookup scans again."""
+    try:
+        await run_db(
+            partial(record_checked_folders, artifact_id=artifact_id, folders=folders, replaces=replaces),
+            scope=scope,
+        )
+    except Exception:
+        logger.warning("could not record an artifact's location", exc_info=True)
+
+
+async def _review(
+    scope: TenantScope, *, project_ref: str, artifact_id: str, read: Callable[[ResolvedArtifact], T],
 ) -> ReviewedRead[T]:
-    """`_reviewable_in`, then `read` on the artifact it found, on the calling
-    thread. `read` runs only once `_reviewable_in` returned, so never for a
-    caller it refused."""
-    artifact = _reviewable_in(plan, artifact_id, org_id=org_id)
-    return ReviewedRead(artifact, read(artifact))
+    """The lookup behind review_artifact_for_request and
+    review_artifact_and_read: the location row's folder when the row answers
+    the request, else a scan of the project's roots, whose folders are then
+    recorded unless they leave the row as it is."""
+    artifact_id = _canonical_or_400(artifact_id)
+    lookup = await run_db(
+        partial(_lookup_for_request, project_ref=project_ref, artifact_id=artifact_id), scope=scope
+    )
+    keeps_rows = keeps_locations(scope)
+    found = await run_efs(
+        partial(
+            _open_or_scan, lookup, artifact_id=artifact_id, org_id=scope.org_id, read=read, keeps_rows=keeps_rows,
+        ),
+        scope=scope,
+    )
+    opened, scanned, records, clears = found
+    if scanned is None:
+        return opened.reviewed
+    seen: tuple[Location, ...] = ()
+    if opened is not None and opened.check is FolderCheck.HOLDS and lookup.in_plan:
+        # A folder of this project holds the id, whether or not the caller
+        # may be served it, so the scan's count includes it.
+        seen = (lookup.row.location,)
+    replaces = _replaced_row(lookup, opened)
+    folders = tuple(dict.fromkeys(seen + (scanned.folders or ())))
+    # With no stale row to replace, a scan that found no folder, or only the
+    # one the row names, leaves the row as it is. So does a scan that could
+    # not read every folder, and one from a project the row does not name:
+    # without a stale row to replace, record_checked_folders keeps a row
+    # naming another project whatever this one holds.
+    unchanged = scanned.folders is None or (
+        replaces is None
+        and (
+            not folders
+            or (
+                lookup.row is not None
+                and (not lookup.in_plan or folders == (lookup.row.location,))
+            )
+        )
+    )
+    if keeps_rows and (clears or (records and not unchanged)):
+        await _record(artifact_id, folders=folders, replaces=replaces, scope=scope)
+    if scanned.refusal is not None:
+        raise scanned.refusal
+    return scanned.reviewed
+
+
+async def review_artifact_for_request(
+    scope: TenantScope, project_ref: str, artifact_id: str
+) -> ResolvedArtifact:
+    """Resolve an artifact the caller may at least review, and say which it is.
+
+    An artifact without a grant is a 404 rather than a 403: the private case
+    must not be distinguishable from a missing artifact.
+
+    In org tenancy the artifact's location row names its folder, and the
+    lookup opens only that one: the caller's own, or a co-member's behind the
+    owner's review grant. Without a row that answers, or when its folder no
+    longer holds the artifact, the lookup lists the project's roots: the
+    caller's own folder answers, else a co-member's behind the grant, and two
+    folders in the roots that decide are a 409. That scan reads every folder
+    of the project holding the id and records them
+    (cowork.services.artifact_locations.record_checked_folders): a row names
+    the id's folder only when one folder holds it, and an id two folders hold
+    is marked conflicted, so its lookups keep listing the roots. While the
+    row's folder holds the id but the row cannot answer (a conflicted id, or
+    a row naming another project), the lookup reads the caller's own roots
+    first and records nothing, except a conflicted mark it clears
+    (_open_or_scan).
+
+    One database unit reads the project row, the conversations the caller
+    owns and the location row (run_db), then one file store call opens the
+    row's folder or lists the roots (run_efs): no pooled connection is held
+    while a stat waits on the file server, the event loop never waits for
+    either, and the lookup waits for a file store slot once. A scan whose
+    folders can change the row records them in another database unit after
+    that call.
+    """
+    return (await _review(scope, project_ref=project_ref, artifact_id=artifact_id, read=_read_nothing)).artifact
 
 
 async def review_artifact_and_read(
@@ -239,8 +614,4 @@ async def review_artifact_and_read(
     may see. An owner-only route checks ownership in a database unit after
     the lookup, and reads in a file store call of its own after that check.
     """
-    plan = await run_db(partial(_plan_for_project_ref, project_ref=project_ref), scope=scope)
-    return await run_efs(
-        partial(_reviewable_and_read, plan, artifact_id, org_id=scope.org_id, read=read),
-        scope=scope,
-    )
+    return await _review(scope, project_ref=project_ref, artifact_id=artifact_id, read=read)
