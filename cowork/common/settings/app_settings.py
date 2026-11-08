@@ -314,7 +314,17 @@ def _env_file_chain() -> list[str]:
 
     COWORK_HOME is read at import; the desktop app sets it before the server
     process starts, so an isolated build reads its own .env.
+
+    Org tenancy reads no ``<COWORK_HOME>/.env``. There COWORK_HOME is the
+    shared file store, an NFS mount, the pod's environment carries the whole
+    configuration, and the file does not exist. pydantic-settings stats each
+    file in the chain on every construction, before any source hook runs, so
+    each ``Settings()`` and ``UserSettings(**data)`` would otherwise ask the
+    file server about a missing file, and a slow file server would slow every
+    one of them.
     """
+    if os.environ.get("COWORK_TENANCY_MODE") == "org":
+        return [".env"]
     files = [str(cowork_home() / ".env"), ".env"]
     if not os.environ.get("COWORK_HOME"):
         # Prod (default home) still consults the legacy file, ordered BEFORE
@@ -496,6 +506,28 @@ class StorageSettings(Settings):
             "(cowork.shared_skills)."
         ),
     )
+    # Threads for work on the shared file store (cowork.db.units.run_efs),
+    # per event loop. These read their bare names, as the database pool
+    # settings do, and POOL_TIMEOUT bounds the wait for one of them too.
+    efs_slots: int = Field(
+        default=100,
+        ge=1,
+        description=(
+            "Threads file store work may hold at once. A call stuck on the hard "
+            "mount keeps its thread until the file server answers, so this is also "
+            "the most threads a stalled mount can take."
+        ),
+    )  # EFS_SLOTS
+    # Per person, or per organization for its work with no person. Nothing
+    # caps an organization: ten busy people fill the default EFS_SLOTS.
+    efs_share: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "File store threads one person may hold at once, so one heavy client "
+            "is refused before anyone else waits."
+        ),
+    )  # EFS_SHARE
 
 
 class SkillSettings(Settings):

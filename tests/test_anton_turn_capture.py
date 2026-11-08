@@ -213,7 +213,6 @@ def _stream(monkeypatch, session, *, question: str = "hi", read_earlier_answers=
     ``read_earlier_answers``, so the turn opens no database unit for it."""
     monkeypatch.setattr(harness_mod, "read_earlier_answers", read_earlier_answers)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_a, **_k: (set(), {}))
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", lambda *_a, **_k: ([], set(), None))
     monkeypatch.setattr(task_objects, "cards_for_slugs", lambda *_a, **_k: [])
 
     async def _no_autopublish(*_a, **_k):

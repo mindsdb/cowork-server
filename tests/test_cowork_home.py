@@ -691,3 +691,77 @@ def test_every_per_organization_override_is_a_real_knob(monkeypatch, tmp_path):
         assert str(home) not in str(resolved)
 
     get_app_settings.cache_clear()
+
+
+def test_org_tenancy_reads_no_env_file_under_cowork_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "shared"))
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    assert _env_file_chain() == [".env"]
+
+
+def test_local_tenancy_still_reads_the_env_file_under_cowork_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    assert str(tmp_path / "home" / ".env") in _env_file_chain()
+
+
+# Run in its own interpreter: Settings fixes its env-file chain when the module
+# is imported, so this process's import (local tenancy) can't show org's.
+_COUNT_SETTINGS_FILE_CALLS = r"""
+import builtins, io, json, os, sys
+
+home = os.environ["COWORK_HOME"]
+from cowork.common.settings import app_settings
+from cowork.common.settings.user_settings import UserSettings
+import cowork.harnesses.anton_harness.settings  # noqa: F401  (more Settings subclasses)
+
+calls = []
+
+def counted(fn, name):
+    def call(path, *args, **kwargs):
+        if isinstance(path, (str, os.PathLike)) and os.fspath(path).startswith(home):
+            calls.append(f"{name} {os.fspath(path)}")
+        return fn(path, *args, **kwargs)
+    return call
+
+for name in ("stat", "lstat", "open", "scandir", "listdir"):
+    setattr(os, name, counted(getattr(os, name), name))
+builtins.open = io.open = counted(builtins.open, "open")
+
+def subclasses(cls):
+    for sub in cls.__subclasses__():
+        yield sub
+        yield from subclasses(sub)
+
+built = 0
+for cls in subclasses(app_settings.Settings):
+    try:
+        cls()
+        built += 1
+    except Exception:
+        pass  # a required field: the files were still read before validation
+UserSettings(**{"theme": "dark"})
+print(json.dumps({"calls": calls, "built": built}))
+"""
+
+
+def test_constructing_every_settings_class_in_org_tenancy_touches_no_file_under_cowork_home(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    home = tmp_path / "shared"
+    home.mkdir()
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _PER_RESOURCE_OVERRIDES and key != "DATABASE_URI"
+    }
+    env.update(COWORK_HOME=str(home), COWORK_TENANCY_MODE="org")
+    result = subprocess.run(
+        [sys.executable, "-c", _COUNT_SETTINGS_FILE_CALLS],
+        capture_output=True, text=True, env=env, cwd=tmp_path, timeout=120, check=True,
+    )
+    outcome = json.loads(result.stdout.strip().splitlines()[-1])
+    assert outcome["built"] >= 10, outcome
+    assert outcome["calls"] == []

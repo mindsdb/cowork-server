@@ -1,68 +1,30 @@
 """Project-scoped artifact resolution shared by artifact HTTP endpoints."""
 from __future__ import annotations
 
-import os
 import secrets
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from functools import partial
+from pathlib import Path
+from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar
 from uuid import UUID
 
 from fastapi import HTTPException, status
 
-from cowork.db.scoped import ScopedSession, tenant_scope_required
+from cowork.db.scoped import ScopedSession, TenantScope, tenant_scope_required
+from cowork.db.units import run_db, run_efs
 from cowork.services.artifact_roots import (
-    artifacts_sources_for_project,
-    artifacts_sources_for_scope,
+    RootsPlan,
+    discover_roots,
+    plan_project_roots,
+    plan_scope_roots,
+    readable_sources,
 )
-from cowork.services.artifacts import _org_mode
+from cowork.services.artifacts import ProjectArtifacts, _org_mode
 
 if TYPE_CHECKING:
     from cowork.services.projects import ProjectService
 
-
-def _project_dir_matches(source, wanted: str) -> bool:
-    project_dir = source.base.parent.parent
-    try:
-        resolved = str(project_dir.resolve(strict=False))
-    except OSError:
-        resolved = ""
-    return wanted in (str(project_dir), resolved)
-
-
-def artifact_sources_for_request(
-    session,
-    project_id: UUID | None,
-    project_path: str | None,
-):
-    """Return only artifact roots authorized by this request's project scope.
-
-    ``project_id`` is honored in both tenancy modes. Organization requests
-    reject client filesystem paths; desktop paths only select from roots the
-    server already discovered and never become filesystem inputs themselves.
-    """
-    if _org_mode() and project_path is not None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="project_path is not accepted in org deployments; use project_id",
-        )
-    if project_id is not None:
-        # Even a typed FastAPI UUID originates at the request boundary. Recover
-        # the equal UUID object from the scoped project catalog before any root
-        # discovery so downstream paths depend only on server-owned records.
-        project_id = scoped_project_id_for_request(session, str(project_id))
-        try:
-            return artifacts_sources_for_project(session, project_id)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Unknown project",
-            ) from exc
-    sources = artifacts_sources_for_scope(session)
-    if _org_mode():
-        return sources
-    if project_path is not None:
-        wanted = os.path.normpath(os.path.expanduser(project_path))
-        sources = [source for source in sources if _project_dir_matches(source, wanted)]
-    return sources
+T = TypeVar("T")
 
 
 def scoped_project_id_for_request(session: ScopedSession, project_ref: str) -> UUID:
@@ -125,24 +87,20 @@ def _refuse_a_persons_project_in_the_operator_view(service: ProjectService, proj
         )
 
 
-def _sources_for_project_ref(
-    session: ScopedSession, project_ref: str, *, include_other_members: bool = False
-):
+def _plan_for_project_ref(session: ScopedSession, *, project_ref: str) -> RootsPlan:
+    """The database half of root discovery for one request's project, run as
+    a unit (cowork.db.units.run_db)."""
     if project_ref == "local":
         if _org_mode():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
-        return artifacts_sources_for_scope(session)
+        return plan_scope_roots(session)
     # Recover the project id from a tenant-scoped database row before artifact
     # root discovery.  The request value is used only for an in-memory equality
     # check; the UUID passed into the filesystem-facing source resolver is the
     # value the server loaded from its own database.
     project_id = scoped_project_id_for_request(session, project_ref)
     try:
-        return artifacts_sources_for_project(
-            session,
-            project_id,
-            include_other_members=include_other_members,
-        )
+        return plan_project_roots(session, project_id)
     except ValueError as exc:
         # The row can disappear between the scoped inventory and the second
         # scoped read performed by artifact root discovery.
@@ -187,39 +145,102 @@ def _resolve_in(sources, artifact_id: str):
         ) from exc
 
 
-def workspace_artifact_for_request(session: ScopedSession, project_ref: str, artifact_id: str):
-    """Resolve an artifact identity only inside roots authorized for the caller."""
-    return _resolve_in(_sources_for_project_ref(session, project_ref), artifact_id)
+class ResolvedArtifact(NamedTuple):
+    """An artifact folder the caller may at least review.
 
-
-def review_artifact_for_request(session: ScopedSession, project_ref: str, artifact_id: str):
-    """Resolve an artifact the caller may at least review, and say which it is.
-
-    Returns `(source, folder, metadata, is_own)`. `is_own` false means the bytes
-    sit in a co-member's private conversation workspace and the only reason this
-    call succeeded is the owner's draft-review grant on that artifact — the
-    caller is a reviewer and no route may let them mutate anything.
-
-    Own roots are tried first, so an owner never pays for the wider scan, and an
-    artifact without a grant is a 404 rather than a 403: the private case must
-    not be distinguishable from a missing artifact.
+    `is_own` false means the bytes sit in a co-member's private conversation
+    workspace and the only reason resolution succeeded is the owner's
+    draft-review grant on that artifact: the caller is a reviewer, and no
+    route may let them mutate anything.
     """
+
+    source: ProjectArtifacts
+    folder: Path
+    metadata: dict
+    is_own: bool
+
+
+def _reviewable_in(plan: RootsPlan, artifact_id: str, *, org_id: str | None) -> ResolvedArtifact:
+    """The file store half of `review_artifact_for_request`, all on the
+    calling thread: the caller's own roots (`readable_sources`, which skips
+    another member's workspaces by name before any stat), then, in org mode
+    and only when those hold no folder, every root and the owner's grant for
+    a reviewer."""
     try:
-        source, folder, metadata = workspace_artifact_for_request(
-            session, project_ref, artifact_id
-        )
-        return source, folder, metadata, True
+        return ResolvedArtifact(*_resolve_in(readable_sources(plan), artifact_id), True)
     except HTTPException as exc:
         if exc.status_code != status.HTTP_404_NOT_FOUND or not _org_mode():
             raise
 
     from cowork.services.artifact_draft_review import draft_review_allows
 
-    source, folder, metadata = _resolve_in(
-        _sources_for_project_ref(session, project_ref, include_other_members=True),
-        artifact_id,
-    )
-    scope = getattr(session, "scope", None)
-    if not draft_review_allows(folder, getattr(scope, "org_id", None)):
+    source, folder, metadata = _resolve_in(discover_roots(plan).unfiltered(), artifact_id)
+    if not draft_review_allows(folder, org_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
-    return source, folder, metadata, False
+    return ResolvedArtifact(source, folder, metadata, False)
+
+
+async def review_artifact_for_request(
+    scope: TenantScope, project_ref: str, artifact_id: str
+) -> ResolvedArtifact:
+    """Resolve an artifact the caller may at least review, and say which it is.
+
+    Own roots are tried first, so an owner never pays for the wider scan, and an
+    artifact without a grant is a 404 rather than a 403: the private case must
+    not be distinguishable from a missing artifact.
+
+    One database unit reads the project row and the conversations the caller
+    owns (run_db), then one file store call does the rest (run_efs): no pooled
+    connection is held while a stat waits on the file server, the event loop
+    never waits for either, and the lookup waits for a file store slot once.
+    """
+    plan = await run_db(partial(_plan_for_project_ref, project_ref=project_ref), scope=scope)
+    return await run_efs(partial(_reviewable_in, plan, artifact_id, org_id=scope.org_id), scope=scope)
+
+
+class ReviewedRead(NamedTuple, Generic[T]):
+    """An artifact the caller may at least review, and what a route's read of
+    it returned."""
+
+    artifact: ResolvedArtifact
+    value: T
+
+
+def _reviewable_and_read(
+    plan: RootsPlan,
+    artifact_id: str,
+    *,
+    org_id: str | None,
+    read: Callable[[ResolvedArtifact], T],
+) -> ReviewedRead[T]:
+    """`_reviewable_in`, then `read` on the artifact it found, on the calling
+    thread. `read` runs only once `_reviewable_in` returned, so never for a
+    caller it refused."""
+    artifact = _reviewable_in(plan, artifact_id, org_id=org_id)
+    return ReviewedRead(artifact, read(artifact))
+
+
+async def review_artifact_and_read(
+    scope: TenantScope,
+    project_ref: str,
+    artifact_id: str,
+    *,
+    read: Callable[[ResolvedArtifact], T],
+) -> ReviewedRead[T]:
+    """`review_artifact_for_request`, with the route's own blocking ``read`` of
+    the artifact run in the lookup's file store call, so the route waits for a
+    file store slot once, and its read is never refused a slot after the
+    lookup's work. A database unit the route runs after this, such as the
+    review entry's capabilities read, can still answer 503 when no connection
+    frees within POOL_TIMEOUT.
+
+    Only for a route whose authorization ends with the review: ``read`` runs
+    for a reviewer as well as the owner, so it may read only what a reviewer
+    may see. An owner-only route checks ownership in a database unit after
+    the lookup, and reads in a file store call of its own after that check.
+    """
+    plan = await run_db(partial(_plan_for_project_ref, project_ref=project_ref), scope=scope)
+    return await run_efs(
+        partial(_reviewable_and_read, plan, artifact_id, org_id=scope.org_id, read=read),
+        scope=scope,
+    )

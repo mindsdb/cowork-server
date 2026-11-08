@@ -32,6 +32,7 @@ from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.principal import ORG_MANAGE_ROLE, Principal
 from cowork.services import artifact_locks
 from cowork.services.publish import ARTIFACT_ORG_REFUSAL
+from _async_stub import awaitable
 from tests._org_sharing import (
     BOB,
     CAROL,
@@ -83,9 +84,9 @@ def as_owner(monkeypatch, folder):
     """Owner resolution succeeds and yields this folder."""
     monkeypatch.setattr(
         aw, "_owner_workspace",
-        lambda session, project_ref, artifact_id: (
+        awaitable(lambda scope, project_ref, artifact_id: (
             SimpleNamespace(project_id="proj-1"), folder, {"slug": "rep"}, {},
-        ),
+        )),
     )
     return folder
 
@@ -833,7 +834,7 @@ async def test_a_non_owner_cannot_change_access(monkeypatch, publish_calls, publ
     def refuse(*_a, **_kw):
         raise HTTPException(status_code=403, detail="Not the owner")
 
-    monkeypatch.setattr(aw, "_owner_workspace", refuse)
+    monkeypatch.setattr(aw, "_owner_workspace", awaitable(refuse))
 
     with pytest.raises(HTTPException) as excinfo:
         await aw.set_artifact_access(

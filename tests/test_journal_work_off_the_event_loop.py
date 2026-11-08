@@ -47,14 +47,14 @@ async def test_the_in_process_turn_end_capture_runs_off_the_loop(turns, monkeypa
 async def test_the_remote_turn_end_capture_runs_off_the_loop(monkeypatch):
     seen: list[bool] = []
 
-    def index(*_args, **_kwargs):
+    def changes(**_kwargs):
         seen.append(on_the_event_loop())
-        return [], set(), None
+        return task_objects.ArtifactChanges(created=[], touched=set())
 
     context = (object(), object(), "project", "Project")
     test_remote_turn._fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", index)
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", changes)
     monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
 
     async def replies(**_kwargs):

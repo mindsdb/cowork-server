@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from cowork.db.scoped import TenantScope
 from cowork.services import product_permissions as permissions
+from _async_stub import awaitable
 
 ORG = TenantScope(
     org_mode=True,
@@ -162,7 +163,7 @@ def test_artifact_http_write_denied_before_resource_or_disk_access(monkeypatch):
     app.include_router(artifact_workspace.router)
     app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=ORG)
     disk = Mock(side_effect=AssertionError("No resource or disk access"))
-    monkeypatch.setattr(artifact_workspace, "_owner_workspace", disk)
+    monkeypatch.setattr(artifact_workspace, "_owner_workspace", awaitable(disk))
     with TestClient(app) as client:
         response = client.put(
             "/workspace/project/33333333-3333-4333-8333-333333333333",
@@ -317,7 +318,7 @@ def test_every_artifact_mutation_checks_authority_before_resolving_files(
     app.include_router(artifact_workspace.router)
     app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=ORG)
     resolve = Mock(side_effect=AssertionError("No artifact mutation"))
-    monkeypatch.setattr(artifact_workspace, "_owner_workspace", resolve)
+    monkeypatch.setattr(artifact_workspace, "_owner_workspace", awaitable(resolve))
     with TestClient(app) as client:
         response = client.request(
             method,
