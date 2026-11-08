@@ -393,8 +393,13 @@ class RedisStreamBuffer(StreamBuffer):
                     # reader would wait here forever. Write one, so this reader
                     # and any other stop, and the client sees a failed turn
                     # rather than a spinner.
-                    async for rec in self._terminate_as_orphan():
+                    async for rec in self._terminate_as_orphan(after_id=last_id):
+                        if rec.seq < from_seq or rec.seq <= yielded_seq:
+                            continue
+                        yielded_seq = rec.seq
                         yield rec
+                        if rec.is_terminal:
+                            return
                     return
                 continue
             idle_ms = 0
@@ -465,8 +470,9 @@ class RedisStreamBuffer(StreamBuffer):
             )
             return True
 
-    async def _terminate_as_orphan(self) -> AsyncIterator[TurnRecord]:
-        """Close an abandoned turn, and yield the terminal record.
+    async def _terminate_as_orphan(self, *, after_id: str) -> AsyncIterator[TurnRecord]:
+        """Close an abandoned turn, and yield every record from ``after_id``
+        on, through its terminal record.
 
         Written by whichever reader notices, since the replica that owned the
         turn is the one that is gone. Idempotent by construction: the write is
@@ -474,29 +480,33 @@ class RedisStreamBuffer(StreamBuffer):
         reader arriving at the same moment replays this one rather than adding
         another.
 
+        A turn that finished between the reader's empty read and its claim
+        check has its last frames and its terminal record in the stream
+        already, and its claim released. Yielding from ``after_id`` rather
+        than only the latest record keeps those frames. The entry at
+        ``after_id`` itself comes back too; the caller skips each seq it has
+        yielded.
+
         Written through a buffer object of its own, never this one: on the
         replica running the turn, this object can be the producer's own
         buffer (the POST stream and /tail read it), and closing it would tell
         the registry the turn had ended while its producer still writes.
         """
-        logger.warning(
-            "A turn stream went quiet past the tail's idle cut with no terminal record; ending it.",
-            extra={
-                "event": "turn_tail_idle_cut",
-                "conversation_id": self._conversation_id, "turn_id": self._turn_id,
-            },
-        )
         r = get_redis()
         entries = await r.xrevrange(self.key, count=1)
-        if entries and self._record(entries[0][1]).is_terminal:
-            yield self._record(entries[0][1])
-            return
-        orphan = RedisStreamBuffer(conversation_id=self._conversation_id, turn_id=self._turn_id)
-        orphan._next_seq = (self._record(entries[0][1]).seq + 1) if entries else 0
-        await orphan.close("interrupted", {"error": "the worker running this turn stopped responding"})
-        latest = await r.xrevrange(self.key, count=1)
-        if latest:
-            yield self._record(latest[0][1])
+        if not (entries and self._record(entries[0][1]).is_terminal):
+            logger.warning(
+                "A turn stream went quiet past the tail's idle cut with no terminal record; ending it.",
+                extra={
+                    "event": "turn_tail_idle_cut",
+                    "conversation_id": self._conversation_id, "turn_id": self._turn_id,
+                },
+            )
+            orphan = RedisStreamBuffer(conversation_id=self._conversation_id, turn_id=self._turn_id)
+            orphan._next_seq = (self._record(entries[0][1]).seq + 1) if entries else 0
+            await orphan.close("interrupted", {"error": "the worker running this turn stopped responding"})
+        for _entry_id, fields in await r.xrange(self.key, min=after_id):
+            yield self._record(fields)
 
     @property
     def latest_seq(self) -> int:
