@@ -85,9 +85,10 @@ def test_turn_stream_uses_the_remote_worker_when_backend_is_remote(monkeypatch):
     conv_id = uuid4()
     turn_rows = []
 
-    # Staging is a unit, run by cowork.handlers.responses; it runs inline
-    # here, on a session nothing reads.
-    monkeypatch.setattr(responses_mod, "run_db", inline_run_db(None))
+    # Staging is a unit on the file store's threads, run by
+    # cowork.handlers.responses; it runs inline here, on a session nothing
+    # reads.
+    monkeypatch.setattr(responses_mod, "run_efs_unit", inline_run_db(None))
     scope = TenantScope(org_mode=True, org_id="org-a")
 
     async def scenario():
@@ -237,7 +238,7 @@ def test_a_channel_turn_whose_staging_unit_finds_no_connection_is_refused(monkey
     async def staging_refused(fn, *, scope):
         raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
 
-    monkeypatch.setattr(responses_mod, "run_db", staging_refused)
+    monkeypatch.setattr(responses_mod, "run_efs_unit", staging_refused)
     registry = PluginRegistry()
     load_first_party_plugins(registry)
     adapters = runtime_mod.LiveAdapterRegistry(registry)

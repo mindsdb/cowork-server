@@ -39,7 +39,7 @@ from cowork.services.connectors.oauth import auth_proxy
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
-def _require_org(scope: ScopeDep) -> None:
+async def _require_org(scope: ScopeDep) -> None:
     """Refuse the whole surface outside org mode: a desktop caller gets 404.
 
     A router dependency rather than a handler call, because FastAPI validates

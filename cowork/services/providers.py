@@ -1243,6 +1243,8 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
         `max_tokens` is kept at a small-but-safe 20 rather than 1 — some
         models reject a 1-token budget (or can't emit even a stop token),
         which would fail the probe for a perfectly valid key."""
+        from cowork.db.units import run_on_unit_threads
+
         payload = {"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "ping"}]}
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(url, headers=headers, json=payload)
@@ -1260,7 +1262,8 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
         return ProviderPing(
             status="fail",
             detail=f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}",
-            denial=_probe_denial(response=r),
+            # Off the loop: the gateway check reads settings.
+            denial=await run_on_unit_threads(lambda: _probe_denial(response=r)),
         )
 
     try:

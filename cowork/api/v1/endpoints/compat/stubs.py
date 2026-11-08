@@ -10,18 +10,19 @@ import logging
 import mimetypes
 import os
 import shutil
+from functools import partial
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import log_context
-from cowork.db.scoped import MissingTenantScopeError, ScopedSessionDep, TenantScope, get_tenant_scope
-from cowork.db.units import FilesystemBusy
+from cowork.db.scoped import MissingTenantScopeError, ScopedSession, ScopedSessionDep, TenantScopeDep
+from cowork.db.units import FilesystemBusy, run_db, run_efs_unit
+from cowork.schemas.files import AttachmentMoveResponse
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
 
 logger = logging.getLogger(__name__)
@@ -103,7 +104,7 @@ def list_attachments(
 async def upload_attachment(
     project_name: str,
     session_id: str,
-    scope: Annotated[TenantScope, Depends(get_tenant_scope)],
+    scope: TenantScopeDep,
     files: list[UploadFile] = File(...),
 ):
     from cowork.services.files import save_upload
@@ -144,34 +145,48 @@ async def upload_attachment(
 
 
 @attachments_router.delete("/{attachment_id}")
-def delete_attachment(attachment_id: UUID, scoped: ScopedSessionDep):
+async def delete_attachment(attachment_id: UUID, scope: TenantScopeDep):
     from cowork.services.files import FileService
-    FileService(scoped).delete_file(attachment_id)
+    await run_efs_unit(lambda session: FileService(session).delete_file(attachment_id), scope=scope)
     return {"ok": True}
 
 
 @attachments_router.delete("/{project_name}/{session_id}/{attachment_id}")
-def delete_attachment_scoped(project_name: str, session_id: str, attachment_id: UUID, scoped: ScopedSessionDep):
+async def delete_attachment_scoped(
+    project_name: str,
+    session_id: str,
+    attachment_id: UUID,
+    scope: TenantScopeDep,
+):
     from cowork.services.files import FileService
-    FileService(scoped).delete_file(attachment_id)
+    await run_efs_unit(lambda session: FileService(session).delete_file(attachment_id), scope=scope)
     return {"ok": True}
 
 
 @attachments_router.get("/{project_name}/{session_id}/{attachment_id}/raw")
-def attachment_raw(project_name: str, session_id: str, attachment_id: UUID, scoped: ScopedSessionDep):
+async def attachment_raw(
+    project_name: str,
+    session_id: str,
+    attachment_id: UUID,
+    scope: TenantScopeDep,
+):
+    from cowork.api.v1.efs_file_response import EfsFileResponse
     from cowork.services.files import FileService
+    # The row only: the response opens the file itself on the file store's
+    # threads, and answers 404 when its bytes are gone.
     try:
-        content_type, filename, path = FileService(scoped).get_file_content(attachment_id)
+        stored = await run_db(lambda session: FileService(session).stored_file(file_id=attachment_id), scope=scope)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     # Inline, not attachment: the rail's row click opens this URL in a
     # browser tab expecting the file to RENDER (image/pdf/text). The
     # default attachment disposition silently downloads instead, which
     # reads as "open does nothing" (ENG-264).
-    return FileResponse(
-        path,
-        media_type=content_type,
-        filename=filename,
+    return EfsFileResponse(
+        stored.path,
+        scope=scope,
+        media_type=stored.content_type,
+        filename=stored.filename,
         content_disposition_type="inline",
     )
 
@@ -202,20 +217,36 @@ def _unique_project_target(project_dir: Path, filename: str) -> Path:
     raise HTTPException(status_code=409, detail="Could not choose a unique project filename")
 
 
-@attachments_router.post("/{project_name}/{session_id}/{attachment_id}/move-to-project")
-def move_attachment_to_project(
-    project_name: str, session_id: str, attachment_id: UUID, scoped: ScopedSessionDep
+@attachments_router.post(
+    "/{project_name}/{session_id}/{attachment_id}/move-to-project", response_model=AttachmentMoveResponse
+)
+async def move_attachment_to_project(
+    project_name: str,
+    session_id: str,
+    attachment_id: UUID,
+    scope: TenantScopeDep,
 ):
+    # The copy into the project and the attachment's delete run together, as
+    # one unit on the file store's threads.
+    return await run_efs_unit(
+        partial(_move_attachment_to_project, project_name=project_name, attachment_id=attachment_id),
+        scope=scope,
+    )
+
+
+def _move_attachment_to_project(
+    scoped: ScopedSession, *, project_name: str, attachment_id: UUID
+) -> AttachmentMoveResponse:
     from cowork.services.files import FileService
     from cowork.services.projects import ProjectService
 
     try:
         project = ProjectService(scoped).get_project_by_name(project_name)
-        content_type, filename, source = FileService(scoped).get_file_content(attachment_id)
+        stored = FileService(scoped).get_file_content(attachment_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
-    destination_name = _project_destination_name(filename)
+    destination_name = _project_destination_name(stored.filename)
     if scoped.scope.org_mode and destination_name in _RESERVED_PROJECT_ROOT_NAMES:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -224,15 +255,15 @@ def move_attachment_to_project(
 
     project_dir = Path(project.path)
     project_dir.mkdir(parents=True, exist_ok=True)
-    target = _unique_project_target(project_dir, filename)
-    shutil.copy2(source, target)
+    target = _unique_project_target(project_dir, stored.filename)
+    shutil.copy2(stored.path, target)
     FileService(scoped).delete_file(attachment_id)
-    return {
-        "ok": True,
-        "project_path": target.name,
-        "absolute_path": str(target),
-        "content_type": content_type or mimetypes.guess_type(str(target))[0] or "application/octet-stream",
-    }
+    return AttachmentMoveResponse(
+        ok=True,
+        project_path=target.name,
+        absolute_path=str(target),
+        content_type=stored.content_type or mimetypes.guess_type(str(target))[0] or "application/octet-stream",
+    )
 
 
 # ── Scratchpad ───────────────────────────────────────────────────────

@@ -169,7 +169,7 @@ async def test_a_request_in_flight_is_named_by_its_route_template_never_its_path
 
 
 async def test_the_watchdog_watches_every_limiter_a_request_can_queue_on():
-    assert set(loop_limiters()) == {"anyio_default", "run_db", "run_efs"}
+    assert set(loop_limiters()) == {"anyio_default", "run_db", "run_efs", "run_efs_unit"}
 
 
 async def test_holding_the_file_store_slots_full_logs_a_saturation_naming_run_efs(caplog, monkeypatch):

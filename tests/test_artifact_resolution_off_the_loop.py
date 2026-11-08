@@ -14,8 +14,10 @@ liveness answer, not only as a slow request.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import contextlib
 import contextvars
+import io
 import json
 import os
 import shutil
@@ -23,10 +25,12 @@ import threading
 import time
 from functools import partial
 from pathlib import Path
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import NamedTuple
 from uuid import UUID, uuid4
 
+import anyio
 import httpx
 import pytest
 from fastapi import HTTPException
@@ -44,7 +48,9 @@ from cowork.models.project import Project
 from cowork.server import create_app
 from cowork.services import artifact_files, artifact_identity, artifact_roots
 from cowork.services.artifact_identity import ensure_full_id
+from cowork.services.projects import ProjectService
 
+import _blocking_guard as blocking_guard
 import test_artifacts_api_tenancy as tenancy
 from draft_host_support import DRAFT_HOST, FETCH, configure_draft_env, draft_token
 from test_artifact_roots import _count_hops
@@ -1002,3 +1008,171 @@ async def test_a_non_owner_is_refused_access_before_any_read(
     # at the lookup. Either way the access state is never read.
     assert access_reads == []
     assert hops == ([*LOOKUP, "run_db"] if granted else LOOKUP)
+
+
+# In org tenancy, where COWORK_HOME is the shared file store: with every file
+# store call stuck, the requests that need the store are refused, and the
+# projects list, a database route, still answers.
+
+
+class _StuckFileStore:
+    """Every call that names a path under COWORK_HOME, made on a worker
+    thread, blocks until ``release``, as calls on a hard NFS mount do while
+    the file server doesn't answer. Counts the calls blocked now and at most.
+    A call on a descriptor alone goes through: its open already stuck."""
+
+    def __init__(self) -> None:
+        self.blocked = 0
+        self.most = 0
+        self._released = threading.Event()
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        self._released.set()
+
+    @staticmethod
+    def _names_the_store(*, parameters, args, kwargs) -> bool:
+        if any(kwargs.get(name) is not None for name in blocking_guard._DIR_FD_KEYWORDS):
+            return True
+        for position, name in enumerate(parameters):
+            if name is None:
+                continue
+            target = args[position] if position < len(args) else kwargs.get(name)
+            if target is not None and not isinstance(target, int) and blocking_guard._names_the_file_store(target):
+                return True
+        return False
+
+    def wrap(self, *, real, parameters):
+        def call(*args, **kwargs):
+            if threading.current_thread() is not threading.main_thread() and self._names_the_store(
+                parameters=parameters, args=args, kwargs=kwargs
+            ):
+                with self._lock:
+                    self.blocked += 1
+                    self.most = max(self.most, self.blocked)
+                try:
+                    self._released.wait(timeout=60)
+                finally:
+                    with self._lock:
+                        self.blocked -= 1
+            return real(*args, **kwargs)
+
+        return call
+
+
+@contextlib.contextmanager
+def _every_file_store_call_stuck(monkeypatch) -> Iterator[_StuckFileStore]:
+    """_StuckFileStore over every os call the blocking guard wraps, and open.
+    Code that asks os which calls take a descriptor or a dir_fd, as shutil
+    does, gets the same answer for each wrapper as for the call it wraps."""
+    stuck = _StuckFileStore()
+    blocking_guard._home_prefixes()  # resolved now, before its own stat could stick
+    added: list[tuple[set, object]] = []
+    targets = [(os, name, parameters) for name, parameters in blocking_guard._PATH_PARAMETERS.items() if hasattr(os, name)]
+    targets += [(io, "open", blocking_guard._OPEN_PARAMETERS), (builtins, "open", blocking_guard._OPEN_PARAMETERS)]
+    for owner, name, parameters in targets:
+        real = getattr(owner, name)
+        wrapper = stuck.wrap(real=real, parameters=parameters)
+        monkeypatch.setattr(owner, name, wrapper)
+        for supported in blocking_guard._SUPPORTS:
+            if real in supported:
+                supported.add(wrapper)
+                added.append((supported, wrapper))
+    try:
+        yield stuck
+    finally:
+        stuck.release()
+        for supported, wrapper in added:
+            supported.discard(wrapper)
+
+
+async def _until(*, condition, seconds: float) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    while not condition() and loop.time() < deadline:
+        await asyncio.sleep(0.02)
+
+
+async def _answered_within(*, request, seconds: float) -> httpx.Response | None:
+    """``request``'s response, or None when it took longer than ``seconds``.
+    The request keeps running: a cancel would wait for a unit stuck on the
+    file store, so the test releases the store before it awaits the rest."""
+    task = asyncio.ensure_future(request)
+    done, _pending = await asyncio.wait({task}, timeout=seconds)
+    return task.result() if done else None
+
+
+async def test_with_every_file_store_call_stuck_the_projects_list_answers(
+    org_project_review, granted_product_permissions, monkeypatch
+):
+    """Enough members' reviews to take every file store slot, each stuck in
+    its lookup. Liveness and a member's projects list answer within budget,
+    and no more threads block than the file store has slots: the list reads
+    rows only once the organization's general project exists."""
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    storage = db_session.settings.storage
+    members = [f"5c0a1e5e-0000-4000-8000-0000000001{n:02d}" for n in range(storage.efs_slots // storage.efs_share + 1)]
+    transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        warm = await client.get("/api/v1/projects/", headers=_as(FIRST_MEMBER))
+        assert warm.status_code == 200, warm.text
+        with _every_file_store_call_stuck(monkeypatch) as stuck:
+            reviews = [
+                asyncio.create_task(client.get(org_project_review, headers=_as(member)))
+                for member in members
+                for _ in range(storage.efs_share)
+            ]
+            try:
+                # Each review authenticates and reads its rows before it reaches the
+                # stuck store, so a slow runner takes a while to fill every slot.
+                await _until(condition=lambda: stuck.blocked >= storage.efs_slots, seconds=30)
+                live = await _answered_within(request=client.get(LIVE), seconds=LIVE_BUDGET_SECONDS)
+                listed = await _answered_within(
+                    request=client.get("/api/v1/projects/", headers=_as(SECOND_MEMBER)), seconds=LIVE_BUDGET_SECONDS
+                )
+                most = stuck.most
+            finally:
+                stuck.release()
+                await asyncio.gather(*reviews, return_exceptions=True)
+
+    assert live is not None and live.status_code == 200
+    assert listed is not None, "the projects list waited on the stuck file store"
+    assert listed.status_code == 200, listed.text
+    assert most == storage.efs_slots
+
+
+async def test_lists_stuck_on_the_general_folder_leave_database_routes_answering(org_deployment, monkeypatch):
+    """Four database unit slots, and the general project's folder check
+    stuck. Five lists at once all answer, and database-only routes keep
+    their slots: a list that checked the folder in its unit would hold a slot
+    each until the mount answered, and the rest would be refused."""
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    headers = _as(FIRST_MEMBER)
+    transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        warm = await client.get("/api/v1/projects/", headers=headers)
+        assert warm.status_code == 200, warm.text
+        slots = anyio.CapacityLimiter(4)
+        monkeypatch.setattr(units, "_slots", lambda _engine: slots)
+        released = threading.Event()
+        for name in ("_in_scoped_root", "ensure_dir_exists"):
+            real = getattr(ProjectService, name)
+
+            def stuck(self, *args, _real=real, **kwargs):
+                released.wait(timeout=60)
+                return _real(self, *args, **kwargs)
+
+            monkeypatch.setattr(ProjectService, name, stuck)
+        lists = [asyncio.ensure_future(client.get("/api/v1/projects/", headers=headers)) for _ in range(5)]
+        try:
+            _done, slow = await asyncio.wait(lists, timeout=LIVE_BUDGET_SECONDS)
+            search = await client.get("/api/v1/search", params={"q": "x"}, headers=headers)
+            models = await client.get("/api/v1/settings/recommended-models", headers=headers)
+        finally:
+            released.set()
+            await asyncio.gather(*lists, return_exceptions=True)
+
+    assert not slow, f"{len(slow)} of 5 lists waited on the general project's folder"
+    assert [task.result().status_code for task in lists] == [200] * 5
+    assert search.status_code == 200, search.text
+    assert models.status_code == 200, models.text

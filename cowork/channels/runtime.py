@@ -34,7 +34,7 @@ from cowork.db.scoped import (
     scope_for_org,
     unsafe_unscoped_session,
 )
-from cowork.db.units import FilesystemBusy, conversation_writes, run_db, run_efs
+from cowork.db.units import FilesystemBusy, conversation_writes, run_db, run_efs, run_efs_unit
 from cowork.handlers.responses import stage_remote_workspace
 from cowork.harnesses.base import ChannelContext, HarnessProvider, get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
@@ -437,10 +437,14 @@ class AntonChannelRuntime:
         # after the answer retry and never raise a busy refusal (_save_turn_row).
         scope = scope_for_org(org_id) if org_id else scope_for_background_context()
         try:
-            binding = await run_db(
-                partial(self._resolve_or_create_binding, channel_type=channel_type, event=event),
-                scope=scope,
-            )
+            # A known thread's binding is a row. Only a new one may start in
+            # the general project, whose folder is checked, which is file
+            # store work.
+            binding = await run_db(partial(self._find_binding, channel_type=channel_type, event=event), scope=scope)
+            if binding is None:
+                binding = await run_efs_unit(
+                    partial(self._resolve_or_create_binding, channel_type=channel_type, event=event), scope=scope
+                )
         except (PoolTimeoutError, FilesystemBusy):
             # The trigger rule is unknown here: answer only a message addressed to the bot.
             if event.message.is_mention or not event.message.is_group:
@@ -539,24 +543,27 @@ class AntonChannelRuntime:
         project = scoped.get(Project, binding.anton_project_id or self._resolve_default_project_id(scoped))
         return project.name if project else "general"
 
-    def _resolve_or_create_binding(self, scoped: ScopedSession, channel_type: str, event: Any) -> ChannelBinding:
-        group_id = event.address.platform_id
-        thread_id = event.address.thread_id
-        thread_key = thread_id or _DEFAULT_THREAD_KEY
-        binding = scoped.exec(
+    @staticmethod
+    def _find_binding(scoped: ScopedSession, *, channel_type: str, event: Any) -> ChannelBinding | None:
+        """The binding of the event's thread, when it has one."""
+        return scoped.exec(
             scoped.select(ChannelBinding).where(
                 ChannelBinding.channel_type == channel_type,
-                ChannelBinding.external_group_id == group_id,
-                ChannelBinding.external_thread_key == thread_key,
+                ChannelBinding.external_group_id == event.address.platform_id,
+                ChannelBinding.external_thread_key == (event.address.thread_id or _DEFAULT_THREAD_KEY),
             )
         ).first()
+
+    def _resolve_or_create_binding(self, scoped: ScopedSession, channel_type: str, event: Any) -> ChannelBinding:
+        binding = self._find_binding(scoped, channel_type=channel_type, event=event)
         if binding is not None:
             return binding
+        thread_id = event.address.thread_id
         binding = ChannelBinding(
             channel_type=channel_type,
-            external_group_id=group_id,
+            external_group_id=event.address.platform_id,
             external_thread_id=thread_id,
-            external_thread_key=thread_key,
+            external_thread_key=thread_id or _DEFAULT_THREAD_KEY,
             anton_project_id=self._resolve_default_project_id(scoped),
             trigger_rule="mention_only" if event.message.is_group else "always",
         )

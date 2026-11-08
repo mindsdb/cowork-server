@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
 from cowork.api.v1.endpoints.responses import _shared_turn
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_tenant_scope
-from cowork.db.units import run_db
+from cowork.db.units import run_db, run_efs_unit
 from cowork.models.comparison import Comparison
 from cowork.principal import mindshub_credential
 from cowork.schemas.comparisons import (
@@ -125,8 +125,15 @@ def list_comparisons(scoped: ScopedSessionDep, limit: int = 50, offset: int = 0)
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
-def create_comparison(body: ComparisonCreateRequest, scoped: ScopedSessionDep):
-    service = ComparisonService(scoped)
+async def create_comparison(body: ComparisonCreateRequest, scope: ScopeDep):
+    """Copies the source project's files into each side's sandbox, so it runs
+    as one unit on the file store's threads (run_efs_unit)."""
+    return await run_efs_unit(partial(_create_comparison, body=body), scope=scope)
+
+
+def _create_comparison(session: ScopedSession, *, body: ComparisonCreateRequest) -> dict:
+    """ComparisonService.create_comparison, as one unit."""
+    service = ComparisonService(session)
     try:
         comparison = service.create_comparison(
             title=body.title,
@@ -191,6 +198,8 @@ async def get_comparison_usage(comparison_id: UUID, request: Request, scope: Sco
 async def delete_comparison(comparison_id: UUID, scope: ScopeDep):
     # The sides are read in one unit and the delete runs in another, so no
     # pooled connection is held while another replica is asked about them.
+    # The delete removes the sandbox folders, so it runs on the file store's
+    # threads (run_efs_unit).
     conversation_ids = await run_db(
         lambda session: [
             str(side.conversation_id)
@@ -201,7 +210,7 @@ async def delete_comparison(comparison_id: UUID, scope: ScopeDep):
     )
     running = await _running_elsewhere(conversation_ids, scope)
     try:
-        await run_db(
+        await run_efs_unit(
             lambda session: ComparisonService(session).delete_comparison(
                 comparison_id, running_elsewhere=running
             ),
@@ -260,8 +269,14 @@ async def continue_side(
     scope: ScopeDep,
     label: str = Path(pattern=_SIDE_LABEL),
 ):
+    """Continue with one side: its task and the work it made move out of its
+    sandbox into the project the body names (ComparisonService.continue_side).
+    ``carriedAll`` is false while some of the side's work stays in the
+    sandbox; continuing again into the same project carries the rest."""
     # The side is read in one unit and continued in another, so no pooled
-    # connection is held while another replica is asked about it.
+    # connection is held while another replica is asked about it. Continuing
+    # moves the side's work out of its sandbox, so it runs on the file
+    # store's threads (run_efs_unit).
     conversation_ids = await run_db(
         lambda session: [
             str(side.conversation_id)
@@ -272,7 +287,7 @@ async def continue_side(
     )
     running = await _running_elsewhere(conversation_ids, scope)
     try:
-        continued = await run_db(
+        continued = await run_efs_unit(
             partial(
                 _continue_side, comparison_id=comparison_id, label=label, body=body, running=running
             ),

@@ -412,6 +412,17 @@ class DatabaseSettings(Settings):
             "with 503. Short, so a full pool answers within seconds."
         ),
     )  # POOL_TIMEOUT
+    efs_unit_slots: int = Field(
+        default=16,
+        ge=1,
+        description=(
+            "Database unit slots the units that also work on the shared file store "
+            "(cowork.db.units.run_efs_unit) may hold at once, of the POOL_SIZE plus "
+            "MAX_OVERFLOW every unit shares, so units stuck on the file store leave "
+            "the rest to database units. SQLite gives file units no unit slot, so "
+            "it ignores this."
+        ),
+    )  # EFS_UNIT_SLOTS
     # PostgreSQL session settings for the app's own connections, set when each
     # connection opens. Migrations run with both off: the db-migrate init
     # container opens its own engine, and the server's startup migration turns

@@ -1,8 +1,16 @@
 from datetime import datetime
-from pydantic import BaseModel, model_validator
+from typing import Annotated
+
+from pydantic import BaseModel, PlainSerializer, model_validator
 from pydantic.alias_generators import to_camel
 
 from cowork.common.datetime_utils import ensure_utc
+
+#: A datetime a route sends as ``datetime.isoformat()`` ("...+00:00"), the text
+#: FastAPI's jsonable_encoder writes for a datetime in a returned dict.
+#: Pydantic's own JSON writes UTC as "Z", so a model a route returns, or names
+#: as its response_model, sends these fields as its dict did.
+IsoDatetime = Annotated[datetime, PlainSerializer(datetime.isoformat, return_type=str, when_used="json")]
 
 # SHIM:client-compat — remove alias_generator and populate_by_name from both
 # classes when the client is updated to use snake_case field names.

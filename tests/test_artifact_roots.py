@@ -27,6 +27,7 @@ from cowork.services.artifact_roots import (
     artifacts_sources_for_scope,
     conversation_artifacts_base,
     owned_conversation_ids,
+    plan_project_roots,
     plan_scope_roots,
     project_artifacts_base,
 )
@@ -594,3 +595,33 @@ async def test_a_project_list_reads_its_roots_and_cards_in_one_file_store_call(
     # The owner's legacy root is still listed: the owner filter kept it.
     assert [card["slug"] for card in cards] == ["brief"]
     assert hops == ["run_db", "run_efs", "run_db"]
+
+
+async def test_a_plan_leaves_out_a_project_in_another_partition_with_no_file_store_call(session, org_deployment):
+    """A row naming a folder in another partition of the shared root, as agent
+    code from before the code sandbox could leave, is left out of the plan the
+    database unit builds, so no reader of RootsPlan.projects reaches it. The
+    unit compares the path against the shared root resolved at startup, so the
+    blocking guard sees no file store call in it."""
+    from cowork.db.units import run_db
+    from cowork.services.projects import resolve_shared_root
+
+    shared = resolve_shared_root()  # as the lifespan does before the port binds
+    suffix = uuid.uuid4().hex[:8]
+    mine = Project(name=f"mine-{suffix}", path=str(shared / ORG_A / "projects" / "mine"), org_id=ORG_A)
+    planted = Project(name=f"planted-{suffix}", path=str(shared / ORG_B / "projects" / "theirs"), org_id=ORG_A)
+    session.add_all([mine, planted])
+    session.commit()
+    scope = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
+    try:
+        listed = await run_db(plan_scope_roots, scope=scope)
+        by_id = await run_db(lambda scoped: plan_project_roots(scoped, planted.id), scope=scope)
+    finally:
+        session.delete(mine)
+        session.delete(planted)
+        session.commit()
+
+    names = {row.name for row in listed.projects}
+    assert mine.name in names
+    assert planted.name not in names
+    assert by_id.projects == ()

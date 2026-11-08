@@ -9,15 +9,17 @@ from uuid import UUID
 
 from cowork.common.logger import log_context
 from cowork.db.scoped import ScopedSession, TenantScope
-from cowork.db.units import TurnEndRecord, note_turn_end_slugs, run_db, run_efs, run_turn_end_record
+from cowork.db.units import TurnEndRecord, note_turn_end_slugs, run_db, run_efs, run_efs_unit, run_turn_end_record
 from cowork.handlers.responses import (
     ResponsesHandler,
     _RemoteArtifactsDir,
     _RemoteTurnInputs,
+    remote_turn_skills,
     save_turn_compaction,
     save_turn_memory,
 )
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
+from cowork.schemas.turn_skills import TurnSkills
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import read_earlier_answers
 from cowork.services.task_objects import ArtifactChanges
@@ -32,15 +34,13 @@ logger = logging.getLogger(__name__)
 def _read_channel_turn_inputs(session: ScopedSession, *, conv_id: UUID) -> _RemoteTurnInputs:
     """A channel turn's seed, read as one unit: a browser turn's reads
     (ResponsesHandler._read_remote_turn_inputs), less the project memory a
-    channel turn has never sent. A channel turn has no member behind it, so
-    its skills are the fail-closed set, the skills shared with everyone, and
-    never a fallback to a mounted skills tree (remote_turn_skills).
+    channel turn has never sent. Its skills block reads skill folders, so it
+    is read in a unit of its own on the file store's threads
+    (remote_turn_events).
 
     The settings these reads ask for come from the turn's snapshot, which
     AntonChannelRuntime._run_anton binds before the turn starts."""
-    return ResponsesHandler._read_remote_turn_inputs(
-        session, conv_id=conv_id, viewer=None, with_memory=False,
-    )
+    return ResponsesHandler._read_remote_turn_inputs(session, conv_id=conv_id, with_memory=False)
 
 
 class RemoteTurnFailed(Exception):
@@ -99,6 +99,11 @@ async def remote_turn_events(
     # a web turn; the seed history below is scrubbed against them.
     await register_vault_secrets(scope)
     inputs = await run_db(partial(_read_channel_turn_inputs, conv_id=conv_id), scope=scope)
+    # A channel turn has no member behind it: the fail-closed set, the skills
+    # shared with everyone, and never a fallback to a mounted skills tree
+    # (remote_turn_skills). It seeds the built-in skills and reads each
+    # selected skill's folder, so it runs on the file store's threads.
+    skills: TurnSkills = await run_efs_unit(partial(remote_turn_skills, conv_id=conv_id), scope=scope)
     seeded_history, seed_info = inputs.history, inputs.seed_info
     yield TurnContext(
         question=input_text,
@@ -133,7 +138,7 @@ async def remote_turn_events(
             history=seeded_history,
             workspace=inputs.workspace,
             started_at=inputs.started_at,
-            skills=inputs.skills,
+            skills=skills,
             correlation_id=correlation_id,
             llm=llm,
         ):

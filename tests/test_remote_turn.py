@@ -53,9 +53,11 @@ def _fake_handler(
         return ()
 
     monkeypatch.setattr(remote_turn_mod, "read_earlier_answers", earlier_answers or no_earlier_answers)
-    monkeypatch.setattr(responses_mod, "remote_turn_skills", lambda session, conv_id, **kw: {})
-    # Each unit runs inline, on a session that reaches no database.
+    monkeypatch.setattr(remote_turn_mod, "remote_turn_skills", lambda session, conv_id, **kw: {})
+    # Each unit runs inline, on a session that reaches no database: the
+    # skills block's on the file store's threads too.
     monkeypatch.setattr(remote_turn_mod, "run_db", inline_run_db(_FakeSession()))
+    monkeypatch.setattr(remote_turn_mod, "run_efs_unit", inline_run_db(_FakeSession()))
     for name, read in {
         "_remote_artifacts_context": remote_artifacts_context or (lambda s, c: None),
         "_remote_seed_history": remote_seed_history or (lambda s, c: ([], None)),
@@ -66,8 +68,9 @@ def _fake_handler(
         monkeypatch.setattr(responses_mod.ResponsesHandler, name, staticmethod(read))
     # The pod's memory and compaction go through the helpers the browser
     # producer shares (save_turn_memory, save_turn_compaction), which run
-    # their units with cowork.handlers.responses's own run_db.
+    # their units with cowork.handlers.responses's own run_efs_unit and run_db.
     monkeypatch.setattr(responses_mod, "run_db", inline_run_db(_FakeSession()))
+    monkeypatch.setattr(responses_mod, "run_efs_unit", inline_run_db(_FakeSession()))
     monkeypatch.setattr(
         responses_mod.ResponsesHandler, "_persist_turn_memory", staticmethod(persist_turn_memory or _no_memory),
     )
@@ -143,7 +146,7 @@ async def test_a_channel_turn_always_sends_the_fail_closed_skills_block(monkeypa
         sent.append(kwargs["skills"])
         yield "turn_completed", {}
 
-    monkeypatch.setattr(responses_mod, "remote_turn_skills", remote_turn_skills)
+    monkeypatch.setattr(remote_turn_mod, "remote_turn_skills", remote_turn_skills)
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
     conv_id = uuid4()
     await _drain(remote_turn_events(
@@ -151,7 +154,7 @@ async def test_a_channel_turn_always_sends_the_fail_closed_skills_block(monkeypa
         input_text="hi", model="anton", turn_rows=[],
     ))
     # No viewer: the fail-closed set.
-    assert built == [(conv_id, {"viewer": None})]
+    assert built == [(conv_id, {})]
     assert sent == [block]
 
 
@@ -484,15 +487,21 @@ async def test_an_org_channel_turn_saves_no_memory_and_says_so_at_info(monkeypat
 
 
 @pytest.mark.parametrize(
-    ("kind", "data"),
+    ("kind", "data", "warning"),
     [
-        ("turn_memory", {"entries": [{"key": "likes", "value": "pizza"}]}),
-        ("turn_compaction", {"summary": "EARLIER: …", "covered_through": 1}),
+        (
+            "turn_memory", {"entries": [{"key": "likes", "value": "pizza"}]},
+            "[responses] no database connection or file store slot freed in time to apply a turn's memory",
+        ),
+        (
+            "turn_compaction", {"summary": "EARLIER: …", "covered_through": 1},
+            "[responses] no database connection freed in time to save a turn's compaction",
+        ),
     ],
     ids=["memory", "compaction"],
 )
 async def test_a_busy_pool_on_a_memory_or_compaction_frame_keeps_the_channel_turn(
-    monkeypatch, controller_flags, one_connection_pool, caplog, kind, data,
+    monkeypatch, controller_flags, one_connection_pool, caplog, kind, data, warning,
 ):
     """The pod sends a memory or a compaction frame while the pool frees no
     connection within POOL_TIMEOUT. The write is dropped with one WARNING,
@@ -504,8 +513,10 @@ async def test_a_busy_pool_on_a_memory_or_compaction_frame_keeps_the_channel_tur
     from cowork.db.scoped import LOCAL_SCOPE
 
     _fake_handler(monkeypatch)
-    # The write's unit waits for the app's pool, which the test holds.
+    # The write's unit waits for the app's pool, which the test holds: the
+    # memory's on the file store's threads, the compaction's on run_db's.
     monkeypatch.setattr(responses_mod, "run_db", units.run_db)
+    monkeypatch.setattr(responses_mod, "run_efs_unit", units.run_efs_unit)
 
     async def fake_replies(**kwargs):
         yield "turn_delta", {"text": "before "}
@@ -527,7 +538,7 @@ async def test_a_busy_pool_on_a_memory_or_compaction_frame_keeps_the_channel_tur
     assert await controller_flags.keys("*") == []
     warned = [r for r in caplog.records if r.name == responses_mod.logger.name and r.levelno >= logging.WARNING]
     assert [r.levelname for r in warned] == ["WARNING"]
-    assert warned[0].getMessage().startswith("[responses] no database connection freed in time")
+    assert warned[0].getMessage() == warning
     assert warned[0].conversation_id == str(conv_id)
 
 
@@ -1358,3 +1369,33 @@ async def test_a_turn_record_that_waits_for_the_database_at_the_last_wait_names_
         logged.output(), event="shutdown_turn_record_lost", conversation_id=str(conv_id), touched=["report"],
     )
     assert [call.slugs for call in recorded] == [["report"]]
+
+
+@pytest.mark.asyncio
+async def test_a_busy_file_store_fails_the_channel_turn_before_its_seed_history_is_built(monkeypatch):
+    """With no file store slot free, the vault's secrets cannot be registered,
+    and a seed history scrubbed by key shape alone would carry a saved
+    password to the pod. The turn fails instead, as it does on a busy pool."""
+    import cowork.db.session as db_session
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.units import FilesystemBusy
+    from test_run_efs import holding
+
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    seeded = []
+    _fake_handler(monkeypatch, remote_seed_history=lambda s, c: seeded.append(c) or ([], None))
+
+    async def fake_replies(**kwargs):
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    session = _FakeSession()
+    async with holding(db_session.settings.storage.efs_slots, LOCAL_SCOPE):
+        with pytest.raises(FilesystemBusy):
+            await _drain(remote_turn_events(
+                scope=session.scope, conv_id=uuid4(), org_id="org-123", user_id=None,
+                input_text="hi", model="anton", turn_rows=[],
+            ))
+
+    assert seeded == []
