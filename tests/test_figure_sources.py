@@ -2988,6 +2988,17 @@ class TestQuestionForms:
 
         assert _origins(sources) == [(text, FigureOrigin.question)]
 
+    @pytest.mark.parametrize(("answer", "question", "text"), [
+        ("The fee is $100.", "Is the fee €100?", "$100"),
+        ("Each costs $5.", "We have 5 sites. What do they pay?", "$5"),
+        ("Each costs 5.", "See https://example.com/five for the rates.", "5"),
+        ("Order 5 units.", "Run `print(five)` and tell me.", "5"),
+    ])
+    def test_a_different_quantity_in_the_question_is_not_the_questions(self, answer: str, question: str, text: str):
+        sources = find_figure_sources(answer=answer, question=question, steps=[])
+
+        assert _origins(sources) == [(text, FigureOrigin.none)]
+
     def test_a_spelled_out_count_is_not_a_figure_with_a_currency(self):
         sources = find_figure_sources(answer="Each costs $5.", question="What do the five sites pay?", steps=[])
 
@@ -3613,6 +3624,13 @@ class TestWrittenArithmetic:
         )
 
         assert [f.origin for f in sources.figures if f.text == "8%"] == [FigureOrigin.step, FigureOrigin.step]
+
+    def test_a_later_figure_with_another_currency_does_not_take_the_worked_out_sources(self):
+        sources = find_figure_sources(
+            answer="2 × 3 = 6 months. The fee is $6.", question="What happens with 2 and 3 inputs?", steps=[],
+        )
+
+        assert _origins(sources)[-1] == ("$6", FigureOrigin.none)
 
     def test_arithmetic_from_question_figures_alone_is_the_questions(self):
         sources = find_figure_sources(answer="50,000 × 4 = 200,000.", question=DISCOUNT_QUESTION, steps=[])

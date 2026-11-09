@@ -420,6 +420,10 @@ _COUNT_WORDS = {
     )
     if word != "one"
 }
+# Below this a bare number and a money figure of the same value are often
+# different things ("5 sites", "$5"), so a currency on one side only blocks
+# a question match.
+_ONE_SIDED_CURRENCY_MIN = Decimal(1_000)
 _COUNT_WORD = re.compile(rf"\b(?:{'|'.join(_COUNT_WORDS)})\b", re.IGNORECASE)
 # What joins two operands of arithmetic the answer writes: ×, ÷, + or a spaced
 # x or *, after up to three words of unit ("2% per month × 6"). A spaced
@@ -872,7 +876,9 @@ def find_figure_sources(
 def _asked_numbers(question: str) -> list[tuple[_Number, bool]]:
     """The numbers the question writes, and the counts it spells out, each
     with whether it is spelled out."""
-    numbers = [(number, False) for number in _numbers(question, skips=_skipped_spans(question), prose=True)]
+    skips = _skipped_spans(question)
+    skipped = _Spans.of(skips)
+    numbers = [(number, False) for number in _numbers(question, skips=skips, prose=True)]
     return numbers + [
         (
             _Number(
@@ -882,6 +888,7 @@ def _asked_numbers(question: str) -> list[tuple[_Number, bool]]:
             True,
         )
         for match in _COUNT_WORD.finditer(question)
+        if not skipped.hold(start=match.start(), end=match.end())
     ]
 
 
@@ -889,13 +896,17 @@ def _question_gives(
     asked: _Number, *, asked_unit: _TimeUnit | None, spelled: bool, figure: _Number, figure_unit: _TimeUnit | None,
 ) -> bool:
     """Whether a number in the question gives the figure: the same value, sign
-    and percent, however its currency, scale and grouping are written, so
-    "25,000" gives "$25,000" and "six" gives "6". A number in a time unit
-    gives no figure with a currency sign, nor the other way round, and two
-    time units must agree: "30 days" gives neither "$30" nor "30 hours". A
-    spelled-out count gives no figure with a currency sign: "five sites" is
-    not "$5"."""
-    if spelled and figure.currency:
+    and percent, however its scale and grouping are written, so "25k" gives
+    "25,000" and "six" gives "6". Two different currency signs never match.
+    A currency sign on one side only matches from
+    ``_ONE_SIDED_CURRENCY_MIN`` up and never for a spelled-out count, so
+    "25,000" gives "$25,000" while "5 sites" and "five sites" don't give
+    "$5". A number in a time unit gives no figure with a currency sign, nor
+    the other way round, and two time units must agree: "30 days" gives
+    neither "$30" nor "30 hours"."""
+    if asked.currency != figure.currency and (
+        (asked.currency and figure.currency) or spelled or figure.value < _ONE_SIDED_CURRENCY_MIN
+    ):
         return False
     if (asked.value, asked.negative, asked.percent) != (figure.value, figure.negative, figure.percent):
         return False
@@ -912,7 +923,8 @@ def _worked_out(answer: str, *, numbers: Sequence[_Number], figures: Sequence[Fi
     figure out when it writes the
     arithmetic right before it and that arithmetic gives its value
     (``_arithmetic_operands``), or states it as a table column's total
-    (``_total_operands``). A later figure of the same value is worked out too.
+    (``_total_operands``). A later figure of the same value, sign, percent and currency
+    is worked out too.
     A figure worked out without the arithmetic written, or from a figure of
     origin none, keeps origin none."""
     worked = list(figures)
@@ -921,7 +933,7 @@ def _worked_out(answer: str, *, numbers: Sequence[_Number], figures: Sequence[Fi
         if figure.origin is not FigureOrigin.none:
             continue
         number = numbers[index]
-        key = (number.value, number.negative, number.percent)
+        key = (number.value, number.negative, number.percent, number.currency)
         operands = _arithmetic_operands(answer, numbers=numbers, index=index) or _total_operands(
             answer, numbers=numbers, index=index,
         )
