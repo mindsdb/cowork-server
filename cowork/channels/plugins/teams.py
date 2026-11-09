@@ -12,7 +12,9 @@ before anything is stored or run: signed with one of Microsoft's keys
 Framework, for this bot's App ID, in date, and naming the message's
 serviceUrl. Then the tenant: Teams can send the bot messages from any
 organization, so every tenant ID the message carries must be the configured
-one, and with none configured every message is refused.
+one, and with none configured every message is refused. Last the sender: a
+channel turn uses this install's connections, so the webhook answers only the
+people on ``COWORK_TEAMS_ALLOWED_USERS``, and nobody when it's empty.
 
 The bot is set in the environment (``COWORK_TEAMS_*``, see
 cowork/channels/teams.py), not in Settings → Channels, so the channel config
@@ -52,6 +54,8 @@ OPENID_CONFIG_URL = "https://login.botframework.com/v1/.well-known/openidconfigu
 TOKEN_ISSUER = "https://api.botframework.com"
 CLOCK_SKEW_S = 5 * 60
 KEYS_MAX_AGE_S = 24 * 60 * 60
+# An unknown key can come from anyone, so it starts a fetch at most this often.
+KEYS_MIN_REFRESH_S = 5 * 60
 # Reply addresses kept for the turns in flight; the oldest go first.
 MAX_REPLY_ADDRESSES = 1000
 
@@ -70,6 +74,7 @@ class SigningKeys:
         self._http = http
         self._keys: dict[str, tuple[jwt.PyJWK, frozenset[str]]] = {}
         self._fetched_at = 0.0
+        self._attempted_at = 0.0
         self._refreshing: asyncio.Task[None] | None = None
 
     def load(self, jwks: Mapping[str, Any]) -> None:
@@ -84,6 +89,7 @@ class SigningKeys:
         self._fetched_at = time.time()
 
     async def refresh(self) -> None:
+        self._attempted_at = time.time()
         http = self._http or httpx.AsyncClient(timeout=10)
         try:
             config = (await http.get(OPENID_CONFIG_URL)).raise_for_status().json()
@@ -96,6 +102,8 @@ class SigningKeys:
                 await http.aclose()
 
     def _refresh_soon(self) -> None:
+        if time.time() - self._attempted_at < KEYS_MIN_REFRESH_S:
+            return
         if self._refreshing is None or self._refreshing.done():
             try:
                 self._refreshing = asyncio.get_running_loop().create_task(self.refresh())
@@ -140,6 +148,7 @@ class TeamsBridge:
     def __init__(self, settings: TeamsSettings, keys: SigningKeys, bot: TeamsBot) -> None:
         self._app_id = settings.bot_app_id
         self._tenant_id = settings.tenant_id
+        self._allowed_users = frozenset(settings.allowed_users)
         self._keys = keys
         self._bot = bot
         self._reply_to: OrderedDict[PlatformAddress, tuple[str, str, str]] = OrderedDict()
@@ -208,6 +217,12 @@ class TeamsBridge:
         if not named or any(tenant != self._tenant_id for tenant in named):
             raise self._refuse("message from another tenant")
 
+        sender = ((activity.get("from") or {}).get("aadObjectId") or "").lower()
+        if sender not in self._allowed_users:
+            # The ID only: it's what the operator adds to the list.
+            log.info("Teams: message from %s, who isn't on COWORK_TEAMS_ALLOWED_USERS", sender or "an unknown sender")
+            raise self._refuse("sender not on COWORK_TEAMS_ALLOWED_USERS")
+
     async def parse_inbound(self, *, body: bytes, headers: Mapping[str, str], route_name: str | None) -> list[InboundEvent]:
         activity = json.loads(body)
         if activity.get("type") != "message":
@@ -238,7 +253,8 @@ class TeamsBridge:
             self._reply_to.popitem(last=False)
 
     def dedupe_key(self, event: InboundEvent) -> str | None:
-        return event.message.id
+        # Teams message ids are unique only within a conversation.
+        return f"{event.address.platform_id}:{event.message.id}"
 
     async def deliver(self, message: OutboundMessage) -> None:
         reference = self._reply_to.get(message.address)
@@ -263,8 +279,23 @@ async def _factory(credentials: Mapping[str, str]) -> ChannelAdapter | None:
 
 
 def _build() -> ChannelPlugin | None:
-    if not teams_available() or not TeamsSettings().bot_app_id:
+    settings = TeamsSettings()
+    if not teams_available() or not settings.bot_app_id:
         return None
+    # verify_signature refuses here too, as a backstop.
+    if get_app_settings().trust_identity_headers:
+        return None
+    missing = [
+        name
+        for name, value in (
+            ("COWORK_TEAMS_BOT_APP_SECRET", settings.bot_app_secret.get_secret_value()),
+            ("COWORK_TEAMS_TENANT_ID", settings.tenant_id),
+            ("COWORK_TEAMS_ALLOWED_USERS", settings.allowed_users),
+        )
+        if not value
+    ]
+    if missing:
+        log.warning("Teams channel: %s not set, so it can't answer anyone", ", ".join(missing))
     return ChannelPlugin(
         channel_type=CHANNEL_TYPE,
         display_name="Microsoft Teams",

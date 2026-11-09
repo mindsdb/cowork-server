@@ -63,12 +63,14 @@ class TeamsSettings(Settings):
     # Teams names the address to reply to in each message (serviceUrl), e.g.
     # https://smba.trafficmanager.net/amer/<tenant ID>/.
     service_hosts: Annotated[tuple[str, ...], NoDecode] = ("smba.trafficmanager.net",)
+    # Microsoft Entra object IDs of the people the webhook takes questions from.
+    allowed_users: Annotated[tuple[str, ...], NoDecode] = ()
 
-    @field_validator("service_hosts", mode="before")
+    @field_validator("service_hosts", "allowed_users", mode="before")
     @classmethod
-    def _split_hosts(cls, value: Any) -> Any:
+    def _split_list(cls, value: Any) -> Any:
         if isinstance(value, str):
-            return tuple(host.strip().lower() for host in value.split(",") if host.strip())
+            return tuple(item.strip().lower() for item in value.split(",") if item.strip())
         return value
 
     def missing(self) -> list[str]:
