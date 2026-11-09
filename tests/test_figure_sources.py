@@ -2979,9 +2979,9 @@ class TestQuestionForms:
         assert _origins(sources) == [("30", FigureOrigin.none)]
 
     @pytest.mark.parametrize(("answer", "question", "text"), [
-        ("The line is worth $40,000.", "An order line worth 40,000 arrives late.", "$40,000"),
-        ("The line is worth 40,000.", "An order line worth $40k arrives late.", "40,000"),
-        ("It is 3 weeks late.", "It arrives three full weeks late.", "3"),
+        ("The plan is worth $25,000.", "A plan worth 25,000 renews today.", "$25,000"),
+        ("The plan is worth 25,000.", "A plan worth $25k renews today.", "25,000"),
+        ("It ran 6 months.", "It ran for six months.", "6"),
     ])
     def test_the_questions_value_in_another_form_stays_the_questions(self, answer: str, question: str, text: str):
         sources = find_figure_sources(answer=answer, question=question, steps=[])
@@ -2989,9 +2989,9 @@ class TestQuestionForms:
         assert _origins(sources) == [(text, FigureOrigin.question)]
 
     def test_a_spelled_out_count_is_not_a_figure_with_a_currency(self):
-        sources = find_figure_sources(answer="Each costs $3.", question="What do the three sites pay?", steps=[])
+        sources = find_figure_sources(answer="Each costs $5.", question="What do the five sites pay?", steps=[])
 
-        assert _origins(sources) == [("$3", FigureOrigin.none)]
+        assert _origins(sources) == [("$5", FigureOrigin.none)]
 
     def test_one_spelled_out_is_not_a_count(self):
         sources = find_figure_sources(answer="Site 1 holds the most.", question="Which one holds the most?", steps=[])
@@ -3570,19 +3570,19 @@ class TestModelWorkedFigures:
         assert sources.steps == []
 
 
-RATES_PDF = _cell(
+TERMS_PDF = _cell(
     "toolu_pdf",
-    code="from pypdf import PdfReader\nprint(PdfReader('agreement.pdf').pages[0].extract_text())",
-    stdout="A late delivery is credited 2% of the line value per full week, capped at 10% of the line value.\n",
+    code="from pypdf import PdfReader\nprint(PdfReader('terms.pdf').pages[0].extract_text())",
+    stdout="A plan earns a 2% discount per full year, capped at 10% of its value.\n",
 )
-CREDIT_QUESTION = "An order line worth 50,000 arrives four full weeks late. How much can we claim?"
+DISCOUNT_QUESTION = "A plan worth 50,000 has run four full years. What discount applies?"
 
 
 class TestWrittenArithmetic:
     def test_written_arithmetic_names_its_operands_sources(self):
         sources = find_figure_sources(
-            answer="2% × 4 full weeks = 8%, so the claim is $50,000 × 8% = $4,000.",
-            question=CREDIT_QUESTION, steps=[RATES_PDF],
+            answer="2% × 4 full years = 8%, so the discount is $50,000 × 8% = $4,000.",
+            question=DISCOUNT_QUESTION, steps=[TERMS_PDF],
         )
 
         assert _origins(sources) == [
@@ -3594,12 +3594,12 @@ class TestWrittenArithmetic:
     def test_arithmetic_in_a_table_cell_gives_the_next_cells_figure(self):
         answer = (
             "| Item | Calculation | Amount |\n|---|---|---|\n"
-            "| Weekly credit | 2% × $50,000 | $1,000 |\n"
-            "| Claim | 4 × $1,000 | **$4,000** |\n"
+            "| Yearly discount | 2% × $50,000 | $1,000 |\n"
+            "| Discount | 4 × $1,000 | **$4,000** |\n"
             "| Cap | 10% × $50,000 | $5,000 |\n"
         )
 
-        sources = find_figure_sources(answer=answer, question=CREDIT_QUESTION, steps=[RATES_PDF])
+        sources = find_figure_sources(answer=answer, question=DISCOUNT_QUESTION, steps=[TERMS_PDF])
 
         assert {text: origin for text, origin in _origins(sources)} == {
             "2%": FigureOrigin.step, "$50,000": FigureOrigin.question, "$1,000": FigureOrigin.step,
@@ -3609,27 +3609,27 @@ class TestWrittenArithmetic:
 
     def test_a_later_mention_of_a_worked_out_figure_keeps_its_sources(self):
         sources = find_figure_sources(
-            answer="2% × 4 = 8%. Four weeks produce 8%.", question=CREDIT_QUESTION, steps=[RATES_PDF],
+            answer="2% × 4 = 8%. Four years give 8%.", question=DISCOUNT_QUESTION, steps=[TERMS_PDF],
         )
 
         assert [f.origin for f in sources.figures if f.text == "8%"] == [FigureOrigin.step, FigureOrigin.step]
 
     def test_arithmetic_from_question_figures_alone_is_the_questions(self):
-        sources = find_figure_sources(answer="50,000 × 4 = 200,000.", question=CREDIT_QUESTION, steps=[])
+        sources = find_figure_sources(answer="50,000 × 4 = 200,000.", question=DISCOUNT_QUESTION, steps=[])
 
         assert _figure(sources, "200,000").origin is FigureOrigin.question
         assert _figure(sources, "200,000").sources == []
 
     @pytest.mark.parametrize("answer", [
         # An operand no step returned and the question doesn't give.
-        "3% × 4 full weeks = 12%.",
+        "3% × 4 full years = 12%.",
         # Arithmetic that doesn't give the figure.
-        "2% × 4 full weeks = 9%.",
+        "2% × 4 full years = 9%.",
         # A result the answer doesn't write right after the arithmetic.
-        "2% over 4 weeks makes 8%.",
+        "2% over 4 years makes 8%.",
     ])
     def test_a_figure_the_arithmetic_does_not_back_has_no_source(self, answer: str):
-        sources = find_figure_sources(answer=answer, question=CREDIT_QUESTION, steps=[RATES_PDF])
+        sources = find_figure_sources(answer=answer, question=DISCOUNT_QUESTION, steps=[TERMS_PDF])
 
         assert _origins(sources)[-1][1] is FigureOrigin.none
 
@@ -3659,31 +3659,31 @@ class TestWrittenArithmetic:
 class TestCellsThatReadADocumentAndRunAQuery:
     CODE = (
         "import os, requests\nfrom pypdf import PdfReader\n"
-        "print(PdfReader('rates.pdf').pages[0].extract_text())\n"
+        "print(PdfReader('handbook.pdf').pages[0].extract_text())\n"
         "r = requests.get(os.environ['DS_ERP_URL'] + '/resources')\n"
         "print(r.text)"
     )
     STDOUT = (
-        "Rates - page 1 Overtime on Line 7 costs $42 an hour.\n"
-        '[{"name": "R1", "cost": 68329.65}]\n'
+        "Handbook - page 1 Shipping one pallet costs $35 by road.\n"
+        '[{"name": "R1", "cost": 1240.5}]\n'
     )
 
     def _sources(self, answer: str) -> FigureSources:
-        step = _cell("toolu_mixed", code=self.CODE, stdout=self.STDOUT, description="Read rates and fetch resource costs")
+        step = _cell("toolu_mixed", code=self.CODE, stdout=self.STDOUT, description="Read the handbook and fetch resource costs")
         return find_figure_sources(answer=answer, question="", steps=[step])
 
     def test_a_figure_from_the_documents_text_names_the_document(self):
-        [step] = self._sources("Overtime on Line 7 costs $42 an hour.").steps
+        [step] = self._sources("Shipping one pallet costs $35.").steps
 
-        assert step == FigureStep(tool_use_id="toolu_mixed", kind=SourceKind.file, label="rates.pdf")
+        assert step == FigureStep(tool_use_id="toolu_mixed", kind=SourceKind.file, label="handbook.pdf")
 
     def test_a_figure_from_the_querys_records_names_the_query(self):
-        [step] = self._sources("The resource costs 68,329.65.").steps
+        [step] = self._sources("The resource costs 1,240.50.").steps
 
         assert (step.kind, step.requests) == (SourceKind.query, ["GET {DS_ERP_URL}/resources"])
 
     def test_figures_from_both_name_a_bare_step(self):
-        [step] = self._sources("Overtime costs $42 an hour; the resource costs 68,329.65.").steps
+        [step] = self._sources("A pallet costs $35; the resource costs 1,240.50.").steps
 
         assert step.kind is SourceKind.step
 

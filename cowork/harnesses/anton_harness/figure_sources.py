@@ -410,7 +410,7 @@ _STEP_TIME_WORDS = frozenset({
 _WORD_AFTER = re.compile(
     r"[*_]{0,2}[ \u00a0-]?[*_]{0,2}(?:(?i:business|working|work|calendar)[ \u00a0-])?(?P<word>[A-Za-z]{2,})"
 )
-# Counts a question may spell out ("three full weeks"). "one" is left out: it
+# Counts a question may spell out ("six months"). "one" is left out: it
 # is more often a pronoun ("which one") than a count.
 _COUNT_WORDS = {
     word: Decimal(count)
@@ -422,14 +422,14 @@ _COUNT_WORDS = {
 }
 _COUNT_WORD = re.compile(rf"\b(?:{'|'.join(_COUNT_WORDS)})\b", re.IGNORECASE)
 # What joins two operands of arithmetic the answer writes: ×, ÷, + or a spaced
-# x or *, after up to three words of unit ("1.5% per week × 3"). A spaced
+# x or *, after up to three words of unit ("2% per month × 6"). A spaced
 # minus is read as the next number's sign, so subtraction is not read.
 _OPERATOR = re.compile(
     r"[*_  ]*(?:[A-Za-z]+[  ]+){0,3}(?P<op>[×÷+]|(?<=[  ])[x*](?=[  ]))[*_  ]*"
 )
 # What joins written arithmetic to its result, after up to three words of unit:
-# = or ≈ ("3 full weeks = 4.5%"), or the border to the next cell of a table
-# row ("| $40,000 × 4.5% | $1,800 |").
+# = or ≈ ("6 months = 12%"), or the border to the next cell of a table
+# row ("| $25,000 × 12% | $3,000 |").
 _RESULT_JOIN = re.compile(r"[*_  ]*(?:[A-Za-z]+[  ]+){0,3}[=≈|][*_  ]*")
 # A word before a figure on the line after a table that says the figure is
 # the table's total.
@@ -890,11 +890,11 @@ def _question_gives(
 ) -> bool:
     """Whether a number in the question gives the figure: the same value, sign
     and percent, however its currency, scale and grouping are written, so
-    "40,000" gives "$40,000" and "three" gives "3". A number in a time unit
+    "25,000" gives "$25,000" and "six" gives "6". A number in a time unit
     gives no figure with a currency sign, nor the other way round, and two
     time units must agree: "30 days" gives neither "$30" nor "30 hours". A
-    spelled-out count gives no figure with a currency sign: "three sites" is
-    not "$3"."""
+    spelled-out count gives no figure with a currency sign: "five sites" is
+    not "$5"."""
     if spelled and figure.currency:
         return False
     if (asked.value, asked.negative, asked.percent) != (figure.value, figure.negative, figure.percent):
@@ -946,7 +946,7 @@ def _arithmetic_operands(answer: str, *, numbers: Sequence[_Number], index: int)
     ``index``, when it gives the figure's value: two or more numbers joined
     by ×, ÷ or + (``_OPERATOR``), then = or the next table cell
     (``_RESULT_JOIN``). A percent operand is read as its percentage and as
-    its fraction, so "1.5% × 3 = 4.5%" and "$40,000 × 4.5% = $1,800" both
+    its fraction, so "2% × 6 = 12%" and "$25,000 × 12% = $3,000" both
     hold. None otherwise."""
     if index < 2 or not _RESULT_JOIN.fullmatch(answer, numbers[index - 1].end, numbers[index].start):
         return None
