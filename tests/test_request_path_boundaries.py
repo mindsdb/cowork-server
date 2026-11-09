@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -14,7 +13,7 @@ from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.artifacts import ProjectArtifacts
 
 
-def test_desktop_project_path_keeps_local_card_addressing(tmp_path, monkeypatch):
+async def test_desktop_project_path_keeps_local_card_addressing(tmp_path, monkeypatch):
     project = tmp_path / "legacy-desktop-project"
     base = project / ".anton" / "artifacts"
     folder = base / "quarterly-report"
@@ -37,9 +36,7 @@ def test_desktop_project_path_keeps_local_card_addressing(tmp_path, monkeypatch)
     )
     monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", lambda *, scope: [source])
 
-    cards = artifacts._desktop_artifacts_for_project_path(
-        SimpleNamespace(scope=LOCAL_SCOPE), str(project)
-    )
+    cards = await artifacts.list_artifacts(LOCAL_SCOPE, project_id=None, project_path=str(project))
 
     assert len(cards) == 1
     assert cards[0]["projectId"] is None

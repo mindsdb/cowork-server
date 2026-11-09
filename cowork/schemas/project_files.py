@@ -62,3 +62,16 @@ class ProjectFileWriteResponse(BaseModel):
 class ProjectFileDeleteResponse(BaseModel):
     status: str
     path: str
+
+
+class ProjectUploadResult(BaseModel):
+    """One file of an upload: its size when written, its error when not."""
+
+    name: str
+    ok: bool
+    size: int | None = None
+    error: str | None = None
+
+
+class ProjectUploadResponse(BaseModel):
+    results: list[ProjectUploadResult]

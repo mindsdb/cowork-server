@@ -14,8 +14,10 @@ import logging
 import time
 import uuid
 from datetime import datetime
+from functools import partial
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
+from redis.exceptions import RedisError
 
 from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metadata, surface
 from cowork.handlers.turn_errors import (
@@ -38,9 +40,18 @@ from cowork.turnqueue.auth_keys import (
     mint_turn_key_details,
     register_datasource_grants,
 )
-from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
-from cowork.streaming.turn_index import record_turn
-from cowork.turnqueue.redis_client import cancel_cause_key, cancel_flag_key, get_redis, reply_stream_key
+from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnJobHeader, TurnReply, TurnReplyHeader
+from cowork.streaming.cancellation import stop_controller_turn
+from cowork.streaming.turn_index import record_channel_turn
+from cowork.turnqueue.redis_client import (
+    REDIS_BLOCK_MS,
+    cancel_cause_key,
+    cancel_flag_key,
+    get_redis,
+    reply_stream_key,
+    send_once,
+    xread_blocking,
+)
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
 logger = logging.getLogger(__name__)
@@ -518,6 +529,56 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
 UNRESPONSIVE_WORKER_ERROR = (
     f"{WORKER_UNRESPONSIVE_TYPE_NAME}: the turn worker stopped responding"
 )
+# What the reply loop reports when a reply's number is below the last one it
+# applied: a second run of the same job is replying, and the two runs' answers
+# would mix. Shaped like the pod's errors, so remote_turn_error classifies it
+# as a failure with the generic message.
+SECOND_RUN_ERROR = "TurnRunRepeated: a second run of this turn's job sent replies"
+#: How many of the newest entries of a conversation's job stream the producer
+#: reads back after a job XADD whose reply it lost. A conversation's turns run
+#: one at a time, so a job that landed is among the last few.
+_JOB_READBACK_COUNT = 5
+
+
+async def _job_queued(*, r, job_stream: str, correlation_id: str) -> bool:
+    """Whether the job for ``correlation_id`` is among the newest entries of
+    ``job_stream``. Raises when Redis cannot be read."""
+    for _entry_id, fields in await r.xrevrange(job_stream, count=_JOB_READBACK_COUNT):
+        try:
+            if TurnJobHeader.model_validate_json(fields["payload"]).correlation_id == correlation_id:
+                return True
+        except (KeyError, ValidationError):
+            continue
+    return False
+
+
+async def _queued_after_a_failed_send(
+    *, r, job_stream: str, conversation_id: str, turn_id: int, correlation_id: str,
+) -> bool:
+    """After a job XADD that failed without saying whether Redis applied it
+    (a lost reply, or one slower than the socket timeout), whether the job is
+    queued.
+
+    Reads the job stream back. When the job is not there, or the read fails
+    too, writes the turn's cancel flag before answering False, so a copy the
+    controller picks up later stops at its first check rather than run with
+    nobody reading its replies. A resend would not be safe: the controller
+    skips a repeated job only after its first run ended normally.
+    """
+    try:
+        queued = await _job_queued(r=r, job_stream=job_stream, correlation_id=correlation_id)
+    except RedisError:
+        queued = False
+    logger.warning(
+        "A remote turn's job XADD failed without saying whether Redis applied it; read the job stream back.",
+        extra={
+            "event": "remote_job_send_unconfirmed", "outcome": "queued" if queued else "canceled",
+            "conversation_id": conversation_id, "request_id": correlation_id,
+        },
+    )
+    if not queued:
+        await stop_controller_turn(correlation_id, turn_id=str(turn_id), reason="job_send_unconfirmed")
+    return queued
 
 
 def _remote_reset_at(*, code: str, value: object) -> str | None:
@@ -696,7 +757,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # a valid minds alias, independent of any harness's built-in default.
     if not model:
         from cowork.common.settings.user_settings import get_user_settings
-        model = get_user_settings(scope).resolved_planning_model
+        from cowork.db.units import run_on_unit_threads
+
+        model = (await run_on_unit_threads(partial(get_user_settings, scope))).resolved_planning_model
 
     # Independent network round trips (llm's turn-key mint, oauth's active-
     # connections list) — run concurrently rather than paying both latencies
@@ -707,7 +770,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # turn_failed so both callers stream permission_unavailable, not a generic error.
     try:
         from cowork.common.settings.user_settings import get_user_settings
-        workspace_id = getattr(get_user_settings(scope), "hub_workspace_id", "") or None
+        from cowork.db.units import run_on_unit_threads
+
+        user_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+        workspace_id = getattr(user_settings, "hub_workspace_id", "") or None
         oauth_connections_coro = _oauth_block_and_connector_key(
             org_id=org_id, user_id=user_id, disabled=disabled, correlation_id=corr,
             settings=settings, workspace_id=workspace_id,
@@ -781,6 +847,15 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         else None
     )
     workspace_rel_path = workspace.workspace_rel_path if workspace is not None else _DEFAULT_WORKSPACE_PATH
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.db.units import run_on_unit_threads
+
+    # The organization's Jev opt-out, read here so every remote turn carries
+    # it: web UI, scheduled and channel turns alike. Off the loop: a turn
+    # with no settings snapshot, such as a channel turn, reads it through a
+    # session of its own.
+    jev_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+    jev_decisions = getattr(jev_settings, "jev_decisions_enabled", True) is not False
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -790,6 +865,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # The cowork UI renders a tool's message to the user as an
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
+              # False when the organization opted out of Jev: the pod's
+              # completion check then never asks it. A controller that
+              # predates the field drops it, and the pod keeps Jev on.
+              "jev_decisions": jev_decisions,
               **({"memory": memory_block} if memory_block else {}),
               # Only the skills the caller sees, and the pod's whole
               # recallable set, so always present, even empty.
@@ -835,23 +914,48 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     last_id = tail[0][0] if tail else "0-0"
     # Registry first: a conversation whose stream exists but isn't registered would
     # be invisible to the controller. The reverse is harmless, it prunes empty queues.
-    await r.sadd(f"{settings.jobs_stream}:queues", conversation_id)
-    await r.xadd(f"{settings.jobs_stream}:{conversation_id}", {"payload": job.model_dump_json()})
+    registry_key = f"{settings.jobs_stream}:queues"
+    await r.sadd(registry_key, conversation_id)
+    job_stream = f"{settings.jobs_stream}:{conversation_id}"
+    try:
+        # Sent at most once: an XADD resent after its reply was lost would
+        # queue the turn twice, and the controller would run it twice.
+        with send_once():
+            await r.xadd(job_stream, {"payload": job.model_dump_json()})
+    except RedisError:
+        if not await _queued_after_a_failed_send(
+            r=r, job_stream=job_stream, conversation_id=conversation_id, turn_id=turn_id, correlation_id=corr,
+        ):
+            raise
+    # Registered again: the controller retires a drained queue by deleting its
+    # stream and its registry entry in one script. One that ran between the
+    # SADD and the XADD above left this job in a new stream nobody reads. The
+    # new stream has no consumer group, so the script never retires it, and
+    # the controller creates the group when it next reads.
+    await r.sadd(registry_key, conversation_id)
     # Any replica can now find this turn: its turn_id to open the buffer, its
     # correlation_id to cancel it, its org to authorize the caller. Recorded
     # here rather than after the first buffer record, because this generator
     # does not own the buffer; _shared_turn covers the gap between the two.
+    # A turn with a run id was recorded by RunRegistry.start, which holds the
+    # conversation's claim; one without is skipped while such a run holds it.
     if run_id is None:
-        await record_turn(
-            conversation_id, turn_id=turn_id, correlation_id=corr,
+        await record_channel_turn(
+            conversation_id=conversation_id, turn_id=turn_id, correlation_id=corr,
             org_id=org_id, user_id=user_id, client=r,
         )
 
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds
     last_reply_at = time.monotonic()
+    # The counter of the last reply applied. The controller numbers each
+    # turn's replies, counting up by one, and a reply its retried XADD wrote
+    # twice repeats a number.
+    last_n: int | None = None
     while True:
-        resp = await r.xread({reply_stream: last_id}, count=100, block=5000)
+        resp = await xread_blocking(
+            r=r, streams={reply_stream: last_id}, count=100, block_ms=REDIS_BLOCK_MS,
+        )
         if not resp:
             # Unbounded, this loop spun forever whenever the worker was down:
             # only a terminal reply ends the turn, so the SSE response never
@@ -878,6 +982,36 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                     # turn's replies say nothing about ours.
                     continue
                 reply = TurnReply.model_validate_json(fields["payload"])
+                if reply.n is not None and last_n is not None:
+                    numbers = {
+                        "conversation_id": conversation_id, "request_id": corr,
+                        "last_reply_n": last_n, "reply_n": reply.n,
+                    }
+                    if reply.n == last_n:
+                        logger.warning(
+                            "Dropped a repeated remote turn reply",
+                            extra={"event": "remote_reply_repeat_dropped", **numbers},
+                        )
+                        continue
+                    if reply.n < last_n:
+                        # One run's publishes are serialized, so its numbers
+                        # never go back: a second run of the job is replying.
+                        logger.warning(
+                            "A second run of a remote turn's job sent replies; the turn fails.",
+                            extra={"event": "remote_reply_second_run", **numbers},
+                        )
+                        code, message = remote_turn_error(SECOND_RUN_ERROR)
+                        yield "turn_failed", {"error": SECOND_RUN_ERROR, "code": code, "message": message}
+                        return
+                    if reply.n > last_n + 1:
+                        # Applied: the answer lacks only the reply that never
+                        # reached the stream (a failover or an eviction lost it).
+                        logger.warning(
+                            "A remote turn reply skipped a number; a reply went missing.",
+                            extra={"event": "remote_reply_gap", **numbers},
+                        )
+                if reply.n is not None:
+                    last_n = reply.n
                 last_reply_at = time.monotonic()
                 kind = reply.kind
                 data = reply.data or {}

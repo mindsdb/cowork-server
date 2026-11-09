@@ -91,6 +91,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class ComparisonPublishRefused(ValueError):
+    """Publishing from a model-comparison side, which is never allowed.
+
+    A ValueError so every caller's existing mapping applies unchanged: 400 on
+    the REST paths, a failed tool result for the agent.
+    """
+
+
 class PublisherUnavailable(RuntimeError):
     """A local publish dependency (anton.publisher, markdown) failed to import.
 
@@ -1040,6 +1048,27 @@ def _stored_rule(keys: list[str], scope: TenantScope) -> ArtifactRule:
     return ArtifactRule.nobody() if rule is None else rule
 
 
+def stored_rule_keys(
+    artifact: Path, *, artifacts_base: Path, scope: TenantScope, project_id: str | None
+) -> list[str]:
+    """The keys stored_artifact_rule reads ``artifact``'s rule under
+    (_audience_rule_keys), from its .published.json entry and its identity.
+    The file store half of that read, so a caller can run it on the file
+    store's threads and ask MindsHub (stored_rule_under) elsewhere."""
+    _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=[artifacts_base]
+    )
+    previous = _load_published_map(published_dir).get(published_key)
+    canonical_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
+    return _audience_rule_keys(canonical_key, previous, owner_user_id=scope.user_id)
+
+
+def stored_rule_under(keys: list[str], scope: TenantScope) -> ArtifactRule:
+    """stored_artifact_rule's MindsHub half: the rule held under ``keys``
+    (stored_rule_keys), else nobody but the owner."""
+    return _stored_rule(keys, scope)
+
+
 def stored_artifact_rule(
     artifact: Path, *, artifacts_base: Path, scope: TenantScope, project_id: str | None
 ) -> ArtifactRule:
@@ -1051,12 +1080,32 @@ def stored_artifact_rule(
     already shared with everyone keeps it so. What the access route checks
     a save against and shows; .published.json never says it in MindsHub
     mode."""
+    keys = stored_rule_keys(artifact, artifacts_base=artifacts_base, scope=scope, project_id=project_id)
+    return stored_rule_under(keys, scope)
+
+
+def held_rule_keys_over_entry(
+    artifact: Path, *, artifacts_base: Path, scope: TenantScope, project_id: str | None
+) -> list[str]:
+    """The keys rule_held_over_entry reads ``artifact``'s rule under
+    (_held_rule_keys), from its live .published.json entry and its identity;
+    none for no live entry. The file store half of that read, so a caller
+    can run it on the file store's threads and ask MindsHub (held_rule_under)
+    elsewhere."""
     _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
-    previous = _load_published_map(published_dir).get(published_key)
+    entry = _load_published_map(published_dir).get(published_key)
+    if not isinstance(entry, dict) or not entry.get("published", True):
+        return []
     canonical_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
-    return _stored_rule(_audience_rule_keys(canonical_key, previous, owner_user_id=scope.user_id), scope)
+    return _held_rule_keys(canonical_key, entry, owner_user_id=scope.user_id)
+
+
+def held_rule_under(keys: list[str], scope: TenantScope) -> ArtifactRule | None:
+    """rule_held_over_entry's MindsHub half: the first rule held under
+    ``keys`` (held_rule_keys_over_entry), or None."""
+    return _held_rule(keys, scope)
 
 
 def rule_held_over_entry(
@@ -1071,14 +1120,8 @@ def rule_held_over_entry(
     leaves a rule in MindsHub mode, so a rule held there means the pod
     rewrote the entry's mode after the owner's last save, and the rule, not
     the entry, says who the artifact is shared with. A failed read raises."""
-    _target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
-        artifact, container_dirs=[artifacts_base]
-    )
-    entry = _load_published_map(published_dir).get(published_key)
-    if not isinstance(entry, dict) or not entry.get("published", True):
-        return None
-    canonical_key = _authorization_key(published_dir, artifacts_base, project_id, scope)
-    return _held_rule(_held_rule_keys(canonical_key, entry, owner_user_id=scope.user_id), scope)
+    keys = held_rule_keys_over_entry(artifact, artifacts_base=artifacts_base, scope=scope, project_id=project_id)
+    return held_rule_under(keys, scope)
 
 
 def publish_artifact(
@@ -1158,6 +1201,17 @@ def publish_artifact(
     narrowed when MindsHub's upload service refuses it before writing
     anything (_refused_before_writing).
     """
+    # Checked first, before anything that needs a credential: every publish
+    # path -- the agent's tool, the desktop endpoint, the owner's access
+    # change, autopublish -- ends here, so this is the one place a comparison
+    # side is kept from sharing anything.
+    from cowork.services.projects import path_in_comparison_sandbox
+
+    if path_in_comparison_sandbox(artifacts_base):
+        raise ComparisonPublishRefused(
+            "Publishing is turned off while models are being compared. The user can "
+            "publish this after continuing with this side as a task; do not try again here."
+        )
     if scope is not None and scope.org_mode and project_id is None:
         raise ValueError("publish_artifact requires project_id in organization mode")
     if not api_key:

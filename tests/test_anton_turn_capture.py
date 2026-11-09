@@ -213,7 +213,6 @@ def _stream(monkeypatch, session, *, question: str = "hi", read_earlier_answers=
     ``read_earlier_answers``, so the turn opens no database unit for it."""
     monkeypatch.setattr(harness_mod, "read_earlier_answers", read_earlier_answers)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_a, **_k: (set(), {}))
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", lambda *_a, **_k: ([], set(), None))
     monkeypatch.setattr(task_objects, "cards_for_slugs", lambda *_a, **_k: [])
 
     async def _no_autopublish(*_a, **_k):
@@ -223,7 +222,7 @@ def _stream(monkeypatch, session, *, question: str = "hi", read_earlier_answers=
 
     async def _fake_build(
         self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
-        tool_messages=False,
+        tool_messages=False, interactive=True,
     ):
         return BuiltChatSession(session=session, turn_scratch_dir=None, seed_info=None, learns=True)
 

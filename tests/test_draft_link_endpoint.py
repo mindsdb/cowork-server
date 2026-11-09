@@ -38,8 +38,13 @@ from draft_host_support import (
     events,
     fake_review,
     make_artifact,
+    reviewed_and_read,
 )
 from test_artifacts_api_tenancy import session  # noqa: F401  (fixture)
+
+# Every project row a test makes goes with the test, so its artifact's
+# location row cannot answer another module's lookup of the same id.
+pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
 
 IDENTITY = {"X-User-Id": USER, "X-Organization-Id": ORG}
 DASHED_ARTIFACT = str(UUID(ARTIFACT))
@@ -55,8 +60,8 @@ def reviewed(tmp_path, monkeypatch):
     def set_artifact(**kwargs):
         source, folder, metadata = make_artifact(tmp_path / f"artifact-{next(folders)}", **kwargs)
         review = fake_review(source, folder, metadata, seen)
-        monkeypatch.setattr(workspace_ep, "review_artifact_for_request", review)
-        monkeypatch.setattr(draft_app_module, "review_artifact_for_request", review)
+        monkeypatch.setattr(workspace_ep, "review_artifact_and_read", reviewed_and_read(review))
+        monkeypatch.setattr(draft_app_module, "review_artifact_and_read", reviewed_and_read(review))
 
     set_artifact()
     return seen, set_artifact
@@ -149,17 +154,18 @@ def test_a_draft_the_caller_may_not_review_is_404(api, monkeypatch):
     def refuse(*_args):
         raise HTTPException(status_code=404, detail="Artifact not found")
 
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", refuse)
+    monkeypatch.setattr(workspace_ep, "review_artifact_and_read", reviewed_and_read(refuse))
 
     assert api.post(LINK, headers=IDENTITY).status_code == 404
 
 
-def test_the_review_and_the_path_lookup_run_off_the_event_loop(api, reviewed, monkeypatch):
-    # The review reads the database and the artifact roots, and the path lookup
-    # resolves symlinks: all blocking, on a request the web app sends at every
-    # preview open and reload.
+def test_the_path_lookup_runs_off_the_event_loop(api, reviewed, monkeypatch):
+    # The path lookup resolves symlinks on the file store: blocking, on a
+    # request the web app sends at every preview open and reload. The review
+    # is a coroutine whose database and file store reads run in worker
+    # threads of their own (tests/test_artifact_resolution_off_the_loop.py).
     on_loop: dict[str, bool] = {}
-    names = ("review_artifact_for_request", "_artifact_primary", "_primary_rel_path", "_draft_file_parts")
+    names = ("_artifact_primary", "_primary_rel_path", "_draft_file_parts")
     for name in names:
 
         def watched(*args, _name=name, _original=getattr(workspace_ep, name)):
@@ -181,7 +187,9 @@ def test_an_artifact_with_no_previewable_file_gets_no_link(api, tmp_path, monkey
     source, folder, metadata = make_artifact(tmp_path)
     (folder / "index.html").unlink()
     shutil.rmtree(folder / "assets")
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", fake_review(source, folder, metadata, {}))
+    monkeypatch.setattr(
+        workspace_ep, "review_artifact_and_read", reviewed_and_read(fake_review(source, folder, metadata, {}))
+    )
 
     with caplog.at_level("WARNING", logger="cowork.api.v1.endpoints.artifact_workspace"):
         response = api.post(LINK, headers=IDENTITY)
@@ -195,7 +203,9 @@ def test_a_primary_outside_the_artifact_folder_gets_no_link(api, tmp_path, monke
     source, folder, metadata = make_artifact(tmp_path)
     outside = folder.parent / "secret.txt"
     assert outside.is_file()
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", fake_review(source, folder, metadata, {}))
+    monkeypatch.setattr(
+        workspace_ep, "review_artifact_and_read", reviewed_and_read(fake_review(source, folder, metadata, {}))
+    )
     monkeypatch.setattr(workspace_ep, "_artifact_primary", lambda *_args: outside)
 
     with caplog.at_level("WARNING", logger="cowork.api.v1.endpoints.artifact_workspace"):
@@ -220,11 +230,11 @@ async def test_a_scope_without_a_user_or_an_org_is_401_and_reviews_nothing(draft
     def never(*_args):
         raise AssertionError("the review must not run")
 
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", never)
+    monkeypatch.setattr(workspace_ep, "review_artifact_and_read", reviewed_and_read(never))
 
     with caplog.at_level("WARNING", logger="cowork.api.v1.endpoints.artifact_workspace"):
         with pytest.raises(HTTPException) as refused:
-            await workspace_ep.create_draft_link(PROJECT, DASHED_ARTIFACT, SimpleNamespace(scope=scope))
+            await workspace_ep.create_draft_link(PROJECT, DASHED_ARTIFACT, scope)
 
     assert refused.value.status_code == 401
     assert events(caplog, "draft_link_issued") == []
@@ -272,7 +282,7 @@ def test_health_says_no_draft_links_while_a_value_is_missing(draft_env, monkeypa
 
 
 
-# The tests above stub review_artifact_for_request. These do not: they pin that
+# The tests above stub the review. These do not: they pin that
 # the draft host asks the real review on every request, so a grant that is
 # withdrawn stops a link that was issued while it stood.
 
@@ -282,7 +292,7 @@ real_review = pytest.mark.usefixtures("draft_env", "granted_product_permissions"
 
 
 async def _issue_link(row, artifact_id, scoped) -> str:
-    response = await workspace_ep.create_draft_link(str(row.id), artifact_id, scoped)
+    response = await workspace_ep.create_draft_link(str(row.id), artifact_id, scoped.scope)
     assert response.status_code == 200, response.body
     return json.loads(response.body)["url"]
 
@@ -321,6 +331,6 @@ async def test_a_co_member_without_a_grant_gets_no_link(session, tmp_path):
     with Session(session.get_bind()) as other_session:
         other = tenancy._scoped(other_session, tenancy.ORG_A, tenancy.USER_A2)
         with pytest.raises(HTTPException) as refused:
-            await workspace_ep.create_draft_link(str(row.id), artifact_id, other)
+            await workspace_ep.create_draft_link(str(row.id), artifact_id, other.scope)
 
     assert refused.value.status_code == 404

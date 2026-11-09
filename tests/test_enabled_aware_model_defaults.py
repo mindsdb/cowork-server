@@ -386,7 +386,7 @@ def test_recommended_models_caches_enabled_map(monkeypatch):
     session = get_open_session()
     try:
         _set_settings(session, minds_api_key="mdb_test")
-        asyncio.run(recommended_models(FakeRequest(), session, LOCAL_SCOPE))
+        asyncio.run(recommended_models(FakeRequest(), LOCAL_SCOPE))
         cached = SettingService(session).load().minds_model_enabled
         assert json.loads(cached) == {"mindshub_air": True, "sonnet": False}
     finally:
@@ -409,7 +409,7 @@ def test_recommended_models_failed_fetch_preserves_cache(monkeypatch):
     session = get_open_session()
     try:
         _set_settings(session, minds_api_key="mdb_test", minds_model_enabled=FREE_MAP)
-        asyncio.run(recommended_models(FakeRequest(), session, LOCAL_SCOPE))
+        asyncio.run(recommended_models(FakeRequest(), LOCAL_SCOPE))
         cached = SettingService(session).load().minds_model_enabled
         assert json.loads(cached) == json.loads(FREE_MAP)  # untouched
     finally:

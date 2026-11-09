@@ -79,6 +79,179 @@ def test_ingress_manager_poll_lifecycle():
     asyncio.run(scenario())
 
 
+def test_a_poll_whose_intake_fails_polls_the_batch_again_and_keeps_polling(monkeypatch):
+    """A batch's intake is refused, as by a pool that frees no connection
+    within POOL_TIMEOUT. The poll loop goes on (in local mode nothing would
+    restart it), and the next poll sends the offset from before the batch,
+    so the platform delivers the same events again rather than counting them
+    confirmed."""
+    from cowork.channels import ingress
+    from cowork.db.units import DatabaseBusy
+
+    batch = [{"key": "evt-1"}]
+
+    class _OneBatchBridge:
+        def __init__(self):
+            self.offsets: list[int | None] = []
+            self.third_poll = asyncio.Event()
+
+        async def poll(self, *, offset):
+            self.offsets.append(offset)
+            if len(self.offsets) == 3:
+                self.third_poll.set()
+            await asyncio.sleep(0)
+            return list(batch), 11
+
+        def dedupe_key(self, event):
+            return event["key"]
+
+    intakes: list[list] = []
+
+    async def intake_events(channel_type, bridge, events, *, sink, org_id):
+        intakes.append(events)
+        if len(intakes) == 1:
+            raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+
+    monkeypatch.setattr(ingress, "intake_events", intake_events)
+    monkeypatch.setattr(ingress, "_ERROR_BACKOFF_S", 0.01)
+
+    async def scenario():
+        mgr = IngressManager(sink=_noop_sink)
+        bridge = _OneBatchBridge()
+        await mgr.start("telegram", bridge)
+        try:
+            await asyncio.wait_for(bridge.third_poll.wait(), 2.0)
+            assert mgr.is_running("telegram")
+        finally:
+            await mgr.stop("telegram")
+        return bridge.offsets[:3]
+
+    assert asyncio.run(scenario()) == [None, None, 11]
+    assert intakes[:2] == [batch, batch]
+
+
+def test_a_poll_resending_a_partly_recorded_batch_schedules_each_event_once(monkeypatch):
+    """The real intake records the batch's first event, and the pool refuses
+    the second. The poll loop sends the batch again, dedupe drops the first
+    event, and each event reaches the runtime exactly once."""
+    from cowork.channels import ingress, webhooks
+    from cowork.db.units import DatabaseBusy
+    from cowork.db.session import get_open_session
+    from cowork.models.channel import ChannelEvent
+    from sqlmodel import select
+
+    keys = ("evt-partly-1", "evt-partly-2")
+    real_record = webhooks._record_inbound
+    records: list[str] = []
+
+    def record_refusing_the_second_once(session, *, channel_type, key):
+        records.append(key)
+        if len(records) == 2:
+            raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+        return real_record(session, channel_type=channel_type, key=key)
+
+    monkeypatch.setattr(webhooks, "_record_inbound", record_refusing_the_second_once)
+    monkeypatch.setattr(ingress, "_ERROR_BACKOFF_S", 0.01)
+
+    class _BatchBridge:
+        def __init__(self):
+            self.polls = 0
+            self.fourth_poll = asyncio.Event()
+
+        async def poll(self, *, offset):
+            self.polls += 1
+            if self.polls == 4:
+                self.fourth_poll.set()
+            await asyncio.sleep(0)
+            return [{"key": key} for key in keys], 21
+
+        def dedupe_key(self, event):
+            return event["key"]
+
+    routed: list[str] = []
+
+    async def sink(channel_type, event, org_id=None):
+        routed.append(event["key"])
+
+    async def scenario():
+        mgr = IngressManager(sink=sink)
+        bridge = _BatchBridge()
+        await mgr.start("telegram", bridge)
+        try:
+            await asyncio.wait_for(bridge.fourth_poll.wait(), 5.0)
+        finally:
+            await mgr.stop("telegram")
+        await webhooks.drain_background_tasks()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        session = get_open_session()
+        try:
+            for row in session.exec(select(ChannelEvent).where(ChannelEvent.dedupe_key.in_(keys))).all():
+                session.delete(row)
+            session.commit()
+        finally:
+            session.close()
+
+    assert records[:3] == ["evt-partly-1", "evt-partly-2", "evt-partly-1"]
+    assert sorted(routed) == sorted(keys)
+
+
+class _OpenStreamBridge:
+    """Stream-shaped adapter whose connection delivers one batch, then stays
+    open until cancelled."""
+
+    def __init__(self, batch):
+        self.batch = batch
+        self.connections = 0
+
+    async def stream_events(self):
+        self.connections += 1
+        yield list(self.batch)
+        await asyncio.Event().wait()
+
+    def dedupe_key(self, event):
+        return event["key"]
+
+
+def test_a_stream_batch_the_pool_refuses_is_taken_in_again_on_the_same_connection(monkeypatch):
+    """A stream has no offset to resend, and a new connection does not bring
+    the event back. So a batch the pool refuses is retried in place, and the
+    stream stays connected."""
+    from cowork.channels import ingress
+    from cowork.db.units import DatabaseBusy
+
+    batch = [{"key": "evt-stream-1"}]
+    offered: list[list] = []
+    recorded = asyncio.Event()
+
+    async def intake_events(channel_type, bridge, events, *, sink, org_id):
+        offered.append(events)
+        if len(offered) == 1:
+            raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+        recorded.set()
+
+    monkeypatch.setattr(ingress, "intake_events", intake_events)
+    monkeypatch.setattr(ingress, "_ERROR_BACKOFF_S", 0.01)
+
+    async def scenario():
+        mgr = IngressManager(sink=_noop_sink)
+        bridge = _OpenStreamBridge(batch)
+        await mgr.start("discord", bridge)
+        try:
+            await asyncio.wait_for(recorded.wait(), 2.0)
+            # Time a reconnect would have taken.
+            await asyncio.sleep(0.05)
+            assert mgr.is_running("discord")
+        finally:
+            await mgr.stop("discord")
+        return bridge.connections
+
+    assert asyncio.run(scenario()) == 1
+    assert offered == [batch, batch]
+
+
 def test_ingress_manager_stream_lifecycle():
     async def scenario():
         mgr = IngressManager(sink=_noop_sink)
