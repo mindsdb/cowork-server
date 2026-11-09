@@ -305,7 +305,7 @@ def test_teams_stays_off_and_says_what_is_missing(teams_on, caplog):
     with caplog.at_level(logging.WARNING):
         assert not install_teams_routes(app, exempt, _settings(tenant_id="", internal_key=""))
     assert exempt == set()
-    assert "COWORK_TEAMS_TENANT_ID, COWORK_TEAMS_INTERNAL_KEY not set" in caplog.text
+    assert [record.reason for record in caplog.records] == ["COWORK_TEAMS_TENANT_ID, COWORK_TEAMS_INTERNAL_KEY not set"]
     assert SECRET not in caplog.text
 
 
@@ -368,3 +368,21 @@ def test_check_names_missing_settings(teams_on, capsys):
 def test_check_flags_a_missing_internal_key(teams_on, capsys):
     assert teams.check(_settings(internal_key=""), make_client=StandInTeams) == 1
     assert "COWORK_TEAMS_INTERNAL_KEY is not set" in capsys.readouterr().out
+
+
+def test_the_server_log_names_the_missing_settings(teams_on):
+    """The server's log format drops values filled into a message, so the
+    names must travel as a field it keeps."""
+    from cowork.common.structured_logging import make_formatter
+
+    lines: list[str] = []
+    handler = logging.Handler()
+    handler.setFormatter(make_formatter())
+    handler.emit = lambda record: lines.append(handler.format(record))
+    logging.getLogger("cowork.channels.teams").addHandler(handler)
+    try:
+        install_teams_routes(FastAPI(), set(), _settings(internal_key=""))
+    finally:
+        logging.getLogger("cowork.channels.teams").removeHandler(handler)
+    [line] = lines
+    assert json.loads(line)["reason"] == "COWORK_TEAMS_INTERNAL_KEY not set"
