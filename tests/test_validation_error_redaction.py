@@ -25,10 +25,11 @@ MALFORMED_BODY = {
     "values": SENTINEL,
 }
 
-#: The submission route holds no request session, so the session log is read
-#: on a route that does and whose body carries a key: the settings write.
-SESSION_ROUTE = "/api/v1/settings/"
-MALFORMED_SETTINGS_BODY = {"values": SENTINEL}
+#: The submission route and the settings writes hold no request session (they
+#: read and write through database units), so the session log is read on a
+#: connector route that does: a custom connector's update.
+SESSION_ROUTE = "/api/v1/connectors/custom/not-a-real-connector"
+MALFORMED_SESSION_BODY = {"spec": SENTINEL}
 
 
 @pytest.fixture(autouse=True)
@@ -87,7 +88,7 @@ def test_malformed_body_is_not_echoed_in_the_response(client):
 
 
 def test_malformed_body_is_not_echoed_in_the_session_log(client, session_log):
-    res = client.put(SESSION_ROUTE, json=MALFORMED_SETTINGS_BODY)
+    res = client.patch(SESSION_ROUTE, json=MALFORMED_SESSION_BODY)
 
     assert res.status_code == 422
     assert SENTINEL not in res.text

@@ -433,6 +433,24 @@ def _turn_skill_service(
     return SkillService(scope, viewer=viewer, session=session)
 
 
+def has_always_on_rows(*, session: ScopedSession) -> bool:
+    """Whether any of the org's skill_access rows is always on: the database
+    half of has_always_on_skills, which reads no SKILL.md and lists no store.
+    No turn has an always-on skill when it is False. Never outside MindsHub
+    mode.
+
+    It reads the rows as they stand, without the backfill that gives each
+    skill from before sharing its row (backfill_legacy_access). That backfill
+    lists the store on the file store, and every row it writes is shared with
+    everyone and never always on, so it can't change this answer;
+    has_always_on_skills runs it once this read finds an always-on row."""
+    if not sharing_applies(session.scope):
+        return False
+    from cowork.services.skill_access import access_rows
+
+    return any(row.always_on for row in access_rows(session).values())
+
+
 def has_always_on_skills(
     scope: TenantScope | None,
     *,
@@ -737,6 +755,10 @@ class SkillService:
         # a skill with neither: nobody's.
         self._session = session
         self._rows: dict[str, SkillAccess] | None = None
+        # The creator each skill's attribution row records, read in one query
+        # the first time a skill with no skill_access row needs it
+        # (access_rule), so a listing doesn't read one row per such skill.
+        self._creators: dict[str, str | None] | None = None
         self._backfilled = False
         # The slugs the scope's person turned off for themselves
         # (cowork.services.skill_user_settings): given, as an in-process
@@ -805,16 +827,25 @@ class SkillService:
             return BUILTIN_RULE
         row = self._access_rows().get(skill.name)
         if row is None and self._session is not None and self.org_sharing:
-            from cowork.services.shared_resources import SKILL, SharedResourceAccess
-
-            creator_id = SharedResourceAccess(self._session).creator_id(SKILL, skill.name)
-            return access_rule_for(None, creator_id)
+            return access_rule_for(None, self._creator_ids().get(skill.name))
         return access_rule_for(row)
 
+    def _creator_ids(self) -> dict[str, str | None]:
+        """Every skill's recorded creator in the org, by slug, read once per
+        instance (SharedResourceAccess.snapshots)."""
+        if self._creators is None:
+            from cowork.services.shared_resources import SKILL, SharedResourceAccess
+
+            snapshots = SharedResourceAccess(self._session).snapshots(SKILL)
+            self._creators = {slug: snapshot.created_by_id for slug, snapshot in snapshots.items()}
+        return self._creators
+
     def forget_access(self) -> None:
-        """Drop the rows read so far: the next read asks the database again,
-        after a change to them or under a lock another change waited on."""
+        """Drop the rows and creators read so far: the next read asks the
+        database again, after a change to them or under a lock another change
+        waited on."""
         self._rows = None
+        self._creators = None
 
     def off_for_me(self) -> frozenset[str]:
         """The slugs this scope's person turned off for themselves, read in

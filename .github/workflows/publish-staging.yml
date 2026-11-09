@@ -57,6 +57,14 @@ jobs:
       contents: read
     uses: ./.github/workflows/tests-services.yml
 
+  codeql:
+    # The scan of what staging now holds. Independent of the release chain: an
+    # alert shows on the Security tab without holding up the rc wheel.
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/codeql.yml
+
   build-deploy:
     # The container image, for the per-PR environments and whatever comes after.
     # Independent of the release chain on purpose: a scan finding should not hold

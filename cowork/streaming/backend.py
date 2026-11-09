@@ -14,10 +14,19 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from pathlib import Path
 
+from redis import Redis
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
 from cowork.common.settings.app_settings import StreamSettings
-from cowork.turnqueue.redis_client import get_sync_redis
+from cowork.turnqueue.redis_client import (
+    SYNC_CALL_BUDGET_S,
+    get_sync_redis,
+    redis_deadline,
+    sync_connections_opened,
+)
 from cowork.streaming.buffer import (
     FileStreamBuffer,
     RedisStreamBuffer,
@@ -59,9 +68,38 @@ def _remove_redis_buffers(conversation_id: str) -> None:
     replayed as that turn's answer.
     """
     r = get_sync_redis()
-    keys = list(r.scan_iter(match=f"cowork:stream:{conversation_id}:*", count=100))
+    keys = _scan_keys(r=r, match=f"cowork:stream:{conversation_id}:*")
     if keys:
         r.delete(*keys)
+
+
+def _scan_keys(*, r: Redis, match: str) -> set[str]:
+    """Every key matching ``match``, walked with SCAN under one deadline.
+
+    A SCAN cursor means something only to the server that issued it. A page
+    that went out on a connection opened after its cursor was issued (a retry,
+    or a reconnect after the server dropped the connection) may have reached a
+    new primary after a failover, so the walk starts again from cursor 0
+    rather than skip keys. The walk holds one connection of the pool for all
+    its pages: a pooled connection moves between threadpool threads, and one
+    that another thread reconnected would carry an old cursor to a new server
+    with no reconnect counted in this thread.
+    """
+    keys: set[str] = set()
+    with redis_deadline(budget_s=SYNC_CALL_BUDGET_S) as deadline, r.client() as pinned:
+        cursor = 0
+        while True:
+            opened = sync_connections_opened()
+            next_cursor, page = pinned.scan(cursor=cursor, match=match, count=100)
+            keys.update(page)
+            if cursor != 0 and sync_connections_opened() != opened:
+                if time.monotonic() >= deadline:
+                    raise RedisTimeoutError("SCAN kept reconnecting and did not finish before its deadline")
+                cursor = 0
+                continue
+            if int(next_cursor) == 0:
+                return keys
+            cursor = int(next_cursor)
 
 
 def remove_conversation_buffers(conversation_id: str) -> None:
