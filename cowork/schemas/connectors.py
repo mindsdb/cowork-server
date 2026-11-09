@@ -262,6 +262,16 @@ class CustomConnectionResponse(BaseModel):
     template_missing: bool = False
 
 
+class CustomConnectRequest(BaseModel):
+    """Connect a member's own custom connector: a name, the API address they type, and the field values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=255)
+    address: str = Field(min_length=1, max_length=300)
+    values: dict[str, Any] = Field(default_factory=dict, repr=False)
+
+
 class CustomConnectorAvailability(BaseModel):
     """Whether the caller can build a custom connector that is kept for reuse."""
 
