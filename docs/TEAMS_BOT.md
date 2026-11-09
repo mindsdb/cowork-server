@@ -107,20 +107,20 @@ Then every tenant ID the message carries (`conversation.tenantId`, `channelData.
 `x-ms-tenant-id` header) must be `COWORK_TEAMS_TENANT_ID`; with no tenant set, every message is
 refused.
 
-Last, the sender. A channel turn runs as this install's owner, with their connections (mail,
-files and the rest), so anyone in the tenant who could @mention the bot could ask the agent to
-read them. The webhook answers only the people on `COWORK_TEAMS_ALLOWED_USERS`, by their Entra
-object ID (`from.aadObjectId`), and nobody when it's empty. A refused sender's ID is in the server
-log, to copy into the list.
+A message that fails these checks gets 401, no reply and nothing stored, and the server log says
+why.
 
-A refused message gets 401, no reply and nothing stored, and the server log says why. Keep a test
-bot's app out of the organization's app catalogue.
+Then the sender. A channel turn runs as this install's owner, with their connections (mail, files
+and the rest), so anyone in the tenant who could @mention the bot could ask the agent to read
+them. Only the people on `COWORK_TEAMS_ALLOWED_USERS`, by their Entra object ID
+(`from.aadObjectId`), get an answer, and nobody when it's empty. Anyone else's message gets 200,
+since Microsoft did send it, with no reply and nothing stored; their ID is in the server log, to
+copy into the list. Keep a test bot's app out of the organization's app catalogue.
 
 The address to reply to is kept in memory, so a reply to a question asked before a restart is
 lost.
 
 A channel turn runs with no person, so on a Cowork that trusts identity headers the channel isn't
 registered, and the webhook would refuse every message anyway; Teams questions go through the
-recording proxy there. The channel config
-routes (save, delete, reload, set up, tear down) answer 409 for Teams, since the bot is set in the
-environment.
+recording proxy there. The channel config routes (save, delete, reload, set up, tear down) answer
+409 for Teams, since the bot is set in the environment.

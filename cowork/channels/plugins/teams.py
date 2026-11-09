@@ -12,9 +12,9 @@ before anything is stored or run: signed with one of Microsoft's keys
 Framework, for this bot's App ID, in date, and naming the message's
 serviceUrl. Then the tenant: Teams can send the bot messages from any
 organization, so every tenant ID the message carries must be the configured
-one, and with none configured every message is refused. Last the sender: a
-channel turn uses this install's connections, so the webhook answers only the
-people on ``COWORK_TEAMS_ALLOWED_USERS``, and nobody when it's empty.
+one, and with none configured every message is refused. Then the sender: a
+channel turn uses this install's connections, so only the people on
+``COWORK_TEAMS_ALLOWED_USERS`` get an answer, and nobody when it's empty.
 
 The bot is set in the environment (``COWORK_TEAMS_*``, see
 cowork/channels/teams.py), not in Settings → Channels, so the channel config
@@ -25,6 +25,7 @@ installed and ``COWORK_TEAMS_BOT_APP_ID`` is set.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -217,18 +218,20 @@ class TeamsBridge:
         if not named or any(tenant != self._tenant_id for tenant in named):
             raise self._refuse("message from another tenant")
 
-        sender = ((activity.get("from") or {}).get("aadObjectId") or "").lower()
-        if sender not in self._allowed_users:
-            # The ID only: it's what the operator adds to the list.
-            log.info("Teams: message from %s, who isn't on COWORK_TEAMS_ALLOWED_USERS", sender or "an unknown sender")
-            raise self._refuse("sender not on COWORK_TEAMS_ALLOWED_USERS")
-
     async def parse_inbound(self, *, body: bytes, headers: Mapping[str, str], route_name: str | None) -> list[InboundEvent]:
         activity = json.loads(body)
         if activity.get("type") != "message":
             return []
-        address = _address(activity)
         sender = activity.get("from") or {}
+        sender_id = (sender.get("aadObjectId") or "").lower()
+        if sender_id not in self._allowed_users:
+            # Microsoft really sent it, so it's answered 200 rather than 401,
+            # which Teams could show as a failed send; nothing is stored or run.
+            # The ID only: it's what the operator adds to the list.
+            self.refused["sender not on COWORK_TEAMS_ALLOWED_USERS"] += 1
+            log.info("Teams: message from %s, who isn't on COWORK_TEAMS_ALLOWED_USERS", sender_id or "an unknown sender")
+            return []
+        address = _address(activity)
         conversation = activity.get("conversation") or {}
         self._remember_reply_to(address, (activity["serviceUrl"], conversation["id"], activity["id"]))
         return [
@@ -253,8 +256,10 @@ class TeamsBridge:
             self._reply_to.popitem(last=False)
 
     def dedupe_key(self, event: InboundEvent) -> str | None:
-        # Teams message ids are unique only within a conversation.
-        return f"{event.address.platform_id}:{event.message.id}"
+        # Teams message ids are unique only within a conversation. The column
+        # holds 255 characters, and a personal chat's id can be long.
+        key = f"{event.address.platform_id}:{event.message.id}"
+        return key if len(key) <= 255 else "sha256:" + hashlib.sha256(key.encode()).hexdigest()
 
     async def deliver(self, message: OutboundMessage) -> None:
         reference = self._reply_to.get(message.address)

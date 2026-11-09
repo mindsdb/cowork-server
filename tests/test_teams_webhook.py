@@ -173,22 +173,43 @@ def test_with_identity_headers_trusted_every_message_is_refused(bridge, identity
         _verify(bridge)
 
 
-def test_a_sender_not_on_the_allowed_list_is_refused(bridge, caplog):
+async def _questions(bridge, activity=None):
+    return await bridge.parse_inbound(body=json.dumps(activity or _activity()).encode(), headers=_headers(), route_name=None)
+
+
+async def test_a_sender_not_on_the_allowed_list_gets_nothing(bridge, caplog):
     activity = _activity(**{"from": {"id": "29:user-2", "name": "Someone Else", "aadObjectId": "aad-2"}})
-    with caplog.at_level(logging.INFO), pytest.raises(SignatureError, match="sender not on COWORK_TEAMS_ALLOWED_USERS"):
-        _verify(bridge, activity)
+    _verify(bridge, activity)  # Microsoft did send it
+    with caplog.at_level(logging.INFO):
+        assert await _questions(bridge, activity) == []
+    assert bridge.refused["sender not on COWORK_TEAMS_ALLOWED_USERS"] == 1
     assert "message from aad-2, who isn't on COWORK_TEAMS_ALLOWED_USERS" in caplog.text
 
 
-def test_with_no_allowed_senders_nobody_is_answered(identity_headers, stand_in):
+async def test_with_no_allowed_senders_nobody_is_answered(identity_headers, stand_in):
     bridge = _bridge(stand_in, allowed_users="")
-    with pytest.raises(SignatureError, match="sender not on COWORK_TEAMS_ALLOWED_USERS"):
-        _verify(bridge)
+    assert await _questions(bridge) == []
 
 
-def test_allowed_senders_are_read_from_a_comma_separated_setting(identity_headers, stand_in):
+async def test_allowed_senders_are_read_from_a_comma_separated_setting(identity_headers, stand_in):
     bridge = _bridge(stand_in, allowed_users="aad-9, AAD-1")
-    _verify(bridge)
+    assert len(await _questions(bridge)) == 1
+
+
+def test_through_the_webhook_a_sender_not_on_the_list_gets_200_and_runs_nothing(bridge):
+    sunk: list = []
+    activity = _activity(**{"from": {"id": "29:user-2", "aadObjectId": "aad-2"}})
+    response = _route(bridge, sunk).post(WEBHOOK, content=json.dumps(activity).encode(), headers=_headers())
+    assert response.status_code == 200
+    assert sunk == []
+
+
+async def test_a_long_conversation_id_still_fits_the_dedupe_column(bridge):
+    activity = _activity(conversation={"id": "a:" + "x" * 300, "conversationType": "personal", "tenantId": TENANT})
+    [event] = await _questions(bridge, activity)
+    key = bridge.dedupe_key(event)
+    assert len(key) <= 255
+    assert key == bridge.dedupe_key(event)
 
 
 async def test_the_same_message_id_in_two_conversations_isnt_a_duplicate(bridge):
