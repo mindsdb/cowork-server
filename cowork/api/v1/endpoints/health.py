@@ -1,6 +1,9 @@
+import hashlib
+import hmac
+import re
 from importlib.metadata import version, PackageNotFoundError
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
 from cowork.api.v1.permissions import OpenByDesign, require
 from cowork.code_sandbox import live_apps_on
@@ -84,6 +87,28 @@ def _minds_runtime_credential_required(
     )
 
 
+#: A nonce the app may send: hex, 16 to 64 bytes. Anything else gets no
+#: proof rather than an error, since every client polls this before it can
+#: do anything else.
+_NONCE = re.compile(r"[0-9a-f]{32,128}")
+
+
+def health_proof(*, key: str, nonce: str | None, port: int | None) -> str | None:
+    """The proof /health gives the desktop app that it is the server the app
+    spawned: HMAC-SHA256, keyed by the per-install proof key the app passed at
+    spawn, of the app's nonce and the port the request arrived on, in hex.
+
+    The owner token /health echoes says only whose server this claims to be,
+    and any local caller can read it and replay it from a listener of its own.
+    That listener can't compute this without the key. Naming the port binds
+    the proof to the listener the app asked: a listener on the app's port that
+    relays the nonce to the app's real server on another port gets a proof
+    for that other port. None without a key, a nonce or a port."""
+    if not key or nonce is None or port is None or not _NONCE.fullmatch(nonce):
+        return None
+    return hmac.new(key.encode(), f"cowork-health-proof:{port}:{nonce}".encode(), hashlib.sha256).hexdigest()
+
+
 # Health endpoint — the Electron app and dev-web.mjs probe this
 # to know when the server is ready before mounting the renderer.
 # The cowork frontend also reads config_ready / config_error from
@@ -94,12 +119,27 @@ def _minds_runtime_credential_required(
 # this matches its own token, so one OS user's app can't drive another
 # user's sidecar on a shared loopback port (ENG-439). Empty when unset.
 #
+# `proof` (health_proof) answers a `nonce` the app sends, so the app can
+# check the server it spawned is the one answering. The owner echo stays for
+# apps that predate the proof.
+#
 # OpenByDesign, standalone reason: this is the pre-auth readiness probe every
 # client polls before it can authenticate at all, so it has to answer with no
 # credential of any kind. Not "the middleware exempts it" — that the middleware
 # also lists it in _EXEMPT_PATHS follows from this, rather than justifying it.
 @router.get("/", response_model=dict, dependencies=[Depends(require(OpenByDesign))])
+def health_probe(request: Request, nonce: str | None = None) -> dict:
+    server = request.scope.get("server")
+    proof = health_proof(
+        key=get_app_settings().health_proof_key.get_secret_value(),
+        nonce=nonce,
+        port=server[1] if server else None,
+    )
+    return {**health(), "proof": proof}
+
+
 def health() -> dict:
+    """/health's body, apart from the proof."""
     settings = get_user_settings()
     # Read once: `org_mode` and the `aid` gate are the same decision, and two
     # separate reads could in principle disagree within one response.
@@ -111,7 +151,7 @@ def health() -> dict:
         # development an older published sidecar can still answer /health while
         # returning 404 for every Code Mode route. Keep this list additive so a
         # client can require the capability it needs before adopting a sidecar.
-        "capabilities": ["coding", "pending-credential-clear"],
+        "capabilities": ["coding", "pending-credential-clear", "health-proof"],
         "anton_available": True,
         "mode": "anton",
         "server_version": _pkg_version("cowork-server"),
