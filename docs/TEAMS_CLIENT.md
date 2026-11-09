@@ -71,3 +71,6 @@ member = await client.get_member(service_url, conversation_id, member_id)
 
 Each call sends the bot's token to `service_url`. Check it against the allowed Teams hosts before
 calling, so a forged message can't send the token elsewhere.
+
+On a self-hosted Cowork, the client is used through two internal routes; see
+[Teams bot on a self-hosted Cowork](TEAMS_BOT.md).
