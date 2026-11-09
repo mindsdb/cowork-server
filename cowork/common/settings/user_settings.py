@@ -206,7 +206,9 @@ def _enabled_aware_default(
     minds-cloud: direct (BYOK) providers have no such availability map.
 
     Org mode requires the same positive evidence, but falls back to
-    MINDS_FREE_MODEL instead, so a credit-less org isn't charged.
+    MINDS_FREE_MODEL instead, so a credit-less org isn't charged. When the map
+    marks the free model itself disabled (e.g. zero data retention blocks it),
+    org mode takes the first enabled model instead.
     """
     default = defaults.get(provider_value)
     if provider_value != Provider.MINDS_CLOUD.value:
@@ -214,6 +216,11 @@ def _enabled_aware_default(
     if get_app_settings().tenancy_mode == "org":
         if default is not None and enabled_map.get(default) is True:
             return default
+        # A disabled free model would be refused every call (ZDR blocks it).
+        if enabled_map.get(MINDS_FREE_MODEL) is False:
+            enabled = next((m for m, en in enabled_map.items() if en), None)
+            if enabled is not None:
+                return enabled
         # Free model, unless a known catalogue no longer serves it — then it's
         # retired and would 404 every turn, so hand out a served model.
         if enabled_map and MINDS_FREE_MODEL not in enabled_map:

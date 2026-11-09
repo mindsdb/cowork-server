@@ -156,13 +156,12 @@ class TestOrgModeCreditAwareDefaults:
     def test_org_moves_every_role_off_a_free_model_the_map_disowns(
         self, org_mode, enabled_map
     ):
-        """Both layers fire, and the second one decides.
+        """Both layers agree on the first enabled alias.
 
-        The org arm of ``_enabled_aware_default`` has no first-enabled fallback, so
-        it fills all three roles with MINDS_FREE_MODEL even here, where the map
-        says that model cannot be called. ``_resolved_model`` then runs
-        ``wallet_aware`` on each role and swaps in the first enabled alias, so the
-        org arm's answer never reaches a turn.
+        The org arm of ``_enabled_aware_default`` leaves a free model the map marks
+        disabled, and ``_resolved_model``'s ``wallet_aware`` pass would swap it out
+        anyway. The gate has no such second layer; see
+        ``test_org_gate_leaves_a_disabled_free_model``.
 
         Planning was exempt from that second layer until the wallet-aware pass was
         extended to it (ENG-1632 follow-up), which is why this used to read as a
@@ -177,6 +176,21 @@ class TestOrgModeCreditAwareDefaults:
         assert s.resolved_planning_model == "sonnet"
         assert s.resolved_coding_model == "sonnet"
         assert s.resolved_router_model == "sonnet"
+
+    def test_org_gate_leaves_a_disabled_free_model(self, org_mode):
+        # Zero data retention disables the free model. The gate has no wallet-aware
+        # pass, so the default fill itself must move to an enabled model.
+        s = _settings(
+            minds_model_enabled=json.dumps({MINDS_FREE_MODEL: False, "kimi": True, "sonnet": True})
+        )
+        assert s.planning_model == "kimi"
+        assert s.router_model == "kimi"
+        assert s.resolved_gate_model == "kimi"
+
+    def test_org_gate_keeps_the_free_model_when_nothing_is_enabled(self, org_mode):
+        # Nothing to move to: keep the free model rather than a disabled paid one.
+        s = _settings(minds_model_enabled=json.dumps({MINDS_FREE_MODEL: False, "sonnet": False}))
+        assert s.resolved_gate_model == MINDS_FREE_MODEL
 
     @pytest.mark.parametrize("listed", [True, False])
     def test_org_needs_positive_evidence_for_a_non_free_default(
