@@ -206,8 +206,9 @@ def test_through_the_webhook_a_sender_not_on_the_list_gets_200_and_runs_nothing(
 
 async def test_a_long_conversation_id_still_fits_the_dedupe_column(bridge):
     keys = []
-    for chat in ("x", "y"):
-        conversation = {"id": "a:" + chat * 300, "conversationType": "personal", "tenantId": TENANT}
+    # The ids differ only past the 255th character.
+    for chat in ("1", "2"):
+        conversation = {"id": "a:" + "x" * 300 + chat, "conversationType": "personal", "tenantId": TENANT}
         [event] = await _questions(bridge, _activity(conversation=conversation))
         keys.append(bridge.dedupe_key(event))
     assert all(len(key) <= 255 for key in keys)
