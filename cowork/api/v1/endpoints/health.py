@@ -6,6 +6,7 @@ from importlib.metadata import version, PackageNotFoundError
 from fastapi import APIRouter, Depends, Request
 
 from cowork.api.v1.permissions import OpenByDesign, require
+from cowork.app_secret import get_app_secret
 from cowork.code_sandbox import live_apps_on
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import (
@@ -144,6 +145,9 @@ def health() -> dict:
     # Read once: `org_mode` and the `aid` gate are the same decision, and two
     # separate reads could in principle disagree within one response.
     _org_mode = get_app_settings().tenancy_mode == "org"
+    # Present only while this server holds the desktop app's secret: the app
+    # then sends it on the routes that need it and pushes MCP tokens to memory.
+    protocol = {"app_secret_protocol": 1} if get_app_secret() is not None else {}
     return {
         "status": "ok",
         # Runtime feature handshake for desktop clients. A healthy HTTP server
@@ -180,6 +184,7 @@ def health() -> dict:
         # scratchpad pod, so the machine that ran the turn is not this one.
         "aid": "" if _org_mode else _anton_install_id(),
         **settings.config_status,
+        **protocol,
     }
 
 

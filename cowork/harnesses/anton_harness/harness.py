@@ -1697,8 +1697,9 @@ class AntonHarness:
         data_vault = None
         turn_scratch_dir: Path | None = None
         if LocalDataVault is not None:
+            from cowork.services.connectors import app_held
             from cowork.services.connectors.layered_vault import FilteredDataVault
-            from cowork.services.connectors.persist import turn_vault_for_scope
+            from cowork.services.connectors.persist import own_vault_root, turn_vault_for_scope
 
             # The asker's own connections, with the operator's managed ones
             # over them and the ones others share with the asker after them,
@@ -1715,6 +1716,10 @@ class AntonHarness:
                 )
             else:
                 data_vault = source_vault
+            if app_held.active():
+                data_vault = app_held.AppHeldVault(
+                    source=data_vault, root=own_vault_root(current_settings_scope())
+                )
             # Registers this turn's DS_* names and values for scrubbing, and
             # touches no process state, so a concurrent turn's are left alone.
             from anton.utils.datasources import restore_namespaced_env
