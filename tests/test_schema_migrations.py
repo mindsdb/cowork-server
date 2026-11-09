@@ -47,6 +47,20 @@ def _alembic_version(path) -> str:
         return connection.execute("select version_num from alembic_version").fetchone()[0]
 
 
+def _alembic_versions(path) -> set[str]:
+    """Every revision stamped, one per branch applied: a downgrade to a
+    revision that is not an ancestor of every head leaves the other branch's
+    head stamped beside it."""
+    with sqlite3.connect(path) as connection:
+        return {row[0] for row in connection.execute("select version_num from alembic_version")}
+
+
+# main's twin of dce94d4bafc0 (the conversations owner index), on its own
+# branch off 2a366c1f4b9f until f93151b5bad1 merges it. A downgrade to a
+# staging revision after 2a366c1f4b9f leaves it stamped.
+MAINS_OWNER_INDEX = "599bf4bf0370"
+
+
 def _set_alembic_version(path, revision: str) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("update alembic_version set version_num = ?", (revision,))
@@ -273,6 +287,8 @@ def test_schema_migrations_upgrade_pre_alembic_database(tmp_path, monkeypatch):
         for index in (
             "ix_projects_org_id",
             "ix_conversations_org_id",
+            # Rides on conversations.created_by (dce94d4bafc0).
+            "ix_conversations_org_id_created_by",
             "ix_files_org_id",
             "ix_schedules_org_id",
             "ix_pins_user_id_org_id",
@@ -307,6 +323,28 @@ def test_schema_migrations_upgrade_pre_alembic_database(tmp_path, monkeypatch):
 
     assert "harness" in _message_columns(db_path)
     assert _alembic_version(db_path) == expected_head()
+
+
+def _conversation_indexes(*, path) -> set[str]:
+    with sqlite3.connect(path) as connection:
+        return {row[1] for row in connection.execute("pragma index_list(conversations)")}
+
+
+def test_the_conversations_owner_index_is_added_by_its_migration_and_dropped_on_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "owner-index.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert "ix_conversations_org_id_created_by" in _conversation_indexes(path=db_path)
+
+    _downgrade_to(engine, uri, "6f1b8d3a5c27")
+
+    assert "ix_conversations_org_id_created_by" not in _conversation_indexes(path=db_path)
+    assert "ix_conversations_org_id" in _conversation_indexes(path=db_path)
+    assert _alembic_versions(db_path) == {"6f1b8d3a5c27", MAINS_OWNER_INDEX}
 
 
 def test_task_objects_downgrade_drops_table(tmp_path, monkeypatch):
@@ -977,7 +1015,7 @@ def test_custom_connector_id_is_unique_per_scope(tmp_path, monkeypatch):
 
 
 #: The revision before org custom connectors became one per builder.
-PRIOR_TO_PER_BUILDER = "c69488788ac7"
+PRIOR_TO_PER_BUILDER = "f93151b5bad1"
 
 
 def test_custom_connector_id_is_unique_per_builder_in_an_org(tmp_path, monkeypatch):
@@ -1026,6 +1064,36 @@ def test_custom_connectors_per_builder_upgrade_and_downgrade(tmp_path, monkeypat
     with pytest.raises(IntegrityError):
         with engine.begin() as connection:
             _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-2")
+def _insert_queued_repair(connection, *, conversation_id: str, org_id=None):
+    connection.execute(
+        text(
+            "INSERT INTO queued_agent_repairs (id, org_id, conversation_id, slug) "
+            "VALUES (:id, :org_id, :conversation_id, 'fixme')"
+        ),
+        {"id": uuid.uuid4().hex, "org_id": org_id, "conversation_id": conversation_id},
+    )
+
+
+def test_queued_agent_repairs_hold_one_row_per_folder_in_each_org(tmp_path, monkeypatch):
+    """Two organizations' rows for one conversation and folder never collide,
+    and the rows with no org keep one per conversation and folder too."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    uri = _sqlite_uri(tmp_path / "queued_agent_repairs.db")
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    conversation_id = uuid.uuid4().hex
+
+    with engine.begin() as connection:
+        _insert_queued_repair(connection, conversation_id=conversation_id)
+        _insert_queued_repair(connection, conversation_id=conversation_id, org_id="org-a")
+        _insert_queued_repair(connection, conversation_id=conversation_id, org_id="org-b")
+
+    for org_id in (None, "org-a"):
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                _insert_queued_repair(connection, conversation_id=conversation_id, org_id=org_id)
 
 
 def test_published_page_ownership_upgrade_is_unique_and_survives_rollback(tmp_path):
@@ -1228,3 +1296,41 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
         assert connection.execute("SELECT * FROM live_app_launches").fetchall() == launch_before
         assert connection.execute("SELECT * FROM live_app_shares").fetchall() == shares_before
     engine.dispose()
+
+
+def test_artifact_locations_upgrade_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "artifact_locations.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    assert "conflicted" in _table_columns(db_path, "artifact_locations")
+    # Indexed for the conversations foreign key's ON DELETE CASCADE.
+    assert _has_index(db_path, "ix_artifact_locations_conversation_id")
+
+    _downgrade_to(engine, uri, "dce94d4bafc0")
+    assert not _has_table(db_path, "artifact_locations")
+
+    _upgrade_to(engine, uri, "head")
+    assert _has_index(db_path, "ix_artifact_locations_conversation_id")
+
+
+def test_artifact_locations_downgrade_guards_missing_table(tmp_path, monkeypatch):
+    # Mirrors the upgrade guard, as task_objects' downgrade does.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "artifact_locations_missing.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE artifact_locations"))
+
+    _downgrade_to(engine, uri, "dce94d4bafc0")  # must not raise
+
+    assert _alembic_versions(db_path) == {"dce94d4bafc0", MAINS_OWNER_INDEX}

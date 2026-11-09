@@ -41,8 +41,7 @@ MINDS_PROBE_MODEL = "mindshub_air"
 
 # Marks a request as our own background call on the user's key, not activity
 # they asked for, so the customer's Traces list hides it by default: the
-# connectivity/health-check pings below and the Jev shadow probe
-# (cowork/handlers/jev_shadow.py). Read by mindshub_inference; it is
+# connectivity/health-check pings below. Read by mindshub_inference; it is
 # our own header and means nothing to a non-Minds endpoint, so it is only ever
 # sent to a Minds host.
 MINDS_REQUEST_KIND_HEADER = "X-Minds-Request-Kind"
@@ -1244,6 +1243,8 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
         `max_tokens` is kept at a small-but-safe 20 rather than 1 — some
         models reject a 1-token budget (or can't emit even a stop token),
         which would fail the probe for a perfectly valid key."""
+        from cowork.db.units import run_on_unit_threads
+
         payload = {"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "ping"}]}
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(url, headers=headers, json=payload)
@@ -1261,7 +1262,8 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
         return ProviderPing(
             status="fail",
             detail=f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}",
-            denial=_probe_denial(response=r),
+            # Off the loop: the gateway check reads settings.
+            denial=await run_on_unit_threads(lambda: _probe_denial(response=r)),
         )
 
     try:
@@ -1552,6 +1554,14 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     it would fail every turn.
     """
     from anton.core.session import ChatSessionConfig
+
+    return WebToolKwargs(**supported_kwargs(ChatSessionConfig, **web_tool_switches(planning_provider)))
+
+
+def web_tool_switches(planning_provider: Provider) -> WebToolKwargs:
+    """The web tools this server turns off for a session on `planning_provider`,
+    before `web_tool_kwargs_for` drops the fields the installed anton lacks.
+    For callers that apply them themselves, such as the direct answer."""
     from cowork.common.settings.user_settings import Provider
 
     if (
@@ -1564,7 +1574,7 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     for field, env_name in _WEB_TOOL_ENV.items():
         if os.environ.get(env_name, "").strip().lower() in _OFF_VALUES:
             kwargs[field] = False
-    return WebToolKwargs(**supported_kwargs(ChatSessionConfig, **kwargs))
+    return kwargs
 
 
 def build_llm_client(

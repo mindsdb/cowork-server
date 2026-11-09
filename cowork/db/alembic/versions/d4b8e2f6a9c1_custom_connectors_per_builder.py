@@ -6,7 +6,7 @@ Rows with an org but no builder keep the one-per-org rule; local rows
 (org_id NULL) keep theirs.
 
 Revision ID: d4b8e2f6a9c1
-Revises: c69488788ac7
+Revises: f93151b5bad1
 Create Date: 2026-11-07 00:00:00.000000
 
 """
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "d4b8e2f6a9c1"
-down_revision: Union[str, Sequence[str], None] = "c69488788ac7"
+down_revision: Union[str, Sequence[str], None] = "f93151b5bad1"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -4,6 +4,7 @@ import pytest
 
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services import artifacts
+from _async_stub import awaitable
 
 
 @pytest.fixture
@@ -154,12 +155,12 @@ async def test_export_in_org_mode_checks_artifact_manage_before_resolving(
         raise AssertionError("an artifact was resolved before the role check")
 
     monkeypatch.setattr(product_permissions, "has_product_permission", denied)
-    monkeypatch.setattr(artifact_workspace, "_owner_workspace", resolved)
-    session = SimpleNamespace(scope=TenantScope(org_mode=True, org_id="org", user_id="user"))
+    monkeypatch.setattr(artifact_workspace, "_owner_workspace", awaitable(resolved))
+    scope = TenantScope(org_mode=True, org_id="org", user_id="user")
 
     with pytest.raises(HTTPException) as exc:
         await artifact_workspace.export_workspace_artifact(
-            "project", _EXPORT_ARTIFACT_ID, ExportRequest(format=fmt), session
+            "project", _EXPORT_ARTIFACT_ID, ExportRequest(format=fmt), scope
         )
     assert exc.value.status_code == 403
 
@@ -178,11 +179,11 @@ async def test_export_on_desktop_reaches_artifact_resolution(desktop, monkeypatc
     def missing(*_args):
         raise HTTPException(status_code=404, detail="Artifact not found")
 
-    monkeypatch.setattr(artifact_workspace, "review_artifact_for_request", missing)
+    monkeypatch.setattr(artifact_workspace, "review_artifact_for_request", awaitable(missing))
 
     with pytest.raises(HTTPException) as exc:
         await artifact_workspace.export_workspace_artifact(
-            "local", _EXPORT_ARTIFACT_ID, ExportRequest(format=fmt), SimpleNamespace(scope=LOCAL_SCOPE)
+            "local", _EXPORT_ARTIFACT_ID, ExportRequest(format=fmt), LOCAL_SCOPE
         )
     assert exc.value.status_code == 404
 

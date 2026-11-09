@@ -205,6 +205,26 @@ def _bare_origin(value: str) -> tuple[str, str] | None:
     return f"{match['scheme'].lower()}://{host}{match['port'] or ''}", host
 
 
+_ROUTER_URL = re.compile(
+    r"https://(?P<host>[a-z0-9][a-z0-9.-]*)(?P<port>:[0-9]{1,5})?"
+    r"(?P<path>(?:/[A-Za-z0-9._~-]+)*)/?",
+    re.IGNORECASE,
+)
+
+
+def _router_url(value: str) -> str | None:
+    """``value`` as a browser router base URL without its trailing slash, or
+    None when it isn't one: https to any host with an optional plain path, and
+    nothing else (no query, fragment or userinfo, which the pattern can't
+    match). Only https, because anton's browser tool takes no other router
+    address (anton.core.browser.config.BrowserConfig)."""
+    match = _ROUTER_URL.fullmatch(value.strip())
+    if match is None:
+        return None
+    host = match["host"].lower().rstrip(".")
+    return f"https://{host}{match['port'] or ''}{match['path']}"
+
+
 def _env_slug() -> str:
     """Return the env slug for URL construction, or '' for prod.
 
@@ -314,7 +334,17 @@ def _env_file_chain() -> list[str]:
 
     COWORK_HOME is read at import; the desktop app sets it before the server
     process starts, so an isolated build reads its own .env.
+
+    Org tenancy reads no ``<COWORK_HOME>/.env``. There COWORK_HOME is the
+    shared file store, an NFS mount, the pod's environment carries the whole
+    configuration, and the file does not exist. pydantic-settings stats each
+    file in the chain on every construction, before any source hook runs, so
+    each ``Settings()`` and ``UserSettings(**data)`` would otherwise ask the
+    file server about a missing file, and a slow file server would slow every
+    one of them.
     """
+    if os.environ.get("COWORK_TENANCY_MODE") == "org":
+        return [".env"]
     files = [str(cowork_home() / ".env"), ".env"]
     if not os.environ.get("COWORK_HOME"):
         # Prod (default home) still consults the legacy file, ordered BEFORE
@@ -402,6 +432,17 @@ class DatabaseSettings(Settings):
             "with 503. Short, so a full pool answers within seconds."
         ),
     )  # POOL_TIMEOUT
+    efs_unit_slots: int = Field(
+        default=16,
+        ge=1,
+        description=(
+            "Database unit slots the units that also work on the shared file store "
+            "(cowork.db.units.run_efs_unit) may hold at once, of the POOL_SIZE plus "
+            "MAX_OVERFLOW every unit shares, so units stuck on the file store leave "
+            "the rest to database units. SQLite gives file units no unit slot, so "
+            "it ignores this."
+        ),
+    )  # EFS_UNIT_SLOTS
     # PostgreSQL session settings for the app's own connections, set when each
     # connection opens. Migrations run with both off: the db-migrate init
     # container opens its own engine, and the server's startup migration turns
@@ -496,6 +537,28 @@ class StorageSettings(Settings):
             "(cowork.shared_skills)."
         ),
     )
+    # Threads for work on the shared file store (cowork.db.units.run_efs),
+    # per event loop. These read their bare names, as the database pool
+    # settings do, and POOL_TIMEOUT bounds the wait for one of them too.
+    efs_slots: int = Field(
+        default=100,
+        ge=1,
+        description=(
+            "Threads file store work may hold at once. A call stuck on the hard "
+            "mount keeps its thread until the file server answers, so this is also "
+            "the most threads a stalled mount can take."
+        ),
+    )  # EFS_SLOTS
+    # Per person, or per organization for its work with no person. Nothing
+    # caps an organization: ten busy people fill the default EFS_SLOTS.
+    efs_share: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "File store threads one person may hold at once, so one heavy client "
+            "is refused before anyone else waits."
+        ),
+    )  # EFS_SHARE
 
 
 class SkillSettings(Settings):
@@ -694,29 +757,29 @@ class TurnQueueSettings(Settings):
             "per-PR / non-standard envs whose host the slug logic cannot derive. Empty = derive."
         ),
     )  # COWORK_TURN_MINDS_BASE_URL
-    jev_shadow_enabled: bool = Field(
-        default=False,
-        description=(
-            "Fire a Jev '/v1/decisions' call alongside the LLM gate on every remote turn, "
-            "purely for latency/agreement comparison. Never used to route; logged only. "
-            "Requires a minted minds-cloud credential, so it's a no-op unless backend is "
-            "'remote'. Off by default: the call runs on the turn's own minted key and "
-            "sends the turn's text history as state. Jev is zero-priced, so it charges no "
-            "wallet, but on an unfunded org every turn draws that org's free Jev allowance "
-            "in the background, and a refused call shows up only as the "
-            "'jev_error=http_<status>' field of the '[jev-shadow]' warning that "
-            "responses._spawn_jev_shadow_probe logs."
-        ),
-    )  # COWORK_TURN_JEV_SHADOW_ENABLED
-    jev_shadow_model: str = Field(
+    jev_route_model: str = Field(
         default="jev",
-        description="MindsHub catalog alias passed to the shadow '/v1/decisions' call.",
-    )  # COWORK_TURN_JEV_SHADOW_MODEL
-    jev_shadow_timeout_seconds: float = Field(
+        description="MindsHub catalog alias of the Jev model the route gate asks ('/v1/decisions').",
+    )  # COWORK_TURN_JEV_ROUTE_MODEL
+    jev_route_timeout_seconds: float = Field(
         default=3.0,
         gt=0,
-        description="Hard wall-clock timeout for the shadow Jev call (enforced via asyncio.timeout, not just httpx's own per-phase timeout). Independent of the gate's own budget, since a slow or hung probe must never hold up the turn it's shadowing.",
-    )  # COWORK_TURN_JEV_SHADOW_TIMEOUT_SECONDS
+        description=(
+            "Hard wall-clock timeout for the route gate's Jev call (enforced via asyncio.timeout, "
+            "not just httpx's own per-phase timeout). Past it the turn delegates. The call sits "
+            "ahead of every MindsHub turn: the eval measured p95 about 1.4s, and single live "
+            "calls reached 2.0s, so a 2s budget would quietly send direct turns to the agent."
+        ),
+    )  # COWORK_TURN_JEV_ROUTE_TIMEOUT_SECONDS
+    jev_route_min_p_direct: float = Field(
+        default=0.5,
+        ge=0,
+        le=1,
+        description=(
+            "Jev's probability of a direct answer needed to answer directly. Low on purpose: the "
+            "direct model can still delegate. See scripts/eval_jev_route before raising it."
+        ),
+    )  # COWORK_TURN_JEV_ROUTE_MIN_P_DIRECT
     minds_coding_model: str = Field(
         default="",
         description=(
@@ -1110,6 +1173,50 @@ class AppSettings(Settings):
         ),
     )
 
+    browser_router_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_ROUTER_URL"),
+        description=(
+            "The browser router, for example https://cowork.mindshub.ai/browser. "
+            "MindsHub mode only (COWORK_TENANCY_MODE=org): served on the cowork "
+            "host under /browser, it starts one browser per person and routes "
+            "each caller to their own by the credential they present. Status, "
+            "warm-up, viewer links and each web turn's browser go through it "
+            "(cowork.services.browser). https with an optional path; the "
+            "trailing slash is dropped. Blank (default): the web app has no "
+            "browser. Ignored outside MindsHub mode, where the desktop app "
+            "runs its own browser."
+        ),
+    )
+
+    @field_validator("browser_router_url", mode="before")
+    @classmethod
+    def _check_browser_router_url(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            return "" if value is None else value
+        normalized = _router_url(value)
+        if normalized is None:
+            raise ValueError(
+                "COWORK_BROWSER_ROUTER_URL must be an https URL with an optional "
+                "path (no query, fragment or credentials)"
+            )
+        return normalized
+
+    browser_scope_key_file: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_SCOPE_KEY_FILE"),
+        description=(
+            "A file holding the browser router's scope key, sent beside each web "
+            "turn's key on the router's _scope, so only this server can scope a "
+            "turn key (cowork.services.browser.scope_turn). MindsHub mode only. "
+            "The chart mounts the router's own Secret, browser-proxy, key "
+            "scope_key, here, so the two never differ. Read on every scope, so a "
+            "Secret that appears or rotates after start is picked up without a "
+            "restart. Blank, missing or empty: the router refuses every scope and "
+            "web turns run without a browser."
+        ),
+    )
+
     organization_switch_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("COWORK_ORGANIZATION_SWITCH_ENABLED"),
@@ -1240,6 +1347,17 @@ class AppSettings(Settings):
         ),
     )  # COWORK_SERVER_OWNER
 
+    health_proof_key: SecretStr = Field(
+        default=SecretStr(os.environ.get("COWORK_SERVER_HEALTH_PROOF_KEY", "")),
+        description=(
+            "Per-install secret the desktop app passes at spawn and keeps in a file only its OS "
+            "user can read. /health answers an HMAC of the app's nonce and the port it answered "
+            "on, keyed by this, so the app can tell its own server from a listener another OS "
+            "user put on its port, which can replay the owner token /health echoes but can't "
+            "compute this. Empty means /health proves nothing."
+        ),
+    )  # COWORK_SERVER_HEALTH_PROOF_KEY
+
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
     # The same switch that turns on anton's per-call usage log. Set by evals only.
     usage_log: bool = Field(
@@ -1332,27 +1450,28 @@ class AppSettings(Settings):
     # NOTE: get_app_settings() is @lru_cache'd, so changing the COWORK_DEFAULT_*
     # env requires a process restart — "I changed the env and nothing happened"
     # means the old value is cached for the life of the process.
+    #
+    # The defaults are safety limits for a turn that never finishes, the values
+    # anton's own defaults move to: 30 days of production had no runaway turn,
+    # and the largest legitimate one used 34.4M tokens, 171 tool rounds and 6
+    # continuations.
+    # Users who want a tighter limit set their own.
     default_max_tool_rounds: int = Field(
-        default=50,
+        default=250,
         ge=5,
         le=500,
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TOOL_ROUNDS"),
         description="Default for the per-user 'Max Steps per Task' agent budget.",
     )  # COWORK_DEFAULT_MAX_TOOL_ROUNDS
     default_max_continuations: int = Field(
-        default=5,
+        default=10,
         ge=0,
         le=25,
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_CONTINUATIONS"),
         description="Default for the per-user 'Max Auto-Continues' agent budget.",
     )  # COWORK_DEFAULT_MAX_CONTINUATIONS
-    # Unlike the two above, this one does NOT deliberately run looser than
-    # anton's own default — it matches it (ENG-1286's 1,250,000). The measured
-    # per-turn distribution that set that number came from Cowork traffic, so
-    # it already reflects these looser round budgets; raising it here would
-    # loosen a ceiling against the very population it was sized on.
     default_max_turn_tokens: int = Field(
-        default=1_250_000,
+        default=25_000_000,
         # Deployment-level default. Kept at ge=750_000 rather than mirroring
         # UserSettings' "0 = unlimited": an operator turning the guard off for a
         # whole org silently is exactly the outcome the per-user sentinel exists
@@ -1363,6 +1482,39 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TURN_TOKENS"),
         description="Default for the per-user 'Max Tokens per Task' agent budget.",
     )  # COWORK_DEFAULT_MAX_TURN_TOKENS
+    # Wall-clock cap on one scheduled run, past which the scheduler stops its
+    # turn. The step and token budgets above bound how much work a run does;
+    # this only catches a run that keeps going without ever finishing, so it
+    # sits well above how long real runs take.
+    scheduled_run_max_seconds: int = Field(
+        default=1800,
+        ge=300,
+        le=86_400,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUN_MAX_SECONDS"),
+        description="Longest a scheduled run may take before it is stopped.",
+    )  # COWORK_SCHEDULED_RUN_MAX_SECONDS
+    # Scheduled runs one server process drives at once, across every
+    # organization. Unset, it follows where turns run: 3 on the desktop, where
+    # each run is an agent on the user's own machine, and 16 when turns run in
+    # sandbox pods, where the process only streams them (scheduler).
+    scheduled_runs_per_process: int | None = Field(
+        default=None,
+        ge=1,
+        le=64,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUNS_PER_PROCESS"),
+        description="Scheduled runs one server process drives at once; unset follows the backend.",
+    )  # COWORK_SCHEDULED_RUNS_PER_PROCESS
+    # Scheduled runs one organization may have going at once, counted across
+    # every replica, only when explicitly configured. Hosted policy will come
+    # from auth; no deployment-wide default is imposed. A
+    # desktop schedule has no organization, so this doesn't apply there.
+    scheduled_runs_per_org: int | None = Field(
+        default=None,
+        ge=1,
+        le=256,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUNS_PER_ORG"),
+        description="Scheduled runs one organization may have going at once, across all replicas.",
+    )  # COWORK_SCHEDULED_RUNS_PER_ORG
 
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_URI; the other fields read their bare names
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*

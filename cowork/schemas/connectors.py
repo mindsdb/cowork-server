@@ -129,9 +129,9 @@ class CloudMethod(BaseModel):
     # driver/server/method row it depends on.
     available: bool = False
     # Cloud copy, never inherited from the desktop method. The desktop text
-    # documents an SSL on/off toggle and a CA field the cloud form does not
-    # offer, and a localhost server the hosted path refuses, so rendering it
-    # to a cloud user would describe a form that cannot be submitted.
+    # documents an SSL on/off toggle and CA fields the cloud form does not
+    # offer in that shape, and a localhost server the hosted path refuses, so
+    # rendering it to a cloud user would describe a form that cannot be submitted.
     description: str | None = None
     how_to: str | None = None
     # The COMPLETE cloud field list, not a delta on the desktop `fields`.
@@ -443,7 +443,7 @@ class DatasourceTls(BaseModel):
     answered, `disabled` does neither, and `prefer` takes encryption where the
     server offers it. The default is `prefer`, because a self-hosted server
     usually has the certificate its installer generated for it, or none, and
-    the form no longer asks.
+    a form left at its default asks for nothing more.
     """
 
     model_config = ConfigDict(extra="forbid")

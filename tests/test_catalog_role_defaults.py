@@ -321,7 +321,7 @@ class _Endpoint:
     def call(self):
         from cowork.api.v1.endpoints.settings import recommended_models
 
-        return asyncio.run(recommended_models(FakeRequest(), self.session, LOCAL_SCOPE))
+        return asyncio.run(recommended_models(FakeRequest(), LOCAL_SCOPE))
 
     def stored(self, key):
         from cowork.services.settings import SettingService
@@ -685,6 +685,24 @@ def test_the_row_is_told_which_model_gates(monkeypatch):
     assert payload["gate"] == {"provider": "minds-cloud", "model": "kimi", "followsRouterPick": False}
     # The same answer the pair gives for the role, and the one a turn resolves to.
     assert payload["gate"]["model"] == payload["recommendedPair"]["minds-cloud"][2]
+
+
+def test_settings_are_told_which_gate_decides_turns(monkeypatch):
+    """`routing` states the gate turns use (jev_route.gate_mode), so the
+    decision-model section shows what actually happens."""
+    _stub_listing(
+        monkeypatch,
+        ids=["mindshub_air", "sonnet", "haiku", "kimi"],
+        enabled={"mindshub_air": True, "sonnet": True, "haiku": True, "kimi": True},
+        role_defaults={"planning": "sonnet", "coding": "haiku", "router": "kimi"},
+    )
+
+    with _Endpoint() as endpoint:
+        payload = endpoint.call()
+
+    assert payload["routing"] == {"mode": "jev", "routerProvider": "minds-cloud"}
+    # Kept for UIs that predate `routing`.
+    assert "gate" in payload
 
 
 def test_the_gate_model_is_availability_adjusted_like_resolution_is(monkeypatch):

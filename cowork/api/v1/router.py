@@ -10,9 +10,11 @@ from fastapi import APIRouter
 from cowork.api.v1.endpoints import (
     artifacts,
     artifact_workspace,
+    browse,
     capabilities,
     channels,
     comments,
+    comparisons,
     coding,
     coding_personal_skills,
     coding_runtime,
@@ -52,7 +54,6 @@ from cowork.api.v1.endpoints.connectors import (
 # "Compat routes" section below when the client is updated.
 from cowork.api.v1.endpoints.compat.stubs import (
     attachments_router,
-    browse_router,
     integrations_router,
     scratchpad_router,
 )
@@ -62,6 +63,7 @@ api_router = APIRouter(prefix="/api/v1")
 
 # ── Canonical routes ─────────────────────────────────────────────────
 api_router.include_router(health.router, prefix="/health", tags=["health"])
+api_router.include_router(browse.router, prefix="/browse", tags=["browser"])
 api_router.include_router(
     capabilities.router, prefix="/capabilities", tags=["capabilities"]
 )
@@ -88,6 +90,7 @@ api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
 # The sharing routes first: GET /skills/sharing-capabilities must match before
 # the skills router's GET /skills/{skill_id} reads it as a skill's id.
 api_router.include_router(skill_sharing.router, prefix="/skills", tags=["skills"])
+api_router.include_router(comparisons.router, prefix="/comparisons", tags=["comparisons"])
 api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])
@@ -114,4 +117,3 @@ api_router.include_router(mindshub_people.router, prefix="/hub/people", tags=["m
 api_router.include_router(integrations_router, prefix="/integrations", tags=["compat"])
 api_router.include_router(attachments_router, prefix="/attachments", tags=["compat"])
 api_router.include_router(scratchpad_router, prefix="/scratchpad", tags=["compat"])
-api_router.include_router(browse_router, prefix="/browse", tags=["compat"])

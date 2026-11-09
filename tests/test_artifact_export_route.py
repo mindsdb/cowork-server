@@ -46,6 +46,7 @@ from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.markdown_render import MAX_FENCE_LENGTH
 from cowork.services.render_pdf_client import RenderServicePdf
 from test_artifact_ownership import legacy_root, make_conversation, make_project, project_root
+from _async_stub import awaitable
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
 ROUTE_CASES = yaml.safe_load((FIXTURES / "route_cases.yaml").read_text(encoding="utf-8"))["cases"]
@@ -120,7 +121,7 @@ def local_artifact(tmp_path, monkeypatch):
         monkeypatch.setattr(
             workspace_ep,
             "review_artifact_for_request",
-            lambda *_args: (source, folder, _metadata(folder), True),
+            awaitable(lambda *_args: (source, folder, _metadata(folder), True)),
         )
         return folder
 
@@ -764,7 +765,7 @@ def test_a_unc_primary_is_passed_over_before_any_file_call(client, local_artifac
 
 
 def test_permission_is_checked_before_any_file_is_resolved(monkeypatch):
-    from cowork.db.scoped import get_scoped_session
+    from cowork.db.scoped import get_tenant_scope
     from cowork.services import product_permissions
 
     async def denied(_scope, _permission):
@@ -772,11 +773,11 @@ def test_permission_is_checked_before_any_file_is_resolved(monkeypatch):
 
     monkeypatch.setattr(product_permissions, "has_product_permission", denied)
     resolve = Mock(side_effect=AssertionError("resolved an artifact"))
-    monkeypatch.setattr(workspace_ep, "_owner_workspace", resolve)
+    monkeypatch.setattr(workspace_ep, "_owner_workspace", awaitable(resolve))
     app = FastAPI()
     app.include_router(workspace_ep.router)
     org = TenantScope(org_mode=True, org_id="org", user_id="user")
-    app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=org)
+    app.dependency_overrides[get_tenant_scope] = lambda: org
 
     with TestClient(app) as test_client:
         response = test_client.post(
@@ -923,7 +924,7 @@ async def _export(world, user_id: str, slug: str, export_format: str = "docx", *
             str(world.project.id),
             world.artifacts[slug].id,
             ExportRequest(format=export_format),
-            session,
+            session.scope,
         )
 
 

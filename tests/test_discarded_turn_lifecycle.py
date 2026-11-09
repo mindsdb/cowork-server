@@ -14,16 +14,25 @@ stream buffer for) history that was just truncated.
 from __future__ import annotations
 
 import asyncio
+import importlib
 from types import SimpleNamespace
 from uuid import uuid4
 
+import fakeredis
+import fakeredis.aioredis
 import pytest
 
 from anton.core.interaction.elicit import AskOption, AskRequest
 import cowork.handlers.responses as responses_mod
 from cowork.handlers.responses import ResponsesHandler
+from cowork.streaming import backend as backend_mod
+from cowork.streaming import buffer as buffer_mod
+from cowork.streaming import cancellation, turn_claim, turn_index
 from cowork.streaming.answers import SubmitResult, broker
-from cowork.streaming.registry import RunHandle, TurnLifecycle, discard_conversation, registry
+from cowork.streaming.buffer import stream_key
+from cowork.streaming.registry import RunHandle, RunRegistry, TurnLifecycle, discard_conversation, registry
+from cowork.streaming.turn_claim import CLAIMS_KEY, claim_key
+from cowork.turnqueue.redis_client import cancel_cause_key
 
 from _fakes import inline_run_db, opens
 
@@ -246,3 +255,89 @@ async def test_discard_of_an_unknown_or_finished_conversation_is_a_no_op():
     # Flagged (the handle is gone either way) but nothing to cancel.
     assert lifecycle.discarded is True
     assert registry.get(CID) is None
+
+
+class _HeldCancelWatch:
+    """The cancel watch's Redis client, holding each of its flag reads until
+    ``allowed`` is set: the turn hears of a cancel only when the test says."""
+
+    def __init__(self, client) -> None:
+        self._client = client
+        self.allowed = asyncio.Event()
+
+    async def exists(self, *keys):
+        await self.allowed.wait()
+        return await self._client.exists(*keys)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
+@pytest.fixture
+def two_replicas(monkeypatch):
+    """One Redis, on the Redis backend, for two RunRegistry objects."""
+    server = fakeredis.FakeServer()
+    client = fakeredis.aioredis.FakeRedis(server=server, decode_responses=True)
+    sync_client = fakeredis.FakeRedis(server=server, decode_responses=True)
+    watch = _HeldCancelWatch(client)
+    for module in (turn_claim, turn_index, buffer_mod):
+        monkeypatch.setattr(module, "get_redis", lambda: client)
+    monkeypatch.setattr(cancellation, "get_redis", lambda: watch)
+    for module in (turn_claim, turn_index, backend_mod, cancellation):
+        monkeypatch.setattr(module, "get_sync_redis", lambda: sync_client)
+    monkeypatch.setattr(cancellation, "CANCEL_POLL_SECONDS", 0.01)
+    monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
+    return SimpleNamespace(redis=client, watch=watch)
+
+
+async def _answered(buffer):
+    await buffer.append("sse", {"sse": "event: response.completed\ndata: {}\n\n"})
+    await buffer.close("completed")
+
+
+async def test_a_delete_another_replica_serves_stops_the_turn_without_saving_and_admits_the_resend(
+    monkeypatch, two_replicas,
+):
+    """Replica A runs a turn blocked on a question, and the delete lands on
+    replica B, which holds no handle for it. B used to forget the index entry
+    and remove the stream and leave A's turn running: A's keeper went on
+    renewing the claim, so every replica refused the resend with 409 until
+    the question timed out. B now writes the turn's cancel flag with the
+    ``discarded`` cause, so A stops as a local delete stops it: nothing saved
+    into the deleted history, no terminal record, and no stream left behind,
+    not even the records A wrote before it heard of the delete."""
+    registry_mod = importlib.import_module("cowork.streaming.registry")
+    replica_a, replica_b = RunRegistry(), RunRegistry()
+    saved: dict = {}
+    asked = asyncio.Event()
+    handler = _blocked_handler(monkeypatch, saved, asked)
+    lifecycle = TurnLifecycle()
+    handle = await replica_a.start(
+        conversation_id=CID, turn_id=0, open_buffer=lambda: backend_mod.new_buffer(CID, 0),
+        produce=lambda buffer: handler._run_turn(
+            conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
+            disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
+            lifecycle=lifecycle,
+        ),
+        lifecycle=lifecycle,
+    )
+    await asyncio.wait_for(asked.wait(), timeout=5)
+    monkeypatch.setattr(registry_mod, "registry", replica_b)
+
+    await asyncio.to_thread(discard_conversation, CID)
+    assert await two_replicas.redis.get(cancel_cause_key(lifecycle.identity.correlation_id)) == "discarded"
+    # A frame the turn writes before it hears of the delete recreates its stream.
+    await handle.buffer.append("sse", {"sse": "event: response.output_text.delta\ndata: {}\n\n"})
+    two_replicas.watch.allowed.set()
+    await asyncio.wait_for(asyncio.gather(handle.task, return_exceptions=True), timeout=5)
+
+    assert lifecycle.discarded is True
+    assert "assistant" not in saved and "events" not in saved and "finalized" not in saved
+    assert await two_replicas.redis.exists(stream_key(CID, 0), claim_key(CID), CLAIMS_KEY) == 0
+    for runs in (replica_a, replica_b):
+        admitted = await runs.start(
+            conversation_id=CID, turn_id=0, open_buffer=lambda: backend_mod.new_buffer(CID, 0), produce=_answered,
+        )
+        await asyncio.wait_for(admitted.task, timeout=2)
+        records = await two_replicas.redis.xrange(stream_key(CID, 0))
+        assert [fields["seq"] for _id, fields in records] == ["0", "1"]

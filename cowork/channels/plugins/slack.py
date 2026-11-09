@@ -7,7 +7,6 @@ import logging
 import time
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -92,6 +91,10 @@ def _slack_shared(event: dict, channel: str) -> bool | None:
 
 
 class SlackBridge:
+    # The largest file send_attachment takes. A channel turn skips a larger
+    # artifact before it reads the file (AntonChannelRuntime.send_turn_artifacts).
+    max_attachment_bytes = SLACK_MAX_UPLOAD_BYTES
+
     def __init__(self, credentials: Mapping[str, str]) -> None:
         self._secrets = dict(credentials)
         self._setup: ChannelSetup | None = None
@@ -257,17 +260,16 @@ class SlackBridge:
         )
         return mark_shared(event_out, _slack_shared(event, channel))
 
-    async def send_attachment(self, *, address: PlatformAddress, path: str, filename: str | None = None) -> str:
-        """Upload via the external-upload flow (files.upload is deprecated):
-        getUploadURLExternal → POST bytes → completeUploadExternal."""
+    async def send_attachment(self, *, address: PlatformAddress, data: bytes, filename: str) -> str:
+        """Upload ``data`` named ``filename`` via the external-upload flow
+        (files.upload is deprecated): getUploadURLExternal → POST bytes →
+        completeUploadExternal."""
         bot_token = (self._secrets.get("bot_token") or "").strip()
         if not bot_token:
             raise RuntimeError("slack bot_token not configured")
-        source = Path(path)
-        if source.stat().st_size > SLACK_MAX_UPLOAD_BYTES:
+        if len(data) > SLACK_MAX_UPLOAD_BYTES:
             raise RuntimeError("slack attachment exceeds the upload size cap")
-        name = (filename or source.name).strip() or "file"
-        data = source.read_bytes()
+        name = filename.strip() or "file"
 
         issued = await self.web_api(bot_token, "files.getUploadURLExternal",
                                     data={"filename": name, "length": len(data)})

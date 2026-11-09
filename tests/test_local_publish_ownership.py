@@ -97,10 +97,10 @@ def _source(root: Path) -> ProjectArtifacts:
 def _delete(publisher, page, scope, route):
     """Delete the page's whole artifact folder through one of the two delete routes."""
     if route == "slug":
-        artifacts.delete_artifact_from_source(
-            _source(publisher.root), page.parent.name, expected_artifact_id=None,
+        asyncio.run(artifacts.delete_artifact_from_source(
+            source=_source(publisher.root), folder_name=page.parent.name, expected_artifact_id=None,
             api_key="test-key", publish_url=publisher.endpoint, scope=scope,
-        )
+        ))
     else:
         artifacts.delete_artifact(
             page.parent, artifacts_base=publisher.root, api_key="test-key",
@@ -475,8 +475,6 @@ def test_the_path_delete_route_answers_the_owner_refusal(publisher, monkeypatch)
 
 @pytest.mark.parametrize("path", ["agent", "update", "editor"])
 def test_every_publish_path_refuses_another_testers_page(publisher, monkeypatch, path):
-    from types import SimpleNamespace
-
     from cowork.api.v1.endpoints.artifact_workspace import _sync_live_artifact
     from cowork.common.settings.user_settings import use_settings_scope
     from cowork.harnesses.anton_harness import tools
@@ -495,7 +493,7 @@ def test_every_publish_path_refuses_another_testers_page(publisher, monkeypatch,
         with pytest.raises(publish.PublishOwnedByOtherUser):
             publish.update_artifact(str(page), scope=BOB)
     else:
-        assert asyncio.run(_sync_live_artifact(SimpleNamespace(scope=BOB), page.parent)) is False
+        assert asyncio.run(_sync_live_artifact(BOB, page.parent)) is False
     assert publisher.pages == before
     assert len(publisher.uploads) == before_uploads
 
@@ -599,13 +597,13 @@ def test_the_slug_delete_route_checks_the_requesting_tester(publisher, monkeypat
     before = copy.deepcopy(publisher.pages)
 
     with Session(engine) as raw, pytest.raises(HTTPException) as caught:
-        asyncio.run(delete_artifact_for_request(ScopedSession(raw, BOB), artifact_id, project_id=project_id))
+        asyncio.run(delete_artifact_for_request(BOB, artifact_id, project_id=project_id))
     assert caught.value.status_code == 409
     assert caught.value.detail["code"] == publish.OWNED_BY_OTHER_USER_CODE
     assert folder.is_dir() and publisher.pages == before and publisher.deletes == []
 
     with Session(engine) as raw:
-        asyncio.run(delete_artifact_for_request(ScopedSession(raw, ALICE), artifact_id, project_id=project_id))
+        asyncio.run(delete_artifact_for_request(ALICE, artifact_id, project_id=project_id))
     assert publisher.deletes == [published["result"]["report_id"]]
     assert not folder.exists()
 

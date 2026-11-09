@@ -14,3 +14,17 @@
     Premise check. When the model ends the turn before it can be seen running,
     there is nothing to cancel, so the run proves nothing for this test. That
     is a fact about the deployment's speed, not a defect.
+
+- test: tests/integration/test_post_deploy.py::test_reconnect_replays_a_turn_in_progress
+  reason: >-
+    Premise check. When the model ends the turn before the first answer delta
+    lets the client drop mid-answer, the replay and saved answer are still
+    checked, but no mid-turn reconnect happened. That is a fact about the
+    deployment's speed, not a defect.
+
+- test: tests/integration/test_post_deploy.py::test_reconnect_works_on_the_other_replica
+  reason: >-
+    Premise check. When the model ends the turn before the first answer delta
+    lets the client drop mid-answer on replica A, replica B's replay and saved
+    answer are still checked, but no mid-turn reconnect happened. That is a
+    fact about the deployment's speed, not a defect.

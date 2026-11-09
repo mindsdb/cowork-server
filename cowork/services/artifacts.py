@@ -24,7 +24,8 @@ import sys
 import time
 import uuid
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -1110,24 +1111,20 @@ def _unpublish_identifier(
         raise RuntimeError(f"Unpublishing failed: {message}") from exc
 
 
-def _unpublish_pinned_folder(
-    folder: PinnedDir, *, api_key: str, publish_url: str,
-    scope: TenantScope | None = None,
-) -> None:
-    """Unpublish records read and updated through one pinned artifact folder.
+class _PageToTakeDown(NamedTuple):
+    """A live page of an artifact's publish record that its delete takes down."""
 
-    On a protected publisher each page id goes through the same owner check
-    as `unpublish_artifact`: another tester's page refuses the delete, and an
-    id this artifact has no record for is dropped locally without a request.
-    """
-    from cowork.services.published_page_ownership import (
-        protects_publisher,
-        publication_owner,
-    )
+    name: str
+    identifier: str
+    entry: dict
 
-    protected = protects_publisher(publish_url)
-    published_map = _load_published_map_pinned(folder)
-    for name, entry in list(published_map.items()):
+
+def _pages_to_take_down(*, folder: PinnedDir, published_map: dict) -> list[_PageToTakeDown]:
+    """The pages ``published_map`` records as live whose primary is still a
+    regular file in ``folder``. A page whose primary name is invalid or whose
+    primary is gone is logged as an orphaned publish and left up."""
+    pages: list[_PageToTakeDown] = []
+    for name, entry in published_map.items():
         if not isinstance(entry, dict) or entry.get("published") is False:
             continue
         identifier = entry.get("report_id") or entry.get("last_md5")
@@ -1151,30 +1148,58 @@ def _unpublish_pinned_folder(
                 entry.get("url", ""),
             )
             continue
+        pages.append(_PageToTakeDown(name, str(identifier), entry))
+    return pages
 
-        if protected:
-            with publication_owner(
-                folder.path / name, published_dir=folder.path,
-                publish_url=publish_url, scope=scope,
-            ) as ownership:
-                identifier = ownership.checked_report_id(
-                    entry.get("report_id"), url=entry.get("url", ""),
-                )
-                if identifier is None:
-                    published_map.pop(name, None)
-                    _write_published_map_pinned(folder, published_map)
-                    continue
-                _unpublish_identifier(
-                    identifier, entry, api_key=api_key, publish_url=publish_url
-                )
-        else:
-            _unpublish_identifier(
-                str(identifier), entry, api_key=api_key, publish_url=publish_url
+
+def _unpublish_protected_pages(
+    *, folder: PinnedDir, api_key: str, publish_url: str, scope: TenantScope | None,
+) -> None:
+    """Take down a pinned folder's pages on a protected publisher
+    (``protects_publisher``), updating its publish record as each comes down.
+
+    Each page goes through the same owner check as `unpublish_artifact`, which
+    holds the publish record's lock across the take-down: another tester's
+    page refuses the delete, and an id this artifact has no record for is
+    dropped locally without a request.
+    """
+    from cowork.services.published_page_ownership import publication_owner
+
+    published_map = _load_published_map_pinned(folder)
+    for page in _pages_to_take_down(folder=folder, published_map=published_map):
+        with publication_owner(
+            folder.path / page.name, published_dir=folder.path,
+            publish_url=publish_url, scope=scope,
+        ) as ownership:
+            identifier = ownership.checked_report_id(
+                page.entry.get("report_id"), url=page.entry.get("url", ""),
             )
-        entry["published"] = False
-        published_map[name] = entry
+            if identifier is None:
+                published_map.pop(page.name, None)
+                _write_published_map_pinned(folder, published_map)
+                continue
+            _unpublish_identifier(
+                identifier, page.entry, api_key=api_key, publish_url=publish_url
+            )
+        page.entry["published"] = False
+        published_map[page.name] = page.entry
         # Match the historical partial-progress behavior: if a later remote
         # revoke fails, earlier successful records remain marked unpublished.
+        _write_published_map_pinned(folder, published_map)
+
+
+def _record_taken_down(*, folder: PinnedDir, names: list[str]) -> None:
+    """Mark each of ``names`` unpublished in a pinned folder's publish record.
+    The record is read again here: a publish may have written it while the
+    pages came down."""
+    published_map = _load_published_map_pinned(folder)
+    marked = False
+    for name in names:
+        entry = published_map.get(name)
+        if isinstance(entry, dict):
+            entry["published"] = False
+            marked = True
+    if marked:
         _write_published_map_pinned(folder, published_map)
 
 
@@ -1227,14 +1252,142 @@ def artifact_id_for_folder(source: ProjectArtifacts, folder_name: str) -> str:
         return artifact_id
 
 
-def delete_artifact_from_source(
+@dataclass
+class _PinnedDelete:
+    """An artifact folder a delete has pinned and checked, and the pages it
+    takes down before it removes the folder.
+
+    ``descriptors`` keeps the root's and the folder's descriptors open from
+    the check to the removal, so the folder's inode can't be reused, and a
+    folder replaced by another one or a link in between is refused rather
+    than removed. ``folder_descriptor`` closes the folder's alone, before the
+    removal. ``taken_down`` names each page the delete has taken down.
+    """
+
+    root: PinnedDir
+    folder: PinnedDir
+    folder_name: str
+    pages: list[_PageToTakeDown]
+    descriptors: ExitStack
+    folder_descriptor: ExitStack
+    taken_down: list[str] = field(default_factory=list)
+
+
+def _pin_for_delete(
+    *,
     source: ProjectArtifacts,
     folder_name: str,
-    *,
     expected_artifact_id: str | None,
     api_key: str,
     publish_url: str,
-    scope: TenantScope | None = None,
+    scope: TenantScope | None,
+) -> _PinnedDelete:
+    """The delete's first file store step: pin the root and the folder, check
+    the folder is the artifact asked for, and list the pages to take down.
+
+    A protected publisher's pages come down here, in this step, since each
+    one's owner check holds the publish record's lock across its take-down
+    (`_unpublish_protected_pages`); the delete then lists none.
+    """
+    from cowork.services.artifact_identity import (
+        _opened_child_directory,
+        canonical_artifact_id,
+        ensure_full_id,
+        opened_artifact_root,
+    )
+    from cowork.services.published_page_ownership import protects_publisher
+
+    expected = (
+        canonical_artifact_id(expected_artifact_id)
+        if expected_artifact_id is not None
+        else None
+    )
+    descriptors = ExitStack()
+    try:
+        root = descriptors.enter_context(opened_artifact_root(source))
+        folder_descriptor = descriptors.enter_context(ExitStack())
+        folder = folder_descriptor.enter_context(_opened_child_directory(root, folder_name))
+        try:
+            metadata_stat = dir_stat(folder, "metadata.json", follow_symlinks=False)
+        except OSError as exc:
+            raise FileNotFoundError("Artifact not found") from exc
+        if not stat.S_ISREG(metadata_stat.st_mode):
+            raise FileNotFoundError("Artifact metadata is not a regular file")
+
+        if expected is not None:
+            found, _metadata = ensure_full_id(folder.path, _pinned=folder)
+            if found != expected:
+                raise FileNotFoundError("Artifact identity changed before deletion")
+
+        if protects_publisher(publish_url):
+            _unpublish_protected_pages(folder=folder, api_key=api_key, publish_url=publish_url, scope=scope)
+            pages: list[_PageToTakeDown] = []
+        else:
+            pages = _pages_to_take_down(folder=folder, published_map=_load_published_map_pinned(folder))
+    except BaseException:
+        descriptors.close()
+        raise
+    return _PinnedDelete(
+        root=root,
+        folder=folder,
+        folder_name=folder_name,
+        pages=pages,
+        descriptors=descriptors,
+        folder_descriptor=folder_descriptor,
+    )
+
+
+def _take_down_pages(*, pinned: _PinnedDelete, api_key: str, publish_url: str) -> None:
+    """The delete's network step: take down each page ``pinned`` lists, with no
+    file store call, so a slow publish service holds no file store slot. Each
+    page is added to ``pinned.taken_down`` once it is down, so a failure
+    part-way still records the pages already down."""
+    for page in pinned.pages:
+        _unpublish_identifier(page.identifier, page.entry, api_key=api_key, publish_url=publish_url)
+        pinned.taken_down.append(page.name)
+
+
+def _finish_delete(*, pinned: _PinnedDelete, remove: bool) -> None:
+    """The delete's last file store step: record the pages taken down in the
+    publish record, then, with ``remove``, check that the folder is still the
+    one pinned and remove it. Closes the descriptors either way."""
+    with pinned.descriptors:
+        if pinned.taken_down:
+            _record_taken_down(folder=pinned.folder, names=pinned.taken_down)
+        if not remove:
+            return
+        folder = pinned.folder
+        opened_stat = (
+            os.fstat(folder.fd)
+            if folder.fd is not None
+            else folder.path.stat(follow_symlinks=False)
+        )
+        try:
+            current_stat = dir_stat(pinned.root, pinned.folder_name, follow_symlinks=False)
+        except OSError as exc:
+            raise FileNotFoundError("Artifact changed before deletion") from exc
+        if (
+            not stat.S_ISDIR(current_stat.st_mode)
+            or (current_stat.st_dev, current_stat.st_ino)
+            != (opened_stat.st_dev, opened_stat.st_ino)
+        ):
+            raise FileNotFoundError("Artifact changed before deletion")
+        pinned.folder_descriptor.close()
+        # POSIX ``shutil.rmtree(..., dir_fd=...)`` performs its own fd/stat
+        # symlink-attack checks while walking. The root descriptor also keeps
+        # this operation in the authorized container if its lexical path moves.
+        dir_rmtree(pinned.root, pinned.folder_name)
+
+
+async def delete_artifact_from_source(
+    *,
+    source: ProjectArtifacts,
+    folder_name: str,
+    expected_artifact_id: str | None,
+    api_key: str,
+    publish_url: str,
+    scope: TenantScope,
+    deadline: bool = True,
 ) -> None:
     """Delete one direct artifact child through pinned directory descriptors.
 
@@ -1244,64 +1397,46 @@ def delete_artifact_from_source(
     validated legacy name. Keeping the root and folder descriptors open across
     validation and unpublishing prevents a writable root/folder symlink swap
     from redirecting the eventual removal to another tenant's storage.
+
+    It runs in three steps, so a slow publish service holds no file store
+    slot. A file store call pins and checks the folder and lists its live
+    pages (``run_efs``; ``deadline`` as there). The pages come down on
+    asyncio's default executor, as the publish uploads go up. A second file
+    store call then records them in the publish record and removes the
+    folder. That call waits for a slot as long as it takes: the pages are
+    already down. A failed take-down leaves the folder in place and
+    propagates, with the pages already down recorded.
     """
-    from cowork.services.artifact_identity import (
-        _opened_child_directory,
-        canonical_artifact_id,
-        ensure_full_id,
-        opened_artifact_root,
-    )
+    from cowork.db.units import run_efs, run_to_completion
 
-    expected = (
-        canonical_artifact_id(expected_artifact_id)
-        if expected_artifact_id is not None
-        else None
-    )
-    with opened_artifact_root(source) as root:
-        with _opened_child_directory(root, folder_name) as folder:
-            try:
-                metadata_stat = dir_stat(
-                    folder, "metadata.json", follow_symlinks=False
-                )
-            except OSError as exc:
-                raise FileNotFoundError("Artifact not found") from exc
-            if not stat.S_ISREG(metadata_stat.st_mode):
-                raise FileNotFoundError("Artifact metadata is not a regular file")
+    # Filled once the pin step returns, so a caller canceled while that step
+    # ran still closes what it pinned.
+    pinned: list[_PinnedDelete] = []
 
-            if expected is not None:
-                found, _metadata = ensure_full_id(folder.path, _pinned=folder)
-                if found != expected:
-                    raise FileNotFoundError("Artifact identity changed before deletion")
+    def pin() -> None:
+        pinned.append(_pin_for_delete(
+            source=source,
+            folder_name=folder_name,
+            expected_artifact_id=expected_artifact_id,
+            api_key=api_key,
+            publish_url=publish_url,
+            scope=scope,
+        ))
 
-            # Unpublish before deletion. A remote failure propagates while the
-            # exact folder remains present, preserving the established contract.
-            _unpublish_pinned_folder(
-                folder,
-                api_key=api_key,
-                publish_url=publish_url,
-                scope=scope,
+    taken_down = False
+    try:
+        await run_efs(pin, scope=scope, deadline=deadline)
+        # Waits for the take-down even when canceled: its pages must be
+        # recorded, and the descriptors stay open until it ends.
+        await run_to_completion(asyncio.to_thread(
+            _take_down_pages, pinned=pinned[0], api_key=api_key, publish_url=publish_url,
+        ))
+        taken_down = True
+    finally:
+        if pinned:
+            await run_efs(
+                partial(_finish_delete, pinned=pinned[0], remove=taken_down), scope=scope, deadline=False,
             )
-
-            opened_stat = (
-                os.fstat(folder.fd)
-                if folder.fd is not None
-                else folder.path.stat(follow_symlinks=False)
-            )
-            try:
-                current_stat = dir_stat(root, folder_name, follow_symlinks=False)
-            except OSError as exc:
-                raise FileNotFoundError("Artifact changed before deletion") from exc
-            if (
-                not stat.S_ISDIR(current_stat.st_mode)
-                or (current_stat.st_dev, current_stat.st_ino)
-                != (opened_stat.st_dev, opened_stat.st_ino)
-            ):
-                raise FileNotFoundError("Artifact changed before deletion")
-
-        # POSIX ``shutil.rmtree(..., dir_fd=...)`` performs its own fd/stat
-        # symlink-attack checks while walking. The root descriptor also keeps
-        # this operation in the authorized container if its lexical path moves.
-        dir_rmtree(root, folder_name)
 
 
 def reveal_in_file_manager(path: Path) -> None:
@@ -2300,10 +2435,24 @@ async def _launch_backend_locked(
             from cowork.services.connectors.persist import turn_vault_for_scope
 
             vault = turn_vault_for_scope(scope)
+            # The agent writes metadata.json, so a comparison side could name a
+            # connection its turn is kept from: its backend gets none of those.
+            from cowork.services.projects import path_in_comparison_sandbox
+
+            comparison_side = path_in_comparison_sandbox(project_root)
             for ds in datasources:
                 engine, name = ds.get("engine"), ds.get("name")
                 if not engine or not name:
                     continue
+                if comparison_side:
+                    from cowork.services.comparisons import _blocked
+
+                    if _blocked(engine):
+                        logger.info(
+                            "Comparison side's backend %s declared blocked connector %s; not passed",
+                            slug, engine,
+                        )
+                        continue
                 env = vault.env_for(engine, name)
                 if env is None:
                     logger.warning(
@@ -2372,6 +2521,19 @@ async def _launch_backend_locked(
         slug, new_port, result.get("pid"),
     )
     return BackendStatus(running=True, detail="launched", port=new_port)
+
+
+def stop_project_backends(project_root: str | Path) -> None:
+    """Stop the backends launched for one project, for a project going away."""
+    root = Path(project_root)
+    for key in {str(root), str(root.resolve())}:
+        for entry in list(_LAUNCHED_BACKENDS.pop(key, {}).values()):
+            backend = LaunchedBackend.from_entry(entry)
+            if backend.live:
+                try:
+                    backend.proc.terminate()
+                except (OSError, ProcessLookupError):
+                    pass
 
 
 def shutdown_launched_backends() -> None:
