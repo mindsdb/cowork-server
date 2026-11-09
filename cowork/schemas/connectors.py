@@ -246,6 +246,22 @@ class ConnectorSpecResponse(ConnectorMetadataResponse):
     usage_notes: str | None = Field(default=None, exclude=True)
 
 
+class CustomConnectionResponse(BaseModel):
+    """A member's stored custom API connection, as auth lists it: never a value."""
+
+    id: int
+    connector_id: str
+    name: str
+    secure_keys: list[str] = []
+    status: str
+    credential_version: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    # The member deleted the template this connection was made from; it can
+    # still be deleted, but not connected again.
+    template_missing: bool = False
+
+
 class CustomConnectorAvailability(BaseModel):
     """Whether the caller can build a custom connector that is kept for reuse."""
 

@@ -247,7 +247,8 @@ def test_in_org_mode_the_builder_manages_their_connector_and_no_one_else(engine,
 def test_both_routes_require_an_authenticated_member_not_an_admin():
     routes = [
         r for r in create_app().routes
-        if getattr(r, "path", "").startswith("/api/v1/connectors/custom")
+        if getattr(r, "path", "") == "/api/v1/connectors/custom"
+        or getattr(r, "path", "").startswith("/api/v1/connectors/custom/")
     ]
 
     assert {tuple(sorted(r.methods)) for r in routes} == {("POST",), ("PATCH",), ("DELETE",)}
