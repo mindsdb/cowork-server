@@ -289,7 +289,7 @@ async def test_a_run_whose_turn_claim_redis_cannot_answer_leaves_its_slot_due_an
     from _fakes import UnreachableRedis
 
     class ClaimingHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
