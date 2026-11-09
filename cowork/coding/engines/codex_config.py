@@ -186,6 +186,10 @@ def auto_compact_token_limit() -> int:
 _TOML_CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
 
 
+# Paths, not secrets: where the connector vault and the files it is keyed by live.
+_CONNECTOR_STORAGE_VARIABLES = ("COWORK_HOME", "COWORK_VAULT_DIR", "CONNECTOR_VAULT_DIR")
+
+
 def toml_string(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     escaped = _TOML_CONTROL_CHARACTER.sub(lambda match: f"\\u{ord(match.group()):04X}", escaped)
@@ -252,7 +256,22 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
                 config.cowork_root,
                 config.session_id,
             )),
+            # An optional server still starting when a turn begins is left out
+            # of that turn, and this one connects to each provider before it
+            # lists tools, so make Codex wait for it.
+            "mcp_servers.mindshub_code.required=true",
+            "mcp_servers.mindshub_code.startup_timeout_sec=30",
         ])
+        # Codex starts MCP servers with a minimal environment, so without these
+        # the server reads connections from the default home's vault, not this
+        # install's (a staging or organization build's).
+        storage = {name: os.environ[name] for name in _CONNECTOR_STORAGE_VARIABLES if os.environ.get(name)}
+        if storage:
+            overrides.append(
+                "mcp_servers.mindshub_code.env={"
+                + ",".join(f"{name}={toml_string(value)}" for name, value in storage.items())
+                + "}"
+            )
     thread_params = {
         "cwd": str(workspace),
         "model": config.model,

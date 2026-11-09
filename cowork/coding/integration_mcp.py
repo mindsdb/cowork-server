@@ -8,6 +8,7 @@ from typing import Any
 from cowork.coding.integrations import DeveloperIntegrationService
 from cowork.coding.project_models import SourceContextRequest
 from cowork.coding.project_store import CodeProjectStore
+from cowork.coding.provider_mcp import ProviderTools
 from cowork.coding.store import CodingStore
 
 
@@ -20,6 +21,10 @@ class CodeIntegrationMcp:
             raise RuntimeError("This coding task is not linked to a Code Project")
         self.project = CodeProjectStore(root).get(self.session.project_id)
         self.integrations = DeveloperIntegrationService(None)
+        self.providers = ProviderTools(
+            self.project,
+            lambda connection: self.integrations.hosted_mcp_token(self.project, connection),
+        )
 
     def handle(self, method: str, params: dict[str, Any]) -> dict[str, Any] | None:
         if method == "initialize":
@@ -33,12 +38,16 @@ class CodeIntegrationMcp:
         if method == "ping":
             return {}
         if method == "tools/list":
-            return {"tools": self._tools()}
+            return {"tools": [*self._tools(), *self.providers.tools()]}
         if method == "tools/call":
-            return self._call(str(params.get("name") or ""), params.get("arguments") or {})
+            name = str(params.get("name") or "")
+            if self.providers.owns(name):
+                return self.providers.call(name, params.get("arguments") or {})
+            return self._call(name, params.get("arguments") or {})
         raise RuntimeError(f"Unsupported MCP method: {method}")
 
     def close(self) -> None:
+        self.providers.close()
         self.integrations.close()
 
     def _call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -57,7 +66,11 @@ class CodeIntegrationMcp:
                 "guidance": self.session.guidance_summary,
                 "linkedSources": [item.model_dump(mode="json") for item in self.session.source_contexts],
                 "connectedTools": [
-                    {"provider": item.provider, "label": item.label or item.name}
+                    {
+                        "provider": item.provider,
+                        "label": item.label or item.name,
+                        **({"tools": status} if (status := self.providers.status.get(item.label or item.name)) else {}),
+                    }
                     for item in self.project.connections
                 ],
             }

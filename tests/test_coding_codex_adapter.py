@@ -289,9 +289,32 @@ def test_codex_launch_policy_is_resolved_once_for_client_and_thread(monkeypatch)
     )
     assert any(item.startswith("mcp_servers.mindshub_code.command=") for item in launch.config_overrides)
     assert any('"cowork.coding.integration_mcp","/cowork-data","task-123"' in item for item in launch.config_overrides)
+    assert "mcp_servers.mindshub_code.required=true" in launch.config_overrides
     assert launch.thread_params["developerInstructions"] == "Use the project playbook."
     assert launch.thread_params["approvalPolicy"] == launch.approval_policy
     assert launch.thread_params["sandbox"] == "workspace-write"
+
+
+def test_codex_integration_mcp_server_gets_this_installs_connector_storage(monkeypatch) -> None:
+    monkeypatch.setenv("COWORK_HOME", "/Users/me/.cowork-stable")
+    monkeypatch.setenv("COWORK_VAULT_DIR", "/Users/me/.cowork-stable/orgs/org-a/data-vault")
+    monkeypatch.delenv("CONNECTOR_VAULT_DIR", raising=False)
+    launch = codex_config.prepare_launch(
+        EngineSessionConfig(
+            model="gpt",
+            permission_mode=PermissionMode.workspace,
+            session_id="task-123",
+            cowork_root="/cowork-data",
+            project_linked=True,
+        ),
+        Path("/workspace"),
+        "http://127.0.0.1:26866/api/v1/coding/inference",
+    )
+
+    assert (
+        'mcp_servers.mindshub_code.env={COWORK_HOME="/Users/me/.cowork-stable",'
+        'COWORK_VAULT_DIR="/Users/me/.cowork-stable/orgs/org-a/data-vault"}'
+    ) in launch.config_overrides
 
 
 def test_codex_folder_task_without_a_project_launches_no_integration_mcp_server() -> None:
