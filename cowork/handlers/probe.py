@@ -693,8 +693,9 @@ class ProbeHandler:
         return None
 
     async def _usage_notes(self, connector_id: str) -> tuple[str | None, bool]:
-        """The connector's agent-facing notes, or None when it has none or they
-        could not be read; the probe runs without them then. The flag is True
+        """The connector's agent-facing notes from the catalog, or None when it
+        has none or they could not be read; a handcrafted form's own notes may
+        then stand in (``_form_usage_notes``). The flag is True
         only for a built-in spec's notes, the ones reviewed like code, which
         may tell the probe what counts as a pass."""
         try:
@@ -702,7 +703,9 @@ class ProbeHandler:
                 lambda session: ConnectorCatalog(session).usage_notes_for([connector_id]), scope=self.scope,
             )
         except Exception:
-            logger.exception("Could not read the usage notes for %s; probing without them", connector_id)
+            logger.exception(
+                "Could not read the catalog usage notes for %s; probing with the form's own, if any", connector_id,
+            )
             return None, False
         text = notes.get(connector_id)
         return text, text is not None and text == registry.usage_notes_for([connector_id]).get(connector_id)

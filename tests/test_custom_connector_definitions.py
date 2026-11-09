@@ -248,7 +248,9 @@ class TestProbeStream:
         assert "not added to your connectors list" in stream
 
     @pytest.mark.asyncio
-    async def test_the_probe_runs_without_notes_when_they_cannot_be_read(self, engine, vault, monkeypatch):
+    async def test_the_probe_falls_back_to_the_forms_notes_when_the_catalog_cannot_be_read(
+        self, engine, vault, monkeypatch,
+    ):
         _Probe.verdict = "success"
 
         def failing_notes(self, engines):
