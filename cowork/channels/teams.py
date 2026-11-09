@@ -110,7 +110,9 @@ class TeamsProxySignature:
             fresh = False
         target = request.url.path + (f"?{request.url.query}" if request.url.query else "")
         expected = sign(bot.internal_key, request.method, target, timestamp, await request.body())
-        if not (fresh and hmac.compare_digest(given, expected)):
+        # Bytes: compare_digest raises on a str with non-ASCII characters, and
+        # Starlette decodes header values as Latin-1.
+        if not (fresh and hmac.compare_digest(given.encode("latin-1"), expected.encode())):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or missing Teams proxy signature")
 
 

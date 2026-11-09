@@ -160,6 +160,14 @@ def test_deliver_refuses_a_call_the_proxy_didnt_sign(client, stand_in, headers):
     assert stand_in.calls == []
 
 
+def test_a_non_ascii_signature_is_refused_not_a_server_error(client, stand_in):
+    body = _deliver_body()
+    headers = {TIMESTAMP_HEADER: str(int(time.time())), SIGNATURE_HEADER: "é".encode("latin-1")}
+    response = client.post(DELIVER, content=body, headers=headers)
+    assert response.status_code == 401
+    assert stand_in.calls == []
+
+
 def test_a_signature_for_one_route_doesnt_open_the_other(client, stand_in):
     body = _deliver_body()
     response = client.post(DELIVER, content=body, headers=_signed("POST", MEMBER, body))

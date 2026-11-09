@@ -58,7 +58,7 @@ import hashlib, hmac, time
 
 def headers(key: bytes, method: str, target: str, body: bytes = b"") -> dict[str, str]:
     timestamp = str(int(time.time()))
-    message = b"\n".join([method.encode(), target.encode(), timestamp.encode(), body])
+    message = b"\n".join([method.upper().encode(), target.encode(), timestamp.encode(), body])
     return {
         "X-Cowork-Teams-Timestamp": timestamp,
         "X-Cowork-Teams-Signature": hmac.new(key, message, hashlib.sha256).hexdigest(),
@@ -66,6 +66,15 @@ def headers(key: bytes, method: str, target: str, body: bytes = b"") -> dict[str
 ```
 
 The routes skip Cowork's bearer token and identity headers: the signature is their credential.
+
+Two limits:
+
+- The key keeps the agent's code out only with the code sandbox on (`COWORK_CODE_SANDBOX=landlock`).
+  The agent's code doesn't get `COWORK_*` variables, and Landlock stops it reading the server's
+  environment from `/proc`. Without the sandbox, it runs as the server's user and could read the
+  key there. A self-hosted Cowork always has the sandbox on, since identity headers need it.
+- A signed call can be sent again within the 60 seconds, which would post the same reply twice. Only
+  the proxy and Cowork see these calls, on their own internal network, so this is accepted.
 
 ## Checking the bot
 
