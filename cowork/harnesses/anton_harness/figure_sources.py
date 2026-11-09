@@ -17,8 +17,11 @@ one origin:
   output holds it first. A step with no tool_use_id holds a figure but is
   never named, nor are the cells it read data from: the client opens a step
   by that id;
-- ``question``: no step of this turn holds it, but the question writes it in
-  the same form (value, sign, currency, scale and percent);
+- ``question``: no step of this turn holds it, but the question gives its
+  value (``_question_gives``);
+- ``step`` or ``question`` too for a figure the answer works out in writing
+  from figures that have one of these origins (``_worked_out``): it names
+  their sources;
 - ``earlier_answer``: neither a step of this turn nor the question gives it,
   but one of the conversation's last answers wrote it in the same form with
   an origin other than none (``mark_repeated_figures``). It names no source;
@@ -76,7 +79,8 @@ created and last-changed times every record carries would source almost any
 small number. A date-time in a connector call's input, such as a filter's,
 states no number either, so a record's value equal to its hour, minutes or
 seconds is still read. A figure the model works out in its own text, without
-a step printing it, has no source.
+a step printing it, has no source unless the answer writes the arithmetic
+out (``_worked_out``).
 
 A figure written in a time unit, glued to its digits (12h), as the word
 after it (22 hours, a 13.08-day lead time, 22 business days) or as the
@@ -101,7 +105,9 @@ keeps its step.
 
 Each step a figure names is described once: its kind, a short label, the file
 it read, the web page it reached, and the SQL and HTTP requests its code shows
-(``cell_queries``) or, for a connector tool, the statement its call ran. Its
+(``cell_queries``) or, for a connector tool, the statement its call ran. A
+cell that read documents and ran a query is described as the figures that
+name it read it (``_as_read``). Its
 label, web page, SQL and requests pass through ``_redacted``, a best-effort
 credential sweep, before they leave this module. Its file is named by its
 place in the project or by its files-store id, never by the text the code
@@ -308,7 +314,7 @@ class _Number:
     percent: bool
     negative: bool
     # The currency sign and scale as written, so a figure can be compared
-    # with a number in the question in the same form.
+    # with an earlier answer's in the same form.
     currency: str
     scale: Decimal
     start: int
@@ -404,6 +410,32 @@ _STEP_TIME_WORDS = frozenset({
 _WORD_AFTER = re.compile(
     r"[*_]{0,2}[ \u00a0-]?[*_]{0,2}(?:(?i:business|working|work|calendar)[ \u00a0-])?(?P<word>[A-Za-z]{2,})"
 )
+# Counts a question may spell out ("three full weeks"). "one" is left out: it
+# is more often a pronoun ("which one") than a count.
+_COUNT_WORDS = {
+    word: Decimal(count)
+    for count, word in enumerate(
+        "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen"
+        " sixteen seventeen eighteen nineteen twenty".split()
+    )
+    if word != "one"
+}
+_COUNT_WORD = re.compile(rf"\b(?:{'|'.join(_COUNT_WORDS)})\b", re.IGNORECASE)
+# What joins two operands of arithmetic the answer writes: ×, ÷, + or a spaced
+# x or *, after up to three words of unit ("1.5% per week × 3"). A spaced
+# minus is read as the next number's sign, so subtraction is not read.
+_OPERATOR = re.compile(
+    r"[*_  ]*(?:[A-Za-z]+[  ]+){0,3}(?P<op>[×÷+]|(?<=[  ])[x*](?=[  ]))[*_  ]*"
+)
+# What joins written arithmetic to its result, after up to three words of unit:
+# = or ≈ ("3 full weeks = 4.5%"), or the border to the next cell of a table
+# row ("| $40,000 × 4.5% | $1,800 |").
+_RESULT_JOIN = re.compile(r"[*_  ]*(?:[A-Za-z]+[  ]+){0,3}[=≈|][*_  ]*")
+# A word before a figure on the line after a table that says the figure is
+# the table's total.
+_TOTAL_WORD = re.compile(r"\b(?:total|sum|combined|altogether)\b", re.IGNORECASE)
+# A Markdown table's rule line, under its header.
+_TABLE_RULE = re.compile(r"[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*")
 # What joins a range's two numbers when the unit follows only the second:
 # "22-25 hours", "22 to 25 hours", "22 or 23 days".
 _RANGE_JOIN = re.compile(r"[*_]{0,2}[ \u00a0]*(?:[-\u2013]|to|or)[ \u00a0]*[*_]{0,2}")
@@ -535,6 +567,13 @@ _SHORTENED_LINE = re.compile(r"\[line truncated: \d+ chars\]")
 # An ISO date-time, as a connector stamps each record with when it was
 # created and last changed: 2026-03-04T09:12:44.512Z, 2026-03-04 09:12+05:00.
 _ISO_DATETIME = re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?")
+# A word of running text: two or more lowercase letters.
+_LOWER_WORD = re.compile(r"\b[a-z]{2,}\b")
+# A word of a cell's code, identifiers split at underscores and digits.
+_CODE_WORD = re.compile(r"[a-z]{2,}")
+# Punctuation a printed record has and a document's sentence doesn't: a JSON
+# key, or a list of rows.
+_RECORD_MARK = re.compile(r"\"[ \t]*:|\[[ \t]*\[|\][ \t]*,[ \t]*\[")
 
 _REDACTED = "[redacted]"
 # The rules below bound how far each part of a match may run, or let a match
@@ -787,8 +826,9 @@ def find_figure_sources(
     for index, step in enumerate(described):
         if step.tool_use_id:
             index_of.setdefault(step.tool_use_id, index)
-    asked = _numbers(question, skips=_skipped_spans(question), prose=True)
+    asked = [(value, _time_unit(question, number=value), spelled) for value, spelled in _asked_numbers(question)]
     named: set[int] = set()
+    in_documents: dict[int, set[bool]] = {}
     figures: list[Figure] = []
     for position, number in enumerate(numbers):
         next_number = numbers[position + 1] if position + 1 < len(numbers) else None
@@ -797,9 +837,15 @@ def find_figure_sources(
         holders = _named_holders(described, outputs=outputs, figure=number, holders=held)
         readers = _readers(described, holders=holders, index_of=index_of)
         named.update(holders, readers)
+        for index in holders:
+            if described[index].kind is SourceKind.query and described[index].documents:
+                in_documents.setdefault(index, set()).add(_in_document_text(described[index], figure=number))
         if held:
             origin = FigureOrigin.step
-        elif any(_same_form(value, figure=number) for value in asked):
+        elif any(
+            _question_gives(value, asked_unit=unit, spelled=spelled, figure=number, figure_unit=time_unit)
+            for value, unit, spelled in asked
+        ):
             origin = FigureOrigin.question
         else:
             origin = FigureOrigin.none
@@ -815,20 +861,210 @@ def find_figure_sources(
         ))
     return FigureSources(
         project_id=files.project_id if files is not None else None,
-        steps=[_figure_step(described[index], files=files) for index in sorted(named)],
-        figures=figures,
+        steps=[
+            _figure_step(_as_read(described[index], in_documents=in_documents.get(index, set())), files=files)
+            for index in sorted(named)
+        ],
+        figures=_worked_out(answer, numbers=numbers, figures=figures),
     )
+
+
+def _asked_numbers(question: str) -> list[tuple[_Number, bool]]:
+    """The numbers the question writes, and the counts it spells out, each
+    with whether it is spelled out."""
+    numbers = [(number, False) for number in _numbers(question, skips=_skipped_spans(question), prose=True)]
+    return numbers + [
+        (
+            _Number(
+                value=_COUNT_WORDS[match.group().lower()], tolerance=Decimal(0), percent=False, negative=False,
+                currency="", scale=Decimal(1), start=match.start(), end=match.end(),
+            ),
+            True,
+        )
+        for match in _COUNT_WORD.finditer(question)
+    ]
+
+
+def _question_gives(
+    asked: _Number, *, asked_unit: _TimeUnit | None, spelled: bool, figure: _Number, figure_unit: _TimeUnit | None,
+) -> bool:
+    """Whether a number in the question gives the figure: the same value, sign
+    and percent, however its currency, scale and grouping are written, so
+    "40,000" gives "$40,000" and "three" gives "3". A number in a time unit
+    gives no figure with a currency sign, nor the other way round, and two
+    time units must agree: "30 days" gives neither "$30" nor "30 hours". A
+    spelled-out count gives no figure with a currency sign: "three sites" is
+    not "$3"."""
+    if spelled and figure.currency:
+        return False
+    if (asked.value, asked.negative, asked.percent) != (figure.value, figure.negative, figure.percent):
+        return False
+    if asked_unit is not None and figure_unit is not None:
+        return asked_unit == figure_unit
+    return not ((asked_unit is not None and figure.currency) or (figure_unit is not None and asked.currency))
+
+
+def _worked_out(answer: str, *, numbers: Sequence[_Number], figures: Sequence[Figure]) -> list[Figure]:
+    """``figures`` with the figures the answer works out in writing given an
+    origin. A figure of origin none worked out from figures of origin step or
+    question takes origin step when any of them has it, else question. It
+    names their sources, at most MAX_FIGURE_SOURCES. The answer works a
+    figure out when it writes the
+    arithmetic right before it and that arithmetic gives its value
+    (``_arithmetic_operands``), or states it as a table column's total
+    (``_total_operands``). A later figure of the same value is worked out too.
+    A figure worked out without the arithmetic written, or from a figure of
+    origin none, keeps origin none."""
+    worked = list(figures)
+    by_value: dict[tuple[Decimal, bool, bool], Figure] = {}
+    for index, figure in enumerate(worked):
+        if figure.origin is not FigureOrigin.none:
+            continue
+        number = numbers[index]
+        key = (number.value, number.negative, number.percent)
+        operands = _arithmetic_operands(answer, numbers=numbers, index=index) or _total_operands(
+            answer, numbers=numbers, index=index,
+        )
+        if operands and all(worked[operand].origin is not FigureOrigin.none for operand in operands):
+            origins = {worked[operand].origin for operand in operands}
+            sources = list({
+                source.tool_use_id: source for operand in operands for source in worked[operand].sources
+            }.values())
+            worked[index] = figure.model_copy(update={
+                "origin": FigureOrigin.step if FigureOrigin.step in origins else FigureOrigin.question,
+                "sources": sources[:MAX_FIGURE_SOURCES],
+            })
+            by_value.setdefault(key, worked[index])
+        elif key in by_value:
+            earlier = by_value[key]
+            worked[index] = figure.model_copy(update={"origin": earlier.origin, "sources": earlier.sources})
+    return worked
+
+
+def _arithmetic_operands(answer: str, *, numbers: Sequence[_Number], index: int) -> list[int] | None:
+    """The operands of the arithmetic the answer writes right before figure
+    ``index``, when it gives the figure's value: two or more numbers joined
+    by ×, ÷ or + (``_OPERATOR``), then = or the next table cell
+    (``_RESULT_JOIN``). A percent operand is read as its percentage and as
+    its fraction, so "1.5% × 3 = 4.5%" and "$40,000 × 4.5% = $1,800" both
+    hold. None otherwise."""
+    if index < 2 or not _RESULT_JOIN.fullmatch(answer, numbers[index - 1].end, numbers[index].start):
+        return None
+    operands, ops = [index - 1], []
+    while operands[0] > 0 and (
+        join := _OPERATOR.fullmatch(answer, numbers[operands[0] - 1].end, numbers[operands[0]].start)
+    ):
+        ops.insert(0, join["op"])
+        operands.insert(0, operands[0] - 1)
+    if not ops:
+        return None
+    result = numbers[index]
+    for fractions in (False, True):
+        value = _calculated([numbers[operand] for operand in operands], ops=ops, fractions=fractions)
+        if value is not None and (
+            abs(value - _signed(result)) <= result.tolerance
+            or (result.percent and abs(value * 100 - _signed(result)) <= result.tolerance)
+        ):
+            return operands
+    return None
+
+
+def _calculated(operands: Sequence[_Number], *, ops: Sequence[str], fractions: bool) -> Decimal | None:
+    """The value of ``operands`` joined by ``ops``, × and ÷ before +, with
+    each percent as its fraction when ``fractions``. None on a division by
+    zero."""
+    values = [_signed(number) / 100 if fractions and number.percent else _signed(number) for number in operands]
+    total, term = Decimal(0), values[0]
+    for op, value in zip(ops, values[1:]):
+        if op == "+":
+            total, term = total + term, value
+        elif op == "÷":
+            if not value:
+                return None
+            term /= value
+        else:
+            term *= value
+    return total + term
+
+
+def _signed(number: _Number) -> Decimal:
+    return -number.value if number.negative else number.value
+
+
+def _total_operands(answer: str, *, numbers: Sequence[_Number], index: int) -> list[int] | None:
+    """The figures of the table column whose sum figure ``index`` states,
+    when it sits in the table's total row or after a total word on the line
+    right after the table (``_TOTAL_WORD``), and each of the table's other
+    rows holds one number in that column. None otherwise."""
+    figure = numbers[index]
+    line_start, line = _line_at(answer, start=figure.start, end=figure.end)
+    if line.lstrip().startswith("|"):
+        cells = line.split("|")
+        if len(cells) < 3 or not _TOTAL_WORD.search(cells[1]):
+            return None
+        rows = _rows_above(answer, end=line_start)
+        columns = [answer.count("|", line_start, figure.start)]
+    else:
+        if not _TOTAL_WORD.search(answer, line_start, figure.start):
+            return None
+        rows = _rows_above(answer, end=line_start)
+        columns = range(1, max((row.count("|") for _, row in rows), default=0) + 1)
+    starts = [number.start for number in numbers]
+    # Column c is the cell after the row's c-th border.
+    for column in columns:
+        operands = []
+        for row_start, row in rows:
+            borders = [row_start + offset for offset, char in enumerate(row) if char == "|"]
+            if column > len(borders):
+                break
+            cell_end = borders[column] if column < len(borders) else row_start + len(row)
+            held = range(bisect_left(starts, borders[column - 1]), bisect_left(starts, cell_end))
+            if len(held) != 1:
+                break
+            operands.append(held[0])
+        else:
+            if len(operands) > 1 and abs(
+                sum(_signed(numbers[operand]) for operand in operands) - _signed(figure)
+            ) <= figure.tolerance:
+                return operands
+    return None
+
+
+def _line_at(text: str, *, start: int, end: int) -> tuple[int, str]:
+    """Where the line holding ``text[start:end]`` starts, and the line."""
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", end)
+    return line_start, text[line_start:line_end if line_end >= 0 else len(text)]
+
+
+def _rows_above(answer: str, *, end: int) -> list[tuple[int, str]]:
+    """The body rows, with their offsets, of the Markdown table that ends at
+    ``end`` past any blank lines, leaving out a total row. Empty when no
+    table ends there or it has no rule line under its header."""
+    lines = answer[:end].split("\n")[:-1]
+    offset = end
+    while lines and not lines[-1].strip():
+        offset -= len(lines.pop()) + 1
+    rows: list[tuple[int, str]] = []
+    while lines and lines[-1].lstrip().startswith("|"):
+        row = lines.pop()
+        offset -= len(row) + 1
+        if _TABLE_RULE.fullmatch(row):
+            return rows
+        cells = row.split("|")
+        if not (len(cells) > 1 and _TOTAL_WORD.search(cells[1])):
+            rows.insert(0, (offset, row))
+    return []
 
 
 @dataclass(frozen=True)
 class _WrittenForm:
     """How a number is written, apart from how its digits are grouped: its
     value, sign, currency, scale and percent, and the unit written right
-    after the digits. An earlier answer's figure must match all of them.
-    The question's rule (``_same_form``) leaves the unit out: a question
-    match only spares a figure the no-source mark, while an earlier answer's
-    match claims the figure was given before, so "3x" must not stand for
-    "3"."""
+    after the digits. An earlier answer's figure must match all of them,
+    since its match claims the figure was given before, so "3x" must not
+    stand for "3". The question's rule (``_question_gives``) reads the value
+    alone: the user wrote it, in whatever form."""
 
     value: Decimal
     negative: bool
@@ -903,6 +1139,9 @@ class _DescribedStep:
     # The cells, by tool_use_id, that read the data this cell's code draws on
     # through names earlier cells bound.
     drawn_from: frozenset[str] = frozenset()
+    # The lowercase words of a cell's code, so a line it prints by its own
+    # template is not read as a document's text (``_in_document_text``).
+    code_words: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -1186,6 +1425,7 @@ def _describe_cell(
         output=output,
         literals=code,
         drawn_from=drawn_from,
+        code_words=frozenset(_CODE_WORD.findall(code.lower())),
     )
 
 
@@ -1256,6 +1496,7 @@ def _described(
     output: str,
     literals: str,
     drawn_from: frozenset[str] = frozenset(),
+    code_words: frozenset[str] = frozenset(),
 ) -> _DescribedStep:
     # An output value equal to a number the step's input states only echoes
     # it, so it is not read, not even for a figure that rounds to it. An
@@ -1285,6 +1526,7 @@ def _described(
         output_time_units=output_time_units,
         time_units=time_units,
         drawn_from=drawn_from,
+        code_words=code_words,
     )
 
 
@@ -1305,6 +1547,33 @@ def _figure_step(step: _DescribedStep, *, files: AgentFiles | None) -> FigureSte
         queries=[_capped(_redacted(query), limit=MAX_QUERY_CHARS) for query in step.queries],
         requests=[_capped(_redacted(request), limit=MAX_REQUEST_CHARS) for request in step.requests],
     )
+
+
+def _as_read(step: _DescribedStep, *, in_documents: Set[bool]) -> _DescribedStep:
+    """A cell that read documents and ran a query, as the figures it holds
+    read it (``_in_document_text``): its documents, without its queries and
+    requests, when each figure sits in a document's text; a bare step when
+    some do and some don't; else the query. Any other step as it is."""
+    if in_documents == {True}:
+        return replace(step, kind=SourceKind.file, label=_documents_label(step.documents), queries=(), requests=())
+    if in_documents == {True, False}:
+        return replace(step, kind=SourceKind.step)
+    return step
+
+
+def _in_document_text(step: _DescribedStep, *, figure: _Number) -> bool:
+    """Whether the figure's first place in the output sits in a document's
+    text rather than a record: a line with no JSON key or list of rows
+    (``_RECORD_MARK``) and three or more lowercase words the cell's code
+    doesn't write. A record's free-text field reads as a document's text
+    too."""
+    place = _first_place(step.output_numbers, figure=figure)
+    if place is None:
+        return False
+    _, line = _line_at(step.output, start=place.start, end=place.end)
+    if _RECORD_MARK.search(line):
+        return False
+    return len(set(_LOWER_WORD.findall(line)) - step.code_words) >= 3
 
 
 def _readers(
@@ -1802,13 +2071,6 @@ def _same_value(number: _Number, *, figure: _Number, tolerance: Decimal) -> bool
     if abs(number.value - figure.value) <= tolerance:
         return True
     return figure.percent and abs(number.value * 100 - figure.value) <= tolerance
-
-
-def _same_form(asked: _Number, *, figure: _Number) -> bool:
-    """Whether a number in the question writes the figure: the same written
-    form (``_WrittenForm``) less the unit, so the same value, sign, currency,
-    scale and percent, and "30 days" does not cover "$30"."""
-    return replace(_WrittenForm.of(number=asked), unit="") == replace(_WrittenForm.of(number=figure), unit="")
 
 
 def _output_numbers(output: str) -> list[_Number]:
