@@ -799,7 +799,8 @@ class TurnQueueSettings(Settings):
         default=False,
         description=(
             "Let cloud turns build custom connector templates a member saves "
-            "from a card. Keep false until members can connect what they save."
+            "from a card and connects. Keep false until hosted turns can use "
+            "what members connect."
         ),
     )  # COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
     custom_connect_refused_domains: list[str] = Field(
