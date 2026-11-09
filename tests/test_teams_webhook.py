@@ -205,11 +205,13 @@ def test_through_the_webhook_a_sender_not_on_the_list_gets_200_and_runs_nothing(
 
 
 async def test_a_long_conversation_id_still_fits_the_dedupe_column(bridge):
-    activity = _activity(conversation={"id": "a:" + "x" * 300, "conversationType": "personal", "tenantId": TENANT})
-    [event] = await _questions(bridge, activity)
-    key = bridge.dedupe_key(event)
-    assert len(key) <= 255
-    assert key == bridge.dedupe_key(event)
+    keys = []
+    for chat in ("x", "y"):
+        conversation = {"id": "a:" + chat * 300, "conversationType": "personal", "tenantId": TENANT}
+        [event] = await _questions(bridge, _activity(conversation=conversation))
+        keys.append(bridge.dedupe_key(event))
+    assert all(len(key) <= 255 for key in keys)
+    assert keys[0] != keys[1]
 
 
 async def test_the_same_message_id_in_two_conversations_isnt_a_duplicate(bridge):
