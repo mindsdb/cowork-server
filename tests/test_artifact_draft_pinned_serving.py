@@ -50,7 +50,7 @@ async def _serve(
         "0123456789abcdef0123456789abcdef",
         rel_path,
         request,
-        SimpleNamespace(scope=LOCAL_SCOPE),
+        LOCAL_SCOPE,
         download=download,
     )
 
@@ -201,7 +201,7 @@ async def test_send_failure_before_iteration_closes_the_pinned_file(tmp_path):
     fd = os.open(path, os.O_RDONLY)
     resources = ExitStack()
     resources.callback(os.close, fd)
-    response = workspace_ep._draft_stream(resources, fd, 5, "text/plain")
+    response = workspace_ep._draft_stream(resources, fd, 5, "text/plain", scope=LOCAL_SCOPE)
 
     async def receive():
         return {"type": "http.disconnect"}
@@ -456,7 +456,7 @@ async def test_download_does_not_bypass_authorization(tmp_path, monkeypatch):
     with pytest.raises(HTTPException) as excinfo:
         await workspace_ep.serve_private_draft(
             "local", "0123456789abcdef0123456789abcdef", "report.xlsx",
-            SimpleNamespace(query_params={}), SimpleNamespace(scope=LOCAL_SCOPE), download=True,
+            SimpleNamespace(query_params={}), LOCAL_SCOPE, download=True,
         )
     assert excinfo.value.status_code == 404
 

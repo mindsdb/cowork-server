@@ -31,7 +31,6 @@ from cowork.db.scoped import (
     ScopedSession,
     ScopedSessionDep,
     TenantScope,
-    get_scoped_session,
     get_tenant_scope,
 )
 from cowork.db.session import get_session
@@ -44,7 +43,7 @@ from cowork.api.v1.artifact_preview import (
     wants_html_preview,
 )
 from cowork.api.v1.artifact_scope import scoped_project_id_for_request
-from cowork.db.units import FilesystemBusy, run_db, run_efs
+from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
 from cowork.api.v1.endpoints.live_apps import LiveAppRoute
@@ -56,12 +55,15 @@ from cowork.schemas.live_apps import (
     LiveAppShareResponse,
     SharedLiveAppResponse,
 )
+from cowork.services.artifact_identity import canonical_artifact_id
+from cowork.services.artifact_locations import forget_location
 from cowork.services.artifact_roots import (
     RootsPlan,
     artifacts_sources_for_scan,
     plan_project_roots,
     plan_scope_roots,
     readable_sources,
+    recorded_location,
 )
 from cowork.services.artifacts import (
     BackendPreviewRefused,
@@ -80,7 +82,7 @@ from cowork.services.artifacts import (
     resolve_artifact_path,
     reveal_in_file_manager,
 )
-from cowork.services.projects import ProjectService
+from cowork.services.projects import ProjectService, is_comparison_sandbox
 
 if TYPE_CHECKING:
     from cowork.services.artifact_export import ExportSource
@@ -224,6 +226,16 @@ def _sources_and_cards(*, find_sources: Callable[[], list[ProjectArtifacts]]) ->
     )
 
 
+def _browsable_sources(*, plan: RootsPlan) -> list[ProjectArtifacts]:
+    """The roots of ``plan`` the caller may read, without the model-comparison
+    sides. Only the unfiltered list uses this: it means every project a person
+    browses, while the same roots also resolve artifacts by id, and a
+    comparison's own artifacts must keep resolving."""
+    return [
+        source for source in readable_sources(plan) if not is_comparison_sandbox(source.project_name)
+    ]
+
+
 async def _cards_for(
     scope: TenantScope, find_sources: Callable[[], list[ProjectArtifacts]]
 ) -> list[dict]:
@@ -241,22 +253,33 @@ def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[dic
     """The database half of the cards: each card's owner, its capabilities and,
     with live apps, who shared it. Reads no artifact folder: the file store
     half found each card's export source (``_sources_and_cards``)."""
-    from cowork.services.artifact_ownership import resolve_artifact_owners
+    from cowork.services.artifact_ownership import (
+        OwnerRequest,
+        resolve_artifact_owners_by_source,
+    )
     from cowork.services.artifact_permissions import artifact_capabilities
 
     # Capabilities are a property of each ARTIFACT: in org mode a project root is
     # shared by every member (ENG-2056), so each card's owner is resolved on its
-    # own. Owners are read in one query per root (the unfiltered listing spans
-    # every project of the organization, so one query per project root).
+    # own. Project roots' owners are read in one query for every root together,
+    # and legacy roots' in one more (the unfiltered listing spans every project
+    # of the organization).
     by_base = {Path(source.base): source for source in sources}
     cards_by_base: dict[Path, list[tuple[str, _FoundCard]]] = {}
     for found in cards:
         folder = Path(str(found.card.get("folder") or ""))
         if folder.parent in by_base:
             cards_by_base.setdefault(folder.parent, []).append((folder.name, found))
-    for base, entries in cards_by_base.items():
+    roots = list(cards_by_base.items())
+    owners_by_root = resolve_artifact_owners_by_source(
+        session,
+        [
+            OwnerRequest(source=by_base[base], slugs=tuple(slug for slug, _ in entries))
+            for base, entries in roots
+        ],
+    )
+    for (base, entries), resolutions in zip(roots, owners_by_root, strict=True):
         source = by_base[base]
-        resolutions = resolve_artifact_owners(session, source, [slug for slug, _ in entries])
         for slug, found in entries:
             found.card["capabilities"] = artifact_capabilities(
                 session,
@@ -655,12 +678,14 @@ def _desktop_artifact_status_for_path(path: str, *, scope: TenantScope | None) -
     return ArtifactStatusView()
 
 
-# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
-# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
-# whenever org mode has no org in scope.
+# require(AuthenticatedInOrgMode), declared explicitly, refuses a caller with
+# no org in scope in org mode before the route runs. Without it the route
+# still fails closed: the ScopedSession each run_db unit builds (unit_session
+# in cowork/db/units.py) raises MissingTenantScopeError (401,
+# cowork/db/scoped.py) at its first partitioned query.
 @router.get("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def list_artifacts(
-    session: ScopedSessionDep,
+    scope: ScopeDep,
     project_id: UUID | None = Query(default=None),
     project_path: str | None = Query(default=None, max_length=4096),
 ):
@@ -674,7 +699,7 @@ async def list_artifacts(
         # UUID. Do not let the ignored compatibility field enter resolution.
         if project_id is None:
             catalog = await run_efs(
-                partial(_desktop_registered_path_catalog, scope=session.scope), scope=session.scope
+                partial(_desktop_registered_path_catalog, scope=scope), scope=scope
             )
             if not project_path or "\x00" in project_path:
                 return []
@@ -689,7 +714,7 @@ async def list_artifacts(
             source = _desktop_registered_source(catalog, requested, project_name)
             if source is None:
                 return []
-            return await _cards_for(session.scope, lambda: [source])
+            return await _cards_for(scope, lambda: [source])
     if project_id is not None:
         raw_project_ref = str(project_id)
         # Although FastAPI has already parsed this as UUID, make the recognized
@@ -700,15 +725,15 @@ async def list_artifacts(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid project",
             )
-        plan = await _scoped_project_plan(session.scope, project_ref)
-        return await _cards_for(session.scope, partial(readable_sources, plan))
-    plan = await run_db(plan_scope_roots, scope=session.scope)
-    return await _cards_for(session.scope, partial(readable_sources, plan))
+        plan = await _scoped_project_plan(scope, project_ref)
+        return await _cards_for(scope, partial(readable_sources, plan))
+    plan = await run_db(plan_scope_roots, scope=scope)
+    return await _cards_for(scope, partial(_browsable_sources, plan=plan))
 
 
 
-# AuthenticatedInOrgMode, declared explicitly: same ScopedSessionDep
-# fail-closed reasoning as list_artifacts above.
+# AuthenticatedInOrgMode, declared explicitly: same reasoning as
+# list_artifacts above.
 @router.delete(
     "/{slug}", status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require(AuthenticatedInOrgMode))],
@@ -717,19 +742,19 @@ async def delete_artifact_by_slug(
     slug: str,
     # Keep the dependency explicit: SAST treats the Annotated alias as an HTTP
     # parameter, then incorrectly taints the server-owned artifact roots.
-    session: ScopedSession = Depends(get_scoped_session),
+    scope: TenantScope = Depends(get_tenant_scope),
     project_id: UUID = Query(...),
     # D7: an org admin may delete an artifact whose owner is unknown.
     principal: Principal | None = Depends(get_principal),
 ):
     ref = _artifact_delete_ref(slug)
     return await delete_artifact_for_request(
-        session, ref, project_id=project_id, principal=principal
+        scope, ref, project_id=project_id, principal=principal
     )
 
 
 async def delete_artifact_for_request(
-    session, slug: str | _ArtifactDeleteRef, *, project_id: UUID, principal: Principal | None = None
+    scope: TenantScope, slug: str | _ArtifactDeleteRef, *, project_id: UUID, principal: Principal | None = None
 ) -> None:
     """Delete one artifact of one project. Unpublishes first; a failed unpublish
     leaves the folder in place and surfaces the error."""
@@ -740,7 +765,7 @@ async def delete_artifact_for_request(
     # This helper is also called directly by internal/test code, so retain the
     # same concrete parsing boundary the HTTP adapter applies above. In
     # particular, no request-derived string can select a project path.
-    await require_product_permission(session.scope, "artifact.manage")
+    await require_product_permission(scope, "artifact.manage")
 
     project_id = UUID(str(project_id))
 
@@ -766,16 +791,16 @@ async def delete_artifact_for_request(
         from cowork.api.v1.artifact_scope import review_artifact_for_request
 
         source, folder, _metadata, _is_own = await review_artifact_for_request(
-            session.scope, project_ref, artifact_id
+            scope, project_ref, artifact_id
         )
     else:
         # The legacy name is compared with entries discovered under each
         # authorized root. It is never joined onto the root, and symlinked
         # artifact folders are not eligible for mutation.
         assert ref.legacy_slug is not None
-        plan = await _scoped_project_plan(session.scope, project_id)
+        plan = await _scoped_project_plan(scope, project_id)
         source, folder = await run_efs(
-            partial(_legacy_artifact_in_plan, plan, ref.legacy_slug), scope=session.scope
+            partial(_legacy_artifact_in_plan, plan, ref.legacy_slug), scope=scope
         )
     if source is None or folder is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
@@ -798,17 +823,14 @@ async def delete_artifact_for_request(
             require_artifact_owner(unit, source, folder_name, resolution=resolution)
         return admin_delete
 
-    admin_delete = await run_db(owner_decision, scope=session.scope)
+    admin_delete = await run_db(owner_decision, scope=scope)
     expected_artifact_id = artifact_id if ref.artifact_id is not None else None
-    publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
+    publish_url, api_key = _resolve_publish_endpoint(await run_on_unit_threads(get_user_settings))
     # Set once the draft review rule is gone: the delete step may then no
     # longer refuse a busy file store, which would leave the folder's review
     # marker without its rule.
     revoked = False
     if _org_mode():
-        # `ScopedSession.scope` is the wrapper's own attribute — the same one
-        # ProjectService reads for `scoped_storage_root`.
-        scope = session.scope
         if not scope or not scope.org_id or not scope.user_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant in scope")
         # Unpublish acts on the viewer, and the viewer scopes by the token's owner,
@@ -817,7 +839,8 @@ async def delete_artifact_for_request(
         from cowork.services.artifact_autopublish import _active_workspace_id
 
         api_key = await PublishKey(
-            scope.user_id, scope.org_id, min_ttl_s=120.0, workspace_id=_active_workspace_id(scope)
+            scope.user_id, scope.org_id, min_ttl_s=120.0,
+            workspace_id=await run_on_unit_threads(partial(_active_workspace_id, scope)),
         ).get()
         if not api_key:
             raise HTTPException(
@@ -832,7 +855,7 @@ async def delete_artifact_for_request(
         try:
             if expected_artifact_id is None:
                 expected_artifact_id = await run_efs(
-                    partial(_artifact_id_for_folder, source, folder_name), scope=session.scope
+                    partial(_artifact_id_for_folder, source, folder_name), scope=scope
                 )
             canonical_key = await run_in_threadpool(
                 existing_authorization_key,
@@ -873,7 +896,7 @@ async def delete_artifact_for_request(
             expected_artifact_id=expected_artifact_id,
             api_key=api_key,
             publish_url=publish_url,
-            scope=session.scope,
+            scope=scope,
             deadline=not revoked,
         )
     except FileNotFoundError as e:
@@ -894,11 +917,11 @@ async def delete_artifact_for_request(
     # After the bytes are gone: a later artifact with the same slug starts with
     # its own owner (a no-op outside org mode). Best-effort; a stale row is
     # replaced on rekey and never grants anything to a folder that does not
-    # exist. Synchronous on purpose: it uses the request session, which must
-    # not cross threads, and it is one indexed lookup plus one delete.
+    # exist.
     try:
-        forget_artifact_owner(
-            session, source, folder_name, actor_id=str(session.scope.user_id)
+        await run_db(
+            lambda unit: forget_artifact_owner(unit, source, folder_name, actor_id=str(scope.user_id)),
+            scope=scope,
         )
     except Exception:
         logger.warning(
@@ -906,6 +929,23 @@ async def delete_artifact_for_request(
             exc_info=True,
             extra=log_context(project_id=source.project_id, artifact_slug=folder_name),
         )
+
+    # The location row goes with the folder (org mode; a no-op elsewhere).
+    # Best-effort: a row left behind names a folder that no longer holds the
+    # id, and the next lookup drops it.
+    location = recorded_location(source, Path(source.base) / folder_name)
+    if expected_artifact_id is not None and location is not None:
+        try:
+            await run_db(
+                partial(forget_location, artifact_id=canonical_artifact_id(expected_artifact_id), location=location),
+                scope=scope,
+            )
+        except Exception:
+            logger.warning(
+                "Could not drop the location of a deleted artifact",
+                exc_info=True,
+                extra=log_context(project_id=source.project_id, artifact_slug=folder_name),
+            )
 
 
 # The routes below (through delete_artifact_endpoint) are DesktopOnly, which
@@ -958,7 +998,8 @@ async def preview_artifact(scope: ScopeDep, path: str = Query(...)):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     _refuse_a_second_name(artifact)
     try:
-        return _preview_artifact(artifact)
+        # Reading and counting a large file would stall every other request.
+        return await run_in_threadpool(_preview_artifact, artifact)
     except ValueError as e:
         raise HTTPException(status_code=415, detail=str(e))
     except Exception as e:
@@ -1339,7 +1380,7 @@ async def withdraw_live_app_share(share_id: UUID, principal: Principal | None = 
 
 @live_app_router.get("/shared-live-apps", dependencies=_LIVE_APP_ROUTE)
 async def shared_live_apps(
-    session: ScopedSession = Depends(get_scoped_session),
+    scope: TenantScope = Depends(get_tenant_scope),
     principal: Principal | None = Depends(get_principal),
 ) -> list[SharedLiveAppResponse]:
     """The apps other people let the caller duplicate, by address or for
@@ -1373,7 +1414,7 @@ async def shared_live_apps(
             metadata = await run_in_threadpool(read_app_metadata, project_dir, share.slug)
         except (LiveAppGone, LiveAppCopyRefused):
             continue
-        kept = await _kept_copy_of(session, copies.get(share.share_id, []))
+        kept = await _kept_copy_of(scope, copies.get(share.share_id, []))
         listed.append(
             SharedLiveAppResponse(
                 share_id=share.share_id,
@@ -1389,21 +1430,21 @@ async def shared_live_apps(
     return listed
 
 
-async def _kept_copy_of(session: ScopedSession, copies: list[CopyOfShare]) -> CopyOfShare | None:
+async def _kept_copy_of(scope: TenantScope, copies: list[CopyOfShare]) -> CopyOfShare | None:
     """The caller's copy among ``copies`` whose folder is still there, in a
-    project of theirs (``session``'s scope)."""
+    project of theirs (``scope``)."""
     from cowork.services.live_apps import kept_copy
 
     project_dirs = {}
     for copy in copies:
-        project_dirs[copy.project_id] = await run_in_threadpool(_project_dir, session, project_id=copy.project_id)
+        project_dirs[copy.project_id] = await run_db(partial(_project_dir, project_id=copy.project_id), scope=scope)
     return await run_in_threadpool(kept_copy, project_dirs, copies)
 
 
 @live_app_router.post("/live-app-duplicate", dependencies=_LIVE_APP_ROUTE)
 async def duplicate_live_app(
     body: LiveAppDuplicateRequest,
-    session: ScopedSession = Depends(get_scoped_session),
+    scope: TenantScope = Depends(get_tenant_scope),
     principal: Principal | None = Depends(get_principal),
 ) -> dict:
     """Copy an app someone let the caller duplicate into a project of the
@@ -1434,13 +1475,13 @@ async def duplicate_live_app(
     if share is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_LONGER_SHARED)
     copies = await run_db(partial(copies_of_shares, recipient=recipient), scope=SYSTEM_SCOPE)
-    if await _kept_copy_of(session, copies.get(share.share_id, [])) is not None:
+    if await _kept_copy_of(scope, copies.get(share.share_id, [])) is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_ALREADY_COPIED)
     owner_scope = scope_for_identity(org_id=share.owner_partition_id, user_id=share.owner_user_id)
     owner_dir = await run_db(partial(_project_dir, project_id=share.project_id), scope=owner_scope)
     if owner_dir is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_LONGER_SHARED)
-    target_dir = await run_in_threadpool(_project_dir, session, project_id=body.project_id)
+    target_dir = await run_db(partial(_project_dir, project_id=body.project_id), scope=scope)
     if target_dir is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_SUCH_PROJECT)
     try:
@@ -1459,8 +1500,11 @@ async def duplicate_live_app(
         # local tenancy, where the copy is the caller's by the project it
         # lands in. The one helper for that row, should live apps ever run
         # in org mode.
-        await run_in_threadpool(
-            record_artifact_owner, session, body.project_id, slug, recipient.user_id, action="live_app_duplicate"
+        await run_db(
+            lambda unit: record_artifact_owner(
+                unit, body.project_id, slug, recipient.user_id, action="live_app_duplicate"
+            ),
+            scope=scope,
         )
     except Exception:
         # A copy without its received mark would reach the agent as the
@@ -1480,8 +1524,8 @@ async def duplicate_live_app(
                 },
             )
         raise
-    plan = await _scoped_project_plan(session.scope, str(body.project_id))
-    cards = await _cards_for(session.scope, partial(readable_sources, plan))
+    plan = await _scoped_project_plan(scope, str(body.project_id))
+    cards = await _cards_for(scope, partial(readable_sources, plan))
     card = next((card for card in cards if Path(str(card.get("folder") or "")).name == slug), None)
     if card is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="The copy has no card")

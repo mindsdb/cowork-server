@@ -156,12 +156,13 @@ async def test_queued_reuse_denial_precedes_redis_even_with_an_existing_key(
 
 def test_artifact_http_write_denied_before_resource_or_disk_access(monkeypatch):
     from cowork.api.v1.endpoints import artifact_workspace
-    from cowork.db.scoped import get_scoped_session
+    from cowork.db.scoped import get_scoped_session, get_tenant_scope
 
     authority(monkeypatch, body={"allowed": False})
     app = FastAPI()
     app.include_router(artifact_workspace.router)
     app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=ORG)
+    app.dependency_overrides[get_tenant_scope] = lambda: ORG
     disk = Mock(side_effect=AssertionError("No resource or disk access"))
     monkeypatch.setattr(artifact_workspace, "_owner_workspace", awaitable(disk))
     with TestClient(app) as client:
@@ -311,12 +312,13 @@ def test_every_artifact_mutation_checks_authority_before_resolving_files(
     monkeypatch, suffix, method, body, allowed, status
 ):
     from cowork.api.v1.endpoints import artifact_workspace
-    from cowork.db.scoped import get_scoped_session
+    from cowork.db.scoped import get_scoped_session, get_tenant_scope
 
     authority(monkeypatch, body={"allowed": allowed})
     app = FastAPI()
     app.include_router(artifact_workspace.router)
     app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=ORG)
+    app.dependency_overrides[get_tenant_scope] = lambda: ORG
     resolve = Mock(side_effect=AssertionError("No artifact mutation"))
     monkeypatch.setattr(artifact_workspace, "_owner_workspace", awaitable(resolve))
     with TestClient(app) as client:
@@ -347,12 +349,13 @@ def test_generic_file_routes_cannot_mutate_artifact_bytes_or_ancestors(
     monkeypatch, path, method
 ):
     from cowork.api.v1.endpoints import project_files
-    from cowork.db.scoped import get_scoped_session
+    from cowork.db.scoped import get_scoped_session, get_tenant_scope
 
     authority(monkeypatch, body={"allowed": False})
     app = FastAPI()
     app.include_router(project_files.router)
     app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=ORG)
+    app.dependency_overrides[get_tenant_scope] = lambda: ORG
     write = Mock(side_effect=AssertionError("No disk access"))
     monkeypatch.setattr(project_files, "_require_workspace_path", write)
     with TestClient(app) as client:
@@ -379,7 +382,7 @@ async def test_generic_non_artifact_paths_keep_their_existing_resource_authority
 
     call = authority(monkeypatch, body={"allowed": False})
     await project_files._authorize_artifact_file_mutation(
-        project_files._validated_project_path(path), SimpleNamespace(scope=ORG)
+        project_files._validated_project_path(path), ORG
     )
     assert call == []
 
@@ -393,7 +396,7 @@ async def test_artifact_parent_paths_continue_after_a_current_grant(monkeypatch,
 
     calls = authority(monkeypatch, body={"allowed": True})
     await project_files._authorize_artifact_file_mutation(
-        project_files._validated_project_path(path), SimpleNamespace(scope=ORG)
+        project_files._validated_project_path(path), ORG
     )
     assert len(calls) == 1
 
@@ -418,7 +421,7 @@ async def test_artifact_capabilities_reflect_current_role_and_execution(
         "canPreview": True,
     }
     actual = await artifact_workspace._current_capabilities(
-        SimpleNamespace(scope=ORG), original
+        ORG, original
     )
     assert actual == {
         "canEdit": can_edit,
@@ -441,7 +444,7 @@ async def test_artifact_role_permissions_never_elevate_a_reviewer(monkeypatch):
     }
     assert (
         await artifact_workspace._current_capabilities(
-            SimpleNamespace(scope=ORG), original
+            ORG, original
         )
         == original
     )
@@ -450,12 +453,13 @@ async def test_artifact_role_permissions_never_elevate_a_reviewer(monkeypatch):
 
 def test_artifact_delete_checks_role_before_resolving_a_slug(monkeypatch):
     from cowork.api.v1.endpoints import artifacts
-    from cowork.db.scoped import get_scoped_session
+    from cowork.db.scoped import get_scoped_session, get_tenant_scope
 
     authority(monkeypatch, body={"allowed": False})
     app = FastAPI()
     app.include_router(artifacts.router)
     app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=ORG)
+    app.dependency_overrides[get_tenant_scope] = lambda: ORG
     resolve = Mock(side_effect=AssertionError("No artifact lookup"))
     monkeypatch.setattr(artifacts, "scoped_project_id_for_request", resolve)
     with TestClient(app) as client:
@@ -470,6 +474,7 @@ def test_artifact_delete_checks_role_before_resolving_a_slug(monkeypatch):
 async def test_schedules_recheck_stored_owner_before_creating_a_conversation(
     monkeypatch, is_manual
 ):
+    import json
     from datetime import datetime, timezone
     from uuid import uuid4
     from sqlmodel import Session, select
@@ -479,7 +484,7 @@ async def test_schedules_recheck_stored_owner_before_creating_a_conversation(
     from cowork.db.session import get_engine
     from cowork.models.project import Project
     from cowork.models.schedule import ScheduleRun
-    from cowork.schemas.schedules import RunStatus
+    from cowork.schemas.schedules import AttemptOutcome, RunStatus
     from cowork.services.schedules import ScheduleService
     from cowork.services.conversations import ConversationService
     from cowork.handlers import responses
@@ -516,9 +521,15 @@ async def test_schedules_recheck_stored_owner_before_creating_a_conversation(
                 select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)
             ).all()
             assert len(runs) == 1 and runs[0].status == RunStatus.failed
-            assert "permission_denied" in runs[0].error
+            assert runs[0].outcome == AttemptOutcome.failed_before_execution
+            assert runs[0].error == scheduler._FAILED_BEFORE_ERROR
             assert runs[0].conversation_id is None
         assert len(requests) == 1
+        assert json.loads(requests[0].content) == {
+            "user_id": ORG.user_id,
+            "organization_id": ORG.org_id,
+            "permission": "product.execute",
+        }
         create.assert_not_called()
         handler.assert_not_called()
     finally:
@@ -564,7 +575,7 @@ async def test_a_role_grant_does_not_override_narrow_artifact_operation_flags(
     }
     assert (
         await artifact_workspace._current_capabilities(
-            SimpleNamespace(scope=ORG), narrow
+            ORG, narrow
         )
         == narrow
     )
@@ -582,7 +593,7 @@ async def test_agent_repair_requires_execution_after_artifact_management(monkeyp
     monkeypatch.setattr(permissions, "has_product_permission", allowed)
     with pytest.raises(permissions.ProductPermissionDenied):
         await artifact_workspace.request_agent_repair(
-            "project", "artifact", Mock(), SimpleNamespace(scope=ORG)
+            "project", "artifact", Mock(), ORG
         )
     assert calls == ["artifact.manage", "product.execute"]
 
@@ -620,7 +631,7 @@ def test_generic_write_detaches_a_hardlink_to_a_protected_artifact(
     import stat
     from contextlib import contextmanager
     from cowork.api.v1.endpoints import project_files
-    from cowork.db.scoped import get_scoped_session
+    from cowork.db.scoped import get_scoped_session, get_tenant_scope
 
     base = tmp_path / "project"
     artifact = base / ".anton" / "artifacts" / "report" / "index.html"
@@ -641,6 +652,7 @@ def test_generic_write_detaches_a_hardlink_to_a_protected_artifact(
     app = FastAPI()
     app.include_router(project_files.router)
     app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=ORG)
+    app.dependency_overrides[get_tenant_scope] = lambda: ORG
     with TestClient(app) as client:
         response = client.put(
             "/project/files/ordinary.html", json={"content": "changed alias"}

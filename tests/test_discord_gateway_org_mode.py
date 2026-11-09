@@ -17,6 +17,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_open_session
 from cowork.models.channel import ChannelBinding, ChannelEvent, ChannelInstallation, ChannelSession
+from cowork.models.conversation import Conversation
 from cowork.services.channels import ChannelConfigService
 
 ORG_A = "8f14e45f-ceea-467e-adde-3fb5ba9302f0"
@@ -118,7 +119,10 @@ def test_discord_gateway_message_in_org_mode_gets_a_reply(monkeypatch, org_mode)
     async def fake_post(self, url, json=None, **kw):
         if not str(url).startswith("https://discord.com/api"):
             return await real_post(self, url, json=json, **kw)
-        posted.append(json or {})
+        # The typing indicator posts too while the turn runs; only the reply
+        # is a message.
+        if str(url).endswith("/messages"):
+            posted.append(json or {})
 
         class R:
             status_code = 200
@@ -175,6 +179,7 @@ def test_discord_gateway_message_in_org_mode_gets_a_reply(monkeypatch, org_mode)
         asyncio.run(flow())
 
         assert len(fake_harness.calls) == 1, "the turn must actually run"
+        conversation_id = fake_harness.calls[0]["conversation"].id
 
         assert len(posted) == 1
         assert "pong from the org bot" in posted[0]["content"]
@@ -186,6 +191,9 @@ def test_discord_gateway_message_in_org_mode_gets_a_reply(monkeypatch, org_mode)
             ).one()
             assert row.status == "routed", row.status
             assert row.org_id == ORG_A
+            conversation = s.get(Conversation, conversation_id)
+            # A DM to the bot (no guild_id): never marked, so no admin can read it.
+            assert (conversation.channel_type, conversation.created_by) == (None, None)
         finally:
             s.close()
     finally:

@@ -319,26 +319,24 @@ async def test_org_mode_still_requires_a_successful_republish_to_card_an_edit(
     assert cards == []
 
 
-def test_scope_falls_back_to_the_ambient_turn_scope(conv, monkeypatch):
-    # A detached or expired session yields no scope. The turn boundary binds an
-    # ambient one (use_settings_scope in handlers.responses), and it survives
-    # that — otherwise a whole class of "artifact never published" would depend
-    # on session lifetime.
-    from cowork.db.scoped import TenantScope
-
-    ambient = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
-    monkeypatch.setattr(t, "scope_of_session", lambda _s: None)
-    monkeypatch.setattr(
-        "cowork.common.settings.user_settings.current_settings_scope", lambda: ambient
+def test_changes_ignore_bytecode_written_during_the_turn(conv, tmp_path):
+    """A scratchpad import from the artifact folder writes `__pycache__`; the
+    agent did not edit the artifact, so no revision is captured."""
+    base = tmp_path / "artifacts"
+    _make_artifact(
+        base, "old",
+        files={"backend.py": "x = 1", "routes/x.py": "y = 1"},
+        meta={"slug": "old", "type": "document"},
     )
+    before, before_mtimes = t.snapshot_artifact_state(base)
 
-    assert t._recover_turn_scope(conv) is ambient
+    cache = base / "old" / "routes" / "__pycache__" / "x.cpython-313.pyc"
+    cache.parent.mkdir()
+    cache.write_bytes(b"\0")
+    _bump_mtime(cache, 120)
 
-
-def test_scope_is_none_when_neither_source_has_one(conv, monkeypatch):
-    monkeypatch.setattr(t, "scope_of_session", lambda _s: None)
-    monkeypatch.setattr(
-        "cowork.common.settings.user_settings.current_settings_scope", lambda: None
+    changes = t.turn_artifact_changes(
+        conversation_id=conv.id, artifacts_base=base, before=before, before_mtimes=before_mtimes,
     )
-
-    assert t._recover_turn_scope(conv) is None
+    assert changes.created == []
+    assert changes.touched == set()

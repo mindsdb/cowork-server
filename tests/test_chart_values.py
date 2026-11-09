@@ -63,6 +63,8 @@ import pytest
 import yaml
 
 from _hosted_command import graceful_shutdown_seconds, hosted_command, image_cmd
+from cowork.common.settings.app_settings import AppSettings
+from cowork.services.connectors.datasource_capabilities import DatasourceManifest, load_datasource_capabilities
 
 CHART = Path(__file__).resolve().parents[1] / "deployment" / "cowork-server"
 BASE = CHART / "values.yaml"
@@ -71,10 +73,12 @@ ENV_KEYS = ("globalEnvs", "globalEnvsSecondary", "extraEnvs")
 BUNDLE = "datasource-service-keys"
 FLAG = "COWORK_TURN_DATASOURCE_ENABLED"
 CAPABILITIES = "COWORK_DATASOURCE_CAPABILITIES"
-# Environments the release gate has switched datasource grants on in. Empty
-# until it does; the gate's own change adds the environment here and sets
-# both deployment scalars in its values file.
-ENABLED_ENVIRONMENTS: frozenset[str] = frozenset()
+# Environments the release gate has switched datasource grants on in; the
+# gate's own change adds the environment here and sets both deployment scalars
+# in its values file.
+ENABLED_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
+# The exact methods each enabled environment offers.
+OFFERED_METHODS: dict[str, frozenset[str]] = {"staging": frozenset({"mysql:host-password", "postgres:host-port"})}
 # The draft host of each environment. cowork's web build frames exactly these
 # (src/shared/draft-link-origins.ts there) and refuses a link to any other.
 DRAFT_HOSTS = {
@@ -145,17 +149,35 @@ def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed
         )
 
 
-def test_no_datasource_method_is_offered_in_the_released_values(base):
+def test_datasource_methods_are_offered_exactly_where_the_gate_passed(base):
     """The list of methods a deployment may run, empty until a gate says
     otherwise, and set only where grants are on."""
     assert _deployment(BASE)["datasourceCapabilities"] == ""
     assert _entry(base, CAPABILITIES).value == "{{ $.Values.datasourceCapabilities }}"
+    assert set(OFFERED_METHODS) == ENABLED_ENVIRONMENTS
     for env_values in ENVIRONMENTS:
         environment = env_values.stem.removeprefix("values-")
         if environment not in ENABLED_ENVIRONMENTS:
             assert "datasourceCapabilities" not in _deployment(env_values), (
                 f"{env_values.name} offers a method where grants are off"
             )
+        else:
+            # The configured list is pinned as written, so a leftover pair cannot
+            # switch an engine on later when an image marks its spec available.
+            raw = _deployment(env_values)["datasourceCapabilities"]
+            configured = DatasourceManifest.model_validate_json(raw)
+            assert set(configured.enabled) == OFFERED_METHODS[environment], env_values.name
+            # Then loaded as the server loads it, against the shipped specs: a
+            # wrong-version value, or an engine whose spec is not marked
+            # available, turns a method off with only a warning.
+            caps = load_datasource_capabilities(AppSettings(COWORK_DATASOURCE_CAPABILITIES=raw))
+            offered = {
+                f"{connector}:{method}"
+                for connector, methods in caps.methods.items()
+                for method, available in methods.items()
+                if available and caps.cloud_target(connector, method) == (connector, method)
+            }
+            assert offered == OFFERED_METHODS[environment], env_values.name
         assert not [e for e in _env(env_values) if e.name == CAPABILITIES], (
             f"{env_values.name} declares {CAPABILITIES}; set deployment.datasourceCapabilities instead"
         )
@@ -320,9 +342,9 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     """Counted from the pod's deletion: the preStop sleep, the pre-drain that
     ends remote turns before uvicorn sees SIGTERM, uvicorn's drain bound, then
     the lifespan teardown's bounded waits (the draft listener's own drain,
-    another pass over turns, channel tasks, scratchpad closes, and last the
-    turn-end artifact records a file store stall left waiting), and a margin
-    for its unbounded closes.
+    another pass over turns, the location backfill's stop, channel tasks,
+    scratchpad closes, and last the turn-end artifact records a file store
+    stall left waiting), and a margin for its unbounded closes.
 
     The channel drain cancels the tasks still running at its timeout, then
     waits up to its cancel_timeout for them to unwind: a cancelled channel turn
@@ -334,6 +356,7 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     from cowork.draft_host.listener import (
         _GRACEFUL_SHUTDOWN_SECONDS as DRAFT_LISTENER_DRAIN_SECONDS,
     )
+    from cowork.server import LOCATION_BACKFILL_SHUTDOWN_SECONDS
     from cowork.streaming.cancellation import CANCEL_REQUEST_SECONDS
     from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
 
@@ -345,6 +368,7 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     teardown = (
         DRAFT_LISTENER_DRAIN_SECONDS
         + TURN_SHUTDOWN_GRACE_SECONDS
+        + LOCATION_BACKFILL_SHUTDOWN_SECONDS
         + _timeout_default(drain_background_tasks) + channel_cancel_wait
         + _timeout_default(drain_scratchpad_closes)
         + TURN_END_RECORD_DRAIN_SECONDS

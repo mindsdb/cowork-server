@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -37,9 +36,7 @@ async def test_desktop_project_path_keeps_local_card_addressing(tmp_path, monkey
     )
     monkeypatch.setattr(artifacts, "artifacts_sources_for_scan", lambda *, scope: [source])
 
-    cards = await artifacts.list_artifacts(
-        SimpleNamespace(scope=LOCAL_SCOPE), project_id=None, project_path=str(project)
-    )
+    cards = await artifacts.list_artifacts(LOCAL_SCOPE, project_id=None, project_path=str(project))
 
     assert len(cards) == 1
     assert cards[0]["projectId"] is None

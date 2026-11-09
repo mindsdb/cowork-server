@@ -147,10 +147,10 @@ def test_legacy_identity_widening_merges_latest_metadata(tmp_path):
 
 
 def test_legacy_identity_widening_preserves_metadata_mtime(tmp_path):
-    """Channel delivery (artifacts_since) reads metadata.json's mtime as "this
-    turn touched the artifact". Widening an id is bookkeeping, not an update —
-    if it refreshed the mtime, the first card build after an upgrade would
-    deliver every legacy artifact to the chat as though it were new."""
+    """The artifacts list (list_artifacts) orders folders by metadata.json's
+    mtime, newest first. Widening an id is bookkeeping, not an update: if it
+    refreshed the mtime, the first card build after an upgrade would move
+    every legacy artifact to the top as though it were new."""
     import os
 
     folder = tmp_path / "legacy"
@@ -1034,7 +1034,7 @@ def test_rejected_repair_retry_finishes_interrupted_status_write(artifact, monke
 
     def fail_once(folder_arg, repair):
         nonlocal failed
-        if not failed and repair.get("status") == "rejected":
+        if not failed and repair.status == "rejected":
             failed = True
             raise OSError("simulated repair status interruption")
         return write_repair(folder_arg, repair)

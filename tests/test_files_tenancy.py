@@ -9,13 +9,14 @@ from __future__ import annotations
 import io
 from collections.abc import Callable
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from fastapi import UploadFile
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from _fakes import stored_file, units_on_engine
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.harnesses.anton_harness.harness import _conversation_attachment_context
@@ -23,7 +24,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.file import File
 from cowork.models.project import Project
 from cowork.principal import Principal
-from cowork.services.files import FileService, attachment_purpose
+from cowork.services.files import FileService, attachment_purpose, save_upload
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -52,7 +53,7 @@ def _svc(engine, scope: TenantScope) -> FileService:
 
 
 def _mkfile(svc: FileService, purpose: str = "assistants") -> File:
-    return svc.create_file_from_bytes(
+    return stored_file(scoped=svc.session,
         filename="report.csv", content_type="text/csv", data=b"a,b\n1,2\n", purpose=purpose
     )
 
@@ -201,7 +202,7 @@ def _conversation_with_file(engine, scope: TenantScope):
     scoped.add(conv)
     scoped.commit()
     scoped.refresh(conv)
-    FileService(scoped).create_file_from_bytes(
+    stored_file(scoped=scoped,
         filename="doc.txt", content_type="text/plain", data=b"hi",
         purpose=attachment_purpose(str(conv.id)),
     )
@@ -328,10 +329,9 @@ async def test_compat_upload_leaves_a_busy_store_to_the_503_handlers(units_read_
     from test_run_efs import holding
 
     monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
-    scoped = ScopedSession(Session(units_read_engine), _scope(ORG_A))
 
     def upload():
-        return stubs.upload_attachment("general", str(uuid4()), scoped=scoped, files=[_upload("notes.txt")])
+        return stubs.upload_attachment("general", str(uuid4()), scope=_scope(ORG_A), files=[_upload("notes.txt")])
 
     if busy == "file_store":
         async with holding(db_session.settings.storage.efs_slots, LOCAL_SCOPE):
@@ -371,8 +371,7 @@ async def test_a_refused_upload_row_answers_at_once_and_its_folder_goes_once_a_s
         raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
 
     monkeypatch.setattr(files, "_insert_file", refused_row)
-    svc = _svc(units_read_engine, _scope(ORG_A))
-    upload = asyncio.create_task(svc.create_file(_upload("notes.txt"), purpose="assistants"))
+    upload = asyncio.create_task(save_upload(_upload("notes.txt"), purpose="assistants", scope=_scope(ORG_A)))
     assert await asyncio.to_thread(row_asked.wait, 5)
     [path] = written
     loop = asyncio.get_running_loop()
@@ -393,12 +392,60 @@ async def test_a_refused_upload_row_answers_at_once_and_its_folder_goes_once_a_s
 async def test_upload_filename_cannot_escape_root(units_read_engine, tmp_path, name):
     # The upload's row is written in a database unit, on the app's engine.
     svc = _svc(units_read_engine, _scope(ORG_A))
-    res = await svc.create_file(_upload(name), purpose="assistants")
-    stored = Path(svc._get_file_model(UUID(res.id)).path).resolve()
+    res = await save_upload(_upload(name), purpose="assistants", scope=_scope(ORG_A))
+    stored = Path(svc._get_file_model(res.id).path).resolve()
     # org-first layout: bytes contained under <shared>/<org>/files
     assert (tmp_path / ORG_A / "files").resolve() in stored.parents
     assert stored.name in ("pwned", "upload")                # basename or fallback
     assert not (tmp_path / "etc").exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "basename"),
+    [
+        (None, None), ("", None), (".", None), ("..", None), (" .. ", None), ("a/..", None),
+        ("../../etc/pwned", "pwned"), ("/etc/cron.d/pwned", "pwned"), (" report.csv ", "report.csv"),
+    ],
+)
+def test_an_untrusted_name_keeps_its_last_component_or_nothing(name, basename):
+    from cowork.services.files import upload_basename
+
+    assert upload_basename(name=name) == basename
+
+
+async def test_a_cancel_while_the_uploads_row_commits_keeps_its_bytes(units_read_engine, monkeypatch):
+    """A cancel lands while the row's unit runs, as at process exit for a
+    channel turn's attachment. run_db lets the unit commit before the cancel
+    propagates, so the bytes the row names must stay on disk."""
+    import asyncio
+    import threading
+    import time
+
+    from cowork.services import files as files_mod
+
+    inside = threading.Event()
+    real_insert = files_mod._insert_file
+
+    def slow_insert(session, *, file):
+        inside.set()
+        time.sleep(0.3)
+        return real_insert(session, file=file)
+
+    monkeypatch.setattr(files_mod, "_insert_file", slow_insert)
+    upload = asyncio.ensure_future(files_mod.store_file(
+        scope=_scope(ORG_A), filename="a.txt", content_type="text/plain", data=b"hi", purpose="assistants",
+    ))
+    deadline = time.monotonic() + 5
+    while not inside.is_set():
+        assert time.monotonic() < deadline, "the row's unit never ran"
+        await asyncio.sleep(0.01)
+    upload.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await upload
+
+    with Session(units_read_engine) as session:
+        (row,) = session.exec(select(File)).all()
+    assert Path(row.path).read_bytes() == b"hi"
 
 
 def test_delete_never_rmtrees_an_escaped_legacy_path(engine, tmp_path):
@@ -520,9 +567,9 @@ def test_delete_after_root_move_still_ignores_escaped_paths(engine, tmp_path, mo
 def test_stage_conversation_attachments_copies_into_workspace(engine, tmp_path):
     svc = _svc(engine, _scope(ORG_A))
     conv = str(uuid4())
-    a = svc.create_file_from_bytes(filename="shot.png", content_type="image/png",
+    a = stored_file(scoped=svc.session, filename="shot.png", content_type="image/png",
                                    data=b"img", purpose=attachment_purpose(conv))
-    b = svc.create_file_from_bytes(filename="notes.txt", content_type="text/plain",
+    b = stored_file(scoped=svc.session, filename="notes.txt", content_type="text/plain",
                                    data=b"hi", purpose=attachment_purpose(conv))
     proj = tmp_path / "proj"
     assert svc.stage_conversation_attachments(conv, proj) == 2
@@ -534,9 +581,9 @@ def test_stage_conversation_attachments_copies_into_workspace(engine, tmp_path):
 def test_stage_is_idempotent_and_conversation_scoped(engine, tmp_path):
     svc = _svc(engine, _scope(ORG_A))
     conv, other = str(uuid4()), str(uuid4())
-    svc.create_file_from_bytes(filename="a.txt", content_type="text/plain",
+    stored_file(scoped=svc.session, filename="a.txt", content_type="text/plain",
                                data=b"x", purpose=attachment_purpose(conv))
-    svc.create_file_from_bytes(filename="b.txt", content_type="text/plain",
+    stored_file(scoped=svc.session, filename="b.txt", content_type="text/plain",
                                data=b"y", purpose=attachment_purpose(other))
     proj = tmp_path / "proj"
     assert svc.stage_conversation_attachments(conv, proj) == 1      # only this conv's
@@ -584,9 +631,9 @@ def test_clearing_staged_instructions_works_without_os_o_nofollow(tmp_path, monk
 def test_stage_prunes_a_deleted_attachment(engine, tmp_path):
     svc = _svc(engine, _scope(ORG_A))
     conv = str(uuid4())
-    a = svc.create_file_from_bytes(filename="keep.txt", content_type="text/plain",
+    a = stored_file(scoped=svc.session, filename="keep.txt", content_type="text/plain",
                                    data=b"k", purpose=attachment_purpose(conv))
-    b = svc.create_file_from_bytes(filename="gone.txt", content_type="text/plain",
+    b = stored_file(scoped=svc.session, filename="gone.txt", content_type="text/plain",
                                    data=b"g", purpose=attachment_purpose(conv))
     proj = tmp_path / "proj"
     assert svc.stage_conversation_attachments(conv, proj) == 2
@@ -606,7 +653,7 @@ def test_stage_refuses_symlinked_attachments_dir(engine, tmp_path):
     # the victim's data. The staging path must never follow it.
     svc = _svc(engine, _scope(ORG_A))
     conv = str(uuid4())
-    a = svc.create_file_from_bytes(filename="keep.txt", content_type="text/plain",
+    a = stored_file(scoped=svc.session, filename="keep.txt", content_type="text/plain",
                                    data=b"k", purpose=attachment_purpose(conv))
 
     # Stand-in for another org's tree, and the pod-planted symlink over `attachments`.
@@ -873,10 +920,10 @@ def test_undecodable_memory_slot_does_not_404_a_project_delete(org_engine):
     )
     project_id = project.id
 
-    projects_endpoint.delete_project(
-        project_id,
+    projects_endpoint._delete_project(
         scoped,
-        _org_principal(ORG_MEMBER),
+        project_id=project_id,
+        principal=_org_principal(ORG_MEMBER),
     )
 
     with pytest.raises(ValueError, match="not found"):
@@ -901,10 +948,10 @@ def test_symlinked_memory_dir_does_not_500_a_project_delete(org_engine):
     scoped, project = _project_with_unreadable_rules(org_engine, plant_link)
     project_id = project.id
 
-    projects_endpoint.delete_project(
-        project_id,
+    projects_endpoint._delete_project(
         scoped,
-        _org_principal(ORG_MEMBER),
+        project_id=project_id,
+        principal=_org_principal(ORG_MEMBER),
     )
 
     with pytest.raises(ValueError, match="not found"):
@@ -920,12 +967,12 @@ def _instructions_project(engine) -> tuple[ScopedSession, Project]:
 
     scoped = _org_scoped(engine, ORG_MEMBER)
     project = ProjectService(scoped).create_project("gated-instructions")
-    project_files.write_project_file(
-        project.name,
-        project_files._validated_project_path(".anton/anton.md"),
-        project_files._FileWriteRequest(content="the creator's rules"),
+    project_files._write_project_file(
         scoped,
-        _org_principal(ORG_MEMBER),
+        project_name=project.name,
+        path=project_files._validated_project_path(".anton/anton.md"),
+        req=project_files._FileWriteRequest(content="the creator's rules"),
+        principal=_org_principal(ORG_MEMBER),
     )
     return scoped, project
 
@@ -949,21 +996,21 @@ def test_peer_member_cannot_write_instructions_through_the_file_route(org_engine
     path = project_files._validated_project_path(alias)
 
     with pytest.raises(HTTPException) as denied:
-        project_files.write_project_file(
-            project.name,
-            path,
-            project_files._FileWriteRequest(content="peer takeover"),
+        project_files._write_project_file(
             peer,
-            _org_principal(ORG_PEER),
+            project_name=project.name,
+            path=path,
+            req=project_files._FileWriteRequest(content="peer takeover"),
+            principal=_org_principal(ORG_PEER),
         )
     assert denied.value.status_code == 403
 
     with pytest.raises(HTTPException) as delete_denied:
-        project_files.delete_project_file(
-            project.name,
-            path,
+        project_files._delete_project_file(
             peer,
-            _org_principal(ORG_PEER),
+            project_name=project.name,
+            path=path,
+            principal=_org_principal(ORG_PEER),
         )
     assert delete_denied.value.status_code == 403
 
@@ -972,7 +1019,7 @@ def test_peer_member_cannot_write_instructions_through_the_file_route(org_engine
 
 
 @pytest.mark.asyncio
-async def test_upload_route_cannot_reach_the_instructions_file(org_engine):
+async def test_upload_route_cannot_reach_the_instructions_file(org_engine, monkeypatch):
     """The upload route writes project-root children only.
 
     A separator in the filename is stripped rather than honoured, so an upload
@@ -982,14 +1029,16 @@ async def test_upload_route_cannot_reach_the_instructions_file(org_engine):
 
     _creator, project = _instructions_project(org_engine)
     peer = _org_scoped(org_engine, ORG_PEER)
+    units_on_engine(monkeypatch, org_engine)
 
     result = await project_files.upload_project_files(
         project.name,
-        peer,
+        peer.scope,
         files=[_upload(".anton/anton.md", b"peer takeover")],
     )
 
-    assert result["results"] == [{"name": "anton.md", "ok": True, "size": 13}]
+    # As the route sends it: a field left unset is left out.
+    assert result.model_dump(exclude_unset=True)["results"] == [{"name": "anton.md", "ok": True, "size": 13}]
     anton_md = Path(project.path) / ".anton" / "anton.md"
     assert anton_md.read_text() == "the creator's rules"
     assert (Path(project.path) / "anton.md").read_bytes() == b"peer takeover"

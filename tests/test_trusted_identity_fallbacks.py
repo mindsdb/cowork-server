@@ -47,23 +47,6 @@ def _refuse_sessions(monkeypatch):
     monkeypatch.setattr(db_session, "get_open_session", refuse)
 
 
-# ── artifact indexing ───────────────────────────────────────────────────────
-
-def test_indexing_without_a_scope_is_skipped(scope_required, caplog, owned_logger):
-    owned_logger(task_objects.logger.name, level=logging.WARNING)
-    conversation_id = uuid4()
-    assert task_objects.turn_record_scope(None, conversation_id=conversation_id) is None
-    [record] = [
-        r for r in caplog.records if r.name == task_objects.logger.name and r.levelno == logging.WARNING
-    ]
-    assert record.getMessage() == "artifact indexing skipped: no tenant scope provided on a partitioned deployment"
-    assert record.conversation_id == str(conversation_id)
-
-
-def test_indexing_without_a_scope_is_local_on_a_desktop(desktop):
-    assert task_objects.turn_record_scope(None, conversation_id=uuid4()) is LOCAL_SCOPE
-
-
 # ── skill-draft seeding ─────────────────────────────────────────────────────
 
 @pytest.fixture

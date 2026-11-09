@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
 import time
 from collections import OrderedDict
@@ -15,7 +16,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import SecretStr
 
-from cowork.build_info import surface
+from cowork.build_info import supported_kwargs, surface
 from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
@@ -40,8 +41,7 @@ MINDS_PROBE_MODEL = "mindshub_air"
 
 # Marks a request as our own background call on the user's key, not activity
 # they asked for, so the customer's Traces list hides it by default: the
-# connectivity/health-check pings below and the Jev shadow probe
-# (cowork/handlers/jev_shadow.py). Read by mindshub_inference; it is
+# connectivity/health-check pings below. Read by mindshub_inference; it is
 # our own header and means nothing to a non-Minds endpoint, so it is only ever
 # sent to a Minds host.
 MINDS_REQUEST_KIND_HEADER = "X-Minds-Request-Kind"
@@ -1243,6 +1243,8 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
         `max_tokens` is kept at a small-but-safe 20 rather than 1 — some
         models reject a 1-token budget (or can't emit even a stop token),
         which would fail the probe for a perfectly valid key."""
+        from cowork.db.units import run_on_unit_threads
+
         payload = {"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "ping"}]}
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(url, headers=headers, json=payload)
@@ -1260,7 +1262,8 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
         return ProviderPing(
             status="fail",
             detail=f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}",
-            denial=_probe_denial(response=r),
+            # Off the loop: the gateway check reads settings.
+            denial=await run_on_unit_threads(lambda: _probe_denial(response=r)),
         )
 
     try:
@@ -1517,6 +1520,18 @@ class WebToolKwargs(TypedDict, total=False):
 
     web_search_enabled: bool
     web_fetch_enabled: bool
+    # False: the agent answers from the connected data only (no web tools, no
+    # scratchpad web_search(), no internet guidance in its prompt).
+    internet_research_enabled: bool
+
+
+# anton's own setting names, so the CLI and a cowork-server read the same variables.
+_WEB_TOOL_ENV = {
+    "web_search_enabled": "ANTON_WEB_SEARCH_ENABLED",
+    "web_fetch_enabled": "ANTON_WEB_FETCH_ENABLED",
+    "internet_research_enabled": "ANTON_INTERNET_RESEARCH_ENABLED",
+}
+_OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
@@ -1529,15 +1544,37 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     onto that flavor runs with both off. Every other session keeps anton's
     defaults: MindsHub keeps its native web tools, and direct OpenAI keeps
     what its flavor provides.
+
+    ``ANTON_WEB_SEARCH_ENABLED`` / ``ANTON_WEB_FETCH_ENABLED`` set to a false
+    value in the server's env turn that tool off for every session this server
+    runs, and ``ANTON_INTERNET_RESEARCH_ENABLED`` turns internet research off;
+    they never turn anything on. Org turns run in a pod through
+    ``anton.cloud_turn``, which doesn't read this env. A field the installed
+    anton's ChatSessionConfig lacks is dropped (``supported_kwargs``): passing
+    it would fail every turn.
     """
+    from anton.core.session import ChatSessionConfig
+
+    return WebToolKwargs(**supported_kwargs(ChatSessionConfig, **web_tool_switches(planning_provider)))
+
+
+def web_tool_switches(planning_provider: Provider) -> WebToolKwargs:
+    """The web tools this server turns off for a session on `planning_provider`,
+    before `web_tool_kwargs_for` drops the fields the installed anton lacks.
+    For callers that apply them themselves, such as the direct answer."""
     from cowork.common.settings.user_settings import Provider
 
     if (
         planning_provider is Provider.OPENAI_COMPATIBLE
         and openai_compatible_agent_api() == "responses"
     ):
-        return WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
-    return WebToolKwargs()
+        kwargs = WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
+    else:
+        kwargs = WebToolKwargs()
+    for field, env_name in _WEB_TOOL_ENV.items():
+        if os.environ.get(env_name, "").strip().lower() in _OFF_VALUES:
+            kwargs[field] = False
+    return kwargs
 
 
 def build_llm_client(

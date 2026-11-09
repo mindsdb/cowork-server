@@ -274,8 +274,12 @@ def _is_browser_jwt_request(request: Request) -> bool:
     return len(parts) == 3 and all(parts) and _has_jose_header(parts[0])
 
 
-def get_principal(request: Request) -> Principal | None:
-    """FastAPI dependency: the request's Principal, or None in local mode."""
+async def get_principal(request: Request) -> Principal | None:
+    """FastAPI dependency: the request's Principal, or None in local mode.
+
+    A coroutine, so FastAPI runs it on the event loop: it does no I/O, and a
+    sync dependency would take one of anyio's default threads on every
+    authenticated request, the threads sync routes' file store work fills."""
     return getattr(request.state, "principal", None)
 
 

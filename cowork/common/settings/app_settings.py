@@ -412,6 +412,17 @@ class DatabaseSettings(Settings):
             "with 503. Short, so a full pool answers within seconds."
         ),
     )  # POOL_TIMEOUT
+    efs_unit_slots: int = Field(
+        default=16,
+        ge=1,
+        description=(
+            "Database unit slots the units that also work on the shared file store "
+            "(cowork.db.units.run_efs_unit) may hold at once, of the POOL_SIZE plus "
+            "MAX_OVERFLOW every unit shares, so units stuck on the file store leave "
+            "the rest to database units. SQLite gives file units no unit slot, so "
+            "it ignores this."
+        ),
+    )  # EFS_UNIT_SLOTS
     # PostgreSQL session settings for the app's own connections, set when each
     # connection opens. Migrations run with both off: the db-migrate init
     # container opens its own engine, and the server's startup migration turns
@@ -467,6 +478,28 @@ class CodingSettings(Settings):
             "so it is not partitioned per organization there."
         ),
     )  # COWORK_CODING_DIR
+    workspace_retention_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_RETENTION"),
+        description=(
+            "Also release the workspaces of long-idle, unarchived coding tasks "
+            "to reclaim disk, beyond the most recent few. Archiving a task "
+            "releases its workspace either way. A released workspace is "
+            "rebuilt with its changes when the task is next used."
+        ),
+    )  # COWORK_CODING_WORKSPACE_RETENTION
+    workspace_keep_count: int = Field(
+        default=10,
+        ge=0,
+        validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_KEEP_COUNT"),
+        description="Most recently active task workspaces that are never released automatically.",
+    )  # COWORK_CODING_WORKSPACE_KEEP_COUNT
+    workspace_min_idle_hours: float = Field(
+        default=14 * 24,
+        ge=0,
+        validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_MIN_IDLE_HOURS"),
+        description="How long a task must be idle before its workspace can be released automatically.",
+    )  # COWORK_CODING_WORKSPACE_MIN_IDLE_HOURS
 
 
 class StorageSettings(Settings):
@@ -704,29 +737,29 @@ class TurnQueueSettings(Settings):
             "per-PR / non-standard envs whose host the slug logic cannot derive. Empty = derive."
         ),
     )  # COWORK_TURN_MINDS_BASE_URL
-    jev_shadow_enabled: bool = Field(
-        default=False,
-        description=(
-            "Fire a Jev '/v1/decisions' call alongside the LLM gate on every remote turn, "
-            "purely for latency/agreement comparison. Never used to route; logged only. "
-            "Requires a minted minds-cloud credential, so it's a no-op unless backend is "
-            "'remote'. Off by default: the call runs on the turn's own minted key and "
-            "sends the turn's text history as state. Jev is zero-priced, so it charges no "
-            "wallet, but on an unfunded org every turn draws that org's free Jev allowance "
-            "in the background, and a refused call shows up only as the "
-            "'jev_error=http_<status>' field of the '[jev-shadow]' warning that "
-            "responses._spawn_jev_shadow_probe logs."
-        ),
-    )  # COWORK_TURN_JEV_SHADOW_ENABLED
-    jev_shadow_model: str = Field(
+    jev_route_model: str = Field(
         default="jev",
-        description="MindsHub catalog alias passed to the shadow '/v1/decisions' call.",
-    )  # COWORK_TURN_JEV_SHADOW_MODEL
-    jev_shadow_timeout_seconds: float = Field(
+        description="MindsHub catalog alias of the Jev model the route gate asks ('/v1/decisions').",
+    )  # COWORK_TURN_JEV_ROUTE_MODEL
+    jev_route_timeout_seconds: float = Field(
         default=3.0,
         gt=0,
-        description="Hard wall-clock timeout for the shadow Jev call (enforced via asyncio.timeout, not just httpx's own per-phase timeout). Independent of the gate's own budget, since a slow or hung probe must never hold up the turn it's shadowing.",
-    )  # COWORK_TURN_JEV_SHADOW_TIMEOUT_SECONDS
+        description=(
+            "Hard wall-clock timeout for the route gate's Jev call (enforced via asyncio.timeout, "
+            "not just httpx's own per-phase timeout). Past it the turn delegates. The call sits "
+            "ahead of every MindsHub turn: the eval measured p95 about 1.4s, and single live "
+            "calls reached 2.0s, so a 2s budget would quietly send direct turns to the agent."
+        ),
+    )  # COWORK_TURN_JEV_ROUTE_TIMEOUT_SECONDS
+    jev_route_min_p_direct: float = Field(
+        default=0.5,
+        ge=0,
+        le=1,
+        description=(
+            "Jev's probability of a direct answer needed to answer directly. Low on purpose: the "
+            "direct model can still delegate. See scripts/eval_jev_route before raising it."
+        ),
+    )  # COWORK_TURN_JEV_ROUTE_MIN_P_DIRECT
     minds_coding_model: str = Field(
         default="",
         description=(
@@ -751,6 +784,15 @@ class TurnQueueSettings(Settings):
         repr=False,
         description="Secret for the dedicated datasource producer service role.",
     )  # COWORK_TURN_DATASOURCE_PRODUCER_KEY
+    datasource_gateway_base_url: str = Field(
+        default="",
+        description=(
+            "In-cluster base URL of the datasource gateway, used to validate a captured "
+            "connection. The Service name, as auth is addressed (http://mindshub-inference): "
+            "the public datasource ingress admits execution alone. Empty means no validation "
+            "runs and a captured connection stays pending."
+        ),
+    )  # COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL
 
 
 # The OpenAI API an openai_compatible provider's planning, coding and router roles call.
@@ -832,6 +874,20 @@ class AppSettings(Settings):
                 f"http://127.0.0.1:{self.renderer_port}",
             ]
         return self
+
+    # Which connector methods this deployment may run as a cloud datasource:
+    # `{"manifest_version": 1, "enabled": ["postgres:host-port"]}`. A string,
+    # not a dict: pydantic-settings parses a dict field from the environment
+    # while the settings object is built, so malformed JSON would raise before
+    # any policy code runs and crash the process at import. Parsed, and failed
+    # closed, in services/connectors/datasource_capabilities.py instead.
+    # One spelling only: a second alias would also become an unprefixed
+    # environment name for a policy that decides what this deployment stores.
+    datasource_capabilities: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DATASOURCE_CAPABILITIES"),
+        description="Versioned datasource capability manifest as JSON; empty means nothing is enabled.",
+    )
 
     require_auth: bool = Field(
         default=False,
@@ -1312,27 +1368,28 @@ class AppSettings(Settings):
     # NOTE: get_app_settings() is @lru_cache'd, so changing the COWORK_DEFAULT_*
     # env requires a process restart — "I changed the env and nothing happened"
     # means the old value is cached for the life of the process.
+    #
+    # The defaults are safety limits for a turn that never finishes, the values
+    # anton's own defaults move to: 30 days of production had no runaway turn,
+    # and the largest legitimate one used 34.4M tokens, 171 tool rounds and 6
+    # continuations.
+    # Users who want a tighter limit set their own.
     default_max_tool_rounds: int = Field(
-        default=50,
+        default=250,
         ge=5,
         le=500,
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TOOL_ROUNDS"),
         description="Default for the per-user 'Max Steps per Task' agent budget.",
     )  # COWORK_DEFAULT_MAX_TOOL_ROUNDS
     default_max_continuations: int = Field(
-        default=5,
+        default=10,
         ge=0,
         le=25,
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_CONTINUATIONS"),
         description="Default for the per-user 'Max Auto-Continues' agent budget.",
     )  # COWORK_DEFAULT_MAX_CONTINUATIONS
-    # Unlike the two above, this one does NOT deliberately run looser than
-    # anton's own default — it matches it (ENG-1286's 1,250,000). The measured
-    # per-turn distribution that set that number came from Cowork traffic, so
-    # it already reflects these looser round budgets; raising it here would
-    # loosen a ceiling against the very population it was sized on.
     default_max_turn_tokens: int = Field(
-        default=1_250_000,
+        default=25_000_000,
         # Deployment-level default. Kept at ge=750_000 rather than mirroring
         # UserSettings' "0 = unlimited": an operator turning the guard off for a
         # whole org silently is exactly the outcome the per-user sentinel exists
@@ -1343,6 +1400,39 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TURN_TOKENS"),
         description="Default for the per-user 'Max Tokens per Task' agent budget.",
     )  # COWORK_DEFAULT_MAX_TURN_TOKENS
+    # Wall-clock cap on one scheduled run, past which the scheduler stops its
+    # turn. The step and token budgets above bound how much work a run does;
+    # this only catches a run that keeps going without ever finishing, so it
+    # sits well above how long real runs take.
+    scheduled_run_max_seconds: int = Field(
+        default=1800,
+        ge=300,
+        le=86_400,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUN_MAX_SECONDS"),
+        description="Longest a scheduled run may take before it is stopped.",
+    )  # COWORK_SCHEDULED_RUN_MAX_SECONDS
+    # Scheduled runs one server process drives at once, across every
+    # organization. Unset, it follows where turns run: 3 on the desktop, where
+    # each run is an agent on the user's own machine, and 16 when turns run in
+    # sandbox pods, where the process only streams them (scheduler).
+    scheduled_runs_per_process: int | None = Field(
+        default=None,
+        ge=1,
+        le=64,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUNS_PER_PROCESS"),
+        description="Scheduled runs one server process drives at once; unset follows the backend.",
+    )  # COWORK_SCHEDULED_RUNS_PER_PROCESS
+    # Scheduled runs one organization may have going at once, counted across
+    # every replica, only when explicitly configured. Hosted policy will come
+    # from auth; no deployment-wide default is imposed. A
+    # desktop schedule has no organization, so this doesn't apply there.
+    scheduled_runs_per_org: int | None = Field(
+        default=None,
+        ge=1,
+        le=256,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUNS_PER_ORG"),
+        description="Scheduled runs one organization may have going at once, across all replicas.",
+    )  # COWORK_SCHEDULED_RUNS_PER_ORG
 
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_URI; the other fields read their bare names
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*

@@ -14,6 +14,7 @@ from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.models.task_object import TaskObject
 from cowork.services import artifact_ownership as ownership
 from cowork.services import task_objects
+from cowork.services.artifact_identity import ListedIds
 from cowork.services.task_objects import record_new_artifacts
 
 from test_artifact_ownership import make_conversation, make_project, project_root, scoped
@@ -95,3 +96,77 @@ def test_a_failed_slug_is_logged_as_an_error_and_the_next_slug_is_recorded(tmp_p
     assert indexed == ["b-report"]
     assert owners["b-report"].owner_user_id == owner
     assert owners[FAILING].unknown
+
+
+def _missing_owner_warnings(caplog) -> list[logging.LogRecord]:
+    return [
+        record for record in caplog.records
+        if record.name == task_objects.logger.name and record.levelno == logging.WARNING
+        and record.getMessage().startswith("artifact owner not recorded")
+    ]
+
+
+def test_a_conversation_with_no_creator_warns_only_when_a_created_folder_needs_an_owner(
+    tmp_path, caplog, owned_logger,
+):
+    """A channel conversation has no creator. Its turn end checks the folders
+    the diff listed even when it created none; that call leaves no artifact
+    without an owner, so it logs nothing. A folder it created is left
+    without one, so that call logs the missing owner once."""
+    org_id = "org-no-creator"
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, None)
+    owned_logger(task_objects.logger.name, level=logging.WARNING)
+
+    with scoped(org_id) as session:
+        record_new_artifacts(
+            session, conversation_id=conversation_id, project_id=project.id,
+            slugs=[], creator=None, listed_ids=ListedIds(ids={"brief": "id-of-brief"}, unreadable=frozenset()),
+        )
+    assert _missing_owner_warnings(caplog) == []
+
+    with scoped(org_id) as session:
+        record_new_artifacts(
+            session, conversation_id=conversation_id, project_id=project.id,
+            slugs=["made"], creator=None,
+        )
+    assert [record.getMessage() for record in _missing_owner_warnings(caplog)] == [
+        f"artifact owner not recorded: conversation {conversation_id} has no creator",
+    ]
+
+
+def test_a_failed_check_of_the_listed_folders_raises_once_the_created_rows_are_written(tmp_path, monkeypatch):
+    """The turn end listed every folder, and the check of their locations
+    fails after the created folder's index and owner rows are written.
+    record_new_artifacts raises ListedLocationsUnchecked, so its caller asks
+    for the project's self-heal, and the rows written before the check stay
+    committed though the unit then rolls back."""
+    from cowork.db.units import unit_session
+    from cowork.services import artifact_locations
+
+    org_id, owner = "org-listed-check", "user-listed-check"
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, owner)
+
+    def check(session, **kwargs):
+        raise _connection_lost()
+
+    monkeypatch.setattr(artifact_locations, "record_listed_folders", check)
+    with scoped(org_id) as session:
+        scope = session.scope
+    with pytest.raises(task_objects.ListedLocationsUnchecked) as raised:
+        with unit_session(scope=scope) as session:
+            record_new_artifacts(
+                session, conversation_id=conversation_id, project_id=project.id,
+                slugs=["made"], creator=owner,
+                listed_ids=ListedIds(ids={"made": "id-of-made"}, unreadable=frozenset()),
+            )
+
+    assert isinstance(raised.value.__cause__, OperationalError)
+    with scoped(org_id, owner) as session:
+        indexed = session.exec(
+            session.select(TaskObject.ref).where(TaskObject.conversation_id == conversation_id)
+        ).all()
+        owners = ownership.resolve_artifact_owners(session, project_root(project), ["made"])
+    assert indexed == ["made"]
+    assert owners["made"].owner_user_id == owner

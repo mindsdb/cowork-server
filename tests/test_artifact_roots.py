@@ -8,6 +8,7 @@ whichever project happens to sort first.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from pathlib import Path
 
@@ -541,13 +542,17 @@ async def test_a_grant_never_reaches_another_organization(owners_legacy_artifact
 
 
 def _count_hops(monkeypatch, *modules) -> list[str]:
-    """Record each run_db and run_efs call the named modules make, in order."""
+    """Record each run_db and run_efs call the named modules make, in order.
+    The database unit that records what a lookup's scan found
+    (record_checked_folders) appears as "record"."""
+    from cowork.api.v1 import artifact_scope
     from cowork.db import units
 
     hops: list[str] = []
 
     async def run_db(fn, *, scope):
-        hops.append("run_db")
+        recording = getattr(fn, "func", None) is artifact_scope.record_checked_folders
+        hops.append("record" if recording else "run_db")
         return await units.run_db(fn, scope=scope)
 
     async def run_efs(fn, *, scope, deadline=True):
@@ -561,36 +566,79 @@ def _count_hops(monkeypatch, *modules) -> list[str]:
 
 
 async def test_a_review_lookup_waits_for_the_database_once_and_the_file_store_once(
-    owners_legacy_artifact, monkeypatch,
+    owners_legacy_artifact, monkeypatch, caplog,
 ):
-    """The project row and the conversations the caller owns in one database
-    unit, then the roots, the owner filter, the folder and a reviewer's grant
-    in one file store call. Each wait for a slot can refuse the request, so a
-    lookup that waited again after its file store work could be refused with
-    that work done."""
+    """The project row, the conversations the caller owns and the location
+    row in one database unit, then the row's folder or the roots, the owner
+    filter, the folder and a reviewer's grant in one file store call. Each
+    wait for a slot can refuse the request, so a lookup that waited again
+    after its file store work could be refused with that work done. A lookup
+    that scanned records what it found in one more unit, and a refusal there
+    is only logged."""
     from cowork.api.v1 import artifact_scope
+    from cowork.db.units import DatabaseBusy
 
     row, folder = owners_legacy_artifact
     enable_draft_review(folder, org_id=ORG_A, enabled_by=USER_A)
     hops = _count_hops(monkeypatch, artifact_scope)
+    counted_run_db = artifact_scope.run_db
 
-    for user_id, is_own in ((USER_A, True), (USER_A2, False)):
+    async def busy_record(fn, *, scope):
+        if fn.func is artifact_scope.record_checked_folders:
+            hops.append("record")
+            raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+        return await counted_run_db(fn, scope=scope)
+
+    with monkeypatch.context() as busy, caplog.at_level(logging.WARNING, logger=artifact_scope.logger.name):
+        busy.setattr(artifact_scope, "run_db", busy_record)
+        assert (await _review(row, org_id=ORG_A, user_id=USER_A)).is_own is True
+    assert hops == ["run_db", "run_efs", "record"]
+    [logged] = [
+        record for record in caplog.records
+        if record.name == artifact_scope.logger.name and record.levelno == logging.WARNING
+    ]
+    assert logged.error_type == "DatabaseBusy"
+
+    for user_id, is_own, waits in (
+        # No row yet: the scan, then the unit that records its folder.
+        (USER_A, True, ["run_db", "run_efs", "record"]),
+        # The row that lookup recorded: its folder alone.
+        (USER_A2, False, ["run_db", "run_efs"]),
+    ):
         hops.clear()
         assert (await _review(row, org_id=ORG_A, user_id=user_id)).is_own is is_own
-        assert hops == ["run_db", "run_efs"], user_id
+        assert hops == waits, user_id
+
+
+async def test_a_lookup_whose_scan_changes_no_row_records_nothing(owners_legacy_artifact, monkeypatch):
+    """A miss finds no folder and no row to drop, and a co-member without a
+    grant finds only the folder the owner's row names: neither lookup waits
+    for the database again."""
+    from cowork.api.v1 import artifact_scope
+
+    row, _folder = owners_legacy_artifact
+    hops = _count_hops(monkeypatch, artifact_scope)
+
+    assert await _refusal(row, org_id=ORG_A, user_id=USER_A, artifact_id=uuid.uuid4().hex) == (
+        404, "Artifact not found",
+    )
+    assert hops == ["run_db", "run_efs"]
+
+    await _review(row, org_id=ORG_A, user_id=USER_A)  # records the owner's row
+    hops.clear()
+    assert await _refusal(row, org_id=ORG_A, user_id=USER_A2) == (404, "Artifact not found")
+    assert hops == ["run_db", "run_efs"]
 
 
 async def test_a_project_list_reads_its_roots_and_cards_in_one_file_store_call(
     owners_legacy_artifact, monkeypatch,
 ):
-    from types import SimpleNamespace
-
     from cowork.api.v1 import artifact_scope
     from cowork.api.v1.endpoints import artifacts
 
     row, _folder = owners_legacy_artifact
     hops = _count_hops(monkeypatch, artifact_scope, artifacts)
-    caller = SimpleNamespace(scope=TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A))
+    caller = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
 
     cards = await artifacts.list_artifacts(caller, project_id=row.id, project_path=None)
 
@@ -599,28 +647,16 @@ async def test_a_project_list_reads_its_roots_and_cards_in_one_file_store_call(
     assert hops == ["run_db", "run_efs", "run_db"]
 
 
-async def test_a_plan_leaves_out_a_project_in_another_partition_with_no_file_store_call(
-    session, org_deployment, monkeypatch,
-):
+async def test_a_plan_leaves_out_a_project_in_another_partition_with_no_file_store_call(session, org_deployment):
     """A row naming a folder in another partition of the shared root, as agent
     code from before the code sandbox could leave, is left out of the plan the
     database unit builds, so no reader of RootsPlan.projects reaches it. The
-    unit compares the path against the shared root resolved at startup, so it
-    resolves no link: on a hard mount that stat would hold the unit's pooled
-    connection while the file server doesn't answer."""
-    import os
-
+    unit compares the path against the shared root resolved at startup, so the
+    blocking guard sees no file store call in it."""
     from cowork.db.units import run_db
     from cowork.services.projects import resolve_shared_root
 
     shared = resolve_shared_root()  # as the lifespan does before the port binds
-    resolved: list[str] = []
-    real_realpath = os.path.realpath
-
-    def recording_realpath(path, *args, **kwargs):
-        resolved.append(os.fspath(path))
-        return real_realpath(path, *args, **kwargs)
-
     suffix = uuid.uuid4().hex[:8]
     mine = Project(name=f"mine-{suffix}", path=str(shared / ORG_A / "projects" / "mine"), org_id=ORG_A)
     planted = Project(name=f"planted-{suffix}", path=str(shared / ORG_B / "projects" / "theirs"), org_id=ORG_A)
@@ -628,10 +664,8 @@ async def test_a_plan_leaves_out_a_project_in_another_partition_with_no_file_sto
     session.commit()
     scope = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
     try:
-        with monkeypatch.context() as patch:
-            patch.setattr(os.path, "realpath", recording_realpath)
-            listed = await run_db(plan_scope_roots, scope=scope)
-            by_id = await run_db(lambda scoped: plan_project_roots(scoped, planted.id), scope=scope)
+        listed = await run_db(plan_scope_roots, scope=scope)
+        by_id = await run_db(lambda scoped: plan_project_roots(scoped, planted.id), scope=scope)
     finally:
         session.delete(mine)
         session.delete(planted)
@@ -641,4 +675,3 @@ async def test_a_plan_leaves_out_a_project_in_another_partition_with_no_file_sto
     assert mine.name in names
     assert planted.name not in names
     assert by_id.projects == ()
-    assert resolved == []

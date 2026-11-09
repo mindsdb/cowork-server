@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
@@ -39,6 +40,7 @@ from cowork.api.v1.pinned_response import PinnedStreamingResponse
 
 from cowork.common.paths import (
     O_NOFOLLOW,
+    O_NONBLOCK,
     PinnedDir,
     dir_lstat,
     dir_mkdir,
@@ -61,6 +63,7 @@ from cowork.db.scoped import (
     TenantScope,
     get_tenant_scope,
 )
+from cowork.db.units import run_efs, run_efs_unit
 from cowork.models.project import Project
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.principal import Principal, get_principal
@@ -71,6 +74,8 @@ from cowork.schemas.project_files import (
     ProjectFileReadResponse,
     ProjectFileWriteResponse,
     ProjectInstructionsResponse,
+    ProjectUploadResponse,
+    ProjectUploadResult,
 )
 from cowork.schemas.shared_resources import MutableResourceCapabilities
 from cowork.schemas.sharepoint import (
@@ -106,6 +111,8 @@ logger = logging.getLogger(__name__)
 # instead of taking ScopedSessionDep, but the token is scoped per-mount, not
 # a bypass, so it needs nothing of its own here.)
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 ANTON_INSTRUCTIONS_FILENAME = "anton.md"
 TEXT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
@@ -327,8 +334,14 @@ def _validated_project_path(path: str) -> _ValidatedProjectPath:
     return _ValidatedProjectPath(tuple(parts))
 
 
+async def _project_mutation_path(path: str) -> _ValidatedProjectPath:
+    """The validation as a coroutine, so a request needs no default thread
+    for it."""
+    return _validated_project_path(path)
+
+
 ProjectMutationPathDep = Annotated[
-    _ValidatedProjectPath, Depends(_validated_project_path)
+    _ValidatedProjectPath, Depends(_project_mutation_path)
 ]
 
 
@@ -761,7 +774,7 @@ def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -
 
 
 async def _authorize_artifact_file_mutation(
-    path: ProjectMutationPathDep, scoped: ScopedSessionDep,
+    path: ProjectMutationPathDep, scope: ScopeDep,
 ) -> None:
     """Protect artifact bytes reached through the generic file adapter.
 
@@ -772,19 +785,19 @@ async def _authorize_artifact_file_mutation(
     parts = tuple(part.casefold() for part in path.parts)
     if parts[0] == CONVERSATIONS_DIRNAME:
         if len(parts) == 1:
-            await require_product_permission(scoped.scope, "artifact.manage")
+            await require_product_permission(scope, "artifact.manage")
             return
         if len(parts) == 2:
             try:
                 UUID(parts[1])
             except ValueError:
                 return
-            await require_product_permission(scoped.scope, "artifact.manage")
+            await require_product_permission(scope, "artifact.manage")
             return
         parts = parts[2:]
     artifact_root = (".anton", "artifacts")
     if parts[:2] == artifact_root or parts == artifact_root[:1]:
-        await require_product_permission(scoped.scope, "artifact.manage")
+        await require_product_permission(scope, "artifact.manage")
 
 
 def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:
@@ -812,11 +825,16 @@ def _pinned_fd(target: Path, base: Path, flags: int) -> Iterator[int]:
 
     A planted link raises `OSError` (ELOOP), which callers map to the same 404 a
     genuine miss returns rather than letting it surface as a 500.
+
+    The open never waits: `O_NONBLOCK` returns at once on a FIFO a pod made at
+    the path, which no writer on this node would ever open, so the caller's
+    file type check refuses it rather than the open holding its thread for
+    good. A regular file ignores the flag.
     """
     rel = target.relative_to(base.resolve())
     *dirs, name = rel.parts
     with opened_subdir_nofollow(base, *dirs) as pinned:
-        fd = dir_open(pinned, name, flags | O_NOFOLLOW)
+        fd = dir_open(pinned, name, flags | O_NOFOLLOW | O_NONBLOCK)
         try:
             yield fd
         finally:
@@ -1425,7 +1443,7 @@ def _close_instruction_context(
 
 
 def _pinned_stream(
-    target: Path, base: Path, *, media_type: str, headers: dict
+    target: Path, base: Path, *, media_type: str, headers: dict, scope: TenantScope
 ) -> StreamingResponse:
     """Serve `target` from a pinned descriptor.
 
@@ -1441,19 +1459,16 @@ def _pinned_stream(
     cm, fd, st = _pinned_regular_file(target, base)
     resources = ExitStack()
     resources.push(cm)
-
-    def _chunks():
-        try:
-            yield from read_bounded(fd, st.st_size)
-        finally:
-            resources.close()
-
     try:
         return PinnedStreamingResponse(
-            _chunks(), resources=resources, media_type=media_type, headers=headers
+            read_bounded(fd, st.st_size),
+            resources=resources,
+            scope=scope,
+            media_type=media_type,
+            headers=headers,
         )
     except BaseException:
-        # `_chunks` never ran, so neither it nor the response can close the descriptor.
+        # No response exists to close the descriptor.
         resources.close()
         raise
 
@@ -1463,10 +1478,21 @@ def _pinned_stream(
     response_model=ProjectInstructionsResponse,
     response_model_exclude_unset=True,
 )
-def get_project_instructions(
+async def get_project_instructions(
     project_name: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(
+        partial(_get_project_instructions, project_name=project_name, principal=principal), scope=scope
+    )
+
+
+def _get_project_instructions(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    principal: Principal | None,
 ):
     project = _project_for_name(project_name, scoped)
     base = _project_dir(project_name, scoped)
@@ -1517,10 +1543,19 @@ def get_project_instructions(
     response_model=ProjectFileListResponse,
     response_model_exclude_unset=True,
 )
-def list_project_files(
+async def list_project_files(
     project_name: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(partial(_list_project_files, project_name=project_name, principal=principal), scope=scope)
+
+
+def _list_project_files(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    principal: Principal | None,
 ):
     project = _project_for_name(project_name, scoped)
     base = _project_dir(project_name, scoped)
@@ -1588,11 +1623,23 @@ def list_project_files(
     response_model=ProjectFileReadResponse,
     response_model_exclude_unset=True,
 )
-def read_project_file(
+async def read_project_file(
     project_name: str,
     path: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(
+        partial(_read_project_file, project_name=project_name, path=path, principal=principal), scope=scope
+    )
+
+
+def _read_project_file(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: str,
+    principal: Principal | None,
 ):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
@@ -1660,12 +1707,25 @@ def read_project_file(
     dependencies=[Depends(_authorize_artifact_file_mutation)],
     response_model_exclude_unset=True,
 )
-def write_project_file(
+async def write_project_file(
     project_name: str,
     path: ProjectMutationPathDep,
     req: _FileWriteRequest,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(
+        partial(_write_project_file, project_name=project_name, path=path, req=req, principal=principal), scope=scope
+    )
+
+
+def _write_project_file(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: ProjectMutationPathDep,
+    req: _FileWriteRequest,
+    principal: Principal | None,
 ):
     _require_workspace_path(path, scoped)
     classification_base = (
@@ -1827,13 +1887,23 @@ def write_project_file(
     return response
 
 
-@router.post("/{project_name}/files/upload")
+# Unset fields stay out of each result: a written file has no error, a refused
+# one no size.
+@router.post("/{project_name}/files/upload", response_model=ProjectUploadResponse, response_model_exclude_unset=True)
 async def upload_project_files(
     project_name: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     files: list[UploadFile] = File(...),
 ):
-    results: list[dict[str, Any]] = []
+    # The project lookup and the writes run together on the file store's
+    # threads. Each upload is read there from its own spool, one at a time and
+    # only once the project is found, so a request holds at most one file's
+    # bytes in memory.
+    return await run_efs_unit(partial(_write_uploads, project_name=project_name, uploads=files), scope=scope)
+
+
+def _write_uploads(scoped: ScopedSession, *, project_name: str, uploads: list[UploadFile]) -> ProjectUploadResponse:
+    results: list[ProjectUploadResult] = []
     with _opened_project_directory_inventory(scoped) as inventory:
         selected_project_name = os.path.basename(project_name)
         if (
@@ -1855,28 +1925,24 @@ async def upload_project_files(
         if directory is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
-        for f in files:
-            if not f.filename:
-                results.append({"name": "", "ok": False, "error": "filename missing"})
+        for upload in uploads:
+            if not upload.filename:
+                results.append(ProjectUploadResult(name="", ok=False, error="filename missing"))
                 continue
-            safe_name = os.path.basename(f.filename).strip()
+            safe_name = os.path.basename(upload.filename).strip()
             if not safe_name or safe_name.startswith("."):
-                results.append(
-                    {"name": f.filename, "ok": False, "error": "invalid filename"}
-                )
+                results.append(ProjectUploadResult(name=upload.filename, ok=False, error="invalid filename"))
                 continue
             try:
-                data = await f.read()
+                data = upload.file.read()
                 _write_bytes_at_project_root(
                     directory, _ValidatedProjectPath((safe_name,)), data
                 )
-                results.append({"name": safe_name, "ok": True, "size": len(data)})
+                results.append(ProjectUploadResult(name=safe_name, ok=True, size=len(data)))
             except Exception as exc:
                 logger.error("Failed to write file %s: %s", safe_name, exc)
-                results.append(
-                    {"name": safe_name, "ok": False, "error": "File write failed"}
-                )
-    return {"results": results}
+                results.append(ProjectUploadResult(name=safe_name, ok=False, error="File write failed"))
+    return ProjectUploadResponse(results=results)
 
 
 _SHAREPOINT_IMPORT_FIELDS = frozenset({"connection", "site", "drive_id", "folder", "item_ids"})
@@ -2056,11 +2122,23 @@ def import_sharepoint_files(
     response_model=ProjectFileDeleteResponse,
     dependencies=[Depends(_authorize_artifact_file_mutation)],
 )
-def delete_project_file(
+async def delete_project_file(
     project_name: str,
     path: ProjectMutationPathDep,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(
+        partial(_delete_project_file, project_name=project_name, path=path, principal=principal), scope=scope
+    )
+
+
+def _delete_project_file(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: ProjectMutationPathDep,
+    principal: Principal | None,
 ):
     _require_workspace_path(path, scoped)
     classification_base = (
@@ -2174,13 +2252,26 @@ def delete_project_file(
 @router.delete(
     "/{project_name}/skill_drafts/{slug}", status_code=status.HTTP_204_NO_CONTENT
 )
-def delete_skill_draft(project_name: str, slug: str, scoped: ScopedSessionDep):
+async def delete_skill_draft(
+    project_name: str,
+    slug: str,
+    scope: ScopeDep,
+):
     """Remove a staged skill draft once it is Saved (or dismissed).
 
     Idempotent: a missing draft is a no-op — Save may race the sweep, and a
     lingering draft is the safe default we're clearing, not a hard error. The
     slug is confined to a direct child of the drafts dir (no traversal).
     """
+    return await run_efs_unit(partial(_delete_skill_draft, project_name=project_name, slug=slug), scope=scope)
+
+
+def _delete_skill_draft(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    slug: str,
+):
     safe_slug = os.path.basename(slug)
     if (
         safe_slug != slug
@@ -2210,7 +2301,18 @@ def delete_skill_draft(project_name: str, slug: str, scoped: ScopedSessionDep):
 
 
 @router.post("/preview-mount-file")
-def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
+async def preview_mount_file(
+    req: _PreviewMountRequest,
+    scope: ScopeDep,
+):
+    return await run_efs_unit(partial(_preview_mount_file, req=req), scope=scope)
+
+
+def _preview_mount_file(
+    scoped: ScopedSession,
+    *,
+    req: _PreviewMountRequest,
+):
     base = _project_dir(req.name, scoped)
     target = _safe_relpath(req.path, base)
     _require_workspace_access(target, base, scoped)
@@ -2229,9 +2331,13 @@ def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
 
 
 @router.get("/preview-asset/{token}/{rel_path:path}")
-def preview_asset(
+async def preview_asset(
     token: str, rel_path: str, scope: TenantScope = Depends(get_tenant_scope)
 ):
+    return await run_efs(partial(_preview_asset, token=token, rel_path=rel_path, scope=scope), scope=scope)
+
+
+def _preview_asset(*, token: str, rel_path: str, scope: TenantScope):
     # An unknown token, an expired one and another member's one all answer the
     # same 404: which of the three it was is itself information about somebody
     # else's files.
@@ -2263,11 +2369,25 @@ def preview_asset(
         mount.project_base,
         media_type=media_type,
         headers={"Cache-Control": "private, max-age=300"},
+        scope=scope,
     )
 
 
 @router.get("/{project_name}/files-raw/{path:path}")
-def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
+async def download_project_file(
+    project_name: str,
+    path: str,
+    scope: ScopeDep,
+):
+    return await run_efs_unit(partial(_download_project_file, project_name=project_name, path=path), scope=scope)
+
+
+def _download_project_file(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: str,
+):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
     _require_workspace_access(target, base, scoped)
@@ -2279,4 +2399,5 @@ def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep
         base,
         media_type=media_type,
         headers={"Content-Disposition": attachment_disposition(target.name)},
+        scope=scoped.scope,
     )

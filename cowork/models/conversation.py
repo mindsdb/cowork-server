@@ -16,7 +16,7 @@ class Conversation(BaseSQLModel, table=True):
     __table_args__ = (
         # A person's own conversations in an organization
         # (ConversationService.owned_ids), which every org-mode artifact
-        # request reads. Declared here as well as in migration 599bf4bf0370.
+        # request reads. Declared here as well as in migration dce94d4bafc0.
         sa.Index("ix_conversations_org_id_created_by", "org_id", "created_by"),
     )
 
@@ -45,6 +45,11 @@ class Conversation(BaseSQLModel, table=True):
     )
     reasoning_effort: str | None = Field(
         default=None, description="Reasoning effort the task's harness was launched with"
+    )
+    channel_type: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Channel the runtime created this conversation for (discord, slack, ...); NULL otherwise",
     )
 
     project: "Project" = Relationship()

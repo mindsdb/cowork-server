@@ -42,6 +42,10 @@ from draft_host_support import (
 )
 from test_artifacts_api_tenancy import session  # noqa: F401  (fixture)
 
+# Every project row a test makes goes with the test, so its artifact's
+# location row cannot answer another module's lookup of the same id.
+pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
+
 IDENTITY = {"X-User-Id": USER, "X-Organization-Id": ORG}
 DASHED_ARTIFACT = str(UUID(ARTIFACT))
 LINK = f"/api/v1/artifacts/drafts/{PROJECT}/{DASHED_ARTIFACT}/link"
@@ -230,7 +234,7 @@ async def test_a_scope_without_a_user_or_an_org_is_401_and_reviews_nothing(draft
 
     with caplog.at_level("WARNING", logger="cowork.api.v1.endpoints.artifact_workspace"):
         with pytest.raises(HTTPException) as refused:
-            await workspace_ep.create_draft_link(PROJECT, DASHED_ARTIFACT, SimpleNamespace(scope=scope))
+            await workspace_ep.create_draft_link(PROJECT, DASHED_ARTIFACT, scope)
 
     assert refused.value.status_code == 401
     assert events(caplog, "draft_link_issued") == []
@@ -288,7 +292,7 @@ real_review = pytest.mark.usefixtures("draft_env", "granted_product_permissions"
 
 
 async def _issue_link(row, artifact_id, scoped) -> str:
-    response = await workspace_ep.create_draft_link(str(row.id), artifact_id, scoped)
+    response = await workspace_ep.create_draft_link(str(row.id), artifact_id, scoped.scope)
     assert response.status_code == 200, response.body
     return json.loads(response.body)["url"]
 
@@ -327,6 +331,6 @@ async def test_a_co_member_without_a_grant_gets_no_link(session, tmp_path):
     with Session(session.get_bind()) as other_session:
         other = tenancy._scoped(other_session, tenancy.ORG_A, tenancy.USER_A2)
         with pytest.raises(HTTPException) as refused:
-            await workspace_ep.create_draft_link(str(row.id), artifact_id, other)
+            await workspace_ep.create_draft_link(str(row.id), artifact_id, other.scope)
 
     assert refused.value.status_code == 404

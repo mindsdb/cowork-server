@@ -577,12 +577,14 @@ async def test_a_start_the_shutdown_overtakes_is_refused_before_it_registers(mon
     """close() and shutdown() run while a start() that passed the first closed
     check waits on its buffer. shutdown() cannot see that turn, so start()
     must refuse it at its last check rather than register a turn nothing
-    ends. On Redis it also removes the run it published to the turn index."""
-    from cowork.streaming import turn_index
+    ends. On Redis it also removes the run it published to the turn index and
+    releases the turn claim it took."""
+    from cowork.streaming import turn_claim, turn_index
 
     monkeypatch.setenv("COWORK_STREAM_BACKEND", backend)
     index = fakeredis.aioredis.FakeRedis(decode_responses=True)
     monkeypatch.setattr(turn_index, "get_redis", lambda: index)
+    monkeypatch.setattr(turn_claim, "get_redis", lambda: index)
     published: list[str] = []
     real_record_turn = turn_index.record_turn
 

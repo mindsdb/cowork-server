@@ -27,6 +27,7 @@ from uuid import uuid4
 import pytest
 import yaml
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from cowork.api.v1.endpoints.artifact_workspace import _not_found_detail
 from cowork.services import artifact_journal, artifact_revisions, local_artifact_comments
@@ -41,12 +42,14 @@ from cowork.services.artifact_journal import (
     remove_journal_file,
     write_journal_file,
 )
+from cowork.services.artifact_revision_records import AgentRepair, is_repair_id
 from cowork.services.artifact_revisions import (
     MAX_SOURCE_BYTES,
     RevisionConflict,
     RevisionValidationError,
     active_agent_repair,
     agent_repair_detail,
+    cancel_agent_repair,
     capture_agent_revision,
     create_agent_repair,
     current_source,
@@ -75,6 +78,8 @@ FIXTURES = Path(__file__).parent / "fixtures" / "artifact_revisions"
 CASES = yaml.safe_load((FIXTURES / "planted_content_hashes.yaml").read_text(encoding="utf-8"))
 CASE_IDS = [case["id"] for case in CASES]
 JOURNAL = yaml.safe_load((FIXTURES / "journal_cases.yaml").read_text(encoding="utf-8"))
+UNENCODABLE = JOURNAL["values_json_cannot_encode"]
+UNENCODABLE_IDS = [case["id"] for case in UNENCODABLE]
 
 SECRET = "OPENAI_API_KEY=sk-own-7f3a"
 OTHER_SECRET = "OPENAI_API_KEY=sk-other-91c2"
@@ -174,12 +179,24 @@ def _case_hash(case: dict, layout: Layout, *, real: str) -> object:
     )
 
 
-def _plant_revision(folder: Path, *, content_hash: object) -> str:
+def _unencodable(case: dict) -> object:
+    """A values_json_cannot_encode case's value: empty lists nested ``depth``
+    deep, or its ``text``."""
+    if "text" in case:
+        return case["text"]
+    value: list = []
+    for _ in range(case["depth"] - 1):
+        value = [value]
+    return value
+
+
+def _plant_revision(folder: Path, *, content_hash: object, record: dict | None = None) -> object:
     """Add a revision naming ``content_hash`` before the head, as the agent's
-    code can, and return its id. The head stays the server's own."""
+    code can, and return its id. ``record`` fields replace the head's. The head
+    stays the server's own."""
     manifest_path = folder / ".revisions" / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    planted = {**manifest["revisions"][-1], "id": str(uuid4()), "contentHash": content_hash}
+    planted = {**manifest["revisions"][-1], "id": str(uuid4()), "contentHash": content_hash, **(record or {})}
     manifest["revisions"].insert(0, planted)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return planted["id"]
@@ -410,7 +427,7 @@ def test_a_linked_journal_reads_as_no_journal(layout, tmp_path):
     assert draft_review_grant(layout.folder) is None
     assert active_agent_repair(layout.folder) is None
     # Read before any lock: the lock replaces the link with a real folder.
-    assert artifact_revisions._read_manifest(layout.folder)["revisions"] == []
+    assert artifact_revisions._read_manifest(layout.folder).revisions == []
     assert list_revisions(layout.folder) == []
     assert _files_below(victim / ".revisions") == before
     assert layout.journal.is_dir() and not layout.journal.is_symlink()
@@ -886,7 +903,15 @@ def test_recovery_abandons_a_pending_write_the_server_never_writes(layout, case)
     + [(repair_id, False) for repair_id in JOURNAL["repair_ids"]["refused"]],
 )
 def test_only_a_canonical_uuid_names_a_repair(repair_id, canonical):
-    assert artifact_revisions._is_repair_id(repair_id) is canonical
+    assert is_repair_id(repair_id) is canonical
+
+
+@pytest.mark.parametrize("repair_id", JOURNAL["repair_ids"]["refused"])
+def test_a_repair_record_refuses_an_id_the_server_never_mints(repair_id):
+    """The file-name filter, the read and the write each check the id too; this
+    pins the model's own check, which every repair the server holds passes."""
+    with pytest.raises(ValidationError):
+        AgentRepair.model_validate({"id": repair_id, "path": "brief.md", "status": "queued"})
 
 
 @pytest.mark.parametrize("repair_id", JOURNAL["repair_ids"]["refused"])
@@ -958,6 +983,290 @@ def test_repair_records_are_read_one_at_a_time(layout):
     two_piles = peak()
 
     assert two_piles < one_pile * pile["peak_growth_bound"]
+
+
+def test_a_scan_holds_no_second_copy_of_a_record_that_passes_its_model(layout):
+    """Each read checks that the record can be written back, which must not
+    cost a second copy of it: a large repair the agent's code planted costs a
+    scan about what parsing it does."""
+    large = JOURNAL["large_repair"]
+    current_source(layout.folder, layout.metadata, layout.artifact_id)
+    repairs = layout.journal / "repairs"
+    repairs.mkdir()
+    repair_id = str(uuid4())
+    padding = ",".join(["{}"] * large["objects_per_record"])
+    text = f'{{"id": "{repair_id}", "path": "brief.md", "status": "ready", "thread": [{padding}]}}'
+    (repairs / f"{repair_id}.json").write_text(text, encoding="utf-8")
+
+    def peak(work) -> int:
+        tracemalloc.start()
+        try:
+            work()
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    parsed = peak(lambda: json.loads(text))
+    scanned = peak(lambda: has_queued_agent_repair(layout.folder, "turn-1"))
+
+    assert active_agent_repair(layout.folder)["id"] == repair_id
+    assert scanned < parsed * large["peak_over_parse_bound"]
+
+
+# ── records that fail their model ────────────────────────────────────────────
+
+
+def _filled(record: dict, layout: Layout, *, real: str) -> dict:
+    """A YAML case's record fields with their placeholders filled in."""
+    return {key: _case_hash({"content_hash": value}, layout, real=real) for key, value in record.items()}
+
+
+def _skipped_entry_warnings(caplog) -> list[logging.LogRecord]:
+    return [
+        record
+        for record in caplog.records
+        if record.name == artifact_revisions.logger.name
+        and record.levelno == logging.WARNING
+        and getattr(record, "event", None) == "artifact_revision_entries_skipped"
+    ]
+
+
+def _assert_left_out_then_dropped(layout: Layout, *, head: dict, planted: object, caplog) -> None:
+    """The planted entry is left out of the history, with one warning, and the
+    next write of the manifest drops it."""
+    with caplog.at_level(logging.WARNING, logger=artifact_revisions.logger.name):
+        listed = list_revisions(layout.folder)
+    warnings = _skipped_entry_warnings(caplog)
+    saved = save_source(
+        layout.folder, layout.metadata, layout.artifact_id, content="# Second\n", expected_revision_id=head["id"]
+    )["revision"]
+
+    assert [revision["id"] for revision in listed] == [head["id"]]
+    assert len(warnings) == 1
+    manifest = json.loads((layout.journal / "manifest.json").read_text(encoding="utf-8"))
+    assert [entry["id"] for entry in manifest["revisions"]] == [head["id"], saved["id"]]
+    assert planted not in {entry["id"] for entry in manifest["revisions"]}
+
+
+@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
+def test_a_planted_revision_is_left_out_of_the_history_and_dropped_on_the_next_write(layout, case, caplog):
+    """RevisionEntry refuses the name before any reader sees it. _blob_bytes
+    refuses the same names again where they would open a file, so this is the
+    test that fails when the model's check goes."""
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    planted = _plant_revision(layout.folder, content_hash=_case_hash(case, layout, real=head["contentHash"]))
+
+    _assert_left_out_then_dropped(layout, head=head, planted=planted, caplog=caplog)
+
+
+@pytest.mark.parametrize(
+    "case",
+    JOURNAL["revisions_failing_their_model"],
+    ids=[case["id"] for case in JOURNAL["revisions_failing_their_model"]],
+)
+def test_a_revision_that_fails_its_model_on_another_field_is_left_out_and_dropped(layout, case, caplog):
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    planted = _plant_revision(layout.folder, content_hash=head["contentHash"], record=case["record"])
+
+    _assert_left_out_then_dropped(layout, head=head, planted=planted, caplog=caplog)
+
+
+@pytest.mark.parametrize("case", UNENCODABLE, ids=UNENCODABLE_IDS)
+def test_a_revision_holding_a_value_json_cannot_encode_is_left_out_and_dropped(layout, case, caplog):
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    planted = _plant_revision(
+        layout.folder, content_hash=head["contentHash"], record={"note": _unencodable(case)}
+    )
+
+    _assert_left_out_then_dropped(layout, head=head, planted=planted, caplog=caplog)
+
+
+@pytest.mark.parametrize("case", UNENCODABLE, ids=UNENCODABLE_IDS)
+def test_a_manifest_holding_a_value_json_cannot_encode_reads_as_invalid(layout, case):
+    current_source(layout.folder, layout.metadata, layout.artifact_id)
+    manifest_path = layout.journal / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_path.write_text(json.dumps({**manifest, "note": _unencodable(case)}), encoding="utf-8")
+    before = manifest_path.read_bytes()
+
+    with pytest.raises(RevisionValidationError, match="^Artifact revision history is invalid$"):
+        list_revisions(layout.folder)
+    assert manifest_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "case",
+    JOURNAL["pending_writes_failing_their_model"],
+    ids=[case["id"] for case in JOURNAL["pending_writes_failing_their_model"]],
+)
+def test_recovery_abandons_a_pending_write_that_fails_its_model(layout, case):
+    """The source already holds the revision's bytes, so a recovery that
+    accepted the record would add its revision to the history."""
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    recovered = b"# Recovered\n"
+    write_journal_file(layout.folder, "blobs", _sha(recovered), content=recovered)
+    pending = _plant_pending(
+        layout.folder,
+        content_hash=_sha(recovered),
+        path=head["path"],
+        base_revision_id=head["id"],
+        before=FIRST.encode(),
+    )
+    record = {**json.loads(pending.read_text(encoding="utf-8")), **_filled(case["record"], layout, real=head["contentHash"])}
+    pending.write_text(json.dumps(record), encoding="utf-8")
+    (layout.folder / "brief.md").write_bytes(recovered)
+
+    listed = list_revisions(layout.folder)
+
+    assert [revision["id"] for revision in listed] == [head["id"]]
+    assert not pending.exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    JOURNAL["repairs_failing_their_model"],
+    ids=[case["id"] for case in JOURNAL["repairs_failing_their_model"]],
+)
+def test_a_repair_that_fails_its_model_is_left_alone_and_answers_as_missing(layout, case):
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    repair_id = str(uuid4())
+    repairs = layout.journal / "repairs"
+    repairs.mkdir()
+    record = {
+        "id": repair_id,
+        "path": head["path"],
+        "baseRevisionId": head["id"],
+        "commentThreadId": "thread-1",
+        "conversationId": "turn-1",
+        "status": "queued",
+        "revisionId": None,
+        "createdAt": "2026-11-02T10:00:00+00:00",
+        "updatedAt": "2026-11-02T10:00:00+00:00",
+        **case["record"],
+    }
+    planted = repairs / f"{repair_id}.json"
+    planted.write_text(json.dumps(record), encoding="utf-8")
+    (layout.folder / "brief.md").write_text("# Agent edit\n", encoding="utf-8")
+
+    captured = capture_agent_revision(layout.folder, conversation_id="turn-1")
+
+    assert captured is not None and captured["actor"]["kind"] == "agent"
+    assert json.loads(planted.read_text(encoding="utf-8")) == record
+    with pytest.raises(FileNotFoundError, match="^Agent repair not found$"):
+        agent_repair_detail(layout.folder, repair_id)
+
+
+@pytest.mark.parametrize(
+    "case",
+    JOURNAL["repairs_failing_their_model"],
+    ids=[case["id"] for case in JOURNAL["repairs_failing_their_model"]],
+)
+def test_a_repair_refuses_a_value_set_after_the_read(case):
+    repair = AgentRepair.model_validate({"id": str(uuid4()), "path": "brief.md", "status": "queued"})
+
+    with pytest.raises(ValidationError):
+        for field, value in case["record"].items():
+            setattr(repair, field, value)
+
+
+@pytest.mark.parametrize("case", UNENCODABLE, ids=UNENCODABLE_IDS)
+def test_a_pending_write_holding_a_value_json_cannot_encode_is_abandoned(layout, case):
+    """A recovery that accepted the record would write the source, then fail
+    to write the manifest and keep the record, on every later read."""
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    recovered = b"# Recovered\n"
+    write_journal_file(layout.folder, "blobs", _sha(recovered), content=recovered)
+    pending = _plant_pending(
+        layout.folder,
+        content_hash=_sha(recovered),
+        path=head["path"],
+        base_revision_id=head["id"],
+        before=FIRST.encode(),
+    )
+    record = json.loads(pending.read_text(encoding="utf-8"))
+    record["revision"]["note"] = _unencodable(case)
+    pending.write_text(json.dumps(record), encoding="utf-8")
+
+    reread = current_source(layout.folder, layout.metadata, layout.artifact_id)
+
+    assert reread["content"] == FIRST
+    assert (layout.folder / "brief.md").read_text(encoding="utf-8") == FIRST
+    assert not pending.exists()
+
+
+@pytest.mark.parametrize("case", UNENCODABLE, ids=UNENCODABLE_IDS)
+def test_a_repair_holding_a_value_json_cannot_encode_is_left_alone_and_answers_as_missing(layout, case):
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    repair_id = _plant_ready_repair(
+        layout.folder, base_revision_id=head["id"], revision_id=head["id"], path=head["path"]
+    )
+    planted = layout.journal / "repairs" / f"{repair_id}.json"
+    record = json.loads(planted.read_text(encoding="utf-8"))
+    planted.write_text(json.dumps({**record, "thread": [_unencodable(case)]}), encoding="utf-8")
+    before = planted.read_bytes()
+
+    assert active_agent_repair(layout.folder) is None
+    with pytest.raises(FileNotFoundError, match="^Agent repair not found$"):
+        agent_repair_detail(layout.folder, repair_id)
+    with pytest.raises(FileNotFoundError, match="^Agent repair not found$"):
+        cancel_agent_repair(layout.folder, repair_id, discard_ready=True)
+    assert planted.read_bytes() == before
+
+
+def test_a_revision_another_build_wrote_keeps_its_keys_through_a_write(layout):
+    other = JOURNAL["records_from_another_build"]
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    manifest_path = layout.journal / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    written = {
+        **{key: value for key, value in manifest["revisions"][-1].items() if key not in other["revision_without"]},
+        **other["undeclared"],
+    }
+    manifest["revisions"][-1] = written
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    listed = list_revisions(layout.folder)
+    save_source(
+        layout.folder, layout.metadata, layout.artifact_id, content="# Second\n", expected_revision_id=head["id"]
+    )
+
+    kept = json.loads(manifest_path.read_text(encoding="utf-8"))["revisions"][0]
+    assert list(listed[0].items()) == list(written.items())
+    assert list(kept.items()) == list(written.items())
+
+
+def test_a_repair_another_build_wrote_keeps_its_keys_through_a_write(layout):
+    other = JOURNAL["records_from_another_build"]
+    head = current_source(layout.folder, layout.metadata, layout.artifact_id)["revision"]
+    repair_id = create_agent_repair(
+        layout.folder,
+        layout.metadata,
+        layout.artifact_id,
+        expected_revision_id=head["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Fix the title"}],
+        conversation_id=str(uuid4()),
+    )["repair"]["id"]
+    path = layout.journal / "repairs" / f"{repair_id}.json"
+    written = {
+        **{
+            key: value
+            for key, value in json.loads(path.read_text(encoding="utf-8")).items()
+            if key not in other["repair_without"]
+        },
+        **other["undeclared"],
+    }
+    path.write_text(json.dumps(written), encoding="utf-8")
+
+    cancelled = cancel_agent_repair(layout.folder, repair_id)
+    detail = agent_repair_detail(layout.folder, repair_id)["repair"]
+
+    kept = json.loads(path.read_text(encoding="utf-8"))
+    expected = {**written, "status": "cancelled", "updatedAt": kept["updatedAt"]}
+    assert list(kept.items()) == list(expected.items())
+    assert list(cancelled.items()) == list(expected.items())
+    assert detail == {**expected, "superseded": False}
 
 
 # ── names ────────────────────────────────────────────────────────────────────

@@ -14,8 +14,10 @@ liveness answer, not only as a slow request.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import contextlib
 import contextvars
+import io
 import json
 import os
 import shutil
@@ -23,14 +25,16 @@ import threading
 import time
 from functools import partial
 from pathlib import Path
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import NamedTuple
 from uuid import UUID, uuid4
 
+import anyio
 import httpx
 import pytest
 from fastapi import HTTPException
-from sqlmodel import Session
+from sqlmodel import Session, select
 from starlette.types import ASGIApp
 
 import cowork.db.session as db_session
@@ -38,12 +42,16 @@ from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifact_workspace
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db import units
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.draft_host import app as draft_app
+from cowork.models.artifact_location import ArtifactLocation
 from cowork.models.project import Project
 from cowork.server import create_app
 from cowork.services import artifact_files, artifact_identity, artifact_roots
 from cowork.services.artifact_identity import ensure_full_id
+from cowork.services.projects import ProjectService
 
+import _blocking_guard as blocking_guard
 import test_artifacts_api_tenancy as tenancy
 from draft_host_support import DRAFT_HOST, FETCH, configure_draft_env, draft_token
 from test_artifact_roots import _count_hops
@@ -316,20 +324,23 @@ async def test_a_draft_builds_its_preview_in_the_slot_it_opened_the_file_in(owne
     assert "brief" in response.text
 
 
-def _stick_lookups(monkeypatch, *, sticks=lambda _request: True, realpath_under: tuple[str, ...] = ()):
+def _stick_lookups(monkeypatch, *, sticks=lambda _request: True):
     """Make each artifact root lookup whose request ``sticks`` picks block
     until the returned event is set, as a call on a hard NFS mount does while
-    the file server doesn't answer. Other lookups run. With
-    ``realpath_under``, each os.path.realpath call such a request makes on a
-    path under one of those folders blocks the same way, then resolves.
-    Returns the counts of calls blocked now and at most, and the event. Also
-    cuts POOL_TIMEOUT to 1 s."""
+    the file server doesn't answer. Other lookups run. Returns the counts of
+    lookups blocked now and at most, and the event. Also cuts POOL_TIMEOUT to
+    1 s."""
     real = artifact_identity.opened_artifact_root
     released = threading.Event()
     state = {"blocked": 0, "most": 0}
     lock = threading.Lock()
 
-    def block() -> None:
+    @contextlib.contextmanager
+    def stuck(source):
+        if not sticks(_request.get(None)):
+            with real(source) as root:
+                yield root
+            return
         with lock:
             state["blocked"] += 1
             state["most"] = max(state["most"], state["blocked"])
@@ -338,29 +349,30 @@ def _stick_lookups(monkeypatch, *, sticks=lambda _request: True, realpath_under:
         finally:
             with lock:
                 state["blocked"] -= 1
-
-    @contextlib.contextmanager
-    def stuck(source):
-        if not sticks(_request.get(None)):
-            with real(source) as root:
-                yield root
-            return
-        block()
         raise FileNotFoundError("released")
 
     monkeypatch.setattr(artifact_identity, "opened_artifact_root", stuck)
-    if realpath_under:
-        real_realpath = os.path.realpath
-
-        def stuck_realpath(path, *args, **kwargs):
-            name = os.fspath(path)
-            if isinstance(name, str) and name.startswith(realpath_under) and sticks(_request.get(None)):
-                block()
-            return real_realpath(path, *args, **kwargs)
-
-        monkeypatch.setattr(os.path, "realpath", stuck_realpath)
     monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
     return state, released
+
+
+async def _plan_once(monkeypatch, project_ref: str, *scopes: TenantScope) -> None:
+    """Build each caller's roots plan for ``project_ref`` once, before a
+    burst, and answer every lookup's database half from it. The burst's
+    database work then stays the same whatever rows other tests left in the
+    session database, so under the 1 s POOL_TIMEOUT its requests reach the
+    file store, and only the file store's slots refuse them."""
+    plans = {
+        scope.user_id: await units.run_db(
+            partial(artifact_scope._plan_for_project_ref, project_ref=project_ref), scope=scope
+        )
+        for scope in scopes
+    }
+
+    def planned(session, **_ref):
+        return plans[session.scope.user_id]
+
+    monkeypatch.setattr(artifact_scope, "_plan_for_project_ref", planned)
 
 
 @pytest.fixture
@@ -371,8 +383,9 @@ def stuck_lookup(monkeypatch, seeded_artifact):
     released.set()
 
 
-async def test_a_stuck_file_store_refuses_artifact_reviews_and_nothing_else(stuck_lookup):
+async def test_a_stuck_file_store_refuses_artifact_reviews_and_nothing_else(stuck_lookup, monkeypatch):
     state, released = stuck_lookup
+    await _plan_once(monkeypatch, "local", LOCAL_SCOPE)
     loop = asyncio.get_running_loop()
     extra = 4
     transport = httpx.ASGITransport(app=_marked(create_app()), raise_app_exceptions=False)
@@ -471,70 +484,20 @@ def first_members_lookups_stuck(monkeypatch, org_project_review):
     released.set()
 
 
-@pytest.fixture
-def first_members_store_stuck(monkeypatch, org_project_review):
-    """FIRST_MEMBER's artifact root lookups, and every os.path.realpath their
-    requests make under COWORK_HOME, the hosted file store that holds the
-    shared root, block until the test releases them; SECOND_MEMBER's run.
-    The shared root is resolved first, as the lifespan does before the port
-    binds."""
-    from cowork.common.paths import cowork_home
-    from cowork.services.projects import resolve_shared_root
-
-    resolve_shared_root()
-    home = cowork_home()
-    state, released = _stick_lookups(
-        monkeypatch,
-        sticks=lambda request: request is not None and request["user"] == FIRST_MEMBER,
-        realpath_under=tuple({str(home), os.path.realpath(home)}),
-    )
-    yield state, released
-    released.set()
-
-
-async def test_an_org_review_stuck_on_the_file_store_holds_no_pooled_connection(
-    org_project_review, first_members_store_stuck, granted_product_permissions,
-):
-    """In org tenancy a review's database unit leaves out a project whose
-    folder sits in another partition of the shared root. It compares the
-    path with the root resolved at startup, so with the review's lookup and
-    every link it resolves under COWORK_HOME stuck, the review waits on the
-    file store's thread holding no pooled connection, and the projects list,
-    a database route, still answers. Resolved in the unit, the root's link
-    would hold that connection until the mount answered."""
-    state, released = first_members_store_stuck
-    engine = db_session.get_engine(db_session.settings.database.uri)
-    loop = asyncio.get_running_loop()
-    transport = httpx.ASGITransport(app=_marked(create_app()), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        review = asyncio.create_task(client.get(org_project_review, headers=_as(FIRST_MEMBER)))
-        try:
-            for _ in range(100):
-                if state["blocked"]:
-                    break
-                await asyncio.sleep(0.02)
-            assert state["blocked"] == 1, "the review never reached the file store"
-            checked_out = engine.pool.checkedout()
-            started = loop.time()
-            projects = await client.get("/api/v1/projects/", headers=_as(SECOND_MEMBER))
-            projects_seconds = loop.time() - started
-        finally:
-            released.set()
-            await review
-
-    assert checked_out == 0
-    assert projects.status_code == 200, projects.text
-    assert projects_seconds < LIVE_BUDGET_SECONDS
-
-
 async def test_a_second_member_gets_a_slot_while_the_first_holds_their_share(
-    org_project_review, first_members_lookups_stuck, granted_product_permissions,
+    org_project_review, first_members_lookups_stuck, granted_product_permissions, monkeypatch,
 ):
     """Two members of one organization. The first fires as many reviews as
     there are file store slots, and every one sticks on the file store: the
     first member holds their share, the rest of their reviews are refused,
     and the second member's review still gets a slot and answers."""
     state, released = first_members_lookups_stuck
+    project_ref = org_project_review.removeprefix("/api/v1/artifacts/workspace/").split("/")[0]
+    await _plan_once(
+        monkeypatch,
+        project_ref,
+        *(TenantScope(org_mode=True, org_id=ORG, user_id=user) for user in (FIRST_MEMBER, SECOND_MEMBER)),
+    )
     loop = asyncio.get_running_loop()
     held = db_session.settings.storage.efs_share
     transport = httpx.ASGITransport(app=_marked(create_app()), raise_app_exceptions=False)
@@ -597,11 +560,11 @@ def test_a_warm_lookup_skips_conversation_folders_that_hold_no_artifacts(tmp_pat
     """Org mode, a project with 100 conversation folders and no legacy
     artifacts: the folders are not roots, so a lookup doesn't index each one.
 
-    The saving shows where every folder would be searched: a reviewer's
-    unfiltered lookup, or a caller who owns every conversation. There an
-    empty folder counted as a root costs about 1,039 calls. The owner filter
-    drops another member's folders either way, so its lookup reads the same
-    with or without the saving."""
+    The saving shows where every folder would be searched: a lookup's scan,
+    which reads every root, or a caller who owns every conversation. There an
+    empty folder counted as a root costs about 1,039 calls. The caller's own
+    roots (`readable_sources`) skip another member's folders by name before
+    any stat, so a read of them is the same with or without the saving."""
     monkeypatch.setattr(artifact_roots, "_org_mode", lambda: True)
     project = tmp_path / "project"
     folder = project / ".anton" / "artifacts" / "brief"
@@ -616,7 +579,7 @@ def test_a_warm_lookup_skips_conversation_folders_that_hold_no_artifacts(tmp_pat
     artifact_identity._clear_identity_indexes()
 
     def lookup():
-        found = artifact_roots.discover_roots(plan)
+        found = artifact_roots.discover_roots(plan, own_only=roots != "unfiltered")
         assert [root for root in found.roots if root.legacy] == []
         sources = found.unfiltered() if roots == "unfiltered" else found.sources()
         return artifact_identity.resolve_artifact_folder(sources, ARTIFACT_ID)
@@ -715,25 +678,43 @@ async def test_taking_the_live_publish_lock_waits_out_a_busy_file_store(monkeypa
 # owner-only route checks ownership in a database unit after the lookup, so
 # it reads in one more call, and only once that check has passed.
 
-# The project row and owned conversations, then the lookup.
+# The project row, the owned conversations and the location row, then the
+# lookup.
 LOOKUP = ["run_db", "run_efs"]
+# A lookup whose location row does not answer it: the scan, then the unit that
+# records what the scan found, whose refusal is only logged.
+SCANNED_LOOKUP = [*LOOKUP, "record"]
 # The lookup, the owner check, then the route's one read.
 OWNER_READ = [*LOOKUP, "run_db", "run_efs"]
+
+
+def _own_slug() -> str:
+    """A slug no other test's folder has. An artifact with no id in its
+    metadata takes one from its slug, so a shared slug gives every test's
+    artifact one id, whose location row another module's test may leave
+    naming its own project."""
+    return f"dash-{uuid4().hex[:8]}"
 
 
 @pytest.fixture
 async def owned(session, tmp_path, org_deployment, cleanup_tmp_projects, granted_product_permissions, monkeypatch):
     """USER_A's artifact in an ORG_A project, opened for same-org review.
     Returns (project_id, artifact_id)."""
-    row, _folder, card = await tenancy._grant_draft_review(session, tmp_path, monkeypatch)
+    row, _folder, card = await tenancy._grant_draft_review(session, tmp_path, monkeypatch, slug=_own_slug())
+    with Session(db_session.get_engine(get_app_settings().database.uri)) as raw:
+        location = raw.exec(
+            select(ArtifactLocation).where(
+                ArtifactLocation.org_id == tenancy.ORG_A, ArtifactLocation.artifact_id == card["id"]
+            )
+        ).first()
+    # Opening the review looked the artifact up, which recorded its row here.
+    assert location is not None and location.project_id == row.id, "the artifact's location row names another project"
     return str(row.id), card["id"]
 
 
-@contextlib.contextmanager
-def _caller(session, user_id: str = tenancy.USER_A):
-    """A request's session for ``user_id`` of ORG_A, on its own connection."""
-    with Session(session.get_bind()) as own:
-        yield tenancy._scoped(own, tenancy.ORG_A, user_id)
+def _caller(user_id: str = tenancy.USER_A) -> TenantScope:
+    """The tenant scope a request of ``user_id`` of ORG_A carries."""
+    return TenantScope(org_mode=True, org_id=tenancy.ORG_A, user_id=user_id)
 
 
 def _access_reads(monkeypatch) -> list[Path]:
@@ -767,14 +748,13 @@ def _on_efs_threads(monkeypatch, module, name: str) -> list[bool]:
 
 @pytest.mark.parametrize(("user_id", "role"), [(tenancy.USER_A, "owner"), (tenancy.USER_A2, "reviewer")])
 async def test_a_review_entry_reads_its_revision_in_the_lookups_file_store_call(
-    owned, session, monkeypatch, user_id, role,
+    owned, monkeypatch, user_id, role,
 ):
     project_id, artifact_id = owned
     reads = _on_efs_threads(monkeypatch, artifact_workspace, "current_source")
     hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
-    with _caller(session, user_id) as caller:
-        entry = await artifact_workspace.artifact_review_entry(project_id, artifact_id, caller)
+    entry = await artifact_workspace.artifact_review_entry(project_id, artifact_id, _caller(user_id))
 
     assert entry["capabilities"]["role"] == role
     assert entry["currentRevision"]["artifactId"] == artifact_id
@@ -785,7 +765,7 @@ async def test_a_review_entry_reads_its_revision_in_the_lookups_file_store_call(
 
 @pytest.mark.parametrize("error", [FileNotFoundError, OSError, ValueError, TimeoutError])
 async def test_a_review_entry_with_no_readable_source_still_answers_without_a_revision(
-    owned, session, monkeypatch, error,
+    owned, monkeypatch, error,
 ):
     project_id, artifact_id = owned
 
@@ -795,8 +775,7 @@ async def test_a_review_entry_with_no_readable_source_still_answers_without_a_re
     monkeypatch.setattr(artifact_workspace, "current_source", unreadable)
     hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
-    with _caller(session, tenancy.USER_A2) as reviewer:
-        entry = await artifact_workspace.artifact_review_entry(project_id, artifact_id, reviewer)
+    entry = await artifact_workspace.artifact_review_entry(project_id, artifact_id, _caller(tenancy.USER_A2))
 
     assert entry["currentRevision"] is None
     assert entry["capabilities"]["role"] == "reviewer"
@@ -815,15 +794,14 @@ async def test_a_draft_link_names_its_file_in_the_lookups_file_store_call(
     hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
     try:
-        with _caller(session) as caller:
-            response = await artifact_workspace.create_draft_link(str(row.id), artifact_id, caller)
+        response = await artifact_workspace.create_draft_link(str(row.id), artifact_id, _caller())
     finally:
         get_app_settings.cache_clear()
 
     assert response.status_code == 200, response.body
     assert json.loads(response.body)["url"].endswith("/index.html")
     assert names == [True]
-    assert hops == LOOKUP
+    assert hops == SCANNED_LOOKUP
 
 
 class _PinnedOpen(NamedTuple):
@@ -856,8 +834,8 @@ async def _preview(route: str, project_id: str, artifact_id: str, caller):
             project_id, artifact_id, "index.html", SimpleNamespace(query_params={}), caller
         )
     grant = draft_app._DraftGrant(
-        user_id=str(caller.scope.user_id),
-        org_id=str(caller.scope.org_id),
+        user_id=str(caller.user_id),
+        org_id=str(caller.org_id),
         project_ref=project_id,
         artifact_id=artifact_id,
     )
@@ -867,15 +845,14 @@ async def _preview(route: str, project_id: str, artifact_id: str, caller):
 
 @pytest.mark.parametrize("route", ["drafts", "draft_host"])
 @pytest.mark.parametrize("user_id", [tenancy.USER_A, tenancy.USER_A2], ids=["owner", "reviewer"])
-async def test_a_draft_file_is_opened_in_the_lookups_file_store_call(owned, session, monkeypatch, route, user_id):
+async def test_a_draft_file_is_opened_in_the_lookups_file_store_call(owned, monkeypatch, route, user_id):
     """Every asset of a preview is a request of its own, so the path checks
     and the open run in the lookup's file store call: one wait for a slot."""
     project_id, artifact_id = owned
     opens = _pinned_opens(monkeypatch)
     hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
-    with _caller(session, user_id) as caller:
-        response = await _preview(route, project_id, artifact_id, caller)
+    response = await _preview(route, project_id, artifact_id, _caller(user_id))
 
     assert response.status_code == 200
     assert opens == [_PinnedOpen(("index.html",), True)]
@@ -894,12 +871,12 @@ async def test_a_draft_file_is_never_opened_for_a_caller_the_lookup_refuses(
     hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
     # A co-member, and the owner never opened the draft for review.
-    with pytest.raises(HTTPException) as refused, _caller(session, tenancy.USER_A2) as other:
-        await _preview(route, str(row.id), artifact_id, other)
+    with pytest.raises(HTTPException) as refused:
+        await _preview(route, str(row.id), artifact_id, _caller(tenancy.USER_A2))
 
     assert refused.value.status_code == 404
     assert opens == []
-    assert hops == LOOKUP
+    assert hops == SCANNED_LOOKUP
 
 
 async def _edit(project_id: str, artifact_id: str, caller):
@@ -936,34 +913,34 @@ async def _restore_the_first_revision(project_id: str, artifact_id: str, caller)
 
 
 @pytest.mark.parametrize("route", ["workspace", "save", "access", "comments_access", "restore"])
-async def test_an_owner_route_reads_once_after_its_owner_check(owned, session, monkeypatch, route):
+async def test_an_owner_route_reads_once_after_its_owner_check(owned, monkeypatch, route):
     project_id, artifact_id = owned
     synced: list[Path] = []
 
-    async def sync_live_artifact(_session, folder, *, project_id=None):
+    async def sync_live_artifact(_scope, folder, *, project_id=None):
         synced.append(folder)
 
     # A save that changed the source republishes a live artifact afterwards:
     # its own operation, with the publish lock's waits, not the route's read.
     monkeypatch.setattr(artifact_workspace, "_sync_live_artifact", sync_live_artifact)
-    with _caller(session) as caller:
-        if route == "save":
-            call = await _edit(project_id, artifact_id, caller)
-        elif route == "restore":
-            call = await _restore_the_first_revision(project_id, artifact_id, caller)
-        else:
-            call = {
-                "workspace": partial(artifact_workspace.artifact_source, project_id, artifact_id, caller, path=None),
-                "access": partial(artifact_workspace.artifact_access, project_id, artifact_id, caller),
-                "comments_access": partial(
-                    artifact_workspace.enable_artifact_comments, project_id, artifact_id, caller
-                ),
-            }[route]
-        synced.clear()
-        access_reads = _access_reads(monkeypatch)
-        hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
+    caller = _caller()
+    if route == "save":
+        call = await _edit(project_id, artifact_id, caller)
+    elif route == "restore":
+        call = await _restore_the_first_revision(project_id, artifact_id, caller)
+    else:
+        call = {
+            "workspace": partial(artifact_workspace.artifact_source, project_id, artifact_id, caller, path=None),
+            "access": partial(artifact_workspace.artifact_access, project_id, artifact_id, caller),
+            "comments_access": partial(
+                artifact_workspace.enable_artifact_comments, project_id, artifact_id, caller
+            ),
+        }[route]
+    synced.clear()
+    access_reads = _access_reads(monkeypatch)
+    hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
-        await call()
+    await call()
 
     assert hops == OWNER_READ
     assert len(synced) == (1 if route in ("save", "restore") else 0)
@@ -976,21 +953,193 @@ async def test_a_non_owner_is_refused_access_before_any_read(
     granted, status_code,
 ):
     if granted:
-        row, _folder, card = await tenancy._grant_draft_review(session, tmp_path, monkeypatch)
+        row, _folder, card = await tenancy._grant_draft_review(session, tmp_path, monkeypatch, slug=_own_slug())
         artifact_id = card["id"]
     else:
         row, folder = tenancy._project_with_artifact(
-            session, tmp_path, name="mine", org_id=tenancy.ORG_A, slug="dash"
+            session, tmp_path, name="mine", org_id=tenancy.ORG_A, slug=_own_slug()
         )
         artifact_id, _metadata = ensure_full_id(folder)
     access_reads = _access_reads(monkeypatch)
     hops = _count_hops(monkeypatch, artifact_scope, artifact_workspace)
 
-    with pytest.raises(HTTPException) as refused, _caller(session, tenancy.USER_A2) as reviewer:
-        await artifact_workspace.artifact_access(str(row.id), artifact_id, reviewer)
+    with pytest.raises(HTTPException) as refused:
+        await artifact_workspace.artifact_access(str(row.id), artifact_id, _caller(tenancy.USER_A2))
 
     assert refused.value.status_code == status_code
-    # A reviewer's lookup passes and the owner check refuses; no grant ends
-    # at the lookup. Either way the access state is never read.
+    # A reviewer's lookup opens the row's folder and the owner check refuses;
+    # with no grant, the lookup scans, records its folder and refuses. Either
+    # way the access state is never read.
     assert access_reads == []
-    assert hops == ([*LOOKUP, "run_db"] if granted else LOOKUP)
+    assert hops == ([*LOOKUP, "run_db"] if granted else SCANNED_LOOKUP)
+
+
+# In org tenancy, where COWORK_HOME is the shared file store: with every file
+# store call stuck, the requests that need the store are refused, and the
+# projects list, a database route, still answers.
+
+
+class _StuckFileStore:
+    """Every call that names a path under COWORK_HOME, made on a worker
+    thread, blocks until ``release``, as calls on a hard NFS mount do while
+    the file server doesn't answer. Counts the calls blocked now and at most.
+    A call on a descriptor alone goes through: its open already stuck."""
+
+    def __init__(self) -> None:
+        self.blocked = 0
+        self.most = 0
+        self._released = threading.Event()
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        self._released.set()
+
+    @staticmethod
+    def _names_the_store(*, parameters, args, kwargs) -> bool:
+        if any(kwargs.get(name) is not None for name in blocking_guard._DIR_FD_KEYWORDS):
+            return True
+        for position, name in enumerate(parameters):
+            if name is None:
+                continue
+            target = args[position] if position < len(args) else kwargs.get(name)
+            if target is not None and not isinstance(target, int) and blocking_guard._names_the_file_store(target):
+                return True
+        return False
+
+    def wrap(self, *, real, parameters):
+        def call(*args, **kwargs):
+            if threading.current_thread() is not threading.main_thread() and self._names_the_store(
+                parameters=parameters, args=args, kwargs=kwargs
+            ):
+                with self._lock:
+                    self.blocked += 1
+                    self.most = max(self.most, self.blocked)
+                try:
+                    self._released.wait(timeout=60)
+                finally:
+                    with self._lock:
+                        self.blocked -= 1
+            return real(*args, **kwargs)
+
+        return call
+
+
+@contextlib.contextmanager
+def _every_file_store_call_stuck(monkeypatch) -> Iterator[_StuckFileStore]:
+    """_StuckFileStore over every os call the blocking guard wraps, and open.
+    Code that asks os which calls take a descriptor or a dir_fd, as shutil
+    does, gets the same answer for each wrapper as for the call it wraps."""
+    stuck = _StuckFileStore()
+    blocking_guard._home_prefixes()  # resolved now, before its own stat could stick
+    added: list[tuple[set, object]] = []
+    targets = [(os, name, parameters) for name, parameters in blocking_guard._PATH_PARAMETERS.items() if hasattr(os, name)]
+    targets += [(io, "open", blocking_guard._OPEN_PARAMETERS), (builtins, "open", blocking_guard._OPEN_PARAMETERS)]
+    for owner, name, parameters in targets:
+        real = getattr(owner, name)
+        wrapper = stuck.wrap(real=real, parameters=parameters)
+        monkeypatch.setattr(owner, name, wrapper)
+        for supported in blocking_guard._SUPPORTS:
+            if real in supported:
+                supported.add(wrapper)
+                added.append((supported, wrapper))
+    try:
+        yield stuck
+    finally:
+        stuck.release()
+        for supported, wrapper in added:
+            supported.discard(wrapper)
+
+
+async def _until(*, condition, seconds: float) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    while not condition() and loop.time() < deadline:
+        await asyncio.sleep(0.02)
+
+
+async def _answered_within(*, request, seconds: float) -> httpx.Response | None:
+    """``request``'s response, or None when it took longer than ``seconds``.
+    The request keeps running: a cancel would wait for a unit stuck on the
+    file store, so the test releases the store before it awaits the rest."""
+    task = asyncio.ensure_future(request)
+    done, _pending = await asyncio.wait({task}, timeout=seconds)
+    return task.result() if done else None
+
+
+async def test_with_every_file_store_call_stuck_the_projects_list_answers(
+    org_project_review, granted_product_permissions, monkeypatch
+):
+    """Enough members' reviews to take every file store slot, each stuck in
+    its lookup. Liveness and a member's projects list answer within budget,
+    and no more threads block than the file store has slots: the list reads
+    rows only once the organization's general project exists."""
+    # Every review's database units share the pool before they reach the
+    # store, so on a loaded runner 1 s refused most of them there and few
+    # filled a slot. The reviews past the slots still wait this long, then 503.
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 10)
+    storage = db_session.settings.storage
+    members = [f"5c0a1e5e-0000-4000-8000-0000000001{n:02d}" for n in range(storage.efs_slots // storage.efs_share + 1)]
+    transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        warm = await client.get("/api/v1/projects/", headers=_as(FIRST_MEMBER))
+        assert warm.status_code == 200, warm.text
+        with _every_file_store_call_stuck(monkeypatch) as stuck:
+            reviews = [
+                asyncio.create_task(client.get(org_project_review, headers=_as(member)))
+                for member in members
+                for _ in range(storage.efs_share)
+            ]
+            try:
+                # Each review authenticates and reads its rows before it reaches the
+                # stuck store, so a slow runner takes a while to fill every slot.
+                await _until(condition=lambda: stuck.blocked >= storage.efs_slots, seconds=30)
+                live = await _answered_within(request=client.get(LIVE), seconds=LIVE_BUDGET_SECONDS)
+                listed = await _answered_within(
+                    request=client.get("/api/v1/projects/", headers=_as(SECOND_MEMBER)), seconds=LIVE_BUDGET_SECONDS
+                )
+                most = stuck.most
+            finally:
+                stuck.release()
+                await asyncio.gather(*reviews, return_exceptions=True)
+
+    assert live is not None and live.status_code == 200
+    assert listed is not None, "the projects list waited on the stuck file store"
+    assert listed.status_code == 200, listed.text
+    assert most == storage.efs_slots
+
+
+async def test_lists_stuck_on_the_general_folder_leave_database_routes_answering(org_deployment, monkeypatch):
+    """Four database unit slots, and the general project's folder check
+    stuck. Five lists at once all answer, and database-only routes keep
+    their slots: a list that checked the folder in its unit would hold a slot
+    each until the mount answered, and the rest would be refused."""
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    headers = _as(FIRST_MEMBER)
+    transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        warm = await client.get("/api/v1/projects/", headers=headers)
+        assert warm.status_code == 200, warm.text
+        slots = anyio.CapacityLimiter(4)
+        monkeypatch.setattr(units, "_slots", lambda _engine: slots)
+        released = threading.Event()
+        for name in ("_in_scoped_root", "ensure_dir_exists"):
+            real = getattr(ProjectService, name)
+
+            def stuck(self, *args, _real=real, **kwargs):
+                released.wait(timeout=60)
+                return _real(self, *args, **kwargs)
+
+            monkeypatch.setattr(ProjectService, name, stuck)
+        lists = [asyncio.ensure_future(client.get("/api/v1/projects/", headers=headers)) for _ in range(5)]
+        try:
+            _done, slow = await asyncio.wait(lists, timeout=LIVE_BUDGET_SECONDS)
+            search = await client.get("/api/v1/search", params={"q": "x"}, headers=headers)
+            models = await client.get("/api/v1/settings/recommended-models", headers=headers)
+        finally:
+            released.set()
+            await asyncio.gather(*lists, return_exceptions=True)
+
+    assert not slow, f"{len(slow)} of 5 lists waited on the general project's folder"
+    assert [task.result().status_code for task in lists] == [200] * 5
+    assert search.status_code == 200, search.text
+    assert models.status_code == 200, models.text
