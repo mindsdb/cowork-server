@@ -410,21 +410,30 @@ _STEP_TIME_WORDS = frozenset({
 _WORD_AFTER = re.compile(
     r"[*_]{0,2}[ \u00a0-]?[*_]{0,2}(?:(?i:business|working|work|calendar)[ \u00a0-])?(?P<word>[A-Za-z]{2,})"
 )
-# Counts a question may spell out ("six months"). "one" is left out: it
-# is more often a pronoun ("which one") than a count.
-_COUNT_WORDS = {
-    word: Decimal(count)
-    for count, word in enumerate(
-        "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen"
-        " sixteen seventeen eighteen nineteen twenty".split()
+# English number words, read in a question as its digits are.
+_SMALL_NUMBER_WORDS = {
+    word: Decimal(value)
+    for value, word in enumerate(
+        "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen"
+        " seventeen eighteen nineteen".split()
     )
-    if word != "one"
 }
+_TENS_WORDS = {
+    word: Decimal(value)
+    for value, word in zip(range(20, 100, 10), "twenty thirty forty fifty sixty seventy eighty ninety".split())
+}
+_SCALE_WORDS = {"hundred": Decimal(100), "thousand": Decimal(1_000), "million": Decimal(1_000_000)}
+_NUMBER_WORD = rf"(?:{'|'.join([*_SMALL_NUMBER_WORDS, *_TENS_WORDS, *_SCALE_WORDS])})"
+# A run of number words: "three", "twenty-one", "two hundred and fifty".
+# "and" joins only after a scale word, so "two and three" is two numbers.
+_NUMBER_WORDS = re.compile(
+    rf"\b{_NUMBER_WORD}(?:(?:[ -]|(?:(?<=hundred)|(?<=thousand)|(?<=million)) and ){_NUMBER_WORD})*\b",
+    re.IGNORECASE,
+)
 # Below this a bare number and a money figure of the same value are often
 # different things ("5 sites", "$5"), so a currency on one side only blocks
 # a question match.
 _ONE_SIDED_CURRENCY_MIN = Decimal(1_000)
-_COUNT_WORD = re.compile(rf"\b(?:{'|'.join(_COUNT_WORDS)})\b", re.IGNORECASE)
 # What joins two operands of arithmetic the answer writes: ×, ÷, + or a spaced
 # x or *, after up to three words of unit ("2% per month × 6"). A spaced
 # minus is read as the next number's sign, so subtraction is not read.
@@ -830,7 +839,7 @@ def find_figure_sources(
     for index, step in enumerate(described):
         if step.tool_use_id:
             index_of.setdefault(step.tool_use_id, index)
-    asked = [(value, _time_unit(question, number=value), spelled) for value, spelled in _asked_numbers(question)]
+    asked = [(value, _time_unit(question, number=value)) for value in _asked_numbers(question)]
     named: set[int] = set()
     in_documents: dict[int, set[bool]] = {}
     figures: list[Figure] = []
@@ -847,8 +856,7 @@ def find_figure_sources(
         if held:
             origin = FigureOrigin.step
         elif any(
-            _question_gives(value, asked_unit=unit, spelled=spelled, figure=number, figure_unit=time_unit)
-            for value, unit, spelled in asked
+            _question_gives(value, asked_unit=unit, figure=number, figure_unit=time_unit) for value, unit in asked
         ):
             origin = FigureOrigin.question
         else:
@@ -873,39 +881,64 @@ def find_figure_sources(
     )
 
 
-def _asked_numbers(question: str) -> list[tuple[_Number, bool]]:
-    """The numbers the question writes, and the counts it spells out, each
-    with whether it is spelled out."""
+def _asked_numbers(question: str) -> list[_Number]:
+    """The numbers the question writes, in digits or in words. "one" alone
+    is left out: it is more often a pronoun ("which one") than a count."""
     skips = _skipped_spans(question)
     skipped = _Spans.of(skips)
-    numbers = [(number, False) for number in _numbers(question, skips=skips, prose=True)]
-    return numbers + [
-        (
-            _Number(
-                value=_COUNT_WORDS[match.group().lower()], tolerance=Decimal(0), percent=False, negative=False,
-                currency="", scale=Decimal(1), start=match.start(), end=match.end(),
-            ),
-            True,
-        )
-        for match in _COUNT_WORD.finditer(question)
-        if not skipped.hold(start=match.start(), end=match.end())
-    ]
+    numbers = _numbers(question, skips=skips, prose=True)
+    for match in _NUMBER_WORDS.finditer(question):
+        value = _number_words_value(match.group())
+        if value is None or match.group().lower() == "one" or skipped.hold(start=match.start(), end=match.end()):
+            continue
+        numbers.append(_Number(
+            value=value, tolerance=Decimal(0), percent=False, negative=False, currency="", scale=Decimal(1),
+            start=match.start(), end=match.end(),
+        ))
+    return numbers
+
+
+def _number_words_value(text: str) -> Decimal | None:
+    """The value of a run of number words, or None when they don't make one
+    number ("two three")."""
+    total = group = Decimal(0)
+    # What the last word was: a unit (one to nineteen), tens, or a scale.
+    last = None
+    for word in re.split(r"[ -]+(?:and[ -]+)?", text.lower()):
+        if word in _SCALE_WORDS:
+            if last is None or last == "scale" and word != "hundred" and group == 0:
+                return None
+            if word == "hundred":
+                group *= 100
+            else:
+                total, group = total + group * _SCALE_WORDS[word], Decimal(0)
+            last = "scale"
+        elif word in _TENS_WORDS:
+            if last in ("unit", "tens"):
+                return None
+            group += _TENS_WORDS[word]
+            last = "tens"
+        else:
+            if last == "unit" or (last == "tens" and _SMALL_NUMBER_WORDS[word] >= 10):
+                return None
+            group += _SMALL_NUMBER_WORDS[word]
+            last = "unit"
+    return total + group
 
 
 def _question_gives(
-    asked: _Number, *, asked_unit: _TimeUnit | None, spelled: bool, figure: _Number, figure_unit: _TimeUnit | None,
+    asked: _Number, *, asked_unit: _TimeUnit | None, figure: _Number, figure_unit: _TimeUnit | None,
 ) -> bool:
     """Whether a number in the question gives the figure: the same value, sign
-    and percent, however its scale and grouping are written, so "25k" gives
-    "25,000" and "six" gives "6". Two different currency signs never match.
-    A currency sign on one side only matches from
-    ``_ONE_SIDED_CURRENCY_MIN`` up and never for a spelled-out count, so
-    "25,000" gives "$25,000" while "5 sites" and "five sites" don't give
-    "$5". A number in a time unit gives no figure with a currency sign, nor
-    the other way round, and two time units must agree: "30 days" gives
-    neither "$30" nor "30 hours"."""
+    and percent, however it is written, so "25k" gives "25,000" and "three"
+    gives "3". Two different currency signs never match. A currency sign on
+    one side only matches from ``_ONE_SIDED_CURRENCY_MIN`` up, so "25,000"
+    gives "$25,000" while "5 sites" and "five sites" don't give "$5". A
+    number in a time unit gives no figure with a currency sign, nor the
+    other way round, and two time units must agree: "30 days" gives neither
+    "$30" nor "30 hours"."""
     if asked.currency != figure.currency and (
-        (asked.currency and figure.currency) or spelled or figure.value < _ONE_SIDED_CURRENCY_MIN
+        (asked.currency and figure.currency) or figure.value < _ONE_SIDED_CURRENCY_MIN
     ):
         return False
     if (asked.value, asked.negative, asked.percent) != (figure.value, figure.negative, figure.percent):

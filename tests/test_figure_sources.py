@@ -2982,6 +2982,9 @@ class TestQuestionForms:
         ("The plan is worth $25,000.", "A plan worth 25,000 renews today.", "$25,000"),
         ("The plan is worth 25,000.", "A plan worth $25k renews today.", "25,000"),
         ("It ran 6 months.", "It ran for six months.", "6"),
+        ("We ship 21 units.", "Can we ship twenty-one units?", "21"),
+        ("We ship 250 units.", "Can we ship two hundred and fifty units?", "250"),
+        ("The plan is worth $3,000.", "A plan worth three thousand renews today.", "$3,000"),
     ])
     def test_the_questions_value_in_another_form_stays_the_questions(self, answer: str, question: str, text: str):
         sources = find_figure_sources(answer=answer, question=question, steps=[])
@@ -2991,23 +2994,16 @@ class TestQuestionForms:
     @pytest.mark.parametrize(("answer", "question", "text"), [
         ("The fee is $100.", "Is the fee €100?", "$100"),
         ("Each costs $5.", "We have 5 sites. What do they pay?", "$5"),
+        ("Each costs $5.", "What do the five sites pay?", "$5"),
         ("Each costs 5.", "See https://example.com/five for the rates.", "5"),
         ("Order 5 units.", "Run `print(five)` and tell me.", "5"),
+        ("Site 1 holds the most.", "Which one holds the most?", "1"),
+        ("Order 5 units.", "Order two and three units.", "5"),
     ])
     def test_a_different_quantity_in_the_question_is_not_the_questions(self, answer: str, question: str, text: str):
         sources = find_figure_sources(answer=answer, question=question, steps=[])
 
         assert _origins(sources) == [(text, FigureOrigin.none)]
-
-    def test_a_spelled_out_count_is_not_a_figure_with_a_currency(self):
-        sources = find_figure_sources(answer="Each costs $5.", question="What do the five sites pay?", steps=[])
-
-        assert _origins(sources) == [("$5", FigureOrigin.none)]
-
-    def test_one_spelled_out_is_not_a_count(self):
-        sources = find_figure_sources(answer="Site 1 holds the most.", question="Which one holds the most?", steps=[])
-
-        assert _origins(sources) == [("1", FigureOrigin.none)]
 
     def test_a_signed_figure_is_not_the_questions_unsigned_number(self):
         sources = find_figure_sources(answer="Margin moved -5% this year.", question="Did margin fall 5%?", steps=[])
@@ -3586,7 +3582,7 @@ TERMS_PDF = _cell(
     code="from pypdf import PdfReader\nprint(PdfReader('terms.pdf').pages[0].extract_text())",
     stdout="A plan earns a 2% discount per full year, capped at 10% of its value.\n",
 )
-DISCOUNT_QUESTION = "A plan worth 50,000 has run four full years. What discount applies?"
+DISCOUNT_QUESTION = "A plan worth 50,000 has run 4 full years. What discount applies?"
 
 
 class TestWrittenArithmetic:
