@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+from urllib.parse import parse_qs
 
 import pytest
 from fastapi import FastAPI
@@ -22,6 +23,7 @@ from cowork.api.v1.router import api_router
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.connectors import app_held
 from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.oauth import google as google_module
 from cowork.services.connectors.persist import (
     own_vault_for_scope,
     own_vault_root,
@@ -219,6 +221,38 @@ class TestAppHeldMigration:
         client.put(f"{CONN_URL}/app-held", json={"access_token": "t", "access_mode": "write"}, headers=HEADERS)
         assert client.delete(CONN_URL).status_code == 204
         assert app_held.held(root, "hubspot", CONN) == {}
+
+
+class TestDisconnect:
+    def test_revoke_sends_the_held_token_after_the_file_was_stripped(self, protected, monkeypatch):
+        monkeypatch.setenv("NOTION_CLIENT_ID", "https://mindshub.ai/.well-known/notion-oauth-client.json")
+        persist_connection(
+            "notion", "mcp", "ws", {"access_token": "file-token", "auth_type": "oauth", "account_email": "ann"},
+            scope=LOCAL_SCOPE,
+        )
+        client = _client()
+        client.put(f"{BASE}/notion/ws/app-held", json={"access_token": "held-token", "access_mode": "read"},
+                   headers=HEADERS)
+        assert "access_token" not in _file_fields("notion", "ws")
+        sent: list[dict] = []
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=10):
+            sent.append({"url": request.full_url, "body": parse_qs(request.data.decode())})
+            return _Response()
+
+        monkeypatch.setattr(google_module, "urlopen", fake_urlopen)
+
+        assert client.delete(f"{BASE}/notion/ws").status_code == 204
+
+        assert [(s["url"], s["body"]["token"]) for s in sent] == [("https://mcp.notion.com/token", ["held-token"])]
+        assert app_held.held(own_vault_root(LOCAL_SCOPE), "notion", "ws") == {}
 
 
 class TestProtectedWrites:
