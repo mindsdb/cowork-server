@@ -87,6 +87,12 @@ DRAFT_HOSTS = {
     "prod": "draft.mindshub.co",
 }
 DRAFT_HOST = "{{ $.Values.draftHost }}"
+# The browser router each environment's web app calls: its own host under
+# /browser, where the router is served. prod sets none until its router runs.
+BROWSER_ROUTER_URLS = {
+    "dev": "https://cowork.dev.mindshub.ai/browser",
+    "staging": "https://cowork.staging.mindshub.ai/browser",
+}
 # The Ingress refuses to render without a host, which would make it a catch-all.
 REQUIRED_DRAFT_HOST = '{{ required "set deployment.draftHost to enable ingress_secondary" $.Values.draftHost }}'
 
@@ -440,3 +446,42 @@ def test_hosted_logs_slow_statements_and_leaves_both_session_timeouts_off(base):
         names = {entry.name for entry in _env(path)}
         assert "STATEMENT_TIMEOUT_MS" not in names, path.name
         assert "IDLE_IN_TRANSACTION_TIMEOUT_MS" not in names, path.name
+
+
+@pytest.mark.parametrize("env_values", ENVIRONMENTS, ids=lambda p: p.name)
+def test_an_environment_names_its_own_browser_router(base, env_values, monkeypatch):
+    """The router is served on the web app's own host under /browser, so the
+    URL is that host's: a typo would send every browser call, with the
+    caller's credential, somewhere else. The base sets none, so a PR
+    environment takes its own from where it is deployed, and an environment
+    without a router offers no browser. The value passes the app setting's
+    own check."""
+    from cowork.common.settings.app_settings import AppSettings
+
+    environment = env_values.stem.removeprefix("values-")
+    assert [entry for entry in base if entry.name == "COWORK_BROWSER_ROUTER_URL"] == []
+    entries = [entry for entry in _env(env_values) if entry.name == "COWORK_BROWSER_ROUTER_URL"]
+    expected = BROWSER_ROUTER_URLS.get(environment)
+    if expected is None:
+        assert entries == [], f"{env_values.name} sets a browser router this test does not list"
+        return
+    [entry] = entries
+    primary = [host["host"] for host in (_deployment(env_values).get("ingress") or {}).get("hosts") or []]
+    assert entry.value == expected == f"https://{primary[0]}/browser", env_values.name
+    monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", entry.value)
+    assert AppSettings().browser_router_url == expected
+
+
+def test_the_scope_key_file_is_the_routers_secret_mounted_where_the_server_reads_it(base):
+    """The producer reads COWORK_BROWSER_SCOPE_KEY_FILE on every scope. If the
+    path, the mount and the Secret's item drift apart the file is missing,
+    every _scope gets 403 scope_key_invalid, and only a log line shows it. The
+    volume is optional, so a namespace with no router starts as usual."""
+    deployment = _deployment(BASE)
+    path = Path(_entry(base, "COWORK_BROWSER_SCOPE_KEY_FILE").value)
+    [volume] = [v for v in deployment.get("volumes") or [] if (v.get("secret") or {}).get("secretName") == "browser-proxy"]
+    assert volume["secret"]["optional"] is True
+    [mount] = [m for m in deployment.get("volumeMounts") or [] if m["name"] == volume["name"]]
+    assert mount.get("readOnly") is True
+    [item] = [i for i in volume["secret"]["items"] if i["key"] == "scope_key"]
+    assert path == Path(mount["mountPath"]) / item["path"]

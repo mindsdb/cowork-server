@@ -205,6 +205,26 @@ def _bare_origin(value: str) -> tuple[str, str] | None:
     return f"{match['scheme'].lower()}://{host}{match['port'] or ''}", host
 
 
+_ROUTER_URL = re.compile(
+    r"https://(?P<host>[a-z0-9][a-z0-9.-]*)(?P<port>:[0-9]{1,5})?"
+    r"(?P<path>(?:/[A-Za-z0-9._~-]+)*)/?",
+    re.IGNORECASE,
+)
+
+
+def _router_url(value: str) -> str | None:
+    """``value`` as a browser router base URL without its trailing slash, or
+    None when it isn't one: https to any host with an optional plain path, and
+    nothing else (no query, fragment or userinfo, which the pattern can't
+    match). Only https, because anton's browser tool takes no other router
+    address (anton.core.browser.config.BrowserConfig)."""
+    match = _ROUTER_URL.fullmatch(value.strip())
+    if match is None:
+        return None
+    host = match["host"].lower().rstrip(".")
+    return f"https://{host}{match['port'] or ''}{match['path']}"
+
+
 def _env_slug() -> str:
     """Return the env slug for URL construction, or '' for prod.
 
@@ -1146,6 +1166,50 @@ class AppSettings(Settings):
         ),
     )
 
+    browser_router_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_ROUTER_URL"),
+        description=(
+            "The browser router, for example https://cowork.mindshub.ai/browser. "
+            "MindsHub mode only (COWORK_TENANCY_MODE=org): served on the cowork "
+            "host under /browser, it starts one browser per person and routes "
+            "each caller to their own by the credential they present. Status, "
+            "warm-up, viewer links and each web turn's browser go through it "
+            "(cowork.services.browser). https with an optional path; the "
+            "trailing slash is dropped. Blank (default): the web app has no "
+            "browser. Ignored outside MindsHub mode, where the desktop app "
+            "runs its own browser."
+        ),
+    )
+
+    @field_validator("browser_router_url", mode="before")
+    @classmethod
+    def _check_browser_router_url(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            return "" if value is None else value
+        normalized = _router_url(value)
+        if normalized is None:
+            raise ValueError(
+                "COWORK_BROWSER_ROUTER_URL must be an https URL with an optional "
+                "path (no query, fragment or credentials)"
+            )
+        return normalized
+
+    browser_scope_key_file: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_SCOPE_KEY_FILE"),
+        description=(
+            "A file holding the browser router's scope key, sent beside each web "
+            "turn's key on the router's _scope, so only this server can scope a "
+            "turn key (cowork.services.browser.scope_turn). MindsHub mode only. "
+            "The chart mounts the router's own Secret, browser-proxy, key "
+            "scope_key, here, so the two never differ. Read on every scope, so a "
+            "Secret that appears or rotates after start is picked up without a "
+            "restart. Blank, missing or empty: the router refuses every scope and "
+            "web turns run without a browser."
+        ),
+    )
+
     organization_switch_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("COWORK_ORGANIZATION_SWITCH_ENABLED"),
@@ -1275,6 +1339,17 @@ class AppSettings(Settings):
             "(ENG-439). Empty means the server advertises no owner and is not adoptable."
         ),
     )  # COWORK_SERVER_OWNER
+
+    health_proof_key: SecretStr = Field(
+        default=SecretStr(os.environ.get("COWORK_SERVER_HEALTH_PROOF_KEY", "")),
+        description=(
+            "Per-install secret the desktop app passes at spawn and keeps in a file only its OS "
+            "user can read. /health answers an HMAC of the app's nonce and the port it answered "
+            "on, keyed by this, so the app can tell its own server from a listener another OS "
+            "user put on its port, which can replay the owner token /health echoes but can't "
+            "compute this. Empty means /health proves nothing."
+        ),
+    )  # COWORK_SERVER_HEALTH_PROOF_KEY
 
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
     # The same switch that turns on anton's per-call usage log. Set by evals only.

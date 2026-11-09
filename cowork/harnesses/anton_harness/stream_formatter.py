@@ -7,6 +7,7 @@ Emits typed events:
     response.output_text.delta  (assistant text deltas)
     response.answer_reset       (drop the answer so far; the next delta replaces it)
     response.answer_restore     (a hand-back gives back the answer a reset dropped)
+    response.browser_session_opened (the agent opened the person's browser session; carries its id only)
     response.memory_read        (whether the turn read learned memory, and how many entries)
     response.figure_sources     (each figure in the answer and the steps it came from)
     response.completed          (final response object)
@@ -54,6 +55,17 @@ from cowork.schemas.responses import (
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
 
 logger = logging.getLogger(__name__)
+
+
+class BrowserSessionOpened(BaseModel):
+    """The ``response.browser_session_opened`` event's body: the session id
+    only, never a viewer link (a stored event opens nothing)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["response.browser_session_opened"] = "response.browser_session_opened"
+    sequence_number: int
+    session_id: str
 
 
 @dataclass
@@ -731,6 +743,7 @@ async def format_responses_stream(
     from anton.core.llm.provider import (
         StreamAskUser,
         StreamAskUserAnswered,
+        StreamBrowserSession,
         StreamComplete,
         StreamContextCompacted,
         StreamTaskProgress,
@@ -1183,6 +1196,17 @@ async def format_responses_stream(
                 "thought_role": Role.thought_context_compacted.value,
                 "content": event.message,
             })
+
+        elif isinstance(event, StreamBrowserSession):
+            # The agent opened the person's browser session: the app shows the
+            # browser beside the chat. Persisted like every event, so a reload
+            # reopens the pane. The session id only, never a viewer link: on the
+            # web, whoever opens the pane mints their own link with their own
+            # credential (POST /browse/embed), so a stored event opens nothing.
+            seq += 1
+            yield _event("response.browser_session_opened", BrowserSessionOpened(
+                sequence_number=seq, session_id=event.session_id,
+            ).model_dump())
 
         elif isinstance(event, ArtifactCreated):
             seq += 1

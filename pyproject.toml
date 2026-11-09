@@ -51,7 +51,11 @@ dependencies = [
     # 2.26.10.29.1rc4 is the first whose `LiveAppHost` has `launch_lock`,
     # `slots_full` and `slots_available` (mindsdb/anton#646), which shared
     # live-app slots admit each person's launch through.
-    "anton-agent>=2.26.10.29.1rc4,<3",
+    # 2.26.11.8.1rc1 is the first with `anton.core.browser.config.BrowserConfig`
+    # (mindsdb/anton#540), which `services/browser.py` and the anton harness
+    # import, and with its host-only config, commit hold and hand-back
+    # (mindsdb/anton#763).
+    "anton-agent>=2.26.11.8.1rc1,<3",
     # Floor for GHSA-8bx3-mgpq-m8m9 (IDNA 2003 vs IDNA 2009 host-name encoding
     # mismatch in TLSStream/connect_tcp() lets a hijacked connection to an
     # internationalized domain present a certificate that validates against
