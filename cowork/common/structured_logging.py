@@ -74,6 +74,9 @@ EVENT_FIELDS = frozenset(
         "stack",
         "in_flight",
         "limiter",
+        # The key of the file store share a refused request waited for
+        # (cowork.db.units._efs_share_key): a user id, or org:<org id>.
+        "share",
         "step",
         "steps",
     ]

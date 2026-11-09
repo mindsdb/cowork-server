@@ -128,14 +128,15 @@ def test_project_file_open_is_binary(tmp_path, recorded_flags):
 COWORK_ROOT = Path(paths.__file__).resolve().parents[1]
 
 # Raw ``os.open`` calls that are allowed, by module, with their exact count.
-# ``common/paths.py``: ``open_fd`` itself plus four directory opens. The
+# ``common/paths.py``: ``open_fd`` itself plus five directory opens, one of
+# them ``dir_child_stat``'s ``O_PATH`` open, which reads nothing. The
 # revision journal opens a directory to fsync it. Text mode does not apply to
 # directories. A changed count means a new raw open: check whether it is a
 # regular file and belongs in ``open_fd``.
 # Limitation: only the ``os.open(...)`` form is detected, not
 # ``from os import open`` or ``posix.open``; the codebase uses neither.
 RAW_OS_OPEN_ALLOWED = {
-    "common/paths.py": 5,
+    "common/paths.py": 6,
     "services/artifact_revisions.py": 1,
 }
 

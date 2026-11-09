@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import stat
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -47,6 +48,7 @@ from cowork.services.artifacts import (
 
 if TYPE_CHECKING:
     from cowork.services.artifact_locations import Location
+    from cowork.services.held_artifact_roots import HeldRoot
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +189,9 @@ class RootsPlan:
     of the shared root (`projects.partition_of`): a project whose folder sits
     in another one is left out of `projects` when the plan is built, so no
     reader of the plan reaches it, and again when the plan is expanded.
+    `held`, which only the artifacts list sets (`with_held_roots`), names the
+    roots of `projects` known to hold an artifact folder, so expanding the
+    plan opens nothing on the file store; None finds the roots there.
     """
 
     projects: tuple[ProjectRow, ...] = ()
@@ -196,6 +201,7 @@ class RootsPlan:
     adopted: tuple[ProjectRow, ...] = ()
     owner_filter: bool = False
     owned: frozenset[UUID] = frozenset()
+    held: frozenset[HeldRoot] | None = None
 
 
 @dataclass(frozen=True)
@@ -351,6 +357,21 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
     )
 
 
+def with_held_roots(session: ScopedSession, plan: RootsPlan) -> RootsPlan:
+    """`plan` with the roots of its projects the held_artifact_roots rows
+    name (held_artifact_roots.held_roots), for the artifacts list. Unchanged
+    for a desktop scan, a scope that keeps no rows, or before their backfill
+    has finished. A database step: run it in the unit that built `plan`."""
+    from dataclasses import replace
+
+    from cowork.services.held_artifact_roots import held_roots
+
+    if plan.scan:
+        return plan
+    held = held_roots(session, project_ids=[project.id for project in plan.projects])
+    return plan if held is None else replace(plan, held=held)
+
+
 def _parts_below(path: Path, anchor: Path) -> tuple[str, ...]:
     """``path.relative_to(anchor).parts``, compared by parts, case-sensitive:
     on POSIX paths the same answer, and the same ValueError for a path outside
@@ -470,6 +491,26 @@ def project_roots(
     ]
 
 
+def _held_project_roots(
+    project: ProjectRow, *, held: Collection[UUID | None], owned: frozenset[UUID] | None
+) -> list[_FoundRoot]:
+    """The roots of `project` that its held rows name, `held` being their
+    conversations (None for the shared root), in `project_roots`' order: the
+    shared root, then the legacy roots by conversation id. Opens nothing on
+    the file store. `owned`, when given, keeps only the legacy roots of those
+    conversations, as `project_roots` does by name."""
+    roots = [_FoundRoot(source=recorded_source(project, None))] if None in held else []
+    legacy = sorted(
+        (conversation_id for conversation_id in held
+         if conversation_id is not None and (owned is None or conversation_id in owned)),
+        key=str,
+    )
+    return roots + [
+        _FoundRoot(source=recorded_source(project, conversation_id), legacy=True, conversation_id=conversation_id)
+        for conversation_id in legacy
+    ]
+
+
 def _adopted_root(project: ProjectRow) -> _FoundRoot | None:
     """A desktop project in a folder the user chose.
 
@@ -533,20 +574,28 @@ def discover_roots(plan: RootsPlan, *, own_only: bool = False, strict: bool = Fa
     lookup's scan, which reads `unfiltered()`.
 
     With `strict`, a project root that fails to list or stat raises
-    (project_roots) instead of being left out."""
+    (project_roots) instead of being left out. A plan with `held` lists and
+    stats nothing: its roots are the ones `held` names
+    (_held_project_roots)."""
     from cowork.services.projects import resolved_shared_root
 
     owned = plan.owned if own_only and plan.owner_filter else None
     # Read once for every project the plan names, not once per project.
     shared_root = resolved_shared_root() if plan.partition is not None and plan.projects else None
     roots: list[_FoundRoot] = []
+    held_by_project: dict[UUID, set[UUID | None]] = {}
+    for project_id, conversation_id in plan.held or ():
+        held_by_project.setdefault(project_id, set()).add(conversation_id)
     if plan.scan:
         roots += [_FoundRoot(source=source) for source in artifacts_sources_for_scan(scope=plan.scan_scope)]
         roots += [found for project in plan.adopted if (found := _adopted_root(project)) is not None]
     for project in plan.projects:
         if left_out_for_another_partition(project, partition=plan.partition, shared_root=shared_root):
             continue
-        roots += project_roots(project, owned=owned, strict=strict)
+        if plan.held is not None:
+            roots += _held_project_roots(project, held=held_by_project.get(project.id, set()), owned=owned)
+        else:
+            roots += project_roots(project, owned=owned, strict=strict)
     return DiscoveredRoots(roots=tuple(roots), owner_filter=plan.owner_filter, owned=plan.owned)
 
 

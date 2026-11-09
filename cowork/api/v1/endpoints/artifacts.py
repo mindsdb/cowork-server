@@ -64,6 +64,7 @@ from cowork.services.artifact_roots import (
     plan_scope_roots,
     readable_sources,
     recorded_location,
+    with_held_roots,
 )
 from cowork.services.artifacts import (
     BackendPreviewRefused,
@@ -340,6 +341,12 @@ def _plan_scoped_project(session, *, project_ref: str) -> RootsPlan:
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Unknown project",
         ) from exc
+
+
+def _listed_scope_plan(session) -> RootsPlan:
+    """The unfiltered list's plan: every project of the caller's scope, with
+    the roots the held rows name (with_held_roots), in one database unit."""
+    return with_held_roots(session, plan_scope_roots(session))
 
 
 async def _scoped_project_plan(scope: TenantScope, project_id: UUID | str) -> RootsPlan:
@@ -726,8 +733,9 @@ async def list_artifacts(
                 detail="Invalid project",
             )
         plan = await _scoped_project_plan(scope, project_ref)
+        plan = await run_db(partial(with_held_roots, plan=plan), scope=scope)
         return await _cards_for(scope, partial(readable_sources, plan))
-    plan = await run_db(plan_scope_roots, scope=scope)
+    plan = await run_db(_listed_scope_plan, scope=scope)
     return await _cards_for(scope, partial(_browsable_sources, plan=plan))
 
 

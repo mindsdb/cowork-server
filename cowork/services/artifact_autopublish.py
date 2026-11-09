@@ -740,6 +740,19 @@ def _listed_artifact_ids(*, artifacts_base: Path) -> ListedIds:
     return listed_folder_ids(base=base, listing=artifact_folders_below(base=base))
 
 
+def _record_listing(session, *, project_id: UUID, listing: ListedIds) -> None:
+    """Record what a full listing of `project_id`'s shared root found: that
+    the root holds a folder, when it does, so the artifacts list opens it
+    (held_artifact_roots), and each listed id's location
+    (artifact_locations.record_listed_folders)."""
+    from cowork.services.artifact_locations import record_listed_folders
+    from cowork.services.held_artifact_roots import hold_root
+
+    if listing.ids or listing.unreadable:
+        hold_root(session, project_id=project_id)
+    record_listed_folders(session, project_id=project_id, listing=listing)
+
+
 async def _record_listed_locations(heal: SelfHeal) -> None:
     """Read the id of every artifact folder in `heal`'s project, and mark an
     id conflicted when its location row names another folder of the project,
@@ -754,7 +767,7 @@ async def _record_listed_locations(heal: SelfHeal) -> None:
     does a check that fails outright (request_location_check). Never raises:
     the publish after it runs either way."""
     from cowork.db.units import run_db
-    from cowork.services.artifact_locations import keeps_locations, record_listed_folders
+    from cowork.services.artifact_locations import keeps_locations
 
     if not keeps_locations(heal.scope):
         return
@@ -767,7 +780,7 @@ async def _record_listed_locations(heal: SelfHeal) -> None:
             listing=listing, artifacts_base=heal.artifacts_base, scope=heal.scope, project_id=heal.project_id,
         )
         await run_db(
-            partial(record_listed_folders, project_id=UUID(heal.project_id), listing=listing), scope=heal.scope,
+            partial(_record_listing, project_id=UUID(heal.project_id), listing=listing), scope=heal.scope,
         )
     except Exception:
         logger.warning(

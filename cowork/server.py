@@ -443,20 +443,30 @@ async def _stop_location_backfill(*, task: asyncio.Task | None, stop: threading.
 
 
 async def _run_artifact_location_backfill(stop: threading.Event) -> None:
-    """Background, one-time location backfill: one file store call with no
-    deadline, so it holds one file store slot for the walk. Never affects
-    startup. Shutdown sets ``stop`` before it cancels the task, since a
-    cancelled file store call waits for its work."""
-    try:
-        from cowork.db.scoped import SYSTEM_SCOPE
-        from cowork.db.units import run_efs
-        from cowork.services.artifact_location_backfill import run_artifact_location_backfill
+    """Background, one-time location backfill, then the held-root backfill
+    (cowork.services.held_artifact_roots): each one file store call with no
+    deadline, so the task holds one file store slot at a time for its walks.
+    Never affects startup. Shutdown sets ``stop``, which both walks read,
+    before it cancels the task, since a cancelled file store call waits for
+    its work."""
+    from cowork.db.scoped import SYSTEM_SCOPE
+    from cowork.db.units import run_efs
+    from cowork.services.artifact_location_backfill import run_artifact_location_backfill
+    from cowork.services.held_artifact_roots import run_held_root_backfill
 
-        await run_efs(partial(run_artifact_location_backfill, stop=stop), scope=SYSTEM_SCOPE, deadline=False)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("artifact location backfill failed (non-fatal)")
+    for operation, backfill in (
+        ("artifact_location_backfill", run_artifact_location_backfill),
+        ("held_artifact_roots_backfill", run_held_root_backfill),
+    ):
+        try:
+            await run_efs(partial(backfill, stop=stop), scope=SYSTEM_SCOPE, deadline=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "artifact backfill failed (non-fatal)",
+                extra={"event": "artifact_backfill_failed", "operation": operation},
+            )
 
 
 # Imported lazily by the first agent turn otherwise, adding their import time to
@@ -909,6 +919,10 @@ def create_app() -> FastAPI:
                 "event": "filesystem_busy",
                 "method": request.method,
                 "route": getattr(request.scope.get("route"), "path", None),
+                # Which limit ran out, and whose share it was
+                # (cowork.db.units.FilesystemBusy).
+                "limiter": exc.limiter,
+                "share": exc.share,
             },
         )
         return _server_busy(retry_after=busy_retry_seconds(), status_code=FilesystemBusy.status_code)

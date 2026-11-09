@@ -277,6 +277,18 @@ class TaskObjectService:
                     "Could not move the locations of artifacts to project %s", dest_id, exc_info=True,
                     extra=log_context(project_id=dest_id, conversation_id=conversation_id),
                 )
+            # The destination's shared root holds the moved folders now, so
+            # the artifacts list opens it (held_artifact_roots).
+            from cowork.services.held_artifact_roots import hold_root
+
+            try:
+                hold_root(self.session, project_id=dest_id)
+            except Exception:
+                self.session.rollback()
+                logger.warning(
+                    "Could not record that project %s's artifacts folder holds an artifact", dest_id, exc_info=True,
+                    extra=log_context(project_id=dest_id, conversation_id=conversation_id),
+                )
         # A published page keeps its link: .published.json moved with the
         # folder, and its owner record follows. A failed rekey is logged; the
         # owner's next publish then gets a new link, as a copy would.
@@ -422,6 +434,21 @@ def record_new_artifacts(
         logger.warning(
             "artifact owner not recorded: conversation %s has no creator", conversation_id
         )
+    if org_mode and project_id and (slugs or (listed_ids is not None and (listed_ids.ids or listed_ids.unreadable))):
+        from cowork.services.held_artifact_roots import hold_root
+
+        # The diff found folders in the project's shared root, so the
+        # artifacts list opens it (held_artifact_roots). First, so a failure
+        # below cannot skip it.
+        try:
+            hold_root(session, project_id=project_id)
+        except Exception:
+            session.rollback()
+            logger.error(
+                "Could not record that a project's artifacts folder holds an artifact",
+                exc_info=True,
+                extra=log_context(project_id=project_id, conversation_id=conversation_id),
+            )
     svc = TaskObjectService(session)
     # Independent of the owner writes below: a failed index row must not
     # leave the artifact ownerless as well.

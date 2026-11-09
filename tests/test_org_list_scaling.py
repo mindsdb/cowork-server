@@ -22,6 +22,7 @@ from cowork.db.session import get_engine
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.project import Project
+from cowork.models.setting import Setting
 from cowork.models.shared_resource import SharedResourceAttribution, SharedResourceMutation
 from cowork.server import create_app
 from cowork.services.artifact_ownership import artifact_resource_key
@@ -391,6 +392,213 @@ def test_the_callers_own_legacy_cards_stay_theirs_beside_a_co_members(client, or
     cards = {card["slug"]: card for card in listed}
     assert set(cards) == {"alices-chart"}
     assert cards["alices-chart"]["capabilities"]["role"] == "owner"
+
+
+# The held-root rows (cowork.services.held_artifact_roots): once their
+# backfill has run, the list opens only the roots they name.
+
+
+def _drop_held_sentinel() -> None:
+    from cowork.services.held_artifact_roots import SENTINEL_KEY
+
+    with Session(_engine()) as raw:
+        for row in raw.exec(select(Setting).where(Setting.key == SENTINEL_KEY, Setting.scope.is_(None))).all():
+            raw.delete(row)
+        raw.commit()
+
+
+@pytest.fixture()
+def held_roots(org):
+    """Fills ``org``'s held-root rows with the startup backfill, which writes
+    the sentinel the list trusts them by. The sentinel is global and the
+    database is shared across modules, so it goes again after the test."""
+    from cowork.services.held_artifact_roots import run_held_root_backfill
+
+    def fill() -> None:
+        _drop_held_sentinel()
+        with Session(_engine()) as raw:
+            project_ids = raw.exec(select(Project.id).where(Project.org_id == org)).all()
+        summary = run_held_root_backfill(project_ids=project_ids)
+        assert summary is not None and summary.unread == 0
+
+    yield fill
+    _drop_held_sentinel()
+
+
+_FILE_STORE_CALLS = ("stat", "lstat", "fstat", "open", "scandir", "listdir", "access", "readlink")
+
+
+def _file_store_get(client, monkeypatch, path: str, headers: dict[str, str]) -> tuple[list, int]:
+    """The answer to ``path`` and the os calls it made on the file store's
+    threads (run_efs), where the list finds and walks its roots."""
+    from cowork.db.units import on_efs_thread
+
+    calls: list[str] = []
+
+    def counted(name, real):
+        def call(*args, **kwargs):
+            if on_efs_thread():
+                calls.append(name)
+            return real(*args, **kwargs)
+
+        return call
+
+    with monkeypatch.context() as patched:
+        for name in _FILE_STORE_CALLS:
+            patched.setattr(os, name, counted(name, getattr(os, name)))
+        response = client.get(path, headers=headers)
+    assert response.status_code == 200, response.text
+    return response.json(), len(calls)
+
+
+def _alices_empty_workspaces(org: str, project_path: Path, count: int) -> None:
+    """``count`` of Alice's conversations in one project, each with a working
+    folder holding a file and no ``.anton/artifacts``, as most turns leave."""
+    with Session(_engine()) as raw:
+        project_id = _project_id(org, project_path)
+        conversations = [
+            Conversation(topic="turn", project_id=project_id, org_id=org, created_by=ALICE) for _ in range(count)
+        ]
+        raw.add_all(conversations)
+        raw.commit()
+        ids = [conversation.id for conversation in conversations]
+    for conversation_id in ids:
+        workspace = project_path / "conversations" / str(conversation_id)
+        workspace.mkdir(parents=True)
+        (workspace / "notes.txt").write_text("a turn's working file")
+
+
+def test_the_list_makes_no_more_file_store_calls_at_1000_projects_than_at_10(client, org, held_roots, monkeypatch):
+    """1,000 projects, 10 holding an artifact, against 10 that each hold one:
+    a project that holds no artifact costs the list no file store call. A
+    list that opened every project's root fails here."""
+    for i, path in enumerate(_bulk_paths(client, org, 0, 10)):
+        _project_root_artifact(org, path, ALICE, f"chart-{i:05d}")
+    held_roots()
+    small, small_calls = _file_store_get(client, monkeypatch, "/api/v1/artifacts/", _headers(org, BOB))
+    _bulk_paths(client, org, 10, 990)
+    held_roots()
+    large, large_calls = _file_store_get(client, monkeypatch, "/api/v1/artifacts/", _headers(org, BOB))
+
+    assert (len(small), len(large)) == (10, 10)
+    assert large_calls <= small_calls, f"{small_calls} file store calls at 10 projects, {large_calls} at 1,000"
+
+
+def test_a_projects_list_makes_no_more_file_store_calls_at_1000_workspaces_than_at_10(
+    client, org, held_roots, monkeypatch
+):
+    """One project with 1,000 of the caller's conversation workspaces, 10
+    holding an artifact, against 10 that each hold one: a workspace that
+    holds no artifact costs the list no file store call. A list that stat'ed
+    each of the caller's workspaces fails here."""
+    [path] = _bulk_paths(client, org, 0, 1)
+    for i in range(10):
+        _legacy_workspace(org, path, ALICE, slug=f"chart-{i:05d}")
+    listed = f"/api/v1/artifacts/?project_id={_project_id(org, path)}"
+    held_roots()
+    small, small_calls = _file_store_get(client, monkeypatch, listed, _headers(org, ALICE))
+    _alices_empty_workspaces(org, path, 990)
+    held_roots()
+    large, large_calls = _file_store_get(client, monkeypatch, listed, _headers(org, ALICE))
+
+    assert (len(small), len(large)) == (10, 10)
+    assert large_calls <= small_calls, f"{small_calls} file store calls at 10 workspaces, {large_calls} at 1,000"
+
+
+def _seed_every_kind_of_root(client, org: str) -> list[Path]:
+    """Projects whose roots hold every kind of entry the list reads or
+    refuses; returns their paths."""
+    paths = _bulk_paths(client, org, 0, 8)
+    shared = paths[0] / ".anton" / "artifacts"
+    _project_root_artifact(org, paths[0], ALICE, "alices-chart")
+    _project_root_artifact(org, paths[0], BOB, "bobs-chart")
+    _write_artifact(shared, "nobodys-chart")  # no owner row: an unknown owner
+    _write_artifact(shared / ".locks", "not-an-artifact")
+    _write_artifact(paths[7], "outside")
+    (shared / "a-link").symlink_to(paths[7] / "outside")
+    _legacy_workspace(org, paths[1], ALICE, slug="alices-old-chart")
+    _legacy_workspace(org, paths[1], BOB, slug="bobs-old-chart")
+    _legacy_workspace(org, paths[1], ALICE)  # an empty .anton/artifacts
+    _legacy_workspace(org, paths[1], ALICE, artifacts_folder=False)
+    _write_artifact(paths[1] / "conversations" / "not-a-conversation" / ".anton" / "artifacts", "orphan")
+    _project_root_artifact(org, paths[2], BOB, "bobs-other-chart")
+    _legacy_workspace(org, paths[2], ALICE, slug="alices-other-old-chart")
+    # A project whose shared root is a link: refused, as every link on the way is.
+    (paths[3] / ".anton").mkdir(parents=True)
+    (paths[3] / ".anton" / "artifacts").symlink_to(shared)
+    return paths
+
+
+def test_the_list_shows_the_same_cards_through_the_held_rows(client, org, held_roots):
+    """Every form of the list, for every viewer, answers the same before the
+    held rows exist and after the backfill has filled them."""
+    paths = _seed_every_kind_of_root(client, org)
+    lists = ["/api/v1/artifacts/"] + [f"/api/v1/artifacts/?project_id={_project_id(org, path)}" for path in paths]
+
+    def answers() -> dict:
+        return {
+            (path, viewer): client.get(path, headers=_headers(org, viewer)).json()
+            for path in lists
+            for viewer in (ALICE, BOB, CAROL)
+        }
+
+    walked = answers()
+    held_roots()
+    through_rows = answers()
+
+    assert through_rows == walked
+    shown = {card["slug"] for card in walked[("/api/v1/artifacts/", ALICE)]}
+    assert shown == {
+        "alices-chart", "bobs-chart", "nobodys-chart", "alices-old-chart", "bobs-other-chart",
+        "alices-other-old-chart",
+    }
+
+
+def test_a_held_row_never_shows_a_co_members_workspace_or_another_organizations_project(
+    client, org, held_roots
+):
+    """The rows are hints: the list opens a row's root only for a project the
+    caller's scope returns, and a legacy root only for a conversation the
+    caller owns."""
+    from cowork.models.held_artifact_root import HeldArtifactRoot
+
+    [path] = _bulk_paths(client, org, 0, 1)
+    bobs_workspace = _legacy_workspace(org, path, BOB, slug="bobs-old-chart")
+    other_org = str(uuid4())
+    [elsewhere] = _bulk_paths(client, other_org, 0, 1)
+    _project_root_artifact(other_org, elsewhere, ALICE, "another-orgs-chart")
+    held_roots()
+    with Session(_engine()) as raw:
+        # Rows naming the other organization's project, here and there.
+        raw.add(HeldArtifactRoot(org_id=org, project_id=_project_id(other_org, elsewhere)))
+        raw.add(HeldArtifactRoot(org_id=other_org, project_id=_project_id(other_org, elsewhere)))
+        raw.commit()
+
+    unfiltered = client.get("/api/v1/artifacts/", headers=_headers(org, CAROL))
+    bobs_project = client.get(
+        f"/api/v1/artifacts/?project_id={_project_id(org, path)}", headers=_headers(org, CAROL)
+    )
+    other_project = client.get(
+        f"/api/v1/artifacts/?project_id={_project_id(other_org, elsewhere)}", headers=_headers(org, CAROL)
+    )
+
+    assert bobs_workspace.name in {str(c) for c in _held_conversations(org)}
+    assert unfiltered.json() == []
+    assert bobs_project.json() == []
+    assert other_project.status_code == 404
+
+
+def _held_conversations(org: str) -> set:
+    from cowork.models.held_artifact_root import HeldArtifactRoot
+
+    with Session(_engine()) as raw:
+        return set(
+            raw.exec(
+                select(HeldArtifactRoot.conversation_id).where(
+                    HeldArtifactRoot.org_id == org, HeldArtifactRoot.conversation_id.is_not(None)
+                )
+            ).all()
+        )
 
 
 def _conversations_with_messages(
