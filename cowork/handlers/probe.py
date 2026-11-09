@@ -703,9 +703,7 @@ class ProbeHandler:
                 lambda session: ConnectorCatalog(session).usage_notes_for([connector_id]), scope=self.scope,
             )
         except Exception:
-            logger.exception(
-                "Could not read the catalog usage notes for %s; probing with the form's own, if any", connector_id,
-            )
+            logger.exception("Could not read the catalog usage notes for %s", connector_id)
             return None, False
         text = notes.get(connector_id)
         return text, text is not None and text == registry.usage_notes_for([connector_id]).get(connector_id)

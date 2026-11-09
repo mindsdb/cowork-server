@@ -734,7 +734,7 @@ def build_cowork_lookup_connector_tool():
 
 
 _DATA_REQUEST_NOTE = (
-    "When the API has no plain GET route that returns data, its usage_notes must "
+    "When the API has no plain GET route that returns data, usage_notes must "
     "say how to fetch a small sample of data (method, path, body shape, token "
     "flow), because the connection test passes only once data comes back."
 )
@@ -981,7 +981,7 @@ _REQUEST_CREDENTIALS_SCHEMA = {
                 "label": {"type": "string", "description": "Display name (e.g. 'Acme Planner')."},
                 "description": {"type": "string", "description": "One line on what it connects to."},
                 "category": {"type": "string", "description": "Picker category (e.g. 'database', 'crm', 'developer')."},
-                "usage_notes": {"type": "string", "description": "Short notes for using it later: base URL, auth header, key endpoints, quirks. When the API has no plain GET route that returns data, say how to fetch a small sample of data (method, path, body shape, token flow); the connection test follows it. Never credential values."},
+                "usage_notes": {"type": "string", "description": f"Short notes for using it later: base URL, auth header, key endpoints, quirks. {_DATA_REQUEST_NOTE} Never credential values."},
             },
         },
         "_connector_id": {
