@@ -9,6 +9,7 @@ the server runs in legacy mode, where nothing checks the
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import logging
@@ -19,9 +20,11 @@ from typing import TextIO
 
 STDIN_FLAG = "COWORK_APP_SECRET_STDIN"
 HEADER = "X-Cowork-App-Secret"
+CHALLENGE_HEADER = "X-Cowork-App-Challenge"
 READ_TIMEOUT_SECONDS = 10.0
 
 _SECRET_SHAPE = re.compile(r"[0-9a-f]{32,128}")
+_CHALLENGE_SHAPE = re.compile(r"[0-9a-fA-F]{32,128}")
 _MAX_LINE = 4096
 
 _log = logging.getLogger(__name__)
@@ -37,6 +40,15 @@ def matches(given: str | None) -> bool:
     if _secret is None or not given:
         return False
     return hmac.compare_digest(given.encode(), _secret.encode())
+
+
+def proof(challenge: str | None) -> str | None:
+    """HMAC-SHA256 of the app's ``challenge`` keyed by the held secret, in
+    lowercase hex: lets the app tell the server it handed the secret to from
+    a stand-in on its port. None without a secret or a well-formed challenge."""
+    if _secret is None or challenge is None or not _CHALLENGE_SHAPE.fullmatch(challenge):
+        return None
+    return hmac.new(_secret.encode(), challenge.encode(), hashlib.sha256).hexdigest()
 
 
 def read_from_stdin(stream: TextIO | None = None, *, timeout: float = READ_TIMEOUT_SECONDS) -> bool:

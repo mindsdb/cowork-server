@@ -7,6 +7,8 @@ connection detail.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -151,6 +153,33 @@ class TestSecretCheck:
         assert _client().get("/api/v1/health/").json()["app_secret_protocol"] == 1
 
 
+class TestHealthProof:
+    CHALLENGE = "0f" * 32
+
+    def test_proves_the_secret_for_a_challenge(self, protected):
+        body = _client().get("/api/v1/health/", headers={app_secret.CHALLENGE_HEADER: self.CHALLENGE}).json()
+        expected = hmac.new(SECRET.encode(), self.CHALLENGE.encode(), hashlib.sha256).hexdigest()
+        assert body["app_secret_proof"] == expected
+        assert body["app_secret_protocol"] == 1
+        assert SECRET not in json.dumps(body)
+
+    def test_a_different_challenge_gets_a_different_proof(self, protected):
+        client = _client()
+        first = client.get("/api/v1/health/", headers={app_secret.CHALLENGE_HEADER: self.CHALLENGE}).json()
+        second = client.get("/api/v1/health/", headers={app_secret.CHALLENGE_HEADER: "a1" * 32}).json()
+        assert first["app_secret_proof"] != second["app_secret_proof"]
+
+    @pytest.mark.parametrize("headers", [{}, {app_secret.CHALLENGE_HEADER: "zz" * 32},
+                                         {app_secret.CHALLENGE_HEADER: "ab"}, {app_secret.CHALLENGE_HEADER: "ab" * 65}])
+    def test_no_proof_without_a_valid_challenge(self, protected, headers):
+        assert "app_secret_proof" not in _client().get("/api/v1/health/", headers=headers).json()
+
+    def test_no_proof_without_a_secret(self, stores):
+        body = _client().get("/api/v1/health/", headers={app_secret.CHALLENGE_HEADER: self.CHALLENGE}).json()
+        assert "app_secret_proof" not in body
+        assert "app_secret_protocol" not in body
+
+
 class TestAppHeldMigration:
     def test_put_strips_the_file_only_once_both_are_held(self, protected):
         _seed_mcp(mode="read")
@@ -255,6 +284,68 @@ class TestDisconnect:
         assert app_held.held(own_vault_root(LOCAL_SCOPE), "notion", "ws") == {}
 
 
+class TestOnlyGuardedRoutesSetTheMode:
+    def _assert_mode(self, client, expected):
+        from anton.core.mcp.wiring import _access_mode_of
+
+        turn = app_held.AppHeldVault(source=turn_vault_for_scope(LOCAL_SCOPE), root=own_vault_root(LOCAL_SCOPE))
+        assert client.get(CONN_URL).json()["fields"]["_access_mode"] == expected
+        assert turn.load("hubspot", CONN)["_access_mode"] == expected
+        assert _access_mode_of(turn, "hubspot", CONN) == expected
+
+    def test_delete_then_save_with_write_then_refresh_stays_read(self, protected):
+        _seed_mcp()
+        client = _client()
+        client.put(f"{CONN_URL}/app-held", json={"access_token": "t0", "access_mode": "read"}, headers=HEADERS)
+
+        # Agent code with only the bearer token: delete, then save with write.
+        assert client.delete(CONN_URL).status_code == 204
+        saved = client.post(
+            f"{BASE}/save",
+            json={"connector_id": "hubspot", "method": "mcp", "name": CONN,
+                  "values": {"access_token": "x", "account_email": "acme.hubspot", "_access_mode": "write"}},
+        )
+        assert saved.status_code == 200, saved.text
+        # The app's next refresh puts the real token next to it.
+        refreshed = client.patch(f"{CONN_URL}/token", json={"access_token": "real-token"}, headers=HEADERS)
+        assert refreshed.status_code == 200
+
+        self._assert_mode(client, "read")
+        assert "_access_mode" not in _file_fields()
+
+    def test_a_save_never_changes_a_held_mode(self, protected):
+        _seed_mcp()
+        client = _client()
+        client.put(f"{CONN_URL}/app-held", json={"access_token": "t0", "access_mode": "none"}, headers=HEADERS)
+
+        client.post(
+            f"{BASE}/save",
+            json={"connector_id": "hubspot", "method": "mcp", "name": CONN,
+                  "values": {"access_token": "x", "account_email": "acme.hubspot", "_access_mode": "write"}},
+        )
+
+        self._assert_mode(client, "none")
+
+    def test_a_mode_written_into_the_file_is_ignored(self, protected):
+        _seed_mcp()
+        client = _client()
+        client.put(f"{CONN_URL}/app-held", json={"access_token": "t0", "access_mode": "read"}, headers=HEADERS)
+        client.delete(CONN_URL)
+        _seed_mcp(mode="write")
+
+        from anton.core.mcp.wiring import _access_mode_of
+
+        turn = app_held.AppHeldVault(source=turn_vault_for_scope(LOCAL_SCOPE), root=own_vault_root(LOCAL_SCOPE))
+        assert _access_mode_of(turn, "hubspot", CONN) == "read"
+
+    def test_the_guarded_routes_still_set_it(self, protected):
+        _seed_mcp()
+        client = _client()
+        client.put(f"{CONN_URL}/app-held", json={"access_token": "t0", "access_mode": "read"}, headers=HEADERS)
+        client.patch(f"{CONN_URL}/access-mode", json={"access_mode": "write"}, headers=HEADERS)
+        self._assert_mode(client, "write")
+
+
 class TestProtectedWrites:
     def test_save_leaves_no_token_or_mode_in_the_file(self, protected):
         response = _client().post(
@@ -342,14 +433,16 @@ class TestReadersSeeMemory:
         assert ConnectionsService(LOCAL_SCOPE).mcp_access_token("hubspot", CONN) == "mem-token"
         assert ConnectionsService(LOCAL_SCOPE).get("hubspot", CONN).fields["_access_mode"] == "write"
 
-    def test_before_the_first_push_readers_fall_back_to_the_file(self, protected):
+    def test_before_the_first_push_the_token_falls_back_to_the_file_but_not_the_mode(self, protected):
         _seed_mcp(mode="write")
         turn = app_held.AppHeldVault(source=turn_vault_for_scope(LOCAL_SCOPE), root=own_vault_root(LOCAL_SCOPE))
         from anton.core.mcp.wiring import _access_mode_of
 
         assert turn.load("hubspot", CONN)["access_token"] == "file-token"
-        assert _access_mode_of(turn, "hubspot", CONN) == "write"
+        assert _access_mode_of(turn, "hubspot", CONN) == "read"
         assert ConnectionsService(LOCAL_SCOPE).mcp_access_token("hubspot", CONN) == "file-token"
+        # The app reads the legacy mode from the detail for its one-time migration.
+        assert ConnectionsService(LOCAL_SCOPE).get("hubspot", CONN).fields["_access_mode"] == "write"
 
     def test_legacy_mode_ignores_anything_held(self, stores):
         _seed_mcp(mode="read")

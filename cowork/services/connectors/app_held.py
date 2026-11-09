@@ -42,18 +42,24 @@ def held(root: Path, engine: str, name: str) -> dict[str, str]:
         return dict(_entries.get(_key(root, engine, name), {}))
 
 
-def hold(root: Path, engine: str, name: str, values: dict[str, Any], *, keep_mode: bool = False) -> dict[str, str]:
-    """Merge the non-empty ``values`` into the entry and return it. With
-    ``keep_mode`` an ``access_mode`` already held wins over the one given."""
+def hold(root: Path, engine: str, name: str, values: dict[str, Any]) -> dict[str, str]:
+    """Merge the non-empty ``values`` into the entry and return it."""
     with _lock:
         entry = _entries.setdefault(_key(root, engine, name), {})
         for key, value in values.items():
-            if key not in VAULT_FIELD or not value:
-                continue
-            if key == "access_mode" and keep_mode and entry.get("access_mode"):
-                continue
-            entry[key] = str(value)
+            if key in VAULT_FIELD and value:
+                entry[key] = str(value)
         return dict(entry)
+
+
+def _hold_token_and_default_mode(root: Path, engine: str, name: str, token: str | None, expires_at: str | None) -> None:
+    with _lock:
+        entry = _entries.setdefault(_key(root, engine, name), {})
+        if token:
+            entry["access_token"] = token
+            if expires_at:
+                entry["expires_at"] = str(expires_at)
+        entry.setdefault("access_mode", "read")
 
 
 def release(root: Path, engine: str, name: str) -> None:
@@ -86,25 +92,33 @@ class AppHeldVault(FilteredDataVault):
     doesn't have. ``env_for``/``inject_env`` read the file alone: the token
     must never reach a Scratchpad's environment.
 
-    A save of an MCP connection keeps the token and the mode out of the file
-    and holds them here instead; a mode already held wins over the saved one,
-    which may be the file's legacy value read back.
+    The access mode is the held one, else "read", never the file's: agent code
+    can write the file, or delete the connection and save it again, while only
+    the secret-guarded routes may set a mode. A save of an MCP connection keeps
+    the token out of the file, holds it here, ignores any mode it carries and
+    holds "read" when no mode is held.
     """
 
     def __init__(self, *, source: Any, root: Path) -> None:
         super().__init__(source=source, hidden=frozenset())
         self._root = root
 
+    def _held_mode(self, engine: str, name: str, fields: dict) -> dict:
+        if not active() or fields.get("_method") != MCP_METHOD:
+            return fields
+        return {**fields, "_access_mode": held(self._root, engine, name).get("access_mode") or "read"}
+
     def load(self, engine: str, name: str) -> dict[str, str] | None:
         fields = super().load(engine, name)
-        return None if fields is None else overlay(self._root, engine, name, fields)
+        if fields is None:
+            return None
+        return self._held_mode(engine, name, overlay(self._root, engine, name, fields))
 
     def read_record(self, engine: str, name: str) -> dict[str, Any] | None:
         record = super().read_record(engine, name)
         if record is None:
             return None
-        fields = overlay(self._root, engine, name, record.get("fields") or {}, keys=("access_mode",))
-        return {**record, "fields": fields}
+        return {**record, "fields": self._held_mode(engine, name, record.get("fields") or {})}
 
     def save(
         self,
@@ -117,9 +131,6 @@ class AppHeldVault(FilteredDataVault):
         if active() and credentials.get("_method") == MCP_METHOD:
             credentials = dict(credentials)
             token = credentials.pop("access_token", None)
-            mode = credentials.pop("_access_mode", None)
-            values: dict[str, Any] = {"access_mode": mode}
-            if token:
-                values.update(access_token=token, expires_at=credentials.get("expires_at"))
-            hold(self._root, engine, name, values, keep_mode=True)
+            credentials.pop("_access_mode", None)
+            _hold_token_and_default_mode(self._root, engine, name, token, credentials.get("expires_at"))
         return super().save(engine, name, credentials, secure_keys=secure_keys)

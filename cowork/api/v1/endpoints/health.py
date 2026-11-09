@@ -5,8 +5,8 @@ from importlib.metadata import version, PackageNotFoundError
 
 from fastapi import APIRouter, Depends, Request
 
+from cowork import app_secret
 from cowork.api.v1.permissions import OpenByDesign, require
-from cowork.app_secret import get_app_secret
 from cowork.code_sandbox import live_apps_on
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import (
@@ -136,7 +136,11 @@ def health_probe(request: Request, nonce: str | None = None) -> dict:
         nonce=nonce,
         port=server[1] if server else None,
     )
-    return {**health(), "proof": proof}
+    body = {**health(), "proof": proof}
+    secret_proof = app_secret.proof(request.headers.get(app_secret.CHALLENGE_HEADER))
+    if secret_proof is not None:
+        body["app_secret_proof"] = secret_proof
+    return body
 
 
 def health() -> dict:
@@ -147,7 +151,7 @@ def health() -> dict:
     _org_mode = get_app_settings().tenancy_mode == "org"
     # Present only while this server holds the desktop app's secret: the app
     # then sends it on the routes that need it and pushes MCP tokens to memory.
-    protocol = {"app_secret_protocol": 1} if get_app_secret() is not None else {}
+    protocol = {"app_secret_protocol": 1} if app_secret.get_app_secret() is not None else {}
     return {
         "status": "ok",
         # Runtime feature handshake for desktop clients. A healthy HTTP server

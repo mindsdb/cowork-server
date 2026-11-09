@@ -239,7 +239,8 @@ def _persist_direct_connection(
             # connection; a reconnect (HubSpot session expiring, user
             # re-authorizing) must not silently reset an "edit access"
             # upgrade to "write" back to "read".
-            default_fields={"_access_mode": "read"} if body.method == "mcp" else None,
+            # While app-held, only the secret-guarded routes set the mode (AppHeldVault).
+            default_fields={"_access_mode": "read"} if body.method == "mcp" and not app_held.active() else None,
             vault=vault,
             scope=scope,
         )
