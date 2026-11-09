@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import stat
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -189,9 +189,10 @@ class RootsPlan:
     of the shared root (`projects.partition_of`): a project whose folder sits
     in another one is left out of `projects` when the plan is built, so no
     reader of the plan reaches it, and again when the plan is expanded.
-    `held`, which only the artifacts list sets (`with_held_roots`), names the
-    roots of `projects` known to hold an artifact folder, so expanding the
-    plan opens nothing on the file store; None finds the roots there.
+    `held`, which only the artifacts routes' plans set (`with_held_roots`),
+    names the roots of `projects` known to hold an artifact folder, so
+    expanding the plan opens nothing on the file store; None finds the roots
+    there.
     """
 
     projects: tuple[ProjectRow, ...] = ()
@@ -361,9 +362,7 @@ def with_held_roots(session: ScopedSession, plan: RootsPlan) -> RootsPlan:
     """`plan` with the roots of its projects the held_artifact_roots rows
     name (held_artifact_roots.held_roots), for the artifacts list. Unchanged
     for a desktop scan, a scope that keeps no rows, or before their backfill
-    has finished. A database step: run it in the unit that built `plan`."""
-    from dataclasses import replace
-
+    has finished. A database step: run it in a database unit."""
     from cowork.services.held_artifact_roots import held_roots
 
     if plan.scan:

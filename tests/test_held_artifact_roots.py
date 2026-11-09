@@ -289,3 +289,25 @@ def test_a_task_move_records_the_destinations_shared_root(tmp_path):
     assert _relocate(org_id, owner, conversation_id, source.id, dest.id) == 1
 
     assert _rows(org_id) == {HeldRoot(source.id, None), HeldRoot(dest.id, None)}
+
+
+def test_a_delete_by_old_folder_name_finds_what_the_list_shows(tmp_path, org_deployment, backfill_pending):
+    """Once the rows are complete, a delete by an old folder name looks only
+    in the roots they name, as the list does: a folder in a root no writer
+    recorded is not found, never one outside the caller's roots."""
+    from cowork.api.v1.endpoints.artifacts import _legacy_artifact_in_plan, _plan_scoped_project
+
+    org_id = str(uuid4())
+    project = make_project(tmp_path, org_id)
+    write_artifact(project_root(project).base, "listed")
+    run_held_root_backfill(try_lock=_no_lock, project_ids=[project.id])
+    owned = make_conversation(project, OWNER)
+    write_artifact(_workspace(project, owned) / ".anton" / "artifacts", "never-recorded")
+
+    with scoped(org_id, OWNER) as session:
+        plan = _plan_scoped_project(session, project_ref=str(project.id))
+
+    assert plan.held == {HeldRoot(project.id, None)}
+    source, folder = _legacy_artifact_in_plan(plan, "listed")
+    assert folder == project_root(project).base / "listed"
+    assert _legacy_artifact_in_plan(plan, "never-recorded") == (None, None)
