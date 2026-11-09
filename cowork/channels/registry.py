@@ -58,6 +58,9 @@ def load_first_party_plugins(registry: PluginRegistry | None = None) -> list[str
             continue
 
         plugin = getattr(module, "plugin", None)
+        # A module sets plugin = None when its channel is off on this install.
+        if plugin is None and hasattr(module, "plugin"):
+            continue
         if not isinstance(plugin, ChannelPlugin):
             _log.warning("plugin module %s has no module-level ChannelPlugin; skipping", module_name)
             continue

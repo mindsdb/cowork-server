@@ -87,3 +87,26 @@ python -m cowork.channels.teams check
 It asks Microsoft for the bot's token and prints whether Microsoft accepted the credentials. It
 exits 0 when they work and the internal key is set, 1 when Microsoft refuses them or the key is
 missing, and 2 when Teams isn't configured or available.
+
+## The webhook, for a developer's tunnel
+
+With `COWORK_TEAMS_BOT_APP_ID` set on Linux, Teams is also a channel: Microsoft can post each
+@mention straight to `POST /api/v1/channels/teams/api/messages`, and the agent's answer goes back in
+the same thread. Point the bot's messaging endpoint there through a tunnel to try the bot without
+the recording proxy. The code is in `cowork/channels/plugins/teams.py`.
+
+Before anything is stored or run, each message must carry Microsoft's token:
+
+- signed with one of Microsoft's keys from `login.botframework.com`, endorsed for the message's
+  channel (keys are fetched at start and refreshed daily);
+- issued by `https://api.botframework.com` for this bot's App ID, and in date (5 minutes' leeway);
+- naming the message's `serviceUrl`.
+
+Then every tenant ID the message carries (`conversation.tenantId`, `channelData.tenant.id`, the
+`x-ms-tenant-id` header) must be `COWORK_TEAMS_TENANT_ID`; with no tenant set, every message is
+refused. A refused message gets 401, no reply and nothing stored, and the server log says why.
+
+A channel turn runs with no person, so on a Cowork that trusts identity headers the webhook
+refuses every message; Teams questions go through the recording proxy there. The channel config
+routes (save, delete, reload, set up, tear down) answer 409 for Teams, since the bot is set in the
+environment.

@@ -69,6 +69,20 @@ def _require_org_ready(channel_type: str) -> None:
         )
 
 
+def _refuse_env_channel(channel_type: str) -> None:
+    """Blocks the routes that store or change a channel's configuration for a
+    channel the operator sets in the server's environment (Teams): no person's
+    request may change it."""
+    from cowork.channels.registry import get_registry
+
+    plugin = get_registry().get(channel_type)
+    if plugin is not None and plugin.credentials_from_env:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"channel {channel_type} is set in the server's environment, not here",
+        )
+
+
 async def _reconcile_ingress(request: Request, channel_type: str, org_id: str | None) -> None:
     """Start/stop background ingress (Gateway stream or tunnel-free poll) after
     a change to the channel's live adapter (config/setup/teardown/reload).
@@ -151,6 +165,7 @@ async def set_config(
     request: Request,
     scoped: ScopedSessionDep,
 ) -> ChannelConfigResponse:
+    _refuse_env_channel(channel_type)
     _require_org_ready(channel_type)
     try:
         result = ChannelConfigService(scoped).set_config(channel_type, body.values)
@@ -174,6 +189,7 @@ async def set_config(
 async def delete_config(
     channel_type: str, request: Request, scoped: ScopedSessionDep
 ) -> None:
+    _refuse_env_channel(channel_type)
     _require_org_ready(channel_type)
     try:
         deleted = ChannelConfigService(scoped).delete_config(channel_type)
@@ -200,6 +216,7 @@ async def reload_channel(
     channel_type: str, request: Request, scoped: ScopedSessionDep
 ) -> ChannelReloadResponse:
     """Rebuild a channel's live adapter from its currently stored config."""
+    _refuse_env_channel(channel_type)
     _require_org_ready(channel_type)
     try:
         ChannelConfigService(scoped).get_config(channel_type)
@@ -281,6 +298,7 @@ def _lifecycle_service(request: Request, scoped: ScopedSession) -> ChannelLifecy
 async def setup_channel(
     channel_type: str, request: Request, scoped: ScopedSessionDep
 ) -> ChannelLifecycleResponse:
+    _refuse_env_channel(channel_type)
     _require_org_ready(channel_type)
     svc = _lifecycle_service(request, scoped)
     try:
@@ -306,6 +324,7 @@ async def setup_channel(
 async def teardown_channel(
     channel_type: str, request: Request, scoped: ScopedSessionDep
 ) -> ChannelLifecycleResponse:
+    _refuse_env_channel(channel_type)
     _require_org_ready(channel_type)
     svc = _lifecycle_service(request, scoped)
     try:

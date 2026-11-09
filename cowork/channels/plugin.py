@@ -120,3 +120,6 @@ class ChannelPlugin:
     # Handles platform handshakes (e.g. Slack url_verification, WhatsApp hub.challenge)
     # that arrive before routing. Returns WebhookHandshake; None means no handshake applies.
     handshake: Callable[[bytes, Mapping[str, str], Mapping[str, str]], WebhookHandshake | None] | None = None
+    # The operator sets this channel in the server's environment, not in
+    # Settings, so the routes that store or change its configuration refuse it.
+    credentials_from_env: bool = False
