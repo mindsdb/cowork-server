@@ -183,7 +183,7 @@ async def test_a_sender_not_on_the_allowed_list_gets_nothing(bridge, caplog):
     with caplog.at_level(logging.INFO):
         assert await _questions(bridge, activity) == []
     assert bridge.refused["sender not on COWORK_TEAMS_ALLOWED_USERS"] == 1
-    assert "message from aad-2, who isn't on COWORK_TEAMS_ALLOWED_USERS" in caplog.text
+    assert [record.user_id for record in caplog.records if hasattr(record, "user_id")] == ["aad-2"]
 
 
 async def test_with_no_allowed_senders_nobody_is_answered(identity_headers, stand_in):
@@ -423,9 +423,9 @@ def test_registering_says_what_the_channel_still_needs(monkeypatch, identity_hea
         monkeypatch.delenv(name, raising=False)
     with caplog.at_level(logging.WARNING):
         assert teams_plugin._build() is not None
-    assert (
-        "COWORK_TEAMS_BOT_APP_SECRET, COWORK_TEAMS_TENANT_ID, COWORK_TEAMS_ALLOWED_USERS not set" in caplog.text
-    )
+    assert [record.reason for record in caplog.records] == [
+        "COWORK_TEAMS_BOT_APP_SECRET, COWORK_TEAMS_TENANT_ID, COWORK_TEAMS_ALLOWED_USERS not set"
+    ]
 
 
 def test_an_install_without_teams_loads_the_other_channels_quietly(monkeypatch, caplog):
@@ -440,3 +440,24 @@ def test_an_install_without_teams_loads_the_other_channels_quietly(monkeypatch, 
 
 def test_the_routes_module_and_the_plugin_share_one_settings_class():
     assert teams_plugin.TeamsSettings is teams_routes.TeamsSettings
+
+
+def test_the_server_log_shows_why_and_whom_it_refused(bridge):
+    """The server's log format drops values filled into a message, so the
+    reason and the sender's ID must travel as fields it keeps."""
+    from cowork.common.structured_logging import make_formatter
+
+    lines: list[str] = []
+    handler = logging.Handler()
+    handler.setFormatter(make_formatter())
+    handler.emit = lambda record: lines.append(json.loads(handler.format(record)))
+    logger = logging.getLogger("cowork.channels.plugins.teams")
+    logger.addHandler(handler)
+    try:
+        with pytest.raises(SignatureError):
+            _verify(bridge, headers=_headers(token=_token(aud="another-bot")))
+        asyncio.run(_questions(bridge, _activity(**{"from": {"id": "29:user-2", "aadObjectId": "aad-2"}})))
+    finally:
+        logger.removeHandler(handler)
+    assert [line.get("reason") for line in lines] == ["invalid Microsoft token: InvalidAudienceError", None]
+    assert lines[1]["user_id"] == "aad-2"

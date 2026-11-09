@@ -95,9 +95,12 @@ class SigningKeys:
         try:
             config = (await http.get(OPENID_CONFIG_URL)).raise_for_status().json()
             self.load((await http.get(config["jwks_uri"])).raise_for_status().json())
-            log.info("Teams: loaded %d Microsoft signing keys", len(self._keys))
+            log.info("Teams: loaded Microsoft's signing keys", extra={"event": "teams_keys_loaded", "count": len(self._keys)})
         except Exception as error:
-            log.warning("Teams: couldn't load Microsoft's signing keys: %s", type(error).__name__)
+            log.warning(
+                "Teams: couldn't load Microsoft's signing keys",
+                extra={"event": "teams_keys_failed", "error_type": type(error).__name__},
+            )
         finally:
             if self._http is None:
                 await http.aclose()
@@ -167,6 +170,8 @@ class TeamsBridge:
 
     def _refuse(self, reason: str) -> SignatureError:
         self.refused[reason] += 1
+        # The server's log keeps fields, not values filled into a message.
+        log.warning("Teams message refused", extra={"event": "teams_message_refused", "reason": reason})
         return SignatureError(reason)
 
     def verify_signature(self, *, body: bytes, headers: Mapping[str, str]) -> None:
@@ -229,7 +234,10 @@ class TeamsBridge:
             # which Teams could show as a failed send; nothing is stored or run.
             # The ID only: it's what the operator adds to the list.
             self.refused["sender not on COWORK_TEAMS_ALLOWED_USERS"] += 1
-            log.info("Teams: message from %s, who isn't on COWORK_TEAMS_ALLOWED_USERS", sender_id or "an unknown sender")
+            log.warning(
+                "Teams message from a sender not on COWORK_TEAMS_ALLOWED_USERS",
+                extra={"event": "teams_sender_refused", "user_id": sender_id or "unknown"},
+            )
             return []
         address = _address(activity)
         conversation = activity.get("conversation") or {}
@@ -264,7 +272,7 @@ class TeamsBridge:
     async def deliver(self, message: OutboundMessage) -> None:
         reference = self._reply_to.get(message.address)
         if reference is None:
-            log.warning("Teams: no message to reply to in %s; reply not sent", message.address.platform_id)
+            log.warning("Teams: no message to reply to; reply not sent", extra={"event": "teams_reply_dropped"})
             return
         service_url, conversation_id, activity_id = reference
         self._bot.check_service_url(service_url)
@@ -300,7 +308,10 @@ def _build() -> ChannelPlugin | None:
         if not value
     ]
     if missing:
-        log.warning("Teams channel: %s not set, so it can't answer anyone", ", ".join(missing))
+        log.warning(
+            "Teams channel can't answer anyone yet",
+            extra={"event": "teams_settings_missing", "reason": ", ".join(missing) + " not set"},
+        )
     return ChannelPlugin(
         channel_type=CHANNEL_TYPE,
         display_name="Microsoft Teams",
