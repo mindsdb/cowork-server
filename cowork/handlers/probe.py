@@ -21,7 +21,11 @@ from cowork.handlers.turn_errors import server_busy_message
 from cowork.schemas.connectors import ConnectorSpecResponse
 from cowork.schemas.responses import Role
 from cowork.services.connectors.catalog import ConnectorCatalog
-from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError
+from cowork.services.connectors.custom_connectors import (
+    USAGE_NOTES_MAX,
+    CustomConnectorService,
+    UnstorableFormError,
+)
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
@@ -104,6 +108,20 @@ def _is_oauth_grant(form_spec: dict, method: str | None, credentials: dict) -> b
         ):
             return True
     return False
+
+
+def _form_usage_notes(form_spec: dict) -> str | None:
+    """A handcrafted form's own ``connector.usage_notes``, for its probe.
+
+    Returns the stripped text, or None when the form has none or they exceed
+    USAGE_NOTES_MAX. The cap is checked again here rather than trusting that
+    every route staging a form ran check_handcrafted_form.
+    """
+    meta = form_spec.get("connector")
+    notes = meta.get("usage_notes") if isinstance(meta, dict) else None
+    if not isinstance(notes, str) or len(notes) > USAGE_NOTES_MAX:
+        return None
+    return notes.strip() or None
 
 
 _GRANT_UNLISTED = (
@@ -454,6 +472,10 @@ class ProbeHandler:
             pending_cell: dict = {}
 
             usage_notes, notes_define_pass = await self._usage_notes(connector_id)
+            if spec is None and not usage_notes:
+                # The submitter wrote this form and its probe uses only their own
+                # credentials, so its notes are hints in every scope, never the rule.
+                usage_notes, notes_define_pass = _form_usage_notes(form_spec), False
             probe = CredentialProbe(
                 engine=connector_id,
                 credentials=probe_credentials,

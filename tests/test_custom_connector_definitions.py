@@ -258,7 +258,9 @@ class TestProbeStream:
 
         stream = await _probe(HTTPBIN_FORM, {"token": "a"})
 
-        assert _Probe.built[-1]["usage_notes"] is None
+        # The handcrafted form's own notes stand in, as hints that cannot define a pass.
+        assert _Probe.built[-1]["usage_notes"] == "Call /bearer."
+        assert _Probe.built[-1]["notes_define_pass"] is False
         assert "Saved as" in stream
 
     @pytest.mark.asyncio
