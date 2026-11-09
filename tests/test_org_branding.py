@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from functools import partial
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 from fastapi import HTTPException
@@ -23,6 +25,7 @@ from cowork.api.v1.endpoints import skill_sharing as sharing_ep
 from cowork.api.v1.endpoints import skills as skills_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
+from cowork.db.units import run_efs
 from cowork.models.skill import Skill
 from cowork.principal import ORG_MANAGE_ROLE, Principal
 from cowork.schemas.org_branding import APPEARANCE_FIELDS, OrgAppearanceUpdate
@@ -220,16 +223,33 @@ def desktop(monkeypatch, tmp_path, auth):
         get_app_settings.cache_clear()
 
 
+def _as_unit(route, scoped: ScopedSession):
+    """Await ``route(scope)`` with its file store unit (run_efs_unit) run on
+    the file store's threads against this test's session."""
+
+    async def unit(fn, *, scope, deadline=True):
+        return await run_efs(partial(fn, scoped), scope=scope, deadline=deadline)
+
+    with mock.patch.object(ep, "run_efs_unit", unit):
+        return asyncio.run(route(scoped.scope))
+
+
 def _get(org, user: str, request=None) -> dict:
-    return asyncio.run(ep.get_org_branding(request or _request(), org.as_(user)))
+    return _as_unit(partial(ep.get_org_branding, request or _request()), org.as_(user))
 
 
 def _put(org, user: str, request=None, **body) -> dict:
-    return asyncio.run(ep.put_org_appearance(OrgAppearanceUpdate(**body), request or _request(), org.as_(user)))
+    return _as_unit(
+        partial(ep.put_org_appearance, OrgAppearanceUpdate(**body), request or _request()), org.as_(user)
+    )
 
 
 def _desktop_get(desktop, request) -> dict:
-    return asyncio.run(ep.get_org_branding(request, desktop.session()))
+    return _as_unit(partial(ep.get_org_branding, request), desktop.session())
+
+
+def _desktop_put(desktop, request, **body) -> dict:
+    return _as_unit(partial(ep.put_org_appearance, OrgAppearanceUpdate(**body), request), desktop.session())
 
 
 def _skill_dir(scope):
@@ -286,7 +306,7 @@ def test_a_member_reads_auths_branding_in_the_apps_keys(org):
 
 def test_can_edit_is_auths_answer_whatever_the_role(org):
     org.auth.branding["can_edit"] = False
-    out = asyncio.run(ep.get_org_branding(_request(), org.as_(ADMIN)))
+    out = _get(org, ADMIN)
     assert out["canEdit"] is False
 
 
@@ -316,7 +336,7 @@ def test_the_read_is_cached_per_caller(org):
     _get(org, ALICE)
     _get(org, ALICE)
     assert len(org.auth.gets()) == 1
-    asyncio.run(ep.get_org_branding(_request(OTHER_BEARER), org.as_(ADMIN)))
+    _get(org, ADMIN, _request(OTHER_BEARER))
     assert [bearer for _m, _p, bearer, _b in org.auth.gets()] == [MEMBER_BEARER, OTHER_BEARER]
 
 
@@ -558,25 +578,29 @@ def test_hosted_nobody_edits_renames_deletes_or_shares_the_skill_as_a_skill(org)
     _get(org, ALICE)
     admin = _viewer(ADMIN, admin=True)
     _refused(
-        lambda: skills_ep.update_skill(
-            BRAND_GUIDELINES_SLUG, SkillUpdateRequest(instructions="Hijack."),
-            org.as_(ADMIN), _principal(ADMIN, admin=True), admin,
+        lambda: skills_ep._update_skill(
+            org.as_(ADMIN), skill_id=BRAND_GUIDELINES_SLUG, body=SkillUpdateRequest(instructions="Hijack."),
+            principal=_principal(ADMIN, admin=True), viewer=admin,
         ),
         403, BRAND_GUIDELINES_REFUSAL,
     )
     _refused(
-        lambda: skills_ep.delete_skill(BRAND_GUIDELINES_SLUG, org.as_(ADMIN), _principal(ADMIN, admin=True), admin),
+        lambda: skills_ep._delete_skill(
+            org.as_(ADMIN), skill_id=BRAND_GUIDELINES_SLUG, principal=_principal(ADMIN, admin=True), viewer=admin
+        ),
         403, BRAND_GUIDELINES_REFUSAL,
     )
     _refused(
-        lambda: sharing_ep.set_skill_sharing(
+        lambda: sharing_ep._set_org_skill_sharing(
             BRAND_GUIDELINES_SLUG, SkillSharingRequest(always_on=False),
             org.as_(ADMIN), _principal(ADMIN, admin=True), admin, frozenset(),
         ),
         403, BRAND_GUIDELINES_REFUSAL,
     )
     listed = {
-        s["id"]: s for s in skills_ep.list_skills(org.as_(ADMIN), _principal(ADMIN, admin=True), admin)["skills"]
+        s["id"]: s for s in skills_ep._list_skills(
+            org.as_(ADMIN), principal=_principal(ADMIN, admin=True), viewer=admin
+        )["skills"]
     }
     skill = listed[BRAND_GUIDELINES_SLUG]
     assert skill["capabilities"] == {"canEdit": False, "canDelete": False, "canDisable": False, "canShare": False}
@@ -587,9 +611,9 @@ def test_hosted_the_name_stays_reserved_with_no_branding(org):
     org.auth.branding = copy.deepcopy(NO_BRANDING)
     _get(org, ALICE)
     _refused(
-        lambda: skills_ep.create_skill(
-            SkillCreateRequest(label=BRAND_GUIDELINES_SLUG, instructions="Mine."),
-            org.as_(ALICE), _principal(ALICE), _viewer(ALICE),
+        lambda: skills_ep._create_skill(
+            org.as_(ALICE), body=SkillCreateRequest(label=BRAND_GUIDELINES_SLUG, instructions="Mine."),
+            principal=_principal(ALICE), viewer=_viewer(ALICE),
         ),
         403, BRAND_GUIDELINES_REFUSAL,
     )
@@ -597,9 +621,9 @@ def test_hosted_the_name_stays_reserved_with_no_branding(org):
 
 def test_hosted_a_member_turns_the_skill_off_for_themselves_only(org):
     _get(org, ALICE)
-    out = sharing_ep.set_skill_enabled_for_me(
-        BRAND_GUIDELINES_SLUG, SkillEnabledForMeRequest(enabled=False),
-        org.as_(ALICE), _principal(ALICE), _viewer(ALICE),
+    out = sharing_ep._set_skill_enabled_for_me(
+        org.as_(ALICE), skill_id=BRAND_GUIDELINES_SLUG, body=SkillEnabledForMeRequest(enabled=False),
+        principal=_principal(ALICE), viewer=_viewer(ALICE),
     )
     assert out["enabledForMe"] is False
     assert BRAND_GUIDELINES_SLUG not in build_turn_skills(
@@ -626,18 +650,14 @@ def test_desktop_without_a_hub_credential_is_enabled_false_and_asks_nothing(desk
 
 
 def test_desktop_put_passes_through_with_the_hub_credential(desktop):
-    out = asyncio.run(
-        ep.put_org_appearance(OrgAppearanceUpdate(accent="#0055ff"), _request(hub=HUB_BEARER), desktop.session())
-    )
+    out = _desktop_put(desktop, _request(hub=HUB_BEARER), accent="#0055ff")
     assert out["appearance"]["accent"] == "#0055ff"
     assert desktop.auth.calls[-1][:3] == ("PATCH", "/organizations/current/branding/appearance/", HUB_BEARER)
 
 
 def test_desktop_put_without_a_hub_credential_asks_to_sign_in(desktop):
     _refused(
-        lambda: asyncio.run(
-            ep.put_org_appearance(OrgAppearanceUpdate(accent="#0055ff"), _request(), desktop.session())
-        ),
+        lambda: _desktop_put(desktop, _request(), accent="#0055ff"),
         403, ep.SIGN_IN_TO_EDIT,
     )
     assert desktop.auth.calls == []
@@ -652,11 +672,7 @@ def test_hosted_a_put_with_an_api_or_turn_key_asks_to_sign_in_and_reaches_no_one
 @pytest.mark.parametrize("credential", [API_KEY, TURN_KEY])
 def test_desktop_a_put_with_an_api_or_turn_key_asks_to_sign_in_and_reaches_no_one(desktop, credential):
     _refused(
-        lambda: asyncio.run(
-            ep.put_org_appearance(
-                OrgAppearanceUpdate(accent="#0055ff"), _request(hub=credential), desktop.session()
-            )
-        ),
+        lambda: _desktop_put(desktop, _request(hub=credential), accent="#0055ff"),
         403, ep.SIGN_IN_TO_EDIT,
     )
     assert desktop.auth.calls == []
@@ -682,12 +698,13 @@ def test_desktop_the_skill_is_a_local_on_demand_skill(desktop):
 def test_desktop_the_generated_skill_cant_be_edited_or_deleted(desktop):
     _desktop_get(desktop, _request(hub=HUB_BEARER))
     _refused(
-        lambda: skills_ep.update_skill(
-            BRAND_GUIDELINES_SLUG, SkillUpdateRequest(instructions="Hijack."), desktop.session(), None, None
+        lambda: skills_ep._update_skill(
+            desktop.session(), skill_id=BRAND_GUIDELINES_SLUG, body=SkillUpdateRequest(instructions="Hijack."),
+            principal=None, viewer=None,
         ),
         403, BRAND_GUIDELINES_REFUSAL,
     )
-    _refused(lambda: skills_ep.delete_skill(BRAND_GUIDELINES_SLUG, desktop.session(), None, None), 403,
+    _refused(lambda: skills_ep._delete_skill(desktop.session(), skill_id=BRAND_GUIDELINES_SLUG, principal=None, viewer=None), 403,
              BRAND_GUIDELINES_REFUSAL)
     assert "Acme brand guidelines" in _skill_md(LOCAL_SCOPE)
 

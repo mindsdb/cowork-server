@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -101,7 +104,7 @@ def test_engine_creation_failure_logs_only_its_type_and_preserves_the_error(
     _assert_safe(records)
 
 
-def test_real_failed_sql_rolls_back_and_reraises_without_logging_sql_or_details(
+async def test_real_failed_sql_rolls_back_and_reraises_without_logging_sql_or_details(
     database_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -110,7 +113,7 @@ def test_real_failed_sql_rolls_back_and_reraises_without_logging_sql_or_details(
     with engine.begin() as connection:
         connection.exec_driver_sql(f"CREATE TABLE {SQL_SECRET} ({DETAIL_SECRET} TEXT UNIQUE)")
     generator = db_session.get_session()
-    db = next(generator)
+    db = await anext(generator)
     rollback = mock.Mock(wraps=db.rollback)
     close = mock.Mock(wraps=db.close)
     monkeypatch.setattr(db, "rollback", rollback)
@@ -125,7 +128,7 @@ def test_real_failed_sql_rolls_back_and_reraises_without_logging_sql_or_details(
     assert DETAIL_SECRET in str(failed.value.orig)
     with caplog.at_level(logging.ERROR, logger=db_session.logger.name):
         with pytest.raises(IntegrityError) as reraised:
-            generator.throw(failed.value)
+            await generator.athrow(failed.value)
     assert reraised.value is failed.value
     rollback.assert_called_once_with()
     close.assert_called_once_with()
@@ -138,14 +141,14 @@ def test_real_failed_sql_rolls_back_and_reraises_without_logging_sql_or_details(
 
 
 @pytest.mark.parametrize("status", [404, 409, 500])
-def test_http_error_details_are_not_logged_and_the_original_answer_is_preserved(
+async def test_http_error_details_are_not_logged_and_the_original_answer_is_preserved(
     status: int,
     database_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     generator = db_session.get_session()
-    db = next(generator)
+    db = await anext(generator)
     rollback = mock.Mock(wraps=db.rollback)
     close = mock.Mock(wraps=db.close)
     monkeypatch.setattr(db, "rollback", rollback)
@@ -153,7 +156,7 @@ def test_http_error_details_are_not_logged_and_the_original_answer_is_preserved(
     exc = HTTPException(status_code=status, detail={"private": SECRETS})
     with caplog.at_level(logging.DEBUG, logger=db_session.logger.name):
         with pytest.raises(HTTPException) as raised:
-            generator.throw(exc)
+            await generator.athrow(exc)
     assert raised.value is exc
     assert raised.value.status_code == status
     assert raised.value.detail == {"private": SECRETS}
@@ -189,7 +192,7 @@ def _raised_http_error(*, chain: str) -> HTTPException:
 
 
 @pytest.mark.parametrize("chain", ["cause", "context", "suppressed"])
-def test_a_5xx_http_exception_logs_its_status_and_cause_but_not_its_detail(
+async def test_a_5xx_http_exception_logs_its_status_and_cause_but_not_its_detail(
     chain: str,
     database_uri: str,
     caplog: pytest.LogCaptureFixture,
@@ -199,10 +202,10 @@ def test_a_5xx_http_exception_logs_its_status_and_cause_but_not_its_detail(
     # the only record of why the request failed.
     logged = owned_logger(db_session.logger.name)
     generator = db_session.get_session()
-    next(generator)
+    await anext(generator)
     exc = _raised_http_error(chain=chain)
     with pytest.raises(HTTPException) as raised:
-        generator.throw(exc)
+        await generator.athrow(exc)
     assert raised.value is exc
     [record] = _records(caplog, logging.ERROR)
     if chain == "suppressed":
@@ -220,7 +223,7 @@ def test_a_5xx_http_exception_logs_its_status_and_cause_but_not_its_detail(
 # A 4xx on an error that is not an HTTPException, such as a provider SDK's
 # BadRequestError, is not the endpoint's answer, so it is no expected refusal.
 @pytest.mark.parametrize("status", [400, 404, 502])
-def test_an_error_with_a_status_that_is_not_an_http_exception_logs_only_its_type(
+async def test_an_error_with_a_status_that_is_not_an_http_exception_logs_only_its_type(
     status: int,
     database_uri: str,
     caplog: pytest.LogCaptureFixture,
@@ -233,11 +236,11 @@ def test_an_error_with_a_status_that_is_not_an_http_exception_logs_only_its_type
 
     logged = owned_logger(db_session.logger.name, level=logging.DEBUG)
     generator = db_session.get_session()
-    next(generator)
+    await anext(generator)
     exc = UpstreamFailure(" ".join(SECRETS))
     exc.__cause__ = OSError(28, "No space left on device")
     with pytest.raises(UpstreamFailure) as raised:
-        generator.throw(exc)
+        await generator.athrow(exc)
     assert raised.value is exc
     assert db_session._is_expected_refusal(exc) is False
     assert not [record for record in _records(caplog, logging.DEBUG) if "expected refusal" in record.getMessage()]
@@ -247,7 +250,7 @@ def test_an_error_with_a_status_that_is_not_an_http_exception_logs_only_its_type
     assert "No space left on device" not in logged.output()
 
 
-def test_a_5xx_http_exception_from_a_database_error_logs_only_safe_metadata(
+async def test_a_5xx_http_exception_from_a_database_error_logs_only_safe_metadata(
     database_uri: str,
     caplog: pytest.LogCaptureFixture,
     owned_logger,
@@ -257,7 +260,7 @@ def test_a_5xx_http_exception_from_a_database_error_logs_only_safe_metadata(
     with engine.begin() as connection:
         connection.exec_driver_sql(f"CREATE TABLE {SQL_SECRET} ({DETAIL_SECRET} TEXT UNIQUE)")
     generator = db_session.get_session()
-    db = next(generator)
+    db = await anext(generator)
     statement = sa.text(f"INSERT INTO {SQL_SECRET} ({DETAIL_SECRET}) VALUES (:value)")
     db.execute(statement, {"value": BIND_SECRET})
     try:
@@ -267,7 +270,7 @@ def test_a_5xx_http_exception_from_a_database_error_logs_only_safe_metadata(
             raise HTTPException(status_code=500, detail=str(failure)) from failure
     except HTTPException as exc:
         with pytest.raises(HTTPException):
-            generator.throw(exc)
+            await generator.athrow(exc)
     [record] = _records(caplog, logging.ERROR)
     assert record.getMessage().startswith("Database operation failed: error_type=IntegrityError sqlstate=unknown ")
     _assert_safe([record])
@@ -281,7 +284,7 @@ def test_a_5xx_http_exception_from_a_database_error_logs_only_safe_metadata(
         pytest.param(DatabaseBusy(f"no database unit slot freed {' '.join(SECRETS)}"), id="unit-slot"),
     ],
 )
-def test_a_full_pool_rolls_back_and_logs_one_debug_line_for_the_503(
+async def test_a_full_pool_rolls_back_and_logs_one_debug_line_for_the_503(
     exc: PoolTimeoutError,
     database_uri: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -291,14 +294,14 @@ def test_a_full_pool_rolls_back_and_logs_one_debug_line_for_the_503(
     # plain pool timeout has no status_code, so the line names 503 itself; an
     # error-level line per refused request would bury the server's own line.
     generator = db_session.get_session()
-    db = next(generator)
+    db = await anext(generator)
     rollback = mock.Mock(wraps=db.rollback)
     close = mock.Mock(wraps=db.close)
     monkeypatch.setattr(db, "rollback", rollback)
     monkeypatch.setattr(db, "close", close)
     with caplog.at_level(logging.DEBUG, logger=db_session.logger.name):
         with pytest.raises(PoolTimeoutError) as raised:
-            generator.throw(exc)
+            await generator.athrow(exc)
     assert raised.value is exc
     rollback.assert_called_once_with()
     close.assert_called_once_with()
@@ -311,21 +314,88 @@ def test_a_full_pool_rolls_back_and_logs_one_debug_line_for_the_503(
     _assert_safe(records)
 
 
-def test_an_unexpected_failure_logs_its_type_without_exception_text(
+async def test_an_unexpected_failure_logs_its_type_without_exception_text(
     database_uri: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     generator = db_session.get_session()
-    next(generator)
+    await anext(generator)
     exc = RuntimeError(" ".join(SECRETS))
     with caplog.at_level(logging.ERROR, logger=db_session.logger.name):
         with pytest.raises(RuntimeError) as raised:
-            generator.throw(exc)
+            await generator.athrow(exc)
     assert raised.value is exc
     records = _records(caplog, logging.ERROR)
     assert len(records) == 1
     assert records[0].getMessage() == "Session error: error_type=RuntimeError"
     _assert_safe(records)
+
+
+def _recording_close(*, db, monkeypatch, seconds: float = 0.0) -> list[str]:
+    """Make ``db.close`` record where it ran, and take ``seconds`` first."""
+    loop_thread = threading.get_ident()
+    events: list[str] = []
+    real_close = db.close
+
+    def close():
+        events.append("close on the loop" if threading.get_ident() == loop_thread else "close off the loop")
+        time.sleep(seconds)
+        real_close()
+        events.append("closed")
+
+    monkeypatch.setattr(db, "close", close)
+    return events
+
+
+async def test_a_session_that_ran_a_query_closes_off_the_event_loop(database_uri: str, monkeypatch) -> None:
+    """The close rolls the transaction back and checks the connection in,
+    database round trips that would stop every request on a stalled database,
+    so it runs on the units' threads."""
+    generator = db_session.get_session()
+    db = await anext(generator)
+    events = _recording_close(db=db, monkeypatch=monkeypatch)
+    db.execute(sa.text("SELECT 1"))
+
+    await generator.aclose()
+
+    assert events == ["close off the loop", "closed"]
+
+
+async def test_a_session_that_never_ran_a_query_closes_on_the_event_loop(database_uri: str, monkeypatch) -> None:
+    """With no connection to give back the close does no I/O, so it runs
+    inline and takes no thread."""
+    generator = db_session.get_session()
+    db = await anext(generator)
+    events = _recording_close(db=db, monkeypatch=monkeypatch)
+
+    await generator.aclose()
+
+    assert events == ["close on the loop", "closed"]
+
+
+async def test_a_request_cancelled_during_a_slow_close_unwinds_after_the_close(database_uri: str, monkeypatch) -> None:
+    """A Stop or a disconnect that cancels the request while its session
+    closes waits for the close, so the request never unwinds while the
+    connection is still being given back."""
+    generator = db_session.get_session()
+    db = await anext(generator)
+    events = _recording_close(db=db, monkeypatch=monkeypatch, seconds=0.3)
+    db.execute(sa.text("SELECT 1"))
+
+    async def request() -> None:
+        try:
+            await generator.aclose()
+        finally:
+            events.append("unwound")
+
+    task = asyncio.create_task(request())
+    while not events:
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert events == ["close off the loop", "closed", "unwound"]
 
 
 def test_alembic_online_engine_hides_parameters_without_a_supplied_connection(

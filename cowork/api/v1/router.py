@@ -10,6 +10,7 @@ from fastapi import APIRouter
 from cowork.api.v1.endpoints import (
     artifacts,
     artifact_workspace,
+    browse,
     capabilities,
     channels,
     comments,
@@ -54,7 +55,6 @@ from cowork.api.v1.endpoints.connectors import (
 # "Compat routes" section below when the client is updated.
 from cowork.api.v1.endpoints.compat.stubs import (
     attachments_router,
-    browse_router,
     integrations_router,
     scratchpad_router,
 )
@@ -64,6 +64,7 @@ api_router = APIRouter(prefix="/api/v1")
 
 # ── Canonical routes ─────────────────────────────────────────────────
 api_router.include_router(health.router, prefix="/health", tags=["health"])
+api_router.include_router(browse.router, prefix="/browse", tags=["browser"])
 api_router.include_router(
     capabilities.router, prefix="/capabilities", tags=["capabilities"]
 )
@@ -118,4 +119,3 @@ api_router.include_router(org_branding.router, prefix="/org-branding", tags=["or
 api_router.include_router(integrations_router, prefix="/integrations", tags=["compat"])
 api_router.include_router(attachments_router, prefix="/attachments", tags=["compat"])
 api_router.include_router(scratchpad_router, prefix="/scratchpad", tags=["compat"])
-api_router.include_router(browse_router, prefix="/browse", tags=["compat"])

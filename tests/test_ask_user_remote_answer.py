@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 import cowork.api.v1.endpoints.responses as endpoints
 from cowork.api.v1.endpoints.responses import SharedTurn
+from cowork.streaming.turn_index import TurnIndexEntry
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.server import create_app
 from cowork.turnqueue.answers import RemoteAnswerResult
@@ -29,7 +30,7 @@ def client():
 
 @pytest.fixture()
 def turn(monkeypatch):
-    state = {"found": SharedTurn(index={"correlation_id": "corr-1", "turn_id": "1"},
+    state = {"found": SharedTurn(index=TurnIndexEntry(turn_id=1, run_id=None, correlation_id="corr-1"),
                                  buffer=None, in_flight=True)}
 
     async def fake_shared_turn(conversation_id, scope):

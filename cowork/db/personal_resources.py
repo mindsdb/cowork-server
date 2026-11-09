@@ -78,12 +78,18 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     "channel_installations": PersonalResource.CONVERSATIONS,
     "channel_bindings": PersonalResource.CONVERSATIONS,
     "channel_events": PersonalResource.CONVERSATIONS,
+    # Which artifact folders hold a repair queued to a conversation, so they
+    # follow conversations.
+    "queued_agent_repairs": PersonalResource.CONVERSATIONS,
     "projects": PersonalResource.PROJECTS,
     "artifact_identities": PersonalResource.PROJECTS,
     # The sharing an artifact's owner last chose: MindsHub mode only, where
     # every resource is partitioned, so this entry decides nothing in
     # single-tenant mode.
     "artifact_owner_choices": PersonalResource.PROJECTS,
+    # Written and read only in org mode, where every resource is partitioned,
+    # so this entry decides nothing in a personal scope.
+    "artifact_locations": PersonalResource.PROJECTS,
     # Authorship claims for skills, project memory and project instructions.
     # SharedResourceAccess reads and writes them only in org mode, where every
     # resource is partitioned, so this entry decides nothing in a personal scope.

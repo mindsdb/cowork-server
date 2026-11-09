@@ -126,10 +126,11 @@ def test_delete_pins_complete_inventory_before_project_name_selection(
     monkeypatch.setattr(project_files, "open_pinned_child", record_child)
     monkeypatch.setattr(project_files.os.path, "basename", inspect_request)
 
-    result = project_files.delete_project_file(
-        "reports",
-        validated_path,
+    result = project_files._delete_project_file(
         SimpleNamespace(scope=LOCAL_SCOPE),
+        project_name="reports",
+        path=validated_path,
+        principal=None,
     )
 
     assert result == {"status": "deleted", "path": "notes.txt"}
@@ -174,10 +175,11 @@ def test_delete_uses_the_server_opened_handle_selected_by_name(monkeypatch):
     monkeypatch.setattr(project_files, "dir_lstat", stop_at_filesystem_check)
 
     with pytest.raises(ReachedFilesystemCheck):
-        project_files.delete_project_file(
-            ("reports" + "x")[:-1],
-            project_files._validated_project_path("notes.txt"),
+        project_files._delete_project_file(
             SimpleNamespace(scope=LOCAL_SCOPE),
+            project_name=("reports" + "x")[:-1],
+            path=project_files._validated_project_path("notes.txt"),
+            principal=None,
         )
 
     assert seen == [(server_handle, ("notes.txt",))]
@@ -206,10 +208,11 @@ def test_delete_refuses_a_symlinked_project_root(tmp_path, monkeypatch):
     monkeypatch.setattr(project_files, "ProjectService", Catalog)
 
     with pytest.raises(HTTPException) as error:
-        project_files.delete_project_file(
-            "project",
-            project_files._validated_project_path("victim.txt"),
+        project_files._delete_project_file(
             SimpleNamespace(scope=LOCAL_SCOPE),
+            project_name="project",
+            path=project_files._validated_project_path("victim.txt"),
+            principal=None,
         )
 
     assert error.value.status_code == 404
@@ -241,11 +244,12 @@ def test_write_refuses_a_symlinked_projects_store(tmp_path, monkeypatch):
     monkeypatch.setattr(project_files, "ProjectService", Catalog)
 
     with pytest.raises(HTTPException) as error:
-        project_files.write_project_file(
-            "project",
-            project_files._validated_project_path("victim.txt"),
-            project_files._FileWriteRequest(content="replace"),
+        project_files._write_project_file(
             SimpleNamespace(scope=LOCAL_SCOPE),
+            project_name="project",
+            path=project_files._validated_project_path("victim.txt"),
+            req=project_files._FileWriteRequest(content="replace"),
+            principal=None,
         )
 
     assert error.value.status_code == 404

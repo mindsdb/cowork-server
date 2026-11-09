@@ -37,12 +37,14 @@ server.
 from __future__ import annotations
 
 import logging
+from functools import partial
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from starlette.concurrency import run_in_threadpool
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSession, ScopedSessionDep
+from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
+from cowork.db.units import run_efs_unit
 from cowork.principal import caller_bearer, is_session_jwt, mindshub_credential
 from cowork.schemas.org_branding import OrgAppearanceUpdate, OrgAppearanceView, OrgBrandingView
 from cowork.services.org_branding import (
@@ -57,18 +59,20 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+
 SIGN_IN_TO_EDIT = "Sign in to MindsHub to change branding."
 
 
-def _credential(request: Request, scoped: ScopedSession) -> str:
+def _credential(request: Request, scope: TenantScope) -> str:
     """The caller's MindsHub credential for this deployment (module docstring)."""
-    if scoped.scope.org_mode:
-        return caller_bearer(request) if scoped.scope.org_id else ""
+    if scope.org_mode:
+        return caller_bearer(request) if scope.org_id else ""
     return mindshub_credential(request)
 
 
-def _who(scoped: ScopedSession) -> dict[str, str]:
-    return {"org_id": scoped.scope.org_id or "", "user_id": scoped.scope.user_id or ""}
+def _who(scope: TenantScope) -> dict[str, str]:
+    return {"org_id": scope.org_id or "", "user_id": scope.user_id or ""}
 
 
 def _sync_skill(scoped: ScopedSession, branding: AuthBranding) -> None:
@@ -113,25 +117,28 @@ def _view(branding: AuthBranding) -> dict:
     ).model_dump(by_alias=True)
 
 
+def _settle(scoped: ScopedSession, *, branding: AuthBranding) -> dict:
+    """Sync the skill and answer the view. The skill is a folder on the
+    shared file store and a skill_access row, so this runs as one unit on the
+    file store's threads (run_efs_unit), never on anyio's default threads."""
+    _sync_skill(scoped, branding)
+    return _view(branding)
+
+
 @router.get("", response_model=OrgBrandingView)
-async def get_org_branding(request: Request, scoped: ScopedSessionDep):
-    branding = await fetch_auth_branding(bearer_token=_credential(request, scoped), **_who(scoped))
-
-    def settle() -> dict:
-        _sync_skill(scoped, branding)
-        return _view(branding)
-
-    return await run_in_threadpool(settle)
+async def get_org_branding(request: Request, scope: ScopeDep):
+    branding = await fetch_auth_branding(bearer_token=_credential(request, scope), **_who(scope))
+    return await run_efs_unit(partial(_settle, branding=branding), scope=scope)
 
 
 @router.put("/appearance", response_model=OrgBrandingView)
-async def put_org_appearance(body: OrgAppearanceUpdate, request: Request, scoped: ScopedSessionDep):
-    credential = _credential(request, scoped)
+async def put_org_appearance(body: OrgAppearanceUpdate, request: Request, scope: ScopeDep):
+    credential = _credential(request, scope)
     if not is_session_jwt(credential):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=SIGN_IN_TO_EDIT)
     try:
         branding = await update_auth_appearance(
-            bearer_token=credential, changes=body.auth_changes(), **_who(scoped)
+            bearer_token=credential, changes=body.auth_changes(), **_who(scope)
         )
     except AuthAppearanceError as refused:
         if refused.status_code == status.HTTP_401_UNAUTHORIZED:
@@ -144,9 +151,4 @@ async def put_org_appearance(body: OrgAppearanceUpdate, request: Request, scoped
                 extra={"event": "org_branding_appearance_save_failed", "status": refused.status_code},
             )
         raise HTTPException(status_code=refused.status_code, detail=refused.detail)
-
-    def settle() -> dict:
-        _sync_skill(scoped, branding)
-        return _view(branding)
-
-    return await run_in_threadpool(settle)
+    return await run_efs_unit(partial(_settle, branding=branding), scope=scope)

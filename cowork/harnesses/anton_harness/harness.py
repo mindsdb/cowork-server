@@ -30,7 +30,7 @@ from cowork.common.settings.user_settings import current_settings_scope, effecti
 from cowork.deployment_identity import identity_for_turn, learned_memory_scope
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
-from cowork.db.units import run_db, run_to_completion, unit_session
+from cowork.db.units import run_db, run_efs, run_on_unit_threads, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
 from cowork.harnesses.memory.policy import memory_policy
@@ -68,6 +68,7 @@ from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
+    from anton.core.browser.config import BrowserConfig
     from anton.core.session import ChatSession
 
     from cowork.services.conversations import ReplayHistory
@@ -962,7 +963,9 @@ class AntonHarness:
         artifacts_base = project_path / ".anton" / "artifacts"
         # Names AND content mtimes: a name diff only reveals artifacts the turn
         # CREATED, and the reconciler must also see the ones it EDITED.
-        before_slugs, before_mtimes = snapshot_artifact_state(artifacts_base)
+        before_slugs, before_mtimes = await run_efs(
+            partial(snapshot_artifact_state, artifacts_base), scope=_units_scope(), deadline=False
+        )
         # Capture ids while the conversation is unambiguously attached — the
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
@@ -1028,14 +1031,18 @@ class AntonHarness:
             try:
                 # It waits on each touched artifact's lock and parses its
                 # journal, so it runs off the event loop the server shares.
-                changes = await asyncio.to_thread(
-                    turn_artifact_changes,
-                    conversation_id=conv_id,
-                    artifacts_base=artifacts_base,
-                    before=before_slugs,
-                    before_mtimes=before_mtimes,
-                    tracked_new=getattr(session, "artifacts_touched", None),
-                    tracked_edits=getattr(session, "artifacts_touched", None),
+                changes = await run_efs(
+                    partial(
+                        turn_artifact_changes,
+                        conversation_id=conv_id,
+                        artifacts_base=artifacts_base,
+                        before=before_slugs,
+                        before_mtimes=before_mtimes,
+                        tracked_new=getattr(session, "artifacts_touched", None),
+                        tracked_edits=getattr(session, "artifacts_touched", None),
+                    ),
+                    scope=_units_scope(),
+                    deadline=False,
                 )
                 new_slugs, touched_slugs, turn_scope = changes.created, changes.touched, _units_scope()
                 if new_slugs:
@@ -1046,6 +1053,7 @@ class AntonHarness:
                             project_id=conv_project_id,
                             slugs=new_slugs,
                             creator=getattr(conversation, "created_by", None),
+                            artifact_ids=changes.created_ids,
                         ),
                         scope=turn_scope,
                     )
@@ -1487,7 +1495,7 @@ class AntonHarness:
         # turn's scratch folder below).
         anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
 
-        user = get_user_settings()
+        user = await run_on_unit_threads(get_user_settings)
         _overlay_user_settings(anton_settings, user)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
@@ -1988,6 +1996,14 @@ class AntonHarness:
                 # brief when the agent acts first); without it the tool hands
                 # the content to the agent. Dropped by an anton without the field.
                 **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
+                # The desktop app's own browser, when it registered one and the
+                # person turned the browser on: anton registers its `browser`
+                # tool only then. Never for a channel turn. Passed directly:
+                # every anton the floor admits has the field.
+                browser=await _browser_config(
+                    user, channel_context=channel_context,
+                    conversation_id=str(conversation.id), project_id=conversation.project_id,
+                ),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
@@ -2061,3 +2077,29 @@ class AntonHarness:
     def _build_llm_client(effort: str | None = None, *, model: str | None = None, settings=None):
         from cowork.services.providers import build_llm_client
         return build_llm_client(effort_override=effort, model_override=model, settings=settings)
+
+
+async def _browser_config(
+    user, *, channel_context: ChannelContext | None, conversation_id: str, project_id,
+) -> "BrowserConfig | None":
+    """anton's browser for an in-process turn: the desktop app's own browser,
+    with the task's own session, or None.
+
+    None for a channel turn: it comes from a chat where people other than the
+    desktop's owner can write, and the browser holds the owner's sign-ins.
+    None when the person turned the browser off, when the app registered no
+    browser, which is always the case where more than one person shares this
+    process (cowork.common.settings.runtime_credential.get_browser_host), and
+    when a signed-in desktop's organization turned the browser off, read
+    before each turn (cowork.services.browser.desktop_organization_off).
+    The web's browser never reaches an in-process turn: web turns run
+    remotely, and the producer gives them the router.
+    """
+    if channel_context is not None or not getattr(user, "browser_enabled", False):
+        return None
+    from cowork.services.browser import desktop_browser_config, desktop_organization_off
+
+    config = desktop_browser_config(conversation_id=conversation_id, project_id=project_id)
+    if config is None or await desktop_organization_off():
+        return None
+    return config
