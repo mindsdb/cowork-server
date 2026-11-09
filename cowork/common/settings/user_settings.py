@@ -926,19 +926,16 @@ class UserSettings(Settings):
         # Plain contiguous range. "No limit" in the UI is the TOP of it
         # (50_000_000), not a sentinel.
         #
-        # "No limit" is EFFECTIVELY, not literally, true — and the bound is
-        # closer than it looks. A turn makes about
-        # `max_tool_rounds x (max_continuations + 1)` LLM calls, which at the
-        # defaults (250 x 11) is ~2,750 calls, so 50M is reached at ~18k per
-        # call — far below the ~190k context a long conversation carries. At the
-        # maxima a user can set (500 x 26) it is ~13,000 calls and ~3.8k per
-        # call. So the step cap does NOT always land first; the token ceiling
-        # usually does. The largest turn in 30 days of production (2026-10-14)
-        # was 34.4M.
+        # "No limit" is EFFECTIVELY, not literally, true. `max_tool_rounds`
+        # counts across the whole turn, continuations included, so a turn makes
+        # about `max_tool_rounds + max_continuations + 1` LLM calls: ~260 at
+        # the defaults, so 50M is reached at ~190k per call, the context a long
+        # conversation carries; ~530 at the maxima a user can set (500 + 26),
+        # so there the ceiling lands first on a long conversation. The largest
+        # turn in 30 days of production (2026-10-14) was 34.4M.
         # Do not restate this as "the ceiling can never fire at max" — an
         # earlier version of this comment did, using anton's own 25x3 defaults
-        # rather than Cowork's, which put the threshold at 480k per call and
-        # made it look unreachable.
+        # rather than Cowork's, which made it look unreachable.
         #
         # A 0-means-unlimited sentinel was built
         # and then removed — it needed a hole in the range, a validator to guard

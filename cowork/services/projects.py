@@ -198,6 +198,73 @@ class ProjectRenameStage:
     skill_rewrites_applied: bool = False
 
 
+def partition_of(scope: TenantScope) -> str | None:
+    """The partition of the shared root that holds `scope`'s projects, or None
+    when its projects are not kept per person."""
+    if not scope.partitioned_for(PersonalResource.PROJECTS) or scope.org_id is None:
+        return None
+    return str(scope.org_id)
+
+
+#: The shared root with its links resolved, by the value configured for it.
+_RESOLVED_SHARED_ROOTS: dict[str, Path] = {}
+
+
+def resolve_shared_root() -> Path:
+    """Resolve the configured shared root's links and keep the answer for
+    `resolved_shared_root`. File store work: the lifespan runs it once on the
+    file store's threads, before the port binds, so a database unit that
+    checks a project's partition makes no file store call. A shared root
+    whose link changes while the server runs keeps its startup answer."""
+    configured = get_app_settings().storage.shared_root
+    resolved = Path(os.path.realpath(configured))
+    _RESOLVED_SHARED_ROOTS[configured] = resolved
+    return resolved
+
+
+def resolved_shared_root() -> Path:
+    """The shared root `resolve_shared_root` resolved at startup, as
+    `sits_in_another_partition` compares against it. Resolved here only when
+    the configured value changed since, as a test's does. A check over every
+    project reads it once and passes it in."""
+    resolved = _RESOLVED_SHARED_ROOTS.get(get_app_settings().storage.shared_root)
+    return resolved if resolved is not None else resolve_shared_root()
+
+
+def sits_in_another_partition(
+    path: str, *, partition: str | None, shared_root: Path | None = None
+) -> bool:
+    """Whether a project folder at `path` sits in a partition of the shared
+    root other than `partition`, the caller's (partition_of).
+
+    Rows are stored resolved (`_project_path`), so a project recorded while
+    the person's partition folder was a link to someone else's, which agent
+    code from before the code sandbox could leave, names that person's
+    folder, and still names it once the link is gone. No folder on that path
+    is a link any more, so a walk that refuses links can't tell it apart.
+    It compares against the shared root resolved at startup
+    (`resolved_shared_root`), or `shared_root` when a check over every
+    project passes it in, so it does no file store work and a database unit
+    may run it.
+    """
+    if partition is None:
+        return False
+    root_parts = (shared_root or resolved_shared_root()).parts
+    # The first folder below the shared root, compared by parts,
+    # case-sensitive: on POSIX paths the same answer as Path.relative_to,
+    # without its walk over every parent. A partition needs an org, so this
+    # runs only in MindsHub mode, never on the desktop.
+    parts = Path(path).parts
+    if len(parts) <= len(root_parts) or parts[: len(root_parts)] != root_parts:
+        return False
+    name = parts[len(root_parts)]
+    try:
+        is_partition = str(UUID(name)) == name
+    except ValueError:
+        return False
+    return is_partition and name != partition
+
+
 class ProjectService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
@@ -729,7 +796,7 @@ class ProjectService:
         (LOCAL_SCOPE) sees its directory under that partition's own root, not
         a folder somebody chose; reading it as one would list that person's
         artifacts in the operator view's list
-        (`artifact_roots._sources_outside_the_projects_root`).
+        (`artifact_roots._adopted_root`).
         """
         if (
             get_app_settings().tenancy_mode == "org"
@@ -750,42 +817,6 @@ class ProjectService:
         except (OSError, RuntimeError):
             return False
         return parent != root
-
-    @staticmethod
-    def resolved_shared_root() -> Path:
-        """The shared root as `sits_in_another_partition` compares against it.
-        A check over every project resolves it once and passes it in."""
-        return Path(os.path.realpath(get_app_settings().storage.shared_root))
-
-    def sits_in_another_partition(
-        self, project: Project, *, shared_root: Path | None = None
-    ) -> bool:
-        """Whether a person's project names a folder in another person's
-        partition in the shared root.
-
-        Rows are stored resolved (`_project_path`), so a project recorded while
-        the person's partition folder was a link to someone else's, which agent
-        code from before the code sandbox could leave, names that person's
-        folder, and still names it once the link is gone. No folder on that path
-        is a link any more, so a walk that refuses links can't tell it apart.
-        """
-        scope = self.session.scope
-        if not scope.partitioned_for(PersonalResource.PROJECTS) or scope.org_id is None:
-            return False
-        root_parts = (shared_root or self.resolved_shared_root()).parts
-        # The first folder below the shared root, compared by parts,
-        # case-sensitive: on POSIX paths the same answer as Path.relative_to,
-        # without its walk over every parent. A partition needs an org, so
-        # this runs only in MindsHub mode, never on the desktop.
-        parts = Path(project.path).parts
-        if len(parts) <= len(root_parts) or parts[: len(root_parts)] != root_parts:
-            return False
-        name = parts[len(root_parts)]
-        try:
-            is_partition = str(UUID(name)) == name
-        except ValueError:
-            return False
-        return is_partition and name != str(scope.org_id)
 
     def _within_root(self, path: Path) -> bool:
         try:

@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
-from cowork.common.paths import O_NOFOLLOW, dir_open, pinned_dir
+from cowork.common.paths import O_NOFOLLOW, O_NONBLOCK, dir_open, pinned_dir
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.shared_resource import SharedResourceAttribution
@@ -113,7 +113,7 @@ def project_root_source(project) -> ProjectArtifacts:
     Built directly rather than picked out of `artifacts_sources_for_project`,
     which also lists every legacy conversation root on the shared mount: a
     caller that already knows its base is the project root has nothing to
-    discover. It is the same shape `artifact_roots._sources_for` gives that
+    discover. It is the same shape `artifact_roots.project_roots` gives that
     root, so `is_project_root` holds for it.
     """
     return ProjectArtifacts(
@@ -294,7 +294,7 @@ def _resolve_in_root(
 
     if not _reads_recorded_owners(source):
         if source.project_id and getattr(source, "trusted_anchor", None) is None:
-            # Every org root built by `artifact_roots._sources_for` carries an
+            # Every org root built by `artifact_roots.project_roots` carries an
             # anchor; one without it resolves `unknown` for every artifact.
             logger.error(
                 "artifact_owner source without trusted_anchor project=%s base=%s",
@@ -371,11 +371,13 @@ def provenance_origin(folder: Path) -> UUID | None:
 
     The folder and its ``metadata.json`` are opened without following links,
     so a link planted on the shared mount cannot point the server at a file
-    outside the project. Never raises.
+    outside the project. ``metadata.json`` is opened ``O_NONBLOCK`` too, so a
+    FIFO in its place opens at once and reads as None, as any file that is
+    not a regular file does. Never raises.
     """
     try:
         with pinned_dir(folder, nofollow_base=True) as pinned:
-            fd = dir_open(pinned, "metadata.json", os.O_RDONLY | O_NOFOLLOW)
+            fd = dir_open(pinned, "metadata.json", os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
             try:
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
                     return None
@@ -429,9 +431,12 @@ def turn_created_slugs(
     try:
         expected = UUID(str(conversation_id))
         if after is None:
-            from cowork.services.task_objects import snapshot_artifact_slugs
+            from cowork.services.artifact_identity import artifact_folders_below
 
-            after = snapshot_artifact_slugs(base)
+            listing = artifact_folders_below(base=Path(base))
+            if listing.base_error is not None:
+                raise listing.base_error
+            after = listing.found
         appeared = set(after) - set(before_slugs or ())
         kept: set[str] = set()
         for slug in sorted(appeared):

@@ -433,6 +433,24 @@ def _turn_skill_service(
     return SkillService(scope, viewer=viewer, session=session)
 
 
+def has_always_on_rows(*, session: ScopedSession) -> bool:
+    """Whether any of the org's skill_access rows is always on: the database
+    half of has_always_on_skills, which reads no SKILL.md and lists no store.
+    No turn has an always-on skill when it is False. Never outside MindsHub
+    mode.
+
+    It reads the rows as they stand, without the backfill that gives each
+    skill from before sharing its row (backfill_legacy_access). That backfill
+    lists the store on the file store, and every row it writes is shared with
+    everyone and never always on, so it can't change this answer;
+    has_always_on_skills runs it once this read finds an always-on row."""
+    if not sharing_applies(session.scope):
+        return False
+    from cowork.services.skill_access import access_rows
+
+    return any(row.always_on for row in access_rows(session).values())
+
+
 def has_always_on_skills(
     scope: TenantScope | None,
     *,

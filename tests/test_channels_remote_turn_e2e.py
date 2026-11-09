@@ -114,7 +114,7 @@ def test_slack_message_gets_a_reply_via_the_remote_worker(monkeypatch, org_mode_
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._persist_turn_memory",
-        staticmethod(lambda session, conv_id, entries: None),
+        staticmethod(lambda session, conv_id, entries, principal: None),
     )
 
     async def fake_replies(**kwargs):
@@ -207,7 +207,7 @@ def test_a_remote_turn_failure_delivers_an_error_message_not_silence(monkeypatch
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._persist_turn_memory",
-        staticmethod(lambda session, conv_id, entries: None),
+        staticmethod(lambda session, conv_id, entries, principal: None),
     )
 
     async def fake_replies(**kwargs):
@@ -410,4 +410,108 @@ def test_a_remote_allowance_stop_posts_the_allowance_message_not_out_of_credits(
         finally:
             session.close()
         _delete_channel_events("slack:event:Ev-remote-billing-1")
+        _delete_binding_and_its_rows("slack", "D1", ORG_A)
+
+
+def test_a_turn_sends_only_its_own_artifacts_from_the_shared_project_base(monkeypatch, org_mode_remote_backend):
+    """In org mode the pod writes into the project-level artifacts base, which
+    every conversation of the project shares. The turn sends the file of the
+    artifact it made, and not the one another conversation made in the same
+    project while it ran."""
+    import shutil
+    from uuid import uuid4
+
+    from cowork.channels.plugins.slack import SlackBridge
+    from cowork.handlers.responses import ResponsesHandler
+    from test_artifact_ownership import write_artifact
+
+    monkeypatch.setattr(
+        ResponsesHandler, "_stage_remote_workspace_files", staticmethod(lambda session, conv_id: None),
+    )
+    monkeypatch.setattr(ResponsesHandler, "_remote_seed_history", staticmethod(lambda session, conv_id: ([], None)))
+    monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(lambda session, conv_id: None))
+    real_context = ResponsesHandler._remote_artifacts_context
+    contexts: list = []
+
+    def context(session, conv_id):
+        found = real_context(session, conv_id)
+        contexts.append(found)
+        return found
+
+    monkeypatch.setattr(ResponsesHandler, "_remote_artifacts_context", staticmethod(context))
+    folders: list = []
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        base = contexts[0].base
+        folders.append(write_artifact(base, f"chart-this-turn-{uuid4().hex[:6]}", conversation=kwargs["conversation_id"]))
+        theirs = write_artifact(base, f"chart-another-chat-{uuid4().hex[:6]}", conversation=uuid4())
+        (theirs / "index.html").write_text("<html>another chat's chart</html>")
+        folders.append(theirs)
+        yield "turn_delta", {"text": "here is your chart"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    sent: list[tuple] = []
+
+    async def send_attachment(self, *, address, data, filename):
+        sent.append((address.platform_id, data, filename))
+        return "F1"
+
+    monkeypatch.setattr(SlackBridge, "send_attachment", send_attachment)
+    posted: list = []
+    real_post = httpx.AsyncClient.post
+
+    async def fake_post(self, url, json=None, **kw):
+        if not str(url).startswith("https://slack.com/api"):
+            return await real_post(self, url, json=json, **kw)
+        posted.append((str(url).rsplit("/", 1)[-1], json))
+
+        class R:
+            def json(self):
+                return {"ok": True, "ts": "1700000004.000000"}
+        return R()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    from cowork.server import create_app
+    app = create_app()
+    adapters = app.state.channel_adapters
+
+    session = get_open_session()
+    try:
+        svc = ChannelConfigService(ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A)))
+        svc.set_config("slack", {"bot_token": "xoxb-org-a-artifacts", "signing_secret": SIGNING_SECRET})
+        svc.set_external_account_id("slack", "T-ORG-A-ARTIFACTS")
+    finally:
+        session.close()
+
+    try:
+        async def flow():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                assert await adapters.get_or_refresh("slack", ORG_A) is not None
+                body = _slack_event_body("T-ORG-A-ARTIFACTS", "Ev-remote-artifacts-1")
+                r = await client.post(
+                    "/api/v1/channels/slack/events", content=body,
+                    headers=_signed_slack_headers(body, SIGNING_SECRET),
+                )
+                assert r.status_code == 200
+                await drain_background_tasks()
+
+        asyncio.run(flow())
+
+        assert [m for m, _payload in posted] == ["chat.postMessage"]
+        assert sent == [("D1", b"<html></html>", "index.html")]
+        assert len(folders) == 2
+    finally:
+        for folder in folders:
+            shutil.rmtree(folder, ignore_errors=True)
+        session = get_open_session()
+        try:
+            ChannelConfigService(ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A))).delete_config("slack")
+        finally:
+            session.close()
+        _delete_channel_events("slack:event:Ev-remote-artifacts-1")
         _delete_binding_and_its_rows("slack", "D1", ORG_A)

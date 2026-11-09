@@ -1495,5 +1495,41 @@ async def test_a_reader_ends_a_quiet_stream_once_its_runs_claim_lapses(redis, mo
     assert [r.type for r in records][-1] == "Interrupted"
 
 
+async def test_a_reader_whose_turn_finishes_at_its_idle_check_yields_the_turns_last_frames(
+    redis, monkeypatch,
+):
+    """The turn writes its last frame and its terminal record, then releases
+    its claim, between a reader's empty read and that reader's claim check.
+    The reader yields every record after the last one it read, not only the
+    terminal record, so the answer's last frame still reaches the user."""
+    monkeypatch.setattr(buffer_mod, "REDIS_TAIL_IDLE_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(RedisStreamBuffer, "_BLOCK_MS", 20)
+    writer = RedisStreamBuffer(conversation_id="c", turn_id=1)
+    await writer.append("sse", {"sse": "partial"})
+    real_xread = buffer_mod.xread_blocking
+    reads = 0
+
+    async def xread_that_ran_out_as_the_turn_finished(**kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            await writer.append("sse", COMPLETED)
+            await writer.close("completed")
+            return []
+        return await real_xread(**kwargs)
+
+    monkeypatch.setattr(buffer_mod, "xread_blocking", xread_that_ran_out_as_the_turn_finished)
+
+    records = await asyncio.wait_for(
+        _drain(RedisStreamBuffer(conversation_id="c", turn_id=1).tail(from_seq=0)), timeout=2,
+    )
+
+    assert [(r.type, r.data) for r in records] == [
+        ("sse", {"sse": "partial"}), ("sse", COMPLETED), ("Done", {"reason": "completed"}),
+    ]
+    entries = await redis.xrange(stream_key("c", 1))
+    assert [fields["type"] for _id, fields in entries] == ["sse", "sse", "Done"]
+
+
 async def _drain(records):
     return [record async for record in records]

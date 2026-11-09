@@ -25,6 +25,7 @@ from cowork.db.scoped import LOCAL_SCOPE
 from cowork.db.units import DatabaseBusy, run_db
 from cowork.server import create_app
 from cowork.services.conversations import ConversationService
+from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.streaming import registry
 
 from _fakes import PausedHarness
@@ -49,9 +50,10 @@ class _Measured:
     live_answers: int
 
 
-async def _ask_while_others_are_served() -> _Measured:
+async def _ask_while_others_are_served(*, project_id: str | None = None) -> _Measured:
     """POST a question while a heartbeat ticks every 10 ms and
-    /api/v1/health/live is asked every 50 ms."""
+    /api/v1/health/live is asked every 50 ms. ``project_id`` names the new
+    conversation's project."""
     ticks = 0
     live_answers = 0
 
@@ -77,7 +79,7 @@ async def _ask_while_others_are_served() -> _Measured:
         started = loop.time()
         try:
             response = await asyncio.wait_for(
-                client.post("/api/v1/responses/", json={"input": "hi", "stream": True}),
+                client.post("/api/v1/responses/", json={"input": "hi", "stream": True, "project_id": project_id}),
                 timeout=WAIT * 5,
             )
             elapsed = loop.time() - started
@@ -147,7 +149,10 @@ async def test_a_question_that_finds_every_unit_slot_taken_is_refused_while_the_
 ):
     """Units queue for a slot, one per connection the pool can lend (one on
     SQLite), before they ask the pool. That wait is bounded by POOL_TIMEOUT
-    too, and ends in the same refusal."""
+    too, and ends in the same refusal. The question names its project by id,
+    so its first unit is a database unit: one that names none may start in
+    the general project and reads on the file store's threads, which on
+    SQLite take no unit slot."""
     monkeypatch.setattr(db_session.settings.database, "pool_timeout", WAIT)
     entered = threading.Event()
     release = threading.Event()
@@ -160,7 +165,7 @@ async def test_a_question_that_finds_every_unit_slot_taken_is_refused_while_the_
     try:
         while not entered.is_set():
             await asyncio.sleep(0.01)
-        measured = await _ask_while_others_are_served()
+        measured = await _ask_while_others_are_served(project_id=str(GENERAL_PROJECT_ID))
     finally:
         release.set()
         await holder

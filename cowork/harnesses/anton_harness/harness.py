@@ -30,7 +30,7 @@ from cowork.common.settings.user_settings import current_settings_scope, effecti
 from cowork.deployment_identity import identity_for_turn, learned_memory_scope
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
-from cowork.db.units import run_db, run_to_completion, unit_session
+from cowork.db.units import run_db, run_efs, run_on_unit_threads, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
 from cowork.harnesses.memory.policy import memory_policy
@@ -963,7 +963,9 @@ class AntonHarness:
         artifacts_base = project_path / ".anton" / "artifacts"
         # Names AND content mtimes: a name diff only reveals artifacts the turn
         # CREATED, and the reconciler must also see the ones it EDITED.
-        before_slugs, before_mtimes = snapshot_artifact_state(artifacts_base)
+        before_slugs, before_mtimes = await run_efs(
+            partial(snapshot_artifact_state, artifacts_base), scope=_units_scope(), deadline=False
+        )
         # Capture ids while the conversation is unambiguously attached — the
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
@@ -1029,14 +1031,18 @@ class AntonHarness:
             try:
                 # It waits on each touched artifact's lock and parses its
                 # journal, so it runs off the event loop the server shares.
-                changes = await asyncio.to_thread(
-                    turn_artifact_changes,
-                    conversation_id=conv_id,
-                    artifacts_base=artifacts_base,
-                    before=before_slugs,
-                    before_mtimes=before_mtimes,
-                    tracked_new=getattr(session, "artifacts_touched", None),
-                    tracked_edits=getattr(session, "artifacts_touched", None),
+                changes = await run_efs(
+                    partial(
+                        turn_artifact_changes,
+                        conversation_id=conv_id,
+                        artifacts_base=artifacts_base,
+                        before=before_slugs,
+                        before_mtimes=before_mtimes,
+                        tracked_new=getattr(session, "artifacts_touched", None),
+                        tracked_edits=getattr(session, "artifacts_touched", None),
+                    ),
+                    scope=_units_scope(),
+                    deadline=False,
                 )
                 new_slugs, touched_slugs, turn_scope = changes.created, changes.touched, _units_scope()
                 if new_slugs:
@@ -1047,6 +1053,7 @@ class AntonHarness:
                             project_id=conv_project_id,
                             slugs=new_slugs,
                             creator=getattr(conversation, "created_by", None),
+                            artifact_ids=changes.created_ids,
                         ),
                         scope=turn_scope,
                     )
@@ -1488,7 +1495,7 @@ class AntonHarness:
         # turn's scratch folder below).
         anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
 
-        user = get_user_settings()
+        user = await run_on_unit_threads(get_user_settings)
         _overlay_user_settings(anton_settings, user)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)

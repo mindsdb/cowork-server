@@ -566,8 +566,10 @@ class ConversationService:
         the ids.
 
         Same rule as `_owned`, batched. The artifact roots resolver reads it
-        once per request, before it walks any project's workspaces, so a
-        listing over every project runs one query, not one per project.
+        once per request, before it walks the file store, so a listing over
+        every project runs one query, not one per project. The query can name
+        neither the directories it will find nor their project: a task moved
+        to another project keeps its workspace directory under the old one.
         """
         stmt = self.session.select(Conversation).with_only_columns(Conversation.id)
         if self.session.scope.org_mode:
@@ -691,13 +693,18 @@ class ConversationService:
                 return archived
         return []
 
-    def delete_conversation(self, conversation_id: UUID) -> bool:
+    def delete_conversation(self, conversation_id: UUID, *, cleanup_project_files: bool = True) -> bool:
         """Owner-scoped delete for the request path: a member can only delete
-        their own conversation."""
+        their own conversation.
+
+        ``cleanup_project_files=False`` deletes the rows and the attachments'
+        files but leaves the conversation's folders in its project alone, for
+        a caller that knows none were made and runs off the file store's
+        threads, such as the scheduler's discard of a run that never started."""
         conversation = self._owned(conversation_id)
         if conversation is None:
             return False
-        return self._delete_conversation(conversation)
+        return self._delete_conversation(conversation, cleanup_project_files=cleanup_project_files)
 
     def stage_delete_conversation_row(
         self,
@@ -804,7 +811,7 @@ class ConversationService:
                 stage.conversation_id,
             )
 
-    def _delete_conversation(self, conversation: Conversation) -> bool:
+    def _delete_conversation(self, conversation: Conversation, *, cleanup_project_files: bool = True) -> bool:
         try:
             # A direct delete is the actor's own: never reach past their file
             # rows into a peer's attachment on the same conversation.
@@ -816,7 +823,7 @@ class ConversationService:
         except Exception:
             self.session.rollback()
             raise
-        self.finalize_staged_conversation_delete(stage)
+        self.finalize_staged_conversation_delete(stage, cleanup_project_files=cleanup_project_files)
         return True
 
     def delete_turn(self, conversation_id: UUID, message_id: UUID) -> int:

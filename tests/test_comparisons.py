@@ -1803,7 +1803,9 @@ def test_autopublish_skips_a_side(tmp_path, monkeypatch):
 
     monkeypatch.setattr(artifact_autopublish, "_is_enabled", lambda scope: True)
     candidates = []
-    monkeypatch.setattr(artifact_autopublish, "_candidate_slugs", lambda base: candidates.append(base) or [])
+    monkeypatch.setattr(
+        artifact_autopublish, "_candidate_slugs", lambda *, artifacts_base: candidates.append(artifacts_base) or [],
+    )
     scope = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
 
     side_base = tmp_path / f"{COMPARISON_SANDBOX_PREFIX}abc" / ".anton" / "artifacts"
@@ -2239,3 +2241,44 @@ def test_continue_releases_the_sandboxs_runtime_only_with_the_sandbox(client, mo
     finally:
         scratchpad_runtime._pads.clear()
         artifacts._LAUNCHED_BACKENDS.clear()
+
+
+_ORG_MEMBER = {"X-User-Id": "6e7d2a1f-3c8b-4d4e-9f0a-1b2c3d4e5f61", "X-Organization-Id": "5d6c1f0e-2b7a-4c3d-8e9f-0a1b2c3d4e50"}
+
+
+def test_an_org_members_comparison_works_on_the_file_store_off_the_default_threads(org_deployment):
+    """Create copies the source project into each side's sandbox, continue
+    moves a side's work into a project, and delete removes the sandboxes:
+    file store work, which in org tenancy the blocking guard fails when it
+    runs on anyio's default threads. Each runs as a unit on the file store's
+    threads (run_efs_unit)."""
+    from cowork.server import create_app
+
+    client = TestClient(create_app())
+    source = client.post("/api/v1/projects/", json={"name": f"org-source-{uuid4().hex[:8]}"}, headers=_ORG_MEMBER)
+    assert source.status_code == 201, source.text
+    target = client.post("/api/v1/projects/", json={"name": f"org-target-{uuid4().hex[:8]}"}, headers=_ORG_MEMBER)
+    assert target.status_code == 201, target.text
+
+    created = client.post(
+        "/api/v1/comparisons/",
+        json={
+            "title": "Org comparison",
+            "sides": [{"model": "kimi", "reasoningEffort": None}, {"model": "qwen", "reasoningEffort": None}],
+            "sourceProjectId": source.json()["id"],
+        },
+        headers=_ORG_MEMBER,
+    )
+    assert created.status_code == 201, created.text
+    comparison = created.json()
+
+    continued = client.post(
+        f"/api/v1/comparisons/{comparison['id']}/sides/a/continue",
+        json={"projectId": target.json()["id"]},
+        headers=_ORG_MEMBER,
+    )
+    assert continued.status_code == 200, continued.text
+
+    deleted = client.delete(f"/api/v1/comparisons/{comparison['id']}", headers=_ORG_MEMBER)
+    assert deleted.status_code == 204, deleted.text
+    assert client.get(f"/api/v1/comparisons/{comparison['id']}", headers=_ORG_MEMBER).status_code == 404

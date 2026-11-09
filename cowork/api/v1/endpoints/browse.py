@@ -27,6 +27,7 @@ other routes answer 409, as the web does without a router.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Annotated, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -35,6 +36,7 @@ from pydantic import BaseModel, Field
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.units import run_on_unit_threads
 from cowork.principal import mindshub_credential
 from cowork.services import browser as browser_service
 from cowork.services.browser_contract import SESSION_ID
@@ -70,7 +72,7 @@ def _raise(exc: browser_service.BrowserServiceError) -> NoReturn:
 async def browse_status(request: Request, scope: ScopeDep) -> browser_service.BrowseStatus:
     try:
         return await browser_service.browse_status(
-            get_user_settings(scope), bearer=mindshub_credential(request),
+            await run_on_unit_threads(partial(get_user_settings, scope)), bearer=mindshub_credential(request),
             org_id=scope.org_id or "", user_id=scope.user_id or "",
         )
     except browser_service.BrowserServiceError as exc:
@@ -84,7 +86,7 @@ async def browse_status(request: Request, scope: ScopeDep) -> browser_service.Br
 async def browse_provision(
     request: Request, scope: ScopeDep, body: ProvisionRequest | None = None,
 ) -> browser_service.BrowseStatus:
-    user = get_user_settings(scope)
+    user = await run_on_unit_threads(partial(get_user_settings, scope))
     body = body or ProvisionRequest()
     prefs = browser_service.router_prefs(timezone=body.timezone, locale=body.locale)
     try:

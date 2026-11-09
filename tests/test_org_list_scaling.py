@@ -359,13 +359,13 @@ def test_the_artifact_list_never_stats_a_co_members_workspace(
     real_is_dir = artifact_roots._is_real_directory
     real_safe = artifact_roots._storage_components_are_safe
 
-    def is_dir(path):
+    def is_dir(path, *, strict=False):
         touched.append(Path(path))
-        return real_is_dir(path)
+        return real_is_dir(path, strict=strict)
 
-    def safe(workspace, *, may_be_absent):
+    def safe(workspace, *, may_be_absent, strict=False):
         touched.append(Path(workspace))
-        return real_safe(workspace, may_be_absent=may_be_absent)
+        return real_safe(workspace, may_be_absent=may_be_absent, strict=strict)
 
     monkeypatch.setattr(artifact_roots, "_is_real_directory", is_dir)
     monkeypatch.setattr(artifact_roots, "_storage_components_are_safe", safe)
