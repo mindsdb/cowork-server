@@ -214,9 +214,22 @@ class CustomConnectorUpdate(BaseModel):
     spec: dict[str, Any] | None = None
 
 
+class ConnectorCheck(BaseModel):
+    """How a custom connector tests its credentials: a GET of ``path`` on the address the member types.
+
+    ``headers`` maps a header name to its value, where ``{field}`` stands for
+    that field's value. There is no host: the member supplies it.
+    """
+
+    path: str
+    headers: dict[str, str]
+
+
 class ConnectorSpecResponse(ConnectorMetadataResponse):
     keywords: list[str] = []
     form: ConnectorForm
+    # Custom connectors only; None for every built-in and for a template saved without one.
+    check: ConnectorCheck | None = None
     # Agent-facing notes on using this connector's API once connected: traps,
     # efficient endpoints, auth quirks. The chat agent sees them only when a
     # connection of this engine exists; the credential prober sees them while

@@ -24,7 +24,13 @@
             "required": false,
             "placeholder": "eu"
           }
-        ]
+        ],
+        "check": {
+          "path": "/v2/me",
+          "headers": {
+            "Authorization": "Bearer {api_key}"
+          }
+        }
       }
     ]
   }
