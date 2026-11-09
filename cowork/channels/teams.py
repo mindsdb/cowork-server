@@ -185,11 +185,18 @@ async def _call_teams(bot: TeamsBot, what: str, call):
     try:
         return await call(await bot.client())
     except TeamsAuthError as error:
-        logger.warning("Teams %s: Microsoft refused the bot's credentials: %s", what, error)
+        # The log keeps fields, never message values; the code (e.g.
+        # invalid_client) says what to fix without Microsoft's full text.
+        logger.warning(
+            "Microsoft refused the Teams bot's credentials",
+            extra={"event": "teams_call_failed", "operation": what, "reason": str(error).split(":")[0]},
+        )
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Microsoft refused the bot's credentials") from None
     except Exception as error:
         # Only the type: an error from the Teams service can echo the request.
-        logger.warning("Teams %s failed: %s", what, type(error).__name__)
+        logger.warning(
+            "Teams call failed", extra={"event": "teams_call_failed", "operation": what, "error_type": type(error).__name__}
+        )
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Teams {what} failed") from None
 
 
@@ -241,7 +248,7 @@ def install_teams_routes(app: FastAPI, exempt_paths: set[str], settings: TeamsSe
     ):
         return False
     if missing:
-        logger.warning("Teams is off: %s not set", ", ".join(missing))
+        logger.warning("Teams is off: settings missing", extra={"event": "teams_off", "reason": ", ".join(missing) + " not set"})
         return False
     if not teams_available():
         logger.warning("Teams is off: the Teams packages are installed only on Linux")
@@ -249,7 +256,7 @@ def install_teams_routes(app: FastAPI, exempt_paths: set[str], settings: TeamsSe
     app.state.teams_bot = TeamsBot(settings)
     app.include_router(router, prefix=ROUTE_PREFIX, tags=["channels"])
     exempt_paths.update(f"{ROUTE_PREFIX}{route.path}" for route in router.routes)
-    logger.info("Teams bot routes on (App ID %s)", settings.bot_app_id)
+    logger.info("Teams bot routes on", extra={"event": "teams_routes_on"})
     return True
 
 
