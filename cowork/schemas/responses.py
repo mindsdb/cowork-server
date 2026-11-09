@@ -220,9 +220,9 @@ class ResponsesRequest(BaseModel):
         ),
     )
 
-    # One task's opt-out of the shared browser (ENG-3188): the composer's
-    # Browser switch. "off" runs this turn as browser_enabled=false does: no
-    # browser tool and no early start of the user's browser.
+    # One task's opt-out of the agent's browser: the composer's Browser
+    # switch. "off" runs this turn as browser_enabled=false does: no browser
+    # tool, and on the web no scope call that would start the browser.
     browser: Literal["on", "off"] = Field(
         default="on",
         description=(

@@ -1,4 +1,5 @@
 import ipaddress
+from collections.abc import Mapping
 from contextlib import ExitStack
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -32,6 +33,7 @@ from cowork.services.shared_resources import (
     PROJECT_MEMORY,
     SKILL,
     SKILL_PROJECT_REFERENCES,
+    AttributionSnapshot,
     ResourceDeletion,
     SharedResourceAccess,
     project_memory_resource_key,
@@ -209,24 +211,40 @@ def _guard_project_memory_for_move(
         )
 
 
-def _project_response(project: Project, access: SharedResourceAccess) -> dict:
+def _project_response(
+    project: Project,
+    access: SharedResourceAccess,
+    *,
+    snapshots: Mapping[str, AttributionSnapshot] | None = None,
+) -> dict:
+    """One project as the API returns it.
+
+    ``snapshots`` is every project attribution row, as a listing reads them
+    once (SharedResourceAccess.snapshots); without it, this reads the one row.
+    """
     key = project_resource_key(project.id)
-    if access.org_mode and access.has_trusted_actor:
+    snapshot = access.listed_snapshot(PROJECT, key, snapshots)
+    if (
+        access.org_mode
+        and access.has_trusted_actor
+        and snapshot is not None
+        and snapshot.may_be_recoverable()
+    ):
         access.recover_stale_claim(
             PROJECT,
             key,
             resource_exists=lambda: access.session.get(Project, project.id) is not None,
         )
-    pending = access.claim_is_pending(PROJECT, key)
+        snapshot = access.snapshot(PROJECT, key)
+    pending = snapshot is not None and snapshot.pending
     creator_id = project.created_by
     is_general = project.name == GENERAL_PROJECT
     can_change = not pending and not is_general and access.can_change(creator_id)
     directory_is_external = ProjectService(access.session).directory_is_external(project)
     return {
         **project.model_dump(),
-        "attribution": access.attribution(
-            PROJECT,
-            key,
+        "attribution": access.attribution_of(
+            snapshot,
             fallback_creator_id=project.created_by,
             fallback_modified_at=project.modified_at,
         ),
@@ -251,7 +269,14 @@ def list_projects(
     # the first listing (no-op in local mode / once claimed).
     service.ensure_general_for_scope()
     access = SharedResourceAccess(session, principal)
-    owned = [_project_response(project, access) for project in service.list_visible_projects()]
+    projects = service.list_visible_projects()
+    # Read after the projects: create_project commits its claim
+    # (SharedResourceAccess.reserve_claim) before ProjectService.create_project
+    # commits the project row, so every listed project's claim is in this read.
+    snapshots = access.snapshots(PROJECT)
+    owned = [
+        _project_response(project, access, snapshots=snapshots) for project in projects
+    ]
     return [*owned, *SharedProjectFiles(session).list_projects()]
 
 

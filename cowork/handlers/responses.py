@@ -63,9 +63,10 @@ from cowork.streaming import StreamBuffer, TurnLifecycle, new_buffer, registry, 
 from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.liveness import ModelWaitTicker
 from cowork.streaming.records import TerminalReason
-from cowork.streaming.registry import RunHandle, RunIdentity
+from cowork.streaming.registry import RunHandle, RunIdentity, mark_question_saved
 from cowork.turnqueue.producer import RemoteWorkspace, step_stream_events, stream_remote_replies
 from cowork.turnqueue.redis_client import (
+    DISCARDED_CANCEL_REASON,
     STALLED_CANCEL_REASON,
     cancel_cause_key,
     cancel_flag_key,
@@ -251,16 +252,19 @@ async def _remote_cancel_confirmed(error: str | None, correlation_id: str) -> bo
         return False
 
 
-async def _remote_cancel_stalled(correlation_id: str) -> bool:
-    """Whether a confirmed remote cancel was the UI giving up on a stall.
+async def _remote_cancel_cause(correlation_id: str) -> str | None:
+    """Why a confirmed remote cancel was asked for: ``STALLED_CANCEL_REASON``
+    when the UI gave up on a stall, ``DISCARDED_CANCEL_REASON`` when another
+    replica deleted the conversation, else None (a Stop).
 
     A ``/cancel`` that lands on a replica which does not own the turn can only
     leave Redis keys behind, and scratchpad-controller's ``_clear_cancel`` may
     already have deleted the flag when this replica hears of the cancel. The
-    cause key outlives it, so it is what tells a stall from a Stop here.
+    cause key outlives it, so it is what tells a stall or a delete from a Stop
+    here.
     """
     try:
-        return await get_redis().get(cancel_cause_key(correlation_id)) == STALLED_CANCEL_REASON
+        return await get_redis().get(cancel_cause_key(correlation_id))
     except Exception:
         # Read as a Stop, the outcome of any cancel with no cause: reading it
         # as a stall would put a failure row under a real Stop, the more
@@ -270,7 +274,7 @@ async def _remote_cancel_stalled(correlation_id: str) -> bool:
             "[responses] could not read the cancel cause for correlation_id=%s; "
             "saving the turn as a Stop", correlation_id,
         )
-        return False
+        return None
 
 
 async def _seal_unterminated_buffer(
@@ -842,7 +846,7 @@ class ResponsesHandler:
         # copy with memory off, so AntonHarness._build_chat_session gives it
         # two empty tiers in its scratch folder and no background passes.
         # A task with its browser switched off gets a copy with it off, so the
-        # turn neither offers anton the browser nor starts it early.
+        # turn neither offers anton the browser nor scopes the router for it.
         off: dict = {}
         if request.memory == "off":
             off["memory_enabled"] = False
@@ -1718,7 +1722,7 @@ class ResponsesHandler:
                     partial(save_turn, events=saved_events), scope=scope_from_principal(self.principal),
                 )
             if saved is not None:
-                lifecycle.saved_question = True
+                await mark_question_saved(lifecycle=lifecycle, conversation_id=str(conv_id))
             if saved is None or lifecycle.discarded:
                 # Deleted while it saved: its buffer is gone, and writing a
                 # terminal record would recreate it for the next turn to tail.
@@ -1869,7 +1873,7 @@ class ResponsesHandler:
             if started is None:
                 return None
             question_id = started.question_id
-            lifecycle.saved_question = True
+            await mark_question_saved(lifecycle=lifecycle, conversation_id=str(conv_id))
             return question_id
 
         async def persist(events: list[dict]) -> _SavedAnswer:
@@ -2847,7 +2851,7 @@ class ResponsesHandler:
                     scope=scope,
                 )
             if question_id is not None:
-                lifecycle.saved_question = True
+                await mark_question_saved(lifecycle=lifecycle, conversation_id=str(conv_id))
 
         async def replies_as_stream_events():
             nonlocal turn_artifacts
@@ -2968,8 +2972,13 @@ class ResponsesHandler:
                     break
                 elif kind == "turn_failed":
                     if await _remote_cancel_confirmed(data.get("error"), corr):
-                        if await _remote_cancel_stalled(corr):
+                        cause = await _remote_cancel_cause(corr)
+                        if cause == STALLED_CANCEL_REASON:
                             lifecycle.stalled = True
+                        elif cause == DISCARDED_CANCEL_REASON:
+                            # Another replica deleted the conversation: the
+                            # discarded branch below saves nothing.
+                            lifecycle.note_discarded_elsewhere()
                         # A /cancel that reached a replica which doesn't
                         # own the producer sets the Redis flag only, so
                         # the controller is what discards the pod and it
@@ -3331,7 +3340,7 @@ class ResponsesHandler:
             if started is None:
                 return None
             question_id = started.question_id
-            lifecycle.saved_question = True
+            await mark_question_saved(lifecycle=lifecycle, conversation_id=str(conv_id))
             return started.conversation
 
         try:

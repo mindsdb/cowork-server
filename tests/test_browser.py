@@ -1,407 +1,923 @@
-"""The user's MindsHub browser (ENG-3298): provisioning and status as the
-caller, the viewer embed URL, the per-turn block anton reads, and the
-`response.browser_session_opened` event on both the desktop and web paths."""
+"""The agent's browser: the browser router on the web, the desktop app's own
+browser on the desktop, the /browse routes on both, each turn's browser, and
+the `response.browser_session_opened` event on both turn paths."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
 import json
+import logging
+import re
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Literal, NamedTuple
 
 import httpx
 import pytest
+from anton.core.browser.config import BrowserConfig
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
 
 from cowork.api.v1.router import api_router
-from cowork.principal import HEADER_HUB_CREDENTIAL, get_principal
+from cowork.common.settings import runtime_credential
+from cowork.common.settings.runtime_credential import LocalBrowserHost
+from cowork.principal import Principal, get_principal
 from cowork.services import browser as svc
+from cowork.services.browser_contract import SESSION_ID
 
-ENDPOINT = "https://br-ab12cd34.4nton.ai"
+ROUTER = "https://app.example.test/browser"
+SCOPE_KEY = "scope-key-" + "s" * 32
+ORG = "org-1"
+APP_BROWSER = LocalBrowserHost(url="http://127.0.0.1:51234", token=SecretStr("k" * 43))
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+# ── fixture files ──────────────────────────────────────────────────────────
+
+
+class _Example(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    where: str
+    kind: Literal["request", "response", "event", "turn_block", "constructor", "classification"]
+    status: int | None = None
+    refused: bool = False
+    body: Any
+
+
+class _FixtureFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    description: str
+    limits: dict[str, int] = {}
+    examples: dict[str, _Example]
+
+
+def _fixture(folder: str, name: str) -> _FixtureFile:
+    return _FixtureFile.model_validate_json((FIXTURES / folder / name).read_text())
+
+
+# ── fakes ──────────────────────────────────────────────────────────────────
+
+
+class Call(NamedTuple):
+    method: str
+    url: str
+    body: Any
+    auth: str
+    scope_key: str = ""
+
+
+def _embed_answer(session_id: str, *, view_url: str | None = None) -> dict:
+    return {
+        "session_id": session_id,
+        "view_url": view_url or f"{ROUTER}/sessions/{session_id}/view?et=tok",
+        "ticket_expires_at": 1999999120,
+        "lease_expires_at": 1999999900,
+    }
+
+
+def _route_router(monkeypatch, handler) -> list[Call]:
+    """Send every browser call this server makes to ``handler``, recording each."""
+    calls: list[Call] = []
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        calls.append(Call(
+            request.method, str(request.url), body, request.headers.get("authorization", ""),
+            request.headers.get("x-browser-scope-key", ""),
+        ))
+        return handler(request, body)
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(svc.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(recording), **kw))
+    return calls
+
+
+@pytest.fixture
+def nothing_goes_out(monkeypatch):
+    """Any call to the router, or any MindsHub read, fails the test."""
+    from cowork.services import mindshub_teams
+
+    def refuse(request, body):
+        raise AssertionError(f"called out: {request.method} {request.url}")
+
+    async def no_mindshub(path, bearer):
+        raise AssertionError(f"asked MindsHub: {path}")
+
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", no_mindshub)
+    return _route_router(monkeypatch, refuse)
+
+
+@pytest.fixture
+def scope_key_file(tmp_path):
+    """The router's scope key, mounted as the chart mounts it."""
+    path = tmp_path / "scope_key"
+    path.write_text(SCOPE_KEY + "\n")
+    return path
+
+
+@pytest.fixture
+def web(monkeypatch, scope_key_file):
+    """The web app: org tenancy, with the browser router configured."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", ROUTER + "/")
+    monkeypatch.setenv("COWORK_BROWSER_SCOPE_KEY_FILE", str(scope_key_file))
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def router(monkeypatch, web):
+    """A fake router at ROUTER. ``state.answers`` overrides a path's answer."""
+    state = SimpleNamespace(status="none", answers={})
+
+    def handler(request: httpx.Request, body: Any) -> httpx.Response:
+        path = request.url.path
+        if path in state.answers:
+            return state.answers[path]
+        if path == "/browser/_status":
+            return httpx.Response(200, json={"status": state.status})
+        if path == "/browser/_warm":
+            state.status = "starting"
+            return httpx.Response(200, json={"status": "starting"})
+        if path == "/browser/_embed":
+            return httpx.Response(200, json=_embed_answer(body["session_id"]))
+        if path == "/browser/_scope":
+            return httpx.Response(200, json=body)
+        if path.startswith("/browser/sessions/") and path.endswith("/approve"):
+            return httpx.Response(200, json={**body, "approved": True, "expires_at": 1999999300})
+        if path.startswith("/browser/sessions/") and path.endswith("/decline"):
+            return httpx.Response(200, json={"declined": True})
+        if path == "/browser/logins" and request.method == "DELETE":
+            return httpx.Response(200, json={"cleared": True})
+        return httpx.Response(404, json={"error": "not_found", "message": "Not found."})
+
+    state.calls = _route_router(monkeypatch, handler)
+    return state
+
+
+def _entitlements(enabled: bool, *, block: bool = True, reason: str = "not_permitted") -> dict:
+    answer: dict[str, Any] = {"permissions": ["browser.use"] if enabled else []}
+    if block:
+        answer["browser"] = {
+            "enabled": enabled, "daily_bytes": 1073741824,
+            "disabled_reason": None if enabled else reason,
+        }
+    return answer
 
 
 @pytest.fixture
 def mindshub(monkeypatch):
-    """Fake MindsHub: the /instance lambda and the browser worker's /_embed."""
-    calls: list[tuple[str, str, dict | None, str]] = []
-    state = {"provisioned": False, "status": "running"}
+    """MindsHub's entitlements answer, per credential. ``replies`` overrides one."""
+    from cowork.services import mindshub_teams
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content) if request.content else None
-        calls.append((request.method, str(request.url), body, request.headers.get("authorization", "")))
-        if request.url.path == "/instance" and request.method == "GET":
-            if not state["provisioned"]:
-                return httpx.Response(200, json={"status": "none", "provisioned": False})
-            return httpx.Response(200, json={"status": state["status"], "provisioned": True, "endpoint": ENDPOINT})
-        if request.url.path == "/instance" and request.method == "POST":
-            state["provisioned"] = True
-            return httpx.Response(200, json={"status": "provisioning", "endpoint": ENDPOINT})
-        if request.url.path == "/_embed":
-            return httpx.Response(200, json={"view_url": f"{ENDPOINT}/sessions/{body['session_id']}/view?et=tok", "expires_at": 1999999999})
-        return httpx.Response(404)
+    state = SimpleNamespace(asked=[], replies={})
 
-    real = httpx.AsyncClient
-    monkeypatch.setattr(svc.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
-    monkeypatch.setattr(svc, "instance_api_base", lambda: "https://api.dev.mindshub.ai")
-    return SimpleNamespace(calls=calls, state=state)
+    async def reply(path, bearer):
+        state.asked.append((path, bearer))
+        return state.replies.get(bearer, MindsHubReply(MindsHubAnswer.OK, payload=_entitlements(True)))
+
+    mindshub_teams.reset_caches_for_tests()
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", reply)
+    yield state
+    mindshub_teams.reset_caches_for_tests()
+
+
+@pytest.fixture
+def app_browser():
+    """The desktop app registered its browser for this test."""
+    runtime_credential.set_browser_host(APP_BROWSER)
+    yield APP_BROWSER
+    runtime_credential.clear_browser_host()
+
+
+@pytest.fixture(autouse=True)
+def no_app_browser():
+    runtime_credential.clear_browser_host()
+    yield
+    runtime_credential.clear_browser_host()
+
+
+def _delete_browser_settings(scope) -> None:
+    from sqlmodel import Session
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.db.session import get_engine
+    from cowork.services.settings import SettingService
+
+    with Session(get_engine(get_app_settings().database.uri)) as session:
+        service = SettingService(session, scope)
+        for key in [k for k in UserSettings.model_fields if k.startswith("browser_")]:
+            service.delete_setting(key)
 
 
 @pytest.fixture
 def client():
+    """The desktop: local tenancy, no principal."""
+    from cowork.db.scoped import LOCAL_SCOPE
+
     app = FastAPI()
     app.include_router(api_router)
     app.dependency_overrides[get_principal] = lambda: None
     yield TestClient(app)
-    # Leave the global settings row as we found it.
-    from cowork.db.scoped import LOCAL_SCOPE
-    from cowork.db.session import get_engine
-    from cowork.common.settings.app_settings import get_app_settings
-    from cowork.services.settings import SettingService
-    from sqlmodel import Session
-
-    with Session(get_engine(get_app_settings().database.uri)) as session:
-        service = SettingService(session, LOCAL_SCOPE)
-        for key in ("browser_url", "browser_enabled", "browser_mode", "browser_service_url", "browser_service_api_key"):
-            try:
-                service.delete_setting(key)
-            except Exception:
-                pass
-
-
-HUB = {HEADER_HUB_CREDENTIAL: "Bearer user-jwt"}
-
-
-# ── service ────────────────────────────────────────────────────────────────
-
-
-def test_instance_api_base_follows_the_deployment(monkeypatch):
-    import cowork.common.settings.app_settings as app_settings
-
-    for host, expected in [
-        ("https://api.mindshub.ai", "https://4nton.ai"),
-        ("https://api.staging.mindshub.ai", "https://api.staging.mindshub.ai"),
-        ("https://api-pr-cowork-12.dev.mindshub.ai", "https://api-pr-cowork-12.dev.mindshub.ai"),
-    ]:
-        monkeypatch.setattr(app_settings, "default_turn_minds_api_host", lambda h=host: h)
-        assert svc.instance_api_base() == expected
-
-
-def test_only_hosted_browser_instances_are_accepted():
-    assert svc.valid_endpoint(ENDPOINT)
-    assert svc.valid_endpoint("https://br-ab12cd34-alpha.dev.mindshub.ai/")
-    for bad in ["", "http://br-x.4nton.ai", "https://hm-x.4nton.ai", "https://br-x.evil.com", "https://br-x.4nton.ai.evil.com"]:
-        assert not svc.valid_endpoint(bad), bad
-
-
-def test_turn_block_needs_the_toggle_and_a_valid_instance():
-    on = SimpleNamespace(browser_enabled=True, browser_url=ENDPOINT + "/")
-    assert svc.turn_block(on) == {"base_url": ENDPOINT, "profile": "main"}
-    assert svc.turn_block(SimpleNamespace(browser_enabled=False, browser_url=ENDPOINT)) is None
-    assert svc.turn_block(SimpleNamespace(browser_enabled=True, browser_url="https://elsewhere.com")) is None
-    config = svc.anton_browser_config(on)
-    assert (config.base_url, config.profile) == (ENDPOINT, "main")
-
-
-def test_calls_go_out_as_the_caller(mindshub):
-    view = asyncio.run(svc.provision("user-jwt"))
-    assert view == {"provisioned": True, "status": "provisioning", "endpoint": ENDPOINT}
-    method, url, body, auth = mindshub.calls[-1]
-    assert (method, url, body, auth) == ("POST", "https://api.dev.mindshub.ai/instance", {"agent": "browser"}, "Bearer user-jwt")
-
-
-def test_no_credential_is_a_401_before_any_call(mindshub):
-    with pytest.raises(svc.BrowserServiceError) as err:
-        asyncio.run(svc.fetch_status(""))
-    assert err.value.status == 401
-    assert mindshub.calls == []
-
-
-def test_embed_rejects_a_foreign_viewer_url(monkeypatch):
-    async def lying(*args, **kwargs):
-        return {"view_url": "https://evil.example/x", "expires_at": 1}
-
-    monkeypatch.setattr(svc, "_call", lying)
-    with pytest.raises(svc.BrowserServiceError):
-        asyncio.run(svc.embed("jwt", ENDPOINT))
-    with pytest.raises(svc.BrowserServiceError) as err:
-        asyncio.run(svc.embed("jwt", ""))
-    assert err.value.status == 409
-
-
-# ── routes ─────────────────────────────────────────────────────────────────
-
-
-def test_status_before_provisioning(client, mindshub):
-    res = client.get("/api/v1/browse/status", headers=HUB)
-    assert res.status_code == 200
-    assert res.json() == {
-        "provisioned": False, "status": "none", "endpoint": "", "mode": "mindshub", "enabled": True, "available": False,
-    }
-
-
-def test_provision_remembers_the_instance_and_embed_uses_it(client, mindshub):
-    res = client.post("/api/v1/browse/provision", headers=HUB)
-    assert res.status_code == 200 and res.json()["endpoint"] == ENDPOINT
-
-    from cowork.common.settings.user_settings import get_user_settings
-
-    assert get_user_settings().browser_url == ENDPOINT
-
-    client.put("/api/v1/settings/browser_enabled", json={"value": "true"})
-    status = client.get("/api/v1/browse/status", headers=HUB).json()
-    assert status["enabled"] is True and status["available"] is True
-
-    embed = client.post("/api/v1/browse/embed", headers=HUB, json={"session_id": "main"})
-    assert embed.status_code == 200
-    assert embed.json()["view_url"] == f"{ENDPOINT}/sessions/main/view?et=tok"
-    assert mindshub.calls[-1][1] == f"{ENDPOINT}/_embed"
-    assert mindshub.calls[-1][3] == "Bearer user-jwt"
-
-
-def test_embed_before_provisioning_is_a_409(client, mindshub):
-    assert client.post("/api/v1/browse/embed", headers=HUB, json={}).status_code == 409
-
-
-def test_mindshub_failures_say_what_failed(monkeypatch):
-    def broken(request):
-        return httpx.Response(500, json={"message": "Internal server error"})
-
-    real = httpx.AsyncClient
-    monkeypatch.setattr(svc.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(broken), **kw))
-    monkeypatch.setattr(svc, "instance_api_base", lambda: "https://api-pr-x.dev.mindshub.ai")
-    with pytest.raises(svc.BrowserServiceError) as err:
-        asyncio.run(svc.fetch_status("jwt"))
-    # 4xx, not 502: the ingress replaces 5xx bodies and the reason would be lost.
-    assert err.value.status == 424
-    assert err.value.detail == "api-pr-x.dev.mindshub.ai returned HTTP 500: Internal server error"
-
-
-def test_mindshub_refusals_pass_through(client, monkeypatch):
-    async def refused(*args, **kwargs):
-        raise svc.BrowserServiceError(403, "Your plan doesn't include agents.")
-
-    monkeypatch.setattr(svc, "_call", refused)
-    res = client.post("/api/v1/browse/provision", headers=HUB)
-    assert res.status_code == 403
-    assert res.json()["detail"] == "Your plan doesn't include agents."
-
-
-# ── standalone mode ────────────────────────────────────────────────────────
-
-SERVICE = "https://browser.example.com"
-SERVICE_KEY = "svc-secret-token-123"
-
-
-def _standalone(**overrides):
-    from pydantic import SecretStr
-
-    values = dict(
-        browser_enabled=True, browser_url="", browser_mode="standalone",
-        browser_service_url=SERVICE + "/", browser_service_api_key=SecretStr(SERVICE_KEY),
-    )
-    values.update(overrides)
-    return SimpleNamespace(**values)
+    _delete_browser_settings(LOCAL_SCOPE)
 
 
 @pytest.fixture
-def service(monkeypatch):
-    """Fake standalone browser service; MindsHub's /instance must never be hit."""
-    calls: list[tuple[str, str, dict | None, str]] = []
-    state = {"health": httpx.Response(200, json={"ok": True, "sessions": 0, "max_sessions": 4}), "embed_url": None}
+def web_client(web):
+    """The web app, where each request names its person in X-Test-User and
+    carries their credential as the web shell does, in Authorization."""
+    from cowork.db.scoped import TenantScope
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content) if request.content else None
-        calls.append((request.method, str(request.url), body, request.headers.get("authorization", "")))
-        if request.url.path == "/instance":
-            raise AssertionError("standalone mode called MindsHub /instance")
-        if request.url.path == "/healthz":
-            if isinstance(state["health"], Exception):
-                raise state["health"]
-            return state["health"]
-        if request.url.path == "/_embed":
-            view_url = state["embed_url"] or f"{SERVICE}/sessions/{body['session_id']}/view?et=tok"
-            return httpx.Response(200, json={"session_id": body["session_id"], "view_url": view_url,
-                                             "events_url": f"{SERVICE}/x", "expires_at": 1999999999})
-        return httpx.Response(404)
+    app = FastAPI()
+    app.include_router(api_router)
 
-    real = httpx.AsyncClient
-    monkeypatch.setattr(svc.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
-    monkeypatch.setattr(svc, "instance_api_base", lambda: "https://api.dev.mindshub.ai")
-    return SimpleNamespace(calls=calls, state=state)
+    @app.middleware("http")
+    async def as_person(request, call_next):
+        user = request.headers.get("X-Test-User")
+        if user:
+            request.state.principal = Principal(user_id=user, org_id=ORG)
+        return await call_next(request)
+
+    yield TestClient(app)
+    for user in ("alice", "bob"):
+        _delete_browser_settings(TenantScope(org_mode=True, org_id=ORG, user_id=user))
 
 
-def test_browser_settings_defaults_and_scope():
+def _as(user: str) -> dict[str, str]:
+    return {"X-Test-User": user, "Authorization": f"Bearer jwt-{user}"}
+
+
+def _detail(response) -> tuple[int, str]:
+    return response.status_code, response.json()["detail"]["code"]
+
+
+# ── settings ───────────────────────────────────────────────────────────────
+
+
+def test_removed_browser_settings_are_gone(client):
+    from cowork.common.settings.user_settings import UserSettings
+
+    browser_keys = {k for k in UserSettings.model_fields if k.startswith("browser_")}
+    assert browser_keys == {"browser_enabled"}
+    gone_keys = ("browser_mode", "browser_service_url", "browser_service_api_key", "browser_url", "browser_proxy", "browser_city")
+    for gone in gone_keys:
+        assert client.put(f"/api/v1/settings/{gone}", json={"value": "x"}).status_code == 400, gone
+
+
+def test_the_browser_switch_defaults_on_and_is_the_persons_own():
     from cowork.common.settings.user_settings import UserSettings, setting_is_org_scoped
 
-    defaults = UserSettings()
-    assert defaults.browser_mode == "mindshub"
-    assert defaults.browser_service_url == ""
-    assert defaults.browser_service_api_key is None
-    assert UserSettings.field_is_sensitive("browser_service_api_key")
-    assert UserSettings.field_options("browser_mode") == ["mindshub", "standalone"]
-    for key in ("browser_mode", "browser_service_url", "browser_service_api_key"):
-        assert setting_is_org_scoped(key) is True, key
-    # The person's own toggle and MindsHub instance stay per-user.
-    for key in ("browser_enabled", "browser_url"):
-        assert setting_is_org_scoped(key) is False, key
+    assert UserSettings().browser_enabled is True
+    assert setting_is_org_scoped("browser_enabled") is False
 
 
-def test_standalone_service_url_must_be_https_or_loopback():
-    for good, expected in [
-        ("https://browser.example.com", "https://browser.example.com"),
-        ("https://browser.example.com:8443/", "https://browser.example.com:8443"),
-        ("http://localhost:3000", "http://localhost:3000"),
-        ("http://127.0.0.1:3000/", "http://127.0.0.1:3000"),
-        ("http://[::1]:3000", "http://[::1]:3000"),
+def test_no_setting_offers_an_exit_city_or_a_proxy():
+    """Sites see MindsDB's own addresses: no setting picks where the browser
+    leaves from or names a proxy that carries it."""
+    from cowork.common.settings.user_settings import UserSettings
+
+    for field in UserSettings.model_fields.values():
+        text = f"{field.title} {field.description}".lower()
+        for word in ("residential", "exit city", "home connection", "proxy provider"):
+            assert word not in text, (field.title, word)
+
+
+def test_router_url_setting_is_https_only_and_normalized(monkeypatch):
+    from cowork.common.settings.app_settings import AppSettings
+
+    for raw, expected in [
+        ("", ""),
+        (ROUTER + "/", ROUTER),
+        ("https://cowork.mindshub.ai/browser", "https://cowork.mindshub.ai/browser"),
+        ("https://browser.example.com:8443", "https://browser.example.com:8443"),
     ]:
-        assert svc.normalize_service_url(good) == expected, good
+        monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", raw)
+        assert AppSettings().browser_router_url == expected, raw
     for bad in [
-        "", "browser.example.com", "http://browser.example.com", "http://10.0.0.5:3000",
-        "https://browser.example.com/api", "https://browser.example.com/?x=1", "https://browser.example.com/#f",
-        "ftp://browser.example.com", "https://user:pw@browser.example.com",
+        "cowork.mindshub.ai/browser", "http://cowork.mindshub.ai/browser", "http://localhost:8080/browser",
+        "http://127.0.0.1:8080", "https://cowork.mindshub.ai/browser?x=1", "https://cowork.mindshub.ai/browser#f",
+        "https://u:p@cowork.mindshub.ai/browser", "ftp://cowork.mindshub.ai",
     ]:
-        assert svc.normalize_service_url(bad) == "", bad
+        monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", bad)
+        with pytest.raises(ValidationError):
+            AppSettings()
 
 
-def test_standalone_service_needs_the_mode_a_url_and_a_key():
-    assert svc.standalone_service(_standalone()) == (SERVICE, SERVICE_KEY)
-    assert svc.standalone_service(_standalone(browser_mode="mindshub")) is None
-    assert svc.standalone_service(_standalone(browser_service_url="http://browser.example.com")) is None
-    assert svc.standalone_service(_standalone(browser_service_api_key=None)) is None
+def test_the_router_is_the_webs_alone(monkeypatch):
+    """Outside org tenancy the router setting is ignored: the desktop app has
+    its own browser, and an in-process turn never gets the router."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", ROUTER)
+    get_app_settings.cache_clear()
+    try:
+        assert svc.router_url() == ""
+        monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+        get_app_settings.cache_clear()
+        assert svc.router_url() == ROUTER
+    finally:
+        get_app_settings.cache_clear()
 
 
-def test_standalone_profile_is_per_user_and_stable():
-    a = svc.standalone_profile("user-a")
-    assert a == svc.standalone_profile("user-a")
-    assert a != svc.standalone_profile("user-b")
-    assert a.startswith("u-") and "user-a" not in a
-    assert svc._SESSION_ID.match(a)
-    assert svc.standalone_profile(None) == svc.standalone_profile("") == "main"
+# ── sessions and the turn's browser ────────────────────────────────────────
 
 
-def test_standalone_status_reads_healthz_with_the_key(service):
-    view = asyncio.run(svc.service_status(_standalone()))
-    assert view == {"provisioned": True, "status": "running", "endpoint": SERVICE}
-    assert service.calls == [("GET", f"{SERVICE}/healthz", None, f"Bearer {SERVICE_KEY}")]
-
-    service.state["health"] = httpx.Response(200, json={"ok": False})
-    assert asyncio.run(svc.service_status(_standalone()))["status"] == "unreachable"
-
-
-def test_standalone_status_reports_an_unreachable_service(service):
-    service.state["health"] = httpx.ConnectError("refused")
-    view = asyncio.run(svc.service_status(_standalone()))
-    assert view == {"provisioned": True, "status": "unreachable", "endpoint": SERVICE}
-
-    service.state["health"] = httpx.Response(503, text="down")
-    assert asyncio.run(svc.service_status(_standalone()))["status"] == "unreachable"
+def test_task_sessions_and_project_keys_hash_the_ids():
+    sid = svc.task_session("user-a", "conv-1")
+    assert sid == "t-" + hashlib.sha256(b"user-a:conv-1").hexdigest()[:24]
+    assert sid != svc.task_session("user-a", "conv-2")
+    assert svc.project_key("user-a", "proj-1") == "p-" + hashlib.sha256(b"user-a:proj-1").hexdigest()[:24]
+    assert svc.project_key("user-a", None) == "" and svc.project_key("user-a", "") == ""
+    assert svc.task_session(None, "conv-1") == "t-" + hashlib.sha256(b":conv-1").hexdigest()[:24]
 
 
-def test_standalone_rejected_key_is_an_error_without_the_key(service):
-    service.state["health"] = httpx.Response(401, json={"error": f"bad token {SERVICE_KEY}"})
-    with pytest.raises(svc.BrowserServiceError) as err:
-        asyncio.run(svc.service_status(_standalone()))
-    assert err.value.detail == "The browser service at browser.example.com rejected the API key."
-    assert SERVICE_KEY not in err.value.detail and SERVICE_KEY not in str(err.value)
+@pytest.mark.parametrize("candidate", [
+    "t-0123456789abcdef01234567", "main", "a", "A_b-9", "x" * 64,
+    "", "x" * 65, "has space", "../escape", "dot.dot", "new\nline", "trailing\n",
+])
+def test_the_session_id_pattern_is_antons(candidate):
+    """SESSION_ID accepts exactly the session ids anton's BrowserConfig takes as
+    its profile, so a session this server names is one the tool can drive."""
+    try:
+        BrowserConfig(base_url=ROUTER, profile=candidate)
+        anton_takes = True
+    except ValidationError:
+        anton_takes = False
+    assert (SESSION_ID.fullmatch(candidate) is not None) is anton_takes
 
 
-def test_standalone_errors_name_the_service_not_mindshub(service):
-    service.state["health"] = httpx.ConnectError("refused")
-    with pytest.raises(svc.BrowserServiceError) as err:
-        asyncio.run(svc._call("GET", f"{SERVICE}/healthz", SERVICE_KEY, standalone=True))
-    assert "the browser service at browser.example.com" in err.value.detail.lower()
-    assert "MindsHub" not in err.value.detail and SERVICE_KEY not in err.value.detail
-
-
-def test_standalone_status_when_not_configured_calls_nothing(service):
-    view = asyncio.run(svc.service_status(_standalone(browser_service_api_key=None)))
-    assert view == {"provisioned": False, "status": "not_configured", "endpoint": ""}
-    assert service.calls == []
-
-
-def test_standalone_embed_uses_the_key_and_the_users_profile(service):
-    out = asyncio.run(svc.embed_for(_standalone(), "user-jwt", "user-a"))
-    profile = svc.standalone_profile("user-a")
-    assert out == {"session_id": profile, "view_url": f"{SERVICE}/sessions/{profile}/view?et=tok", "expires_at": 1999999999}
-    assert service.calls == [("POST", f"{SERVICE}/_embed", {"session_id": profile}, f"Bearer {SERVICE_KEY}")]
-
-
-def test_standalone_embed_refuses_someone_elses_session_and_a_foreign_viewer(service):
-    with pytest.raises(svc.BrowserServiceError) as err:
-        asyncio.run(svc.embed_for(_standalone(), "", "user-a", svc.standalone_profile("user-b")))
-    assert err.value.status == 403
-    assert service.calls == []
-
-    service.state["embed_url"] = "https://evil.example/view"
-    with pytest.raises(svc.BrowserServiceError) as err:
-        asyncio.run(svc.embed_for(_standalone(), "", "user-a"))
-    assert SERVICE_KEY not in err.value.detail
-
-    with pytest.raises(svc.BrowserServiceError) as err:
-        asyncio.run(svc.embed_for(_standalone(browser_service_url=""), "", "user-a"))
-    assert err.value.status == 409
-
-
-def test_turn_block_standalone_carries_the_token_and_the_users_profile():
-    block = svc.turn_block(_standalone(), "user-a")
-    assert block == {"base_url": SERVICE, "profile": svc.standalone_profile("user-a"), "token": SERVICE_KEY}
-    assert svc.turn_block(_standalone(), None)["profile"] == "main"
-    assert svc.turn_block(_standalone(browser_enabled=False), "user-a") is None
-    assert svc.turn_block(_standalone(browser_service_api_key=None), "user-a") is None
-    # mindshub mode is unchanged: no token, the shared profile, the user id ignored.
-    on = SimpleNamespace(browser_enabled=True, browser_mode="mindshub", browser_url=ENDPOINT,
-                         browser_service_url=SERVICE, browser_service_api_key=SERVICE_KEY)
-    assert svc.turn_block(on, "user-a") == {"base_url": ENDPOINT, "profile": "main"}
-    config = svc.anton_browser_config(_standalone(), "user-a")
-    assert (config.base_url, config.profile) == (SERVICE, svc.standalone_profile("user-a"))
-    # Every task keeps the user's one profile (the service has no login store
-    # of its own); its project gets a key for saved tabs.
-    assert svc.turn_block(_standalone(), "user-a", "conv-1", "proj-1") == {
-        "base_url": SERVICE, "profile": svc.standalone_profile("user-a"), "token": SERVICE_KEY,
+def test_web_turn_block_round_trips_through_anton(web):
+    on = SimpleNamespace(browser_enabled=True)
+    config = svc.turn_block(on, user_id="user-a", conversation_id="conv-1", project_id="proj-1")
+    block = config.to_dict()
+    assert block == {
+        "base_url": ROUTER,
+        "profile": svc.task_session("user-a", "conv-1"),
         "project": svc.project_key("user-a", "proj-1"),
     }
-    assert "project" not in svc.turn_block(_standalone(), "user-a", "conv-1")
-    # The per-user instance keeps its one profile and no project.
-    assert svc.turn_block(on, "user-a", "conv-1", "proj-1") == {"base_url": ENDPOINT, "profile": "main"}
+    assert BrowserConfig.from_dict(block) == config
+    assert config.token is None and "token" not in block
+    no_project = svc.turn_block(on, user_id="user-a", conversation_id="conv-1", project_id=None)
+    assert no_project.to_dict() == {"base_url": ROUTER, "profile": svc.task_session("user-a", "conv-1")}
 
 
-def test_the_harness_uses_the_turns_user_for_the_standalone_profile():
-    from cowork.common.settings.user_settings import use_settings_scope
-    from cowork.db.scoped import TenantScope
+def test_turn_block_needs_the_router_a_person_and_the_switch(web, monkeypatch):
+    on, off = SimpleNamespace(browser_enabled=True), SimpleNamespace(browser_enabled=False)
+    assert svc.turn_block(on, user_id="u", conversation_id="c", project_id=None) is not None
+    assert svc.turn_block(off, user_id="u", conversation_id="c", project_id=None) is None
+    # An organization's channel turn has no person behind it.
+    assert svc.turn_block(on, user_id=None, conversation_id="c", project_id=None) is None
+    monkeypatch.setattr(svc, "router_url", lambda: "")
+    assert svc.turn_block(on, user_id="u", conversation_id="c", project_id=None) is None
+
+
+def test_the_turn_blocks_this_server_writes_are_antons(web):
+    """anton's fixture: the router blocks this server writes have exactly the
+    fixture's keys, and anton reads each fixture block back as written."""
+    examples = _fixture("browser_contract", "browser_config.json").examples
+    on = SimpleNamespace(browser_enabled=True)
+    ours = {
+        "the router block": svc.turn_block(on, user_id="u", conversation_id="c", project_id="p"),
+        "the router block without a project": svc.turn_block(on, user_id="u", conversation_id="c", project_id=None),
+    }
+    for name, config in ours.items():
+        assert config.to_dict().keys() == examples[name].body.keys(), name
+    for name, example in examples.items():
+        if example.kind != "turn_block":
+            continue
+        read = BrowserConfig.from_dict(example.body)
+        assert (read is None) is example.refused, name
+        if read is not None:
+            assert read.to_dict() == example.body, name
+
+
+def test_the_desktop_config_is_built_as_antons_constructor_takes_it(app_browser):
+    """anton's fixture: the in-app constructor arguments it accepts are the
+    shape desktop_browser_config passes, and those it refuses stay refused."""
+    examples = _fixture("browser_contract", "browser_config.json").examples
+    config = svc.desktop_browser_config(conversation_id="conv-1", project_id="proj-1")
+    accepted = examples["the in-app browser"].body
+    assert set(config.model_dump(exclude_defaults=True)) == set(accepted)
+    for name, example in examples.items():
+        if example.kind != "constructor":
+            continue
+        if example.refused:
+            with pytest.raises(ValidationError):
+                BrowserConfig(**example.body)
+        else:
+            assert BrowserConfig(**example.body).in_app, name
+
+
+# ── the desktop's own browser ──────────────────────────────────────────────
+
+
+def test_the_harness_gives_a_desktop_turn_the_apps_browser(app_browser):
     from cowork.harnesses.anton_harness.harness import _browser_config
 
-    with use_settings_scope(TenantScope(org_mode=True, org_id="o", user_id="user-a")):
-        assert _browser_config(_standalone()).profile == svc.standalone_profile("user-a")
-        assert _browser_config(_standalone(), conversation_id="c1").profile == svc.standalone_profile("user-a")
-    assert _browser_config(_standalone()).profile == "main"
+    on = SimpleNamespace(browser_enabled=True)
+    config = asyncio.run(_browser_config(on, channel_context=None, conversation_id="conv-1", project_id="proj-1"))
+    assert config.in_app
+    assert (config.base_url, config.profile, config.project) == (
+        APP_BROWSER.url, svc.task_session(None, "conv-1"), svc.project_key(None, "proj-1"),
+    )
+    assert config.token.get_secret_value() == APP_BROWSER.token.get_secret_value()
+    off = SimpleNamespace(browser_enabled=False)
+    assert asyncio.run(_browser_config(off, channel_context=None, conversation_id="conv-1", project_id=None)) is None
 
 
-def _configure_standalone(client):
-    for key, value in [
-        ("browser_mode", "standalone"), ("browser_service_url", SERVICE), ("browser_service_api_key", SERVICE_KEY),
-    ]:
-        assert client.put(f"/api/v1/settings/{key}", json={"value": value}).status_code == 200, key
+def test_a_channel_turn_gets_no_browser(app_browser):
+    """A chat anyone can write to must never drive the desktop owner's
+    signed-in browser."""
+    from cowork.harnesses.anton_harness.harness import _browser_config
+    from cowork.harnesses.base import ChannelContext
+
+    on = SimpleNamespace(browser_enabled=True)
+    group = ChannelContext("telegram", is_group=True)
+    assert asyncio.run(_browser_config(on, channel_context=group, conversation_id="c", project_id=None)) is None
+    assert asyncio.run(_browser_config(on, channel_context=ChannelContext("slack"), conversation_id="c", project_id=None)) is None
+    assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)).in_app
 
 
-def test_standalone_routes_need_no_mindshub_credential(client, service):
-    _configure_standalone(client)
+def test_the_session_builder_passes_the_channel_to_the_browser():
+    from cowork.harnesses.anton_harness import harness
 
+    source = inspect.getsource(harness.AntonHarness._build_turn_session)
+    assert re.search(r"browser=await _browser_config\(\s*user, channel_context=channel_context,", source)
+    assert "supported_kwargs(ChatSessionConfig, browser=" not in source
+
+
+def test_in_process_turn_never_gets_the_router(monkeypatch, nothing_goes_out):
+    """Even with a router configured and the desktop's MindsHub credential
+    held, an in-process turn gets only the app's own browser, and here there
+    is none."""
+    from cowork.harnesses.anton_harness.harness import _browser_config
+
+    monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", ROUTER)
+    monkeypatch.setattr(runtime_credential, "get_minds_credential", lambda: "desktop-jwt")
+    from cowork.common.settings.app_settings import get_app_settings
+
+    get_app_settings.cache_clear()
+    try:
+        on = SimpleNamespace(browser_enabled=True)
+        assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id="p")) is None
+    finally:
+        get_app_settings.cache_clear()
+    assert nothing_goes_out == []
+
+
+def test_personal_deployment_holds_no_browser_host(personal_deployment):
+    """A local deployment that trusts identity headers serves several people,
+    so no one's browser may answer another's turn."""
+    from cowork.harnesses.anton_harness.harness import _browser_config
+
+    runtime_credential.set_browser_host(APP_BROWSER)
+    assert runtime_credential.get_browser_host() is None
+    on = SimpleNamespace(browser_enabled=True)
+    assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)) is None
+
+
+def test_a_refused_app_browser_is_logged_without_its_key(caplog):
+    """anton refuses an address it doesn't take; the turn runs without a
+    browser, and the log line carries neither the address check's input nor
+    the key."""
+    secret = "s" * 43
+    runtime_credential.set_browser_host(LocalBrowserHost(url="http://localhost:51234", token=SecretStr(secret)))
+    with caplog.at_level(logging.WARNING, logger=svc.__name__):
+        assert svc.desktop_browser_config(conversation_id="c", project_id=None) is None
+    records = [r for r in caplog.records if r.name == svc.__name__ and r.levelno == logging.WARNING]
+    assert len(records) == 1
+    assert secret not in records[0].getMessage() and secret not in str(records[0].__dict__)
+
+
+def test_desktop_routes_answer_from_the_app_and_call_nothing(client, nothing_goes_out):
     status = client.get("/api/v1/browse/status")
     assert status.status_code == 200
-    assert status.json() == {"provisioned": True, "status": "running", "endpoint": SERVICE,
-                             "mode": "standalone", "enabled": True, "available": True}
+    assert status.json() == {"enabled": True, "available": False, "status": "unavailable"}
+    svc.BrowseStatus.model_validate(status.json())
 
-    provision = client.post("/api/v1/browse/provision")
-    assert provision.status_code == 200 and provision.json()["mode"] == "standalone"
-    from cowork.common.settings.user_settings import get_user_settings
+    runtime_credential.set_browser_host(APP_BROWSER)
+    assert client.get("/api/v1/browse/status").json() == {"enabled": True, "available": True, "status": "running"}
+    # Available whatever the switch says, so the person can turn it back on.
+    assert client.put("/api/v1/settings/browser_enabled", json={"value": "false"}).status_code == 200
+    assert client.get("/api/v1/browse/status").json() == {"enabled": False, "available": True, "status": "running"}
 
-    # Never MindsHub, and MindsHub's instance slot stays untouched.
-    assert all("/instance" not in url for _, url, _, _ in service.calls)
-    assert get_user_settings().browser_url == ""
+    assert _detail(client.post("/api/v1/browse/provision")) == (409, "unavailable")
+    assert _detail(client.post("/api/v1/browse/embed", json={"session_id": "t-abc"})) == (409, "unavailable")
+    approve = client.post("/api/v1/browse/approve", json={"session_id": "t-abc", "pending_id": "pa-1"})
+    assert _detail(approve) == (409, "unavailable")
+    decline = client.post("/api/v1/browse/decline", json={"session_id": "t-abc", "pending_id": "pa-1"})
+    assert _detail(decline) == (409, "unavailable")
+    assert _detail(client.delete("/api/v1/browse/logins")) == (409, "unavailable")
+    assert nothing_goes_out == []
 
-    embed = client.post("/api/v1/browse/embed", json={})
-    assert embed.status_code == 200 and embed.json()["session_id"] == "main"
-    assert service.calls[-1][1:] == (f"{SERVICE}/_embed", {"session_id": "main"}, f"Bearer {SERVICE_KEY}")
+
+# ── the web: no router ─────────────────────────────────────────────────────
+
+
+def test_without_a_router_nothing_goes_out(web_client, monkeypatch, nothing_goes_out):
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", "")
+    get_app_settings.cache_clear()
+
+    status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
+    assert status.status_code == 200
+    assert status.json() == {"enabled": True, "available": False, "status": "unavailable"}
+    assert _detail(web_client.post("/api/v1/browse/provision", headers=_as("alice"))) == (409, "unavailable")
+    embed = web_client.post("/api/v1/browse/embed", headers=_as("alice"), json={"session_id": "t-abc"})
+    assert _detail(embed) == (409, "unavailable")
+    approve = web_client.post(
+        "/api/v1/browse/approve", headers=_as("alice"), json={"session_id": "t-abc", "pending_id": "pa-1"},
+    )
+    assert _detail(approve) == (409, "unavailable")
+    assert _detail(web_client.delete("/api/v1/browse/logins", headers=_as("alice"))) == (409, "unavailable")
+    on = SimpleNamespace(browser_enabled=True)
+    assert svc.turn_block(on, user_id="alice", conversation_id="c", project_id=None) is None
+    assert nothing_goes_out == []
+
+
+# ── the web: the router ────────────────────────────────────────────────────
+
+
+def test_web_status_reads_the_entitlement_then_the_router(web_client, router, mindshub):
+    router.status = "running"
+    status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
+    assert status.status_code == 200
+    assert status.json() == {"enabled": True, "available": True, "status": "running"}
+    assert mindshub.asked == [("/entitlements/me/", "jwt-alice")]
+    assert router.calls == [Call("GET", f"{ROUTER}/_status", None, "Bearer jwt-alice")]
+
+
+def test_an_account_without_the_browser_is_not_entitled(web_client, router, mindshub):
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    mindshub.replies["jwt-alice"] = MindsHubReply(MindsHubAnswer.OK, payload=_entitlements(False))
+    status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
+    assert status.status_code == 200
+    assert status.json() == {"enabled": True, "available": False, "status": "not_entitled"}
+    # Read from MindsHub: the router isn't asked.
+    assert router.calls == []
+
+    # MindsHub refusing the read grants nothing, the browser included.
+    mindshub.replies["jwt-bob"] = MindsHubReply(MindsHubAnswer.REFUSED, status_code=403)
+    assert web_client.get("/api/v1/browse/status", headers=_as("bob")).json()["status"] == "not_entitled"
+    assert router.calls == []
+
+
+@pytest.mark.parametrize("answer", ["unreachable", "throttled", "no block"])
+def test_web_status_fails_closed_when_mindshub_cant_say(web_client, router, mindshub, answer):
+    """An outage, a throttle with nothing known, or an answer without the
+    block is "couldn't check", never "not entitled" and never a browser."""
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    mindshub.replies["jwt-alice"] = {
+        "unreachable": MindsHubReply(MindsHubAnswer.UNREACHABLE),
+        "throttled": MindsHubReply(MindsHubAnswer.THROTTLED, status_code=429),
+        "no block": MindsHubReply(MindsHubAnswer.OK, payload=_entitlements(True, block=False)),
+    }[answer]
+    status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
+    assert _detail(status) == (503, "mindshub_unreachable")
+    assert router.calls == []
+
+
+def test_web_status_answers_match_the_model(web_client, router, mindshub):
+    answer = web_client.get("/api/v1/browse/status", headers=_as("alice")).json()
+    assert set(answer) == {"enabled", "available", "status"}
+    svc.BrowseStatus.model_validate(answer)
+
+
+def test_an_organization_that_turned_the_browser_off_reads_as_organization_off(web_client, router, mindshub):
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    mindshub.replies["jwt-alice"] = MindsHubReply(
+        MindsHubAnswer.OK, payload=_entitlements(False, reason="organization_off"),
+    )
+    status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
+    assert status.json() == {"enabled": True, "available": False, "status": "organization_off"}
+    assert router.calls == []
+
+
+@pytest.fixture
+def signed_in_desktop(monkeypatch, mindshub):
+    """A desktop the person signed in to MindsHub on, with its browser registered."""
+    monkeypatch.setattr(svc, "get_minds_credential", lambda: "desktop-jwt")
+    monkeypatch.setattr(svc, "_desktop_organization_off", False)
+    runtime_credential.set_browser_host(APP_BROWSER)
+    return mindshub
+
+
+def test_a_signed_in_desktop_whose_organization_turned_the_browser_off_gets_none(client, signed_in_desktop):
+    from cowork.harnesses.anton_harness.harness import _browser_config
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    on = SimpleNamespace(browser_enabled=True)
+    assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)).in_app
+    signed_in_desktop.replies["desktop-jwt"] = MindsHubReply(
+        MindsHubAnswer.OK, payload=_entitlements(False, reason="organization_off"),
+    )
+    from cowork.services import mindshub_teams
+
+    mindshub_teams.reset_caches_for_tests()
+    assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)) is None
+    assert client.get("/api/v1/browse/status").json() == {"enabled": True, "available": False, "status": "organization_off"}
+    assert ("/entitlements/me/", "desktop-jwt") in signed_in_desktop.asked
+
+
+def test_a_desktop_ignores_not_permitted_and_keeps_its_answer_through_an_outage(client, signed_in_desktop):
+    """browser.use governs the web only, and the desktop browser runs on the
+    person's own machine, so an outage leaves the last answer standing."""
+    from cowork.services import mindshub_teams
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    replies = signed_in_desktop.replies
+    replies["desktop-jwt"] = MindsHubReply(MindsHubAnswer.OK, payload=_entitlements(False))
+    assert client.get("/api/v1/browse/status").json()["status"] == "running"
+    mindshub_teams.reset_caches_for_tests()
+    replies["desktop-jwt"] = MindsHubReply(MindsHubAnswer.OK, payload=_entitlements(False, reason="organization_off"))
+    assert client.get("/api/v1/browse/status").json()["status"] == "organization_off"
+    mindshub_teams.reset_caches_for_tests()
+    replies["desktop-jwt"] = MindsHubReply(MindsHubAnswer.UNREACHABLE)
+    assert client.get("/api/v1/browse/status").json()["status"] == "organization_off"
+
+
+def test_a_desktop_on_the_persons_own_model_key_asks_mindshub_nothing(client, nothing_goes_out, monkeypatch):
+    monkeypatch.setattr(svc, "get_minds_credential", lambda: None)
+    runtime_credential.set_browser_host(APP_BROWSER)
+    assert client.get("/api/v1/browse/status").json() == {"enabled": True, "available": True, "status": "running"}
+    assert nothing_goes_out == []
+
+
+def test_org_routes_go_out_as_each_caller(web_client, router, mindshub):
+    for user in ("alice", "bob"):
+        assert web_client.get("/api/v1/browse/status", headers=_as(user)).status_code == 200
+        assert web_client.post("/api/v1/browse/provision", headers=_as(user)).status_code == 200
+        sid = svc.task_session(user, "conv-1")
+        assert web_client.post("/api/v1/browse/embed", headers=_as(user), json={"session_id": sid}).status_code == 200
+        assert web_client.delete("/api/v1/browse/logins", headers=_as(user)).status_code == 200
+    alice = [c for c in router.calls if c.auth == "Bearer jwt-alice"]
+    bob = [c for c in router.calls if c.auth == "Bearer jwt-bob"]
+    assert len(alice) == len(bob) == 4 and len(router.calls) == 8
+    assert {c.auth for c in router.calls} == {"Bearer jwt-alice", "Bearer jwt-bob"}
+    assert ("/entitlements/me/", "jwt-bob") in mindshub.asked
+
+
+def test_org_routes_refuse_no_principal(web_client, router, mindshub):
+    for method, path, body in [
+        ("GET", "/api/v1/browse/status", None), ("POST", "/api/v1/browse/provision", None),
+        ("POST", "/api/v1/browse/embed", {"session_id": "t-abc"}),
+        ("POST", "/api/v1/browse/approve", {"session_id": "t-abc", "pending_id": "pa-1"}),
+        ("POST", "/api/v1/browse/decline", {"session_id": "t-abc", "pending_id": "pa-1"}),
+        ("DELETE", "/api/v1/browse/logins", None),
+    ]:
+        response = web_client.request(method, path, json=body, headers={"Authorization": "Bearer jwt-x"})
+        assert response.status_code == 401, path
+    assert router.calls == [] and mindshub.asked == []
+
+
+def test_provision_hands_the_router_the_prefs_and_answers_like_status(web_client, router, mindshub):
+    # No body still works.
+    plain = web_client.post("/api/v1/browse/provision", headers=_as("alice"))
+    assert plain.status_code == 200
+    assert plain.json() == {"enabled": True, "available": True, "status": "starting"}
+    hinted = web_client.post(
+        "/api/v1/browse/provision", headers=_as("alice"),
+        json={"timezone": "America/Los_Angeles", "locale": "en-US"},
+    )
+    assert hinted.status_code == 200
+    bad = web_client.post(
+        "/api/v1/browse/provision", headers=_as("alice"), json={"timezone": "Europe/London; rm", "locale": "en_GB<x>"},
+    )
+    assert bad.status_code == 200
+    warms = [c.body for c in router.calls if c.url.endswith("/_warm")]
+    assert warms == [
+        {"prefs": {}},
+        {"prefs": {"timezone": "America/Los_Angeles", "locale": "en-US"}},
+        {"prefs": {}},
+    ]
+
+
+def test_approve_forwards_the_persons_approval_as_them(web_client, router, mindshub):
+    sid = svc.task_session("alice", "conv-1")
+    approved = web_client.post(
+        "/api/v1/browse/approve", headers=_as("alice"), json={"session_id": sid, "pending_id": "pa-7"},
+    )
+    assert approved.status_code == 200
+    assert approved.json() == {"pending_id": "pa-7", "approved": True, "expires_at": 1999999300}
+    assert router.calls == [Call("POST", f"{ROUTER}/sessions/{sid}/approve", {"pending_id": "pa-7"}, "Bearer jwt-alice")]
+
+
+def test_approve_checks_its_ids_and_the_routers_answer(web_client, router, mindshub):
+    for body in (
+        {"session_id": "t-abc"}, {"session_id": "../x", "pending_id": "pa-1"}, {"session_id": "t-abc", "pending_id": "p a"},
+        {"session_id": "t-abc", "pending_id": "pa-1", "step": "click"},
+    ):
+        assert web_client.post("/api/v1/browse/approve", headers=_as("alice"), json=body).status_code == 422, body
+    assert router.calls == []
+    router.answers["/browser/sessions/t-abc/approve"] = httpx.Response(
+        200, json={"pending_id": "pa-other", "approved": True, "expires_at": 1999999300},
+    )
+    other = web_client.post("/api/v1/browse/approve", headers=_as("alice"), json={"session_id": "t-abc", "pending_id": "pa-1"})
+    assert _detail(other) == (svc.UPSTREAM_FAILED, "bad_response")
+
+
+@pytest.mark.parametrize(("name", "code"), [
+    ("an approval that lapsed", "approval_lapsed"),
+    ("an approval with no running browser", "session_not_found"),
+])
+def test_a_refused_approval_reaches_the_app_with_its_code(web_client, router, mindshub, name, code):
+    refusal = _fixture("browser_router", "error_answer.json").examples[name]
+    router.answers["/browser/sessions/t-abc/approve"] = httpx.Response(refusal.status, json=refusal.body)
+    answer = web_client.post("/api/v1/browse/approve", headers=_as("alice"), json={"session_id": "t-abc", "pending_id": "pa-1"})
+    assert _detail(answer) == (svc.UPSTREAM_FAILED, code)
+
+
+def test_decline_forwards_the_persons_skip_as_them(web_client, router, mindshub):
+    """The card's Skip drops the held step and any approval that landed late,
+    so a resend after it stays held."""
+    sid = "t-abc"
+    declined = web_client.post(
+        "/api/v1/browse/decline", headers=_as("alice"), json={"session_id": sid, "pending_id": "pa-7"},
+    )
+    assert declined.status_code == 200 and declined.json() == {"declined": True}
+    assert router.calls == [Call("POST", f"{ROUTER}/sessions/{sid}/decline", {"pending_id": "pa-7"}, "Bearer jwt-alice")]
+
+
+def test_decline_checks_its_ids_and_passes_the_routers_refusal_on(web_client, router, mindshub):
+    for body in ({"session_id": "t abc", "pending_id": "pa-1"}, {"session_id": "t-abc", "pending_id": "pa:1"},
+                 {"session_id": "t-abc", "pending_id": "pa-1", "extra": 1}):
+        assert web_client.post("/api/v1/browse/decline", headers=_as("alice"), json=body).status_code == 422, body
+    assert router.calls == []
+    refusal = _fixture("browser_router", "error_answer.json").examples["an approval with no running browser"]
+    router.answers["/browser/sessions/t-abc/decline"] = httpx.Response(refusal.status, json=refusal.body)
+    answer = web_client.post("/api/v1/browse/decline", headers=_as("alice"), json={"session_id": "t-abc", "pending_id": "pa-1"})
+    assert _detail(answer) == (svc.UPSTREAM_FAILED, "session_not_found")
+
+
+def test_sign_out_of_every_site_goes_to_the_router_as_the_person(web_client, router, mindshub):
+    cleared = web_client.delete("/api/v1/browse/logins", headers=_as("alice"))
+    assert cleared.status_code == 200 and cleared.json() == {"cleared": True}
+    assert router.calls == [Call("DELETE", f"{ROUTER}/logins", None, "Bearer jwt-alice")]
+    # No entitlement read: a person whose browser is off can still clear their sign-ins.
+    assert mindshub.asked == []
+
+
+def test_embed_passes_the_routers_link_through(web_client, router, mindshub):
+    sid = svc.task_session("alice", "conv-1")
+    embed = web_client.post("/api/v1/browse/embed", headers=_as("alice"), json={"session_id": sid})
+    assert embed.status_code == 200
+    assert embed.json() == _embed_answer(sid)
+    assert router.calls == [Call("POST", f"{ROUTER}/_embed", {"session_id": sid}, "Bearer jwt-alice")]
+
+
+def test_embed_needs_a_session_id(web_client, router, mindshub):
+    for body in ({}, {"session_id": ""}, {"session_id": "../escape"}, {"session_id": "x" * 65}):
+        assert web_client.post("/api/v1/browse/embed", headers=_as("alice"), json=body).status_code == 422, body
+    assert router.calls == []
+
+
+@pytest.mark.parametrize("view_url", [
+    f"{ROUTER}/sessions/t-other/view?et=tok",
+    "https://elsewhere.example/browser/sessions/t-mine/view?et=tok",
+    f"{ROUTER}/sessions/t-mine/view/extra?et=tok",
+    "https://user@app.example.test/browser/sessions/t-mine/view?et=tok",
+    f"{ROUTER}/sessions/t-mine/view#frag?et=tok",
+])
+def test_embed_refuses_a_viewer_url_outside_the_session(web_client, router, mindshub, view_url):
+    router.answers["/browser/_embed"] = httpx.Response(200, json=_embed_answer("t-mine", view_url=view_url))
+    embed = web_client.post("/api/v1/browse/embed", headers=_as("alice"), json={"session_id": "t-mine"})
+    assert _detail(embed) == (svc.UPSTREAM_FAILED, "bad_response")
+
+
+def test_embed_refuses_an_answer_for_another_session(web_client, router, mindshub):
+    router.answers["/browser/_embed"] = httpx.Response(200, json=_embed_answer("t-other"))
+    embed = web_client.post("/api/v1/browse/embed", headers=_as("alice"), json={"session_id": "t-mine"})
+    assert _detail(embed) == (svc.UPSTREAM_FAILED, "bad_response")
+
+
+def test_router_refusals_reach_the_app_with_their_code(web_client, router, mindshub):
+    """Each of the router's error bodies (the fixture) reaches the app with
+    the router's code: 401, 403 and 429 with their own status, anything else
+    as 424."""
+    for name, example in _fixture("browser_router", "error_answer.json").examples.items():
+        router.answers["/browser/logins"] = httpx.Response(example.status, json=example.body)
+        answer = web_client.delete("/api/v1/browse/logins", headers=_as("alice"))
+        expected = example.status if example.status in (401, 403, 429) else svc.UPSTREAM_FAILED
+        assert answer.status_code == expected, name
+        assert answer.json()["detail"] == {"code": example.body["error"], "message": example.body["message"]}, name
+
+
+def test_an_unreachable_router_says_so_without_the_credential(web_client, monkeypatch, web, mindshub):
+    def down(request, body):
+        raise httpx.ConnectError("refused")
+
+    _route_router(monkeypatch, down)
+    answer = web_client.delete("/api/v1/browse/logins", headers=_as("alice"))
+    assert _detail(answer) == (svc.UPSTREAM_FAILED, "browser_unreachable")
+    assert "jwt-alice" not in answer.text
+
+
+def test_no_credential_is_a_401_before_any_call(router):
+    with pytest.raises(svc.BrowserServiceError) as err:
+        asyncio.run(svc.clear_logins(""))
+    assert (err.value.status, err.value.detail.code) == (401, "unauthorized")
+    assert router.calls == []
+
+
+# ── a web turn's scope ─────────────────────────────────────────────────────
+
+
+def test_scope_turn_binds_the_turn_key_to_its_session_and_project(router):
+    """The fixture's _scope bodies are what scope_turn sends, with the turn's
+    own key as the bearer."""
+    examples = _fixture("browser_router", "scope_request.json").examples
+    on = SimpleNamespace(browser_enabled=True)
+    in_project = svc.turn_block(on, user_id="u", conversation_id="c", project_id="p")
+    no_project = svc.turn_block(on, user_id="u", conversation_id="c", project_id=None)
+
+    asyncio.run(svc.scope_turn(turn_key="mdb_turnkey", router=ROUTER, config=in_project))
+    asyncio.run(svc.scope_turn(turn_key="mdb_turnkey", router=ROUTER, config=no_project))
+    asyncio.run(svc.scope_turn(turn_key="mdb_turnkey", router=ROUTER, config=None))
+    sent = [c.body for c in router.calls]
+    assert [c.url for c in router.calls] == [f"{ROUTER}/_scope"] * 3
+    assert {c.auth for c in router.calls} == {"Bearer mdb_turnkey"}
+    # Only this server holds the scope key, and every scope carries it.
+    assert {c.scope_key for c in router.calls} == {SCOPE_KEY}
+    assert sent == [
+        {"session_id": in_project.profile, "project": in_project.project}, {"session_id": no_project.profile},
+        {"session_id": None},
+    ]
+    assert sent[0].keys() == examples["a turn in a project"].body.keys()
+    assert sent[1].keys() == examples["a turn with no project"].body.keys()
+    assert sent[2] == examples["a turn with no browser"].body
+
+
+def test_a_refused_scope_raises_with_the_routers_code(router):
+    conflict = _fixture("browser_router", "error_answer.json").examples["a key scoped to another session"]
+    router.answers["/browser/_scope"] = httpx.Response(conflict.status, json=conflict.body)
+    config = svc.turn_block(SimpleNamespace(browser_enabled=True), user_id="u", conversation_id="c", project_id=None)
+    with pytest.raises(svc.BrowserServiceError) as err:
+        asyncio.run(svc.scope_turn(turn_key="mdb_turnkey", router=ROUTER, config=config))
+    assert (err.value.status, err.value.detail.code) == (svc.UPSTREAM_FAILED, "scope_conflict")
+
+
+def test_the_scope_key_is_read_on_every_scope_so_a_late_or_rotated_secret_lands(router, scope_key_file):
+    """The kubelet fills the mounted Secret after a pod that started first, and
+    rewrites it on rotation; neither needs a restart."""
+    scope_key_file.unlink()
+    asyncio.run(svc.scope_turn(turn_key="mdb_turnkey", router=ROUTER, config=None))
+    scope_key_file.write_text("rotated-" + "r" * 32)
+    asyncio.run(svc.scope_turn(turn_key="mdb_turnkey", router=ROUTER, config=None))
+    # No file: no header at all, and the router answers scope_key_invalid.
+    assert [c.scope_key for c in router.calls] == ["", "rotated-" + "r" * 32]
+
+
+def test_the_scope_key_never_reaches_a_log_line(router, caplog):
+    invalid = _fixture("browser_router", "error_answer.json").examples["a scope without the scope key"]
+    router.answers["/browser/_scope"] = httpx.Response(invalid.status, json=invalid.body)
+    with caplog.at_level(logging.DEBUG), pytest.raises(svc.BrowserServiceError) as err:
+        asyncio.run(svc.scope_turn(turn_key="mdb_turnkey", router=ROUTER, config=None))
+    assert (err.value.status, err.value.detail.code) == (403, "scope_key_invalid")
+    assert SCOPE_KEY not in caplog.text and "mdb_turnkey" not in caplog.text
+
+
+# ── the router contract fixtures ───────────────────────────────────────────
+
+
+def test_router_contract_fixtures(router):
+    """Each request file is what this server sends, built with its own code,
+    and each answer file parses into the model it is read with."""
+    warm = _fixture("browser_router", "warm_request.json").examples
+    asyncio.run(svc.warm("jwt", svc.router_prefs(timezone="America/Los_Angeles", locale="en-US")))
+    asyncio.run(svc.warm("jwt", svc.router_prefs()))
+    assert [c.body for c in router.calls] == [warm["time zone and language"].body, warm["nothing to change"].body]
+
+    approve = _fixture("browser_router", "approve.json").examples
+    asyncio.run(svc.approve("jwt", svc.ApproveRequest(session_id="t-abc", pending_id="pa-0123456789abcdef01234567")))
+    assert router.calls[-1].body == approve["approve a held step"].body
+    svc.BrowserApproval.model_validate(approve["approved"].body)
+    decline = _fixture("browser_router", "decline.json").examples
+    asyncio.run(svc.decline("jwt", svc.DeclineRequest(session_id="t-abc", pending_id="pa-0123456789abcdef01234567")))
+    assert router.calls[-1].body == decline["decline a held step"].body
+    svc.BrowserDecline.model_validate(decline["declined"].body)
+    for example in _fixture("browser_router", "logins_answer.json").examples.values():
+        svc.LoginsCleared.model_validate(example.body)
+    for example in _fixture("browser_router", "status_answer.json").examples.values():
+        svc.RouterStatus.model_validate(example.body)
+    for example in _fixture("browser_router", "embed_answer.json").examples.values():
+        parsed = svc.BrowserEmbed.model_validate(example.body)
+        assert parsed.model_dump() == example.body
+        router.answers["/browser/_embed"] = httpx.Response(200, json=example.body)
+        assert asyncio.run(svc.embed("jwt", example.body["session_id"])) == parsed
 
 
 # ── the event ──────────────────────────────────────────────────────────────
@@ -420,324 +936,100 @@ def _events(stream_events):
     return asyncio.run(collect())
 
 
-def test_formatter_emits_browser_session_opened():
+def test_formatter_persists_only_the_session_id():
     from anton.core.llm.provider import StreamBrowserSession
 
-    chunks = _events([StreamBrowserSession(session_id="main", view_url=f"{ENDPOINT}/sessions/main/view?et=t", expires_at=5)])
+    chunks = _events([StreamBrowserSession(session_id="t-abc")])
     opened = [c for c in chunks if c.startswith("event: response.browser_session_opened")]
     assert len(opened) == 1
     data = json.loads(opened[0].split("data: ", 1)[1])
-    assert (data["session_id"], data["view_url"], data["expires_at"]) == ("main", f"{ENDPOINT}/sessions/main/view?et=t", 5)
+    # at_ms is the time stamp every event carries.
+    assert set(data) == {"type", "sequence_number", "session_id", "at_ms"}
+    assert data["session_id"] == "t-abc"
+    assert "et=" not in opened[0] and "view_url" not in opened[0]
 
 
-def test_a_pod_browser_step_becomes_the_same_event():
+def test_a_pod_browser_step_carries_only_the_session_id():
     from anton.core.llm.provider import StreamBrowserSession
+
     from cowork.turnqueue.producer import step_stream_events
 
-    [event] = step_stream_events({"step": "browser", "session_id": "main", "view_url": f"{ENDPOINT}/x", "expires_at": 7})
-    assert event == StreamBrowserSession(session_id="main", view_url=f"{ENDPOINT}/x", expires_at=7)
-    assert step_stream_events({"step": "browser", "view_url": "javascript:alert(1)"}) == []
-    assert step_stream_events({"step": "browser", "view_url": f"{ENDPOINT}/x", "expires_at": True})[0].expires_at == 0
+    sid = "t-0123456789abcdef01234567"
+    step = {"step": "browser", "session_id": sid, "view_url": f"{ROUTER}/sessions/{sid}/view?et=t", "expires_at": 7}
+    assert step_stream_events(step) == [StreamBrowserSession(session_id=sid)]
+    for bad in ("", "../x", "has space", "x" * 65, None, 7):
+        assert step_stream_events({"step": "browser", "session_id": bad}) == [], bad
+    assert step_stream_events({"step": "browser"}) == []
 
 
-def test_the_harness_passes_anton_a_browser_only_when_enabled():
-    from cowork.harnesses.anton_harness.harness import _browser_config
+def test_the_cloud_turns_browser_line_becomes_the_event():
+    """anton's fixture: the line its cloud turn writes, as the turn queue
+    relays it (the line's kind becomes the step), is one session event."""
+    from anton.core.llm.provider import StreamBrowserSession
 
-    assert _browser_config(SimpleNamespace(browser_enabled=False, browser_url=ENDPOINT)) is None
-    assert _browser_config(SimpleNamespace(browser_enabled=True, browser_url=ENDPOINT)).base_url == ENDPOINT
+    from cowork.turnqueue.producer import step_stream_events
 
-
-# ── the shared router (ENG-3188) ───────────────────────────────────────────
-
-ROUTER = "https://cowork-pr-cowork-1146.dev.mindshub.ai/browser"
-#: What a turn's warm-up sends for someone who never touched the proxy settings.
-DEFAULT_PREFS = {"proxy": True, "city": ""}
-
-
-@pytest.fixture
-def router(monkeypatch):
-    """Fake router at ROUTER; MindsHub's /instance must never be hit."""
-    calls: list[tuple[str, str, dict | None, str]] = []
-    state = {"status": "none", "fail": None}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content) if request.content else None
-        calls.append((request.method, str(request.url), body, request.headers.get("authorization", "")))
-        if state["fail"] is not None:
-            return state["fail"]
-        path = request.url.path
-        if path == "/instance":
-            raise AssertionError("router mode called MindsHub /instance")
-        if path == "/browser/_status":
-            return httpx.Response(200, json={"status": state["status"]})
-        if path == "/browser/_warm":
-            state["status"] = "starting"
-            return httpx.Response(200, json={"status": "starting"})
-        if path == "/browser/_prefs":
-            return httpx.Response(200, json=state.get("prefs_answer") or {
-                "proxy_available": True, "prefs": {"proxy": True, "city": ""},
-                "cities": [{"id": "us-los_angeles", "label": "Los Angeles, United States"}, {"id": "bad"}, "x"],
-                "effective_city": "us-los_angeles", "extra": "dropped",
-            })
-        if path == "/browser/_embed":
-            sid = body["session_id"]
-            return httpx.Response(200, json={
-                "session_id": sid, "view_url": f"{ROUTER}/sessions/{sid}/view?et=tok",
-                "events_url": "wss://x/events", "expires_at": 1999999999,
-            })
-        return httpx.Response(404)
-
-    real = httpx.AsyncClient
-    monkeypatch.setattr(svc.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
-    monkeypatch.setattr(svc, "instance_api_base", lambda: "https://api.dev.mindshub.ai")
-    monkeypatch.setattr(svc, "router_url", lambda: ROUTER)
-    return SimpleNamespace(calls=calls, state=state)
+    for example in _fixture("browser_contract", "session_event.json").examples.values():
+        line = dict(example.body)
+        step = {"step": line.pop("kind"), **line}
+        assert step_stream_events(step) == [StreamBrowserSession(session_id=example.body["session_id"])]
 
 
-def test_router_url_setting_is_validated_and_normalized(monkeypatch):
-    from pydantic import ValidationError
+def test_a_mindshub_401_asks_the_person_to_sign_in_again(web_client, router, mindshub):
+    """A credential MindsHub refused says nothing about the browser."""
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
 
-    from cowork.common.settings.app_settings import AppSettings
-
-    for raw, expected in [
-        ("", ""),
-        (ROUTER + "/", ROUTER),
-        ("https://cowork.mindshub.ai/browser", "https://cowork.mindshub.ai/browser"),
-        ("https://browser.example.com:8443", "https://browser.example.com:8443"),
-        ("http://localhost:8080/browser/", "http://localhost:8080/browser"),
-        ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
-    ]:
-        monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", raw)
-        assert AppSettings().browser_router_url == expected, raw
-    for bad in [
-        "cowork.mindshub.ai/browser", "http://cowork.mindshub.ai/browser", "https://cowork.mindshub.ai/browser?x=1",
-        "https://cowork.mindshub.ai/browser#f", "https://u:p@cowork.mindshub.ai/browser", "ftp://cowork.mindshub.ai",
-    ]:
-        monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", bad)
-        with pytest.raises(ValidationError):
-            AppSettings()
+    mindshub.replies["jwt-alice"] = MindsHubReply(MindsHubAnswer.REFUSED, status_code=401)
+    status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
+    assert _detail(status) == (401, "unauthorized")
+    assert router.calls == []
 
 
-def test_router_is_a_valid_endpoint_only_when_configured(monkeypatch):
-    assert not svc.valid_endpoint(ROUTER)
-    monkeypatch.setattr(svc, "router_url", lambda: ROUTER)
-    assert svc.valid_endpoint(ROUTER) and svc.valid_endpoint(ROUTER + "/")
-    assert svc.valid_endpoint(ENDPOINT)
-    assert not svc.valid_endpoint(ROUTER + "/sessions")
-    assert not svc.valid_endpoint("https://cowork-pr-cowork-1146.dev.mindshub.ai")
+def test_auths_outage_answer_is_kept_only_as_long_as_a_failure(mindshub):
+    """auth answers no permissions and no browser block when it can't read
+    membership. Kept the good answer's 60 s, /browse/status would stay 503
+    for a minute after auth recovers."""
+    from cowork.services import mindshub_teams
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    mindshub.replies["jwt-alice"] = MindsHubReply(MindsHubAnswer.OK, payload={"permissions": [], "browser": None})
+    first = asyncio.run(mindshub_teams.fetch_mindshub_permissions(bearer_token="jwt-alice", org_id="o", user_id="u"))
+    assert first.is_outage_answer()
+    key = mindshub_teams.CallerCacheKey.for_caller(org_id="o", user_id="u", bearer_token="jwt-alice")
+    cache = mindshub_teams._permissions_cache
+    entry = cache._entries[key]
+    assert entry.fresh_until - entry.stored_at == pytest.approx(cache.ttl_fail_s)
 
 
-def test_router_sessions_and_project_keys_hash_the_ids():
-    import hashlib
+def test_a_desktop_keeps_its_switch_answer_when_mindshub_refuses_the_credential(client, signed_in_desktop, monkeypatch):
+    from cowork.services import mindshub_teams
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
 
-    sid = svc.router_session("user-a", "conv-1")
-    assert sid == "t-" + hashlib.sha256(b"user-a:conv-1").hexdigest()[:24]
-    assert sid != svc.router_session("user-a", "conv-2") and svc._SESSION_ID.match(sid)
-    assert svc.project_key("user-a", "proj-1") == "p-" + hashlib.sha256(b"user-a:proj-1").hexdigest()[:24]
-    assert svc.project_key("user-a", None) == "" and svc.project_key("user-a", "") == ""
-    assert svc.router_session(None, "conv-1") == "t-" + hashlib.sha256(b":conv-1").hexdigest()[:24]
-
-
-def test_router_status_warm_and_embed_go_to_the_router_as_the_caller(router):
-    assert asyncio.run(svc.status_for("user-jwt")) == {"provisioned": False, "status": "none", "endpoint": ROUTER}
-    assert asyncio.run(svc.provision_for("user-jwt")) == {"provisioned": True, "status": "starting", "endpoint": ROUTER}
-    # "starting" reaches the renderer as is.
-    assert asyncio.run(svc.status_for("user-jwt"))["status"] == "starting"
-
-    sid = svc.router_session("user-a", "conv-1")
-    on = SimpleNamespace(browser_enabled=True, browser_mode="mindshub", browser_url="")
-    out = asyncio.run(svc.embed_for(on, "user-jwt", "user-a", sid))
-    assert out == {"session_id": sid, "view_url": f"{ROUTER}/sessions/{sid}/view?et=tok", "expires_at": 1999999999}
-    assert [(m, u, b, a) for m, u, b, a in router.calls] == [
-        ("GET", f"{ROUTER}/_status", None, "Bearer user-jwt"),
-        ("POST", f"{ROUTER}/_warm", None, "Bearer user-jwt"),
-        ("GET", f"{ROUTER}/_status", None, "Bearer user-jwt"),
-        ("POST", f"{ROUTER}/_embed", {"session_id": sid}, "Bearer user-jwt"),
-    ]
+    replies = signed_in_desktop.replies
+    replies["desktop-jwt"] = MindsHubReply(MindsHubAnswer.OK, payload=_entitlements(False, reason="organization_off"))
+    assert asyncio.run(svc.desktop_organization_off()) is True
+    mindshub_teams.reset_caches_for_tests()
+    logged = []
+    monkeypatch.setattr(svc.logger, "warning", lambda msg, *a, **kw: logged.append(kw.get("extra", {}).get("event")))
+    replies["desktop-jwt"] = MindsHubReply(MindsHubAnswer.REFUSED, status_code=401)
+    assert asyncio.run(svc.desktop_organization_off()) is True
+    replies["desktop-jwt"] = MindsHubReply(MindsHubAnswer.UNREACHABLE)
+    mindshub_teams.reset_caches_for_tests()
+    assert asyncio.run(svc.desktop_organization_off()) is True
+    assert logged == ["desktop_browser_switch_unread", "desktop_browser_switch_unread"]
 
 
-def test_router_embed_checks_the_session_and_the_viewer_url(router, monkeypatch):
-    on = SimpleNamespace(browser_enabled=True, browser_mode="mindshub", browser_url="")
-    with pytest.raises(svc.BrowserServiceError) as err:
-        asyncio.run(svc.embed_for(on, "user-jwt", "user-a", "../escape"))
-    assert err.value.status == 400 and router.calls == []
+def test_handing_over_the_desktop_browser_reads_the_organizations_switch(signed_in_desktop):
+    from fastapi.testclient import TestClient
 
-    router.state["fail"] = httpx.Response(200, json={"view_url": "https://cowork-pr-cowork-1146.dev.mindshub.ai/x"})
-    with pytest.raises(svc.BrowserServiceError) as err:
-        asyncio.run(svc.embed_for(on, "user-jwt", "user-a", "t-abc"))
-    assert err.value.status == svc.UPSTREAM_FAILED
+    from cowork.server import create_app
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
 
-
-def test_router_errors_pass_through(router):
-    router.state["fail"] = httpx.Response(401, json={"error": "unauthorized", "message": "Sign in again."})
-    with pytest.raises(svc.BrowserServiceError) as err:
-        asyncio.run(svc.status_for("stale"))
-    assert (err.value.status, err.value.detail) == (401, "Sign in again.")
-
-
-def test_turn_block_with_the_router(monkeypatch):
-    monkeypatch.setattr(svc, "router_url", lambda: ROUTER)
-    on = SimpleNamespace(browser_enabled=True, browser_mode="mindshub", browser_url=ENDPOINT)
-    assert svc.turn_block(on, "user-a", "conv-1", "proj-1") == {
-        "base_url": ROUTER, "profile": svc.router_session("user-a", "conv-1"),
-        "project": svc.project_key("user-a", "proj-1"),
-    }
-    assert svc.turn_block(on, "user-a", "conv-1") == {"base_url": ROUTER, "profile": svc.router_session("user-a", "conv-1")}
-    # No stored instance needed: the router is the endpoint.
-    assert svc.turn_block(SimpleNamespace(browser_enabled=True, browser_url=""), "u", "c")["base_url"] == ROUTER
-    assert svc.turn_block(SimpleNamespace(browser_enabled=False, browser_url=""), "u", "c") is None
-    # Standalone still wins when the org chose it.
-    assert svc.turn_block(_standalone(), "user-a", "conv-1")["base_url"] == SERVICE
-    config = svc.anton_browser_config(on, "user-a", "conv-1")
-    assert (config.base_url, config.profile) == (ROUTER, svc.router_session("user-a", "conv-1"))
-
-
-def test_start_early_warms_without_waiting_or_failing(router):
-    on = SimpleNamespace(browser_enabled=True, browser_mode="mindshub", browser_url="")
-
-    async def scenario():
-        assert svc.start_early(on, "turn-key") is True
-        # Not awaited by the caller: nothing has gone out yet.
-        assert router.calls == []
-        await asyncio.gather(*list(svc._WARMING))
-        assert router.calls == [("POST", f"{ROUTER}/_warm", {"prefs": DEFAULT_PREFS}, "Bearer turn-key")]
-        assert not svc._WARMING
-
-        # A failing router is only logged.
-        router.state["fail"] = httpx.Response(503, json={"error": "no_capacity"})
-        assert svc.start_early(on, "turn-key") is True
-        await asyncio.gather(*list(svc._WARMING))
-
-        # Off, standalone, or no credential: nothing to warm.
-        assert svc.start_early(SimpleNamespace(browser_enabled=False), "turn-key") is False
-        assert svc.start_early(_standalone(), "turn-key") is False
-        assert svc.start_early(on, "") is False
-        assert svc.start_early(on, None) is False
-
-    asyncio.run(scenario())
-    assert len(router.calls) == 2
-    # Outside a running loop it declines rather than raising.
-    assert svc.start_early(on, "turn-key") is False
-
-
-def test_start_early_needs_the_router(mindshub):
-    async def scenario():
-        on = SimpleNamespace(browser_enabled=True, browser_mode="mindshub", browser_url=ENDPOINT)
-        assert svc.start_early(on, "turn-key") is False
-
-    asyncio.run(scenario())
-    assert mindshub.calls == []
-
-
-def test_router_routes_answer_from_the_router_and_store_nothing(client, router):
-    client.put("/api/v1/settings/browser_enabled", json={"value": "true"})
-    status = client.get("/api/v1/browse/status", headers=HUB)
-    assert status.status_code == 200
-    assert status.json() == {
-        "provisioned": False, "status": "none", "endpoint": ROUTER, "mode": "mindshub", "enabled": True,
-        "available": False,
-    }
-    provision = client.post("/api/v1/browse/provision", headers=HUB).json()
-    assert (provision["status"], provision["endpoint"], provision["available"]) == ("starting", ROUTER, False)
-    router.state["status"] = "running"
-    assert client.get("/api/v1/browse/status", headers=HUB).json()["available"] is True
-
-    from cowork.common.settings.user_settings import get_user_settings
-
-    assert get_user_settings().browser_url == ""
-
-    sid = svc.router_session(None, "conv-1")
-    embed = client.post("/api/v1/browse/embed", headers=HUB, json={"session_id": sid})
-    assert embed.status_code == 200 and embed.json()["view_url"] == f"{ROUTER}/sessions/{sid}/view?et=tok"
-    assert all(auth == "Bearer user-jwt" for _, _, _, auth in router.calls)
-
-
-def test_the_harness_threads_the_task_and_warms_with_the_held_credential(router, monkeypatch):
-    from cowork.common.settings import runtime_credential
-    from cowork.harnesses.anton_harness.harness import _browser_config
-
-    monkeypatch.setattr(runtime_credential, "get_minds_credential", lambda: "desktop-jwt")
-    on = SimpleNamespace(browser_enabled=True, browser_mode="mindshub", browser_url="")
-
-    async def scenario():
-        config = _browser_config(on, conversation_id="conv-1", project_id="proj-1")
-        assert (config.base_url, config.profile) == (ROUTER, svc.router_session(None, "conv-1"))
-        await asyncio.gather(*list(svc._WARMING))
-
-    asyncio.run(scenario())
-    assert router.calls == [("POST", f"{ROUTER}/_warm", {"prefs": DEFAULT_PREFS}, "Bearer desktop-jwt")]
-
-
-def test_proxy_settings_defaults_scope_and_city_check():
-    from pydantic import ValidationError
-
-    from cowork.common.settings.user_settings import UserSettings, setting_is_org_scoped
-
-    defaults = UserSettings()
-    assert (defaults.browser_proxy, defaults.browser_city) == (True, "")
-    for key in ("browser_proxy", "browser_city"):
-        assert setting_is_org_scoped(key) is False, key
-    assert UserSettings(browser_city=" us-new_york ").browser_city == "us-new_york"
-    for bad in ("US-new_york", "us", "us-new york", "us-../x", "usa-la"):
-        with pytest.raises(ValidationError):
-            UserSettings(browser_city=bad)
-
-
-def test_router_prefs_keep_only_sane_time_zones_and_locales():
-    user = SimpleNamespace(browser_proxy=False, browser_city="gb-london")
-    assert svc.router_prefs(user) == {"proxy": False, "city": "gb-london"}
-    assert svc.router_prefs(user, "Europe/London", "en-GB") == {
-        "proxy": False, "city": "gb-london", "timezone": "Europe/London", "locale": "en-GB",
-    }
-    assert svc.router_prefs(user, "Etc/GMT+5", "zh-Hant-TW")["timezone"] == "Etc/GMT+5"
-    assert svc.router_prefs(user, "Europe/London; rm", "en_GB<script>") == {"proxy": False, "city": "gb-london"}
-    # Settings objects from before the proxy existed read as the defaults.
-    assert svc.router_prefs(SimpleNamespace()) == DEFAULT_PREFS
-
-
-def test_start_early_sends_the_users_proxy_choice(router):
-    off = SimpleNamespace(browser_enabled=True, browser_mode="mindshub", browser_proxy=False, browser_city="fr-paris")
-
-    async def scenario():
-        assert svc.start_early(off, "turn-key") is True
-        await asyncio.gather(*list(svc._WARMING))
-
-    asyncio.run(scenario())
-    assert router.calls == [("POST", f"{ROUTER}/_warm", {"prefs": {"proxy": False, "city": "fr-paris"}}, "Bearer turn-key")]
-
-
-def test_provision_hands_the_router_the_prefs_and_locations_list_cities(client, router):
-    client.put("/api/v1/settings/browser_enabled", json={"value": "true"})
-    client.put("/api/v1/settings/browser_city", json={"value": "us-los_angeles"})
-    # No body still works, as the renderer that doesn't send one expects.
-    assert client.post("/api/v1/browse/provision", headers=HUB).status_code == 200
-    answer = client.post(
-        "/api/v1/browse/provision", headers=HUB, json={"timezone": "America/Los_Angeles", "locale": "en-US"},
+    signed_in_desktop.replies["desktop-jwt"] = MindsHubReply(
+        MindsHubAnswer.OK, payload=_entitlements(False, reason="organization_off"),
     )
+    # The app hands its browser over from the same machine.
+    loopback = TestClient(create_app(), client=("127.0.0.1", 40000))
+    answer = loopback.put("/api/v1/runtime-credential/browser", json={"url": APP_BROWSER.url, "token": APP_BROWSER.token.get_secret_value()})
     assert answer.status_code == 200
-    warms = [body for method, url, body, _ in router.calls if url.endswith("/_warm")]
-    assert warms == [
-        {"prefs": {"proxy": True, "city": "us-los_angeles"}},
-        {"prefs": {"proxy": True, "city": "us-los_angeles", "timezone": "America/Los_Angeles", "locale": "en-US"}},
-    ]
-
-    listed = client.get("/api/v1/browse/locations", headers=HUB)
-    assert listed.status_code == 200
-    assert listed.json() == {
-        "proxy_available": True, "prefs": {"proxy": True, "city": ""},
-        "cities": [
-            # An id Settings couldn't save is dropped.
-            {"id": "us-los_angeles", "label": "Los Angeles, United States"},
-        ],
-        "effective_city": "us-los_angeles",
-    }
-    assert ("GET", f"{ROUTER}/_prefs", None, "Bearer user-jwt") in router.calls
-
-
-def test_locations_without_a_router_or_in_standalone(client, mindshub, monkeypatch):
-    assert client.get("/api/v1/browse/locations", headers=HUB).json() == svc.NO_LOCATIONS
-    assert mindshub.calls == []
-    monkeypatch.setattr(svc, "router_url", lambda: ROUTER)
-    client.put("/api/v1/settings/browser_mode", json={"value": "standalone"})
-    assert client.get("/api/v1/browse/locations", headers=HUB).json() == svc.NO_LOCATIONS
-    assert mindshub.calls == []
+    assert svc._desktop_organization_off is True

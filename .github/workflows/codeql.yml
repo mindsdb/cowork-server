@@ -1,0 +1,51 @@
+name: CodeQL
+
+# Replaces CodeQL default setup, which scans only the default branch and
+# branches under classic branch protection. staging is protected by rulesets,
+# so default setup never scanned a PR onto it and an alert first showed on the
+# staging -> main release PR. Same languages, query suite and categories as
+# default setup, so existing alerts carry over. Default setup must be off for
+# this workflow's uploads to be accepted.
+#
+# Called from each event's own pipeline (dev-build-deploy.yml on a pull
+# request, publish-staging.yml on a push to staging, publish.yml on a push to
+# main), so each event keeps one run tree. The weekly schedule runs on main and
+# scans with the latest queries even when nothing was pushed. No concurrency
+# block: a called workflow's group is evaluated in its caller's context and
+# would collide with the caller's own.
+
+on:
+  workflow_call:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, javascript-typescript, python]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}

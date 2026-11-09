@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Mapping
 from contextlib import ExitStack, nullcontext
 from typing import Annotated, NamedTuple
 
@@ -32,6 +33,7 @@ from cowork.services.projects import ProjectService
 from cowork.services.shared_resources import (
     SKILL,
     SKILL_PROJECT_REFERENCES,
+    AttributionSnapshot,
     SharedResourceAccess,
 )
 from cowork.services.skills import (
@@ -162,12 +164,22 @@ def _builtins_immutable(scope: TenantScope) -> bool:
 
 
 def _skill_response(
-    visible: VisibleSkill, *, access: SharedResourceAccess, service: SkillService
+    visible: VisibleSkill,
+    *,
+    access: SharedResourceAccess,
+    service: SkillService,
+    snapshots: Mapping[str, AttributionSnapshot] | None = None,
 ) -> SkillResponse:
+    """One skill as the API returns it.
+
+    ``snapshots`` is every skill attribution row, as a listing reads them once
+    (SharedResourceAccess.snapshots); without it, this reads the one row.
+    """
     skill = visible.skill
     shared = visible.shared
     viewer = service.viewer if service.org_sharing else None
     rule: SkillAccessRule | None = None
+    snapshot = access.listed_snapshot(SKILL, skill.name, snapshots)
     if visible.origin is SkillOrigin.MANAGED:
         # The operator's managed skill: built-in and read-only for every
         # caller, and authored by nobody here.
@@ -181,12 +193,21 @@ def _skill_response(
         builtin = False
         can_change = False
     else:
-        if access.org_mode and access.has_trusted_actor:
+        # Only a claim that may have expired takes the locks: a false answer
+        # is final (AttributionSnapshot.may_be_recoverable), and
+        # recover_stale_claim re-decides under them.
+        if (
+            access.org_mode
+            and access.has_trusted_actor
+            and snapshot is not None
+            and snapshot.may_be_recoverable()
+        ):
             with access.coordination_lock(SKILL_PROJECT_REFERENCES, "all"):
                 with access.coordination_lock(SKILL, skill.name):
                     _recover_skill_claim(access, service, skill.name)
-        pending = access.claim_is_pending(SKILL, skill.name)
-        creator_id = access.creator_id(SKILL, skill.name)
+            snapshot = access.snapshot(SKILL, skill.name)
+        pending = snapshot is not None and snapshot.pending
+        creator_id = access.creator_id_of(snapshot)
         if viewer is not None:
             rule = service.access_rule(skill)
         builtin = is_builtin_skill(skill.name)
@@ -220,9 +241,8 @@ def _skill_response(
         can_disable_for_everyone=can_change and not builtin,
         visible_to_others=_visible_to_others(visible, service=service, viewer=viewer, rule=rule),
         projects=skill.projects,
-        attribution=access.attribution(
-            SKILL,
-            skill.name,
+        attribution=access.attribution_of(
+            snapshot,
             fallback_creator_id=creator_id,
             fallback_modified_at=skill.updated_at,
         ),
@@ -468,11 +488,18 @@ def list_skills(
     skill_service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     skill_service.ensure_builtin_skills()
     access = SharedResourceAccess(scoped, principal)
+    visible_skills = skill_service.list_visible_skills()
+    # Read after the skills: a create or upload commits its claim
+    # (_reserve_free_slug) before it writes the folder, so every listed skill's
+    # claim is in this read. A rename moves the folder first and its
+    # attribution row in a later commit (update_skill), so a listing in between
+    # shows the new name with no attribution until the rename commits.
+    snapshots = access.snapshots(SKILL)
     # The typed response carries can_share's "canShare" alias from the model.
     return SkillListResponse(
         skills=[
-            _skill_response(visible, access=access, service=skill_service)
-            for visible in skill_service.list_visible_skills()
+            _skill_response(visible, access=access, service=skill_service, snapshots=snapshots)
+            for visible in visible_skills
         ],
         can_share=skill_service.sharing_available,
     ).model_dump(by_alias=True)

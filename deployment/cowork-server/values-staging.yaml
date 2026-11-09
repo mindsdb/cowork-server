@@ -85,6 +85,11 @@ deployment:
     - name: COWORK_ORGANIZATION_SWITCH_ENABLED
       value: "true"
 
+    # The agent's browser on the web: the browser router, served on this host
+    # under /browser. Unset, the web app offers no browser; see README.md.
+    - name: COWORK_BROWSER_ROUTER_URL
+      value: "https://cowork.staging.mindshub.ai/browser"
+
     - name: COWORK_TURN_MINDS_BASE_URL
       value: "https://api.staging.mindshub.ai/v1"
 

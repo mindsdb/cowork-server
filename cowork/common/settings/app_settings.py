@@ -206,25 +206,23 @@ def _bare_origin(value: str) -> tuple[str, str] | None:
 
 
 _ROUTER_URL = re.compile(
-    r"(?P<scheme>https?)://(?P<host>[a-z0-9][a-z0-9.-]*)(?P<port>:[0-9]{1,5})?"
+    r"https://(?P<host>[a-z0-9][a-z0-9.-]*)(?P<port>:[0-9]{1,5})?"
     r"(?P<path>(?:/[A-Za-z0-9._~-]+)*)/?",
     re.IGNORECASE,
 )
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1"})
 
 
 def _router_url(value: str) -> str | None:
     """``value`` as a browser router base URL without its trailing slash, or
-    None when it isn't one: https to any host, http only to loopback (it
-    carries callers' credentials), an optional plain path, and nothing else
-    (no query, fragment or userinfo, which the pattern can't match)."""
+    None when it isn't one: https to any host with an optional plain path, and
+    nothing else (no query, fragment or userinfo, which the pattern can't
+    match). Only https, because anton's browser tool takes no other router
+    address (anton.core.browser.config.BrowserConfig)."""
     match = _ROUTER_URL.fullmatch(value.strip())
     if match is None:
         return None
-    scheme, host = match["scheme"].lower(), match["host"].lower().rstrip(".")
-    if scheme == "http" and host not in _LOOPBACK_HOSTS:
-        return None
-    return f"{scheme}://{host}{match['port'] or ''}{match['path']}"
+    host = match["host"].lower().rstrip(".")
+    return f"https://{host}{match['port'] or ''}{match['path']}"
 
 
 def _env_slug() -> str:
@@ -1129,15 +1127,15 @@ class AppSettings(Settings):
         default="",
         validation_alias=AliasChoices("COWORK_BROWSER_ROUTER_URL"),
         description=(
-            "The shared browser router (ENG-3188), for example "
-            "https://cowork.mindshub.ai/browser: served on the cowork host "
-            "under /browser, it starts one browser pod per user and routes "
-            "each caller to their own by the credential they present. When "
-            "set, the MindsHub browser mode uses it for status, warm-up and "
-            "viewer URLs (cowork.services.browser) instead of provisioning a "
-            "per-user instance. https with an optional path, or http to "
-            "loopback for local testing; the trailing slash is dropped. "
-            "Blank (default): the per-user instance path."
+            "The browser router, for example https://cowork.mindshub.ai/browser. "
+            "MindsHub mode only (COWORK_TENANCY_MODE=org): served on the cowork "
+            "host under /browser, it starts one browser per person and routes "
+            "each caller to their own by the credential they present. Status, "
+            "warm-up, viewer links and each web turn's browser go through it "
+            "(cowork.services.browser). https with an optional path; the "
+            "trailing slash is dropped. Blank (default): the web app has no "
+            "browser. Ignored outside MindsHub mode, where the desktop app "
+            "runs its own browser."
         ),
     )
 
@@ -1150,9 +1148,24 @@ class AppSettings(Settings):
         if normalized is None:
             raise ValueError(
                 "COWORK_BROWSER_ROUTER_URL must be an https URL with an optional "
-                "path (no query, fragment or credentials), or http to localhost"
+                "path (no query, fragment or credentials)"
             )
         return normalized
+
+    browser_scope_key_file: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_SCOPE_KEY_FILE"),
+        description=(
+            "A file holding the browser router's scope key, sent beside each web "
+            "turn's key on the router's _scope, so only this server can scope a "
+            "turn key (cowork.services.browser.scope_turn). MindsHub mode only. "
+            "The chart mounts the router's own Secret, browser-proxy, key "
+            "scope_key, here, so the two never differ. Read on every scope, so a "
+            "Secret that appears or rotates after start is picked up without a "
+            "restart. Blank, missing or empty: the router refuses every scope and "
+            "web turns run without a browser."
+        ),
+    )
 
     organization_switch_enabled: bool = Field(
         default=False,
@@ -1284,6 +1297,17 @@ class AppSettings(Settings):
         ),
     )  # COWORK_SERVER_OWNER
 
+    health_proof_key: SecretStr = Field(
+        default=SecretStr(os.environ.get("COWORK_SERVER_HEALTH_PROOF_KEY", "")),
+        description=(
+            "Per-install secret the desktop app passes at spawn and keeps in a file only its OS "
+            "user can read. /health answers an HMAC of the app's nonce and the port it answered "
+            "on, keyed by this, so the app can tell its own server from a listener another OS "
+            "user put on its port, which can replay the owner token /health echoes but can't "
+            "compute this. Empty means /health proves nothing."
+        ),
+    )  # COWORK_SERVER_HEALTH_PROOF_KEY
+
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
     # The same switch that turns on anton's per-call usage log. Set by evals only.
     usage_log: bool = Field(
@@ -1408,6 +1432,39 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TURN_TOKENS"),
         description="Default for the per-user 'Max Tokens per Task' agent budget.",
     )  # COWORK_DEFAULT_MAX_TURN_TOKENS
+    # Wall-clock cap on one scheduled run, past which the scheduler stops its
+    # turn. The step and token budgets above bound how much work a run does;
+    # this only catches a run that keeps going without ever finishing, so it
+    # sits well above how long real runs take.
+    scheduled_run_max_seconds: int = Field(
+        default=1800,
+        ge=300,
+        le=86_400,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUN_MAX_SECONDS"),
+        description="Longest a scheduled run may take before it is stopped.",
+    )  # COWORK_SCHEDULED_RUN_MAX_SECONDS
+    # Scheduled runs one server process drives at once, across every
+    # organization. Unset, it follows where turns run: 3 on the desktop, where
+    # each run is an agent on the user's own machine, and 16 when turns run in
+    # sandbox pods, where the process only streams them (scheduler).
+    scheduled_runs_per_process: int | None = Field(
+        default=None,
+        ge=1,
+        le=64,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUNS_PER_PROCESS"),
+        description="Scheduled runs one server process drives at once; unset follows the backend.",
+    )  # COWORK_SCHEDULED_RUNS_PER_PROCESS
+    # Scheduled runs one organization may have going at once, counted across
+    # every replica, only when explicitly configured. Hosted policy will come
+    # from auth; no deployment-wide default is imposed. A
+    # desktop schedule has no organization, so this doesn't apply there.
+    scheduled_runs_per_org: int | None = Field(
+        default=None,
+        ge=1,
+        le=256,
+        validation_alias=AliasChoices("COWORK_SCHEDULED_RUNS_PER_ORG"),
+        description="Scheduled runs one organization may have going at once, across all replicas.",
+    )  # COWORK_SCHEDULED_RUNS_PER_ORG
 
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_URI; the other fields read their bare names
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*

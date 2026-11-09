@@ -21,6 +21,7 @@ import test_turn_pool_connections as turn_pool
 from _fakes import PausedModel
 
 import cowork.scheduler as scheduler
+from cowork.common.datetime_utils import ensure_utc
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.db.units import unit_session
 from cowork.harnesses.anton_harness import harness as harness_mod
@@ -276,7 +277,7 @@ async def test_pause_resume_and_delete_each_take_a_confirmation():
 
 
 @pytest.mark.parametrize(("hours_overdue", "catch_up"), [
-    (1, "It runs once right away for the run it missed while paused."),
+    (1, "The run it missed while paused is skipped."),
     (3 * 24 + 1, "The 4 runs it missed while paused are skipped."),
 ])
 async def test_a_resume_card_shows_the_run_that_will_really_happen(hours_overdue, catch_up):
@@ -431,6 +432,32 @@ async def test_a_task_in_the_local_timezone_can_be_paused_from_chat():
 
     assert result["task"]["paused"] is True
     assert "(local)" in card.shown[0].prompt
+
+
+async def test_a_slot_left_due_by_a_run_that_never_acted_runs_right_away():
+    # The one case where resuming doesn't skip ahead: the run at the due slot
+    # gave it back before its agent acted (see ScheduleService.resume_plan).
+    task = await _create_confirmed(cadence="daily")
+    await _call(MANAGE_TOOL_NAME, _Session(_Card(CONFIRM)), {"action": "pause", "schedule_id": task["schedule_id"]})
+    slot = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=1)
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        schedule = session.get(Schedule, UUID(task["schedule_id"]))
+        schedule.next_run_at = slot
+        session.add(schedule)
+        session.add(ScheduleRun(
+            schedule_id=schedule.id, started_at=slot + timedelta(minutes=1),
+            finished_at=slot + timedelta(minutes=2), status="failed", is_manual=False,
+            outcome="failed_before_execution",
+        ))
+    card = _Card(CONFIRM)
+
+    result = await _call(MANAGE_TOOL_NAME, _Session(card), {"action": "resume", "schedule_id": task["schedule_id"]})
+
+    assert "It runs once right away for the run it missed while paused." in card.shown[0].prompt
+    assert result["task"]["catch_up"] == "It runs once right away for the run it missed while paused."
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        # Left due, so the scheduler's next poll runs it.
+        assert ensure_utc(session.get(Schedule, UUID(task["schedule_id"])).next_run_at) == slot
 
 
 async def test_a_confirmed_resume_reports_the_run_the_card_showed():

@@ -34,6 +34,15 @@ EVENT_FIELDS = frozenset(
         "project_id",
         "schedule_id",
         "turn_id",
+        # The turn whose saved question refused a stale start
+        # (cowork.streaming.registry).
+        "saved_turn_id",
+        # A turn's run, the run holding its conversation's turn claim, and
+        # that run's pod (cowork.streaming.turn_claim).
+        "run_id",
+        "holder_run_id",
+        "holder_pod",
+        "pod",
         "job_id",
         "trace_id",
         "method",
@@ -49,6 +58,10 @@ EVENT_FIELDS = frozenset(
         # (cowork.turnqueue.producer._fit_request).
         "request_bytes",
         "cap_bytes",
+        # A remote turn reply's number and the last one the relay applied
+        # (cowork.turnqueue.producer.stream_remote_replies).
+        "reply_n",
+        "last_reply_n",
         "slot",
         "model_alias",
         "managed_connection_file",

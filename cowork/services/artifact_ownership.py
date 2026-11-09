@@ -23,7 +23,7 @@ import json
 import logging
 import os
 import stat
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -68,6 +68,15 @@ class OwnerResolution:
     @property
     def unknown(self) -> bool:
         return self.state == "unknown"
+
+
+@dataclass(frozen=True)
+class OwnerRequest:
+    """One root's slugs whose owners a listing asks for
+    (resolve_artifact_owners_by_source)."""
+
+    source: ProjectArtifacts
+    slugs: tuple[str, ...]
 
 
 def artifact_resource_key(project_id, slug: str) -> str:
@@ -170,7 +179,11 @@ def conversation_creator(session, conversation_id, *, project_id=None) -> str | 
     With ``project_id`` the conversation must also belong to that project: a
     conversation owns artifacts only inside its own project.
     """
-    conversation = session.get(Conversation, conversation_id)
+    return _creator_in_project(session.get(Conversation, conversation_id), project_id)
+
+
+def _creator_in_project(conversation: Conversation | None, project_id) -> str | None:
+    """``conversation_creator``'s answer for a row already read."""
     if conversation is None:
         return None
     if project_id is not None and str(conversation.project_id) != str(project_id):
@@ -190,21 +203,96 @@ def _report_unknown(project_id, slug: str) -> None:
 
 def resolve_artifact_owners(session, source, slugs: Iterable[str]) -> dict[str, OwnerResolution]:
     """Owner of each slug under one root. Read-only; one query per root."""
-    wanted = list(dict.fromkeys(slugs))
-    scope = _org_scope(session)
-    if scope is None:
+    request = OwnerRequest(source=source, slugs=tuple(slugs))
+    return resolve_artifact_owners_by_source(session, [request])[0]
+
+
+def resolve_artifact_owners_by_source(
+    session, wanted: Sequence[OwnerRequest]
+) -> list[dict[str, OwnerResolution]]:
+    """Owner of each slug under each root, in the order of ``wanted``.
+
+    Read-only. Every project root's owners come from one attribution query
+    together, and every legacy root's from one conversation query, so a
+    listing across the organization's projects reads them once, not once per
+    root.
+    """
+    requests = [
+        OwnerRequest(source=request.source, slugs=tuple(dict.fromkeys(request.slugs)))
+        for request in wanted
+    ]
+    if _org_scope(session) is None:
         user_id = getattr(getattr(session, "scope", None), "user_id", None)
-        return {slug: OwnerResolution(user_id, "local") for slug in wanted}
-    if not wanted:
+        return [
+            {slug: OwnerResolution(user_id, "local") for slug in request.slugs}
+            for request in requests
+        ]
+
+    keys = [
+        artifact_resource_key(request.source.project_id, slug)
+        for request in requests
+        if _reads_recorded_owners(request.source)
+        for slug in request.slugs
+    ]
+    recorded: dict[str, str] = {}
+    if keys:
+        rows = session.exec(
+            session.select(SharedResourceAttribution).where(
+                SharedResourceAttribution.resource_kind == ARTIFACT,
+                SharedResourceAttribution.resource_key.in_(keys),
+            )
+        ).all()
+        recorded = {
+            row.resource_key: row.created_by_id
+            for row in rows
+            if row.created_by_id and not row.pending_claim_token
+        }
+    legacy_ids = {
+        conversation_id
+        for request in requests
+        if request.slugs
+        and (conversation_id := _legacy_conversation_id(request.source)) is not None
+    }
+    conversations: dict[UUID, Conversation] = {}
+    if legacy_ids:
+        # Through the scope, as conversation_creator's get reads them.
+        conversations = {
+            conversation.id: conversation
+            for conversation in session.exec(
+                session.select(Conversation).where(Conversation.id.in_(legacy_ids))
+            ).all()
+        }
+    return [_resolve_in_root(request, recorded, conversations) for request in requests]
+
+
+def _reads_recorded_owners(source) -> bool:
+    """Whether a root's owners are its artifacts' attribution rows: the
+    project root's, and no legacy or unanchored root's."""
+    return bool(
+        source.project_id
+        and _legacy_conversation_id(source) is None
+        and is_project_root(source)
+    )
+
+
+def _resolve_in_root(
+    request: OwnerRequest,
+    recorded: dict[str, str],
+    conversations: dict[UUID, Conversation],
+) -> dict[str, OwnerResolution]:
+    """One root's owners, given every recorded owner by key and every legacy
+    root's conversation by id."""
+    source, slugs = request.source, request.slugs
+    if not slugs:
         return {}
 
     conversation_id = _legacy_conversation_id(source)
     if conversation_id is not None:
-        owner = conversation_creator(session, conversation_id, project_id=source.project_id)
+        owner = _creator_in_project(conversations.get(conversation_id), source.project_id)
         state: OwnerState = "legacy_path" if owner else "unknown"
-        return {slug: OwnerResolution(owner, state) for slug in wanted}
+        return {slug: OwnerResolution(owner, state) for slug in slugs}
 
-    if not source.project_id or not is_project_root(source):
+    if not _reads_recorded_owners(source):
         if source.project_id and getattr(source, "trusted_anchor", None) is None:
             # Every org root built by `artifact_roots._sources_for` carries an
             # anchor; one without it resolves `unknown` for every artifact.
@@ -212,23 +300,11 @@ def resolve_artifact_owners(session, source, slugs: Iterable[str]) -> dict[str, 
                 "artifact_owner source without trusted_anchor project=%s base=%s",
                 source.project_id, source.base,
             )
-        return {slug: OwnerResolution(None, "unknown") for slug in wanted}
+        return {slug: OwnerResolution(None, "unknown") for slug in slugs}
 
-    keys = {artifact_resource_key(source.project_id, slug): slug for slug in wanted}
-    rows = session.exec(
-        session.select(SharedResourceAttribution).where(
-            SharedResourceAttribution.resource_kind == ARTIFACT,
-            SharedResourceAttribution.resource_key.in_(list(keys)),
-        )
-    ).all()
-    owners = {
-        keys[row.resource_key]: row.created_by_id
-        for row in rows
-        if row.created_by_id and not row.pending_claim_token
-    }
     resolutions: dict[str, OwnerResolution] = {}
-    for slug in wanted:
-        owner = owners.get(slug)
+    for slug in slugs:
+        owner = recorded.get(artifact_resource_key(source.project_id, slug))
         if owner:
             resolutions[slug] = OwnerResolution(owner, "recorded")
         else:

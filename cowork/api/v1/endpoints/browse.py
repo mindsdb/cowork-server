@@ -1,138 +1,139 @@
-"""/browse — the user's MindsHub browser (ENG-3298).
+"""/browse: the agent's browser, for Settings and the chat's browser pane.
 
-GET  /browse/status     is it provisioned, running, enabled
-POST /browse/provision  create or wake it, and remember where it is
-POST /browse/embed      a fresh viewer URL for the side pane
-GET  /browse/locations  the router's cities and the caller's proxy preferences
+GET    /browse/status     whether this deployment offers the caller a browser, and its state
+POST   /browse/provision  web: start the caller's browser early, with their time zone and language
+POST   /browse/embed      web: a viewer link for one of the caller's sessions
+POST   /browse/approve    web: the person approves one step the browser held for them
+POST   /browse/decline    web: the person skips one step the browser held for them
+DELETE /browse/logins     web: sign the person out of every site in their browser
 
-Replaces the compat stub that always answered ``{"available": false}``;
-``available`` stays in the answer for the renderer that already reads it.
+On the web the routes go to the browser router as the caller, with their own
+MindsHub credential (cowork.services.browser). Status first reads the caller's
+browser entitlement from MindsHub, and answers ``organization_off`` or
+``not_entitled`` for an account that may not use the browser without asking
+the router. A refusal from the router keeps its 401, 403 or 429 and its code in
+``detail``; any other router failure is 424 with the router's code. The router
+answers a turn key ``person_only`` on every route here.
 
-In ``standalone`` browser mode the same routes talk to the org's own browser
-service with its API key instead: no MindsHub credential needed, nothing to
-provision, and ``mode`` in the answer says which one the renderer is showing.
+Approve doesn't answer the chat card: the web app calls it first and answers
+the card only once the browser recorded the approval. The card's Skip, and any
+answer but Approve, sends decline, best effort: the step stays held either way.
 
-With the shared browser router (``COWORK_BROWSER_ROUTER_URL``, ENG-3188) the
-MindsHub mode's routes go to it instead of the per-user instance: status reads
-the caller's pod (``starting`` while it comes up), provision warms it, and the
-answer's ``endpoint`` is the router. Nothing is remembered in ``browser_url``
-then: the router is the same for everyone. Provision also hands the router the
-caller's proxy preferences (``browser_proxy``, ``browser_city``) and, when the
-renderer sends them, its time zone and language; ``/browse/locations`` lists
-the cities Settings can offer.
+On the desktop the browser is the app's own, registered through
+``PUT /runtime-credential/browser``. Status says whether one is registered,
+and a signed-in desktop whether its organization turned the browser off; the
+other routes answer 409, as the web does without a router.
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Optional
+from typing import Annotated, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
-from sqlmodel import Session
+from pydantic import BaseModel, Field
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
-from cowork.db.session import get_session
 from cowork.principal import mindshub_credential
 from cowork.services import browser as browser_service
-from cowork.services.settings import SettingService
+from cowork.services.browser_contract import SESSION_ID
 
 router = APIRouter()
 
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
-SessionDep = Annotated[Session, Depends(get_session)]
 
 
 class ProvisionRequest(BaseModel):
-    # The renderer's own, so the browser presents the same time zone and
-    # language as the person (and picks their city when none is chosen).
-    timezone: Optional[str] = None
-    locale: Optional[str] = None
+    # The app's own, so the browser presents the same time zone and language
+    # as the person.
+    timezone: str | None = None
+    locale: str | None = None
 
 
 class EmbedRequest(BaseModel):
-    # None: the user's own profile for the mode, resolved server-side since on
-    # a standalone service it depends on who is asking.
-    session_id: Optional[str] = None
+    session_id: str = Field(pattern=SESSION_ID.pattern)
 
 
-def _raise(exc: browser_service.BrowserServiceError) -> None:
-    raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+def _raise(exc: browser_service.BrowserServiceError) -> NoReturn:
+    raise HTTPException(status_code=exc.status, detail=exc.detail.model_dump()) from exc
 
 
-def _answer(view: dict, user) -> dict:
-    enabled = bool(user.browser_enabled)
-    return {
-        **view,
-        "mode": browser_service.browser_mode(user),
-        "enabled": enabled,
-        "available": enabled and view.get("status") == "running" and bool(view.get("endpoint")),
-    }
-
-
-def _remember_endpoint(session: Session, scope: TenantScope, endpoint: str) -> None:
-    # The router is deployment config, not where this user's instance is.
-    if browser_service.router_url():
-        return
-    if endpoint and get_user_settings(scope).browser_url != endpoint:
-        SettingService(session, scope).upsert_setting("browser_url", endpoint)
-
-
-# AuthenticatedInOrgMode, same as /hub/usage: in mindshub mode every route
-# here acts as the caller with their MindsHub credential, and MindsHub rejects
-# a missing or invalid one. Local mode has no principal, and the desktop's
-# credential is what the call carries. Standalone mode needs no MindsHub
-# credential, but still only answers an authenticated caller.
-@router.get("/status", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def browse_status(request: Request, scope: ScopeDep, session: SessionDep) -> dict:
-    user = get_user_settings(scope)
+# AuthenticatedInOrgMode, same as /hub/usage: on the web every route here acts
+# as the caller with their MindsHub credential, and the router and MindsHub
+# refuse a missing or invalid one. The desktop has no principal, and its
+# routes call nothing.
+@router.get(
+    "/status", response_model=browser_service.BrowseStatus,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def browse_status(request: Request, scope: ScopeDep) -> browser_service.BrowseStatus:
     try:
-        if browser_service.browser_mode(user) == browser_service.STANDALONE:
-            return _answer(await browser_service.service_status(user), user)
-        view = await browser_service.status_for(mindshub_credential(request))
-    except browser_service.BrowserServiceError as exc:
-        _raise(exc)
-    _remember_endpoint(session, scope, view.get("endpoint", ""))
-    return _answer(view, user)
-
-
-@router.post("/provision", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def browse_provision(
-    request: Request, scope: ScopeDep, session: SessionDep, body: Optional[ProvisionRequest] = None,
-) -> dict:
-    user = get_user_settings(scope)
-    body = body or ProvisionRequest()
-    try:
-        if browser_service.browser_mode(user) == browser_service.STANDALONE:
-            # Nothing to create on someone's own service, and `browser_url`
-            # stays MindsHub's: answer as status does.
-            return _answer(await browser_service.service_status(user), user)
-        prefs = browser_service.router_prefs(user, body.timezone, body.locale)
-        view = await browser_service.provision_for(mindshub_credential(request), prefs)
-    except browser_service.BrowserServiceError as exc:
-        _raise(exc)
-    _remember_endpoint(session, scope, view.get("endpoint", ""))
-    return _answer(view, user)
-
-
-@router.post("/embed", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def browse_embed(body: EmbedRequest, request: Request, scope: ScopeDep) -> dict:
-    try:
-        return await browser_service.embed_for(
-            get_user_settings(scope), mindshub_credential(request), scope.user_id, body.session_id,
+        return await browser_service.browse_status(
+            get_user_settings(scope), bearer=mindshub_credential(request),
+            org_id=scope.org_id or "", user_id=scope.user_id or "",
         )
     except browser_service.BrowserServiceError as exc:
         _raise(exc)
 
 
-@router.get("/locations", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def browse_locations(request: Request, scope: ScopeDep) -> dict:
-    # Only the router has cities; a standalone service or a per-user instance
-    # browses from wherever it runs.
-    if browser_service.browser_mode(get_user_settings(scope)) == browser_service.STANDALONE:
-        return dict(browser_service.NO_LOCATIONS)
+@router.post(
+    "/provision", response_model=browser_service.BrowseStatus,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def browse_provision(
+    request: Request, scope: ScopeDep, body: ProvisionRequest | None = None,
+) -> browser_service.BrowseStatus:
+    user = get_user_settings(scope)
+    body = body or ProvisionRequest()
+    prefs = browser_service.router_prefs(timezone=body.timezone, locale=body.locale)
     try:
-        return await browser_service.locations(mindshub_credential(request))
+        warmed = await browser_service.warm(mindshub_credential(request), prefs)
+    except browser_service.BrowserServiceError as exc:
+        _raise(exc)
+    # The router started it for the caller, so it is theirs to use.
+    return browser_service.BrowseStatus(enabled=bool(user.browser_enabled), available=True, status=warmed.status)
+
+
+@router.post(
+    "/embed", response_model=browser_service.BrowserEmbed,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def browse_embed(body: EmbedRequest, request: Request) -> browser_service.BrowserEmbed:
+    try:
+        return await browser_service.embed(mindshub_credential(request), body.session_id)
+    except browser_service.BrowserServiceError as exc:
+        _raise(exc)
+
+
+@router.post(
+    "/approve", response_model=browser_service.BrowserApproval,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def browse_approve(body: browser_service.ApproveRequest, request: Request) -> browser_service.BrowserApproval:
+    try:
+        return await browser_service.approve(mindshub_credential(request), body)
+    except browser_service.BrowserServiceError as exc:
+        _raise(exc)
+
+
+@router.post(
+    "/decline", response_model=browser_service.BrowserDecline,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def browse_decline(body: browser_service.DeclineRequest, request: Request) -> browser_service.BrowserDecline:
+    try:
+        return await browser_service.decline(mindshub_credential(request), body)
+    except browser_service.BrowserServiceError as exc:
+        _raise(exc)
+
+
+@router.delete(
+    "/logins", response_model=browser_service.LoginsCleared,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def browse_clear_logins(request: Request) -> browser_service.LoginsCleared:
+    try:
+        return await browser_service.clear_logins(mindshub_credential(request))
     except browser_service.BrowserServiceError as exc:
         _raise(exc)

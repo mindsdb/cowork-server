@@ -68,6 +68,7 @@ from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
+    from anton.core.browser.config import BrowserConfig
     from anton.core.session import ChatSession
 
     from cowork.services.conversations import ReplayHistory
@@ -1988,12 +1989,14 @@ class AntonHarness:
                 # brief when the agent acts first); without it the tool hands
                 # the content to the agent. Dropped by an anton without the field.
                 **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
-                # The user's MindsHub browser, when they turned it on (ENG-3298):
-                # anton registers its `browser` tool only then. None, or dropped
-                # by an anton without the field, means no browser this turn.
-                **supported_kwargs(ChatSessionConfig, browser=_browser_config(
-                    user, conversation_id=str(conversation.id), project_id=conversation.project_id,
-                )),
+                # The desktop app's own browser, when it registered one and the
+                # person turned the browser on: anton registers its `browser`
+                # tool only then. Never for a channel turn. Passed directly:
+                # every anton the floor admits has the field.
+                browser=await _browser_config(
+                    user, channel_context=channel_context,
+                    conversation_id=str(conversation.id), project_id=conversation.project_id,
+                ),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
@@ -2069,29 +2072,27 @@ class AntonHarness:
         return build_llm_client(effort_override=effort, model_override=model, settings=settings)
 
 
-def _browser_config(user, *, conversation_id=None, project_id=None):
-    """anton's BrowserConfig for this user and task, or None (ENG-3298). Never
-    raises: a turn must not fail over the browser.
+async def _browser_config(
+    user, *, channel_context: ChannelContext | None, conversation_id: str, project_id,
+) -> "BrowserConfig | None":
+    """anton's browser for an in-process turn: the desktop app's own browser,
+    with the task's own session, or None.
 
-    With the shared browser router (ENG-3188) this is also where the turn
-    starts the user's pod warming, as the desktop's signed-in user: the
-    server's held MindsHub credential. None of that in org mode, which holds
-    none; the router then starts the pod on anton's first call.
+    None for a channel turn: it comes from a chat where people other than the
+    desktop's owner can write, and the browser holds the owner's sign-ins.
+    None when the person turned the browser off, when the app registered no
+    browser, which is always the case where more than one person shares this
+    process (cowork.common.settings.runtime_credential.get_browser_host), and
+    when a signed-in desktop's organization turned the browser off, read
+    before each turn (cowork.services.browser.desktop_organization_off).
+    The web's browser never reaches an in-process turn: web turns run
+    remotely, and the producer gives them the router.
     """
-    try:
-        from cowork.common.settings import runtime_credential
-        from cowork.common.settings.user_settings import current_settings_scope
-        from cowork.services.browser import anton_browser_config, start_early
-
-        # The turn's ambient scope says who this is, for their own sessions on
-        # a shared standalone service; None (desktop) means the one person.
-        scope = current_settings_scope()
-        config = anton_browser_config(
-            user, getattr(scope, "user_id", None), conversation_id=conversation_id, project_id=project_id,
-        )
-        if config is not None:
-            start_early(user, runtime_credential.get_minds_credential())
-        return config
-    except Exception:  # pragma: no cover - defensive
-        logger.warning("could not resolve the browser for this turn", exc_info=True)
+    if channel_context is not None or not getattr(user, "browser_enabled", False):
         return None
+    from cowork.services.browser import desktop_browser_config, desktop_organization_off
+
+    config = desktop_browser_config(conversation_id=conversation_id, project_id=project_id)
+    if config is None or await desktop_organization_off():
+        return None
+    return config

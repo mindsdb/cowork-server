@@ -35,6 +35,7 @@ from cowork.db.scoped import (
 )
 from cowork.models.project import Project
 from cowork.services.shared_resources import RESOURCE_LOCK_TIMEOUT_SECONDS
+from cowork.turnqueue.redis_client import SYNC_CALL_BUDGET_S, redis_deadline
 
 if TYPE_CHECKING:
     from cowork.services.skills import ProjectReferenceRewrite
@@ -750,7 +751,15 @@ class ProjectService:
             return False
         return parent != root
 
-    def sits_in_another_partition(self, project: Project) -> bool:
+    @staticmethod
+    def resolved_shared_root() -> Path:
+        """The shared root as `sits_in_another_partition` compares against it.
+        A check over every project resolves it once and passes it in."""
+        return Path(os.path.realpath(get_app_settings().storage.shared_root))
+
+    def sits_in_another_partition(
+        self, project: Project, *, shared_root: Path | None = None
+    ) -> bool:
         """Whether a person's project names a folder in another person's
         partition in the shared root.
 
@@ -763,11 +772,18 @@ class ProjectService:
         scope = self.session.scope
         if not scope.partitioned_for(PersonalResource.PROJECTS) or scope.org_id is None:
             return False
-        shared_root = Path(os.path.realpath(get_app_settings().storage.shared_root))
+        root_parts = (shared_root or self.resolved_shared_root()).parts
+        # The first folder below the shared root, compared by parts,
+        # case-sensitive: on POSIX paths the same answer as Path.relative_to,
+        # without its walk over every parent. A partition needs an org, so
+        # this runs only in MindsHub mode, never on the desktop.
+        parts = Path(project.path).parts
+        if len(parts) <= len(root_parts) or parts[: len(root_parts)] != root_parts:
+            return False
+        name = parts[len(root_parts)]
         try:
-            name = Path(project.path).relative_to(shared_root).parts[0]
             is_partition = str(UUID(name)) == name
-        except (ValueError, IndexError):
+        except ValueError:
             return False
         return is_partition and name != str(scope.org_id)
 
@@ -1315,11 +1331,17 @@ class ProjectService:
                         extra=log_context(project_id=project_id),
                     )
             raise
-        for conversation_stage in conversation_stages:
-            conv_svc.finalize_staged_conversation_delete(
-                conversation_stage,
-                cleanup_project_files=staged_path is None,
-            )
+        # On the Redis stream backend each conversation's stream cleanup calls
+        # Redis (streaming.discard_conversation). One deadline for them all
+        # holds the delete for one call budget while Redis does not answer,
+        # not one per conversation. Once it passes, each later call fails at
+        # once without reaching Redis (redis_client._refuse_a_passed_deadline).
+        with redis_deadline(budget_s=SYNC_CALL_BUDGET_S):
+            for conversation_stage in conversation_stages:
+                conv_svc.finalize_staged_conversation_delete(
+                    conversation_stage,
+                    cleanup_project_files=staged_path is None,
+                )
         try:
             from cowork.services.memory import remove_project_memory_tiers
 

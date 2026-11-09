@@ -176,10 +176,55 @@ reads no reply the controller sends after that and saves nothing. Ending the
 answer, saving it and stopping its sandbox turn leaves the user a saved answer
 to retry from instead of one that never ends.
 
+Each answer holds its conversation's turn claim in Redis while it runs, so a
+second question that reaches another pod is refused with `409` (README.md, the
+`turn_in_progress` refusal). A pod that stops this way releases each claim once
+the answer's stream has its last frame. A pod that never runs the steps above
+(a SIGKILL, an OOM kill, a lost node) releases nothing, so a question sent into
+one of its conversations is refused with `409` until that claim lapses, 90 s
+after the pod's last renewal. A container restarted in place (an OOM kill or a
+crash) keeps the pod's name, and the new process releases the claims its pod
+left as it starts, and writes the controller's cancel flag for each of their
+turns, so their sandbox turns stop. That relies on one uvicorn process per pod,
+which `tests/test_turn_claim.py` pins for the image's command. The claims are
+still held only when the container starts again within 90 s. A liveness
+restart kills a stalled process only after its claims lapsed (the probe gives
+up after about 60 s, then the 60 s grace runs out), so it frees nothing sooner,
+but the new process still stops those sandbox turns.
+
+The first rollout of the claim mixes pods that take it with pods that predate
+it, for the readiness spread of the new pods plus about 20 s, and longer while
+a new pod waits for a node (the rollout timing above). Until the last older pod
+stops, an older pod admits a duplicate question as it always did, also one sent
+during a newer pod's turn, and its turn index write replaces the newer turn's
+entry. A Stop for that newer turn that reaches a pod other than the one running
+it then answers `404`, and a stale question at its number is not refused.
+
 Desktop and other non-hosted deployments are unchanged. They run turns in the
 server's own process, keep uvicorn's SIGTERM handling, and end their turns in
 the lifespan teardown, as before. A single-replica PR environment renders these
 values too, and they change only how its pod stops.
+
+## The agent's browser
+
+`COWORK_BROWSER_ROUTER_URL` turns on the agent's browser for the web app: it
+names the browser router, served on the same host under `/browser`.
+`values-dev.yaml` and `values-staging.yaml` set it to their own host.
+`values-prod.yaml` sets none, so production offers no browser and makes no
+browser call; add the entry there only once the production router answers on
+`https://cowork.mindshub.ai/browser`, since until then that path reaches the
+web frontend. PR environments get theirs from where they are deployed.
+`tests/test_chart_values.py` pins each value to its environment's host. What
+the router does with it is in the top-level README ("The agent's browser").
+
+The router's scope key is the `browser-scope-key` volume: the router's own
+Secret, `browser-proxy`, key `scope_key`, in the same namespace, mounted at
+`/etc/cowork/browser-scope/scope_key` (`COWORK_BROWSER_SCOPE_KEY_FILE`,
+`values.yaml`). The router takes a turn key's scope only with that key beside
+it, so the two must match, and reading one Secret keeps them so. cowork-server
+reads the file on every scope, and the kubelet fills it when the Secret first
+appears and rewrites it on rotation, so no restart is needed. The volume is
+optional: a namespace with no router has no such Secret and scopes no turn.
 
 ## Browser organization boundary
 
