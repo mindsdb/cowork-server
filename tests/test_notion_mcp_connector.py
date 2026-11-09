@@ -81,9 +81,9 @@ def test_credentials_missing_client_id_is_reported(monkeypatch):
     assert exc.value.status_code == 422
 
 
-def test_tile_subtitle_prefers_workspace_name_over_composite_identity():
+def test_tile_subtitle_is_the_email_never_the_composite_identity():
     fields = {"account_email": "ann@acme.com:ws-1", "account_name": "Acme"}
-    assert connection_display_name(fields, "notion") == "Acme"
+    assert connection_display_name(fields, "notion") == "ann@acme.com"
 
 
 try:  # pragma: no cover - import probe, not logic

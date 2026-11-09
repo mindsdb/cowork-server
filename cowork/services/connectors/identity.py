@@ -139,6 +139,10 @@ def spec_secret_fields(connector_id: str, method: str | None, form: dict | None 
 # engines instead of leaking the composite string.
 SYNTHETIC_ACCOUNT_EMAIL_ENGINES = frozenset({"supabase", "linear", "posthog", "notion"})
 
+# Of those, the engines whose composite starts with the person's real email
+# (`<email>:<workspace_id>`) and whose subtitle shows that email.
+EMAIL_SUBTITLE_ENGINES = frozenset({"notion"})
+
 
 def connection_display_name(fields: dict, engine: str = "") -> str | None:
     """Human-facing identity for a saved connection, or None.
@@ -166,6 +170,12 @@ def connection_display_name(fields: dict, engine: str = "") -> str | None:
     emails.
     """
     f = fields or {}
+    if engine in EMAIL_SUBTITLE_ENGINES:
+        # Like HubSpot's: the workspace is already the title (the
+        # connection's label), so the subtitle names the person who connected.
+        email = str(f.get("account_email", "")).split(":", 1)[0].strip()
+        if "@" in email:
+            return email
     keys = (
         ("account_name", "email", "account_email")
         if engine in SYNTHETIC_ACCOUNT_EMAIL_ENGINES
