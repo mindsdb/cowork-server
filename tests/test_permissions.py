@@ -197,6 +197,7 @@ def test_require_resolves_annotations_against_the_permissions_own_module():
         ("LoopbackOnly", ["require_local"]),
         ("DesktopOnly", ["require_local_tenancy"]),
         ("LoopbackDesktopOnly", ["require_local", "require_local_tenancy"]),
+        ("SingleUserOnly", ["require_single_user"]),
     ],
 )
 def test_the_absorbed_guards_stay_reachable_through_dependency_overrides(

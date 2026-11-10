@@ -10,13 +10,15 @@ import dataclasses
 import logging
 import time
 from typing import Any
+from uuid import UUID
 
-from cowork.db.scoped import TenantScope
-from cowork.db.units import run_db
+from cowork.db.scoped import ScopedSession, TenantScope
+from cowork.db.units import conversation_writes, run_db
 from cowork.services.connectors.connector_test_run import run_test_request
 from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError
 from cowork.services.connectors.pending_tests import PendingTest, pending_tests
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
+from cowork.services.conversations import ConversationService
 
 logger = logging.getLogger(__name__)
 
@@ -97,3 +99,44 @@ async def save_confirmed(entry: PendingTest) -> tuple[str, str | None, str | Non
     if entry.handcrafted and not entry.extends_name:
         note = await save_definition(entry.scope, entry.connector_id, entry.form_spec)
     return slug, user_label, note
+
+
+NOT_ALLOWED = "Not saved: you did not allow the private address."
+CANCELLED = "Not saved: you cancelled the test result."
+
+
+def saved_patch(form_id: str, slug: str) -> dict[str, Any]:
+    """The form patch for a connection saved on the member's confirmation."""
+    return {
+        "form_id": form_id, "title": f"Connected — {slug}", "subtitle": "Saved after you confirmed the test result.",
+        "status_text": None, "form_error": None, "_is_probing": False, "_is_success": True,
+        "_awaiting_confirmation": False, "_awaiting_private_approval": False,
+    }
+
+
+def failed_patch(form_id: str, reason: str) -> dict[str, Any]:
+    """The form patch for a test that failed or was not saved."""
+    return {
+        "form_id": form_id, "subtitle": "Update the form and try again.", "status_text": None,
+        "form_error": reason, "_is_probing": False, "_is_success": False,
+        "_awaiting_confirmation": False, "_awaiting_private_approval": False,
+    }
+
+
+def _save_outcome(session: ScopedSession, conversation_id: UUID, text: str) -> None:
+    """Save ``text`` as an assistant turn with no events."""
+    ConversationService(session).save_assistant_turn(conversation_id, text, [])
+
+
+async def record_outcome(entry: PendingTest, text: str) -> None:
+    """Add one fixed line to the conversation the test ran in, so a reload and
+    the agent's next turn see how it ended. Never an id or a preview."""
+    if not entry.conversation_id:
+        return
+    conversation_id = UUID(entry.conversation_id)
+    try:
+        async with conversation_writes(conversation_id):
+            await run_db(lambda session: _save_outcome(session, conversation_id, text), scope=entry.scope)
+    except Exception:
+        # The form still shows the outcome; only the conversation misses the line.
+        logger.exception("Could not record a connection test's outcome in its conversation")

@@ -119,6 +119,10 @@ def saved(tmp_path, monkeypatch):
         probe_handler, "_save_probe_turn",
         lambda session, conversation_id, text, events: turns.append({"text": text, "events": events}) or uuid4(),
     )
+    monkeypatch.setattr(
+        connector_test_flow, "_save_outcome",
+        lambda session, conversation_id, text: turns.append({"text": text, "events": ()}),
+    )
     return SimpleNamespace(vault=vault, engine=engine, turns=turns, conversation_id=str(conversation.id))
 
 

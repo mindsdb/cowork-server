@@ -99,6 +99,23 @@ def require_local_tenancy() -> None:
         )
 
 
+def require_single_user() -> None:
+    """Reject the request in org mode and on a deployment that trusts identity
+    headers: wherever a scope can be one of many people (``tenant_scope_required``).
+
+    For surfaces built for one person's own install first, such as answering a
+    custom connector's connection test, until the shared deployments get theirs.
+    Answers 403, as ``require_local_tenancy`` does.
+    """
+    from cowork.db.scoped import tenant_scope_required
+
+    if tenant_scope_required():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="not available on shared deployments yet",
+        )
+
+
 def refuse_code_mode_in_sandbox() -> None:
     """Reject a Code mode request when agent code runs in the sandbox.
 

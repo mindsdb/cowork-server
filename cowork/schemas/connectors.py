@@ -558,3 +558,13 @@ class DatasourceConnectionResponse(BaseModel):
     validation_code: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class ConnectorTestAnswer(BaseModel):
+    """The member's answer to a waiting custom connector test: the id of the
+    approval or confirmation it answers, exactly one of the two."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: str | None = Field(default=None, min_length=1, max_length=64)
+    confirm_id: str | None = Field(default=None, min_length=1, max_length=64)

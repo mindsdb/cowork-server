@@ -5,17 +5,18 @@ DISCLAIMER: The probe for connectors will always run through Anton regardless of
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, SingleUserOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope, tenant_scope_required
 from cowork.db.units import run_db
 from cowork.handlers.datasource_relay import relay_cloud_submission
 from cowork.handlers.probe import ProbeHandler
-from cowork.schemas.connectors import ConnectorField, InvalidConnectorIdError, SubmitFormRequest
+from cowork.schemas.connectors import ConnectorField, ConnectorTestAnswer, InvalidConnectorIdError, SubmitFormRequest
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
 from cowork.services.connectors.custom_connectors import (
@@ -26,11 +27,24 @@ from cowork.services.connectors.custom_connectors import (
     has_test_requests,
 )
 from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.connector_test_flow import (
+    CANCELLED,
+    NOT_ALLOWED,
+    advance,
+    failed_patch,
+    record_outcome,
+    save_confirmed,
+    saved_patch,
+)
+from cowork.services.connectors.connector_test_run import ConnectorTestError
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL
 from cowork.services.connectors.persist import connection_a_new_save_replaces, vault_for_scope
 from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 from cowork.services.connectors.specs._registry import registry
+from cowork.services.connectors.pending_tests import pending_tests
 from cowork.services.connectors.submissions import missing_required_fields, store
+
+logger = logging.getLogger(__name__)
 
 # AuthenticatedInOrgMode: in org mode a request with no verified principal is
 # refused with 401 before the form is read. The stream holds no request
@@ -120,6 +134,71 @@ async def submit_form_route(req: SubmitFormRequest, request: Request, scope: Ten
         if _relayed_in_org_mode(connector_id):
             return await relay_cloud_submission(req, connector_id, req.resolve_method(), scope, request)
     return await submit_form(req, scope)
+
+
+_GONE = "This test result is no longer waiting. Submit the form again."
+
+
+@router.post(
+    "/allow-private", name="submission_allow_private", dependencies=[Depends(require(SingleUserOnly))],
+)
+async def allow_private_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> dict:
+    """Continue a custom connector's test after the member allows a private host.
+
+    The approval covers the host, port and addresses the member was shown, for
+    this test only. Answers with the next host to allow, the preview to
+    confirm, or the failure patch; 404 when the id is unknown, used, expired
+    or another scope's.
+    """
+    entry = pending_tests.pop(answer.approval_id or "", "approval", scope)
+    if entry is None or entry.asking is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_GONE)
+    key, addresses = entry.asking
+    entry.approved[key] = addresses
+    try:
+        return await advance(entry)
+    except ConnectorTestError as exc:
+        await record_outcome(entry, f"Not saved: {exc}")
+        return {"patch": failed_patch(entry.form_id, str(exc))}
+
+
+@router.post("/confirm", name="submission_confirm", dependencies=[Depends(require(SingleUserOnly))])
+async def confirm_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> dict:
+    """Save the connection whose test result the member confirmed.
+
+    Single use: the entry is gone before anything is saved, so a second
+    confirm answers 404. A save that then fails is not retried; the member
+    submits the form again.
+    """
+    entry = pending_tests.pop(answer.confirm_id or "", "confirm", scope)
+    if entry is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_GONE)
+    try:
+        slug, user_label, note = await save_confirmed(entry)
+    except Exception:
+        logger.exception("Could not save a confirmed %s connection", entry.connector_id)
+        reason = "Cowork could not save the connection. Submit the form again."
+        await record_outcome(entry, f"Not saved: {reason}")
+        return {"patch": failed_patch(entry.form_id, reason)}
+    await record_outcome(entry, f"Saved as `{slug}`." + (note or ""))
+    return {"patch": saved_patch(entry.form_id, slug), "saved_slug": slug, "user_label": user_label}
+
+
+@router.post(
+    "/cancel", name="submission_cancel", status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require(SingleUserOnly))],
+)
+async def cancel_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> None:
+    """Drop a waiting test and the values it holds. Idempotent: an unknown id
+    is not an error, and another scope's entry is left in place."""
+    if (answer.approval_id is None) == (answer.confirm_id is None):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Send one of approval_id or confirm_id.")
+    if answer.approval_id is not None:
+        entry, text = pending_tests.pop(answer.approval_id, "approval", scope), NOT_ALLOWED
+    else:
+        entry, text = pending_tests.pop(answer.confirm_id, "confirm", scope), CANCELLED
+    if entry is not None:
+        await record_outcome(entry, text)
 
 
 @router.post("/replaces", name="submission_replaces")
