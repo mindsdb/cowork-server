@@ -92,7 +92,7 @@ class ConnectorSpecRegistry:
             featured=c.get("featured", False),
             notice=c.get("notice"),
             custom=c.get("custom", False),
-        needs_rebuild=c.get("needs_rebuild", False),
+            needs_rebuild=c.get("needs_rebuild", False),
             keywords=c.get("keywords", []),
             form=c.get("form", {}),
         )

@@ -136,6 +136,14 @@ class TestPlaceholdersCannotMoveTheHost:
     def test_a_url_without_an_http_scheme_and_host_is_refused(self, url):
         _refused(_with(FORM, ("test_request", "data", "url"), url), "http or https URL")
 
+    @pytest.mark.parametrize("url", [
+        "https://p.example.com:443:80/d", "https://api.exa\tmple.com/x", "https://api.example.com\n/x",
+        "https://api.example.com\u200b/x", "https://api.ex\xadample.com/x",
+    ], ids=["two ports", "tab", "newline", "zero width space", "soft hyphen"])
+    def test_a_url_the_runner_cannot_parse_is_refused_when_the_form_is_built(self, url):
+        with pytest.raises(UnstorableFormError):
+            check_handcrafted_form(_with(FORM, ("test_request", "data", "url"), url))
+
     def test_http_is_allowed_when_the_form_is_built(self):
         check_handcrafted_form(_with(FORM, ("test_request", "data", "url"), "http://127.0.0.1:8765/items"))
 

@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 WAITING_FOR_APPROVAL = "Waiting for you to allow a private address."
 WAITING_FOR_CONFIRMATION = "Waiting for you to confirm the test result."
+NOT_ALLOWED = "Not saved: you did not allow the private address."
+CANCELLED = "Not saved: you cancelled the test result."
 
 
 async def advance(entry: PendingTest) -> dict[str, Any]:
@@ -100,9 +102,6 @@ async def save_confirmed(entry: PendingTest) -> tuple[str, str | None, str | Non
         note = await save_definition(entry.scope, entry.connector_id, entry.form_spec)
     return slug, user_label, note
 
-
-NOT_ALLOWED = "Not saved: you did not allow the private address."
-CANCELLED = "Not saved: you cancelled the test result."
 
 
 def saved_patch(form_id: str, slug: str) -> dict[str, Any]:

@@ -31,6 +31,7 @@ from urllib.parse import quote, quote_plus, unquote, urlsplit
 import httpx
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.services.connectors.custom_connectors import PLACEHOLDER
 from cowork.services.connectors.egress import (
     connection_attempts,
     embedded_ipv4,
@@ -41,6 +42,8 @@ IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 ALLOWLIST_ENV = "COWORK_CONNECTOR_TEST_PRIVATE_ALLOWLIST"
 _REQUEST_SECONDS = 10.0
+#: A whole step, connect to last byte.
+_STEP_SECONDS = 20.0
 _RESOLVE_SECONDS = 5.0
 _BODY_CAP = 256 * 1024
 _PREVIEW_ITEM_CHARS = 500
@@ -48,8 +51,7 @@ _PREVIEW_ITEM_CHARS = 500
 _MASK_MIN = 4
 #: Secrets shorter than this are not searched for: they match too much data.
 _ECHO_MIN = 6
-_TOKEN_KEYS = frozenset({"access_token", "id_token", "token_type"})
-_PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+_TOKEN_KEYS = frozenset({"access_token", "id_token", "token_type", "accesstoken", "idtoken", "tokentype"})
 _RESOLVER: Callable[..., list[tuple]] = socket.getaddrinfo
 
 #: Ranges a member may allow for one test. Everything else that is not public
@@ -84,6 +86,7 @@ class PrivateHost:
         return approval_key(self.step, self.method, self.scheme, self.host, self.port)
 
     def to_dict(self) -> dict[str, Any]:
+        """The question as the form shows it: no filled-in value, every address."""
         return {
             "step": self.step, "method": self.method, "scheme": self.scheme, "host": self.host,
             "host_ascii": _ascii_host(self.host), "port": self.port, "path": self.path,
@@ -107,6 +110,7 @@ class ConnectorTestPreview:
     masked_count: int
 
     def to_dict(self) -> dict[str, Any]:
+        """The preview as JSON-ready data."""
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
 
@@ -145,10 +149,19 @@ def approval_key(step: str, method: str, scheme: str, host: str, port: int) -> s
 
 
 def _normal_host(host: str) -> str:
+    """``host`` lower-cased, without a trailing dot."""
     return host.strip().rstrip(".").lower()
 
 
+def url_host(url: httpx.URL) -> str:
+    """The one host a step is resolved, dialled, verified and shown as: the
+    ASCII form httpx puts on the wire, not its decoded Unicode, which Python's
+    older IDNA codec would encode to a different name."""
+    return _normal_host(url.raw_host.decode("ascii"))
+
+
 def _ascii_host(host: str) -> str:
+    """``host`` in its ASCII (punycode) form, or as given when it has none."""
     try:
         return host.encode("idna").decode("ascii")
     except UnicodeError:
@@ -201,10 +214,11 @@ async def _resolve(host: str, resolver: Callable[..., list[tuple]]) -> tuple[IPA
 
 
 def _fill(text: str, values: Mapping[str, str], *, encode: Callable[[str], str] | None = None) -> str:
+    """``text`` with each placeholder replaced by its value, passed through ``encode`` when given."""
     def sub(match: re.Match) -> str:
         value = values[match.group(1)]
         return encode(value) if encode else value
-    return _PLACEHOLDER.sub(sub, text)
+    return PLACEHOLDER.sub(sub, text)
 
 
 def _fill_json(value: Any, values: Mapping[str, str]) -> Any:
@@ -228,7 +242,7 @@ def placeholder_names(step: Mapping[str, Any]) -> set[str]:
     texts = [step.get("url") or "", *(step.get("headers") or {}).values(), *(step.get("basic_auth") or [])]
     texts += list((step.get("form") or {}).values())
     texts += _json_leaves(step.get("json_body"))
-    return {name for text in texts for name in _PLACEHOLDER.findall(str(text))}
+    return {name for text in texts for name in PLACEHOLDER.findall(str(text))}
 
 
 def request_hosts(test_request: Mapping[str, Any]) -> set[str]:
@@ -237,13 +251,14 @@ def request_hosts(test_request: Mapping[str, Any]) -> set[str]:
     for name in ("token", "data"):
         step = test_request.get(name)
         if step:
-            host = urlsplit(_PLACEHOLDER.sub("x", str(step.get("url") or ""))).hostname
+            host = urlsplit(PLACEHOLDER.sub("x", str(step.get("url") or ""))).hostname
             if host:
                 hosts.add(_normal_host(host))
     return hosts
 
 
 def _json_leaves(value: Any) -> list[str]:
+    """Every leaf string of a JSON value, keys left out."""
     if isinstance(value, str):
         return [value]
     if isinstance(value, dict):
@@ -258,14 +273,18 @@ def _endpoint(url: httpx.URL) -> tuple[str, str, int, str]:
     path = re.sub(r"/+", "/", "/" + unquote(url.path or "/"))
     path = posixpath.normpath(path).rstrip("/").lower() or "/"
     port = url.port or (443 if url.scheme == "https" else 80)
-    return url.scheme, _normal_host(url.host), port, path
+    return url.scheme, url_host(url), port, path
 
 
 @dataclass
 class _Step:
+    """One test step with the member's values filled in."""
+
     name: str
     method: str
     url: httpx.URL
+    #: The path as the form wrote it, placeholders kept: what the member is shown.
+    shown_path: str
     headers: dict[str, str]
     auth: tuple[str, str] | None
     form: dict[str, str] | None
@@ -273,17 +292,31 @@ class _Step:
 
 
 def _build_step(name: str, step: Mapping[str, Any], values: Mapping[str, str]) -> _Step:
+    """Fill ``values`` into one step.
+
+    Raises:
+        ConnectorTestError: when a filled header holds a line break or a
+            character HTTP headers cannot carry, or the URL does not parse.
+    """
     headers = {k: _fill(v, values) for k, v in (step.get("headers") or {}).items()}
     for key, value in headers.items():
         if "\r" in value or "\n" in value:
             raise ConnectorTestError(f"The {name} step's {key} header holds a line break once filled in.")
+        if not value.isascii():
+            raise ConnectorTestError(f"The {name} step's {key} header holds a character headers cannot carry.")
     auth = None
     if step.get("basic_auth"):
         user, password = (_fill(item, values) for item in step["basic_auth"])
         auth = (user, password)
     form = {k: _fill(v, values) for k, v in step["form"].items()} if step.get("form") is not None else None
     body = _fill_json(step.get("json_body"), values) if step.get("json_body") is not None else None
-    return _Step(name, step["method"], _fill_url(step["url"], values), headers, auth, form, body)
+    try:
+        url = _fill_url(step["url"], values)
+        url_host(url)
+    except (httpx.InvalidURL, UnicodeError) as exc:
+        raise ConnectorTestError(f"The {name} step's url is not a valid URL.") from exc
+    shown_path = urlsplit(PLACEHOLDER.sub(lambda m: f"{{{{{m.group(1)}}}}}", str(step["url"]))).path or "/"
+    return _Step(name, step["method"], url, shown_path, headers, auth, form, body)
 
 
 def _encodings(value: str) -> set[str]:
@@ -321,9 +354,14 @@ class _Guard:
 
 
 def _walk(value: Any) -> Iterable[str]:
-    """Every key and leaf string of a parsed JSON value."""
+    """Every key and leaf of a parsed JSON value, numbers as text, and each
+    string again with HTML entities decoded."""
     if isinstance(value, str):
         yield value
+        if "&" in value:
+            yield html.unescape(value)
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        yield str(value)
     elif isinstance(value, dict):
         for k, v in value.items():
             yield str(k)
@@ -334,18 +372,30 @@ def _walk(value: Any) -> Iterable[str]:
 
 
 def _has_token_object(value: Any) -> bool:
+    """Whether any object in ``value`` carries a token key, snake or camel case."""
     if isinstance(value, dict):
-        return bool(_TOKEN_KEYS & set(value)) or any(_has_token_object(v) for v in value.values())
+        keys = {str(k).lower() for k in value}
+        return bool(_TOKEN_KEYS & keys) or any(_has_token_object(v) for v in value.values())
     if isinstance(value, list):
         return any(_has_token_object(v) for v in value)
     return False
 
 
 def _is_empty(value: Any) -> bool:
-    return value in (None, "", [], {}) or value == [{}]
+    """Whether ``value`` holds no data: nothing, or only empty items."""
+    if value in (None, "", [], {}):
+        return True
+    if isinstance(value, list):
+        return all(item in (None, "", [], {}) for item in value)
+    return False
 
 
 def _mask(value: Any, guard: _Guard, counter: list[int]) -> Any:
+    """``value`` with every key or leaf holding a masked value replaced by ``***``;
+    ``counter[0]`` counts the replacements."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and guard.hides(str(value)):
+        counter[0] += 1
+        return "***"
     if isinstance(value, str):
         if guard.hides(value):
             counter[0] += 1
@@ -366,6 +416,8 @@ def _mask(value: Any, guard: _Guard, counter: list[int]) -> Any:
 
 
 def _item_count(value: Any) -> int | None:
+    """How many items an answer holds: its own length when it is a list, else
+    its longest top-level list's; None when it has no list."""
     if isinstance(value, list):
         return len(value)
     if isinstance(value, dict):
@@ -375,6 +427,7 @@ def _item_count(value: Any) -> int | None:
 
 
 def _first_item(value: Any) -> Any:
+    """The item the preview shows: the first of the list ``_item_count`` counted."""
     if isinstance(value, list):
         return value[0] if value else None
     if isinstance(value, dict):
@@ -407,7 +460,7 @@ def judge(
     except ValueError:
         parsed, is_json = text, False
     if is_json:
-        if _is_empty(parsed):
+        if _is_empty(parsed) or _item_count(parsed) == 0:
             raise ConnectorTestError("The data step's answer holds no data.")
         if isinstance(parsed, dict) and (parsed.get("error") or parsed.get("errors")):
             raise ConnectorTestError("The data step's answer is an error.")
@@ -415,7 +468,7 @@ def judge(
             raise ConnectorTestError("The data step's answer is a token, not data.")
         if any(guard.echoes(s) for s in _walk(parsed)):
             raise ConnectorTestError("The data step's answer repeats a credential, so it was not shown.")
-    elif guard.echoes(text):
+    elif guard.echoes(text) or guard.echoes(html.unescape(text)):
         raise ConnectorTestError("The data step's answer repeats a credential, so it was not shown.")
     counter = [0]
     masked = _mask(parsed, guard, counter)
@@ -436,7 +489,7 @@ async def _judge_host(
     Raises:
         ConnectorTestError: when any address is one no test may reach.
     """
-    host = _normal_host(step.url.host)
+    host = url_host(step.url)
     port = step.url.port or (443 if step.url.scheme == "https" else 80)
     key = approval_key(step.name, step.method, step.url.scheme, host, port)
     if key in approved:
@@ -454,7 +507,7 @@ async def _judge_host(
     private = [a for a in addresses if not is_public_address(a)]
     if private and not allowed:
         return addresses, PrivateHost(
-            step.name, step.method, step.url.scheme, host, port, step.url.path or "/",
+            step.name, step.method, step.url.scheme, host, port, step.shown_path,
             tuple(str(a) for a in addresses),
         )
     # http only to this computer, once it is allowed; anywhere else it would
@@ -467,8 +520,19 @@ async def _judge_host(
 async def _send(
     step: _Step, addresses: tuple[IPAddress, ...], transport: httpx.AsyncBaseTransport | None,
 ) -> tuple[int, bytes, bool, str]:
+    """Send ``step`` within one overall deadline, so an answer dripped a byte at
+    a time cannot hold the test open. Returns what ``_send_once`` does."""
+    try:
+        return await asyncio.wait_for(_send_once(step, addresses, transport), timeout=_STEP_SECONDS)
+    except asyncio.TimeoutError as exc:
+        raise ConnectorTestError(f"The {step.name} step took longer than {int(_STEP_SECONDS)} seconds.") from exc
+
+
+async def _send_once(
+    step: _Step, addresses: tuple[IPAddress, ...], transport: httpx.AsyncBaseTransport | None,
+) -> tuple[int, bytes, bool, str]:
     """Send ``step`` to its vetted addresses: status, body (capped), over-cap, content type."""
-    host = step.url.host
+    host = url_host(step.url)
     # Identity only: the cap counts what is read, and a compressed answer
     # could expand far past it in one decoded chunk.
     headers = {**step.headers, "Host": step.url.netloc.decode("ascii"), "Accept-Encoding": "identity"}
@@ -517,6 +581,11 @@ async def _send(
 
 
 def _token_from(status: int, body: bytes, token_field: str) -> str:
+    """The issued token from the token step's answer.
+
+    Raises:
+        ConnectorTestError: when the step failed or its answer has no token.
+    """
     if not 200 <= status < 300:
         raise ConnectorTestError(f"The token step got HTTP {status}.")
     try:
@@ -584,14 +653,14 @@ async def run_test_request(
     # The password half of basic_auth only: the user is often an account name that data repeats.
     for spec in (token_spec or {}, data_spec):
         for item in (spec.get("basic_auth") or [])[1:]:
-            refused |= {filled[n] for n in _PLACEHOLDER.findall(item) if n in filled}
+            refused |= {filled[n] for n in PLACEHOLDER.findall(item) if n in filled}
     for key, value in (data_spec.get("headers") or {}).items():
         if key.lower() == "authorization":
-            refused |= {filled[n] for n in _PLACEHOLDER.findall(value) if n in filled}
+            refused |= {filled[n] for n in PLACEHOLDER.findall(value) if n in filled}
     for value in ((token_spec or {}).get("form") or {}).values():
-        refused |= {filled[n] for n in _PLACEHOLDER.findall(value) if n in filled}
+        refused |= {filled[n] for n in PLACEHOLDER.findall(value) if n in filled}
     for value in _json_leaves((token_spec or {}).get("json_body")):
-        refused |= {filled[n] for n in _PLACEHOLDER.findall(value) if n in filled}
+        refused |= {filled[n] for n in PLACEHOLDER.findall(value) if n in filled}
 
     token_host = None
     if token_spec:
@@ -600,7 +669,7 @@ async def run_test_request(
         token = _token_from(status, body, token_spec["token_field"])
         refused.add(token)
         filled["token"] = token
-        token_host = token_step.url.host
+        token_host = url_host(token_step.url)
     data_step = _build_step("data", data_spec, filled)
     if token_spec and _endpoint(data_step.url) == _endpoint(steps[0].url):
         raise ConnectorTestError("The data step asks the token URL again; it must fetch data.")
@@ -608,6 +677,6 @@ async def run_test_request(
     guard = _Guard(refused, filled.values())
     outcome.preview = judge(
         status=status, body=body, over_cap=over_cap, content_type=content_type, guard=guard,
-        token_host=token_host, data_host=data_step.url.host,
+        token_host=token_host, data_host=url_host(data_step.url),
     )
     return outcome

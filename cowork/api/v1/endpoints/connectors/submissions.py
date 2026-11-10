@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 _DATABASE_CATEGORY = "database"
+_GONE = "This test result is no longer waiting. Submit the form again."
 _NO_CUSTOM_IN_ORG = (
     "Custom connectors cannot be connected in an organization yet. "
     "Use a connector from Connect Apps and Data."
@@ -134,9 +135,6 @@ async def submit_form_route(req: SubmitFormRequest, request: Request, scope: Ten
         if _relayed_in_org_mode(connector_id):
             return await relay_cloud_submission(req, connector_id, req.resolve_method(), scope, request)
     return await submit_form(req, scope)
-
-
-_GONE = "This test result is no longer waiting. Submit the form again."
 
 
 @router.post(

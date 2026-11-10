@@ -6,6 +6,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from anton.utils.datasources import scrub_output
+import httpx
 from pydantic import ValidationError
 from sqlalchemy import false
 
@@ -137,7 +138,8 @@ def check_handcrafted_form(form_spec: dict[str, Any]) -> None:
         check_test_requests(form_spec)
 
 
-_PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+#: A `{{name}}` placeholder in a test request; the runner fills the same pattern.
+PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _ANY_BRACES = re.compile(r"\{\{|\}\}")
 _FORBIDDEN_HEADERS = frozenset({"host", "connection", "transfer-encoding", "content-length", "te", "upgrade"})
 _FORBIDDEN_HEADER_PREFIXES = ("proxy-", "x-forwarded-")
@@ -166,14 +168,14 @@ def _form_methods(form_spec: dict[str, Any]) -> list[tuple[str, dict[str, Any], 
 
 def _placeholders(text: str) -> set[str]:
     """Placeholder names in ``text``; raises when braces are left over that are not one."""
-    if _ANY_BRACES.search(_PLACEHOLDER.sub("", text)):
+    if _ANY_BRACES.search(PLACEHOLDER.sub("", text)):
         raise UnstorableFormError("test_request has a malformed {{placeholder}}.")
-    return set(_PLACEHOLDER.findall(text))
+    return set(PLACEHOLDER.findall(text))
 
 
 def _check_literal(text: str, where: str) -> None:
     """Refuse literal text in a test request that looks like a credential value."""
-    literal = _PLACEHOLDER.sub("", text)
+    literal = PLACEHOLDER.sub("", text)
     if scrub_output(literal) != literal:
         raise UnstorableFormError(
             f"test_request {where} looks like it holds a credential value. Use a {{{{field}}}} placeholder."
@@ -204,13 +206,19 @@ def _check_step(step: dict[str, Any], where: str) -> set[str]:
     if head is not None and _ANY_BRACES.search(head.group()):
         raise UnstorableFormError(f"test_request {where} url may use placeholders only in its path and query.")
     try:
-        parts = urlsplit(_PLACEHOLDER.sub("x", url))
+        parts = urlsplit(PLACEHOLDER.sub("x", url))
     except ValueError as e:
         raise UnstorableFormError(f"test_request {where} url is not a valid URL.") from e
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise UnstorableFormError(f"test_request {where} url must be an http or https URL with a host.")
     if "@" in parts.netloc:
         raise UnstorableFormError(f"test_request {where} url must not carry user info; use basic_auth.")
+    # The runner dials with httpx, so the form is checked with the same parser.
+    filled = PLACEHOLDER.sub("x", url)
+    try:
+        httpx.URL(filled).raw_host.decode("ascii")
+    except (httpx.InvalidURL, UnicodeError) as e:
+        raise UnstorableFormError(f"test_request {where} url is not a valid URL.") from e
     used = _placeholders(url)
     _check_literal(url, f"{where} url")
     for name, value in (step.get("headers") or {}).items():
@@ -225,7 +233,7 @@ def _check_step(step: dict[str, Any], where: str) -> set[str]:
         _check_literal(value, f"{where} header {name}")
     for item in step.get("basic_auth") or []:
         names = _placeholders(item)
-        if not names or _PLACEHOLDER.sub("", item).strip():
+        if not names or PLACEHOLDER.sub("", item).strip():
             raise UnstorableFormError(f"test_request {where} basic_auth takes two {{{{field}}}} placeholders.")
         used |= names
     if step.get("form") is not None and step.get("json_body") is not None:

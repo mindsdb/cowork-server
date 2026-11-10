@@ -380,3 +380,30 @@ class TestAnOldConnectorCanBeBuiltAgain:
             assert ConnectorCatalog(ScopedSession(session, LOCAL_SCOPE)).get_connector("planner").needs_rebuild is True
             monkeypatch.setattr(catalog_module, "tenant_scope_required", lambda: True)
             assert ConnectorCatalog(ScopedSession(session, LOCAL_SCOPE)).get_connector("planner").needs_rebuild is False
+
+
+class TestSelfHostedWithTheRealSetting:
+    """The same path as a self-hosted deployment takes it: identity headers
+    trusted, so a handcrafted form needs no test request and the model probe runs."""
+
+    @pytest.mark.asyncio
+    async def test_a_handcrafted_form_without_a_test_request_still_goes_to_the_model_probe(self, api, saved, monkeypatch):
+        from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
+        from cowork.common.settings.app_settings import get_app_settings
+        from cowork.schemas.connectors import SubmitFormRequest
+
+        monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
+        get_app_settings.cache_clear()
+        monkeypatch.setattr(submissions_endpoint, "run_db", connector_test_flow.run_db)
+        try:
+            form = {k: v for k, v in PLANNER_FORM.items() if k != "test_request"}
+            response = await submissions_endpoint.submit_form(
+                SubmitFormRequest(form_spec=form, values=VALUES, conversation_id=saved.conversation_id), LOCAL_SCOPE,
+            )
+            _ = [chunk async for chunk in response.body_iterator]
+        finally:
+            monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS")
+            get_app_settings.cache_clear()
+
+        assert ModelSaysYes.built == 1 and api.requests == []
+        assert len(saved.vault.list_connections()) == 1

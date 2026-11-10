@@ -7,6 +7,7 @@ member is shown a masked preview. These run the real runner against an
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import json
@@ -457,3 +458,75 @@ class TestLargeAnswers:
     async def test_an_answer_over_the_cap_is_still_checked_for_echoes(self):
         raw = b"[" + (b'{"note": "' + SECRET.encode() + b'"},') * 20000 + b"{}]"
         await refused("repeats a credential", api=Api(raw=raw))
+
+
+class TestReviewFindings:
+    @pytest.mark.asyncio
+    async def test_the_private_host_question_shows_the_path_as_written_not_filled(self):
+        request = with_url("https://api.example.com/bot{{client_secret}}/getMe")
+        outcome, _ = await run(request, table={**PUBLIC, "api.example.com": "10.0.0.5"})
+        shown = json.dumps(outcome.private_host.to_dict())
+        assert SECRET not in shown and quote(SECRET, safe="") not in shown
+        assert outcome.private_host.path == "/bot{{client_secret}}/getMe"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["Zürich", "Kraków", "key-\U0001f511"])
+    async def test_a_value_headers_cannot_carry_fails_the_test_cleanly(self, value):
+        request = copy.deepcopy(CLIENT_REQUEST)
+        request["data"]["headers"]["X-Tenant"] = "{{tenant}}"
+        api = await refused("character headers cannot carry", request, values={**VALUES, "tenant": value})
+        assert len(api.requests) <= 1
+
+    @pytest.mark.asyncio
+    async def test_a_url_httpx_will_not_parse_fails_the_test_cleanly(self):
+        await refused("not a valid URL", with_url("https://api.example.com:443:80/d"))
+
+    @pytest.mark.asyncio
+    async def test_the_host_is_resolved_dialled_and_shown_as_its_wire_form(self):
+        table = resolver({**PUBLIC, "xn--fa-hia.de": "93.184.216.30"})
+        api = Api()
+        outcome = await run_test_request(
+            with_url("https://xn--fa-hia.de/x"), VALUES, secret_names=SECRETS, resolver=table, transport=api.transport,
+        )
+        assert table.asked[-1] == outcome.preview.data_host == "xn--fa-hia.de"
+        assert api.requests[-1].extensions["sni_hostname"] == "xn--fa-hia.de"
+
+    @pytest.mark.asyncio
+    async def test_a_step_that_never_finishes_fails_within_its_deadline(self, monkeypatch):
+        monkeypatch.setattr(connector_test_run, "_STEP_SECONDS", 0.2)
+
+        class Slow(Api):
+            def __call__(self, request):
+                self.requests.append(request)
+                if request.url.path.endswith("/token"):
+                    return super().__call__(request)
+
+                async def drip():
+                    while True:
+                        await asyncio.sleep(0.05)
+                        yield b" "
+
+                return httpx.Response(200, content=drip())
+
+        # Bounded here too, so a runner without its deadline fails rather than hangs.
+        await asyncio.wait_for(refused("took longer than", api=Slow()), timeout=5)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [
+        {"data": []}, {"data": [], "total": 0}, [{}, {}], [None], ["", None],
+        {"accessToken": "x", "expiresIn": 3600}, {"result": {"idToken": "x"}},
+    ], ids=["empty data", "empty data with total", "empty objects", "null item", "blank items", "camel token", "nested camel"])
+    async def test_more_answers_with_no_data_are_refused(self, body):
+        await refused("data step", api=Api(data=body))
+
+    @pytest.mark.asyncio
+    async def test_a_numeric_secret_echo_is_refused_and_a_numeric_value_masked(self):
+        await refused("repeats a credential", values={**VALUES, "client_secret": "987654321"},
+                      api=Api(data={"rows": [{"pin": 987654321}]}))
+        outcome, _ = await run(values={**VALUES, "client_id": "4242"}, api=Api(data={"rows": [{"account": 4242, "qty": 1}]}))
+        assert json.loads(outcome.preview.first_item) == {"account": "***", "qty": 1}
+
+    @pytest.mark.asyncio
+    async def test_a_secret_echoed_as_html_numeric_entities_is_refused(self):
+        echo = "".join(f"&#{ord(c)};" if not c.isalnum() else c for c in SECRET)
+        await refused("repeats a credential", api=Api(data={"rows": [{"note": echo}]}))
