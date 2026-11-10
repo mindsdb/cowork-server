@@ -248,7 +248,9 @@ class TestProbeStream:
         assert "not added to your connectors list" in stream
 
     @pytest.mark.asyncio
-    async def test_the_probe_runs_without_notes_when_they_cannot_be_read(self, engine, vault, monkeypatch):
+    async def test_the_probe_falls_back_to_the_forms_notes_when_the_catalog_cannot_be_read(
+        self, engine, vault, monkeypatch,
+    ):
         _Probe.verdict = "success"
 
         def failing_notes(self, engines):
@@ -258,7 +260,9 @@ class TestProbeStream:
 
         stream = await _probe(HTTPBIN_FORM, {"token": "a"})
 
-        assert _Probe.built[-1]["usage_notes"] is None
+        # The handcrafted form's own notes stand in, as hints that cannot define a pass.
+        assert _Probe.built[-1]["usage_notes"] == "Call /bearer."
+        assert _Probe.built[-1]["notes_define_pass"] is False
         assert "Saved as" in stream
 
     @pytest.mark.asyncio

@@ -733,6 +733,11 @@ def build_cowork_lookup_connector_tool():
     )
 
 
+_DATA_REQUEST_NOTE = (
+    "When the API has no plain GET route that returns data, usage_notes must "
+    "say how to fetch a small sample of data (method, path, body shape, token "
+    "flow), because the connection test passes only once data comes back."
+)
 _BUILD_CUSTOM_CONNECTOR = (
     "No built-in or saved connector matches. Build a custom connector: ask the "
     "user how the system is reached (a REST or GraphQL API, a database, or file "
@@ -740,13 +745,14 @@ _BUILD_CUSTOM_CONNECTOR = (
     "handcraft the form with `engine` set to the new connector's id and a "
     "`connector` block (label, description, category, usage_notes), and pass it "
     "to `request_credentials`. Credentials go only through that form, never chat. "
-    "Once its connection test passes it is saved for reuse."
+    f"{_DATA_REQUEST_NOTE} Once its connection test passes it is saved for reuse."
 )
 _NO_CUSTOM_CONNECTOR = (
     "No built-in or saved connector matches, and custom connectors can't be "
     "saved for reuse on this deployment. Tell the user so. A handcrafted form "
     "passed to `request_credentials` still saves this connection once its test "
-    "passes, but it won't be listed with the connectors."
+    "passes, but it won't be listed with the connectors. Still give the form a "
+    f"`connector` block with usage_notes. {_DATA_REQUEST_NOTE}"
 )
 
 
@@ -970,12 +976,12 @@ _REQUEST_CREDENTIALS_SCHEMA = {
         },
         "connector": {
             "type": "object",
-            "description": "Only when building a new custom connector: how it is listed for reuse, where lookup_connector says one can be saved, once its connection test passes.",
+            "description": "On every handcrafted form. Its usage_notes guide the connection test, and where lookup_connector says a custom connector can be saved, it is how the connector is listed for reuse once that test passes.",
             "properties": {
                 "label": {"type": "string", "description": "Display name (e.g. 'Acme Planner')."},
                 "description": {"type": "string", "description": "One line on what it connects to."},
                 "category": {"type": "string", "description": "Picker category (e.g. 'database', 'crm', 'developer')."},
-                "usage_notes": {"type": "string", "description": "Short notes for using it later: base URL, auth header, key endpoints, quirks. Never credential values."},
+                "usage_notes": {"type": "string", "description": f"Short notes for using it later: base URL, auth header, key endpoints, quirks. {_DATA_REQUEST_NOTE} Never credential values."},
             },
         },
         "_connector_id": {
