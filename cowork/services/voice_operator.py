@@ -46,6 +46,11 @@ OPERATOR_PROMPT = (
     "Anton work in, or else the one on screen. Ask which only when several are running and nothing says which.\n"
     "- Find tasks and projects by name in the snapshot. When a name is ambiguous, ask which one instead of "
     "guessing. Never invent an id.\n"
+    "- Anton does one thing at a time for this call. While the snapshot says he is busy, never start other work "
+    "beside it. A question about that work (how it is going, what he has found): answer from task_steps. More "
+    "work: say in a few words what he is busy with, then either queue it with queue_for_anton when it can wait "
+    "or adds to that work, or, when it would replace that work or they sound like it can't wait, ask whether to "
+    "stop the current work and do this now; if they say yes, stop_task and then ask_anton.\n"
     "- Say what you did, from the tool results. Never say something is done when a tool failed.\n\n"
     "What is on the screen now:\n"
 )
@@ -73,6 +78,16 @@ TOOLS: list[dict[str, Any]] = [
             "request": {"type": "string", "description": "The request, in the person's words, complete."},
             "task_id": {"type": "string", "description": "A task id from the snapshot, or 'new'."},
             "project": {"type": "string", "description": "For a new task: the project to start it in."},
+        },
+        ["request", "task_id"],
+    ),
+    _tool(
+        "queue_for_anton",
+        "Queue work for Anton behind what he is busy with, in that task or another; it starts when the current "
+        "work ends, and the person hears when it is done. Returns at once.",
+        {
+            "request": {"type": "string", "description": "The request, in the person's words, complete."},
+            "task_id": {"type": "string", "description": "A task id from the snapshot: the busy task's, to run right after it."},
         },
         ["request", "task_id"],
     ),
