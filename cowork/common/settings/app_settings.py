@@ -1195,6 +1195,28 @@ class AppSettings(Settings):
             )
         return normalized
 
+    nuance_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("COWORK_NUANCE_API_KEY"),
+        description=(
+            "The organization's Nuance Labs API key (nk_...), for video calls "
+            "with the agent (cowork.services.facetime, prototype). This server "
+            "mints one session token per call with it; the key never reaches "
+            "a browser. Blank (default): no video calls."
+        ),
+    )
+    nuance_api_url: str = Field(
+        default="https://api.nuancelabs.ai",
+        validation_alias=AliasChoices("COWORK_NUANCE_API_URL"),
+        description="Nuance Labs' API, for video calls.",
+    )
+    nuance_persona: str = Field(
+        default="sam",
+        pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$",
+        validation_alias=AliasChoices("COWORK_NUANCE_PERSONA"),
+        description="Which Nuance avatar the video call shows: sam (default), sonia or mira.",
+    )
+
     browser_scope_key_file: str = Field(
         default="",
         validation_alias=AliasChoices("COWORK_BROWSER_SCOPE_KEY_FILE"),

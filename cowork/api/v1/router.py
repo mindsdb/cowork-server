@@ -19,6 +19,7 @@ from cowork.api.v1.endpoints import (
     coding_personal_skills,
     coding_runtime,
     conversations,
+    facetime,
     files,
     health,
     mindshub_people,
@@ -64,6 +65,7 @@ api_router = APIRouter(prefix="/api/v1")
 # ── Canonical routes ─────────────────────────────────────────────────
 api_router.include_router(health.router, prefix="/health", tags=["health"])
 api_router.include_router(browse.router, prefix="/browse", tags=["browser"])
+api_router.include_router(facetime.router, prefix="/facetime", tags=["facetime"])
 api_router.include_router(
     capabilities.router, prefix="/capabilities", tags=["capabilities"]
 )
