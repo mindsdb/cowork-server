@@ -6,7 +6,7 @@ limit and its key keeps the old 20-minute life.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import httpx
@@ -165,6 +165,18 @@ async def test_extend_patches_the_turns_key_on_the_cluster_only_route(monkeypatc
     assert captured["headers"] == {"X-Internal-Auth": "shh"}
     expiry = datetime.fromisoformat(captured["json"]["expiry_date"])
     assert 5390 <= (expiry - before).total_seconds() <= 5410
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("granted_after_s", "covered"), [(5400, True), (3000, False)])
+async def test_an_extension_auth_cut_short_reports_false(monkeypatch, granted_after_s, covered):
+    """auth clamps a key's expiry to its lifetime and still answers 200, with
+    the expiry it kept; a window cut short doesn't cover a Keep going."""
+    granted = (datetime.now(timezone.utc) + timedelta(seconds=granted_after_s)).isoformat()
+    monkeypatch.setattr(httpx, "AsyncClient", _client_answering(200, {}, {"expiry_date": granted}))
+    assert await auth_keys.extend_turn_key(
+        instance_id="corr-1", ttl_seconds=5400, settings=_Settings(),
+    ) is covered
 
 
 @pytest.mark.asyncio

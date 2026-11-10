@@ -219,7 +219,8 @@ async def extend_turn_key(*, instance_id: str, ttl_seconds: int, settings) -> bo
     """
     if not settings.auth_internal_base_url or not settings.auth_internal_secret:
         return False
-    expiry = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+    requested = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+    expiry = requested.isoformat()
     url = f"{settings.auth_internal_base_url.rstrip('/')}/internal/turn-keys/{instance_id}/"
     headers = {"X-Internal-Auth": settings.auth_internal_secret}
     try:
@@ -234,4 +235,30 @@ async def extend_turn_key(*, instance_id: str, ttl_seconds: int, settings) -> bo
             instance_id, resp.status_code, _error_code(resp),
         )
         return False
+    # auth clamps the expiry to the key's lifetime and still answers 200 with
+    # the expiry it kept: a window it cut short is no window for Keep going.
+    granted = _granted_expiry(resp)
+    if granted is not None and granted < requested - timedelta(seconds=_EXTEND_TOLERANCE_SECONDS):
+        logger.warning(
+            "turn key extend cut short: instance_id=%s requested=%s granted=%s",
+            instance_id, expiry, granted.isoformat(),
+        )
+        return False
     return True
+
+
+#: How far auth's granted expiry may fall short of the one asked for (its
+#: rounding, and the time the request takes) before the window counts as cut.
+_EXTEND_TOLERANCE_SECONDS = 60
+
+
+def _granted_expiry(resp) -> datetime | None:
+    """The expiry auth says the key now has, or None when its body has none."""
+    try:
+        value = resp.json().get("expiry_date")
+        granted = datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+    except Exception:
+        return None
+    if granted is not None and granted.tzinfo is None:
+        granted = granted.replace(tzinfo=timezone.utc)
+    return granted
