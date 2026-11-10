@@ -518,7 +518,16 @@ def _published_url_for(
         # have no `published` field; a url means they're live.
         if not entry.get("published", True):
             return ""
-        return entry.get("url", "") or ""
+        url = entry.get("url")
+        # The record sits in the agent-writable folder: only text the card
+        # can carry counts as a link.
+        if not isinstance(url, str):
+            return ""
+        try:
+            url.encode("utf-8")
+        except UnicodeEncodeError:
+            return ""
+        return url
     return ""
 
 

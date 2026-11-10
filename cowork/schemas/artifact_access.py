@@ -263,6 +263,21 @@ class ArtifactStatusView(CamelResponse):
             artifact_key=card.get("artifactKey") or "",
         )
 
+    @classmethod
+    def of_access(cls, access: ArtifactAccessView, *, published_url: str) -> ArtifactStatusView:
+        """The status of a file with no metadata.json, which has no card: its
+        published URL and its access state, never modified."""
+        return cls(
+            published_url=published_url or "",
+            modified=False,
+            access_mode=access.access_mode or AccessMode.PUBLIC,
+            access_protected=bool(access.access_protected),
+            access_emails=access.access_emails,
+            org_allowed=access.org_allowed,
+            owner_only=access.owner_only,
+            artifact_key=access.artifact_key or "",
+        )
+
 
 class ArtifactPublishResult(ArtifactAudienceView):
     """What a publish answers: the link, who it opens for, and anton's

@@ -295,3 +295,16 @@ def test_a_share_notice_titles_a_numeric_name_by_its_folder(tmp_path):
     notice = share_notice(folder, "index.html", "https://view.example/r/1", recipients=ShareNotify(emails=("a@b.co",)))
 
     assert notice.artifact_title == "quarterly"
+
+
+def test_a_published_url_that_is_not_text_lists_as_unpublished(source):
+    _artifact(source.base, "good", name="Good")
+    folder = _artifact(source.base, "odd-url", name="Odd")
+    (folder / ".published.json").write_text(json.dumps({"index.html": {"url": 5, "published": True}}))
+
+    cards = {card["slug"]: card for card in _json(a.list_artifacts([source]))}
+    inline = _json(cards_for_slugs(source.base, ["odd-url"], scope=LOCAL_SCOPE, project_id=None, project_name="proj"))
+
+    assert set(cards) == {"good", "odd-url"}
+    assert cards["odd-url"]["publishedUrl"] == ""
+    assert inline[0]["publishedUrl"] == ""
