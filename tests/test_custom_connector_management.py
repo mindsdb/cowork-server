@@ -247,7 +247,8 @@ def test_in_org_mode_the_builder_manages_their_connector_and_no_one_else(engine,
 def test_both_routes_require_an_authenticated_member_not_an_admin():
     routes = [
         r for r in create_app().routes
-        if getattr(r, "path", "").startswith("/api/v1/connectors/custom")
+        if getattr(r, "path", "") == "/api/v1/connectors/custom"
+        or getattr(r, "path", "").startswith("/api/v1/connectors/custom/")
     ]
 
     assert {tuple(sorted(r.methods)) for r in routes} == {("POST",), ("PATCH",), ("DELETE",)}
@@ -311,6 +312,41 @@ class TestSaveConnectorDraft:
         ]
         assert spec.form.methods is None
         assert ConnectorCatalog(_scoped(engine, ORG_A_OTHER)).get_connector("acme_crm") is None
+
+    def test_the_templates_check_is_kept_and_served_without_a_host(self, engine, org_tenancy):
+        check = {"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}}
+        client = _org_client(engine, _member(ORG_A), ORG_A)
+
+        assert client.post("/custom", json=_anton_draft(check=check)).status_code == 200
+
+        [row] = _org_rows(engine)
+        assert row.connection_check == check
+        spec = ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm")
+        assert spec.check.model_dump() == check
+
+    def test_a_template_without_a_check_keeps_none(self, engine, org_tenancy):
+        assert _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=_anton_draft()).status_code == 200
+
+        [row] = _org_rows(engine)
+        assert row.connection_check is None
+        assert ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm").check is None
+
+    def test_a_check_the_parser_refuses_is_never_stored(self, engine, org_tenancy):
+        """The card posts the draft back; a check edited on the way is parsed again, and refused."""
+        draft = _anton_draft(check={"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}})
+        draft["check"] = {"path": "//evil.example/me", "headers": {"Authorization": "Bearer {api_key}"}}
+
+        assert _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=draft).status_code == 422
+        assert _org_rows(engine) == []
+
+    def test_a_resave_replaces_the_check(self, engine, org_tenancy):
+        client = _org_client(engine, _member(ORG_A), ORG_A)
+        client.post("/custom", json=_anton_draft(check={"path": "/v1/me", "headers": {"X-Key": "{api_key}"}}))
+
+        client.post("/custom", json=_anton_draft())
+
+        [row] = _org_rows(engine)
+        assert row.connection_check is None
 
     def test_two_members_keep_the_same_id_and_a_resave_updates_in_place(self, engine, org_tenancy):
         assert _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=_anton_draft()).status_code == 200

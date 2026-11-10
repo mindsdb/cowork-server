@@ -2,15 +2,28 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from anton.core.tools.connector_draft import ConnectorDraftError, parse_connector_draft
-from fastapi import APIRouter, Body, Depends, HTTPException, Response, status
+from anton.core.tools.connector_draft import ConnectorDraftCheck, ConnectorDraftError, parse_connector_draft
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import TurnQueueSettings
-from cowork.db.scoped import ScopedSessionDep
+from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_tenant_scope
+from cowork.db.units import run_db
 from cowork.models.custom_connector import CustomConnector
-from cowork.schemas.connectors import ConnectorMetadataResponse, CustomConnectorUpdate
+from cowork.schemas.connectors import (
+    ConnectorMetadataResponse,
+    CustomConnectionResponse,
+    CustomConnectorUpdate,
+    CustomConnectRequest,
+)
+from cowork.services.connectors import custom_connect
 from cowork.services.connectors.catalog import custom_connector_spec
+from cowork.services.connectors.custom_connections import (
+    CustomConnectionRefused,
+    CustomConnectionUnavailable,
+    create_custom_connection,
+)
 from cowork.services.connectors.custom_connectors import (
     CustomConnectorService,
     MemberConnectorLimitError,
@@ -18,6 +31,7 @@ from cowork.services.connectors.custom_connectors import (
     is_builtin_connector_id,
 )
 from cowork.services.connectors.specs._registry import connector_metadata
+from cowork.turnqueue.redis_client import get_redis
 
 # In org mode a custom connector is visible to its builder only (see
 # scope_definitions), so the member who built it manages it. A no-op on a
@@ -131,3 +145,90 @@ def delete_custom_connector(connector_id: str, session: ScopedSessionDep) -> Res
     if not CustomConnectorService(session).delete(connector_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom connector not found.")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _connect_template(connector_id: str, session: ScopedSession) -> tuple[list[dict[str, Any]], ConnectorDraftCheck]:
+    """The caller's own template's fields and its check, parsed again.
+
+    Raises:
+        custom_connect.ConnectRefused: 404 when the caller has no such
+            template, 409 ``no_check`` when it has no usable check.
+    """
+    row = CustomConnectorService(session).get(connector_id)
+    if row is None:
+        raise custom_connect.ConnectRefused("not_found", 404, "Custom connector not found.")
+    return list(row.spec.get("fields", [])), custom_connect.stored_check(row)
+
+
+#: What auth's refusals mean to the member; any other code reads as the fallback.
+_AUTH_REFUSALS = {
+    "conflict": "You already have a connection with this name. Choose another name, or remove the old one in Connect Apps and Data.",
+    "quota_exceeded": "You have reached the limit of custom connections. Remove one in Connect Apps and Data to connect another.",
+    "organization_mismatch": "Your active organization changed while connecting. Reload and try again.",
+    "disabled": "Custom connections are turned off on this deployment.",
+}
+
+
+def _refusal(code: str, status_code: int, message: str) -> JSONResponse:
+    """A refusal as ``{"detail": {"code", "message"}}``; never a submitted value."""
+    return JSONResponse({"detail": {"code": code, "message": message}}, status_code=status_code)
+
+
+@router.post("/{connector_id}/connect", response_model=CustomConnectionResponse, status_code=status.HTTP_201_CREATED)
+async def connect_custom_connector(
+    connector_id: str,
+    body: CustomConnectRequest,
+    request: Request,
+    scope: Annotated[TenantScope, Depends(get_tenant_scope)],
+) -> CustomConnectionResponse | JSONResponse:
+    """Check a member's credentials for their own template at the address they typed, then store them.
+
+    Org mode only, with the setting on and the turn queue on Redis, which
+    counts each member's attempts. auth is asked first whether it would take
+    the connection (dry run), then the check runs against the typed address
+    only, then auth stores it verified.
+
+    Returns:
+        201 with the stored connection. A refusal answers its own status with
+        ``detail`` ``{code, message}``; a check that ran and failed answers
+        422 with ``detail`` ``{code, provider_status, excerpt}``.
+    """
+    settings = TurnQueueSettings()
+    if not scope.org_mode or not settings.connector_drafts_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
+    try:
+        if not settings.is_remote:
+            raise custom_connect.ConnectRefused("unavailable", 503, "Connecting is unavailable on this deployment.")
+        await custom_connect.take_attempt(get_redis(), f"cowork:custom-connect:{scope.org_id}:{scope.user_id}")
+        fields, check = await run_db(lambda session: _connect_template(connector_id, session), scope=scope)
+        origin = custom_connect.normalize_address(body.address, settings.custom_connect_refused_domains)
+        values = custom_connect.check_values(fields, body.values)
+        custom_connect.check_headers(check, values)
+    except custom_connect.ConnectRefused as refused:
+        return _refusal(refused.code, refused.status_code, refused.message)
+    payload = {
+        "connector_id": connector_id,
+        "name": body.name,
+        "fields": {**values, custom_connect.BASE_URL_FIELD: origin},
+        "secure_keys": custom_connect.secure_keys(fields, check, values),
+    }
+    credential = request.headers.get("authorization", "")
+    try:
+        await create_custom_connection(
+            credential=credential, organization_id=str(scope.org_id), payload=payload, dry_run=True, settings=settings,
+        )
+        failure = await custom_connect.run_check(origin, check, values)
+        if failure is not None:
+            return JSONResponse(
+                {"detail": {"code": failure.code, "provider_status": failure.provider_status, "excerpt": failure.excerpt}},
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            )
+        stored = await create_custom_connection(
+            credential=credential, organization_id=str(scope.org_id), payload=payload, dry_run=False, settings=settings,
+        )
+    except CustomConnectionRefused as refused:
+        message = _AUTH_REFUSALS.get(refused.code, "The connection could not be stored.")
+        return _refusal(refused.code, refused.status_code, message)
+    except CustomConnectionUnavailable:
+        return _refusal("unavailable", status.HTTP_503_SERVICE_UNAVAILABLE, "Connecting is unavailable right now; try again later.")
+    return CustomConnectionResponse.model_validate(stored)

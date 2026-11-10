@@ -42,6 +42,7 @@ def custom_connector_spec(row: CustomConnector) -> dict[str, Any]:
         "custom": True,
         "usage_notes": row.usage_notes,
         "form": dict(row.spec),
+        "check": dict(row.connection_check) if row.connection_check else None,
     }
 
 

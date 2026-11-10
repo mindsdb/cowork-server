@@ -965,7 +965,21 @@ Publishing uses a separate `artifact_publish` mint purpose. It requires artifact
 
 `COWORK_TURN_DATASOURCE_ENABLED` (default `false`) lets a hosted turn query the user's verified PostgreSQL and MySQL connections in the organization. When it is on, the producer lists them from MindsHub under the dedicated producer service role (`COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID` and `COWORK_TURN_DATASOURCE_PRODUCER_KEY`), bound to the turn key it has just minted, registers one grant per connection before enqueueing, and puts only connection ids and credential versions on the queue. No capability or password crosses Redis; the pod reaches the gateway on the inference host the turn's `llm` block already names. A listing or registration failure fails the dispatch as `permission_unavailable` instead of silently dropping the datasources.
 
-`COWORK_TURN_CONNECTOR_DRAFTS_ENABLED` (default `false`) lets a member's hosted turn build a custom connector template for an API: the connector's id, label, the credential fields the member will fill in, and usage notes, never a value. Each template comes back as a card the member saves (`POST /api/v1/connectors/custom`), and only that member sees it. The setting also gates that save route. Channel turns never get the tool. Keep it off until members can connect what they save. It is not in the Helm chart yet.
+`COWORK_TURN_CONNECTOR_DRAFTS_ENABLED` (default `false`) lets a member's hosted turn build a custom connector template for an API: the connector's id, label, the credential fields the member will fill in, and usage notes, never a value. Each template comes back as a card the member saves (`POST /api/v1/connectors/custom`), and only that member sees it. The setting also gates that save route. Channel turns never get the tool. Keep it off until hosted turns can use what members connect. It is not in the Helm chart yet.
+
+#### Connecting a custom connector
+
+With that setting on, a member's own templates are listed in `GET /api/v1/connectors/specs` in org mode, and `custom-availability` answers yes. The member connects one with `POST /api/v1/connectors/custom/{connector_id}/connect`, sending `{name, address, values}`:
+
+- `address` is the API's address, typed by the member: a host name or an `https://` origin, port 443, no path. The template never names a host, so a model-written template cannot choose where the key goes. Our own domains are refused (`COWORK_TURN_CUSTOM_CONNECT_REFUSED_DOMAINS`), and the name must resolve to public addresses only.
+- The template's check is one GET of a path it declares, with headers that place the member's values. The server sends it once without the credential headers, which must answer 401 or 403, then with them, which must answer 2xx. A check that ignores the credential proves nothing and is refused.
+- Before sending anything, the server asks auth whether it would take the connection (a dry run). After a passing check, auth stores it verified, with the normalized address as `base_url`. Only this server creates custom API connections, on auth's internal route with the producer credential and the member's own forwarded.
+- A failed check answers 422 with the provider's status and the first 300 characters of its answer, with every submitted value replaced by `***`. That is best effort: a value the provider re-encodes or splits is not caught. Every other refusal answers `detail: {code, message}`. No value is logged or written to a conversation.
+- Attempts are counted per member in Redis, 10 per 10 minutes. A deployment without Redis (the in-process turn backend) cannot connect.
+
+`GET /api/v1/connectors/custom-connections/` and `DELETE .../{id}` list and remove a member's custom API connections. They stay open while the setting is off, so a member can always see and remove what is stored.
+
+A check cannot express Basic auth, a key in the query or the URL, OAuth, or a host taken from a field (per-account subdomains). A template without a check cannot be connected; the form says so.
 
 Turn the flag on only after MindsHub serves the datasource producer and resolver endpoints, the inference deployment serves `/v1/datasources/`, the turn controller passes the `datasource` block on, and the scratchpad image includes the typed helper that reads the gateway from the turn's inference host, with live pods from an older image recycled first. With the flag off nothing in this path runs, so the flag is also the rollback.
 

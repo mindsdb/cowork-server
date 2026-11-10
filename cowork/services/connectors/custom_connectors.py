@@ -348,6 +348,8 @@ class CustomConnectorService:
             "category": draft.category,
             "usage_notes": draft.usage_notes,
             "spec": stored_form(draft.connector_id, draft_form(draft)),
+            # Only from anton's parse: no other writer, so a stored check passed its rules.
+            "connection_check": draft.check.to_dict() if draft.check is not None else None,
         }
         row = self.get(draft.connector_id)
         if row is None:

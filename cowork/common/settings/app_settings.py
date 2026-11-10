@@ -799,9 +799,17 @@ class TurnQueueSettings(Settings):
         default=False,
         description=(
             "Let cloud turns build custom connector templates a member saves "
-            "from a card. Keep false until members can connect what they save."
+            "from a card and connects. Keep false until hosted turns can use "
+            "what members connect."
         ),
     )  # COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
+    custom_connect_refused_domains: list[str] = Field(
+        default=["mindshub.ai", "mindsdb.com", "mindsdb.cloud", "mdb.ai", "4nton.ai", "cluster.local"],
+        description=(
+            "Domains a custom connector's address may not be, or be under: our own, "
+            "so a member cannot point the check at our services."
+        ),
+    )  # COWORK_TURN_CUSTOM_CONNECT_REFUSED_DOMAINS
     datasource_producer_key_id: str = Field(
         default="",
         description="Key id for the dedicated datasource producer service role.",

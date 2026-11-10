@@ -56,6 +56,11 @@ class CustomConnector(BaseSQLModel, table=True):
         description="Validated connection form plus how_to and help_url",
     )
     usage_notes: str | None = Field(default=None, description="Agent-facing notes for using the connector")
+    connection_check: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=sa.Column(sa.JSON, nullable=True),
+        description="The template's check, {path, headers}, as anton's parser accepted it; never a host",
+    )
     featured: bool = Field(default=True, description="Shown in the picker's Featured section")
     org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")

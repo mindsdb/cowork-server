@@ -214,9 +214,22 @@ class CustomConnectorUpdate(BaseModel):
     spec: dict[str, Any] | None = None
 
 
+class ConnectorCheck(BaseModel):
+    """How a custom connector tests its credentials: a GET of ``path`` on the address the member types.
+
+    ``headers`` maps a header name to its value, where ``{field}`` stands for
+    that field's value. There is no host: the member supplies it.
+    """
+
+    path: str
+    headers: dict[str, str]
+
+
 class ConnectorSpecResponse(ConnectorMetadataResponse):
     keywords: list[str] = []
     form: ConnectorForm
+    # Custom connectors only; None for every built-in and for a template saved without one.
+    check: ConnectorCheck | None = None
     # Agent-facing notes on using this connector's API once connected: traps,
     # efficient endpoints, auth quirks. The chat agent sees them only when a
     # connection of this engine exists; the credential prober sees them while
@@ -231,6 +244,32 @@ class ConnectorSpecResponse(ConnectorMetadataResponse):
     # Describe per-method differences by field name (`app_password`,
     # `access_token`), not by env var name.
     usage_notes: str | None = Field(default=None, exclude=True)
+
+
+class CustomConnectionResponse(BaseModel):
+    """A member's stored custom API connection, as auth lists it: never a value."""
+
+    id: int
+    connector_id: str
+    name: str
+    secure_keys: list[str] = []
+    status: str
+    credential_version: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    # The member deleted the template this connection was made from; it can
+    # still be deleted, but not connected again.
+    template_missing: bool = False
+
+
+class CustomConnectRequest(BaseModel):
+    """Connect a member's own custom connector: a name, the API address they type, and the field values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=255)
+    address: str = Field(min_length=1, max_length=300)
+    values: dict[str, Any] = Field(default_factory=dict, repr=False)
 
 
 class CustomConnectorAvailability(BaseModel):
