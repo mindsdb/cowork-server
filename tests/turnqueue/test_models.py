@@ -142,3 +142,41 @@ def test_turn_job_refuses_a_malformed_datasource_block_before_it_is_queued(datas
     with pytest.raises(ValidationError, match="datasource"):
         TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
                 reply_stream="scratchpad:reply:c", params={"input": "hi", "datasource": datasource})
+
+
+_CUSTOM_REF = {"connection_id": 7, "connector_id": "acme_crm", "name": "Prod", "credential_version": 2}
+
+
+def test_turn_job_carries_a_custom_api_block():
+    custom_api = {"turn_key": "mdb_x.secret", "connections": [_CUSTOM_REF]}
+    job = TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
+                  reply_stream="scratchpad:reply:c", params={"input": "hi", "custom_api": custom_api})
+    assert TurnJob.model_validate_json(job.model_dump_json()).params["custom_api"] == custom_api
+
+
+@pytest.mark.parametrize(
+    "custom_api",
+    [
+        "tk_abc",
+        {"connections": [_CUSTOM_REF]},
+        {"turn_key": "", "connections": [_CUSTOM_REF]},
+        {"turn_key": "k", "connections": [_CUSTOM_REF], "fields": {"api_key": "s"}},
+        {"turn_key": "k", "connections": []},
+        {"turn_key": "k", "connections": [{**_CUSTOM_REF, "connection_id": i} for i in range(1, 27)]},
+        {"turn_key": "k", "connections": [{**_CUSTOM_REF, "connection_id": True}]},
+        {"turn_key": "k", "connections": [{**_CUSTOM_REF, "credential_version": 0}]},
+        {"turn_key": "k", "connections": [{**_CUSTOM_REF, "name": ""}]},
+        {"turn_key": "k", "connections": [{**_CUSTOM_REF, "connector_id": 5}]},
+        {"turn_key": "k", "connections": [{**_CUSTOM_REF, "api_key": "s"}]},
+        {"turn_key": "k", "connections": [_CUSTOM_REF, _CUSTOM_REF]},
+    ],
+    ids=["not_an_object", "no_turn_key", "empty_turn_key", "extra_field", "empty", "over_the_cap",
+         "bool_id", "zero_version", "empty_name", "non_text_connector", "secret_bearing_reference",
+         "duplicate_id"],
+)
+def test_turn_job_refuses_a_malformed_custom_api_block_before_it_is_queued(custom_api):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
+                reply_stream="scratchpad:reply:c", params={"input": "hi", "custom_api": custom_api})

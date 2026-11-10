@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -101,7 +102,8 @@ def check_handcrafted_form(form_spec: dict[str, Any]) -> None:
     if len(notes) > USAGE_NOTES_MAX:
         raise UnstorableFormError(f"connector.usage_notes must be at most {USAGE_NOTES_MAX} characters.")
     # Hygiene for the builder's own prompt: anton's output scrubber knows the key
-    # and token shapes. No one else reads a definition (scope_is_one_persons).
+    # and token shapes. No one else reads a definition (scope_is_one_persons;
+    # in org mode, only the builder's own turns, member_turn_usage_notes).
     if scrub_output(notes) != notes:
         raise UnstorableFormError(
             "connector.usage_notes looks like it holds a credential value. "
@@ -121,12 +123,41 @@ def scope_is_one_persons(scope: TenantScope) -> bool:
     usage notes) is model-written and may hold what its builder typed, in
     any encoding. A handcrafted form is therefore kept only where this is
     True. In org mode a member keeps only checked drafts
-    (save_member_draft), seen by that member alone (scope_definitions).
-    Sharing definitions across people is not built yet.
+    (save_member_draft), seen by that member alone (scope_definitions), and
+    their notes reach only that member's own cloud turns
+    (member_turn_usage_notes). Sharing definitions across people is not
+    built yet.
     """
     if scope.personal:
         return scope.partitioned_for(PersonalResource.CONNECTIONS)
     return not scope.org_mode and not tenant_scope_required()
+
+
+def member_turn_usage_notes(session: ScopedSession, connector_ids: Iterable[str]) -> dict[str, str]:
+    """Usage notes of an org-mode member's own templates, for that member's own cloud turn.
+
+    Args:
+        session: The turn's scoped session; only its user's rows are read
+            (scope_definitions).
+        connector_ids: The connector ids of the custom connections the turn
+            carries.
+
+    Returns:
+        connector id -> notes, through anton's output scrubber and cut to
+        USAGE_NOTES_MAX. Empty outside org mode or without a user, and for a
+        connection whose template the member no longer keeps.
+    """
+    scope = session.scope
+    wanted = set(connector_ids)
+    if not scope.org_mode or not scope.user_id or not wanted:
+        return {}
+    stmt = scope_definitions(session).where(CustomConnector.connector_id.in_(wanted))
+    notes: dict[str, str] = {}
+    for row in session.exec(stmt).all():
+        text = (row.usage_notes or "")[:USAGE_NOTES_MAX]
+        if text.strip():
+            notes[row.connector_id] = scrub_output(text)
+    return notes
 
 
 def _text(value: Any, limit: int | None = None) -> str | None:

@@ -11,6 +11,7 @@ from cowork.turnqueue.redis_client import cancel_flag_key
 
 from cowork.handlers import turn_errors as te
 from cowork.turnqueue import producer as prod
+from cowork.turnqueue.auth_keys import MintedTurnKey
 
 from _fakes import QueuedPipeline
 
@@ -25,7 +26,12 @@ def _stub_llm_mint(monkeypatch):
     async def _fake_mint(**kw):
         return "mdb_turnkey"
 
+    async def _fake_mint_details(**kw):
+        return MintedTurnKey(key="mdb_turnkey", prefix="turnkey")
+
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+    # Minted when a turn key prefix is needed: the datasource or the custom connector setting.
+    monkeypatch.setattr(prod, "mint_turn_key_details", _fake_mint_details)
 
 
 class FakeRedis:
