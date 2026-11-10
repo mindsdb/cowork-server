@@ -606,3 +606,10 @@ def pytest_sessionstart(session):
         _blocking_guard.StaleEntryCheck(tests_dir=Path(__file__).parent, reached=_GUARD_REACHED),
         "cowork-blocking-guard-stale-entries",
     )
+
+
+@pytest.fixture()
+def self_hosted_probe(monkeypatch):
+    """The probe handler as self-hosted runs it: a custom connector still goes
+    to the model probe there, until self-hosted gets its own test requests."""
+    monkeypatch.setattr("cowork.handlers.probe.tenant_scope_required", lambda: True)

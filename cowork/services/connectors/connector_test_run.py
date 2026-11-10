@@ -26,7 +26,7 @@ import socket
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, quote_plus, unquote
+from urllib.parse import quote, quote_plus, unquote, urlsplit
 
 import httpx
 
@@ -223,11 +223,24 @@ def _fill_url(url: str, values: Mapping[str, str]) -> httpx.URL:
     return httpx.URL(_fill(url, values, encode=lambda v: quote(v, safe="")))
 
 
-def _placeholder_names(step: Mapping[str, Any]) -> set[str]:
+def placeholder_names(step: Mapping[str, Any]) -> set[str]:
+    """The ``{{name}}`` placeholders one test step uses."""
     texts = [step.get("url") or "", *(step.get("headers") or {}).values(), *(step.get("basic_auth") or [])]
     texts += list((step.get("form") or {}).values())
     texts += _json_leaves(step.get("json_body"))
     return {name for text in texts for name in _PLACEHOLDER.findall(str(text))}
+
+
+def request_hosts(test_request: Mapping[str, Any]) -> set[str]:
+    """The hosts a test request's steps are sent to, as written in the form."""
+    hosts = set()
+    for name in ("token", "data"):
+        step = test_request.get(name)
+        if step:
+            host = urlsplit(_PLACEHOLDER.sub("x", str(step.get("url") or ""))).hostname
+            if host:
+                hosts.add(_normal_host(host))
+    return hosts
 
 
 def _json_leaves(value: Any) -> list[str]:
@@ -549,7 +562,7 @@ async def run_test_request(
     for name, spec in (("token", token_spec), ("data", data_spec)):
         if not spec:
             continue
-        for placeholder in _placeholder_names(spec) - ({"token"} if name == "data" and token_spec else set()):
+        for placeholder in placeholder_names(spec) - ({"token"} if name == "data" and token_spec else set()):
             if placeholder not in filled:
                 raise ConnectorTestError(f"The {name} step needs {placeholder}, which was left empty.")
 

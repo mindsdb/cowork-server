@@ -22,11 +22,25 @@ _COLOR_PATTERN = re.compile(r"#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?")
 USAGE_NOTES_MAX = 1600
 
 
+#: What a member reads when a custom connector was saved before connection tests.
+NEEDS_REBUILD_FOR_MEMBER = (
+    "This connector was saved before connection tests existed. Ask the agent to build it again."
+)
+#: What the agent reads instead of a form it cannot use.
+NEEDS_REBUILD_FOR_AGENT = (
+    "{connector_id!r} was saved before connection tests existed and cannot be connected as it is. "
+    "Build a handcrafted form for it again, with engine {connector_id!r} and a test_request; it "
+    "replaces the old definition once its test passes."
+)
+
+
 class UnstorableFormError(ValueError):
     """A handcrafted form that cannot be kept as a custom connector."""
 
 
-def handcrafted_form_allowed(*, known: bool, custom: bool, extends: bool) -> bool:
+def handcrafted_form_allowed(
+    *, known: bool, custom: bool, extends: bool, stored_test_request: bool | None,
+) -> bool:
     """Whether a connector id may take a handcrafted form instead of its stored one.
 
     Args:
@@ -34,13 +48,39 @@ def handcrafted_form_allowed(*, known: bool, custom: bool, extends: bool) -> boo
         custom: It is a custom connector.
         extends: The form is a follow-up step that adds fields to a saved
             connection.
+        stored_test_request: Whether the stored custom definition carries a
+            test request; None when the id is not a stored custom connector.
+            Required, so no caller can leave the stored definition out.
 
     Returns:
-        True for an unknown id, and for a follow-up step of a custom
-        connector. A known id is otherwise checked and saved against its
-        stored form, so a handcrafted one would skip that check.
+        True for an unknown id, for a follow-up step of a custom connector,
+        and, on a single-user install, for a custom connector saved before
+        connection tests existed, which can only be connected again once a
+        new form replaces it. A known id is otherwise checked and saved
+        against its stored form, so a handcrafted one would skip that check.
     """
-    return not known or (custom and extends)
+    if not known or (custom and extends):
+        return True
+    return custom and stored_test_request is False and not tenant_scope_required()
+
+
+def test_request_for(form_spec: dict[str, Any], method: str | None) -> dict[str, Any] | None:
+    """The test request a submission of ``method`` runs: the form's own on a
+    form with no methods, else that method's; None when there is none."""
+    methods = [m for m in form_spec.get("methods") or [] if isinstance(m, dict)]
+    if not methods:
+        request = form_spec.get("test_request")
+    else:
+        chosen = next((m for m in methods if m.get("id") == method), None)
+        request = (chosen or {}).get("test_request")
+    return request if isinstance(request, dict) else None
+
+
+def has_test_requests(form_spec: dict[str, Any]) -> bool:
+    """Whether every method of ``form_spec`` carries a test request."""
+    methods = [m for m in form_spec.get("methods") or [] if isinstance(m, dict)]
+    holders = methods or [form_spec]
+    return all(isinstance(h.get("test_request"), dict) for h in holders)
 
 
 def _require_https(value: Any, what: str) -> None:

@@ -37,9 +37,11 @@ from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_i
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.custom_connectors import (
+    NEEDS_REBUILD_FOR_AGENT,
     UnstorableFormError,
     check_handcrafted_form,
     handcrafted_form_allowed,
+    has_test_requests,
     scope_is_one_persons,
 )
 from cowork.services.connectors.persist import vault_for_scope
@@ -901,9 +903,14 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         return f"request_credentials: {_sharepoint_instruction()}"
     known = (await _scope_connectors()).get(connector_id)
     extends_name = spec.get("extends_connection")
+    custom = bool(known and known.get("custom"))
+    stored_test_request = has_test_requests(known.get("form") or {}) if custom else None
     handcrafted = handcrafted_form_allowed(
-        known=known is not None, custom=bool(known and known.get("custom")), extends=extends_name is not None,
+        known=known is not None, custom=custom, extends=extends_name is not None,
+        stored_test_request=stored_test_request,
     )
+    if spec.get("_connector_id") and stored_test_request is False and not tenant_scope_required():
+        return f"request_credentials: {NEEDS_REBUILD_FOR_AGENT.format(connector_id=connector_id)}"
     if not spec.get("_connector_id") and not handcrafted:
         return (
             f"request_credentials: {connector_id!r} is already a connector. Call "

@@ -20,6 +20,7 @@ from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.handlers import probe as probe_handler
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import SubmitFormRequest
+from cowork.services.connectors import connector_test_flow
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.harnesses.anton_harness import tools
 from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError, check_handcrafted_form
@@ -62,6 +63,7 @@ def engine(monkeypatch):
             return fn(ScopedSession(session, scope))
 
     monkeypatch.setattr(probe_handler, "run_db", run_db)
+    monkeypatch.setattr(connector_test_flow, "run_db", run_db)
     return eng
 
 
@@ -147,6 +149,7 @@ class TestService:
                 )
 
 
+@pytest.mark.usefixtures("self_hosted_probe")
 class TestProbeStream:
     @pytest.mark.asyncio
     async def test_a_passing_probe_saves_the_connection_and_the_definition(self, engine, vault):
@@ -313,6 +316,7 @@ class TestProbeStream:
         assert _Probe.built[-1]["notes_define_pass"] is defines_pass
 
 
+@pytest.mark.usefixtures("self_hosted_probe")
 class TestProbeIsNotSkippedByAModelFlag:
     """Only a real OAuth grant on the selected method skips the live test."""
 

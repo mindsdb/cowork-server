@@ -15,6 +15,8 @@ from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import SubmissionStore
 
+pytestmark = pytest.mark.usefixtures("self_hosted_probe")
+
 
 def _prompt(**kw):
     probe = CredentialProbe(

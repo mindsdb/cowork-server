@@ -240,6 +240,9 @@ class ConnectorMetadataResponse(BaseModel):
     # Built in Cowork and stored per org (or per local install), not shipped
     # in the static registry.
     custom: bool = False
+    # A custom connector saved before connection tests existed, which cannot
+    # be connected until the agent builds it again.
+    needs_rebuild: bool = False
 
 
 class CustomConnectorUpdate(BaseModel):
