@@ -268,6 +268,7 @@ def _anton_draft(**overrides) -> dict:
             {"name": "api_key", "label": "API key", "help": "Settings, then API."},
             {"name": "region", "label": "Region", "secret": False, "required": False, "placeholder": "eu"},
         ],
+        "check": {"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}},
         **overrides,
     }
     outcome = asyncio.run(connector_draft_tool(box).handler(None, data))
@@ -324,12 +325,16 @@ class TestSaveConnectorDraft:
         spec = ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm")
         assert spec.check.model_dump() == check
 
-    def test_a_template_without_a_check_keeps_none(self, engine, org_tenancy):
-        assert _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=_anton_draft()).status_code == 200
+    def test_a_template_without_a_check_is_never_stored(self, engine, org_tenancy):
+        """The card posts the draft back; one sent without its check could never connect."""
+        draft = _anton_draft()
+        del draft["check"]
 
-        [row] = _org_rows(engine)
-        assert row.connection_check is None
-        assert ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm").check is None
+        resp = _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=draft)
+
+        assert resp.status_code == 422
+        assert "no connection check" in resp.json()["detail"]
+        assert _org_rows(engine) == []
 
     def test_a_check_the_parser_refuses_is_never_stored(self, engine, org_tenancy):
         """The card posts the draft back; a check edited on the way is parsed again, and refused."""
@@ -346,7 +351,7 @@ class TestSaveConnectorDraft:
         client.post("/custom", json=_anton_draft())
 
         [row] = _org_rows(engine)
-        assert row.connection_check is None
+        assert row.connection_check == {"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}}
 
     def test_two_members_keep_the_same_id_and_a_resave_updates_in_place(self, engine, org_tenancy):
         assert _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=_anton_draft()).status_code == 200
