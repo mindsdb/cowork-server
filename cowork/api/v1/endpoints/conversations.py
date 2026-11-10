@@ -49,6 +49,7 @@ def _serialize_conversation(c, updated_at=None) -> ConversationListItem:
         "project_id": c.project_id,
         "harness": c.harness,
         "model": c.model,
+        "reasoning_effort": c.reasoning_effort,
     })
 
 

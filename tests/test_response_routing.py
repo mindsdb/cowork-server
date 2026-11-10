@@ -437,6 +437,7 @@ async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -536,6 +537,7 @@ async def test_handle_logs_every_router_fallback_at_default_level(
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: SimpleNamespace(id=conv_id),
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=history,
         ),
     )

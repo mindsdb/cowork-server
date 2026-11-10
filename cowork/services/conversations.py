@@ -647,6 +647,30 @@ class ConversationService:
         self.session.refresh(conversation)
         return conversation
 
+    def record_turn_picks(
+        self, *, conversation: Conversation, model: str | None, reasoning_effort: str | None,
+    ) -> None:
+        """Save a turn's model and reasoning-effort picks as the conversation's
+        own, so a reopened chat comes back on the latest ones.
+
+        A pick the turn leaves out keeps the saved value. Cowork's renderer
+        sends no model for Auto and for a pinned model its picker no longer
+        offers (`offeredModelId`, e.g. one the wallet locks), and that turn
+        must not wipe the pin a top-up brings back. Commits only on a change.
+        """
+        changed = False
+        if model and model != conversation.model:
+            conversation.model = model
+            changed = True
+        if reasoning_effort and reasoning_effort != conversation.reasoning_effort:
+            conversation.reasoning_effort = reasoning_effort
+            changed = True
+        if not changed:
+            return
+        self.session.add(conversation)
+        self.session.commit()
+        self.session.refresh(conversation)
+
     def update_history_compaction(
         self,
         conversation_id: UUID,

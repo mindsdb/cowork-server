@@ -161,3 +161,74 @@ def test_conversation_from_a_removed_harness_still_opens_and_continues(client, h
     items = client.get(f"/api/v1/conversations/{conv_id}/items").json()
     assert [i["harness"] for i in items[:2]] == ["hermes", "hermes"]
     assert len(items) > 2 and all(i.get("harness") != "hermes" for i in items[2:])
+
+
+def _saved_picks(client, conv_id: str) -> tuple[dict, dict]:
+    """The conversation as GET /conversations/{id} and the all-projects list
+    return it, the two reads a reopened chat is built from."""
+    got = client.get(f"/api/v1/conversations/{conv_id}")
+    assert got.status_code == 200, got.text
+    listed = client.get("/api/v1/conversations/", params={"project": "all"})
+    assert listed.status_code == 200, listed.text
+    row = next(c for c in listed.json()["conversations"] if c["id"] == conv_id)
+    return got.json(), row
+
+
+def _first_turn(client, harness, **picks) -> str:
+    r = client.post("/api/v1/responses/", json={"input": "hello", "stream": False, **picks})
+    assert r.status_code == 200, r.text
+    return str(harness.calls[-1]["conversation"].id)
+
+
+def _next_turn(client, conv_id: str, **picks) -> None:
+    r = client.post(
+        "/api/v1/responses/",
+        json={"input": "again", "stream": False, "conversation": conv_id, **picks},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_list_and_get_return_the_effort_the_chat_was_created_at(client, harness):
+    conv_id = _first_turn(client, harness, model="picked-model", reasoning_effort="low")
+
+    for body in _saved_picks(client, conv_id):
+        assert body["reasoningEffort"] == "low"
+        assert body["model"] == "picked-model"
+
+
+def test_a_later_turn_saves_its_effort_and_model_as_the_chats_own(client, harness):
+    conv_id = _first_turn(client, harness, model="picked-model", reasoning_effort="low")
+
+    _next_turn(client, conv_id, model="other-model", reasoning_effort="high")
+
+    for body in _saved_picks(client, conv_id):
+        assert body["reasoningEffort"] == "high"
+        assert body["model"] == "other-model"
+
+
+def test_a_later_turn_without_a_pick_keeps_the_saved_one(client, harness):
+    # A pinned model the wallet locks goes out as model: null, and that turn
+    # must not wipe the pin; an effort the composer leaves unset is omitted.
+    conv_id = _first_turn(client, harness, model="picked-model", reasoning_effort="low")
+
+    _next_turn(client, conv_id, model=None)
+    for body in _saved_picks(client, conv_id):
+        assert (body["model"], body["reasoningEffort"]) == ("picked-model", "low")
+
+    _next_turn(client, conv_id, reasoning_effort="high")
+    for body in _saved_picks(client, conv_id):
+        assert (body["model"], body["reasoningEffort"]) == ("picked-model", "high")
+
+    _next_turn(client, conv_id, model="other-model")
+    for body in _saved_picks(client, conv_id):
+        assert (body["model"], body["reasoningEffort"]) == ("other-model", "high")
+
+
+def test_a_chat_with_no_picks_still_returns_none(client, harness):
+    conv_id = _first_turn(client, harness)
+
+    _next_turn(client, conv_id)
+
+    for body in _saved_picks(client, conv_id):
+        assert body["model"] is None
+        assert body["reasoningEffort"] is None

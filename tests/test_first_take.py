@@ -672,6 +672,7 @@ async def test_a_routing_error_cancels_the_take(monkeypatch):
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: SimpleNamespace(id=conv_id),
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
