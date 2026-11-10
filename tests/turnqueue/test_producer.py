@@ -1590,6 +1590,28 @@ async def test_tool_messages_defaults_to_false(monkeypatch):
     assert json.loads(fake.added[0][1]["payload"])["params"]["tool_messages"] is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ui_locale", ["es", "pt-BR"])
+async def test_ui_locale_reaches_the_job_params(monkeypatch, ui_locale):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", ui_locale=ui_locale))
+    assert json.loads(fake.added[0][1]["payload"])["params"]["ui_locale"] == ui_locale
+
+
+@pytest.mark.asyncio
+async def test_no_ui_locale_leaves_the_job_params_without_the_key(monkeypatch):
+    """Channel and scheduled turns have no request, so no locale."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m"))
+    assert "ui_locale" not in json.loads(fake.added[0][1]["payload"])["params"]
+
+
 _REPLY_STREAM = "scratchpad:reply:conv-1"
 _AUTHORIZED = ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"})
 

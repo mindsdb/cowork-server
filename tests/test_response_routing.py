@@ -79,7 +79,7 @@ async def test_text_context_routes_direct_with_resolved_router(monkeypatch):
 
     client = _Client(_response(content="The result was 42."))
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, **_kwargs):
         assert binding.provider is client
         return "The result was 42."
 
@@ -147,7 +147,7 @@ async def test_gate_runs_on_resolved_gate_model_not_the_router_pick(monkeypatch)
     client.router_model = "opus"  # the user's router pick, as the client sees it
     seen_models = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, **_kwargs):
         seen_models.append(binding.model)
         return "The result was 42."
 
@@ -546,7 +546,7 @@ async def test_handle_logs_every_router_fallback_at_default_level(
             raise RuntimeError(private)
         return (None if failure == "no_model" else binding), None
 
-    async def gate(_binding, *, history):
+    async def gate(_binding, *, history, ui_locale=None):
         if failure == "provider":
             raise RuntimeError(private)
         if failure == "timeout":
@@ -2558,7 +2558,7 @@ def _tool_turn(prompt="pull the sales table", result="rows: 1204", answer="Pulle
 def _no_gate(monkeypatch):
     import cowork.handlers.response_routing as routing
 
-    async def gate_must_not_run(binding, *, history):
+    async def gate_must_not_run(binding, *, history, **_kwargs):
         raise AssertionError("the gate must not be called")
 
     monkeypatch.setattr(routing, "_gate", gate_must_not_run)
@@ -2592,7 +2592,7 @@ async def test_plain_previous_turn_still_reaches_the_gate(monkeypatch):
 
     seen = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, **_kwargs):
         seen.append(history)
         return "Hello!"
 
@@ -2668,7 +2668,7 @@ def _gate_spy(monkeypatch):
 
     seen = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, **_kwargs):
         seen.append(history)
         return "Hello!"
 

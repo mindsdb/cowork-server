@@ -717,6 +717,7 @@ def _start_first_take(
     harness: str | None,
     metadata: dict[str, str],
     binding_factory: Callable[[], RouterBinding | None] | None = None,
+    ui_locale: str | None = None,
 ) -> FirstTake | None:
     """Start the turn's first take on the gate's model, or None when it is
     switched off or there is no model to run it on.
@@ -739,7 +740,7 @@ def _start_first_take(
     ))
     try:
         # The task copies the context here, trace included.
-        return FirstTake(binding, history).start()
+        return FirstTake(binding, history, ui_locale=ui_locale).start()
     finally:
         reset_trace_context(token)
 
@@ -763,6 +764,8 @@ class ResponsesHandler:
     # Also the class default, so a producer reached without __init__ reads
     # the common case: a person watching who can answer a card.
     interactive: bool = True
+    # Same reason: no language line unless a request named one.
+    ui_locale: str | None = None
 
     def __init__(
         self,
@@ -770,8 +773,14 @@ class ResponsesHandler:
         principal: Principal | None = None,
         interactive: bool = True,
         mindshub_bearer: str = "",
+        ui_locale: str | None = None,
     ) -> None:
         self.principal = principal
+        # The app's language, normalized from Accept-Language
+        # (cowork.common.ui_locale), for every model call that writes to the
+        # user. None for a turn with no request behind it (a scheduled run),
+        # which leaves every prompt as it was.
+        self.ui_locale = ui_locale
         self.scope = scope_from_principal(principal)
         # The Authorization the gateway validated (cowork.principal.caller_bearer),
         # used only to read the caller's teams and permissions for skill
@@ -825,6 +834,9 @@ class ResponsesHandler:
         # metric be attributed to a release instead of to a date on which
         # several changes happened to ship together.
         trace_metadata = build_trace_metadata(identity_trace_metadata(self.principal, request.trace_metadata))
+        if self.ui_locale:
+            # Server-derived, so it wins over a client key, like the build stamp.
+            trace_metadata["ui_locale"] = self.ui_locale
         original_content = self._extract_original_content(request)
         disabled = (
             [dc.model_dump() for dc in request.disabled_connections]
@@ -1121,6 +1133,7 @@ class ResponsesHandler:
                     disabled_connections=disabled,
                     trace_tags=request.trace_tags,
                     trace_metadata=trace_metadata,
+                    ui_locale=self.ui_locale,
                 )
                 return await self._collect(stream, start.conversation_id, request.model, original_content)
 
@@ -1433,6 +1446,7 @@ class ResponsesHandler:
                                 **(trace_metadata or {}),
                                 **({"correlation_id": correlation_id} if correlation_id else {}),
                             },
+                            ui_locale=self.ui_locale,
                         )
                     trace_token = set_trace_context(TraceContext(
                         session_id=str(conversation_id),
@@ -1460,6 +1474,7 @@ class ResponsesHandler:
                             binding=binding,
                             binding_factory=binding_for_turn,
                             jev=jev,
+                            ui_locale=self.ui_locale,
                         )
                     gate_ms = round((time.monotonic() - gate_started) * 1000)
                     # warning, not info: this deployment's LOG_LEVEL defaults to
@@ -2025,7 +2040,7 @@ class ResponsesHandler:
             ))
             try:
                 answer = await direct_answer.start_answer(
-                    binding, history=history, needs_search=route.needs_search,
+                    binding, history=history, needs_search=route.needs_search, ui_locale=self.ui_locale,
                 )
             finally:
                 reset_trace_context(token)
@@ -3069,6 +3084,8 @@ class ResponsesHandler:
                 # not it can answer questions. Channel turns build their
                 # own request in turnqueue/remote_turn.py and leave it off.
                 tool_messages=True,
+                # Rides the queued job, so the pod's anton gets it (ENG-4149).
+                ui_locale=self.ui_locale,
             ):
                 if kind == "progress" and data.get("phase") == "workspace_authorized":
                     if turn_artifacts is not None:
@@ -3520,6 +3537,7 @@ class ResponsesHandler:
                 tool_messages=True,
                 model_wait=model_wait,
                 interactive=self.interactive,
+                ui_locale=self.ui_locale,
             )
             event_count = 0
             completed_frame: str | None = None
