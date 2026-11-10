@@ -452,3 +452,30 @@ class TestBuildFlowPrompt:
         assert result["match"] == "none"
         assert "can't be saved for reuse" in result["message"]
         assert "Build a custom connector" not in result["message"]
+
+
+_DATA_SAMPLE = "how to fetch a small sample of data"
+
+
+class TestHandcraftedFormsSayHowToFetchData:
+    """The connection test passes only on data, and a handcrafted form's
+    usage_notes are its only guide to an API with no plain GET data route."""
+
+    def test_both_no_match_answers_ask_for_the_data_request(self):
+        assert _DATA_SAMPLE in tools._DATA_REQUEST_NOTE
+        assert tools._DATA_REQUEST_NOTE in tools._BUILD_CUSTOM_CONNECTOR
+        assert tools._DATA_REQUEST_NOTE in tools._NO_CUSTOM_CONNECTOR
+        assert "won't be listed with the connectors" in tools._NO_CUSTOM_CONNECTOR
+
+    def test_the_schema_puts_the_connector_block_on_every_handcrafted_form(self):
+        connector = tools._REQUEST_CREDENTIALS_SCHEMA["properties"]["connector"]
+
+        assert "every handcrafted form" in connector["description"]
+        assert tools._DATA_REQUEST_NOTE in connector["properties"]["usage_notes"]["description"]
+
+    def test_the_connect_skill_asks_for_the_data_request(self):
+        skill = Path(tools.__file__).parent / "skills" / "connect-datasource" / "SKILL.md"
+
+        text = skill.read_text()
+        assert "every handcrafted form" in text
+        assert _DATA_SAMPLE in text
