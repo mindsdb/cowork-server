@@ -201,6 +201,11 @@ def is_builtin_connector_id(connector_id: str) -> bool:
     )
 
 
+def custom_id_for(builtin_id: str) -> str:
+    """The id a member's template takes when Anton named it after a built-in connector."""
+    return f"{builtin_id}_custom"
+
+
 def turn_connector_cards(entries: Any) -> tuple[list[dict[str, Any]], list[str]]:
     """Check one ``turn_connector`` reply's drafts again before they are shown.
 
@@ -214,15 +219,23 @@ def turn_connector_cards(entries: Any) -> tuple[list[dict[str, Any]], list[str]]
     items = entries if isinstance(entries, list) else []
     cards: list[dict[str, Any]] = []
     notices: list[str] = []
+    shown: set[str] = set()
     for entry in items[:MAX_DRAFTS_PER_TURN]:
         try:
             draft = parse_connector_draft(entry)
+            if is_builtin_connector_id(draft.connector_id):
+                # Its own id, so every place where a built-in id wins stays right.
+                draft = parse_connector_draft({**entry, "connector_id": custom_id_for(draft.connector_id)})
         except ConnectorDraftError as e:
             notices.append(f"A connector template was not shown: {e}")
             continue
         if is_builtin_connector_id(draft.connector_id):
             notices.append(f"A connector template was not shown: {draft.connector_id!r} is a built-in connector.")
             continue
+        if draft.connector_id in shown:
+            notices.append(f"A second connector template for {draft.connector_id!r} was not shown.")
+            continue
+        shown.add(draft.connector_id)
         cards.append(draft.to_dict())
     if len(items) > MAX_DRAFTS_PER_TURN:
         notices.append(f"{len(items) - MAX_DRAFTS_PER_TURN} more connector template(s) from this turn were not shown.")
