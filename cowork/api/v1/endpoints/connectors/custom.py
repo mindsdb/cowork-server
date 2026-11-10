@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from anton.core.tools.connector_draft import ConnectorDraftCheck, ConnectorDraftError, parse_connector_draft
+from anton.core.tools.connector_draft import ConnectorDraftCheck, ConnectorDraftError, check_draft_text, parse_connector_draft
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 
@@ -26,7 +26,6 @@ from cowork.services.connectors.custom_connections import (
 )
 from cowork.services.connectors.custom_connectors import (
     CustomConnectorService,
-    MemberConnectorLimitError,
     UnstorableFormError,
     is_builtin_connector_id,
 )
@@ -48,28 +47,22 @@ def _unprocessable(detail: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail)
 
 
-def _check_member_edit(row: CustomConnector, body: CustomConnectorUpdate) -> None:
+def _check_member_edit(body: CustomConnectorUpdate) -> None:
     """Check an org-mode edit's texts with the draft rules they were saved under.
-
-    The parser checks a whole draft, so the row's id and one stand-in field
-    complete it; only the label, description and category are under test.
 
     Raises:
         HTTPException: 422 naming the field, without its value.
     """
-    sent = body.model_fields_set
-    draft = {
-        "connector_id": row.connector_id,
-        "label": body.label if "label" in sent and body.label is not None else row.label,
-        "fields": [{"name": "field", "label": "Field"}],
-    }
-    for key in ("description", "category"):
-        if key in sent and getattr(body, key) is not None:
-            draft[key] = getattr(body, key)
-    try:
-        parse_connector_draft(draft)
-    except ConnectorDraftError as e:
-        raise _unprocessable(str(e)) from e
+    for key in sorted(body.model_fields_set & _ORG_MODE_CHANGES):
+        value = getattr(body, key)
+        if value is None:
+            continue
+        try:
+            checked = check_draft_text(key, value)
+        except ConnectorDraftError as e:
+            raise _unprocessable(str(e)) from e
+        if key == "label" and checked is None:
+            raise _unprocessable("label is required.")
 
 
 @router.post("", response_model=ConnectorMetadataResponse)
@@ -84,8 +77,7 @@ def save_connector_draft(
 
     Raises:
         HTTPException: 404 outside org mode or with the setting off, 422 for
-            a draft outside the allowlist or a built-in id, 409 at the
-            member's connector limit.
+            a draft outside the allowlist or a built-in id.
     """
     if not session.scope.org_mode or not TurnQueueSettings().connector_drafts_enabled:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
@@ -98,8 +90,6 @@ def save_connector_draft(
         raise _unprocessable(f"{connector_id!r} is already a built-in connector.")
     try:
         row = CustomConnectorService(session).save_member_draft(parsed)
-    except MemberConnectorLimitError as e:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except UnstorableFormError as e:
         raise _unprocessable(str(e)) from e
     return connector_metadata(custom_connector_spec(row))
@@ -119,11 +109,10 @@ def update_custom_connector(
     if session.scope.org_mode:
         if not body.model_fields_set <= _ORG_MODE_CHANGES:
             raise _unprocessable("Only label, description and category can be changed here.")
-        row = CustomConnectorService(session).get(connector_id)
-        if row is None:
+        if CustomConnectorService(session).get(connector_id) is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom connector not found.")
-        _check_member_edit(row, body)
-        for key in ("label", "description", "category"):
+        _check_member_edit(body)
+        for key in _ORG_MODE_CHANGES:
             if isinstance(getattr(body, key), str):
                 setattr(body, key, getattr(body, key).strip())
     try:

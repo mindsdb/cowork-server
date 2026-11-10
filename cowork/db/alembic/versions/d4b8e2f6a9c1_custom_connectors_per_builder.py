@@ -2,8 +2,7 @@
 
 An org-mode custom connector belongs to the member who built it, so two
 members of one org may each keep a definition under the same connector id.
-Rows with an org but no builder keep the one-per-org rule; local rows
-(org_id NULL) keep theirs.
+Local rows (org_id NULL) keep their one-per-id rule.
 
 Revision ID: d4b8e2f6a9c1
 Revises: f93151b5bad1
@@ -36,24 +35,15 @@ def upgrade() -> None:
     names = _index_names()
     if "uq_custom_connectors_connector_id_org" in names:
         op.drop_index("uq_custom_connectors_connector_id_org", table_name=_TABLE)
-    if "uq_custom_connectors_connector_id_org_builder" in names:
-        return
-    op.create_index(
-        "uq_custom_connectors_connector_id_org_builder",
-        _TABLE,
-        ["connector_id", "org_id", "created_by"],
-        unique=True,
-        sqlite_where=sa.text("org_id IS NOT NULL AND created_by IS NOT NULL"),
-        postgresql_where=sa.text("org_id IS NOT NULL AND created_by IS NOT NULL"),
-    )
-    op.create_index(
-        "uq_custom_connectors_connector_id_org_no_builder",
-        _TABLE,
-        ["connector_id", "org_id"],
-        unique=True,
-        sqlite_where=sa.text("org_id IS NOT NULL AND created_by IS NULL"),
-        postgresql_where=sa.text("org_id IS NOT NULL AND created_by IS NULL"),
-    )
+    if "uq_custom_connectors_connector_id_org_builder" not in names:
+        op.create_index(
+            "uq_custom_connectors_connector_id_org_builder",
+            _TABLE,
+            ["connector_id", "org_id", "created_by"],
+            unique=True,
+            sqlite_where=sa.text("org_id IS NOT NULL AND created_by IS NOT NULL"),
+            postgresql_where=sa.text("org_id IS NOT NULL AND created_by IS NOT NULL"),
+        )
 
 
 def downgrade() -> None:
@@ -69,7 +59,6 @@ def downgrade() -> None:
             "are kept by more than one member of an org, which the one-per-org index "
             "cannot hold; remove the extra rows first. Nothing was changed."
         )
-    op.drop_index("uq_custom_connectors_connector_id_org_no_builder", table_name=_TABLE)
     op.drop_index("uq_custom_connectors_connector_id_org_builder", table_name=_TABLE)
     op.create_index(
         "uq_custom_connectors_connector_id_org",
