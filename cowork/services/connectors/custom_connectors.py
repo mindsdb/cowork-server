@@ -198,12 +198,21 @@ def _json_strings(value: Any, where: str) -> list[str]:
     return []
 
 
+def _scheme_and_authority(url: str) -> str:
+    """The text up to the end of ``url``'s host and port, or "" when it has no
+    "scheme://". Plain string search: the url is form text of any length."""
+    scheme, sep, rest = url.partition("://")
+    if not sep or any(c in scheme for c in ":/?#"):
+        return ""
+    end = min((i for i in (rest.find(c) for c in "/?#") if i != -1), default=len(rest))
+    return f"{scheme}://{rest[:end]}"
+
+
 def _check_step(step: dict[str, Any], where: str) -> set[str]:
     """Check one test step's shape rules and return the placeholder names it uses."""
     url = str(step.get("url") or "")
     # The raw scheme and authority, before any placeholder could add a "/".
-    head = re.match(r"[^:/?#]*://[^/?#]*", url)
-    if head is not None and _ANY_BRACES.search(head.group()):
+    if _ANY_BRACES.search(_scheme_and_authority(url)):
         raise UnstorableFormError(f"test_request {where} url may use placeholders only in its path and query.")
     try:
         parts = urlsplit(PLACEHOLDER.sub("x", url))

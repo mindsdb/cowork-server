@@ -156,8 +156,8 @@ async def allow_private_route(answer: ConnectorTestAnswer, scope: TenantScopeDep
     try:
         return await advance(entry)
     except ConnectorTestError as exc:
-        await record_outcome(entry, f"Not saved: {exc}")
-        return {"patch": failed_patch(entry.form_id, str(exc))}
+        await record_outcome(entry, f"Not saved: {exc.reason}")
+        return {"patch": failed_patch(entry.form_id, exc.reason)}
 
 
 @router.post("/confirm", name="submission_confirm", dependencies=[Depends(require(SingleUserOnly))])

@@ -463,7 +463,7 @@ class ProbeHandler:
                 try:
                     result = await advance(entry)
                 except ConnectorTestError as exc:
-                    reason = str(exc)
+                    reason = exc.reason
                     if grant_slug:
                         yield _delta(_GRANT_UNLISTED.format(reason=reason))
                         yield _patch_delta(_grant_saved_patch(form_id, grant_slug))

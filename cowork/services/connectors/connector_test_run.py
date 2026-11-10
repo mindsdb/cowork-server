@@ -67,8 +67,12 @@ _METADATA = frozenset(ipaddress.ip_address(a) for a in ("fd00:ec2::254", "100.10
 
 
 class ConnectorTestError(Exception):
-    """A test that cannot be judged as passing. The message is safe to show:
+    """A test that cannot be judged as passing. ``reason`` is safe to show:
     it names a step, a status code or a field, never a value or a URL."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass(frozen=True)

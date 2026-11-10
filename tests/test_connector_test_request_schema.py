@@ -7,6 +7,7 @@ moving the host or slipping a credential into literal text.
 from __future__ import annotations
 
 import copy
+import time
 
 import pytest
 
@@ -147,6 +148,12 @@ class TestPlaceholdersCannotMoveTheHost:
     @pytest.mark.parametrize("url", ["https://api.example.com:99999/rows", "https://api.example.com:0/rows"])
     def test_a_port_outside_the_range_is_refused_when_the_form_is_built(self, url):
         _refused(_with(FORM, ("test_request", "data", "url"), url), "port outside 1 to 65535")
+
+    def test_a_very_long_url_is_checked_quickly(self):
+        start = time.monotonic()
+        with pytest.raises(UnstorableFormError):
+            check_handcrafted_form(_with(FORM, ("test_request", "data", "url"), '"' * 200_000))
+        assert time.monotonic() - start < 2
 
     def test_http_is_allowed_when_the_form_is_built(self):
         check_handcrafted_form(_with(FORM, ("test_request", "data", "url"), "http://127.0.0.1:8765/items"))
