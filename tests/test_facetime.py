@@ -104,3 +104,15 @@ async def test_a_refusal_says_why_in_words_for_the_person(keyed, nuance, status,
     detail = refused.json()["detail"]
     assert detail["code"] == code and words in detail["message"]
     assert "bad key" not in detail["message"] and KEY not in refused.text
+
+
+def test_a_test_key_counts_only_without_the_real_one(monkeypatch):
+    monkeypatch.delenv("COWORK_NUANCE_API_KEY", raising=False)
+    monkeypatch.setenv("COWORK_NUANCE_TEST_API_KEY", "nk_test_only")
+    get_app_settings.cache_clear()
+    assert get_app_settings().nuance_api_key.get_secret_value() == "nk_test_only"
+
+    monkeypatch.setenv("COWORK_NUANCE_API_KEY", "nk_real")
+    get_app_settings.cache_clear()
+    assert get_app_settings().nuance_api_key.get_secret_value() == "nk_real"
+    get_app_settings.cache_clear()

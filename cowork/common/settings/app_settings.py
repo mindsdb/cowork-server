@@ -1197,12 +1197,16 @@ class AppSettings(Settings):
 
     nuance_api_key: SecretStr = Field(
         default=SecretStr(""),
-        validation_alias=AliasChoices("COWORK_NUANCE_API_KEY"),
+        validation_alias=AliasChoices("COWORK_NUANCE_API_KEY", "COWORK_NUANCE_TEST_API_KEY"),
         description=(
             "The organization's Nuance Labs API key (nk_...), for video calls "
             "with the agent (cowork.services.facetime, prototype). This server "
             "mints one session token per call with it; the key never reaches "
-            "a browser. Blank (default): no video calls."
+            "a browser. Blank (default): no video calls. "
+            "COWORK_NUANCE_TEST_API_KEY is read only when this one is unset: a "
+            "PR environment's test key, set beside the chart's optional "
+            "COWORK_NUANCE_API_KEY from mindsdb-secrets, which an env list can't "
+            "name twice."
         ),
     )
     nuance_api_url: str = Field(
