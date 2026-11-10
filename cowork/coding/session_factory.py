@@ -7,7 +7,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from cowork.coding.context import validate_directories
+from cowork.coding.context import message_attachments, validate_directories
 from cowork.coding.contracts import (
     CodingEvent,
     CodingSession,
@@ -284,7 +284,13 @@ class CodingSessionFactory:
             # which stays ``preparing`` until the workspace exists.
             self.store.append_event(
                 session_id,
-                CodingEvent(type=EventType.user_message, title="You", text=request.prompt, phase="completed"),
+                CodingEvent(
+                    type=EventType.user_message,
+                    title="You",
+                    text=request.prompt,
+                    phase="completed",
+                    data=message_attachments(request.attachments),
+                ),
             )
             self.store.append_event(
                 session_id,

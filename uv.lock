@@ -141,7 +141,7 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.11.8.1rc1"
+version = "2.26.11.9.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
@@ -163,9 +163,9 @@ dependencies = [
     { name = "truststore" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/de/2d/16a51f497003d5ecf381c08a1beb34877cddc6c9a5912ebecde1bf2e41ec/anton_agent-2.26.11.8.1rc1.tar.gz", hash = "sha256:44466f289cc9b00218eb5c595006b86ea5404ff699f17bfa22ad40b33aa01463", size = 7091779, upload-time = "2026-11-08T09:44:38.785Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/22/19fd11fd331221460b67af45303b30e02485c9653692b20c0ac143c5e6ab/anton_agent-2.26.11.9.1.tar.gz", hash = "sha256:63d48466f590ee073cf2793401ee7232411baa8cc81d366ff189ccde61d1d7d4", size = 7097847, upload-time = "2026-11-09T03:10:23.147Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/10/9a/ecf6303eefc1338e50f30aa3b105486e6e0b7d309a54c8cc13706e58f8c9/anton_agent-2.26.11.8.1rc1-py3-none-any.whl", hash = "sha256:f6672e48120ec8b622a4eee417edc09baeeac2c553b27808c6196c38c8dfb8f0", size = 4353812, upload-time = "2026-11-08T09:44:36.133Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/e5/6869a3c1229e7ad83fb59be55a8962494c4acf4dcee7ed8b14738896a5f0/anton_agent-2.26.11.9.1-py3-none-any.whl", hash = "sha256:46055041de9bd15b788b8bac4fc430e11a9ee40d9e98cd0f5b7ed5933550ec2d", size = 4355722, upload-time = "2026-11-09T03:10:20.516Z" },
 ]
 
 [[package]]
@@ -456,7 +456,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14" },
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", specifier = ">=2.26.11.8.1rc1,<3" },
+    { name = "anton-agent", specifier = ">=2.26.11.9.1,<3" },
     { name = "anyio", specifier = ">=4.14.2" },
     { name = "beautifulsoup4", specifier = "==4.15.0" },
     { name = "cryptography", specifier = ">=48.0.0,<51" },
