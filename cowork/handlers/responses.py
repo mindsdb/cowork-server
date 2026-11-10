@@ -1091,14 +1091,14 @@ class ResponsesHandler:
                         user_id=self.scope.user_id,
                         lifecycle=lifecycle,
                     )
-                except BaseException as exc:
+                except BaseException:
                     if first_take is not None:
                         first_take.cancel()
-                    # A refused start never runs the turn that would revoke the
-                    # gate's key. Not on cancellation: a dropped connection must
-                    # not end a turn that may already be running detached.
-                    if isinstance(exc, Exception):
-                        await _drop_gate_key(turn_llm)
+                    # A refused or cancelled start never runs the turn that would
+                    # revoke the gate's key: start() launches the producer after
+                    # its last await, so none is running on the key either way.
+                    # Shielded, so a dropped connection doesn't cancel the revoke.
+                    await asyncio.shield(_drop_gate_key(turn_llm))
                     raise
                 self.last_run_handle = handle
                 return sse_from_buffer(handle.buffer, 0)
@@ -1530,6 +1530,11 @@ class ResponsesHandler:
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None
+        except BaseException:
+            # Cancelled (the client went away) after the mint: no turn runs on
+            # the key. Shielded, so the same cancellation can't stop the revoke.
+            await asyncio.shield(self._drop_gate_key_and_take(turn_llm))
+            raise
 
     async def _drop_gate_key_and_take(self, turn_llm: dict | None) -> None:
         """Revoke the gate's key after a gate failure, cancelling the first take

@@ -2845,6 +2845,40 @@ async def test_a_failed_gate_cancels_the_first_take_before_revoking_its_key(monk
 
 
 @pytest.mark.asyncio
+async def test_a_gate_cancelled_after_its_mint_revokes_the_key(monkeypatch):
+    """The client went away while the gate ran: no turn will run on its key."""
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+
+    async def cancelled_gate(**_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(responses, "decide_route", cancelled_gate)
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    with pytest.raises(asyncio.CancelledError):
+        await handler._route_request(
+            conversation_id="conv-1",
+            gate_rows=[],
+            harness_input=[{"type": "text", "text": "Hello"}],
+            has_attachments=False,
+            has_disabled_connections=False,
+        )
+    assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
 async def test_a_jev_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
     """Jev routes the turn direct and the user's own model answers it, with
     no agent turn to revoke the gate's key."""
@@ -2899,12 +2933,11 @@ async def test_a_jev_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("refusal,revokes", [(RuntimeError("already running"), True), (asyncio.CancelledError(), False)])
-async def test_a_refused_start_revokes_the_gate_key_but_a_dropped_connection_does_not(
-    monkeypatch, refusal, revokes,
-):
-    """A turn the registry refused never runs to revoke the key. A cancelled
-    request may leave a detached turn running on that key, so it keeps it."""
+@pytest.mark.parametrize("refusal", [RuntimeError("already running"), asyncio.CancelledError()])
+async def test_a_refused_or_cancelled_start_revokes_the_gate_key(monkeypatch, refusal):
+    """A turn the registry refused never runs to revoke the key. Nor does one
+    whose request was cancelled during start(): it launches the producer after
+    its last await, so a cancellation there means no turn is running."""
     from uuid import uuid4
 
     import cowork.handlers.responses as responses
@@ -2946,4 +2979,4 @@ async def test_a_refused_start_revokes_the_gate_key_but_a_dropped_connection_doe
     monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
     with pytest.raises(type(refusal)):
         await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id), stream=True))
-    assert revoked == (["corr-gate"] if revokes else [])
+    assert revoked == ["corr-gate"]
