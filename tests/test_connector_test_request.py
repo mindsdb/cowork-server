@@ -462,6 +462,23 @@ class TestLargeAnswers:
     async def test_padding_an_answer_past_the_cap_does_not_skip_the_checks(self, answer):
         await refused("too large to check", api=Api(raw=answer + b" " * (256 * 1024)))
 
+    @pytest.mark.asyncio
+    async def test_rows_after_padding_past_the_cap_are_too_large_not_empty(self):
+        await refused("too large to check", api=Api(raw=b" " * (256 * 1024) + b'[{"a": 1}]'))
+
+    @pytest.mark.asyncio
+    async def test_a_token_answer_over_the_cap_is_too_large_to_check(self):
+        class PaddedToken(Api):
+            def __call__(self, request):
+                if request.url.path.endswith("/token"):
+                    self.requests.append(request)
+                    token = json.dumps({"access_token": ISSUED, "token_type": "bearer"}).encode()
+                    return httpx.Response(200, content=token + b" " * (256 * 1024))
+                return super().__call__(request)
+
+        api = await refused("token step's answer was too large to check", api=PaddedToken())
+        assert [r.url.path for r in api.requests] == ["/oauth2/token"]
+
 
 class TestReviewFindings:
     @pytest.mark.asyncio

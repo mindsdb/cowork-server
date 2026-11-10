@@ -478,14 +478,14 @@ def judge(
     """
     if not 200 <= status < 300:
         raise ConnectorTestError(f"The data step got HTTP {status}.")
-    text = body.decode("utf-8", errors="replace")
-    if not text.strip():
-        raise ConnectorTestError("The data step got an empty answer.")
     # A cut-off answer cannot be parsed, so none of the data checks below could run on it.
     if over_cap:
         raise ConnectorTestError(
             "The data step's answer was too large to check. Ask for fewer rows, for example with a page size or limit."
         )
+    text = body.decode("utf-8", errors="replace")
+    if not text.strip():
+        raise ConnectorTestError("The data step got an empty answer.")
     try:
         parsed: Any = json.loads(text)
         is_json = True
@@ -612,14 +612,16 @@ async def _send_once(
     raise ConnectorTestError(f"The {step.name} step could not connect.")
 
 
-def _token_from(status: int, body: bytes, token_field: str) -> str:
+def _token_from(status: int, body: bytes, over_cap: bool, token_field: str) -> str:
     """The issued token from the token step's answer.
 
     Raises:
-        ConnectorTestError: when the step failed or its answer has no token.
+        ConnectorTestError: when the step failed, its answer was cut off at the cap, or it has no token.
     """
     if not 200 <= status < 300:
         raise ConnectorTestError(f"The token step got HTTP {status}.")
+    if over_cap:
+        raise ConnectorTestError("The token step's answer was too large to check.")
     try:
         token = json.loads(body).get(token_field)
     except (ValueError, AttributeError) as exc:
@@ -720,8 +722,8 @@ async def _run_test_request(
     token_host = None
     if token_spec:
         token_step = steps[0]
-        status, body, _, _ = await _send(token_step, dial["token"], transport)
-        token = _token_from(status, body, token_spec["token_field"])
+        status, body, over_cap, _ = await _send(token_step, dial["token"], transport)
+        token = _token_from(status, body, over_cap, token_spec["token_field"])
         refused.add(token)
         filled["token"] = token
         token_host = url_host(token_step.url)
