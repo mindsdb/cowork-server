@@ -100,5 +100,6 @@ keeps the shared link current.
   choose this artifact's project.
 
 Once the task exists, suggest Run now on its page to check one refresh before
-the first scheduled run. Refreshes don't crowd the artifact's version history:
-each one replaces the task's previous refresh.
+the first scheduled run. Refreshes don't usually crowd the artifact's version
+history: each one replaces the task's previous refresh, but one that someone
+commented on is kept.
