@@ -472,23 +472,25 @@ def _answer_response(result: SubmitResult | RemoteAnswerResult):
     return JSONResponse(status_code=status_code, content=content)
 
 
-#: anton asks its "Keep going / Stop here" limit question under this id prefix
-#: (ChatSession._continue_question), with this value for Keep going.
-_LIMIT_QUESTION_PREFIX = "limit:"
+#: anton asks its time-limit "Keep going / Stop here" question under this id
+#: prefix (ChatSession._continue_question), with this value for Keep going. Its
+#: step-limit and spend-ceiling questions use plain ``limit:``: those don't
+#: lengthen the turn, so their answers go to the pod as given.
+_TIME_LIMIT_QUESTION_PREFIX = "limit:time:"
 _KEEP_GOING = "continue"
 _STOP_HERE = "stop"
 
 
 def _keeps_going_past_a_limit(question_id: str, values: list[str]) -> bool:
-    return question_id.startswith(_LIMIT_QUESTION_PREFIX) and values == [_KEEP_GOING]
+    return question_id.startswith(_TIME_LIMIT_QUESTION_PREFIX) and values == [_KEEP_GOING]
 
 
 async def _extend_turn_key_window(correlation_id: str) -> bool:
     """Give a time-limited turn's key one more window before its "Keep going"
     reaches the pod. False when auth refused twice, or couldn't be reached.
 
-    Any limit's Keep going extends it: the turn runs on either way, and auth
-    bounds each window and the key's whole life. Asked before the answer is
+    auth bounds each window, and clamps the last one to the key's lifetime,
+    which covers the turn's whole time budget. Asked before the answer is
     delivered, so a duplicate answer the pod rejects extends the key to the
     same window again, which is harmless. True with no time limit: there is
     nothing to extend.

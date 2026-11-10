@@ -89,10 +89,11 @@ async def test_without_a_time_limit_nothing_changes(remote_turn):
 @pytest.mark.parametrize(
     ("question_id", "values", "extends"),
     [
-        ("limit:abc", ["continue"], True),
-        ("limit:abc", ["stop"], False),
+        ("limit:time:abc", ["continue"], True),
+        ("limit:time:abc", ["stop"], False),
+        ("limit:abc", ["continue"], False),
         ("q-1", ["continue"], False),
-        ("limit:abc", ["continue", "stop"], False),
+        ("limit:time:abc", ["continue", "stop"], False),
     ],
 )
 def test_only_keep_going_at_a_limit_extends(question_id, values, extends):

@@ -109,8 +109,10 @@ def test_malformed_body_is_rejected_before_queueing(client, turn, pod, body, exp
 
 
 @pytest.mark.parametrize("question_id,values,extended", [
-    ("limit:abc", ["continue"], True),
-    ("limit:abc", ["stop"], False),
+    ("limit:time:abc", ["continue"], True),
+    ("limit:time:abc", ["stop"], False),
+    # The step limit and spend ceiling don't lengthen the turn.
+    ("limit:abc", ["continue"], False),
     (QID, ["continue"], False),
 ])
 def test_keep_going_at_a_limit_extends_the_turns_key_first(
@@ -143,7 +145,7 @@ def test_keep_going_whose_key_cannot_be_extended_reaches_the_pod_as_stop_here(
     extend = AsyncMock(return_value=False)
     monkeypatch.setattr(endpoints, "extend_turn_key", extend)
     resp = client.post("/api/v1/responses/answer",
-                       json={"conversation_id": CID, "question_id": "limit:abc", "values": ["continue"]})
+                       json={"conversation_id": CID, "question_id": "limit:time:abc", "values": ["continue"]})
     assert resp.status_code == 200
     assert extend.call_count == 2
     assert pod["calls"][0]["payload"]["values"] == ["stop"]
