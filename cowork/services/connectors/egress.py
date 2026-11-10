@@ -24,6 +24,7 @@ _EMBEDDED_IPV4_NETWORKS = (
     ipaddress.ip_network("::/96"),
     ipaddress.ip_network("::ffff:0:0:0/96"),
 )
+_NOT_EMBEDDED = frozenset({ipaddress.ip_address("::"), ipaddress.ip_address("::1")})
 
 
 class EgressHostUnresolved(RuntimeError):
@@ -76,6 +77,9 @@ def embedded_ipv4(
     """Return the IPv4 address a NAT64, IPv4-compatible or SIIT address
     carries in its last 32 bits, or None for any other address."""
     if address.version != 6 or not any(address in net for net in _EMBEDDED_IPV4_NETWORKS):
+        return None
+    # "::" and "::1" sit inside ::/96 but are IPv6's own unspecified and loopback.
+    if address in _NOT_EMBEDDED:
         return None
     return ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
 

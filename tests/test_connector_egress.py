@@ -115,3 +115,10 @@ def test_embedded_ipv4_reads_only_the_fixed_position_ranges():
     assert embedded_ipv4(ipaddress.ip_address("64:ff9b::a00:5")) == ipaddress.ip_address("10.0.0.5")
     assert embedded_ipv4(ipaddress.ip_address("64:ff9b:1::a00:5")) is None
     assert embedded_ipv4(ipaddress.ip_address("10.0.0.5")) is None
+
+
+@pytest.mark.parametrize("address", ["::", "::1"])
+def test_ipv6_unspecified_and_loopback_are_not_read_as_ipv4(address):
+    assert embedded_ipv4(ipaddress.ip_address(address)) is None
+    with pytest.raises(EgressHostNotPublic):
+        vetted_public_addresses(address, _resolving_to(address))
