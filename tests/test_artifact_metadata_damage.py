@@ -268,3 +268,30 @@ def test_the_desktop_status_answers_for_damaged_metadata(tmp_path, monkeypatch, 
         get_app_settings.cache_clear()
 
     assert res.status_code == 200
+
+
+from cowork.services.artifact_audience import ShareNotify, share_notice
+from cowork.services.preview_proxy import _read_backend_port
+
+
+@pytest.mark.parametrize("text", ["[]", '{"port": "8080"}', '{"port": true}', '{"port": 70000}'])
+def test_a_backend_port_that_is_not_a_port_reads_as_none(tmp_path, text):
+    (tmp_path / "metadata.json").write_text(text)
+
+    assert _read_backend_port(tmp_path) is None
+
+
+def test_a_backend_port_reads(tmp_path):
+    (tmp_path / "metadata.json").write_text('{"port": 8080}')
+
+    assert _read_backend_port(tmp_path) == 8080
+
+
+def test_a_share_notice_titles_a_numeric_name_by_its_folder(tmp_path):
+    folder = tmp_path / "quarterly"
+    folder.mkdir()
+    (folder / "metadata.json").write_text('{"name": 5}')
+
+    notice = share_notice(folder, "index.html", "https://view.example/r/1", recipients=ShareNotify(emails=("a@b.co",)))
+
+    assert notice.artifact_title == "quarterly"

@@ -2011,10 +2011,7 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
     metadata_path = root / "metadata.json"
     if metadata_path.is_file():
         try:
-            meta = json.loads(metadata_path.read_text(encoding="utf-8"))
-            raw_port = meta.get("port")
-            if isinstance(raw_port, int) and 0 < raw_port < 65536:
-                backend_port = raw_port
+            backend_port = ArtifactMetadata.parse(metadata_path.read_text(encoding="utf-8")).port
         except Exception:
             backend_port = None
 
