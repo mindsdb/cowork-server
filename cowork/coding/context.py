@@ -186,7 +186,7 @@ FAILURE_MESSAGES = {
     ),
     "budget_exceeded": (
         "Your organization's spending budget is used up. An owner or admin can raise it in Budgets, "
-        "or choose MindsHub Air."
+        "or choose a model that is still available."
     ),
 }
 

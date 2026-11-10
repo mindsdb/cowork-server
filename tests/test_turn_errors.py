@@ -1252,7 +1252,11 @@ def _budget_via_body_code():
         pytest.param(lambda: _gateway_failure(402, reason="budget_exceeded"), id="header"),
         pytest.param(_budget_via_body_code, id="body-code"),
         pytest.param(
-            lambda: te.BudgetExceededError("Server returned 402: budget used up."), id="typed"
+            # anton's own signature, so the case holds once uv.lock pins an anton with the type.
+            lambda: te.BudgetExceededError(
+                "Server returned 402: budget used up.", reason="budget_exceeded", status_code=402
+            ),
+            id="typed",
         ),
     ],
 )

@@ -42,7 +42,12 @@ try:
 except ImportError:  # TODO(ENG-1585): import it above once uv.lock pins an anton that has it.
 
     class BudgetExceededError(Exception):  # type: ignore[no-redef]
-        """Stand-in for an anton without the type; never raised, so it never matches."""
+        """Stand-in for an anton without the type, with anton's signature; anton never raises it."""
+
+        def __init__(self, message: str, *, reason: str = "", status_code: int | None = None, **_: object):
+            super().__init__(message)
+            self.reason = reason
+            self.status_code = status_code
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.settings.app_settings import default_minds_url
@@ -1277,7 +1282,8 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     NOT, because that user has never paid, so it has its own code and copy.
     The free-Air spend fuse is neither: free serving is paused for
     every org whose wallet cannot pay, not just this one, so it has its own code
-    and copy too. A spent budget is not out of credits either: an admin raises it. A policy outage is transient. An unknown model can't be fixed
+    and copy too. A spent budget is not out of credits either: an admin
+    raises it. A policy outage is transient. An unknown model can't be fixed
     with credits.
 
     A velocity ``rate_limited`` is NOT out of credits and must never share that

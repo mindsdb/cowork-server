@@ -184,11 +184,19 @@ async def test_proxy_answers_an_upstream_402_with_one_terminal_400(monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_proxy_keeps_a_spent_budget_apart_from_an_empty_wallet(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "upstream",
+    [
+        {"json": {"error": {"message": "Budget reached.", "code": "budget_exceeded"}}},
+        {"json": {"error": {"message": "Budget reached."}}, "headers": {"x-mindshub-reason": "budget_exceeded"}},
+    ],
+    ids=["body-code", "reason-header"],
+)
+async def test_proxy_keeps_a_spent_budget_apart_from_an_empty_wallet(monkeypatch: pytest.MonkeyPatch, upstream) -> None:
     """Both are 402s, but credits do not lift a budget, so Codex gets its own code."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(402, json={"error": {"message": "Budget reached.", "code": "budget_exceeded"}})
+        return httpx.Response(402, **upstream)
 
     real_client = httpx.AsyncClient
     monkeypatch.setattr(

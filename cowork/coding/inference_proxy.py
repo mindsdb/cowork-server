@@ -186,7 +186,10 @@ async def proxy_inference(request: Request, path: str, credentials: EngineCreden
         finally:
             await upstream.aclose()
         # A spent budget is a 402 too, but credits do not lift it, so it keeps its own code.
-        budget = upstream.status_code == 402 and upstream_error_code(raw) == "budget_exceeded"
+        budget = upstream.status_code == 402 and "budget_exceeded" in (
+            upstream_error_code(raw),
+            upstream.headers.get("x-mindshub-reason", ""),
+        )
         return _terminal_response(upstream, raw, "budget_exceeded" if budget else None)
     return _UpstreamStreamingResponse(upstream)
 
