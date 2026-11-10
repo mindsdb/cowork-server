@@ -21,6 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cowork.server import create_app
+from tests._connector_test_request import with_test_request
 
 PATH = "/api/v1/connectors/submissions/"
 BEARER = "Bearer sentinel-caller-credential"
@@ -39,12 +40,12 @@ MEMBER_HEADERS = {
 AUTH_HEADERS = {**MEMBER_HEADERS, "Authorization": BEARER}
 
 #: A model-written form that passes check_handcrafted_form.
-HANDCRAFTED_FORM = {
+HANDCRAFTED_FORM = with_test_request({
     "form_id": "fm_bbbbbbbbbb",
     "engine": "handcrafted",
     "title": "Connect handcrafted",
     "fields": [{"name": "token", "label": "Token", "type": "password", "secret": True, "required": True}],
-}
+})
 
 #: Shaped like auth's DatasourceConnectionResponseSerializer.
 CONNECTION = {

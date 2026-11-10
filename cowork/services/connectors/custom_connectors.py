@@ -92,6 +92,165 @@ def check_handcrafted_form(form_spec: dict[str, Any]) -> None:
             "connector.usage_notes looks like it holds a credential value. "
             "Say how to authenticate (header name, scheme) without the value."
         )
+    # Self-hosted and org mode keep the model probe until their own milestone.
+    if not tenant_scope_required():
+        check_test_requests(form_spec)
+
+
+_PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+_ANY_BRACES = re.compile(r"\{\{|\}\}")
+_FORBIDDEN_HEADERS = frozenset({"host", "connection", "transfer-encoding", "content-length", "te", "upgrade"})
+_FORBIDDEN_HEADER_PREFIXES = ("proxy-", "x-forwarded-")
+_NEEDS_TEST_REQUEST = (
+    "The connection form needs a test_request: the request Cowork sends to "
+    "check that the API returns data. Give each method one."
+)
+
+
+def _is_oauth_grant_method(method: dict[str, Any]) -> bool:
+    """Whether ``method`` is a browser OAuth grant (its values arrive from the provider)."""
+    return method.get("submit_action") == "oauth_launch" and isinstance(method.get("oauth"), dict)
+
+
+def _form_methods(form_spec: dict[str, Any]) -> list[tuple[str, dict[str, Any], dict[str, Any] | None]]:
+    """Each submittable method as (where, holder of its test_request, method or None).
+
+    A form with no ``methods`` is one method: the form itself holds it.
+    """
+    methods = [m for m in form_spec.get("methods") or [] if isinstance(m, dict) and not m.get("hidden")]
+    if not methods:
+        return [("the form", form_spec, None)]
+    return [(f"method {m.get('id')!r}", m, m) for m in methods]
+
+
+def _placeholders(text: str) -> set[str]:
+    """Placeholder names in ``text``; raises when braces are left over that are not one."""
+    if _ANY_BRACES.search(_PLACEHOLDER.sub("", text)):
+        raise UnstorableFormError("test_request has a malformed {{placeholder}}.")
+    return set(_PLACEHOLDER.findall(text))
+
+
+def _check_literal(text: str, where: str) -> None:
+    """Refuse literal text in a test request that looks like a credential value."""
+    literal = _PLACEHOLDER.sub("", text)
+    if scrub_output(literal) != literal:
+        raise UnstorableFormError(
+            f"test_request {where} looks like it holds a credential value. Use a {{{{field}}}} placeholder."
+        )
+
+
+def _json_strings(value: Any, where: str) -> list[str]:
+    """Every leaf string of a JSON body; placeholders are refused in object keys."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        out: list[str] = []
+        for key, item in value.items():
+            if _placeholders(str(key)):
+                raise UnstorableFormError(f"test_request {where} may not use a placeholder in a JSON key.")
+            out += _json_strings(item, where)
+        return out
+    if isinstance(value, list):
+        return [s for item in value for s in _json_strings(item, where)]
+    return []
+
+
+def _check_step(step: dict[str, Any], where: str) -> set[str]:
+    """Check one test step's shape rules and return the placeholder names it uses."""
+    url = str(step.get("url") or "")
+    # The raw scheme and authority, before any placeholder could add a "/".
+    head = re.match(r"[^:/?#]*://[^/?#]*", url)
+    if head is not None and _ANY_BRACES.search(head.group()):
+        raise UnstorableFormError(f"test_request {where} url may use placeholders only in its path and query.")
+    try:
+        parts = urlsplit(_PLACEHOLDER.sub("x", url))
+    except ValueError as e:
+        raise UnstorableFormError(f"test_request {where} url is not a valid URL.") from e
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise UnstorableFormError(f"test_request {where} url must be an http or https URL with a host.")
+    if "@" in parts.netloc:
+        raise UnstorableFormError(f"test_request {where} url must not carry user info; use basic_auth.")
+    used = _placeholders(url)
+    _check_literal(url, f"{where} url")
+    for name, value in (step.get("headers") or {}).items():
+        if any(c in f"{name}{value}" for c in "\r\n"):
+            raise UnstorableFormError(f"test_request {where} has a header with a line break.")
+        lowered = name.strip().lower()
+        if lowered in _FORBIDDEN_HEADERS or lowered.startswith(_FORBIDDEN_HEADER_PREFIXES):
+            raise UnstorableFormError(f"test_request {where} may not set the {name} header.")
+        if _placeholders(name):
+            raise UnstorableFormError(f"test_request {where} may not use a placeholder in a header name.")
+        used |= _placeholders(value)
+        _check_literal(value, f"{where} header {name}")
+    for item in step.get("basic_auth") or []:
+        names = _placeholders(item)
+        if not names or _PLACEHOLDER.sub("", item).strip():
+            raise UnstorableFormError(f"test_request {where} basic_auth takes two {{{{field}}}} placeholders.")
+        used |= names
+    if step.get("form") is not None and step.get("json_body") is not None:
+        raise UnstorableFormError(f"test_request {where} takes a form or a json_body, not both.")
+    for key, value in (step.get("form") or {}).items():
+        if _placeholders(key):
+            raise UnstorableFormError(f"test_request {where} may not use a placeholder in a form key.")
+        used |= _placeholders(value)
+        _check_literal(value, f"{where} form value")
+    for text in _json_strings(step.get("json_body"), where):
+        used |= _placeholders(text)
+        _check_literal(text, f"{where} json_body")
+    return used
+
+
+def check_test_requests(form_spec: dict[str, Any]) -> None:
+    """Refuse a handcrafted form whose methods do not each carry a valid test_request.
+
+    A single-method form holds one at the top level; a multi-method form holds
+    one on every submittable method and none at the top level. Placeholders
+    may name only the method's own fields, ``token`` in the data step after a
+    token step, and ``access_token``/``refresh_token`` on an OAuth grant
+    method. A follow-up step (``_extends_connection``) may also name the saved
+    connection's fields, which the probe handler checks once it has read them.
+
+    Raises:
+        UnstorableFormError: with a message the model can act on.
+    """
+    multi = bool([m for m in form_spec.get("methods") or [] if isinstance(m, dict) and not m.get("hidden")])
+    if multi and form_spec.get("test_request") is not None:
+        raise UnstorableFormError(
+            "A multi-method form puts a test_request on each method, not at the top level."
+        )
+    extends = bool(form_spec.get("_extends_connection"))
+    for where, holder, method in _form_methods(form_spec):
+        request = holder.get("test_request")
+        if not isinstance(request, dict):
+            raise UnstorableFormError(f"{_NEEDS_TEST_REQUEST} {where.capitalize()} has none.")
+        fields = (method or form_spec).get("fields") or []
+        field_names = {f.get("name") for f in fields if isinstance(f, dict) and f.get("name")}
+        secret_names = {
+            f["name"] for f in fields
+            if isinstance(f, dict) and f.get("name") and (f.get("secret") or f.get("type") == "password")
+        }
+        grant_names = {"access_token", "refresh_token"} if method and _is_oauth_grant_method(method) else set()
+        token_step = request.get("token")
+        allowed = field_names | grant_names
+        if isinstance(token_step, dict):
+            unknown = _check_step(token_step, f"{where} token step") - allowed
+            if unknown and not extends:
+                raise UnstorableFormError(
+                    f"test_request {where} token step names {', '.join(sorted(unknown))}, which are not form fields."
+                )
+        data_step = request.get("data") or {}
+        data_allowed = allowed | ({"token"} if isinstance(token_step, dict) else set())
+        data_used = _check_step(data_step, f"{where} data step")
+        unknown = data_used - data_allowed
+        if unknown and not extends:
+            raise UnstorableFormError(
+                f"test_request {where} data step names {', '.join(sorted(unknown))}, which are not form fields."
+            )
+        if not (data_used & ({"token", "access_token"} | secret_names) or data_step.get("basic_auth") or extends):
+            raise UnstorableFormError(
+                f"test_request {where} data step must send a credential: {{{{token}}}}, "
+                "basic_auth or a secret field."
+            )
 
 
 def scope_is_one_persons(scope: TenantScope) -> bool:

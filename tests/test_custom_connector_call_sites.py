@@ -26,15 +26,16 @@ from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import DirectSaveRequest, SubmitFormRequest
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.persist import persist_connection
+from tests._connector_test_request import bearer_test_request, with_test_request
 from tests._fakes import FakeRequest
 
-HTTPBIN_FORM = {
+HTTPBIN_FORM = with_test_request({
     "form_id": "httpbin-connector",
     "title": "Connect httpbin",
     "fields": [
         {"name": "token", "label": "Bearer token", "type": "password", "required": True, "secret": True},
     ],
-}
+})
 
 
 @pytest.fixture()
@@ -122,7 +123,10 @@ class TestAgentTools:
         monkeypatch.setattr(tools, "vault_for_scope", lambda scope: vault)
         result = await tools._cowork_request_credentials(
             None,
-            {"engine": "httpbin", "title": "Finish", "fields": [], "extends_connection": "httpbin-1a2b3c4d"},
+            {
+                "engine": "httpbin", "title": "Finish", "fields": [], "extends_connection": "httpbin-1a2b3c4d",
+                "test_request": bearer_test_request(),
+            },
         )
 
         assert '"_extends_connection": "httpbin-1a2b3c4d"' in result
@@ -143,7 +147,10 @@ class TestConnectorIdStamp:
     @pytest.mark.asyncio
     async def test_an_unknown_stamped_id_routes_by_engine(self, engine):
         result = await tools._cowork_request_credentials(
-            None, {"_connector_id": "acme", "title": "Connect Acme", "fields": []},
+            None, with_test_request({
+                "_connector_id": "acme", "title": "Connect Acme",
+                "fields": [{"name": "token", "label": "Token", "type": "password", "secret": True}],
+            }),
         )
 
         block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
@@ -192,7 +199,7 @@ class TestSubmitForm:
         req = SubmitFormRequest(
             form_spec={
                 "form_id": "fm_bbbbbbbbbb", "engine": "httpbin", "title": "httpbin", "fields": [],
-                "_extends_connection": "httpbin-1a2b3c4d",
+                "_extends_connection": "httpbin-1a2b3c4d", "test_request": bearer_test_request(),
             },
             values={"refresh": "r"},
         )
@@ -366,11 +373,11 @@ class TestWithoutABoundScope:
 class TestBuildFlowPrompt:
     @pytest.mark.asyncio
     async def test_the_connector_block_reaches_the_form(self, engine):
-        result = await tools._cowork_request_credentials(None, {
+        result = await tools._cowork_request_credentials(None, with_test_request({
             "engine": "acme", "title": "Connect Acme",
             "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}],
             "connector": {"label": "Acme", "category": "erp", "usage_notes": "Base URL is per tenant."},
-        })
+        }, field="api_key"))
 
         block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
         assert block["connector"] == {"label": "Acme", "category": "erp", "usage_notes": "Base URL is per tenant."}

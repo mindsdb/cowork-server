@@ -18,6 +18,7 @@ from cowork.schemas.connectors import MatchRequest
 from cowork.services.connectors import catalog as catalog_module
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.custom_connectors import CustomConnectorService
+from tests._connector_test_request import with_test_request
 from tests._fakes import FakeRequest
 
 ORG_A = TenantScope(org_mode=True, org_id="org-a", user_id="user-a")
@@ -33,11 +34,11 @@ PERSON_SHARED = TenantScope(
     personal_resources=ALL_PERSONAL_RESOURCES - {PersonalResource.CONNECTIONS},
 )
 
-HTTPBIN_FORM = {
+HTTPBIN_FORM = with_test_request({
     "form_id": "httpbin-connector",
     "title": "Connect httpbin",
     "fields": [{"name": "token", "label": "Bearer token", "type": "password", "secret": True}],
-}
+})
 
 
 @pytest.fixture()
