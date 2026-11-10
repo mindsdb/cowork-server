@@ -1220,6 +1220,11 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_NUANCE_PERSONA"),
         description="Which Nuance avatar the video call shows: sam (default), sonia or mira.",
     )
+    voice_operator_model: str = Field(
+        default=MINDS_FREE_MODEL,
+        validation_alias=AliasChoices("COWORK_VOICE_OPERATOR_MODEL"),
+        description="The MindsHub model that turns a voice call's requests into app actions (cowork.services.voice_operator).",
+    )
 
     browser_scope_key_file: str = Field(
         default="",
