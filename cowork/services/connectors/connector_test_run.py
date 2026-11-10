@@ -24,7 +24,7 @@ import posixpath
 import re
 import socket
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, quote_plus, unquote
 
@@ -72,14 +72,20 @@ class PrivateHost:
 
     step: str
     method: str
+    scheme: str
     host: str
     port: int
     path: str
     addresses: tuple[str, ...]
 
+    @property
+    def key(self) -> str:
+        """What one approval covers: this step, its method, scheme, host and port."""
+        return approval_key(self.step, self.method, self.scheme, self.host, self.port)
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "step": self.step, "method": self.method, "host": self.host,
+            "step": self.step, "method": self.method, "scheme": self.scheme, "host": self.host,
             "host_ascii": _ascii_host(self.host), "port": self.port, "path": self.path,
             "addresses": list(self.addresses), "this_computer": all(_is_loopback(a) for a in self.addresses),
         }
@@ -110,8 +116,6 @@ class ConnectorTestOutcome:
 
     preview: ConnectorTestPreview | None = None
     private_host: PrivateHost | None = None
-    #: Hosts and the addresses judged for them, to pin when the test continues.
-    resolved: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @functools.cache
@@ -132,6 +136,12 @@ def private_allowlist() -> tuple[frozenset[str], tuple[ipaddress.IPv4Network | i
         except ValueError:
             hosts.add(_normal_host(entry))
     return frozenset(hosts), tuple(networks)
+
+
+def approval_key(step: str, method: str, scheme: str, host: str, port: int) -> str:
+    """The key an approval is stored under; a different step, method, scheme,
+    host or port is a different question."""
+    return f"{step} {method} {scheme}://{_normal_host(host)}:{port}"
 
 
 def _normal_host(host: str) -> str:
@@ -415,8 +425,9 @@ async def _judge_host(
     """
     host = _normal_host(step.url.host)
     port = step.url.port or (443 if step.url.scheme == "https" else 80)
-    if host in approved:
-        addresses = tuple(ipaddress.ip_address(a) for a in approved[host])
+    key = approval_key(step.name, step.method, step.url.scheme, host, port)
+    if key in approved:
+        addresses = tuple(ipaddress.ip_address(a) for a in approved[key])
         allowed = True
     else:
         addresses = await _resolve(host, resolver)
@@ -430,7 +441,8 @@ async def _judge_host(
     private = [a for a in addresses if not is_public_address(a)]
     if private and not allowed:
         return addresses, PrivateHost(
-            step.name, step.method, host, port, step.url.path or "/", tuple(str(a) for a in addresses),
+            step.name, step.method, step.url.scheme, host, port, step.url.path or "/",
+            tuple(str(a) for a in addresses),
         )
     # http only to this computer, once it is allowed; anywhere else it would
     # carry the member's credential in the clear.
@@ -444,7 +456,9 @@ async def _send(
 ) -> tuple[int, bytes, bool, str]:
     """Send ``step`` to its vetted addresses: status, body (capped), over-cap, content type."""
     host = step.url.host
-    headers = {**step.headers, "Host": step.url.netloc.decode("ascii")}
+    # Identity only: the cap counts what is read, and a compressed answer
+    # could expand far past it in one decoded chunk.
+    headers = {**step.headers, "Host": step.url.netloc.decode("ascii"), "Accept-Encoding": "identity"}
     kwargs: dict[str, Any] = {"headers": headers}
     if step.form is not None:
         kwargs["data"] = step.form
@@ -469,8 +483,12 @@ async def _send(
                 raise ConnectorTestError(f"The {step.name} step could not connect.") from exc
             except httpx.HTTPError as exc:
                 raise ConnectorTestError(f"The {step.name} step failed before an answer came back.") from exc
+            if response.headers.get("content-encoding", "identity").strip().lower() != "identity":
+                await response.aclose()
+                raise ConnectorTestError(f"The {step.name} step's answer came back compressed; Cowork reads plain answers only.")
             try:
                 chunks, size = [], 0
+                # Identity was checked above, so these bytes are the bytes read.
                 async for chunk in response.aiter_bytes():
                     chunks.append(chunk)
                     size += len(chunk)
@@ -513,7 +531,8 @@ async def run_test_request(
         values: The member's submitted values by field name.
         secret_names: Fields whose values a response may never echo: the
             form's secret fields and, on a follow-up step, every saved field.
-        approved: Hosts the member allowed, with the exact addresses to dial.
+        approved: The member's approvals (``PrivateHost.key``), each with the
+            exact addresses to dial.
         resolver, transport: Seams for tests.
 
     Returns:
@@ -523,7 +542,7 @@ async def run_test_request(
         ConnectorTestError: when the test fails or its answer is not data.
     """
     resolver = resolver or _RESOLVER
-    approved = {_normal_host(h): a for h, a in (approved or {}).items()}
+    approved = dict(approved or {})
     filled = {k: str(v) for k, v in values.items() if v is not None and str(v) != ""}
     token_spec = test_request.get("token")
     data_spec = test_request["data"]
@@ -543,7 +562,6 @@ async def run_test_request(
     dial: dict[str, tuple[IPAddress, ...]] = {}
     for step in [*steps, data_probe]:
         addresses, private = await _judge_host(step, approved, resolver)
-        outcome.resolved[_normal_host(step.url.host)] = tuple(str(a) for a in addresses)
         if private is not None:
             outcome.private_host = private
             return outcome

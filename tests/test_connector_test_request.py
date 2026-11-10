@@ -213,7 +213,7 @@ class TestEveryHostIsJudgedBeforeAnyRequest:
     async def test_an_allowed_host_is_dialled_only_at_its_approved_addresses(self):
         table = {**PUBLIC, "api.example.com": "10.0.0.5"}
         first, _ = await run(table=table)
-        approved = {"api.example.com": first.private_host.addresses}
+        approved = {first.private_host.key: first.private_host.addresses}
 
         # The name now answers with another address; the approved one is dialled.
         outcome, api = await run(table={**PUBLIC, "api.example.com": "10.9.9.9"}, approved=approved)
@@ -255,6 +255,21 @@ class TestEveryHostIsJudgedBeforeAnyRequest:
         assert outcome.preview is not None and api.requests[-1].url.scheme == "http"
         allow(monkeypatch, "10.0.0.0/8")
         await refused("use https", with_url("http://api.example.com/q"), table={**PUBLIC, "api.example.com": "10.0.0.5"})
+
+
+    @pytest.mark.asyncio
+    async def test_an_approval_covers_only_its_own_step_method_scheme_and_port(self):
+        table = {**PUBLIC, "api.example.com": "10.0.0.5"}
+        first, _ = await run(table=table)
+        approved = {first.private_host.key: first.private_host.addresses}
+
+        for url in ("https://api.example.com:8443/integration/V1/query", "http://api.example.com/integration/V1/query"):
+            outcome, api = await run(with_url(url), table=table, approved=approved)
+            assert outcome.private_host is not None and api.requests == []
+        request = copy.deepcopy(CLIENT_REQUEST)
+        request["data"]["method"] = "GET"
+        outcome, _ = await run(request, table=table, approved=approved)
+        assert outcome.private_host is not None
 
 
 class TestFillingIn:
@@ -396,6 +411,21 @@ class TestCredentialsNeverComeBack:
 
 
 class TestLargeAnswers:
+    @pytest.mark.asyncio
+    async def test_a_compressed_answer_is_refused_unread(self):
+        class Gzip(Api):
+            def __call__(self, request):
+                self.requests.append(request)
+                if request.url.path.endswith("/token"):
+                    return super().__call__(request)
+                async def body():
+                    yield b"\x1f\x8b..."
+
+                return httpx.Response(200, content=body(), headers={"content-encoding": "gzip"})
+
+        api = await refused("came back compressed", api=Gzip())
+        assert all(r.headers["accept-encoding"] == "identity" for r in api.requests)
+
     @pytest.mark.asyncio
     async def test_reading_stops_at_the_cap(self):
         read = []
