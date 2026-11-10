@@ -144,6 +144,10 @@ class TestPlaceholdersCannotMoveTheHost:
         with pytest.raises(UnstorableFormError):
             check_handcrafted_form(_with(FORM, ("test_request", "data", "url"), url))
 
+    @pytest.mark.parametrize("url", ["https://api.example.com:99999/rows", "https://api.example.com:0/rows"])
+    def test_a_port_outside_the_range_is_refused_when_the_form_is_built(self, url):
+        _refused(_with(FORM, ("test_request", "data", "url"), url), "port outside 1 to 65535")
+
     def test_http_is_allowed_when_the_form_is_built(self):
         check_handcrafted_form(_with(FORM, ("test_request", "data", "url"), "http://127.0.0.1:8765/items"))
 

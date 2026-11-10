@@ -15,14 +15,21 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from anton.core.datasources.data_vault import LocalDataVault
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
+from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.handlers import probe as probe_handler
+from cowork.harnesses.anton_harness import tools
 from cowork.models.custom_connector import CustomConnector
+from cowork.services.connectors import catalog as catalog_module
 from cowork.services.connectors import connector_test_flow, connector_test_run
+from cowork.services.connectors.catalog import ConnectorCatalog
+from cowork.schemas.connectors import SubmitFormRequest
 from cowork.services.connectors.probe import ProbeOutcome
 from cowork.services.connectors.submissions import store
 
@@ -260,6 +267,25 @@ class TestStoredCustomConnectors:
         assert any("only to the hosts" in d.get("delta", "") for d in of(events, "response.output_text.delta"))
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("url", [
+        "https://planner.example.com:22/x?k={{client_secret}}",
+        "http://planner.example.com/x?k={{client_secret}}",
+    ], ids=["another port", "another scheme"])
+    async def test_a_follow_up_step_may_not_send_a_saved_field_to_another_port_or_scheme(self, api, saved, url):
+        saved.vault.save("planner", "planner-1", {"client_secret": SECRET}, secure_keys=["client_secret"])
+        _stored(saved.engine, {k: v for k, v in PLANNER_FORM.items() if k not in ("engine", "connector")})
+        step = {
+            "form_id": "fm_bbbbbbbbbb", "engine": "planner", "title": "Finish", "fields": [],
+            "_extends_connection": "planner-1",
+            "test_request": {"data": {"method": "GET", "url": url}},
+        }
+
+        events = await connect(step, {}, saved)
+
+        assert api.requests == []
+        assert any("only to the hosts" in d.get("delta", "") for d in of(events, "response.output_text.delta"))
+
+    @pytest.mark.asyncio
     async def test_a_blank_field_named_like_a_saved_one_still_counts_as_saved(self, api, saved):
         saved.vault.save("planner", "planner-1", {"client_secret": SECRET}, secure_keys=["client_secret"])
         _stored(saved.engine, {k: v for k, v in PLANNER_FORM.items() if k not in ("engine", "connector")})
@@ -331,9 +357,6 @@ class TestAnOldConnectorCanBeBuiltAgain:
 
     @pytest.fixture()
     def old_connector(self, saved, monkeypatch):
-        from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
-        from cowork.harnesses.anton_harness import tools
-
         _stored(saved.engine, self.OLD)
         for module in (submissions_endpoint, tools):
             monkeypatch.setattr(module, "run_db", connector_test_flow.run_db)
@@ -354,10 +377,6 @@ class TestAnOldConnectorCanBeBuiltAgain:
 
     @pytest.mark.asyncio
     async def test_a_stamped_submission_of_it_is_refused_before_it_is_staged(self, old_connector):
-        from fastapi import HTTPException
-
-        from cowork.schemas.connectors import SubmitFormRequest
-
         req = SubmitFormRequest(form_spec={"_connector_id": "planner", "form_id": "planner-connector"}, values=VALUES)
         with pytest.raises(HTTPException) as exc:
             await old_connector.submissions.submit_form(req, LOCAL_SCOPE)
@@ -366,15 +385,10 @@ class TestAnOldConnectorCanBeBuiltAgain:
 
     @pytest.mark.asyncio
     async def test_a_handcrafted_submission_may_replace_it(self, old_connector):
-        from cowork.schemas.connectors import SubmitFormRequest
-
         await old_connector.submissions.submit_form(SubmitFormRequest(form_spec=PLANNER_FORM, values=VALUES), LOCAL_SCOPE)
         assert [s["form_id"] for s in old_connector.staged] == ["fm_aaaaaaaaaa"]
 
     def test_the_catalog_marks_it_for_rebuilding_on_a_single_user_install_only(self, saved, monkeypatch):
-        from cowork.services.connectors import catalog as catalog_module
-        from cowork.services.connectors.catalog import ConnectorCatalog
-
         _stored(saved.engine, self.OLD)
         with Session(saved.engine) as session:
             assert ConnectorCatalog(ScopedSession(session, LOCAL_SCOPE)).get_connector("planner").needs_rebuild is True
@@ -388,10 +402,6 @@ class TestSelfHostedWithTheRealSetting:
 
     @pytest.mark.asyncio
     async def test_a_handcrafted_form_without_a_test_request_still_goes_to_the_model_probe(self, api, saved, monkeypatch):
-        from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
-        from cowork.common.settings.app_settings import get_app_settings
-        from cowork.schemas.connectors import SubmitFormRequest
-
         monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
         get_app_settings.cache_clear()
         monkeypatch.setattr(submissions_endpoint, "run_db", connector_test_flow.run_db)

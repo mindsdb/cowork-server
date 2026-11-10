@@ -103,7 +103,6 @@ async def save_confirmed(entry: PendingTest) -> tuple[str, str | None, str | Non
     return slug, user_label, note
 
 
-
 def saved_patch(form_id: str, slug: str) -> dict[str, Any]:
     """The form patch for a connection saved on the member's confirmation."""
     return {

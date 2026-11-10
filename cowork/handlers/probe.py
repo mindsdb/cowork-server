@@ -27,7 +27,7 @@ from cowork.services.connectors.connector_test_flow import (
     advance,
     save_definition,
 )
-from cowork.services.connectors.connector_test_run import ConnectorTestError, placeholder_names, request_hosts
+from cowork.services.connectors.connector_test_run import ConnectorTestError, placeholder_names, request_endpoints
 from cowork.services.connectors.custom_connectors import (
     NEEDS_REBUILD_FOR_MEMBER,
     USAGE_NOTES_MAX,
@@ -781,8 +781,8 @@ class ProbeHandler:
         """Why a follow-up step's test request may not run, or None when it may.
 
         It may name only its own fields, the saved connection's and the token
-        names, and it may send a saved field only to the hosts the stored
-        connector's own test requests use, so a new step cannot carry a saved
+        names, and it may send a saved field only to the scheme, host and port the
+        stored connector's own test requests use, so a new step cannot carry a saved
         credential somewhere else.
         """
         used = {n for step in (test_request.get("token"), test_request.get("data")) if step for n in placeholder_names(step)}
@@ -793,13 +793,13 @@ class ProbeHandler:
         if not used & saved_fields:
             return None
         stored = await run_db(lambda session: ConnectorCatalog(session).get_connector(connector_id), scope=self.scope)
-        allowed: set[str] = set()
+        allowed: set[tuple[str, str, int]] = set()
         if stored is not None and stored.custom:
             form = stored.form.model_dump()
             for holder in [form, *(form.get("methods") or [])]:
                 if isinstance(holder.get("test_request"), dict):
-                    allowed |= request_hosts(holder["test_request"])
-        if not request_hosts(test_request) <= allowed:
+                    allowed |= request_endpoints(holder["test_request"])
+        if not request_endpoints(test_request) <= allowed:
             return "A follow-up step may send saved fields only to the hosts this connector was tested with."
         return None
 

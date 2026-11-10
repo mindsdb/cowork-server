@@ -216,9 +216,12 @@ def _check_step(step: dict[str, Any], where: str) -> set[str]:
     # The runner dials with httpx, so the form is checked with the same parser.
     filled = PLACEHOLDER.sub("x", url)
     try:
-        httpx.URL(filled).raw_host.decode("ascii")
+        parsed = httpx.URL(filled)
+        parsed.raw_host.decode("ascii")
     except (httpx.InvalidURL, UnicodeError) as e:
         raise UnstorableFormError(f"test_request {where} url is not a valid URL.") from e
+    if parsed.port is not None and not 1 <= parsed.port <= 65535:
+        raise UnstorableFormError(f"test_request {where} url has a port outside 1 to 65535.")
     used = _placeholders(url)
     _check_literal(url, f"{where} url")
     for name, value in (step.get("headers") or {}).items():

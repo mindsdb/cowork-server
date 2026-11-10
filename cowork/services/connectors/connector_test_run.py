@@ -19,6 +19,7 @@ import functools
 import html
 import ipaddress
 import json
+import logging
 import os
 import posixpath
 import re
@@ -39,6 +40,8 @@ from cowork.services.connectors.egress import (
 )
 
 IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+logger = logging.getLogger(__name__)
 
 ALLOWLIST_ENV = "COWORK_CONNECTOR_TEST_PRIVATE_ALLOWLIST"
 _REQUEST_SECONDS = 10.0
@@ -245,16 +248,16 @@ def placeholder_names(step: Mapping[str, Any]) -> set[str]:
     return {name for text in texts for name in PLACEHOLDER.findall(str(text))}
 
 
-def request_hosts(test_request: Mapping[str, Any]) -> set[str]:
-    """The hosts a test request's steps are sent to, as written in the form."""
-    hosts = set()
+def request_endpoints(test_request: Mapping[str, Any]) -> set[tuple[str, str, int]]:
+    """Where a test request's steps go, as (scheme, wire host, port), read with
+    the parser the runner dials with."""
+    endpoints = set()
     for name in ("token", "data"):
         step = test_request.get(name)
         if step:
-            host = urlsplit(PLACEHOLDER.sub("x", str(step.get("url") or ""))).hostname
-            if host:
-                hosts.add(_normal_host(host))
-    return hosts
+            url = httpx.URL(PLACEHOLDER.sub("x", str(step.get("url") or "")))
+            endpoints.add((url.scheme, url_host(url), url.port or (443 if url.scheme == "https" else 80)))
+    return endpoints
 
 
 def _json_leaves(value: Any) -> list[str]:
@@ -315,6 +318,8 @@ def _build_step(name: str, step: Mapping[str, Any], values: Mapping[str, str]) -
         url_host(url)
     except (httpx.InvalidURL, UnicodeError) as exc:
         raise ConnectorTestError(f"The {name} step's url is not a valid URL.") from exc
+    if url.port is not None and not 1 <= url.port <= 65535:
+        raise ConnectorTestError(f"The {name} step's url has a port outside 1 to 65535.")
     shown_path = urlsplit(PLACEHOLDER.sub(lambda m: f"{{{{{m.group(1)}}}}}", str(step["url"]))).path or "/"
     return _Step(name, step["method"], url, shown_path, headers, auth, form, body)
 
@@ -390,6 +395,28 @@ def _is_empty(value: Any) -> bool:
     return False
 
 
+def _is_blank(value: Any) -> bool:
+    """Whether a scalar or object beside an answer's lists holds no value."""
+    if isinstance(value, bool):
+        return value is False
+    if isinstance(value, (int, float)):
+        return value == 0
+    return value in (None, "", {})
+
+
+def _holds_no_data(value: Any) -> bool:
+    """Whether an answer carries nothing: empty, a list of empty items, or an
+    object whose lists are all empty and whose other values are all blank.
+    A single record with an empty list beside its fields is data."""
+    if _is_empty(value):
+        return True
+    if not isinstance(value, dict):
+        return False
+    lists = [v for v in value.values() if isinstance(v, list)]
+    others = [v for v in value.values() if not isinstance(v, list)]
+    return bool(lists) and all(_is_empty(v) for v in lists) and all(_is_blank(v) for v in others)
+
+
 def _mask(value: Any, guard: _Guard, counter: list[int]) -> Any:
     """``value`` with every key or leaf holding a masked value replaced by ``***``;
     ``counter[0]`` counts the replacements."""
@@ -460,7 +487,7 @@ def judge(
     except ValueError:
         parsed, is_json = text, False
     if is_json:
-        if _is_empty(parsed) or _item_count(parsed) == 0:
+        if _holds_no_data(parsed):
             raise ConnectorTestError("The data step's answer holds no data.")
         if isinstance(parsed, dict) and (parsed.get("error") or parsed.get("errors")):
             raise ConnectorTestError("The data step's answer is an error.")
@@ -623,6 +650,30 @@ async def run_test_request(
     Raises:
         ConnectorTestError: when the test fails or its answer is not data.
     """
+    try:
+        return await _run_test_request(
+            test_request, values, secret_names=secret_names, approved=approved, resolver=resolver, transport=transport,
+        )
+    except ConnectorTestError:
+        raise
+    except Exception as exc:
+        # One boundary rather than a list of exception types: whatever a
+        # library raises, the test ends with a reason. Only the type is
+        # logged, since a message can carry the URL with the member's values.
+        logger.error("A connector test failed with %s", type(exc).__name__)
+        raise ConnectorTestError("The connection test failed before an answer came back.") from exc
+
+
+async def _run_test_request(
+    test_request: Mapping[str, Any],
+    values: Mapping[str, Any],
+    *,
+    secret_names: Iterable[str],
+    approved: Mapping[str, tuple[str, ...]] | None = None,
+    resolver: Callable[..., list[tuple]] | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> ConnectorTestOutcome:
+    """``run_test_request`` without its boundary."""
     resolver = resolver or _RESOLVER
     approved = dict(approved or {})
     filled = {k: str(v) for k, v in values.items() if v is not None and str(v) != ""}

@@ -307,7 +307,8 @@ class TestTheAnswerMustLookLikeData:
         {"data": None, "errors": [{"message": "unauthorized"}]},
     ], ids=["null", "empty string", "empty list", "empty object", "list of empty", "error", "graphql errors"])
     async def test_an_answer_with_no_data_is_refused(self, body):
-        await refused("data step", api=Api(raw=json.dumps(body).encode()))
+        words = "is an error" if isinstance(body, dict) and ("error" in body or "errors" in body) else "holds no data"
+        await refused(words, api=Api(raw=json.dumps(body).encode()))
 
     @pytest.mark.asyncio
     async def test_whitespace_is_refused(self):
@@ -512,12 +513,40 @@ class TestReviewFindings:
         await asyncio.wait_for(refused("took longer than", api=Slow()), timeout=5)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(("body", "words"), [
+        ({"data": []}, "holds no data"), ({"data": [], "total": 0}, "holds no data"),
+        ([{}, {}], "holds no data"), ([None], "holds no data"), (["", None], "holds no data"),
+        ({"data": [None]}, "holds no data"), ({"data": [{}]}, "holds no data"),
+        ({"accessToken": "x", "expiresIn": 3600}, "a token, not data"), ({"result": {"idToken": "x"}}, "a token, not data"),
+    ], ids=["empty data", "empty data with total", "empty objects", "null item", "blank items", "data of null",
+            "data of empty", "camel token", "nested camel"])
+    async def test_more_answers_with_no_data_are_refused(self, body, words):
+        await refused(words, api=Api(data=body))
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("body", [
-        {"data": []}, {"data": [], "total": 0}, [{}, {}], [None], ["", None],
-        {"accessToken": "x", "expiresIn": 3600}, {"result": {"idToken": "x"}},
-    ], ids=["empty data", "empty data with total", "empty objects", "null item", "blank items", "camel token", "nested camel"])
-    async def test_more_answers_with_no_data_are_refused(self, body):
-        await refused("data step", api=Api(data=body))
+        {"id": 7, "name": "Acme Ltd", "roles": []},
+        {"user": {"id": 7, "email": "a@b.c"}, "teams": [], "scopes": []},
+    ], ids=["record with an empty list", "nested record with empty lists"])
+    async def test_a_single_record_beside_empty_lists_is_data(self, body):
+        outcome, _ = await run(api=Api(data=body))
+        assert outcome.preview is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("url", ["https://api.example.com:99999/rows", "https://api.example.com:0/rows"])
+    async def test_a_port_outside_the_range_fails_cleanly(self, url):
+        await refused("port outside 1 to 65535", with_url(url))
+
+    @pytest.mark.asyncio
+    async def test_any_library_failure_ends_with_a_reason(self):
+        class Broken(Api):
+            def __call__(self, request):
+                raise ExceptionGroup("unhandled errors in a TaskGroup", [OverflowError("port must be 0-65535")])
+
+        with pytest.raises(ConnectorTestError) as exc:
+            await run(api=Broken())
+        assert str(exc.value) == "The connection test failed before an answer came back."
+        assert isinstance(exc.value.__cause__, ExceptionGroup)
 
     @pytest.mark.asyncio
     async def test_a_numeric_secret_echo_is_refused_and_a_numeric_value_masked(self):
