@@ -435,3 +435,52 @@ class TestHandcraftedFormsSayHowToFetchData:
         text = skill.read_text()
         assert "every handcrafted form" in text
         assert _DATA_SAMPLE in text
+
+
+class TestHandcraftedFormsCarryATestRequest:
+    """On a single-user install Cowork tests a handcrafted form only through
+    its test_request, so the agent is told to write one, and where."""
+
+    def test_both_no_match_answers_ask_for_a_test_request(self):
+        for text in (tools._BUILD_CUSTOM_CONNECTOR, tools._NO_CUSTOM_CONNECTOR):
+            assert tools._TEST_REQUEST_NOTE in text
+        note = tools._TEST_REQUEST_NOTE
+        assert "`test_request`" in note and "never in the host" in note and "ask the user for it first" in note
+        assert "signed requests or client certificates" in note
+
+    def test_the_schema_offers_it_on_the_form_and_on_each_method(self):
+        props = tools._REQUEST_CREDENTIALS_SCHEMA["properties"]
+        method_props = props["methods"]["items"]["properties"]
+
+        for schema in (props["test_request"], method_props["test_request"]):
+            assert set(schema["properties"]) == {"token", "data"} and schema["required"] == ["data"]
+            assert {"url", "headers", "basic_auth", "json_body", "token_field"} <= set(schema["properties"]["data"]["properties"])
+
+    @pytest.mark.asyncio
+    async def test_the_tool_no_longer_says_the_server_saves_on_its_own(self, engine):
+        form = with_test_request({
+            "engine": "acme", "title": "Connect Acme",
+            "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}],
+        }, field="api_key")
+
+        result = await tools._cowork_request_credentials(None, form)
+
+        assert "saves the credentials automatically" not in " ".join(result.split())
+        assert "once the user confirms its result" in " ".join(result.split())
+
+    @pytest.mark.asyncio
+    async def test_the_rendered_form_keeps_its_test_request(self, engine):
+        form = with_test_request({
+            "engine": "acme", "title": "Connect Acme",
+            "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}],
+        }, field="api_key")
+
+        result = await tools._cowork_request_credentials(None, form)
+
+        block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
+        assert block["test_request"] == form["test_request"]
+
+    def test_the_connect_skill_asks_for_a_test_request(self):
+        text = (Path(tools.__file__).parent / "skills" / "connect-datasource" / "SKILL.md").read_text()
+        assert "Give every handcrafted form a `test_request`" in text
+        assert "confirms what came back before anything is saved" in text
