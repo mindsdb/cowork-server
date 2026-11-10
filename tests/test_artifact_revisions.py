@@ -1534,6 +1534,64 @@ def test_a_comment_on_the_head_makes_the_next_refresh_append(artifact):
     assert revision_with_content(folder, first["id"])["content"] == "# Data 1\n"
 
 
+def _published(monkeypatch, entry):
+    from cowork.services import publish
+
+    monkeypatch.setattr(publish, "published_owner_state", lambda _path, *, scope: entry)
+
+
+RESTRICTED = {
+    "report_id": "c675003f",
+    "url": "https://view.dev.mindshub.ai/view/b9996ebec/c675003f",
+    "published": True,
+    "mode": "restricted",
+}
+
+
+def test_a_restricted_publication_makes_every_refresh_append(artifact, monkeypatch):
+    """Its comments go to the cloud service, not the local journal, so a
+    comment on a refresh leaves no local trace; replacing that refresh would
+    lose the content the comment is about."""
+    folder, _metadata, _artifact_id = artifact
+    _published(monkeypatch, RESTRICTED)
+    first = _refresh(folder, "# Data 1\n")
+    second = _refresh(folder, "# Data 2\n")
+
+    assert [r["id"] for r in list_revisions(folder)][:2] == [second["id"], first["id"]]
+    assert revision_with_content(folder, first["id"])["content"] == "# Data 1\n"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [{}, {**RESTRICTED, "mode": "public"}, {**RESTRICTED, "published": False}],
+    ids=["unpublished", "public", "unpublished-again"],
+)
+def test_a_publication_with_local_comments_still_lets_a_refresh_replace(
+    artifact, monkeypatch, entry
+):
+    folder, _metadata, _artifact_id = artifact
+    _published(monkeypatch, entry)
+    first = _refresh(folder, "# Data 1\n")
+    second = _refresh(folder, "# Data 2\n")
+
+    ids = [r["id"] for r in list_revisions(folder)]
+    assert second["id"] in ids and first["id"] not in ids
+
+
+def test_a_failed_publication_check_keeps_the_head(artifact, monkeypatch):
+    from cowork.services import publish
+
+    def boom(_path, *, scope):
+        raise RuntimeError("publication record unreadable")
+
+    folder, _metadata, _artifact_id = artifact
+    monkeypatch.setattr(publish, "published_owner_state", boom)
+    first = _refresh(folder, "# Data 1\n")
+    second = _refresh(folder, "# Data 2\n")
+
+    assert [r["id"] for r in list_revisions(folder)][:2] == [second["id"], first["id"]]
+
+
 def test_an_unreadable_comment_journal_keeps_the_head(artifact):
     folder, _metadata, _artifact_id = artifact
     first = _refresh(folder, "# Data 1\n")

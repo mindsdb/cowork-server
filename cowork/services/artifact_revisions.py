@@ -553,6 +553,37 @@ def _has_comment_on(folder: Path, revision_id: str | None) -> bool:
     )
 
 
+def _comments_live_in_the_cloud(folder: Path) -> bool:
+    """Whether a desktop artifact's comments go to the cloud comments service
+    rather than its local journal, so the journal can't say which revisions
+    were commented on.
+
+    A restricted publication sends them there. This asks the same question
+    resolve_comments_route does, so the two agree: an artifact whose record
+    it can't read keeps its comments in the local journal, which the caller
+    then checks. If asking fails outright, it answers yes, as an unreadable
+    journal does. Org mode keeps every artifact's comments in the cloud
+    service and is left out: there a refresh sees only the threads a repair
+    links to.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    if get_app_settings().tenancy_mode == "org":
+        return False
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.services.comments_scope import cloud_comments_scope
+    from cowork.services.publish import published_owner_state
+
+    try:
+        return bool(cloud_comments_scope(published_owner_state(str(folder), scope=LOCAL_SCOPE)))
+    except Exception:
+        logger.warning(
+            "Could not read an artifact's publication record; its refresh keeps the last revision",
+            exc_info=True,
+        )
+        return True
+
+
 def _refresh_replaces_head(
     folder: Path, head: RevisionEntry | None, rel_path: str, schedule_id: str | None
 ) -> bool:
@@ -563,6 +594,8 @@ def _refresh_replaces_head(
     save, a chat edit or another schedule in between always keeps its
     revision. A head that comments or a pending repair point at is kept too,
     since replacing it would leave them referring to content that is gone.
+    So is every head of an artifact whose comments live in the cloud, where
+    the local journal can't tell.
     """
     if not schedule_id or head is None:
         return False
@@ -574,6 +607,8 @@ def _refresh_replaces_head(
         head.id in (repair.base_revision_id, repair.revision_id)
         for repair in _actionable_repairs_for_path(folder, rel_path)
     ):
+        return False
+    if _comments_live_in_the_cloud(folder):
         return False
     return not _has_comment_on(folder, head.id)
 
