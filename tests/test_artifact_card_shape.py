@@ -6,17 +6,40 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from cowork.api.v1.endpoints import artifacts as ep
+from sqlmodel import Session, select
+
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
+from cowork.db.session import get_engine
+from cowork.models.conversation import Conversation
+from cowork.models.project import Project
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, format_responses_stream
 from cowork.services import artifacts as a
 from cowork.services.task_objects import cards_for_slugs
 from test_artifacts_api_tenancy import (  # noqa: F401  (fixtures)
-    ORG_A, _project_with_artifact, _published, _scoped, local_mode, org_mode, session,
+    ORG_A, _project_with_artifact, _published, _scoped, local_mode, org_mode,
 )
 from test_live_apps_sharing import _client, _duplicate, _share, people, stack  # noqa: F401
+
+
+@pytest.fixture
+def session(tmp_path):
+    """A session that removes the projects and chats the test created under ``tmp_path``."""
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as s:
+        yield s
+        s.rollback()
+        for row in s.exec(select(Project)).all():
+            if str(row.path).startswith(str(tmp_path)):
+                for chat in s.exec(select(Conversation).where(Conversation.project_id == row.id)).all():
+                    s.delete(chat)
+                s.delete(row)
+        s.commit()
+
 
 _HEAD = [
     "id", "slug", "title", "description", "type", "kind", "ext", "updated", "mtime", "live", "bg",
