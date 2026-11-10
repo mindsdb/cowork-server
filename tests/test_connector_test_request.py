@@ -566,7 +566,7 @@ class TestReviewFindings:
         assert SECRET not in output
 
     @pytest.mark.asyncio
-    async def test_a_single_record_beside_empty_lists_counts_as_one_item(self):
+    async def test_a_single_record_beside_empty_lists_has_no_item_count_and_previews_the_record(self):
         outcome, _ = await run(api=Api(data={"id": 7, "name": "Acme Ltd", "roles": []}))
         assert outcome.preview.item_count is None
         assert json.loads(outcome.preview.first_item)["name"] == "Acme Ltd"

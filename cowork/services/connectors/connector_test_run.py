@@ -657,10 +657,8 @@ async def run_test_request(
     except ConnectorTestError:
         raise
     except Exception as exc:
-        # One boundary rather than a list of exception types: whatever a
-        # library raises, the test ends with a reason. The structured log keeps
-        # the error's type and frames and drops its message, which can carry
-        # the URL with the member's values.
+        # Whatever a library raises, the test ends with a reason; the structured
+        # log keeps type and frames, never the message (it can hold the values).
         logger.exception("A connector test failed")
         raise ConnectorTestError("The connection test failed. Try again, or check the test request.") from exc
 
