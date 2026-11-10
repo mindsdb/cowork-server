@@ -225,11 +225,10 @@ values too, and they change only how its pod stops.
 
 `COWORK_BROWSER_ROUTER_URL` turns on the agent's browser for the web app: it
 names the browser router, served on the same host under `/browser`.
-`values-dev.yaml` and `values-staging.yaml` set it to their own host.
-`values-prod.yaml` sets none, so production offers no browser and makes no
-browser call; add the entry there only once the production router answers on
-`https://cowork.mindshub.ai/browser`, since until then that path reaches the
-web frontend. PR environments get theirs from where they are deployed.
+`values-dev.yaml`, `values-staging.yaml` and `values-prod.yaml` set it to
+their own host. The router must answer on that host's `/browser` path before
+the entry ships, since without it the path reaches the web frontend. PR
+environments get theirs from where they are deployed.
 `tests/test_chart_values.py` pins each value to its environment's host. What
 the router does with it is in the top-level README ("The agent's browser").
 
