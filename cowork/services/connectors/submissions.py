@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Sequence
 from typing import Any
+
+from cowork.schemas.connectors import ConnectorField
 
 
 class SubmissionStore:
@@ -19,6 +22,8 @@ class SubmissionStore:
         values: dict[str, Any],
         skipped: list[str] | None = None,
         form_spec: dict[str, Any] | None = None,
+        custom_spec: dict[str, Any] | None = None,
+        checked_against_stored_spec: bool | None = None,
     ) -> str:
         self._purge_expired()
         submission_id = "sub_" + uuid.uuid4().hex[:12]
@@ -30,6 +35,11 @@ class SubmissionStore:
             "values": dict(values or {}),
             "skipped": list(skipped or []),
             "form_spec": dict(form_spec) if form_spec else None,
+            # A custom connector's stored spec, resolved at submit time so the
+            # probe stream never reads the database while it runs.
+            "custom_spec": dict(custom_spec) if custom_spec else None,
+            # submit_form's decision, carried so the probe cannot reach another.
+            "checked_against_stored_spec": checked_against_stored_spec,
             "created_at": time.time(),
             "status": "received",
         }
@@ -55,3 +65,19 @@ class SubmissionStore:
 
 
 store = SubmissionStore()
+
+
+def missing_required_fields(
+    fields: Sequence[ConnectorField], values: dict[str, Any], skipped: Sequence[str]
+) -> list[str]:
+    """Names of the required fields a submission neither filled nor skipped.
+
+    Blank counts as missing: the form posts an untouched text input as "".
+    """
+    skipped_set = set(skipped)
+    return [
+        f.name for f in fields
+        if f.required
+        and f.name not in skipped_set
+        and (values.get(f.name) is None or str(values.get(f.name, "")).strip() == "")
+    ]

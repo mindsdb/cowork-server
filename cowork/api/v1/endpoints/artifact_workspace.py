@@ -7,29 +7,41 @@ import mimetypes
 import os
 import stat
 import time
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple
 from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from functools import partial
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
+from cowork.api.v1.content_disposition import attachment_disposition
+from cowork.api.v1.pinned_response import PinnedStreamingResponse
 from cowork.common.paths import (
     dir_lstat,
     open_pinned_child,
     read_bounded,
 )
-from cowork.api.v1.artifact_scope import review_artifact_for_request
+from cowork.api.v1.artifact_scope import (
+    ResolvedArtifact,
+    review_artifact_and_read,
+    review_artifact_for_request,
+)
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
-from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
+from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.draft_host.token import DRAFT_TTL_SECONDS, issue_draft_token
+from cowork.principal import Principal, get_principal
 from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
@@ -40,7 +52,13 @@ from cowork.services import artifact_files
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
+from cowork.schemas.artifact_access import (
+    ArtifactAccessRequest,
+    ArtifactAccessView,
+    access_refusal,
+)
 from cowork.schemas.base import CamelResponse
+from cowork.services.sharing_contract import AudienceField
 from cowork.services.artifact_export import (
     ExportRefusal,
     ExportRefused,
@@ -69,14 +87,19 @@ from cowork.services.artifact_revisions import (
     save_source,
 )
 
+if TYPE_CHECKING:
+    from cowork.services.artifact_access import ArtifactRule
+
 logger = logging.getLogger(__name__)
 
-# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# AuthenticatedInOrgMode, declared explicitly: a ScopedSession already fails
 # closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
 # whenever org mode has no org in scope. Declaring it too makes the
 # requirement visible to a route walker instead of something only
 # discoverable by reading scoped.py.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 _DRAFT_RESPONSE_HEADERS = {
     "Cache-Control": "private, no-store",
@@ -88,36 +111,6 @@ _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
 # walk refuses them there casefolded too, and the store-owned ones at any
 # depth (`artifact_files.refuse_housekeeping`).
 _PRIVATE_DRAFT_ENTRIES = NON_CONTENT_NAMES
-
-
-def _attachment_disposition(filename: str) -> str:
-    """``Content-Disposition`` for saving ``filename``, safe to put on the wire.
-
-    The name is a request-derived path component. ``relative_file_parts``
-    rejects NUL, separators and ``..``, but a quote, CR or LF still pass — and
-    any of them interpolated raw into a header is a header-injection vector
-    (``project_files.download_project_file`` has exactly that shape; ENG-2044).
-
-    Two spellings so every client gets a usable name: an ASCII ``filename=``
-    with quotes and backslashes escaped and non-printables dropped, and an
-    RFC 5987 ``filename*=UTF-8''…`` carrying the exact name percent-encoded,
-    which is what current browsers read first.
-    """
-    cleaned = "".join(ch for ch in filename if ch.isprintable())
-    ascii_name = cleaned.encode("ascii", "ignore").decode("ascii")
-    ascii_name = ascii_name.replace("\\", "\\\\").replace('"', '\\"').strip() or "download"
-    # A fully non-ASCII stem leaves only the extension(s) behind — "报告.xlsx"
-    # -> ".xlsx", "报告.tar.gz" -> ".tar.gz" — a HIDDEN dotfile on macOS/Linux.
-    # Prefix rather than rpartition: splitting on the last dot rescued only
-    # single-extension names (review pass 2 on #413). Distinct artifacts can
-    # still degrade to the same "download.xlsx" — acceptable, since the ASCII
-    # spelling is a fallback and `filename*` below carries the exact name.
-    if ascii_name.startswith("."):
-        ascii_name = "download" + ascii_name
-    return (
-        f'attachment; filename="{ascii_name}"; '
-        f"filename*=UTF-8''{quote(cleaned or 'download', safe='')}"
-    )
 
 
 def _artifact_folder_component(source, folder: Path) -> str:
@@ -252,10 +245,12 @@ def _draft_stream(
     size: int,
     media_type: str,
     *,
+    scope: TenantScope,
     extra_headers: dict[str, str] | None = None,
 ):
     """Stream at most *size* bytes from the pinned descriptor and close every
-    held handle.
+    held handle, reading and closing on the file store's threads in *scope*
+    (PinnedStreamingResponse).
 
     No ``Content-Length``: the agent may still be writing the file, and a
     length taken from ``fstat`` would then disagree with the bytes read, which
@@ -264,36 +259,13 @@ def _draft_stream(
     size at authorization) still bounds the body, so a file that keeps growing
     cannot keep the response open.
     """
-    def chunks():
-        try:
-            yield from read_bounded(fd, size)
-        finally:
-            resources.close()
-
-    return _PinnedDraftResponse(
-        chunks(),
+    return PinnedStreamingResponse(
+        read_bounded(fd, size),
         resources=resources,
+        scope=scope,
         media_type=media_type,
         headers={**_DRAFT_RESPONSE_HEADERS, **(extra_headers or {})},
     )
-
-
-class _PinnedDraftResponse(StreamingResponse):
-    """Always release draft descriptors, including before iteration starts."""
-
-    def __init__(self, *args, resources: ExitStack, **kwargs):
-        self._resources = resources
-        super().__init__(*args, **kwargs)
-
-    async def __call__(self, scope, receive, send) -> None:
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            # StreamingResponse does not run a BackgroundTask when the ASGI
-            # send callable raises before body iteration. This outer finally
-            # covers that disconnect path; ExitStack.close is idempotent with
-            # the generator's normal cleanup.
-            self._resources.close()
 
 
 def _draft_selectors(project_ref: str, artifact_id: str) -> tuple[str, str]:
@@ -366,24 +338,29 @@ def _draft_file_parts(rel_path: str, metadata: dict) -> tuple[str, ...]:
 
 
 def _draft_file_response(
-    source,
-    folder: Path,
-    parts: tuple[str, ...],
+    artifact: ResolvedArtifact,
+    rel_path: str,
     *,
+    scope: TenantScope,
     comments: bool,
     download: bool = False,
 ):
-    """Open the draft file at ``parts`` and answer with it.
+    """Check ``rel_path`` against the artifact the lookup found
+    (``_draft_file_parts``), then open the draft file there and answer with it.
 
-    Shared by the authenticated ``/drafts`` route and the draft host. HTML goes
-    out as the preview document unless ``download`` asks for the bytes; every
-    other file, and HTML that is not UTF-8, streams from the pinned descriptor.
-    Blocking, so callers run it in a worker thread.
+    Shared by the authenticated ``/drafts`` route and the draft host, which run
+    it as their lookup's own read (``review_artifact_and_read``): the checks
+    and the open share the lookup's file store call, and run only once the
+    lookup authorized the caller. HTML goes out as the preview document unless
+    ``download`` asks for the bytes; every other file, and HTML that is not
+    UTF-8, streams from the pinned descriptor, read on the file store's
+    threads in ``scope``.
     """
+    parts = _draft_file_parts(rel_path, artifact.metadata)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
     try:
         resources, fd, file_stat = artifact_files.open_pinned_draft_file(
-            source, folder, parts
+            artifact.source, artifact.folder, parts
         )
     except artifact_files.ArtifactFileRefused as exc:
         raise HTTPException(
@@ -397,18 +374,18 @@ def _draft_file_response(
                 resources.close()
                 return response
         extra = (
-            {"Content-Disposition": _attachment_disposition(parts[-1])}
+            {"Content-Disposition": attachment_disposition(parts[-1])}
             if download else None
         )
         return _draft_stream(
-            resources, fd, file_stat.st_size, media_type, extra_headers=extra,
+            resources, fd, file_stat.st_size, media_type, scope=scope, extra_headers=extra,
         )
     except BaseException:
         resources.close()
         raise
 
 
-def _artifact_id_from_path(artifact_id: UUID) -> str:
+async def _artifact_id_from_path(artifact_id: UUID) -> str:
     """The identity gate for every route in this file.
 
     Declaring the path parameter as a `UUID` makes FastAPI answer 422 before any
@@ -428,6 +405,13 @@ def _artifact_id_from_path(artifact_id: UUID) -> str:
 #: Path-validated artifact identity. Routes keep `{artifact_id}` in their path;
 #: the dependency claims that parameter and hands the handler a canonical id.
 ArtifactIdDep = Annotated[str, Depends(_artifact_id_from_path)]
+
+
+def _not_found_detail(exc: FileNotFoundError) -> str:
+    """A 404's detail. The service's own messages ("Revision not found") pass
+    through; an OS error carries the server's path, so it answers as a missing
+    artifact instead."""
+    return "Artifact not found" if exc.filename is not None else str(exc)
 
 
 class _SourceUpdateBody(BaseModel):
@@ -480,7 +464,7 @@ class _RepairReleaseBody(BaseModel):
     commentThreadId: str = Field(min_length=1, max_length=100)
 
 
-def _owner_workspace(session, project_ref: str, artifact_id: str):
+async def _owner_workspace(scope: TenantScope, project_ref: str, artifact_id: str):
     """Resolve one scoped artifact and enforce its source-mutation boundary.
 
     Resolution goes through the review path so a reviewer the owner granted
@@ -488,15 +472,17 @@ def _owner_workspace(session, project_ref: str, artifact_id: str):
     draft, and "not found" would read as deleted. Anything without a grant is
     still invisible — `review_artifact_for_request` raises 404 there.
     """
-    source, folder, metadata, _is_own = review_artifact_for_request(
-        session, project_ref, artifact_id
+    source, folder, metadata, _is_own = await review_artifact_for_request(
+        scope, project_ref, artifact_id
     )
-    capabilities = require_artifact_owner(session, source, folder.name)
+    capabilities = await run_db(
+        lambda unit: require_artifact_owner(unit, source, folder.name), scope=scope
+    )
     return source, folder, metadata, capabilities
 
 
 async def _sync_live_artifact(
-    session, folder: Path, *, project_id: str | None = None
+    scope: TenantScope, folder: Path, *, project_id: str | None = None
 ) -> bool | None:
     """Re-publish a live artifact after an editor write.
 
@@ -508,8 +494,10 @@ async def _sync_live_artifact(
     the artifact's modified state visible for a manual retry.
     """
     from cowork.services.publish import (
+        AccessModeChanged,
         PublishOwnedByOtherUser,
         PublishTooLarge,
+        ShareOrgRequired,
         desktop_publish_credential,
         publish_artifact,
         published_artifact_access,
@@ -517,7 +505,7 @@ async def _sync_live_artifact(
     from cowork.services.artifact_locks import release
 
     artifacts_base = folder.parent
-    if not await _acquire_live_publish_lock(folder):
+    if not await _acquire_live_publish_lock(folder, scope):
         logger.warning("Could not synchronize live artifact %s: publish lock busy", folder)
         return False
 
@@ -526,10 +514,17 @@ async def _sync_live_artifact(
     publish_started = False
     try:
         try:
-            access = await run_in_threadpool(
-                published_artifact_access,
-                folder,
-                artifacts_base=artifacts_base,
+            # In MindsHub mode who a restricted artifact is shared with is
+            # read from MindsHub's rule by the publish itself, and a
+            # failed read fails this sync rather than guessing.
+            access = await run_efs(
+                partial(
+                    published_artifact_access,
+                    folder,
+                    artifacts_base=artifacts_base,
+                    org_mode=scope.org_mode,
+                ),
+                scope=scope,
             )
         except FileNotFoundError:
             return None
@@ -537,9 +532,8 @@ async def _sync_live_artifact(
             logger.warning("Could not read live publish state for %s", folder, exc_info=True)
             return False
 
-        scope = getattr(session, "scope", None)
-        if scope is not None and getattr(scope, "org_mode", False):
-            artifacts_base, publish_url, key = _owner_publish_context(session, folder)
+        if scope.org_mode:
+            artifacts_base, publish_url, key = await run_on_unit_threads(partial(_owner_publish_context, scope, folder))
             api_key = await key.get()
             if not api_key:
                 logger.warning("Could not synchronize live artifact %s: no publish key", folder)
@@ -580,38 +574,49 @@ async def _sync_live_artifact(
         # Repeats on every save until the artifact shrinks, so no traceback.
         logger.warning("Could not synchronize live artifact %s: it is too large to publish", folder)
         return False
+    except (AccessModeChanged, ShareOrgRequired):
+        # publish_artifact logged the refusal: a mode changed after the
+        # owner's last save, or MindsHub refusing a share with everyone that
+        # an entry from before the rule changed still asks for. It repeats on
+        # every save until the owner saves the artifact's sharing again.
+        return False
     except Exception:
         logger.warning("Could not synchronize live artifact %s", folder, exc_info=True)
         return False
     finally:
         if not publish_abandoned:
-            await run_in_threadpool(release, folder.parent, folder.name)
+            # Waits for a slot: a lock left behind would block the next publish.
+            await run_efs(
+                partial(release, folder.parent, folder.name), scope=scope, deadline=False
+            )
         if key is not None and not publish_abandoned:
             await key.revoke()
 
 
-async def _acquire_live_publish_lock(folder: Path) -> bool:
+async def _acquire_live_publish_lock(folder: Path, scope: TenantScope) -> bool:
     from cowork.services.artifact_locks import acquire
 
     loop = asyncio.get_running_loop()
     lock_deadline = loop.time() + _LIVE_PUBLISH_TIMEOUT_S
-    while not await run_in_threadpool(
-        acquire,
-        folder.parent,
-        folder.name,
-        ttl_s=_LIVE_PUBLISH_LOCK_TTL_S,
-    ):
+    while True:
+        try:
+            if await run_efs(
+                partial(acquire, folder.parent, folder.name, ttl_s=_LIVE_PUBLISH_LOCK_TTL_S),
+                scope=scope,
+            ):
+                return True
+        except FilesystemBusy:
+            pass  # a busy file store is a busy lock: wait and try again
         if loop.time() >= lock_deadline:
             return False
         await asyncio.sleep(0.1)
-    return True
 
 
-async def _current_capabilities(session, capabilities: dict) -> dict:
+async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
     if not capabilities["canEdit"]:
         return capabilities
-    can_edit = await has_product_permission(session.scope, "artifact.manage")
-    can_execute = await has_product_permission(session.scope, "product.execute")
+    can_edit = await has_product_permission(scope, "artifact.manage")
+    can_execute = await has_product_permission(scope, "product.execute")
     current = {
         **capabilities,
         "canEdit": can_edit,
@@ -624,13 +629,82 @@ async def _current_capabilities(session, capabilities: dict) -> dict:
     return current
 
 
+def _selected_source(source, folder: Path, metadata: dict, requested: str | None) -> str | None:
+    """The source file a workspace read or write addresses: the request's own
+    path when it names an editable file, else the one the folder records."""
+    selected = _editable_source_selector(source, folder, requested)
+    if selected is None:
+        selected = _recorded_source_selector(source, folder, metadata)
+    return selected
+
+
+class _WorkspaceState(NamedTuple):
+    """What the workspace GET reads from the folder."""
+
+    # The source and its revision.
+    result: dict
+    # The agent repair in progress on that source, if any.
+    repair: dict | None
+    export_source: ExportSource
+
+
+def _workspace_state(
+    source,
+    folder: Path,
+    metadata: dict,
+    artifact_id: str,
+    requested: str | None,
+    *,
+    with_export: bool,
+) -> _WorkspaceState:
+    """What the workspace GET returns from the folder, in one file store hop:
+    the source the request addresses and its revision, the repair in
+    progress, and the export source."""
+    selected = _selected_source(source, folder, metadata, requested)
+    result = current_workspace(folder, metadata, artifact_id, selected)
+    repair = active_agent_repair(folder, result.get("path"))
+    export_source = (
+        primary_export_source(folder=folder, metadata=metadata)
+        if with_export
+        else ExportSource(source_name="", is_backend=False)
+    )
+    return _WorkspaceState(result, repair, export_source)
+
+
+def _save_selected_source(
+    source,
+    folder: Path,
+    metadata: dict,
+    artifact_id: str,
+    requested: str | None,
+    *,
+    content: str,
+    expected_revision_id: str,
+    actor_id: str | None,
+    summary: str,
+) -> dict:
+    """A manual edit's file store work, in one hop: the source the request
+    addresses, then the save."""
+    return save_source(
+        folder,
+        metadata,
+        artifact_id,
+        content=content,
+        expected_revision_id=expected_revision_id,
+        rel_path=_selected_source(source, folder, metadata, requested),
+        actor_kind="manual",
+        actor_id=actor_id,
+        summary=summary,
+    )
+
+
 @router.get("/workspace/{project_ref}/{artifact_id}")
 async def artifact_source(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    # Spell out the dependency so SAST does not treat the server-created
-    # session (and the artifact roots it discovers) as an HTTP parameter.
-    session: ScopedSession = Depends(get_scoped_session),
+    # Spell out the dependency so SAST does not treat the server-derived
+    # scope (and the artifact roots it discovers) as an HTTP parameter.
+    scope: TenantScope = Depends(get_tenant_scope),
     path: str | None = Query(default=None, max_length=1000),
 ):
     """Authenticated source + revision token for Desktop and Cowork SaaS.
@@ -639,33 +713,25 @@ async def artifact_source(
     ``exportFormats``, which read the artifact's primary file, once the folder
     is resolved, through the helper ``artifact_capabilities`` adds it with.
     """
-    source, folder, metadata, owner_capabilities = _owner_workspace(
-        session, project_ref, artifact_id
+    source, folder, metadata, owner_capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
-    selected = await run_in_threadpool(_editable_source_selector, source, folder, path)
-    if selected is None:
-        selected = await run_in_threadpool(
-            _recorded_source_selector, source, folder, metadata
-        )
+    # No format is offered whatever the folder holds while org export is off,
+    # so the walk that finds the primary is skipped, and the source names none.
+    with_export = not org_export_refused(org_mode=bool(scope.org_mode))
     try:
-        result = await run_in_threadpool(
-            current_workspace, folder, metadata, artifact_id, selected
+        result, repair, export_source = await run_efs(
+            partial(
+                _workspace_state, source, folder, metadata, artifact_id, path, with_export=with_export
+            ),
+            scope=scope,
         )
-        repair = await run_in_threadpool(active_agent_repair, folder, result.get("path"))
-        if org_export_refused(org_mode=bool(session.scope.org_mode)):
-            # No format is offered whatever the folder holds, so the walk that
-            # finds the primary is skipped, and the source names none.
-            export_source = ExportSource(source_name="", is_backend=False)
-        else:
-            export_source = await run_in_threadpool(
-                primary_export_source, folder=folder, metadata=metadata
-            )
         capabilities = await _current_capabilities(
-            session, with_export_formats(session, owner_capabilities, export_source)
+            scope, with_export_formats(scope, owner_capabilities, export_source)
         )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -675,35 +741,32 @@ async def update_artifact_source(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     body: _SourceUpdateBody,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
     """Optimistic, atomic manual edit. A stale tab receives 409, never overwrite."""
-    await require_product_permission(session.scope, "artifact.manage")
-    source, folder, metadata, _capabilities = _owner_workspace(
-        session, project_ref, artifact_id
+    await require_product_permission(scope, "artifact.manage")
+    source, folder, metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
-    scope = getattr(session, "scope", None)
     actor_id = str(scope.user_id) if scope and scope.user_id else None
-    selected = await run_in_threadpool(_editable_source_selector, source, folder, body.path)
-    if selected is None:
-        selected = await run_in_threadpool(
-            _recorded_source_selector, source, folder, metadata
-        )
     try:
-        saved = await run_in_threadpool(
-            save_source,
-            folder,
-            metadata,
-            artifact_id,
-            content=body.content,
-            expected_revision_id=body.expectedRevisionId,
-            rel_path=selected,
-            actor_kind="manual",
-            actor_id=actor_id,
-            summary=body.summary,
+        saved = await run_efs(
+            partial(
+                _save_selected_source,
+                source,
+                folder,
+                metadata,
+                artifact_id,
+                body.path,
+                content=body.content,
+                expected_revision_id=body.expectedRevisionId,
+                actor_id=actor_id,
+                summary=body.summary,
+            ),
+            scope=scope,
         )
         if saved["revision"]["id"] != body.expectedRevisionId:
-            await _sync_live_artifact(session, folder, project_id=source.project_id)
+            await _sync_live_artifact(scope, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
         raise HTTPException(
@@ -711,7 +774,7 @@ async def update_artifact_source(
             detail={"message": str(exc), "currentRevision": exc.current},
         ) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except (RevisionValidationError, TimeoutError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -737,7 +800,7 @@ async def export_workspace_artifact(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     body: ExportRequest,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ) -> ExportResult:
     """Export the artifact's primary file as a new HTML, Word or PDF file beside it.
 
@@ -750,26 +813,29 @@ async def export_workspace_artifact(
     that doesn't come back answers the render client's status, and only a
     200 leaves a file behind.
     """
-    await require_product_permission(session.scope, "artifact.manage")
-    source, folder, metadata, capabilities = _owner_workspace(
-        session, project_ref, artifact_id
+    await require_product_permission(scope, "artifact.manage")
+    source, folder, metadata, capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
-    if org_export_refused(org_mode=bool(session.scope.org_mode)):
+    if org_export_refused(org_mode=bool(scope.org_mode)):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Export isn't available on this deployment.",
         )
     folder_name = _artifact_folder_component(source, folder)
     try:
-        async with export_slot(scope=session.scope, export_format=body.format):
-            return await run_in_threadpool(
-                export_primary_file,
-                source=source,
-                folder_name=folder_name,
-                metadata=metadata,
-                artifact_id=artifact_id,
-                export_format=body.format,
-                can_edit=bool(capabilities.get("canEdit")),
+        async with export_slot(scope=scope, export_format=body.format):
+            return await run_efs(
+                partial(
+                    export_primary_file,
+                    source=source,
+                    folder_name=folder_name,
+                    metadata=metadata,
+                    artifact_id=artifact_id,
+                    export_format=body.format,
+                    can_edit=bool(capabilities.get("canEdit")),
+                ),
+                scope=scope,
             )
     except ExportRefused as exc:
         raise HTTPException(
@@ -781,6 +847,8 @@ async def export_workspace_artifact(
         raise HTTPException(
             status_code=exc.status, detail=_PDF_FAILURE_DETAIL[exc.status]
         ) from exc
+    except FilesystemBusy:
+        raise  # 503 with Retry-After (cowork.server), not a failed export
     except Exception as exc:
         logger.warning(
             "Artifact export to %s failed for %s", body.format, artifact_id, exc_info=True
@@ -794,22 +862,32 @@ async def export_workspace_artifact(
 async def artifact_revisions(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
     path: str | None = Query(default=None, max_length=1000),
 ):
-    _source, folder, _metadata, _capabilities = _owner_workspace(
-        session, project_ref, artifact_id
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
-    return {"revisions": await run_in_threadpool(list_revisions, folder, rel_path=path)}
+    return {"revisions": await run_efs(partial(list_revisions, folder, rel_path=path), scope=scope)}
+
+
+def _current_revision(folder: Path, metadata: dict, artifact_id: str) -> dict | None:
+    """The revision comments anchor to, or None for an artifact with no
+    editable source."""
+    try:
+        return current_source(folder, metadata, artifact_id).get("revision")
+    except (FileNotFoundError, OSError, ValueError, TimeoutError):
+        # Binary/oversized artifacts still support general review comments.
+        return None
 
 
 @router.get("/workspace/{project_ref}/{artifact_id}/review")
 async def artifact_review_entry(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    # Spell out the dependency so SAST does not treat the server-created
-    # session (and the artifact roots it discovers) as an HTTP parameter.
-    session: ScopedSession = Depends(get_scoped_session),
+    # Spell out the dependency so SAST does not treat the server-derived
+    # scope (and the artifact roots it discovers) as an HTTP parameter.
+    scope: TenantScope = Depends(get_tenant_scope),
 ):
     """What a reviewer needs to comment, and nothing that reveals the source.
 
@@ -821,19 +899,21 @@ async def artifact_review_entry(
     """
     from cowork.services.artifact_identity import artifact_key
 
-    source, folder, metadata, _is_own = review_artifact_for_request(
-        session, project_ref, artifact_id
+    # The revision is what a reviewer may see, so it is read in the lookup's
+    # own file store call.
+    artifact, current_revision = await review_artifact_and_read(
+        scope,
+        project_ref,
+        artifact_id,
+        read=lambda found: _current_revision(found.folder, found.metadata, artifact_id),
     )
     capabilities = await _current_capabilities(
-        session, artifact_capabilities(session, source, folder.name)
+        scope,
+        await run_db(
+            lambda unit: artifact_capabilities(unit, artifact.source, artifact.folder.name),
+            scope=scope,
+        ),
     )
-    current_revision = None
-    try:
-        draft = await run_in_threadpool(current_source, folder, metadata, artifact_id)
-        current_revision = draft.get("revision")
-    except (FileNotFoundError, OSError, ValueError, TimeoutError):
-        # Binary/oversized artifacts still support general review comments.
-        pass
     return {
         "artifactKey": artifact_key(artifact_id),
         "capabilities": capabilities,
@@ -842,19 +922,231 @@ async def artifact_review_entry(
 
 
 class _AccessBody(BaseModel):
-    """The access selection, in `anton.publish_access.resolve_access` shape.
+    """The Share dialog's save: ``access``, an ArtifactAccessRequest. A body
+    that isn't one answers 400 with a sentence saying what is wrong
+    (_AccessSaveRoute).
 
-    Passed through rather than re-modelled per mode: the publisher owns the
-    schema (`{"mode": "public"}`, `{"mode": "password", "password": ...}`,
-    `{"mode": "restricted", "emails": [...], "org_allowed": bool,
-    "owner_only": bool}`) and validates it, so a second definition here could
-    only drift away from it.
+    A restricted audience goes by MindsHub's artifact rule names:
+    ``org_allowed``, ``allowed_emails`` (people outside the org, by address),
+    and in MindsHub mode ``allowed_team_ids`` and ``allowed_user_ids`` (user
+    ids of people in the org), which this server writes to MindsHub itself
+    (cowork.services.artifact_audience.sync_team_audience). In MindsHub mode a
+    field a restricted save leaves out keeps what MindsHub's rule holds. A
+    top-level ``emails`` is a 400 saying to send ``allowed_emails``. Teams or
+    people alone keep the rule restricted to them, never public. ``notify:
+    {user_ids, emails}`` names the people this save added and chose to tell;
+    MindsHub emails them. It applies to this save only and is never stored.
     """
 
-    access: dict
+    access: ArtifactAccessRequest
 
 
-def _owner_publish_context(session, folder: Path):
+# Where the save's access object sits in a validation error's location.
+_ACCESS_IN_BODY = ("body", "access")
+ACCESS_BODY_REFUSAL = "Send the access to save as an object under access."
+
+
+def _access_save_refusal(errors: Sequence[Any]) -> str | None:
+    """The 400 sentence for an access save FastAPI couldn't read, from its
+    validation ``errors``: access_refusal for errors inside ``access``,
+    named from inside it, and ACCESS_BODY_REFUSAL for a body with no access
+    object at all. None when an error isn't the body's, such as a path
+    parameter's, which keeps FastAPI's own answer."""
+    if not errors or any(tuple(error["loc"][:1]) != _ACCESS_IN_BODY[:1] for error in errors):
+        return None
+    if any(tuple(error["loc"][:2]) != _ACCESS_IN_BODY for error in errors):
+        return ACCESS_BODY_REFUSAL
+    return access_refusal({**error, "loc": tuple(error["loc"][2:])} for error in errors)
+
+
+class _AccessSaveRoute(APIRoute):
+    """PUT .../access: a body that isn't a save answers 400 with a sentence
+    saying what is wrong with it (_access_save_refusal), which the Share
+    dialog shows as it is, never FastAPI's 422 with a list of errors."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def route_handler(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except RequestValidationError as exc:
+                refusal = _access_save_refusal(exc.errors())
+                if refusal is None:
+                    raise
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=refusal) from None
+
+        return route_handler
+
+
+OWN_EMAIL_REFUSAL = "Your own email address can't be added: you can always open your own artifact."
+
+
+class CheckedAccess(NamedTuple):
+    """A save's access after _checked_team_audience, and the artifact's
+    rule it was checked against: None when the check didn't read it."""
+
+    access: ArtifactAccessRequest
+    stored: ArtifactRule | None = None
+
+
+async def _checked_team_audience(
+    access: ArtifactAccessRequest,
+    *,
+    request: Request,
+    scope: TenantScope,
+    principal: Principal | None,
+    stored_rule: Callable[[], Awaitable[ArtifactRule]],
+) -> CheckedAccess:
+    """``access``, a restricted save of the share dialog, checked against the
+    caller and against the artifact's rule as MindsHub stores it
+    (``stored_rule``, read only when the save names teams, people or the org
+    flag), the one record of who the artifact is shared with. What the
+    artifact's .published.json says decides nothing: an agent can write it.
+    The rule it read comes back with the access, so the publish plans
+    against the same rule (publish_artifact's ``stored``).
+
+    - The caller's own address among the emails is a 400.
+    - Teams and people are normalized, at most MAX_TEAMS_PER_RULE and
+      MAX_PEOPLE_PER_RULE each (400), before anything is published.
+    - The org's default team is never sent: naming it sets ``org_allowed``
+      (skill_sharing.default_team_as_org). While the caller's teams can't be
+      read the default team can't be told apart, so a save that adds a team
+      is a 503 ``mindshub_unreachable``, an admin's included.
+    - ``org_allowed`` the stored rule doesn't have takes
+      ``artifacts.share_org``: without it the save is refused with
+      ShareOrgRequired (403). An owner without it can still save an
+      artifact already shared with everyone.
+    - A team the stored rule doesn't have must be one the caller belongs to
+      (400), by the caller's teams read now, past the cache
+      (mindshub_teams.read_mindshub_teams_now): a team deleted since the
+      cached read is refused here, before anything is published, never by
+      MindsHub after the upload (503 while they can't be read, 429 while
+      MindsHub throttles the caller). An org admin may name any team of the
+      organization: one they aren't in is checked against the organization's
+      teams, read now (mindshub_teams.org_team_ids), and one that isn't the
+      organization's is a 400 before anything is published (503 while they
+      can't be read). A team the rule has is kept unchecked: MindsHub drops a
+      deleted team's id from every rule itself.
+    - When the save changes the people, each one it names is asked about in
+      one batched org-member lookup (503 while it can't be asked). One the
+      stored rule doesn't have must be a member (400 naming them). One it
+      has who has left the org is dropped: MindsHub keeps a departed person's
+      id on the rule and refuses it on the next write.
+
+    The caller's teams and permissions, and the org's members, are read with
+    the Authorization the gateway validated (cowork.principal.caller_bearer).
+    ``principal`` is the route's get_principal dependency, so an override of
+    it applies here too.
+
+    Outside MindsHub mode, and for a save that isn't restricted, ``access``
+    is returned as it is: there are no teams or org members there, and
+    artifact_audience.for_publisher keeps a rule that names them
+    restricted to its owner."""
+    from cowork.principal import caller_bearer
+    from cowork.services.artifact_access import FOREIGN_TEAM_REFUSAL, NOT_A_MEMBER_REFUSAL
+    from cowork.services.mindshub_client import (
+        PERMISSIONS_UNREACHABLE,
+        TEAMS_UNREACHABLE,
+        MindsHubUnreachable,
+    )
+    from cowork.services.mindshub_teams import org_team_ids, read_mindshub_teams_now
+    from cowork.services.publish import ShareOrgRequired
+    from cowork.services.skill_sharing import (
+        default_team_as_org,
+        get_org_member_lookup,
+        members_checked,
+        normalize_team_ids,
+        normalize_user_ids,
+        resolve_skill_viewer,
+    )
+
+    if not scope.org_mode or not access.restricted:
+        return CheckedAccess(access)
+    own_email = (principal.email if principal is not None else "").strip().lower()
+    if own_email and own_email in {e.strip().lower() for e in access.allowed_emails or []}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=OWN_EMAIL_REFUSAL)
+    try:
+        team_ids = list(normalize_team_ids(access.allowed_team_ids or [], subject="an artifact"))
+        user_ids = list(normalize_user_ids(access.allowed_user_ids or [], subject="an artifact"))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    org_allowed = access.org_allowed
+    rule: ArtifactRule | None = None
+    if team_ids or user_ids or org_allowed:
+        rule = await stored_rule()
+        if team_ids or (org_allowed and not rule.org_allowed):
+            viewer = await resolve_skill_viewer(
+                scope=scope, principal=principal, bearer_token=caller_bearer(request)
+            )
+            # The org's default team has everyone in the org as members:
+            # naming it is "Everyone at <org>", which is org_allowed.
+            teams = default_team_as_org(team_ids, viewer.default_team_id)
+            team_ids = list(teams.team_ids)
+            if teams.named_default:
+                org_allowed = True
+            added = [t for t in team_ids if t not in rule.allowed_team_ids]
+            if added and not viewer.teams_known:
+                # Without the caller's teams the default team can't be told
+                # apart, and MindsHub is never sent it.
+                raise MindsHubUnreachable(TEAMS_UNREACHABLE)
+            if org_allowed and not rule.org_allowed and not viewer.can_share_artifacts_org:
+                if not viewer.permissions_known:
+                    raise MindsHubUnreachable(PERMISSIONS_UNREACHABLE)
+                raise ShareOrgRequired()
+            outside: list[str] = []
+            if added:
+                # The caller's teams read now: one deleted since the cached
+                # read would pass here and be refused by MindsHub only after
+                # the upload had made the save's emails and org flag live.
+                current = await read_mindshub_teams_now(
+                    bearer_token=caller_bearer(request),
+                    org_id=scope.org_id or "",
+                    user_id=scope.user_id or "",
+                )
+                if not current.reachable:
+                    raise MindsHubUnreachable(TEAMS_UNREACHABLE)
+                outside = [t for t in added if t not in current.team_ids]
+            if outside and not viewer.is_admin:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"You can only share with teams you belong to: {', '.join(outside)}.",
+                )
+            if outside:
+                # An admin's team they aren't in. Checked before the publish:
+                # MindsHub would refuse it only after the lambda had already
+                # made the save's emails and org flag live.
+                org_teams = await org_team_ids(bearer_token=caller_bearer(request))
+                if org_teams is None:
+                    raise MindsHubUnreachable(TEAMS_UNREACHABLE)
+                foreign = [t for t in outside if t not in org_teams]
+                if foreign:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"{FOREIGN_TEAM_REFUSAL}: {', '.join(foreign)}",
+                    )
+        stored_people = {u.lower() for u in rule.allowed_user_ids}
+        if user_ids and set(user_ids) != stored_people:
+            me = (scope.user_id or "").lower()
+            asked = [u for u in user_ids if u != me]
+            members = await members_checked(
+                await get_org_member_lookup(request),
+                added=[u for u in asked if u not in stored_people],
+                kept=[u for u in asked if u in stored_people],
+                refusal=NOT_A_MEMBER_REFUSAL,
+            )
+            user_ids = [u for u in user_ids if u == me or u in members]
+    checked = access.model_copy(
+        update={
+            AudienceField.ORG_ALLOWED.value: org_allowed,
+            AudienceField.ALLOWED_TEAM_IDS.value: team_ids if access.allowed_team_ids is not None else None,
+            AudienceField.ALLOWED_USER_IDS.value: user_ids if access.allowed_user_ids is not None else None,
+        }
+    )
+    return CheckedAccess(checked, rule)
+
+
+def _owner_publish_context(scope: TenantScope, folder: Path):
     """The (artifacts_base, publish_url, key) an org-mode publish needs.
 
     The same three `autopublish_project_artifacts` resolves, and deliberately
@@ -866,7 +1158,6 @@ def _owner_publish_context(session, folder: Path):
     from cowork.services.artifact_autopublish import _active_workspace_id, _publish_url
     from cowork.services.artifact_publish_key import PublishKey
 
-    scope = session.scope
     return (
         folder.parent,
         _publish_url(scope),
@@ -884,38 +1175,105 @@ def _artifact_primary(folder: Path, metadata: dict | None):
     return _pick_primary(folder, _user_files(folder), primary_hint=(metadata or {}).get("primary"))
 
 
-@router.get("/workspace/{project_ref}/{artifact_id}/access")
-async def artifact_access(
-    project_ref: str,
-    artifact_id: ArtifactIdDep,
-    session: ScopedSessionDep,
-):
-    """The owner's full access state for the Share control.
+def _access_state(folder: Path, metadata: dict) -> ArtifactAccessView:
+    """The access state of the folder's primary file, in one file store hop;
+    404 when the folder has no publishable file."""
+    from cowork.services.artifacts import published_access_view
 
-    Owner-only, and that is the point. The artifact CARD drops `accessEmails`
-    and `accessPassword` in org mode because one artifacts root is shared by the
-    whole organization, so the card cannot tell owner from co-member. This route
-    can: `_owner_workspace` refuses anyone else, so the owner gets back what they
-    need to pre-fill the dialog without widening what a card exposes.
-    """
-    from cowork.services.artifacts import _published_access_for
-
-    _source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
-    primary = await run_in_threadpool(_artifact_primary, folder, metadata)
+    primary = _artifact_primary(folder, metadata)
     if primary is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This artifact has no publishable file.",
         )
-    return await run_in_threadpool(_published_access_for, folder, primary)
+    return published_access_view(folder, primary)
 
 
-@router.put("/workspace/{project_ref}/{artifact_id}/access")
+class _AccessRead(NamedTuple):
+    """What artifact_access reads from the file store in its one hop: the
+    primary file's access state, and in MindsHub mode the keys the artifact's
+    rule is read under, which only MindsHub then answers."""
+
+    state: ArtifactAccessView
+    rule_keys: list[str]
+
+
+def _access_read(
+    folder: Path, metadata: dict, *, scope: TenantScope, project_id: str | None
+) -> _AccessRead:
+    """_access_state, and in MindsHub mode the rule's keys: those
+    stored_artifact_rule reads for a restricted entry, else those
+    rule_held_over_entry reads (cowork.services.publish)."""
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.publish import held_rule_keys_over_entry, stored_rule_keys
+
+    state = _access_state(folder, metadata)
+    if not scope.org_mode:
+        return _AccessRead(state, [])
+    rule_keys = stored_rule_keys if state.access_mode is AccessMode.RESTRICTED else held_rule_keys_over_entry
+    return _AccessRead(
+        state, rule_keys(folder, artifacts_base=folder.parent, scope=scope, project_id=project_id)
+    )
+
+
+@router.get("/workspace/{project_ref}/{artifact_id}/access", response_model=ArtifactAccessView)
+async def artifact_access(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    scope: ScopeDep,
+) -> ArtifactAccessView:
+    """The owner's full access state for the Share control.
+
+    Owner-only, and that is the point. The artifact CARD drops `accessEmails`
+    and `accessPassword` in MindsHub mode because one artifacts root is shared
+    by everyone in the organization, so the card cannot tell owner from
+    co-member. This route can: `_owner_workspace` refuses anyone else, so the
+    owner gets back what they need to pre-fill the dialog without widening
+    what a card exposes.
+
+    In MindsHub mode who a restricted artifact is shared with comes from its
+    rule as MindsHub stores it, the one record of it
+    (cowork.services.publish.stored_artifact_rule): 503 while it can't be
+    read, 409 when MindsHub refuses the read. The pod can write
+    .published.json, so an entry that isn't restricted is checked too: when
+    MindsHub still holds a rule for the artifact
+    (cowork.services.publish.rule_held_over_entry, the check a re-publish
+    makes before it goes ahead), the artifact is restricted to that rule's
+    audience, which is what this answers. The rule's keys are read from the
+    file store with the access state, in one call on its threads (run_efs),
+    and MindsHub is asked on one of anyio's default threads.
+    """
+    from cowork.models.artifact_owner_choice import AccessMode
+    from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
+    from cowork.services.publish import held_rule_under, stored_rule_under
+
+    source, folder, metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    try:
+        state, keys = await run_efs(
+            partial(_access_read, folder, metadata, scope=scope, project_id=source.project_id), scope=scope
+        )
+        if not scope.org_mode:
+            return state
+        rule_under: Callable[[list[str], TenantScope], ArtifactRule | None] = (
+            stored_rule_under if state.access_mode is AccessMode.RESTRICTED else held_rule_under
+        )
+        rule = await run_in_threadpool(rule_under, keys, scope)
+    except ArtifactAccessUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ArtifactAccessRefused as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return state if rule is None else state.restricted_to(rule)
+
+
 async def set_artifact_access(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     body: _AccessBody,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
+    request: Request,
+    principal: Principal | None = Depends(get_principal),
 ):
     """Re-publish this artifact with a new audience. Owner-only.
 
@@ -924,18 +1282,42 @@ async def set_artifact_access(
     shared URL survives the change. This is the same call autopublish makes on
     every turn, with the owner's selection in place of the first-publish default.
     """
-    await require_product_permission(session.scope, "artifact.manage")
-    from cowork.services.publish import PublishRejected, PublisherUnavailable
+    await require_product_permission(scope, "artifact.manage")
+    from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired
     from cowork.services.publish import publish_artifact as _publish_bundle
-    from cowork.services.artifact_access import ArtifactAccessUnavailable
+    from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
 
-    source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
-    if _artifact_primary(folder, metadata) is None:
+    source, folder, metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    if await run_efs(partial(_artifact_primary, folder, metadata), scope=scope) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This artifact has no publishable file.",
         )
-    if not await _acquire_live_publish_lock(folder):
+    from cowork.services.artifact_audience import share_notify
+    from cowork.services.publish import stored_rule_keys, stored_rule_under
+
+    # "Notify people" belongs to this save alone: read here and passed on its
+    # own, so it is never stored with the access a later re-publish reads.
+    access = body.access
+    try:
+        notify = share_notify(access.notify)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    async def stored_rule() -> ArtifactRule:
+        # The keys from the file store on its threads, then MindsHub on a
+        # default thread, as artifact_access reads the rule.
+        keys = await run_efs(
+            partial(
+                stored_rule_keys, folder, artifacts_base=folder.parent, scope=scope, project_id=source.project_id
+            ),
+            scope=scope,
+        )
+        return await run_in_threadpool(stored_rule_under, keys, scope)
+
+    if not await _acquire_live_publish_lock(folder, scope):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Publishing is busy right now. Try again in a moment.",
@@ -946,7 +1328,13 @@ async def set_artifact_access(
     publish_abandoned = False
     publish_started = False
     try:
-        artifacts_base, publish_url, key = _owner_publish_context(session, folder)
+        # Checked under the lock, so no other publish of this artifact writes
+        # its rule between the check's read and this publish, which plans
+        # against the rule the check read rather than reading it again.
+        checked = await _checked_team_audience(
+            access, request=request, scope=scope, principal=principal, stored_rule=stored_rule
+        )
+        artifacts_base, publish_url, key = await run_on_unit_threads(partial(_owner_publish_context, scope, folder))
         api_key = await key.get()
         if not api_key:
             raise HTTPException(
@@ -962,9 +1350,12 @@ async def set_artifact_access(
                     artifacts_base=artifacts_base,
                     api_key=api_key,
                     publish_url=publish_url,
-                    access=dict(body.access or {}),
-                    scope=session.scope,
+                    access=checked.access,
+                    scope=scope,
                     project_id=source.project_id,
+                    notify=notify or None,
+                    stored=checked.stored,
+                    owner_save=True,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -979,13 +1370,20 @@ async def set_artifact_access(
         raise
     except ArtifactAccessUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ArtifactAccessRefused as exc:
+        # Asking again gets the same answer, so never the retryable 503.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     # PublisherUnavailable and PublishRejected are RuntimeErrors, so they come first.
     except PublisherUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ShareOrgRequired as exc:
+        # This server's check or MindsHub refused the share with everyone, so
+        # nothing was published: a 403 the app can tell apart by its code.
+        return JSONResponse(exc.refusal().model_dump(), status_code=exc.status_code)
     except PublishRejected as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
     except (RuntimeError, OSError) as exc:
@@ -998,9 +1396,20 @@ async def set_artifact_access(
         ) from exc
     finally:
         if not publish_abandoned:
-            await run_in_threadpool(release, folder.parent, folder.name)
+            # Waits for a slot: a lock left behind would block the next publish.
+            await run_efs(
+                partial(release, folder.parent, folder.name), scope=scope, deadline=False
+            )
         if key is not None and not publish_abandoned:
             await key.revoke()
+
+
+router.add_api_route(
+    "/workspace/{project_ref}/{artifact_id}/access",
+    set_artifact_access,
+    methods=["PUT"],
+    route_class_override=_AccessSaveRoute,
+)
 
 
 class CommentsAccessResponse(CamelResponse):
@@ -1014,11 +1423,30 @@ class CommentsAccessResponse(CamelResponse):
     current_revision: dict[str, Any] | None
 
 
+def _open_comments(
+    folder: Path,
+    metadata: dict,
+    artifact_id: str,
+    *,
+    review_scope: TenantScope | None,
+) -> dict | None:
+    """The comments-access file store work, in one hop: when ``review_scope``
+    is set, the marker that opens the draft to that scope's organization for
+    review, granted by its user; then the revision comments anchor to."""
+    from cowork.services.artifact_draft_review import enable_draft_review
+
+    if review_scope is not None:
+        enable_draft_review(
+            folder, org_id=str(review_scope.org_id), enabled_by=str(review_scope.user_id)
+        )
+    return _current_revision(folder, metadata, artifact_id)
+
+
 @router.post("/workspace/{project_ref}/{artifact_id}/comments-access")
 async def enable_artifact_comments(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ) -> CommentsAccessResponse:
     """Turn on draft comments for the artifact's owner.
 
@@ -1032,31 +1460,41 @@ async def enable_artifact_comments(
     only among the caller's artifacts roots, so the owner is the one person who
     reaches them.
     """
-    await require_product_permission(session.scope, "artifact.manage")
+    await require_product_permission(scope, "artifact.manage")
     from cowork.services.artifact_access import (
         ArtifactAccessUnavailable,
         provision_draft_review_access,
     )
-    from cowork.services.artifact_draft_review import enable_draft_review
     from cowork.services.artifact_authorization_identity import ensure_authorization_key
     from cowork.services.artifact_identity import artifact_key
+    from cowork.services.projects import path_in_comparison_sandbox
 
-    source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
-    capabilities = await _current_capabilities(session, capabilities)
-    if session.scope.org_mode:
+    source, folder, metadata, capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    # In org mode this opens the draft to the organization, and nothing leaves
+    # a model comparison until the user continues with a side.
+    if path_in_comparison_sandbox(folder):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Sharing is off while models are being compared. Continue with this side to share it.",
+        )
+    capabilities = await _current_capabilities(scope, capabilities)
+    review_scope = None
+    if scope.org_mode:
         # `_owner_workspace` already refused anyone but the owner, so the owner is
         # the caller; resolving it again would only repeat that query.
-        owner_user_id = str(session.scope.user_id) if session.scope.user_id else None
+        owner_user_id = str(scope.user_id) if scope.user_id else None
         try:
             canonical_key = await run_in_threadpool(
                 ensure_authorization_key,
                 artifact_id,
-                session.scope,
+                scope,
                 owner_user_id=owner_user_id,
             )
             await provision_draft_review_access(
                 canonical_key.split("/", 1)[1],
-                session.scope,
+                scope,
                 owner_user_id=owner_user_id,
             )
         except ArtifactAccessUnavailable as exc:
@@ -1064,25 +1502,18 @@ async def enable_artifact_comments(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=str(exc),
             ) from exc
-        # After the auth rule, never before: the marker is what reopens the folder
-        # to co-members on this server, and a rule-less grant would show a draft the
-        # comments service then refuses to talk about.
-        await run_in_threadpool(
-            enable_draft_review,
-            folder,
-            org_id=str(session.scope.org_id),
-            enabled_by=str(session.scope.user_id),
-        )
+        # The review marker is written below, after the auth rule, never before:
+        # the marker is what reopens the folder to co-members on this server, and
+        # a rule-less grant would show a draft the comments service then refuses
+        # to talk about.
+        review_scope = scope
         comments_scope = "organization"
     else:
         comments_scope = "owner"
-    current_revision = None
-    try:
-        draft = await run_in_threadpool(current_source, folder, metadata, artifact_id)
-        current_revision = draft.get("revision")
-    except (FileNotFoundError, OSError, ValueError, TimeoutError):
-        # Binary/oversized artifacts still support general review comments.
-        pass
+    current_revision = await run_efs(
+        partial(_open_comments, folder, metadata, artifact_id, review_scope=review_scope),
+        scope=scope,
+    )
     return CommentsAccessResponse(
         # Workspace routes/cards keep the local id. The authenticated comments
         # proxy translates it through the same durable alias used to publish.
@@ -1098,17 +1529,42 @@ async def artifact_revision(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     revision_id: str,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
-    _source, folder, _metadata, _capabilities = _owner_workspace(
-        session, project_ref, artifact_id
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
     try:
-        return await run_in_threadpool(revision_with_content, folder, revision_id)
+        return await run_efs(partial(revision_with_content, folder, revision_id), scope=scope)
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _restore_revision(
+    folder: Path,
+    metadata: dict,
+    artifact_id: str,
+    revision_id: str,
+    *,
+    expected_revision_id: str,
+    actor_id: str | None,
+) -> dict:
+    """A restore's file store work, in one hop: the old revision's content,
+    then its save as the new head."""
+    restored = revision_with_content(folder, revision_id)
+    return save_source(
+        folder,
+        metadata,
+        artifact_id,
+        content=restored["content"],
+        expected_revision_id=expected_revision_id,
+        rel_path=restored["path"],
+        actor_kind="manual",
+        actor_id=actor_id,
+        summary=f"Restored revision {restored['number']}",
+    )
 
 
 @router.post("/workspace/{project_ref}/{artifact_id}/revisions/{revision_id}/restore")
@@ -1117,30 +1573,28 @@ async def restore_artifact_revision(
     artifact_id: ArtifactIdDep,
     revision_id: str,
     body: _RestoreBody,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
-    await require_product_permission(session.scope, "artifact.manage")
-    source, folder, metadata, _capabilities = _owner_workspace(
-        session, project_ref, artifact_id
+    await require_product_permission(scope, "artifact.manage")
+    source, folder, metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
     try:
-        restored = await run_in_threadpool(revision_with_content, folder, revision_id)
-        scope = getattr(session, "scope", None)
         actor_id = str(scope.user_id) if scope and scope.user_id else None
-        saved = await run_in_threadpool(
-            save_source,
-            folder,
-            metadata,
-            artifact_id,
-            content=restored["content"],
-            expected_revision_id=body.expectedRevisionId,
-            rel_path=restored["path"],
-            actor_kind="manual",
-            actor_id=actor_id,
-            summary=f"Restored revision {restored['number']}",
+        saved = await run_efs(
+            partial(
+                _restore_revision,
+                folder,
+                metadata,
+                artifact_id,
+                revision_id,
+                expected_revision_id=body.expectedRevisionId,
+                actor_id=actor_id,
+            ),
+            scope=scope,
         )
         if saved["revision"]["id"] != body.expectedRevisionId:
-            await _sync_live_artifact(session, folder, project_id=source.project_id)
+            await _sync_live_artifact(scope, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
         raise HTTPException(
@@ -1148,7 +1602,7 @@ async def restore_artifact_revision(
             detail={"message": str(exc), "currentRevision": exc.current},
         ) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except (RevisionValidationError, TimeoutError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1158,26 +1612,41 @@ async def request_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     body: _AgentRepairBody,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
-    await require_product_permission(session.scope, "artifact.manage")
-    await require_product_permission(session.scope, "product.execute")
-    _source, folder, metadata, _capabilities = _owner_workspace(
-        session, project_ref, artifact_id
+    await require_product_permission(scope, "artifact.manage")
+    await require_product_permission(scope, "product.execute")
+    _source, folder, metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    # Before the repair is queued, so the end of the conversation's turn
+    # checks this folder; a failed write queues nothing.
+    from cowork.services.queued_repairs import record_queued_repair, take_back_queued_repair
+
+    added_row = await run_db(
+        partial(record_queued_repair, conversation_id=body.conversationId, slug=folder.name), scope=scope
     )
     try:
-        return await run_in_threadpool(
-            create_agent_repair,
-            folder,
-            metadata,
-            artifact_id,
-            expected_revision_id=body.expectedRevisionId,
-            comment_thread_id=body.commentThreadId,
-            selector=body.selector,
-            thread=[entry.model_dump() for entry in body.thread],
-            conversation_id=str(body.conversationId),
-            preview_errors=body.previewErrors,
-        )
+        try:
+            return await run_efs(
+                partial(
+                    create_agent_repair,
+                    folder,
+                    metadata,
+                    artifact_id,
+                    expected_revision_id=body.expectedRevisionId,
+                    comment_thread_id=body.commentThreadId,
+                    selector=body.selector,
+                    thread=[entry.model_dump() for entry in body.thread],
+                    conversation_id=str(body.conversationId),
+                    preview_errors=body.previewErrors,
+                ),
+                scope=scope,
+            )
+        except (FilesystemBusy, RevisionConflict, RepairAlreadyPending, RevisionValidationError, TimeoutError):
+            # Refused before anything was queued.
+            await take_back_queued_repair(conversation_id=body.conversationId, row_id=added_row, scope=scope)
+            raise
     except RevisionConflict as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1201,15 +1670,15 @@ async def get_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     repair_id: str,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
-    _source, folder, _metadata, _capabilities = _owner_workspace(
-        session, project_ref, artifact_id
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
     try:
-        return await run_in_threadpool(agent_repair_detail, folder, repair_id)
+        return await run_efs(partial(agent_repair_detail, folder, repair_id), scope=scope)
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1219,7 +1688,7 @@ async def release_agent_repairs_for_comment(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     body: _RepairReleaseBody,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
     """Release the repairs waiting on a comment thread the owner resolved.
 
@@ -1227,17 +1696,20 @@ async def release_agent_repairs_for_comment(
     the comments route forwards to inference in org mode and carries no tenant
     scope, so only here can one call serve both desktop and cloud.
     """
-    await require_product_permission(session.scope, "artifact.manage")
-    _source, folder, _metadata, _capabilities = _owner_workspace(
-        session, project_ref, artifact_id
+    await require_product_permission(scope, "artifact.manage")
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
     try:
-        released = await run_in_threadpool(
-            release_repairs_for_comment, folder, body.commentThreadId
+        released = await run_efs(
+            partial(
+                release_repairs_for_comment, folder, body.commentThreadId,
+            ),
+            scope=scope,
         )
         return {"released": released}
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except (RevisionValidationError, TimeoutError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1247,23 +1719,26 @@ async def cancel_queued_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     repair_id: str,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
     body: _RepairCancelBody | None = None,
 ):
     """Release a queued repair, or discard a ready one the owner is done with."""
-    await require_product_permission(session.scope, "artifact.manage")
-    _source, folder, _metadata, _capabilities = _owner_workspace(
-        session, project_ref, artifact_id
+    await require_product_permission(scope, "artifact.manage")
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
     try:
-        return await run_in_threadpool(
-            cancel_agent_repair,
-            folder,
-            repair_id,
-            discard_ready=bool(body and body.discardReady),
+        return await run_efs(
+            partial(
+                cancel_agent_repair,
+                folder,
+                repair_id,
+                discard_ready=bool(body and body.discardReady),
+            ),
+            scope=scope,
         )
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1274,24 +1749,26 @@ async def decide_agent_repair(
     artifact_id: ArtifactIdDep,
     repair_id: str,
     body: _RepairDecisionBody,
-    session: ScopedSessionDep,
+    scope: ScopeDep,
 ):
-    await require_product_permission(session.scope, "artifact.manage")
-    _source, folder, metadata, _capabilities = _owner_workspace(
-        session, project_ref, artifact_id
+    await require_product_permission(scope, "artifact.manage")
+    _source, folder, metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
     )
     try:
-        scope = getattr(session, "scope", None)
         actor_id = str(scope.user_id) if scope and scope.user_id else None
-        return await run_in_threadpool(
-            finalize_agent_repair,
-            folder,
-            metadata,
-            artifact_id,
-            repair_id,
-            body.status,
-            actor_id=actor_id,
-            expected_head_revision_id=body.expectedHeadRevisionId,
+        return await run_efs(
+            partial(
+                finalize_agent_repair,
+                folder,
+                metadata,
+                artifact_id,
+                repair_id,
+                body.status,
+                actor_id=actor_id,
+                expected_head_revision_id=body.expectedHeadRevisionId,
+            ),
+            scope=scope,
         )
     except RevisionConflict as exc:
         raise HTTPException(
@@ -1299,7 +1776,7 @@ async def decide_agent_repair(
             detail={"message": str(exc), "currentRevision": exc.current},
         ) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
     except RevisionValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1320,19 +1797,14 @@ def _primary_rel_path(folder: Path, primary: Path | None) -> str:
         ) from exc
 
 
-def _draft_link_file_parts(
-    session: ScopedSession, project_selector: str, artifact_selector: str
-) -> tuple[str, ...]:
-    """Review access to the draft and name its primary file for the link.
+def _draft_link_file_parts(folder: Path, metadata: dict) -> tuple[str, ...]:
+    """Name the draft's primary file for the link.
 
-    Blocking (database, artifact-root discovery, path resolution), so the
-    endpoint runs it in a worker thread, as the draft host does.
+    Blocking (path resolution on the file store), so the endpoint runs it in
+    the lookup's file store thread.
     """
     from cowork.services.artifacts import _pick_primary
 
-    _source, folder, metadata, _is_own = review_artifact_for_request(
-        session, project_selector, artifact_selector
-    )
     hint = metadata.get("primary")
     # A recorded primary that resolves needs no walk of the artifact tree.
     primary = _pick_primary(folder, [], primary_hint=hint) if hint else None
@@ -1345,9 +1817,9 @@ def _draft_link_file_parts(
 async def create_draft_link(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    # Spell out the dependency so SAST does not treat the server-created
-    # session (and the artifact roots it discovers) as an HTTP parameter.
-    session: ScopedSession = Depends(get_scoped_session),
+    # Spell out the dependency so SAST does not treat the server-derived
+    # scope (and the artifact roots it discovers) as an HTTP parameter.
+    scope: TenantScope = Depends(get_tenant_scope),
 ):
     """A 30-minute signed link to this draft on the draft host.
 
@@ -1363,12 +1835,16 @@ async def create_draft_link(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Draft links are not available",
         )
-    scope = session.scope
     if not scope.user_id or not scope.org_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
     project_selector, artifact_selector = _draft_selectors(project_ref, artifact_id)
-    parts = await run_in_threadpool(
-        _draft_link_file_parts, session, project_selector, artifact_selector
+    # A reviewer may open the draft, so its primary file is named in the
+    # lookup's own file store call.
+    _artifact, parts = await review_artifact_and_read(
+        scope,
+        project_selector,
+        artifact_selector,
+        read=lambda found: _draft_link_file_parts(found.folder, found.metadata),
     )
     now = int(time.time())
     token = issue_draft_token(
@@ -1397,16 +1873,16 @@ async def serve_private_draft(
     artifact_id: ArtifactIdDep,
     rel_path: str,
     request: Request,
-    # Spell out the dependency so SAST does not treat the server-created
-    # session (and the artifact roots it discovers) as an HTTP parameter.
-    session: ScopedSession = Depends(get_scoped_session),
+    # Spell out the dependency so SAST does not treat the server-derived
+    # scope (and the artifact roots it discovers) as an HTTP parameter.
+    scope: TenantScope = Depends(get_tenant_scope),
     download: Annotated[bool, Query()] = False,
 ):
     """Authenticated draft preview with project/org containment and relative assets.
 
-    Open to a reviewer as well as the owner, but only through
-    `review_artifact_for_request`: a co-member's draft is reachable here solely
-    because its owner granted same-org review on that one artifact.
+    Open to a reviewer as well as the owner, but only through the review
+    lookup (`review_artifact_and_read`): a co-member's draft is reachable here
+    solely because its owner granted same-org review on that one artifact.
 
     ``?download=1`` returns the same bytes as an attachment (ENG-2044). On an
     org deployment this is the ONLY way to obtain a non-HTML artifact: the
@@ -1423,16 +1899,18 @@ async def serve_private_draft(
     bare ``request`` carries no query string of its own.
     """
     project_selector, artifact_selector = _draft_selectors(project_ref, artifact_id)
-    source, folder, metadata, _is_own = review_artifact_for_request(
-        session, project_selector, artifact_selector
+    # A reviewer may read every file of the draft, so the path checks and the
+    # open run in the lookup's own file store call.
+    _artifact, response = await review_artifact_and_read(
+        scope,
+        project_selector,
+        artifact_selector,
+        read=partial(
+            _draft_file_response,
+            rel_path=rel_path,
+            scope=scope,
+            comments=wants_comment_layer(request),
+            download=download or wants_download(request),
+        ),
     )
-    parts = _draft_file_parts(rel_path, metadata)
-
-    return await run_in_threadpool(
-        _draft_file_response,
-        source,
-        folder,
-        parts,
-        comments=wants_comment_layer(request),
-        download=download or wants_download(request),
-    )
+    return response

@@ -706,14 +706,6 @@ class MemoryService:
         # Org mode → per-(org, user); the store keys itself (see GlobalMemoryStore).
         self._global_store = GlobalMemoryStore(scope=session.scope)
 
-    async def get_memory(
-        self,
-        scope: MemoryScope,
-        category: MemorySlot,
-        project_id: UUID | None = None,
-    ) -> MemoryResponse:
-        return self.get_memory_sync(scope, category, project_id)
-
     def get_memory_sync(
         self,
         scope: MemoryScope,
@@ -732,15 +724,6 @@ class MemoryService:
             read_verified=state.readable,
         )
 
-    async def update_memory(
-        self,
-        scope: MemoryScope,
-        category: MemorySlot,
-        content: str,
-        project_id: UUID | None = None,
-    ) -> MemoryResponse:
-        return self.update_memory_sync(scope, category, content, project_id)
-
     def update_memory_sync(
         self,
         scope: MemoryScope,
@@ -753,14 +736,6 @@ class MemoryService:
         self._refuse_while_memory_off(refused="Changing it is refused.")
         self._write(scope, category, content, project_id)
         return self._response(scope, category, content, project_id)
-
-    async def delete_memory(
-        self,
-        scope: MemoryScope,
-        category: MemorySlot,
-        project_id: UUID | None = None,
-    ) -> None:
-        self.delete_memory_sync(scope, category, project_id)
 
     def delete_memory_sync(
         self,
@@ -787,9 +762,6 @@ class MemoryService:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=OWN_RESET_REFUSED)
         self._refuse_while_memory_off(refused="Resetting it is refused.")
         return reset_person_memory(self.session.scope)
-
-    async def list_memory(self, project_id: UUID | None = None) -> list[MemoryResponse]:
-        return self.list_memory_sync(project_id)
 
     def list_memory_sync(
         self,
@@ -835,6 +807,13 @@ class MemoryService:
             }
         if project_id is not None:
             stores = {tier_id: store for tier_id, store in stores.items() if tier_id == project_id}
+        else:
+            # The unfiltered list is the Memories screen. A comparison side
+            # never writes memory, so its project has nothing to show there.
+            from cowork.services.projects import is_comparison_sandbox
+
+            sandboxes = {p.id for p in projects if is_comparison_sandbox(p.name)}
+            stores = {tier_id: store for tier_id, store in stores.items() if tier_id not in sandboxes}
 
         for tier_id, store in stores.items():
             for category in PROJECT_SLOTS:

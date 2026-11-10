@@ -6,7 +6,6 @@ import json
 import logging
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -21,6 +20,7 @@ from cowork.channels.plugin import (
     VerifyResult,
     WebhookRoute,
 )
+from cowork.channels.sharing import mark_shared
 from cowork.channels.text import split_for_limit
 from cowork.channels.webhooks import SignatureError, WebhookAck, WebhookHandshake
 
@@ -97,6 +97,10 @@ def _verify_ed25519(public_key_hex: str, signature_hex: str, message: bytes) -> 
 
 
 class DiscordBridge:
+    # The largest file send_attachment takes. A channel turn skips a larger
+    # artifact before it reads the file (AntonChannelRuntime.send_turn_artifacts).
+    max_attachment_bytes = DISCORD_MAX_UPLOAD_BYTES
+
     def __init__(self, credentials: Mapping[str, str]) -> None:
         self._secrets = dict(credentials)
         self._setup: ChannelSetup | None = None
@@ -207,6 +211,7 @@ class DiscordBridge:
             ),
         )
         event._dedupe_key = f"discord:interaction:{interaction_id}"  # type: ignore[attr-defined]
+        mark_shared(event, bool(data.get("guild_id")))
         return [event]
 
     def dedupe_key(self, event: InboundEvent) -> str | None:
@@ -318,6 +323,8 @@ class DiscordBridge:
             ),
         )
         event._dedupe_key = f"discord:message:{message_id}"  # type: ignore[attr-defined]
+        # A guild channel or thread is shared; a DM or group DM has no guild.
+        mark_shared(event, is_group)
         return event
 
     @staticmethod
@@ -345,21 +352,21 @@ class DiscordBridge:
             content_type="application/json",
         )
 
-    async def send_attachment(self, *, address: PlatformAddress, path: str, filename: str | None = None) -> str:
-        """Post one file to the channel; returns the platform message id."""
+    async def send_attachment(self, *, address: PlatformAddress, data: bytes, filename: str) -> str:
+        """Post ``data`` named ``filename`` to the channel; returns the
+        platform message id."""
         bot_token = (self._secrets.get("bot_token") or "").strip()
         if not bot_token:
             raise RuntimeError("discord bot_token not configured")
-        source = Path(path)
-        if source.stat().st_size > DISCORD_MAX_UPLOAD_BYTES:
+        if len(data) > DISCORD_MAX_UPLOAD_BYTES:
             raise RuntimeError("discord attachment exceeds the upload size cap")
-        name = (filename or source.name).strip() or "file"
+        name = filename.strip() or "file"
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
                     f"{DISCORD_API_BASE}/channels/{address.platform_id}/messages",
                     headers={"Authorization": f"Bot {bot_token}"},
-                    files={"files[0]": (name, source.read_bytes())},
+                    files={"files[0]": (name, data)},
                 )
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise ConnectionError(f"discord upload transport error: {exc!r}") from exc

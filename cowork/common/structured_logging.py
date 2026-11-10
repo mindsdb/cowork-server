@@ -28,12 +28,24 @@ EVENT_FIELDS = frozenset(
         "turn_request_id",
         "artifact_slug",
         "artifact_slugs",
+        # The slugs a turn-end artifact record writes rows for
+        # (cowork.db.units.drain_turn_end_records).
+        "touched",
         "sqlstate",
         "provider_error",
         "conversation_id",
         "project_id",
         "schedule_id",
         "turn_id",
+        # The turn whose saved question refused a stale start
+        # (cowork.streaming.registry).
+        "saved_turn_id",
+        # A turn's run, the run holding its conversation's turn claim, and
+        # that run's pod (cowork.streaming.turn_claim).
+        "run_id",
+        "holder_run_id",
+        "holder_pod",
+        "pod",
         "job_id",
         "trace_id",
         "method",
@@ -45,14 +57,35 @@ EVENT_FIELDS = frozenset(
         "attempt",
         "attempts",
         "count",
+        # A turn request's size and the cap it was shed to fit
+        # (cowork.turnqueue.producer._fit_request).
+        "request_bytes",
+        "cap_bytes",
+        # A remote turn reply's number and the last one the relay applied
+        # (cowork.turnqueue.producer.stream_remote_replies).
+        "reply_n",
+        "last_reply_n",
         "slot",
         "model_alias",
         "managed_connection_file",
         "retryable",
+        "statement_fingerprint",
+        # cowork.common.loop_watchdog and the lifespan's step timings.
+        "stack",
+        "in_flight",
+        "limiter",
+        "step",
+        "steps",
     ]
 )
 HEALTH_PATHS = frozenset(
-    ["/health", "/api/v1/health", "/api/v1/health/", "/api/v1/health/live"]
+    [
+        "/health",
+        "/api/v1/health",
+        "/api/v1/health/",
+        "/api/v1/health/live",
+        "/api/v1/health/ready",
+    ]
 )
 
 
@@ -167,7 +200,7 @@ def _event_schema(logger, method_name, event_dict):
     for field in EVENT_FIELDS:
         value = event_dict.get(field)
         if (
-            field == "artifact_slugs"
+            field in ("artifact_slugs", "touched")
             and isinstance(value, (list, tuple))
             and all(type(slug) is str for slug in value)
         ):

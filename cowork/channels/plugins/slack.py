@@ -7,7 +7,6 @@ import logging
 import time
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -22,6 +21,7 @@ from cowork.channels.plugin import (
     VerifyResult,
     WebhookRoute,
 )
+from cowork.channels.sharing import mark_shared
 from cowork.channels.text import split_for_limit
 from cowork.channels.webhooks import SignatureError, WebhookHandshake
 
@@ -71,7 +71,30 @@ def extract_team_id(body: bytes, headers: Mapping[str, str]) -> str | None:
     return team_id if isinstance(team_id, str) and team_id else None
 
 
+def _slack_shared(event: dict, channel: str) -> bool | None:
+    """Whether a Slack event came from a shared channel, not a DM or group DM.
+
+    `message` events name the conversation's kind in `channel_type`: shared for
+    `channel` and `group` (private channel), not for `im` or `mpim`. An
+    `app_mention` carries none: a `C` channel is shared, a `D` is a DM, and a
+    `G` may be a private channel or a group DM, so it is unknown (None) and
+    the runtime leaves the route's conversation as its `message` events set it.
+    """
+    channel_type = event.get("channel_type")
+    if channel_type:
+        return channel_type in ("channel", "group")
+    if channel.startswith("C"):
+        return True
+    if channel.startswith("G"):
+        return None
+    return False
+
+
 class SlackBridge:
+    # The largest file send_attachment takes. A channel turn skips a larger
+    # artifact before it reads the file (AntonChannelRuntime.send_turn_artifacts).
+    max_attachment_bytes = SLACK_MAX_UPLOAD_BYTES
+
     def __init__(self, credentials: Mapping[str, str]) -> None:
         self._secrets = dict(credentials)
         self._setup: ChannelSetup | None = None
@@ -222,7 +245,7 @@ class SlackBridge:
         except (TypeError, ValueError):
             timestamp = datetime.now(timezone.utc)
         is_group = not channel.startswith("D")
-        return InboundEvent(
+        event_out = InboundEvent(
             address=PlatformAddress(channel_type=CHANNEL_TYPE, platform_id=channel, thread_id=thread_ts),
             message=InboundMessage(
                 id=ts,
@@ -235,18 +258,18 @@ class SlackBridge:
                 attachments=attachments,
             ),
         )
+        return mark_shared(event_out, _slack_shared(event, channel))
 
-    async def send_attachment(self, *, address: PlatformAddress, path: str, filename: str | None = None) -> str:
-        """Upload via the external-upload flow (files.upload is deprecated):
-        getUploadURLExternal → POST bytes → completeUploadExternal."""
+    async def send_attachment(self, *, address: PlatformAddress, data: bytes, filename: str) -> str:
+        """Upload ``data`` named ``filename`` via the external-upload flow
+        (files.upload is deprecated): getUploadURLExternal → POST bytes →
+        completeUploadExternal."""
         bot_token = (self._secrets.get("bot_token") or "").strip()
         if not bot_token:
             raise RuntimeError("slack bot_token not configured")
-        source = Path(path)
-        if source.stat().st_size > SLACK_MAX_UPLOAD_BYTES:
+        if len(data) > SLACK_MAX_UPLOAD_BYTES:
             raise RuntimeError("slack attachment exceeds the upload size cap")
-        name = (filename or source.name).strip() or "file"
-        data = source.read_bytes()
+        name = filename.strip() or "file"
 
         issued = await self.web_api(bot_token, "files.getUploadURLExternal",
                                     data={"filename": name, "length": len(data)})

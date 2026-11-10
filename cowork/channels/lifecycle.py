@@ -27,7 +27,7 @@ class LifecycleContext:
     channel_type: str
     webhook_url: str | None
     credentials: Mapping[str, str]
-    persist_credentials: Callable[[dict[str, str]], None]
+    persist_credentials: Callable[[dict[str, str]], Awaitable[None]]
     refresh_adapter: Callable[[], Awaitable[bool]]
     remove_adapter: Callable[[], Awaitable[None]]
 

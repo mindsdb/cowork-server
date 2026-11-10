@@ -111,8 +111,8 @@ def _bytes_under(folder: Path) -> dict[str, bytes]:
 
 async def _remember(*, engine, scope, project_id, rule: str, lesson: str) -> None:
     service = _service(engine=engine, scope=scope)
-    await service.update_memory(scope=MemoryScope.global_, category=MemorySlot.RULES, content=rule)
-    await service.update_memory(
+    service.update_memory_sync(scope=MemoryScope.global_, category=MemorySlot.RULES, content=rule)
+    service.update_memory_sync(
         scope=MemoryScope.project, category=MemorySlot.LESSONS, content=lesson, project_id=project_id
     )
 
@@ -417,7 +417,7 @@ async def test_hosted_org_mode_lists_stored_memory_whatever_memory_enabled_says(
     project = _project(engine=engine, scope=member, path=tmp_path / "org-project")
     (tmp_path / "org-project" / ".anton" / "memory").mkdir(parents=True)
     (tmp_path / "org-project" / ".anton" / "memory" / "lessons.md").write_text("team lesson\n")
-    await _service(engine=engine, scope=member).update_memory(
+    _service(engine=engine, scope=member).update_memory_sync(
         scope=MemoryScope.global_, category=MemorySlot.RULES, content="alice's rule"
     )
 
@@ -453,7 +453,7 @@ async def test_the_operator_view_keeps_the_projects_own_folder_where_memory_is_p
     store = project_memory_store(scope=LOCAL_SCOPE, project_path=project_path, project_id=project)
     assert type(store) is ProjectMemoryStore
     assert store.root == project_path / ".anton" / "memory"
-    await _service(engine=engine, scope=LOCAL_SCOPE).update_memory(
+    _service(engine=engine, scope=LOCAL_SCOPE).update_memory_sync(
         scope=MemoryScope.project, category=MemorySlot.LESSONS, content="operator lesson", project_id=project
     )
     assert (project_path / ".anton" / "memory" / "lessons.md").read_text().strip() == "operator lesson"
@@ -478,7 +478,7 @@ async def test_the_operator_view_reads_the_deployment_tier_where_memory_is_share
 
     store = project_memory_store(scope=LOCAL_SCOPE, project_path=project_path, project_id=project)
     assert type(store) is NestedProjectMemoryStore and store.root == _shared_tier(root, project)
-    await _service(engine=engine, scope=LOCAL_SCOPE).update_memory(
+    _service(engine=engine, scope=LOCAL_SCOPE).update_memory_sync(
         scope=MemoryScope.project, category=MemorySlot.LESSONS, content="operator lesson", project_id=project
     )
 
@@ -552,7 +552,7 @@ async def test_reset_in_org_mode_removes_only_the_members_global_tier(env, tmp_p
     project_path = tmp_path / "org-project"
     (project_path / ".anton" / "memory").mkdir(parents=True)
     (project_path / ".anton" / "memory" / "lessons.md").write_text("team lesson\n")
-    await _service(engine=engine, scope=member).update_memory(
+    _service(engine=engine, scope=member).update_memory_sync(
         scope=MemoryScope.global_, category=MemorySlot.RULES, content="alice's rule"
     )
 

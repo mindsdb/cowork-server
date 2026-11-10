@@ -90,9 +90,11 @@ class IncompleteDetails(BaseModel):
             "`spend_ceiling` (the token budget), `round_cap` (the step limit), "
             "`handback_budget` (automatic continuations ran out), "
             "`handback_verifier_failure` (the completion check returned no verdict), "
-            "`handback_stuck` (the completion check judged the task stuck) or "
-            "`retry_exhausted` (repeated errors). Treat any other value as a stop "
-            "for an unlisted reason."
+            "`handback_stuck` (the completion check judged the task stuck), "
+            "`retry_exhausted` (repeated errors), `content_filter` (the model "
+            "provider's content filter blocked a reply) or `question_unanswered` "
+            "(an `ask_user` question timed out or was skipped). Treat any other "
+            "value as a stop for an unlisted reason."
         ),
     )
 
@@ -215,6 +217,17 @@ class ResponsesRequest(BaseModel):
             '"off" keeps this question from reading learned memory or learning any; '
             "the operator's managed rules still apply. "
             '"on", the default, follows the deployment\'s memory setting and never turns memory on.'
+        ),
+    )
+
+    # One task's opt-out of the agent's browser: the composer's Browser
+    # switch. "off" runs this turn as browser_enabled=false does: no browser
+    # tool, and on the web no scope call that would start the browser.
+    browser: Literal["on", "off"] = Field(
+        default="on",
+        description=(
+            '"off" runs this turn without the shared browser. '
+            '"on", the default, follows the user\'s browser setting and never turns the browser on.'
         ),
     )
 

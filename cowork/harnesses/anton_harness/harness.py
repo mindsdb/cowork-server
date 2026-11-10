@@ -26,11 +26,11 @@ from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, makedirs_below_nofollow, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import current_settings_scope
+from cowork.common.settings.user_settings import current_settings_scope, effective_turn_limits
 from cowork.deployment_identity import identity_for_turn, learned_memory_scope
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
-from cowork.db.units import run_db, run_to_completion, unit_session
+from cowork.db.units import run_db, run_efs, run_on_unit_threads, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
 from cowork.harnesses.memory.policy import memory_policy
@@ -49,11 +49,9 @@ from cowork.harnesses.anton_harness.stream_formatter import (
 )
 from cowork.managed import managed_folder
 from cowork.models.conversation import Conversation
-from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
-from cowork.services.connectors.specs._registry import registry
 from cowork.services.conversations import read_earlier_answers
 from cowork.services.live_apps import (
     TurnLiveApps,
@@ -64,12 +62,13 @@ from cowork.services.live_apps import (
     stop_time_text,
     turn_live_apps,
 )
-from cowork.services.projects import display_label
+from cowork.services.projects import display_label, is_comparison_sandbox
 from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
 from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_shared_skills
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
+    from anton.core.browser.config import BrowserConfig
     from anton.core.session import ChatSession
 
     from cowork.services.conversations import ReplayHistory
@@ -177,10 +176,8 @@ def _turn_cortex(*, layout: TurnMemoryLayout, mode: str, llm_client):
 #: Settings copied from the Cowork DB onto anton's own settings object, in
 #: order. The last three are non-nullable ints with defaults — unlike the
 #: entries above them, ``db_val`` is never None, so they ALWAYS override anton's
-#: own 25/3 defaults (and any ANTON_* env value) for Cowork sessions.
-#: ``max_turn_tokens`` is the per-turn spend ceiling (ENG-1286); it overlays the
-#: SAME value anton defaults to rather than a looser one, because the
-#: distribution that sized it was measured on this traffic.
+#: own defaults (and any ANTON_* env value) for Cowork sessions.
+#: ``max_turn_tokens`` is the per-turn spend ceiling.
 _OVERLAID_SETTINGS: tuple[str, ...] = (
     "planning_provider", "planning_model",
     "coding_provider", "coding_model",
@@ -201,6 +198,9 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
 
     Returns the attrs actually applied, so a caller or test can assert on it.
 
+    The three budgets come from ``effective_turn_limits``, so the
+    ``limits_enabled`` switch decides them.
+
     **The skew guard is the load-bearing part.** uv.lock pins anton to a
     release, and a PyPI-channel install takes any release at or above the
     floor in ``pyproject.toml``, so cowork-server can ship a setting whose
@@ -212,8 +212,9 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     missing setting.
     """
     applied: list[str] = []
+    limits = effective_turn_limits(user)._asdict()
     for attr in _OVERLAID_SETTINGS:
-        db_val = getattr(user, attr, None)
+        db_val = limits[attr] if attr in limits else getattr(user, attr, None)
         if db_val is None:
             continue
         if not hasattr(anton_settings, attr):
@@ -230,6 +231,13 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
             db_val = db_val.value.replace("_", "-")
         setattr(anton_settings, attr, db_val)
         applied.append(attr)
+    # The Jev opt-out covers anton's completion check too, so an organization
+    # that turns Jev off sends it nothing. Only ever turns it off: on leaves
+    # anton's own setting alone. An organization MindsHub refuses Jev to needs
+    # no switch: anton stops asking after the first refusal.
+    if getattr(user, "jev_decisions_enabled", True) is False and hasattr(anton_settings, "verifier_jev"):
+        anton_settings.verifier_jev = "off"
+        applied.append("verifier_jev")
     return applied
 
 
@@ -494,6 +502,15 @@ def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
     )
 
 
+def _learns_this_turn(conversation, learns: bool) -> bool:
+    """Whether the turn may write memory: its layout's say, except on a
+    model-comparison side, which reads memory like any task but never writes
+    it, since two agents on the same task would each record the same lessons."""
+    if is_comparison_sandbox(getattr(getattr(conversation, "project", None), "name", None)):
+        return False
+    return learns
+
+
 def _turn_style_context(channel: ChannelContext | None) -> str:
     """Lead block of the system-prompt suffix: desktop guidance for UI turns,
     support-chat guidance for channel turns.
@@ -735,6 +752,30 @@ def _archived_messages(session: ScopedSession, *, conversation_id: UUID) -> list
     return ConversationService(session).archived_messages(conversation_id)
 
 
+async def _turn_skills_off_for_me(scope: TenantScope | None) -> frozenset[str]:
+    """The skills the turn's person turned off for themselves
+    (cowork.services.skill_user_settings.off_for_me), in one database unit.
+
+    No scope on a partitioned deployment names no person, so nothing; the
+    desktop's no scope is LOCAL_SCOPE's one person. A failed read logs and
+    turns nothing off, rather than failing the turn over a preference. A wait
+    for a connection that runs out is the turn's failure, so it propagates.
+    """
+    from cowork.services.skill_user_settings import off_for_me
+
+    if scope is None:
+        if tenant_scope_required():
+            return frozenset()
+        scope = LOCAL_SCOPE
+    try:
+        return await run_db(off_for_me, scope=scope)
+    except PoolTimeoutError:
+        raise
+    except Exception:
+        logger.exception("turn skills: couldn't read the person's skill settings")
+        return frozenset()
+
+
 async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[_AttachedFile] | None:
     """The conversation's attachments, read in a database unit, or None when
     they could not be looked up.
@@ -878,6 +919,7 @@ class AntonHarness:
         tool_messages: bool = False,
         # Keeps the turn alive while a model call is quiet (see HarnessProvider).
         model_wait: ModelWaitTicker | None = None,
+        interactive: bool = True,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -921,7 +963,9 @@ class AntonHarness:
         artifacts_base = project_path / ".anton" / "artifacts"
         # Names AND content mtimes: a name diff only reveals artifacts the turn
         # CREATED, and the reconciler must also see the ones it EDITED.
-        before_slugs, before_mtimes = snapshot_artifact_state(artifacts_base)
+        before_slugs, before_mtimes = await run_efs(
+            partial(snapshot_artifact_state, artifacts_base), scope=_units_scope(), deadline=False
+        )
         # Capture ids while the conversation is unambiguously attached — the
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
@@ -985,13 +1029,20 @@ class AntonHarness:
                         extra=log_context(conversation_id=conv_id),
                     )
             try:
-                changes = turn_artifact_changes(
-                    conversation_id=conv_id,
-                    artifacts_base=artifacts_base,
-                    before=before_slugs,
-                    before_mtimes=before_mtimes,
-                    tracked_new=getattr(session, "artifacts_touched", None),
-                    tracked_edits=getattr(session, "artifacts_touched", None),
+                # It waits on each touched artifact's lock and parses its
+                # journal, so it runs off the event loop the server shares.
+                changes = await run_efs(
+                    partial(
+                        turn_artifact_changes,
+                        conversation_id=conv_id,
+                        artifacts_base=artifacts_base,
+                        before=before_slugs,
+                        before_mtimes=before_mtimes,
+                        tracked_new=getattr(session, "artifacts_touched", None),
+                        tracked_edits=getattr(session, "artifacts_touched", None),
+                    ),
+                    scope=_units_scope(),
+                    deadline=False,
                 )
                 new_slugs, touched_slugs, turn_scope = changes.created, changes.touched, _units_scope()
                 if new_slugs:
@@ -1002,6 +1053,7 @@ class AntonHarness:
                             project_id=conv_project_id,
                             slugs=new_slugs,
                             creator=getattr(conversation, "created_by", None),
+                            artifact_ids=changes.created_ids,
                         ),
                         scope=turn_scope,
                     )
@@ -1023,6 +1075,7 @@ class AntonHarness:
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
                 tool_messages=tool_messages,
+                interactive=interactive,
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1326,6 +1379,7 @@ class AntonHarness:
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
+        interactive: bool = True,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
         (_build_turn_session). The live-app stops its prompt tells ride on the
@@ -1339,6 +1393,7 @@ class AntonHarness:
                 disabled_connections=disabled_connections,
                 channel_context=channel_context,
                 tool_messages=tool_messages,
+                interactive=interactive,
                 live_app_notices=notices,
             )
         except BaseException:
@@ -1366,6 +1421,7 @@ class AntonHarness:
         disabled_connections: list[dict] | None,
         channel_context: ChannelContext | None,
         tool_messages: bool,
+        interactive: bool,
         live_app_notices: list[UUID],
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
@@ -1389,7 +1445,9 @@ class AntonHarness:
             build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
             build_cowork_create_skill_draft_tool,
+            scope_usage_notes,
         )
+        from .schedule_tools import build_schedule_tools
         CONNECT_DATASOURCE_TOOL = build_cowork_connect_datasource_tool()
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
@@ -1437,10 +1495,20 @@ class AntonHarness:
         # turn's scratch folder below).
         anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
 
-        user = get_user_settings()
+        user = await run_on_unit_threads(get_user_settings)
         _overlay_user_settings(anton_settings, user)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
+        elicitor = build_elicitor(str(conversation.id))
+        # Every change to a scheduled task waits on a card the user confirms,
+        # so the tools exist only where someone can: not in a scheduled run
+        # (a task must not rewrite itself unattended), a channel bot, or a
+        # deployment with questions off.
+        schedule_tools = (
+            build_schedule_tools(project_id=conversation.project_id)
+            if interactive and elicitor is not None and channel_context is None
+            else []
+        )
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
         for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
@@ -1547,8 +1615,11 @@ class AntonHarness:
         # App backends are refused under the code sandbox (`sandboxed`), so
         # the agent is never told to build one, unless live apps run them in
         # app slots outside this server for a turn with a launcher, the only
-        # turn that gets a host (live_app_host_for_turn).
-        launcher = current_live_app_launcher() if live_apps_on() else None
+        # turn that gets a host (live_app_host_for_turn). A model-comparison
+        # side gets neither: a live app is shareable and holds a capped slot,
+        # and nothing leaves a comparison until the user continues with a side.
+        comparison_side = is_comparison_sandbox(conversation.project.name)
+        launcher = current_live_app_launcher() if live_apps_on() and not comparison_side else None
         offers_live_apps = launcher is not None
         turn_apps = (
             await turn_live_apps(
@@ -1574,7 +1645,7 @@ class AntonHarness:
             "You can perform operations on these files via the scratchpad. "
             + _project_file_actions_rule(anton_settings.act_first)
             + _other_files_rule(sandboxed=sandboxed)
-            + "You can read text files with `read_text_file`, or in the scratchpad when that is more efficient (for example, when the data goes straight into scratchpad code or the file needs special parsing). Use the scratchpad for everything else you do with files. "
+            + "Read text files with `read_text_file` (`end_line=-1` returns the whole file), several in one step. Read in the scratchpad only data that goes straight into scratchpad code or a file that needs special parsing: printed scratchpad output stops at 10,000 characters. Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
             # (close_session_scratchpads), with their whole process group.
@@ -1687,7 +1758,7 @@ class AntonHarness:
                 )
                 # Agent-facing API notes for this turn's connected engines.
                 # `data_vault` is already filtered by `disabled_connections`.
-                connector_usage_notes = registry.usage_notes_for(
+                connector_usage_notes = await scope_usage_notes(
                     c["engine"] for c in vault_connections
                 )
 
@@ -1749,7 +1820,8 @@ class AntonHarness:
                 layout=memory_layout,
                 mode=(
                     anton_settings.memory_mode
-                    if anton_settings.memory_enabled and memory_layout.learns
+                    if anton_settings.memory_enabled
+                    and _learns_this_turn(conversation, memory_layout.learns)
                     else "off"
                 ),
                 llm_client=llm_client,
@@ -1766,13 +1838,21 @@ class AntonHarness:
             # read-only root, never links a slug the managed folder reserves
             # (linked_turn_skills), and neither do the fan-outs into projects
             # (reconcile_skill_links, reconcile_project).
+            # The skills the asker turned off for themselves, read once for
+            # the whole turn: none of them is linked or followed by an
+            # artifact build, whichever root holds it.
+            off_for_me = await _turn_skills_off_for_me(current_settings_scope())
             managed = managed_folder()
             managed_skill_dirs: dict[str, Path] = {}
             if managed is not None:
                 if turn_scratch_dir is None:
                     turn_scratch_dir = _new_turn_scratch_dir()
                 managed_skills_dir = turn_scratch_dir / "managed-skills"
-                managed_skill_dirs = managed.skill_dirs()
+                managed_skill_dirs = {
+                    slug: path
+                    for slug, path in managed.skill_dirs().items()
+                    if slug not in off_for_me
+                }
                 sync_turn_skill_links(skills_dir=managed_skills_dir, wanted=managed_skill_dirs)
                 anton_settings.skills_extra_roots = [
                     *anton_settings.skills_extra_roots,
@@ -1819,6 +1899,7 @@ class AntonHarness:
                     project_name=conversation.project.name,
                     skills_dir=turn_skills_dir,
                     shared_skills_dir=shared_skills_dir,
+                    off_for_me=off_for_me,
                 )
                 if turn_skills_dir != project_skills_dir:
                     read_only_dirs.append(turn_skills_dir)
@@ -1830,7 +1911,11 @@ class AntonHarness:
             anton_settings.skills_artifact_roots = [
                 HOST_SKILLS_DIR,
                 *managed_skill_dirs.values(),
-                *artifact_skill_dirs(scope=turn_scope, project_name=conversation.project.name),
+                *artifact_skill_dirs(
+                    scope=turn_scope,
+                    project_name=conversation.project.name,
+                    off_for_me=off_for_me,
+                ),
             ]
             read_only_dirs += anton_settings.skills_extra_roots
             read_only_dirs += [Path(row.path).parent for row in attachment_rows or () if row.path]
@@ -1842,9 +1927,11 @@ class AntonHarness:
             cell_sandbox = await asyncio.to_thread(
                 build_cell_sandbox, scope=turn_scope, project_dir=base, read_only_dirs=read_only_dirs,
             )
-            # None with live apps off, or for a turn that names nobody with an
-            # email, and then not passed at all.
-            live_app_host = live_app_host_for_turn(project_id=conversation.project.id)
+            # None with live apps off, for a turn that names nobody with an
+            # email, or on a comparison side, and then not passed at all.
+            live_app_host = (
+                None if comparison_side else live_app_host_for_turn(project_id=conversation.project.id)
+            )
 
             deployment = identity_for_turn()
             deployment_kwargs = {} if deployment is None else {
@@ -1866,7 +1953,7 @@ class AntonHarness:
                 # either. Passed directly, as _turn_cortex passes managed_hc:
                 # every anton the floor admits has the field, and a dropped
                 # one would silently bring the memory passes back.
-                background_memory=memory_layout.learns,
+                background_memory=_learns_this_turn(conversation, memory_layout.learns),
                 # episodic=episodic,
                 system_prompt_context=SystemPromptContext(
                     runtime_context=build_runtime_context(anton_settings),
@@ -1888,7 +1975,7 @@ class AntonHarness:
                 initial_history=initial_history,
                 # history_store=history_store,
                 session_id=str(conversation.id),
-                elicitor=build_elicitor(str(conversation.id)),
+                elicitor=elicitor,
                 # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
                 # are attributed to the active harness. self.id == "anton".
                 harness=self.id,
@@ -1909,6 +1996,14 @@ class AntonHarness:
                 # brief when the agent acts first); without it the tool hands
                 # the content to the agent. Dropped by an anton without the field.
                 **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
+                # The desktop app's own browser, when it registered one and the
+                # person turned the browser on: anton registers its `browser`
+                # tool only then. Never for a channel turn. Passed directly:
+                # every anton the floor admits has the field.
+                browser=await _browser_config(
+                    user, channel_context=channel_context,
+                    conversation_id=str(conversation.id), project_id=conversation.project_id,
+                ),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
@@ -1929,6 +2024,7 @@ class AntonHarness:
                     # FETCH_SUBMISSION_TOOL,
                     # UPDATE_FORM_TOOL,
                     *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
+                    *schedule_tools,
                     *mcp_tool_defs,
                 ],
                 # Same gate as the discovery call above, not a second one:
@@ -1981,3 +2077,29 @@ class AntonHarness:
     def _build_llm_client(effort: str | None = None, *, model: str | None = None, settings=None):
         from cowork.services.providers import build_llm_client
         return build_llm_client(effort_override=effort, model_override=model, settings=settings)
+
+
+async def _browser_config(
+    user, *, channel_context: ChannelContext | None, conversation_id: str, project_id,
+) -> "BrowserConfig | None":
+    """anton's browser for an in-process turn: the desktop app's own browser,
+    with the task's own session, or None.
+
+    None for a channel turn: it comes from a chat where people other than the
+    desktop's owner can write, and the browser holds the owner's sign-ins.
+    None when the person turned the browser off, when the app registered no
+    browser, which is always the case where more than one person shares this
+    process (cowork.common.settings.runtime_credential.get_browser_host), and
+    when a signed-in desktop's organization turned the browser off, read
+    before each turn (cowork.services.browser.desktop_organization_off).
+    The web's browser never reaches an in-process turn: web turns run
+    remotely, and the producer gives them the router.
+    """
+    if channel_context is not None or not getattr(user, "browser_enabled", False):
+        return None
+    from cowork.services.browser import desktop_browser_config, desktop_organization_off
+
+    config = desktop_browser_config(conversation_id=conversation_id, project_id=project_id)
+    if config is None or await desktop_organization_off():
+        return None
+    return config

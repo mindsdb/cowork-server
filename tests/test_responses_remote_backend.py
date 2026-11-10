@@ -8,19 +8,23 @@ the persistence layer inside _produce_remote) are stubbed, and its database
 units run inline on fakes (inline_run_db) unless a test needs the real ones.
 """
 from __future__ import annotations
+from tests._event_loop import on_the_event_loop
 from tests._logging_assertions import assert_log_fields
 
 import asyncio
 import json
 from contextlib import contextmanager
 import logging
+from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
+from typing import NamedTuple
+from uuid import UUID, uuid4
 
 import pytest
 
 import cowork.handlers.responses as responses_mod
-from cowork.handlers.responses import ResponsesHandler
+from cowork.handlers.responses import ResponsesHandler, _RemoteArtifactsDir
+from cowork.services.artifact_identity import ListedIds
 from cowork.streaming.registry import TurnLifecycle
 from cowork.turnqueue import producer as prod
 from cowork.turnqueue.producer import RemoteWorkspace
@@ -30,7 +34,13 @@ from _fakes import QueuedPipeline, inline_run_db, opens
 
 class _FakeScope:
     org_id = "org-123"
+    # A partitioned scope, which cowork.db.units.run_efs reads for the share.
+    partitioned = True
     user_id = "user-456"
+    # Outside org tenancy, as record_new_artifacts has always read this
+    # scope, so its artifacts keep no location rows and a turn end asks for
+    # no self-heal (artifact_locations.keeps_locations).
+    org_mode = False
 
 
 class _FakeScoped:
@@ -239,7 +249,7 @@ def _remote_handler(monkeypatch, saved):
     """Handler wired for _produce_remote with the DB layer faked out."""
     handler = _handler()
     handler.principal = object()
-    handler._remote_seed_history = lambda session, conv_id: ([], None)
+    monkeypatch.setattr(ResponsesHandler, "_remote_seed_history", staticmethod(lambda session, conv_id: ([], None)))
 
     class FakeConversationService:
         def __init__(self, session):
@@ -268,6 +278,8 @@ def _remote_handler(monkeypatch, saved):
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
     monkeypatch.setattr(responses_mod, "run_db", inline_run_db(_FakeUnitSession()))
+    # The skills block's unit, on the file store's threads.
+    monkeypatch.setattr(responses_mod, "run_efs_unit", inline_run_db(_FakeUnitSession()))
     monkeypatch.setattr(responses_mod, "read_earlier_answers", _no_earlier_answers)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
     return handler
@@ -302,10 +314,12 @@ async def test_the_producer_task_scrubs_the_job_history_with_the_requests_regist
     })
     request.addfinalizer(_reset_registered_ds_vars)
 
+    real_seed_history = ResponsesHandler._remote_seed_history
     handler = _remote_handler(monkeypatch, {})
     # The real seed builder, run where the producer runs it.
-    handler._remote_seed_history = (
-        lambda session, conv_id: ResponsesHandler._remote_seed_history(_FakeScoped(), conv_id)
+    monkeypatch.setattr(
+        ResponsesHandler, "_remote_seed_history",
+        staticmethod(lambda session, conv_id: real_seed_history(_FakeScoped(), conv_id)),
     )
     rows = [_msg("user", "the password is hunter2xyz")]
 
@@ -387,7 +401,7 @@ async def test_produce_remote_passes_project_memory_to_turnqueue(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
     expected = {"project": {"rules": "shared", "lessons": "learned"}}
-    handler._remote_memory = lambda session, conv_id: expected
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: expected))
     captured = {}
 
     async def fake_replies(**kwargs):
@@ -413,7 +427,9 @@ async def test_produce_remote_passes_project_memory_to_turnqueue(monkeypatch):
 async def test_produce_remote_passes_started_at_to_turnqueue(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
-    handler._remote_started_at = lambda session, conv_id: "2026-09-01T08:15:00"
+    monkeypatch.setattr(
+        ResponsesHandler, "_remote_started_at", staticmethod(lambda session, conv_id: "2026-09-01T08:15:00"),
+    )
     captured = {}
 
     async def fake_replies(**kwargs):
@@ -601,12 +617,11 @@ def test_no_compaction_is_saved_when_seeding_was_disabled(monkeypatch):
 async def test_produce_remote_saves_the_pods_compaction(monkeypatch):
     """End of the wire: a turn_compaction reply reaches persistence."""
     handler = _remote_handler(monkeypatch, {})
-    handler._remote_seed_history = lambda session, conv_id: ([], _SEED)
+    monkeypatch.setattr(ResponsesHandler, "_remote_seed_history", staticmethod(lambda session, conv_id: ([], _SEED)))
     persisted = {}
-    handler._persist_remote_compaction = (
-        lambda session, *, conv_id, data, seed_info: persisted.update(
-            data=data, seed_info=seed_info,
-        )
+    monkeypatch.setattr(
+        ResponsesHandler, "_persist_remote_compaction",
+        staticmethod(lambda session, *, conv_id, data, seed_info: persisted.update(data=data, seed_info=seed_info)),
     )
 
     async def fake_replies(**kwargs):
@@ -671,6 +686,10 @@ def test_persist_turn_memory_refetches_under_project_lock(monkeypatch):
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
     monkeypatch.setattr(responses_mod, "apply_turn_memory", fake_apply)
     monkeypatch.setattr(shared_resources, "SharedResourceAccess", FakeAccess)
+    monkeypatch.setattr(
+        responses_mod, "get_user_settings",
+        lambda scope=None: SimpleNamespace(memory_enabled=True, memory_mode="autopilot"),
+    )
 
     entries = [{"text": "remember", "kind": "always", "scope": "project"}]
     ResponsesHandler._persist_turn_memory(FakeSession(), uuid4(), entries, object())
@@ -687,6 +706,99 @@ def test_persist_turn_memory_refetches_under_project_lock(monkeypatch):
     ]
 
 
+@pytest.fixture()
+def memory_write_fakes(monkeypatch):
+    """The collaborators of ``_persist_turn_memory`` as fakes that record what
+    reached the write, so a test can tell "dropped" from "written"."""
+    import cowork.services.shared_resources as shared_resources
+
+    project_id = uuid4()
+    conversation = SimpleNamespace(project_id=project_id)
+    project = SimpleNamespace(id=project_id, path="/projects/one")
+    written: list[list] = []
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return conversation
+
+    class FakeSession:
+        scope = _FakeScope()
+
+        def get(self, model, ident):
+            return project
+
+        def refresh(self, row):
+            pass
+
+    class FakeAccess:
+        def __init__(self, session, principal):
+            pass
+
+        @contextmanager
+        def coordination_lock(self, kind, key):
+            yield
+
+    def fake_apply(scope, path, entries, **kwargs):
+        written.append(entries)
+        return len(entries)
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(responses_mod, "apply_turn_memory", fake_apply)
+    monkeypatch.setattr(shared_resources, "SharedResourceAccess", FakeAccess)
+    return SimpleNamespace(session=FakeSession(), written=written)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        SimpleNamespace(memory_enabled=True, memory_mode="off"),
+        SimpleNamespace(memory_enabled=False, memory_mode="autopilot"),
+    ],
+    ids=["mode-off", "memory-disabled"],
+)
+def test_memory_off_drops_what_the_pod_asked_to_remember(monkeypatch, memory_write_fakes, settings):
+    """The desktop harness turns either setting into mode "off" and writes
+    nothing; the cloud path honours the same two settings."""
+    monkeypatch.setattr(responses_mod, "get_user_settings", lambda scope=None: settings)
+    entries = [{"text": "remember", "kind": "always", "scope": "project"}]
+
+    ResponsesHandler._persist_turn_memory(memory_write_fakes.session, uuid4(), entries, object())
+
+    assert memory_write_fakes.written == []
+
+
+@pytest.mark.parametrize("mode", ["autopilot", "copilot"])
+def test_memory_on_still_writes(monkeypatch, memory_write_fakes, mode):
+    """Guards the test above: a settings read that raised would also skip the
+    write, so the on modes must be seen to reach it."""
+    monkeypatch.setattr(
+        responses_mod, "get_user_settings",
+        lambda scope=None: SimpleNamespace(memory_enabled=True, memory_mode=mode),
+    )
+    entries = [{"text": "remember", "kind": "always", "scope": "project"}]
+
+    ResponsesHandler._persist_turn_memory(memory_write_fakes.session, uuid4(), entries, object())
+
+    assert memory_write_fakes.written == [entries]
+
+
+def test_a_failed_settings_read_writes_nothing(monkeypatch, memory_write_fakes):
+    """Fail closed: with the settings unknown, a user who turned memory off must
+    not get a write, and the turn itself must not fail over it."""
+    def raising(scope=None):
+        raise RuntimeError("settings store down")
+
+    monkeypatch.setattr(responses_mod, "get_user_settings", raising)
+    entries = [{"text": "remember", "kind": "always", "scope": "project"}]
+
+    ResponsesHandler._persist_turn_memory(memory_write_fakes.session, uuid4(), entries, object())
+
+    assert memory_write_fakes.written == []
+
+
 def _units_on_the_test_database(monkeypatch, *, scope=None):
     """The real units, each in a worker thread on the test database, for a
     test that needs a unit to block or a cancel to wait for one. They run in
@@ -696,6 +808,7 @@ def _units_on_the_test_database(monkeypatch, *, scope=None):
 
     turn_scope = scope if scope is not None else LOCAL_SCOPE
     monkeypatch.setattr(responses_mod, "run_db", units.run_db)
+    monkeypatch.setattr(responses_mod, "run_efs_unit", units.run_efs_unit)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: turn_scope)
 
 
@@ -790,12 +903,14 @@ async def test_a_cancel_during_a_memory_save_waits_for_it_then_saves_the_turn(mo
 
 
 def _no_workspace_or_memory_units(monkeypatch):
-    """Staging, the project memory read and the workspace lookups do nothing.
+    """Staging, the project memory read, the workspace lookups and the skills
+    block do nothing.
     The fake unit session cannot run them, and each would log an error."""
     monkeypatch.setattr(ResponsesHandler, "_stage_remote_workspace_files", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: {}))
     monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(lambda session, conv_id, *, workspace: None))
+    monkeypatch.setattr(responses_mod, "remote_turn_skills", lambda session, conv_id, *, viewer=None: {})
 
 
 @pytest.mark.asyncio
@@ -803,7 +918,7 @@ def _no_workspace_or_memory_units(monkeypatch):
 async def test_every_remote_unit_runs_in_the_turns_tenant_scope(monkeypatch, tmp_path, ending):
     """Every database unit of a remote turn runs in the scope the producer
     resolved from its principal, here an organization's: staging, the
-    question, the seed read, the memory, the compaction, the artifact record
+    question, the seed read, the skills block, the memory, the compaction, the artifact record
     and the answer on a clean finish, and the image-content repair when the
     pod reports a content-validation error. A unit in another scope reads or
     writes another tenant's rows."""
@@ -822,19 +937,22 @@ async def test_every_remote_unit_runs_in_the_turns_tenant_scope(monkeypatch, tmp
         return await inline(fn, scope=scope)
 
     monkeypatch.setattr(responses_mod, "run_db", spy)
+    monkeypatch.setattr(responses_mod, "run_efs_unit", spy)
     artifacts_base = tmp_path / "proj" / ".anton" / "artifacts"
     artifacts_base.mkdir(parents=True)
     _no_workspace_or_memory_units(monkeypatch)
     monkeypatch.setattr(
         ResponsesHandler, "_remote_artifacts_context",
-        staticmethod(lambda session, conv_id: (
-            SimpleNamespace(created_by="user-456"), artifacts_base, str(uuid4()), "proj",
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=artifacts_base, project_id=str(uuid4()), project_name="proj", creator="user-456",
         )),
     )
     monkeypatch.setattr(
         ResponsesHandler, "_persist_turn_memory", staticmethod(lambda session, conv_id, entries, principal: None),
     )
-    handler._persist_remote_compaction = lambda session, *, conv_id, data, seed_info: None
+    monkeypatch.setattr(
+        ResponsesHandler, "_persist_remote_compaction", staticmethod(lambda session, *, conv_id, data, seed_info: None),
+    )
     monkeypatch.setattr(task_objects, "record_new_artifacts", lambda session, **kwargs: None)
 
     async def no_publish(*args, **kwargs):
@@ -867,9 +985,9 @@ async def test_every_remote_unit_runs_in_the_turns_tenant_scope(monkeypatch, tmp
         model="anton", harness_id="anton", buffer=buffer,
     )
 
-    # Staging, the question and the seed read open every turn, and the
-    # answer's save ends it.
-    expected = 7 if ending == "completed" else 5
+    # Staging, the question, the seed read and the skills block open every
+    # turn, and the answer's save ends it.
+    expected = 8 if ending == "completed" else 6
     assert [scope for _, scope in units] == [org] * expected, units
     assert buffer.frames[-1] == ("CLOSE:completed" if ending == "completed" else "CLOSE:error")
 
@@ -902,8 +1020,8 @@ async def test_a_stop_while_the_artifact_record_waits_for_a_slot_still_writes_it
     _units_on_the_test_database(monkeypatch, scope=scope)
     monkeypatch.setattr(
         ResponsesHandler, "_remote_artifacts_context",
-        staticmethod(lambda session, conv_id: (
-            SimpleNamespace(created_by=creator), source.base, str(project.id), project.name,
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=source.base, project_id=str(project.id), project_name=project.name, creator=creator,
         )),
     )
     # The test database is SQLite, so units share one slot.
@@ -977,8 +1095,8 @@ async def test_a_stop_while_the_artifact_record_times_out_still_logs_the_unrecor
     monkeypatch.setattr(units.logger, "disabled", False)
     monkeypatch.setattr(
         ResponsesHandler, "_remote_artifacts_context",
-        staticmethod(lambda session, conv_id: (
-            SimpleNamespace(created_by=creator), source.base, str(project.id), project.name,
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=source.base, project_id=str(project.id), project_name=project.name, creator=creator,
         )),
     )
     # The test database is SQLite, so units share one slot.
@@ -1038,6 +1156,151 @@ async def test_a_stop_while_the_artifact_record_times_out_still_logs_the_unrecor
         r for r in caplog.records
         if r.name == units.logger.name and "caller was cancelled" in r.getMessage()
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("cleanup_tmp_projects")
+async def test_a_record_that_waits_for_the_database_at_shutdowns_last_wait_names_its_new_artifacts(
+    monkeypatch, tmp_path, caplog,
+):
+    """The pod finished cleanly and created an artifact, and the unit that
+    records it waits for a slot past the teardown's last wait. The ERROR
+    names the turn and the slug its diff found."""
+    from cowork.db import units
+    from cowork.db.scoped import TenantScope
+    from test_artifact_ownership import make_conversation, make_project, project_root, write_artifact
+
+    org_id, creator = str(uuid4()), str(uuid4())
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id=creator)
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, creator)
+    source = project_root(project)
+    slug = "sales-report"
+    handler = _remote_handler(monkeypatch, {})
+    _units_on_the_test_database(monkeypatch, scope=scope)
+    monkeypatch.setattr(
+        ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=source.base, project_id=str(project.id), project_name=project.name, creator=creator,
+        )),
+    )
+    # The test database is SQLite, so units share one slot.
+    slots = units._slots(units._engine())
+    holder = object()
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        write_artifact(source.base, slug, conversation=conversation_id)
+        yield "turn_delta", {"text": "done"}
+        await slots.acquire_on_behalf_of(holder)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    buffer = _RecBuffer()
+    task = asyncio.create_task(handler._produce_remote(
+        conv_id=conversation_id, input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    ))
+    with caplog.at_level(logging.ERROR, logger=units.logger.name):
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5
+            while slots.statistics().tasks_waiting == 0:
+                assert loop.time() < deadline, "the artifact record never waited for a slot"
+                await asyncio.sleep(0.01)
+            await units.drain_turn_end_records(timeout=0.1)
+        finally:
+            if holder in slots.statistics().borrowers:
+                slots.release_on_behalf_of(holder)
+    await asyncio.wait_for(task, timeout=5)
+
+    [lost] = [
+        r for r in caplog.records
+        if r.name == units.logger.name and getattr(r, "event", None) == "shutdown_turn_record_lost"
+    ]
+    assert lost.levelno == logging.ERROR
+    assert (lost.conversation_id, lost.project_id, lost.touched) == (
+        str(conversation_id), str(project.id), [slug],
+    )
+    assert buffer.frames[-1] == "CLOSE:completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("cleanup_tmp_projects")
+@pytest.mark.parametrize(
+    ("completed", "named"),
+    [({"artifacts_touched": ["summary", "chart"]}, ["chart", "summary"]), ({}, [])],
+    ids=["pod-list", "no-pod-list"],
+)
+async def test_a_record_whose_diff_a_stall_holds_at_shutdowns_last_wait_names_the_pods_list(
+    monkeypatch, tmp_path, caplog, owned_logger, completed, named,
+):
+    """The member's file store share is held by calls stuck on a stalled
+    mount, so the turn end's diff waits for a slot past the teardown's last
+    wait. The diff never answered, so the ERROR names the artifacts the
+    pod's list named, none for a pod that sends no list, on the record and
+    in the line the console prints."""
+    import threading
+
+    import cowork.db.session as db_session
+    from cowork.db import units
+    from cowork.db.scoped import TenantScope
+    from cowork.services import task_objects
+    from test_artifact_ownership import make_conversation, make_project, project_root, write_artifact
+    from test_remote_turn import _hold_a_share, _until_the_turn_end_waits_for_the_share
+
+    org_id, creator = str(uuid4()), str(uuid4())
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id=creator)
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, creator)
+    source = project_root(project)
+    handler = _remote_handler(monkeypatch, {})
+    _units_on_the_test_database(monkeypatch, scope=scope)
+    monkeypatch.setattr(
+        ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=source.base, project_id=str(project.id), project_name=project.name, creator=creator,
+        )),
+    )
+
+    async def no_publish(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", no_publish)
+    logged = owned_logger(units.logger.name)
+    stall = threading.Event()
+    held: list[asyncio.Task] = []
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        for slug in ("summary", "chart"):
+            write_artifact(source.base, slug, conversation=conversation_id)
+        held.extend(await _hold_a_share(scope=scope, share=db_session.settings.storage.efs_share, stall=stall))
+        yield "turn_completed", completed
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    task = asyncio.create_task(handler._produce_remote(
+        conv_id=conversation_id, input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_RecBuffer(),
+    ))
+    try:
+        await _until_the_turn_end_waits_for_the_share(scope=scope)
+        await units.drain_turn_end_records(timeout=0.1)
+    finally:
+        stall.set()
+    await asyncio.wait_for(task, timeout=10)
+    await asyncio.gather(*held)
+
+    [lost] = [
+        r for r in caplog.records
+        if r.name == units.logger.name and getattr(r, "event", None) == "shutdown_turn_record_lost"
+    ]
+    assert lost.levelno == logging.ERROR
+    assert (lost.conversation_id, lost.project_id, lost.touched) == (str(conversation_id), str(project.id), named)
+    assert_log_fields(
+        logged.output(), event="shutdown_turn_record_lost", conversation_id=str(conversation_id),
+        project_id=str(project.id), touched=named,
+    )
 
 
 @pytest.mark.asyncio
@@ -1625,7 +1888,7 @@ async def test_produce_remote_streams_desktop_step_vocabulary(monkeypatch):
 
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
-    handler._remote_memory = lambda session, conv_id: None
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: None))
 
     async def fake_replies(**kwargs):
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
@@ -1698,10 +1961,12 @@ async def test_produce_remote_gives_a_figures_step_the_project_path_of_the_file_
     (workspace / "stock.csv").write_text("part,site,qty\nP100,S1,250\n")
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
-    handler._remote_memory = lambda session, conv_id: None
-    handler._remote_agent_files = lambda session, conv_id, *, workspace: AgentFiles.in_cloud_pod(
-        tmp_path, conversation_id=conv_id, workspace_rel_path=None,
-    )
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(
+        lambda session, conv_id, *, workspace: AgentFiles.in_cloud_pod(
+            tmp_path, conversation_id=conv_id, workspace_rel_path=None,
+        )
+    ))
     code = "print(open('/workspace/stock.csv').read())"
     cell = {"code": code, "stdout": "part,site,qty\nP100,S1,250\n", "stderr": "", "error": None, "description": ""}
 
@@ -1730,8 +1995,8 @@ async def test_produce_remote_gives_a_figures_step_the_project_path_of_the_file_
 
 def _figure_sources_handler(monkeypatch, saved):
     handler = _remote_handler(monkeypatch, saved)
-    handler._remote_memory = lambda session, conv_id: None
-    handler._remote_agent_files = lambda session, conv_id, *, workspace: None
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(lambda session, conv_id, *, workspace: None))
     return handler
 
 
@@ -1888,7 +2153,9 @@ async def test_produce_remote_reads_a_compacted_turns_history_frame_and_saves_no
     sends both signals; a hard truncation sends only the step."""
     saved = {}
     handler = _figure_sources_handler(monkeypatch, saved)
-    handler._persist_remote_compaction = lambda session, *, conv_id, data, seed_info: None
+    monkeypatch.setattr(
+        ResponsesHandler, "_persist_remote_compaction", staticmethod(lambda session, *, conv_id, data, seed_info: None),
+    )
     rows = [
         *_web_fetch_rows("w1", "https://example.com/rates", "Overtime rate: $42 per hour."),
         *_web_fetch_rows("w4", "https://example.com/lines", "The plant runs 9 lines."),
@@ -1937,7 +2204,9 @@ async def test_produce_remote_leaves_a_figure_no_step_holds_unmarked_when_a_pod_
 
     saved = {}
     handler = _figure_sources_handler(monkeypatch, saved)
-    handler._persist_remote_compaction = lambda session, *, conv_id, data, seed_info: None
+    monkeypatch.setattr(
+        ResponsesHandler, "_persist_remote_compaction", staticmethod(lambda session, *, conv_id, data, seed_info: None),
+    )
     code = "print(open('/workspace/stock.csv').read())"
     cell = {"code": code, "stdout": "part,site,qty\nP100,S1,250\n", "stderr": "", "error": None, "description": ""}
 
@@ -1989,7 +2258,7 @@ async def test_produce_remote_names_the_earlier_turns_cell_a_figure_was_computed
         )}]},
         {"role": "assistant", "content": "S1 holds 250 units and S2 holds 90."},
     ]
-    handler._remote_seed_history = lambda session, conv_id: (history, None)
+    monkeypatch.setattr(ResponsesHandler, "_remote_seed_history", staticmethod(lambda session, conv_id: (history, None)))
     code = "print(df.qty.sum())"
     cell = {"code": code, "stdout": "340\n", "stderr": "", "error": None, "description": ""}
 
@@ -2109,7 +2378,7 @@ async def test_produce_remote_surfaces_a_skill_draft_as_a_card(monkeypatch):
 
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
-    handler._remote_memory = lambda session, conv_id: None
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: None))
 
     async def fake_replies(**kwargs):
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
@@ -2160,7 +2429,7 @@ async def test_a_bad_draft_does_not_break_the_turn(monkeypatch):
 
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
-    handler._remote_memory = lambda session, conv_id: None
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: None))
 
     async def fake_replies(**kwargs):
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
@@ -2217,7 +2486,7 @@ def _artifact(folder, slug, *, body="<html>report</html>", conversation_id=None)
 
 def _conversation_at(project_dir):
     project = SimpleNamespace(path=str(project_dir), name=project_dir.name, id=uuid4())
-    return SimpleNamespace(project=project, project_id=project.id)
+    return SimpleNamespace(project=project, project_id=project.id, created_by=None)
 
 
 def _patch_conversation_service(monkeypatch, conversation):
@@ -2243,10 +2512,12 @@ def test_remote_artifacts_context_diffs_the_project_base(monkeypatch, tmp_path):
 
     ctx = ResponsesHandler._remote_artifacts_context(None, uuid4())
 
-    assert ctx is not None
-    assert ctx[1] == project_dir / ".anton" / "artifacts"
-    assert ctx[2] == str(conversation.project_id)
-    assert ctx[3] == "proj"
+    assert ctx == _RemoteArtifactsDir(
+        base=project_dir / ".anton" / "artifacts",
+        project_id=str(conversation.project_id),
+        project_name="proj",
+        creator=conversation.created_by,
+    )
 
 
 def test_remote_agent_files_place_the_pod_in_the_conversations_folder_with_its_project_and_attachments(
@@ -2340,7 +2611,7 @@ def test_a_remote_turns_inputs_look_up_the_workspace_once(monkeypatch):
     monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(remote_workspace))
     monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(remote_agent_files))
 
-    inputs = object.__new__(ResponsesHandler)._read_remote_turn_inputs(None, conv_id=uuid4())
+    inputs = ResponsesHandler._read_remote_turn_inputs(None, conv_id=uuid4(), with_memory=True)
 
     assert len(looked_up) == 1
     assert inputs.workspace is workspace
@@ -2406,9 +2677,9 @@ async def test_produce_remote_cards_an_artifact_the_worker_wrote(monkeypatch, tm
     conversation = _conversation_at(project_dir)
     monkeypatch.setattr(
         responses_mod.ResponsesHandler, "_remote_artifacts_context",
-        staticmethod(lambda session, conv_id: (
-            conversation, artifacts_base,
-            str(conversation.project_id), conversation.project.name,
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=artifacts_base, project_id=str(conversation.project_id),
+            project_name=conversation.project.name, creator=conversation.created_by,
         )),
     )
 
@@ -2465,9 +2736,9 @@ async def test_produce_remote_does_not_claim_a_concurrent_siblings_artifact(monk
     conversation = _conversation_at(project_dir)
     monkeypatch.setattr(
         responses_mod.ResponsesHandler, "_remote_artifacts_context",
-        staticmethod(lambda session, conv_id: (
-            conversation, artifacts_base,
-            str(conversation.project_id), conversation.project.name,
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=artifacts_base, project_id=str(conversation.project_id),
+            project_name=conversation.project.name, creator=conversation.created_by,
         )),
     )
 
@@ -2515,9 +2786,9 @@ async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path)
     conversation = _conversation_at(project_dir)
     monkeypatch.setattr(
         responses_mod.ResponsesHandler, "_remote_artifacts_context",
-        staticmethod(lambda session, conv_id: (
-            conversation, artifacts_base,
-            str(conversation.project_id), conversation.project.name,
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=artifacts_base, project_id=str(conversation.project_id),
+            project_name=conversation.project.name, creator=conversation.created_by,
         )),
     )
 
@@ -2530,6 +2801,7 @@ async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path)
 
     def spy_diff(**kwargs):
         indexed["completed_cleanly"] = kwargs["completed_cleanly"]
+        indexed["on_the_event_loop"] = on_the_event_loop()
         return diff(**kwargs)
 
     def spy_index(session, **kwargs):
@@ -2558,17 +2830,70 @@ async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path)
         model="anton", harness_id="anton", buffer=_FakeBuffer(),
     )
 
-    assert indexed == {"completed_cleanly": False, "slugs": ["half-written"]}
+    # The diff waits on artifact locks and parses journals: off the loop.
+    assert indexed == {"completed_cleanly": False, "on_the_event_loop": False, "slugs": ["half-written"]}
     assert not [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_records_the_ids_of_the_folders_a_turn_made(monkeypatch, tmp_path):
+    """The turn end passes each new folder's id, read with the turn's diff,
+    to the record, so checking the id against its row needs no file store
+    call of its own."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=artifacts_base, project_id=str(conversation.project_id),
+            project_name=conversation.project.name, creator=conversation.created_by,
+        )),
+    )
+
+    from cowork.services import task_objects
+
+    recorded = {}
+    monkeypatch.setattr(task_objects, "record_new_artifacts", lambda session, **kwargs: recorded.update(kwargs))
+
+    async def fake_autopublish(*args, **kwargs):
+        raise AssertionError("a failed turn must not publish")
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+    artifact_id = uuid4().hex
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        folder = _artifact(artifacts_base, "half-written")
+        metadata = json.loads((folder / "metadata.json").read_text())
+        (folder / "metadata.json").write_text(json.dumps({**metadata, "id": artifact_id}))
+        yield "turn_failed", {"error": "boom", "code": "anton_error", "message": "failed"}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert recorded["slugs"] == ["half-written"]
+    assert recorded["artifact_ids"] == {"half-written": artifact_id}
 
 
 def _artifacts_context_at(monkeypatch, artifacts_base):
     conversation = _conversation_at(artifacts_base.parent.parent)
     monkeypatch.setattr(
         responses_mod.ResponsesHandler, "_remote_artifacts_context",
-        staticmethod(lambda session, conv_id: (
-            conversation, artifacts_base,
-            str(conversation.project_id), conversation.project.name,
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=artifacts_base, project_id=str(conversation.project_id),
+            project_name=conversation.project.name, creator=conversation.created_by,
         )),
     )
     return conversation
@@ -2638,6 +2963,71 @@ async def test_a_remote_artifact_record_that_fails_logs_the_unrecorded_slugs_as_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lost", ["created_nothing", "check_after_the_created_rows"])
+async def test_a_record_of_a_remote_turn_that_lost_only_the_listed_check_says_so(
+    monkeypatch, tmp_path, caplog, owned_logger, lost,
+):
+    """The pod sent no list, so the record's unit also checks the folders
+    the diff listed. Either the turn created nothing, so the unit's failure
+    lost only that check, or it created a folder and record_new_artifacts
+    raised at the check, once that folder's rows were written
+    (ListedLocationsUnchecked). The line says the check failed, not that
+    created folders went unrecorded."""
+    from cowork.services import task_objects
+
+    handler = _remote_handler(monkeypatch, {})
+    artifacts_base = tmp_path / "proj" / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    _artifacts_context_at(monkeypatch, artifacts_base)
+    _no_workspace_or_memory_units(monkeypatch)
+    created = [] if lost == "created_nothing" else ["report"]
+    monkeypatch.setattr(
+        task_objects, "turn_artifact_changes",
+        lambda **_: task_objects.ArtifactChanges(
+            created=created, touched=set(created),
+            listed_ids=ListedIds(ids={"brief": "id-of-brief"}, unreadable=frozenset()),
+        ),
+    )
+    error = (
+        RuntimeError("the listed folders could not be checked")
+        if lost == "created_nothing"
+        else task_objects.ListedLocationsUnchecked()
+    )
+
+    def failing_record(session, **kwargs):
+        raise error
+
+    monkeypatch.setattr(task_objects, "record_new_artifacts", failing_record)
+
+    async def no_publish(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", no_publish)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    owned_logger(responses_mod.logger.name)
+
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        await handler._produce_remote(
+            conv_id=uuid4(), input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=_RecBuffer(),
+        )
+
+    errors = [
+        r for r in caplog.records
+        if r.name == responses_mod.logger.name and r.levelno == logging.ERROR
+    ]
+    assert [r.getMessage() for r in errors] == [
+        "[responses] could not check the locations of the artifacts a remote turn listed",
+    ]
+    assert errors[0].exc_info[1] is error
+
+
+@pytest.mark.asyncio
 async def test_a_stop_during_publish_records_the_turns_artifacts_once(monkeypatch, tmp_path):
     """The pod finished cleanly and left two new folders: one whose
     provenance names this conversation, and one with none yet, a sibling
@@ -2702,9 +3092,9 @@ async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(m
     conversation = _conversation_at(project_dir)
     monkeypatch.setattr(
         responses_mod.ResponsesHandler, "_remote_artifacts_context",
-        staticmethod(lambda session, conv_id: (
-            conversation, artifacts_base,
-            str(conversation.project_id), conversation.project.name,
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=artifacts_base, project_id=str(conversation.project_id),
+            project_name=conversation.project.name, creator=conversation.created_by,
         )),
     )
 
@@ -2714,7 +3104,9 @@ async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(m
     # what reaches the index step.
     indexed = {"new": set()}
 
-    def spy_index_new(session, *, conversation_id, project_id, slugs, creator):
+    def spy_index_new(
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+    ):
         indexed["new"] = set(slugs)
 
     monkeypatch.setattr(task_objects, "record_new_artifacts", spy_index_new)
@@ -2746,9 +3138,9 @@ async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(mon
     conversation = _conversation_at(project_dir)
     monkeypatch.setattr(
         responses_mod.ResponsesHandler, "_remote_artifacts_context",
-        staticmethod(lambda session, conv_id: (
-            conversation, artifacts_base,
-            str(conversation.project_id), conversation.project.name,
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=artifacts_base, project_id=str(conversation.project_id),
+            project_name=conversation.project.name, creator=conversation.created_by,
         )),
     )
 
@@ -2758,7 +3150,9 @@ async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(mon
     # what reaches the index step.
     indexed = {"new": set()}
 
-    def spy_index_new(session, *, conversation_id, project_id, slugs, creator):
+    def spy_index_new(
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+    ):
         indexed["new"] = set(slugs)
 
     monkeypatch.setattr(task_objects, "record_new_artifacts", spy_index_new)
@@ -2804,8 +3198,10 @@ async def test_execution_only_turn_never_indexes_or_publishes_saved_artifacts(mo
 
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
-    handler._remote_memory = lambda *_: None
-    handler._remote_artifacts_context = lambda *_: (object(), object(), "project", "Project")
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda *_: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_artifacts_context", staticmethod(lambda *_: _RemoteArtifactsDir(
+        base=Path("/project/artifacts"), project_id="project", project_name="Project", creator=None,
+    )))
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
     index = Mock(return_value=task_objects.ArtifactChanges(created=[], touched=set()))
     publish = AsyncMock(return_value=[])
@@ -2933,7 +3329,7 @@ async def test_a_forced_continuation_persists_only_the_replacement(monkeypatch):
     stream: the reloaded conversation has to show what the user saw."""
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
-    handler._remote_memory = lambda session, conv_id: {}
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: {}))
 
     async def fake_replies(**kwargs):
         yield "turn_delta", {"text": "SUPERSEDED"}
@@ -2964,7 +3360,7 @@ def _remote_handler_with_message_id(monkeypatch, saved, *, assistant_message_id)
     file relies on NOT mattering."""
     handler = _handler()
     handler.principal = object()
-    handler._remote_seed_history = lambda session, conv_id: ([], None)
+    monkeypatch.setattr(ResponsesHandler, "_remote_seed_history", staticmethod(lambda session, conv_id: ([], None)))
 
     class FakeConversationService:
         def __init__(self, session):
@@ -2989,6 +3385,8 @@ def _remote_handler_with_message_id(monkeypatch, saved, *, assistant_message_id)
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
     monkeypatch.setattr(responses_mod, "run_db", inline_run_db(_FakeUnitSession()))
+    # The skills block's unit, on the file store's threads.
+    monkeypatch.setattr(responses_mod, "run_efs_unit", inline_run_db(_FakeUnitSession()))
     monkeypatch.setattr(responses_mod, "read_earlier_answers", _no_earlier_answers)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
     return handler
@@ -3439,3 +3837,371 @@ async def test_the_selected_effort_reaches_the_queued_job_on_every_turn(monkeypa
         )
     efforts = [job["params"].get("reasoning_effort", "absent") for job in redis.jobs]
     assert efforts == ["high", "high", "absent"]
+
+
+@pytest.mark.asyncio
+async def test_a_remote_turns_artifact_bookkeeping_leaves_the_event_loop_free(monkeypatch, tmp_path):
+    """The snapshot at turn start, and the diff and cards at turn end, read
+    the shared file store. Each is made slow here, the diff behind a
+    revision-lock wait too, and the loop keeps ticking through all of it."""
+    import threading
+    import time
+
+    from cowork.services import task_objects
+    from cowork.services.artifact_lock import artifact_lock
+
+    slow = 1.0
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    _no_workspace_or_memory_units(monkeypatch)
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=artifacts_base, project_id=str(conversation.project_id),
+            project_name=conversation.project.name, creator=conversation.created_by,
+        )),
+    )
+
+    async def fake_autopublish(base, scope, *, touched, **kwargs):
+        return set(touched)
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts", fake_autopublish,
+    )
+    steps = []
+    real_snapshot = task_objects.snapshot_artifact_state
+    real_changes = task_objects.turn_artifact_changes
+    real_cards = task_objects.cards_for_slugs
+
+    def slow_snapshot(base):
+        steps.append("snapshot")
+        time.sleep(slow)
+        return real_snapshot(base)
+
+    def slow_changes(**kwargs):
+        steps.append("diff")
+        folder = artifacts_base / "sales-report"
+        held = threading.Event()
+
+        def another_writer():
+            with artifact_lock(folder):
+                held.set()
+                time.sleep(0.5)
+
+        writer = threading.Thread(target=another_writer)
+        writer.start()
+        held.wait(5)
+        with artifact_lock(folder):  # spins until the other writer lets go
+            time.sleep(slow)
+        writer.join()
+        return real_changes(**kwargs)
+
+    def slow_cards(*args, **kwargs):
+        steps.append("cards")
+        time.sleep(slow)
+        return real_cards(*args, **kwargs)
+
+    monkeypatch.setattr(task_objects, "snapshot_artifact_state", slow_snapshot)
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", slow_changes)
+    monkeypatch.setattr(task_objects, "cards_for_slugs", slow_cards)
+    # A spy, since the fake unit session cannot run the record.
+    recorded: list[list[str]] = []
+    monkeypatch.setattr(
+        task_objects, "record_new_artifacts", lambda session, **kwargs: recorded.append(kwargs["slugs"]),
+    )
+    conv_id = uuid4()
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        _artifact(artifacts_base, "sales-report", conversation_id=conv_id)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    loop = asyncio.get_running_loop()
+    beat = asyncio.create_task(heartbeat())
+    started = loop.time()
+    try:
+        await handler._produce_remote(
+            conv_id=conv_id, input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=_FakeBuffer(),
+        )
+    finally:
+        beat.cancel()
+    elapsed = loop.time() - started
+
+    assert steps == ["snapshot", "diff", "cards"]
+    assert recorded == [["sales-report"]]
+    assert elapsed >= 3 * slow
+    # A free loop ticks about 100 times a second here; a blocked one stops.
+    assert ticks >= 50 * elapsed * 0.5, f"{ticks} ticks in {elapsed:.1f}s"
+    cards = [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
+    assert [card["artifact"]["slug"] for card in cards] == ["sales-report"]
+
+
+class _FileStoreSlots:
+    """Every file store slot of the running event loop, taken by placeholders
+    the way calls stuck on a stalled mount take them."""
+
+    def __init__(self) -> None:
+        from cowork.db import units
+
+        self.limiter = units._efs_slots()
+        self.holders = [object() for _ in range(units.db_session.settings.storage.efs_slots)]
+
+    async def take(self) -> None:
+        for holder in self.holders:
+            await self.limiter.acquire_on_behalf_of(holder)
+
+    async def until_someone_waits(self) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while self.limiter.statistics().tasks_waiting == 0:
+            assert loop.time() < deadline, "nothing waited for a file store slot"
+            await asyncio.sleep(0.01)
+
+    def free(self) -> None:
+        for holder in self.holders:
+            if holder in self.limiter.statistics().borrowers:
+                self.limiter.release_on_behalf_of(holder)
+
+
+class _ArtifactTurn(NamedTuple):
+    """A remote turn whose pod creates one artifact, "mine", and finishes
+    cleanly. ``recorded`` holds the slugs of each record_new_artifacts call."""
+
+    handler: ResponsesHandler
+    conv_id: UUID
+    artifacts_base: Path
+    recorded: list[list[str]]
+
+    def produce(self, buffer):
+        return self.handler._produce_remote(
+            conv_id=self.conv_id, input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=buffer,
+        )
+
+
+def _a_remote_turn_that_creates_an_artifact(monkeypatch, tmp_path, *, before_completed=None) -> _ArtifactTurn:
+    """The pod creates "mine", whose provenance names the turn's
+    conversation, awaits ``before_completed`` when one is given, then
+    finishes cleanly. A spy stands in for record_new_artifacts, which the
+    fake unit session cannot run, and nothing is published."""
+    from cowork.services import task_objects
+
+    handler = _remote_handler(monkeypatch, {})
+    artifacts_base = tmp_path / "proj" / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    _artifacts_context_at(monkeypatch, artifacts_base)
+    _no_workspace_or_memory_units(monkeypatch)
+    recorded: list[list[str]] = []
+    monkeypatch.setattr(
+        task_objects, "record_new_artifacts", lambda session, **kwargs: recorded.append(kwargs["slugs"]),
+    )
+
+    async def no_publish(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", no_publish)
+    conv_id = uuid4()
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        _artifact(artifacts_base, "mine", conversation_id=conv_id)
+        yield "turn_delta", {"text": "done"}
+        if before_completed is not None:
+            await before_completed()
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    return _ArtifactTurn(handler, conv_id, artifacts_base, recorded)
+
+
+@pytest.mark.asyncio
+async def test_a_stop_while_a_remote_turns_artifact_diff_runs_still_records_its_rows(monkeypatch, tmp_path):
+    """The pod finished cleanly and created an artifact, and a Stop lands
+    while the turn diffs the project's artifacts on the file store. The Stop
+    waits for the diff and then for the record, so the artifact gets its
+    rows once, and the stream ends cancelled. Without its owner row, in org
+    mode its creator could no longer edit it."""
+    import threading
+
+    from cowork.services import task_objects
+
+    turn = _a_remote_turn_that_creates_an_artifact(monkeypatch, tmp_path)
+    diffing, finish = threading.Event(), threading.Event()
+    real_changes = task_objects.turn_artifact_changes
+
+    def blocked_diff(**kwargs):
+        diffing.set()
+        finish.wait(timeout=5)
+        return real_changes(**kwargs)
+
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", blocked_diff)
+    buffer = _RecBuffer()
+    task = asyncio.create_task(turn.produce(buffer))
+    try:
+        assert await asyncio.to_thread(diffing.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0.2)
+        assert not task.done(), "the Stop did not wait for the diff"
+    finally:
+        finish.set()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+    assert turn.recorded == [["mine"]]
+    assert buffer.frames[-1] == "CLOSE:cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("cleanup_tmp_projects")
+async def test_a_stop_while_the_artifact_diff_waits_for_a_file_store_slot_still_writes_its_rows(
+    monkeypatch, tmp_path,
+):
+    """The pod finished cleanly and created an artifact while the mount
+    stalls with every file store slot taken, and a Stop lands while the
+    turn's diff waits for one. The Stop waits for a slot, the diff and the
+    record: the artifact still gets its task_objects row and its owner row
+    once the slots free."""
+    from cowork.db import units
+    from cowork.db.scoped import TenantScope
+    from cowork.models.task_object import TaskObject
+    from cowork.services import artifact_ownership as ownership
+    from test_artifact_ownership import make_conversation, make_project, project_root, write_artifact
+
+    org_id, creator = str(uuid4()), str(uuid4())
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id=creator)
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, creator)
+    source = project_root(project)
+    slug = "sales-report"
+    handler = _remote_handler(monkeypatch, {})
+    _units_on_the_test_database(monkeypatch, scope=scope)
+    _no_workspace_or_memory_units(monkeypatch)
+    monkeypatch.setattr(
+        ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: _RemoteArtifactsDir(
+            base=source.base, project_id=str(project.id), project_name=project.name, creator=creator,
+        )),
+    )
+    slots = _FileStoreSlots()
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        write_artifact(source.base, slug, conversation=conversation_id)
+        yield "turn_delta", {"text": "done"}
+        await slots.take()
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    buffer = _RecBuffer()
+    task = asyncio.create_task(handler._produce_remote(
+        conv_id=conversation_id, input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    ))
+    try:
+        await slots.until_someone_waits()
+        task.cancel()
+        await asyncio.sleep(0.2)
+        assert not task.done(), "the Stop did not wait for the artifact diff"
+    finally:
+        slots.free()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+    assert buffer.frames[-1] == "CLOSE:cancelled"
+    with units.unit_session(scope=scope) as session:
+        indexed = session.exec(
+            session.select(TaskObject).where(
+                TaskObject.conversation_id == conversation_id, TaskObject.ref == slug,
+            )
+        ).all()
+        owner = ownership.resolve_artifact_owner(session, source, slug)
+    assert (len(indexed), owner) == (1, ownership.OwnerResolution(creator, "recorded"))
+
+
+@pytest.mark.asyncio
+async def test_a_remote_turns_artifact_diff_waits_past_pool_timeout_for_a_file_store_slot(
+    monkeypatch, tmp_path, caplog,
+):
+    """The pod finished cleanly and created an artifact while every file
+    store slot stays taken past POOL_TIMEOUT. The turn's diff waits for a
+    slot rather than fail, and records the artifact once the slots free: in
+    org mode nothing records it later."""
+    from cowork.db import units
+    from cowork.db.units import FilesystemBusy
+
+    monkeypatch.setattr(units.db_session.settings.database, "pool_timeout", 1)
+    slots = _FileStoreSlots()
+    turn = _a_remote_turn_that_creates_an_artifact(monkeypatch, tmp_path, before_completed=slots.take)
+    buffer = _RecBuffer()
+    with caplog.at_level(logging.WARNING):
+        task = asyncio.create_task(turn.produce(buffer))
+        try:
+            await slots.until_someone_waits()
+            await asyncio.sleep(1.5)
+            assert not task.done(), "the diff gave up waiting for a slot"
+            assert turn.recorded == []
+        finally:
+            slots.free()
+        await asyncio.wait_for(task, timeout=5)
+
+    assert turn.recorded == [["mine"]]
+    assert buffer.frames[-1] == "CLOSE:completed"
+    assert not [r for r in caplog.records if r.exc_info and isinstance(r.exc_info[1], FilesystemBusy)]
+
+
+@pytest.mark.asyncio
+async def test_a_stop_while_the_diff_holds_an_artifacts_revision_lock_waits_for_it(monkeypatch, tmp_path):
+    """The diff captures a revision of each folder the turn touched under
+    that folder's revision lock. A Stop that lands while the diff holds the
+    lock waits for the diff to end: the stream ends cancelled only after the
+    lock is let go, and no lock file stays behind for the folder's next
+    writer to wait on."""
+    import threading
+    import time
+
+    from cowork.services import task_objects
+    from cowork.services.artifact_lock import artifact_lock
+
+    turn = _a_remote_turn_that_creates_an_artifact(monkeypatch, tmp_path)
+    folder = turn.artifacts_base / "mine"
+    entered = threading.Event()
+    let_go: list[float] = []
+    real_changes = task_objects.turn_artifact_changes
+
+    def diff_under_the_revision_lock(**kwargs):
+        with artifact_lock(folder):
+            entered.set()
+            time.sleep(0.5)
+        let_go.append(time.monotonic())
+        return real_changes(**kwargs)
+
+    monkeypatch.setattr(task_objects, "turn_artifact_changes", diff_under_the_revision_lock)
+    closed: list[float] = []
+
+    class TimedBuffer(_RecBuffer):
+        async def close(self, reason):
+            closed.append(time.monotonic())
+            await super().close(reason)
+
+    buffer = TimedBuffer()
+    task = asyncio.create_task(turn.produce(buffer))
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+    assert buffer.frames[-1] == "CLOSE:cancelled"
+    assert let_go and closed and let_go[0] <= closed[0], "the stream ended while the diff held the lock"
+    assert not (folder / ".revisions" / ".lock").exists()
+    assert turn.recorded == [["mine"]]

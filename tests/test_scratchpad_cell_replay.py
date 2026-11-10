@@ -20,6 +20,7 @@ from anton.core.utils.scratchpad import WriteGate, hold_unapproved_write
 from anton.core.utils.write_check import snapshot_project_files
 
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import (
+    _CELL_FIELDS,
     SCRATCHPAD_REPLAY_ROLES,
     extract_scratchpad_cells,
 )
@@ -318,6 +319,35 @@ def test_an_exec_end_and_its_result_make_a_cell():
     cells = extract_scratchpad_cells([_start(), _end("exec"), _result("x = 1")])
 
     assert cells == [Cell(code="x = 1", stdout="1\n", stderr="", error=None)]
+
+
+def test_a_result_with_a_field_this_cell_lacks_still_makes_a_cell():
+    """An anton of another version may save a field this one's Cell doesn't
+    declare, as a pin moved back after a release that added one does. The
+    cell still replays, with the fields this Cell has."""
+    saved = {"code": "x = 1", "stdout": "1\n", "stderr": "", "error": None, "field_from_another_version": 3}
+    result = {"type": "response.in_progress", "thought_role": "thought.scratchpad.result", "content": json.dumps(saved)}
+
+    cells = extract_scratchpad_cells([_start(), _end("exec"), result])
+
+    assert cells == [Cell(code="x = 1", stdout="1\n", stderr="", error=None)]
+
+
+@pytest.mark.skipif(
+    not {"stopped_at", "ended_process"} <= _CELL_FIELDS, reason="this anton's Cell records no stop line or process end",
+)
+def test_a_result_cut_in_its_logs_keeps_where_the_cell_stopped():
+    """A result cut at 65,536 characters inside its logs still replays with
+    the line the cell stopped at and whether it ended its process, since
+    anton's Cell declares both before its logs."""
+    saved = Cell(code="x = 1", stdout="", stderr="", error="Timed out after 60s.", stopped_at=3,
+                 ended_process=True, logs="x" * 70_000)
+    result = {"type": "response.in_progress", "thought_role": "thought.scratchpad.result",
+              "content": json.dumps(asdict(saved))[:65_536]}
+
+    cells = extract_scratchpad_cells([_start(), _end("exec"), result])
+
+    assert [(c.code, c.stopped_at, c.ended_process) for c in cells] == [("x = 1", 3, True)]
 
 
 def test_a_result_after_a_non_exec_end_makes_no_cell():
