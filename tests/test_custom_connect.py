@@ -175,6 +175,9 @@ def test_a_stored_check_that_no_longer_parses_cannot_connect(engine, world, monk
     res = _connect(_client(engine, monkeypatch))
 
     assert (res.status_code, res.json()["detail"]["code"]) == (409, "no_check")
+    message = res.json()["detail"]["message"]
+    assert message.startswith("This connector's connection check is not usable")
+    assert "if it takes none, Anton can use it without a connector" in message
     assert world["auth"] == [] and world["provider"] == []
 
 

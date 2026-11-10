@@ -30,6 +30,7 @@ _KEPT_FORM_KEYS = ("how_to", "help_url")
 _COLOR_PATTERN = re.compile(r"#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?")
 # Matches the cap agent-facing usage notes have on built-in specs.
 USAGE_NOTES_MAX = 1600
+NO_CHECK_REASON = "has no connection check, so it cannot be connected."
 
 
 class UnstorableFormError(ValueError):
@@ -200,9 +201,6 @@ def custom_id_for(builtin_id: str) -> str:
     return f"{builtin_id}_custom"
 
 
-NO_CHECK_REASON = "has no connection check, so it cannot be connected."
-
-
 def turn_connector_cards(entries: Any) -> tuple[list[dict[str, Any]], list[str]]:
     """Check one ``turn_connector`` reply's drafts again before they are shown.
 
@@ -220,6 +218,7 @@ def turn_connector_cards(entries: Any) -> tuple[list[dict[str, Any]], list[str]]
     for entry in items[:MAX_DRAFTS_PER_TURN]:
         try:
             draft = parse_connector_draft(entry)
+            asked_id = draft.connector_id
             if is_builtin_connector_id(draft.connector_id):
                 # Its own id, so every place where a built-in id wins stays right.
                 draft = parse_connector_draft({**entry, "connector_id": custom_id_for(draft.connector_id)})
@@ -230,7 +229,7 @@ def turn_connector_cards(entries: Any) -> tuple[list[dict[str, Any]], list[str]]
             notices.append(f"A connector template was not shown: {draft.connector_id!r} is a built-in connector.")
             continue
         if draft.check is None:
-            notices.append(f"A connector template was not shown: {draft.connector_id!r} {NO_CHECK_REASON}")
+            notices.append(f"A connector template was not shown: {asked_id!r} {NO_CHECK_REASON}")
             continue
         if draft.connector_id in shown:
             notices.append(f"A second connector template for {draft.connector_id!r} was not shown.")
