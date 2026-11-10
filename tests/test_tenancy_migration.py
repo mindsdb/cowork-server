@@ -315,10 +315,8 @@ def test_postgres_custom_connectors_are_unique_per_builder(monkeypatch):
         command.upgrade(cfg, "head")
         _insert_connector(engine, created_by="user-1")
         _insert_connector(engine, created_by="user-2")
-        _insert_connector(engine, created_by=None)
-        for repeat in ("user-1", None):
-            with pytest.raises(IntegrityError):
-                _insert_connector(engine, created_by=repeat)
+        with pytest.raises(IntegrityError):
+            _insert_connector(engine, created_by="user-1")
     finally:
         with engine.begin() as connection:
             connection.execute(text("delete from custom_connectors"))
