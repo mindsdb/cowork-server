@@ -242,6 +242,17 @@ def test_a_time_limit_whose_key_window_auth_would_refuse_is_rejected(monkeypatch
     assert TurnQueueSettings().turn_key_lifetime_seconds <= AUTH_TURN_KEY_MAX_TTL_SECONDS - AUTH_TURN_KEY_SKEW_SECONDS
 
 
+def test_a_time_limit_longer_than_the_backstop_and_key_lifetime_cover_is_rejected(monkeypatch):
+    """The controller's backstop and auth's key lifetime are sized for four
+    60-minute windows. 3700 s fits auth's per-window cap, but its fourth
+    window would end on the backstop or a dead key, with no summary."""
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "3700")
+    with pytest.raises(ValidationError):
+        TurnQueueSettings()
+
+
 @pytest.mark.asyncio
 async def test_a_failed_extension_is_retried_once(time_limit, monkeypatch):
     from cowork.api.v1.endpoints import responses as endpoint

@@ -752,6 +752,11 @@ class TurnQueueSettings(Settings):
     time_limit_seconds: int = Field(
         default=0,
         ge=0,
+        # Sized elsewhere for four 60-minute windows: scratchpad-controller's
+        # time_limited_turn_ceiling_seconds (16 200) and auth's
+        # turn_key_max_lifetime_seconds (17 100). A longer limit would end its
+        # last window on one of them, with no summary; raise those first.
+        le=3600,
         description=(
             "Per-turn time limit sent to the pod as params.limits.max_turn_seconds. "
             "anton asks \"Keep going / Stop here\" at it and ends with a summary. 0 sends "
