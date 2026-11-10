@@ -8,9 +8,12 @@ watchdog both read the turn as hung.
 anton reports what it is waiting on through ``ChatSession.model_calls``. While
 that reports a call waiting on the provider and the buffer has been quiet for
 ``MODEL_WAIT_TICK_SECONDS``, ``ModelWaitTicker`` appends one ``model_wait``
-progress frame, which resets every idle bound. A hung tool, a cell, an open
-question or a frozen process reports no waiting call, so it still hits every
-bound.
+progress frame, which resets every idle bound. In process, a hung tool, a
+cell, an open question or a frozen process reports no waiting call, so it
+still hits every bound. On a web turn the pod writes nothing during a long
+cell either; there scratchpad-controller relays the pod's heartbeat
+(``WORKER_ALIVE_PHASE``), and the web turn shows it as the same frame after the
+same quiet stretch, never over an open question.
 
 The frame is a live signal only. It goes straight to the buffer, never
 through the formatter's ``event_sink``, so a reload does not replay it.
@@ -38,7 +41,8 @@ MODEL_WAIT_PHASE = "model_wait"
 WORKER_ALIVE_PHASE = "worker_alive"
 MODEL_WAIT_LABEL = "Still working"
 
-# How long the buffer must stay quiet before a frame goes out, and how often
+# How long the buffer (in process) or the reply stream (a web turn's relay,
+# handlers/responses.py) must stay quiet before a frame goes out, and how often
 # the ticker checks. Frames therefore arrive every 20 to 25 s, well inside the
 # UI's 300 s cut. Module constants rather than settings so tests can shrink
 # them; the loop reads them on every pass.
@@ -73,7 +77,10 @@ def model_wait_sse(*, message: str, waited_s: float | None, sequence_number: int
         data["sequence_number"] = sequence_number
     data.update({
         "thought_role": Role.thought_progress.value,
-        "content": f"{MODEL_WAIT_LABEL}: {message}" if message else MODEL_WAIT_LABEL,
+        "content": (
+            f"{MODEL_WAIT_LABEL}: {message}" if message and message != MODEL_WAIT_LABEL
+            else MODEL_WAIT_LABEL
+        ),
         "phase": MODEL_WAIT_PHASE,
         "message": message,
         "eta_seconds": waited_s,
