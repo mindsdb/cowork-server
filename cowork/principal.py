@@ -270,6 +270,22 @@ def _is_browser_jwt_request(request: Request) -> bool:
     return is_session_jwt(authorization[7:].strip())
 
 
+def hub_credential_for(request: Request | None, *, org_mode: bool, org_id: str | None) -> str:
+    """The caller's MindsHub credential for a read or write this server makes
+    as them on a surface that works in hosted org mode and on a local server
+    alike (org branding, the org switcher's icons).
+
+    Hosted org mode: the ``Authorization`` the gateway validated
+    (``caller_bearer``), and only with an org in scope. Never the client-set
+    ``X-MindsHub-Authorization``, which may name another org of the caller's
+    than the one the request is scoped to. Local server: that header, which
+    the desktop app sends with its hub calls (``mindshub_credential``); this
+    server's own ``Authorization`` is never forwarded. Empty without one."""
+    if org_mode:
+        return caller_bearer(request) if org_id else ""
+    return mindshub_credential(request)
+
+
 def is_session_jwt(credential: str) -> bool:
     """True only for a credential shaped like a user's Keycloak session JWT:
     three segments, the first a JOSE header. A MindsDB API key (``mdb_``), a

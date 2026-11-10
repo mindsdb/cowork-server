@@ -45,7 +45,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.units import run_efs_unit
-from cowork.principal import caller_bearer, is_session_jwt, mindshub_credential
+from cowork.principal import hub_credential_for, is_session_jwt
 from cowork.schemas.org_branding import OrgAppearanceUpdate, OrgAppearanceView, OrgBrandingView
 from cowork.services.org_branding import (
     AuthAppearanceError,
@@ -66,9 +66,7 @@ SIGN_IN_TO_EDIT = "Sign in to MindsHub to change branding."
 
 def _credential(request: Request, scope: TenantScope) -> str:
     """The caller's MindsHub credential for this deployment (module docstring)."""
-    if scope.org_mode:
-        return caller_bearer(request) if scope.org_id else ""
-    return mindshub_credential(request)
+    return hub_credential_for(request, org_mode=scope.org_mode, org_id=scope.org_id)
 
 
 def _who(scope: TenantScope) -> dict[str, str]:

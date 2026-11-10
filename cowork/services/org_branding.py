@@ -42,6 +42,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from anton.core.tools.skill_format import SKILL_FILE
 
+from cowork.common.settings.app_settings import default_minds_auth_host
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill
 from cowork.services.mindshub_client import (
@@ -152,11 +153,33 @@ class AuthBranding:
         return self.answer is not MindsHubAnswer.REFUSED
 
 
-def _absolute_url(value: Any) -> str | None:
-    if not isinstance(value, str) or not value:
+def absolute_auth_url(value: Any) -> str | None:
+    """An image URL from auth as one a browser can load, or None.
+
+    auth answers root-relative URLs (``/v1/organizations/{id}/branding/icon?v=…``)
+    wherever it doesn't trust the request's Host (PR envs). Those are joined
+    to the public auth origin this deployment is configured with
+    (cowork.common.settings.app_settings.default_minds_auth_host, derived
+    from ENV or the pod's namespace, never from a request): the same origin
+    cowork-server reads auth on. An absolute ``https`` URL is kept as it is.
+    Anything else is refused: another scheme, a protocol-relative ``//host``,
+    a backslash (which browsers read as a slash), whitespace or a control
+    character."""
+    if not isinstance(value, str):
         return None
+    value = value.strip()
+    if not value or "\\" in value or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return None
+    if value.startswith("/"):
+        if value.startswith("//"):
+            return None
+        origin = default_minds_auth_host().rstrip("/")
+        parts = urlsplit(origin)
+        if parts.scheme != "https" or not parts.netloc or parts.path:
+            return None
+        return f"{origin}{value}"
     parts = urlsplit(value)
-    if parts.scheme not in ("https", "http") or not parts.netloc:
+    if parts.scheme != "https" or not parts.netloc:
         return None
     return value
 
@@ -194,9 +217,9 @@ def parse_auth_branding(payload: Any) -> AuthBranding:
     sidebar_title = payload.get("sidebar_title")
     return AuthBranding(
         answer=MindsHubAnswer.OK,
-        icon_url=_absolute_url(payload.get("icon_url")),
-        logo_url=_absolute_url(payload.get("logo_url")),
-        logo_dark_url=_absolute_url(payload.get("logo_dark_url")),
+        icon_url=absolute_auth_url(payload.get("icon_url")),
+        logo_url=absolute_auth_url(payload.get("logo_url")),
+        logo_dark_url=absolute_auth_url(payload.get("logo_dark_url")),
         org_name=_text(payload.get("org_name")),
         # auth resolves it; null is the 'none' mode (only the logo).
         sidebar_title=sidebar_title if isinstance(sidebar_title, str) and sidebar_title else None,

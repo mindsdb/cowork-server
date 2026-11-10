@@ -803,3 +803,62 @@ def test_send_mindshub_keeps_a_refusals_body_and_sends_the_json(monkeypatch):
     ok = asyncio.run(mindshub_client.send_mindshub("PATCH", "/x/", MEMBER_BEARER, json_body={"accent": "#000000"}))
     assert (ok.answer, ok.payload) == (MindsHubAnswer.OK, {"ok": True})
     assert seen[0][:3] == ("PATCH", "/v1/x/", f"Bearer {MEMBER_BEARER}")
+
+
+# ── auth's image URLs, made browser-loadable ─────────────────────────────────
+
+PUBLIC_AUTH = "https://auth-pr-cowork-1.dev.mindshub.ai"
+
+
+@pytest.fixture
+def public_auth(monkeypatch):
+    monkeypatch.setattr(org_branding, "default_minds_auth_host", lambda: PUBLIC_AUTH)
+
+
+def test_a_root_relative_url_is_joined_to_the_public_auth_origin(public_auth):
+    path = f"/v1/organizations/{ORG_ID}/branding/icon?v=abc"
+    assert org_branding.absolute_auth_url(path) == f"{PUBLIC_AUTH}{path}"
+
+
+def test_an_absolute_https_url_is_kept(public_auth):
+    assert org_branding.absolute_auth_url(f"{AUTH}/logo?v=1") == f"{AUTH}/logo?v=1"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None, 7, "", "   ",
+        "http://auth.acme.com/v1/organizations/x/branding/icon",
+        "//evil.example/icon.png",
+        "/\\evil.example/icon.png",
+        "javascript:alert(1)",
+        "data:image/png;base64,AAAA",
+        "ftp://auth.acme.com/icon",
+        "https:///no-host",
+        "relative/path/icon.png",
+        "/v1/organizations/x/branding/icon?v=1\nSet-Cookie: x",
+        "/v1/organizations/x/branding/ icon",
+    ],
+)
+def test_anything_else_is_refused(public_auth, value):
+    assert org_branding.absolute_auth_url(value) is None
+
+
+def test_a_relative_url_is_refused_without_an_https_public_origin(monkeypatch):
+    monkeypatch.setattr(org_branding, "default_minds_auth_host", lambda: "http://localhost:8000")
+    assert org_branding.absolute_auth_url("/v1/organizations/x/branding/icon") is None
+
+
+def test_relative_urls_from_auth_reach_the_app_and_the_skill_absolute(org, public_auth):
+    org.auth.branding.update(
+        icon_url=f"/v1/organizations/{ORG_ID}/branding/icon?v=abc",
+        logo_url=f"/v1/organizations/{ORG_ID}/branding/logo?v=def",
+        logo_dark_url="//evil.example/logo.png",
+    )
+    out = _get(org, ALICE)
+    assert out["iconUrl"] == f"{PUBLIC_AUTH}/v1/organizations/{ORG_ID}/branding/icon?v=abc"
+    assert out["logoUrl"] == f"{PUBLIC_AUTH}/v1/organizations/{ORG_ID}/branding/logo?v=def"
+    assert out["logoDarkUrl"] is None
+    text = _skill_md(_org_scope(org))
+    assert f"- Logo (for light backgrounds): {PUBLIC_AUTH}/v1/organizations/{ORG_ID}/branding/logo\n" in text
+    assert "evil.example" not in text and "?v=" not in text
