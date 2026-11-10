@@ -239,3 +239,127 @@ async def test_a_grant_at_no_version_is_refused_by_the_producer_itself(turn):
             scope=TenantScope(org_mode=True, org_id="o1", user_id="u1"), correlation_id="r",
             turn_key_id="turnkey", disabled=None, settings=TurnQueueSettings(),
         )
+
+
+# ── usage notes (step 2) ─────────────────────────────────────────────────────
+
+
+@pytest.fixture()
+def templates(monkeypatch):
+    """A database holding acme_crm templates for two members of o1 and one of o2, saved the real way."""
+    from anton.core.tools.connector_draft import parse_connector_draft
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, SQLModel, create_engine
+
+    from cowork.db.scoped import ScopedSession, TenantScope
+    from cowork.services.connectors.custom_connectors import CustomConnectorService
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    for org, user, notes in (("o1", "u1", "Call /v1/me first."), ("o1", "u2", "Other member's notes."),
+                             ("o2", "u1", "Other org's notes.")):
+        draft = {"connector_id": "acme_crm", "label": "Acme CRM", "usage_notes": notes,
+                 "fields": [{"name": "api_key", "label": "API key"}]}
+        scope = TenantScope(org_mode=True, org_id=org, user_id=user)
+        CustomConnectorService(ScopedSession(Session(engine), scope)).save_member_draft(parse_connector_draft(draft))
+
+    async def run_db(fn, *, scope):
+        return fn(ScopedSession(Session(engine), scope))
+
+    monkeypatch.setattr(prod, "run_db", run_db)
+    return engine
+
+
+async def test_the_turn_carries_the_notes_of_the_members_own_template(turn, templates):
+    params, _ = await _run(turn)
+
+    assert params["connectors"]["acme_crm"] == {"usage_notes": "Call /v1/me first."}
+    assert "beta_api" not in params["connectors"]
+
+
+@pytest.mark.parametrize(("org_id", "user_id", "expected"), [
+    ("o1", "u2", "Other member's notes."), ("o2", "u1", "Other org's notes."),
+], ids=["another member", "another org"])
+async def test_each_member_gets_only_their_own_templates_notes(turn, templates, org_id, user_id, expected):
+    turn["grant"].return_value = _granted({3: 1, 5: 2}, user_id=user_id, organization_id=org_id)
+
+    params, _ = await _run(turn, org_id=org_id, user_id=user_id)
+
+    assert params["connectors"]["acme_crm"] == {"usage_notes": expected}
+
+
+async def test_a_connection_whose_template_is_gone_gets_no_notes(turn, templates):
+    turn["list"].return_value = [_listed(3, "beta_api", "Ops")]
+    turn["grant"].return_value = _granted({3: 1})
+
+    params, _ = await _run(turn)
+
+    assert "connectors" not in params
+    assert params["custom_api"]["connections"][0]["connector_id"] == "beta_api"
+
+
+async def test_notes_are_scrubbed_and_cut(turn, templates):
+    from sqlmodel import Session, select
+
+    from cowork.models.custom_connector import CustomConnector
+    from cowork.services.connectors.custom_connectors import USAGE_NOTES_MAX
+
+    # A shape scrub_output knows; the template parser refuses long token runs at save anyway.
+    planted = "sk-proj-" + "abcdefghijklmnopqrstuvwxyz0123456789ABCD"
+    with Session(templates) as session:
+        row = session.exec(select(CustomConnector).where(CustomConnector.created_by == "u1",
+                                                         CustomConnector.org_id == "o1")).one()
+        row.usage_notes = f"Use {planted}. " + "x" * 3000
+        session.add(row)
+        session.commit()
+
+    params, _ = await _run(turn)
+
+    notes = params["connectors"]["acme_crm"]["usage_notes"]
+    assert planted not in notes
+    assert len(notes) <= USAGE_NOTES_MAX
+
+
+async def test_built_in_notes_stay_beside_the_custom_ones(turn, templates, monkeypatch):
+    monkeypatch.setattr(prod, "_mint_oauth_block",
+                        AsyncMock(return_value={"connections": [{"engine": "hubspot", "name": "main"}]}))
+    monkeypatch.setattr(prod.registry, "usage_notes_for", lambda engines: {"hubspot": "Built-in notes."})
+
+    params, _ = await _run(turn)
+
+    assert params["connectors"] == {
+        "acme_crm": {"usage_notes": "Call /v1/me first."}, "hubspot": {"usage_notes": "Built-in notes."},
+    }
+
+
+async def test_a_database_that_cannot_answer_costs_the_notes_not_the_turn(turn, monkeypatch):
+    async def broken(fn, *, scope):
+        raise RuntimeError("database down")
+
+    monkeypatch.setattr(prod, "run_db", broken)
+
+    params, _ = await _run(turn)
+
+    assert params["custom_api"]["connections"]
+    assert "connectors" not in params
+
+
+def test_the_notes_read_nothing_outside_a_members_org_scope(templates):
+    from sqlmodel import Session
+
+    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
+    from cowork.services.connectors.custom_connectors import member_turn_usage_notes
+
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+    from cowork.models.custom_connector import CustomConnector
+
+    assert member_turn_usage_notes(ScopedSession(Session(templates), LOCAL_SCOPE), ["acme_crm"]) == {}
+    no_user = TenantScope(org_mode=True, org_id="o1", user_id=None)
+    assert member_turn_usage_notes(ScopedSession(Session(templates), no_user), ["acme_crm"]) == {}
+    # One person's partition sees its own definitions, but is not an org member's turn.
+    personal = TenantScope(personal=True, org_id="p1", user_id="u1", personal_resources=ALL_PERSONAL_RESOURCES)
+    with Session(templates) as session:
+        session.add(CustomConnector(connector_id="acme_crm", label="Acme", spec={"fields": []},
+                                    usage_notes="Personal notes.", org_id="p1", created_by="u1"))
+        session.commit()
+    assert member_turn_usage_notes(ScopedSession(Session(templates), personal), ["acme_crm"]) == {}

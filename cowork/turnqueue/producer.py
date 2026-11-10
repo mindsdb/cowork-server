@@ -29,7 +29,9 @@ from cowork.handlers.turn_errors import (
 from cowork.schemas.turn_skills import TurnSkillEntry, TurnSkills, turn_skills_wire
 from cowork.services.providers import minds_chat_base_url
 from cowork.db.scoped import TenantScope, scope_for_identity
+from cowork.db.units import run_db
 from cowork.services import product_permissions
+from cowork.services.connectors.custom_connectors import member_turn_usage_notes
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
@@ -327,6 +329,25 @@ def _connectors_block(oauth_connections: dict | None) -> dict | None:
     connections = (oauth_connections or {}).get("connections") or []
     notes = registry.usage_notes_for(dict.fromkeys(c.get("engine") for c in connections))
     return {engine: {"usage_notes": text} for engine, text in notes.items()} or None
+
+
+async def _with_custom_usage_notes(connectors_block: dict | None, scope: TenantScope,
+                                   custom_api_block: dict) -> dict | None:
+    """The connectors block plus the notes of the member's own templates for this turn's custom connections.
+
+    Read from the member's own rows only (member_turn_usage_notes). A
+    database that cannot answer leaves the notes out, never the turn.
+    """
+    connector_ids = [c["connector_id"] for c in custom_api_block["connections"]]
+    try:
+        notes = await run_db(partial(member_turn_usage_notes, connector_ids=connector_ids), scope=scope)
+    except Exception:
+        logger.warning("[producer] custom connector usage notes left out: the database did not answer",
+                       exc_info=True)
+        return connectors_block
+    merged = {connector_id: {"usage_notes": text} for connector_id, text in notes.items()}
+    merged.update(connectors_block or {})
+    return merged or None
 
 
 def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermissionUnavailable:
@@ -963,6 +984,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     custom_api_block = (
         {"turn_key": llm_block.get("api_key", ""), **custom_api_connections} if custom_api_connections else None
     )
+    if custom_api_block:
+        connectors_block = await _with_custom_usage_notes(connectors_block, scope, custom_api_block)
     browser_block = await _scoped_browser_block(
         scope=scope, conversation_id=conversation_id, turn_key=llm_block.get("api_key", ""),
         project_id=workspace.project_id if workspace is not None else None,
