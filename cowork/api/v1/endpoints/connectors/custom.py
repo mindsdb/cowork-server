@@ -25,6 +25,7 @@ from cowork.services.connectors.custom_connections import (
     create_custom_connection,
 )
 from cowork.services.connectors.custom_connectors import (
+    NO_CHECK_REASON,
     CustomConnectorService,
     MemberConnectorLimitError,
     UnstorableFormError,
@@ -84,7 +85,7 @@ def save_connector_draft(
 
     Raises:
         HTTPException: 404 outside org mode or with the setting off, 422 for
-            a draft outside the allowlist or a built-in id, 409 at the
+            a draft outside the allowlist, a built-in id or no check, 409 at the
             member's connector limit.
     """
     if not session.scope.org_mode or not TurnQueueSettings().connector_drafts_enabled:
@@ -96,6 +97,8 @@ def save_connector_draft(
     connector_id = parsed.connector_id
     if is_builtin_connector_id(connector_id):
         raise _unprocessable(f"{connector_id!r} is already a built-in connector.")
+    if parsed.check is None:
+        raise _unprocessable(f"{connector_id!r} {NO_CHECK_REASON}")
     try:
         row = CustomConnectorService(session).save_member_draft(parsed)
     except MemberConnectorLimitError as e:

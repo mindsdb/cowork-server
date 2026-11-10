@@ -47,3 +47,15 @@ def test_a_renamed_id_that_is_also_built_in_is_refused(monkeypatch):
 
     assert cards == []
     assert notices == ["A connector template was not shown: 'hasdata_custom' is a built-in connector."]
+
+
+def test_a_template_without_a_check_is_a_notice_not_a_card():
+    """An older pod's template with no check could never be connected."""
+    entry = {k: v for k, v in _ENTRY.items() if k != "check"}
+
+    cards, notices = turn_connector_cards([entry, _ENTRY])
+
+    assert _ids(cards) == [_ENTRY["connector_id"]]
+    assert notices == [
+        f"A connector template was not shown: {_ENTRY['connector_id']!r} has no connection check, so it cannot be connected."
+    ]

@@ -206,6 +206,9 @@ def custom_id_for(builtin_id: str) -> str:
     return f"{builtin_id}_custom"
 
 
+NO_CHECK_REASON = "has no connection check, so it cannot be connected."
+
+
 def turn_connector_cards(entries: Any) -> tuple[list[dict[str, Any]], list[str]]:
     """Check one ``turn_connector`` reply's drafts again before they are shown.
 
@@ -231,6 +234,9 @@ def turn_connector_cards(entries: Any) -> tuple[list[dict[str, Any]], list[str]]
             continue
         if is_builtin_connector_id(draft.connector_id):
             notices.append(f"A connector template was not shown: {draft.connector_id!r} is a built-in connector.")
+            continue
+        if draft.check is None:
+            notices.append(f"A connector template was not shown: {draft.connector_id!r} {NO_CHECK_REASON}")
             continue
         if draft.connector_id in shown:
             notices.append(f"A second connector template for {draft.connector_id!r} was not shown.")
