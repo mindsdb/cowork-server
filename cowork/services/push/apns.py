@@ -30,7 +30,9 @@ SANDBOX_HOST = "https://api.sandbox.push.apple.com"
 _TOKEN_REFRESH_SECONDS = 50 * 60
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 # APNs answers these for a token that will never reach an app again.
-_DEAD_TOKEN_REASONS = frozenset({"BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"})
+# DeviceTokenNotForTopic is left out: it is what every device answers when the
+# configured topic is wrong, and treating it as dead would delete them all.
+_DEAD_TOKEN_REASONS = frozenset({"BadDeviceToken", "Unregistered"})
 _STALE_PROVIDER_TOKEN_REASONS = frozenset({"ExpiredProviderToken", "InvalidProviderToken"})
 
 
@@ -77,6 +79,7 @@ class ApnsSender:
         self._clock = clock
         self._token: str | None = None
         self._token_issued_at = 0.0
+        self._http: httpx.AsyncClient | None = None
 
     def provider_token(self) -> str:
         now = self._clock()
@@ -91,9 +94,20 @@ class ApnsSender:
         return self._token
 
     def _client(self) -> httpx.AsyncClient:
-        if self._transport is not None:
-            return httpx.AsyncClient(transport=self._transport, timeout=_TIMEOUT)
-        return httpx.AsyncClient(http2=True, timeout=_TIMEOUT)
+        """One client for every send, so its HTTP/2 connections are reused:
+        Apple asks providers to keep connections open rather than open one
+        per notification."""
+        if self._http is None or self._http.is_closed:
+            if self._transport is not None:
+                self._http = httpx.AsyncClient(transport=self._transport, timeout=_TIMEOUT)
+            else:
+                self._http = httpx.AsyncClient(http2=True, timeout=_TIMEOUT)
+        return self._http
+
+    async def aclose(self) -> None:
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
 
     async def _post(self, client: httpx.AsyncClient, host: str, device: Device, payload: PushPayload) -> tuple[int, str]:
         response = await client.post(
@@ -116,15 +130,15 @@ class ApnsSender:
 
     async def send(self, device: Device, payload: PushPayload) -> ApnsResult:
         sandbox_first = device.environment == "sandbox"
-        async with self._client() as client:
-            status, reason = await self._post(
-                client, SANDBOX_HOST if sandbox_first else PRODUCTION_HOST, device, payload,
-            )
-            if status == 400 and reason == "BadDeviceToken" and not sandbox_first:
-                # A development build's token: production doesn't know it.
-                status, reason = await self._post(client, SANDBOX_HOST, device, payload)
-                if status == 200:
-                    return ApnsResult(Delivery.SENT, environment="sandbox")
+        client = self._client()
+        status, reason = await self._post(
+            client, SANDBOX_HOST if sandbox_first else PRODUCTION_HOST, device, payload,
+        )
+        if status == 400 and reason == "BadDeviceToken" and not sandbox_first:
+            # A development build's token: production doesn't know it.
+            status, reason = await self._post(client, SANDBOX_HOST, device, payload)
+            if status == 200:
+                return ApnsResult(Delivery.SENT, environment="sandbox")
         if status == 200:
             return ApnsResult(Delivery.SENT)
         if status == 410 or reason in _DEAD_TOKEN_REASONS:

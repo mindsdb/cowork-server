@@ -118,6 +118,26 @@ async def test_a_task_someone_watched_end_pushes_nothing(tmp_path, pushes):
     assert pushes == []
 
 
+async def test_with_push_off_a_stream_records_no_watcher(tmp_path, monkeypatch):
+    from cowork.handlers.responses import sse_from_buffer
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    dispatch.set_senders(dispatch.Senders())  # no platform configured: push is off
+    watchers.reset()
+    try:
+        handle = await _handle(tmp_path, "completed")
+        frames = [frame async for frame in sse_from_buffer(
+            handle.buffer, 0, watching=(handle.conversation_id, handle.turn_id),
+        )]
+        assert frames
+        assert not await watchers.is_watched(handle.conversation_id, handle.turn_id)
+    finally:
+        watchers.reset()
+        dispatch.set_senders(None)
+        get_app_settings.cache_clear()
+
+
 async def test_a_reader_that_left_before_the_end_no_longer_counts(tmp_path, pushes):
     handle = await _handle(tmp_path, "completed")
     async with watchers.watch(handle.conversation_id, handle.turn_id):

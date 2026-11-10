@@ -4249,10 +4249,17 @@ def sse_from_buffer(
 ) -> AsyncGenerator[str, None]:
     """``_sse_from_buffer``. With ``watching`` (conversation id, turn id) the
     reader also counts as watching that turn while it streams, which holds
-    back the turn's "task finished" push (cowork.streaming.watchers)."""
-    if watching is None:
+    back the turn's "task finished" push (cowork.streaming.watchers). Where
+    push is off nothing reads that signal, so the stream skips recording it."""
+    if watching is None or not _push_reads_watchers():
         return _sse_from_buffer(buffer, from_seq)
     return _watched_sse_from_buffer(buffer, from_seq, watching)
+
+
+def _push_reads_watchers() -> bool:
+    from cowork.services.push.dispatch import push_enabled
+
+    return push_enabled()
 
 
 async def _watched_sse_from_buffer(

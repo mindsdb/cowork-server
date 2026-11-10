@@ -160,14 +160,19 @@ def spawn(coro: Coroutine[Any, Any, None]) -> asyncio.Task[Any] | None:
 
 
 async def drain_background_tasks(*, timeout: float = 3.0) -> None:
-    """Wait for pushes still sending. Called at shutdown; best effort."""
+    """Wait for pushes still sending, then close the APNs connection. Called
+    at shutdown; best effort."""
     tasks = list(_background_tasks)
-    if not tasks:
-        return
-    try:
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning(
-            "Push notifications still sending at shutdown",
-            extra={"event": "push_shutdown_unfinished", "count": len(tasks)},
-        )
+    if tasks:
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Push notifications still sending at shutdown",
+                extra={"event": "push_shutdown_unfinished", "count": len(tasks)},
+            )
+    if _senders is not None and _senders.apns is not None:
+        try:
+            await _senders.apns.aclose()
+        except Exception:
+            logger.debug("Could not close the APNs client", exc_info=True)
