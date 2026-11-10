@@ -91,6 +91,13 @@ class TestEveryMethodNeedsOne:
         }
         _refused(form, "not at the top level")
 
+    def test_a_hidden_method_is_checked_too(self):
+        good = {"id": "key", "label": "Key", "fields": [TOKEN_FIELD], "test_request": bearer_test_request()}
+        hidden = {**good, "id": "legacy", "hidden": True}
+        _refused({"form_id": "fm_cccccccccc", "title": "Acme", "methods": [good, {k: v for k, v in hidden.items() if k != "test_request"}]}, "has none")
+        bad = _with(hidden, ("test_request", "data", "url"), "https://{{token}}.example.com/x")
+        _refused({"form_id": "fm_cccccccccc", "title": "Acme", "methods": [good, bad]}, "only in its path and query")
+
     def test_an_oauth_grant_method_without_one_is_refused(self):
         _refused({"form_id": "fm_dddddddddd", "title": "Acme", "methods": [OAUTH_METHOD]}, "has none")
 

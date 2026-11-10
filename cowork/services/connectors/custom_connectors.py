@@ -113,11 +113,12 @@ def _is_oauth_grant_method(method: dict[str, Any]) -> bool:
 
 
 def _form_methods(form_spec: dict[str, Any]) -> list[tuple[str, dict[str, Any], dict[str, Any] | None]]:
-    """Each submittable method as (where, holder of its test_request, method or None).
+    """Each method as (where, holder of its test_request, method or None).
 
     A form with no ``methods`` is one method: the form itself holds it.
     """
-    methods = [m for m in form_spec.get("methods") or [] if isinstance(m, dict) and not m.get("hidden")]
+    # Hidden methods too: a client can still submit one.
+    methods = [m for m in form_spec.get("methods") or [] if isinstance(m, dict)]
     if not methods:
         return [("the form", form_spec, None)]
     return [(f"method {m.get('id')!r}", m, m) for m in methods]
@@ -204,7 +205,7 @@ def check_test_requests(form_spec: dict[str, Any]) -> None:
     """Refuse a handcrafted form whose methods do not each carry a valid test_request.
 
     A single-method form holds one at the top level; a multi-method form holds
-    one on every submittable method and none at the top level. Placeholders
+    one on every method, hidden ones included, and none at the top level. Placeholders
     may name only the method's own fields, ``token`` in the data step after a
     token step, and ``access_token``/``refresh_token`` on an OAuth grant
     method. A follow-up step (``_extends_connection``) may also name the saved
@@ -213,7 +214,7 @@ def check_test_requests(form_spec: dict[str, Any]) -> None:
     Raises:
         UnstorableFormError: with a message the model can act on.
     """
-    multi = bool([m for m in form_spec.get("methods") or [] if isinstance(m, dict) and not m.get("hidden")])
+    multi = bool([m for m in form_spec.get("methods") or [] if isinstance(m, dict)])
     if multi and form_spec.get("test_request") is not None:
         raise UnstorableFormError(
             "A multi-method form puts a test_request on each method, not at the top level."
