@@ -143,8 +143,14 @@ def base() -> list[_Env]:
     return _env(BASE)
 
 
+# TEST ENABLEMENT, integration branch only: the base switches are on here so a
+# pull request environment runs the feature. Released, they read "false" and "".
+_BASE_TURNS_ENABLED = "true"
+_BASE_CAPABILITIES = '{"manifest_version": 1, "enabled": ["mysql:host-password", "postgres:host-port"]}'
+
+
 def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed(base):
-    assert _deployment(BASE)["datasourceTurnsEnabled"] == "false"
+    assert _deployment(BASE)["datasourceTurnsEnabled"] == _BASE_TURNS_ENABLED
     assert _entry(base, FLAG).value == "{{ $.Values.datasourceTurnsEnabled }}"
     for env_values in ENVIRONMENTS:
         environment = env_values.stem.removeprefix("values-")
@@ -158,7 +164,7 @@ def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed
 def test_datasource_methods_are_offered_exactly_where_the_gate_passed(base):
     """The list of methods a deployment may run, empty until a gate says
     otherwise, and set only where grants are on."""
-    assert _deployment(BASE)["datasourceCapabilities"] == ""
+    assert _deployment(BASE)["datasourceCapabilities"] == _BASE_CAPABILITIES
     assert _entry(base, CAPABILITIES).value == "{{ $.Values.datasourceCapabilities }}"
     assert set(OFFERED_METHODS) == ENABLED_ENVIRONMENTS
     for env_values in ENVIRONMENTS:

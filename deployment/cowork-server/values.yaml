@@ -134,8 +134,10 @@ deployment:
   # release gate replaces these scalars in values-<env>.yaml, since an extraEnvs
   # entry would render a second copy of the variable. Off in the base, so a PR
   # environment, which renders this file alone, stays off.
-  datasourceTurnsEnabled: "false"
-  datasourceCapabilities: ""
+  # TEST ENABLEMENT, integration branch only, never merged or cherry-picked.
+  # On `staging` these read "false" and "", and tests/test_chart_values.py expects that.
+  datasourceTurnsEnabled: "true"
+  datasourceCapabilities: '{"manifest_version": 1, "enabled": ["mysql:host-password", "postgres:host-port"]}'
 
   # The draft-preview host name and the one page allowed to frame a draft. The
   # draft Ingress and the COWORK_DRAFT_* variables below are templated from
