@@ -1595,7 +1595,7 @@ class ResponsesHandler:
         queue_settings = TurnQueueSettings()
         turn_key_id = None
         workspace_id = getattr(settings, "hub_workspace_id", "") or None
-        if queue_settings.datasource_enabled:
+        if queue_settings.needs_turn_key_id:
             block, turn_key_id = await _mint_llm_block_with_turn_key_id(
                 org_id=self.scope.org_id,
                 user_id=self.scope.user_id,

@@ -697,6 +697,11 @@ class TurnQueueSettings(Settings):
     def is_remote(self) -> bool:
         return self.backend == "remote"
 
+    @property
+    def needs_turn_key_id(self) -> bool:
+        """Whether a turn key's public prefix is minted, which auth binds turn grants to."""
+        return self.datasource_enabled or self.connector_drafts_enabled
+
     redis_url: str = Field(
         default="redis://localhost:6379/0",
         description="Redis connection URL used when backend is 'remote'.",
