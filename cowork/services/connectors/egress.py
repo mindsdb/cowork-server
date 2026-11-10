@@ -17,6 +17,13 @@ from collections.abc import Callable
 FALLBACK_CONNECT_SECONDS = 3.0
 #: Addresses tried per request. A cloud host can answer with a dozen or more.
 MAX_CONNECTION_ATTEMPTS = 4
+#: IPv6 ranges that carry an IPv4 address in their last 32 bits: well-known
+#: NAT64, IPv4-compatible and SIIT. A translator dials that IPv4 address.
+_EMBEDDED_IPV4_NETWORKS = (
+    ipaddress.ip_network("64:ff9b::/96"),
+    ipaddress.ip_network("::/96"),
+    ipaddress.ip_network("::ffff:0:0:0/96"),
+)
 
 
 class EgressHostUnresolved(RuntimeError):
@@ -35,7 +42,7 @@ def vetted_public_addresses(
 
     Accepts an address literal as itself. Raises ``EgressHostUnresolved``
     when resolution fails and ``EgressHostNotPublic`` when the answer holds
-    any address that is not globally routable: one private address in a
+    any address that is not public (``is_public_address``): one private address in a
     mixed answer refuses the whole host, because dialing the rest would
     still leave the private one reachable on a later attempt.
 
@@ -58,9 +65,36 @@ def vetted_public_addresses(
                 addresses.append(ipaddress.ip_address(record[4][0]))
             except (IndexError, ValueError):
                 continue
-    if not addresses or any(not address.is_global for address in addresses):
+    if not addresses or any(not is_public_address(address) for address in addresses):
         raise EgressHostNotPublic(hostname)
     return addresses
+
+
+def embedded_ipv4(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | None:
+    """Return the IPv4 address a NAT64, IPv4-compatible or SIIT address
+    carries in its last 32 bits, or None for any other address."""
+    if address.version != 6 or not any(address in net for net in _EMBEDDED_IPV4_NETWORKS):
+        return None
+    return ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+
+
+def is_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Whether ``address`` may be dialed as a public host.
+
+    It must be globally routable, not multicast and not IPv6 site-local, and
+    so must the IPv4 address it embeds (``embedded_ipv4``), since that is the
+    one a translator connects to.
+    """
+    for candidate in (address, embedded_ipv4(address)):
+        if candidate is None:
+            continue
+        if not candidate.is_global or candidate.is_multicast:
+            return False
+        if candidate.version == 6 and candidate.is_site_local:
+            return False
+    return True
 
 
 def connection_attempts(
