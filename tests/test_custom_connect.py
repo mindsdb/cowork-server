@@ -286,12 +286,23 @@ def test_an_address_that_resolves_privately_is_not_dialed(engine, world, monkeyp
     assert world["provider"] == []
 
 
-def test_auths_dry_run_refusal_answers_before_anything_reaches_the_provider(engine, world, monkeypatch):
-    world["dry_answer"] = (409, {"code": "conflict", "detail": "name in use"})
+@pytest.mark.parametrize(
+    ("status", "code", "says"),
+    [
+        (409, "conflict", "already have a connection with this name"),
+        (429, "quota_exceeded", "limit of custom connections"),
+        (409, "organization_mismatch", "organization changed"),
+        (503, "disabled", "turned off"),
+        (400, "invalid_connection", "could not be stored"),
+    ],
+)
+def test_auths_dry_run_refusal_answers_before_anything_reaches_the_provider(engine, world, monkeypatch, status, code, says):
+    world["dry_answer"] = (status, {"code": code, "detail": "auth's own words"})
 
     res = _connect(_client(engine, monkeypatch))
 
-    assert (res.status_code, res.json()["detail"]["code"]) == (409, "conflict")
+    assert (res.status_code, res.json()["detail"]["code"]) == (status, code)
+    assert says in res.json()["detail"]["message"]
     assert world["provider"] == []
 
 

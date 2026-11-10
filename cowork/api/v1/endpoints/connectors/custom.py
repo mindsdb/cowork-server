@@ -160,6 +160,15 @@ def _connect_template(connector_id: str, session: ScopedSession) -> tuple[list[d
     return list(row.spec.get("fields", [])), custom_connect.stored_check(row)
 
 
+#: What auth's refusals mean to the member; any other code reads as the fallback.
+_AUTH_REFUSALS = {
+    "conflict": "You already have a connection with this name. Choose another name, or remove the old one in Connect Apps and Data.",
+    "quota_exceeded": "You have reached the limit of custom connections. Remove one in Connect Apps and Data to connect another.",
+    "organization_mismatch": "Your active organization changed while connecting. Reload and try again.",
+    "disabled": "Custom connections are turned off for this organization.",
+}
+
+
 def _refusal(code: str, status_code: int, message: str) -> JSONResponse:
     """A refusal as ``{"detail": {"code", "message"}}``; never a submitted value."""
     return JSONResponse({"detail": {"code": code, "message": message}}, status_code=status_code)
@@ -218,7 +227,8 @@ async def connect_custom_connector(
             credential=credential, organization_id=str(scope.org_id), payload=payload, dry_run=False, settings=settings,
         )
     except CustomConnectionRefused as refused:
-        return _refusal(refused.code, refused.status_code, "The connection could not be stored.")
+        message = _AUTH_REFUSALS.get(refused.code, "The connection could not be stored.")
+        return _refusal(refused.code, refused.status_code, message)
     except CustomConnectionUnavailable:
         return _refusal("unavailable", status.HTTP_503_SERVICE_UNAVAILABLE, "Connecting is unavailable right now; try again later.")
     return CustomConnectionResponse.model_validate(stored)
