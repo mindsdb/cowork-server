@@ -3105,6 +3105,9 @@ class ResponsesHandler:
                     if turn_artifacts is not None:
                         turn_artifacts.writes_allowed = data.get("workspace_mode") == "persistent"
                 elif kind == "turn_delta":
+                    # The pod writes nothing while a question waits, so text
+                    # means it's answered, even if that reply was lost.
+                    open_questions.clear()
                     yield StreamTextDelta(text=data.get("text", ""))
                 elif kind == "turn_step":
                     if data.get("step") == "compacted":
@@ -3113,6 +3116,9 @@ class ResponsesHandler:
                         open_questions.add(data["id"])
                     elif data.get("step") == "ask_user_answered":
                         open_questions.discard(data.get("id"))
+                    elif data.get("step") == "tool_start":
+                        # As for text: a cell starts only once the question is over.
+                        open_questions.clear()
                     for event in step_stream_events(data):
                         yield event
                 elif kind == "turn_memory":

@@ -1519,6 +1519,56 @@ async def test_no_still_working_line_over_an_open_question(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("next_output", [
+    ("turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}),
+    ("turn_delta", {"text": "Working on it."}),
+])
+async def test_a_lost_answered_reply_does_not_hide_still_working_for_the_rest_of_the_turn(
+    monkeypatch, next_output,
+):
+    """The producer applies a turn whose reply numbers skip one. If the skipped
+    reply is the question's ask_user_answered, the pod's next text or cell
+    still shows the question is over, and a later quiet stretch shows
+    "Still working"."""
+    import asyncio
+
+    from cowork.streaming import liveness
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    monkeypatch.setattr(liveness, "MODEL_WAIT_TICK_SECONDS", 0.05)
+    asked = {"step": "ask_user", "id": "q1", "prompt": "Which one?", "timeout_s": 300,
+             "options": [{"value": "a", "label": "A"}, {"value": "b", "label": "B"}]}
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", asked
+        # ask_user_answered never arrives.
+        yield next_output
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    assert any("model_wait" in f for f in buffer.frames)
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_persists_on_failure(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
