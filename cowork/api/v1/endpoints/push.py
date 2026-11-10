@@ -7,6 +7,7 @@ and nothing to push with, and a 404 tells the app to stop trying, where a
 from __future__ import annotations
 
 from functools import partial
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.exc import IntegrityError
@@ -33,7 +34,10 @@ router = APIRouter(
 )
 
 
-def _caller(principal: Principal | None = Depends(get_principal)) -> Principal:
+PrincipalDep = Annotated[Principal | None, Depends(get_principal)]
+
+
+def _caller(principal: PrincipalDep) -> Principal:
     if principal is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
     return principal
