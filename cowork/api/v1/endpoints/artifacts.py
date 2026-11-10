@@ -191,9 +191,8 @@ def _artifact_cards(session, sources) -> list[ArtifactCard]:
     """The cards of ``sources``, with the file store and the database read in
     turn on the calling thread. The routes read the two halves in their own
     worker threads instead (``_cards_for``)."""
-    # Owner-side fields are stripped inside `card_for_folder`, not here: inline chat
-    # cards use the same builder and would otherwise still carry the plaintext
-    # password.
+    # Owner-side fields are left out of org-mode cards by the single card builder,
+    # `_prepare_artifact_card`, not here, so inline chat cards are covered too.
     found = _sources_and_cards(find_sources=lambda: sources)
     return _card_capabilities(session, sources=found.sources, cards=found.cards)
 

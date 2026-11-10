@@ -14,10 +14,12 @@ from cowork.api.v1.endpoints.search import _RowMatches, search_cowork
 from cowork.common.paths import pinned_dir
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services import artifacts as a
+from cowork.services.artifact_audience import ShareNotify, share_notice
 from cowork.services.artifact_export import _record_primary
 from cowork.services.artifact_identity import ensure_full_id
 from cowork.services.artifact_ownership import provenance_origin
 from cowork.services.artifact_revisions import capture_agent_revision
+from cowork.services.preview_proxy import _read_backend_port
 from cowork.services.task_objects import _artifact_owner, cards_for_slugs, turn_artifact_changes
 
 GOOD_ID = "0123456789abcdef0123456789abcdef"
@@ -30,8 +32,8 @@ DAMAGED = {
 
 
 def _json(cards):
-    """Cards as they go out, whether the service returns dicts or models."""
-    return [card.to_json() if hasattr(card, "to_json") else card for card in cards]
+    """Cards as they go out on the wire."""
+    return [card.to_json() for card in cards]
 
 
 def _artifact(base, slug, **meta):
@@ -268,10 +270,6 @@ def test_the_desktop_status_answers_for_damaged_metadata(tmp_path, monkeypatch, 
         get_app_settings.cache_clear()
 
     assert res.status_code == 200
-
-
-from cowork.services.artifact_audience import ShareNotify, share_notice
-from cowork.services.preview_proxy import _read_backend_port
 
 
 @pytest.mark.parametrize("text", ["[]", '{"port": "8080"}', '{"port": true}', '{"port": 70000}'])

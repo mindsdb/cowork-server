@@ -1596,8 +1596,8 @@ def _prepare_artifact_card(
         # conversations and can fetch the rest.
         origin_conversation_id=origin_conversation_id(meta),
         published_url=_published_url_for(io_folder, primary, published_map=published_map),
-        # Filled by one of the two callers below. Keeping the slot here preserves
-        # the canonical response shape and key order.
+        # Set explicitly so `to_json()` (exclude_unset) keeps the key for a caller
+        # that doesn't assign it.
         modified=False,
         **access_fields,
         serve_url=serve_url_for(

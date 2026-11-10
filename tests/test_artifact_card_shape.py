@@ -57,7 +57,7 @@ ORG = _HEAD + [
 
 
 def _json(card):
-    return card.to_json() if hasattr(card, "to_json") else card
+    return card.to_json()
 
 
 def _password(folder):
