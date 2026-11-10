@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import httpx
+from urllib.parse import urlsplit
 from anton.core.browser.config import BrowserConfig
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -361,6 +362,42 @@ async def warm(bearer: str, prefs: RouterPrefs) -> RouterStatus:
     the preferences the router keeps for them. Safe to repeat."""
     body = {"prefs": prefs.model_dump(exclude_none=True)}
     return _parsed(RouterStatus, await _call("POST", f"{_require_router()}/_warm", bearer, json=body))
+
+
+class OpenedSession(BaseModel):
+    """``POST /browse/open``'s answer: the task's session, now at the address."""
+
+    session_id: str
+
+
+def person_url(raw: str) -> str | None:
+    """An address the person typed, as the browser takes it: http or https with
+    a host, ``https://`` added when they typed none. None for anything else."""
+    text = (raw or "").strip()
+    if not text or len(text) > 4096 or any(c.isspace() for c in text):
+        return None
+    if "://" not in text:
+        # "javascript:…" or "mailto:…" is a scheme, not a host; "localhost:3000" is a port.
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:(?!\d)", text):
+            return None
+        text = f"https://{text}"
+    parsed = urlsplit(text)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    return text
+
+
+async def person_open(bearer: str, *, user_id: str | None, conversation_id: str, url: str) -> OpenedSession:
+    """The person opens ``url`` in a task's browser themselves, from the pane:
+    the task's session (``task_session``) opens at it, or, open already, goes
+    there. As the caller, so it is their browser and their allowance; no turn
+    and no agent are involved. Raises BrowserServiceError."""
+    router = _require_router()
+    session_id = task_session(user_id, conversation_id)
+    opened = await _call("POST", f"{router}/sessions", bearer, json={"session_id": session_id, "url": url})
+    if isinstance(opened, dict) and opened.get("created") is False:
+        await _call("POST", f"{router}/sessions/{session_id}/action", bearer, json={"action": "navigate", "url": url})
+    return OpenedSession(session_id=session_id)
 
 
 async def embed(bearer: str, session_id: str) -> BrowserEmbed:

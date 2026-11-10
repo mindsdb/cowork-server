@@ -57,6 +57,11 @@ class EmbedRequest(BaseModel):
     session_id: str = Field(pattern=SESSION_ID.pattern)
 
 
+class OpenRequest(BaseModel):
+    conversation_id: str = Field(pattern=SESSION_ID.pattern)
+    url: str = Field(min_length=1, max_length=4096)
+
+
 def _raise(exc: browser_service.BrowserServiceError) -> NoReturn:
     raise HTTPException(status_code=exc.status, detail=exc.detail.model_dump()) from exc
 
@@ -104,6 +109,24 @@ async def browse_provision(
 async def browse_embed(body: EmbedRequest, request: Request) -> browser_service.BrowserEmbed:
     try:
         return await browser_service.embed(mindshub_credential(request), body.session_id)
+    except browser_service.BrowserServiceError as exc:
+        _raise(exc)
+
+
+@router.post(
+    "/open", response_model=browser_service.OpenedSession,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def browse_open(body: OpenRequest, request: Request, scope: ScopeDep) -> browser_service.OpenedSession:
+    """The person typed an address in a task's browser pane: open it there
+    directly, without the agent (ENG-4138, prototype)."""
+    url = browser_service.person_url(body.url)
+    if url is None:
+        raise HTTPException(status_code=400, detail={"code": "bad_url", "message": "That isn't a web address."})
+    try:
+        return await browser_service.person_open(
+            mindshub_credential(request), user_id=scope.user_id, conversation_id=body.conversation_id, url=url,
+        )
     except browser_service.BrowserServiceError as exc:
         _raise(exc)
 
