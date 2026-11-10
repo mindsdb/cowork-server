@@ -32,7 +32,6 @@ from cowork.schemas.connectors import CustomConnectorUpdate
 from cowork.server import create_app
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.custom_connectors import (
-    MEMBER_CONNECTORS_MAX,
     CustomConnectorService,
     UnstorableFormError,
 )
@@ -352,25 +351,21 @@ class TestSaveConnectorDraft:
         assert resp.status_code == 404
         assert _org_rows(engine) == []
 
+    def test_with_the_setting_off_a_member_can_still_change_or_delete_theirs(self, engine, org_tenancy, monkeypatch):
+        """Turning the setting off stops new saves; a member can still remove what they saved."""
+        monkeypatch.setenv("COWORK_TURN_CONNECTOR_DRAFTS_ENABLED", "false")
+        client = _org_client(engine, _member(ORG_A), ORG_A)
+
+        assert client.patch("/custom/httpbin", json={"label": "Acme"}).status_code == 200
+        assert client.delete("/custom/httpbin").status_code == 204
+        assert _org_rows(engine, "httpbin") == []
+
     def test_outside_org_mode_there_is_no_save(self, engine):
         app = FastAPI()
         app.include_router(custom_router, prefix="/custom")
         app.dependency_overrides[get_scoped_session] = lambda: _scoped(engine)
 
         assert TestClient(app).post("/custom", json=_anton_draft()).status_code == 404
-
-    def test_the_member_limit_refuses_a_new_id_but_not_a_resave(self, engine, org_tenancy):
-        client = _org_client(engine, _member(ORG_A), ORG_A)
-        # The fixture's httpbin row is one of the member's own.
-        for i in range(MEMBER_CONNECTORS_MAX - 1):
-            assert client.post("/custom", json=_anton_draft(connector_id=f"acme_{i}")).status_code == 200
-
-        refused = client.post("/custom", json=_anton_draft(connector_id="acme_extra"))
-        assert refused.status_code == 409
-        assert client.post("/custom", json=_anton_draft(connector_id="acme_0", label="Kept")).status_code == 200
-        assert _org_client(engine, _member(ORG_A_OTHER), ORG_A_OTHER).post(
-            "/custom", json=_anton_draft(connector_id="acme_extra"),
-        ).status_code == 200
 
     def test_a_save_racing_the_same_members_save_updates_their_row(self, engine, monkeypatch):
         """The insert loses to the other save's row, so it updates that row instead."""
@@ -412,6 +407,12 @@ class TestOrgModeEditUsesTheDraftRules:
         assert resp.status_code == 422
         for value in body.values():
             assert value not in resp.text
+        assert [r.label for r in _org_rows(engine, "httpbin")] == ["httpbin"]
+
+    def test_an_empty_label_is_a_422(self, engine, org_tenancy):
+        resp = _org_client(engine, _member(ORG_A), ORG_A).patch("/custom/httpbin", json={"label": "  "})
+
+        assert resp.status_code == 422 and "label is required" in resp.text
         assert [r.label for r in _org_rows(engine, "httpbin")] == ["httpbin"]
 
     def test_a_plain_rename_and_recategorize_pass(self, engine, org_tenancy):

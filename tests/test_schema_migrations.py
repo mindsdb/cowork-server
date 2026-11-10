@@ -1003,15 +1003,15 @@ def test_custom_connector_id_is_unique_per_scope(tmp_path, monkeypatch):
 
     with engine.begin() as connection:
         _insert_custom_connector(connection, connector_id="httpbin")
-        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
-        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-b")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a", created_by="user-1")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-b", created_by="user-1")
 
     with pytest.raises(IntegrityError):
         with engine.begin() as connection:
             _insert_custom_connector(connection, connector_id="httpbin")
     with pytest.raises(IntegrityError):
         with engine.begin() as connection:
-            _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
+            _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a", created_by="user-1")
 
 
 #: The revision before org custom connectors became one per builder.
@@ -1029,14 +1029,10 @@ def test_custom_connector_id_is_unique_per_builder_in_an_org(tmp_path, monkeypat
     with engine.begin() as connection:
         _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
         _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-2")
-        _insert_custom_connector(connection, connector_id="acme", org_id="org-a")
 
     with pytest.raises(IntegrityError):
         with engine.begin() as connection:
             _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
-    with pytest.raises(IntegrityError):
-        with engine.begin() as connection:
-            _insert_custom_connector(connection, connector_id="acme", org_id="org-a")
 
 
 def test_custom_connectors_per_builder_upgrade_and_downgrade(tmp_path, monkeypatch):

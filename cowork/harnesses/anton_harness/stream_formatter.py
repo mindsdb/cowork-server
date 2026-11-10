@@ -1092,7 +1092,7 @@ async def format_responses_stream(
             # A lost/trimmed skill draft is one-shot per draft, same shape as
             # the rate-limit notice — throttling it away would silently
             # recreate the exact bug it exists to surface.
-            is_skill_draft_notice = phase_str in ("skill_draft_dropped", "connector_draft_dropped")
+            is_draft_notice = phase_str in ("skill_draft_dropped", "connector_draft_dropped")
             is_tool_progress = phase_str == "tool_progress"
             is_tool_done = phase_str == "tool_done" and event.id in progress_tool_ids
 
@@ -1128,7 +1128,7 @@ async def format_responses_stream(
                     or is_tool_done
                     or is_tool_progress
                     or is_rate_limited_notice
-                    or is_skill_draft_notice
+                    or is_draft_notice
                 )
                 now = time.time()
                 should_emit = never_throttle or (now - last_progress >= PROGRESS_THROTTLE)
