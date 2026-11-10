@@ -184,6 +184,17 @@ def stage_project_instructions(
         return False
 
 
+def project_holds_files(project_path: str | Path) -> bool:
+    """Whether a project folder holds anything the user put there: an entry
+    other than a hidden one (``.anton``) or the server's own folders.
+    Stops at the first, so a large project costs one directory read."""
+    from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
+
+    server_dirs = {CONVERSATIONS_DIRNAME, "skills"}
+    with os.scandir(project_path) as entries:
+        return any(not entry.name.startswith(".") and entry.name not in server_dirs for entry in entries)
+
+
 def attachment_purpose(session_id: str) -> str:
     """Canonical purpose tag for conversation attachments. The composer
     uploads against a client-allocated conversation id, and the rail's

@@ -511,7 +511,7 @@ async def test_handle_resolves_the_skill_viewer_before_the_turn_start_unit(monke
     ],
 )
 async def test_handle_logs_every_router_fallback_at_default_level(
-    monkeypatch, caplog, owned_logger, failure, reason, fallback,
+    monkeypatch, caplog, owned_logger, tmp_path, failure, reason, fallback,
 ):
     """Exercise the request boundary, including failures before the gate runs."""
     import logging
@@ -534,7 +534,8 @@ async def test_handle_logs_every_router_fallback_at_default_level(
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(
-            get_conversation=lambda _cid: SimpleNamespace(id=conv_id),
+            # A project with no files, so the gate still runs.
+            get_conversation=lambda _cid: SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path))),
             message_count=lambda _conversation: 0,
             get_recent_messages=history,
         ),
@@ -602,6 +603,171 @@ async def test_handle_logs_every_router_fallback_at_default_level(
     router_lines = [line for line in output.splitlines() if '"event":"router_' in line]
     assert router_lines and all("%s" not in line for line in router_lines)
     assert private not in output
+
+
+@pytest.mark.asyncio
+async def test_handle_sends_a_turn_in_a_project_with_files_to_the_agent(monkeypatch, caplog, tmp_path):
+    """A question in a project holding the user's notes never reaches the
+    gate: only the agent reads them, and a direct answer would go to the web."""
+    import logging
+    from uuid import uuid4
+
+    import cowork.handlers.response_routing as routing
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    (tmp_path / "Chapter 1.md").write_text("The porter was named in chapter one.")
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path))),
+            message_count=lambda _conversation: 0,
+            get_recent_messages=lambda *_a, **_k: [],
+        ),
+    )
+
+    async def no_binding():
+        return None, None
+
+    async def no_gate(*_args, **_kwargs):
+        pytest.fail("the gate must not run when the project holds files")
+
+    monkeypatch.setattr(handler, "_router_binding", no_binding)
+    monkeypatch.setattr(routing, "_gate", no_gate)
+
+    class StopBeforeAgent(Exception):
+        pass
+
+    def stop_before_agent():
+        raise StopBeforeAgent
+
+    monkeypatch.setattr(handler, "_get_harness", stop_before_agent)
+    caplog.set_level(logging.INFO, logger=responses.__name__)
+    with pytest.raises(StopBeforeAgent):
+        await handler.handle(
+            ResponsesRequest(input="What's the porter's name?", conversation=str(conv_id), stream=False)
+        )
+
+    (record,) = [row for row in caplog.records if getattr(row, "event", None) == "router_route"]
+    assert (record.outcome, record.reason) == (DELEGATED_AGENTIC, "files_present")
+
+
+@pytest.mark.asyncio
+async def test_route_request_hands_has_files_to_decide_route(monkeypatch):
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen.update(kwargs)
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="files_present")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+    await handler._route_request(
+        conversation_id=None,
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        has_files=True,
+    )
+
+    assert seen["has_files"] is True
+
+
+@pytest.mark.asyncio
+async def test_files_send_the_turn_to_the_agent_before_jev_or_the_gate(monkeypatch):
+    async def no_jev(_messages):
+        pytest.fail("Jev must not be asked when the conversation has files")
+
+    def no_gate():
+        pytest.fail("the gate must not be resolved when the conversation has files")
+
+    history = [{"role": "user", "content": "What's the porter's name?"}]
+    with_jev = await decide_route(
+        history=history, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
+        has_files=True, jev=no_jev,
+    )
+    with_gate = await decide_route(
+        history=history, has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
+        has_files=True, binding_factory=no_gate,
+    )
+
+    assert (with_jev.route, with_jev.reason) == (DELEGATED_AGENTIC, "files_present")
+    assert (with_gate.route, with_gate.reason) == (DELEGATED_AGENTIC, "files_present")
+
+
+@pytest.mark.parametrize(
+    ("entries", "holds"),
+    [
+        ([], False),
+        # The server's own folders: instructions, conversations, skills.
+        ([".anton/", "conversations/", "skills/"], False),
+        ([".anton/", "conversations/", "notes.md"], True),
+        (["research/"], True),
+    ],
+)
+def test_project_holds_files_counts_only_what_the_user_put_there(tmp_path, entries, holds):
+    from cowork.services.files import project_holds_files
+
+    for entry in entries:
+        if entry.endswith("/"):
+            (tmp_path / entry).mkdir()
+        else:
+            (tmp_path / entry).write_text("x")
+
+    assert project_holds_files(tmp_path) is holds
+
+
+@pytest.mark.parametrize(
+    ("attached", "project_file", "has_files"),
+    [
+        # A file attached on an earlier turn, in a project with none.
+        (True, False, True),
+        (False, True, True),
+        (False, False, False),
+    ],
+)
+def test_reads_files_counts_earlier_attachments_and_project_files(
+    monkeypatch, tmp_path, attached, project_file, has_files,
+):
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+
+    if project_file:
+        (tmp_path / "notes.md").write_text("x")
+    monkeypatch.setattr(
+        responses, "FileService", lambda _s: SimpleNamespace(list_file_rows=lambda _purpose: [object()] if attached else []),
+    )
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda _s: SimpleNamespace(get_conversation=lambda _cid: SimpleNamespace(project=SimpleNamespace(path=str(tmp_path)))),
+    )
+
+    assert ResponsesHandler._reads_files(SimpleNamespace(), conversation_id=uuid4()) is has_files
+
+
+def test_a_failed_files_read_reports_a_failure(monkeypatch):
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+
+    rolled_back = []
+
+    def fail(_purpose):
+        raise RuntimeError("database gone")
+
+    monkeypatch.setattr(responses, "FileService", lambda _s: SimpleNamespace(list_file_rows=fail))
+    session = SimpleNamespace(rollback=lambda: rolled_back.append(True))
+
+    assert ResponsesHandler._reads_files(session, conversation_id=uuid4()) is None
+    assert rolled_back == [True]
 
 
 @pytest.mark.asyncio

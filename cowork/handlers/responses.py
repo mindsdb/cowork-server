@@ -143,7 +143,7 @@ from cowork.services.comparisons import (
 )
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
-from cowork.services.files import FileService
+from cowork.services.files import FileService, attachment_purpose, project_holds_files
 from cowork.services.live_apps import use_live_app_launcher
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
@@ -405,6 +405,8 @@ class _TurnStart:
     # threads, and the gate's history after that
     # (ResponsesHandler._settle_always_on). gate_rows is unread until then.
     always_on_unread: bool = False
+    # Whether the turn's shape lets the gate run (ineligible_reason is None).
+    gate_eligible: bool = False
     # Set when the conversation is a contained model-comparison side: what it
     # was set up with, read here because the side row stays in the unit.
     comparison_pin: "_ComparisonPin | None" = None
@@ -853,6 +855,15 @@ class ResponsesHandler:
         )
         if start.always_on_unread:
             start = await self._settle_always_on(start)
+        # Read only for a turn the gate could still route.
+        has_files = False
+        if start.gate_eligible and start.gate_rows is not None and not start.always_on_skills:
+            has_files = await run_efs_unit(
+                partial(self._reads_files, conversation_id=start.conversation_id), scope=self.scope
+            )
+            if has_files is None:
+                # The read failed: the turn goes to the agent as when the history read fails.
+                start = replace(start, gate_rows=None)
         self.harness_name = start.harness_name
         self.last_conversation_id = str(start.conversation_id)
 
@@ -906,6 +917,7 @@ class ResponsesHandler:
                     has_attachments=bool(request.attachment_ids),
                     has_disabled_connections=bool(disabled),
                     has_always_on_skills=start.always_on_skills,
+                    has_files=bool(has_files),
                     is_comparison_side=start.comparison_pin is not None,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
@@ -1222,12 +1234,13 @@ class ResponsesHandler:
         has_non_text_input = any(block.get("type") != "text" for block in harness_input)
         gate_rows: list[Message] | None = []
         always_on_unread = False
-        if ineligible_reason(
+        gate_eligible = ineligible_reason(
             has_non_text_input=has_non_text_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=comparison_pin is not None,
-        ) is None:
+        ) is None
+        if gate_eligible:
             rows = self._reads_always_on_rows(session, conversation_id=conversation_id)
             if rows is None:
                 # The read failed: the turn goes to the agent as when the
@@ -1248,6 +1261,7 @@ class ResponsesHandler:
             turn_id=turn_id,
             gate_rows=gate_rows,
             always_on_unread=always_on_unread,
+            gate_eligible=gate_eligible,
             comparison_pin=comparison_pin,
         )
 
@@ -1317,6 +1331,27 @@ class ResponsesHandler:
             return None
 
     @staticmethod
+    def _reads_files(session: ScopedSession, *, conversation_id: UUID) -> bool | None:
+        """Whether the conversation has files only the agent reads: a file
+        attached on any turn, or the project's own (project_holds_files).
+        Runs on the file store's threads. None when the read fails, as
+        _reads_always_on_skills."""
+        try:
+            if FileService(session).list_file_rows(attachment_purpose(str(conversation_id))):
+                return True
+            conversation = ConversationService(session).get_conversation(conversation_id)
+            return project_holds_files(conversation.project.path)
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.exception(
+                "[responses] could not check the conversation's files; delegating",
+                extra=log_context(conversation_id=conversation_id),
+            )
+            session.rollback()
+            return None
+
+    @staticmethod
     def _read_gate_rows(session: ScopedSession, *, conversation_id: UUID) -> list[Message] | None:
         """The rows decide_route and the direct answer can use: user and
         assistant messages, at most the direct answer's window (the gate reads
@@ -1346,6 +1381,7 @@ class ResponsesHandler:
         has_attachments: bool,
         has_disabled_connections: bool,
         has_always_on_skills: bool = False,
+        has_files: bool = False,
         is_comparison_side: bool = False,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
@@ -1359,7 +1395,7 @@ class ResponsesHandler:
         `gate_rows` is the history handle()'s first unit read for the gate
         (see _TurnStart). `has_always_on_skills` delegates the turn without a
         gate call: an always-on skill applies to every answer, and only the
-        agent's prompt carries it.
+        agent's prompt carries it. `has_files` (_reads_files) goes to decide_route.
 
         The composer's per-conversation model pick (`request.model`) is
         deliberately not passed down: it drives Anton's turn, not the gate
@@ -1457,6 +1493,7 @@ class ResponsesHandler:
                             has_attachments=has_attachments,
                             has_disabled_connections=has_disabled_connections,
                             after_router_answer=_last_answer_harness(gate_rows) == DIRECT_HARNESS,
+                            has_files=has_files,
                             binding=binding,
                             binding_factory=binding_for_turn,
                             jev=jev,

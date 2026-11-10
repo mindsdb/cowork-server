@@ -789,6 +789,7 @@ async def decide_route(
     has_attachments: bool,
     has_disabled_connections: bool,
     after_router_answer: bool = False,
+    has_files: bool = False,
     binding: RouterBinding | None = None,
     binding_factory: Callable[[], RouterBinding | None] | None = None,
     jev: Callable[[list[dict]], Awaitable[JevRoute]] | None = None,
@@ -806,6 +807,11 @@ async def decide_route(
     rows don't carry. Such a turn always goes to the agent: whatever the reply
     says, in any language, the router could only act out what its own answer
     asked, and a typed "yes" would then read as an approval.
+
+    `has_files` says the conversation has files only the agent reads: an
+    attachment on any turn, or the project's own. Such a turn goes to the
+    agent, as an attachment on this turn does: a direct answer would fall
+    back on general knowledge or the web.
 
     `binding` lets the caller supply a pre-built gate target (org mode mints a
     per-turn key); when None the binding comes from stored settings or the
@@ -826,6 +832,9 @@ async def decide_route(
 
     if explicit_file_context(history):
         return RouteDecision(route=DELEGATED_AGENTIC, reason="explicit_file_context")
+
+    if has_files:
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="files_present")
 
     # Jev reads the tool markers itself: a follow-up to tool work goes direct
     # when the reply's facts are in visible text (the dashboard recall case),
