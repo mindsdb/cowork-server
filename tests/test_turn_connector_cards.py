@@ -24,12 +24,6 @@ def test_a_template_named_after_a_built_in_takes_its_own_id():
     assert notices == []
 
 
-def test_a_template_already_named_with_the_suffix_keeps_it():
-    cards, _ = turn_connector_cards([{**_ENTRY, "connector_id": "hasdata_custom"}])
-
-    assert _ids(cards) == ["hasdata_custom"]
-
-
 def test_two_templates_that_become_one_id_show_once():
     cards, notices = turn_connector_cards([
         {**_ENTRY, "connector_id": "hasdata"}, {**_ENTRY, "connector_id": "hasdata_custom"},
@@ -47,6 +41,14 @@ def test_a_renamed_id_that_is_also_built_in_is_refused(monkeypatch):
 
     assert cards == []
     assert notices == ["A connector template was not shown: 'hasdata_custom' is a built-in connector."]
+
+
+def test_a_renamed_template_without_a_check_is_named_as_anton_named_it():
+    entry = {k: v for k, v in _ENTRY.items() if k != "check"}
+
+    _, notices = turn_connector_cards([{**entry, "connector_id": "hasdata"}])
+
+    assert notices == ["A connector template was not shown: 'hasdata' has no connection check, so it cannot be connected."]
 
 
 def test_a_template_without_a_check_is_a_notice_not_a_card():

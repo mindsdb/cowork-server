@@ -12,6 +12,28 @@ from cowork.schemas.connectors import (
 )
 
 
+_NOT_API_CATEGORIES = frozenset({"database", "vector-db"})
+
+
+def _takes_api_key(c: dict) -> bool:
+    """Whether a raw spec connects with a typed key or token.
+
+    True when its category is not a database kind and one of its form methods
+    is not an OAuth launch and asks for a secret or password field.
+    """
+    if c.get("category") in _NOT_API_CATEGORIES:
+        return False
+    form = c.get("form")
+    methods = form.get("methods") if isinstance(form, dict) else None
+    for method in methods or []:
+        if not isinstance(method, dict) or method.get("submit_action") == "oauth_launch":
+            continue
+        for field in method.get("fields") or []:
+            if isinstance(field, dict) and (field.get("secret") or field.get("type") == "password"):
+                return True
+    return False
+
+
 def connector_metadata(c: dict) -> ConnectorMetadataResponse:
     """Return a raw connector spec's directory entry, defaults filled in."""
     return ConnectorMetadataResponse(
@@ -26,6 +48,7 @@ def connector_metadata(c: dict) -> ConnectorMetadataResponse:
         featured=c.get("featured", False),
         notice=c.get("notice"),
         custom=c.get("custom", False),
+        api_key=_takes_api_key(c),
     )
 
 

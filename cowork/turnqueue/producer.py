@@ -614,6 +614,12 @@ SECOND_RUN_ERROR = "TurnRunRepeated: a second run of this turn's job sent replie
 #: one at a time, so a job that landed is among the last few.
 _JOB_READBACK_COUNT = 5
 
+# Replies a turn streams to the client before it ends; each needs the
+# workspace authorized first. `TurnReply.kind` lists the kinds it accepts.
+_STREAMED_REPLY_KINDS = (
+    "turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_connector", "turn_history", "turn_compaction",
+)
+
 
 async def _job_queued(*, r, job_stream: str, correlation_id: str) -> bool:
     """Whether the job for ``correlation_id`` is among the newest entries of
@@ -1038,6 +1044,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # session of its own.
     jev_settings = await run_on_unit_threads(partial(get_user_settings, scope))
     jev_decisions = getattr(jev_settings, "jev_decisions_enabled", True) is not False
+    offer_connector_drafts = bool(
+        connector_drafts and settings.connector_drafts_enabled and scope.org_mode and user_id
+    )
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -1047,9 +1056,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # The cowork UI renders a tool's message to the user as an
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
-              **({"connector_drafts": True} if (
-                  connector_drafts and settings.connector_drafts_enabled and scope.org_mode and user_id
-              ) else {}),
+              **({"connector_drafts": True} if offer_connector_drafts else {}),
               # False when the organization opted out of Jev: the pod's
               # completion check then never asks it. A controller that
               # predates the field drops it, and the pod keeps Jev on.
@@ -1234,8 +1241,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         yield "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
                         continue
                     if kind == "error" or (
-                        kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_connector",
-                                 "turn_history", "turn_compaction", "turn_completed")
+                        (kind in _STREAMED_REPLY_KINDS or kind == "turn_completed")
                         and authorized_workspace_mode is None
                     ):
                         # Unsupported v2 operations and missing mount-policy
@@ -1263,8 +1269,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         )
                     if kind in ("turn_completed", "turn_failed"):
                         ended = True
-                    if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_connector",
-                                "turn_history", "turn_compaction", "turn_completed", "turn_failed"):
+                    if kind in _STREAMED_REPLY_KINDS or kind in ("turn_completed", "turn_failed"):
                         yield kind, data
                     if kind in ("turn_completed", "turn_failed"):
                         return

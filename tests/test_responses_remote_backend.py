@@ -3882,6 +3882,8 @@ async def test_a_refused_draft_is_a_notice_without_its_value(monkeypatch):
     assert "label" in notices[0] and "not allowed" in notices[1]
     assert not any(token in f for f in frames)
     assert frames[-1] == "CLOSE:completed"
+
+
 class _QueueRedis:
     """Records queued jobs and answers each with its own terminal reply."""
 

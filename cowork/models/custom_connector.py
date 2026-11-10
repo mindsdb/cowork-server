@@ -17,8 +17,7 @@ class CustomConnector(BaseSQLModel, table=True):
 
     __tablename__ = "custom_connectors"
     # One local definition per connector id (org_id NULL). In an org, one per
-    # connector id per builder, since a member's definition is theirs alone;
-    # an org row with no builder stays one per org.
+    # connector id per builder, since a member's definition is theirs alone.
     __table_args__ = (
         sa.Index(
             "uq_custom_connectors_connector_id_global",
@@ -35,14 +34,6 @@ class CustomConnector(BaseSQLModel, table=True):
             unique=True,
             sqlite_where=sa.text("org_id IS NOT NULL AND created_by IS NOT NULL"),
             postgresql_where=sa.text("org_id IS NOT NULL AND created_by IS NOT NULL"),
-        ),
-        sa.Index(
-            "uq_custom_connectors_connector_id_org_no_builder",
-            "connector_id",
-            "org_id",
-            unique=True,
-            sqlite_where=sa.text("org_id IS NOT NULL AND created_by IS NULL"),
-            postgresql_where=sa.text("org_id IS NOT NULL AND created_by IS NULL"),
         ),
     )
 
