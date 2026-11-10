@@ -168,15 +168,14 @@ async def test_extend_patches_the_turns_key_on_the_cluster_only_route(monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("granted_after_s", "covered"), [(5400, True), (3000, False)])
-async def test_an_extension_auth_cut_short_reports_false(monkeypatch, granted_after_s, covered):
-    """auth clamps a key's expiry to its lifetime and still answers 200, with
-    the expiry it kept; a window cut short doesn't cover a Keep going."""
-    granted = (datetime.now(timezone.utc) + timedelta(seconds=granted_after_s)).isoformat()
-    monkeypatch.setattr(httpx, "AsyncClient", _client_answering(200, {}, {"expiry_date": granted}))
-    assert await auth_keys.extend_turn_key(
-        instance_id="corr-1", ttl_seconds=5400, settings=_Settings(),
-    ) is covered
+async def test_an_extension_auth_clamped_to_the_keys_lifetime_still_counts(monkeypatch):
+    """auth clamps the last window to the key's lifetime, which covers the
+    turn's whole time budget, and answers 200 with the expiry it kept. The
+    third Keep going always lands there; refusing it ended the turn an hour
+    early."""
+    clamped = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat()
+    monkeypatch.setattr(httpx, "AsyncClient", _client_answering(200, {}, {"expiry_date": clamped}))
+    assert await auth_keys.extend_turn_key(instance_id="corr-1", ttl_seconds=6000, settings=_Settings())
 
 
 @pytest.mark.asyncio
