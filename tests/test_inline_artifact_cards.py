@@ -55,7 +55,7 @@ def test_card_for_folder_prefers_html_entry_over_alphabetical(tmp_path):
         files={"index.html": "<html></html>", "data/prices.csv": "a,b\n1,2"},
         meta={"slug": "dash", "name": "Dash", "type": "html-app"},
     )
-    card = card_for_folder(tmp_path / "dash", scope=LOCAL_SCOPE)
+    card = card_for_folder(tmp_path / "dash", scope=LOCAL_SCOPE).to_json()
     assert card["path"].endswith("index.html")
     assert card["ext"] == ".html"
     assert card["slug"] == "dash"
@@ -114,7 +114,7 @@ def _turn_cards(monkeypatch, conversation) -> list[dict]:
     )
     monkeypatch.setattr(t, "record_new_artifacts", lambda *_a, **_k: None)
     events = asyncio.run(_drain())
-    return [event.artifact for event in events if isinstance(event, ArtifactCreated)]
+    return [event.artifact.to_json() for event in events if isinstance(event, ArtifactCreated)]
 
 
 @pytest.mark.usefixtures("cleanup_tmp_projects")

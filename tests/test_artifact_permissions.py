@@ -138,7 +138,7 @@ def test_cards_carry_per_artifact_capabilities(world):
     for slug in ("mine", "theirs", "orphan"):
         write_artifact(source.base, slug)
     with scoped(org_id, creator) as session:
-        cards = {c["slug"]: c for c in artifacts_ep._artifact_cards(session, [source])}
+        cards = {card.slug: card.to_json() for card in artifacts_ep._artifact_cards(session, [source])}
     assert cards["mine"]["capabilities"]["role"] == "owner"
     assert cards["theirs"]["capabilities"]["role"] == "reviewer"
     assert cards["orphan"]["capabilities"]["ownerUnknown"] is True

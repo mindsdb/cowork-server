@@ -31,7 +31,7 @@ def _base_meta(**extra) -> dict:
 def test_card_reports_the_creating_conversation(tmp_path: Path):
     root = _artifact(tmp_path, _base_meta(provenance=[{"conversation": CONVERSATION}]))
 
-    assert card_for_folder(root, scope=LOCAL_SCOPE)["originConversationId"] == CONVERSATION
+    assert card_for_folder(root, scope=LOCAL_SCOPE).to_json()["originConversationId"] == CONVERSATION
 
 
 def test_later_provenance_entries_do_not_move_the_origin(tmp_path: Path):
@@ -42,13 +42,13 @@ def test_later_provenance_entries_do_not_move_the_origin(tmp_path: Path):
         {"conversation": str(uuid4())},
     ]))
 
-    assert card_for_folder(root, scope=LOCAL_SCOPE)["originConversationId"] == CONVERSATION
+    assert card_for_folder(root, scope=LOCAL_SCOPE).to_json()["originConversationId"] == CONVERSATION
 
 
 def test_card_and_task_objects_agree_on_the_owner(tmp_path: Path):
     root = _artifact(tmp_path, _base_meta(provenance=[{"conversation": CONVERSATION}]))
 
-    assert card_for_folder(root, scope=LOCAL_SCOPE)["originConversationId"] == _artifact_owner(root)
+    assert card_for_folder(root, scope=LOCAL_SCOPE).to_json()["originConversationId"] == _artifact_owner(root)
 
 
 def test_artifact_without_provenance_reports_no_origin(tmp_path: Path):
@@ -56,7 +56,7 @@ def test_artifact_without_provenance_reports_no_origin(tmp_path: Path):
     # new conversation, so the key must be present and empty, never missing.
     root = _artifact(tmp_path, _base_meta())
 
-    card = card_for_folder(root, scope=LOCAL_SCOPE)
+    card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["originConversationId"] == ""
     assert _artifact_owner(root) is None
 
@@ -66,7 +66,7 @@ def test_malformed_provenance_reports_no_origin(tmp_path: Path):
     # raise out of the artifacts list.
     for provenance in ({"conversation": CONVERSATION}, ["not-a-dict"], [], [{}]):
         root = _artifact(tmp_path, _base_meta(provenance=provenance))
-        assert card_for_folder(root, scope=LOCAL_SCOPE)["originConversationId"] == ""
+        assert card_for_folder(root, scope=LOCAL_SCOPE).to_json()["originConversationId"] == ""
 
 
 def test_origin_conversation_id_tolerates_absent_metadata():

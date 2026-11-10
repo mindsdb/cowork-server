@@ -245,14 +245,14 @@ def _publish_static(tmp_path: Path) -> Path:
 def test_modified_false_when_unchanged(tmp_path: Path):
     root = _publish_static(tmp_path)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is False
 
 
 def test_modified_false_for_unpublished(tmp_path: Path):
     root = _make_static_html(tmp_path)  # never published
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is False
 
 
@@ -263,7 +263,7 @@ def test_modified_true_after_content_change(tmp_path: Path):
     idx.write_text("<h1>CHANGED</h1>", encoding="utf-8")
     _touch(idx, publish_mod._content_mtime(root) + 100)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is True
 
 
@@ -275,7 +275,7 @@ def test_touch_without_change_self_heals(tmp_path: Path):
     idx = root / "index.html"
     _touch(idx, old + 100)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is False
     # Self-heal: published_mtime advanced so the next listing hits the cheap gate.
     healed = json.loads(pub.read_text(encoding="utf-8"))["index.html"]["published_mtime"]
@@ -615,7 +615,7 @@ def test_fullstack_modified_false_when_only_backend_log_changes(tmp_path: Path):
     log.write_text("server started\n", encoding="utf-8")
     _touch(log, publish_mod._content_mtime(root) + 10_000)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is False
 
 
@@ -679,7 +679,7 @@ def test_fullstack_modified_true_after_real_change(tmp_path: Path):
     idx.write_text("<h1>CHANGED</h1>", encoding="utf-8")
     _touch(idx, publish_mod._content_mtime(root) + 100)
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is True
 
 
@@ -692,7 +692,7 @@ def test_fullstack_binary_touch_self_heals(tmp_path: Path):
     png = root / "static" / "logo.png"
     _touch(png, old + 100)  # bump past the gate, identical bytes
     with _patch_scan(tmp_path):
-        card = card_for_folder(root, scope=LOCAL_SCOPE)
+        card = card_for_folder(root, scope=LOCAL_SCOPE).to_json()
     assert card["modified"] is False
     healed = json.loads(pub.read_text(encoding="utf-8"))["index.html"]["published_mtime"]
     assert healed >= old + 100

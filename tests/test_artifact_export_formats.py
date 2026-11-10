@@ -39,6 +39,7 @@ from cowork.services.artifact_permissions import artifact_capabilities
 from cowork.services.artifacts import ProjectArtifacts
 from test_artifact_ownership import make_project, project_root
 from _async_stub import awaitable
+from _artifact_cards import make_card
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
 FORMAT_CASES = yaml.safe_load((FIXTURES / "formats.yaml").read_text(encoding="utf-8"))["cases"]
@@ -105,7 +106,7 @@ def test_a_card_names_its_primary_file_and_type(tmp_path, primary, artifact_type
         path = folder / primary
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("x")
-    card = {"folder": str(folder), "path": str(path), "type": artifact_type}
+    card = make_card(folder=str(folder), path=str(path), type=artifact_type)
 
     assert card_export_source(card) == expected
 
@@ -181,7 +182,7 @@ def test_local_cards_carry_export_formats(tmp_path, local_mode):
         _write_artifact(source.base, slug, files, **metadata)
 
     with Session(get_engine(get_app_settings().database.uri)) as raw:
-        cards = artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])
+        cards = [card.to_json() for card in artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])]
 
     listed = {card["slug"]: card["capabilities"]["exportFormats"] for card in cards}
     assert listed == {slug: expected for slug, (_f, _m, expected) in _LOCAL_ARTIFACTS.items()}
@@ -248,7 +249,7 @@ def test_a_hard_linked_primary_offers_nothing_anywhere_and_the_route_answers_422
     )
     os.link(folder / "report.md", tmp_path / "backup.md")
     with Session(get_engine(get_app_settings().database.uri)) as raw:
-        cards = artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])
+        cards = [card.to_json() for card in artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])]
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_for_request",
@@ -314,7 +315,7 @@ def org_export_on(monkeypatch):
 
 def _org_card_formats(world) -> dict[str, list[str]]:
     with _scoped(world.org_id, world.creator) as session:
-        cards = artifacts_ep._artifact_cards(session, [world.source])
+        cards = [card.to_json() for card in artifacts_ep._artifact_cards(session, [world.source])]
     return {card["slug"]: card["capabilities"]["exportFormats"] for card in cards}
 
 
@@ -425,7 +426,7 @@ def test_the_route_accepts_exactly_the_formats_the_card_lists(tmp_path, local_mo
     source = _local_source(tmp_path)
     artifact_id, folder = _write_artifact(source.base, slug, files, **metadata)
     with Session(get_engine(get_app_settings().database.uri)) as raw:
-        (card,) = artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])
+        (card,) = [card.to_json() for card in artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])]
     listed = card["capabilities"]["exportFormats"]
     monkeypatch.setattr(
         workspace_ep,

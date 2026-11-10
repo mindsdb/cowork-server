@@ -643,7 +643,7 @@ def _card(folder: Path) -> dict:
         trusted_anchor=folder.parent.parent.parent,
         root_parts=(".anton", "artifacts"),
     )
-    (card,) = artifacts_service.list_artifacts([source])
+    (card,) = [card.to_json() for card in artifacts_service.list_artifacts([source])]
     # A card with no primary file has no draftUrl.
     return {key: card.get(key) for key in ("path", "publishedUrl", "accessMode", "draftUrl")}
 

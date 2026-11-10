@@ -2923,7 +2923,7 @@ def test_a_fifo_in_place_of_metadata_holds_no_id_and_holds_no_thread(tmp_path, o
     metadata.unlink()
     os.mkfifo(metadata)
 
-    listed = _within(1, fifo=metadata, call=lambda: artifacts_service.list_artifacts([source]))
+    listed = _within(1, fifo=metadata, call=lambda: [card.to_json() for card in artifacts_service.list_artifacts([source])])
     assert [card["id"] for card in listed] == [other_id]
     recorded = _within(1, fifo=metadata, call=lambda: artifact_identity.resolve_recorded_folder(source, "brief", artifact_id))
     assert recorded.check is FolderCheck.STALE

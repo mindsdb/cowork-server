@@ -211,7 +211,7 @@ def test_a_listed_card_from_an_adopted_folder_serves_under_the_row_name(
     )
 
     session = _scoped(engine)
-    cards = list_artifacts(artifacts_sources_for_scope(session))
+    cards = [card.to_json() for card in list_artifacts(artifacts_sources_for_scope(session))]
     card = next(c for c in cards if c["title"] == "Dashboard")
     assert card["serveUrl"] == (
         f"/api/v1/artifacts/serve/{project.name}/dash/index.html"
