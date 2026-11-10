@@ -108,7 +108,7 @@ class _Harness:
         self, *, conversation, input, model=None, reasoning_effort=None,
         disabled_connections=None, trace_tags=None, trace_metadata=None,
         channel_context=None, tool_messages=False, model_wait=None,
-        interactive=True,
+        interactive=True, ui_locale=None,
     ):
         if model_wait is not None:
             model_wait.attach(session=self.session)
