@@ -24,6 +24,18 @@ def _spec(category="crm", **method):
     return {"id": "x", "label": "X", "category": category, "form": {"methods": [method]}}
 
 
+@pytest.mark.asyncio
+async def test_one_connector_answers_as_the_directory_does():
+    hasdata = await specs_endpoints.get_connector_spec("hasdata", LOCAL_SCOPE)
+    postgres = await specs_endpoints.get_connector_spec("postgres", LOCAL_SCOPE)
+
+    assert hasdata.api_key is True and postgres.api_key is False
+
+
+def test_a_secret_field_counts_as_a_key():
+    assert connector_metadata(_spec(fields=[{"name": "api_key", "secret": True}])).api_key is True
+
+
 def test_a_secret_field_behind_an_oauth_launch_is_not_a_key():
     spec = _spec(submit_action="oauth_launch", fields=[{"name": "client_secret", "secret": True}])
 

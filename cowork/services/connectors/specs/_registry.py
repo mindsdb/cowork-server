@@ -114,6 +114,7 @@ class ConnectorSpecRegistry:
             featured=c.get("featured", False),
             notice=c.get("notice"),
             custom=c.get("custom", False),
+            api_key=_takes_api_key(c),
             keywords=c.get("keywords", []),
             form=c.get("form", {}),
             check=c.get("check"),
