@@ -363,3 +363,21 @@ def test_the_notes_read_nothing_outside_a_members_org_scope(templates):
                                     usage_notes="Personal notes.", org_id="p1", created_by="u1"))
         session.commit()
     assert member_turn_usage_notes(ScopedSession(Session(templates), personal), ["acme_crm"]) == {}
+
+
+# ── no value in the job or a log (step 6) ────────────────────────────────────
+
+
+async def test_an_answer_carrying_values_puts_none_of_them_in_the_job_or_a_log(turn, monkeypatch):
+    """Only ids and names are copied from auth's answers, whatever else they carry."""
+    planted = "acct-77f3c9e2b1d4-private"
+    lines: list[str] = []
+    monkeypatch.setattr(prod.logger, "warning", lambda msg, *a, **k: lines.append(msg % a if a else msg))
+    monkeypatch.setattr(prod.logger, "info", lambda msg, *a, **k: lines.append(msg % a if a else msg))
+    turn["list"].return_value = [{**_listed(5), "fields": {"api_key": planted}, "secret": planted}]
+    turn["grant"].return_value = {**_granted({5: 1}), "fields": {"api_key": planted}}
+
+    params, _ = await _run(turn)
+
+    assert planted not in json.dumps(params)
+    assert not [line for line in lines if planted in line]
