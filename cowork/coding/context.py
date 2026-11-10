@@ -58,6 +58,17 @@ def workspace_files(session: CodingSession, query: str = "", limit: int = 40) ->
     return matches
 
 
+def message_attachments(attachments: list[InputReference] | tuple[InputReference, ...]) -> dict:
+    """What the timeline shows of a message's attachments, as event data.
+
+    Only the label the composer showed and the kind: the transcript needs no
+    disk path, so none is stored with the message.
+    """
+    if not attachments:
+        return {}
+    return {"attachments": [{"name": item.name, "kind": item.kind} for item in attachments]}
+
+
 def require_attachments_exist(attachments: list[InputReference] | tuple[InputReference, ...]) -> None:
     """Reject absolute attachment paths that are already missing.
 

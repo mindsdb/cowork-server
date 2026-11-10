@@ -14,7 +14,7 @@ from anton.core.tools.connector_draft import (
 )
 from anton.utils.datasources import scrub_output
 from pydantic import ValidationError
-from sqlalchemy import false, func
+from sqlalchemy import false
 from sqlalchemy.exc import IntegrityError
 
 from cowork.db.personal_resources import PersonalResource
@@ -30,16 +30,10 @@ _KEPT_FORM_KEYS = ("how_to", "help_url")
 _COLOR_PATTERN = re.compile(r"#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?")
 # Matches the cap agent-facing usage notes have on built-in specs.
 USAGE_NOTES_MAX = 1600
-#: Custom connectors one member may keep in an organization.
-MEMBER_CONNECTORS_MAX = 25
 
 
 class UnstorableFormError(ValueError):
     """A handcrafted form that cannot be kept as a custom connector."""
-
-
-class MemberConnectorLimitError(ValueError):
-    """A member already keeps the most custom connectors allowed."""
 
 
 def handcrafted_form_allowed(*, known: bool, custom: bool, extends: bool) -> bool:
@@ -363,10 +357,7 @@ class CustomConnectorService:
         else:
             for key, value in values.items():
                 setattr(row, key, value)
-        self.session.add(row)
-        self.session.commit()
-        self.session.refresh(row)
-        return row
+        return self._commit(row)
 
     def save_member_draft(self, draft: ConnectorDraft) -> CustomConnector:
         """Save a checked draft as the org-mode member's own definition.
@@ -382,9 +373,6 @@ class CustomConnectorService:
         Raises:
             UnstorableFormError: when the scope is not one member's in org
                 mode, or the built form is invalid.
-            MemberConnectorLimitError: when this would be a new definition
-                past MEMBER_CONNECTORS_MAX. Two saves racing can each pass
-                the count and reach one over.
 
         Side effects:
             Commits the session.
@@ -403,11 +391,6 @@ class CustomConnectorService:
         }
         row = self.get(draft.connector_id)
         if row is None:
-            count_stmt = scope_definitions(self.session).with_only_columns(func.count(), maintain_column_froms=True)
-            if self.session.exec(count_stmt).one() >= MEMBER_CONNECTORS_MAX:
-                raise MemberConnectorLimitError(
-                    f"You can keep at most {MEMBER_CONNECTORS_MAX} custom connectors; delete one first."
-                )
             try:
                 return self._commit(CustomConnector(connector_id=draft.connector_id, **values))
             except IntegrityError:
@@ -472,10 +455,7 @@ class CustomConnectorService:
             row.description = changes.description or ""
         if "category" in sent:
             row.category = changes.category
-        self.session.add(row)
-        self.session.commit()
-        self.session.refresh(row)
-        return row
+        return self._commit(row)
 
     def delete(self, connector_id: str) -> bool:
         """Delete a definition. Saved connections that use it are kept.
