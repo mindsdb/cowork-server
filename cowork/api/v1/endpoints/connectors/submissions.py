@@ -38,6 +38,10 @@ from cowork.services.connectors.submissions import missing_required_fields, stor
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 _DATABASE_CATEGORY = "database"
+_NO_CUSTOM_IN_ORG = (
+    "Custom connectors cannot be connected in an organization yet. "
+    "Use a connector from Connect Apps and Data."
+)
 
 
 def _resolve_fields(spec, method_id: str | None) -> list:
@@ -167,6 +171,10 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScope) -> StreamingRe
     if known is None:
         known = await run_db(lambda session: ConnectorCatalog(session).get_connector(connector_id), scope=scope)
         is_custom = known is not None
+    if scope.org_mode and (is_custom or (known is None and req.form_spec)):
+        # Nothing tests a custom connector in an organization yet; refused
+        # before anything is checked or staged, so no value is kept.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_CUSTOM_IN_ORG)
     if known is not None and stamped and extends_name is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
