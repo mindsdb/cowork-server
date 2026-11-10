@@ -1043,6 +1043,7 @@ class AntonHarness:
                         tracked_new=getattr(session, "artifacts_touched", None),
                         tracked_edits=getattr(session, "artifacts_touched", None),
                         schedule_id=schedule_id,
+                        scope=_units_scope(),
                     ),
                     scope=_units_scope(),
                     deadline=False,

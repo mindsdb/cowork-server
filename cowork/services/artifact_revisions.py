@@ -21,6 +21,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from cowork.common.logger import log_context
+from cowork.db.scoped import TenantScope
 from cowork.common.paths import (
     O_NOFOLLOW,
     O_NONBLOCK,
@@ -553,29 +554,15 @@ def _has_comment_on(folder: Path, revision_id: str | None) -> bool:
     )
 
 
-def _comments_live_in_the_cloud(folder: Path) -> bool:
-    """Whether a desktop artifact's comments go to the cloud comments service
-    rather than its local journal, so the journal can't say which revisions
-    were commented on.
-
-    A restricted publication sends them there. This asks the same question
-    resolve_comments_route does, so the two agree: an artifact whose record
-    it can't read keeps its comments in the local journal, which the caller
-    then checks. If asking fails outright, it answers yes, as an unreadable
-    journal does. Org mode keeps every artifact's comments in the cloud
-    service and is left out: there a refresh sees only the threads a repair
-    links to.
-    """
+def _comments_live_in_the_cloud(folder: Path, scope: TenantScope | None) -> bool:
+    """Keep revisions whenever the local journal cannot see their comments."""
     from cowork.common.settings.app_settings import get_app_settings
+    from cowork.services.comments_scope import published_comments_route
 
-    if get_app_settings().tenancy_mode == "org":
-        return False
-    from cowork.db.scoped import LOCAL_SCOPE
-    from cowork.services.comments_scope import cloud_comments_scope
-    from cowork.services.publish import published_owner_state
-
+    if get_app_settings().tenancy_mode == "org" or (scope is not None and scope.org_mode):
+        return True
     try:
-        return bool(cloud_comments_scope(published_owner_state(str(folder), scope=LOCAL_SCOPE)))
+        return published_comments_route(str(folder), scope=scope) is not None
     except Exception:
         logger.warning(
             "Could not read an artifact's publication record; its refresh keeps the last revision",
@@ -585,7 +572,8 @@ def _comments_live_in_the_cloud(folder: Path) -> bool:
 
 
 def _refresh_replaces_head(
-    folder: Path, head: RevisionEntry | None, rel_path: str, schedule_id: str | None
+    folder: Path, head: RevisionEntry | None, rel_path: str, schedule_id: str | None,
+    scope: TenantScope | None,
 ) -> bool:
     """Whether a scheduled refresh may overwrite the head instead of adding a
     revision.
@@ -608,7 +596,7 @@ def _refresh_replaces_head(
         for repair in _actionable_repairs_for_path(folder, rel_path)
     ):
         return False
-    if _comments_live_in_the_cloud(folder):
+    if _comments_live_in_the_cloud(folder, scope):
         return False
     return not _has_comment_on(folder, head.id)
 
@@ -957,7 +945,8 @@ def revision_with_content(folder: Path, revision_id: str) -> dict:
 
 
 def capture_agent_revision(
-    folder: Path, *, conversation_id: str | None = None, schedule_id: str | None = None
+    folder: Path, *, conversation_id: str | None = None, schedule_id: str | None = None,
+    scope: TenantScope | None = None,
 ) -> dict | None:
     """Record an agent edit and finish repair handoffs attributed to this turn.
 
@@ -994,6 +983,30 @@ def capture_agent_revision(
                 repair.updated_at = _now()
                 _write_repair(folder, repair)
             if latest is not None and latest.content_hash == _sha(content):
+                if (
+                    schedule_id
+                    and latest.actor is not None
+                    and latest.actor.kind == "system"
+                    and latest.summary == "Captured current draft"
+                ):
+                    # A viewer may capture the write before the turn ends.
+                    # Keep its id: comments and editors may already hold it.
+                    previous = manifest.revision(latest.base_revision_id)
+                    latest.actor = RevisionActor(kind="agent", id=None)
+                    latest.schedule_id = schedule_id
+                    latest.conversation_id = conversation_id
+                    latest.summary = "Scheduled task updated artifact"
+                    if (
+                        not queued
+                        and previous is not None
+                        and previous.path == relative
+                        and _refresh_replaces_head(folder, previous, relative, schedule_id, scope)
+                    ):
+                        latest.number = previous.number
+                        latest.base_revision_id = previous.base_revision_id
+                        manifest.revisions.remove(previous)
+                    _write_manifest(folder, manifest)
+                    _prune_orphan_blobs(folder, manifest.revisions)
                 _finish_queued_repairs(
                     folder,
                     queued,
@@ -1019,7 +1032,7 @@ def capture_agent_revision(
                 ],
                 schedule_id=schedule_id,
             )
-            if not queued and _refresh_replaces_head(folder, latest, relative, schedule_id):
+            if not queued and _refresh_replaces_head(folder, latest, relative, schedule_id, scope):
                 return _replace_head_revision(folder, manifest, latest, entry, content).to_json()
             entry = _persist_revision(folder, manifest, entry, content)
             _finish_queued_repairs(

@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope
+from cowork.common.settings.user_settings import use_settings_scope
+
 import cowork.services.task_objects as task_objects
 from cowork.handlers import responses as responses_mod
 from cowork.streaming.buffer import FileStreamBuffer
@@ -26,6 +29,7 @@ def _spy_artifact_changes(monkeypatch) -> dict:
 
     def spy(**kwargs):
         seen["schedule_id"] = kwargs.get("schedule_id")
+        seen["scope"] = kwargs.get("scope")
         return task_objects.ArtifactChanges(created=[], touched=set())
 
     monkeypatch.setattr(task_objects, "turn_artifact_changes", spy)
@@ -64,9 +68,11 @@ async def test_inprocess_turn_hands_the_schedule_to_the_harness(monkeypatch, tmp
 async def test_harness_attributes_its_artifact_edits_to_the_schedule(turns, monkeypatch):
     seen = _spy_artifact_changes(monkeypatch)
 
-    await _drain(turns.run(_completes, schedule_id="schedule-1"))
+    scope = TenantScope(personal=True, org_id="person-1", user_id="user-1")
+    with use_settings_scope(scope):
+        await _drain(turns.run(_completes, schedule_id="schedule-1"))
 
-    assert seen == {"schedule_id": "schedule-1"}
+    assert seen == {"schedule_id": "schedule-1", "scope": scope}
 
 
 async def test_harness_turn_without_a_schedule_is_an_ordinary_edit(turns, monkeypatch):
@@ -74,11 +80,12 @@ async def test_harness_turn_without_a_schedule_is_an_ordinary_edit(turns, monkey
 
     await _drain(turns.run(_completes))
 
-    assert seen == {"schedule_id": None}
+    assert seen == {"schedule_id": None, "scope": LOCAL_SCOPE}
 
 
 async def test_remote_turn_attributes_its_artifact_edits_to_the_schedule(monkeypatch, tmp_path):
     handler = _remote_handler(monkeypatch, {})
+    monkeypatch.setattr(responses_mod, "scope_from_principal", lambda _: handler.scope)
     handler.schedule_id = "schedule-1"
     artifacts_base = tmp_path / "proj" / ".anton" / "artifacts"
     artifacts_base.mkdir(parents=True)
@@ -98,4 +105,19 @@ async def test_remote_turn_attributes_its_artifact_edits_to_the_schedule(monkeyp
         model="anton", harness_id="anton", buffer=_FakeBuffer(),
     )
 
-    assert seen == {"schedule_id": "schedule-1"}
+    assert seen == {"schedule_id": "schedule-1", "scope": handler.scope}
+
+
+def test_artifact_diff_forwards_the_tenant_scope(monkeypatch, tmp_path):
+    scope = TenantScope(personal=True, org_id="person-1", user_id="user-1")
+    _artifact(tmp_path, "dash")
+    seen = []
+    from cowork.services import artifact_revisions
+    monkeypatch.setattr(artifact_revisions, "capture_agent_revision", lambda folder, **kw: seen.append(kw))
+    task_objects.turn_artifact_changes(
+        conversation_id=uuid4(), artifacts_base=tmp_path, before=set(), before_mtimes={},
+        scope=scope, schedule_id="schedule-1",
+    )
+    assert len(seen) == 1
+    assert seen[0]["scope"] is scope
+    assert seen[0]["schedule_id"] == "schedule-1"

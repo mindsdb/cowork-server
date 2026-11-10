@@ -2776,6 +2776,7 @@ class ResponsesHandler:
                             completed_cleanly=completed_cleanly,
                             repair_slugs=repairs.slugs if repairs is not None else None,
                             schedule_id=self.schedule_id,
+                            scope=scope,
                         ),
                         scope=scope,
                         deadline=False,
