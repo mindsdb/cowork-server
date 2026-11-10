@@ -434,10 +434,14 @@ class ProbeHandler:
                 # The staged copy goes now; the values wait only in the pending test.
                 store.consume(submission_id)
                 test_request = test_request_for(form_spec, method)
+                # Every value the test sends from the saved record, declared in
+                # this step's form or not: a blank field of the same name still
+                # sends the saved value.
+                from_saved = set(probe_credentials) - set(credentials)
                 refusal = (
                     (NEEDS_REBUILD_FOR_MEMBER if spec is not None else _NO_TEST_REQUEST)
                     if test_request is None
-                    else await self._follow_up_refusal(connector_id, test_request, form_spec, method, saved_only_fields)
+                    else await self._follow_up_refusal(connector_id, test_request, form_spec, method, from_saved)
                 )
                 if refusal is not None:
                     yield _delta(refusal)
@@ -448,7 +452,7 @@ class ProbeHandler:
                     kind="confirm", scope=self.scope, connector_id=connector_id, method=method, name=name,
                     conversation_id=conversation_id, form_id=form_id, form_spec=form_spec,
                     test_request=test_request, test_values=probe_credentials, credentials=credentials,
-                    secret_names=sorted(set(spec_secret_fields(connector_id, method, form_spec)) | saved_only_fields),
+                    secret_names=sorted(set(spec_secret_fields(connector_id, method, form_spec)) | from_saved),
                     label=connection_label, user_label=connection_user_label, extends_name=extends_name,
                     grant_slug=grant_slug, handcrafted=spec is None,
                 )
