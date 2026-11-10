@@ -29,6 +29,7 @@ from cowork.schemas.artifact_export import OmittedReason
 from cowork.services import artifact_export, artifact_identity
 from cowork.services.artifact_export import ExportRefusal, ExportRefused, export_slot
 from cowork.services.artifact_files import ArtifactFileRefused
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
 from test_artifact_export_route import _snapshot, padded_png
 from test_artifact_files import _symlink
@@ -101,7 +102,7 @@ def test_a_word_export_fetches_nothing_and_takes_nothing_from_another_partition(
             result = artifact_export.export_primary_file(
                 source=source,
                 folder_name=folder.name,
-                metadata=json.loads((folder / "metadata.json").read_text()),
+                metadata=ArtifactMetadata.parse((folder / "metadata.json").read_text()),
                 artifact_id=artifact_id,
                 export_format="docx",
                 can_edit=True,
@@ -135,7 +136,7 @@ def test_a_first_export_records_the_primary_the_card_shows(local_mode, partition
     result = artifact_export.export_primary_file(
         source=source,
         folder_name=folder.name,
-        metadata=metadata,
+        metadata=ArtifactMetadata.model_validate(metadata),
         artifact_id=artifact_id,
         export_format="docx",
         can_edit=True,
@@ -154,7 +155,7 @@ def _export_docx(source: ProjectArtifacts, folder: Path, artifact_id: str) -> st
     return artifact_export.export_primary_file(
         source=source,
         folder_name=folder.name,
-        metadata=json.loads((folder / "metadata.json").read_text()),
+        metadata=ArtifactMetadata.parse((folder / "metadata.json").read_text()),
         artifact_id=artifact_id,
         export_format="docx",
         can_edit=True,
@@ -228,7 +229,7 @@ def test_a_parent_folder_swapped_for_a_link_mid_export_is_never_written_through(
         artifact_export.export_primary_file(
             source=source,
             folder_name=folder.name,
-            metadata=metadata,
+            metadata=ArtifactMetadata.model_validate(metadata),
             artifact_id=artifact_id,
             export_format=export_format,
             can_edit=True,
@@ -308,7 +309,7 @@ def test_rewriting_metadata_keeps_its_permission_bits(local_mode, partitions, wr
         artifact_export.export_primary_file(
             source=source,
             folder_name=folder.name,
-            metadata=metadata,
+            metadata=ArtifactMetadata.model_validate(metadata),
             artifact_id=artifact_id,
             export_format="docx",
             can_edit=True,
@@ -339,7 +340,7 @@ def test_a_volume_that_refuses_a_mode_change_still_records_the_primary(
     result = artifact_export.export_primary_file(
         source=source,
         folder_name=folder.name,
-        metadata=metadata,
+        metadata=ArtifactMetadata.model_validate(metadata),
         artifact_id=artifact_id,
         export_format="docx",
         can_edit=True,

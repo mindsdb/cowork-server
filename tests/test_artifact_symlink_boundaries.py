@@ -13,6 +13,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services import artifact_identity, artifact_roots, artifacts
 from cowork.services.artifact_identity import ensure_full_id, resolve_artifact_folder
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts, list_artifacts
 
 
@@ -113,7 +114,7 @@ def test_symlinked_artifact_folder_is_neither_resolved_nor_migrated(tmp_path):
     with pytest.raises(FileNotFoundError, match="Artifact not found"):
         resolve_artifact_folder([_source(project)], wanted)
     with pytest.raises(OSError):
-        ensure_full_id(linked, legacy)
+        ensure_full_id(linked, ArtifactMetadata.model_validate(legacy))
 
     assert (outside / "metadata.json").read_bytes() == before
 

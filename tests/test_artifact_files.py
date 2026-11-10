@@ -26,6 +26,7 @@ from cowork.services.artifact_files import (
     read_artifact_file,
     read_artifact_file_entry,
 )
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
 from cowork.db.scoped import LOCAL_SCOPE
 from draft_host_support import reviewed_and_read
@@ -712,7 +713,7 @@ async def _serve_draft(*, monkeypatch, source, folder, rel_path):
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_and_read",
-        reviewed_and_read(lambda *_args: (source, folder, {"type": "html-app"}, True)),
+        reviewed_and_read(lambda *_args: (source, folder, ArtifactMetadata.model_validate({"type": "html-app"}), True)),
     )
     return await workspace_ep.serve_private_draft(
         "local",

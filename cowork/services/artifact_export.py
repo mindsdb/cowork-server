@@ -14,7 +14,6 @@ from __future__ import annotations
 import codecs
 import errno
 import html
-import json
 import os
 import secrets
 from collections.abc import AsyncIterator, Callable
@@ -45,11 +44,12 @@ from cowork.schemas.artifact_export import (
 )
 from cowork.services import artifact_files
 from cowork.services.artifact_identity import (
-    _atomic_json,
     _read_no_follow,
+    _write_metadata,
     opened_artifact_folder,
 )
 from cowork.services.artifact_inline import inline_artifact_html
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import (
     ProjectArtifacts,
     _is_single_named_file,
@@ -229,12 +229,9 @@ def offered_export_formats(
     )
 
 
-def _primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...] | None:
+def _primary_parts(*, folder: Path, metadata: ArtifactMetadata) -> tuple[str, ...] | None:
     """The primary file's path inside *folder*, picked the way the artifact card picks it."""
-    hint = metadata.get("primary")
-    primary = _pick_primary(
-        folder, _user_files(folder), primary_hint=hint if isinstance(hint, str) else None
-    )
+    primary = _pick_primary(folder, _user_files(folder), primary_hint=metadata.primary)
     if primary is None:
         return None
     try:
@@ -244,7 +241,7 @@ def _primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...] | None:
     return relative.parts or None
 
 
-def _exportable_primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...] | None:
+def _exportable_primary_parts(*, folder: Path, metadata: ArtifactMetadata) -> tuple[str, ...] | None:
     """The primary file's path inside *folder*, or None when the export's read would refuse it.
 
     A primary the read refuses for what it is on disk names no source: a file
@@ -258,12 +255,12 @@ def _exportable_primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...
     return parts
 
 
-def primary_export_source(*, folder: Path, metadata: dict) -> ExportSource:
+def primary_export_source(*, folder: Path, metadata: ArtifactMetadata) -> ExportSource:
     """The export source of the artifact in *folder*: its primary file and its type."""
     parts = _exportable_primary_parts(folder=folder, metadata=metadata)
     return ExportSource(
         source_name="/".join(parts or ()),
-        is_backend=is_backend_type(metadata.get("type")),
+        is_backend=is_backend_type(metadata.type),
     )
 
 
@@ -448,15 +445,20 @@ def _record_primary(*, folder: PinnedDir, primary: str) -> None:
     ``ensure_full_id`` widens an id, and the file's timestamps are put back
     because the artifact's content did not change. If the export then fails,
     the record stays: it names the file the card already shows. A primary
-    that names a file is never changed.
+    that names a file is never changed. A document that isn't an object, or
+    one that can't be written back, gets no record.
     """
-    latest = json.loads(_read_no_follow(folder, _METADATA))
-    if not isinstance(latest, dict) or _primary_names_a_file(
-        folder=folder, primary=latest.get("primary")
-    ):
+    try:
+        latest = ArtifactMetadata.parse(_read_no_follow(folder, _METADATA))
+    except ValueError:
+        return
+    if _primary_names_a_file(folder=folder, primary=latest.primary):
         return
     before = dir_stat(folder, _METADATA, follow_symlinks=False)
-    _atomic_json(folder, _METADATA, {**latest, "primary": primary})
+    try:
+        _write_metadata(folder, latest.with_value("primary", primary))
+    except ValueError:
+        return
     times = (before.st_atime_ns, before.st_mtime_ns)
     try:
         if folder.fd is not None:
@@ -464,7 +466,7 @@ def _record_primary(*, folder: PinnedDir, primary: str) -> None:
         else:
             # Windows, the only place a pinned folder has no descriptor, can't
             # set times without following a link: follow_symlinks=False raises
-            # NotImplementedError there. _atomic_json has just put a regular
+            # NotImplementedError there. _write_metadata has just put a regular
             # file at this name.
             os.utime(folder.path / _METADATA, ns=times)
     except OSError:
@@ -647,7 +649,7 @@ def export_primary_file(
     *,
     source: ProjectArtifacts,
     folder_name: str,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     export_format: ExportFormat,
     can_edit: bool,
@@ -670,7 +672,7 @@ def export_primary_file(
         offered = offered_export_formats(
             source=ExportSource(
                 source_name="/".join(parts or ()),
-                is_backend=is_backend_type(metadata.get("type")),
+                is_backend=is_backend_type(metadata.type),
             ),
             can_edit=can_edit,
             org_mode=org_mode,

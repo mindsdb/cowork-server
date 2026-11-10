@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from cowork.db.scoped import LOCAL_SCOPE
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import card_for_folder, origin_conversation_id
 from cowork.services.task_objects import _artifact_owner
 
@@ -70,4 +71,4 @@ def test_malformed_provenance_reports_no_origin(tmp_path: Path):
 
 def test_origin_conversation_id_tolerates_absent_metadata():
     assert origin_conversation_id(None) == ""
-    assert origin_conversation_id({}) == ""
+    assert origin_conversation_id(ArtifactMetadata.model_validate({})) == ""

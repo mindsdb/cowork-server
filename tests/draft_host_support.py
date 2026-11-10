@@ -13,6 +13,7 @@ from cowork.api.v1.artifact_scope import ResolvedArtifact, ReviewedRead
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.units import run_efs
 from cowork.draft_host.token import issue_draft_token
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
 
 USER = "11111111-1111-4111-8111-111111111111"
@@ -114,7 +115,7 @@ def make_artifact(tmp_path, *, metadata=None, files=None):
         trusted_anchor=project,
         root_parts=(".anton", "artifacts"),
     )
-    return source, folder, metadata or {"type": "html-app"}
+    return source, folder, ArtifactMetadata.model_validate(metadata or {"type": "html-app"})
 
 
 def fake_review(source, folder, metadata, seen: dict):

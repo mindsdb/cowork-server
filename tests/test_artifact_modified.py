@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from cowork.db.scoped import LOCAL_SCOPE
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import _content_mtime, _user_files_with_mtimes
 
 
@@ -105,7 +106,7 @@ def test_prepare_artifact_card_walks_folder_once(tmp_path: Path, monkeypatch):
         tmp_path,
         0,
         artifact_id=artifact_id,
-        meta=meta,
+        meta=ArtifactMetadata.model_validate(meta),
         published_map={},
         project_id=None,
         project_name="proj",

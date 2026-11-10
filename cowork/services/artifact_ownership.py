@@ -19,7 +19,6 @@ turn's claim (``turn_created_slugs``), never grant ownership.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import stat
@@ -34,6 +33,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.services.artifact_access import ArtifactAccessUnavailable
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_roots import (
     _ARTIFACTS_SUBPATH,
     CONVERSATIONS_DIRNAME,
@@ -383,7 +383,7 @@ def provenance_origin(folder: Path) -> UUID | None:
                     return None
                 with os.fdopen(fd, "r", encoding="utf-8") as handle:
                     fd = -1
-                    data = json.load(handle)
+                    data = ArtifactMetadata.parse(handle.read())
             finally:
                 if fd >= 0:
                     os.close(fd)
@@ -391,7 +391,7 @@ def provenance_origin(folder: Path) -> UUID | None:
         return None
     from cowork.services.artifacts import origin_conversation_id
 
-    raw = origin_conversation_id(data if isinstance(data, dict) else None)
+    raw = origin_conversation_id(data)
     try:
         return UUID(raw) if raw else None
     except ValueError:

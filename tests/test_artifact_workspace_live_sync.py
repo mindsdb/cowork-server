@@ -9,6 +9,7 @@ import pytest
 from cowork.api.v1.endpoints import artifact_workspace as workspace
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.services import artifact_locks
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_revisions import current_source
 from cowork.services.artifacts import ProjectArtifacts
 from _async_stub import awaitable
@@ -30,7 +31,7 @@ def artifact(tmp_path):
     (folder / "report.html").write_text("<html>before</html>", encoding="utf-8")
     metadata = {"slug": "report", "type": "html-app", "primary": "report.html"}
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
-    return folder, metadata
+    return folder, ArtifactMetadata.model_validate(metadata)
 
 
 def _source_for(folder):

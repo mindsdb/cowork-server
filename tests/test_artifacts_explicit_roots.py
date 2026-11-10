@@ -170,7 +170,7 @@ def test_list_call_graph_does_not_reach_mutating_identity_or_card_helpers(
         pytest.fail("read-only listing reached a mutating helper")
 
     monkeypatch.setattr(artifact_identity, "ensure_full_id", unexpected)
-    monkeypatch.setattr(artifact_identity, "_atomic_json", unexpected)
+    monkeypatch.setattr(artifact_identity, "_write_metadata", unexpected)
     monkeypatch.setattr(artifact_identity.os, "utime", unexpected)
     monkeypatch.setattr(a, "_is_modified", unexpected)
     monkeypatch.setattr(a, "_write_published_map_pinned", unexpected)
