@@ -6,7 +6,7 @@ in on moves to them. Org mode only; the desktop's SQLite gets the empty table
 and never writes it.
 
 Revision ID: 1d5fe417cc0a
-Revises: 6f1b8d3a5c27
+Revises: f93151b5bad1
 Create Date: 2026-11-06 12:00:00.000000
 
 """
@@ -17,7 +17,7 @@ from alembic import op
 
 
 revision: str = "1d5fe417cc0a"
-down_revision: Union[str, Sequence[str], None] = "6f1b8d3a5c27"
+down_revision: Union[str, Sequence[str], None] = "f93151b5bad1"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

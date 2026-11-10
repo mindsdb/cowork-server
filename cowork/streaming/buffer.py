@@ -31,7 +31,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import AsyncIterator, Iterator
 
-from cowork.turnqueue.redis_client import get_redis
+from cowork.turnqueue.redis_client import REDIS_BLOCK_MS, get_redis, xread_blocking
 from cowork.streaming.records import (
     REASON_TO_TYPE,
     TerminalReason,
@@ -323,7 +323,9 @@ class RedisStreamBuffer(StreamBuffer):
             self._next_seq += 1
             # One round trip per frame, with the TTL refresh in the same
             # transaction as the write, so a connection lost mid-append cannot
-            # leave a stream with no TTL.
+            # leave a stream with no TTL. The client resends the transaction
+            # when its reply is lost, which can write this seq twice; tail()
+            # yields each seq once.
             async with get_redis().pipeline(transaction=True) as pipe:
                 pipe.xadd(self.key, {
                     "seq": str(seq),
@@ -345,7 +347,7 @@ class RedisStreamBuffer(StreamBuffer):
         await self.append(REASON_TO_TYPE[reason], {"reason": reason, **(extra or {})})
         self._closed = True
 
-    _BLOCK_MS = 5000
+    _BLOCK_MS = REDIS_BLOCK_MS
 
     @staticmethod
     def _record(fields: dict) -> TurnRecord:
@@ -359,13 +361,17 @@ class RedisStreamBuffer(StreamBuffer):
     async def tail(self, from_seq: int = 0) -> AsyncIterator[TurnRecord]:
         r = get_redis()
         last_id = "0-0"
+        # The highest seq yielded so far. An append the client resent after a
+        # lost reply leaves a second entry with the same seq, skipped here.
+        yielded_seq = -1
         # Replay. Filtered on the seq field rather than sliced by entry id:
         # ids are timestamps and carry no relation to from_seq.
         for entry_id, fields in await r.xrange(self.key):
             last_id = entry_id
             rec = self._record(fields)
-            if rec.seq < from_seq:
+            if rec.seq < from_seq or rec.seq <= yielded_seq:
                 continue
+            yielded_seq = rec.seq
             yield rec
             if rec.is_terminal:
                 return
@@ -373,17 +379,27 @@ class RedisStreamBuffer(StreamBuffer):
         # and the first XREAD is picked up rather than skipped.
         idle_ms = 0
         while True:
-            resp = await r.xread({self.key: last_id}, block=self._BLOCK_MS)
+            resp = await xread_blocking(r=r, streams={self.key: last_id}, block_ms=self._BLOCK_MS)
             if not resp:
                 idle_ms += self._BLOCK_MS
                 if idle_ms >= REDIS_TAIL_IDLE_TIMEOUT_SECONDS * 1000:
+                    if await self._writer_holds_claim(client=r):
+                        # A live run is quiet, such as one waiting on an
+                        # unanswered ask_user question: keep waiting.
+                        idle_ms = 0
+                        continue
                     # Nothing is writing this turn. The producer replica died
                     # mid-turn, so no terminal record is ever coming and every
                     # reader would wait here forever. Write one, so this reader
                     # and any other stop, and the client sees a failed turn
                     # rather than a spinner.
-                    async for rec in self._terminate_as_orphan():
+                    async for rec in self._terminate_as_orphan(after_id=last_id):
+                        if rec.seq < from_seq or rec.seq <= yielded_seq:
+                            continue
+                        yielded_seq = rec.seq
                         yield rec
+                        if rec.is_terminal:
+                            return
                     return
                 continue
             idle_ms = 0
@@ -391,8 +407,9 @@ class RedisStreamBuffer(StreamBuffer):
                 for entry_id, fields in entries:
                     last_id = entry_id
                     rec = self._record(fields)
-                    if rec.seq < from_seq:
+                    if rec.seq < from_seq or rec.seq <= yielded_seq:
                         continue
+                    yielded_seq = rec.seq
                     yield rec
                     if rec.is_terminal:
                         return
@@ -409,6 +426,10 @@ class RedisStreamBuffer(StreamBuffer):
         entries = await r.xrevrange(self.key, count=1)
         if entries and self._record(entries[0][1]).is_terminal:
             await r.delete(self.key)
+
+    async def remove(self) -> None:
+        """Delete this turn's stream. Unbounded; the caller bounds it."""
+        await get_redis().delete(self.key)
 
     async def refresh(self) -> None:
         """Load latest_seq and is_closed from Redis.
@@ -430,30 +451,62 @@ class RedisStreamBuffer(StreamBuffer):
         self._closed = rec.is_terminal
         self._finishing = _is_final_client_frame(rec.type, rec.data)
 
-    async def _terminate_as_orphan(self) -> AsyncIterator[TurnRecord]:
-        """Close an abandoned turn, and yield the terminal record.
+    async def _writer_holds_claim(self, *, client) -> bool:
+        """Whether a run holds this turn's claim (turn_claim), so its quiet
+        stretch is not an abandoned turn. A claim that cannot be read counts
+        as held: an idle cut on a guess would end a live turn."""
+        from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, claim_held_for_turn
+
+        try:
+            async with asyncio.timeout(REDIS_CALL_SECONDS):
+                return await claim_held_for_turn(
+                    conversation_id=self._conversation_id, turn_id=self._turn_id, client=client,
+                )
+        except Exception:
+            logger.warning(
+                "Could not read a quiet turn's claim; its readers keep waiting.",
+                exc_info=True,
+                extra={"event": "turn_claim_read_failed", "conversation_id": self._conversation_id},
+            )
+            return True
+
+    async def _terminate_as_orphan(self, *, after_id: str) -> AsyncIterator[TurnRecord]:
+        """Close an abandoned turn, and yield every record from ``after_id``
+        on, through its terminal record.
 
         Written by whichever reader notices, since the replica that owned the
         turn is the one that is gone. Idempotent by construction: the write is
         conditional on the stream still having no terminal record, so a second
         reader arriving at the same moment replays this one rather than adding
         another.
+
+        A turn that finished between the reader's empty read and its claim
+        check has its last frames and its terminal record in the stream
+        already, and its claim released. Yielding from ``after_id`` rather
+        than only the latest record keeps those frames. The entry at
+        ``after_id`` itself comes back too; the caller skips each seq it has
+        yielded.
+
+        Written through a buffer object of its own, never this one: on the
+        replica running the turn, this object can be the producer's own
+        buffer (the POST stream and /tail read it), and closing it would tell
+        the registry the turn had ended while its producer still writes.
         """
-        logger.warning(
-            "Turn buffer %s went quiet for %ss with no terminal record; ending it",
-            self.key, REDIS_TAIL_IDLE_TIMEOUT_SECONDS,
-        )
         r = get_redis()
         entries = await r.xrevrange(self.key, count=1)
-        if entries and self._record(entries[0][1]).is_terminal:
-            yield self._record(entries[0][1])
-            return
-        self._next_seq = (self._record(entries[0][1]).seq + 1) if entries else 0
-        self._closed = False   # so close() writes rather than returning early
-        await self.close("interrupted", {"error": "the worker running this turn stopped responding"})
-        latest = await r.xrevrange(self.key, count=1)
-        if latest:
-            yield self._record(latest[0][1])
+        if not (entries and self._record(entries[0][1]).is_terminal):
+            logger.warning(
+                "A turn stream went quiet past the tail's idle cut with no terminal record; ending it.",
+                extra={
+                    "event": "turn_tail_idle_cut",
+                    "conversation_id": self._conversation_id, "turn_id": self._turn_id,
+                },
+            )
+            orphan = RedisStreamBuffer(conversation_id=self._conversation_id, turn_id=self._turn_id)
+            orphan._next_seq = (self._record(entries[0][1]).seq + 1) if entries else 0
+            await orphan.close("interrupted", {"error": "the worker running this turn stopped responding"})
+        for _entry_id, fields in await r.xrange(self.key, min=after_id):
+            yield self._record(fields)
 
     @property
     def latest_seq(self) -> int:

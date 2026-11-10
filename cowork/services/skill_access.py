@@ -133,7 +133,11 @@ def _insert_once(session: Session, row: Setting | SkillAccess) -> None:
 
 def backfill_legacy_access(session: ScopedSession, list_slugs: Callable[[], Iterable[str]]) -> None:
     """Give every skill of the org's store that predates sharing its row,
-    once per org, before its rows are first read.
+    once per org, the first time the store's reader reads the org's rows
+    (cowork.services.skills.SkillService._access_rows), for a skills listing
+    or a turn's skills. The always-on check at a turn's start
+    (cowork.services.skills.has_always_on_rows) reads the rows without it:
+    no row this writes is always on, so that check's answer is the same.
 
     Each slug of ``list_slugs()`` with no row gets one shared with everyone
     (what every member saw before sharing), owned by the creator its

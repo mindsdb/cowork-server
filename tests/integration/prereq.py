@@ -18,7 +18,7 @@ containers and sets it to `true`.
 from __future__ import annotations
 
 import os
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import pytest
 
@@ -33,3 +33,20 @@ def missing_prerequisite(
             f"supposed to have it and the absence is a defect rather than a skip."
         )
     pytest.skip(reason)
+
+
+_redis_version_reported = False
+
+
+async def report_redis_version(*, client: Any, config: pytest.Config) -> None:
+    """Write the test Redis's ``INFO server`` ``redis_version`` to the
+    terminal, once per run, so a service job's log names the Redis its tests
+    reached. Not the URL, which can carry a password."""
+    global _redis_version_reported
+    if _redis_version_reported:
+        return
+    _redis_version_reported = True
+    version = (await client.info("server"))["redis_version"]
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(f"Redis service tests reached redis_version {version}")

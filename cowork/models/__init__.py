@@ -1,3 +1,4 @@
+from cowork.models.artifact_location import ArtifactLocation  # noqa: F401
 from cowork.models.artifact_owner_choice import ArtifactOwnerChoice  # noqa: F401
 from cowork.models.channel import (  # noqa: F401
     ChannelBinding,
@@ -8,6 +9,7 @@ from cowork.models.channel import (  # noqa: F401
 from cowork.models.code_control import CodeControlRecord  # noqa: F401
 from cowork.models.custom_connector import CustomConnector  # noqa: F401
 from cowork.models.published_page import PublishedPageOwner  # noqa: F401
+from cowork.models.queued_agent_repair import QueuedAgentRepair  # noqa: F401
 from cowork.models.live_app import (  # noqa: F401
     LiveAppAvailabilityWait,
     LiveAppCopy,

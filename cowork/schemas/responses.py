@@ -220,6 +220,17 @@ class ResponsesRequest(BaseModel):
         ),
     )
 
+    # One task's opt-out of the agent's browser: the composer's Browser
+    # switch. "off" runs this turn as browser_enabled=false does: no browser
+    # tool, and on the web no scope call that would start the browser.
+    browser: Literal["on", "off"] = Field(
+        default="on",
+        description=(
+            '"off" runs this turn without the shared browser. '
+            '"on", the default, follows the user\'s browser setting and never turns the browser on.'
+        ),
+    )
+
     @model_validator(mode="after")
     def disconnect_requires_streaming(self) -> "ResponsesRequest":
         if self.cancel_on_disconnect and self.stream is not True:

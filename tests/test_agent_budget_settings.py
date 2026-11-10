@@ -195,11 +195,12 @@ def test_turn_token_ceiling_out_of_bounds_rejected(bad):
 def test_the_top_of_the_range_is_the_no_limit_setting():
     """"No limit" in the UI writes the MAX, not a sentinel.
 
-    At 50_000_000 the ceiling is effectively — not literally — off. A turn makes
-    roughly `max_tool_rounds x (max_continuations + 1)` LLM calls; at the
-    defaults (250 x 11 = ~2,750) that reaches 50M at ~18k per call, far below
-    the ~190k a long conversation carries, so "the step cap always lands first"
-    is not a guarantee.
+    At 50_000_000 the ceiling is effectively, not literally, off.
+    `max_tool_rounds` counts across the whole turn, continuations included, so
+    a turn makes roughly `max_tool_rounds + max_continuations + 1` LLM calls:
+    ~260 at the defaults, which reaches 50M at ~190k per call, the context a
+    long conversation carries; ~530 at the maxima (500 + 26), where the ceiling
+    lands first on a long conversation.
 
     The top of the range being the off switch used to be a problem because it
     was undiscoverable; the checkbox fixes that, which is why the

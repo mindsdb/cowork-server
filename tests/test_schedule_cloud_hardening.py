@@ -199,10 +199,13 @@ def test_a_reaped_run_whose_turn_may_have_started_is_named_for_its_pod_to_stop(s
 
 
 def _turn_index(monkeypatch, turn: dict | None) -> None:
+    """get_turn answering with the entry ``turn``'s fields make, or None."""
     import cowork.streaming.turn_index as turn_index
 
+    entry = None if turn is None else turn_index.TurnIndexEntry.from_index({"turn_id": "1", **turn})
+
     async def get_turn(_conversation_id):
-        return turn
+        return entry
 
     monkeypatch.setattr(turn_index, "get_turn", get_turn)
 

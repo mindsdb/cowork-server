@@ -24,7 +24,7 @@ from cowork.db.scoped import (
     scope_from_principal,
     unsafe_unscoped_session,
 )
-from cowork.db.units import run_db
+from cowork.db.units import FilesystemBusy, run_db
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schedule_timing import missed_slots, next_future_occurrence
 from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus, RunTrigger, resolve_schedule_model
@@ -41,6 +41,7 @@ from cowork.streaming.liveness import MODEL_WAIT_PHASE
 from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import request_cancel
 from cowork.streaming.registry import ServerShuttingDown, registry
+from cowork.streaming.turn_claim import TurnClaimUnavailable
 
 if TYPE_CHECKING:
     from cowork.principal import Principal
@@ -104,6 +105,10 @@ def schedule_conversation_topic(title: str) -> str:
 # A run's error when its turn was refused because the server was shutting
 # down. The run never started, so the schedule's own last_error is left alone.
 _SHUTDOWN_RUN_ERROR = "Run did not start: the server was shutting down."
+# A run's error when Redis could not say whether another run holds the turn's
+# conversation (turn_claim.TurnClaimUnavailable), the 503 a client retries.
+# The run never started either.
+_CLAIM_UNAVAILABLE_RUN_ERROR = "Run did not start: Cowork was busy."
 # A run's error when a shutdown cancelled it before it recorded its turn's
 # outcome. Saved as failed, not success, so a cron slot it did not consume
 # stays due, and the freshness guard skips no slot because of it.
@@ -566,13 +571,38 @@ def _delete_unstarted_conversation(
 ) -> None:
     """Delete the conversation _link_conversation made for a run whose turn
     never started, so it is not left empty in its owner's list. Under the
-    schedule's own scope, as it was created."""
+    schedule's own scope, as it was created.
+
+    Rows only: create_conversation makes no folder for it and the run attached
+    nothing, and this runs in a database unit, where a call to a stalled file
+    store would hold its connection and unit slot with no time limit."""
     from cowork.services.conversations import ConversationService
 
     conv_session = ScopedSession(
         unsafe_unscoped_session(session), scope_from_principal(scheduled.principal)
     )
-    ConversationService(conv_session).delete_conversation(conversation_id)
+    ConversationService(conv_session).delete_conversation(conversation_id, cleanup_project_files=False)
+
+
+async def _discard_unstarted_conversation(
+    *, scheduled: _ScheduledTurn, conversation_id: UUID, schedule_id: UUID,
+) -> bool:
+    """Delete the conversation a run made for a turn that never started
+    (_delete_unstarted_conversation) in a unit of its own. True when it went;
+    a failed delete is logged, and the run keeps its link to the conversation."""
+    try:
+        await run_db(
+            partial(_delete_unstarted_conversation, scheduled=scheduled, conversation_id=conversation_id),
+            scope=SYSTEM_SCOPE,
+        )
+    except Exception:
+        logger.warning(
+            "Could not delete the empty conversation of a run that did not start",
+            exc_info=True,
+            extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+        )
+        return False
+    return True
 
 
 def _record_turn_outcome(
@@ -850,6 +880,9 @@ async def _execute_schedule(
             # remote backend's per-tenant key mint) run in org mode with no
             # request in flight. The handler opens its own short sessions.
             stream = await ResponsesHandler(principal=scheduled.principal, interactive=False).handle(request)
+            # handle() returns once it has started the turn's producer, which
+            # saves the question first. A refusal before that, such as the
+            # vault restore's or the turn start's read, leaves nothing done.
             turn_started = True
             async for _ in stream:
                 pass
@@ -863,34 +896,35 @@ async def _execute_schedule(
             timed_out = True
             await _stop_timed_out_turn(str(conversation_id))
             raise RuntimeError(_duration_error(limit)) from exc
-        except ServerShuttingDown:
-            # This replica is ending its turns for a shutdown and refused the
-            # run's turn before it started. Nothing ran, so the schedule keeps
-            # its last_error, and _record_turn_outcome never consumes the cron
+        except (ServerShuttingDown, TurnClaimUnavailable) as refused:
+            # This replica is ending its turns for a shutdown, or Redis could
+            # not answer the turn's claim, and the run's turn was refused
+            # before it started: the 503 an HTTP client waits out and sends
+            # again. Nothing ran, so the schedule keeps its last_error and its
+            # failure streak, and _record_turn_outcome never consumes the cron
             # slot: it stays due for the next poll, on a replica still
             # serving. The finally below finishes the run row.
-            error = _SHUTDOWN_RUN_ERROR
             outcome = AttemptOutcome.failed_before_execution
-            logger.info(
-                "Schedule run did not start; the server is shutting down",
-                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
-            )
-            if created_conversation:
-                try:
-                    await run_db(
-                        partial(
-                            _delete_unstarted_conversation,
-                            scheduled=scheduled, conversation_id=conversation_id,
-                        ),
-                        scope=SYSTEM_SCOPE,
-                    )
-                    conversation_id = None
-                except Exception:
-                    logger.warning(
-                        "Could not delete the empty conversation of a run that did not start",
-                        exc_info=True,
-                        extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
-                    )
+            if isinstance(refused, ServerShuttingDown):
+                error = _SHUTDOWN_RUN_ERROR
+                logger.info(
+                    "Schedule run did not start; the server is shutting down",
+                    extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+                )
+            else:
+                error = _CLAIM_UNAVAILABLE_RUN_ERROR
+                logger.warning(
+                    "Schedule run did not start; Redis could not answer its turn's claim",
+                    exc_info=refused,
+                    extra={
+                        "event": "schedule_run_claim_unavailable",
+                        **log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+                    },
+                )
+            if created_conversation and await _discard_unstarted_conversation(
+                scheduled=scheduled, conversation_id=conversation_id, schedule_id=schedule_id,
+            ):
+                conversation_id = None
             return
 
         if lease_lost_first:
@@ -975,10 +1009,19 @@ async def _execute_schedule(
         # A run that raised consumes its cron slot like one that failed inside
         # its turn. Left due, the next poll starts it again, and a failure that
         # repeats (a timeout, a revoked permission) re-fires every poll. A busy
-        # pool or an auth outage before the turn starts is the exception: it
-        # clears on its own, the agent has done nothing yet, and skipping the
-        # slot would drop a daily or weekly occurrence over a short blip.
-        transient = not turn_started and isinstance(exc, (PoolTimeoutError, ProductPermissionUnavailable))
+        # pool, a busy file store or an auth outage before the turn starts is
+        # the exception: it clears on its own, the agent has done nothing yet,
+        # and skipping the slot would drop a daily or weekly occurrence over a
+        # short blip. As on a shutdown, the empty conversation this run made
+        # for its turn is deleted; the next poll makes its own.
+        transient = not turn_started and isinstance(
+            exc, (PoolTimeoutError, FilesystemBusy, ProductPermissionUnavailable)
+        )
+        if transient and created_conversation and conversation_id is not None:
+            if await _discard_unstarted_conversation(
+                scheduled=scheduled, conversation_id=conversation_id, schedule_id=schedule_id,
+            ):
+                conversation_id = None
         try:
             slot_consumed = await _until_it_lands(
                 partial(
@@ -1155,7 +1198,7 @@ async def _cancel_abandoned_turn(abandoned: AbandonedTurn) -> None:
         turn = await get_turn(conversation_id)
         if turn is None:
             return
-        started = float(turn.get("started_at") or 0)
+        started = turn.started_at
         if started:
             if started < abandoned.run_started_at.timestamp() - _LEASE_RENEW_SECONDS:
                 return
@@ -1164,7 +1207,7 @@ async def _cancel_abandoned_turn(abandoned: AbandonedTurn) -> None:
             last_renewed = abandoned.lease_expired_at.timestamp() - _RUN_LEASE_SECONDS
             if started > last_renewed + _LEASE_RENEW_SECONDS:
                 return
-        await request_cancel(turn["correlation_id"])
+        await request_cancel(turn.correlation_id)
         logger.warning(
             "Asked the pod running an abandoned scheduled turn to stop",
             extra=log_context(conversation_id=conversation_id),
@@ -1483,6 +1526,8 @@ def _poll(
 
 
 async def _scheduler_loop() -> None:
+    from cowork.services.artifact_autopublish import start_due_self_heals
+
     logger.info("Scheduler loop started")
     # Replicas a rollout starts together would otherwise poll in step, and two
     # replicas polling together can both start one due schedule.
@@ -1519,6 +1564,9 @@ async def _scheduler_loop() -> None:
             run = asyncio.create_task(run_admitted(slot.schedule_id, is_manual=False, slot_at=slot.slot_at))
             _scheduled_runs.add(run)
             run.add_done_callback(_scheduled_runs.discard)
+        # The artifact self-heals remote turn ends asked for, each project at
+        # its own slower cadence.
+        start_due_self_heals()
 
 
 def start_scheduler() -> None:

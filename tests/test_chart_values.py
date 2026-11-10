@@ -42,6 +42,13 @@ environment renders the base alone, so each is checked as rendered:
 - The grace period covers the preStop, the pre-drain, uvicorn's bound and the
   lifespan teardown's bounded waits, each read from where it is set.
 - A rollout starts every new pod before it stops an old one.
+
+The probes keep a slow dependency from restarting or unrouting the pod:
+readiness reads ``/api/v1/health/ready`` and liveness ``/api/v1/health/live``,
+neither of which touches the database, the file store or settings, and the
+liveness delay leaves the boot room to finish. The ``deployment`` subchart
+that renders them is pinned to one version, so a new release of it can't
+change them unreviewed.
 """
 
 from __future__ import annotations
@@ -80,6 +87,12 @@ DRAFT_HOSTS = {
     "prod": "draft.mindshub.co",
 }
 DRAFT_HOST = "{{ $.Values.draftHost }}"
+# The browser router each environment's web app calls: its own host under
+# /browser, where the router is served. prod sets none until its router runs.
+BROWSER_ROUTER_URLS = {
+    "dev": "https://cowork.dev.mindshub.ai/browser",
+    "staging": "https://cowork.staging.mindshub.ai/browser",
+}
 # The Ingress refuses to render without a host, which would make it a catch-all.
 REQUIRED_DRAFT_HOST = '{{ required "set deployment.draftHost to enable ingress_secondary" $.Values.draftHost }}'
 
@@ -335,27 +348,36 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     """Counted from the pod's deletion: the preStop sleep, the pre-drain that
     ends remote turns before uvicorn sees SIGTERM, uvicorn's drain bound, then
     the lifespan teardown's bounded waits (the draft listener's own drain,
-    another pass over turns, channel tasks, scratchpad closes), and a margin
-    for its unbounded closes.
+    another pass over turns, the location backfill's stop, channel tasks,
+    scratchpad closes, and last the turn-end artifact records a file store
+    stall left waiting), and a margin for its unbounded closes.
 
-    The channel drain's wait_for waits for the tasks it cancels at its
-    timeout, and a cancelled channel turn writes its controller cancel flag
-    before it ends, so that drain can run CANCEL_REQUEST_SECONDS past its
-    own timeout."""
+    The channel drain cancels the tasks still running at its timeout, then
+    waits up to its cancel_timeout for them to unwind: a cancelled channel turn
+    writes its controller cancel flag, which takes up to
+    CANCEL_REQUEST_SECONDS, before it ends."""
     from cowork.channels.webhooks import drain_background_tasks
     from cowork.common.chat_session import drain_scratchpad_closes
+    from cowork.db.units import TURN_END_RECORD_DRAIN_SECONDS
     from cowork.draft_host.listener import (
         _GRACEFUL_SHUTDOWN_SECONDS as DRAFT_LISTENER_DRAIN_SECONDS,
     )
+    from cowork.server import LOCATION_BACKFILL_SHUTDOWN_SECONDS
     from cowork.streaming.cancellation import CANCEL_REQUEST_SECONDS
     from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
 
+    channel_cancel_wait = (
+        inspect.signature(drain_background_tasks).parameters["cancel_timeout"].default
+    )
+    assert channel_cancel_wait >= CANCEL_REQUEST_SECONDS
     deployment = _rendered(values)
     teardown = (
         DRAFT_LISTENER_DRAIN_SECONDS
         + TURN_SHUTDOWN_GRACE_SECONDS
-        + _timeout_default(drain_background_tasks) + CANCEL_REQUEST_SECONDS
+        + LOCATION_BACKFILL_SHUTDOWN_SECONDS
+        + _timeout_default(drain_background_tasks) + channel_cancel_wait
         + _timeout_default(drain_scratchpad_closes)
+        + TURN_END_RECORD_DRAIN_SECONDS
     )
     needed = (
         _prestop_seconds(deployment)
@@ -377,6 +399,45 @@ def test_a_rollout_starts_every_new_pod_before_it_stops_an_old_one(values):
     }
 
 
+# The liveness delay the boot has: kill comes at this plus failureThreshold *
+# periodSeconds, and staging boots under load took about 120s on 28 Oct.
+LIVENESS_DELAY_SECONDS = 180
+DEPLOYMENT_SUBCHART_VERSION = "1.0.47"
+
+
+@pytest.mark.parametrize("values", RENDERED, ids=lambda p: p.name)
+def test_readiness_reads_the_route_that_does_no_io(values):
+    probe = _rendered(values)["readinessProbe"]
+    assert probe["enabled"] is True
+    assert probe["path"] == "/api/v1/health/ready"
+
+
+@pytest.mark.parametrize("values", RENDERED, ids=lambda p: p.name)
+def test_liveness_reads_live_and_leaves_the_boot_its_delay(values):
+    probe = _rendered(values)["livenessProbe"]
+    assert probe["enabled"] is True
+    assert probe["path"] == "/api/v1/health/live"
+    assert probe["initialDelaySeconds"] == LIVENESS_DELAY_SECONDS
+    # The process may still be killed for a real hang: 60s of failures.
+    assert probe["failureThreshold"] * probe["periodSeconds"] == 60
+
+
+def test_both_probe_routes_are_async_so_they_never_wait_for_a_thread():
+    """A sync route runs on anyio's default threads, which sync dependencies
+    and file reads fill, so a probe there would fail with the pool and not
+    with the process."""
+    from cowork.api.v1.endpoints import health
+
+    assert inspect.iscoroutinefunction(health.live)
+    assert inspect.iscoroutinefunction(health.ready)
+
+
+def test_the_deployment_subchart_is_pinned_to_one_version():
+    requirements = yaml.safe_load((CHART / "requirements.yaml").read_text())
+    (subchart,) = [dep for dep in requirements["dependencies"] if dep["alias"] == "deployment"]
+    assert subchart["version"] == DEPLOYMENT_SUBCHART_VERSION
+
+
 def test_hosted_logs_slow_statements_and_leaves_both_session_timeouts_off(base):
     """The slow-statement line is what the two PostgreSQL timeouts get chosen
     from, so it is on everywhere hosted, and neither timeout is set yet."""
@@ -385,3 +446,42 @@ def test_hosted_logs_slow_statements_and_leaves_both_session_timeouts_off(base):
         names = {entry.name for entry in _env(path)}
         assert "STATEMENT_TIMEOUT_MS" not in names, path.name
         assert "IDLE_IN_TRANSACTION_TIMEOUT_MS" not in names, path.name
+
+
+@pytest.mark.parametrize("env_values", ENVIRONMENTS, ids=lambda p: p.name)
+def test_an_environment_names_its_own_browser_router(base, env_values, monkeypatch):
+    """The router is served on the web app's own host under /browser, so the
+    URL is that host's: a typo would send every browser call, with the
+    caller's credential, somewhere else. The base sets none, so a PR
+    environment takes its own from where it is deployed, and an environment
+    without a router offers no browser. The value passes the app setting's
+    own check."""
+    from cowork.common.settings.app_settings import AppSettings
+
+    environment = env_values.stem.removeprefix("values-")
+    assert [entry for entry in base if entry.name == "COWORK_BROWSER_ROUTER_URL"] == []
+    entries = [entry for entry in _env(env_values) if entry.name == "COWORK_BROWSER_ROUTER_URL"]
+    expected = BROWSER_ROUTER_URLS.get(environment)
+    if expected is None:
+        assert entries == [], f"{env_values.name} sets a browser router this test does not list"
+        return
+    [entry] = entries
+    primary = [host["host"] for host in (_deployment(env_values).get("ingress") or {}).get("hosts") or []]
+    assert entry.value == expected == f"https://{primary[0]}/browser", env_values.name
+    monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", entry.value)
+    assert AppSettings().browser_router_url == expected
+
+
+def test_the_scope_key_file_is_the_routers_secret_mounted_where_the_server_reads_it(base):
+    """The producer reads COWORK_BROWSER_SCOPE_KEY_FILE on every scope. If the
+    path, the mount and the Secret's item drift apart the file is missing,
+    every _scope gets 403 scope_key_invalid, and only a log line shows it. The
+    volume is optional, so a namespace with no router starts as usual."""
+    deployment = _deployment(BASE)
+    path = Path(_entry(base, "COWORK_BROWSER_SCOPE_KEY_FILE").value)
+    [volume] = [v for v in deployment.get("volumes") or [] if (v.get("secret") or {}).get("secretName") == "browser-proxy"]
+    assert volume["secret"]["optional"] is True
+    [mount] = [m for m in deployment.get("volumeMounts") or [] if m["name"] == volume["name"]]
+    assert mount.get("readOnly") is True
+    [item] = [i for i in volume["secret"]["items"] if i["key"] == "scope_key"]
+    assert path == Path(mount["mountPath"]) / item["path"]

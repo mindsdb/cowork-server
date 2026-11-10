@@ -17,7 +17,7 @@ from sqlmodel import select
 import cowork.channels.plugins.telegram as telegram_plugin
 import cowork.channels.runtime as runtime_mod
 from cowork.channels.registry import PluginRegistry, load_first_party_plugins
-from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry, artifacts_since
+from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
 from cowork.channels.webhooks import drain_background_tasks
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import ChannelContext
@@ -35,10 +35,16 @@ LINK_PREFIX = "https://app.example.com/c/"
 class FakeHarness:
     """Stands in for the Anton harness — one assistant delta, no LLM."""
 
-    def __init__(self, tool_event: bool = False, delay: float = 0.0, turn_history: list | None = None):
+    def __init__(
+        self, tool_event: bool = False, delay: float = 0.0, turn_history: list | None = None,
+        artifacts: list[dict] | None = None,
+    ):
         self.tool_event = tool_event
         self.delay = delay
         self.turn_history = turn_history
+        # Artifact cards the turn emits, as the real formatter does for each
+        # ArtifactCreated.
+        self.artifacts = artifacts or []
         self.inputs: list[list[dict]] = []
         self.channel_contexts: list = []
         self.trace_metadata: list = []
@@ -67,6 +73,8 @@ class FakeHarness:
                 "type": "response.turn_history",
                 "rows": self.turn_history,
             })
+        for card in self.artifacts:
+            event_sink("response.artifact_created", {"type": "response.artifact_created", "artifact": card})
         event_sink("response.output_text.delta", {"delta": REPLY})
         if False:
             yield
@@ -396,6 +404,46 @@ def test_telegram_fetch_attachment(monkeypatch):
     assert asyncio.run(bridge.fetch_attachment(attachment)) is None
 
 
+@pytest.mark.parametrize(("name", "stored_as"), [("..", "file"), (" . ", "file"), ("../../notes.txt", "notes.txt")])
+def test_a_channel_attachments_name_keeps_its_file_in_its_own_folder(monkeypatch, tmp_path, name, stored_as):
+    """A platform's file name is untrusted. Only its last component is kept,
+    and a name that would point at the folder itself or the files root ("."
+    or "..") is stored as "file", so the turn goes on rather than failing on
+    a write to a directory."""
+    from pathlib import Path
+
+    from anton.core.dispatch import Attachment
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    monkeypatch.setenv("COWORK_FILES_DIR", str(tmp_path / "files"))
+    get_app_settings.cache_clear()
+    event = SimpleNamespace(message=SimpleNamespace(
+        attachments=[Attachment(filename=name, mime_type="text/plain", data=b"notes")],
+    ))
+    try:
+        runtime = AntonChannelRuntime(LiveAdapterRegistry(PluginRegistry()))
+        blocks = asyncio.run(runtime.build_input_blocks(LOCAL_SCOPE, None, event, "read this"))
+    finally:
+        get_app_settings.cache_clear()
+
+    [file_block, text_block] = blocks
+    stored = Path(file_block["path"])
+    # The test database is shared: other tests count the channel's files.
+    from cowork.models.file import File
+
+    s = get_open_session()
+    try:
+        [row] = s.exec(select(File).where(File.path == str(stored))).all()
+        s.delete(row)
+        s.commit()
+    finally:
+        s.close()
+    assert (file_block["filename"], stored.name, stored.read_bytes()) == (stored_as, stored_as, b"notes")
+    assert (tmp_path / "files").resolve() in stored.resolve().parents
+    assert text_block == {"type": "text", "text": "read this"}
+
+
 def test_inbound_media_becomes_harness_blocks(monkeypatch, tmp_path):
     from cowork.common.settings.app_settings import get_app_settings
 
@@ -441,7 +489,7 @@ def test_inbound_media_becomes_harness_blocks(monkeypatch, tmp_path):
     s.close()
 
 
-def test_telegram_send_attachment(monkeypatch, tmp_path):
+def test_telegram_send_attachment(monkeypatch):
     captured = {}
 
     async def fake_post(self, url, data=None, files=None, **kw):
@@ -453,99 +501,352 @@ def test_telegram_send_attachment(monkeypatch, tmp_path):
         return R()
 
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
-    source = tmp_path / "report.pdf"
-    source.write_bytes(b"PDFDATA")
     bridge = telegram_plugin.TelegramBridge({"bot_token": "tok", "secret_token": "s"})
     from anton.core.dispatch import PlatformAddress
 
-    mid = asyncio.run(bridge.send_attachment(address=PlatformAddress("telegram", "7", None), path=str(source)))
+    def send():
+        return asyncio.run(bridge.send_attachment(
+            address=PlatformAddress("telegram", "7", None), data=b"PDFDATA", filename="report.pdf",
+        ))
+
+    mid = send()
     assert mid == "321"
     assert captured["url"].endswith("/sendDocument") and captured["data"] == {"chat_id": "7"}
     assert captured["files"]["document"] == ("report.pdf", b"PDFDATA")
 
     monkeypatch.setattr(telegram_plugin, "TELEGRAM_MAX_UPLOAD_BYTES", 3)
     try:
-        asyncio.run(bridge.send_attachment(address=PlatformAddress("telegram", "7", None), path=str(source)))
+        send()
         raise SystemExit("oversize must raise")
     except RuntimeError:
         pass
 
 
-def test_turn_artifacts_delivered(monkeypatch):
-    import os
-    import time as time_mod
-
-    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: FakeHarness(tool_event=True))
-
-    class ArtifactAdapter(FakeAdapter):
-        def __init__(self):
-            super().__init__()
-            self.sent = []
-
-        async def send_attachment(self, *, address, path, filename=None):
-            self.sent.append((address.platform_id, path, filename))
-            return "1"
-
+def _general_project_dir() -> str:
     from cowork.models.project import Project
     from cowork.services.projects import GENERAL_PROJECT_ID
+
     s = get_open_session()
-    project_dir = s.get(Project, GENERAL_PROJECT_ID).path
-    s.close()
+    try:
+        return s.get(Project, GENERAL_PROJECT_ID).path
+    finally:
+        s.close()
 
-    fresh = os.path.join(project_dir, ".anton", "artifacts", "demo")
-    os.makedirs(fresh, exist_ok=True)
-    with open(os.path.join(fresh, "metadata.json"), "w") as f:
-        f.write(json.dumps({"name": "Demo", "type": "html"}))
-    with open(os.path.join(fresh, "dashboard.html"), "w") as f:
-        f.write("<html/>")
-    stale = os.path.join(project_dir, ".anton", "artifacts", "old")
-    os.makedirs(stale, exist_ok=True)
-    with open(os.path.join(stale, "metadata.json"), "w") as f:
-        f.write(json.dumps({"name": "Old", "type": "html"}))
-    with open(os.path.join(stale, "page.html"), "w") as f:
-        f.write("<html/>")
-    past = time_mod.time() - 3600
-    os.utime(os.path.join(stale, "metadata.json"), (past, past))
 
-    registry = PluginRegistry()
-    load_first_party_plugins(registry)
-    bridge = telegram_plugin.TelegramBridge({"bot_token": "x", "secret_token": "s"})
-    event = asyncio.run(bridge.parse_inbound(
-        body=telegram_update(90, 555, 1, "make a dashboard"), headers={}, route_name=None,
+def _telegram_event(update_id: int, chat_id: int, text: str, chat_type: str = "private"):
+    bridge = telegram_plugin.TelegramBridge({"bot_token": "x", "secret_token": "s", "bot_username": "b"})
+    return asyncio.run(bridge.parse_inbound(
+        body=telegram_update(update_id, chat_id, 1, text, chat_type=chat_type), headers={}, route_name=None,
     ))[0]
 
+
+def _runtime_with(adapter) -> AntonChannelRuntime:
+    registry = PluginRegistry()
+    load_first_party_plugins(registry)
     adapters = LiveAdapterRegistry(registry)
-    adapter = ArtifactAdapter()
     adapters._cache[("telegram", None)] = adapter
-    asyncio.run(AntonChannelRuntime(adapters).handle("telegram", event))
+    return AntonChannelRuntime(adapters)
 
-    # Text reply (with link) lands first, then exactly the fresh artifact.
+
+class ArtifactAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__()
+        self.sent = []
+
+    async def send_attachment(self, *, address, data, filename):
+        self.sent.append((address.platform_id, data, filename))
+        return "1"
+
+
+def test_turn_artifacts_delivered(monkeypatch):
+    """The turn sends the files of the artifact cards it emitted, and no other
+    artifact in the project, however recent."""
+    import os
+    import shutil
+
+    project_dir = _general_project_dir()
+    artifacts_dir = os.path.join(project_dir, ".anton", "artifacts")
+    made = os.path.join(artifacts_dir, "demo-delivered")
+    os.makedirs(made, exist_ok=True)
+    with open(os.path.join(made, "metadata.json"), "w") as f:
+        f.write(json.dumps({"name": "Demo", "type": "html"}))
+    with open(os.path.join(made, "dashboard.html"), "w") as f:
+        f.write("<html/>")
+    # Written just now by another conversation: no card of this turn names it.
+    other = os.path.join(artifacts_dir, "someone-elses")
+    os.makedirs(other, exist_ok=True)
+    with open(os.path.join(other, "page.html"), "w") as f:
+        f.write("<html>theirs</html>")
+
+    card = {"path": os.path.join(made, "dashboard.html"), "folder": made}
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: FakeHarness(tool_event=True, artifacts=[card]))
+    adapter = ArtifactAdapter()
+    try:
+        asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(90, 555, "make a dashboard")))
+    finally:
+        shutil.rmtree(made, ignore_errors=True)
+        shutil.rmtree(other, ignore_errors=True)
+
+    # Text reply (with link) lands first, then exactly the turn's own file.
     assert adapter.delivered and adapter.delivered[0][0] == "555"
-    assert len(adapter.sent) == 1
-    chat_id, path, filename = adapter.sent[0]
-    assert chat_id == "555" and path.endswith("dashboard.html") and filename == "dashboard.html"
+    assert adapter.sent == [("555", b"<html/>", "dashboard.html")]
 
 
-def test_artifacts_since_uses_the_conversation_scoped_root_in_org_mode(monkeypatch, tmp_path):
-    """Org mode's remote worker writes turn artifacts under conversations/<id>/,
-    not the project-wide root — the old hardcoded path would have missed this."""
-    import time as time_mod
-    from uuid import uuid4
+def test_reading_a_turns_files_keeps_regular_files_under_the_artifacts_base(tmp_path):
+    """A card's path is a file the agent wrote, so only a regular file inside
+    the project's artifacts base is read: never a link it planted, a folder,
+    a path outside the base, or a file past the size cap."""
+    from cowork.channels.runtime import TurnFile, read_turn_files
 
-    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: True)
-    conv_id = uuid4()
-    project_path = tmp_path / "proj"
-    scoped_dir = project_path / "conversations" / str(conv_id) / ".anton" / "artifacts" / "demo"
-    scoped_dir.mkdir(parents=True)
-    (scoped_dir / "metadata.json").write_text(json.dumps({"name": "Demo", "type": "html"}))
-    (scoped_dir / "dashboard.html").write_text("<html/>")
+    project = tmp_path / "proj"
+    folder = project / ".anton" / "artifacts" / "report"
+    folder.mkdir(parents=True)
+    (folder / "report.csv").write_bytes(b"a,b\n")
+    outside = tmp_path / "secret.txt"
+    outside.write_bytes(b"not yours")
+    (folder / "leak.txt").symlink_to(outside)
+    linked = project / ".anton" / "artifacts" / "linked"
+    linked.symlink_to(tmp_path)
+    (folder / "huge.bin").write_bytes(b"x" * 11)
 
-    since = time_mod.time() - 3600
-    found = artifacts_since(str(project_path), conv_id, since)
+    paths = [
+        str(folder / "leak.txt"),
+        str(linked / "secret.txt"),
+        str(folder),
+        str(outside),
+        str(project / "notes.txt"),
+        str(folder / "huge.bin"),
+        str(folder / "report.csv"),
+        str(folder / "report.csv"),
+    ]
 
-    assert found == [(str(scoped_dir / "dashboard.html"), "dashboard.html")]
-    # The old hardcoded project-wide root has nothing in it at all.
-    assert not (project_path / ".anton" / "artifacts").exists()
+    files = read_turn_files(project_path=str(project), paths=paths, max_bytes=10)
+
+    assert files == [TurnFile(filename="report.csv", data=b"a,b\n")]
+
+
+def test_a_turn_never_reads_a_file_past_its_adapters_upload_cap(monkeypatch):
+    """Each bridge states its platform's upload cap. A turn's file past the
+    adapter's cap, though far under MAX_TURN_ATTACHMENT_BYTES, is skipped on
+    its size: its bytes are never read off the file store, and it is never
+    sent. A file within the cap still goes."""
+    import os
+    import shutil
+
+    project_dir = _general_project_dir()
+    made = os.path.join(project_dir, ".anton", "artifacts", "demo-capped")
+    os.makedirs(made, exist_ok=True)
+    with open(os.path.join(made, "big.bin"), "wb") as f:
+        f.write(b"x" * 16)
+    with open(os.path.join(made, "small.txt"), "wb") as f:
+        f.write(b"ok")
+    cards = [
+        {"path": os.path.join(made, "big.bin"), "folder": made},
+        {"path": os.path.join(made, "small.txt"), "folder": made},
+    ]
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: FakeHarness(tool_event=True, artifacts=cards))
+    read_sizes: list[int] = []
+    real_read_bounded = runtime_mod.read_bounded
+
+    def recording_read_bounded(fd, size):
+        read_sizes.append(size)
+        return real_read_bounded(fd, size)
+
+    monkeypatch.setattr(runtime_mod, "read_bounded", recording_read_bounded)
+
+    class CappedAdapter(ArtifactAdapter):
+        max_attachment_bytes = 10
+
+    adapter = CappedAdapter()
+    try:
+        asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(92, 557, "make a file")))
+    finally:
+        shutil.rmtree(made, ignore_errors=True)
+
+    assert read_sizes == [2]
+    assert adapter.sent == [("557", b"ok", "small.txt")]
+
+
+def test_each_first_party_bridge_states_its_platforms_upload_cap():
+    """The cap a turn reads files under is the one send_attachment enforces."""
+    from cowork.channels.plugins import discord, slack, telegram, whatsapp
+
+    assert discord.DiscordBridge.max_attachment_bytes == discord.DISCORD_MAX_UPLOAD_BYTES == 10 * 1024 * 1024
+    assert slack.SlackBridge.max_attachment_bytes == slack.SLACK_MAX_UPLOAD_BYTES == 50 * 1024 * 1024
+    assert telegram.TelegramBridge.max_attachment_bytes == telegram.TELEGRAM_MAX_UPLOAD_BYTES == 50 * 1024 * 1024
+    assert whatsapp.WhatsAppBridge.max_attachment_bytes == whatsapp.WHATSAPP_MAX_UPLOAD_BYTES == 100 * 1024 * 1024
+
+
+def test_a_file_store_that_refuses_the_turns_files_still_ends_the_turn_well(monkeypatch, caplog):
+    """The reply is already delivered when the turn's files are read, so a
+    busy file store sends no files, logs one WARNING, and sends no busy
+    notice: the turn ended well."""
+    import logging
+    from cowork.db.units import FilesystemBusy
+
+    card = {"path": "/nowhere/.anton/artifacts/x/index.html"}
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: FakeHarness(tool_event=True, artifacts=[card]))
+
+    async def refused(fn, *, scope, deadline=True):
+        raise FilesystemBusy("no shared file store slot freed within POOL_TIMEOUT")
+
+    monkeypatch.setattr(runtime_mod, "run_efs", refused)
+    adapter = ArtifactAdapter()
+    with caplog.at_level(logging.WARNING, logger=runtime_mod.log.name):
+        asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(91, 556, "make a dashboard")))
+
+    assert [chat for chat, _text in adapter.delivered] == ["556"]
+    assert REPLY in adapter.delivered[0][1]
+    assert adapter.sent == []
+    [record] = [r for r in caplog.records if r.name == runtime_mod.log.name and r.levelname == "WARNING"]
+    assert record.getMessage() == "channel turn: no file store slot freed in time to send the turn's files"
+    assert record.conversation_id
+
+
+@pytest.mark.parametrize(
+    ("chat_type", "chat_id", "text", "told"),
+    [
+        ("private", 601, "hello", True),
+        ("group", -602, "@b hello", True),
+        # A group message not addressed to the bot: the trigger rule, unread,
+        # may be set to ignore it.
+        ("group", -603, "hello all", False),
+    ],
+)
+def test_a_message_whose_binding_unit_finds_no_connection_hears_the_busy_notice(
+    monkeypatch, chat_type, chat_id, text, told,
+):
+    from cowork.channels.runtime import BUSY_NOTICE
+    from cowork.db.units import DatabaseBusy
+
+    def refused(self, scoped, channel_type, event):
+        raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+
+    monkeypatch.setattr(AntonChannelRuntime, "_resolve_or_create_binding", refused)
+    adapter = FakeAdapter()
+
+    with pytest.raises(DatabaseBusy):
+        asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(600, chat_id, text, chat_type)))
+
+    assert adapter.delivered == ([(str(chat_id), BUSY_NOTICE)] if told else [])
+
+
+@pytest.mark.parametrize(("step", "chat_id"), [("read", 607), ("make", 608)])
+def test_a_refusal_at_either_step_of_a_binding_tells_a_direct_sender(monkeypatch, step, chat_id):
+    """A thread's binding is read as a row in a database unit, and only a new
+    one is made on the file store's threads (run_efs_unit), since it may
+    start in the general project. The pool refusing the read, or the file
+    store refusing the make, tells a sender who wrote to the bot directly."""
+    from cowork.channels.runtime import BUSY_NOTICE
+    from cowork.db.units import DatabaseBusy, FilesystemBusy
+
+    if step == "read":
+        refusal = DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+
+        def refused_read(scoped, *, channel_type, event):
+            raise refusal
+
+        monkeypatch.setattr(AntonChannelRuntime, "_find_binding", staticmethod(refused_read))
+    else:
+        refusal = FilesystemBusy("no shared file store slot freed within POOL_TIMEOUT")
+
+        async def refused_make(fn, *, scope, deadline=True):
+            raise refusal
+
+        monkeypatch.setattr(runtime_mod, "run_efs_unit", refused_make)
+    adapter = FakeAdapter()
+
+    with pytest.raises(type(refusal)):
+        asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(606, chat_id, "hello")))
+
+    assert adapter.delivered == [(str(chat_id), BUSY_NOTICE)]
+
+
+def test_a_new_command_whose_detach_finds_no_connection_hears_the_busy_notice(monkeypatch):
+    """/new runs no turn: it detaches the route's conversation in a unit of
+    its own. A pool that refuses that unit tells the sender, who would
+    otherwise hear nothing, and the refusal still propagates so the event
+    records failed."""
+    from cowork.channels.runtime import BUSY_NOTICE
+    from cowork.db.units import DatabaseBusy
+
+    def refused(self, scoped, *, binding):
+        raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+
+    monkeypatch.setattr(AntonChannelRuntime, "_detach_conversation", refused)
+    adapter = FakeAdapter()
+
+    with pytest.raises(DatabaseBusy):
+        asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(604, 605, "/new")))
+
+    assert adapter.delivered == [("605", BUSY_NOTICE)]
+
+
+def _assistant_rows(chat_id: int) -> list:
+    s = get_open_session()
+    try:
+        binding = s.exec(select(ChannelBinding).where(ChannelBinding.external_group_id == str(chat_id))).one()
+        return [
+            m for m in s.exec(select(Message).where(Message.conversation_id == binding.anton_conversation_id)).all()
+            if m.role == "assistant"
+        ]
+    finally:
+        s.close()
+
+
+def test_an_answer_whose_save_is_refused_every_time_is_still_delivered(monkeypatch, caplog):
+    """The pod already produced the reply: a pool that refuses the answer's
+    save on every try costs the conversation its row, not the sender the
+    reply, and logs one WARNING naming the conversation."""
+    import logging
+    from cowork.db.units import DatabaseBusy
+
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: FakeHarness())
+    monkeypatch.setattr(runtime_mod, "_SAVE_BACKOFF_S", 0.0)
+    tries = []
+
+    def refused(self, conversation_id, text, events, harness=None, tool_rows=None):
+        tries.append(conversation_id)
+        raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+
+    monkeypatch.setattr(ConversationService, "save_assistant_turn", refused)
+    adapter = FakeAdapter()
+    with caplog.at_level(logging.WARNING, logger=runtime_mod.log.name):
+        asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(610, 611, "hi")))
+
+    assert adapter.delivered == [("611", REPLY)]
+    assert len(tries) == runtime_mod._SAVE_TRIES
+    [record] = [r for r in caplog.records if r.name == runtime_mod.log.name and r.levelname == "WARNING"]
+    assert record.getMessage() == (
+        "channel turn: no database connection freed to save a message; the conversation lacks it"
+    )
+    assert (record.conversation_id, record.step, record.attempts) == (
+        str(tries[0]), "save_answer", runtime_mod._SAVE_TRIES,
+    )
+    assert _assistant_rows(611) == []
+
+
+def test_an_answer_whose_save_is_refused_once_is_saved_on_the_retry(monkeypatch):
+    from cowork.db.units import DatabaseBusy
+
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: FakeHarness())
+    monkeypatch.setattr(runtime_mod, "_SAVE_BACKOFF_S", 0.0)
+    real_save = ConversationService.save_assistant_turn
+    tries = []
+
+    def refused_once(self, *args, **kwargs):
+        tries.append(1)
+        if len(tries) == 1:
+            raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+        return real_save(self, *args, **kwargs)
+
+    monkeypatch.setattr(ConversationService, "save_assistant_turn", refused_once)
+    adapter = FakeAdapter()
+    asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(620, 621, "hi")))
+
+    assert adapter.delivered == [("621", REPLY)]
+    assert len(tries) == 2
+    assert [m.content for m in _assistant_rows(621)] == [REPLY]
 
 
 def test_slack_parses_shared_files(monkeypatch):
@@ -630,7 +931,7 @@ def test_whatsapp_parses_media_messages(monkeypatch):
     assert asyncio.run(bridge.fetch_attachment(image.message.attachments[0])) is None
 
 
-def test_slack_send_attachment(monkeypatch, tmp_path):
+def test_slack_send_attachment(monkeypatch):
     from cowork.channels.plugins.slack import SlackBridge
     from anton.core.dispatch import PlatformAddress
     calls = []
@@ -647,12 +948,10 @@ def test_slack_send_attachment(monkeypatch, tmp_path):
 
     monkeypatch.setattr(SlackBridge, "web_api", staticmethod(fake_web_api))
     monkeypatch.setattr(SlackBridge, "upload_bytes", staticmethod(fake_upload))
-    source = tmp_path / "notes.txt"
-    source.write_bytes(b"HI")
     bridge = SlackBridge({"signing_secret": "ss", "bot_token": "xoxb"})
 
     mid = asyncio.run(bridge.send_attachment(
-        address=PlatformAddress("slack", "C9", "111.222"), path=str(source)))
+        address=PlatformAddress("slack", "C9", "111.222"), data=b"HI", filename="notes.txt"))
     assert mid == "F1"
     assert calls[0] == ("files.getUploadURLExternal", {"filename": "notes.txt", "length": 2}, None)
     assert calls[1] == ("upload", "https://up.slack/x", b"HI")
@@ -662,7 +961,7 @@ def test_slack_send_attachment(monkeypatch, tmp_path):
     assert payload["files"] == [{"id": "F1", "title": "notes.txt"}]
 
 
-def test_discord_send_attachment(monkeypatch, tmp_path):
+def test_discord_send_attachment(monkeypatch):
     from cowork.channels.plugins.discord import DiscordBridge
     from anton.core.dispatch import PlatformAddress
     captured = {}
@@ -678,17 +977,17 @@ def test_discord_send_attachment(monkeypatch, tmp_path):
         return R()
 
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
-    source = tmp_path / "chart.png"
-    source.write_bytes(b"PNG")
     bridge = DiscordBridge({"public_key": "00", "bot_token": "tok"})
 
-    mid = asyncio.run(bridge.send_attachment(address=PlatformAddress("discord", "CH2", None), path=str(source)))
+    mid = asyncio.run(bridge.send_attachment(
+        address=PlatformAddress("discord", "CH2", None), data=b"PNG", filename="chart.png",
+    ))
     assert mid == "M77"
     assert captured["url"].endswith("/channels/CH2/messages")
     assert captured["files"]["files[0]"] == ("chart.png", b"PNG")
 
 
-def test_whatsapp_send_attachment(monkeypatch, tmp_path):
+def test_whatsapp_send_attachment(monkeypatch):
     import datetime as dt
     from cowork.channels.plugins.whatsapp import WhatsAppBridge
     from anton.core.dispatch import PlatformAddress
@@ -704,20 +1003,23 @@ def test_whatsapp_send_attachment(monkeypatch, tmp_path):
 
     monkeypatch.setattr(WhatsAppBridge, "upload_media", staticmethod(fake_upload))
     monkeypatch.setattr(WhatsAppBridge, "send_media_message", staticmethod(fake_send))
-    source = tmp_path / "report.pdf"
-    source.write_bytes(b"PDF")
     bridge = WhatsAppBridge({"phone_number_id": "p", "access_token": "tok", "app_secret": "k", "verify_token": "v"})
+
+    def send():
+        return asyncio.run(bridge.send_attachment(
+            address=PlatformAddress("whatsapp", "155", None), data=b"PDF", filename="report.pdf",
+        ))
 
     # outside the 24h window → refused before any upload
     try:
-        asyncio.run(bridge.send_attachment(address=PlatformAddress("whatsapp", "155", None), path=str(source)))
+        send()
         raise SystemExit("window must be enforced")
     except RuntimeError:
         pass
     assert calls == []
 
     bridge._last_inbound["155"] = dt.datetime.now(dt.timezone.utc)
-    mid = asyncio.run(bridge.send_attachment(address=PlatformAddress("whatsapp", "155", None), path=str(source)))
+    mid = send()
     assert mid == "wamid.OUT"
     assert calls[0] == ("upload", "report.pdf", "application/pdf", b"PDF")
     assert calls[1] == ("send", "155", "MEDIA9", "report.pdf")

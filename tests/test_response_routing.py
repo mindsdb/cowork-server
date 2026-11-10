@@ -486,7 +486,10 @@ async def test_handle_resolves_the_skill_viewer_before_the_turn_start_unit(monke
         raise _StopHere
 
     monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+    # A question that names no project by id reads on the file store's
+    # threads, one that names it in a database unit: either is the first unit.
     monkeypatch.setattr(responses, "run_db", first_unit)
+    monkeypatch.setattr(responses, "run_efs_unit", first_unit)
     handler._resolve_skill_viewer = resolve_viewer
 
     with pytest.raises(_StopHere):
@@ -1102,13 +1105,13 @@ async def test_streaming_direct_response_registers_its_shared_redis_buffer(monke
     import fakeredis.aioredis
 
     import cowork.handlers.responses as responses
-    from cowork.streaming import buffer as buffer_mod, cancellation, turn_index
+    from cowork.streaming import buffer as buffer_mod, cancellation, turn_claim, turn_index
     from cowork.streaming.registry import RunRegistry
 
     handler = _routing_handler(monkeypatch)
     handler.scope = SimpleNamespace(org_id="org-1", user_id="user-1")
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    for module in (buffer_mod, cancellation, turn_index):
+    for module in (buffer_mod, cancellation, turn_claim, turn_index):
         monkeypatch.setattr(module, "get_redis", lambda: redis)
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
     runs = RunRegistry()
@@ -1136,11 +1139,11 @@ async def test_streaming_direct_response_registers_its_shared_redis_buffer(monke
 
     try:
         recorded = await turn_index.get_turn(str(conversation_id))
-        assert recorded["turn_id"] == "3"
-        assert recorded["run_id"] == handler.last_run_handle.run_id
-        assert recorded["correlation_id"] == handler.last_run_handle.lifecycle.identity.correlation_id
-        assert recorded["org_id"] == "org-1"
-        assert recorded["user_id"] == "user-1"
+        assert recorded.turn_id == 3
+        assert recorded.run_id == handler.last_run_handle.run_id
+        assert recorded.correlation_id == handler.last_run_handle.lifecycle.identity.correlation_id
+        assert recorded.org_id == "org-1"
+        assert recorded.user_id == "user-1"
     finally:
         await asyncio.sleep(0)  # start the bounded producer before shutdown
         await runs.shutdown()
