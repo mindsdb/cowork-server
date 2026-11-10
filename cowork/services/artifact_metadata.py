@@ -32,7 +32,8 @@ from pydantic import (
 )
 
 
-def _text(value: Any) -> str | None:
+def lenient_text(value: Any) -> str | None:
+    """``value`` when it is text a JSON response can carry, else None."""
     # A string that can't be encoded (a lone surrogate) would break every
     # JSON response that carries it.
     if not isinstance(value, str):
@@ -51,7 +52,7 @@ def _port(value: Any) -> int | None:
     return value if 0 < value < 65536 else None
 
 
-LenientStr = Annotated[str | None, BeforeValidator(_text)]
+LenientStr = Annotated[str | None, BeforeValidator(lenient_text)]
 LenientPort = Annotated[int | None, BeforeValidator(_port)]
 
 
@@ -144,6 +145,8 @@ class ArtifactMetadata(BaseModel):
         return type(self).model_validate({k: v for k, v in self._document.items() if k != key})
 
     def to_document(self) -> dict[str, Any]:
+        """A copy of the document's top level. Nested values are shared with
+        the model, so treat them as read-only."""
         return dict(self._document)
 
     def encoded(self) -> bytes:

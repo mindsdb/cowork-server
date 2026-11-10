@@ -74,12 +74,21 @@ async def test_a_desktop_list_card(session, tmp_path, local_mode):
 
 
 async def test_an_org_list_card(session, tmp_path, org_mode):
-    _row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="pw")
+    row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="pw")
     _password(folder)
+    scope = _scoped(session, ORG_A).scope
 
-    [card] = await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=None, project_path=None)
+    [in_project] = await ep.list_artifacts(scope, project_id=row.id, project_path=None)
+    # The unfiltered list spans every ORG_A project, including any another
+    # test file left behind, so pick this test's card by its folder.
+    [unfiltered] = [
+        card
+        for card in await ep.list_artifacts(scope, project_id=None, project_path=None)
+        if card["folder"] == str(folder)
+    ]
 
-    assert list(card) == ORG + ["capabilities"]
+    assert list(in_project) == ORG + ["capabilities"]
+    assert list(unfiltered) == ORG + ["capabilities"]
 
 
 def test_a_desktop_inline_card(session, tmp_path, local_mode):

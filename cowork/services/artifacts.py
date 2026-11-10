@@ -46,7 +46,7 @@ from cowork.db.personal_resources import PersonalResource
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
 from cowork.schemas.artifact_card import ArtifactCard
-from cowork.services.artifact_metadata import ArtifactMetadata
+from cowork.services.artifact_metadata import ArtifactMetadata, lenient_text
 from anton.core.artifacts.internal_files import (
     NON_CONTENT_NAMES,
     REVISIONS_DIRNAME,
@@ -519,16 +519,9 @@ def _published_url_for(
         # have no `published` field; a url means they're live.
         if not entry.get("published", True):
             return ""
-        url = entry.get("url")
         # The record sits in the agent-writable folder: only text the card
         # can carry counts as a link.
-        if not isinstance(url, str):
-            return ""
-        try:
-            url.encode("utf-8")
-        except UnicodeEncodeError:
-            return ""
-        return url
+        return lenient_text(entry.get("url")) or ""
     return ""
 
 
@@ -2399,8 +2392,10 @@ async def _ensure_backend_running(
 
 def _record_backend_port(artifact_dir: Path, port: int) -> None:
     """Write the relaunched backend's port into metadata.json, changing only
-    that key. Not atomic, as before; the encoding is metadata.json's own
-    (ArtifactMetadata.encoded), so on Windows the file gets LF line ends."""
+    that key. Backends launch only with the sandbox off, so the file is
+    written as on the desktop: in place, through a metadata.json the project
+    links. The encoding is metadata.json's own (ArtifactMetadata.encoded), so
+    on Windows the file gets LF line ends."""
     meta_path = artifact_dir / "metadata.json"
     latest = ArtifactMetadata.parse(meta_path.read_text(encoding="utf-8"))
     meta_path.write_bytes(latest.with_value("port", port).encoded())

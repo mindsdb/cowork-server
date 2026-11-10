@@ -252,30 +252,28 @@ class ArtifactStatusView(CamelResponse):
     def of_card(cls, card: ArtifactCard) -> ArtifactStatusView:
         """The status part of ``card`` (cowork.services.artifacts.card_for_folder).
         A field the card doesn't carry reads as the card model's default."""
-        return cls(
-            published_url=card.published_url or "",
-            modified=card.modified,
-            access_mode=card.access_mode or AccessMode.PUBLIC,
-            access_protected=card.access_protected,
-            access_emails=card.access_emails,
-            org_allowed=card.org_allowed,
-            owner_only=card.owner_only,
-            artifact_key=card.artifact_key or "",
-        )
+        return cls._of(card, published_url=card.published_url, modified=card.modified)
 
     @classmethod
     def of_access(cls, access: ArtifactAccessView, *, published_url: str) -> ArtifactStatusView:
         """The status of a file with no metadata.json, which has no card: its
         published URL and its access state, never modified."""
+        return cls._of(access, published_url=published_url, modified=False)
+
+    @classmethod
+    def _of(
+        cls, access: ArtifactAccessView | ArtifactCard, *, published_url: str, modified: bool
+    ) -> ArtifactStatusView:
+        # A card carries the access view's fields under the same names.
         return cls(
-            published_url=published_url or "",
-            modified=False,
-            access_mode=access.access_mode or AccessMode.PUBLIC,
-            access_protected=bool(access.access_protected),
+            published_url=published_url,
+            modified=modified,
+            access_mode=access.access_mode,
+            access_protected=access.access_protected,
             access_emails=access.access_emails,
             org_allowed=access.org_allowed,
             owner_only=access.owner_only,
-            artifact_key=access.artifact_key or "",
+            artifact_key=access.artifact_key,
         )
 
 

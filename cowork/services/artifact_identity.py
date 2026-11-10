@@ -326,15 +326,21 @@ def _ensure_full_id(
         before = None
     try:
         _write_metadata(folder, updated)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
         # Persisting is an optimization, not the contract: the id is derived
         # deterministically, so a read-only or full artifacts root, or a
         # document that can't be written back, still resolves to the same
         # value on every read — exactly what anton does. Propagating would
         # drop the artifact from every listing (both callers treat an identity
         # error as "skip this folder"), which reads as a deletion of files
-        # that are sitting right there.
-        logger.warning("Could not persist widened artifact id for %s", folder.path, exc_info=True)
+        # that are sitting right there. A document that can't be written back
+        # fails the same way on every read, so it is logged without a stack.
+        logger.warning(
+            "Could not persist widened artifact id for %s (%s)",
+            folder.path,
+            exc,
+            exc_info=isinstance(exc, OSError),
+        )
         return resolved, updated
     if before is not None:
         try:

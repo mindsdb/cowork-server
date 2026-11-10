@@ -14,6 +14,7 @@ from __future__ import annotations
 import codecs
 import errno
 import html
+import logging
 import os
 import secrets
 from collections.abc import AsyncIterator, Callable
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
     from cowork.schemas.artifact_card import ArtifactCard
 
+logger = logging.getLogger(__name__)
 
 _MARKDOWN_SOURCES = frozenset({".md", ".markdown"})
 _HTML_SOURCES = frozenset({".html", ".htm"})
@@ -449,14 +451,16 @@ def _record_primary(*, folder: PinnedDir, primary: str) -> None:
     """
     try:
         latest = ArtifactMetadata.parse(_read_no_follow(folder, _METADATA))
-    except ValueError:
+    except ValueError as exc:
+        logger.warning("Export records no primary for %s (%s)", folder.path, exc)
         return
     if _primary_names_a_file(folder=folder, primary=latest.primary):
         return
     before = dir_stat(folder, _METADATA, follow_symlinks=False)
     try:
         _write_metadata(folder, latest.with_value("primary", primary))
-    except ValueError:
+    except ValueError as exc:
+        logger.warning("Export records no primary for %s (%s)", folder.path, exc)
         return
     times = (before.st_atime_ns, before.st_mtime_ns)
     try:
