@@ -580,6 +580,7 @@ async def _answer(chunks, *, raise_after=None, delay=0.0):
 
 async def _produce(
     monkeypatch, conversation_id, answer, *, delegate=None, lifecycle=None, started=None, first_take=None,
+    gate_key=None,
 ):
     from cowork.streaming.registry import TurnLifecycle
 
@@ -608,6 +609,7 @@ async def _produce(
         buffer=buffer,
         delegate=delegate or (lambda: pytest.fail("must not delegate")),
         first_take=first_take,
+        gate_key=gate_key,
     )
     return handler, buffer, coro
 
@@ -643,6 +645,37 @@ async def test_produce_answer_streams_then_saves_the_turn(monkeypatch):
         ("assistant", "Revenue was $4.81M, up 14.2%.", False, "cowork-direct"),
     ]
     assert created["user_message_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delegates", [False, True])
+async def test_produce_answer_revokes_the_gate_key_unless_the_agent_takes_the_turn(monkeypatch, delegates):
+    """An answered turn runs no agent turn to revoke the gate's key; a
+    delegated one runs on that key, and the agent's producer revokes it."""
+    import cowork.handlers.responses as responses
+
+    conversation_id = await _conversation()
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    buffers = []
+
+    async def delegate():
+        await buffers[0].close("completed")
+
+    answer = None if delegates else await _answer(["Revenue was ", "$4.81M."])
+    _handler, buffer, coro = await _produce(
+        monkeypatch, conversation_id, answer, delegate=delegate if delegates else None,
+        gate_key={"correlation_id": "corr-gate"},
+    )
+    buffers.append(buffer)
+
+    await coro
+
+    assert revoked == ([] if delegates else ["corr-gate"])
 
 
 @pytest.mark.asyncio
