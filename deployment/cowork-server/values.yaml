@@ -592,3 +592,13 @@ deployment:
         secretKeyRef:
           name: mindsdb-secrets
           key: GEMINI_API_KEY
+
+    # Video calls with the agent (cowork.services.facetime, prototype): the
+    # organization's Nuance Labs key. Optional: without it the app offers no
+    # video call.
+    - name: COWORK_NUANCE_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: mindsdb-secrets
+          key: COWORK_NUANCE_API_KEY
+          optional: true
