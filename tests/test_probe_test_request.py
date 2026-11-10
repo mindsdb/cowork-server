@@ -269,8 +269,8 @@ class TestStoredCustomConnectors:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("url", [
         "https://planner.example.com:22/x?k={{client_secret}}",
-        "http://planner.example.com/x?k={{client_secret}}",
-    ], ids=["another port", "another scheme"])
+        "http://planner.example.com:443/x?k={{client_secret}}",
+    ], ids=["another port", "only another scheme"])
     async def test_a_follow_up_step_may_not_send_a_saved_field_to_another_port_or_scheme(self, api, saved, url):
         saved.vault.save("planner", "planner-1", {"client_secret": SECRET}, secure_keys=["client_secret"])
         _stored(saved.engine, {k: v for k, v in PLANNER_FORM.items() if k not in ("engine", "connector")})

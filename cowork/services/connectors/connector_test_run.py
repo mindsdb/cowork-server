@@ -444,12 +444,12 @@ def _mask(value: Any, guard: _Guard, counter: list[int]) -> Any:
 
 def _item_count(value: Any) -> int | None:
     """How many items an answer holds: its own length when it is a list, else
-    its longest top-level list's; None when it has no list."""
+    its longest top-level list's; None when it has no list with items."""
     if isinstance(value, list):
         return len(value)
     if isinstance(value, dict):
         lists = [len(v) for v in value.values() if isinstance(v, list)]
-        return max(lists) if lists else None
+        return max(lists) if lists and max(lists) else None
     return None
 
 
@@ -658,10 +658,11 @@ async def run_test_request(
         raise
     except Exception as exc:
         # One boundary rather than a list of exception types: whatever a
-        # library raises, the test ends with a reason. Only the type is
-        # logged, since a message can carry the URL with the member's values.
-        logger.error("A connector test failed with %s", type(exc).__name__)
-        raise ConnectorTestError("The connection test failed before an answer came back.") from exc
+        # library raises, the test ends with a reason. The structured log keeps
+        # the error's type and frames and drops its message, which can carry
+        # the URL with the member's values.
+        logger.exception("A connector test failed")
+        raise ConnectorTestError("The connection test failed. Try again, or check the test request.") from exc
 
 
 async def _run_test_request(

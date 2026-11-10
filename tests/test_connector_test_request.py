@@ -11,6 +11,7 @@ import asyncio
 import base64
 import copy
 import json
+import logging
 import re
 from urllib.parse import quote, quote_plus
 
@@ -19,6 +20,7 @@ import pytest
 
 from cowork.services.connectors import connector_test_run
 from cowork.services.connectors.connector_test_run import ConnectorTestError, run_test_request
+from tests._logging_assertions import assert_log_fields
 
 SECRET = "s3cr3t-Value/with+chars@x"
 CLIENT_ID = "planner-client"
@@ -545,8 +547,39 @@ class TestReviewFindings:
 
         with pytest.raises(ConnectorTestError) as exc:
             await run(api=Broken())
-        assert str(exc.value) == "The connection test failed before an answer came back."
+        assert str(exc.value) == "The connection test failed. Try again, or check the test request."
         assert isinstance(exc.value.__cause__, ExceptionGroup)
+
+    @pytest.mark.asyncio
+    async def test_the_boundary_logs_the_error_type_and_never_its_message(self, owned_logger):
+        logged = owned_logger(connector_test_run.logger.name, level=logging.ERROR)
+
+        class Broken(Api):
+            def __call__(self, request):
+                raise RuntimeError(f"connect to {SECRET} failed")
+
+        with pytest.raises(ConnectorTestError):
+            await run(api=Broken())
+
+        output = logged.output()
+        assert_log_fields(output, error_type="RuntimeError")
+        assert SECRET not in output
+
+    @pytest.mark.asyncio
+    async def test_a_single_record_beside_empty_lists_counts_as_one_item(self):
+        outcome, _ = await run(api=Api(data={"id": 7, "name": "Acme Ltd", "roles": []}))
+        assert outcome.preview.item_count is None
+        assert json.loads(outcome.preview.first_item)["name"] == "Acme Ltd"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("flag", "refused_as_empty"), [(True, False), (False, True)])
+    async def test_a_boolean_beside_empty_lists_is_blank_only_when_false(self, flag, refused_as_empty):
+        api = Api(data={"has_more": flag, "data": []})
+        if refused_as_empty:
+            await refused("holds no data", api=api)
+        else:
+            outcome, _ = await run(api=api)
+            assert outcome.preview is not None
 
     @pytest.mark.asyncio
     async def test_a_numeric_secret_echo_is_refused_and_a_numeric_value_masked(self):

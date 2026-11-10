@@ -800,7 +800,7 @@ class ProbeHandler:
                 if isinstance(holder.get("test_request"), dict):
                     allowed |= request_endpoints(holder["test_request"])
         if not request_endpoints(test_request) <= allowed:
-            return "A follow-up step may send saved fields only to the hosts this connector was tested with."
+            return "A follow-up step may send saved fields only to the hosts, ports and schemes this connector was tested with."
         return None
 
     async def _usage_notes(self, connector_id: str) -> tuple[str | None, bool]:
