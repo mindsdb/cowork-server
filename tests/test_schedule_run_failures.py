@@ -84,7 +84,7 @@ def turns(monkeypatch):
     ending = SimpleNamespace(reason="completed", acted=True, failure=None)
 
     class RecordingHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
