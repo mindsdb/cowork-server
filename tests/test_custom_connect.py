@@ -292,7 +292,7 @@ def test_an_address_that_resolves_privately_is_not_dialed(engine, world, monkeyp
         (409, "conflict", "already have a connection with this name"),
         (429, "quota_exceeded", "limit of custom connections"),
         (409, "organization_mismatch", "organization changed"),
-        (503, "disabled", "turned off"),
+        (503, "disabled", "turned off on this deployment"),
         (400, "invalid_connection", "could not be stored"),
     ],
 )
