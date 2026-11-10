@@ -38,6 +38,7 @@ BASE_URL_FIELD = "base_url"
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _TOP_LABEL = re.compile(r"[a-z]{2,63}")
 _PLACEHOLDER = re.compile(r"\{([a-z][a-z0-9_]{0,39})\}")
+_NO_CHECK_NEXT = "If the API takes a key, ask Anton to build it again; if it takes none, Anton can use it without a connector."
 _ADDRESS_HINT = "type only the address, like api.example.com"
 
 
@@ -75,9 +76,9 @@ def stored_check(row: CustomConnector) -> ConnectorDraftCheck:
     try:
         parsed = parse_connector_draft(draft)
     except ConnectorDraftError as exc:
-        raise ConnectRefused("no_check", 409, "This connector's connection check is not usable; ask Anton to build it again.") from exc
+        raise ConnectRefused("no_check", 409, "This connector's connection check is not usable, so it cannot be connected. " + _NO_CHECK_NEXT) from exc
     if parsed.check is None:
-        raise ConnectRefused("no_check", 409, "This connector has no connection check; ask Anton to build it again.")
+        raise ConnectRefused("no_check", 409, "This connector has no connection check, so it cannot be connected. " + _NO_CHECK_NEXT)
     return parsed.check
 
 

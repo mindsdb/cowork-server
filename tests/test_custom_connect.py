@@ -159,6 +159,9 @@ def test_a_template_without_a_check_cannot_connect(engine, world, monkeypatch):
     res = _connect(_client(engine, monkeypatch), "no_check_api")
 
     assert (res.status_code, res.json()["detail"]["code"]) == (409, "no_check")
+    message = res.json()["detail"]["message"]
+    assert "ask Anton to build it again" in message
+    assert "if it takes none, Anton can use it without a connector" in message
     assert world["auth"] == [] and world["provider"] == []
 
 
