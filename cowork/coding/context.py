@@ -184,6 +184,10 @@ FAILURE_MESSAGES = {
     "free_air_daily_spend_fuse_exceeded": (
         "Free MindsHub Air is paused until the daily budget resets. Add credits to continue now."
     ),
+    "budget_exceeded": (
+        "Your organization's spending budget is used up. An owner or admin can raise it in Budgets, "
+        "or choose MindsHub Air."
+    ),
 }
 
 _FAILURE_MARKERS = (

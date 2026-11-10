@@ -184,6 +184,28 @@ async def test_proxy_answers_an_upstream_402_with_one_terminal_400(monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_proxy_keeps_a_spent_budget_apart_from_an_empty_wallet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both are 402s, but credits do not lift a budget, so Codex gets its own code."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, json={"error": {"message": "Budget reached.", "code": "budget_exceeded"}})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inference_proxy_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    request = _request([(b"content-type", b"application/json")], b'{"model": "gpt", "input": "hi"}')
+
+    response = await proxy_inference(request, "responses", EngineCredentials(minds_url="https://api.example", minds_api_key="mdb_key"))
+
+    assert response.status_code == 400
+    assert response.headers["x-mindshub-error-code"] == "budget_exceeded"
+    assert json.loads(response.body)["error"]["code"] == "budget_exceeded"
+
+
+@pytest.mark.asyncio
 async def test_proxy_streams_successful_and_retryable_responses_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, content=b"busy", headers={"retry-after": "2"})

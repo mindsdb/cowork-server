@@ -679,8 +679,9 @@ async def recommended_models(request: Request, scope: ScopeDep, refresh: bool = 
 
     # `modelDisabledReasons` maps a model id that `modelEnabled` marks false to
     # the gateway's reason for it: "model_restricted" (an admin in the org
-    # restricted it, so credits cannot unlock it), "wallet_empty" or
-    # "included_allowance_exhausted". Filled from the MindsHub listing only,
+    # restricted it, so credits cannot unlock it), "wallet_empty",
+    # "included_allowance_exhausted" or "budget_exceeded" (an org budget is
+    # spent, which credits cannot lift either). Filled from the MindsHub listing only,
     # never from a custom endpoint: a BYO base URL must not be able to label a
     # model "restricted by your admin". A model absent from this map keeps
     # today's locked, add-credits treatment.
