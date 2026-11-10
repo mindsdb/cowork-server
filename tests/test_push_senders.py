@@ -194,6 +194,27 @@ async def test_apns_410_is_dead():
     assert len(recorder.requests) == 1
 
 
+async def test_apns_wrong_topic_fails_without_forgetting_the_device():
+    # Every device answers this when the configured topic is wrong; deleting
+    # them would wipe every registration over a configuration mistake.
+    recorder = _Recorder(lambda request: httpx.Response(400, json={"reason": "DeviceTokenNotForTopic"}))
+    assert (await _apns(recorder).send(Device("ios", "abc", None), _PAYLOAD)).delivery == Delivery.FAILED
+    assert len(recorder.requests) == 1
+
+
+async def test_apns_reuses_one_client_across_sends_until_closed():
+    recorder = _Recorder(lambda request: httpx.Response(200))
+    sender = _apns(recorder)
+    await sender.send(Device("ios", "a", None), _PAYLOAD)
+    first = sender._client()
+    await sender.send(Device("ios", "b", None), _PAYLOAD)
+    assert sender._client() is first and not first.is_closed
+    await sender.aclose()
+    assert first.is_closed
+    await sender.send(Device("ios", "c", None), _PAYLOAD)
+    assert len(recorder.requests) == 3
+
+
 async def test_apns_other_errors_fail_and_an_expired_provider_token_is_resigned():
     now = [1_000_000.0]
     responses = iter([httpx.Response(403, json={"reason": "ExpiredProviderToken"}), httpx.Response(200)])
