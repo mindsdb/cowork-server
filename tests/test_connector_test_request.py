@@ -446,21 +446,21 @@ class TestLargeAnswers:
                     return super().__call__(request)
                 return httpx.Response(200, content=chunks())
 
-        outcome, _ = await run(api=Streaming())
-        assert outcome.preview.over_cap is True
+        await refused("too large to check", api=Streaming())
         assert len(read) <= 257
 
     @pytest.mark.asyncio
-    async def test_an_answer_over_the_cap_is_shown_as_too_large(self):
-        outcome, _ = await run(api=Api(raw=b"[" + b'{"a": 1},' * 40000 + b'{"a": 1}]'))
-        preview = outcome.preview
-        assert preview.over_cap is True and preview.size == 256 * 1024
-        assert (preview.keys, preview.first_item, preview.item_count) == ([], None, None)
+    async def test_an_answer_over_the_cap_is_refused_since_it_cannot_be_checked(self):
+        await refused("Ask for fewer rows", api=Api(raw=b"[" + b'{"a": 1},' * 40000 + b'{"a": 1}]'))
 
     @pytest.mark.asyncio
-    async def test_an_answer_over_the_cap_is_still_checked_for_echoes(self):
-        raw = b"[" + (b'{"note": "' + SECRET.encode() + b'"},') * 20000 + b"{}]"
-        await refused("repeats a credential", api=Api(raw=raw))
+    @pytest.mark.parametrize("answer", [
+        b'{"error":"invalid credentials"}',
+        b'{"access_token":"' + ISSUED.encode() + b'","token_type":"bearer"}',
+        b"[" + (b'{"note": "' + SECRET.encode() + b'"},') * 20000 + b"{}]",
+    ], ids=["error", "token", "echo"])
+    async def test_padding_an_answer_past_the_cap_does_not_skip_the_checks(self, answer):
+        await refused("too large to check", api=Api(raw=answer + b" " * (256 * 1024)))
 
 
 class TestReviewFindings:

@@ -474,17 +474,18 @@ def judge(
     """Apply the floor checks to the data step's answer and build its preview.
 
     Raises:
-        ConnectorTestError: when the answer is plainly not data.
+        ConnectorTestError: when the answer is plainly not data, or too large to check.
     """
     if not 200 <= status < 300:
         raise ConnectorTestError(f"The data step got HTTP {status}.")
     text = body.decode("utf-8", errors="replace")
     if not text.strip():
         raise ConnectorTestError("The data step got an empty answer.")
+    # A cut-off answer cannot be parsed, so none of the data checks below could run on it.
     if over_cap:
-        if guard.echoes(text):
-            raise ConnectorTestError("The data step's answer repeats a credential, so it was not shown.")
-        return ConnectorTestPreview(status, token_host, data_host, content_type, len(body), True, None, [], None, 0)
+        raise ConnectorTestError(
+            "The data step's answer was too large to check. Ask for fewer rows, for example with a page size or limit."
+        )
     try:
         parsed: Any = json.loads(text)
         is_json = True
