@@ -66,6 +66,7 @@ from cowork.services.render_pdf_client import RenderServicePdf, pdf_request
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
+    from cowork.schemas.artifact_card import ArtifactCard
 
 
 _MARKDOWN_SOURCES = frozenset({".md", ".markdown"})
@@ -264,7 +265,7 @@ def primary_export_source(*, folder: Path, metadata: ArtifactMetadata) -> Export
     )
 
 
-def card_export_source(card: dict) -> ExportSource:
+def card_export_source(card: ArtifactCard) -> ExportSource:
     """The export source an artifact card describes, from its ``path``, ``folder`` and ``type``.
 
     A primary with a second hard link names no source, as in
@@ -273,20 +274,18 @@ def card_export_source(card: dict) -> ExportSource:
     offers a format then.
     """
     try:
-        relative = Path(str(card.get("path") or "")).relative_to(
-            Path(str(card.get("folder") or ""))
-        )
+        relative = Path(card.path).relative_to(Path(card.folder))
     except ValueError:
         relative = Path()
     if (
         relative.parts
         and not org_export_refused(org_mode=_org_mode())
-        and not _is_single_named_file(Path(str(card["path"])))
+        and not _is_single_named_file(Path(card.path))
     ):
         relative = Path()
     return ExportSource(
         source_name="/".join(relative.parts),
-        is_backend=is_backend_type(card.get("type")),
+        is_backend=is_backend_type(card.type),
     )
 
 

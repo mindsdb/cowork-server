@@ -24,6 +24,7 @@ from cowork.schemas.base import CamelRequest, CamelResponse
 from cowork.services.sharing_contract import AudienceField
 
 if TYPE_CHECKING:
+    from cowork.schemas.artifact_card import ArtifactCard
     from cowork.services.artifact_access import ArtifactRule
 
 # anton's publisher's name for the people outside the organization, by
@@ -248,19 +249,18 @@ class ArtifactStatusView(CamelResponse):
     link_owner_recorded: bool | None = None
 
     @classmethod
-    def of_card(cls, card: Mapping[str, Any]) -> ArtifactStatusView:
-        """The status part of ``card``, an artifact card under the app's
-        names (cowork.services.artifacts.card_for_folder). A field the card
-        doesn't carry takes its default."""
+    def of_card(cls, card: ArtifactCard) -> ArtifactStatusView:
+        """The status part of ``card`` (cowork.services.artifacts.card_for_folder).
+        A field the card doesn't carry reads as the card model's default."""
         return cls(
-            published_url=card.get("publishedUrl") or "",
-            modified=bool(card.get("modified")),
-            access_mode=card.get("accessMode") or AccessMode.PUBLIC,
-            access_protected=bool(card.get("accessProtected")),
-            access_emails=card.get("accessEmails", []),
-            org_allowed=card.get("orgAllowed", False),
-            owner_only=card.get("ownerOnly", False),
-            artifact_key=card.get("artifactKey") or "",
+            published_url=card.published_url or "",
+            modified=card.modified,
+            access_mode=card.access_mode or AccessMode.PUBLIC,
+            access_protected=card.access_protected,
+            access_emails=card.access_emails,
+            org_allowed=card.org_allowed,
+            owner_only=card.owner_only,
+            artifact_key=card.artifact_key or "",
         )
 
     @classmethod

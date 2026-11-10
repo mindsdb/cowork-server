@@ -25,7 +25,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from typing import Annotated, Any, AsyncIterator, Callable, Literal, Optional
+from typing import TYPE_CHECKING, Annotated, Any, AsyncIterator, Callable, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
@@ -54,6 +54,9 @@ from cowork.schemas.responses import (
 )
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
 
+if TYPE_CHECKING:
+    from cowork.schemas.artifact_card import ArtifactCard
+
 logger = logging.getLogger(__name__)
 
 
@@ -77,7 +80,7 @@ class ArtifactCreated:
     renderer shows an inline card for every artifact type, identically and
     deterministically — live and on reload."""
 
-    artifact: dict
+    artifact: ArtifactCard
 
 
 @dataclass(frozen=True)
@@ -1214,7 +1217,7 @@ async def format_responses_stream(
             yield _event("response.artifact_created", {
                 "type": "response.artifact_created",
                 "sequence_number": seq,
-                "artifact": event.artifact,
+                "artifact": event.artifact.to_json(),
             })
 
         elif isinstance(event, StreamAskUser):

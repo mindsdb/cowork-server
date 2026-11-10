@@ -45,6 +45,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
+from cowork.schemas.artifact_card import ArtifactCard
 from cowork.services.artifact_metadata import ArtifactMetadata
 from anton.core.artifacts.internal_files import (
     NON_CONTENT_NAMES,
@@ -1478,7 +1479,7 @@ def draft_url_for(*, project_id: str | None, artifact_id: str, rel_path: str) ->
 class _PreparedArtifactCard:
     """Pure card result plus the inputs needed for its modified badge."""
 
-    card: dict
+    card: ArtifactCard
     io_folder: Path
     io_root: Path | None
     primary: Path | None
@@ -1541,65 +1542,71 @@ def _prepare_artifact_card(
     # — already sorted mtime desc, so this is its first entry.
     mtime_seconds = (files_with_mtimes[0][1] // 1_000_000_000) if files_with_mtimes else 0
 
-    card = {
+    from cowork.services.artifact_identity import artifact_key
+
+    # Owner-side access state (lock badge + eye-reveal). accessPassword is the
+    # plaintext, returned only to the owner's own session.
+    access = published_access_view(io_folder, primary, published_map=published_map)
+    # Dropped at the single card builder so inline chat cards are covered
+    # too: they call this function as well, and a filter applied only at the
+    # list endpoint would still hand the plaintext password to the chat.
+    # In org mode the owner reads the password and the emails from GET
+    # .../access, which can tell owner from co-member, so the card carries
+    # neither. `accessMode` stays: ArtifactStatus draws its badge from it.
+    access_fields = access.model_dump(
+        exclude={"access_password", "access_emails"} if _org_mode() else None
+    )
+    # Drafts and every published version share this key. A legacy
+    # `.published.json` key is intentionally overridden here so comments do not
+    # fork when an artifact is re-published under a different report URL.
+    access_fields["artifact_key"] = artifact_key(artifact_id)
+    card = ArtifactCard(
         # The one identity: drafts, published versions, revisions, comments
         # and the workspace API all key off it.
-        "id": artifact_id,
-        "slug": meta.slug or folder.name,
-        "title": meta.name or folder.name,
-        "description": meta.description or "",
-        "type": artifact_type,
-        "kind": kind,
-        "ext": primary_ext,
-        "updated": _human_mtime(mtime_seconds),
-        "mtime": mtime_seconds,
-        "live": is_live,
-        "bg": BG_CYCLE[idx % len(BG_CYCLE)],
-        "fileCount": len(files),
+        id=artifact_id,
+        slug=meta.slug or folder.name,
+        title=meta.name or folder.name,
+        description=meta.description or "",
+        type=artifact_type,
+        kind=kind,
+        ext=primary_ext,
+        updated=_human_mtime(mtime_seconds),
+        mtime=mtime_seconds,
+        live=is_live,
+        bg=BG_CYCLE[idx % len(BG_CYCLE)],
+        file_count=len(files),
         # `folder`/`path` stay in the payload even in org mode: the renderer uses
         # `path` as an opaque state key (the in-flight `busyPaths` set, live-row
         # matching, title fallbacks), and it is no secret — a client of its own
         # organization already knows `<root>/<org_id>`. Isolation comes from
         # `projectId` plus the server-side scope, not from hiding the path.
-        "folder": str(logical_folder),
-        "path": primary_path,
-        "primary": meta.primary or None,
-        "projectId": project_id,
+        folder=str(logical_folder),
+        path=primary_path,
+        primary=meta.primary or None,
+        project_id=project_id,
         # What the card shows. The serve URL below carries `project_name`
         # instead, because serve_artifact_file resolves that segment by name
         # (_project_artifacts_base).
-        "projectName": project_label or project_name,
+        project_name=project_label or project_name,
         # The conversation that produced the artifact, so a comment addressed
         # with the agent from the artifacts list resumes that chat instead of
         # opening a fresh one. Empty for artifacts written before provenance —
         # the client then falls back to a new conversation. Whether the chat is
         # still reachable is the client's call: it already knows its own
         # conversations and can fetch the rest.
-        "originConversationId": origin_conversation_id(meta),
-        "publishedUrl": _published_url_for(
-            io_folder, primary, published_map=published_map
-        ),
+        origin_conversation_id=origin_conversation_id(meta),
+        published_url=_published_url_for(io_folder, primary, published_map=published_map),
         # Filled by one of the two callers below. Keeping the slot here preserves
         # the canonical response shape and key order.
-        "modified": False,
-        # Owner-side access state (lock badge + eye-reveal). accessPassword
-        # is the plaintext, returned only to the owner's own session.
-        **_published_access_for(
-            io_folder, primary, published_map=published_map
-        ),
-        "serveUrl": serve_url_for(
+        modified=False,
+        **access_fields,
+        serve_url=serve_url_for(
             primary_path,
             scope=scope,
             artifacts_base=artifacts_base,
             project_name=project_name,
         ),
-    }
-    from cowork.services.artifact_identity import artifact_key
-
-    # Drafts and every published version share this key. A legacy
-    # `.published.json` key is intentionally overridden here so comments do not
-    # fork when an artifact is re-published under a different report URL.
-    card["artifactKey"] = artifact_key(artifact_id)
+    )
     if primary is not None:
         # macOS commonly exposes the same temporary directory through both
         # ``/var`` and ``/private/var``. Canonicalize both sides before deriving
@@ -1616,18 +1623,9 @@ def _prepare_artifact_card(
         except ValueError:
             logger.warning("Artifact primary resolves outside its folder: %s", folder)
         else:
-            card["draftUrl"] = draft_url_for(
+            card.draft_url = draft_url_for(
                 project_id=project_id, artifact_id=artifact_id, rel_path=rel
             )
-    if _org_mode():
-        # Dropped at the single card builder so inline chat cards are covered
-        # too: they call this function as well, and a filter applied only at the
-        # list endpoint would still hand the plaintext password to the chat.
-        # In org mode the owner reads the password and the emails from GET
-        # .../access, which can tell owner from co-member, so the card carries
-        # neither. `accessMode` stays: ArtifactStatus draws its badge from it.
-        card.pop("accessPassword", None)
-        card.pop("accessEmails", None)
     return _PreparedArtifactCard(
         card=card,
         io_folder=io_folder,
@@ -1648,7 +1646,7 @@ def card_for_folder(
     _pinned_folder: PinnedDir | None = None,
     _pinned_root: PinnedDir | None = None,
     artifacts_base: Path | None = None,
-) -> dict | None:
+) -> ArtifactCard | None:
     """Build one card, retaining legacy metadata and publish-map self-heals.
 
     Inline chat cards and status refreshes historically migrate legacy ids and
@@ -1690,7 +1688,7 @@ def card_for_folder(
     )
     if prepared is None:
         return None
-    prepared.card["modified"] = _is_modified(
+    prepared.card.modified = _is_modified(
         prepared.io_folder,
         prepared.primary,
         prepared.mtime_seconds,
@@ -1710,7 +1708,7 @@ def _listed_card_for_pinned_folder(
     pinned_folder: PinnedDir,
     pinned_root: PinnedDir,
     artifacts_base: Path,
-) -> dict | None:
+) -> ArtifactCard | None:
     """Build one list card through a call graph containing no artifact writes.
 
     The caller names the card's artifacts root, so its serve URL is built from
@@ -1744,7 +1742,7 @@ def _listed_card_for_pinned_folder(
     )
     if prepared is None:
         return None
-    prepared.card["modified"] = _is_modified_read_only(
+    prepared.card.modified = _is_modified_read_only(
         prepared.io_folder,
         prepared.primary,
         prepared.mtime_seconds,
@@ -1797,15 +1795,12 @@ def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -
     if card is None:
         # Loose / legacy file (no metadata.json anywhere up to the artifacts
         # container root).
-        card = {
-            "publishedUrl": _published_url_for(folder, artifact),
-            "modified": False,
-            **_published_access_for(folder, artifact),
-        }
-    # One response shape for BOTH branches: explicitly the published /
-    # modified / access subset, and NEVER `accessPassword` — that owner-only
-    # plaintext (which `_published_access_for` and the card both carry) must
-    # not leave this endpoint. ArtifactStatusView has no field for it.
+        return ArtifactStatusView.of_access(
+            published_access_view(folder, artifact),
+            published_url=_published_url_for(folder, artifact),
+        )
+    # ArtifactStatusView has no field for the owner-only plaintext password,
+    # so it never leaves this endpoint.
     return ArtifactStatusView.of_card(card)
 
 
@@ -1820,7 +1815,7 @@ def artifact_status(raw_path: str, *, scope: TenantScope | None) -> ArtifactStat
     return artifact_status_for_resolved(artifact, scope=scope)
 
 
-def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
+def list_artifacts(sources: list[ProjectArtifacts]) -> list[ArtifactCard]:
     """Every artifact under the given roots, newest first, capped at 80.
 
     Roots come from the caller (see services.artifact_roots) — this function
@@ -1877,7 +1872,7 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
 
     candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
 
-    cards: list[dict] = []
+    cards: list[ArtifactCard] = []
     # One root open per source, not per surviving candidate: opening a root
     # costs an openat+stat per path component, so re-opening it per card
     # would undo what capping the candidates before this pass just saved.

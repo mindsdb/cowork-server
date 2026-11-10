@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from anton.core.browser.config import BrowserConfig
     from anton.core.session import ChatSession
 
+    from cowork.schemas.artifact_card import ArtifactCard
     from cowork.services.conversations import ReplayHistory
 
 
@@ -986,7 +987,7 @@ class AntonHarness:
         skill_drafts_base = project_path / ".anton" / "skill_drafts"
         before_drafts = snapshot_skill_drafts(skill_drafts_base)
         before_strays = snapshot_stray_skills(project_path / "skills")
-        cards: list[dict] = []
+        cards: list[ArtifactCard] = []
         skill_drafts: list[dict] = []
         new_slugs: list[str] = []
         touched_slugs: set[str] = set()

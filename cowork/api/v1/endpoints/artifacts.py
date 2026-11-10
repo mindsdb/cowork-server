@@ -48,6 +48,7 @@ from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
 from cowork.api.v1.endpoints.live_apps import LiveAppRoute
 from cowork.schemas.artifact_access import ArtifactStatusView
+from cowork.schemas.artifact_card import ArtifactCard
 from cowork.schemas.live_apps import (
     LiveAppCopyRef,
     LiveAppDuplicateRequest,
@@ -186,7 +187,7 @@ def _legacy_artifact_in_plan(plan: RootsPlan, folder_name: str):
 # Query sentinels standing in for the defaults.
 
 
-def _artifact_cards(session, sources) -> list[dict]:
+def _artifact_cards(session, sources) -> list[ArtifactCard]:
     """The cards of ``sources``, with the file store and the database read in
     turn on the calling thread. The routes read the two halves in their own
     worker threads instead (``_cards_for``)."""
@@ -202,7 +203,7 @@ class _FoundCard(NamedTuple):
     capabilities read. That is found there too: it can lstat the card's
     primary file."""
 
-    card: dict
+    card: ArtifactCard
     export_source: ExportSource
 
 
@@ -238,7 +239,7 @@ def _browsable_sources(*, plan: RootsPlan) -> list[ProjectArtifacts]:
 
 async def _cards_for(
     scope: TenantScope, find_sources: Callable[[], list[ProjectArtifacts]]
-) -> list[dict]:
+) -> list[ArtifactCard]:
     """``_artifact_cards`` with the roots found and their folders walked in one
     file store call, then the owner reads in a database unit, so no pooled
     connection waits on the file server. ``find_sources`` runs in that file
@@ -249,7 +250,7 @@ async def _cards_for(
     )
 
 
-def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[dict]:
+def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[ArtifactCard]:
     """The database half of the cards: each card's owner, its capabilities and,
     with live apps, who shared it. Reads no artifact folder: the file store
     half found each card's export source (``_sources_and_cards``)."""
@@ -267,7 +268,7 @@ def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[dic
     by_base = {Path(source.base): source for source in sources}
     cards_by_base: dict[Path, list[tuple[str, _FoundCard]]] = {}
     for found in cards:
-        folder = Path(str(found.card.get("folder") or ""))
+        folder = Path(found.card.folder)
         if folder.parent in by_base:
             cards_by_base.setdefault(folder.parent, []).append((folder.name, found))
     roots = list(cards_by_base.items())
@@ -281,7 +282,7 @@ def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[dic
     for (base, entries), resolutions in zip(roots, owners_by_root, strict=True):
         source = by_base[base]
         for slug, found in entries:
-            found.card["capabilities"] = artifact_capabilities(
+            found.card.capabilities = artifact_capabilities(
                 session,
                 source,
                 slug,
@@ -298,7 +299,7 @@ def _mark_received_live_apps(
     *,
     cards_by_base: dict[Path, list[tuple[str, _FoundCard]]],
     by_base: dict[Path, ProjectArtifacts],
-    cards: list[dict],
+    cards: list[ArtifactCard],
 ) -> None:
     """With live apps on, give each card ``receivedFrom``: the owner's email
     for a copy the caller duplicated from a share, from the server's own
@@ -312,7 +313,7 @@ def _mark_received_live_apps(
 
     received = received_from(session, partition_id=scope.org_id)
     for card in cards:
-        card["receivedFrom"] = None
+        card.received_from = None
     for base, entries in cards_by_base.items():
         project_id = by_base[base].project_id
         if not project_id:
@@ -320,7 +321,7 @@ def _mark_received_live_apps(
         for slug, found in entries:
             owner_email = received.get((UUID(str(project_id)), slug))
             if owner_email:
-                found.card["receivedFrom"] = {"email": owner_email}
+                found.card.received_from = {"email": owner_email}
 
 
 def _plan_scoped_project(session, *, project_ref: str) -> RootsPlan:
@@ -510,25 +511,14 @@ def _pinned_loose_status(directory, logical_file: Path) -> ArtifactStatusView:
     """Status for a metadata-less legacy file using its pinned parent record."""
     from cowork.services.artifacts import (
         _load_published_map_pinned,
-        _published_access_for,
         _published_url_for,
+        published_access_view,
     )
 
     published_map = _load_published_map_pinned(directory)
-    return ArtifactStatusView.of_card(
-        {
-            "publishedUrl": _published_url_for(
-                directory.path,
-                logical_file,
-                published_map=published_map,
-            ),
-            "modified": False,
-            **_published_access_for(
-                directory.path,
-                logical_file,
-                published_map=published_map,
-            ),
-        }
+    return ArtifactStatusView.of_access(
+        published_access_view(directory.path, logical_file, published_map=published_map),
+        published_url=_published_url_for(directory.path, logical_file, published_map=published_map),
     )
 
 
@@ -714,7 +704,7 @@ async def list_artifacts(
             source = _desktop_registered_source(catalog, requested, project_name)
             if source is None:
                 return []
-            return await _cards_for(scope, lambda: [source])
+            return [card.to_json() for card in await _cards_for(scope, lambda: [source])]
     if project_id is not None:
         raw_project_ref = str(project_id)
         # Although FastAPI has already parsed this as UUID, make the recognized
@@ -726,9 +716,9 @@ async def list_artifacts(
                 detail="Invalid project",
             )
         plan = await _scoped_project_plan(scope, project_ref)
-        return await _cards_for(scope, partial(readable_sources, plan))
+        return [card.to_json() for card in await _cards_for(scope, partial(readable_sources, plan))]
     plan = await run_db(plan_scope_roots, scope=scope)
-    return await _cards_for(scope, partial(_browsable_sources, plan=plan))
+    return [card.to_json() for card in await _cards_for(scope, partial(_browsable_sources, plan=plan))]
 
 
 
@@ -1526,7 +1516,7 @@ async def duplicate_live_app(
         raise
     plan = await _scoped_project_plan(scope, str(body.project_id))
     cards = await _cards_for(scope, partial(readable_sources, plan))
-    card = next((card for card in cards if Path(str(card.get("folder") or "")).name == slug), None)
+    card = next((card for card in cards if Path(card.folder).name == slug), None)
     if card is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="The copy has no card")
-    return card
+    return card.to_json()
