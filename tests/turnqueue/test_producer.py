@@ -79,7 +79,7 @@ async def test_default_model_uses_the_verified_hosted_scope(monkeypatch, org_dep
         assert scope.org_mode is True
         assert scope.org_id == "org-verified"
         assert scope.user_id == "user-verified"
-        return SimpleNamespace(resolved_planning_model="minds-default")
+        return SimpleNamespace(limits_enabled=False, resolved_planning_model="minds-default")
 
     monkeypatch.setattr(user_settings, "get_user_settings", current_settings)
     await _drain(prod.stream_remote_replies(
@@ -102,7 +102,7 @@ async def _scope_reaching_settings(monkeypatch, *, org_id, user_id):
 
     def current_settings(scope):
         seen.append(scope)
-        return SimpleNamespace(resolved_planning_model="m-default", hub_workspace_id="")
+        return SimpleNamespace(limits_enabled=False, resolved_planning_model="m-default", hub_workspace_id="")
 
     monkeypatch.setattr(user_settings, "get_user_settings", current_settings)
     await _drain(prod.stream_remote_replies(
@@ -575,21 +575,6 @@ async def test_a_web_turn_sends_the_limits_of_its_settings_snapshot(monkeypatch,
     with use_turn_settings(scope, snapshot):
         params = await _enqueued_params(monkeypatch, "limits-snapshot")
     assert params["limits"] == _STORED_LIMITS
-
-
-@pytest.mark.asyncio
-async def test_a_turn_whose_limits_cant_be_read_still_runs_without_them(monkeypatch):
-    from cowork.common.settings import user_settings as us
-
-    def unreadable(scope):
-        raise RuntimeError("settings store down")
-
-    monkeypatch.setattr(us, "get_user_settings", unreadable)
-    params = await _enqueued_params(
-        monkeypatch, "o1", llm={"provider": "minds-cloud", "api_key": "k", "base_url": "https://x/v1"},
-    )
-    assert "limits" not in params
-    assert params["input"] == "hi"
 
 
 @pytest.mark.asyncio
@@ -1098,7 +1083,7 @@ async def test_stream_remote_replies_forwards_the_active_hub_workspace(monkeypat
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setattr(
         user_settings, "get_user_settings",
-        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id="ws-1"),
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id="ws-1"),
     )
 
     captured = {}
@@ -1131,7 +1116,7 @@ async def test_the_active_hub_workspace_binds_the_key_with_datasources_on_too(mo
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
     monkeypatch.setattr(
         user_settings, "get_user_settings",
-        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id="ws-1"),
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id="ws-1"),
     )
     captured = {}
 
@@ -1160,7 +1145,7 @@ async def test_stream_remote_replies_omits_workspace_id_when_none_picked(monkeyp
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setattr(
         user_settings, "get_user_settings",
-        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id=""),
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id=""),
     )
 
     captured = {}
@@ -2096,7 +2081,7 @@ def browser_router(monkeypatch, org_deployment):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
-    settings = SimpleNamespace(browser_enabled=True, resolved_planning_model="m", hub_workspace_id="")
+    settings = SimpleNamespace(limits_enabled=False, browser_enabled=True, resolved_planning_model="m", hub_workspace_id="")
     monkeypatch.setattr(user_settings, "get_user_settings", lambda scope=None: settings)
     state = SimpleNamespace(fake=fake, settings=settings, scoped=[], refuse=None)
 
@@ -2221,7 +2206,7 @@ async def test_the_job_carries_the_organizations_jev_opt_out(monkeypatch, enable
 
     monkeypatch.setattr(
         user_settings, "get_user_settings",
-        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id="", jev_decisions_enabled=enabled),
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id="", jev_decisions_enabled=enabled),
     )
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)

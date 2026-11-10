@@ -15,6 +15,7 @@ import time
 import uuid
 from datetime import datetime
 from functools import partial
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from redis.exceptions import RedisError
@@ -55,6 +56,9 @@ from cowork.turnqueue.redis_client import (
     xread_blocking,
 )
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
+
+if TYPE_CHECKING:
+    from cowork.common.settings.user_settings import UserSettings
 
 logger = logging.getLogger(__name__)
 
@@ -113,22 +117,14 @@ def _trace_block(*, user_id: str | None = None, org_id: str | None = None) -> di
         return {}
 
 
-def _limits_block(scope: TenantScope) -> dict[str, int] | None:
-    """The per-task limits this tenant's turns run under, for the job's params.
+def _limits_block(settings: UserSettings) -> dict[str, int]:
+    """The per-task limits this tenant's turns run under, for the job's params:
+    the same values the desktop harness overlays for an in-process turn, the
+    deployment defaults while the tenant's limits switch is off and its own
+    values once it's on."""
+    from cowork.common.settings.user_settings import effective_turn_limits
 
-    The same values the desktop harness overlays for an in-process turn:
-    the deployment defaults while the tenant's limits switch is off, its own
-    values once it's on. None when they can't be read: the pod then keeps
-    anton's own defaults, which is what every web turn ran under before this
-    block existed. Not a reason to fail the turn.
-    """
-    from cowork.common.settings.user_settings import effective_turn_limits, get_user_settings
-
-    try:
-        return effective_turn_limits(get_user_settings(scope))._asdict()
-    except Exception:
-        logger.warning("could not read the turn's limits; the pod keeps its defaults", exc_info=True)
-        return None
+    return effective_turn_limits(settings)._asdict()
 
 
 def _request_wire_size(params: dict) -> int:
@@ -875,8 +871,6 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         project_id=workspace.project_id if workspace is not None else None,
     )
 
-    limits_block = _limits_block(scope)
-
     # Org-relative, never absolute. cowork-server sees the shared tree at
     # <root>/<org_id> while the pod mounts its own org's access point AT
     # <root>, so the two sit at different depths and an absolute path from
@@ -896,14 +890,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.db.units import run_on_unit_threads
 
-    # The organization's Jev opt-out, read here so every remote turn carries
-    # it: web UI, scheduled and channel turns alike. Off the loop: a turn
-    # with no settings snapshot, such as a channel turn, reads it through a
-    # session of its own.
-    jev_settings = await run_on_unit_threads(partial(get_user_settings, scope))
-    jev_decisions = getattr(jev_settings, "jev_decisions_enabled", True) is not False
+    # The organization's Jev opt-out and per-task limits, read here so every
+    # remote turn carries them: web UI, scheduled and channel turns alike. Off
+    # the loop: a turn with no settings snapshot, such as a channel turn, reads
+    # them through a session of its own.
+    turn_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+    jev_decisions = getattr(turn_settings, "jev_decisions_enabled", True) is not False
     time_limit = settings.time_limit_seconds
-    turn_limits = {**(limits_block or {}), **({"max_turn_seconds": time_limit} if time_limit else {})}
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -944,11 +937,15 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # with the `llm` turn key, which _scoped_browser_block scoped to
               # this session and project. Absent when the turn has no browser.
               **({"browser": browser_block} if browser_block else {}),
-              # The tenant's per-task limits (steps, auto-continues, tokens)
-              # and the turn's time limit, in one block: anton asks at the time
-              # limit and ends with a summary, and the controller raises its
-              # backstop above it. Absent when there are none.
-              **({"limits": turn_limits} if turn_limits else {}),
+              # The per-task limits (steps, auto-continues, tokens) this turn
+              # runs under, and its time limit when one is set: anton asks at it
+              # and ends with a summary, and the controller raises its backstop
+              # above it. Without them the pod runs on anton's built-in defaults,
+              # whatever the tenant set.
+              "limits": {
+                  **_limits_block(turn_settings),
+                  **({"max_turn_seconds": time_limit} if time_limit else {}),
+              },
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
               # there can derive the surface, this server's version, or its
