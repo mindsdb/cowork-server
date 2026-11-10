@@ -1,4 +1,4 @@
-"""org_appearance.sidebar_title_mode: company, custom or no title (ENG-4020)
+"""org_appearance.sidebar_title_mode: company, custom or no title
 
 Which sidebar title the app shows: 'company' (the org's name, the
 default), 'custom' (sidebar_title) or 'none' (no title, only the logo).

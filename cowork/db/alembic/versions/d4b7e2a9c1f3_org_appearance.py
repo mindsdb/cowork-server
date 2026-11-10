@@ -1,4 +1,4 @@
-"""org_appearance: an organization's look in the Cowork app (ENG-4020)
+"""org_appearance: an organization's look in the Cowork app
 
 One row per org, keyed by the org's UUID like skill_access. Every look field
 is nullable (NULL is the app's stock value); members_can_choose defaults to

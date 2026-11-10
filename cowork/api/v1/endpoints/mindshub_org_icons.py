@@ -1,5 +1,5 @@
 """GET /hub/org-icons: the icons of the caller's MindsHub organizations, for
-the org switcher (ENG-4020).
+the org switcher.
 
 Read from auth's ``GET /v1/organizations/available/`` with the caller's own
 credential (cowork.principal.hub_credential_for: the gateway's Authorization

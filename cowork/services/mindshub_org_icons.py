@@ -1,4 +1,4 @@
-"""The icons of the organizations the caller belongs to (ENG-4020).
+"""The icons of the organizations the caller belongs to.
 
 Read from auth's ``GET /v1/organizations/available/`` with the caller's own
 credential, cached per caller for 60 s (CallerTtlCache). auth answers each
@@ -69,8 +69,10 @@ def _parse(payload: Any) -> OrgIcons:
 
 async def fetch_org_icons(*, bearer_token: str, org_id: str, user_id: str) -> OrgIcons:
     """The caller's organizations' icons. No session credential is no
-    organizations, reachable. auth refusing (a 4xx) is the same: it answered
-    that the caller has none to list. Never raises."""
+    organizations, reachable, and so is auth's 403. Any other refusal (a 401
+    for an expired session, a 404) says nothing about the caller's orgs, so
+    it is ``reachable`` false, as an outage is, and not cached: the switcher
+    keeps the icons it has. Never raises."""
     if not is_session_jwt(bearer_token):
         return OrgIcons(reachable=True)
     key = CallerCacheKey.for_caller(org_id=org_id, user_id=user_id, bearer_token=bearer_token)
@@ -80,9 +82,9 @@ async def fetch_org_icons(*, bearer_token: str, org_id: str, user_id: str) -> Or
     reply = await get_mindshub_reply(AVAILABLE_ORGS_PATH, bearer_token)
     if reply.answer is MindsHubAnswer.OK:
         value = _parse(reply.payload)
-    elif reply.answer is MindsHubAnswer.REFUSED:
+    elif reply.answer is MindsHubAnswer.REFUSED and reply.status_code == 403:
         value = OrgIcons(reachable=True)
     else:
-        value = OrgIcons()
+        return OrgIcons()
     _cache.put(key, value)
     return value

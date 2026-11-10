@@ -1,4 +1,4 @@
-"""drop org_appearance: auth now owns the org look (ENG-4020)
+"""drop org_appearance: auth now owns the org look
 
 The org's look moved to auth (``GET /v1/organizations/current/branding/``
 and ``PATCH .../branding/appearance/``), so cowork-server stops storing it.

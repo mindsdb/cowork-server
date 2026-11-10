@@ -1,4 +1,4 @@
-"""org_appearance.background_light and background_dark (ENG-4020)
+"""org_appearance.background_light and background_dark
 
 The org's look keeps a background for the light theme and one for the dark
 theme, as the app's custom theme does (bgLight, bgDark). Each column is

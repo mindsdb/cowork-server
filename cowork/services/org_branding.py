@@ -1,4 +1,4 @@
-"""An organization's branding, read from and written to auth (ENG-4020).
+"""An organization's branding, read from and written to auth.
 
 auth is the source of truth for the whole org look: the images, the
 appearance (colors, font, radius, skin, theme, greeting, sidebar title,
@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -70,6 +70,9 @@ AUTH_BRANDING_PATH = "/organizations/current/branding/"
 AUTH_APPEARANCE_PATH = "/organizations/current/branding/appearance/"
 
 BRAND_SKILL_DISPLAY_NAME = "Brand guidelines"
+# The look the generated skill was last written from: auth's
+# appearance.updated_at, so an older answer never writes over it.
+META_BRAND_LOOK_UPDATED_AT = "brand_look_updated_at"
 # The admin's guidelines that don't fit in SKILL.md go here, beside it, for
 # the agent to read on demand.
 GUIDELINES_FILE = "guidelines.md"
@@ -122,10 +125,20 @@ STOCK_LOOK = BrandLook()
 class AuthBranding:
     """auth's answer for the caller's current org.
 
-    ``answer`` is how auth answered: OK; REFUSED, which here means the caller
-    has no current org (a personal account, or signed out of every org) and
-    branding is off; or UNREACHABLE (also THROTTLED), when nothing is known.
-    Only an OK answer may change the skill."""
+    ``answer`` is how auth answered: OK; REFUSED, which here means only what
+    auth's 403 says, that the caller has no current org (a personal account,
+    or no org at all), or that a local server has no credential to ask with;
+    or UNREACHABLE, when nothing is known: no answer, a 5xx, a throttle, and
+    a 401 or 404 too, which say nothing about the org (an expired desktop
+    session, a route missing).
+
+    ``fresh``: read from auth in this request (or answered by the caller's
+    own write), not served from the cache. Only a fresh answer may change
+    the skill (sync_brand_skill), so a member's cached answer, up to 60 s
+    old, never writes over a newer admin save. ``stale``: auth couldn't be
+    asked and this is the caller's last answer instead. ``look_updated_at``
+    is auth's ``appearance.updated_at``: the skill records it and never
+    takes an older look."""
 
     answer: MindsHubAnswer = MindsHubAnswer.UNREACHABLE
     icon_url: str | None = None
@@ -135,6 +148,9 @@ class AuthBranding:
     sidebar_title: str | None = DEFAULT_SIDEBAR_TITLE
     can_edit: bool = False
     look: BrandLook = STOCK_LOOK
+    look_updated_at: str | None = None
+    fresh: bool = False
+    stale: bool = False
 
     @property
     def reachable(self) -> bool:
@@ -225,36 +241,63 @@ def parse_auth_branding(payload: Any) -> AuthBranding:
         sidebar_title=sidebar_title if isinstance(sidebar_title, str) and sidebar_title else None,
         can_edit=payload.get("can_edit") is True,
         look=_look(payload.get("appearance")),
+        look_updated_at=_text((payload.get("appearance") or {}).get("updated_at"))
+        if isinstance(payload.get("appearance"), dict)
+        else None,
     )
 
 
-_branding_cache: CallerTtlCache[AuthBranding] = CallerTtlCache(ttl_ok_s=MINDSHUB_TTL_OK_S)
+# How long a caller's last answer is served while auth can't be asked, so an
+# outage or an expired desktop session never flips the app to the stock look.
+LAST_GOOD_MAX_AGE_S = 600.0
+
+_branding_cache: CallerTtlCache[AuthBranding] = CallerTtlCache(
+    ttl_ok_s=MINDSHUB_TTL_OK_S, keep_s=LAST_GOOD_MAX_AGE_S
+)
 
 
 def _cache_key(*, bearer_token: str, org_id: str, user_id: str) -> CallerCacheKey:
     return CallerCacheKey.for_caller(org_id=org_id, user_id=user_id, bearer_token=bearer_token)
 
 
+# auth's answer for "not a member of an active organization": the only
+# refusal that means no org. Any other is unknown (AuthBranding.answer).
+_NO_ORG_STATUS = 403
+
+
 async def _read_auth_branding(bearer_token: str) -> AuthBranding:
     reply = await get_mindshub_reply(AUTH_BRANDING_PATH, bearer_token)
     if reply.answer is MindsHubAnswer.OK and isinstance(reply.payload, dict):
         return parse_auth_branding(reply.payload)
-    if reply.answer is MindsHubAnswer.REFUSED:
+    if reply.answer is MindsHubAnswer.REFUSED and reply.status_code == _NO_ORG_STATUS:
         return AuthBranding(answer=MindsHubAnswer.REFUSED)
+    if reply.answer is not MindsHubAnswer.UNREACHABLE:
+        logger.info(
+            "auth's branding read answered nothing usable",
+            extra={"event": "org_branding_read_unknown", "status": reply.status_code},
+        )
     return AuthBranding()
 
 
 async def fetch_auth_branding(*, bearer_token: str, org_id: str, user_id: str) -> AuthBranding:
     """The caller's current org's branding from auth, read with their own
-    credential and cached per caller. No credential is no org. Never raises."""
+    credential and cached per caller. No credential is no org. When auth
+    can't be asked the caller's last answer (at most LAST_GOOD_MAX_AGE_S
+    old) comes back ``stale``, else an UNREACHABLE answer; neither is cached,
+    so the next read asks again. Never raises."""
     if not bearer_token:
-        return AuthBranding(answer=MindsHubAnswer.REFUSED)
+        return AuthBranding(answer=MindsHubAnswer.REFUSED, fresh=True)
     key = _cache_key(bearer_token=bearer_token, org_id=org_id, user_id=user_id)
     cached = _branding_cache.fresh(key)
     if cached is not None:
-        return cached
+        return replace(cached, fresh=False, stale=False)
     value = await _read_auth_branding(bearer_token)
-    _branding_cache.put(key, value)
+    if value.reachable:
+        _branding_cache.put(key, value)
+        return replace(value, fresh=True)
+    last = _branding_cache.answered_within(key, max_age_s=LAST_GOOD_MAX_AGE_S)
+    if last is not None:
+        return replace(last, fresh=False, stale=True)
     return value
 
 
@@ -331,8 +374,10 @@ async def update_auth_appearance(
     else:
         # A PATCH that answers less than the whole body: read it again.
         value = await _read_auth_branding(bearer_token)
+    if not value.reachable:
+        raise AuthAppearanceError(502, APPEARANCE_UNREACHABLE)
     _branding_cache.put(_cache_key(bearer_token=bearer_token, org_id=org_id, user_id=user_id), value)
-    return value
+    return replace(value, fresh=True)
 
 
 def fixed_image_url(url: str | None) -> str | None:
@@ -563,26 +608,40 @@ def _current_text(path: Path) -> str | None:
         return None
 
 
-def _is_ours(skill_dir: Path) -> bool:
-    """Whether the folder holds the generated skill (META_MANAGED_BY). On a
-    local server a person's own skill may already be named
-    BRAND_GUIDELINES_SLUG; it is never overwritten or removed."""
+def _generated(skill_dir: Path) -> Skill | None:
+    """The generated skill in ``skill_dir``, or None when the folder holds
+    none, or holds a skill nobody generated: only META_MANAGED_BY, which
+    this module writes, marks it, in every mode. A person's own skill named
+    BRAND_GUIDELINES_SLUG (it is a natural name, and the name was free
+    before branding) is never overwritten, removed or shared."""
     skill = _skill_from_dir(skill_dir) if (skill_dir / SKILL_FILE).exists() else None
-    return skill is not None and skill.metadata.get(META_MANAGED_BY) == BRAND_GUIDELINES_MANAGER
+    if skill is None or skill.metadata.get(META_MANAGED_BY) != BRAND_GUIDELINES_MANAGER:
+        return None
+    return skill
+
+
+def _is_ours(skill_dir: Path) -> bool:
+    return _generated(skill_dir) is not None
+
+
+def _skip_taken_name(service: SkillService) -> BrandSkillSync:
+    logger.info(
+        "Leaving a skill named %s alone: it isn't the generated one",
+        BRAND_GUIDELINES_SLUG,
+        extra={"event": "org_branding_skill_name_taken", "hosted": service.org_sharing},
+    )
+    return BrandSkillSync(present=False, changed=False)
 
 
 def remove_brand_skill(scope: TenantScope | None, session: ScopedSession | None = None) -> bool:
     """Take the generated skill out of ``scope``'s store, and in hosted org
-    mode its skill_access row. Returns whether anything was removed. A
-    local folder that isn't ours is left alone."""
+    mode its skill_access row with it. Returns whether anything was removed.
+    A folder that isn't the generated one, and its row, are left alone."""
     service = SkillService(scope)
     skill_dir = service.root / BRAND_GUIDELINES_SLUG
-    changed = False
-    # In hosted org mode the name is reserved for it, so the folder is ours
-    # whether or not an earlier build marked it.
-    if skill_dir.exists() and (service.org_sharing or _is_ours(skill_dir)):
-        service._rmtree_direct_child(service.root, BRAND_GUIDELINES_SLUG, ignore_errors=True)
-        changed = True
+    if not _is_ours(skill_dir):
+        return False
+    service._rmtree_direct_child(service.root, BRAND_GUIDELINES_SLUG, ignore_errors=True)
     if service.org_sharing and session is not None and access_row(session, BRAND_GUIDELINES_SLUG) is not None:
         try:
             stage_delete(session, BRAND_GUIDELINES_SLUG)
@@ -590,8 +649,31 @@ def remove_brand_skill(scope: TenantScope | None, session: ScopedSession | None 
         except Exception:
             session.rollback()
             raise
-        changed = True
-    return changed
+    return True
+
+
+def _stamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _older_than_the_skill(branding: AuthBranding, current: Skill | None) -> bool:
+    """Whether ``branding``'s look is older than the one the generated skill
+    was last written from (META_BRAND_LOOK_UPDATED_AT): a read that started
+    before an admin's save and ended after it. An answer with no stamp is
+    older than any stamp."""
+    if current is None:
+        return False
+    recorded = _stamp(current.metadata.get(META_BRAND_LOOK_UPDATED_AT))
+    if recorded is None:
+        return False
+    answered = _stamp(branding.look_updated_at)
+    return answered is None or answered < recorded
 
 
 def sync_brand_skill(
@@ -599,16 +681,31 @@ def sync_brand_skill(
 ) -> BrandSkillSync:
     """Make the Brand guidelines skill of ``scope``'s store match the org's
     branding: written when the org has some, removed when it has none, and
-    on a local server when the caller has no org. Writes only what changed, so calling it on
-    every read is cheap. An answer from auth that isn't known changes
-    nothing: unknown images must not take the logo out of the skill.
+    on a local server when the caller has no org. Writes only what changed,
+    so calling it on every read is cheap.
+
+    Nothing changes unless ``branding`` is fresh (read now, or the admin's
+    own write) and known: a cached answer may be older than an admin's
+    save, and unknown images must not take the logo out of the skill. An
+    answer whose look is older than the one the skill records
+    (META_BRAND_LOOK_UPDATED_AT) changes nothing either. A skill of that
+    name that this module didn't generate (no META_MANAGED_BY) is never
+    touched, in any mode: generation is skipped and logged.
 
     In hosted org mode ``session`` stages and commits the skill's
     skill_access row (everyone, always on). On a local server it is an
-    ordinary skill, recalled on demand, and a person's own skill of the same
-    name is left as it is.
+    ordinary skill, recalled on demand.
     """
     service = SkillService(scope)
+    if not branding.fresh:
+        # A cached or last-known answer: up to 60 s old for a member, older
+        # still in an outage. Only an answer read now (or the admin's own
+        # write) may change what every turn reads.
+        return BrandSkillSync(present=False, changed=False)
+    skill_dir = service.root / BRAND_GUIDELINES_SLUG
+    if skill_dir.exists() and not _is_ours(skill_dir):
+        return _skip_taken_name(service)
+    current = _generated(skill_dir)
     if branding.answer is MindsHubAnswer.REFUSED:
         # No org for this caller. On a local server that is the person's own
         # store: signed out, or in a personal account. In hosted org mode one
@@ -618,27 +715,23 @@ def sync_brand_skill(
         return BrandSkillSync(present=False, changed=remove_brand_skill(scope, session))
     if not branding.known:
         return BrandSkillSync(present=False, changed=False)
+    if _older_than_the_skill(branding, current):
+        logger.info(
+            "Not writing an older look over the Brand guidelines skill",
+            extra={"event": "org_branding_skill_older_answer"},
+        )
+        return BrandSkillSync(present=current is not None, changed=False)
     if not has_brand_content(branding):
         return BrandSkillSync(present=False, changed=remove_brand_skill(scope, session))
 
-    skill_dir = service.root / BRAND_GUIDELINES_SLUG
-    if not service.org_sharing and skill_dir.exists() and not _is_ours(skill_dir):
-        logger.info(
-            "Leaving a local skill named %s alone: it isn't the generated one",
-            BRAND_GUIDELINES_SLUG,
-            extra={"event": "org_branding_skill_name_taken"},
-        )
-        return BrandSkillSync(present=False, changed=False)
-
     description, body, extra = render_brand_skill(branding)
     changed = False
-    current = _skill_from_dir(skill_dir) if (skill_dir / SKILL_FILE).exists() else None
     if (
         current is None
         or current.description != description
         or current.instructions.strip() != body.strip()
         or current.display_name != BRAND_SKILL_DISPLAY_NAME
-        or current.metadata.get(META_MANAGED_BY) != BRAND_GUIDELINES_MANAGER
+        or current.metadata.get(META_BRAND_LOOK_UPDATED_AT) != (branding.look_updated_at or None)
     ):
         created_at = (
             current.metadata.get(META_CREATED_AT) if current is not None else None
@@ -651,6 +744,11 @@ def sync_brand_skill(
                 META_DISPLAY_NAME: BRAND_SKILL_DISPLAY_NAME,
                 META_CREATED_AT: created_at,
                 META_MANAGED_BY: BRAND_GUIDELINES_MANAGER,
+                **(
+                    {META_BRAND_LOOK_UPDATED_AT: branding.look_updated_at}
+                    if branding.look_updated_at
+                    else {}
+                ),
             },
         )
         service._write(skill, reconcile=False)

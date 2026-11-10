@@ -682,10 +682,8 @@ class UserSettings(Settings):
         title="Auto Pin",
         description="Automatically pin important items.",
     )
-    # Off by default: the animated background is opt-in. Only a person with
-    # no stored value gets the default; a stored true stays on.
     show_dots: bool = Field(
-        default=False,
+        default=True,
         title="Show Dots",
         description="Show dot grid background.",
     )

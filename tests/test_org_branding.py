@@ -1,4 +1,4 @@
-"""Organization branding (ENG-4020): a pass-through to auth, which owns the
+"""Organization branding: a pass-through to auth, which owns the
 org look, and the Brand guidelines skill generated from auth's answer.
 
 Handlers are called directly, the suite's convention for org routes. auth is
@@ -40,6 +40,7 @@ from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
 from cowork.services.skill_access import access_row
 from cowork.services.skill_sharing import SkillViewer
 from cowork.services.skills import (
+    BRAND_GUIDELINES_NAME_RESERVED,
     BRAND_GUIDELINES_REFUSAL,
     BRAND_GUIDELINES_SLUG,
     SkillService,
@@ -325,11 +326,51 @@ def test_no_org_for_the_caller_is_enabled_false(org):
     }
 
 
-def test_auth_unreachable_is_the_stock_look_and_still_answers(org):
-    org.auth.get_answer = MindsHubReply(MindsHubAnswer.UNREACHABLE)
+def _expire_cache(monkeypatch, seconds: float = 120.0) -> None:
+    """Move the cache's clock past the 60 s TTL (still within the last-good window)."""
+    from cowork.services import mindshub_client
+
+    now = mindshub_client.time.monotonic()
+    monkeypatch.setattr(mindshub_client.time, "monotonic", lambda: now + seconds)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        MindsHubReply(MindsHubAnswer.UNREACHABLE),
+        MindsHubReply(MindsHubAnswer.UNREACHABLE, status_code=502),
+        MindsHubReply(MindsHubAnswer.THROTTLED, status_code=429),
+        MindsHubReply(MindsHubAnswer.REFUSED, status_code=401),
+        MindsHubReply(MindsHubAnswer.REFUSED, status_code=404),
+    ],
+)
+def test_an_unknown_read_with_nothing_cached_is_a_503_not_the_stock_look(org, reply):
+    org.auth.get_answer = reply
+    _refused(lambda: _get(org, ALICE), 503, ep.READ_UNREACHABLE)
+
+
+@pytest.mark.parametrize("status_code", [401, 404, 502])
+def test_an_unknown_read_serves_the_callers_last_answer(org, monkeypatch, status_code):
+    _set_look(org.auth, accent="#0055ff")
+    assert _get(org, ALICE)["appearance"]["accent"] == "#0055ff"
+    _expire_cache(monkeypatch)
+    answer = MindsHubAnswer.UNREACHABLE if status_code >= 500 else MindsHubAnswer.REFUSED
+    org.auth.get_answer = MindsHubReply(answer, status_code=status_code)
     out = _get(org, ALICE)
-    assert (out["enabled"], out["iconUrl"], out["sidebarTitle"], out["canEdit"]) == (True, None, "MindsHub", False)
-    assert out["appearance"]["sidebarTitleMode"] == "company"
+    assert (out["enabled"], out["appearance"]["accent"], out["logoUrl"]) == (True, "#0055ff", BRANDING["logo_url"])
+
+
+def test_a_failed_read_isnt_cached(org):
+    org.auth.get_answer = MindsHubReply(MindsHubAnswer.REFUSED, status_code=401)
+    _refused(lambda: _get(org, ALICE), 503)
+    org.auth.get_answer = None
+    assert _get(org, ALICE)["enabled"] is True
+    assert len(org.auth.gets()) == 2
+
+
+def test_only_auths_403_is_no_org(org):
+    org.auth.get_answer = MindsHubReply(MindsHubAnswer.REFUSED, status_code=403)
+    assert _get(org, ALICE)["enabled"] is False
 
 
 def test_the_read_is_cached_per_caller(org):
@@ -557,12 +598,98 @@ def test_hosted_no_branding_removes_the_skill(org):
 def test_hosted_a_members_refused_or_unknown_read_leaves_the_org_skill(org):
     _get(org, ALICE)
     before = _skill_md(_org_scope(org))
-    for answer in (MindsHubReply(MindsHubAnswer.REFUSED, status_code=403), MindsHubReply(MindsHubAnswer.UNREACHABLE)):
+    for answer in (
+        MindsHubReply(MindsHubAnswer.REFUSED, status_code=403),
+        MindsHubReply(MindsHubAnswer.REFUSED, status_code=401),
+        MindsHubReply(MindsHubAnswer.REFUSED, status_code=404),
+        MindsHubReply(MindsHubAnswer.UNREACHABLE),
+    ):
         org.auth.get_answer = answer
         org_branding._branding_cache.clear()
-        _get(org, ALICE)
+        try:
+            _get(org, ALICE)
+        except HTTPException as unknown:
+            assert unknown.status_code == 503
         assert _skill_md(_org_scope(org)) == before
     assert access_row(org.as_(ALICE), BRAND_GUIDELINES_SLUG) is not None
+
+
+# ── a member's own skill named brand-guidelines ──────────────────────────────
+
+
+def _members_own_skill(scope, extra_file: str | None = None) -> None:
+    from anton.core.tools.skill_format import dump_skill
+
+    skill_dir = _skill_dir(scope)
+    skill_dir.mkdir(parents=True)
+    mine = Skill(name=BRAND_GUIDELINES_SLUG, description="Mine", instructions="My own rules.")
+    (skill_dir / "SKILL.md").write_text(dump_skill(mine))
+    if extra_file:
+        (skill_dir / "notes.md").write_text(extra_file)
+
+
+@pytest.mark.parametrize("branding", [BRANDING, NO_BRANDING], ids=["org-has-branding", "org-has-none"])
+def test_hosted_a_members_existing_skill_of_that_name_is_never_touched_or_shared(org, branding):
+    from cowork.services.skill_access import stage_only_owner
+
+    _members_own_skill(_org_scope(org), extra_file="Private notes.")
+    session = org.as_(ALICE)
+    stage_only_owner(session, slug=BRAND_GUIDELINES_SLUG, owner_user_id=ALICE)
+    session.commit()
+    before = _skill_md(_org_scope(org))
+    org.auth.branding = copy.deepcopy(branding)
+
+    _get(org, ADMIN)
+    _put(org, ADMIN, accent="#0055ff")
+
+    assert _skill_md(_org_scope(org)) == before
+    assert (_skill_dir(_org_scope(org)) / "notes.md").read_text() == "Private notes."
+    row = access_row(org.as_(ALICE), BRAND_GUIDELINES_SLUG)
+    assert (row.org_allowed, row.always_on, str(row.owner_user_id)) == (False, False, ALICE)
+    # Still hers to change, and in nobody else's turns.
+    edited = skills_ep._update_skill(
+        org.as_(ALICE), skill_id=BRAND_GUIDELINES_SLUG, body=SkillUpdateRequest(instructions="My newer rules."),
+        principal=_principal(ALICE), viewer=_viewer(ALICE),
+    )
+    assert edited["declarative"] == "My newer rules."
+    assert BRAND_GUIDELINES_SLUG not in build_turn_skills(
+        org.as_(ADMIN).scope, project_name="general", viewer=_viewer(ADMIN, admin=True), session=org.as_(ADMIN)
+    )
+
+
+# ── a stale answer never writes over a newer one ─────────────────────────────
+
+
+def test_a_members_cached_answer_doesnt_write_over_an_admins_save(org):
+    _set_look(org.auth, accent="#0055ff", guidelines="Old guidelines.")
+    org.auth.branding["appearance"]["updated_at"] = "2026-11-10T10:00:00+00:00"
+    _get(org, ALICE)  # Alice's answer is cached with the old look.
+    # The admin saves new guidelines; auth's look moves on.
+    org.auth.branding["appearance"]["updated_at"] = "2026-11-10T10:00:30+00:00"
+    _put(org, ADMIN, _request(OTHER_BEARER), guidelines="New guidelines.")
+    assert "New guidelines." in _skill_md(_org_scope(org))
+    # Alice opens Settings 5 s later, answered from her cache.
+    _get(org, ALICE)
+    assert "New guidelines." in _skill_md(_org_scope(org))
+
+
+def test_a_fresh_read_that_answers_an_older_look_doesnt_write_over_a_newer_one(org):
+    _set_look(org.auth, accent="#0055ff", guidelines="New guidelines.")
+    org.auth.branding["appearance"]["updated_at"] = "2026-11-10T10:00:30+00:00"
+    _get(org, ADMIN)
+    assert "brand_look_updated_at: '2026-11-10T10:00:30+00:00'" in _skill_md(_org_scope(org)) or (
+        "brand_look_updated_at: 2026-11-10T10:00:30+00:00" in _skill_md(_org_scope(org))
+    )
+    # A read that began before the save answers the older look.
+    org.auth.branding["appearance"].update(guidelines="Old guidelines.", updated_at="2026-11-10T10:00:00+00:00")
+    org_branding._branding_cache.clear()
+    _get(org, ALICE)
+    assert "New guidelines." in _skill_md(_org_scope(org))
+    # A newer look is taken.
+    org.auth.branding["appearance"].update(guidelines="Newest guidelines.", updated_at="2026-11-10T10:01:00+00:00")
+    org_branding._branding_cache.clear()
+    _get(org, ALICE)
+    assert "Newest guidelines." in _skill_md(_org_scope(org))
 
 
 def test_hosted_an_unchanged_skill_is_not_rewritten(org):
@@ -607,7 +734,7 @@ def test_hosted_nobody_edits_renames_deletes_or_shares_the_skill_as_a_skill(org)
     assert (skill["access"]["alwaysOn"], skill["name"]) == (True, "Brand guidelines")
 
 
-def test_hosted_the_name_stays_reserved_with_no_branding(org):
+def test_hosted_a_new_skill_cant_take_the_name(org):
     org.auth.branding = copy.deepcopy(NO_BRANDING)
     _get(org, ALICE)
     _refused(
@@ -615,7 +742,7 @@ def test_hosted_the_name_stays_reserved_with_no_branding(org):
             org.as_(ALICE), body=SkillCreateRequest(label=BRAND_GUIDELINES_SLUG, instructions="Mine."),
             principal=_principal(ALICE), viewer=_viewer(ALICE),
         ),
-        403, BRAND_GUIDELINES_REFUSAL,
+        403, BRAND_GUIDELINES_NAME_RESERVED,
     )
 
 
@@ -739,18 +866,29 @@ def test_desktop_sign_out_removes_the_skill(desktop):
 
 
 def test_desktop_a_persons_own_skill_of_that_name_is_left_alone(desktop):
-    from anton.core.tools.skill_format import dump_skill
-
-    skill_dir = _skill_dir(LOCAL_SCOPE)
-    skill_dir.mkdir(parents=True)
-    mine = Skill(name=BRAND_GUIDELINES_SLUG, description="Mine", instructions="My own rules.")
-    (skill_dir / "SKILL.md").write_text(dump_skill(mine))
+    _members_own_skill(LOCAL_SCOPE)
     _desktop_get(desktop, _request(hub=HUB_BEARER))
     assert "My own rules." in _skill_md(LOCAL_SCOPE)
+    for gone in (copy.deepcopy(NO_BRANDING),):
+        desktop.auth.branding = gone
+        org_branding._branding_cache.clear()
+        _desktop_get(desktop, _request(hub=HUB_BEARER))
     _desktop_get(desktop, _request())
+    settings_ep.logout_clear_credentials(desktop.raw(), LOCAL_SCOPE)
     assert "My own rules." in _skill_md(LOCAL_SCOPE)
     # Not the generated skill, so it stays the person's to change.
     assert SkillService(LOCAL_SCOPE).is_brand_guidelines(BRAND_GUIDELINES_SLUG) is False
+
+
+def test_desktop_an_expired_session_keeps_the_skill_and_the_look(desktop, monkeypatch):
+    _set_look(desktop.auth, accent="#0055ff")
+    _desktop_get(desktop, _request(hub=HUB_BEARER))
+    before = _skill_md(LOCAL_SCOPE)
+    _expire_cache(monkeypatch)
+    desktop.auth.get_answer = MindsHubReply(MindsHubAnswer.REFUSED, status_code=401)
+    out = _desktop_get(desktop, _request(hub=HUB_BEARER))
+    assert (out["enabled"], out["appearance"]["accent"]) == (True, "#0055ff")
+    assert _skill_md(LOCAL_SCOPE) == before
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

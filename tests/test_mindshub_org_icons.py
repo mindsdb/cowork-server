@@ -1,4 +1,4 @@
-"""GET /hub/org-icons (ENG-4020): the caller's organizations' icons, read
+"""GET /hub/org-icons: the caller's organizations' icons, read
 from auth's GET /v1/organizations/available/ with the caller's own
 credential, for the org switcher. auth is stubbed at get_mindshub_reply."""
 
@@ -140,9 +140,19 @@ def test_auth_unreachable_is_reachable_false(org_deployment, auth):
     assert _get(_request(SESSION), _hosted()) == {"reachable": False, "orgs": []}
 
 
-def test_auth_refusing_is_no_orgs_reachable(org_deployment, auth):
-    auth.reply = MindsHubReply(MindsHubAnswer.REFUSED, status_code=401)
+def test_auths_403_is_no_orgs_reachable(org_deployment, auth):
+    auth.reply = MindsHubReply(MindsHubAnswer.REFUSED, status_code=403)
     assert _get(_request(SESSION), _hosted()) == {"reachable": True, "orgs": []}
+
+
+@pytest.mark.parametrize("status_code", [401, 404, 429])
+def test_any_other_refusal_is_unknown_and_not_cached(org_deployment, auth, status_code):
+    answer = MindsHubAnswer.THROTTLED if status_code == 429 else MindsHubAnswer.REFUSED
+    auth.reply = MindsHubReply(answer, status_code=status_code)
+    assert _get(_request(SESSION), _hosted()) == {"reachable": False, "orgs": []}
+    auth.reply = MindsHubReply(MindsHubAnswer.OK, payload=AVAILABLE, status_code=200)
+    assert _get(_request(SESSION), _hosted()) == EXPECTED
+    assert len(auth.calls) == 2
 
 
 def test_the_answer_is_cached_per_caller(org_deployment, auth):

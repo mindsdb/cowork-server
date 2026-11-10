@@ -346,7 +346,7 @@ def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     if scope.org_mode:
         return {"ok": True, "deleted": []}
     deleted = SettingService(session, scope).clear_credentials()
-    # The org's Brand guidelines skill was the signed-in org's (ENG-4020).
+    # The org's Brand guidelines skill was the signed-in org's.
     try:
         remove_brand_skill(scope)
     except Exception:

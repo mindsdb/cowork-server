@@ -1,4 +1,4 @@
-"""Wire shapes for an organization's branding (ENG-4020).
+"""Wire shapes for an organization's branding.
 
 ``GET /api/v1/org-branding`` answers OrgBrandingView in camelCase. ``PUT
 /api/v1/org-branding/appearance`` takes OrgAppearanceUpdate in snake_case
@@ -62,11 +62,11 @@ class OrgAppearanceView(CamelResponse):
 class OrgBrandingView(CamelResponse):
     """What the app reads on startup, org switch, sign-in and when Settings
     opens. ``enabled`` is false, and the rest null, without a MindsHub org:
-    no credential, or auth refused (no current org). The image URLs are
-    auth's (absolute, with ``?v=<hash>``). ``sidebar_title`` is auth's
+    no credential, or auth's 403 (no current org). The image URLs are
+    auth's, absolute https (with ``?v=<hash>``). ``sidebar_title`` is auth's
     resolved title: the company name, the custom text, or null for no title
-    (only the logo). ``can_edit`` is auth's ``can_edit``. When auth couldn't
-    be asked the look is stock and the title "MindsHub"."""
+    (only the logo). ``can_edit`` is auth's ``can_edit``. When auth can't be
+    asked the caller's last answer is served, or the route answers 503."""
 
     enabled: bool = False
     org_name: str | None = None

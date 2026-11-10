@@ -1,4 +1,4 @@
-"""org_appearance.sidebar_title: the org's sidebar title (ENG-4020)
+"""org_appearance.sidebar_title: the org's sidebar title
 
 d4b7e2a9c1f3 was edited after a deployed environment had already run it, so
 a database there is at d4b7e2a9c1f3 with an org_appearance table that has no

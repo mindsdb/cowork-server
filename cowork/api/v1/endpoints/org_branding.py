@@ -1,11 +1,15 @@
-"""An organization's branding for the Cowork app (ENG-4020): a pass-through
+"""An organization's branding for the Cowork app: a pass-through
 to auth, which owns it.
 
 ``GET /org-branding``: auth's ``GET /v1/organizations/current/branding/``,
 read with the caller's own credential and cached per caller for at most 60 s
 (cowork.services.org_branding.fetch_auth_branding), answered in camelCase.
 No credential, or auth answering that the caller has no current org, is
-``enabled: false``. auth unreachable is a 200 with the stock look.
+``enabled: false``; only auth's 403 says the caller has no current org.
+When auth can't be asked (no answer, a 5xx, a throttle, a 401 or a 404)
+the caller's last answer is served for up to 10 minutes, and without one
+the route answers 503, which the app takes as "keep the look you have",
+so an outage or an expired session never flips the look to stock.
 
 ``PUT /org-branding/appearance``: the snake_case body (camelCase too)
 passed to auth's ``PATCH /v1/organizations/current/branding/appearance/``,
@@ -47,6 +51,7 @@ from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.units import run_efs_unit
 from cowork.principal import hub_credential_for, is_session_jwt
 from cowork.schemas.org_branding import OrgAppearanceUpdate, OrgAppearanceView, OrgBrandingView
+from cowork.services.mindshub_client import MindsHubAnswer
 from cowork.services.org_branding import (
     AuthAppearanceError,
     AuthBranding,
@@ -62,6 +67,7 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 SIGN_IN_TO_EDIT = "Sign in to MindsHub to change branding."
+READ_UNREACHABLE = "Couldn't reach MindsHub for the organization's branding. Try again."
 
 
 def _credential(request: Request, scope: TenantScope) -> str:
@@ -126,6 +132,11 @@ def _settle(scoped: ScopedSession, *, branding: AuthBranding) -> dict:
 @router.get("", response_model=OrgBrandingView)
 async def get_org_branding(request: Request, scope: ScopeDep):
     branding = await fetch_auth_branding(bearer_token=_credential(request, scope), **_who(scope))
+    if branding.answer is MindsHubAnswer.UNREACHABLE:
+        # auth couldn't be asked and there is no recent answer to serve. A
+        # 503, which the app takes as "keep the look you have", rather than
+        # the stock look or enabled: false, which would flip it.
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=READ_UNREACHABLE)
     return await run_efs_unit(partial(_settle, branding=branding), scope=scope)
 
 

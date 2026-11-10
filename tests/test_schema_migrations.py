@@ -60,7 +60,7 @@ def _alembic_versions(path) -> set[str]:
 # staging revision after 2a366c1f4b9f leaves it stamped.
 MAINS_OWNER_INDEX = "599bf4bf0370"
 
-# ENG-4020's org_appearance branch head (it drops the table), on its own
+# The org_appearance branch head (it drops the table), on its own
 # branch off c69488788ac7 until e2a7c4f9b613 merges it with staging's
 # f93151b5bad1. A downgrade to a revision on staging's side of that merge
 # leaves it stamped.
