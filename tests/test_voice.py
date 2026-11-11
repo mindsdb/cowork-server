@@ -55,8 +55,22 @@ async def test_starts_a_gpt_live_session_as_the_caller_with_the_fixed_session(in
     assert str(request.url) == "https://api-pr-cowork-1.dev.mindshub.ai/v1/live/sessions"
     assert request.headers["Authorization"] == BEARER
     body = json.loads(request.content)
-    assert body["session"] == {"model": "gpt-live-1", "instructions": voice.VOICE_PROMPT, "delegation": {"type": "client"}}
+    assert body["session"] == {
+        "model": "gpt-live-1",
+        "instructions": voice.VOICE_PROMPT,
+        "delegation": {"type": "client"},
+        "audio": {"output": {"voice": "marin"}},
+    }
     assert body["transport"] == {"type": "webrtc", "sdp": "offer-sdp"}
+
+
+@pytest.mark.parametrize(("asked", "sent"), [("willow", "willow"), ("cedar", "cedar"), ("not-a-voice", "marin")])
+async def test_the_session_speaks_in_the_chosen_voice_or_the_default(inference, asked, sent):
+    started = await _call("POST", "/session", json={"sdp": "offer-sdp", "voice": asked})
+
+    assert started.status_code == 200, started.text
+    [request] = inference.seen
+    assert json.loads(request.content)["session"]["audio"] == {"output": {"voice": sent}}
 
 
 @pytest.mark.parametrize(

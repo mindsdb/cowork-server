@@ -25,6 +25,7 @@ router = APIRouter()
 
 class VoiceSessionRequest(BaseModel):
     sdp: str = Field(min_length=1, max_length=voice.MAX_SDP_CHARS)
+    voice: str | None = Field(default=None, max_length=32)
 
 
 class VoiceOperateRequest(BaseModel):
@@ -40,7 +41,7 @@ async def voice_status(request: Request) -> voice.VoiceStatus:
 @router.post("/session", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def voice_session(body: VoiceSessionRequest, request: Request) -> dict:
     try:
-        return await voice.start_session(mindshub_credential(request), body.sdp)
+        return await voice.start_session(mindshub_credential(request), body.sdp, body.voice)
     except voice.VoiceError as exc:
         raise HTTPException(status_code=exc.status, detail={"code": exc.code, "message": exc.message}) from exc
 

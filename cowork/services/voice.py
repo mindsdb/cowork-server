@@ -39,6 +39,15 @@ MODEL = "gpt-live-1"
 # An SDP offer is a few KB.
 MAX_SDP_CHARS = 64_000
 
+# GPT-Live's voices, by API name. A session's voice is set when it starts and
+# can't change during it, so the app starts a new session to switch voices.
+DEFAULT_VOICE = "marin"
+VOICES = frozenset({
+    "marin", "cedar",
+    "quartz", "ripple", "vesper", "willow", "stone", "gleam", "meridian", "beacon", "delta", "cinder",
+    "bossa", "tempo", "nuri", "juni", "flitz", "brise", "sillage", "nira", "harema", "shida", "noeul",
+})
+
 VOICE_PROMPT = (
     "You are Anton, the user's coworker in MindsHub Cowork, on a voice call with them. Cowork is where they get "
     "work done with you: you analyze their data, research, write documents, browse websites and work with the "
@@ -107,9 +116,14 @@ async def available(bearer: str) -> bool:
     return on
 
 
-def session_body(sdp: str) -> dict[str, Any]:
+def session_body(sdp: str, voice: str | None = None) -> dict[str, Any]:
     return {
-        "session": {"model": MODEL, "instructions": VOICE_PROMPT, "delegation": {"type": "client"}},
+        "session": {
+            "model": MODEL,
+            "instructions": VOICE_PROMPT,
+            "delegation": {"type": "client"},
+            "audio": {"output": {"voice": voice if voice in VOICES else DEFAULT_VOICE}},
+        },
         "transport": {"type": "webrtc", "sdp": sdp},
     }
 
@@ -121,7 +135,7 @@ _REFUSALS = {
 }
 
 
-async def start_session(bearer: str, sdp: str) -> dict:
+async def start_session(bearer: str, sdp: str, voice: str | None = None) -> dict:
     """GPT-Live's answer for the browser's SDP offer: ``{session: {id}, transport: {type, sdp}}``."""
     if not bearer:
         raise VoiceError(401, "unauthorized", "Sign in to MindsHub to start a voice call.")
@@ -130,7 +144,7 @@ async def start_session(bearer: str, sdp: str) -> dict:
     try:
         async with _client() as client:
             response = await asyncio.wait_for(
-                client.post(live_sessions_url(), json=session_body(sdp), headers={"Authorization": f"Bearer {bearer}"}),
+                client.post(live_sessions_url(), json=session_body(sdp, voice), headers={"Authorization": f"Bearer {bearer}"}),
                 _TIMEOUT_S,
             )
     except Exception as exc:
