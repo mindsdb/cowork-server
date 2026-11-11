@@ -599,8 +599,9 @@ def test_held_artifact_roots_keep_one_row_per_root_and_take_their_sentinel_on_do
     """One row per root: a project's shared root (no conversation) and each
     legacy root once. The settings row that says the backfill filled them
     goes with the table on a downgrade: left behind, a re-upgrade's list
-    would trust an empty table and show no card."""
-    from cowork.services.held_artifact_roots import SENTINEL_KEY
+    would trust an empty table and show no card. So does the backfill's
+    progress, which would let a re-upgrade's backfill skip projects."""
+    from cowork.services.held_artifact_roots import PROGRESS_KEY, SENTINEL_KEY
 
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     get_app_settings.cache_clear()
@@ -626,14 +627,15 @@ def test_held_artifact_roots_keep_one_row_per_root_and_take_their_sentinel_on_do
         with pytest.raises(IntegrityError):
             add(again)
     with engine.begin() as connection:
-        _insert_setting(connection, key=SENTINEL_KEY, value="1")
+        _insert_setting(connection, key=SENTINEL_KEY, value='{"unread": []}')
+        _insert_setting(connection, key=PROGRESS_KEY, value='{"after": null, "unread": []}')
         _insert_setting(connection, key="tone", value="balanced", scope="org", org_id=_ORG)
 
     _downgrade_to(engine, uri, "f93151b5bad1")
     with engine.connect() as connection:
         keys = {row[0] for row in connection.execute(text("SELECT key FROM settings"))}
     assert "held_artifact_roots" not in inspect(engine).get_table_names()
-    assert SENTINEL_KEY not in keys
+    assert SENTINEL_KEY not in keys and PROGRESS_KEY not in keys
     assert "tone" in keys
 
     _upgrade_to(engine, uri, "head")

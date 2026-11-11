@@ -186,7 +186,11 @@ class TaskObjectService:
         Org mode (ENG-2961, D8): only folders owned by the task's creator move,
         and their owner rows follow them. A row whose folder is already gone is
         retargeted without an ownership check or a "not moved" log line — there
-        is nothing on disk to move or to protect.
+        is nothing on disk to move or to protect. Once a folder moved, the
+        destination's shared root is held (held_artifact_roots.hold_root). A
+        failed hold is logged, and asks for the destination's location check
+        (artifact_autopublish.request_location_check), whose listing holds
+        the root.
         """
         rows = self.reconcile_conversation(conversation, source)
         if not rows:
@@ -289,6 +293,18 @@ class TaskObjectService:
                     "Could not record that project %s's artifacts folder holds an artifact", dest_id, exc_info=True,
                     extra=log_context(project_id=dest_id, conversation_id=conversation_id),
                 )
+                # The move writes no message, and the heal sweep lists only
+                # projects with a recent one, so it may never reach the
+                # destination. Ask for the destination's location check,
+                # built as a turn end builds its project's: its listing of
+                # the shared root holds the root once it finds a folder there
+                # (artifact_autopublish._record_listing). The request is an
+                # entry in an in-memory set, no file store call.
+                from cowork.services.artifact_autopublish import _project_self_heal, request_location_check
+
+                heal = _project_self_heal(artifacts_base=dest_base, scope=self.session.scope, project_id=str(dest_id))
+                if heal is not None:
+                    request_location_check(heal)
         # A published page keeps its link: .published.json moved with the
         # folder, and its owner record follows. A failed rekey is logged; the
         # owner's next publish then gets a new link, as a copy would.
@@ -386,9 +402,12 @@ def snapshot_artifact_state(artifacts_base) -> tuple[set[str], dict[str, int]]:
 
 
 class ListedLocationsUnchecked(Exception):
-    """record_new_artifacts could not check the locations of the folders a
-    full listing found (record_listed_folders). The index, owner and
-    location writes it made before that check have committed."""
+    """record_new_artifacts could not write what the project's self-heal
+    writes again (artifact_autopublish._record_listed_locations): the check
+    of the locations of the folders a full listing found
+    (record_listed_folders), or the row that holds the project's shared root
+    (held_artifact_roots.hold_root). The index, owner and location writes it
+    made besides have committed."""
 
 
 def record_new_artifacts(
@@ -412,7 +431,17 @@ def record_new_artifacts(
     and the id's next lookup moves it (record_listed_folders). That check
     runs last, and when it fails it raises ListedLocationsUnchecked, once
     the writes before it have committed, so the caller can ask for the
-    project's self-heal to check the folders again.
+    project's self-heal to check the folders again. In org mode the
+    project's shared root is held first when the turn created or listed a
+    folder there (held_artifact_roots.hold_root). A failed hold is logged,
+    and once every other write has run it raises ListedLocationsUnchecked
+    too, since the self-heal's listing holds the root again. A listing that
+    read no id but found folders it could not read holds the root as well.
+    Only a direct caller reaches that hold: the turn ends
+    (remote_turn._record_turn_artifacts and the responses handler's) call
+    this only when the turn created a folder or the listing read an id, and
+    send a listing's unread folders to the project's self-heal
+    (request_self_heal_for_unread_folders), whose listing holds the root.
 
     Two records: the `task_objects` row, and in org mode (ENG-2961) the owner
     row naming ``creator``, the conversation's creator, since a project-level
@@ -434,6 +463,8 @@ def record_new_artifacts(
         logger.warning(
             "artifact owner not recorded: conversation %s has no creator", conversation_id
         )
+    # Set when the hold below fails, which the end of this function raises.
+    hold_failed = False
     if org_mode and project_id and (slugs or (listed_ids is not None and (listed_ids.ids or listed_ids.unreadable))):
         from cowork.services.held_artifact_roots import hold_root
 
@@ -443,6 +474,7 @@ def record_new_artifacts(
         try:
             hold_root(session, project_id=project_id)
         except Exception:
+            hold_failed = True
             session.rollback()
             logger.error(
                 "Could not record that a project's artifacts folder holds an artifact",
@@ -507,6 +539,13 @@ def record_new_artifacts(
         except Exception as exc:
             session.rollback()
             raise ListedLocationsUnchecked from exc
+    if hold_failed:
+        # Without the row the artifacts list never opens the root, and only
+        # the project's next turn end would write it. Raised last, once every
+        # other write has run, so the caller can ask for the project's
+        # self-heal, whose listing holds the root
+        # (artifact_autopublish._record_listing).
+        raise ListedLocationsUnchecked
 
 
 @dataclass(frozen=True)

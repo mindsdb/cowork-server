@@ -150,15 +150,27 @@ def conversation_artifacts_base(project_path: str, conversation_id) -> Path:
     ).joinpath(*_ARTIFACTS_SUBPATH)
 
 
-def _conversation_id(child: Path) -> UUID | None:
-    """The conversation a workspace directory belongs to, or None when the name
-    is not one. Every directory this module writes is `str(conversation_id)`
-    (see `conversation_artifacts_base`), so a name that will not parse names no
-    conversation and therefore has no owner to check against."""
+def workspace_conversation_id(name: str) -> UUID | None:
+    """The conversation a workspace directory named `name` belongs to, or None
+    when the name is not one. Every directory this module writes is
+    `str(conversation_id)` (see `conversation_artifacts_base`), so only that
+    canonical spelling names a conversation. A name that will not parse names
+    none, and neither does another spelling of an id: an uppercase spelling
+    is another folder on a case-sensitive store, and one without hyphens or
+    with braces is another folder on every store, which the held rows would
+    never reach, since a row's root is rebuilt from `str(conversation_id)`
+    (recorded_source). Neither has an owner to check against."""
     try:
-        return UUID(child.name)
+        conversation_id = UUID(name)
     except ValueError:
         return None
+    return conversation_id if str(conversation_id) == name else None
+
+
+def _conversation_id(child: Path) -> UUID | None:
+    """The conversation the workspace directory `child` belongs to
+    (workspace_conversation_id)."""
+    return workspace_conversation_id(child.name)
 
 
 @dataclass(frozen=True)
@@ -202,6 +214,12 @@ class RootsPlan:
     adopted: tuple[ProjectRow, ...] = ()
     owner_filter: bool = False
     owned: frozenset[UUID] = frozenset()
+    # Set beside `held` (with_held_roots): the projects of `projects` whose
+    # roots the held-root backfill could not read (the unread list of its
+    # sentinel, held_artifact_roots.HeldRootSentinel). No row names their
+    # roots, so `discover_roots` finds them on the file store, as for a plan
+    # without `held`.
+    walk: frozenset[UUID] = frozenset()
     held: frozenset[HeldRoot] | None = None
 
 
@@ -360,15 +378,31 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
 
 def with_held_roots(session: ScopedSession, plan: RootsPlan) -> RootsPlan:
     """`plan` with the roots of its projects the held_artifact_roots rows
-    name (held_artifact_roots.held_roots), for the artifacts list. Unchanged
-    for a desktop scan, a scope that keeps no rows, or before their backfill
-    has finished. A database step: run it in a database unit."""
-    from cowork.services.held_artifact_roots import held_roots
+    name (held_artifact_roots.held_roots), for the artifacts list, and the
+    projects whose roots their backfill could not read (the unread list of
+    its sentinel, held_artifact_roots.read_sentinel), which it still walks.
+    Unchanged for a desktop scan, a scope that keeps no rows, or before
+    their backfill has finished. A database step: run it in a database
+    unit."""
+    from cowork.services.artifact_locations import keeps_locations
+    from cowork.services.held_artifact_roots import held_roots, read_sentinel
 
-    if plan.scan:
+    if plan.scan or not keeps_locations(session.scope):
         return plan
-    held = held_roots(session, project_ids=[project.id for project in plan.projects])
-    return plan if held is None else replace(plan, held=held)
+    # `walk` comes from this read of the sentinel, which comes before the
+    # rows (held_roots reads the sentinel again only to check that it is
+    # there). Another replica's pass over the unread projects commits a
+    # project's rows, then the sentinel without it: whenever it lands after
+    # this read, the project is still in `walk` and found on the file store,
+    # never left both unheld and unwalked.
+    sentinel = read_sentinel(session)
+    if sentinel is None:
+        return plan
+    project_ids = [project.id for project in plan.projects]
+    held = held_roots(session, project_ids=project_ids)
+    if held is None:
+        return plan
+    return replace(plan, held=held, walk=frozenset(sentinel.unread).intersection(project_ids))
 
 
 def _parts_below(path: Path, anchor: Path) -> tuple[str, ...]:
@@ -574,8 +608,9 @@ def discover_roots(plan: RootsPlan, *, own_only: bool = False, strict: bool = Fa
 
     With `strict`, a project root that fails to list or stat raises
     (project_roots) instead of being left out. A plan with `held` lists and
-    stats nothing: its roots are the ones `held` names
-    (_held_project_roots)."""
+    stats nothing for a project outside `walk`: its roots are the ones
+    `held` names (_held_project_roots). A project in `walk` has its roots
+    found on the file store, as without `held`."""
     from cowork.services.projects import resolved_shared_root
 
     owned = plan.owned if own_only and plan.owner_filter else None
@@ -591,7 +626,7 @@ def discover_roots(plan: RootsPlan, *, own_only: bool = False, strict: bool = Fa
     for project in plan.projects:
         if left_out_for_another_partition(project, partition=plan.partition, shared_root=shared_root):
             continue
-        if plan.held is not None:
+        if plan.held is not None and project.id not in plan.walk:
             roots += _held_project_roots(project, held=held_by_project.get(project.id, set()), owned=owned)
         else:
             roots += project_roots(project, owned=owned, strict=strict)

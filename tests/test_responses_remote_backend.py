@@ -3200,8 +3200,9 @@ async def test_a_record_of_a_remote_turn_that_lost_only_the_listed_check_says_so
     the diff listed. Either the turn created nothing, so the unit's failure
     lost only that check, or it created a folder and record_new_artifacts
     raised at the check, once that folder's rows were written
-    (ListedLocationsUnchecked). The line says the check failed, not that
-    created folders went unrecorded."""
+    (ListedLocationsUnchecked), which a failed hold of the root raises too.
+    The line names the check and the hold, not created folders gone
+    unrecorded."""
     from cowork.services import task_objects
 
     handler = _remote_handler(monkeypatch, {})
@@ -3251,7 +3252,8 @@ async def test_a_record_of_a_remote_turn_that_lost_only_the_listed_check_says_so
         if r.name == responses_mod.logger.name and r.levelno == logging.ERROR
     ]
     assert [r.getMessage() for r in errors] == [
-        "[responses] could not check the locations of the artifacts a remote turn listed",
+        "[responses] could not check the locations of the artifacts a remote turn found,"
+        " or record the folder that holds them",
     ]
     assert errors[0].exc_info[1] is error
 

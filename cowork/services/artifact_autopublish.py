@@ -16,6 +16,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -640,6 +643,11 @@ _self_heals_started_at: dict[SelfHeal, float] = {}
 # The task of each one started, so a second never runs beside it and a
 # shutdown can cancel it (cancel_self_heals).
 _self_heal_tasks: dict[SelfHeal, asyncio.Task] = {}
+# The location checks a check run inside keep_location_checks asks for, kept
+# apart from _self_heals_requested, or None outside one. A ContextVar, so
+# only the requests of the task that entered the block, and of any task it
+# starts there, land in it.
+_location_checks_kept: ContextVar[set[SelfHeal] | None] = ContextVar("_location_checks_kept", default=None)
 
 
 def request_self_heal(heal: SelfHeal) -> None:
@@ -658,8 +666,32 @@ def request_location_check(heal: SelfHeal) -> None:
     (_record_listed_locations), for a project whose locations a listing has
     to check again. The poll starts it as it starts a self-heal
     (start_due_self_heals), and it publishes nothing unless the publish is
-    asked for too (request_self_heal) before it starts."""
+    asked for too (request_self_heal) before it starts. Inside
+    keep_location_checks the request goes to that block's own set instead,
+    and the poll never sees it."""
+    kept = _location_checks_kept.get()
+    if kept is not None:
+        kept.add(heal)
+        return
     _self_heals_requested.add(heal)
+
+
+@contextmanager
+def keep_location_checks() -> Iterator[set[SelfHeal]]:
+    """Collect the location checks this task asks for inside the block
+    (request_location_check) in the set it yields, instead of asking this
+    replica's poll for them (start_due_self_heals). The heal sweep
+    (artifact_heal_sweep) runs each project's check inside it: a check that
+    asks for another has fallen short, and the sweep, not the poll, lists
+    that project again, one project at a time. The set lives in a
+    ContextVar, so a turn end or a self-heal in another task that asks for
+    the same project's self-heal during the block still reaches the poll."""
+    kept: set[SelfHeal] = set()
+    token = _location_checks_kept.set(kept)
+    try:
+        yield kept
+    finally:
+        _location_checks_kept.reset(token)
 
 
 def request_turn_end_self_heal(*, artifacts_base: Path, scope: TenantScope | None, project_id: str | None) -> None:
@@ -693,7 +725,8 @@ def request_self_heal_for_unread_folders(
     root itself: log one WARNING, and ask for the project's location check
     alone (request_location_check), so the poll lists the project again
     once SELF_HEAL_INTERVAL_S has passed since its last self-heal
-    (start_due_self_heals), and publishes nothing for it. A copy no turn end
+    (start_due_self_heals), or the heal sweep does for its own check
+    (keep_location_checks), and publishes nothing for it. A copy no turn end
     claims, in a folder the listing could not read, is then marked at the
     first listing that reads it. Asked for even when the listing found no
     id, and wherever artifacts have location rows, as
@@ -713,7 +746,7 @@ def request_self_heal_for_unread_folders(
         else {"reason": "folders_unreadable", "count": len(listing.unreadable)}
     )
     logger.warning(
-        "a full listing of a project's artifacts could not read every folder, so the project's self-heal lists it again",
+        "a full listing of a project's artifacts could not read every folder, so the project is listed again",
         extra={"event": "artifact_location_listing_unreadable", **log_context(project_id=project_id), **unread},
     )
     request_location_check(heal)

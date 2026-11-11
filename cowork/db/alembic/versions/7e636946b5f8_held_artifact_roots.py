@@ -78,13 +78,20 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Downgrade schema."""
-    # The settings row that marks the rows as complete
-    # (cowork.services.held_artifact_roots.SENTINEL_KEY, kept as a literal so
-    # this revision stands alone) goes with the rows it vouches for: left
-    # behind, a later upgrade would find it over an empty table, never fill
-    # the table again, and the list would show no card.
+    # The settings rows that mark the rows as complete and keep the
+    # backfill's progress (cowork.services.held_artifact_roots.SENTINEL_KEY
+    # and PROGRESS_KEY, kept as literals so this revision stands alone) go
+    # with the rows they vouch for. Left behind, a later upgrade would find
+    # the sentinel over an empty table and never fill it again, so the list
+    # would show no card; or a progress row would let the backfill skip the
+    # projects it names as finished, whose rows are gone.
     if _has_table("settings"):
-        op.execute(sa.text("DELETE FROM settings WHERE key = '_held_artifact_roots_backfill_v1'"))
+        op.execute(
+            sa.text(
+                "DELETE FROM settings WHERE key IN "
+                "('_held_artifact_roots_backfill_v2', '_held_artifact_roots_backfill_v2_progress')"
+            )
+        )
     if not _has_table("held_artifact_roots"):
         return
     op.drop_index("uq_held_artifact_roots_legacy", table_name="held_artifact_roots")

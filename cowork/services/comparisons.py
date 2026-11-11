@@ -30,6 +30,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import defer
 
+from cowork.common.logger import log_context
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -493,7 +494,45 @@ class ComparisonService:
             org_mode=self.session.scope.org_mode,
             copied=comparison.copied_files or {},
         )
+        self._hold_carried_workspace(side, destination)
         return work_carried and not _artifacts_left(Path(sandbox.path))
+
+    def _hold_carried_workspace(self, side: ComparisonSide, destination: Project) -> None:
+        """Record that the destination's legacy artifacts root of the side's
+        conversation holds a folder (held_artifact_roots.hold_root), when the
+        workspace the carry brought there holds one the artifacts list opens
+        (held_artifact_roots.holds_a_folder). The list trusts the rows once
+        their backfill has finished, so without the row it never opens that
+        root. A workspace with no artifacts folder gets no row. Org tenancy
+        only, where the rows are kept. Runs in the continue's file store unit,
+        after every carry, since one cut short may already have brought the
+        folder there; a retry's carry checks again. Best-effort, as the task
+        move's hold is: a failure is logged and rolled back, and the continue
+        goes on."""
+        from cowork.services.artifact_locations import keeps_locations
+        from cowork.services.artifact_roots import ProjectRow, recorded_source
+        from cowork.services.held_artifact_roots import hold_root, holds_a_folder
+
+        if not keeps_locations(self.session.scope):
+            return
+        # Plain values: a failed commit expires every loaded row.
+        project_id, conversation_id = destination.id, side.conversation_id
+        # An org project's folder is never one the user chose
+        # (ProjectService.directory_is_external).
+        row = ProjectRow(id=project_id, name=destination.name, path=destination.path, external=False)
+        try:
+            if holds_a_folder(recorded_source(row, conversation_id)):
+                hold_root(self.session, project_id=project_id, conversation_id=conversation_id)
+        except Exception:
+            self.session.rollback()
+            logger.warning(
+                "Could not record that a continued side's workspace holds an artifact folder",
+                exc_info=True,
+                extra={
+                    "event": "held_artifact_root_not_recorded",
+                    **log_context(project_id=project_id, conversation_id=conversation_id),
+                },
+            )
 
     def _remove_sandbox(self, sandbox: Project) -> None:
         _release_project_runtime(sandbox.path)

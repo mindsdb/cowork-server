@@ -1104,8 +1104,9 @@ async def test_a_record_that_lost_only_the_listed_check_says_so(monkeypatch, cap
     the diff listed. Either the turn created nothing, so the unit's failure
     lost only that check, or it created a folder and record_new_artifacts
     raised at the check, once that folder's rows were written
-    (ListedLocationsUnchecked). The line says the check failed, not that
-    created folders went unrecorded."""
+    (ListedLocationsUnchecked), which a failed hold of the root raises too.
+    The line names the check and the hold, not created folders gone
+    unrecorded."""
     import logging
 
     from cowork.db.scoped import LOCAL_SCOPE
@@ -1137,7 +1138,8 @@ async def test_a_record_that_lost_only_the_listed_check_says_so(monkeypatch, cap
     assert failure is None
     record = _artifact_record_log(caplog)
     assert (record.levelname, record.getMessage()) == (
-        "ERROR", "Could not check the locations of the artifacts a channel turn listed",
+        "ERROR",
+        "Could not check the locations of the artifacts a channel turn found, or record the folder that holds them",
     )
     assert record.exc_info[1] is error
 

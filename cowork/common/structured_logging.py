@@ -57,6 +57,11 @@ EVENT_FIELDS = frozenset(
         "attempt",
         "attempts",
         "count",
+        # A heal sweep pass's projects that fell short, and those it listed
+        # again only because an earlier pass fell short
+        # (cowork.services.artifact_heal_sweep.run_heal_sweep).
+        "failed_count",
+        "retried_count",
         # A turn request's size and the cap it was shed to fit
         # (cowork.turnqueue.producer._fit_request).
         "request_bytes",

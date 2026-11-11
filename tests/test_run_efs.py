@@ -132,33 +132,45 @@ def org_app(monkeypatch):
 
 
 @pytest.mark.parametrize("full", ["share", "slots"])
-async def test_a_refused_request_logs_the_limit_that_ran_out_and_whose_share(org_app, monkeypatch, caplog, full):
+async def test_a_refused_request_logs_the_limit_that_ran_out_and_whose_share(
+    org_app, monkeypatch, caplog, owned_logger, full
+):
     """Through the real route and the app's own 503 handler, so a refusal
     raised without its limit, or a handler that drops it, fails here. The
-    server logs through the logger setup_logging returns, cowork.common.logger."""
+    server logs through the logger setup_logging returns, cowork.common.logger.
+    The line is read as the console handler prints it, which keeps only the
+    record attributes in structured_logging.EVENT_FIELDS, so a field left out
+    of them fails here too."""
     import logging
+
+    from tests._logging_assertions import assert_log_fields
 
     alice = TenantScope(org_mode=True, org_id=ORG_UUID, user_id=ALICE_UUID)
     bob = TenantScope(org_mode=True, org_id=ORG_UUID, user_id=BOB_UUID)
     if full == "slots":
         monkeypatch.setattr(db_session.settings.storage, "efs_slots", 2)
     holder, count = (alice, db_session.settings.storage.efs_share) if full == "share" else (bob, 2)
+    logged = owned_logger("cowork.common.logger", level=logging.WARNING)
 
-    with caplog.at_level(logging.WARNING, logger="cowork.common.logger"):
-        async with holding(count, holder):
-            async with org_app as client:
-                response = await client.get(
-                    "/api/v1/artifacts/", headers={"X-User-Id": ALICE_UUID, "X-Organization-Id": ORG_UUID}
-                )
+    async with holding(count, holder):
+        async with org_app as client:
+            response = await client.get(
+                "/api/v1/artifacts/", headers={"X-User-Id": ALICE_UUID, "X-Organization-Id": ORG_UUID}
+            )
 
     assert response.status_code == 503, response.text
     [record] = [
         record for record in caplog.records
         if record.name == "cowork.common.logger" and getattr(record, "event", None) == "filesystem_busy"
     ]
+    limiter = "efs_share" if full == "share" else "run_efs"
     assert record.levelno == logging.WARNING
     assert record.route == "/api/v1/artifacts/"
-    assert (record.limiter, record.share) == ("efs_share" if full == "share" else "run_efs", ALICE_UUID)
+    assert (record.limiter, record.share) == (limiter, ALICE_UUID)
+    assert_log_fields(
+        logged.output(), log_level="WARNING", event="filesystem_busy", route="/api/v1/artifacts/",
+        limiter=limiter, share=ALICE_UUID,
+    )
 
 
 async def test_an_organizations_work_with_no_person_holds_one_share_and_leaves_slots_for_everyone():
