@@ -797,6 +797,11 @@ async def format_responses_stream(
     # What the last spent boundary set aside, returned if the turn hands back
     # instead of delivering the replacement it promised.
     superseded_stash = ""
+    # Where in `collected_text` the current answer starts: just past the last
+    # tool call. Text before a tool call is narration, which the app files as
+    # a step (ENG-3554), so a boundary sets aside only the text after it and a
+    # hand-back gives back the answer alone (ENG-4194).
+    answer_from = 0
     # Why a turn that handed back stopped (anton's `ended_by`); None if it finished.
     ended_by: str | None = None
 
@@ -872,8 +877,13 @@ async def format_responses_stream(
                 # answer it promised; if it hands back instead, the answer that
                 # was already read has to come back rather than be lost from the
                 # transcript and from the history the next turn is rebuilt from.
-                superseded_stash = "".join(collected_text)
+                # The answer the user read: the text after the last tool
+                # call, or all of it when nothing followed that call.
+                superseded_stash = "".join(collected_text[answer_from:]).lstrip("\n")
+                if not superseded_stash.strip():
+                    superseded_stash = "".join(collected_text)
                 collected_text.clear()
+                answer_from = 0
                 # The armed paragraph break belongs between two rounds of the
                 # answer being discarded, not in front of its replacement.
                 round_break = False
@@ -903,6 +913,7 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, StreamToolUseStart):
+            answer_from = len(collected_text)
             tool_names[event.id] = event.name
             tool_json_parts[event.id] = []
             if is_evidence_tool(name=event.name):
@@ -1064,6 +1075,7 @@ async def format_responses_stream(
                 superseded_pending = False
                 if superseded_stash:
                     collected_text.insert(0, superseded_stash)
+                    answer_from = 0
                     seq += 1
                     yield _event("response.answer_restore", {
                         "type": "response.answer_restore",

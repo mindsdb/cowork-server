@@ -19,6 +19,7 @@ from cowork.streaming.addons import TurnAddon
 from cowork.streaming.turn_index import TurnIndexEntry
 from cowork.turnqueue.addons import RemoteAddonResult, RemoteWithdrawResult
 from cowork.turnqueue.producer import step_stream_events
+from anton.core.llm.provider import StreamTextDelta
 from tests.test_addon_route import TARGET, _Client, _Response, _verdict
 
 CID = "00000000-0000-0000-0000-0000000000a1"
@@ -268,6 +269,74 @@ async def test_a_relayed_addon_is_streamed_and_saved_as_response_addon():
         "addon_id": ADDON_ID, "state": "read", "text": "use the sales DB", "decided_by": "user",
     }
     assert any(t == "response.addon" for t, _ in recorded)
+
+
+# A hosted turn the person added a message to, as the pod wrote it (ENG-4194):
+# captured from anton.cloud_turn's stream_turn driving a real ChatSession with
+# a scripted model. Text deltas and step lines interleave on one wire.
+_OPENING = "I'll pull the daily prices and build a compact dashboard."
+_ACK = "Got it, six months instead. I'll rebuild the dashboard."
+_FINAL = "Updated the dashboard to cover the past six months."
+
+
+def _mid_turn_pod_lines() -> list[dict]:
+    def _tool(call_id):
+        return [
+            {"kind": "tool_start", "id": call_id, "name": "scratchpad"},
+            {"kind": "tool_end", "id": call_id, "args": '{"action": "exec", "name": "main", "code": "print(1)"}'},
+        ]
+
+    def _ran(call_id):
+        return [
+            {"kind": "round_end", "stop_reason": "tool_use", "had_tool_calls": True},
+            {"kind": "progress", "phase": "scratchpad_start", "message": "Fetch prices", "id": call_id},
+            {"kind": "progress", "phase": "scratchpad_done", "message": "Fetch prices", "eta_seconds": 0.1, "id": call_id},
+            {"kind": "tool_result", "id": call_id, "name": "scratchpad", "action": "exec", "content": "{}"},
+        ]
+
+    addon = {"kind": "addon", "addon_id": ADDON_ID, "text": "actually past 6 months", "decided_by": "jev"}
+    return [
+        {"kind": "delta", "text": _OPENING},
+        *_tool("t1"),
+        {**addon, "state": "added"},
+        *_ran("t1"),
+        {**addon, "state": "read"},
+        {"kind": "progress", "phase": "reasoning_start", "message": "Thinking..."},
+        {"kind": "delta", "text": _ACK},
+        *_tool("t2"),
+        *_ran("t2"),
+        {"kind": "delta", "text": _FINAL},
+        {"kind": "round_end", "stop_reason": "end_turn", "had_tool_calls": False},
+    ]
+
+
+async def test_a_message_read_mid_turn_leaves_the_narration_before_each_tool():
+    """The app files text that a tool start follows as a step and keeps only
+    the last round as the answer (ENG-3554). A message read at a step boundary
+    must not change that: no answer reset or restore, and every narration
+    reaches the app before the tool call that ends its round."""
+    async def _events():
+        for line in _mid_turn_pod_lines():
+            if line["kind"] == "delta":
+                yield StreamTextDelta(text=line["text"])
+            else:
+                for event in step_stream_events({**line, "step": line["kind"]}):
+                    yield event
+
+    frames = []
+    async for chunk in format_responses_stream(_events(), model="m"):
+        frames += [json.loads(line[len("data:"):]) for line in chunk.splitlines() if line.startswith("data:")]
+    types = [f["type"] for f in frames]
+    assert "response.answer_reset" not in types
+    assert "response.answer_restore" not in types
+    texts = [(i, f["delta"]) for i, f in enumerate(frames) if f["type"] == "response.output_text.delta"]
+    starts = [i for i, f in enumerate(frames) if f.get("thought_role") == "thought.scratchpad.start"]
+    opening = next(i for i, d in texts if _OPENING in d)
+    ack = next(i for i, d in texts if _ACK in d)
+    final = next(i for i, d in texts if _FINAL in d)
+    assert opening < starts[0] < ack < starts[1] < final
+    read = next(i for i, f in enumerate(frames) if f["type"] == "response.addon" and f["state"] == "read")
+    assert starts[0] < read < ack
 
 
 # ── The running task, from the database ────────────────────────────────────
