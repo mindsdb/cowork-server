@@ -231,7 +231,8 @@ class TestWhyAWaitingTestEnded:
         ("?reason=declined", NOT_ALLOWED),
         ("", NOT_ALLOWED),
         ("?reason=ended", ENDED),
-    ], ids=["declined", "no-reason", "ended"])
+        ("?reason=something_newer", ENDED),
+    ], ids=["declined", "no-reason", "ended", "unknown"])
     async def test_a_waiting_private_address(self, api, saved, monkeypatch, query, text):
         monkeypatch.setattr(connector_test_run, "_RESOLVER", lambda host, port, type=None: [(None, None, None, "", ("10.0.0.5", 443))])
         [ask] = of(await connect(PLANNER_FORM, VALUES, saved), "connector.private_host_request")
