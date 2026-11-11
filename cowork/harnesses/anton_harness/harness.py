@@ -934,6 +934,7 @@ class AntonHarness:
         # Keeps the turn alive while a model call is quiet (see HarnessProvider).
         model_wait: ModelWaitTicker | None = None,
         interactive: bool = True,
+        ui_locale: str | None = None,
         # The scheduler's own turn (see HarnessProvider).
         schedule_id: str | None = None,
     ) -> AsyncIterator[str]:
@@ -1097,6 +1098,7 @@ class AntonHarness:
                 channel_context=channel_context,
                 tool_messages=tool_messages,
                 interactive=interactive,
+                ui_locale=ui_locale,
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1419,6 +1421,7 @@ class AntonHarness:
         channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
         interactive: bool = True,
+        ui_locale: str | None = None,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
         (_build_turn_session). The live-app stops its prompt tells ride on the
@@ -1433,6 +1436,7 @@ class AntonHarness:
                 channel_context=channel_context,
                 tool_messages=tool_messages,
                 interactive=interactive,
+                ui_locale=ui_locale,
                 live_app_notices=notices,
             )
         except BaseException:
@@ -1462,6 +1466,7 @@ class AntonHarness:
         tool_messages: bool,
         interactive: bool,
         live_app_notices: list[UUID],
+        ui_locale: str | None = None,
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
         records whose stop the turn's prompt tells, which the turn claimed
@@ -2035,6 +2040,10 @@ class AntonHarness:
                 # brief when the agent acts first); without it the tool hands
                 # the content to the agent. Dropped by an anton without the field.
                 **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
+                # The app's language (ENG-4149): one line in anton's prompt.
+                # Dropped by an anton without the field, which then answers
+                # in the user's language as it always has.
+                **supported_kwargs(ChatSessionConfig, ui_locale=ui_locale),
                 # The desktop app's own browser, when it registered one and the
                 # person turned the browser on: anton registers its `browser`
                 # tool only then. Never for a channel turn. Passed directly:

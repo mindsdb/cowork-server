@@ -22,6 +22,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from cowork.common.logger import exception_http_status
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
+from cowork.common.ui_locale import with_reply_language
 from cowork.deployment_identity import identity_for_turn
 from cowork.handlers.jev_route import JevRoute
 from cowork.services.providers import build_llm_client
@@ -510,7 +511,7 @@ def answer_rejection(
     return None
 
 
-async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
+async def _gate(binding: RouterBinding, *, history: list[dict], ui_locale: str | None = None) -> str | None:
     """One gating call on the router role, streamed, decided when it ends.
 
     Returns the direct answer, or None to delegate — on a tool call (as an
@@ -538,7 +539,7 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
 
     events = binding.provider.stream(
         model=binding.model,
-        system=with_deployment_identity(_SYSTEM_PROMPT),
+        system=with_reply_language(with_deployment_identity(_SYSTEM_PROMPT), ui_locale),
         messages=history,
         tools=[_DELEGATE_TOOL],
         max_tokens=_DIRECT_MAX_TOKENS,
@@ -861,6 +862,7 @@ async def decide_route(
     binding: RouterBinding | None = None,
     binding_factory: Callable[[], RouterBinding | None] | None = None,
     jev: Callable[[list[dict]], Awaitable[JevRoute]] | None = None,
+    ui_locale: str | None = None,
 ) -> RouteDecision:
     """Choose a direct answer or safe delegation.
 
@@ -950,7 +952,7 @@ async def decide_route(
                 route=DELEGATED_AGENTIC, reason="router_model_unavailable", fallback=True
             )
         try:
-            text = await _gate(binding, history=messages)
+            text = await _gate(binding, history=messages, ui_locale=ui_locale)
         except TimeoutError:
             return RouteDecision(
                 route=DELEGATED_AGENTIC,

@@ -43,6 +43,7 @@ from cowork.turnqueue.auth_keys import (
 )
 from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnJobHeader, TurnReply, TurnReplyHeader
 from cowork.streaming.cancellation import stop_controller_turn
+from cowork.streaming.liveness import WORKER_ALIVE_PHASE
 from cowork.streaming.turn_index import record_channel_turn
 from cowork.turnqueue.redis_client import (
     REDIS_BLOCK_MS,
@@ -218,7 +219,7 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
     """
     api_key = await mint_turn_key(
         user_id=user_id, org_id=org_id, correlation_id=correlation_id,
-        ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
+        ttl_seconds=settings.turn_key_lifetime_seconds, settings=settings,
         workspace_id=workspace_id,
     )
     return _build_llm_block(api_key, settings)
@@ -245,7 +246,7 @@ async def _mint_llm_block_with_turn_key_id(
         user_id=user_id,
         org_id=org_id,
         correlation_id=correlation_id,
-        ttl_seconds=settings.turn_key_ttl_seconds,
+        ttl_seconds=settings.turn_key_lifetime_seconds,
         settings=settings,
         workspace_id=workspace_id,
     )
@@ -746,6 +747,12 @@ async def _scoped_browser_block(
     return config.to_dict() if config is not None else None
 
 
+async def _revoke_turn_key_quietly(correlation_id: str) -> None:
+    """Revoke the key the routing gate minted for a turn that never runs,
+    logging rather than raising: a failed revoke leaves it to its own expiry."""
+    await _revoke_turn_key_at_turn_end(correlation_id, TurnQueueSettings())
+
+
 async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 user_id: str | None, input_text: str,
                                 model: str | None,
@@ -762,6 +769,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
                                 tool_messages: bool = False,
+                                ui_locale: str | None = None,
                                 reasoning_effort: str | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
@@ -774,6 +782,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
     user (the cowork UI does; channel turns never).
+    `ui_locale` is the app's language (cowork.common.ui_locale), which the
+    pod's anton replies in when the user's message does not say; None for a
+    turn with no request behind it.
     `workspace` is the project the turn runs in; None runs it in the org's
     default project with no project on the job.
     `skills` is the caller's visible skills, each with `always_on` set on the
@@ -897,6 +908,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # session of its own.
     jev_settings = await run_on_unit_threads(partial(get_user_settings, scope))
     jev_decisions = getattr(jev_settings, "jev_decisions_enabled", True) is not False
+    time_limit = settings.time_limit_seconds
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -910,6 +922,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # completion check then never asks it. A controller that
               # predates the field drops it, and the pod keeps Jev on.
               "jev_decisions": jev_decisions,
+              # The app's language (ENG-4149), read by anton's TurnRequestV1.
+              # Absent without one. scratchpad-controller relays it to the pod
+              # (mindsdb/scratchpad-controller#124, which merges first).
+              **({"ui_locale": ui_locale} if ui_locale else {}),
               **({"memory": memory_block} if memory_block else {}),
               # Only the skills the caller sees, and the pod's whole
               # recallable set, so always present, even empty.
@@ -933,6 +949,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # with the `llm` turn key, which _scoped_browser_block scoped to
               # this session and project. Absent when the turn has no browser.
               **({"browser": browser_block} if browser_block else {}),
+              # The turn's time limit: anton asks at it and ends with a
+              # summary, and the controller raises its backstop above it.
+              **({"limits": {"max_turn_seconds": time_limit}} if time_limit else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
               # there can derive the surface, this server's version, or its
@@ -1085,6 +1104,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                             return
                         authorized_workspace_mode = resolved_mode
                         yield "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
+                        continue
+                    if kind == "progress" and data.get("phase") == WORKER_ALIVE_PHASE:
+                        # The caller decides whether the turn has been quiet long
+                        # enough to show it; this loop only passes it on.
+                        yield "progress", {"phase": WORKER_ALIVE_PHASE}
                         continue
                     if kind == "error" or (
                         kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_history",

@@ -1249,7 +1249,7 @@ def test_the_turn_reads_the_callers_teams_with_the_gateway_credential(monkeypatc
     built: list[str] = []
 
     class _Handler:
-        def __init__(self, *, principal, mindshub_bearer):
+        def __init__(self, *, principal, mindshub_bearer, ui_locale=None):
             built.append(mindshub_bearer)
             raise RuntimeError("stop here")
 

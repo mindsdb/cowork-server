@@ -685,6 +685,15 @@ class StreamSettings(Settings):
     )
 
 
+#: auth's turn_key_max_ttl_seconds (API_KEYS__TURN_KEY_MAX_TTL_SECONDS in
+#: mindsdb/auth): the longest a turn key may live from now, at mint and at each
+#: extension. Mirrored here only to refuse a time limit whose key window auth
+#: would refuse; change both together.
+AUTH_TURN_KEY_MAX_TTL_SECONDS = 6600
+#: Kept free under that cap for clock skew between cowork-server and auth.
+AUTH_TURN_KEY_SKEW_SECONDS = 300
+
+
 class TurnQueueSettings(Settings):
     model_config = SettingsConfigDict(env_prefix="COWORK_TURN_")
 
@@ -715,12 +724,16 @@ class TurnQueueSettings(Settings):
         default=600.0,
         description=(
             "Fail a remote turn after this many seconds with no reply for it on the reply "
-            "stream (worker down, crashed, or wedged). Generous on purpose: the reply "
-            "protocol has no heartbeat, so a long tool run legitimately produces no reply "
-            "for minutes — tighten it once the pod sends one. <= 0 disables the bound, "
-            "which means an unresponsive worker leaves the turn spinning forever."
-            " An open ask_user question produces no reply either: keep this above the "
-            "pod's question timeout (ANTON_CLOUD_ASK_USER_TIMEOUT_SECONDS, 300 s)."
+            "stream (worker down, crashed, or wedged). A scratchpad-controller that relays "
+            "liveness sends a busy pod's heartbeat as a `worker_alive` progress reply once a "
+            "minute (its SCRATCHPAD_CONTROLLER__LIVENESS_RELAY_SECONDS), which counts as a "
+            "reply here, so a long tool run or an open ask_user question no longer goes "
+            "quiet; the UI also shows it as a model_wait frame after a quiet stretch, but "
+            "not over an open question. Keep this well above that interval. A controller too old to relay sends nothing during either, so until "
+            "every controller does, keep this above the longest quiet step and above the "
+            "pod's question timeout (ANTON_CLOUD_ASK_USER_TIMEOUT_SECONDS, 300 s). <= 0 "
+            "disables the bound, which means an unresponsive worker leaves the turn "
+            "spinning forever."
         ),
     )  # COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS
     auth_internal_base_url: str = Field(
@@ -734,12 +747,60 @@ class TurnQueueSettings(Settings):
     turn_key_ttl_seconds: int = Field(
         default=1200,
         description=(
-            "TTL, in seconds, of the minted per-turn MindsHub key (20 min; keep within "
-            "auth's turn_key_max_ttl_seconds). scratchpad-controller's "
-            "MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from it (TTL - 120); change "
-            "both together."
+            "TTL, in seconds, of the minted per-turn MindsHub key for a turn without a "
+            "time limit (20 min; keep within auth's turn_key_max_ttl_seconds). "
+            "scratchpad-controller's MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from "
+            "it (TTL - 120); change both together."
         ),
     )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
+    time_limit_seconds: int = Field(
+        default=0,
+        ge=0,
+        # Sized elsewhere for four 60-minute windows: scratchpad-controller's
+        # time_limited_turn_ceiling_seconds (16 800) and auth's
+        # turn_key_max_lifetime_seconds (17 100). A longer limit would end its
+        # last window on one of them, with no summary; raise those first.
+        le=3600,
+        description=(
+            "Per-turn time limit sent to the pod as params.limits.max_turn_seconds. "
+            "anton asks \"Keep going / Stop here\" at it and ends with a summary. 0 sends "
+            "none, and the turn keeps today's caps. Turn it on only where auth extends "
+            "turn keys and scratchpad-controller raises its backstop for time-limited "
+            "turns; a turn key then lives one time-limit window at a time "
+            "(turn_key_lifetime_seconds) and is extended on each \"Keep going\"."
+        ),
+    )  # COWORK_TURN_TIME_LIMIT_SECONDS
+    time_limit_key_margin_seconds: int = Field(
+        default=2400,
+        ge=0,
+        description=(
+            "How far past the time limit a turn key window reaches: the pod starts "
+            "after the key is minted, a cell that is already running finishes before "
+            "anton asks (the pod caps one cell at 15 minutes), then the summary is "
+            "written. The limit plus this must stay within auth's per-window cap "
+            "(AUTH_TURN_KEY_MAX_TTL_SECONDS) less clock-skew headroom."
+        ),
+    )  # COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS
+
+    @model_validator(mode="after")
+    def _time_limit_key_fits_auth(self) -> "TurnQueueSettings":
+        if self.time_limit_seconds > 0 and self.turn_key_lifetime_seconds > (
+            AUTH_TURN_KEY_MAX_TTL_SECONDS - AUTH_TURN_KEY_SKEW_SECONDS
+        ):
+            raise ValueError(
+                f"COWORK_TURN_TIME_LIMIT_SECONDS + COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS "
+                f"({self.turn_key_lifetime_seconds}s) must leave {AUTH_TURN_KEY_SKEW_SECONDS}s "
+                f"under auth's turn-key cap ({AUTH_TURN_KEY_MAX_TTL_SECONDS}s), or every web "
+                f"turn's key mint is refused"
+            )
+        return self
+
+    @property
+    def turn_key_lifetime_seconds(self) -> int:
+        """How long a turn key minted now, or extended now, must last."""
+        if self.time_limit_seconds > 0:
+            return self.time_limit_seconds + self.time_limit_key_margin_seconds
+        return self.turn_key_ttl_seconds
     pod_shared_mount_root: str = Field(
         default="/mnt/cowork-shared",
         description=(
