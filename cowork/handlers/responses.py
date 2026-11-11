@@ -1216,6 +1216,7 @@ class ResponsesHandler:
             # A side runs on its own pin, so the request's picks never ran there.
             conversation_service.record_turn_picks(
                 conversation=conversation, model=request.model, reasoning_effort=request.reasoning_effort,
+                reset=request.reset_picks,
             )
         # turn_id: prior message count. The current user message is NOT
         # persisted yet (deferred to the producer for the streaming path), so

@@ -224,6 +224,37 @@ def test_a_later_turn_without_a_pick_keeps_the_saved_one(client, harness):
         assert (body["model"], body["reasoningEffort"]) == ("other-model", "high")
 
 
+def test_a_turn_that_resets_a_pick_clears_it(client, harness):
+    # Model Router after a pinned model, then the default effort after Low:
+    # each turn sends no value for that pick and names it in reset_picks.
+    conv_id = _first_turn(client, harness, model="picked-model", reasoning_effort="low")
+
+    _next_turn(client, conv_id, model=None, reset_picks=["model"])
+    for body in _saved_picks(client, conv_id):
+        assert (body["model"], body["reasoningEffort"]) == (None, "low")
+
+    _next_turn(client, conv_id, reset_picks=["reasoning_effort"])
+    for body in _saved_picks(client, conv_id):
+        assert (body["model"], body["reasoningEffort"]) == (None, None)
+
+
+def test_a_pick_the_turn_sends_wins_over_its_reset(client, harness):
+    conv_id = _first_turn(client, harness, model="picked-model", reasoning_effort="low")
+
+    _next_turn(client, conv_id, model="other-model", reasoning_effort="high", reset_picks=["model", "reasoning_effort"])
+
+    for body in _saved_picks(client, conv_id):
+        assert (body["model"], body["reasoningEffort"]) == ("other-model", "high")
+
+
+def test_a_reset_names_only_known_picks(client, harness):
+    r = client.post(
+        "/api/v1/responses/",
+        json={"input": "hello", "stream": False, "reset_picks": ["harness"]},
+    )
+    assert r.status_code == 422, r.text
+
+
 def test_a_chat_with_no_picks_still_returns_none(client, harness):
     conv_id = _first_turn(client, harness)
 

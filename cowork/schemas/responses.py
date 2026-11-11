@@ -145,6 +145,10 @@ class StreamingResponse(BaseModel):
     response: Response | ResponseDelta
 
 
+# A per-conversation pick a turn can save or reset (ResponsesRequest.reset_picks).
+TurnPick = Literal["model", "reasoning_effort"]
+
+
 class ResponsesRequest(BaseModel):
     input: str | list[Message] | None = Field(
         default=None, description="Input for the responses request, either a string or a list of messages"
@@ -165,9 +169,11 @@ class ResponsesRequest(BaseModel):
     # In OpenAI's Responses API, the model is required; here it is optional.
     # When set (the composer's per-conversation model pick), it overrides the
     # account-wide planning/coding/router model settings for this turn only
-    # (see AntonHarness._apply_model_override) and is persisted onto the new
-    # conversation's Conversation.model so a reopened task remembers the pick.
-    # When omitted, the account-wide user settings govern as before.
+    # (see AntonHarness._apply_model_override). The turn also saves it as the
+    # conversation's Conversation.model (ConversationService.record_turn_picks),
+    # so a reopened task comes back on the latest pick. When omitted, the
+    # account-wide user settings govern as before, and the saved pick stays
+    # unless `reset_picks` names it.
     model: str | None = Field(
         default=None,
         description="Model name for the chat completion request"
@@ -175,15 +181,27 @@ class ResponsesRequest(BaseModel):
     # The composer's per-task reasoning-effort pick — mirrors `model` above.
     # Overrides the account-wide planning/coding reasoning-effort settings for
     # THIS turn only (see providers.build_llm_client's effort_override param).
-    # When set on the turn that creates a new conversation, it is persisted
-    # onto Conversation.reasoning_effort so a reopened task remembers the pick,
-    # same as `model`. Not validated against the model's advertised effort
+    # When set, the turn saves it as Conversation.reasoning_effort, and when
+    # omitted the saved pick stays unless `reset_picks` names it, same as
+    # `model`. Not validated against the model's advertised effort
     # levels here — the client only offers levels the picked model supports
     # (settings.modelEfforts), and an invalid pair is rejected reactively by
     # the provider/gateway, same as an invalid model name.
     reasoning_effort: str | None = Field(
         default=None,
         description="Reasoning effort level for the chat completion request",
+    )
+    # The picks this turn sends back to the default: "model" for Model Router
+    # or the operator's default model, "reasoning_effort" for the default
+    # effort. An omitted pick keeps the conversation's saved one, since Cowork
+    # also sends no model for a pinned model its picker no longer offers, such
+    # as one the wallet locks, and that pin must come back after a top-up. A
+    # reset clears the saved pick instead (record_turn_picks), so a reopened
+    # task comes back on the default the user went back to. A model or effort
+    # the turn sends wins over its own reset, since the turn runs on it.
+    reset_picks: list[TurnPick] = Field(
+        default_factory=list,
+        description="Picks this turn returns to the default, clearing the conversation's saved model or reasoning effort",
     )
     # The composer's per-task harness pick (Coding Mode). Overrides the
     # account-wide `harness` setting for THIS conversation only — mirrors

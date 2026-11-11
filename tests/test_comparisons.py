@@ -1609,11 +1609,14 @@ def test_a_side_turn_leaves_the_sides_saved_model_and_effort_alone(client, harne
 
     with patch("cowork.handlers.responses.blocked_connections", AsyncMock(return_value=[])):
         r = _turn(client, side["conversationId"], model="something-else", reasoning_effort="low")
-    assert r.status_code == 200, r.text
+        assert r.status_code == 200, r.text
+        r = _turn(client, side["conversationId"], reset_picks=["model", "reasoning_effort"])
+        assert r.status_code == 200, r.text
 
     after = _conversation(side["conversationId"])
     assert (after.model, after.reasoning_effort) == (before.model, before.reasoning_effort)
     assert after.reasoning_effort != "low"
+    assert after.model is not None
 
 
 def test_a_side_turn_fails_closed_when_connections_cannot_be_listed(client, harness):
