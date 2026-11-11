@@ -88,10 +88,11 @@ DRAFT_HOSTS = {
 }
 DRAFT_HOST = "{{ $.Values.draftHost }}"
 # The browser router each environment's web app calls: its own host under
-# /browser, where the router is served. prod sets none until its router runs.
+# /browser, where the router is served.
 BROWSER_ROUTER_URLS = {
     "dev": "https://cowork.dev.mindshub.ai/browser",
     "staging": "https://cowork.staging.mindshub.ai/browser",
+    "prod": "https://cowork.mindshub.ai/browser",
 }
 # The Ingress refuses to render without a host, which would make it a catch-all.
 REQUIRED_DRAFT_HOST = '{{ required "set deployment.draftHost to enable ingress_secondary" $.Values.draftHost }}'
