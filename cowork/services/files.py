@@ -184,15 +184,34 @@ def stage_project_instructions(
         return False
 
 
-def project_holds_files(project_path: str | Path) -> bool:
-    """Whether a project folder holds anything the user put there: an entry
-    other than a hidden one (``.anton``) or the server's own folders.
-    Stops at the first, so a large project costs one directory read."""
-    from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
+# Files the OS leaves in a folder, which are not the user's.
+_OS_FILES = frozenset({"desktop.ini", "thumbs.db", "icon\r"})
 
-    server_dirs = {CONVERSATIONS_DIRNAME, "skills"}
-    with os.scandir(project_path) as entries:
-        return any(not entry.name.startswith(".") and entry.name not in server_dirs for entry in entries)
+
+def project_holds_files(project_path: str | Path) -> bool:
+    """Whether a project folder holds anything the user or the agent put
+    there: a file, or a folder with something in it, other than hidden ones
+    (``.anton``), the server's own folders and OS files. Stops at the first.
+    A missing folder holds none."""
+    from cowork.services.artifact_roots import SERVER_PROJECT_FOLDERS
+
+    try:
+        with os.scandir(project_path) as entries:
+            for entry in entries:
+                name = entry.name.casefold()
+                if name.startswith(".") or name in SERVER_PROJECT_FOLDERS or name in _OS_FILES:
+                    continue
+                if not entry.is_dir(follow_symlinks=False):
+                    return True
+                try:
+                    with os.scandir(entry.path) as inner:
+                        if next(inner, None) is not None:
+                            return True
+                except FileNotFoundError:
+                    continue
+    except FileNotFoundError:
+        return False
+    return False
 
 
 def attachment_purpose(session_id: str) -> str:

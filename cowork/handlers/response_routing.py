@@ -809,9 +809,9 @@ async def decide_route(
     asked, and a typed "yes" would then read as an approval.
 
     `has_files` says the conversation has files only the agent reads: an
-    attachment on any turn, or the project's own. Such a turn goes to the
-    agent, as an attachment on this turn does: a direct answer would fall
-    back on general knowledge or the web.
+    attachment on any turn, or the project's own. When Jev routes such a turn
+    direct but expects a web search, it goes to the agent, which reads the
+    files first: the web would answer a question the files may hold.
 
     `binding` lets the caller supply a pre-built gate target (org mode mints a
     per-turn key); when None the binding comes from stored settings or the
@@ -833,9 +833,6 @@ async def decide_route(
     if explicit_file_context(history):
         return RouteDecision(route=DELEGATED_AGENTIC, reason="explicit_file_context")
 
-    if has_files:
-        return RouteDecision(route=DELEGATED_AGENTIC, reason="files_present")
-
     # Jev reads the tool markers itself: a follow-up to tool work goes direct
     # when the reply's facts are in visible text (the dashboard recall case),
     # and to the agent when they are only in omitted tool output. The LLM gate
@@ -856,6 +853,11 @@ async def decide_route(
     if jev is not None:
         result = await jev(jev_history(history))
         if not result.error:
+            if result.direct and result.needs_search and has_files:
+                return RouteDecision(
+                    route=DELEGATED_AGENTIC, reason="files_present", provider="jev",
+                    model=result.model or None, p_direct=result.p_direct,
+                )
             return RouteDecision(
                 route=DIRECT_CONTEXT if result.direct else DELEGATED_AGENTIC,
                 reason="jev_direct" if result.direct else "jev_needs_agent",

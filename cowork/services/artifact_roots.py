@@ -69,6 +69,8 @@ _ARTIFACTS_SUBPATH = (".anton", "artifacts")
 #: Desktop has no such segment: there the workspace IS the project directory, every
 #: conversation shares one artifacts folder, and nothing below changes.
 CONVERSATIONS_DIRNAME = "conversations"
+#: Top-level project folders that are Cowork's own, not the user's files.
+SERVER_PROJECT_FOLDERS = frozenset({CONVERSATIONS_DIRNAME, "skills"})
 
 
 def _artifacts_base(project_path: str) -> Path:
