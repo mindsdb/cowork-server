@@ -89,7 +89,7 @@ def turns(monkeypatch):
     dropped: list = []
 
     class RecordingHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -286,5 +286,59 @@ async def test_fallback_shutdown_marker_does_not_extend_failure_streak(schedule_
     session, _ = _scoped()
     try:
         assert session.get(Schedule, schedule_id).consecutive_failures == 0
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("refusal", [scheduler.ServerShuttingDown, scheduler.TurnClaimUnavailable])
+@pytest.mark.parametrize("created", [True, False])
+@pytest.mark.parametrize("deleted", [True, False])
+async def test_refused_fallback_discards_only_its_new_empty_conversation(
+    schedule_id, turns, monkeypatch, refusal, created, deleted,
+):
+    import cowork.handlers.responses as responses_mod
+    from cowork.models.conversation import Conversation
+    from cowork.services.conversations import ConversationService
+
+    turns.endings.append(_failed("model_not_found", message_id=str(uuid4())))
+    original = responses_mod.ResponsesHandler.handle
+
+    async def handle(self, request):
+        if request.model is None:
+            if refusal is scheduler.TurnClaimUnavailable:
+                raise refusal(conversation_id=request.conversation)
+            raise refusal()
+        return await original(self, request)
+
+    monkeypatch.setattr(responses_mod.ResponsesHandler, "handle", handle)
+    if not deleted:
+        def cannot_delete(*args, **kwargs):
+            raise RuntimeError("delete failed")
+        monkeypatch.setattr(scheduler, "_drop_failed_turn", cannot_delete)
+
+    conversation_id = None
+    if not created:
+        session, scoped = _scoped()
+        try:
+            conversation_id = ConversationService(scoped).create_conversation(
+                topic=session.get(Schedule, schedule_id).title,
+            ).id
+        finally:
+            session.close()
+    await scheduler.execute_schedule(schedule_id, is_manual=True, conversation_id=conversation_id)
+    (run,) = _runs(schedule_id)
+    assert run.status == RunStatus.failed
+    assert run.outcome == AttemptOutcome.failed_before_execution
+    assert run.unavailable_model is None
+    assert "That model isn't available" in run.error
+    original_id = UUID(turns.requests[0].conversation)
+    session, _ = _scoped()
+    try:
+        if created and deleted:
+            assert run.conversation_id is None
+            assert session.get(Conversation, original_id) is None
+        else:
+            assert run.conversation_id == original_id
+            assert session.get(Conversation, original_id) is not None
     finally:
         session.close()

@@ -983,7 +983,7 @@ async def _execute_schedule(
                 "Scheduled run's model %s is unavailable; running it on the account default", pinned,
                 extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
             )
-            await _drop_failed_turn_quietly(
+            failed_turn_deleted = await _drop_failed_turn_quietly(
                 principal=scheduled.principal, conversation_id=conversation_id, failure=end.failure,
                 schedule_id=schedule_id,
             )
@@ -998,11 +998,15 @@ async def _execute_schedule(
                 timed_out = True
                 await _stop_timed_out_turn(str(conversation_id))
                 raise RuntimeError(_duration_error(limit)) from exc
-            except ServerShuttingDown:
-                # The fallback was refused for a shutdown: the run ends as its
-                # pinned turn did.
+            except (ServerShuttingDown, TurnClaimUnavailable):
+                # The fallback never started: retain the pinned failure, but
+                # remove a new conversation if its only turn was deleted.
                 fallback_ran = False
                 lease_lost_first = False
+                if created_conversation and failed_turn_deleted and await _discard_unstarted_conversation(
+                    scheduled=scheduled, conversation_id=conversation_id, schedule_id=schedule_id,
+                ):
+                    conversation_id = None
             if lease_lost_first:
                 await _stop_reaped_turn(str(conversation_id))
                 raise _LeaseLost()
@@ -1163,13 +1167,14 @@ def _drop_failed_turn(
 
 async def _drop_failed_turn_quietly(
     *, principal: Principal | None, conversation_id: UUID, failure: _TurnFailure | None, schedule_id: UUID,
-) -> None:
+) -> bool:
     """Delete the failed turn before the fallback runs. The fallback matters
     more than a tidy transcript, so a failure here only logs and the fallback
-    goes ahead after the failed turn instead of in its place."""
+    goes ahead after the failed turn instead of in its place. Return whether
+    the turn was deleted, so a refused fallback can discard its empty chat."""
     answer = failure.assistant_message_id if failure else None
     if not answer:
-        return
+        return False
     try:
         await run_db(
             partial(
@@ -1183,6 +1188,8 @@ async def _drop_failed_turn_quietly(
             "Could not delete the scheduled run's failed turn",
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
+        return False
+    return True
 
 
 async def _drain_unless_lost(drain, lost: asyncio.Event) -> bool:
