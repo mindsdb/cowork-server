@@ -627,9 +627,35 @@ def step_stream_events(data: dict) -> list:
     if step == "turn_ended":
         ended_by = data.get("ended_by")
         return [StreamTurnEnded(ended_by=ended_by)] if isinstance(ended_by, str) and ended_by else []
+    if step == "addon":
+        return _addon_stream_events(data)
     # `ask_user_answer_rejected` is the pod's verdict on one answer; only
     # /answer reads it (turnqueue/answers.py), nothing renders it.
     return []
+
+
+# The pod's addon states the app renders, as the in-process channel streams
+# them. "refused", "withdrawn" and "already_read" are verdicts on one POST
+# /addon or /addon/withdraw, which answers the person itself
+# (turnqueue/addons.py); the in-process path streams nothing for them either.
+_STREAMED_ADDON_STATES = frozenset({"added", "read", "returned"})
+
+
+def _addon_stream_events(data: dict) -> list:
+    from cowork.streaming.addons import TurnAddon
+
+    addon_id = data.get("addon_id")
+    state = data.get("state")
+    if not isinstance(addon_id, str) or not addon_id or state not in _STREAMED_ADDON_STATES:
+        return []
+    text = data.get("text")
+    decided_by = data.get("decided_by")
+    return [TurnAddon(
+        addon_id=addon_id,
+        state=state,
+        text=text if isinstance(text, str) else None,
+        decided_by=decided_by if decided_by in ("jev", "user") else None,
+    )]
 
 
 def _offered_effort(model: str, effort: str | None, *, org_id: str | None,

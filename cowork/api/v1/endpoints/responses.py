@@ -30,7 +30,7 @@ from cowork.db.scoped import (
     get_tenant_scope,
     scope_from_principal,
 )
-from cowork.handlers.addon_route import queued, route_addon
+from cowork.handlers.addon_route import queued, route_addon, route_remote_addon
 from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
 from cowork.principal import Principal, caller_bearer, get_principal
 from cowork.schemas.responses import ResponsesRequest
@@ -44,6 +44,7 @@ from cowork.streaming.buffer import RedisStreamBuffer
 from cowork.streaming.registry import claim_held_refusal
 from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, TurnClaimUnavailable, live_holder
 from cowork.streaming.turn_index import TurnIndexEntry, TurnOwner, get_turn, list_turns
+from cowork.turnqueue.addons import RemoteWithdrawResult, withdraw_remote_addon
 from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
@@ -560,8 +561,13 @@ async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
     `response.addon` event for each added message as it is added, read by the
     model, or returned at turn end because the model never saw it.
 
-    On the remote backend the turn runs in a pod, which has no way to take a
-    message mid-turn yet: those are queued as not_supported.
+    On the remote backend the turn runs in a pod. Jev decides here, before
+    anything reaches the pod; then the message is queued for the pod's stdin
+    on the turn's answer queue and the status is the pod's own verdict,
+    waited for up to turnqueue.addons.ADDON_ACK_TIMEOUT_S: "added", or queued
+    as no_turn when the pod's turn refused it (it is ending) and as
+    pod_timeout when no verdict came (a withdraw of it is queued too, so a
+    late add can't also run as the next task).
     """
     _require_streaming_scope(scope)
     text = req.text.strip()
@@ -574,7 +580,15 @@ async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
             return queued("empty")
         if not settings.addon_routing_enabled:
             return queued("disabled")
-        return queued("not_supported" if found.in_flight else "no_turn")
+        if not found.in_flight:
+            return queued("no_turn")
+        return await route_remote_addon(
+            conversation_id=req.conversation_id,
+            correlation_id=found.index.correlation_id,
+            text=text,
+            force=req.force,
+            scope=scope,
+        )
     handle = _authorized_handle(registry.get(req.conversation_id), scope)
     if handle is None:
         return JSONResponse(status_code=404, content={"status": "not_found"})
@@ -604,12 +618,36 @@ _WITHDRAW_RESPONSES: dict[str, tuple[int, dict]] = {
 }
 
 
+_REMOTE_WITHDRAW_RESPONSES: dict[RemoteWithdrawResult, tuple[int, dict]] = {
+    **{RemoteWithdrawResult(value): response for value, response in _WITHDRAW_RESPONSES.items()},
+    RemoteWithdrawResult.UNAVAILABLE: (503, {"status": "unavailable"}),
+}
+
+
 @router.post("/addon/withdraw", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def withdraw_addon(req: AddonWithdrawRequest, scope: TenantScopeDep):
     """Take an added message back before the model reads it ("Move to
     queue"). 409 once the model has it; 404 for no turn the caller may touch,
-    or an addon that turn does not hold (it ended and returned it)."""
+    or an addon that turn does not hold (it ended and returned it).
+
+    On the remote backend the withdraw is queued for the pod like the addon,
+    and the status is the pod's verdict. When it does not come in time (or
+    Redis fails) the answer is 503 {"status": "unavailable"}: the withdraw
+    may still land, so the app should leave the message where it is and let
+    the turn's response.addon events settle it.
+    """
     _require_streaming_scope(scope)
+    if TurnQueueSettings().is_remote:
+        found = await _shared_turn(req.conversation_id, scope)
+        if found is None or not found.in_flight:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
+        result = await withdraw_remote_addon(
+            conversation_id=req.conversation_id,
+            correlation_id=found.index.correlation_id,
+            addon_id=req.addon_id,
+        )
+        status_code, content = _REMOTE_WITHDRAW_RESPONSES[result]
+        return JSONResponse(status_code=status_code, content=content)
     handle = _authorized_handle(registry.get(req.conversation_id), scope)
     channel = addons.get(req.conversation_id) if handle is not None else None
     if channel is None:

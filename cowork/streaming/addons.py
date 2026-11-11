@@ -9,7 +9,10 @@ events that tell the app where each one went.
 
 Keyed by ``conversation_id`` and process-local, like ``AnswerBroker``: the
 POST reaches the process that runs the turn by construction on the in-process
-backend. The remote (pod) backend has no channel here, so its messages queue.
+backend. The remote (pod) backend has no channel here: the pod's turn keeps
+the messages (anton's ``cloud_turn/addons.py``), cowork-server hands them over
+through Redis (``cowork.turnqueue.addons``), and the pod's ``addon`` steps
+become the same ``TurnAddon`` events (``producer.step_stream_events``).
 
 Events do not go to the stream buffer directly. The harness yields them
 between anton's own events (``AntonHarness.stream_response``), so they pass
@@ -60,17 +63,23 @@ class TurnAddon:
 
     addon_id: str
     state: AddonState
-    text: str
-    decided_by: DecidedBy
+    # None only on a pod's event that did not carry it (a "read" or
+    # "returned" for a message the pod no longer knows); left out of the
+    # payload then.
+    text: str | None
+    decided_by: DecidedBy | None
 
     def payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "type": "response.addon",
             "addon_id": self.addon_id,
             "state": self.state,
-            "text": self.text,
-            "decided_by": self.decided_by,
         }
+        if self.text is not None:
+            payload["text"] = self.text
+        if self.decided_by is not None:
+            payload["decided_by"] = self.decided_by
+        return payload
 
 
 @dataclass

@@ -152,6 +152,13 @@ def answer_queue_key(correlation_id: str) -> str:
     return f"cowork:answer:{correlation_id}"
 
 
+def addon_index_key(correlation_id: str) -> str:
+    """The hash of the messages a remote turn took mid-task (ENG-4194),
+    addon_id -> {text, decided_by, at}. Only this server reads and writes it
+    (``turnqueue/addons.py``)."""
+    return f"cowork:addons:{correlation_id}"
+
+
 def reply_stream_key(conversation_id: str) -> str:
     """The stream scratchpad-controller relays a turn's replies onto.
 

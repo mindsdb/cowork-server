@@ -191,12 +191,11 @@ async def test_an_old_anton_queues_as_not_supported(client, run):
 
 
 @pytest.mark.parametrize(("found", "status", "body"), [
-    (SimpleNamespace(in_flight=True), 200, {"status": "queued", "reason": "not_supported"}),
     (SimpleNamespace(in_flight=False), 200, {"status": "queued", "reason": "no_turn"}),
     (None, 404, {"status": "not_found"}),
-], ids=["running", "finished", "foreign"])
-async def test_remote_backend_never_adds(client, monkeypatch, found, status, body):
-    """A pod can't take a message mid-turn yet: it is always queued."""
+], ids=["finished", "foreign"])
+async def test_remote_backend_without_a_running_turn(client, monkeypatch, found, status, body):
+    """A running pod turn is tested in tests/test_addon_remote.py."""
     from cowork.api.v1.endpoints import responses as endpoint
 
     async def _found(conversation_id, scope):
