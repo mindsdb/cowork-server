@@ -26,7 +26,8 @@ UI_LOCALE_HEADER = "X-Cowork-UI-Locale"
 #: of anton's ``anton.core.llm.ui_locale.UI_LOCALE_NAMES`` until the anton floor
 #: in pyproject.toml includes that module (mindsdb/anton#776); then this file
 #: imports it and keeps only the header parsing. A tag anton does not know is
-#: dropped there, so a mismatch only loses the line.
+#: dropped there, so a mismatch only loses the line; tests/test_ui_locale.py
+#: compares the two whenever the installed anton has the module.
 UI_LOCALE_NAMES: dict[str, str] = {
     "en": "English",
     "es": "Spanish",

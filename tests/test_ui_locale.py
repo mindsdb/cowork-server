@@ -104,3 +104,14 @@ def test_the_turn_reads_only_the_apps_own_header(monkeypatch, headers, expected)
     with pytest.raises(RuntimeError):
         asyncio.run(responses_ep.responses(SimpleNamespace(conversation=None), request, None))
     assert built == [expected]
+
+
+def test_the_language_table_matches_antons():
+    """The server's table is a copy of anton's until the anton floor includes
+    mindsdb/anton#776 (then it becomes an import). Until then, an installed
+    anton that has the module must agree with it, so a language added in one
+    repo and not the other fails here instead of silently dropping the line."""
+    anton_ui_locale = pytest.importorskip("anton.core.llm.ui_locale")
+    from cowork.common.ui_locale import UI_LOCALE_NAMES
+
+    assert UI_LOCALE_NAMES == anton_ui_locale.UI_LOCALE_NAMES
