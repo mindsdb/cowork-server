@@ -88,10 +88,11 @@ DRAFT_HOSTS = {
 }
 DRAFT_HOST = "{{ $.Values.draftHost }}"
 # The browser router each environment's web app calls: its own host under
-# /browser, where the router is served. prod sets none until its router runs.
+# /browser, where the router is served.
 BROWSER_ROUTER_URLS = {
     "dev": "https://cowork.dev.mindshub.ai/browser",
     "staging": "https://cowork.staging.mindshub.ai/browser",
+    "prod": "https://cowork.mindshub.ai/browser",
 }
 # The Ingress refuses to render without a host, which would make it a catch-all.
 REQUIRED_DRAFT_HOST = '{{ required "set deployment.draftHost to enable ingress_secondary" $.Values.draftHost }}'
@@ -141,6 +142,24 @@ def _entry(entries: list[_Env], name: str) -> _Env:
 @pytest.fixture(scope="module")
 def base() -> list[_Env]:
     return _env(BASE)
+
+
+@pytest.mark.parametrize("name", [
+    "COWORK_PUSH_ENABLED",
+    "COWORK_PUSH_APNS_TOPIC",
+    "COWORK_PUSH_APNS_KEY_P8",
+    "COWORK_PUSH_APNS_KEY_ID",
+    "COWORK_PUSH_APNS_TEAM_ID",
+    "COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON",
+])
+def test_push_settings_use_optional_secret_keys(base, name):
+    assert _entry(base, name) == _Env(
+        name=name, secret="cowork-push", key=name, optional=True,
+    )
+    for env_values in ENVIRONMENTS:
+        assert not [entry for entry in _env(env_values) if entry.name == name], (
+            f"{env_values.name} overrides the shared push secret reference"
+        )
 
 
 def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed(base):

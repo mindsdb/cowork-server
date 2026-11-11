@@ -920,6 +920,8 @@ class AntonHarness:
         # Keeps the turn alive while a model call is quiet (see HarnessProvider).
         model_wait: ModelWaitTicker | None = None,
         interactive: bool = True,
+        # The scheduler's own turn (see HarnessProvider).
+        schedule_id: str | None = None,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -1040,6 +1042,8 @@ class AntonHarness:
                         before_mtimes=before_mtimes,
                         tracked_new=getattr(session, "artifacts_touched", None),
                         tracked_edits=getattr(session, "artifacts_touched", None),
+                        schedule_id=schedule_id,
+                        scope=_units_scope(),
                     ),
                     scope=_units_scope(),
                     deadline=False,
@@ -1645,7 +1649,7 @@ class AntonHarness:
             "You can perform operations on these files via the scratchpad. "
             + _project_file_actions_rule(anton_settings.act_first)
             + _other_files_rule(sandboxed=sandboxed)
-            + "You can read text files with `read_text_file`, or in the scratchpad when that is more efficient (for example, when the data goes straight into scratchpad code or the file needs special parsing). Use the scratchpad for everything else you do with files. "
+            + "Read text files with `read_text_file` (`end_line=-1` returns the whole file), several in one step. Read in the scratchpad only data that goes straight into scratchpad code or a file that needs special parsing: printed scratchpad output stops at 10,000 characters. Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
             # (close_session_scratchpads), with their whole process group.

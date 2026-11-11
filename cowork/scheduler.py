@@ -879,7 +879,9 @@ async def _execute_schedule(
             # The schedule-derived principal is what lets the turn (and the
             # remote backend's per-tenant key mint) run in org mode with no
             # request in flight. The handler opens its own short sessions.
-            stream = await ResponsesHandler(principal=scheduled.principal, interactive=False).handle(request)
+            stream = await ResponsesHandler(
+                principal=scheduled.principal, interactive=False, schedule_id=str(schedule_id),
+            ).handle(request)
             # handle() returns once it has started the turn's producer, which
             # saves the question first. A refusal before that, such as the
             # vault restore's or the turn start's read, leaves nothing done.

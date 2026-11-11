@@ -582,6 +582,18 @@ deployment:
     # its Key ID and the team ID. FCM: a Firebase service-account JSON (or
     # base64 of it) allowed to send through FCM HTTP v1.
     # COWORK_PUSH_ENABLED=false is the kill switch.
+    - name: COWORK_PUSH_ENABLED
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_ENABLED
+          optional: true
+    - name: COWORK_PUSH_APNS_TOPIC
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_APNS_TOPIC
+          optional: true
     - name: COWORK_PUSH_APNS_KEY_P8
       valueFrom:
         secretKeyRef:
