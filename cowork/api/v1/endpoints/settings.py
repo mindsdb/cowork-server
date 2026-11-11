@@ -58,6 +58,7 @@ from cowork.services.providers import (
     validate_provider as validate_provider_svc,
     warm_enabled_model_map,
 )
+from cowork.services.org_branding import remove_brand_skill
 from cowork.services.settings import SettingService, unit_setting_service
 
 logger = logging.getLogger(__name__)
@@ -345,6 +346,14 @@ def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     if scope.org_mode:
         return {"ok": True, "deleted": []}
     deleted = SettingService(session, scope).clear_credentials()
+    # The org's Brand guidelines skill was the signed-in org's.
+    try:
+        remove_brand_skill(scope)
+    except Exception:
+        logger.exception(
+            "Could not remove the Brand guidelines skill on sign-out",
+            extra={"event": "org_branding_skill_remove_failed"},
+        )
     return {"ok": True, "deleted": deleted}
 
 
@@ -679,8 +688,9 @@ async def recommended_models(request: Request, scope: ScopeDep, refresh: bool = 
 
     # `modelDisabledReasons` maps a model id that `modelEnabled` marks false to
     # the gateway's reason for it: "model_restricted" (an admin in the org
-    # restricted it, so credits cannot unlock it), "wallet_empty" or
-    # "included_allowance_exhausted". Filled from the MindsHub listing only,
+    # restricted it, so credits cannot unlock it), "wallet_empty",
+    # "included_allowance_exhausted" or "budget_exceeded" (an org budget is
+    # spent, which credits cannot lift either). Filled from the MindsHub listing only,
     # never from a custom endpoint: a BYO base URL must not be able to label a
     # model "restricted by your admin". A model absent from this map keeps
     # today's locked, add-credits treatment.
