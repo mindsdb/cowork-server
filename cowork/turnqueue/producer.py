@@ -889,9 +889,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # predates the field drops it, and the pod keeps Jev on.
               "jev_decisions": jev_decisions,
               # The app's language (ENG-4149), read by anton's TurnRequestV1.
-              # Absent without one. scratchpad-controller relays it only once
-              # its request builder names the key; until then the pod's
-              # prompt is unchanged.
+              # Absent without one. scratchpad-controller relays it to the pod
+              # (mindsdb/scratchpad-controller#124, which merges first).
               **({"ui_locale": ui_locale} if ui_locale else {}),
               **({"memory": memory_block} if memory_block else {}),
               # Only the skills the caller sees, and the pod's whole

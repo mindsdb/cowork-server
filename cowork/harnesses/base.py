@@ -87,7 +87,7 @@ class HarnessProvider(Protocol):
         # False when nobody is there to answer, as in a scheduled run. A
         # harness withholds tools that need the user's confirmation then.
         interactive: bool = True,
-        # The app's language ("en", "es", "pt-BR"; cowork.common.ui_locale),
+        # The app's language (a UI_LOCALE_NAMES tag; cowork.common.ui_locale),
         # or None when the turn has no request behind it. A harness tells its
         # agent to reply in it when the user's message does not say.
         ui_locale: str | None = None,

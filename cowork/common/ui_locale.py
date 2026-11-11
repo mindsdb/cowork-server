@@ -1,22 +1,32 @@
-"""The user's UI language, read from the request's Accept-Language (ENG-4149).
+"""The user's UI language, read from the app's own request header (ENG-4149).
 
-The Cowork app sends its active language on every request as
-``Accept-Language`` (one of ``en``, ``es``, ``pt-BR``, ``de``, ``fr``, ``it``, ``ja``, ``ko``,
-``zh-CN``). A turn passes the
-normalized tag to anton as ``ChatSessionConfig.ui_locale`` (the in-process
-path) or as the queued job's ``ui_locale`` param (the remote path), and anton
-adds one language line to its system prompt. The fast responders that answer
-before anton (the routing gate, the direct answer and the first take) add the
-same rule through :func:`reply_language_line`.
+The Cowork app sends the language it is showing as ``X-Cowork-UI-Locale``
+(one of ``en``, ``es``, ``pt-BR``, ``de``, ``fr``, ``it``, ``ja``, ``ko``,
+``zh-CN``), and only while its language picker is on. Not ``Accept-Language``:
+browsers and Electron send that on their own from the OS or browser language,
+so older app builds, web bundles and API callers would all look as if they had
+picked a language. A request without the header leaves every prompt as it was.
+
+A turn passes the normalized tag to anton as ``ChatSessionConfig.ui_locale``
+(the in-process path) or as the queued job's ``ui_locale`` param (the remote
+path, relayed to the pod by scratchpad-controller), and anton adds one
+language line to its system prompt. The fast responders that answer before
+anton (the routing gate, the direct answer and the first take) add the rule
+through :func:`reply_language_line`.
 
 The line never forces a language: the user's own message wins, and the UI
 language only decides when the message does not say.
 """
 from __future__ import annotations
 
-#: Supported UI locales and the English name the prompts use for each. Kept in
-#: step with anton's ``anton.core.llm.ui_locale.UI_LOCALE_NAMES``; a tag anton
-#: does not know is dropped there, so a mismatch only loses the line.
+#: The header the app sets; read by the responses endpoint.
+UI_LOCALE_HEADER = "X-Cowork-UI-Locale"
+
+#: Supported UI locales and the English name the prompts use for each. A copy
+#: of anton's ``anton.core.llm.ui_locale.UI_LOCALE_NAMES`` until the anton floor
+#: in pyproject.toml includes that module (mindsdb/anton#776); then this file
+#: imports it and keeps only the header parsing. A tag anton does not know is
+#: dropped there, so a mismatch only loses the line.
 UI_LOCALE_NAMES: dict[str, str] = {
     "en": "English",
     "es": "Spanish",
@@ -71,7 +81,10 @@ def _quality(params: list[str]) -> float | None:
 
 
 def normalize_ui_locale(accept_language: str | None) -> str | None:
-    """The supported UI locale an ``Accept-Language`` value asks for, else None.
+    """The supported UI locale a header value names, else None.
+
+    The app sends one tag; an ``Accept-Language``-style list with q-weights is
+    read too.
 
     Takes the supported tag with the highest q-weight (the first one on a tie),
     mapped by its primary subtag: ``es-*`` -> ``es``, ``pt-*`` -> ``pt-BR``,
@@ -102,8 +115,10 @@ def normalize_ui_locale(accept_language: str | None) -> str | None:
 def reply_language_line(ui_locale: str | None) -> str:
     """The language rule for a prompt, or "" when there is no supported locale.
 
-    Same wording as anton's ``ui_locale_line``, for the fast responders that
-    run without an anton session."""
+    For the fast responders that run without an anton session. Same rule as
+    anton's ``ui_locale_line``, which adds a ``## Language`` heading and a
+    sentence about tool step descriptions: the agent writes those, the fast
+    responders do not."""
     name = UI_LOCALE_NAMES.get(ui_locale or "")
     if name is None:
         return ""
@@ -122,4 +137,4 @@ def with_reply_language(system: str, ui_locale: str | None) -> str:
     return f"{system}\n\n{line}" if line else system
 
 
-__all__ = ["UI_LOCALE_NAMES", "normalize_ui_locale", "reply_language_line", "with_reply_language"]
+__all__ = ["UI_LOCALE_HEADER", "UI_LOCALE_NAMES", "normalize_ui_locale", "reply_language_line", "with_reply_language"]

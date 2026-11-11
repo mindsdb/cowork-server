@@ -778,7 +778,7 @@ class ResponsesHandler:
         schedule_id: str | None = None,
     ) -> None:
         self.principal = principal
-        # The app's language, normalized from Accept-Language
+        # The app's language, normalized from X-Cowork-UI-Locale
         # (cowork.common.ui_locale), for every model call that writes to the
         # user. None for a turn with no request behind it (a scheduled run),
         # which leaves every prompt as it was.

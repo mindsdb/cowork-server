@@ -1,4 +1,4 @@
-"""cowork.common.ui_locale: Accept-Language -> the app's language (ENG-4149)."""
+"""cowork.common.ui_locale: the app's language header -> a supported locale (ENG-4149)."""
 import pytest
 
 from cowork.common.ui_locale import normalize_ui_locale, reply_language_line, with_reply_language
@@ -64,3 +64,43 @@ def test_with_reply_language_appends_last_and_is_noop_without_locale():
     assert with_reply_language("ROLE", None) == "ROLE"
     out = with_reply_language("ROLE", "pt-BR")
     assert out.startswith("ROLE\n\n") and out.endswith("reply in Brazilian Portuguese.")
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({"X-Cowork-UI-Locale": "es"}, "es"),
+        ({"x-cowork-ui-locale": "zh-CN", "Accept-Language": "de-DE,de;q=0.9"}, "zh-CN"),
+        # A browser's own language is not the app's setting: an older build or
+        # an API caller that only sends Accept-Language gets no language line.
+        ({"Accept-Language": "de-DE,de;q=0.9,en;q=0.8"}, None),
+        ({}, None),
+    ],
+)
+def test_the_turn_reads_only_the_apps_own_header(monkeypatch, headers, expected):
+    import asyncio
+    from types import SimpleNamespace
+
+    from starlette.requests import Request
+
+    from cowork.api.v1.endpoints import responses as responses_ep
+
+    built: list[str | None] = []
+
+    class _Handler:
+        def __init__(self, *, principal, mindshub_bearer, ui_locale=None):
+            built.append(ui_locale)
+            raise RuntimeError("stop here")
+
+    async def _admit(**_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(responses_ep, "ResponsesHandler", _Handler)
+    monkeypatch.setattr(responses_ep, "_refuse_while_answering", _admit)
+    request = Request({
+        "type": "http", "method": "POST", "path": "/v1/responses",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+    })
+    with pytest.raises(RuntimeError):
+        asyncio.run(responses_ep.responses(SimpleNamespace(conversation=None), request, None))
+    assert built == [expected]
