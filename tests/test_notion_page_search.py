@@ -300,6 +300,34 @@ class TestProjectPages:
         notion = service.picked_files_by_project(LocalDataVault(tmp_path), "alpha", engine="notion")
         assert list(drive) == ["me-gmail-com"] and list(notion) == ["mcp-ws"]
 
+    def test_an_untagged_notion_page_reaches_no_project(self, vault, tmp_path):
+        self._add("notion", "mcp-ws", [{"id": "p1", "name": "Loose", "url": "u", "projects": []},
+                                       {"id": "p2", "name": "Bare", "url": "u2"}])
+        service = ConnectionsService(LOCAL_SCOPE)
+        assert service.picked_files_by_project(LocalDataVault(tmp_path), "alpha", engine="notion") == {}
+
+    def test_an_untagged_drive_file_still_reaches_every_project(self, vault, tmp_path):
+        vault.save("google_drive", "me-gmail-com", {"access_token": "t"})
+        self._add("google_drive", "me-gmail-com", [{"id": "d1", "name": "Sheet", "projects": []},
+                                                   {"id": "d2", "name": "Doc", "projects": ["beta"]}])
+        found = ConnectionsService(LOCAL_SCOPE).picked_files_by_project(LocalDataVault(tmp_path), "alpha")
+        assert [f["id"] for f in found["me-gmail-com"]] == ["d1"]
+
+    def test_long_page_names_and_urls_are_cut(self):
+        text = describe_project_pages({"ws": [{"id": "p1", "name": "N" * 300, "url": "https://x/" + "u" * 600}]})
+        line = next(line for line in text.splitlines() if line.startswith("- "))
+        name = line[2:line.index(" (url: ")]
+        url = line[line.index("(url: ") + 6:line.index(", connection: ")]
+        assert name == "N" * 199 + "…"
+        assert len(url) == 500 and url.endswith("…")
+
+    def test_at_most_fifty_pages_are_listed(self):
+        pages = [{"id": f"p{i}", "name": f"Page {i}", "url": f"https://www.notion.so/p{i}"} for i in range(53)]
+        text = describe_project_pages({"ws": pages})
+        assert sum(line.startswith("- ") for line in text.splitlines()) == 50
+        assert "Page 49 " in text and "Page 50 " not in text
+        assert "\nand 3 more\n" in text
+
     def test_the_agent_is_told_each_page_url(self):
         text = describe_project_pages({"mcp-ws": [{"id": "p1", "name": "ML Research", "url": "https://www.notion.so/p1"}]})
         assert "- ML Research (url: https://www.notion.so/p1, connection: mcp-ws)" in text

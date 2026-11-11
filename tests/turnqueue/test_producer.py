@@ -706,18 +706,121 @@ async def test_a_turn_without_mcp_connections_mints_no_connector_key(monkeypatch
     assert not [c for c in calls if c.get("purpose") == "connector_token"]
 
 
+def _connector_mint_answered_by(monkeypatch, handler):
+    """Turn keys come back at once; the connector-key mint goes through the
+    real auth_keys.mint_turn_key against ``handler``, so its failure carries
+    the same exception chain a real auth answer does."""
+    from cowork.turnqueue import auth_keys
+
+    real_client = httpx.AsyncClient
+
+    class _AuthClient(real_client):
+        def __init__(self, **kw):
+            super().__init__(transport=httpx.MockTransport(handler), **kw)
+
+    monkeypatch.setattr(auth_keys.httpx, "AsyncClient", _AuthClient)
+    settings = SimpleNamespace(auth_internal_base_url="http://auth", auth_internal_secret="s")
+
+    async def mint(**kw):
+        if kw.get("purpose") != "connector_token":
+            return "mdb_turnkey"
+        return await auth_keys.mint_turn_key(**{**kw, "settings": settings})
+
+    return mint
+
+
+_MIXED_CONNECTIONS = [
+    {"engine": "notion", "name": "acme", "picked_files": []},
+    {"engine": "hubspot", "name": "crm"},
+    {"engine": "google_drive", "name": "work"},
+]
+
+
 @pytest.mark.asyncio
-async def test_a_failed_connector_key_mint_falls_back_to_the_turn_key(monkeypatch):
-    # Until the auth service requires the connector key, the turn key still
-    # fetches MCP tokens, so the turn runs rather than fails.
-    calls = []
-    params = await _turn_params(
-        monkeypatch,
-        [{"engine": "notion", "name": "acme"}],
-        _purpose_keyed_mint(calls, connector=prod.product_permissions.ProductPermissionUnavailable()),
+async def test_an_auth_without_the_connector_purpose_falls_back_to_the_turn_key(monkeypatch):
+    # Such an auth still hands MCP tokens to the turn key, so the turn keeps them.
+    mint = _connector_mint_answered_by(
+        monkeypatch, lambda request: httpx.Response(400, json={"purpose": ['"connector_token" is not a valid choice.']}),
     )
+    params = await _turn_params(monkeypatch, _MIXED_CONNECTIONS, mint)
     assert params["oauth"]["turn_key"] == "mdb_turnkey"
     assert params["llm"]["api_key"] == "mdb_turnkey"
+    assert {c["engine"] for c in params["oauth"]["connections"]} == {"notion", "hubspot", "google_drive"}
+
+
+def _timeout(request):
+    raise httpx.ReadTimeout("timed out", request=request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler", [
+    lambda request: httpx.Response(403, json={"detail": "forbidden"}),
+    lambda request: httpx.Response(400, json={"user_id": ["unknown"]}),
+    lambda request: httpx.Response(503, text="unavailable"),
+    _timeout,
+], ids=["403", "400-other-field", "503", "timeout"])
+async def test_any_other_connector_key_failure_leaves_mcp_connections_out(monkeypatch, caplog, handler):
+    mint = _connector_mint_answered_by(monkeypatch, handler)
+    with caplog.at_level("WARNING", logger=prod.logger.name):
+        params = await _turn_params(monkeypatch, _MIXED_CONNECTIONS, mint)
+
+    assert params["oauth"]["connections"] == [{"engine": "google_drive", "name": "work"}]
+    assert params["oauth"]["turn_key"] == "mdb_turnkey"
+    assert "notion" not in params.get("connectors", {}) and "hubspot" not in params.get("connectors", {})
+    assert any("correlation_id=r" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_with_only_mcp_connections_and_no_connector_key_has_no_oauth_block(monkeypatch):
+    mint = _connector_mint_answered_by(monkeypatch, lambda request: httpx.Response(503))
+    params = await _turn_params(monkeypatch, [{"engine": "notion", "name": "acme"}], mint)
+    assert "oauth" not in params
+    assert "notion" not in params.get("connectors", {})
+
+
+@pytest.mark.asyncio
+async def test_a_failed_turn_key_mint_revokes_the_connector_key(monkeypatch):
+    fake = FakeRedis(replies=[])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    minted, revoked = [], []
+
+    async def mint(**kw):
+        if kw.get("purpose") == "connector_token":
+            await asyncio.sleep(0.01)  # finishes after the turn-key mint has failed
+            minted.append(kw["correlation_id"])
+            return "mdb_connector"
+        raise prod.product_permissions.ProductPermissionUnavailable()
+
+    async def revoke(*, instance_id, settings):
+        revoked.append((instance_id, list(minted)))
+
+    monkeypatch.setattr(prod, "mint_turn_key", mint)
+    monkeypatch.setattr(prod, "revoke_turn_key", revoke)
+    monkeypatch.setenv("COWORK_TURN_AUTH_INTERNAL_BASE_URL", "http://auth")
+    monkeypatch.setenv("COWORK_TURN_AUTH_INTERNAL_SECRET", "s")
+
+    async def fake_list_active_connections(**kw):
+        return [{"engine": "notion", "name": "acme"}]
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+    events = [kind async for kind, _ in prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+    )]
+
+    assert events == ["turn_failed"]
+    assert revoked == [("r", ["r"])]
+    assert fake.added == []
+
+
+@pytest.mark.asyncio
+async def test_the_mcp_engines_come_from_the_specs(monkeypatch):
+    from cowork.services.connectors.specs._registry import registry
+
+    monkeypatch.setattr(registry, "mcp_engines", lambda: frozenset({"gmail"}))
+    calls = []
+    params = await _turn_params(monkeypatch, [{"engine": "gmail", "name": "me"}], _purpose_keyed_mint(calls))
+    assert params["oauth"]["turn_key"] == "mdb_connector"
 
 
 @pytest.mark.asyncio
@@ -831,6 +934,28 @@ async def test_a_web_turn_in_another_project_names_none_of_them(monkeypatch):
 
     notes = params["connectors"]["notion"]["usage_notes"]
     assert "Roadmap" not in notes and "Budget" not in notes
+
+
+@pytest.mark.asyncio
+async def test_a_web_turn_names_no_untagged_notion_page(monkeypatch):
+    workspace = prod.RemoteWorkspace(project_id="1", workspace_rel_path="projects/alpha", project_name="alpha")
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_list_active_connections(**kw):
+        return [{"engine": "notion", "name": "ws-a", "picked_files": [
+            {"id": "p9", "name": "Untagged", "url": "https://www.notion.so/p9", "projects": []},
+            {"id": "p8", "name": "NoProjectsKey", "url": "https://www.notion.so/p8"},
+        ]}]
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+        workspace=workspace,
+    ))
+    notes = json.loads(fake.added[0][1]["payload"])["params"]["connectors"]["notion"]["usage_notes"]
+    assert "Untagged" not in notes and "NoProjectsKey" not in notes
 
 
 def test_connectors_block_is_none_when_nothing_has_notes(monkeypatch):

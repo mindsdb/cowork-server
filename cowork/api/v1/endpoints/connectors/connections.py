@@ -368,7 +368,15 @@ async def delete_picked_file(
     if the file is tagged to other projects too, it stays visible there
     (see remove_picked_file's docstring)."""
     if scope.org_mode and engine in _ORG_PICKED_FILE_REMOVAL_ENGINES:
-        remaining = await auth_proxy.proxy_remove_picked_file(engine, name, file_id, project, request, OAuthSettings())
+        try:
+            remaining = await auth_proxy.proxy_remove_picked_file(engine, name, file_id, project, request, OAuthSettings())
+        except HTTPException as exc:
+            # Already removed, say from another tab: the Remove is done. The
+            # remaining list isn't known without another call, and the
+            # renderer doesn't read it.
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
+            return {"ok": True}
         return {"ok": True, "files": remaining}
     # The caller's vault is files on disk, on the shared file store where
     # hosted, so its read and write run on the file store's threads.
