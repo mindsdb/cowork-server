@@ -24,7 +24,14 @@
             "required": false,
             "placeholder": "eu"
           }
-        ]
+        ],
+        "auth": {
+          "type": "header",
+          "headers": {
+            "Authorization": "Bearer {api_key}",
+            "X-Region": "{region}"
+          }
+        }
       }
     ]
   }

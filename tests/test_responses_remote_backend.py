@@ -3790,6 +3790,7 @@ def _anton_connector_entries() -> list[dict]:
         "usage_notes": "Base URL https://api.acme.example/v2. Send the key as Authorization: Bearer <api_key>.",
         "fields": [{"name": "api_key", "label": "API key", "help": "Settings, then API."},
                    {"name": "region", "label": "Region", "secret": False, "required": False, "placeholder": "eu"}],
+        "auth": {"type": "header", "headers": {"Authorization": "Bearer {api_key}", "X-Region": "{region}"}},
     }))
     return drain_pending_connectors(SimpleNamespace(_connector_drafts=box))
 

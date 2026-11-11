@@ -266,6 +266,7 @@ def _anton_draft(**overrides) -> dict:
             {"name": "api_key", "label": "API key", "help": "Settings, then API."},
             {"name": "region", "label": "Region", "secret": False, "required": False, "placeholder": "eu"},
         ],
+        "auth": {"type": "header", "headers": {"Authorization": "Bearer {api_key}", "X-Region": "{region}"}},
         **overrides,
     }
     outcome = asyncio.run(connector_draft_tool(box).handler(None, data))
