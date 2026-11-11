@@ -753,7 +753,7 @@ class TurnQueueSettings(Settings):
         default=0,
         ge=0,
         # Sized elsewhere for four 60-minute windows: scratchpad-controller's
-        # time_limited_turn_ceiling_seconds (16 200) and auth's
+        # time_limited_turn_ceiling_seconds (16 800) and auth's
         # turn_key_max_lifetime_seconds (17 100). A longer limit would end its
         # last window on one of them, with no summary; raise those first.
         le=3600,
