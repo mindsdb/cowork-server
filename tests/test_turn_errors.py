@@ -1088,6 +1088,7 @@ def _byok_failure(status_code, message="Server returned an upstream error"):
         (402, "wallet_empty", te.TOKEN_LIMIT_CODE),
         (429, "included_allowance_exhausted", te.ALLOWANCE_EXHAUSTED_CODE),
         (429, "free_air_daily_spend_fuse_exceeded", te.FREE_SERVING_PAUSED_CODE),
+        (402, "budget_exceeded", te.BUDGET_EXCEEDED_CODE),
         (429, "rate_limited", te.RATE_LIMITED_CODE),
         (503, "policy_unavailable", te.POLICY_UNAVAILABLE_CODE),
         (404, "unknown_model", te.MODEL_NOT_FOUND_CODE),
@@ -1236,6 +1237,40 @@ def _legacy_stop_via_body_code(reason, *, url=None):
     stop = _LegacyBillingStop(f"Server returned 429: {reason}", reason=reason)
     stop.__cause__ = inner
     return stop
+
+
+def _budget_via_body_code():
+    """A gateway budget denial whose X-MindsHub-Reason header was lost on the way."""
+    exc = ConnectionError("Server returned 402")
+    exc.__cause__ = inner = _FakeAPIStatusError(402, {}, url=_minds_gateway_url())
+    inner.body = {"error": {"code": "budget_exceeded", "message": "Budget reached"}}
+    return exc
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(lambda: _gateway_failure(402, reason="budget_exceeded"), id="header"),
+        pytest.param(_budget_via_body_code, id="body-code"),
+        pytest.param(
+            # anton's own signature, so the case holds once uv.lock pins an anton with the type.
+            lambda: te.BudgetExceededError(
+                "Server returned 402: budget used up.", reason="budget_exceeded", status_code=402
+            ),
+            id="typed",
+        ),
+    ],
+)
+def test_a_spent_budget_maps_to_budget_exceeded_not_out_of_credits(failure):
+    """A gateway 402 alone reads as out of credits; a budget names itself, since credits cannot lift it."""
+    code, message = te.friendly_turn_error(failure())
+    assert code == te.BUDGET_EXCEEDED_CODE
+    assert message == te.BUDGET_EXCEEDED_USER_MESSAGE
+    assert "credits" not in message.lower()
+
+
+def test_a_budget_stop_carries_no_reset_instant():
+    assert te.BUDGET_EXCEEDED_CODE not in te.RESET_AT_CODES
 
 
 def test_fuse_header_maps_to_free_serving_paused_not_out_of_credits():
@@ -1506,7 +1541,7 @@ def test_velocity_rate_limit_maps_from_the_body_code_when_the_header_is_lost():
 
 @pytest.mark.parametrize("code", [
     "wallet_empty", "rate_limited", "included_allowance_exhausted",
-    "free_air_daily_spend_fuse_exceeded",
+    "free_air_daily_spend_fuse_exceeded", "budget_exceeded",
 ])
 def test_a_third_party_body_cannot_select_a_billing_verdict(code):
     # ENG-1537 review. The body-`code` carrier must be host-gated exactly like
@@ -1524,7 +1559,7 @@ def test_a_third_party_body_cannot_select_a_billing_verdict(code):
     result = te.friendly_turn_error(exc)
     assert result is None or result[0] not in (
         te.TOKEN_LIMIT_CODE, te.RATE_LIMITED_CODE, te.ALLOWANCE_EXHAUSTED_CODE,
-        te.FREE_SERVING_PAUSED_CODE,
+        te.FREE_SERVING_PAUSED_CODE, te.BUDGET_EXCEEDED_CODE,
     ), f"a third-party body selected {result!r}"
 
 
@@ -2067,6 +2102,11 @@ def test_remote_error_token_limit():
             te.FREE_SERVING_PAUSED_CODE, te.FREE_SERVING_PAUSED_USER_MESSAGE,
             id="free-serving-paused",
         ),
+        pytest.param(
+            "BudgetExceededError: Server returned 402: your organization's MindsHub spending "
+            "budget is used up.",
+            te.BUDGET_EXCEEDED_CODE, te.BUDGET_EXCEEDED_USER_MESSAGE, id="budget-exceeded",
+        ),
         # Older worker images raise the parent type for every billing stop.
         pytest.param(
             "TokenLimitExceeded: Server returned 429 for 'sk-live-x'",
@@ -2487,6 +2527,10 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # another model is a way forward. The renderer branch lands in
         # mindsdb/cowork's ChatView.jsx + its turnFailureCards list.
         "model_restricted",
+        # ENG-1585 — a spent organization budget. Split off the credits card
+        # because credits cannot lift it; an admin raises it in Budgets. The
+        # renderer branch lands in mindsdb/cowork's ChatView.jsx.
+        "budget_exceeded",
         # No database connection freed within the pool timeout. A renderer
         # without a branch for it shows the frame's `error` in its generic
         # alert, and that sentence already names the wait, so the next step
@@ -2552,6 +2596,7 @@ def test_no_return_emits_a_literal_code():
         (402, "wallet_empty", te.TOKEN_LIMIT_CODE),
         (429, "included_allowance_exhausted", te.ALLOWANCE_EXHAUSTED_CODE),
         (429, "free_air_daily_spend_fuse_exceeded", te.FREE_SERVING_PAUSED_CODE),
+        (402, "budget_exceeded", te.BUDGET_EXCEEDED_CODE),
         (429, "rate_limited", te.RATE_LIMITED_CODE),
         (503, "policy_unavailable", te.POLICY_UNAVAILABLE_CODE),
         (404, "unknown_model", te.MODEL_NOT_FOUND_CODE),
@@ -2872,6 +2917,7 @@ def test_responses_emits_model_for_every_model_unavailable_code():
     ("wallet_empty", "token_limit"),
     ("included_allowance_exhausted", "included_allowance_exhausted"),
     ("free_air_daily_spend_fuse_exceeded", "free_serving_paused"),
+    ("budget_exceeded", "budget_exceeded"),
     ("rate_limited", "rate_limited"),
     ("policy_unavailable", "policy_unavailable"),
     # The fifth. Not a billing verdict, but a third party should not get to
@@ -3162,6 +3208,7 @@ _PROBE_RESET_AT = "2026-09-25T00:00:00Z"
         (429, "free_air_daily_spend_fuse_exceeded", _PROBE_RESET_AT),
         (429, "included_allowance_exhausted", _PROBE_RESET_AT),
         (402, "wallet_empty", None),
+        (402, "budget_exceeded", None),
         (503, "policy_unavailable", None),
     ],
 )
