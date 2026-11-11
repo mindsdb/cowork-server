@@ -59,12 +59,12 @@ async def test_starts_a_gpt_live_session_as_the_caller_with_the_fixed_session(in
         "model": "gpt-live-1",
         "instructions": voice.VOICE_PROMPT,
         "delegation": {"type": "client"},
-        "audio": {"output": {"voice": "marin"}},
+        "audio": {"output": {"voice": "cinder"}},
     }
     assert body["transport"] == {"type": "webrtc", "sdp": "offer-sdp"}
 
 
-@pytest.mark.parametrize(("asked", "sent"), [("willow", "willow"), ("cedar", "cedar"), ("not-a-voice", "marin")])
+@pytest.mark.parametrize(("asked", "sent"), [("willow", "willow"), ("cedar", "cedar"), ("not-a-voice", "cinder")])
 async def test_the_session_speaks_in_the_chosen_voice_or_the_default(inference, asked, sent):
     started = await _call("POST", "/session", json={"sdp": "offer-sdp", "voice": asked})
 

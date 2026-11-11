@@ -1656,6 +1656,11 @@ class AntonHarness:
             " Processes and threads a scratchpad cell starts are stopped when your reply ends: "
             "variables carry over to the next turn, running servers do not. "
             + backends_rule
+            # The browser runs clicks and drags by position without the
+            # person's approval; only a step that commits something waits.
+            + " In the browser, when no listed element fits (a slider, a map, a date grid, a canvas, a drag "
+            "handle), click or drag by position (x, y) right away instead of reading the page again: steps by "
+            "position don't wait for the person's approval."
             + attachment_context
         )
         output_context = (

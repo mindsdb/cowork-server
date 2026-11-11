@@ -24,6 +24,7 @@ import httpx
 
 from cowork.common.settings.app_settings import default_turn_minds_api_host, get_app_settings
 from cowork.services.providers import minds_chat_base_url
+from cowork.services.voice import VOICE_STYLES
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,8 @@ OPERATOR_PROMPT = (
     "work: say in a few words what he is busy with, then either queue it with queue_for_anton when it can wait "
     "or adds to that work, or, when it would replace that work or they sound like it can't wait, ask whether to "
     "stop the current work and do this now; if they say yes, stop_task and then ask_anton.\n"
+    "- To change Anton's voice or accent on the call, call change_voice with the voice that fits what they "
+    "asked (a British voice: vesper). The call reconnects in that voice, so say nothing after it.\n"
     "- Say what you did, from the tool results. Never say something is done when a tool failed.\n\n"
     "What is on the screen now:\n"
 )
@@ -112,6 +115,14 @@ TOOLS: list[dict[str, Any]] = [
         "Show the browser Anton used in a task, so the person sees what Anton sees.",
         {"task_id": _TASK_ID},
         ["task_id"],
+    ),
+    _tool(
+        "change_voice",
+        "Switch Anton's voice on this call. Voices: "
+        + "; ".join(f"{name} ({style})" for name, style in VOICE_STYLES.items())
+        + ".",
+        {"voice": {"type": "string", "enum": sorted(VOICE_STYLES)}},
+        ["voice"],
     ),
 ]
 TOOL_NAMES = frozenset(t["function"]["name"] for t in TOOLS)

@@ -41,12 +41,34 @@ MAX_SDP_CHARS = 64_000
 
 # GPT-Live's voices, by API name. A session's voice is set when it starts and
 # can't change during it, so the app starts a new session to switch voices.
-DEFAULT_VOICE = "marin"
-VOICES = frozenset({
-    "marin", "cedar",
-    "quartz", "ripple", "vesper", "willow", "stone", "gleam", "meridian", "beacon", "delta", "cinder",
-    "bossa", "tempo", "nuri", "juni", "flitz", "brise", "sillage", "nira", "harema", "shida", "noeul",
-})
+DEFAULT_VOICE = "cinder"
+#: Each voice and how it sounds, for the call's change_voice tool.
+VOICE_STYLES = {
+    "cinder": "masculine, Southern U.S.",
+    "delta": "feminine, Southern U.S.",
+    "marin": "feminine, North American",
+    "cedar": "masculine, North American",
+    "gleam": "feminine, North American",
+    "meridian": "masculine, North American",
+    "vesper": "masculine, British",
+    "willow": "feminine, Irish",
+    "stone": "masculine, Irish",
+    "quartz": "feminine, Australian",
+    "ripple": "masculine, Australian",
+    "beacon": "masculine, Filipino",
+    "bossa": "feminine, Brazilian Portuguese",
+    "tempo": "masculine, Brazilian Portuguese",
+    "brise": "feminine, French",
+    "sillage": "masculine, French",
+    "nuri": "feminine, German",
+    "juni": "feminine, German",
+    "flitz": "masculine, German",
+    "nira": "feminine, Hindi",
+    "harema": "feminine, Japanese",
+    "shida": "masculine, Japanese",
+    "noeul": "feminine, Korean",
+}
+VOICES = frozenset(VOICE_STYLES)
 
 VOICE_PROMPT = (
     "You are Anton, the user's coworker in MindsHub Cowork, on a voice call with them. Cowork is where they get "
@@ -58,7 +80,8 @@ VOICE_PROMPT = (
     "doing something in it. When they ask to stop, cancel or pause what is running, delegate it at once, even "
     "while you wait on another result. Say briefly what you are doing, such as \"Let me look into that.\" Never say "
     "something is done before the result arrives. When it does, tell them the gist in two or three plain "
-    "sentences.\n\n"
+    "sentences. When they ask you to change your voice or accent, delegate it: the call reconnects in the new "
+    "voice.\n\n"
     "Answer small talk and questions about this call yourself. Keep every reply short and spoken: no lists, "
     "links or code. When you don't know something, say so."
 )
