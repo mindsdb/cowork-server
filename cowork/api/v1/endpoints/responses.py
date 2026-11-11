@@ -23,6 +23,7 @@ from starlette.responses import JSONResponse, Response as HTTPResponse
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import TurnQueueSettings
+from cowork.common.ui_locale import UI_LOCALE_HEADER, normalize_ui_locale
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     MissingTenantScopeError,
@@ -263,7 +264,14 @@ async def responses(
     await _refuse_while_answering(
         conversation=responses_request.conversation, scope=scope_from_principal(principal)
     )
-    handler = ResponsesHandler(principal=principal, mindshub_bearer=caller_bearer(request))
+    handler = ResponsesHandler(
+        principal=principal,
+        mindshub_bearer=caller_bearer(request),
+        # The app's language (ENG-4149): the agent replies in it when the
+        # user's own message does not say which language to use. The app's
+        # own header, never Accept-Language, which every browser sends.
+        ui_locale=normalize_ui_locale(request.headers.get(UI_LOCALE_HEADER)),
+    )
     if responses_request.cancel_on_disconnect:
         watch = DisconnectWatch(request.receive)
         try:

@@ -736,6 +736,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
                                 tool_messages: bool = False,
+                                ui_locale: str | None = None,
                                 reasoning_effort: str | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
@@ -748,6 +749,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
     user (the cowork UI does; channel turns never).
+    `ui_locale` is the app's language (cowork.common.ui_locale), which the
+    pod's anton replies in when the user's message does not say; None for a
+    turn with no request behind it.
     `workspace` is the project the turn runs in; None runs it in the org's
     default project with no project on the job.
     `skills` is the caller's visible skills, each with `always_on` set on the
@@ -884,6 +888,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # completion check then never asks it. A controller that
               # predates the field drops it, and the pod keeps Jev on.
               "jev_decisions": jev_decisions,
+              # The app's language (ENG-4149), read by anton's TurnRequestV1.
+              # Absent without one. scratchpad-controller relays it to the pod
+              # (mindsdb/scratchpad-controller#124, which merges first).
+              **({"ui_locale": ui_locale} if ui_locale else {}),
               **({"memory": memory_block} if memory_block else {}),
               # Only the skills the caller sees, and the pod's whole
               # recallable set, so always present, even empty.

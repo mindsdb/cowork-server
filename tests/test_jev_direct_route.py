@@ -110,7 +110,7 @@ async def test_a_refused_or_failed_jev_falls_back_to_the_llm_gate(monkeypatch, e
 
     asked = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, **_kwargs):
         asked.append((binding.model, history))
         return "Hello! How can I help?"
 
@@ -585,7 +585,7 @@ async def _produce(
 
     lifecycle = lifecycle or TurnLifecycle()
 
-    async def fake_start(_binding, *, history, needs_search=True):
+    async def fake_start(_binding, *, history, needs_search=True, ui_locale=None):
         if started is not None:
             # An answer that has not started yet: wait to be stopped.
             started.set()

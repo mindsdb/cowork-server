@@ -109,7 +109,7 @@ class _Harness:
         disabled_connections=None, trace_tags=None, trace_metadata=None,
         channel_context=None, tool_messages=False, model_wait=None,
         interactive=True,
-        schedule_id=None,
+        ui_locale=None, schedule_id=None,
     ):
         if model_wait is not None:
             model_wait.attach(session=self.session)
