@@ -112,6 +112,43 @@ async def get_mindshub_reply(path: str, bearer_token: str) -> MindsHubReply:
         return MindsHubReply(MindsHubAnswer.UNREACHABLE, status_code=code)
 
 
+async def send_mindshub(
+    method: str, path: str, bearer_token: str, *, json_body: Any = None
+) -> MindsHubReply:
+    """``method`` one MindsHub path with the caller's bearer and an optional
+    JSON body, and say how MindsHub answered, as get_mindshub_reply does.
+    Unlike it, a refusal (4xx) keeps its JSON body as ``payload``, so a route
+    that passes a write through can repeat MindsHub's own message. No
+    redirects: a write must not be replayed somewhere else."""
+
+    async def _send() -> httpx.Response:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_TIMEOUT_S)) as client:
+            return await client.request(
+                method,
+                f"{mindshub_v1()}{path}",
+                headers={"Authorization": f"Bearer {bearer_token}"},
+                json=json_body,
+            )
+
+    try:
+        response = await asyncio.wait_for(_send(), _TIMEOUT_S)
+    except Exception as exc:
+        logger.debug("MindsHub %s %s failed: %s", method, path, exc)
+        return MindsHubReply(MindsHubAnswer.UNREACHABLE)
+    code = response.status_code
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if code == status.HTTP_429_TOO_MANY_REQUESTS:
+        return MindsHubReply(MindsHubAnswer.THROTTLED, payload=payload, status_code=code)
+    if 400 <= code < 500:
+        return MindsHubReply(MindsHubAnswer.REFUSED, payload=payload, status_code=code)
+    if code >= 500 or payload is None:
+        return MindsHubReply(MindsHubAnswer.UNREACHABLE, status_code=code)
+    return MindsHubReply(MindsHubAnswer.OK, payload=payload, status_code=code)
+
+
 async def get_mindshub_json(path: str, bearer_token: str) -> Any | None:
     """GET one MindsHub path with the caller's bearer (get_mindshub_reply):
     the JSON body of an OK answer, None for any other.

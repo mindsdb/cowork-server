@@ -50,6 +50,7 @@ from cowork.models.skill import (
     META_CREATED_BY,
     META_DISPLAY_NAME,
     META_ENABLED,
+    META_MANAGED_BY,
     META_PROJECTS,
     META_UPDATED_AT,
     Skill,
@@ -158,6 +159,28 @@ CODE_ONLY_BUILTIN_SKILL_NAMES = frozenset({
 })
 CODE_BUILTIN_SKILLS_VERSION = 1
 CODE_BUILTIN_SKILLS_MARKER = ".builtins_seeded"
+
+
+# The org's Brand guidelines skill: generated from the org's branding in
+# auth by cowork.services.org_branding. In MindsHub mode it is shared with
+# everyone and always on; on a local server it is an ordinary skill
+# recalled on demand. In every mode it is told from a person's own skill of
+# that name only by its META_MANAGED_BY. Nobody edits, renames, deletes or
+# shares the generated one as a skill; an org admin changes it through the
+# org's appearance (its ``guidelines``). Each person may still turn it off
+# for themselves. In MindsHub mode a new skill may not take the name, but a
+# member's skill that already had it stays theirs.
+BRAND_GUIDELINES_SLUG = "brand-guidelines"
+BRAND_GUIDELINES_MANAGER = "org-branding"
+BRAND_GUIDELINES_NAME_RESERVED = (
+    f"The name {BRAND_GUIDELINES_SLUG!r} is kept for your organization's Brand guidelines "
+    "skill. Choose another name."
+)
+BRAND_GUIDELINES_REFUSAL = (
+    "The Brand guidelines skill is generated from your organization's branding and can't "
+    "be changed, renamed, shared or deleted here. An organization admin edits it in "
+    "Settings > Branding (Brand guidelines for Anton). You can still turn it off for yourself."
+)
 
 
 def is_builtin_skill(slug: str) -> bool:
@@ -964,6 +987,20 @@ class SkillService:
     def is_managed_skill(self, slug: str) -> bool:
         return slug in self.managed_skill_slugs()
 
+    def is_brand_guidelines(self, slug: str) -> bool:
+        """Whether ``slug`` is the org's generated Brand guidelines skill:
+        BRAND_GUIDELINES_SLUG while the store's folder by that name is the
+        generated one (META_MANAGED_BY), in every mode. A person's own skill
+        of that name is theirs to change."""
+        if slug != BRAND_GUIDELINES_SLUG or self.store_name != "skills":
+            return False
+        try:
+            skill_dir = self._skill_entry(slug)
+        except ValueError:
+            return False
+        skill = _skill_from_dir(skill_dir) if (skill_dir / SKILL_FILE).is_file() else None
+        return skill is not None and skill.metadata.get(META_MANAGED_BY) == BRAND_GUIDELINES_MANAGER
+
     @cached_property
     def _sharing(self) -> _Sharing:
         """What this store's owner shares and is shared, read live from the
@@ -1050,6 +1087,15 @@ class SkillService:
         """
         if any(self.is_managed_skill(slug) for slug in slugs):
             raise SkillImmutableError(SHARED_SKILL_REFUSAL)
+        if any(self.is_brand_guidelines(slug) for slug in slugs):
+            raise SkillImmutableError(BRAND_GUIDELINES_REFUSAL)
+        if (
+            creating
+            and self.org_sharing
+            and BRAND_GUIDELINES_SLUG in slugs
+            and not self._skill_entry(BRAND_GUIDELINES_SLUG).exists()
+        ):
+            raise SkillImmutableError(BRAND_GUIDELINES_NAME_RESERVED)
         shared = self.shared_with_owner()
         taken = [slug for slug in slugs if slug in shared]
         if taken:
