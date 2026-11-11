@@ -156,7 +156,10 @@ def _update_conversation(
         conversation = svc.update_conversation(
             conversation_id, topic=body.topic or body.title, project_id=project_id
         )
-        return _serialize_conversation(conversation, updated_at=svc.last_message_at(conversation_id))
+        return _serialize_conversation(
+            conversation, updated_at=svc.last_message_at(conversation_id),
+            scheduled_id=_scheduled_ids(scoped, [conversation]).get(conversation.id),
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
@@ -195,7 +198,10 @@ def _move_conversation(
         TaskObjectService(scoped).relocate_to_project(conversation, source, dest)
 
     conversation = svc.update_conversation(conversation_id, project_id=dest.id)
-    return _serialize_conversation(conversation, updated_at=svc.last_message_at(conversation_id))
+    return _serialize_conversation(
+        conversation, updated_at=svc.last_message_at(conversation_id),
+        scheduled_id=_scheduled_ids(scoped, [conversation]).get(conversation.id),
+    )
 
 
 @router.get("/{conversation_id}/items")

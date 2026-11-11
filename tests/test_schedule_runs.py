@@ -181,6 +181,16 @@ def test_the_conversation_list_reports_scheduled_id(monkeypatch):
         async with turn_pool._client() as client:
             listed = (await client.get("/api/v1/conversations/", params={"project": "all", "limit": 200})).json()
             one = (await client.get(f"/api/v1/conversations/{conv_id}")).json()
+            for cid, expected in ((conv_id, str(schedule_id)), (chat_id, None)):
+                renamed = await client.patch(f"/api/v1/conversations/{cid}", json={"title": "renamed"})
+                assert renamed.status_code == 200
+                assert renamed.json()["scheduledId"] == expected
+                moved = await client.post(
+                    f"/api/v1/conversations/{cid}/move",
+                    json={"projectId": str(GENERAL_PROJECT_ID), "moveObjects": False},
+                )
+                assert moved.status_code == 200
+                assert moved.json()["scheduledId"] == expected
         return conv_id, chat_id, listed, one
 
     with turn_pool._a_daily_schedule(due=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)) as schedule_id:
@@ -1762,7 +1772,7 @@ def test_the_run_conversation_index_migration_upgrades_and_downgrades(tmp_path, 
     config = _alembic_config(uri)
     with engine.begin() as connection:
         config.attributes["connection"] = connection
-        command.downgrade(config, "6f1b8d3a5c27")
+        command.downgrade(config, "3e7a91c4d2b8-1")
     assert "ix_schedule_runs_conversation_id" not in indexes()
     with engine.begin() as connection:
         config.attributes["connection"] = connection

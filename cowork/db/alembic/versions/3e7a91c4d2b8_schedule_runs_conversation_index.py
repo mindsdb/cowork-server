@@ -5,7 +5,7 @@ looking their ids up in schedule_runs. The index keeps that one lookup per
 page, however long the schedules' history.
 
 Revision ID: 3e7a91c4d2b8
-Revises: f93151b5bad1
+Revises: e2a7c4f9b613
 Create Date: 2026-11-03 00:00:00.000000
 
 """
@@ -17,7 +17,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "3e7a91c4d2b8"
-down_revision: Union[str, Sequence[str], None] = "f93151b5bad1"
+down_revision: Union[str, Sequence[str], None] = "e2a7c4f9b613"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
