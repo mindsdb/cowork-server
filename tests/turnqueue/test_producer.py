@@ -1585,6 +1585,69 @@ async def test_with_the_flag_off_nothing_datasource_related_runs_or_is_queued(mo
     listing.assert_not_awaited()
 
 
+async def _queued_datasource(monkeypatch, listing, *, labels: bool) -> dict | None:
+    """The datasource block a hosted turn queues for ``listing``, through the real producer and queue check."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_LABELS_ENABLED", "true" if labels else "false")
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=listing))
+    refs = [(c["id"], c["credential_version"]) for c in listing]
+    monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(return_value=_echo(refs, turn_key_id="mdb_gate")))
+    block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "https://minds.internal/v1"}
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        correlation_id="r", llm=block, turn_key_id="mdb_gate",
+    ))
+    return json.loads(fake.added[0][1]["payload"])["params"].get("datasource")
+
+
+@pytest.mark.asyncio
+async def test_with_names_off_the_queued_block_is_ids_and_versions_only(monkeypatch):
+    queued = await _queued_datasource(monkeypatch, [_verified(93, "postgres", "qadb", version=2)], labels=False)
+    assert queued == {"protocol_version": 1, "connections": [{"connection_id": 93, "credential_version": 2}]}
+
+
+@pytest.mark.asyncio
+async def test_with_names_on_each_connection_carries_its_label_and_engine(monkeypatch):
+    listing = [_verified(93, "postgres", "qadb", version=2), _verified(80, "mysql", "données", version=1)]
+    queued = await _queued_datasource(monkeypatch, listing, labels=True)
+    assert queued == {"protocol_version": 1, "connections": [
+        {"connection_id": 93, "credential_version": 2, "label": "qadb", "engine": "postgres"},
+        {"connection_id": 80, "credential_version": 1, "label": "données", "engine": "mysql"},
+    ]}
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_name_or_engine_is_left_out_and_the_turn_still_queues(monkeypatch):
+    """Auth accepts a name of only invisible characters and the queue check
+    refuses an empty label, so the producer must drop it rather than fail every
+    turn for that user."""
+    listing = [_verified(93, "postgres", "​", version=2), _verified(80, "Postgres-X", "ops\n", version=1)]
+    queued = await _queued_datasource(monkeypatch, listing, labels=True)
+    assert queued == {"protocol_version": 1, "connections": [
+        {"connection_id": 93, "credential_version": 2, "engine": "postgres"},
+        {"connection_id": 80, "credential_version": 1, "label": "ops"},
+    ]}
+
+
+@pytest.mark.asyncio
+async def test_with_names_on_a_grant_mismatch_still_refuses(monkeypatch):
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[_verified(7)]))
+    monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(return_value=_echo([(7, 4)])))
+    settings = TurnQueueSettings(
+        datasource_enabled=True, datasource_labels_enabled=True,
+        datasource_producer_key_id="producer-v1", datasource_producer_key="producer-secret",
+    )
+    with pytest.raises(ProductPermissionUnavailable):
+        await prod._mint_datasource_block(
+            org_id="o1", user_id="u1", correlation_id="r", turn_key_id="mdb_prefix", disabled=None, settings=settings
+        )
+
+
 def test_disabled_connections_are_matched_on_the_connector_id_auth_emits():
     """A conversation's disabled entries carry `engine`; auth's `connector_id` is
     the same value (`postgres`, `mysql`), and the join is exact."""

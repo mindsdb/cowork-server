@@ -136,6 +136,9 @@ deployment:
   # environment, which renders this file alone, stays off.
   datasourceTurnsEnabled: "false"
   datasourceCapabilities: ""
+  # Names each datasource connection for the agent (COWORK_TURN_DATASOURCE_LABELS_ENABLED).
+  # Turn on only where every scratchpad pod runs an anton that accepts the names.
+  datasourceLabelsEnabled: "false"
 
   # The draft-preview host name and the one page allowed to frame a draft. The
   # draft Ingress and the COWORK_DRAFT_* variables below are templated from
@@ -501,6 +504,8 @@ deployment:
     # per environment; tests/test_chart_values.py pins which environments are on.
     - name: COWORK_TURN_DATASOURCE_ENABLED
       value: '{{ $.Values.datasourceTurnsEnabled }}'
+    - name: COWORK_TURN_DATASOURCE_LABELS_ENABLED
+      value: '{{ $.Values.datasourceLabelsEnabled }}'
     - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
       valueFrom:
         secretKeyRef:

@@ -77,6 +77,9 @@ CAPABILITIES = "COWORK_DATASOURCE_CAPABILITIES"
 # gate's own change adds the environment here and sets both deployment scalars
 # in its values file.
 ENABLED_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
+LABELS_FLAG = "COWORK_TURN_DATASOURCE_LABELS_ENABLED"
+# Environments whose scratchpad pods all run an anton that accepts connection names.
+LABELS_ENABLED_ENVIRONMENTS: frozenset[str] = frozenset()
 # The exact methods each enabled environment offers.
 OFFERED_METHODS: dict[str, frozenset[str]] = {"staging": frozenset({"mysql:host-password", "postgres:host-port"})}
 # The draft host of each environment. cowork's web build frames exactly these
@@ -153,6 +156,23 @@ def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed
         assert _deployment(env_values).get("datasourceTurnsEnabled") == expected, f"{env_values.name} flips the grants"
         assert not [e for e in _env(env_values) if e.name == FLAG], (
             f"{env_values.name} declares {FLAG}; set deployment.datasourceTurnsEnabled instead"
+        )
+
+
+def test_datasource_connection_names_are_off_in_the_base_and_on_only_where_listed(base):
+    """An anton older than the names refuses a block that carries them, so the
+    switch turns on per environment only after its scratchpad image has that anton."""
+    assert _deployment(BASE)["datasourceLabelsEnabled"] == "false"
+    assert _entry(base, LABELS_FLAG).value == "{{ $.Values.datasourceLabelsEnabled }}"
+    assert LABELS_ENABLED_ENVIRONMENTS <= ENABLED_ENVIRONMENTS
+    for env_values in ENVIRONMENTS:
+        environment = env_values.stem.removeprefix("values-")
+        expected = "true" if environment in LABELS_ENABLED_ENVIRONMENTS else None
+        assert _deployment(env_values).get("datasourceLabelsEnabled") == expected, (
+            f"{env_values.name} flips the connection names"
+        )
+        assert not [e for e in _env(env_values) if e.name == LABELS_FLAG], (
+            f"{env_values.name} declares {LABELS_FLAG}; set deployment.datasourceLabelsEnabled instead"
         )
 
 

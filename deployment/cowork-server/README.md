@@ -98,6 +98,12 @@ environments are on.
 - `deployment.datasourceTurnsEnabled`, rendered as
   `COWORK_TURN_DATASOURCE_ENABLED`: `"true"` registers grants and queues the
   datasource block for hosted turns.
+- `deployment.datasourceLabelsEnabled`, rendered as
+  `COWORK_TURN_DATASOURCE_LABELS_ENABLED`: `"true"` adds each connection's
+  name and connector id to the block, so the agent can tell connections
+  apart. An anton older than the change refuses a block carrying them, so
+  turn it on only once the scratchpad image has that anton and no live pod
+  started before the image update. Rollback is `"false"`.
 - `deployment.datasourceCapabilities`, rendered as
   `COWORK_DATASOURCE_CAPABILITIES`: the methods this deployment may run, as a
   versioned manifest such as

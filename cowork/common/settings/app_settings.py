@@ -795,6 +795,14 @@ class TurnQueueSettings(Settings):
             "until the controller and pod support the datasource block."
         ),
     )  # COWORK_TURN_DATASOURCE_ENABLED
+    datasource_labels_enabled: bool = Field(
+        default=False,
+        description=(
+            "Send each datasource connection's name and connector id with its reference, "
+            "so the agent can tell the connections apart. Keep false until every pod runs "
+            "an anton that accepts them: an older one refuses the turn."
+        ),
+    )  # COWORK_TURN_DATASOURCE_LABELS_ENABLED
     datasource_producer_key_id: str = Field(
         default="",
         description="Key id for the dedicated datasource producer service role.",
