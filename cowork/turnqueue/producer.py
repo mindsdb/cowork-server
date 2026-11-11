@@ -43,6 +43,7 @@ from cowork.turnqueue.auth_keys import (
 )
 from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnJobHeader, TurnReply, TurnReplyHeader
 from cowork.streaming.cancellation import stop_controller_turn
+from cowork.streaming.liveness import WORKER_ALIVE_PHASE
 from cowork.streaming.turn_index import record_channel_turn
 from cowork.turnqueue.redis_client import (
     REDIS_BLOCK_MS,
@@ -1067,6 +1068,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                             return
                         authorized_workspace_mode = resolved_mode
                         yield "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
+                        continue
+                    if kind == "progress" and data.get("phase") == WORKER_ALIVE_PHASE:
+                        # The caller decides whether the turn has been quiet long
+                        # enough to show it; this loop only passes it on.
+                        yield "progress", {"phase": WORKER_ALIVE_PHASE}
                         continue
                     if kind == "error" or (
                         kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_history",

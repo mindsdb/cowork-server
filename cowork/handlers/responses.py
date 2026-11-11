@@ -73,7 +73,8 @@ from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.streaming import StreamBuffer, TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.streaming.answer_text import accumulate_answer_text
-from cowork.streaming.liveness import ModelWaitTicker
+from cowork.streaming import liveness
+from cowork.streaming.liveness import MODEL_WAIT_PHASE, WORKER_ALIVE_PHASE, ModelWaitTicker
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.registry import RunHandle, RunIdentity, mark_question_saved
 from cowork.turnqueue.producer import RemoteWorkspace, step_stream_events, stream_remote_replies
@@ -3065,6 +3066,12 @@ class ResponsesHandler:
             # its compacted step comes for both, its compaction reply for a
             # summary. Both arrive before the history frame.
             compacted = False
+            # When the pod last sent this turn anything but a liveness relay.
+            quiet_since = time.monotonic()
+            # Questions the pod asked that are still open. Its heartbeat goes on
+            # while one waits, and a "Still working" line over the question card
+            # would say the turn is busy when it is waiting on the user.
+            open_questions: set[str] = set()
 
             async for kind, data in stream_remote_replies(
                 conversation_id=str(conv_id),
@@ -3099,14 +3106,43 @@ class ResponsesHandler:
                 # Rides the queued job, so the pod's anton gets it (ENG-4149).
                 ui_locale=self.ui_locale,
             ):
+                if kind == "progress" and data.get("phase") == WORKER_ALIVE_PHASE:
+                    # The controller relays on a timer, busy or not. Shown
+                    # only after a quiet stretch, as the model_wait frame the
+                    # UI and the idle watchdog already count as activity, so
+                    # it never flashes "Still working" while text streams.
+                    if not open_questions and time.monotonic() - quiet_since >= liveness.MODEL_WAIT_TICK_SECONDS:
+                        quiet_since = time.monotonic()
+                        # The UI shows the message, or "Waiting for the model"
+                        # without one, which a long cell is not doing.
+                        yield StreamTaskProgress(phase=MODEL_WAIT_PHASE, message=liveness.MODEL_WAIT_LABEL)
+                    continue
+                quiet_since = time.monotonic()
                 if kind == "progress" and data.get("phase") == "workspace_authorized":
                     if turn_artifacts is not None:
                         turn_artifacts.writes_allowed = data.get("workspace_mode") == "persistent"
                 elif kind == "turn_delta":
+                    # The pod writes nothing while a question waits, so text
+                    # means it's answered, even if that reply was lost.
+                    open_questions.clear()
                     yield StreamTextDelta(text=data.get("text", ""))
                 elif kind == "turn_step":
                     if data.get("step") == "compacted":
                         compacted = True
+                    step = data.get("step")
+                    question_id = data.get("id")
+                    if step == "ask_user":
+                        # Only an id step_stream_events renders as a card counts.
+                        if isinstance(question_id, str) and question_id:
+                            open_questions.add(question_id)
+                    elif step == "ask_user_answered":
+                        if isinstance(question_id, str):
+                            open_questions.discard(question_id)
+                    elif step != "ask_user_answer_rejected":
+                        # As for text: the pod writes nothing else while a
+                        # question waits, so a cell's start, progress or end
+                        # means it is over, even if the answered reply was lost.
+                        open_questions.clear()
                     for event in step_stream_events(data):
                         yield event
                 elif kind == "turn_memory":
