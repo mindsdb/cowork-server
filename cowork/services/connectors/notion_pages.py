@@ -165,21 +165,37 @@ async def fetch_page(access_token: str, page: str) -> dict[str, Any]:
     return parse_fetched_page(await _call_notion(access_token, "notion-fetch", id=page))
 
 
+MAX_LISTED_PAGES = 50
+MAX_PAGE_NAME_CHARS = 200
+MAX_PAGE_URL_CHARS = 500
+
+
+def _capped(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def describe_project_pages(pages_by_connection: dict[str, list[dict]]) -> str:
     """System-prompt list of the Notion pages added to the current project,
     so the agent can read them in any later turn, not only in the message
     they were added with. Empty when there are none. How to read a page is
-    in notion.json's usage_notes; this is per-project data only."""
+    in notion.json's usage_notes; this is per-project data only.
+
+    Names and urls come from the user's workspace, so each is capped, and so
+    is the list, to keep the prompt bounded."""
     lines = [
-        f"- {page.get('name') or 'Untitled'} (url: {page.get('url') or page.get('id')}, connection: {conn_name})"
+        f"- {_capped(str(page.get('name') or 'Untitled'), MAX_PAGE_NAME_CHARS)} "
+        f"(url: {_capped(str(page.get('url') or page.get('id')), MAX_PAGE_URL_CHARS)}, connection: {conn_name})"
         for conn_name, pages in pages_by_connection.items()
         for page in pages
         if isinstance(page, dict)
     ]
     if not lines:
         return ""
+    listed = lines[:MAX_LISTED_PAGES]
+    if len(lines) > MAX_LISTED_PAGES:
+        listed.append(f"and {len(lines) - MAX_LISTED_PAGES} more")
     return (
         "\n\nNotion pages the user added to this project's files:\n"
-        + "\n".join(lines)
+        + "\n".join(listed)
         + "\nWhen the user refers to the project's files, documents or pages, these are included."
     )

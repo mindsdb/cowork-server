@@ -232,15 +232,26 @@ async def test_removing_a_notion_page_in_org_mode_untags_it_in_auth(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_removing_a_notion_page_in_org_mode_relays_auths_404(monkeypatch):
+async def test_removing_an_already_removed_notion_page_in_org_mode_is_done(monkeypatch):
     async def fake_proxy_remove(*args):
         raise HTTPException(status_code=404, detail="No picked file 'p1' in project 'alpha'.")
 
     monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_remove_picked_file", fake_proxy_remove)
 
+    result = await connections_endpoints.delete_picked_file("notion", "ws-a", "p1", "alpha", ORG_SCOPE, FakeRequest())
+    assert result == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_removing_a_notion_page_in_org_mode_relays_other_auth_errors(monkeypatch):
+    async def fake_proxy_remove(*args):
+        raise HTTPException(status_code=502, detail="auth service unreachable")
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_remove_picked_file", fake_proxy_remove)
+
     with pytest.raises(HTTPException) as exc_info:
         await connections_endpoints.delete_picked_file("notion", "ws-a", "p1", "alpha", ORG_SCOPE, FakeRequest())
-    assert exc_info.value.status_code == 404
+    assert exc_info.value.status_code == 502
 
 
 @pytest.mark.asyncio

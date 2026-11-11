@@ -73,6 +73,17 @@ class ConnectorSpecRegistry:
                 notes[engine] = text
         return notes
 
+    def mcp_engines(self) -> frozenset[str]:
+        """Engines whose spec offers an ``mcp`` connect method."""
+        return frozenset(
+            engine
+            for engine, spec in self.get_connectors().items()
+            if any(
+                isinstance(method, dict) and method.get("id") == "mcp"
+                for method in ((spec.get("form") or {}).get("methods") or [])
+            )
+        )
+
     def list_connectors(self) -> list[ConnectorMetadataResponse]:
         items = [connector_metadata(c) for c in self.get_connectors().values()]
         items.sort(key=lambda x: (x.label or "").lower())

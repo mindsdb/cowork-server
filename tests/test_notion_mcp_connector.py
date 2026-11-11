@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from cowork.api.v1.endpoints.connectors import oauth as oauth_endpoints
 from cowork.api.v1.endpoints.connectors.oauth import (
     NOTION_ADMIN_APPROVAL_MESSAGE,
+    NOTION_IDENTITY_FAILED_MESSAGE,
     McpIdentityRequest,
     get_oauth_credentials,
 )
@@ -36,6 +37,24 @@ class TestSpec:
         mcp = self._methods()["mcp"]
         assert mcp.recommended is True
         assert mcp.hidden is False
+
+    def test_the_card_text_is_method_neutral_and_the_mcp_method_says_editing_is_opt_in(self):
+        spec = ConnectorSpecRegistry().get_connector("notion")
+        assert spec.description == "Read and work with Notion pages, databases, and blocks in your workspace."
+        mcp = self._methods()["mcp"].description
+        assert "Anton can read pages" in mcp
+        assert "editing stays off until you allow it in Tool access" in mcp
+
+    def test_the_mcp_engines_are_the_specs_with_an_mcp_method(self):
+        assert ConnectorSpecRegistry().mcp_engines() == {"hubspot", "notion"}
+
+    async def test_mcp_identity_is_offered_only_for_the_spec_mcp_engines(self, monkeypatch):
+        from cowork.services.connectors.specs._registry import registry
+
+        monkeypatch.setattr(registry, "mcp_engines", lambda: frozenset({"hubspot"}))
+        with pytest.raises(HTTPException) as exc:
+            await oauth_endpoints.get_mcp_identity("notion", McpIdentityRequest(access_token="tok"))
+        assert exc.value.status_code == 404
 
     def test_notion_is_featured(self):
         assert ConnectorSpecRegistry().get_connector("notion").featured is True
@@ -152,8 +171,24 @@ class TestIdentityBridge:
         assert exc.value.status_code == 502
         assert exc.value.detail != NOTION_ADMIN_APPROVAL_MESSAGE
 
-    async def test_a_tool_error_returns_the_admin_approval_message(self, monkeypatch):
-        self._tool_returns(monkeypatch, RuntimeError("notion MCP tool 'notion-get-users' returned an error: 'blocked'"))
+    @pytest.mark.parametrize("error", [
+        RuntimeError("notion MCP tool 'notion-get-users' returned an error: 'blocked'"),
+        RuntimeError("notion MCP tool 'notion-get-users' returned an error: 'rate limited'"),
+    ])
+    async def test_a_tool_error_is_a_generic_502_not_an_admin_block(self, monkeypatch, error):
+        self._tool_returns(monkeypatch, error)
+        with pytest.raises(HTTPException) as exc:
+            await oauth_endpoints.get_mcp_identity("notion", McpIdentityRequest(access_token="tok"))
+        assert exc.value.status_code == 502
+        assert exc.value.detail == NOTION_IDENTITY_FAILED_MESSAGE
+
+    @pytest.mark.parametrize("status_code", [401, 403])
+    async def test_a_token_rejection_returns_the_admin_approval_message(self, monkeypatch, status_code):
+        request = httpx.Request("POST", "https://mcp.notion.com/mcp")
+        rejected = httpx.HTTPStatusError(
+            "rejected", request=request, response=httpx.Response(status_code, request=request),
+        )
+        self._tool_returns(monkeypatch, ExceptionGroup("task group", [rejected]))
         with pytest.raises(HTTPException) as exc:
             await oauth_endpoints.get_mcp_identity("notion", McpIdentityRequest(access_token="tok"))
         assert exc.value.detail == NOTION_ADMIN_APPROVAL_MESSAGE
@@ -174,7 +209,7 @@ class TestIdentityBridge:
         with pytest.raises(HTTPException) as exc:
             await oauth_endpoints.get_mcp_identity("notion", McpIdentityRequest(access_token="tok"))
         assert exc.value.status_code == 502
-        assert exc.value.detail != NOTION_ADMIN_APPROVAL_MESSAGE
+        assert exc.value.detail == NOTION_IDENTITY_FAILED_MESSAGE
 
 
 @pytest.mark.skipif(not HAS_ANTON_MCP, reason="installed anton has no anton.core.mcp")

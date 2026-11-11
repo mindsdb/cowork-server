@@ -324,13 +324,15 @@ class ConnectionsService:
         specifically granted ones; for notion, pages the user added to the
         project, which nothing else would point the agent at.
 
-        A file is visible if it's untagged (picked with no project context —
-        a connection-wide grant meant to be usable everywhere, same as the
-        connection's other credentials) or explicitly tagged to `project_name`.
-        A file tagged to OTHER projects only is excluded — that's the scoping
-        leak this closes. Only the Project files rail's display (a UI list,
-        not the agent's access) hides untagged files outside every project;
-        the agent must still be able to use them anywhere.
+        A file is visible if it's explicitly tagged to `project_name`, or, for
+        google_drive only, untagged (picked with no project context — a
+        connection-wide grant meant to be usable everywhere, same as the
+        connection's other credentials). A file tagged to OTHER projects only
+        is excluded — that's the scoping leak this closes. Only the Project
+        files rail's display (a UI list, not the agent's access) hides
+        untagged Drive files outside every project; the agent must still be
+        able to use them anywhere. A Notion page is only ever added to a
+        project, so an untagged one reaches no project.
 
         Takes `data_vault` rather than using `self._vault()` so callers that
         run under a filtered/temp vault (e.g. disabled connections) get
@@ -344,7 +346,8 @@ class ConnectionsService:
             fields = data_vault.load(engine, name) or {}
             scoped = [
                 f for f in self._load_picked_files(fields)
-                if isinstance(f, dict) and (not f.get("projects") or project_name in f["projects"])
+                if isinstance(f, dict)
+                and (project_name in (f.get("projects") or []) or (engine != "notion" and not f.get("projects")))
             ]
             if scoped:
                 picked_by_connection[name] = scoped
