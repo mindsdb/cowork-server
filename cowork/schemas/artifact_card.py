@@ -2,11 +2,11 @@
 app copy send for one artifact folder. cowork.services.artifacts
 ._prepare_artifact_card builds it.
 
-Fields are declared in the order the card's keys go out, and `to_json` sends
-only the fields that were set, so a key a card leaves out (the access
-password and emails in org mode, `draftUrl` without a primary, `capabilities`
-on an inline card) stays out. A route or the stream must send `to_json()`,
-never the model: FastAPI would send every unset field with its default.
+Fields are declared in the order the card's keys go out, and the card
+serializes only the fields that were set, however it is dumped (`to_json`,
+`model_dump`, FastAPI). So a key a card leaves out (the access password and
+emails in org mode, `draftUrl` without a primary, `capabilities` on an
+inline card) stays out.
 
 Each default is the value a consumer reading the card takes for a missing key.
 """
@@ -14,7 +14,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 from pydantic.alias_generators import to_camel
 
 from cowork.models.artifact_owner_choice import AccessMode
@@ -58,5 +65,17 @@ class ArtifactCard(BaseModel):
     capabilities: dict | None = None
     received_from: dict | None = None
 
+    @model_serializer(mode="wrap")
+    def _set_fields_only(
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ) -> dict[str, Any]:
+        data = handler(self)
+        fields = type(self).model_fields
+        kept = {
+            (fields[name].alias or name) if info.by_alias else name
+            for name in self.model_fields_set
+        }
+        return {key: value for key, value in data.items() if key in kept}
+
     def to_json(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", by_alias=True, exclude_unset=True)
+        return self.model_dump(mode="json", by_alias=True)

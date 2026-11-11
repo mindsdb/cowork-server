@@ -25,7 +25,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from typing import TYPE_CHECKING, Annotated, Any, AsyncIterator, Callable, Literal, Optional
+from typing import Annotated, Any, AsyncIterator, Callable, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
@@ -52,10 +52,8 @@ from cowork.schemas.responses import (
     ResponseStatus,
     Role,
 )
+from cowork.schemas.artifact_card import ArtifactCard
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
-
-if TYPE_CHECKING:
-    from cowork.schemas.artifact_card import ArtifactCard
 
 logger = logging.getLogger(__name__)
 

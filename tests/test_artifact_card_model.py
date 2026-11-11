@@ -1,6 +1,8 @@
 """ArtifactCard sends the keys its builder set, in the card's order."""
 from __future__ import annotations
 
+from fastapi.encoders import jsonable_encoder
+
 from cowork.schemas.artifact_access import AccessMode, ArtifactAccessView, ArtifactStatusView
 from cowork.schemas.artifact_card import ArtifactCard
 from cowork.services import artifacts as a
@@ -62,3 +64,12 @@ def test_a_published_url_that_is_not_text_reads_as_unpublished(tmp_path):
 
         assert a._published_url_for(tmp_path, primary, published_map=published_map) == ""
     assert a._published_url_for(tmp_path, primary, published_map={"index.html": {"url": "https://x"}}) == "https://x"
+
+
+def test_every_way_of_dumping_a_card_sends_only_its_set_fields():
+    card = make_card()
+    card.capabilities = {"edit": True}
+
+    assert jsonable_encoder(card) == card.to_json()
+    assert "accessPassword" not in jsonable_encoder(card)
+    assert "access_password" not in card.model_dump()

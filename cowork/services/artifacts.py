@@ -1763,7 +1763,9 @@ def loose_file_status(
     folder: Path, file: Path, *, published_map: dict | None = None
 ) -> ArtifactStatusView:
     """The status of a file with no metadata.json, from its folder's publish
-    record."""
+    record, read once."""
+    if published_map is None:
+        published_map = _load_published_map(folder)
     return ArtifactStatusView.of_access(
         published_access_view(folder, file, published_map=published_map),
         published_url=_published_url_for(folder, file, published_map=published_map),

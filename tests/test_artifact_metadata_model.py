@@ -6,7 +6,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from cowork.services.artifact_metadata import ArtifactMetadata
+from cowork.services.artifact_metadata import ArtifactMetadata, MetadataNotAnObject
 
 SURROGATE = "bad" + chr(0xD800)
 TEXT_FIELDS = ["slug", "name", "title", "description", "type", "primary"]
@@ -116,10 +116,20 @@ def test_with_value_appends_a_new_key():
     assert list(_meta({"id": "a"}).with_value("port", 8080).to_document()) == ["id", "port"]
 
 
-def test_without_drops_one_key():
+def test_with_id_sets_the_id_in_place_and_drops_stable_id():
     meta = _meta({"id": "a", "stableId": "b", "name": "n"})
 
-    assert meta.without("stableId").to_document() == {"id": "a", "name": "n"}
+    assert list(meta.with_id("c").to_document().items()) == [("id", "c"), ("name", "n")]
+
+
+def test_a_document_that_is_not_an_object_raises_its_own_error():
+    with pytest.raises(MetadataNotAnObject):
+        ArtifactMetadata.parse("[]")
+
+
+def test_the_model_is_not_hashable():
+    with pytest.raises(TypeError):
+        hash(_meta({}))
 
 
 def test_to_document_is_a_copy():

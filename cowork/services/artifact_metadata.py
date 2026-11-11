@@ -87,11 +87,18 @@ def _provenance_items(value: Any) -> list[Any]:
     return [item if isinstance(item, dict) else None for item in value]
 
 
+class MetadataNotAnObject(ValueError):
+    """A metadata.json that parses but is not a JSON object. Such a folder
+    holds no artifact id."""
+
+
 class ArtifactMetadata(BaseModel):
     """An artifact's metadata.json as the server reads it (see the module
     docstring)."""
 
     model_config = ConfigDict(frozen=True, extra="ignore")
+    # frozen=True would generate a hash that fails on the list fields.
+    __hash__ = None  # type: ignore[assignment]
 
     id: Any = None
     stableId: Any = None
@@ -114,7 +121,7 @@ class ArtifactMetadata(BaseModel):
         if isinstance(data, cls):
             return handler(data)
         if not isinstance(data, dict):
-            raise ValueError("Artifact metadata is not an object")
+            raise MetadataNotAnObject("Artifact metadata is not an object")
         model = handler(data)
         model._document = dict(data)
         return model
@@ -129,12 +136,12 @@ class ArtifactMetadata(BaseModel):
         except RecursionError as exc:
             raise ValueError("Artifact metadata nests too deeply") from exc
         if not isinstance(document, dict):
-            raise ValueError("Artifact metadata is not an object")
+            raise MetadataNotAnObject("Artifact metadata is not an object")
         return cls.model_validate(document)
 
     @classmethod
     def empty(cls) -> ArtifactMetadata:
-        return _EMPTY
+        return cls.model_validate({})
 
     def with_value(self, key: str, value: Any) -> ArtifactMetadata:
         """The document with ``key`` set to ``value``: an existing key keeps
@@ -147,9 +154,6 @@ class ArtifactMetadata(BaseModel):
         document = {k: v for k, v in self._document.items() if k != "stableId"}
         document["id"] = artifact_id
         return type(self).model_validate(document)
-
-    def without(self, key: str) -> ArtifactMetadata:
-        return type(self).model_validate({k: v for k, v in self._document.items() if k != key})
 
     def to_document(self) -> dict[str, Any]:
         """A copy of the document's top level. Nested values are shared with
@@ -167,9 +171,5 @@ class ArtifactMetadata(BaseModel):
 
     def model_copy(self, *, update: dict[str, Any] | None = None, deep: bool = False) -> ArtifactMetadata:
         if update:
-            raise TypeError("ArtifactMetadata changes only through with_value or without")
+            raise TypeError("ArtifactMetadata changes only through with_value or with_id")
         return super().model_copy(deep=deep)
-
-
-# Frozen, so one instance serves every caller with no document.
-_EMPTY = ArtifactMetadata.model_validate({})

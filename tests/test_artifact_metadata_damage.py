@@ -224,12 +224,21 @@ def test_recording_a_primary_changes_only_the_primary(source):
     }
 
 
-@pytest.mark.parametrize("text", ["[]", json.dumps({"files": [{"path": "bad" + chr(0xD800)}]})])
-def test_recording_a_primary_skips_a_document_it_cannot_use(source, text):
-    folder = _raw_artifact(source.base, "export", text)
-    before = (folder / "metadata.json").read_bytes()
+def test_recording_a_primary_skips_a_document_that_is_not_an_object(source):
+    folder = _raw_artifact(source.base, "export", "[]")
 
     with pinned_dir(folder, nofollow_base=True) as pinned:
+        _record_primary(folder=pinned, primary="index.html")
+
+    assert (folder / "metadata.json").read_text() == "[]"
+
+
+def test_recording_a_primary_refuses_a_document_it_cannot_write_back(source):
+    # Exporting on would let the new file take over the card's primary.
+    folder = _raw_artifact(source.base, "export", json.dumps({"files": [{"path": "bad" + chr(0xD800)}]}))
+    before = (folder / "metadata.json").read_bytes()
+
+    with pinned_dir(folder, nofollow_base=True) as pinned, pytest.raises(ValueError):
         _record_primary(folder=pinned, primary="index.html")
 
     assert (folder / "metadata.json").read_bytes() == before

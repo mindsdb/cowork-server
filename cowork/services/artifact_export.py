@@ -14,7 +14,6 @@ from __future__ import annotations
 import codecs
 import errno
 import html
-import logging
 import os
 import secrets
 from collections.abc import AsyncIterator, Callable
@@ -50,7 +49,7 @@ from cowork.services.artifact_identity import (
     opened_artifact_folder,
 )
 from cowork.services.artifact_inline import inline_artifact_html
-from cowork.services.artifact_metadata import ArtifactMetadata
+from cowork.services.artifact_metadata import ArtifactMetadata, MetadataNotAnObject
 from cowork.services.artifacts import (
     ProjectArtifacts,
     _is_single_named_file,
@@ -69,7 +68,6 @@ if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
     from cowork.schemas.artifact_card import ArtifactCard
 
-logger = logging.getLogger(__name__)
 
 _MARKDOWN_SOURCES = frozenset({".md", ".markdown"})
 _HTML_SOURCES = frozenset({".html", ".htm"})
@@ -446,18 +444,19 @@ def _record_primary(*, folder: PinnedDir, primary: str) -> None:
     ``ensure_full_id`` widens an id, and the file's timestamps are put back
     because the artifact's content did not change. If the export then fails,
     the record stays: it names the file the card already shows. A primary
-    that names a file is never changed. A document that isn't an object, or
-    one that can't be written back, gets no record.
+    that names a file is never changed. A document that isn't an object gets
+    no record: its folder holds no id, so no card shows a primary. Any other
+    document the record can't be read or written to fails the export, before
+    the new file could take over the card.
     """
     try:
         latest = ArtifactMetadata.parse(_read_no_follow(folder, _METADATA))
-        if _primary_names_a_file(folder=folder, primary=latest.primary):
-            return
-        before = dir_stat(folder, _METADATA, follow_symlinks=False)
-        _write_metadata(folder, latest.with_value("primary", primary))
-    except ValueError as exc:
-        logger.warning("Export records no primary for %s (%s)", folder.path, exc)
+    except MetadataNotAnObject:
         return
+    if _primary_names_a_file(folder=folder, primary=latest.primary):
+        return
+    before = dir_stat(folder, _METADATA, follow_symlinks=False)
+    _write_metadata(folder, latest.with_value("primary", primary))
     times = (before.st_atime_ns, before.st_mtime_ns)
     try:
         if folder.fd is not None:
