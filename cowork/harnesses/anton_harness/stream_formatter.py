@@ -52,6 +52,7 @@ from cowork.schemas.responses import (
     ResponseStatus,
     Role,
 )
+from cowork.schemas.artifact_card import ArtifactCard
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,7 @@ class ArtifactCreated:
     renderer shows an inline card for every artifact type, identically and
     deterministically — live and on reload."""
 
-    artifact: dict
+    artifact: ArtifactCard
 
 
 @dataclass(frozen=True)
@@ -1214,7 +1215,7 @@ async def format_responses_stream(
             yield _event("response.artifact_created", {
                 "type": "response.artifact_created",
                 "sequence_number": seq,
-                "artifact": event.artifact,
+                "artifact": event.artifact.to_json(),
             })
 
         elif isinstance(event, StreamAskUser):

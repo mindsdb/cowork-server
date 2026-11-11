@@ -174,10 +174,11 @@ async def _turn_end(base: Path, *, conversation_id, touched_by_pod: set[str] | N
         tracked_new=tracked, tracked_edits=tracked, attribute_by_provenance=True,
         repair_slugs=set() if tracked is not None else None,
     )
-    return changes, await publish_and_card_turn_artifacts(
+    cards = await publish_and_card_turn_artifacts(
         base, new_slugs=changes.created, touched_slugs=changes.touched, scope=ORG_SCOPE,
         project_id=PROJECT_ID, project_name="proj", only_touched=tracked is not None,
     )
+    return changes, [card.to_json() for card in cards]
 
 
 async def _turn_end_editing_one_of(*, base: Path, monkeypatch, published_artifacts: int):  # noqa: F811
@@ -256,10 +257,10 @@ async def test_the_self_heal_publishes_what_the_turn_end_left(base, enabled, key
     # As a producer runs a turn end with the pod's list: the request as its
     # record starts, then the publish.
     ap.request_turn_end_self_heal(artifacts_base=base, scope=ORG_SCOPE, project_id=PROJECT_ID)
-    cards = await publish_and_card_turn_artifacts(
+    cards = [card.to_json() for card in await publish_and_card_turn_artifacts(
         base, new_slugs=["made"], touched_slugs={"made"}, scope=ORG_SCOPE,
         project_id=PROJECT_ID, project_name="proj", only_touched=True,
-    )
+    )]
     assert [card["slug"] for card in cards] == ["made"]
     assert [call["folder"].name for call in published] == ["made"]
 

@@ -31,6 +31,7 @@ from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.principal import ORG_MANAGE_ROLE, Principal
 from cowork.services import artifact_locks
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.publish import ARTIFACT_ORG_REFUSAL
 from _async_stub import awaitable
 from tests._org_sharing import (
@@ -85,7 +86,7 @@ def as_owner(monkeypatch, folder):
     monkeypatch.setattr(
         aw, "_owner_workspace",
         awaitable(lambda scope, project_ref, artifact_id: (
-            SimpleNamespace(project_id="proj-1"), folder, {"slug": "rep"}, {},
+            SimpleNamespace(project_id="proj-1"), folder, ArtifactMetadata.model_validate({"slug": "rep"}), {},
         )),
     )
     return folder

@@ -14,7 +14,6 @@ from __future__ import annotations
 import codecs
 import errno
 import html
-import json
 import os
 import secrets
 from collections.abc import AsyncIterator, Callable
@@ -45,11 +44,12 @@ from cowork.schemas.artifact_export import (
 )
 from cowork.services import artifact_files
 from cowork.services.artifact_identity import (
-    _atomic_json,
     _read_no_follow,
+    _write_metadata,
     opened_artifact_folder,
 )
 from cowork.services.artifact_inline import inline_artifact_html
+from cowork.services.artifact_metadata import ArtifactMetadata, MetadataNotAnObject
 from cowork.services.artifacts import (
     ProjectArtifacts,
     _is_single_named_file,
@@ -66,6 +66,7 @@ from cowork.services.render_pdf_client import RenderServicePdf, pdf_request
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
+    from cowork.schemas.artifact_card import ArtifactCard
 
 
 _MARKDOWN_SOURCES = frozenset({".md", ".markdown"})
@@ -229,12 +230,9 @@ def offered_export_formats(
     )
 
 
-def _primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...] | None:
+def _primary_parts(*, folder: Path, metadata: ArtifactMetadata) -> tuple[str, ...] | None:
     """The primary file's path inside *folder*, picked the way the artifact card picks it."""
-    hint = metadata.get("primary")
-    primary = _pick_primary(
-        folder, _user_files(folder), primary_hint=hint if isinstance(hint, str) else None
-    )
+    primary = _pick_primary(folder, _user_files(folder), primary_hint=metadata.primary)
     if primary is None:
         return None
     try:
@@ -244,7 +242,7 @@ def _primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...] | None:
     return relative.parts or None
 
 
-def _exportable_primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...] | None:
+def _exportable_primary_parts(*, folder: Path, metadata: ArtifactMetadata) -> tuple[str, ...] | None:
     """The primary file's path inside *folder*, or None when the export's read would refuse it.
 
     A primary the read refuses for what it is on disk names no source: a file
@@ -258,16 +256,16 @@ def _exportable_primary_parts(*, folder: Path, metadata: dict) -> tuple[str, ...
     return parts
 
 
-def primary_export_source(*, folder: Path, metadata: dict) -> ExportSource:
+def primary_export_source(*, folder: Path, metadata: ArtifactMetadata) -> ExportSource:
     """The export source of the artifact in *folder*: its primary file and its type."""
     parts = _exportable_primary_parts(folder=folder, metadata=metadata)
     return ExportSource(
         source_name="/".join(parts or ()),
-        is_backend=is_backend_type(metadata.get("type")),
+        is_backend=is_backend_type(metadata.type),
     )
 
 
-def card_export_source(card: dict) -> ExportSource:
+def card_export_source(card: ArtifactCard) -> ExportSource:
     """The export source an artifact card describes, from its ``path``, ``folder`` and ``type``.
 
     A primary with a second hard link names no source, as in
@@ -276,20 +274,18 @@ def card_export_source(card: dict) -> ExportSource:
     offers a format then.
     """
     try:
-        relative = Path(str(card.get("path") or "")).relative_to(
-            Path(str(card.get("folder") or ""))
-        )
+        relative = Path(card.path).relative_to(Path(card.folder))
     except ValueError:
         relative = Path()
     if (
         relative.parts
         and not org_export_refused(org_mode=_org_mode())
-        and not _is_single_named_file(Path(str(card["path"])))
+        and not _is_single_named_file(Path(card.path))
     ):
         relative = Path()
     return ExportSource(
         source_name="/".join(relative.parts),
-        is_backend=is_backend_type(card.get("type")),
+        is_backend=is_backend_type(card.type),
     )
 
 
@@ -448,15 +444,19 @@ def _record_primary(*, folder: PinnedDir, primary: str) -> None:
     ``ensure_full_id`` widens an id, and the file's timestamps are put back
     because the artifact's content did not change. If the export then fails,
     the record stays: it names the file the card already shows. A primary
-    that names a file is never changed.
+    that names a file is never changed. A document that isn't an object gets
+    no record: its folder holds no id, so no card shows a primary. Any other
+    document the record can't be read or written to fails the export, before
+    the new file could take over the card.
     """
-    latest = json.loads(_read_no_follow(folder, _METADATA))
-    if not isinstance(latest, dict) or _primary_names_a_file(
-        folder=folder, primary=latest.get("primary")
-    ):
+    try:
+        latest = ArtifactMetadata.parse(_read_no_follow(folder, _METADATA))
+    except MetadataNotAnObject:
+        return
+    if _primary_names_a_file(folder=folder, primary=latest.primary):
         return
     before = dir_stat(folder, _METADATA, follow_symlinks=False)
-    _atomic_json(folder, _METADATA, {**latest, "primary": primary})
+    _write_metadata(folder, latest.with_value("primary", primary))
     times = (before.st_atime_ns, before.st_mtime_ns)
     try:
         if folder.fd is not None:
@@ -464,7 +464,7 @@ def _record_primary(*, folder: PinnedDir, primary: str) -> None:
         else:
             # Windows, the only place a pinned folder has no descriptor, can't
             # set times without following a link: follow_symlinks=False raises
-            # NotImplementedError there. _atomic_json has just put a regular
+            # NotImplementedError there. _write_metadata has just put a regular
             # file at this name.
             os.utime(folder.path / _METADATA, ns=times)
     except OSError:
@@ -647,7 +647,7 @@ def export_primary_file(
     *,
     source: ProjectArtifacts,
     folder_name: str,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     export_format: ExportFormat,
     can_edit: bool,
@@ -670,7 +670,7 @@ def export_primary_file(
         offered = offered_export_formats(
             source=ExportSource(
                 source_name="/".join(parts or ()),
-                is_backend=is_backend_type(metadata.get("type")),
+                is_backend=is_backend_type(metadata.type),
             ),
             can_edit=can_edit,
             org_mode=org_mode,

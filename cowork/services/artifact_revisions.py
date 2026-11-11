@@ -43,6 +43,7 @@ from cowork.services.artifact_journal import (
     write_journal_file,
 )
 from cowork.services.artifact_lock import artifact_lock
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_revision_records import (
     AgentRepair,
     JournalRecord,
@@ -354,10 +355,10 @@ def _finish_queued_repairs(
         _write_repair(folder, repair)
 
 
-def resolve_source(folder: Path, metadata: dict, rel_path: str | None = None) -> tuple[Path, str]:
+def resolve_source(folder: Path, metadata: ArtifactMetadata, rel_path: str | None = None) -> tuple[Path, str]:
     """Resolve an editable source without accepting an absolute/client path."""
     canonical_folder = folder.resolve(strict=False)
-    candidate_rel = (rel_path or metadata.get("primary") or "").strip().replace("\\", "/")
+    candidate_rel = (rel_path or metadata.primary or "").strip().replace("\\", "/")
     if not candidate_rel:
         # The card's own walk: content files only, no symlinks. The journal is
         # also refused below the top level, as the explicit-path gate does.
@@ -689,7 +690,7 @@ def _recover_pending_source_write(folder: Path) -> None:
         _abandon_pending(folder, "blob_refused")
         return
     try:
-        target, _ = resolve_source(folder, {}, pending.path)
+        target, _ = resolve_source(folder, ArtifactMetadata.empty(), pending.path)
         current = _read_source(target)
     except (FileNotFoundError, ValueError):
         _abandon_pending(folder, "source_unavailable")
@@ -793,7 +794,7 @@ class _RevisionText:
 
 
 def _current_source_locked(
-    folder: Path, metadata: dict, artifact_id: str, rel_path: str | None = None
+    folder: Path, metadata: ArtifactMetadata, artifact_id: str, rel_path: str | None = None
 ) -> _Source:
     """Read/capture source while the caller holds the artifact revision lock."""
     _recover_pending_source_write(folder)
@@ -826,14 +827,14 @@ def _current_source_locked(
     )
 
 
-def current_source(folder: Path, metadata: dict, artifact_id: str, rel_path: str | None = None) -> dict:
+def current_source(folder: Path, metadata: ArtifactMetadata, artifact_id: str, rel_path: str | None = None) -> dict:
     """Read source plus the revision token required by a subsequent save."""
     with artifact_lock(folder):
         return _current_source_locked(folder, metadata, artifact_id, rel_path).to_json()
 
 
 def current_workspace(
-    folder: Path, metadata: dict, artifact_id: str, rel_path: str | None = None
+    folder: Path, metadata: ArtifactMetadata, artifact_id: str, rel_path: str | None = None
 ) -> dict:
     """Read editable source and its history under one artifact lock.
 
@@ -854,7 +855,7 @@ def current_workspace(
 
 def save_source(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     *,
     content: str,
@@ -974,7 +975,7 @@ def capture_agent_revision(
             ]
             queued = [r for r in turn_repairs if r.path == relative]
             # The primary can move between minting a handoff and this capture
-            # (metadata["primary"] rewritten, or resolve_source's sorted
+            # (metadata.primary rewritten, or resolve_source's sorted
             # fallback picking a file the turn created). A handoff left on the
             # old path would never be finished by any later turn either, so it
             # ends here rather than gating that path forever.
@@ -1101,7 +1102,7 @@ def _preview_error_lines(entries: object, source_path: str) -> list[str]:
 
 def create_agent_repair(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     *,
     expected_revision_id: str,
@@ -1275,7 +1276,7 @@ def release_repairs_for_comment(folder: Path, comment_thread_id: str) -> list[di
 
 def finalize_agent_repair(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     repair_id: str,
     decision: str,

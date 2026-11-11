@@ -35,6 +35,7 @@ from cowork.services import (
 )
 from cowork.services.artifact_access import ArtifactAccessUnavailable
 from cowork.services.artifact_identity import artifact_key
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.publish import publish_artifact
 from tests._org_sharing import TEAM_ELSEWHERE, TEAM_ENG, TEAM_OPS, TEAM_QA, member_request, mindshub_sharing_answers
 
@@ -458,7 +459,7 @@ async def test_live_editor_sync_preserves_canonical_identity_and_refuses_peer(
         scope=scope,
         project_id=str(project.id),
     )
-    metadata = json.loads((folder / "metadata.json").read_text())
+    metadata = ArtifactMetadata.parse((folder / "metadata.json").read_text())
     initial = current_source(folder, metadata, local_id)
     body = artifact_workspace._SourceUpdateBody(
         content="<html>Updated owner bytes</html>",

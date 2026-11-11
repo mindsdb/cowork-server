@@ -1,7 +1,7 @@
 """Search endpoint — local search across cowork resources."""
 from __future__ import annotations
 
-from typing import Annotated, Literal, NamedTuple
+from typing import TYPE_CHECKING, Annotated, Literal, NamedTuple
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -15,6 +15,9 @@ from cowork.services.conversations import ConversationService
 from cowork.services.pins import PinService
 from cowork.services.projects import ProjectService, is_comparison_sandbox
 from cowork.services.schedules import ScheduleService
+
+if TYPE_CHECKING:
+    from cowork.schemas.artifact_card import ArtifactCard
 
 # AuthenticatedInOrgMode, declared explicitly: the conversation/project/
 # schedule/pin listings already fail closed on their own
@@ -128,22 +131,17 @@ def _search_rows(session: ScopedSession, query: str) -> _RowMatches:
     return _RowMatches(before_artifacts=before_artifacts, after_artifacts=results)
 
 
-def _artifact_rows(artifacts: list[dict], query: str) -> list[SearchHit]:
+def _artifact_rows(artifacts: list[ArtifactCard], query: str) -> list[SearchHit]:
     results: list[SearchHit] = []
     for artifact in artifacts:
-        text = " ".join([
-            artifact.get("title") or "",
-            artifact.get("description") or "",
-            artifact.get("path") or "",
-            artifact.get("kind") or "",
-        ])
+        text = " ".join([artifact.title, artifact.description, artifact.path, artifact.kind])
         score = _score(text, query)
         if score:
             results.append(SearchHit(
                 type="artifact",
-                id=artifact.get("path") or artifact.get("id") or artifact.get("title"),
-                title=artifact.get("title") or "Artifact",
-                subtitle=artifact.get("description") or artifact.get("path") or "Artifact",
+                id=artifact.path or artifact.id or artifact.title,
+                title=artifact.title or "Artifact",
+                subtitle=artifact.description or artifact.path or "Artifact",
                 route="artifacts",
                 score=score,
             ))

@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cowork.services.artifact_identity import ensure_full_id
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_revisions import (
     _MAX_PREVIEW_ENTRIES_SCANNED,
     _MAX_PREVIEW_FILE,
@@ -126,7 +127,7 @@ def artifact(tmp_path):
     }
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     (folder / "brief.md").write_text("# First\n", encoding="utf-8")
-    artifact_id, metadata = ensure_full_id(folder, metadata)
+    artifact_id, metadata = ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
     return folder, metadata, artifact_id
 
 

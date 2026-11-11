@@ -13,6 +13,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services import artifact_identity, artifact_roots, artifacts
 from cowork.services.artifact_identity import ensure_full_id, resolve_artifact_folder
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts, list_artifacts
 
 
@@ -113,7 +114,7 @@ def test_symlinked_artifact_folder_is_neither_resolved_nor_migrated(tmp_path):
     with pytest.raises(FileNotFoundError, match="Artifact not found"):
         resolve_artifact_folder([_source(project)], wanted)
     with pytest.raises(OSError):
-        ensure_full_id(linked, legacy)
+        ensure_full_id(linked, ArtifactMetadata.model_validate(legacy))
 
     assert (outside / "metadata.json").read_bytes() == before
 
@@ -124,7 +125,7 @@ def test_symlinked_trusted_project_anchor_is_refused(tmp_path):
     folder = real_project / ".anton" / "artifacts" / "draft"
     _write_metadata(folder)
     (folder / "index.html").write_text("<html></html>", encoding="utf-8")
-    assert list_artifacts([_source(real_project)])[0]["slug"] == "draft"
+    assert list_artifacts([_source(real_project)])[0].to_json()["slug"] == "draft"
 
     planted_anchor = tmp_path / "planted-project"
     planted_anchor.symlink_to(real_project, target_is_directory=True)
@@ -161,7 +162,7 @@ def test_listing_does_not_read_a_symlinked_publish_record(tmp_path):
     )
     (folder / ".published.json").symlink_to(outside)
 
-    card = list_artifacts([_source(project)])[0]
+    card = list_artifacts([_source(project)])[0].to_json()
 
     assert card["publishedUrl"] == ""
     assert card["accessMode"] == "public"
@@ -377,14 +378,16 @@ def test_org_storage_opens_every_folder_below_the_shared_root(tmp_path, monkeypa
     artifact_identity._clear_identity_indexes()
 
     assert code_sandbox.anchored_below_a_trusted_root(project).names == (ORG, "projects", "forecast")
-    assert sorted(card["slug"] for card in list_artifacts(sources)) == ["legacy-report", "shared-report"]
+    cards = [card.to_json() for card in list_artifacts(sources)]
+    assert sorted(card["slug"] for card in cards) == ["legacy-report", "shared-report"]
     assert resolve_artifact_folder(sources, LEGACY_ID)[1].name == "legacy-report"
 
     elsewhere = tmp_path / "elsewhere"
     shutil.move(conversation, elsewhere)
     conversation.symlink_to(elsewhere, target_is_directory=True)
     artifact_identity._clear_identity_indexes()
-    assert [card["slug"] for card in list_artifacts(sources)] == ["shared-report"]
+    cards = [card.to_json() for card in list_artifacts(sources)]
+    assert [card["slug"] for card in cards] == ["shared-report"]
     with pytest.raises(FileNotFoundError, match="Artifact not found"):
         resolve_artifact_folder(sources, LEGACY_ID)
 

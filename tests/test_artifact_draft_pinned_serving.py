@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.services import artifact_files
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.comments_layer import ACTIVATION_PARAM
 from cowork.db.scoped import LOCAL_SCOPE
@@ -30,7 +31,7 @@ def _artifact(tmp_path, *, metadata: dict | None = None):
         trusted_anchor=project,
         root_parts=(".anton", "artifacts"),
     )
-    return source, folder, metadata or {"type": "html-app"}
+    return source, folder, ArtifactMetadata.model_validate(metadata or {"type": "html-app"})
 
 
 async def _serve(
@@ -311,7 +312,7 @@ async def test_a_symlinked_artifacts_root_cannot_reuse_the_sources_authority(
             monkeypatch,
             source,
             outside_folder,
-            {"type": "html-app"},
+            ArtifactMetadata.model_validate({"type": "html-app"}),
             "secret.txt",
         )
 
@@ -325,10 +326,10 @@ async def test_fullstack_preview_stays_inside_the_declared_public_subtree(
     (folder / "static").mkdir()
     (folder / "static" / "app.js").write_text("public")
     (folder / "backend.py").write_text("secret")
-    metadata = {
+    metadata = ArtifactMetadata.model_validate({
         "type": "fullstack-stateless-app",
         "primary": "static/index.html",
-    }
+    })
 
     response = await _serve(
         monkeypatch, source, folder, metadata, "static/app.js"

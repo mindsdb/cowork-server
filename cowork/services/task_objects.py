@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -18,7 +18,11 @@ from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
 from cowork.services.artifact_identity import ArtifactListing, ListedIds
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.turnqueue.models import TurnCompleted
+
+if TYPE_CHECKING:
+    from cowork.schemas.artifact_card import ArtifactCard
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +44,7 @@ def _artifact_owner(folder: Path) -> str | None:
     if not meta.is_file():
         return None
     try:
-        data = json.loads(meta.read_text(encoding="utf-8"))
+        data = ArtifactMetadata.parse(meta.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     from cowork.services.artifacts import origin_conversation_id
@@ -729,7 +733,7 @@ def cards_for_slugs(
     project_id: str | None = None,
     project_name: str = "",
     project_label: str = "",
-) -> list[dict]:
+) -> list[ArtifactCard]:
     """Inline-chat card payloads for the given slugs, order preserved.
 
     Uses the same per-folder card builder as the artifacts list
@@ -751,7 +755,7 @@ def cards_for_slugs(
     from cowork.services.artifacts import card_for_folder
 
     base = Path(artifacts_base)
-    cards: list[dict] = []
+    cards: list[ArtifactCard] = []
     for slug in slugs:
         try:
             card = card_for_folder(
@@ -785,7 +789,7 @@ async def publish_and_card_turn_artifacts(
     project_name: str = "",
     project_label: str = "",
     only_touched: bool = False,
-) -> list[dict]:
+) -> list[ArtifactCard]:
     """Reconcile publishes for this turn, then build the cards to emit.
 
     The second half of the end-of-turn artifact flow. The first half records

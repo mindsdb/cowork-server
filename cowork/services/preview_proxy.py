@@ -18,7 +18,6 @@ in the cowork repo.)
 """
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -38,6 +37,7 @@ from cowork.services.artifacts import (
     backend_port_is_the_callers,
     preview_mount_for,
 )
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.comments_layer import ACTIVATION_PARAM
 from cowork.services.preview_html import prepare_preview_html
 
@@ -74,13 +74,10 @@ _UPSTREAM_BLOCKED_REQUEST_HEADERS = {"content-length", "host"}
 
 def _read_backend_port(artifact_dir: Path) -> Optional[int]:
     try:
-        meta = json.loads((artifact_dir / "metadata.json").read_text(encoding="utf-8"))
+        meta = ArtifactMetadata.parse((artifact_dir / "metadata.json").read_text(encoding="utf-8"))
     except Exception:
         return None
-    port = meta.get("port")
-    if isinstance(port, int) and 0 < port < 65536:
-        return port
-    return None
+    return meta.port
 
 
 def _cors_headers(req: Request) -> dict[str, str]:
