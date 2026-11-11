@@ -3881,6 +3881,19 @@ async def test_a_refused_draft_is_a_notice_without_its_value(monkeypatch):
     assert frames[-1] == "CLOSE:completed"
 
 
+@pytest.mark.asyncio
+async def test_a_draft_from_a_pod_without_auth_is_a_notice_not_a_card(monkeypatch):
+    entry = _TURN_CONNECTOR_REPLY["data"]["entries"][0]
+    older = {key: value for key, value in entry.items() if key != "auth"}
+
+    frames, _ = await _connector_frames(monkeypatch, ("turn_connector", {"entries": [older]}))
+
+    assert _payloads(frames, "response.connector_drafted") == []
+    notices = [p["message"] for p in _payloads(frames, "response.in_progress")
+               if p.get("phase") == "connector_draft_dropped"]
+    assert len(notices) == 1 and "auth" in notices[0]
+
+
 class _QueueRedis:
     """Records queued jobs and answers each with its own terminal reply."""
 

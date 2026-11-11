@@ -328,7 +328,9 @@ class TestSaveConnectorDraft:
         {"methods": [{"id": "oauth", "oauth": {"auth_url": "https://acme.example/auth"}}]},
         {"connector_id": "acme_crm\n"},
         {"fields": []},
-    ], ids=["token label", "oauth method", "trailing newline id", "no fields"])
+        {"auth": None},
+        {"check": {"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}}},
+    ], ids=["token label", "oauth method", "trailing newline id", "no fields", "no auth", "check headers"])
     def test_a_draft_outside_the_allowlist_is_a_422_without_the_value(self, engine, org_tenancy, change):
         resp = _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json={**_anton_draft(), **change})
 
