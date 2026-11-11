@@ -237,13 +237,15 @@ def _sources_and_cards(
 
 
 def _newest_cards(sources: list[ProjectArtifacts], newest: NewestFolders) -> list[dict]:
-    """The cards of the folders ``newest`` names, among ``sources``, in the
-    order a walk of every folder sorts them (cards_for_candidates). When
-    fewer than LIST_CARDS of them build a card and the rows were cut at the
-    query's limit, every folder of ``sources`` is read instead
-    (_list_artifacts), so a run of folders gone since their rows were
-    written never leaves the list short."""
-    index: dict[object, int] = {}
+    """The cards of the folders ``newest`` names, among ``sources``, newest
+    first by their recorded time, then by root and name, as
+    cards_for_candidates orders a walk's. When fewer than LIST_CARDS of them
+    build a card and the rows were cut at the query's limit, every folder of
+    ``sources`` is read instead (_list_artifacts), so a run of folders gone
+    since their rows were written never leaves the list short."""
+    from cowork.services.held_artifact_roots import HeldRoot
+
+    index: dict[HeldRoot, int] = {}
     for position, source in enumerate(sources):
         root = held_root_of(source)
         if root is not None:
@@ -251,7 +253,7 @@ def _newest_cards(sources: list[ProjectArtifacts], newest: NewestFolders) -> lis
     candidates = [
         ListCandidate(row.sort_time, position, row.slug, sources[position])
         for row in newest.rows
-        if (position := index.get((row.project_id, row.conversation_id))) is not None
+        if (position := index.get(HeldRoot(row.project_id, row.conversation_id))) is not None
     ]
     cards = cards_for_candidates(candidates)
     if len(cards) < LIST_CARDS and not newest.complete:
