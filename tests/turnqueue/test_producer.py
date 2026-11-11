@@ -1623,7 +1623,7 @@ async def test_an_unusable_name_or_engine_is_left_out_and_the_turn_still_queues(
     """Auth accepts a name of only invisible characters and the queue check
     refuses an empty label, so the producer must drop it rather than fail every
     turn for that user."""
-    listing = [_verified(93, "postgres", "​", version=2), _verified(80, "Postgres-X", "ops\n", version=1)]
+    listing = [_verified(93, "postgres", "\u200b", version=2), _verified(80, "Postgres-X", "ops\n", version=1)]
     queued = await _queued_datasource(monkeypatch, listing, labels=True)
     assert queued == {"protocol_version": 1, "connections": [
         {"connection_id": 93, "credential_version": 2, "engine": "postgres"},
