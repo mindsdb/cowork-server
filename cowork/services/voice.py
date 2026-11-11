@@ -24,7 +24,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from pydantic import BaseModel
@@ -141,11 +143,42 @@ async def available(bearer: str) -> bool:
     return on
 
 
-def session_body(sdp: str, voice: str | None = None) -> dict[str, Any]:
+#: How much of each memory slot the call is told: a profile is a few lines.
+MAX_MEMORY_CHARS = 2_000
+
+
+def local_now(tz_name: str | None, now: datetime | None = None) -> str:
+    """The person's date and time, from this server's clock in their time zone
+    (an IANA name from their browser), or in UTC when it is missing or unknown."""
+    zone: Any = timezone.utc
+    label = "UTC"
+    if tz_name:
+        try:
+            zone = ZoneInfo(tz_name)
+            label = tz_name
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    at = (now or datetime.now(timezone.utc)).astimezone(zone)
+    return f"{at:%A, %B} {at.day}, {at.year}, {at:%I:%M %p}".replace(", 0", ", ") + f" ({label})"
+
+
+def voice_context(*, tz_name: str | None, memory: dict[str, str] | None, now: datetime | None = None) -> str:
+    """What the call knows about the person before they speak: their date and
+    time, and what memory holds about them (their profile and standing rules)."""
+    lines = [f"It is now {local_now(tz_name, now)} where the user is. Use this for anything about dates or time."]
+    memory = memory or {}
+    if profile := (memory.get("profile") or "").strip():
+        lines.append(f"What you know about the user:\n{profile[:MAX_MEMORY_CHARS]}")
+    if rules := (memory.get("rules") or "").strip():
+        lines.append(f"The user's standing preferences:\n{rules[:MAX_MEMORY_CHARS]}")
+    return "\n\n".join(lines)
+
+
+def session_body(sdp: str, voice: str | None = None, context: str = "") -> dict[str, Any]:
     return {
         "session": {
             "model": MODEL,
-            "instructions": VOICE_PROMPT,
+            "instructions": f"{VOICE_PROMPT}\n\n{context}" if context else VOICE_PROMPT,
             "delegation": {"type": "client"},
             "audio": {"output": {"voice": voice if voice in VOICES else DEFAULT_VOICE}},
         },
@@ -160,7 +193,7 @@ _REFUSALS = {
 }
 
 
-async def start_session(bearer: str, sdp: str, voice: str | None = None) -> dict:
+async def start_session(bearer: str, sdp: str, voice: str | None = None, context: str = "") -> dict:
     """GPT-Live's answer for the browser's SDP offer: ``{session: {id}, transport: {type, sdp}}``."""
     if not bearer:
         raise VoiceError(401, "unauthorized", "Sign in to MindsHub to start a voice call.")
@@ -169,7 +202,7 @@ async def start_session(bearer: str, sdp: str, voice: str | None = None) -> dict
     try:
         async with _client() as client:
             response = await asyncio.wait_for(
-                client.post(live_sessions_url(), json=session_body(sdp, voice), headers={"Authorization": f"Bearer {bearer}"}),
+                client.post(live_sessions_url(), json=session_body(sdp, voice, context), headers={"Authorization": f"Bearer {bearer}"}),
                 _TIMEOUT_S,
             )
     except Exception as exc:

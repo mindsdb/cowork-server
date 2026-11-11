@@ -55,13 +55,39 @@ async def test_starts_a_gpt_live_session_as_the_caller_with_the_fixed_session(in
     assert str(request.url) == "https://api-pr-cowork-1.dev.mindshub.ai/v1/live/sessions"
     assert request.headers["Authorization"] == BEARER
     body = json.loads(request.content)
+    instructions = body["session"].pop("instructions")
     assert body["session"] == {
         "model": "gpt-live-1",
-        "instructions": voice.VOICE_PROMPT,
         "delegation": {"type": "client"},
         "audio": {"output": {"voice": "cinder"}},
     }
+    # The fixed prompt, then the person's date and time (UTC with no zone sent).
+    assert instructions.startswith(voice.VOICE_PROMPT + "\n\nIt is now ")
+    assert "(UTC) where the user is" in instructions
     assert body["transport"] == {"type": "webrtc", "sdp": "offer-sdp"}
+
+
+async def test_the_call_knows_the_persons_date_and_time_and_what_memory_holds_about_them(inference, monkeypatch):
+    import cowork.api.v1.endpoints.voice as endpoint
+
+    monkeypatch.setattr(endpoint, "_person_memory", lambda scope: {"profile": "Jorge, founder; lives in SF.", "rules": "Always use metric."})
+    started = await _call("POST", "/session", json={"sdp": "offer-sdp", "timezone": "America/Los_Angeles"})
+
+    assert started.status_code == 200, started.text
+    instructions = json.loads(inference.seen[0].content)["session"]["instructions"]
+    assert "(America/Los_Angeles) where the user is" in instructions
+    assert "What you know about the user:\nJorge, founder; lives in SF." in instructions
+    assert "The user's standing preferences:\nAlways use metric." in instructions
+
+
+def test_local_now_reads_the_persons_zone_or_falls_back_to_utc():
+    from datetime import datetime, timezone
+
+    at = datetime(2026, 11, 12, 4, 5, tzinfo=timezone.utc)
+    assert voice.local_now("America/Los_Angeles", at) == "Wednesday, November 11, 2026, 8:05 PM (America/Los_Angeles)"
+    assert voice.local_now("Not/AZone", at) == "Thursday, November 12, 2026, 4:05 AM (UTC)"
+    assert voice.local_now(None, at).endswith("(UTC)")
+    assert voice.voice_context(tz_name=None, memory={"profile": "x" * 5000}, now=at).count("x") == voice.MAX_MEMORY_CHARS
 
 
 @pytest.mark.parametrize(("asked", "sent"), [("willow", "willow"), ("cedar", "cedar"), ("not-a-voice", "cinder")])
