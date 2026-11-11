@@ -58,7 +58,7 @@ def turns(monkeypatch):
     ending = SimpleNamespace(reason="completed", acted=True)
 
     class Handler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             assert interactive is False, "a scheduled turn is never interactive"
 
         async def handle(self, request):
