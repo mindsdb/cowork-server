@@ -137,21 +137,92 @@ deployment:
   datasourceTurnsEnabled: "false"
   datasourceCapabilities: ""
 
+  # The draft-preview host name and the one page allowed to frame a draft. The
+  # draft Ingress and the COWORK_DRAFT_* variables below are templated from
+  # these, so the host the links point at, the host the listener answers for
+  # and the host the Ingress routes cannot disagree. Empty in the base, so a PR
+  # environment, which renders this file alone, starts no draft listener and
+  # keeps previews on srcdoc. values-<env>.yaml sets both and switches
+  # ingress_secondary on.
+  draftHost: ""
+  webOrigin: ""
+
   image:
     # The build-push-ecr action derives the ECR repo name from the GitHub repo
     # slug, so this must track the GitHub repo name (cowork-server).
     repository: 168681354662.dkr.ecr.us-east-1.amazonaws.com/mindsdb-cowork-server
-    command: ["python", "-m", "uvicorn", "cowork.server:app", "--log-config", "/app/cowork/logging.json"]
-    # Async FastAPI: the event loop handles concurrency per worker. Scale via
-    # replicas (and HPA) rather than worker count. --forwarded-allow-ips '*'
-    # trusts the in-cluster ingress for X-Forwarded-* headers.
-    args: ["--host", "0.0.0.0", "--port", "9010", "--forwarded-allow-ips", "*"]
+    # No command or args here: the image's CMD (Dockerfile) owns the uvicorn
+    # command, one worker per pod, scaled with replicas. That includes
+    # --forwarded-allow-ips '*', which trusts the in-cluster ingress for
+    # X-Forwarded-* headers, and --timeout-graceful-shutdown, the bound on the
+    # shutdown drain that terminationGracePeriodSeconds below counts.
+    # tests/test_chart_values.py fails if a values file sets either key again.
 
-  # Alembic locks via the alembic_version table, so concurrent replicas don't
-  # race; on already-migrated databases this is a no-op. The deployment
-  # subchart applies `tpl` to top-level string fields on each initContainer,
-  # so the image string can reference the same chart helpers as the main
-  # container — no need to duplicate the repository/tag here.
+  # A shutdown, counted from the pod's deletion (README.md, "What a shutdown
+  # does to answers in progress"):
+  #   0-15 s  the preStop sleep. ingress-nginx drops the pod's endpoint and
+  #           sends new requests to the other pods; open answers keep
+  #           streaming here.
+  #   up to 5 s  SIGTERM. Before uvicorn sees it, cowork.server ends each
+  #           remaining answer as interrupted on its open stream
+  #           (TURN_SHUTDOWN_GRACE_SECONDS).
+  #   2 s     uvicorn's own drain (--timeout-graceful-shutdown in the image).
+  #   about 22 s  the lifespan teardown's bounded waits: the draft listener's
+  #           own drain when COWORK_DRAFT_PORT is set (2 s,
+  #           cowork/draft_host/listener.py), another pass over turns (5 s),
+  #           the artifact location backfill's stop (2 s,
+  #           LOCATION_BACKFILL_SHUTDOWN_SECONDS in cowork/server.py),
+  #           channel tasks (3 s, then up to 5 s more while each one
+  #           cancelled writes its sandbox turn's cancel flag and records its
+  #           artifacts) and scratchpad closes (5 s).
+  #   up to 8 s  last, only while a turn's artifact diff or record is still
+  #           running, as during a file store stall: the wait for those
+  #           (TURN_END_RECORD_DRAIN_SECONDS, cowork/db/units.py).
+  # About 44 s in all, or about 52 s during a stall, so 62 s leaves room for
+  # the unbounded closes at the end of teardown before the kubelet's SIGKILL.
+  # A stall that clears within the last wait keeps the turn's artifact rows.
+  # A record still running after it is cut by the event loop's close, so that
+  # turn's artifact rows are lost, and the pod logs shutdown_turn_record_lost
+  # at ERROR with the conversation, the project, touched and count. touched
+  # holds the new artifacts' slugs its diff found, or, when the diff had not
+  # returned, the pod's artifacts_touched list (empty for a pod that sends no
+  # usable list): the first of them in sorted order, none longer than 255
+  # characters, at most 50 (TURN_END_RECORD_NAMES_LOGGED) and only as many as
+  # fit in 12 KiB as the line encodes them (TURN_END_RECORD_TOUCHED_BYTES),
+  # so the line stays under the 16 KiB a container runtime splits a line at;
+  # count says how many the record held. A web answer still streaming at
+  # SIGTERM is saved anyway, marked turn_lost; one whose pod had finished
+  # starts its save once its record ends, and a save that starts as the loop
+  # closes may not finish. A file store call already running on the stuck
+  # mount keeps the process alive until the SIGKILL.
+  terminationGracePeriodSeconds: 62
+
+  lifecycle:
+    preStop:
+      exec:
+        command: ["/bin/sh", "-c", "sleep 15"]
+
+  # Create every new pod at once, as many as the Deployment runs when the
+  # rollout starts (the autoscaler's count in staging and prod, 2 to 4), and
+  # stop no old pod until a new one is Ready. When the cluster has room for
+  # every new pod, the old pods then stop within seconds of each other instead
+  # of a rollout step apart, so the retry an interrupted answer asks for lands
+  # on a new pod rather than on an old one about to stop too. A new pod still
+  # waiting for a node keeps one old pod running until it turns Ready. An
+  # autoscaler scale-in stops a pod the same way a rollout does (README.md).
+  deploymentStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: "100%"
+      maxUnavailable: 0
+
+  # The new pods of a rollout start together, and each runs this. On
+  # PostgreSQL, cowork/db/alembic/env.py takes an advisory lock first
+  # (cowork.db.migrations.lock_migrations), so they migrate one at a time and
+  # the later ones find nothing to do; on an already-migrated database this is
+  # a no-op. The deployment subchart applies `tpl` to top-level string fields
+  # on each initContainer, so the image string can reference the same chart
+  # helpers as the main container, with no need to repeat the repository/tag.
   initContainers:
     - name: db-migrate
       image: '{{ template "get-repository" . }}:{{ template "get-release-tag" . }}'
@@ -167,9 +238,17 @@ deployment:
   # Liveness restarts the pod if it fails. Kept tolerant (failureThreshold * periodSeconds = 60s)
   # so a transient stall doesn't take the pod down. Points at the zero-I/O /live
   # route so a database outage can't be misread as "this process is dead".
+  # The delay covers the boot: the lifespan does file store and database work
+  # before uvicorn binds, and on 28 Oct staging pods booting under load served
+  # their first request about 120s after start, the moment the old 60s delay
+  # plus 60s of failures killed them. With 180s a boot of up to about 230s
+  # survives: the first probe lands in [180, 190)s and the sixth failure 50s
+  # later. startup_finished logs each boot's length from process start. The
+  # deployment subchart renders no startupProbe, so the delay is the one
+  # setting that holds a slow boot.
   livenessProbe:
     enabled: true
-    initialDelaySeconds: 60
+    initialDelaySeconds: 180
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 6
@@ -177,13 +256,16 @@ deployment:
 
   # Readiness gates traffic. Polls quickly so the pod returns to service fast after a hiccup.
   # failureThreshold * periodSeconds = 15s before the pod is pulled from endpoints.
+  # Points at /ready, which reads no database, file store or settings: a full
+  # pool or a slow file store would otherwise fail readiness on every replica
+  # at once and leave nginx with no upstream.
   readinessProbe:
     enabled: true
     initialDelaySeconds: 15
     periodSeconds: 5
     timeoutSeconds: 4
     failureThreshold: 3
-    path: /api/v1/health/
+    path: /api/v1/health/ready
 
   # deployment container resource requests/limits
   # Limits are HARD limits; Requests are "soft" and drive HPA aggressiveness when enabled.
@@ -225,8 +307,54 @@ deployment:
         X-Organization-Id,X-User-Id,X-User-Email,X-User-Roles,X-Forwarded-User
       nginx.ingress.kubernetes.io/auth-request-headers: "Authorization,Cookie"
 
+  # Draft-preview host. A second Ingress with no auth-url: the signed link in
+  # the path is the credential, and the draft sub-app checks it. It sends /_t/
+  # to the draft port only, where the API app does not listen, and pins the
+  # upstream Host, which ingress-nginx would otherwise take from a client's
+  # X-Forwarded-Host (use-forwarded-headers). The draft sub-app reads no
+  # identity headers, so nothing strips them here; a configuration-snippet
+  # would make this release depend on the controller allowing snippets.
+  # An empty host would make this Ingress a catch-all for /_t/ on every host
+  # the controller serves, so switching it on without draftHost fails the render.
+  ingress_secondary:
+    enabled: false
+    # The default would repeat the primary Ingress's name.
+    name: cowork-server-draft
+    # The controller that serves the primary Ingress.
+    nginx_class: "infrastructure"
+    # Cookie affinity would add a "route" Set-Cookie; the draft host sets none.
+    nginx_affinity: false
+    annotations:
+      # Not `required` here: the subchart passes annotations through toYaml,
+      # which folds a long template onto two lines. The host below fails the
+      # render on its own.
+      nginx.ingress.kubernetes.io/upstream-vhost: '{{ $.Values.draftHost }}'
+      # The path carries the link token; keep it out of the access log.
+      nginx.ingress.kubernetes.io/enable-access-log: "false"
+    hosts:
+      - host: '{{ required "set deployment.draftHost to enable ingress_secondary" $.Values.draftHost }}'
+        enableMultiPath: true
+        paths:
+          - path: /_t/
+            serviceName: cowork-server
+            servicePort: 9011
+
+  # The draft listener (COWORK_DRAFT_PORT below): a second server in the same
+  # process that serves only the draft sub-app. Declared everywhere, but it
+  # listens only where draftHost is set. The Service exposes it under the same
+  # name; templates/network-policy.yaml admits it.
+  additionalPorts:
+    - name: draft
+      containerPort: 9011
+      protocol: TCP
+
   service:
     targetPort: 9010
+    additionalPorts:
+      - name: draft
+        port: 9011
+        targetPort: draft
+        protocol: TCP
 
   # Must match the access point's posixUser (uid/gid 1000), or every org tree
   # is unreadable. The image pins the same ids.
@@ -239,10 +367,25 @@ deployment:
     - name: cowork-shared
       persistentVolumeClaim:
         claimName: cowork-shared
+    # The browser router's scope key, from the router's own Secret in this
+    # namespace. A file rather than an environment variable: the kubelet fills
+    # it when the Secret first appears and rewrites it on rotation, so a pod
+    # that started first still scopes once it syncs. Optional, so a namespace
+    # with no router (and so no Secret) starts as usual and scopes no turn.
+    - name: browser-scope-key
+      secret:
+        secretName: browser-proxy
+        optional: true
+        items:
+          - key: scope_key
+            path: scope_key
 
   volumeMounts:
     - name: cowork-shared
       mountPath: /mnt/cowork-shared
+    - name: browser-scope-key
+      mountPath: /etc/cowork/browser-scope
+      readOnly: true
 
   globalEnvs:
 
@@ -284,6 +427,13 @@ deployment:
         secretKeyRef:
           name: cowork-db
           key: database_uri
+
+    # Log each PostgreSQL statement that takes a second or more (event
+    # db_statement_slow), so statement_timeout and
+    # idle_in_transaction_session_timeout can be set from what hosted
+    # statements take. Both timeouts stay off until then.
+    - name: SLOW_STATEMENT_LOG_MS
+      value: "1000"
 
     # Fernet master key for encrypting sensitive settings at rest. Without it
     # the server generates a key into an ephemeral per-pod file, so a restart
@@ -333,6 +483,12 @@ deployment:
     
     - name: COWORK_TURN_TURN_KEY_TTL_SECONDS
       value: "1200"
+
+    # The browser router's scope key, sent beside each web turn's key when the
+    # producer scopes it, so only this server can scope a turn key. The file
+    # is the browser-scope-key volume above, read on every scope.
+    - name: COWORK_BROWSER_SCOPE_KEY_FILE
+      value: /etc/cowork/browser-scope/scope_key
 
     # Cloud datasource grants for hosted turns. Off until the release gate; on,
     # the producer lists the user's verified connections and registers grants
@@ -386,6 +542,34 @@ deployment:
     # correct for dev, staging, prod and per-PR alike.
     # A hardcoded value here pinned a per-PR host and 404'd every env at once
     # when that PR was reaped.
+
+    # ====================================
+    # DRAFT-PREVIEW LINKS
+    # ====================================
+
+    # The draft listener's port, the draft host it answers for, the origin links
+    # point at, the only page allowed to frame a draft (CSP frame-ancestors) and
+    # the signing key ring. All but the key come from draftHost and webOrigin
+    # above. Where draftHost is empty they render empty, and an empty
+    # COWORK_DRAFT_PORT starts no listener. The key is optional so a missing
+    # secret leaves draft links off (srcdoc previews) instead of blocking the
+    # pod; cowork-server logs a warning at boot. README.md has its format.
+    - name: COWORK_DRAFT_PORT
+      value: '{{ if $.Values.draftHost }}9011{{ end }}'
+    - name: COWORK_DRAFT_HOSTS
+      value: '{{ $.Values.draftHost }}'
+    - name: COWORK_DRAFT_ORIGIN
+      value: '{{ with $.Values.draftHost }}https://{{ . }}{{ end }}'
+    - name: COWORK_WEB_ORIGIN
+      value: '{{ $.Values.webOrigin }}'
+    - name: COWORK_DRAFT_LINK_KID
+      value: "v1"
+    - name: COWORK_DRAFT_LINK_KEYS
+      valueFrom:
+        secretKeyRef:
+          name: mindsdb-secrets
+          key: COWORK_DRAFT_LINK_KEYS
+          optional: true
 
     # ====================================
     # PROVIDER API KEYS

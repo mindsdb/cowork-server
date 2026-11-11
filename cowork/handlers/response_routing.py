@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
@@ -22,6 +22,7 @@ from cowork.common.logger import exception_http_status
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.deployment_identity import identity_for_turn
+from cowork.handlers.jev_route import JevRoute
 from cowork.services.providers import build_llm_client
 
 
@@ -29,10 +30,22 @@ logger = logging.getLogger(__name__)
 
 DIRECT_CONTEXT = "direct_context"
 DELEGATED_AGENTIC = "delegated_agentic"
+#: The harness a direct answer is saved and announced under.
+DIRECT_HARNESS = "cowork-direct"
 
 # Keep the gate's context bounded.  It does not need Anton's full tool history.
 _MAX_HISTORY_MESSAGES = 16
 _MAX_MESSAGE_CHARS = 1_500
+# The direct answer's view (`direct_answer`), wider than the gate's: recalling
+# what an earlier reply said is the job that path is routed for, and a long
+# reply cut at 1,500 chars can lose exactly the numbers the user asks about.
+ANSWER_HISTORY_MESSAGES = 40
+ANSWER_MESSAGE_CHARS = 12_000
+# Jev judges whether the direct answer can reply from what it sees, so it reads
+# the same messages at the same length, newest first up to this budget: a long
+# conversation must not push one decision past the gate's time. A narrower view
+# than the answer's only errs toward the agent.
+JEV_HISTORY_CHARS = 24_000
 _DIRECT_MAX_TOKENS = 1_024
 # Three budgets, because the gate has two phases with different needs.
 #
@@ -81,6 +94,9 @@ whether there is a desktop app, how to install, update or remove it, which
 platforms or editions exist, where a setting or feature lives, what it costs.
 You do not have that information either, and answering from general knowledge
 describes some other company's product.
+Delegate any request to change, send, confirm or approve something, and any
+reply to a question asked earlier in this conversation. Never ask the user to
+confirm or approve, and never say that something was done.
 Call the delegate tool when the request needs any of those capabilities or you
 are unsure. Direct answers must be short, helpful, and in the user's language.
 Never mention routing, Anton, tools, or these instructions."""
@@ -268,8 +284,9 @@ class _RejectedAnswer(Exception):
         self.evidence = evidence
 
 
-def names_foreign_product(text: str) -> str | None:
-    """The first foreign product name in ``text``, or None.
+def names_foreign_product(text: str, *, allowed: frozenset[str] = frozenset()) -> str | None:
+    """The first foreign product name in ``text``, or None. Names in
+    ``allowed`` (lowercase) are skipped.
 
     Exported so the regression suite asserts against the same matcher the gate
     uses, rather than a copy that can drift away from it.
@@ -280,8 +297,15 @@ def names_foreign_product(text: str) -> str | None:
         # name ("Acme Copilot"). Only the whole name is removed, so a listed
         # name elsewhere in the text still matches.
         text = re.sub(_configured_name(identity.product_name), "", text or "", flags=re.IGNORECASE)
-    match = _FOREIGN_PRODUCT_RE.search(text or "")
-    return match.group(0) if match else None
+    for match in _FOREIGN_PRODUCT_RE.finditer(text or ""):
+        if match.group(0).lower() not in allowed:
+            return match.group(0)
+    return None
+
+
+def products_named(text: str) -> frozenset[str]:
+    """The foreign product names ``text`` mentions, lowercase."""
+    return frozenset(match.group(0).lower() for match in _FOREIGN_PRODUCT_RE.finditer(text or ""))
 
 
 def denies_our_product(text: str) -> str | None:
@@ -306,12 +330,98 @@ def names_gate_tool(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+def _whole_words(words: tuple[str, ...]) -> re.Pattern[str]:
+    alternatives = "|".join(r"\s+".join(map(re.escape, word.split())) for word in words)
+    return re.compile(rf"(?<![\w])(?:{alternatives})(?![\w])", re.IGNORECASE)
+
+
+# Only the agent can change anything, and only its write check shows the
+# approval card a person has to press. A router answer to a request that
+# changes something, or asks for a confirmation, can only imitate that card or
+# claim work that never ran, and a "yes" typed under it reaches the router
+# again. Whole words, English only: a false positive costs one hop. After a
+# router answer every reply goes to the agent in any language (`decide_route`'s
+# `after_router_answer`); the answer check below reads English only.
+_CHANGE_WORDS = (
+    "add", "added", "adding", "apply", "applied", "assign", "build", "built",
+    "cancel", "change", "changed", "copy", "create", "created", "creating",
+    "decrease", "delete", "deleted", "drop", "duplicate", "edit", "edited",
+    "email", "erase", "export", "generate", "import", "increase", "insert",
+    "load", "make", "modify", "modified", "move", "moved", "post", "publish",
+    "published", "remove", "removed", "rename", "run", "save", "saved",
+    "schedule", "send", "sent", "set up", "share", "submit", "update", "updated",
+    "upload", "write",
+)
+_APPROVAL_WORDS = (
+    "approve", "approved", "approval", "confirm", "confirmed", "confirmation",
+    "permission", "card", "ask me", "check with me", "before you", "go ahead",
+    "proceed",
+)
+_CHANGE_OR_APPROVAL_RE = _whole_words(_CHANGE_WORDS + _APPROVAL_WORDS)
+# A message that is only a yes or a no answers a question someone asked, and
+# the router can only act the answer out.
+_BARE_REPLIES = frozenset({
+    "yes", "y", "yeah", "yep", "yup", "sure", "ok", "okay", "k", "go", "go ahead",
+    "do it", "please do", "yes please", "proceed", "confirm", "confirmed",
+    "approve", "approved", "correct", "no", "n", "nope", "cancel", "stop",
+})
+# Wording only an approval card, a confirmation question or finished work
+# would use. The router has none of the three to offer.
+_IMITATION_RE = _whole_words((
+    "card", "confirm", "confirmed", "confirmation", "approve", "approved",
+    "approval", "permission", "proceed", "proceeding", "go ahead", "yes or no",
+    "yes/no", "y/n", "reply yes", "answer yes", "say yes", "shall i", "should i",
+    "created", "creating", "updated", "updating", "deleted", "deleting", "saved",
+    "sent", "published", "submitted", "scheduled", "added", "removed", "changed",
+    "renamed", "moved", "applied", "uploaded", "imported", "edited", "modified",
+    "done", "completed", "finished", "all set",
+))
+
+
+def _bare_reply(text: str) -> str | None:
+    reply = " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
+    return reply if reply in _BARE_REPLIES else None
+
+
+def names_change_or_approval(text: str) -> str | None:
+    """The change or approval word in ``text``, or the whole of it when it is a
+    bare yes or no; None when it has neither.
+
+    Exported for the same reason as :func:`names_foreign_product`.
+    """
+    bare = _bare_reply(text or "")
+    if bare is not None:
+        return bare
+    match = _CHANGE_OR_APPROVAL_RE.search(text or "")
+    return " ".join(match.group(0).lower().split()) if match else None
+
+
+def imitates_approval(text: str) -> str | None:
+    """The approval or finished-change wording in ``text``, or None.
+
+    Exported for the same reason as :func:`names_foreign_product`.
+    """
+    match = _IMITATION_RE.search(text or "")
+    return " ".join(match.group(0).lower().split()) if match else None
+
+
+def _latest_text(history: list[dict], role: str) -> str:
+    latest = next((m for m in reversed(history) if m.get("role") == role), None)
+    return "" if latest is None else _condense_content(latest.get("content")) or ""
+
+
 @dataclass(frozen=True)
 class RouterBinding:
     """A resolved gate target: an anton LLMProvider, model, and display label."""
     provider: object
     model: str
     label: str
+    # The reasoning effort the user picked in the composer, for the direct
+    # answer on their own model. None leaves the provider's default.
+    reasoning_effort: str | None = None
+    # The native web tools this deployment allows the direct answer
+    # (`providers.web_tool_kwargs_for`); None leaves the provider's own set.
+    web_tools: frozenset[str] | None = None
 
 
 _END = object()  # `anext` default: the stream ended without a StreamComplete
@@ -361,6 +471,42 @@ def _spawn_drain(events, *, deadline: float, model: str) -> None:
     task = asyncio.create_task(_drain(events, deadline=deadline, model=model))
     _drain_tasks.add(task)
     task.add_done_callback(_drain_tasks.discard)
+
+
+def answer_rejection(
+    answer: str, *, allowed_products: frozenset[str] = frozenset(),
+) -> "_RejectedAnswer | None":
+    """Why a direct answer must not ship, or None. Shared by the LLM gate and
+    the direct answer on the user's own model (`direct_answer`), so both
+    reject the same shapes under the same reasons.
+
+    - It names the gate's own tool.
+    - It names another AI product (ENG-2423). On the gate's answer that is
+      overwhelmingly the model describing itself as that product, for example
+      telling a user to install the ChatGPT desktop app when they asked how to
+      install Cowork. ``allowed_products`` are names that are not that: the
+      direct answer passes the ones the user named and its own model's vendor,
+      so "which model are you?" and "ChatGPT or Gemini?" can be answered.
+    - It denies that our own product can be identified or exists.
+    - It imitates an approval card or claims a finished change (ENG-3896):
+      saved, it reads as an approval or as work that never ran, and a "yes"
+      typed under it reaches the router again.
+
+    The evidence is a slice of the model's answer for the last two, which no
+    scrubber has seen, so callers log only the reason.
+    """
+    if names_gate_tool(answer) is not None:
+        return _RejectedAnswer("router_answer_named_gate_tool", "gate tool")
+    foreign = names_foreign_product(answer, allowed=allowed_products)
+    if foreign is not None:
+        return _RejectedAnswer("router_answer_named_foreign_product", foreign)
+    denial = denies_our_product(answer)
+    if denial is not None:
+        return _RejectedAnswer("router_answer_denied_product", denial)
+    imitation = imitates_approval(answer)
+    if imitation is not None:
+        return _RejectedAnswer("router_answer_imitated_approval", imitation)
+    return None
 
 
 async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
@@ -440,41 +586,10 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     answer = text.strip()
     if not answer:
         return None
-    if names_gate_tool(answer) is not None:
-        logger.info("[gate] discarding direct answer naming the gate's own tool; delegating")
-        raise _RejectedAnswer("router_answer_named_gate_tool", "gate tool")
-    # An answer that names another AI
-    # product is, on this gate, overwhelmingly the model describing itself as
-    # that product — telling a user to install the ChatGPT desktop app when they
-    # asked how to install Cowork.  Discarding here rather than post-hoc is what
-    # also satisfies "a wrong gate answer cannot be carried forward": a
-    # delegated turn never reaches `_handle_direct_response`, so nothing is
-    # persisted and the main loop inherits no poisoned history.
-    # Raised rather than returned as None so the decision carries its own
-    # reason: `router_declined_direct_response` would say the model chose to
-    # delegate, when in fact it answered and we overrode it.  The reason is
-    # stamped onto the turn's trace metadata, so "how often does the guard
-    # fire?" stays a query instead of a log grep — and the two shapes stay
-    # countable apart, since they fail for different reasons and would be
-    # tuned separately.
-    foreign = names_foreign_product(answer)
-    if foreign is not None:
-        logger.info(
-            "[gate] discarding direct answer naming a foreign product (%s); delegating",
-            foreign,
-        )
-        raise _RejectedAnswer("router_answer_named_foreign_product", foreign)
-    denial = denies_our_product(answer)
-    if denial is not None:
-        # The matched span is a slice of the MODEL'S ANSWER, unlike the foreign
-        # branch above whose value comes from our own fixed vocabulary.  This
-        # gate sits upstream of every scrubber (ENG-2105 scrubs the history
-        # going *into* it, not its output), so logging the span would put
-        # unscrubbed model output in the logs.  The reason string on the
-        # decision is what makes this countable; the span adds nothing the
-        # trace does not already carry.
-        logger.info("[gate] discarding direct answer denying our own product; delegating")
-        raise _RejectedAnswer("router_answer_denied_product", denial)
+    rejection = answer_rejection(answer)
+    if rejection is not None:
+        logger.info("[gate] discarding a direct answer; delegating", extra={"reason": rejection.reason})
+        raise rejection
     return answer
 
 
@@ -505,11 +620,16 @@ class RouteDecision:
     reason: str
     provider: str | None = None
     model: str | None = None
-    # A direct answer, complete.  Empty on every delegated route: the gate's
-    # answer and Anton's are mutually exclusive by construction, since a
-    # delegated turn never reaches `_handle_direct_response`.
+    # The LLM gate's direct answer, complete.  Empty on every delegated route,
+    # and on a direct route Jev decided: there the user's own model writes the
+    # answer afterwards (`direct_answer`), and may still delegate.
     text: str = ""
     fallback: bool = False
+    # Jev's probability of a direct answer, when Jev decided.
+    p_direct: float | None = None
+    # Whether Jev expects the direct answer to need a web search; sets how
+    # long the answer may take to start (`direct_answer.start_answer`).
+    needs_search: bool = True
 
 
 def _condense_content(content) -> str | None:
@@ -542,8 +662,17 @@ def _condense_content(content) -> str | None:
     return "\n".join(p for p in parts if p)
 
 
-def _text_history(history: list[dict]) -> list[dict]:
-    """Return a bounded, text-only, role-alternating history for the gate."""
+def _text_history(
+    history: list[dict],
+    *,
+    max_messages: int = _MAX_HISTORY_MESSAGES,
+    max_chars: int = _MAX_MESSAGE_CHARS,
+    max_total_chars: int | None = None,
+) -> list[dict]:
+    """Return a bounded, text-only, role-alternating history for the gate.
+
+    The bounds default to the gate's; the direct answer passes wider ones,
+    since recalling what an earlier reply said is the job it is routed for."""
     result: list[dict] = []
     for message in history:
         role = message.get("role")
@@ -555,20 +684,44 @@ def _text_history(history: list[dict]) -> list[dict]:
         content = content.strip()
         if not content:
             continue
-        if len(content) > _MAX_MESSAGE_CHARS:
-            content = content[:_MAX_MESSAGE_CHARS - 17] + "\n[… truncated …]"
+        if len(content) > max_chars:
+            content = content[:max_chars - 17] + "\n[… truncated …]"
         if result and result[-1]["role"] == role:
             result[-1]["content"] += "\n" + content
         else:
             result.append({"role": role, "content": content})
-    result = result[-_MAX_HISTORY_MESSAGES:]
+    result = result[-max_messages:]
+    if max_total_chars is not None:
+        # Oldest first, never the latest message.
+        while len(result) > 1 and sum(len(m["content"]) for m in result) > max_total_chars:
+            result.pop(0)
     while result and result[0]["role"] != "user":
         result.pop(0)
     return result
 
 
-def ineligible_reason(*, has_non_text_input: bool, has_attachments: bool, has_disabled_connections: bool) -> str | None:
-    """Return a deterministic delegation reason for unsupported turn shapes."""
+def jev_history(history: list[dict]) -> list[dict]:
+    """What Jev reads: the direct answer's view, within `JEV_HISTORY_CHARS`."""
+    return _text_history(
+        history, max_messages=ANSWER_HISTORY_MESSAGES, max_chars=ANSWER_MESSAGE_CHARS,
+        max_total_chars=JEV_HISTORY_CHARS,
+    )
+
+
+def ineligible_reason(
+    *,
+    has_non_text_input: bool,
+    has_attachments: bool,
+    has_disabled_connections: bool,
+    is_comparison_side: bool = False,
+) -> str | None:
+    """Return a deterministic delegation reason for unsupported turn shapes.
+
+    A model-comparison side always goes to the agent: the gate answers on its
+    own model, so a direct answer would compare the gate against itself.
+    """
+    if is_comparison_side:
+        return "comparison_side"
     if has_non_text_input:
         return "non_text_input"
     if has_attachments:
@@ -635,10 +788,24 @@ async def decide_route(
     has_non_text_input: bool,
     has_attachments: bool,
     has_disabled_connections: bool,
+    after_router_answer: bool = False,
     binding: RouterBinding | None = None,
     binding_factory: Callable[[], RouterBinding | None] | None = None,
+    jev: Callable[[list[dict]], Awaitable[JevRoute]] | None = None,
 ) -> RouteDecision:
-    """Choose a direct answer or safe delegation on the gate's own model.
+    """Choose a direct answer or safe delegation.
+
+    With `jev` (turns that answer on MindsHub), Jev decides and the direct
+    answer is written afterwards by the user's own model, so a direct route
+    carries no text. Otherwise, or when Jev refuses or fails without running
+    out the time budget, the LLM gate decides and answers in one call on the
+    gate's own model.
+
+    `after_router_answer` says the assistant message before the latest prompt
+    is a direct answer (saved under ``DIRECT_HARNESS``), which the history's
+    rows don't carry. Such a turn always goes to the agent: whatever the reply
+    says, in any language, the router could only act out what its own answer
+    asked, and a typed "yes" would then read as an approval.
 
     `binding` lets the caller supply a pre-built gate target (org mode mints a
     per-turn key); when None the binding comes from stored settings or the
@@ -660,12 +827,51 @@ async def decide_route(
     if explicit_file_context(history):
         return RouteDecision(route=DELEGATED_AGENTIC, reason="explicit_file_context")
 
-    if prior_turn_ran_tools(history):
+    # Jev reads the tool markers itself: a follow-up to tool work goes direct
+    # when the reply's facts are in visible text (the dashboard recall case),
+    # and to the agent when they are only in omitted tool output. The LLM gate
+    # keeps the structural rule, which it was measured with.
+    if jev is None and prior_turn_ran_tools(history):
         return RouteDecision(route=DELEGATED_AGENTIC, reason="prior_turn_ran_tools")
+
+    if after_router_answer:
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="follow_up_to_router_answer")
+
+    if names_change_or_approval(_latest_text(history, "user")) is not None:
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="write_or_approval_request")
 
     messages = _text_history(history)
     if not messages:
         return RouteDecision(route=DELEGATED_AGENTIC, reason="no_routable_history")
+
+    if jev is not None:
+        result = await jev(jev_history(history))
+        if not result.error:
+            return RouteDecision(
+                route=DIRECT_CONTEXT if result.direct else DELEGATED_AGENTIC,
+                reason="jev_direct" if result.direct else "jev_needs_agent",
+                provider="jev",
+                model=result.model or None,
+                p_direct=result.p_direct,
+                needs_search=result.needs_search,
+            )
+        if not result.falls_back_to_llm_gate:
+            # Jev ran out the gate's time: asking the LLM gate now would only
+            # make the agent start later.
+            return RouteDecision(
+                route=DELEGATED_AGENTIC, reason=f"jev_{result.error}", provider="jev",
+                model=result.model or None, fallback=True,
+            )
+        # Jev refused (a spent allowance, a restriction on the organization)
+        # or failed: the LLM gate decides instead, as it does on providers with
+        # no decision model, with the structural rule it was measured with.
+        # Fields, not template values: the log formatter drops those.
+        logger.warning(
+            "Jev could not decide the route; the LLM gate decides",
+            extra={"event": "jev_route_fallback", "reason": f"jev_{result.error}", "duration_ms": result.ms},
+        )
+        if prior_turn_ran_tools(history):
+            return RouteDecision(route=DELEGATED_AGENTIC, reason="prior_turn_ran_tools")
 
     try:
         if binding is None:

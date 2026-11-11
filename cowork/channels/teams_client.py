@@ -71,6 +71,8 @@ class TeamsClient:
             client_credential=app_secret,
             authority=f"{LOGIN_HOST}/{tenant_id}",
             http_client=token_http,
+            # requests waits forever without a timeout; msal ignores it when http_client is set.
+            timeout=15,
         )
         self._http = http or httpx.AsyncClient(timeout=30)
 

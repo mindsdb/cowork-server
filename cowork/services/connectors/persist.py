@@ -45,6 +45,10 @@ class ConnectionNotFoundError(LookupError):
     """An ``extends`` save named a connection that does not exist."""
 
 
+class ConnectionExistsError(Exception):
+    """A ``create_only`` save named a connection that already exists."""
+
+
 def own_vault_root(scope: "TenantScope | None" = None) -> Path:
     """The folder of the vault ``scope`` saves into (own_vault_for_scope), and
     the root its record locks are keyed by (vault_lock)."""
@@ -201,6 +205,8 @@ def persist_connection(
     user_label: str | None = None,
     replace_existing: bool = False,
     extends: bool = False,
+    spec_form: dict | None = None,
+    create_only: bool = False,
     default_label: str | None = None,
     default_fields: dict[str, str] | None = None,
     vault=None,
@@ -237,6 +243,14 @@ def persist_connection(
     tokens after an OAuth grant) adding fields to the named record: stored
     fields this save omits are kept and resubmitted ones are replaced.
     Raises ``ConnectionNotFoundError`` when no record has that name.
+
+    ``spec_form`` is the connection form for a connector the static registry
+    doesn't hold (custom or handcrafted), so its ``secret: true`` fields are
+    masked even when their names don't look secret.
+
+    ``create_only`` saves under ``name`` only if no record holds it, checked
+    under the same record lock as the write; it never falls back to a ``-N``
+    suffix. Raises ``ConnectionExistsError`` when the name is taken.
 
     ``default_fields`` generalizes the same "default once, then sticky"
     behavior ``default_label``/``user_label`` already have, for any other
@@ -277,6 +291,8 @@ def persist_connection(
         # updated, so an unchanged secret keeps its stored value instead of
         # persisting the literal sentinel.
         target = vault.read_record(connector_id, base_slug)
+        if create_only and target is not None:
+            raise ConnectionExistsError(f"A {connector_id} connection named {base_slug!r} already exists.")
         if extends:
             if not (name or "").strip() or target is None:
                 raise ConnectionNotFoundError(
@@ -290,7 +306,7 @@ def persist_connection(
             payload["_method"] = method
         elif extends and target["fields"].get("_method"):
             payload["_method"] = target["fields"]["_method"]
-        secure_keys = secure_keys_for(connector_id, method, payload)
+        secure_keys = secure_keys_for(connector_id, method, payload, spec_form)
         reconnecting_named_record = replace_existing and bool((name or "").strip()) and target is not None
         if is_edit or reconnecting_named_record or extends:
             slug = base_slug  # an edit targets the named connection — update in place
@@ -307,10 +323,10 @@ def persist_connection(
         # from `existing`, the record this save replaces: the record at
         # `base_slug` can belong to a different account that shares the slug.
         existing_fields = (existing or {}).get("fields", {})
-        for key in secure_keys_for(connector_id, method, existing_fields):
+        for key in secure_keys_for(connector_id, method, existing_fields, spec_form):
             if key not in payload and existing_fields.get(key):
                 payload[key] = existing_fields[key]
-        secure_keys = secure_keys_for(connector_id, method, payload)
+        secure_keys = secure_keys_for(connector_id, method, payload, spec_form)
         if extends:
             # A field the record already held as a secret stays one, even if
             # this step's method would not classify it that way.
@@ -344,6 +360,42 @@ def persist_connection(
             payload.setdefault(key, prior if prior is not None else value)
         vault.save(connector_id, slug, payload, secure_keys=secure_keys)
         return slug
+
+
+_LABEL_FIELDS = ("label", "_label", "user_label", "_user_label")
+
+
+def connection_a_new_save_replaces(
+    connector_id: str,
+    method: str | None,
+    credentials: dict,
+    *,
+    vault,
+    spec_form: dict | None = None,
+) -> dict | None:
+    """The saved connection that an unnamed save of ``credentials`` would overwrite.
+
+    A connector named from its own fields (Roam's graph, Gmail's address) maps a
+    second token for the same account onto the same record, so persist_connection
+    replaces it in place. Returns ``{"name", "label"}`` for that record so the
+    caller can ask first, or None when the save would create a new connection.
+    Follows persist_connection's own naming so the two can't disagree.
+    """
+    cred = {k: v for k, v in credentials.items() if k not in _LABEL_FIELDS}
+    base_slug = derive_connection_name(connector_id, method, cred)
+    if not base_slug:
+        return None
+    payload = {**cred, "_connector_id": connector_id}
+    if method:
+        payload["_method"] = method
+    secure_keys = secure_keys_for(connector_id, method, payload, spec_form)
+    slug = resolve_unique_slug(vault, connector_id, base_slug, payload, secure_keys)
+    record = vault.read_record(connector_id, slug)
+    if record is None:
+        return None
+    fields = record.get("fields") or {}
+    label = str(fields.get("_user_label") or fields.get("_label") or "").strip()
+    return {"name": slug, "label": label}
 
 
 def set_connection_label(engine: str, name: str, label: str, *, vault=None,

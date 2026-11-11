@@ -41,19 +41,16 @@ from cowork.server import create_app
 #: that middleware were removed, it does not belong here.
 OPEN_BY_DESIGN_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
     ("/api/v1/health/", ("GET",)): (
-        "the pre-auth readiness probe every client and the kubelet polls before "
-        "anything can authenticate"
+        "the pre-auth status probe every client polls before anything can "
+        "authenticate"
     ),
     ("/api/v1/health/live", ("GET",)): (
         "the kubelet's liveness probe, which has no identity headers to send "
         "and nowhere to get them; refusing it kills the pod"
     ),
-    ("/api/v1/connectors/specs/{connector_id}", ("GET",)): (
-        "a static connector-registry lookup; the same answer for every caller, "
-        "no tenant data and no secret"
-    ),
-    ("/api/v1/connectors/specs/match", ("POST",)): (
-        "a stateless token match against the same static registry"
+    ("/api/v1/health/ready", ("GET",)): (
+        "the kubelet's readiness probe, which has no identity headers to send "
+        "either; refusing it pulls every pod out of the service"
     ),
     ("/api/v1/connectors/oauth/{service}/callback", ("GET",)): (
         "the OAuth provider's own redirect target; the browser arrives with "
@@ -81,7 +78,6 @@ OPEN_BY_DESIGN_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
         "a hardcoded stub that ignores its input and answers 'not yet available'"
     ),
     ("/api/v1/scratchpad/cancel", ("POST",)): "a hardcoded stub",
-    ("/api/v1/browse/status", ("GET",)): "a hardcoded stub reporting the feature is off",
     ("/api/v1/live-apps/{slot}/access", ("GET",)): (
         "the credential is the visitor's viewer sign-in cookie, which the route "
         "checks itself against the viewer sign-in and the slot's recorded launcher; "

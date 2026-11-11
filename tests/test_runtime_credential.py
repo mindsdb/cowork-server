@@ -164,3 +164,118 @@ def test_org_mode_ignores_a_hand_over(monkeypatch):
         assert runtime_credential.get_minds_credential() is None
     finally:
         get_app_settings.cache_clear()
+
+
+# ── the desktop app's own browser ──────────────────────────────────────────
+
+_LAUNCH_KEY = "Ab3_-" + "x" * 38
+
+
+@pytest.fixture
+def no_browser_host():
+    runtime_credential.clear_browser_host()
+    yield
+    runtime_credential.clear_browser_host()
+
+
+def _loopback_client() -> TestClient:
+    from cowork.server import create_app
+
+    return TestClient(create_app(), client=("127.0.0.1", 40000))
+
+
+def test_the_browser_route_holds_and_clears(no_browser_host):
+    client = _loopback_client()
+
+    response = client.put(
+        "/api/v1/runtime-credential/browser", json={"url": "http://127.0.0.1:51234", "token": _LAUNCH_KEY},
+    )
+    assert response.status_code == 200 and response.json() == {"ok": True}
+    held = runtime_credential.get_browser_host()
+    assert (held.url, held.token.get_secret_value()) == ("http://127.0.0.1:51234", _LAUNCH_KEY)
+
+    response = client.put("/api/v1/runtime-credential/browser", json={"url": "", "token": ""})
+    assert response.status_code == 200
+    assert runtime_credential.get_browser_host() is None
+
+
+@pytest.mark.parametrize("body", [
+    {"url": "http://localhost:51234", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1:0", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1:05123", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1:70000", "token": _LAUNCH_KEY},
+    {"url": "https://127.0.0.1:51234", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1:51234/", "token": _LAUNCH_KEY},
+    {"url": "http://10.0.0.5:51234", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1:51234", "token": _LAUNCH_KEY[:-1]},
+    {"url": "http://127.0.0.1:51234", "token": _LAUNCH_KEY[:-1] + "="},
+    {"url": "http://127.0.0.1:51234", "token": ""},
+    {"url": "", "token": _LAUNCH_KEY},
+    {"url": "http://127.0.0.1:51234", "token": _LAUNCH_KEY, "extra": "x"},
+])
+def test_the_browser_route_refuses_a_malformed_body_without_echoing_the_key(no_browser_host, body):
+    response = _loopback_client().put("/api/v1/runtime-credential/browser", json=body)
+
+    assert response.status_code == 422
+    assert _LAUNCH_KEY[:-1] not in response.text
+    assert runtime_credential.get_browser_host() is None
+
+
+def test_the_browser_route_refuses_a_caller_that_is_not_loopback(no_browser_host):
+    # A remote peer must never choose which browser the agent drives.
+    from cowork.server import create_app
+
+    client = TestClient(create_app(), client=("10.1.2.3", 40000))
+    response = client.put(
+        "/api/v1/runtime-credential/browser", json={"url": "http://127.0.0.1:51234", "token": _LAUNCH_KEY},
+    )
+
+    assert response.status_code == 403
+    assert runtime_credential.get_browser_host() is None
+
+
+def test_the_browser_route_is_refused_in_org_mode(no_browser_host, org_deployment):
+    # A signed-in member on loopback still reaches only the desktop-only refusal.
+    response = _loopback_client().put(
+        "/api/v1/runtime-credential/browser",
+        json={"url": "http://127.0.0.1:51234", "token": _LAUNCH_KEY},
+        headers={
+            "X-User-Id": "11111111-1111-4111-8111-111111111111",
+            "X-Organization-Id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        },
+    )
+
+    assert response.status_code == 403
+    assert runtime_credential.get_browser_host() is None
+
+
+def test_the_browser_holder_refuses_wherever_people_share_the_process(no_browser_host, monkeypatch):
+    """Org tenancy and a deployment that trusts identity headers serve several
+    people: a browser set there would answer every person's turn. The route
+    guard refuses org mode first; this is the layer under it, and the only
+    layer for identity headers, where the hand-over is a quiet no-op."""
+    host = runtime_credential.LocalBrowserHost(url="http://127.0.0.1:51234", token=_LAUNCH_KEY)
+    for env in ({"COWORK_TENANCY_MODE": "org"}, {"COWORK_TRUST_IDENTITY_HEADERS": "true"}):
+        with monkeypatch.context() as patch:
+            for name, value in env.items():
+                patch.setenv(name, value)
+            get_app_settings.cache_clear()
+            try:
+                runtime_credential.set_browser_host(host)
+                assert runtime_credential.get_browser_host() is None, env
+            finally:
+                get_app_settings.cache_clear()
+        # Nothing was stored, so nothing appears once the process is single-person.
+        assert runtime_credential.get_browser_host() is None, env
+        # Held before, it is still not served there.
+        runtime_credential.set_browser_host(host)
+        with monkeypatch.context() as patch:
+            for name, value in env.items():
+                patch.setenv(name, value)
+            get_app_settings.cache_clear()
+            try:
+                assert runtime_credential.get_browser_host() is None, env
+            finally:
+                get_app_settings.cache_clear()
+        runtime_credential.clear_browser_host()

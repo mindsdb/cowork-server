@@ -108,6 +108,8 @@ class _Harness:
         self, *, conversation, input, model=None, reasoning_effort=None,
         disabled_connections=None, trace_tags=None, trace_metadata=None,
         channel_context=None, tool_messages=False, model_wait=None,
+        interactive=True,
+        schedule_id=None,
     ):
         if model_wait is not None:
             model_wait.attach(session=self.session)
@@ -133,6 +135,7 @@ class _Harness:
 
 def _handler(monkeypatch, saved: dict, harness: _Harness):
     handler = object.__new__(responses_mod.ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = object()
 
     class FakeConversationService:
@@ -368,7 +371,6 @@ async def test_the_anton_harness_attaches_its_session_for_the_turn_only(monkeypa
     from cowork.harnesses.anton_harness import harness as harness_mod
 
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_a, **_k: (set(), {}))
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", lambda *_a, **_k: ([], set(), None))
     monkeypatch.setattr(task_objects, "cards_for_slugs", lambda *_a, **_k: [])
 
     async def _no_autopublish(*_a, **_k):

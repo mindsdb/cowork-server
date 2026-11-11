@@ -19,9 +19,9 @@ networkPolicy:
 
 deployment:
   # One uvicorn process per pod can use about one core, so cowork-server scales
-  # by replicas, not workers (see `image.args` in values.yaml). The HPA adds a
-  # pod when average CPU passes 70% of the 1-CPU request. The subchart's default
-  # 90% memory target applies too, as it does for auth.
+  # by replicas, not workers (see the `image` comment in values.yaml). The HPA
+  # adds a pod when average CPU passes 70% of the 1-CPU request. The subchart's
+  # default 90% memory target applies too, as it does for auth.
   #
   # The ceiling stays at 4 because each replica widens a race. Every replica runs
   # the scheduler, and `_due_schedules` in cowork/scheduler.py checks
@@ -32,6 +32,11 @@ deployment:
     minReplicas: 2
     maxReplicas: 4
     targetCPUUtilizationPercentage: 70
+
+  # Cloud datasource turns and the methods offered, on for staging by the
+  # release gate. Rollback removes both lines; see the chart README.
+  datasourceTurnsEnabled: "true"
+  datasourceCapabilities: '{"manifest_version": 1, "enabled": ["mysql:host-password", "postgres:host-port"]}'
 
   ingress:
     enabled: true
@@ -49,6 +54,15 @@ deployment:
           - path: /api
             serviceName: cowork-server
             servicePort: 80
+
+  # Draft-preview host. values.yaml builds the draft Ingress and the
+  # COWORK_DRAFT_* variables from these two; ingress_secondary.enabled is not
+  # templated, so it is switched on here too. webOrigin is the primary host
+  # above, where the web app runs.
+  draftHost: draft-staging.mindshub.co
+  webOrigin: https://cowork.staging.mindshub.ai
+  ingress_secondary:
+    enabled: true
 
   extraEnvs:
 
@@ -71,6 +85,11 @@ deployment:
     - name: COWORK_ORGANIZATION_SWITCH_ENABLED
       value: "true"
 
+    # The agent's browser on the web: the browser router, served on this host
+    # under /browser. Unset, the web app offers no browser; see README.md.
+    - name: COWORK_BROWSER_ROUTER_URL
+      value: "https://cowork.staging.mindshub.ai/browser"
+
     - name: COWORK_TURN_MINDS_BASE_URL
       value: "https://api.staging.mindshub.ai/v1"
 
@@ -81,6 +100,8 @@ deployment:
     # conservatively. Changing these requires a pod restart (env is read once
     # per process).
     # - name: COWORK_DEFAULT_MAX_TOOL_ROUNDS
-    #   value: "50"
+    #   value: "250"
     # - name: COWORK_DEFAULT_MAX_CONTINUATIONS
-    #   value: "5"
+    #   value: "10"
+    # - name: COWORK_DEFAULT_MAX_TURN_TOKENS
+    #   value: "25000000"

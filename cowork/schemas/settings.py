@@ -23,6 +23,9 @@ class SettingResponse(BaseModel):
     is_set: bool
     value: str | None
     options: list[str] | None = None
+    # The value in force when nothing is stored; set for the turn budgets only,
+    # so Settings can show the safety limits while the limits switch is off.
+    default: str | None = None
 
 
 class ProviderProbeCard(CamelRequest):
@@ -54,6 +57,7 @@ ProbeDenialCode = Literal[
     "wallet_empty",
     "included_allowance_exhausted",
     "free_air_daily_spend_fuse_exceeded",
+    "budget_exceeded",
     "rate_limited",
     "policy_unavailable",
 ]

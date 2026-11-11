@@ -137,3 +137,20 @@ def test_local_scope_sees_all(engine):
     _make(_svc(engine, _scope(ORG_B)))
     from cowork.db.scoped import LOCAL_SCOPE
     assert len(_svc(engine, LOCAL_SCOPE).list_schedules()) == 2
+
+
+def test_last_finished_run_requires_parent_ownership(engine):
+    from cowork.models.schedule import ScheduleRun
+
+    owner = _svc(engine, _scope(ORG_A, "alice"))
+    schedule = _make(owner)
+    now = datetime.now(timezone.utc)
+    run = ScheduleRun(schedule_id=schedule.id, started_at=now, finished_at=now, status="failed", is_manual=True)
+    owner.session.add(run)
+    owner.session.commit()
+    for scope in [_scope(ORG_B, "alice"), _scope(ORG_A, "bob")]:
+        with Session(engine) as session:
+            assert ScheduleRunService(ScopedSession(session, scope)).last_finished_run(schedule.id) is None
+    for scope in [_scope(ORG_A, "alice"), SYSTEM_SCOPE]:
+        with Session(engine) as session:
+            assert ScheduleRunService(ScopedSession(session, scope)).last_finished_run(schedule.id).id == run.id

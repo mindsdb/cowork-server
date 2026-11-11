@@ -85,6 +85,7 @@ class _FakeBuffer:
 def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
     """A handler whose turn publishes one ask_user and then blocks forever."""
     handler = object.__new__(ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = object()
 
     class FakeConversationService:
@@ -110,7 +111,7 @@ def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
         def close(self):
             pass
 
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         event_sink("response.ask_user", _ask("ask:1"))
         yield "event: response.ask_user\ndata: {}\n\n"
         published.set()

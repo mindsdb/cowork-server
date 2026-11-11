@@ -34,14 +34,14 @@ import re
 import ssl
 import stat
 from collections.abc import Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractAsyncContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import cache, partial
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Literal, NamedTuple
-from uuid import UUID
+from typing import TYPE_CHECKING, Literal, NamedTuple, TypeGuard
+from uuid import UUID, uuid4
 
 import httpx
 import sqlalchemy as sa
@@ -73,6 +73,7 @@ from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
 from cowork.db.units import run_db, run_to_completion
 from cowork.models.live_app import (
     EMAIL_MAX_LENGTH,
+    LiveAppAvailabilityWait,
     LiveAppCopy,
     LiveAppLaunchRecord,
     LiveAppShare,
@@ -80,6 +81,7 @@ from cowork.models.live_app import (
 )
 from cowork.principal import Principal
 from cowork.services.artifact_roots import _ARTIFACTS_SUBPATH, project_artifacts_base
+from cowork.services.live_app_admission import live_app_launch_lock, try_live_app_launch_lock
 
 if TYPE_CHECKING:
     from anton.core.artifacts.live_app_slots import LiveAppLaunch, SlotStatus
@@ -154,13 +156,19 @@ class LiveAppPerson:
     email: str
 
 
+def names_a_person(principal: Principal | None) -> TypeGuard[Principal]:
+    """Whether ``principal`` carries the ``sub`` and space live apps key a
+    person by, whatever its email."""
+    return principal is not None and bool(principal.user_id) and bool(principal.org_id)
+
+
 def live_app_person(principal: Principal | None) -> LiveAppPerson | None:
     """The person ``principal`` names, or None for a principal with no email:
     live apps open, share and copy by email, so such a principal can do none
     of it. An email anton's LiveAppLauncher wouldn't take (under 3 or over
     254 characters) counts as none, so its turn runs without a host instead of
     failing."""
-    if principal is None or not principal.user_id or not principal.org_id:
+    if not names_a_person(principal):
         return None
     email = normalized_email(principal.email)
     if not EMAIL_MIN_LENGTH <= len(email) <= EMAIL_MAX_LENGTH:
@@ -214,6 +222,18 @@ class CoworkLiveAppHost:
         # launch_failed after a Stop that landed once its record was written
         # stops that record too.
         self._launching: dict[int, str] = {}
+
+    def launch_lock(self) -> AbstractAsyncContextManager[None]:
+        return live_app_launch_lock()
+
+    async def slots_full(self) -> None:
+        """Remember this person's full-slot refusal under ``launch_lock``."""
+        await run_db(partial(_wait_for_availability, person=self._person), scope=SYSTEM_SCOPE)
+
+    async def slots_available(self) -> None:
+        """A fresh status snapshot under ``launch_lock`` found an empty slot.
+        Notify every waiting person before the admitted launch consumes it."""
+        await run_db(_notify_slot_available, scope=SYSTEM_SCOPE)
 
     async def claim(self, slot: int) -> None:
         lost_at = await _slot_boot_time(slot)
@@ -401,6 +421,9 @@ def _start_record(
             _stop(session, stale, reason="relaunched", noticed=True)
         else:
             _stop(session, stale, reason="lost", stopped_at=lost_at)
+    # Admission serializes this with new full-slot refusals, so a successful
+    # launch clears only the owner's previous wait, never someone else's.
+    _clear_availability_wait(session, person=launcher)
     session.add(
         LiveAppLaunchRecord(
             slot=launch.slot,
@@ -415,6 +438,120 @@ def _start_record(
             started_at=_utc_now(),
         )
     )
+
+
+# ── full-slot refusals and availability ──────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class AvailabilityNotice:
+    """A slot seen free for a waiting person: ``id`` is their wait's
+    generation, ``notified_at`` when a reconciliation or launch saw the slot."""
+
+    id: UUID
+    notified_at: datetime
+
+    @property
+    def message(self) -> str:
+        return (
+            f"A live app slot became available at {stop_time_text(self.notified_at)}. "
+            "You can try launching again. It is not reserved."
+        )
+
+
+@dataclass(frozen=True)
+class LiveAppAvailability:
+    waiting: bool = False
+    notice: AvailabilityNotice | None = None
+
+
+def _person_wait(session: ScopedSession, *, person: LiveAppPerson) -> LiveAppAvailabilityWait | None:
+    return session.exec(session.select(LiveAppAvailabilityWait).where(
+        LiveAppAvailabilityWait.partition_id == person.partition_id,
+        LiveAppAvailabilityWait.user_id == person.user_id,
+    )).first()
+
+
+def _wait_for_availability(session: ScopedSession, *, person: LiveAppPerson) -> None:
+    row = _person_wait(session, person=person)
+    if row is None:
+        session.add(LiveAppAvailabilityWait(partition_id=person.partition_id, user_id=person.user_id))
+    elif row.notified:
+        row.generation = uuid4()
+        row.notified = False
+        session.add(row)
+    # Repeated refusals while still waiting keep the same generation.
+
+
+def _notify_slot_available(session: ScopedSession) -> None:
+    # The update sets the row's modified_at, which a notified row keeps until
+    # a new refusal or an acknowledgement: it is the notice's time.
+    for row in session.exec(session.select(LiveAppAvailabilityWait).where(
+        LiveAppAvailabilityWait.notified.is_(False)
+    )).all():
+        row.notified = True
+        session.add(row)
+
+
+def _clear_availability_wait(session: ScopedSession, *, person: LiveAppPerson) -> None:
+    row = _person_wait(session, person=person)
+    if row is not None:
+        session.delete(row)
+
+
+def _person_availability(session: ScopedSession, *, person: LiveAppPerson) -> LiveAppAvailability:
+    row = _person_wait(session, person=person)
+    if row is None:
+        return LiveAppAvailability()
+    if not row.notified:
+        return LiveAppAvailability(waiting=True)
+    notified_at = ensure_utc(row.modified_at) or _utc_now()
+    return LiveAppAvailability(notice=AvailabilityNotice(id=row.generation, notified_at=notified_at))
+
+
+async def person_availability(person: LiveAppPerson) -> LiveAppAvailability:
+    """Reconcile real empty slots for all waiters, then return only this person.
+
+    Only a person still waiting reconciles, and only when admission is free:
+    a launch holding it notifies every waiter itself on seeing an empty slot
+    (``CoworkLiveAppHost.slots_available``), and the next poll tries again.
+    A stopped report alone does not establish availability: the container may
+    still be restarting. The frontend polls this route within one minute, even
+    for a person who has never launched an app.
+    """
+    if (await run_db(partial(_person_availability, person=person), scope=SYSTEM_SCOPE)).waiting:
+        async with try_live_app_launch_lock() as admitted:
+            if admitted and (
+                await run_db(partial(_person_availability, person=person), scope=SYSTEM_SCOPE)
+            ).waiting:
+                async with _http_client() as client:
+                    statuses = await asyncio.gather(*(
+                        _slot_status(client, slot) for slot in range(1, len(live_app_slot_addresses()) + 1)
+                    ), return_exceptions=True)
+                for slot, status in enumerate(statuses, 1):
+                    if isinstance(status, LiveAppAccessUnavailable):
+                        logger.warning("Live app availability unchecked", extra={
+                            "event": "live_app_availability_unchecked", "slot": slot, "reason": status.reason,
+                        })
+                    elif isinstance(status, BaseException):
+                        raise status
+                if any(not isinstance(status, BaseException) and status.state == "empty" and status.app is None
+                       for status in statuses):
+                    await run_db(_notify_slot_available, scope=SYSTEM_SCOPE)
+    return await run_db(partial(_person_availability, person=person), scope=SYSTEM_SCOPE)
+
+
+def _ack_availability(session: ScopedSession, *, person: LiveAppPerson, notice_id: UUID) -> None:
+    row = _person_wait(session, person=person)
+    if row is not None and row.notified and row.generation == notice_id:
+        session.delete(row)
+
+
+async def acknowledge_availability(person: LiveAppPerson, notice_id: UUID) -> None:
+    # Share admission's serialization: an old acknowledgement must not race
+    # another worker beginning a new refusal generation or a successful launch.
+    async with live_app_launch_lock():
+        await run_db(partial(_ack_availability, person=person, notice_id=notice_id), scope=SYSTEM_SCOPE)
 
 
 # ── who may open an app ──────────────────────────────────────────────────────

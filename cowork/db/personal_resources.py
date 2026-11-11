@@ -78,14 +78,40 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     "channel_installations": PersonalResource.CONVERSATIONS,
     "channel_bindings": PersonalResource.CONVERSATIONS,
     "channel_events": PersonalResource.CONVERSATIONS,
+    # Which artifact folders hold a repair queued to a conversation, so they
+    # follow conversations.
+    "queued_agent_repairs": PersonalResource.CONVERSATIONS,
     "projects": PersonalResource.PROJECTS,
     "artifact_identities": PersonalResource.PROJECTS,
+    # The sharing an artifact's owner last chose: MindsHub mode only, where
+    # every resource is partitioned, so this entry decides nothing in
+    # single-tenant mode.
+    "artifact_owner_choices": PersonalResource.PROJECTS,
+    # Written and read only in org mode, where every resource is partitioned,
+    # so this entry decides nothing in a personal scope.
+    "artifact_locations": PersonalResource.PROJECTS,
     # Authorship claims for skills, project memory and project instructions.
     # SharedResourceAccess reads and writes them only in org mode, where every
     # resource is partitioned, so this entry decides nothing in a personal scope.
     "shared_resource_attributions": PersonalResource.PROJECTS,
     "shared_resource_mutations": PersonalResource.PROJECTS,
+    # A model comparison is one person's task: its title is their first prompt
+    # and its sides are their conversations, so it is kept with conversations,
+    # even where the sandbox projects those sides run in are shared.
+    "comparisons": PersonalResource.CONVERSATIONS,
+    "comparison_sides": PersonalResource.CONVERSATIONS,
+    "comparison_verdicts": PersonalResource.CONVERSATIONS,
     "files": PersonalResource.FILES,
+    # Shared exactly when the vault is, so a shared connection's connector
+    # definition is visible to everyone who sees the connection.
+    "custom_connectors": PersonalResource.CONNECTIONS,
+    # Who a skill is shared with: MindsHub mode only, where every resource
+    # is partitioned, so this entry decides nothing in single-tenant mode.
+    "skill_access": PersonalResource.SKILLS,
+    # One person's own on/off per skill: kept with the skills it names, so
+    # it is the partition's where skills are, and deployment-wide (keyed by
+    # the person alone) where skills are left shared.
+    "skill_user_setting": PersonalResource.SKILLS,
     "schedules": PersonalResource.SCHEDULES,
     "pins": PersonalResource.PINS,
     # SettingService routes its own rows; ScopedSession leaves this table alone.

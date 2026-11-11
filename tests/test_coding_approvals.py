@@ -124,3 +124,18 @@ def test_concurrent_approval_for_one_task_is_denied_instead_of_hiding_the_visibl
     broker.cancel_session("session-1")
     first_thread.join(timeout=1)
     assert first_result == [{"decision": "decline"}]
+
+
+def test_read_only_session_declines_before_cards_and_remembered_grants() -> None:
+    refused = []
+    broker = ApprovalBroker(
+        lambda *_: pytest.fail("a Read only task must not show an approval card"),
+        lambda *_: pytest.fail("a Read only refusal has no card to close"),
+        lambda _: ["npm test"],
+        is_read_only=lambda session_id: session_id == "session-1",
+        on_refuse=lambda session_id, pending: refused.append((session_id, pending)),
+    )
+    params = {"command": "/bin/zsh -lc 'npm test'", "proposedExecpolicyAmendment": ["npm", "test"]}
+    assert broker.request("session-1", "item/commandExecution/requestApproval", params) == {"decision": "decline"}
+    assert broker.request("session-1", "item/fileChange/requestApproval", {"reason": "edit"}) == {"decision": "decline"}
+    assert [pending.kind for _, pending in refused] == ["command", "file_change"]

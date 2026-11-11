@@ -9,8 +9,8 @@ calls it yet. Receiving messages comes with the Teams plugin.
 Teams runs only on a server Cowork, so `microsoft-teams-api` and `msal` are main dependencies
 marked `sys_platform == 'linux'`:
 
-- Linux installs get them, including cowork's web image and the self-hosted release (on its next
-  pin bump).
+- Linux installs get them, including cowork's web image and any Linux server install built from
+  this lock.
 - macOS and Windows desktop installs don't. There, `teams_available()` returns `False` and
   `TeamsClient(...)` raises `TeamsUnavailableError`. Import the module freely, but check
   `teams_available()` before building a client.

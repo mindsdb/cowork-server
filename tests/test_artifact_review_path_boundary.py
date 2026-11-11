@@ -12,7 +12,9 @@ from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.api.v1.endpoints import artifacts as artifacts_ep
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import LOCAL_SCOPE, get_scoped_session
+from cowork.db.scoped import TenantScope, get_tenant_scope
+from _async_stub import awaitable
+from test_artifact_roots import _count_hops
 
 
 PROJECT_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -30,23 +32,23 @@ def client(monkeypatch):
 
 
 @pytest.mark.parametrize("route", ["draft", "delete"])
-def test_session_comes_from_dependency_and_cannot_be_supplied_in_query(
+def test_scope_comes_from_dependency_and_cannot_be_supplied_in_query(
     client, monkeypatch, route,
 ):
-    scoped_session = SimpleNamespace(scope=LOCAL_SCOPE)
-    client.app.dependency_overrides[get_scoped_session] = lambda: scoped_session
+    scope = TenantScope(org_mode=False, org_id=None, user_id="from-the-dependency")
+    client.app.dependency_overrides[get_tenant_scope] = lambda: scope
     seen = []
 
-    def capture(session, *_args, **_kwargs):
-        seen.append(session)
+    def capture(scope, *_args, **_kwargs):
+        seen.append(scope)
         raise HTTPException(status_code=404, detail="No artifact in test catalog")
 
-    async def capture_delete(session, *args, **kwargs):
-        return capture(session, *args, **kwargs)
+    async def capture_delete(scope, *args, **kwargs):
+        return capture(scope, *args, **kwargs)
 
-    params = {"session": "../../untrusted"}
+    params = {"session": "../../untrusted", "scope": "../../untrusted"}
     if route == "draft":
-        monkeypatch.setattr(workspace_ep, "review_artifact_for_request", capture)
+        monkeypatch.setattr(workspace_ep, "review_artifact_and_read", awaitable(capture))
         method = "get"
         path = f"/api/v1/artifacts/drafts/local/{ARTIFACT_ID.hex}/index.html"
         schema_path = "/api/v1/artifacts/drafts/{project_ref}/{artifact_id}/{rel_path}"
@@ -61,9 +63,10 @@ def test_session_comes_from_dependency_and_cannot_be_supplied_in_query(
 
     assert response.status_code == 404, response.text
     assert len(seen) == 1
-    assert seen[0] is scoped_session
+    # Both routes hand on the dependency's scope.
+    assert seen[0] is scope
     operation = client.app.openapi()["paths"][schema_path][method]
-    assert all(parameter["name"] != "session" for parameter in operation["parameters"])
+    assert all(parameter["name"] not in ("session", "scope") for parameter in operation["parameters"])
 
 
 @pytest.mark.parametrize(
@@ -73,10 +76,10 @@ def test_session_comes_from_dependency_and_cannot_be_supplied_in_query(
 def test_malformed_draft_project_is_rejected_before_review(
     client, monkeypatch, project_ref,
 ):
-    def unexpected_review(*_args):
+    def unexpected_review(*_args, **_kwargs):
         pytest.fail("invalid project reached artifact review resolution")
 
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", unexpected_review)
+    monkeypatch.setattr(workspace_ep, "review_artifact_and_read", awaitable(unexpected_review))
 
     response = client.get(
         f"/api/v1/artifacts/drafts/{project_ref}/{ARTIFACT_ID.hex}/index.html"
@@ -90,10 +93,10 @@ def test_malformed_draft_project_is_rejected_before_review(
 async def test_path_prefixed_uuid_is_rejected_instead_of_selecting_its_basename(
     monkeypatch, selector, prefix,
 ):
-    def unexpected_review(*_args):
+    def unexpected_review(*_args, **_kwargs):
         pytest.fail("a path-prefixed identity reached artifact review resolution")
 
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", unexpected_review)
+    monkeypatch.setattr(workspace_ep, "review_artifact_and_read", awaitable(unexpected_review))
     project_ref = prefix + str(PROJECT_ID) if selector == "project" else "local"
     artifact_id = prefix + ARTIFACT_ID.hex if selector == "artifact" else ARTIFACT_ID.hex
 
@@ -113,11 +116,11 @@ def test_valid_draft_selectors_reach_review_as_canonical_identities(
 ):
     seen = []
 
-    def review(_session, project, artifact):
+    def review(_session, project, artifact, **_kwargs):
         seen.append((project, artifact))
         raise HTTPException(status_code=404, detail="No artifact in test catalog")
 
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", review)
+    monkeypatch.setattr(workspace_ep, "review_artifact_and_read", awaitable(review))
 
     response = client.get(
         f"/api/v1/artifacts/drafts/{project_ref}/{artifact_id}/index.html"
@@ -132,17 +135,26 @@ def test_valid_draft_selectors_reach_review_as_canonical_identities(
 def test_delete_uuid_reaches_review_with_the_scoped_project(
     client, monkeypatch, artifact_id,
 ):
+    """The review lookup recovers the project from the scoped catalog
+    itself, so the delete asks for it there once, and in no unit of its own
+    before."""
     seen = []
-    monkeypatch.setattr(
-        artifacts_ep, "_scoped_project_sources",
-        lambda _session, _project_id: (PROJECT_ID, []),
-    )
+
+    def a_second_catalog_lookup(*_args):
+        pytest.fail("the delete read the project catalog before its review lookup")
+
+    monkeypatch.setattr(artifacts_ep, "scoped_project_id_for_request", a_second_catalog_lookup)
+
+    def unexpected_discovery(*_args):
+        pytest.fail("a delete by id planned the project's roots before its review lookup")
+
+    monkeypatch.setattr(artifacts_ep, "_scoped_project_plan", awaitable(unexpected_discovery))
 
     def review(_session, project, artifact):
         seen.append((project, artifact))
         raise HTTPException(status_code=404, detail="No artifact in test catalog")
 
-    monkeypatch.setattr(artifact_scope, "review_artifact_for_request", review)
+    monkeypatch.setattr(artifact_scope, "review_artifact_for_request", awaitable(review))
 
     response = client.delete(
         f"/api/v1/artifacts/{artifact_id}", params={"project_id": str(PROJECT_ID)},
@@ -153,12 +165,16 @@ def test_delete_uuid_reaches_review_with_the_scoped_project(
 
 
 def test_delete_legacy_slug_still_uses_the_scoped_directory_catalog(client, monkeypatch):
+    plan = object()
     sources = [object()]
     seen = []
     monkeypatch.setattr(
-        artifacts_ep, "_scoped_project_sources",
-        lambda _session, _project_id: (PROJECT_ID, sources),
+        artifacts_ep, "_scoped_project_plan", awaitable(lambda _scope, _project_id: plan)
     )
+
+    def readable(found_plan):
+        assert found_plan is plan
+        return sources
 
     def resolve_legacy(authorized_sources, slug):
         seen.append((authorized_sources, slug))
@@ -167,8 +183,10 @@ def test_delete_legacy_slug_still_uses_the_scoped_directory_catalog(client, monk
     def unexpected_review(*_args):
         pytest.fail("legacy slug entered the UUID review resolver")
 
+    monkeypatch.setattr(artifacts_ep, "readable_sources", readable)
     monkeypatch.setattr(artifacts_ep, "_legacy_artifact_for_sources", resolve_legacy)
-    monkeypatch.setattr(artifact_scope, "review_artifact_for_request", unexpected_review)
+    monkeypatch.setattr(artifact_scope, "review_artifact_for_request", awaitable(unexpected_review))
+    hops = _count_hops(monkeypatch, artifacts_ep)
 
     response = client.delete(
         "/api/v1/artifacts/quarterly-report", params={"project_id": str(PROJECT_ID)},
@@ -176,6 +194,10 @@ def test_delete_legacy_slug_still_uses_the_scoped_directory_catalog(client, monk
 
     assert response.status_code == 404, response.text
     assert seen == [(sources, "quarterly-report")]
+    # The roots and the folder among them in one file store call: each wait
+    # for a slot can refuse the delete, so a second one could refuse it with
+    # the lookup's work done.
+    assert hops == ["run_efs"]
 
 
 @pytest.mark.parametrize("slug", ["..%5Coutside", "report%00", "%2e", "%2e%2e"])
@@ -185,7 +207,7 @@ def test_malformed_delete_slug_is_rejected_before_catalog_resolution(
     def unexpected_resolution(*_args):
         pytest.fail("invalid artifact selector reached the project catalog")
 
-    monkeypatch.setattr(artifacts_ep, "_scoped_project_sources", unexpected_resolution)
+    monkeypatch.setattr(artifacts_ep, "_scoped_project_plan", awaitable(unexpected_resolution))
 
     response = client.delete(
         f"/api/v1/artifacts/{slug}", params={"project_id": str(PROJECT_ID)},
