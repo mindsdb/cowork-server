@@ -18,13 +18,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime
 from typing import Any
 
 import httpx
 
 from cowork.common.settings.app_settings import default_turn_minds_api_host, get_app_settings
 from cowork.services.providers import minds_chat_base_url
-from cowork.services.voice import VOICE_STYLES
+from cowork.services.voice import VOICE_STYLES, local_now
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +55,9 @@ OPERATOR_PROMPT = (
     "stop the current work and do this now; if they say yes, stop_task and then ask_anton.\n"
     "- To change Anton's voice or accent on the call, call change_voice with the voice that fits what they "
     "asked (a British voice: vesper). The call reconnects in that voice, so say nothing after it.\n"
+    "- Pass dates and times to Anton as they said them (\"the weekend after Thanksgiving\", \"next Friday\"): "
+    "don't turn them into exact dates. When you need a date yourself, count from today's date below.\n"
     "- Say what you did, from the tool results. Never say something is done when a tool failed.\n\n"
-    "What is on the screen now:\n"
 )
 
 
@@ -168,23 +170,32 @@ def _clean(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return kept
 
 
-def request_body(messages: list[dict[str, Any]], snapshot: str) -> dict[str, Any]:
+def system_prompt(snapshot: str, tz_name: str | None, now: datetime | None = None) -> str:
+    """The instructions, the person's date and time (an IANA zone from their
+    browser), and what is on their screen."""
+    return (
+        f"{OPERATOR_PROMPT}It is now {local_now(tz_name, now)} where the user is.\n\n"
+        f"What is on the screen now:\n{snapshot[:MAX_SNAPSHOT_CHARS]}"
+    )
+
+
+def request_body(messages: list[dict[str, Any]], snapshot: str, tz_name: str | None = None) -> dict[str, Any]:
     return {
         "model": get_app_settings().voice_operator_model,
-        "messages": [{"role": "system", "content": OPERATOR_PROMPT + snapshot[:MAX_SNAPSHOT_CHARS]}, *_clean(messages)],
+        "messages": [{"role": "system", "content": system_prompt(snapshot, tz_name)}, *_clean(messages)],
         "tools": TOOLS,
         "tool_choice": "auto",
     }
 
 
-async def operate(bearer: str, messages: list[dict[str, Any]], snapshot: str) -> dict[str, Any]:
+async def operate(bearer: str, messages: list[dict[str, Any]], snapshot: str, tz_name: str | None = None) -> dict[str, Any]:
     """The model's next turn: ``{content, tool_calls}``, with only our tools' calls."""
     if not bearer:
         raise OperatorError(401, "unauthorized", "Sign in to MindsHub.")
     try:
         async with _client() as client:
             response = await asyncio.wait_for(
-                client.post(chat_url(), json=request_body(messages, snapshot), headers={"Authorization": f"Bearer {bearer}"}),
+                client.post(chat_url(), json=request_body(messages, snapshot, tz_name), headers={"Authorization": f"Bearer {bearer}"}),
                 _TIMEOUT_S,
             )
     except Exception as exc:

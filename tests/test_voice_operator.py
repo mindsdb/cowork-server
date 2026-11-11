@@ -4,6 +4,7 @@ actions' calls come back for the web app to run."""
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -47,7 +48,10 @@ async def test_asks_the_model_as_the_caller_with_the_snapshot_and_the_fixed_tool
     assert request.headers["Authorization"] == BEARER
     body = json.loads(request.content)
     assert body["tools"] == operator.TOOLS
-    assert body["messages"][0] == {"role": "system", "content": operator.OPERATOR_PROMPT + "Projects: general"}
+    system = body["messages"][0]
+    assert system["role"] == "system"
+    assert system["content"].startswith(operator.OPERATOR_PROMPT)
+    assert system["content"].endswith("What is on the screen now:\nProjects: general")
     assert body["messages"][1:] == [{"role": "user", "content": "Make a project called Sales."}]
 
 
@@ -82,3 +86,18 @@ async def test_a_refusal_is_a_424_with_a_sentence(inference):
 
     assert answered.status_code == 424
     assert answered.json()["detail"]["message"] == "MindsHub couldn't take the request."
+
+
+async def test_the_model_knows_the_persons_date_in_their_time_zone(inference):
+    await _operate({"messages": [{"role": "user", "content": "Flights the weekend after Thanksgiving."}], "timezone": "America/Los_Angeles"})
+
+    system = json.loads(inference.seen[0].content)["messages"][0]["content"]
+    assert "where the user is" in system and "(America/Los_Angeles)" in system
+
+
+def test_the_date_is_the_persons_today_and_relative_dates_pass_through_as_said():
+    # 03:00 UTC on Nov 12 is still Nov 11 in Los Angeles.
+    prompt = operator.system_prompt("", "America/Los_Angeles", datetime(2026, 11, 12, 3, 0, tzinfo=timezone.utc))
+    assert "It is now Wednesday, November 11, 2026" in prompt
+    assert "as they said them" in prompt
+    assert "(UTC)" in operator.system_prompt("", "Not/AZone")

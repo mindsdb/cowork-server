@@ -53,6 +53,8 @@ def _person_memory(scope: TenantScope) -> dict[str, str]:
 class VoiceOperateRequest(BaseModel):
     messages: list[dict[str, Any]] = Field(min_length=1, max_length=200)
     snapshot: str = Field(default="", max_length=voice_operator.MAX_SNAPSHOT_CHARS * 2)
+    # The person's IANA time zone, from their browser, so dates are counted from their today.
+    timezone: str | None = Field(default=None, max_length=64)
 
 
 @router.get("/status", response_model=voice.VoiceStatus, dependencies=[Depends(require(AuthenticatedInOrgMode))])
@@ -75,6 +77,6 @@ async def voice_session(
 @router.post("/operate", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def voice_operate(body: VoiceOperateRequest, request: Request) -> dict:
     try:
-        return await voice_operator.operate(mindshub_credential(request), body.messages, body.snapshot)
+        return await voice_operator.operate(mindshub_credential(request), body.messages, body.snapshot, body.timezone)
     except voice_operator.OperatorError as exc:
         raise HTTPException(status_code=exc.status, detail={"code": exc.code, "message": exc.message}) from exc
