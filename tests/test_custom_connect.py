@@ -192,7 +192,10 @@ def test_an_address_outside_the_rules_is_refused_before_anything_is_sent(engine,
     assert world["auth"] == [] and world["provider"] == []
 
 
-@pytest.mark.parametrize("address", ["mindshub.ai", "auth.mindshub.ai", "API.MDB.AI.", "svc.cluster.local"])
+@pytest.mark.parametrize("address", [
+    "mindshub.ai", "auth.mindshub.ai", "API.MDB.AI.", "svc.cluster.local",
+    "draft.mindshub.co", "mindscloud.ai", "api.minds-db.com",
+])
 def test_our_own_domains_are_refused(engine, world, monkeypatch, address):
     res = _connect(_client(engine, monkeypatch), address=address)
 
@@ -242,12 +245,13 @@ def test_every_needed_value_is_present_before_anything_is_sent(engine, world, mo
 
 
 def test_a_check_that_ignores_the_credential_proves_nothing(engine, world, monkeypatch):
-    world["unprotected"] = (200, b"welcome")
+    world["unprotected"] = (200, b"internal status page")
 
     res = _connect(_client(engine, monkeypatch))
 
     assert res.status_code == 422
-    assert res.json()["detail"] == {"code": "check_not_protected", "provider_status": 200, "excerpt": "welcome"}
+    assert res.json()["detail"] == {"code": "check_not_protected", "provider_status": 200, "excerpt": ""}
+    assert "internal status page" not in res.text
     assert len(world["provider"]) == 1
     assert [json.loads(r.content)["dry_run"] for r in world["auth"]] == [True]
 

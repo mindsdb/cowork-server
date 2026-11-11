@@ -244,16 +244,16 @@ async def run_check(origin: str, check: ConnectorDraftCheck, values: Mapping[str
 
     Without them it must answer 401 or 403, or a passing check would prove
     nothing. With them, 2xx passes, 401 or 403 is ``authentication_failed``
-    and any other status ``provider_error``.
+    and any other status ``provider_error``. Only the answer to the request
+    that carried the credentials is excerpted.
     """
     fixed, placed = check_headers(check, values)
     unprotected = await _send(origin, check.path, fixed)
     if isinstance(unprotected, CheckFailure):
         return unprotected
     if unprotected.status_code not in (401, 403):
-        return CheckFailure(
-            "check_not_protected", unprotected.status_code, scrub_excerpt(unprotected.body, values.values())
-        )
+        # Its body is never shown: an excerpt would let connect read any page our egress can reach.
+        return CheckFailure("check_not_protected", unprotected.status_code, "")
     answer = await _send(origin, check.path, {**fixed, **placed})
     if isinstance(answer, CheckFailure):
         return answer
