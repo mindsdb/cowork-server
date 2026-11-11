@@ -191,6 +191,38 @@ async def test_a_turn_with_no_launcher_gets_no_host_and_no_live_app_rule(live, m
     assert getattr(config, "live_app_host", None) is None
 
 
+async def test_a_comparison_side_gets_no_host_and_no_live_app_rule(live, monkeypatch, tmp_path):
+    """A model-comparison side shares nothing until the user continues with it,
+    and a live app is shareable and holds a capped slot: the side is told what
+    a sandboxed turn is told, and has no host to launch through."""
+    from cowork.services.projects import COMPARISON_SANDBOX_PREFIX
+
+    folder = tmp_path / "projects" / f"{COMPARISON_SANDBOX_PREFIX}{'b' * 32}"
+    folder.mkdir(parents=True)
+    with Session(get_engine(get_app_settings().database.uri)) as db:
+        project = Project(name=folder.name, path=str(folder), org_id=PARTITION_A, created_by=SUB_A)
+        db.add(project)
+        db.commit()
+        db.refresh(project)
+        db.expunge(project)
+    try:
+        with use_live_app_launcher(PRINCIPAL_A):
+            async with built_turn(
+                monkeypatch=monkeypatch, tmp_path=tmp_path, scope=ALICE_SCOPE, project=project
+            ) as turn:
+                suffix = _suffix(turn)
+                config = turn.config
+    finally:
+        with Session(get_engine(get_app_settings().database.uri)) as db:
+            db.delete(db.get(Project, project.id))
+            db.commit()
+
+    assert BASE_SANDBOXED_BACKENDS_RULE in suffix
+    assert not any(sentence in suffix for sentence in LIVE_APPS_RULE_SENTENCES)
+    assert "fullstack apps" not in suffix
+    assert getattr(config, "live_app_host", None) is None
+
+
 async def test_the_turn_names_running_apps_copies_and_each_stop_once(live, monkeypatch, tmp_path):
     folder = tmp_path / "projects" / "alices"
     folder.mkdir(parents=True)
@@ -326,7 +358,6 @@ async def test_a_turn_hands_its_stops_back_unless_it_finishes(monkeypatch, sessi
     monkeypatch.setattr(harness, "release_stop_notices", release)
     monkeypatch.setattr(harness, "read_earlier_answers", no_earlier_answers)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_a, **_k: (set(), {}))
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", lambda *_a, **_k: ([], set(), None))
     monkeypatch.setattr(task_objects, "cards_for_slugs", lambda *_a, **_k: [])
     monkeypatch.setattr(autopublish, "autopublish_project_artifacts", no_autopublish)
     monkeypatch.setattr(harness.AntonHarness, "_build_chat_session", build)
@@ -384,7 +415,7 @@ def test_a_non_streaming_turn_runs_with_its_principals_launcher(live):
             seen.append(current_live_app_launcher())
             return None
 
-        async def formatter(self, stream, model, event_sink):
+        async def formatter(self, stream, model, event_sink, **_kwargs):
             event_sink("response.output_text.delta", {"type": "response.output_text.delta", "delta": "ok"})
             if False:
                 yield

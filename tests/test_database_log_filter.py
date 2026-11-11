@@ -412,7 +412,7 @@ def _error_through_scoped_session() -> IntegrityError:
 
 
 @pytest.mark.parametrize("logged_by", ["outside_cowork", "cowork"])
-def test_the_site_names_the_failing_cowork_frame_only_when_the_logging_call_relays_the_error(
+async def test_the_site_names_the_failing_cowork_frame_only_when_the_logging_call_relays_the_error(
     logged_by: str, caplog: pytest.LogCaptureFixture, owned_logger,
 ) -> None:
     error = _error_through_scoped_session()
@@ -426,12 +426,12 @@ def test_the_site_names_the_failing_cowork_frame_only_when_the_logging_call_rela
         # get_session logs a 5xx's cause from its own line, which names the failure.
         logged = owned_logger(db_session.logger.name)
         generator = db_session.get_session()
-        next(generator)
+        await anext(generator)
         try:
             raise HTTPException(status_code=500) from error
         except HTTPException as exc:
             with pytest.raises(HTTPException):
-                generator.throw(exc)
+                await generator.athrow(exc)
     [record] = [record for record in caplog.records
                 if record.name == logged.logger.name and record.levelno == logging.ERROR]
     if logged_by == "outside_cowork":
@@ -568,3 +568,15 @@ def test_app_logging_disables_sqlalchemy_query_and_connection_diagnostics(tmp_pa
     report = json.loads(result.stdout.splitlines()[-1])
     assert report == {"engine_level": logging.WARNING, "pool_level": logging.WARNING, "diagnostics": []}
     assert not any(secret in result.stdout + result.stderr for secret in SECRETS)
+
+
+def test_the_server_imports_no_psycopg2_of_its_own():
+    """psycopg2-binary bundles its own libpq, libssl and libcrypto, so a server that loads it beside
+    psycopg holds several OpenSSL builds at once. A server that connects with psycopg never needs
+    it; a bare ``postgresql://`` URI still imports it, through SQLAlchemy's dialect."""
+    found = subprocess.run(
+        [sys.executable, "-c", "import sys, cowork.server; print(sorted(m for m in sys.modules if m.startswith('psycopg2')))"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert found.returncode == 0, found.stderr
+    assert found.stdout.splitlines()[-1] == "[]"

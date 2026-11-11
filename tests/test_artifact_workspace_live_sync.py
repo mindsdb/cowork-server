@@ -11,6 +11,7 @@ from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.services import artifact_locks
 from cowork.services.artifact_revisions import current_source
 from cowork.services.artifacts import ProjectArtifacts
+from _async_stub import awaitable
 
 
 ARTIFACT_ID = "11111111111111111111111111111111"
@@ -67,7 +68,7 @@ async def test_manual_save_synchronizes_an_existing_live_artifact(artifact, monk
     monkeypatch.setattr(
         workspace,
         "_owner_workspace",
-        lambda *_args: (_source_for(folder), folder, metadata, {}),
+        awaitable(lambda *_args: (_source_for(folder), folder, metadata, {})),
     )
 
     async def fake_sync(session, live_folder, **_kwargs):
@@ -75,7 +76,7 @@ async def test_manual_save_synchronizes_an_existing_live_artifact(artifact, monk
         return True
 
     monkeypatch.setattr(workspace, "_sync_live_artifact", fake_sync)
-    session = _Session()
+    session = ORG_SCOPE
 
     saved = await workspace.update_artifact_source(
         "project-1",
@@ -99,7 +100,7 @@ async def test_noop_save_does_not_create_a_live_version(artifact, monkeypatch):
     monkeypatch.setattr(
         workspace,
         "_owner_workspace",
-        lambda *_args: (_source_for(folder), folder, metadata, {}),
+        awaitable(lambda *_args: (_source_for(folder), folder, metadata, {})),
     )
 
     async def unexpected_sync(*_args):
@@ -115,7 +116,7 @@ async def test_noop_save_does_not_create_a_live_version(artifact, monkeypatch):
             expectedRevisionId=source["revision"]["id"],
             path="report.html",
         ),
-        _Session(),
+        ORG_SCOPE,
     )
 
     assert saved["revision"]["id"] == source["revision"]["id"]
@@ -137,7 +138,7 @@ async def test_restore_synchronizes_an_existing_live_artifact(artifact, monkeypa
     monkeypatch.setattr(
         workspace,
         "_owner_workspace",
-        lambda *_args: (_source_for(folder), folder, metadata, {}),
+        awaitable(lambda *_args: (_source_for(folder), folder, metadata, {})),
     )
 
     async def fake_sync(session, live_folder, **_kwargs):
@@ -145,7 +146,7 @@ async def test_restore_synchronizes_an_existing_live_artifact(artifact, monkeypa
         return True
 
     monkeypatch.setattr(workspace, "_sync_live_artifact", fake_sync)
-    session = _Session()
+    session = ORG_SCOPE
 
     restored = await workspace.restore_artifact_revision(
         "project-1",
@@ -169,7 +170,7 @@ def test_owner_publish_context_threads_the_active_workspace(artifact, monkeypatc
     monkeypatch.setattr(autopublish, "_active_workspace_id", lambda scope: "ws-1")
     monkeypatch.setattr(autopublish, "_publish_url", lambda scope: "https://api.staging.example")
 
-    _base, publish_url, key = workspace._owner_publish_context(_Session(), folder)
+    _base, publish_url, key = workspace._owner_publish_context(ORG_SCOPE, folder)
 
     assert publish_url == "https://api.staging.example"
     assert key._workspace_id == "ws-1"
@@ -206,19 +207,17 @@ async def test_org_sync_preserves_audience_and_reuses_live_publish(artifact, mon
 
     monkeypatch.setattr("cowork.services.publish.publish_artifact", fake_publish)
 
-    result = await workspace._sync_live_artifact(_Session(), folder, project_id="project-1")
+    result = await workspace._sync_live_artifact(ORG_SCOPE, folder, project_id="project-1")
 
     assert result is True
     assert calls[0][0] == folder
     assert calls[0][1]["artifacts_base"] == folder.parent
     assert calls[0][1]["api_key"] == "turn-key"
     assert calls[0][1]["publish_url"] == "https://api.staging.example"
-    assert calls[0][1]["access"] == {
-        "mode": "restricted",
-        "emails": ["viewer@example.com"],
-        "org_allowed": False,
-        "owner_only": False,
-    }
+    # The restricted mode, naming nobody: the publish reads who the artifact
+    # is shared with from MindsHub's rule, never from the entry an
+    # agent can write (cowork.services.publish._plan_access).
+    assert calls[0][1]["access"].publisher_access() == {"mode": "restricted", "owner_only": True}
     assert calls[0][1]["scope"] is ORG_SCOPE
     assert revoked == [True]
     assert calls[0][1]["project_id"] == "project-1"
@@ -233,7 +232,7 @@ async def test_unpublished_draft_does_not_resolve_publish_credentials(artifact, 
 
     monkeypatch.setattr(workspace, "_owner_publish_context", unexpected_context)
 
-    assert await workspace._sync_live_artifact(_Session(), folder) is None
+    assert await workspace._sync_live_artifact(ORG_SCOPE, folder) is None
 
 
 @pytest.mark.asyncio
@@ -253,12 +252,12 @@ async def test_desktop_save_uses_the_configured_publish_environment(artifact, mo
 
     monkeypatch.setattr("cowork.services.publish.publish_artifact", fake_publish)
 
-    result = await workspace._sync_live_artifact(_Session(LOCAL_SCOPE), folder)
+    result = await workspace._sync_live_artifact(LOCAL_SCOPE, folder)
 
     assert result is True
     assert calls[0][1]["api_key"] == "desktop-key"
     assert calls[0][1]["publish_url"] == "https://api.desktop.example"
-    assert calls[0][1]["access"] == {"mode": "public"}
+    assert calls[0][1]["access"].publisher_access() == {"mode": "public"}
     assert calls[0][1]["scope"] is LOCAL_SCOPE
 
 
@@ -292,7 +291,7 @@ async def test_timed_out_publish_keeps_its_lock_and_key(artifact, monkeypatch):
     monkeypatch.setattr("cowork.services.publish.publish_artifact", slow_publish)
 
     try:
-        assert await workspace._sync_live_artifact(_Session(), folder) is False
+        assert await workspace._sync_live_artifact(ORG_SCOPE, folder) is False
         assert publish_started.is_set()
         assert revoked == []
         assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is False
@@ -307,7 +306,7 @@ async def test_publish_failure_does_not_undo_the_source_save(artifact, monkeypat
     monkeypatch.setattr(
         workspace,
         "_owner_workspace",
-        lambda *_args: (_source_for(folder), folder, metadata, {}),
+        awaitable(lambda *_args: (_source_for(folder), folder, metadata, {})),
     )
 
     async def failed_sync(*_args, **_kwargs):
@@ -323,7 +322,7 @@ async def test_publish_failure_does_not_undo_the_source_save(artifact, monkeypat
             expectedRevisionId=source["revision"]["id"],
             path="report.html",
         ),
-        _Session(),
+        ORG_SCOPE,
     )
 
     assert saved["content"] == "<html>saved locally</html>"
@@ -339,7 +338,7 @@ async def test_source_save_survives_live_publish_authority_failure(artifact, mon
     original = current_source(folder, metadata, ARTIFACT_ID)
     monkeypatch.setattr(
         workspace, "_owner_workspace",
-        lambda *_args: (_source_for(folder), folder, metadata, {}),
+        awaitable(lambda *_args: (_source_for(folder), folder, metadata, {})),
     )
 
     async def reject(**kwargs):
@@ -352,7 +351,7 @@ async def test_source_save_survives_live_publish_authority_failure(artifact, mon
             content="<html>saved locally</html>",
             expectedRevisionId=original["revision"]["id"], path="report.html",
         ),
-        _Session(),
+        ORG_SCOPE,
     )
     assert saved["content"] == "<html>saved locally</html>"
     assert (folder / "report.html").read_text() == "<html>saved locally</html>"
@@ -383,7 +382,7 @@ async def test_another_owners_report_fails_the_sync_without_a_traceback(artifact
     monkeypatch.setattr("cowork.services.publish.publish_artifact", owned_elsewhere)
 
     with caplog.at_level(logging.WARNING, logger=workspace.logger.name):
-        assert await workspace._sync_live_artifact(_Session(LOCAL_SCOPE), folder) is False
+        assert await workspace._sync_live_artifact(LOCAL_SCOPE, folder) is False
 
     record = next(r for r in caplog.records if "Could not synchronize live artifact" in r.getMessage())
     assert "another account owns its report" in record.getMessage()
@@ -411,9 +410,49 @@ async def test_a_too_large_artifact_stops_live_sync_without_a_traceback(artifact
     monkeypatch.setattr("cowork.services.publish.publish_artifact", too_large)
 
     with caplog.at_level(logging.WARNING, logger=workspace.logger.name):
-        assert await workspace._sync_live_artifact(_Session(LOCAL_SCOPE), folder) is False
+        assert await workspace._sync_live_artifact(LOCAL_SCOPE, folder) is False
 
     record = next(r for r in caplog.records if "Could not synchronize live artifact" in r.getMessage())
     assert "too large to publish" in record.getMessage()
     assert record.exc_info is None
+    assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is True
+
+
+@pytest.mark.asyncio
+async def test_a_refused_share_with_everyone_stops_live_sync_with_one_warning(artifact, monkeypatch, caplog):
+    """A desktop entry still asks for everyone after the rule stopped sharing
+    with everyone, and MindsHub refuses the re-publish. The edit stays saved,
+    and the refusal, which repeats on every save, is the upload classifier's
+    one warning: the sync adds no second record and no stack."""
+    import io
+    import logging
+    import urllib.error
+
+    from cowork.services.publish import ShareOrgRequired, classify_upload_error
+
+    folder, _metadata = artifact
+    _publish(folder, {"mode": "restricted", "emails": [], "org_allowed": True})
+    monkeypatch.setattr(
+        "cowork.services.publish.desktop_publish_credential",
+        lambda: ("desktop-key", "https://api.desktop.example"),
+    )
+    body = json.dumps({
+        "error": "Sharing an artifact with everyone in the organization needs the artifacts.share_org permission.",
+        "code": "share_org_required",
+    }).encode()
+
+    def refused(*_args, **_kwargs):
+        classify_upload_error(urllib.error.HTTPError(
+            "https://publish.example/upload", 403, "Forbidden", {}, io.BytesIO(body),
+        ))
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", refused)
+
+    with caplog.at_level(logging.WARNING):
+        assert await workspace._sync_live_artifact(LOCAL_SCOPE, folder) is False
+
+    assert [(r.name, r.levelno, r.exc_info) for r in caplog.records] == [
+        ("cowork.services.publish", logging.WARNING, None),
+    ]
+    assert ShareOrgRequired.code == caplog.records[0].reason
     assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is True

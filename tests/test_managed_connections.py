@@ -152,7 +152,7 @@ async def test_every_change_to_a_managed_connection_is_refused(warehouse, monkey
             "postgres", "warehouse", PatchPickedFilesBody(files=[]), ALICE, None
         )
     )
-    _refused(lambda: connections_ep.delete_picked_file("postgres", "warehouse", "file-1", "general", ALICE))
+    await _refused_async(lambda: connections_ep.delete_picked_file("postgres", "warehouse", "file-1", "general", ALICE))
     await _refused_async(
         lambda: connections_ep.patch_access_mode(
             "postgres", "warehouse", connections_ep.PatchAccessModeBody(access_mode="write"), ALICE, None

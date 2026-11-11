@@ -28,7 +28,7 @@ class _StubHarness:
         self.calls.append(kwargs)
         return None
 
-    async def formatter(self, stream, model, event_sink):
+    async def formatter(self, stream, model, event_sink, **_kwargs):
         event_sink(
             "response.output_text.delta",
             {"type": "response.output_text.delta", "delta": "ok"},

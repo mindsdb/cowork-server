@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 
+from cowork.api.v1.content_disposition import attachment_disposition
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.principal import personal_partition_id
 
@@ -399,3 +400,17 @@ def test_shared_file_open_rechecks_containment_after_component_validation(shared
 
     assert response.status_code == 404
     assert response.json()["detail"] == "File not found"
+
+
+def test_shared_download_serves_a_non_latin1_name(shared):
+    client, project, root, registry, entry = shared
+    (root / "Отчёт.pdf").write_bytes(b"shared report bytes")
+
+    response = client.get(
+        f"/api/v1/shared-projects/{project['id']}/files-raw/Отчёт.pdf",
+        headers=headers(BOB),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.content == b"shared report bytes"
+    assert response.headers["content-disposition"] == attachment_disposition("Отчёт.pdf")

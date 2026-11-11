@@ -220,7 +220,7 @@ async def test_disconnect_after_admission_before_the_first_frame_cancels(transpo
     before_created = asyncio.Event()
 
     class BeforeCreated(PausedHarness):
-        async def formatter(self, stream, model, event_sink):
+        async def formatter(self, stream, model, event_sink, **_kwargs):
             before_created.set()
             await asyncio.Event().wait()
             yield "unreachable"

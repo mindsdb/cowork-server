@@ -7,7 +7,7 @@ import uuid
 
 from cowork.coding.commands import CommandIntent
 from cowork.coding.connector_capabilities import ConnectorCapability
-from cowork.coding.context import require_attachments_exist, validate_references
+from cowork.coding.context import message_attachments, require_attachments_exist, validate_references
 from cowork.coding.contracts import (
     CodingEvent,
     CodingSession,
@@ -105,6 +105,9 @@ class CodingTurnOperations:
                 lambda current: fail_turn(current, False, message),
             )
             return
+        # Setup commands may have written into the workspace since it was
+        # first published.
+        self.workspace_usage.invalidate()
         with self._lock:
             preparing = self._running.pop(session_id, None)
             if preparing is not None and preparing.delete_requested:
@@ -249,6 +252,8 @@ class CodingTurnOperations:
         ``announced`` means the prompt is already in the timeline, as it is for
         a new task's first turn.
         """
+        # A released workspace is rebuilt before validation reads its files.
+        self.ensure_workspace(session_id, reserved=maintenance_reserved)
         intent = self._validated_command_intent(self.get_session(session_id), prompt, attachments)
         if intent.runs_immediately:
             if maintenance_reserved:
@@ -281,7 +286,13 @@ class CodingTurnOperations:
                     phase="started",
                 )
                 if announced
-                else CodingEvent(type=EventType.user_message, title="You", text=prompt, phase="completed"),
+                else CodingEvent(
+                    type=EventType.user_message,
+                    title="You",
+                    text=prompt,
+                    phase="completed",
+                    data=message_attachments(attachments),
+                ),
                 mark_running,
             )
             thread = threading.Thread(
@@ -395,7 +406,13 @@ class CodingTurnOperations:
                 raise RuntimeError("Coding agent state is inconsistent")
             self._emit(
                 session.id,
-                CodingEvent(type=EventType.user_message, title="You", text=prompt, phase="completed"),
+                CodingEvent(
+                    type=EventType.user_message,
+                    title="You",
+                    text=prompt,
+                    phase="completed",
+                    data=message_attachments(attachments),
+                ),
             )
             if intent.name == "status":
                 self.commands.emit_status(session, engine)
@@ -411,7 +428,13 @@ class CodingTurnOperations:
         if outcome is None:
             self._emit(
                 session.id,
-                CodingEvent(type=EventType.user_message, title="Follow-up", text=prompt, phase="completed"),
+                CodingEvent(
+                    type=EventType.user_message,
+                    title="Follow-up",
+                    text=prompt,
+                    phase="completed",
+                    data=message_attachments(attachments),
+                ),
             )
             return self.get_session(session_id)
         # Codex has not answered within its deadline. The instruction is in
@@ -425,7 +448,7 @@ class CodingTurnOperations:
                 title="Follow-up (unconfirmed)",
                 text=prompt,
                 phase="pending",
-                data={"delivery": "unconfirmed"},
+                data={"delivery": "unconfirmed", **message_attachments(attachments)},
             ),
         )
         outcome.on_settled(lambda ok, detail: self._record_late_steer(session_id, prompt, ok, detail))
@@ -492,7 +515,7 @@ class CodingTurnOperations:
                     title="Queued next",
                     text=prompt,
                     phase="pending",
-                    data={"queueId": instruction.id},
+                    data={"queueId": instruction.id, **message_attachments(attachments)},
                 ),
                 lambda current: current.queued_instructions.append(instruction),
             )

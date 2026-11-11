@@ -8,9 +8,9 @@ package exists.
 """
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictStr, field_validator, model_validator
 
 
 #: Ceiling for ``TurnJob.deadline_ms``. 24h is far past any real turn and far
@@ -19,6 +19,23 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 MAX_DEADLINE_MS = 24 * 60 * 60 * 1000
 DATASOURCE_PROTOCOL_VERSION = 1
 MAX_DATASOURCE_CONNECTIONS = 100
+
+#: The ``turn_completed`` key that names the artifact folders the turn's tools
+#: touched. anton holds the same name as ``ARTIFACTS_TOUCHED_KEY`` in
+#: ``anton/cloud_turn/contract.py``, and scratchpad-controller as
+#: ``ARTIFACTS_TOUCHED_KEY`` in ``src/scratchpad_controller/anton_turn.py``.
+ARTIFACTS_TOUCHED_KEY = "artifacts_touched"
+#: The most names that list carries. anton's ``_stream_turn`` leaves out a
+#: longer list and scratchpad-controller relays none, each against its own
+#: ``MAX_ARTIFACTS_TOUCHED`` in the files above; this server reads one as
+#: absent (``TurnCompleted``).
+MAX_ARTIFACTS_TOUCHED = 1000
+#: The longest name that list may hold, this server's own bound: no folder
+#: name is longer on the file systems artifacts live on. A list holding a
+#: longer name reads as absent (``TurnCompleted``), and the shutdown line
+#: that names a turn's artifacts leaves one out
+#: (``cowork.db.units.drain_turn_end_records``).
+MAX_ARTIFACT_NAME_CHARS = 255
 
 
 def _validate_datasource_block(value: object) -> None:
@@ -128,3 +145,29 @@ class TurnReply(BaseModel):
                   "turn_memory", "turn_skill", "turn_history", "turn_compaction",
                   "turn_completed", "turn_failed"]
     data: dict[str, Any] = Field(default_factory=dict)
+    # The reply's number within its turn, counting up by one. The controller
+    # resends a reply whose XADD reply it lost, and the relay drops a reply
+    # whose number repeats the last one it applied (producer.py). A
+    # controller that numbers nothing sends none, and every reply is applied.
+    n: int | None = None
+
+
+class TurnJobHeader(BaseModel):
+    """The field of a queued job the producer reads back after a job XADD
+    whose reply it lost: the turn it queues."""
+
+    correlation_id: str
+
+
+class TurnCompleted(BaseModel):
+    """The ``data`` of a ``turn_completed`` reply, as far as this server reads
+    it. Written by anton's ``_stream_turn`` (``anton/cloud_turn/__main__.py``,
+    documented in ``anton/cloud_turn/contract.py``) and relayed by
+    scratchpad-controller's ``src/scratchpad_controller/anton_turn.py``.
+    Untrusted: the pod writes it."""
+
+    # The folder names of the artifacts the turn's tools touched; None for a
+    # pod that sends no list.
+    artifacts_touched: list[Annotated[StrictStr, Field(max_length=MAX_ARTIFACT_NAME_CHARS)]] | None = Field(
+        default=None, alias=ARTIFACTS_TOUCHED_KEY, max_length=MAX_ARTIFACTS_TOUCHED,
+    )

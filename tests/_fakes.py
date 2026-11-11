@@ -21,11 +21,16 @@ class FakeRequest:
 class QueuedPipeline:
     """``pipeline()`` for a hand-written fake Redis client: each command is
     queued, then run in order against that client's own async method on
-    ``execute()``, so the fake records it as if it were called directly."""
+    ``execute()``, so the fake records it as if it were called directly.
+
+    As redis-py's pipeline does, ``watch()`` switches it to running each
+    command at once, until ``multi()`` starts queueing again. The fake keeps
+    no keys, so a watched key never changes."""
 
     def __init__(self, client) -> None:
         self._client = client
         self._commands: list[tuple[str, tuple, dict]] = []
+        self._watching = False
 
     async def __aenter__(self):
         return self
@@ -33,7 +38,16 @@ class QueuedPipeline:
     async def __aexit__(self, *_exc) -> None:
         return None
 
+    async def watch(self, *_keys) -> None:
+        self._watching = True
+
+    def multi(self) -> None:
+        self._watching = False
+
     def __getattr__(self, name: str):
+        if self._watching:
+            return getattr(self._client, name)
+
         def queue(*args, **kwargs):
             self._commands.append((name, args, kwargs))
             return self
@@ -42,6 +56,18 @@ class QueuedPipeline:
 
     async def execute(self) -> list:
         return [await getattr(self._client, name)(*args, **kwargs) for name, args, kwargs in self._commands]
+
+
+class UnreachableRedis:
+    """A Redis client every command of which fails as a dropped connection does."""
+
+    def __getattr__(self, name):
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        def fail(*_args, **_kwargs):
+            raise RedisConnectionError("Redis is unreachable")
+
+        return fail
 
 
 class PausedHarness:
@@ -62,7 +88,7 @@ class PausedHarness:
         self.started += 1
         return None
 
-    async def formatter(self, stream, model, event_sink):
+    async def formatter(self, stream, model, event_sink, **_kwargs):
         from cowork.streaming import sse_frame
 
         yield sse_frame("response.created", {"type": "response.created"})
@@ -82,6 +108,35 @@ def opens(buffer):
         return buffer
 
     return open_buffer
+
+
+def units_on_engine(monkeypatch, engine):
+    """Point the real ``run_db`` units at a test's own engine, for a test that
+    seeds and reads through a session on an engine of its own. The units still
+    run in worker threads, each in a session of its own."""
+    from cowork.db import units
+
+    monkeypatch.setattr(units, "_engine", lambda: engine)
+
+
+def stored_file(*, scoped, filename: str, content_type: str, data: bytes, purpose: str):
+    """A file's row and bytes, saved as cowork.services.files.store_file saves
+    them, but on the test's own session: for a sync test, or one whose engine
+    no run_db unit reaches. The row is staged first, so a scope the files root
+    refuses fails before any bytes are written."""
+    from cowork.models.file import File
+    from cowork.services.files import _files_root, _write_upload
+
+    file = File(filename=filename, content_type=content_type, size=len(data), purpose=purpose, path="")
+    scoped.add(file)
+    try:
+        file.path = str(_write_upload(_files_root(scoped.scope) / str(file.id), filename, data))
+    except Exception:
+        scoped.rollback()
+        raise
+    scoped.commit()
+    scoped.refresh(file)
+    return file
 
 
 def inline_run_db(session):

@@ -1,9 +1,8 @@
-from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from cowork.schemas.base import CamelRequest, CamelResponse
+from cowork.schemas.base import CamelRequest, CamelResponse, IsoDatetime
 
 
 class ConversationCreateRequest(CamelRequest):
@@ -36,14 +35,20 @@ class ConversationListItem(CamelResponse):
     id: UUID
     title: str
     preview: str
-    updated_at: datetime | None
-    created_at: datetime | None
+    updated_at: IsoDatetime | None
+    created_at: IsoDatetime | None
     project: str | None = None
     project_path: str | None = None
     project_id: UUID | None
     harness: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
+
+
+class ConversationListResponse(CamelResponse):
+    """GET /conversations/'s envelope."""
+
+    conversations: list[ConversationListItem]
 
 
 class ConversationItemsPage(CamelResponse):
