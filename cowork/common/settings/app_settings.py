@@ -809,7 +809,10 @@ class TurnQueueSettings(Settings):
         ),
     )  # COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
     custom_connect_refused_domains: list[str] = Field(
-        default=["mindshub.ai", "mindsdb.com", "mindsdb.cloud", "mdb.ai", "4nton.ai", "cluster.local"],
+        default=[
+            "mindshub.ai", "mindshub.co", "mindsdb.com", "mindsdb.cloud", "mindscloud.ai",
+            "minds-db.com", "mdb.ai", "4nton.ai", "cluster.local",
+        ],
         description=(
             "Domains a custom connector's address may not be, or be under: our own, "
             "so a member cannot point the check at our services."
