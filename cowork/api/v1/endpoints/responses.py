@@ -485,6 +485,11 @@ def _keeps_going_past_a_limit(question_id: str, values: list[str]) -> bool:
     return question_id.startswith(_TIME_LIMIT_QUESTION_PREFIX) and values == [_KEEP_GOING]
 
 
+# Between the two tries of a key extension, so one blip in auth doesn't turn
+# the user's Keep going into Stop here.
+_KEY_EXTENSION_RETRY_PAUSE_SECONDS = 1.0
+
+
 async def _extend_turn_key_window(correlation_id: str) -> bool:
     """Give a time-limited turn's key one more window before its "Keep going"
     reaches the pod. False when auth refused twice, or couldn't be reached.
@@ -498,7 +503,9 @@ async def _extend_turn_key_window(correlation_id: str) -> bool:
     settings = TurnQueueSettings()
     if settings.time_limit_seconds <= 0:
         return True
-    for _attempt in range(2):
+    for attempt in range(2):
+        if attempt:
+            await asyncio.sleep(_KEY_EXTENSION_RETRY_PAUSE_SECONDS)
         if await extend_turn_key(
             instance_id=correlation_id, ttl_seconds=settings.turn_key_lifetime_seconds, settings=settings,
         ):

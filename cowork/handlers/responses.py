@@ -2202,6 +2202,8 @@ class ResponsesHandler:
                 )
                 if first_take is not None:
                     first_take.cancel()
+                # No agent turn runs on the gate's key, so revoke it below.
+                delegated = False
             elif isinstance(exc, PoolTimeoutError):
                 logger.warning(
                     "[direct] turn found no free database connection",

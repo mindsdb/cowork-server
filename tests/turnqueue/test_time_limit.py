@@ -114,6 +114,27 @@ async def test_keep_going_gives_the_key_another_window(time_limit, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_refused_extension_is_tried_again_after_a_pause(time_limit, monkeypatch):
+    """One blip in auth must not turn the user's Keep going into Stop here, so
+    the second try waits a moment rather than following straight on."""
+    import time
+
+    from cowork.api.v1.endpoints import responses as endpoint
+
+    tries = []
+
+    async def extend(**_kwargs):
+        tries.append(time.monotonic())
+        return len(tries) == 2
+
+    monkeypatch.setattr(endpoint, "extend_turn_key", extend)
+    monkeypatch.setattr(endpoint, "_KEY_EXTENSION_RETRY_PAUSE_SECONDS", 0.05)
+    assert await endpoint._extend_turn_key_window("corr-1") is True
+    assert len(tries) == 2
+    assert tries[1] - tries[0] >= 0.05
+
+
+@pytest.mark.asyncio
 async def test_without_a_time_limit_keep_going_leaves_the_key_alone(monkeypatch):
     from cowork.api.v1.endpoints import responses as endpoint
 
@@ -235,11 +256,14 @@ def test_a_time_limit_whose_key_window_auth_would_refuse_is_rejected(monkeypatch
 
     from cowork.common.settings.app_settings import AUTH_TURN_KEY_MAX_TTL_SECONDS, AUTH_TURN_KEY_SKEW_SECONDS
 
-    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "4200")
+    # A limit the time-limit cap allows, with a margin that takes its window
+    # past auth's per-window cap: only the key-window check refuses it.
+    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "3600")
+    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS", "2701")
     with pytest.raises(ValidationError):
         TurnQueueSettings()
-    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "3600")
-    assert TurnQueueSettings().turn_key_lifetime_seconds <= AUTH_TURN_KEY_MAX_TTL_SECONDS - AUTH_TURN_KEY_SKEW_SECONDS
+    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS", "2700")
+    assert TurnQueueSettings().turn_key_lifetime_seconds == AUTH_TURN_KEY_MAX_TTL_SECONDS - AUTH_TURN_KEY_SKEW_SECONDS
 
 
 def test_a_time_limit_longer_than_the_backstop_and_key_lifetime_cover_is_rejected(monkeypatch):

@@ -555,6 +555,24 @@ def test_a_pod_turn_gets_at_least_the_controllers_own_bound(monkeypatch):
     assert scheduler._run_duration_limit() == 3600
 
 
+def test_a_time_limited_pod_turn_gets_its_whole_key_window(monkeypatch):
+    """With the turn time limit at 3600 the scheduler stopped a run at 30
+    minutes, cancelling it with no summary while anton still had half its limit
+    left; three such runs paused the schedule. It now waits out the key window,
+    in which anton hands back at the limit with a summary."""
+    monkeypatch.setenv("COWORK_TURN_TIME_LIMIT_SECONDS", "3600")
+    _limit(monkeypatch, 1800, backend="redis")
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    window = TurnQueueSettings().turn_key_lifetime_seconds
+    assert window > 3600
+    assert scheduler._run_duration_limit() == window + scheduler._REMOTE_SETUP_MARGIN_SECONDS
+    assert scheduler._orphaned_run_age_seconds() > window
+    # Desktop runs keep their own setting.
+    _limit(monkeypatch, 1800)
+    assert scheduler._run_duration_limit() == 1800
+
+
 def test_the_timeout_message_names_the_limit():
     assert scheduler._duration_error(1800) == "Run exceeded the 30-minute limit and was stopped."
     assert scheduler._duration_error(5400) == "Run exceeded the 90-minute limit and was stopped."

@@ -648,10 +648,11 @@ async def test_produce_answer_streams_then_saves_the_turn(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("delegates", [False, True])
+@pytest.mark.parametrize("delegates", [False, True, "fails"])
 async def test_produce_answer_revokes_the_gate_key_unless_the_agent_takes_the_turn(monkeypatch, delegates):
     """An answered turn runs no agent turn to revoke the gate's key; a
-    delegated one runs on that key, and the agent's producer revokes it."""
+    delegated one runs on that key, and the agent's producer revokes it. A
+    hand-off that fails before the agent's turn ends runs nothing on it."""
     import cowork.handlers.responses as responses
 
     conversation_id = await _conversation()
@@ -664,6 +665,8 @@ async def test_produce_answer_revokes_the_gate_key_unless_the_agent_takes_the_tu
     buffers = []
 
     async def delegate():
+        if delegates == "fails":
+            raise RuntimeError("harness no longer resolves")
         await buffers[0].close("completed")
 
     answer = None if delegates else await _answer(["Revenue was ", "$4.81M."])
@@ -675,7 +678,7 @@ async def test_produce_answer_revokes_the_gate_key_unless_the_agent_takes_the_tu
 
     await coro
 
-    assert revoked == ([] if delegates else ["corr-gate"])
+    assert revoked == ([] if delegates is True else ["corr-gate"])
 
 
 @pytest.mark.asyncio
