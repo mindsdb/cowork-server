@@ -330,6 +330,22 @@ def test_saving_a_budget_leaves_a_switch_turned_off_alone(engine, save):
     assert effective_turn_limits(svc.load()) == _defaults()
 
 
+@pytest.mark.parametrize("scope", [LOCAL_SCOPE, TenantScope(org_mode=True, org_id=ORG_A)], ids=["local", "org"])
+def test_turning_the_switch_on_and_changing_budgets_in_one_save(engine, scope):
+    """The Settings form's first save with the switch on: the switch and the
+    budgets arrive together and no switch row is stored yet. The app's sessions
+    don't autoflush, so the staged switch isn't visible to a lookup; adding a
+    second one broke the unique key and the save answered 500."""
+    svc = SettingService(Session(engine, autoflush=False), scope)
+    svc.save_all({"limits_enabled": "true", "max_tool_rounds": "5", "max_continuations": "2"})
+
+    assert len(_switch_rows(engine)) == 1
+    loaded = SettingService(Session(engine), scope).load()
+    assert loaded.limits_enabled is True
+    assert effective_turn_limits(loaded).max_tool_rounds == 5
+    assert effective_turn_limits(loaded).max_continuations == 2
+
+
 def test_saving_the_switch_off_with_a_budget_keeps_it_off(engine):
     svc = SettingService(Session(engine), LOCAL_SCOPE)
     svc.save_all({"limits_enabled": "false", "max_tool_rounds": "12"})
