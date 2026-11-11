@@ -59,7 +59,8 @@ class EmbedRequest(BaseModel):
 
 class OpenRequest(BaseModel):
     conversation_id: str = Field(pattern=SESSION_ID.pattern)
-    url: str = Field(min_length=1, max_length=4096)
+    # None opens the task's browser on a blank tab, where the pane shows its start page.
+    url: str | None = Field(default=None, max_length=4096)
 
 
 def _raise(exc: browser_service.BrowserServiceError) -> NoReturn:
@@ -119,9 +120,10 @@ async def browse_embed(body: EmbedRequest, request: Request) -> browser_service.
 )
 async def browse_open(body: OpenRequest, request: Request, scope: ScopeDep) -> browser_service.OpenedSession:
     """The person typed an address in a task's browser pane: open it there
-    directly, without the agent (ENG-4138, prototype)."""
-    url = browser_service.person_url(body.url)
-    if url is None:
+    directly, without the agent (ENG-4138, prototype). No address opens the
+    browser on a blank tab, or leaves an open one where it is."""
+    url = browser_service.person_url(body.url) if body.url else None
+    if body.url and url is None:
         raise HTTPException(status_code=400, detail={"code": "bad_url", "message": "That isn't a web address."})
     try:
         return await browser_service.person_open(

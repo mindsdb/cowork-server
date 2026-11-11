@@ -58,3 +58,12 @@ async def test_an_open_session_goes_to_the_address(router):
     assert router.calls[-1] == (
         "POST", f"https://cowork.test/browser/sessions/{session}/action", {"action": "navigate", "url": "https://example.com"},
     )
+
+
+async def test_no_address_opens_a_blank_tab_and_leaves_an_open_one_be(router):
+    router.created = False
+
+    await browser.person_open("Bearer jwt", user_id="u1", conversation_id="c1", url=None)
+
+    session = browser.task_session("u1", "c1")
+    assert router.calls == [("POST", "https://cowork.test/browser/sessions", {"session_id": session})]

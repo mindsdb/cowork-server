@@ -387,15 +387,16 @@ def person_url(raw: str) -> str | None:
     return text
 
 
-async def person_open(bearer: str, *, user_id: str | None, conversation_id: str, url: str) -> OpenedSession:
+async def person_open(bearer: str, *, user_id: str | None, conversation_id: str, url: str | None) -> OpenedSession:
     """The person opens ``url`` in a task's browser themselves, from the pane:
     the task's session (``task_session``) opens at it, or, open already, goes
-    there. As the caller, so it is their browser and their allowance; no turn
-    and no agent are involved. Raises BrowserServiceError."""
+    there. No ``url`` opens it on a blank tab and leaves an open one as it is.
+    As the caller, so it is their browser and their allowance; no turn and no
+    agent are involved. Raises BrowserServiceError."""
     router = _require_router()
     session_id = task_session(user_id, conversation_id)
-    opened = await _call("POST", f"{router}/sessions", bearer, json={"session_id": session_id, "url": url})
-    if isinstance(opened, dict) and opened.get("created") is False:
+    opened = await _call("POST", f"{router}/sessions", bearer, json={"session_id": session_id, **({"url": url} if url else {})})
+    if url and isinstance(opened, dict) and opened.get("created") is False:
         await _call("POST", f"{router}/sessions/{session_id}/action", bearer, json={"action": "navigate", "url": url})
     return OpenedSession(session_id=session_id)
 
