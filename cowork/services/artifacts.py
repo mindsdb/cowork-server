@@ -1851,6 +1851,22 @@ class ListCandidate(NamedTuple):
     source: ProjectArtifacts
 
 
+class ListedCards(NamedTuple):
+    """What cards_for_candidates built: the cards, newest first, and the
+    candidates whose folder opened and built no card. A folder lands in
+    `no_card` when the read of its id raises any OSError or ValueError
+    (artifact_identity.read_full_id): it holds no metadata.json, one that
+    is a link or not a regular file, one with no valid id, or one whose
+    read fails, as on EIO or ESTALE. It lands there too when the card
+    builder finds no procfs path for the open folder or its root
+    (_pinned_directory_path), on a Linux host without procfs. A folder
+    that fails to open, or whose card build raises, is skipped and is in
+    neither field."""
+
+    cards: list[dict]
+    no_card: tuple[ListCandidate, ...]
+
+
 def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
     """Every artifact under the given roots, newest first, capped at
     LIST_CARDS.
@@ -1861,17 +1877,28 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
     `sources` spans every project of the organization instead of one tree.
 
     Two passes so the cap is applied before card work, not after: a collect
-    pass opens each artifact once and reads only its `metadata.json` mtime (no
-    card built), then a build pass (cards_for_candidates) walks the sorted
-    candidates and stops once LIST_CARDS cards have been produced. In org
-    mode, once the sort times are recorded, the list skips the collect pass
-    and passes the newest rows as candidates instead
-    (cowork.services.artifact_sort_times).
+    pass (list_candidates) opens each artifact once and reads only its
+    `metadata.json` mtime (no card built), then a build pass
+    (cards_for_candidates) walks the sorted candidates and stops once
+    LIST_CARDS cards have been produced. In org mode, once the sort times are
+    recorded, the list runs the collect pass only over the roots of the
+    projects whose rows it cannot trust, and passes the newest rows as the
+    other candidates (cowork.services.artifact_sort_times).
     """
+    return cards_for_candidates(list_candidates(sources, indexes=range(len(sources)))).cards
+
+
+def list_candidates(sources: list[ProjectArtifacts], *, indexes: Iterable[int]) -> list[ListCandidate]:
+    """The collect pass of list_artifacts over the roots of `sources` at
+    `indexes`: one candidate for each folder of those roots, with its root's
+    index in `sources`, so candidates from separate calls over the same
+    `sources` sort together as one walk's (cards_for_candidates). A root that
+    fails to open or list gives none."""
     from cowork.services.artifact_identity import opened_artifact_root
 
     candidates: list[ListCandidate] = []
-    for source_idx, source in enumerate(sources):
+    for source_idx in indexes:
+        source = sources[source_idx]
         try:
             with opened_artifact_root(source) as root:
                 with dir_scandir(root) as entries:
@@ -1907,13 +1934,15 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                     candidates.append(ListCandidate(mtime, source_idx, child_name, source))
         except (OSError, ValueError):
             continue
-    return cards_for_candidates(candidates)
+    return candidates
 
 
-def cards_for_candidates(candidates: Iterable[ListCandidate]) -> list[dict]:
+def cards_for_candidates(candidates: Iterable[ListCandidate]) -> ListedCards:
     """The cards of `candidates`, newest first, then by root and name, capped
     at LIST_CARDS: each folder opened without following a link, and one
-    that fails to open or holds no valid identity skipped."""
+    that fails to open or builds no card skipped. Each candidate whose
+    folder opened and built no card comes back in ListedCards.no_card,
+    which says when that happens."""
     from cowork.services.artifact_identity import (
         _opened_child_directory,
         opened_artifact_root,
@@ -1921,6 +1950,7 @@ def cards_for_candidates(candidates: Iterable[ListCandidate]) -> list[dict]:
 
     ordered = sorted(candidates, key=lambda item: (-item.sort_time, item.source_index, item.name))
     cards: list[dict] = []
+    no_card: list[ListCandidate] = []
     # One root open per source, not per surviving candidate: opening a root
     # costs an openat+stat per path component, so re-opening it per card
     # would undo what capping the candidates before this pass just saved.
@@ -1937,9 +1967,10 @@ def cards_for_candidates(candidates: Iterable[ListCandidate]) -> list[dict]:
                     opened_roots[source_idx] = None
             return opened_roots[source_idx]
 
-        for _mtime, source_idx, child_name, source in ordered:
+        for candidate in ordered:
             if len(cards) >= LIST_CARDS:
                 break
+            _mtime, source_idx, child_name, source = candidate
             root = _root_for(source_idx, source)
             if root is None:
                 continue
@@ -1955,13 +1986,14 @@ def cards_for_candidates(candidates: Iterable[ListCandidate]) -> list[dict]:
                         pinned_root=root,
                         artifacts_base=source.base,
                     )
-                    if card is None:
-                        continue
-                    cards.append(card)
             except (OSError, ValueError):
                 continue
+            if card is None:
+                no_card.append(candidate)
+                continue
+            cards.append(card)
 
-    return cards
+    return ListedCards(cards=cards, no_card=tuple(no_card))
 
 
 def _line_breaks(text: str, start: int, end: int, has_cr: bool) -> int:

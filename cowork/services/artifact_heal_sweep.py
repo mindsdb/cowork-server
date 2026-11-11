@@ -4,8 +4,9 @@ records what it finds there, as a self-heal's location check does
 (artifact_autopublish._record_listed_locations).
 
 The artifacts list opens only the roots the held_artifact_roots rows name, and
-three things can leave a root holding a folder that no row names. During a
-rollout, old pods serve turns and write no rows. A turn end's record can be
+in them only the newest folders the artifact_sort_times rows name, and three
+things can leave a root, or a folder, that no row names. During a rollout,
+old pods serve turns and write no rows. A turn end's record can be
 lost to the shutdown drain or to a busy pool. And the self-heal a turn end asks
 for lives only in its replica's memory
 (artifact_autopublish.request_turn_end_self_heal), so it dies with the pod.
@@ -221,11 +222,17 @@ async def _check_project(heal: SelfHeal) -> bool:
     """Run one project's location check
     (artifact_autopublish._record_listed_locations), and return whether it
     read and recorded every folder. That check lists the project's shared
-    root, records the root's held row when it holds a folder, and checks each
-    id's location row.
+    root, records the root's held row when it holds a folder, writes each
+    folder's sort time and drops the sort-time row of each folder gone from
+    the root, and checks each id's location row
+    (artifact_autopublish._record_listing). A project renamed since the
+    pass built its heal is neither listed nor recorded, since the heal
+    names the old path (artifact_autopublish._still_the_project_root), and
+    counts as checked: a later pass builds its heal from the new path.
 
-    A check that falls short (its listing could not read a folder or the
-    root, or its listing or record failed) logs its own WARNING and asks for
+    A check that falls short (its listing could not read a folder, a
+    folder's time or the root, or its listing or a write of its record
+    failed) logs its own WARNING and asks for
     the next location check (request_location_check). It runs inside
     keep_location_checks, so that request lands in this task's own set, which
     tells this check's failure, and never reaches this replica's poll

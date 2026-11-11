@@ -88,6 +88,8 @@ from cowork.services.artifact_roots import (
     _ARTIFACTS_SUBPATH,
     CONVERSATIONS_DIRNAME,
     SERVER_PROJECT_FOLDERS,
+    ProjectRow,
+    recorded_source,
     workspace_conversation_id,
 )
 from cowork.services.artifacts import _is_the_projects_secrets
@@ -1735,8 +1737,8 @@ def _read_project_file(
     return response
 
 
-class _ArtifactFolderWrite(NamedTuple):
-    """The artifact folder a project files PUT wrote into: the conversation
+class _ArtifactFolder(NamedTuple):
+    """An artifact folder a project files path lies in: the conversation
     whose legacy root holds it, None for the project's shared root, and the
     folder's name."""
 
@@ -1744,16 +1746,25 @@ class _ArtifactFolderWrite(NamedTuple):
     slug: str
 
 
-def _artifact_folder_written(path: _ValidatedProjectPath) -> _ArtifactFolderWrite | None:
+class _ArtifactFolderPath(NamedTuple):
+    """A project files path below an artifact folder (_artifact_folder_path)."""
+
+    folder: _ArtifactFolder
+    #: The path's parts below the folder.
+    below: tuple[str, ...]
+
+
+def _artifact_folder_path(path: _ValidatedProjectPath) -> _ArtifactFolderPath | None:
     """The artifact folder `path` lies in, when it lies in one: below a
     project's shared root (`.anton/artifacts/<slug>/...`), or below a
     conversation's legacy root (`conversations/<id>/.anton/artifacts/<slug>/
     ...`), whose workspace name only counts in its canonical spelling
     (artifact_roots.workspace_conversation_id). A file directly in a root is
     no folder, and a folder whose name starts with a dot is none the list
-    opens (held_artifact_roots.holds_a_folder). Compared by parts,
-    case-sensitive, as the organization's file store is; the write refuses a
-    link in every component, so these parts are where it wrote."""
+    opens (held_artifact_roots.listable_folders). Compared by parts,
+    case-sensitive, as the organization's file store is; the PUT and the
+    DELETE refuse a link in every component, so these parts are where they
+    wrote or deleted."""
     parts = path.parts
     conversation_id = None
     if parts[0] == CONVERSATIONS_DIRNAME and len(parts) > 2:
@@ -1763,42 +1774,193 @@ def _artifact_folder_written(path: _ValidatedProjectPath) -> _ArtifactFolderWrit
         parts = parts[2:]
     if len(parts) < 4 or parts[:2] != _ARTIFACTS_SUBPATH or parts[2].startswith("."):
         return None
-    return _ArtifactFolderWrite(conversation_id=conversation_id, slug=parts[2])
+    return _ArtifactFolderPath(
+        folder=_ArtifactFolder(conversation_id=conversation_id, slug=parts[2]), below=parts[3:]
+    )
+
+
+def _artifact_folder_written(path: _ValidatedProjectPath) -> _ArtifactFolder | None:
+    """The artifact folder a PUT of `path` wrote into, when it wrote into one
+    (_artifact_folder_path)."""
+    found = _artifact_folder_path(path)
+    return found.folder if found is not None else None
+
+
+def _artifact_folder_unlisted(path: _ValidatedProjectPath) -> _ArtifactFolder | None:
+    """The artifact folder whose card a DELETE of `path` removed: the
+    folder's own `metadata.json`, without which the artifacts list shows no
+    card for it. A DELETE never removes a folder (_delete_project_entry
+    refuses one), and any other file leaves the folder's card as it was."""
+    found = _artifact_folder_path(path)
+    return found.folder if found is not None and found.below == ("metadata.json",) else None
 
 
 def _record_artifact_folder_write(scoped: ScopedSession, *, project_name: str, path: _ValidatedProjectPath) -> None:
     """After a PUT wrote into an artifact folder (_artifact_folder_written),
-    record that the folder's root holds one, in the PUT's own unit, so the
-    artifacts list opens that root (held_artifact_roots.hold_root): the
-    project's shared root, or the caller's own conversation's legacy root,
-    which after the backfill only this PUT and a comparison side's carry
-    (ComparisonService._hold_carried_workspace) record. Only org tenancy keeps
-    these rows. Reads the project's row, and makes no file store call.
+    record two rows in the PUT's own unit, so the artifacts list shows the
+    folder: that the folder's root holds one (held_artifact_roots.hold_root),
+    so the list opens that root, and the folder's sort time
+    (artifact_sort_times.record_sort_times), so the list counts the folder
+    among the newest. The root is the project's shared root, or the caller's
+    own conversation's legacy root, which after the backfills only this PUT
+    and a comparison side's carry (ComparisonService._hold_carried_workspace)
+    record. Only org tenancy keeps these rows.
+
+    The time is the modification time of the folder's `metadata.json`
+    (_record_folder_time). A folder whose `metadata.json` is not written yet
+    gets no time; the PUT that writes it records one, and a later PUT into
+    the folder only moves the row to a newer time (record_sort_times).
 
     Best-effort: the file is written already, so a failure is logged at
-    ERROR and the PUT still succeeds. A shared root is then held at the
-    project's next turn end or self-heal that finds the folder, and a legacy
-    root at the next write into it."""
+    ERROR and the PUT still succeeds. Each row has its own try, so a failed
+    hold still records the time. For a shared root a failed hold asks for
+    the project's location check
+    (_ask_for_location_check), whose listing holds the root and records the
+    time of every folder it reads. A legacy root has no self-heal: its rows
+    wait for the next PUT into the folder."""
     from cowork.services.artifact_locations import keeps_locations
     from cowork.services.held_artifact_roots import hold_root
 
     folder = _artifact_folder_written(path)
     if folder is None or not keeps_locations(scoped.scope):
         return
-    project_id = None
+    project = None
     try:
-        project_id = _project_for_name(project_name, scoped).id
-        hold_root(scoped, project_id=project_id, conversation_id=folder.conversation_id)
+        project = _artifact_folder_project(scoped, project_name)
+        hold_root(scoped, project_id=project.id, conversation_id=folder.conversation_id)
     except Exception:
         scoped.rollback()
         logger.error(
             "Could not record that a project files write put an artifact folder in its root",
             exc_info=True,
+            extra={"event": "held_artifact_root_not_recorded", **_folder_write_context(project, folder)},
+        )
+        _ask_for_location_check(scoped, project=project, folder=folder)
+    if project is None:
+        return
+    _record_folder_time(scoped, project=project, folder=folder)
+
+
+def _artifact_folder_project(scoped: ScopedSession, project_name: str) -> ProjectRow:
+    """`project_name`'s row as plain values, which stay readable after a
+    failed commit expires every loaded row. An org project's folder is never
+    one the user chose (ProjectService.directory_is_external)."""
+    found = _project_for_name(project_name, scoped)
+    return ProjectRow(id=found.id, name=found.name, path=found.path, external=False)
+
+
+def _record_folder_time(scoped: ScopedSession, *, project: ProjectRow, folder: _ArtifactFolder) -> None:
+    """Record `folder`'s sort time in `project` (artifact_sort_times.
+    record_sort_times): the modification time of its `metadata.json`, read
+    here (sort_times_below), since the project files units run on the file
+    store's threads (run_efs_unit). A folder with no `metadata.json` gets no
+    time, and a row only moves to a newer time.
+
+    Best-effort: a failed write is rolled back and logged at ERROR. A
+    `metadata.json` the read could not reach, such as on EIO, is logged at
+    WARNING and leaves the folder's row as it was. For a shared root either
+    one asks for the project's location check (_ask_for_location_check),
+    whose listing records the time of every folder it reads."""
+    from cowork.services.artifact_sort_times import record_sort_times, sort_times_below
+
+    try:
+        read = sort_times_below(base=recorded_source(project, folder.conversation_id).base, slugs=[folder.slug])
+        record_sort_times(scoped, project_id=project.id, times=read.times, conversation_id=folder.conversation_id)
+    except Exception:
+        scoped.rollback()
+        logger.error(
+            "Could not record the sort time of an artifact folder a project files request changed",
+            exc_info=True,
+            extra={"event": "artifact_sort_time_not_recorded", **_folder_write_context(project, folder)},
+        )
+        _ask_for_location_check(scoped, project=project, folder=folder)
+        return
+    if read.unreadable:
+        # The event and level a turn end's or the self-heal's read logs for
+        # folders whose time it could not read.
+        logger.warning(
+            "Could not read the metadata.json of an artifact folder a project files request changed, so its sort "
+            "time was not updated",
             extra={
-                "event": "held_artifact_root_not_recorded",
-                **log_context(project_id=project_id, conversation_id=folder.conversation_id, artifact_slug=folder.slug),
+                "event": "artifact_sort_times_unreadable",
+                **_folder_write_context(project, folder),
+                "count": len(read.unreadable),
             },
         )
+        _ask_for_location_check(scoped, project=project, folder=folder)
+
+
+def _folder_write_context(
+    project: ProjectRow | None, folder: _ArtifactFolder
+) -> dict[str, str | tuple[str, ...]]:
+    """The log fields of a folder a PUT or a DELETE changed: its project,
+    when the request found its row, its conversation for a legacy root, and
+    its name."""
+    return log_context(
+        project_id=project.id if project is not None else None,
+        conversation_id=folder.conversation_id,
+        artifact_slug=folder.slug,
+    )
+
+
+def _ask_for_location_check(
+    scoped: ScopedSession, *, project: ProjectRow | None, folder: _ArtifactFolder
+) -> None:
+    """After a PUT or a DELETE could not record a row of `folder` in
+    `project`'s shared root (_record_artifact_folder_write,
+    _record_folder_time), ask for the project's location check
+    (artifact_autopublish.request_project_location_check). Its listing of
+    the shared root holds the root and records the time of every folder it
+    reads (artifact_autopublish._record_listing). Nothing is asked for a
+    legacy root, which has no self-heal, or when the request found no
+    project row."""
+    from cowork.services.artifact_autopublish import request_project_location_check
+
+    if project is None or folder.conversation_id is not None:
+        return
+    request_project_location_check(
+        artifacts_base=recorded_source(project, None).base, scope=scoped.scope, project_id=str(project.id)
+    )
+
+
+def _forget_artifact_folder_delete(scoped: ScopedSession, *, project_name: str, path: _ValidatedProjectPath) -> None:
+    """After a DELETE removed an artifact folder's `metadata.json`
+    (_artifact_folder_unlisted), drop that folder's sort-time row
+    (artifact_sort_times.forget_sort_time), in the project's shared root or
+    in the caller's own conversation's legacy root, in the DELETE's own
+    unit. Without its `metadata.json` the folder shows no card, so its row
+    would only cost the list a failed open among its newest rows, and no
+    self-heal lists a legacy root to drop it there. Only org tenancy keeps
+    these rows.
+
+    A PUT of the same `metadata.json` may write it again and record its row
+    between the unlink and the drop. So after the drop the DELETE reads the
+    folder's time again and records it (_record_folder_time): the row comes
+    back when the file is back, and none is written when it is still gone.
+
+    Best-effort: the file is deleted already, so a failed drop is rolled
+    back and logged at WARNING, and the DELETE still succeeds."""
+    from cowork.services.artifact_locations import Location, keeps_locations
+    from cowork.services.artifact_sort_times import forget_sort_time
+
+    folder = _artifact_folder_unlisted(path)
+    if folder is None or not keeps_locations(scoped.scope):
+        return
+    project = None
+    try:
+        project = _artifact_folder_project(scoped, project_name)
+        forget_sort_time(
+            scoped, location=Location(project_id=project.id, conversation_id=folder.conversation_id, slug=folder.slug)
+        )
+    except Exception:
+        scoped.rollback()
+        logger.warning(
+            "Could not drop the sort time of an artifact folder whose metadata.json a project files delete removed",
+            exc_info=True,
+            extra={"event": "artifact_sort_time_not_dropped", **_folder_write_context(project, folder)},
+        )
+        return
+    _record_folder_time(scoped, project=project, folder=folder)
 
 
 @router.put(
@@ -2347,6 +2509,7 @@ def _delete_project_file(
             _close_instruction_context(instructions_context)
             raise
         _close_instruction_context(instructions_context)
+    _forget_artifact_folder_delete(scoped, project_name=project_name, path=path)
     return {"status": "deleted", "path": path.value}
 
 

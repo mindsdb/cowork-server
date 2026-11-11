@@ -7,11 +7,12 @@ only the roots these rows name (artifact_roots.with_held_roots), so a project
 or a conversation workspace that never held an artifact costs it no file
 store call. It trusts the rows once their backfill has walked every project,
 and until then finds its roots on the file store as before. It still finds
-there the roots of each project the backfill could not read, which its
-sentinel lists (HeldRootSentinel).
+there the roots of each project the backfill could not read, or that moved
+or went away during its walk, which its sentinel lists (HeldRootSentinel).
 
 A row is written wherever the server sees or writes folders in a root: a
-turn end that created or listed folders in its project's shared root
+turn end that created, listed or timed folders in its project's shared
+root, or could not read a folder's time there
 (task_objects.record_new_artifacts), the self-heal's full listing of that
 root (artifact_autopublish._record_listed_locations), which the heal sweep
 also runs for every project with a recent message (artifact_heal_sweep), a
@@ -33,35 +34,41 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
+from contextlib import closing
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import UUID
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from cowork.common.logger import log_context
-from cowork.common.paths import dir_scandir
+from cowork.common.paths import PinnedDir, dir_scandir
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
+from cowork.models.conversation import Conversation
 from cowork.models.held_artifact_root import HeldArtifactRoot
 from cowork.models.project import Project
-from cowork.models.setting import Setting
-from cowork.services.artifact_identity import _strictly_holds_no_id, opened_artifact_root
+from cowork.services.artifact_identity import _strictly_holds_no_id, is_listable_folder_name, opened_artifact_root
 from cowork.services.artifact_locations import keeps_locations
 from cowork.services.artifact_owner_backfill import (
     BackfillProgress,
-    BackfillStopped as _Stopped,
+    BackfillStopped,
     advisory_try_lock,
-    check_stop as _check_stop,
+    check_stop,
     delete_progress,
+    log_skipped,
     read_progress,
+    read_sentinel_value,
     save_progress,
+    walked_folder_is_gone,
+    walked_path_is_current,
     write_sentinel,
 )
 from cowork.services.artifacts import ProjectArtifacts
@@ -93,11 +100,41 @@ class HeldRoot(NamedTuple):
     conversation_id: UUID | None
 
 
+def lock_root_parents(session: ScopedSession, *, project_id: UUID, conversation_id: UUID | None) -> None:
+    """Take FOR KEY SHARE, until the caller commits, on the rows a root's
+    rows point at: `conversation_id`'s row for a legacy root, then
+    `project_id`'s. A writer of a root's rows (hold_root, and every
+    artifact_sort_times writer) takes them before it locks or adds a row,
+    in the order every delete takes them: ProjectService.delete_project
+    deletes the project's conversations before the project, and a
+    conversation delete (ConversationService.delete_conversation) deletes
+    the conversation alone, each with ON DELETE CASCADE into the root's
+    rows. A writer then waits behind a running delete, or the delete waits
+    behind the writer, and neither holds a row the other needs. An insert's
+    foreign key checks take the same locks, but only after the row is
+    written, and in either order. A parent that is gone locks nothing, and
+    the write fails on its foreign key. SQLite ignores the lock."""
+    if conversation_id is not None:
+        session.exec(
+            session.select(Conversation)
+            .with_only_columns(Conversation.id)
+            .where(Conversation.id == conversation_id)
+            .with_for_update(read=True, key_share=True)
+        ).all()
+    session.exec(
+        session.select(Project)
+        .with_only_columns(Project.id)
+        .where(Project.id == project_id)
+        .with_for_update(read=True, key_share=True)
+    ).all()
+
+
 def hold_root(session: ScopedSession, *, project_id: UUID, conversation_id: UUID | None = None) -> None:
     """Record that a root of `project_id` holds an artifact folder: its
     shared root, or `conversation_id`'s legacy root. A root already recorded
     is left as it is, and so is one whose project or conversation another
-    writer deleted meanwhile."""
+    writer deleted meanwhile. A new row's parents are locked first
+    (lock_root_parents), so the insert never deadlocks a delete."""
     if not keeps_locations(session.scope):
         return
     query = session.select(HeldArtifactRoot).where(HeldArtifactRoot.project_id == project_id)
@@ -107,6 +144,7 @@ def hold_root(session: ScopedSession, *, project_id: UUID, conversation_id: UUID
         query = query.where(HeldArtifactRoot.conversation_id == conversation_id)
     if session.exec(query).first() is not None:
         return
+    lock_root_parents(session, project_id=project_id, conversation_id=conversation_id)
     session.add(HeldArtifactRoot(project_id=project_id, conversation_id=conversation_id))
     try:
         session.commit()
@@ -116,19 +154,11 @@ def hold_root(session: ScopedSession, *, project_id: UUID, conversation_id: UUID
         session.rollback()
 
 
-def sentinel_written(session: ScopedSession, *, key: str = SENTINEL_KEY) -> bool:
-    """Whether a backfill wrote its sentinel, the global settings row `key`:
-    this module's by default."""
-    query = session.select(Setting).where(Setting.key == key, Setting.scope.is_(None))
-    return session.exec(query).first() is not None
-
-
-def held_roots(session: ScopedSession, *, project_ids: Collection[UUID]) -> frozenset[HeldRoot] | None:
-    """The roots of `project_ids` the rows name, or None when the caller has
-    to find its roots on the file store: this scope keeps no rows, or their
-    backfill has not finished."""
-    if not keeps_locations(session.scope) or not sentinel_written(session):
-        return None
+def held_root_rows(session: ScopedSession, *, project_ids: Collection[UUID]) -> frozenset[HeldRoot]:
+    """The roots of `project_ids` the rows name. It reads no sentinel: its
+    caller, artifact_roots.with_held_roots, trusts the rows only in a scope
+    that keeps them and once read_sentinel answers, which it reads once per
+    list."""
     ids = list(project_ids)
     if not ids:
         return frozenset()
@@ -149,64 +179,89 @@ def held_roots(session: ScopedSession, *, project_ids: Collection[UUID]) -> froz
 class HeldRootSentinel(BaseModel):
     """The sentinel's value, as JSON in the settings row SENTINEL_KEY."""
 
-    #: Projects whose roots the pass could not read, so they have no rows
-    #: from it: the list finds their roots on the file store, and each start
-    #: walks them again and rewrites this list.
+    #: Projects whose roots the pass could not read, or that moved or went
+    #: away during their walk, so they have no rows from it: the list finds
+    #: their roots on the file store, and each later pass walks them again
+    #: and rewrites this list. The startup task runs one every
+    #: ARTIFACT_BACKFILL_UNREAD_RETRY_SECONDS while this list is not empty
+    #: (server._run_artifact_backfills).
     unread: list[UUID] = []
 
 
 def read_sentinel(session: ScopedSession) -> HeldRootSentinel | None:
     """The backfill's sentinel, or None before a pass has walked every
     project. A value that is not a HeldRootSentinel, as one written by hand,
-    also reads as None: the list then finds its roots on the file store
-    instead of failing, and the next pass rewrites the value."""
-    query = session.select(Setting).where(Setting.key == SENTINEL_KEY, Setting.scope.is_(None))
-    row = session.exec(query).first()
-    if row is None:
-        return None
+    also reads as None (read_sentinel_value): the list then finds its roots
+    on the file store instead of failing, and the next pass rewrites the
+    value."""
+    return read_sentinel_value(
+        session,
+        key=SENTINEL_KEY,
+        model=HeldRootSentinel,
+        logger=logger,
+        unreadable_event="held_artifact_roots_sentinel_unreadable",
+        unreadable_message=(
+            "held_artifact_roots sentinel holds a value it cannot read; the list finds its roots on the file store"
+        ),
+    )
+
+
+def listable_folders(root: PinnedDir) -> Iterator[str]:
+    """The name of each entry of `root`, an opened artifacts root, that the
+    artifacts list would open: a folder, not a link, whose name it would open
+    (artifact_identity.is_listable_folder_name). An entry whose type cannot
+    be read is skipped when the error says the list could show nothing from
+    it (_strictly_holds_no_id); any other error raises."""
+    with dir_scandir(root) as entries:
+        for entry in entries:
+            if not is_listable_folder_name(entry.name):
+                continue
+            try:
+                if not entry.is_symlink() and entry.is_dir(follow_symlinks=False):
+                    yield entry.name
+            except OSError as exc:
+                if not _strictly_holds_no_id(exc=exc):
+                    raise
+
+
+def _listed_folder_names(source: ProjectArtifacts, *, limit: int | None) -> list[str]:
+    """The first `limit` names listable_folders yields for `source`'s root,
+    or every name when `limit` is None, read in one scandir that stops
+    there. A root that is missing, a link, refused by its anchor, or one the
+    server may not read holds none, since the list could show nothing from
+    it. Any other error raises, so a root the server could not read is never
+    taken for an empty one."""
     try:
-        return HeldRootSentinel.model_validate_json(row.value)
-    except ValidationError:
-        logger.warning(
-            "held_artifact_roots sentinel holds a value it cannot read; the list finds its roots on the file store",
-            extra={"event": "held_artifact_roots_sentinel_unreadable"},
-        )
-        return None
+        with opened_artifact_root(source) as root, closing(listable_folders(root)) as names:
+            return list(islice(names, limit))
+    except ValueError:
+        return []
+    except OSError as exc:
+        if _strictly_holds_no_id(exc=exc):
+            return []
+        raise
+
+
+def listable_folder_names(source: ProjectArtifacts) -> list[str]:
+    """The name of each entry of `source`'s root the artifacts list would
+    open (listable_folders), by the rules of _listed_folder_names."""
+    return _listed_folder_names(source, limit=None)
 
 
 def holds_a_folder(source: ProjectArtifacts) -> bool:
-    """Whether `source`'s root holds an entry the artifacts list would open:
-    a folder, not a link, whose name does not start with a dot
-    (artifacts.list_artifacts). A root that is missing, a link, refused by
-    its anchor, or one the server may not read holds none, since the list
-    could show nothing from it. Any other error raises, so a root the walk
-    could not read is never taken for an empty one."""
-    try:
-        with opened_artifact_root(source) as root:
-            with dir_scandir(root) as entries:
-                for entry in entries:
-                    if entry.name.startswith("."):
-                        continue
-                    try:
-                        if not entry.is_symlink() and entry.is_dir(follow_symlinks=False):
-                            return True
-                    except OSError as exc:
-                        if not _strictly_holds_no_id(exc=exc):
-                            raise
-    except ValueError:
-        return False
-    except OSError as exc:
-        if _strictly_holds_no_id(exc=exc):
-            return False
-        raise
-    return False
+    """Whether `source`'s root holds an entry the artifacts list would open,
+    by the rules of _listed_folder_names. The read stops at the first
+    folder, so an entry after it is never read: one whose type read would
+    fail, as on EIO, does not make the root unread."""
+    return bool(_listed_folder_names(source, limit=1))
 
 
 @dataclass
 class HeldRootBackfillSummary:
     #: Roots found holding a folder, and given a row (or already holding one).
     held: int = 0
-    #: Projects whose roots could not all be read; the sentinel lists them.
+    #: Projects whose roots could not all be read, or that moved or went away
+    #: during their walk; the sentinel lists them.
     unread: int = 0
 
 
@@ -218,7 +273,7 @@ def _held_in(project: ProjectRow, *, stop: threading.Event | None) -> list[HeldR
 
     found: list[HeldRoot] = []
     for root in project_roots(project, strict=True):
-        _check_stop(stop)
+        check_stop(stop)
         if root.legacy and root.conversation_id is None:
             # A workspace whose name is no conversation id has no owner, so
             # no list ever reads it.
@@ -228,11 +283,18 @@ def _held_in(project: ProjectRow, *, stop: threading.Event | None) -> list[HeldR
     return found
 
 
-def _record(engine, *, org_id: str, roots: list[HeldRoot]) -> None:
+def _record(engine, *, project: ProjectRow, org_id: str, roots: list[HeldRoot]) -> bool:
+    """Hold `roots`, found by a walk of `project`'s path, and True; or hold
+    none and False when the project's row no longer holds that path
+    (walked_path_is_current), since the walk may then have missed its roots
+    or read another project's."""
     with Session(engine) as raw:
         session = ScopedSession(raw, TenantScope(org_mode=True, org_id=org_id))
+        if not walked_path_is_current(session, project=project):
+            return False
         for root in roots:
             hold_root(session, project_id=root.project_id, conversation_id=root.conversation_id)
+    return True
 
 
 def _walk_project(
@@ -245,8 +307,10 @@ def _walk_project(
     stop: threading.Event | None,
 ) -> bool:
     """Record the held roots of one project. False when its roots could not
-    all be read, so it got no rows. `shared_root` is the resolved shared root
-    (projects.resolved_shared_root), read once for the pass."""
+    all be read, or when the project moved or went away during its walk
+    (walked_folder_is_gone, _record), so it got no rows. `shared_root` is
+    the resolved shared root (projects.resolved_shared_root), read once for
+    the pass."""
     from cowork.services.artifact_roots import left_out_for_another_partition
 
     if not org_id:
@@ -256,11 +320,18 @@ def _walk_project(
     if left_out_for_another_partition(project, partition=str(org_id), shared_root=shared_root):
         return True
     try:
+        # A folder there before the walk and gone after it moved during the
+        # walk, as a rename moves it before it commits. One already gone
+        # before the walk is taken for a project with no folder, which holds
+        # no root, so this pass, which walks every project, never lists such
+        # a project as unread on every pass.
+        there = not walked_folder_is_gone(project)
         roots = _held_in(project, stop=stop)
+        gone = there and walked_folder_is_gone(project)
     except OSError as exc:
         summary.unread += 1
         logger.warning(
-            "held_artifact_roots backfill could not read a project; the list walks it, and the next start "
+            "held_artifact_roots backfill could not read a project; the list walks it, and the next pass "
             "reads it again",
             extra={
                 **log_context(project_id=project.id),
@@ -269,7 +340,14 @@ def _walk_project(
             },
         )
         return False
-    _record(engine, org_id=str(org_id), roots=roots)
+    if gone or not _record(engine, project=project, org_id=str(org_id), roots=roots):
+        summary.unread += 1
+        logger.warning(
+            "held_artifact_roots backfill walked a project that moved or went away meanwhile; the list walks it, "
+            "and the next pass reads it again",
+            extra={**log_context(project_id=project.id), "event": "held_artifact_roots_backfill_moved"},
+        )
+        return False
     summary.held += len(roots)
     return True
 
@@ -279,34 +357,23 @@ def _read_sentinel(engine) -> HeldRootSentinel | None:
         return read_sentinel(ScopedSession(raw, SYSTEM_SCOPE))
 
 
-def _skipped(reason: str) -> None:
-    """Log why a pass walks nothing: `not_org`, `finished` (the sentinel
-    lists no unread project) or `locked` (another replica holds the walk).
-    WARNING, as the start line below and the summary lines: every hosted
-    deployment runs at LOG_LEVEL=WARNING, where an INFO line never shows, so
-    an operator could not tell a walk that never started from one that
-    runs. One line per pass."""
-    logger.warning(
-        "held_artifact_roots backfill skipped its walk",
-        extra={"event": "held_artifact_roots_backfill_skipped", "reason": reason},
-    )
-
-
 def run_held_root_backfill(
     engine=None, *, try_lock=None, project_ids=None, stop: threading.Event | None = None
 ) -> HeldRootBackfillSummary | None:
     """Walk every org project's roots once per environment, record each root
     that holds a folder, then write the sentinel with the projects it could
-    not read. None when skipped or stopped.
+    not read, or that moved or went away during their walk. None when
+    skipped or stopped.
 
     One replica runs it at a time (an advisory lock). The first pass walks
     the projects in id order and keeps the last one it finished, and each one
     it could not read, in the PROGRESS_KEY setting row, so a stop or a
     restart costs only the project it was in. Once it has walked the last
     project it deletes the progress row and writes the sentinel, listing the
-    projects it could not read (HeldRootSentinel). A later start that finds
-    that list walks only those projects and rewrites it, to an empty list
-    once all of them read; one that finds it empty walks nothing. Recording a
+    projects it could not read (HeldRootSentinel). A later pass that finds
+    that list, at a start or the startup task's next run, walks only those
+    projects and rewrites it, to an empty list once all of them read; one
+    that finds it empty walks nothing. Recording a
     root again changes nothing. Raises when a database write fails for any
     reason but a row another writer recorded first. ``project_ids`` limits
     the pass to those projects; it exists for tests, whose database is shared
@@ -316,21 +383,21 @@ def run_held_root_backfill(
     from cowork.services.projects import resolved_shared_root
 
     if get_app_settings().tenancy_mode != "org":
-        _skipped("not_org")
+        log_skipped(logger, event_prefix="held_artifact_roots", reason="not_org")
         return None
     engine = engine or get_engine(get_app_settings().database.uri)
     lock = try_lock or advisory_try_lock
     sentinel = _read_sentinel(engine)
     if sentinel is not None and not sentinel.unread:
-        _skipped("finished")
+        log_skipped(logger, event_prefix="held_artifact_roots", reason="finished")
         return None
     with lock(engine, _LOCK_KEY) as acquired:
         if not acquired:
-            _skipped("locked")
+            log_skipped(logger, event_prefix="held_artifact_roots", reason="locked")
             return None
         sentinel = _read_sentinel(engine)
         if sentinel is not None and not sentinel.unread:
-            _skipped("finished")
+            log_skipped(logger, event_prefix="held_artifact_roots", reason="finished")
             return None
         query = select(Project.id, Project.name, Project.path, Project.org_id).order_by(Project.id)
         if sentinel is not None:
@@ -359,7 +426,7 @@ def run_held_root_backfill(
         shared_root = resolved_shared_root()
         try:
             for project_id, name, path, org_id in projects:
-                _check_stop(stop)
+                check_stop(stop)
                 project = ProjectRow(id=UUID(str(project_id)), name=name, path=path, external=False)
                 read = _walk_project(
                     engine, project=project, org_id=org_id, shared_root=shared_root, summary=summary, stop=stop
@@ -367,7 +434,7 @@ def run_held_root_backfill(
                 progress = progress.finished(project_id=project.id, read=read)
                 if sentinel is None:
                     save_progress(engine, PROGRESS_KEY, progress=progress)
-        except _Stopped:
+        except BackfillStopped:
             logger.warning(
                 "held_artifact_roots backfill stopped before it finished; the next start resumes it",
                 extra={"event": "held_artifact_roots_backfill_stopped"},

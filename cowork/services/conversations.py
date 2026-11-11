@@ -577,7 +577,7 @@ class ConversationService:
     def owned_ids_query(self) -> ScopedSelect:
         """The query `owned_ids` runs, for a query that filters by the
         caller's conversations in the database
-        (held_artifact_roots.held_roots). Same rule as `_owned`: in org mode
+        (held_artifact_roots.held_root_rows). Same rule as `_owned`: in org mode
         the conversations the scope's user created, and for a scope with no
         user the ones no member created."""
         stmt = self.session.select(Conversation).with_only_columns(Conversation.id)

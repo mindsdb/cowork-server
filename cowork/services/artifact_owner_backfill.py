@@ -20,15 +20,17 @@ from the path. The result is only logged. To run the pass again, delete the
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections.abc import Collection
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeVar
 from uuid import UUID
 
 import sqlalchemy as sa
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlmodel import Session, select
 
 from cowork.common.logger import log_context
@@ -39,6 +41,7 @@ from cowork.models.project import Project
 from cowork.models.setting import Setting
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.models.task_object import TaskObject
+from cowork.services.artifact_identity import _strictly_holds_no_id
 from cowork.services.artifact_ownership import (
     artifact_resource_key,
     conversation_creator,
@@ -46,6 +49,7 @@ from cowork.services.artifact_ownership import (
     record_artifact_owner,
 )
 from cowork.services.artifact_roots import (
+    ProjectRow,
     _is_real_directory,
     _storage_components_are_safe,
     project_artifacts_base,
@@ -62,6 +66,8 @@ logger = logging.getLogger(__name__)
 
 SENTINEL_KEY = "_artifact_owner_backfill_v1"
 _LOCK_KEY = advisory_lock_key(b"cowork\0artifact_owner_backfill_v1")
+
+SentinelValue = TypeVar("SentinelValue", bound=BaseModel)
 
 
 @dataclass
@@ -126,6 +132,92 @@ def write_sentinel(engine, key: str = SENTINEL_KEY, *, value: str = "1") -> None
     already there: a sentinel that lists what its pass left
     (held_artifact_roots) is rewritten by a later pass."""
     _write_global_value(engine, key, value)
+
+
+def read_sentinel_value(
+    session: ScopedSession,
+    *,
+    key: str,
+    model: type[SentinelValue],
+    logger: logging.Logger,
+    unreadable_event: str,
+    unreadable_message: str,
+) -> SentinelValue | None:
+    """The value of the sentinel `key` as a `model`, or None when no pass has
+    written it. A value that is not a `model`, as one written by hand, also
+    reads as None, so a reader falls back to its walk instead of failing, and
+    the next pass rewrites the value. That case logs `unreadable_message` on
+    the backfill's `logger` at WARNING, with `unreadable_event`."""
+    query = session.select(Setting).where(Setting.key == key, Setting.scope.is_(None))
+    row = session.exec(query).first()
+    if row is None:
+        return None
+    try:
+        return model.model_validate_json(row.value)
+    except ValidationError:
+        logger.warning(unreadable_message, extra={"event": unreadable_event})
+        return None
+
+
+def log_skipped(logger: logging.Logger, *, event_prefix: str, reason: str) -> None:
+    """Log on the backfill's `logger` why a pass walks nothing, as the event
+    `<event_prefix>_backfill_skipped`: `not_org`, `locked` (another replica
+    holds the walk), or a reason of the backfill's own, such as `finished`.
+    WARNING, as the start and summary lines: every hosted deployment runs at
+    LOG_LEVEL=WARNING, where an INFO line never shows, so an operator could
+    not tell a walk that never started from one that runs. One line per
+    pass. The message carries the backfill's name with no positional
+    argument: the console prints a message with arguments as its bare
+    template (structured_logging._event_schema), and `event_prefix` is a
+    fixed module name, never a value from a request or the file store."""
+    logger.warning(
+        f"{event_prefix} backfill skipped its walk",
+        extra={"event": f"{event_prefix}_backfill_skipped", "reason": reason},
+    )
+
+
+def walked_path_is_current(session: ScopedSession, *, project: ProjectRow) -> bool:
+    """Whether `project`'s row, read in `session`, still holds the path a
+    backfill read for it before its walk. A rename moves the project's folder
+    (projects.ProjectService._stage_project_rename), so a walk of the old
+    path finds it gone, or finds another project's folders once a project
+    takes the old name. False too for a project the scope no longer sees,
+    such as one deleted since. Makes no file store call, so a rename that
+    has moved the folder but not yet committed still shows the old path
+    here. walked_folder_is_gone catches such a move only when it lands
+    after the backfill's check before the walk and before its check after
+    it; a first sort-time pass, which makes no check before the walk, also
+    catches one that landed before the walk. When the move lands before a
+    held-root pass's check, or before the check of a sort-time pass over
+    its sentinel's list, and the rename commits only after this read, the
+    project looks like one whose folder is gone for good: it counts as
+    read, with no rows."""
+    row = session.get(Project, project.id)
+    return row is not None and row.path == project.path
+
+
+def walked_folder_is_gone(project: ProjectRow) -> bool:
+    """Whether `project`'s folder is missing at the path a backfill walked,
+    one stat that follows no link in its place. A rename moves the folder
+    before it commits the new path (projects.ProjectService.stage_project_update),
+    so a walk in between finds the old path gone while the project's row
+    still holds it (walked_path_is_current). A stat error that the walk
+    reads as a root holding no folder (artifact_identity._strictly_holds_no_id:
+    ENOENT, ENOTDIR, ELOOP, and EACCES or EPERM, which say the server may
+    not read the path) counts as missing too, so a folder the walk could
+    never read is treated as a missing one, never as a read failure that
+    lists its project on every pass. A backfill counts the project as
+    unread when it finds the folder there before its walk and missing after
+    it, and a first sort-time pass also when it finds it missing after the
+    walk alone; the next pass reads it at its committed path. Any other
+    stat error raises."""
+    try:
+        os.lstat(project.path)
+    except OSError as exc:
+        if _strictly_holds_no_id(exc=exc):
+            return True
+        raise
+    return False
 
 
 class BackfillProgress(BaseModel):

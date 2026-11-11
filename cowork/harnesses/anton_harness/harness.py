@@ -1197,7 +1197,7 @@ class AntonHarness:
                     deadline=False,
                 )
                 new_slugs, touched_slugs, turn_scope = changes.created, changes.touched, _units_scope()
-                if new_slugs or changes.sort_times:
+                if new_slugs:
                     await run_db(
                         partial(
                             record_new_artifacts,
@@ -1206,7 +1206,6 @@ class AntonHarness:
                             slugs=new_slugs,
                             creator=getattr(conversation, "created_by", None),
                             artifact_ids=changes.created_ids,
-                            sort_times=changes.sort_times,
                         ),
                         scope=turn_scope,
                     )
