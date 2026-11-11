@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import uuid
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -608,6 +610,69 @@ def _current_text(path: Path) -> str | None:
         return None
 
 
+_SLUG_RE = re.compile(r"^[a-z0-9-]{1,64}$")
+
+
+@dataclass(frozen=True)
+class _BrandSkillPlace:
+    """Where the generated skill lives, every part checked (_safe_brand_skill_dir)."""
+
+    service: SkillService
+    root: Path
+    skill_dir: Path
+
+
+def _canonical_uuid(value: str | None) -> str | None:
+    """``value`` when it is exactly a UUID's canonical form (case aside),
+    else None: no braces, no URN, nothing a path could be built from."""
+    if not isinstance(value, str):
+        return None
+    try:
+        canonical = str(uuid.UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    return canonical if canonical == value.lower() else None
+
+
+def _safe_brand_skill_dir(scope: TenantScope | None) -> _BrandSkillPlace | None:
+    """The generated skill's folder for ``scope``, built only from trusted
+    parts, or None (logged) when any part fails. Every write, move and
+    delete of the generated skill goes through here.
+
+    - The scope's org (its partition of the store) and person, when set,
+      must each be a UUID in canonical form. The store root already refuses
+      a partition that would leave it (cowork.db.scoped.storage_segment);
+      this checks again where the path is used.
+    - The slug is the constant BRAND_GUIDELINES_SLUG, checked against
+      ``^[a-z0-9-]{1,64}$``.
+    - The root and the folder are resolved (realpath), and the folder must
+      be exactly ``<resolved root>/<slug>``: a symlinked folder pointing
+      outside the store, or anywhere but there, is refused.
+    """
+    if scope is not None:
+        for what, value in (("org", scope.org_id), ("user", scope.user_id)):
+            if value is not None and _canonical_uuid(value) is None:
+                logger.warning(
+                    "Refusing the Brand guidelines skill's folder: the %s id isn't a UUID",
+                    what,
+                    extra={"event": "org_branding_skill_path_refused", "reason": f"{what}_id"},
+                )
+                return None
+    if not _SLUG_RE.fullmatch(BRAND_GUIDELINES_SLUG):
+        return None
+    service = SkillService(scope)
+    root = os.path.realpath(service.root)
+    expected = os.path.join(root, BRAND_GUIDELINES_SLUG)
+    target = os.path.realpath(expected)
+    if os.path.commonpath([root, target]) != root or target != expected:
+        logger.warning(
+            "Refusing the Brand guidelines skill's folder: it resolves outside its store",
+            extra={"event": "org_branding_skill_path_refused", "reason": "outside_store"},
+        )
+        return None
+    return _BrandSkillPlace(service=service, root=Path(root), skill_dir=Path(target))
+
+
 def _generated(skill_dir: Path) -> Skill | None:
     """The generated skill in ``skill_dir``, or None when the folder holds
     none, or holds a skill nobody generated: only META_MANAGED_BY, which
@@ -637,11 +702,11 @@ def remove_brand_skill(scope: TenantScope | None, session: ScopedSession | None 
     """Take the generated skill out of ``scope``'s store, and in hosted org
     mode its skill_access row with it. Returns whether anything was removed.
     A folder that isn't the generated one, and its row, are left alone."""
-    service = SkillService(scope)
-    skill_dir = service.root / BRAND_GUIDELINES_SLUG
-    if not _is_ours(skill_dir):
+    place = _safe_brand_skill_dir(scope)
+    if place is None or not _is_ours(place.skill_dir):
         return False
-    service._rmtree_direct_child(service.root, BRAND_GUIDELINES_SLUG, ignore_errors=True)
+    service = place.service
+    service._rmtree_direct_child(place.root, place.skill_dir.name, ignore_errors=True)
     if service.org_sharing and session is not None and access_row(session, BRAND_GUIDELINES_SLUG) is not None:
         try:
             stage_delete(session, BRAND_GUIDELINES_SLUG)
@@ -696,13 +761,16 @@ def sync_brand_skill(
     skill_access row (everyone, always on). On a local server it is an
     ordinary skill, recalled on demand.
     """
-    service = SkillService(scope)
+    place = _safe_brand_skill_dir(scope)
+    if place is None:
+        return BrandSkillSync(present=False, changed=False)
+    service = place.service
     if not branding.fresh:
         # A cached or last-known answer: up to 60 s old for a member, older
         # still in an outage. Only an answer read now (or the admin's own
         # write) may change what every turn reads.
         return BrandSkillSync(present=False, changed=False)
-    skill_dir = service.root / BRAND_GUIDELINES_SLUG
+    skill_dir = place.skill_dir
     if skill_dir.exists() and not _is_ours(skill_dir):
         return _skip_taken_name(service)
     current = _generated(skill_dir)

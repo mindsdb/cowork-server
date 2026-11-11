@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import os
+from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
 from unittest import mock
@@ -1000,3 +1002,64 @@ def test_relative_urls_from_auth_reach_the_app_and_the_skill_absolute(org, publi
     text = _skill_md(_org_scope(org))
     assert f"- Logo (for light backgrounds): {PUBLIC_AUTH}/v1/organizations/{ORG_ID}/branding/logo\n" in text
     assert "evil.example" not in text and "?v=" not in text
+
+
+# ── the generated skill's folder is built only from trusted parts ────────────
+
+
+@pytest.mark.parametrize(
+    "org_id",
+    [
+        "../../etc",
+        "/etc",
+        "33333333-3333-4333-8333-333333333333/../x",
+        "{33333333-3333-4333-8333-333333333333}",
+        "urn:uuid:33333333-3333-4333-8333-333333333333",
+        "..",
+    ],
+)
+def test_a_malicious_org_id_is_refused_and_nothing_is_moved_or_removed(org, monkeypatch, org_id):
+    calls = []
+    monkeypatch.setattr(SkillService, "_rmtree_direct_child", staticmethod(lambda *a, **k: calls.append(a)))
+    monkeypatch.setattr(SkillService, "_write", lambda *a, **k: calls.append(a))
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id=ALICE)
+    assert org_branding._safe_brand_skill_dir(scope) is None
+    assert org_branding.remove_brand_skill(scope) is False
+    branding = replace(org_branding.parse_auth_branding(copy.deepcopy(BRANDING)), fresh=True)
+    assert org_branding.sync_brand_skill(scope, branding) == org_branding.BrandSkillSync(present=False, changed=False)
+    assert calls == []
+
+
+def test_a_malicious_user_id_is_refused(org):
+    scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id="../../etc")
+    assert org_branding._safe_brand_skill_dir(scope) is None
+
+
+def test_a_normal_scope_resolves_inside_its_store(org):
+    place = org_branding._safe_brand_skill_dir(_org_scope(org))
+    root = os.path.realpath(SkillService(_org_scope(org)).root)
+    assert place is not None
+    assert str(place.skill_dir) == os.path.join(root, BRAND_GUIDELINES_SLUG)
+    assert os.path.commonpath([root, str(place.skill_dir)]) == root
+
+
+def test_a_symlinked_skill_folder_pointing_outside_the_store_is_refused(org, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("not yours")
+    root = SkillService(_org_scope(org)).root
+    root.mkdir(parents=True, exist_ok=True)
+    (root / BRAND_GUIDELINES_SLUG).symlink_to(outside, target_is_directory=True)
+
+    assert org_branding._safe_brand_skill_dir(_org_scope(org)) is None
+    assert org_branding.remove_brand_skill(_org_scope(org), org.as_(ALICE)) is False
+    _get(org, ADMIN)
+    assert (outside / "keep.txt").read_text() == "not yours"
+    assert sorted(p.name for p in outside.iterdir()) == ["keep.txt"]
+
+
+def test_a_symlinked_skill_folder_pointing_inside_the_store_is_refused_too(org):
+    root = SkillService(_org_scope(org)).root
+    (root / "someone-elses").mkdir(parents=True)
+    (root / BRAND_GUIDELINES_SLUG).symlink_to(root / "someone-elses", target_is_directory=True)
+    assert org_branding._safe_brand_skill_dir(_org_scope(org)) is None
