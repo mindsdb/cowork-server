@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
 from cowork.handlers import addon_route, jev_route
 from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
 from cowork.server import create_app
@@ -499,3 +499,10 @@ def test_jev_target_follows_the_gate_mode(monkeypatch, mode, key, expected):
         assert found is None
     else:
         assert (found[0].url, found[1]) == expected
+
+
+def test_addon_routing_is_on_by_default(monkeypatch):
+    # A kill switch, not an opt-in: with no Jev to ask the message is queued
+    # anyway (see test_no_decision_model_queues_as_jev_off).
+    monkeypatch.delenv("COWORK_TURN_ADDON_ROUTING_ENABLED", raising=False)
+    assert TurnQueueSettings().addon_routing_enabled is True

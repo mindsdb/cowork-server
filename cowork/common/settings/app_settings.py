@@ -781,10 +781,11 @@ class TurnQueueSettings(Settings):
         ),
     )  # COWORK_TURN_JEV_ROUTE_MIN_P_DIRECT
     addon_routing_enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Let Jev add a message sent while a turn runs to that turn (POST /responses/addon) "
-            "instead of queueing it as the next one. Off: every such message is queued."
+            "instead of queueing it as the next one. A kill switch, on by default: with no Jev "
+            "to ask, or any doubt, the message is queued anyway. Off: every such message is queued."
         ),
     )  # COWORK_TURN_ADDON_ROUTING_ENABLED
     addon_min_p_add: float = Field(
