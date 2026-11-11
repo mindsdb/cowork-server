@@ -1,7 +1,7 @@
 """The user's UI language, read from the request's Accept-Language (ENG-4149).
 
 The Cowork app sends its active language on every request as
-``Accept-Language`` (one of ``en``, ``es``, ``pt-BR``). A turn passes the
+``Accept-Language`` (one of ``en``, ``es``, ``pt-BR``, ``ja``). A turn passes the
 normalized tag to anton as ``ChatSessionConfig.ui_locale`` (the in-process
 path) or as the queued job's ``ui_locale`` param (the remote path), and anton
 adds one language line to its system prompt. The fast responders that answer
@@ -20,11 +20,12 @@ UI_LOCALE_NAMES: dict[str, str] = {
     "en": "English",
     "es": "Spanish",
     "pt-BR": "Brazilian Portuguese",
+    "ja": "Japanese",
 }
 
 #: Primary language subtag -> supported tag. Every Portuguese variant maps to
 #: pt-BR, the only Portuguese the app ships.
-_BY_PRIMARY = {"en": "en", "es": "es", "pt": "pt-BR"}
+_BY_PRIMARY = {"en": "en", "es": "es", "pt": "pt-BR", "ja": "ja"}
 
 #: Bounds on what is parsed: a real header is a few short tags.
 _MAX_HEADER_CHARS = 1024

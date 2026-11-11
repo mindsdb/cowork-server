@@ -17,6 +17,9 @@ from cowork.common.ui_locale import normalize_ui_locale, reply_language_line, wi
         ("fr-FR, es;q=0.8", "es"),  # fr unsupported: the best supported one wins
         ("es;q=0.5, pt-BR;q=0.9", "pt-BR"),
         ("*, es;q=0.4", "es"),
+        ("ja", "ja"),
+        ("ja-JP", "ja"),
+        ("zh-CN, ja;q=0.9", "ja"),
     ],
 )
 def test_normalize_supported(header, expected):
@@ -44,6 +47,7 @@ def test_reply_language_line():
     assert "Reply in the language the user writes in" in reply_language_line("pt-BR")
     assert reply_language_line(None) == ""
     assert reply_language_line("fr") == ""
+    assert "Japanese (ja)" in reply_language_line("ja")
 
 
 def test_with_reply_language_appends_last_and_is_noop_without_locale():
