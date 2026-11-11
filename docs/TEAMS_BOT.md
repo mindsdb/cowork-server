@@ -18,6 +18,7 @@ the Teams equivalent of `python -m cowork.ops.channels`: one install has one bot
 | `COWORK_TEAMS_TENANT_ID` | The organization's Entra tenant ID |
 | `COWORK_TEAMS_INTERNAL_KEY` | A random key shared with the recording proxy only |
 | `COWORK_TEAMS_SERVICE_HOSTS` | Hosts replies may go to, comma-separated. Default `smba.trafficmanager.net` |
+| `COWORK_TEAMS_ALLOWED_USERS` | The webhook only: Entra object IDs of the people it answers, comma-separated |
 
 Every name starts with `COWORK_`, which anton's sandbox never passes to the agent's code. With
 none set, Teams is off. With some missing, or on a non-Linux install, Teams is off and the server
@@ -87,3 +88,39 @@ python -m cowork.channels.teams check
 It asks Microsoft for the bot's token and prints whether Microsoft accepted the credentials. It
 exits 0 when they work and the internal key is set, 1 when Microsoft refuses them or the key is
 missing, and 2 when Teams isn't configured or available.
+
+## The webhook, for a developer's tunnel
+
+With `COWORK_TEAMS_BOT_APP_ID` set on Linux, Teams is also a channel: Microsoft can post each
+@mention straight to `POST /api/v1/channels/teams/api/messages`, and the agent's answer goes back in
+the same thread. Point the bot's messaging endpoint there through a tunnel to try the bot without
+the recording proxy. The code is in `cowork/channels/plugins/teams.py`.
+
+Before anything is stored or run, each message must carry Microsoft's token:
+
+- signed with one of Microsoft's keys from `login.botframework.com`, endorsed for the message's
+  channel (keys are fetched at start and refreshed daily);
+- issued by `https://api.botframework.com` for this bot's App ID, and in date (5 minutes' leeway);
+- naming the message's `serviceUrl`.
+
+Then every tenant ID the message carries (`conversation.tenantId`, `channelData.tenant.id`, the
+`x-ms-tenant-id` header) must be `COWORK_TEAMS_TENANT_ID`; with no tenant set, every message is
+refused.
+
+A message that fails these checks gets 401, no reply and nothing stored, and the server log says
+why.
+
+Then the sender. A channel turn runs as this install's owner, with their connections (mail, files
+and the rest), so anyone in the tenant who could @mention the bot could ask the agent to read
+them. Only the people on `COWORK_TEAMS_ALLOWED_USERS`, by their Entra object ID
+(`from.aadObjectId`), get an answer, and nobody when it's empty. Anyone else's message gets 200,
+since Microsoft did send it, with no reply and nothing stored; their ID is in the server log, to
+copy into the list. Keep a test bot's app out of the organization's app catalogue.
+
+The address to reply to is kept in memory, so a reply to a question asked before a restart is
+lost.
+
+A channel turn runs with no person, so on a Cowork that trusts identity headers the channel isn't
+registered, and the webhook would refuse every message anyway; Teams questions go through the
+recording proxy there. The channel config routes (save, delete, reload, set up, tear down) answer
+409 for Teams, since the bot is set in the environment.
