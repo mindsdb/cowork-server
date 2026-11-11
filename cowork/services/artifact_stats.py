@@ -65,6 +65,10 @@ class StatsTemporarilyUnavailable(StatsError):
     """The service answered 503: its auth, DynamoDB or S3 dependency failed."""
 
 
+class TrackingConflict(StatsError):
+    """A publish kept rewriting the artifact's metadata during the tracking write."""
+
+
 STATS_ROUTE_ERRORS = (StatsError, FileNotFoundError, ValueError, RuntimeError)
 
 
@@ -111,6 +115,8 @@ def _raise_for_status(status: int, body: Any) -> None:
         raise StatsOwnedByOtherAccount()
     if status == 404 and code == "stats_unavailable":
         raise StatsUnavailable()
+    if status == 409 and code == "tracking_conflict":
+        raise TrackingConflict()
     if status == 403:
         if code == "permission_denied":
             raise ProductPermissionDenied()
@@ -221,6 +227,11 @@ def stats_http_exception(exc: Exception, *, desktop: bool) -> HTTPException:
         if not (isinstance(message, str) and message):
             body["message"] = error if isinstance(error, str) and error else "Upgrade required"
         return HTTPException(402, detail=body)
+    if isinstance(exc, TrackingConflict):
+        return HTTPException(409, detail={
+            "code": "tracking_conflict",
+            "message": "The artifact is being updated. Try again in a moment.",
+        })
     if isinstance(exc, StatsTemporarilyUnavailable):
         return HTTPException(503, detail={
             "code": "stats_temporarily_unavailable",
