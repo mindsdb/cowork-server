@@ -58,6 +58,7 @@ from cowork.services.providers import (
     validate_provider as validate_provider_svc,
     warm_enabled_model_map,
 )
+from cowork.services.org_branding import remove_brand_skill
 from cowork.services.settings import SettingService, unit_setting_service
 
 logger = logging.getLogger(__name__)
@@ -345,6 +346,14 @@ def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     if scope.org_mode:
         return {"ok": True, "deleted": []}
     deleted = SettingService(session, scope).clear_credentials()
+    # The org's Brand guidelines skill was the signed-in org's.
+    try:
+        remove_brand_skill(scope)
+    except Exception:
+        logger.exception(
+            "Could not remove the Brand guidelines skill on sign-out",
+            extra={"event": "org_branding_skill_remove_failed"},
+        )
     return {"ok": True, "deleted": deleted}
 
 
