@@ -119,15 +119,12 @@ class TestSecretCheck:
             ("patch", "access-mode", {"access_mode": "write"}),
             ("patch", "token", {"access_token": "stolen"}),
             ("put", "app-held", {"access_mode": "write"}),
-            ("delete", "app-held", None),
         ],
     )
     def test_refused_without_the_right_secret(self, protected, headers, method, path, body):
         _seed_mcp()
         app_held.hold(own_vault_root(LOCAL_SCOPE), "hubspot", CONN, {"access_mode": "read"})
-        kwargs = {"headers": headers} | ({"json": body} if body is not None else {})
-
-        response = getattr(_client(), method)(f"{CONN_URL}/{path}", **kwargs)
+        response = getattr(_client(), method)(f"{CONN_URL}/{path}", headers=headers, json=body)
 
         assert response.status_code == 403
         assert response.json() == {"detail": "app_secret_required"}
@@ -238,18 +235,100 @@ class TestAppHeldMigration:
         assert response.status_code == 422
         assert _file_fields("postgres", "db")["password"] == "pw"
 
-    def test_delete_app_held_and_delete_connection_clear_memory(self, protected):
+    def test_there_is_no_route_to_clear_memory_alone(self, protected):
+        _seed_mcp()
+        client = _client()
+        client.put(f"{CONN_URL}/app-held", json={"access_token": "t", "access_mode": "write"}, headers=HEADERS)
+
+        assert client.delete(f"{CONN_URL}/app-held", headers=HEADERS).status_code == 405
+        assert app_held.held(own_vault_root(LOCAL_SCOPE), "hubspot", CONN)["access_mode"] == "write"
+
+    def test_delete_connection_clears_memory(self, protected):
         _seed_mcp()
         client = _client()
         root = own_vault_root(LOCAL_SCOPE)
         client.put(f"{CONN_URL}/app-held", json={"access_token": "t", "access_mode": "write"}, headers=HEADERS)
-
-        assert client.delete(f"{CONN_URL}/app-held", headers=HEADERS).json() == {"ok": True}
-        assert app_held.held(root, "hubspot", CONN) == {}
-
-        client.put(f"{CONN_URL}/app-held", json={"access_token": "t", "access_mode": "write"}, headers=HEADERS)
         assert client.delete(CONN_URL).status_code == 204
         assert app_held.held(root, "hubspot", CONN) == {}
+
+
+NOTION_SEARCH = "/api/v1/connectors/notion/search"
+NOTION_FETCH = "/api/v1/connectors/notion/fetch"
+NOTION_BODIES = {NOTION_SEARCH: {"name": "ws", "query": "ML"}, NOTION_FETCH: {"name": "ws", "page": "p1"}}
+
+
+class TestNotionPages:
+
+    @pytest.fixture
+    def mcp_calls(self, monkeypatch):
+        calls = []
+
+        async def fake_call_mcp_tool(engine, access_token, tool_name, **kwargs):
+            calls.append((access_token, tool_name))
+            return json.dumps({"results": [], "title": "T", "text": "x"})
+
+        monkeypatch.setattr("anton.core.mcp.servers.mcp_server_url", lambda engine: "https://mcp.notion.com/mcp")
+        monkeypatch.setattr("anton.core.mcp.wiring.call_mcp_tool", fake_call_mcp_tool)
+        return calls
+
+    @staticmethod
+    def _seed_notion():
+        persist_connection(
+            "notion", "mcp", "ws", {"access_token": "file-token", "account_email": "m@x.io:ws1"}, scope=LOCAL_SCOPE,
+        )
+
+    @pytest.mark.parametrize("path", [NOTION_SEARCH, NOTION_FETCH])
+    @pytest.mark.parametrize("headers", [{}, {app_secret.HEADER: WRONG}])
+    def test_refused_without_the_right_secret_before_any_mcp_call(self, protected, mcp_calls, path, headers):
+        self._seed_notion()
+        client = _client()
+        client.put(f"{BASE}/notion/ws/app-held", json={"access_token": "held", "access_mode": "read"},
+                   headers=HEADERS)
+
+        response = client.post(path, json=NOTION_BODIES[path], headers=headers)
+
+        assert response.status_code == 403
+        assert response.json() == {"detail": "app_secret_required"}
+        assert mcp_calls == []
+
+    @pytest.mark.parametrize("path", [NOTION_SEARCH, NOTION_FETCH])
+    def test_served_with_the_secret_using_the_held_token(self, protected, mcp_calls, path):
+        self._seed_notion()
+        client = _client()
+        client.put(f"{BASE}/notion/ws/app-held", json={"access_token": "held", "access_mode": "read"},
+                   headers=HEADERS)
+
+        response = client.post(path, json=NOTION_BODIES[path], headers=HEADERS)
+
+        assert response.status_code == 200, response.text
+        assert [token for token, _ in mcp_calls] == ["held"]
+
+    @pytest.mark.parametrize("path", [NOTION_SEARCH, NOTION_FETCH])
+    def test_legacy_mode_needs_no_secret(self, stores, mcp_calls, path):
+        self._seed_notion()
+        response = _client().post(path, json=NOTION_BODIES[path])
+        assert response.status_code == 200, response.text
+        assert [token for token, _ in mcp_calls] == ["file-token"]
+
+    @pytest.mark.parametrize("path", [NOTION_SEARCH, NOTION_FETCH])
+    def test_org_mode_takes_the_token_from_auth_without_a_secret(self, stores, mcp_calls, monkeypatch, path):
+        from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+        from cowork.db.scoped import TenantScope, get_tenant_scope
+
+        async def fake_proxy_token(engine, request, settings, *, name=""):
+            return {"access_token": "tok-auth"}
+
+        monkeypatch.setattr("cowork.services.connectors.oauth.auth_proxy.proxy_token", fake_proxy_token)
+        app = FastAPI()
+        app.include_router(api_router)
+        app.dependency_overrides[get_tenant_scope] = lambda: TenantScope(org_mode=True, org_id="org-1", user_id="u-1")
+        app.dependency_overrides[require(AuthenticatedInOrgMode)] = lambda: None
+        client = TestClient(app, base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321))
+
+        response = client.post(path, json=NOTION_BODIES[path])
+
+        assert response.status_code == 200, response.text
+        assert [token for token, _ in mcp_calls] == ["tok-auth"]
 
 
 class TestDisconnect:

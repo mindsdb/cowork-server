@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
+from cowork.api.v1.endpoints.connectors.connections import require_app_secret
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
@@ -75,7 +76,10 @@ async def _notion_call(action: str, call):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Could not {action} Notion.") from exc
 
 
-@router.post("/search")
+# require_app_secret: on the desktop these routes use the MCP token the app
+# holds in server memory, so they need the app's secret like the routes that
+# set it. A no-op without one, and so in org mode.
+@router.post("/search", dependencies=[Depends(require_app_secret)])
 async def search_notion_pages(body: NotionSearchRequest, scope: ScopeDep, request: Request) -> dict:
     query = body.query.strip()
     if not query:
@@ -84,7 +88,7 @@ async def search_notion_pages(body: NotionSearchRequest, scope: ScopeDep, reques
     return {"results": await _notion_call("search", search_pages(access_token, query))}
 
 
-@router.post("/fetch")
+@router.post("/fetch", dependencies=[Depends(require_app_secret)])
 async def fetch_notion_page(body: NotionFetchRequest, scope: ScopeDep, request: Request) -> dict:
     """A picked page's text, so the chat can send it with the message rather
     than relying on the agent to fetch it (some models stall on that call)."""

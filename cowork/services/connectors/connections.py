@@ -367,9 +367,6 @@ class ConnectionsService:
         """Merge app-held values (app_held.VAULT_FIELD keys) into server memory."""
         return app_held.hold(own_vault_root(self.scope), engine, name, values)
 
-    def release_app_held(self, engine: str, name: str) -> None:
-        app_held.release(own_vault_root(self.scope), engine, name)
-
     def strip_app_held(self, engine: str, name: str) -> bool:
         """Once memory holds both the token and the access mode, remove them
         from the vault file. Returns whether the file is now without them."""

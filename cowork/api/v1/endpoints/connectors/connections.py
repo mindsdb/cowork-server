@@ -491,13 +491,3 @@ def put_app_held(engine: str, name: str, body: AppHeldBody, scope: ScopeDep):
         )
     service.hold_app_held(engine, name, body.model_dump())
     return {"ok": True, "stripped": service.strip_app_held(engine, name)}
-
-
-# LoopbackOnly: the only caller is Electron main, over 127.0.0.1.
-@router.delete(
-    "/{engine}/{name}/app-held",
-    dependencies=[Depends(require(LoopbackOnly)), Depends(require_app_secret)],
-)
-def delete_app_held(engine: str, name: str, scope: ScopeDep):
-    ConnectionsService(scope).release_app_held(engine, name)
-    return {"ok": True}
