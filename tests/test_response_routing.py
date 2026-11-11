@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -2714,3 +2715,268 @@ async def test_only_the_latest_prompt_is_checked_for_file_names(monkeypatch):
     ]
     decision = await _route(history)
     assert decision.route == DIRECT_CONTEXT and seen
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
+    """The gate mints a turn key for a delegated turn to reuse. When the
+    router answers itself, no turn runs to revoke it, so the handler does."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: conversation,
+            message_count=lambda _conversation: 0,
+            get_recent_messages=lambda *_args, **_kwargs: [],
+        ),
+    )
+
+    async def no_secrets(_scope):
+        return None
+
+    monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+
+    async def direct(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi"), {"correlation_id": "corr-gate"}
+
+    handler._route_request = direct
+
+    async def answered(**_kwargs):
+        return "answered"
+
+    handler._handle_direct_response = answered
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+
+    assert await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id))) == "answered"
+    assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_gate_revokes_the_key_it_minted(monkeypatch):
+    """The gate falls back to the agent, which mints its own key; the gate's
+    would otherwise live out its whole window."""
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+
+    async def broken_gate(**_kwargs):
+        raise RuntimeError("router down")
+
+    monkeypatch.setattr(responses, "decide_route", broken_gate)
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    decision, turn_llm = await handler._route_request(
+        conversation_id="conv-1",
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+    assert decision.fallback is True
+    assert turn_llm is None
+    assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_gate_cancels_the_first_take_before_revoking_its_key(monkeypatch):
+    """The first take runs on the gate's key, and handle() keeps it for the
+    agent when the gate falls back. Revoking the key under it would fail its
+    model call on every router outage, so the take is cancelled first."""
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+    events = []
+
+    class _Take:
+        def cancel(self):
+            events.append("take cancelled")
+
+    monkeypatch.setattr(responses, "_start_first_take", lambda *a, **k: _Take())
+
+    async def broken_gate(**_kwargs):
+        raise RuntimeError("router down")
+
+    monkeypatch.setattr(responses, "decide_route", broken_gate)
+
+    async def revoke(correlation_id):
+        events.append(f"revoked {correlation_id}")
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    decision, _turn_llm = await handler._route_request(
+        conversation_id="conv-1",
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        first_take=True,
+    )
+    assert decision.fallback is True
+    assert events == ["take cancelled", "revoked corr-gate"]
+    assert handler.first_take is None
+
+
+@pytest.mark.asyncio
+async def test_a_gate_cancelled_after_its_mint_revokes_the_key(monkeypatch):
+    """The client went away while the gate ran: no turn will run on its key."""
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+
+    async def cancelled_gate(**_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(responses, "decide_route", cancelled_gate)
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    with pytest.raises(asyncio.CancelledError):
+        await handler._route_request(
+            conversation_id="conv-1",
+            gate_rows=[],
+            harness_input=[{"type": "text", "text": "Hello"}],
+            has_attachments=False,
+            has_disabled_connections=False,
+        )
+    assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
+async def test_a_jev_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
+    """Jev routes the turn direct and the user's own model answers it, with
+    no agent turn to revoke the gate's key."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: conversation,
+            message_count=lambda _conversation: 0,
+            get_recent_messages=lambda *_args, **_kwargs: [],
+        ),
+    )
+
+    async def no_secrets(_scope):
+        return None
+
+    monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+
+    async def jev_direct(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="jev_direct", provider="jev"), {"correlation_id": "corr-gate"}
+
+    handler._route_request = jev_direct
+    handler.routing_history = [{"role": "user", "content": "hi"}]
+    handler._answer_binding = lambda **_kwargs: SimpleNamespace(model="opus-5-5")
+
+    async def complete(_binding, **_kwargs):
+        return "The answer."
+
+    monkeypatch.setattr(responses.direct_answer, "complete_answer", complete)
+
+    async def answered(**_kwargs):
+        return "answered"
+
+    handler._handle_direct_response = answered
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+
+    assert await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id))) == "answered"
+    assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", [RuntimeError("already running"), asyncio.CancelledError()])
+async def test_a_refused_or_cancelled_start_revokes_the_gate_key(monkeypatch, refusal):
+    """A turn the registry refused never runs to revoke the key. Nor does one
+    whose request was cancelled during start(): it launches the producer after
+    its last await, so a cancellation there means no turn is running."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: conversation,
+            message_count=lambda _conversation: 0,
+            get_recent_messages=lambda *_args, **_kwargs: [],
+        ),
+    )
+
+    async def no_secrets(_scope):
+        return None
+
+    monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+
+    async def delegated(**_kwargs):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test"), {"correlation_id": "corr-gate"}
+
+    handler._route_request = delegated
+    handler._get_harness = lambda: SimpleNamespace(id="anton")
+
+    async def refuse(**_kwargs):
+        raise refusal
+
+    monkeypatch.setattr(responses.registry, "start", refuse)
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    with pytest.raises(type(refusal)):
+        await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id), stream=True))
+    assert revoked == ["corr-gate"]

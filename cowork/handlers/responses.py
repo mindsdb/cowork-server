@@ -77,7 +77,12 @@ from cowork.streaming import liveness
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, WORKER_ALIVE_PHASE, ModelWaitTicker
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.registry import RunHandle, RunIdentity, mark_question_saved
-from cowork.turnqueue.producer import RemoteWorkspace, step_stream_events, stream_remote_replies
+from cowork.turnqueue.producer import (
+    RemoteWorkspace,
+    _revoke_turn_key_quietly,
+    step_stream_events,
+    stream_remote_replies,
+)
 from cowork.turnqueue.redis_client import (
     DISCARDED_CANCEL_REASON,
     STALLED_CANCEL_REASON,
@@ -761,6 +766,12 @@ def _carries_attachments(request: ResponsesRequest) -> bool:
     )
 
 
+async def _drop_gate_key(turn_llm: dict | None) -> None:
+    """Revoke the turn key the routing gate minted, for a turn that won't run."""
+    if turn_llm and turn_llm.get("correlation_id"):
+        await _revoke_turn_key_quietly(turn_llm["correlation_id"])
+
+
 class ResponsesHandler:
     # Also the class default, so a producer reached without __init__ reads
     # the common case: a person watching who can answer a card.
@@ -967,14 +978,18 @@ class ResponsesHandler:
 
             if route.route == DIRECT_CONTEXT and route.text:
                 # The LLM gate decided and answered in one call.
-                return await self._handle_direct_response(
-                    request=request,
-                    conversation_id=start.conversation_id,
-                    turn_id=start.turn_id,
-                    original_content=original_content,
-                    question=prompt_text(start.harness_input),
-                    route=route,
-                )
+                try:
+                    return await self._handle_direct_response(
+                        request=request,
+                        conversation_id=start.conversation_id,
+                        turn_id=start.turn_id,
+                        original_content=original_content,
+                        question=prompt_text(start.harness_input),
+                        route=route,
+                    )
+                finally:
+                    # The gate minted this key for a turn that now never runs.
+                    await _drop_gate_key(turn_llm)
 
             # Jev decided the turn goes direct: the user's own model writes the
             # answer, and can still hand the turn to the agent, so the agent's
@@ -1005,14 +1020,18 @@ class ResponsesHandler:
                     finally:
                         reset_trace_context(token)
                     if text is not None:
-                        return await self._handle_direct_response(
-                            request=request,
-                            conversation_id=start.conversation_id,
-                            turn_id=start.turn_id,
-                            original_content=original_content,
-                            question=prompt_text(start.harness_input),
-                            route=replace(route, text=text, model=answer_binding.model),
-                        )
+                        try:
+                            return await self._handle_direct_response(
+                                request=request,
+                                conversation_id=start.conversation_id,
+                                turn_id=start.turn_id,
+                                original_content=original_content,
+                                question=prompt_text(start.harness_input),
+                                route=replace(route, text=text, model=answer_binding.model),
+                            )
+                        finally:
+                            # Answered without the agent: no turn runs on the gate's key.
+                            await _drop_gate_key(turn_llm)
                     answer_binding = None
                 if answer_binding is None:
                     trace_metadata = {**trace_metadata, **_DIRECT_DELEGATED_METADATA}
@@ -1078,6 +1097,7 @@ class ResponsesHandler:
                         buffer=buffer,
                         delegate=lambda: delegated(buffer, {**trace_metadata, **_DIRECT_DELEGATED_METADATA}),
                         first_take=first_take,
+                        gate_key=turn_llm,
                     )
 
                 try:
@@ -1093,6 +1113,11 @@ class ResponsesHandler:
                 except BaseException:
                     if first_take is not None:
                         first_take.cancel()
+                    # A refused or cancelled start never runs the turn that would
+                    # revoke the gate's key: start() launches the producer after
+                    # its last await, so none is running on the key either way.
+                    # Shielded, so a dropped connection doesn't cancel the revoke.
+                    await asyncio.shield(_drop_gate_key(turn_llm))
                     raise
                 self.last_run_handle = handle
                 return sse_from_buffer(handle.buffer, 0)
@@ -1114,6 +1139,7 @@ class ResponsesHandler:
             # missing capability. `stream` defaults to False in ResponsesRequest, so
             # a client can land here by simply omitting the field.
             if not in_process_agent_allowed():
+                await _drop_gate_key(turn_llm)
                 raise HTTPException(
                     status_code=501,
                     detail=(
@@ -1406,6 +1432,9 @@ class ResponsesHandler:
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None
+        # Set once the gate mints a key; a failure after that must revoke it,
+        # since no turn will run to do so.
+        turn_llm = None
         try:
             history = _routing_history(gate_rows, harness_input)
             # Kept for a direct answer, which reads the same scrubbed rows.
@@ -1509,17 +1538,35 @@ class ResponsesHandler:
                     reset_trace_context(trace_token)
             return decision, turn_llm
         except (ProductPermissionDenied, ProductPermissionUnavailable):
+            await self._drop_gate_key_and_take(turn_llm)
             raise
         except PoolTimeoutError:
             # No database connection freed in time. The agent would meet the
             # same full pool, so the request is refused (503), not delegated.
+            await self._drop_gate_key_and_take(turn_llm)
             raise
         except Exception:
-            # Non-authorization routing failures may delegate to the agent.
+            # Non-authorization routing failures may delegate to the agent,
+            # which mints its own key.
             logger.exception("[responses] routing gate failed — delegating")
+            await self._drop_gate_key_and_take(turn_llm)
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None
+        except BaseException:
+            # Cancelled (the client went away) after the mint: no turn runs on
+            # the key. Shielded, so the same cancellation can't stop the revoke.
+            await asyncio.shield(self._drop_gate_key_and_take(turn_llm))
+            raise
+
+    async def _drop_gate_key_and_take(self, turn_llm: dict | None) -> None:
+        """Revoke the gate's key after a gate failure, cancelling the first take
+        first: it runs on that key, and handle() would otherwise hand it to the
+        agent to fail on a revoked key."""
+        if turn_llm and getattr(self, "first_take", None) is not None:
+            self.first_take.cancel()
+            self.first_take = None
+        await _drop_gate_key(turn_llm)
 
     def _jev_gate(self, turn_llm: dict | None):
         """How this turn is gated: a decision callable, "off" when the turn
@@ -1915,9 +1962,13 @@ class ResponsesHandler:
         buffer,
         delegate: Callable[[], Awaitable[None]],
         first_take: FirstTake | None = None,
+        gate_key: dict | None = None,
     ) -> None:
         """Stream the direct answer Jev routed, on the user's own model, or
         hand the turn to the agent on this same buffer.
+
+        `gate_key` is the turn key the gate minted. A delegated turn runs on
+        it; otherwise it is revoked when this answer ends, however it ends.
 
         `first_take` runs while the answer starts and goes to the agent on a
         delegation, whose producer shows it; the answer cancels it once its
@@ -2174,6 +2225,8 @@ class ResponsesHandler:
                 )
                 if first_take is not None:
                     first_take.cancel()
+                # No agent turn runs on the gate's key, so revoke it below.
+                delegated = False
             elif isinstance(exc, PoolTimeoutError):
                 logger.warning(
                     "[direct] turn found no free database connection",
@@ -2192,6 +2245,8 @@ class ResponsesHandler:
                 first_take.cancel()
             # A no-op when a producer closed the buffer, a delegated one included.
             await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
+            if not delegated:
+                await _drop_gate_key(gate_key)
 
     def _select_producer(
         self,
