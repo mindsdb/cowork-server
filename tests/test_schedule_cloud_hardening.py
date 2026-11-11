@@ -139,7 +139,7 @@ def turns(monkeypatch):
     release = asyncio.Event()
 
     class HeldHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
