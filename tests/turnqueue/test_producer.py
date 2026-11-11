@@ -759,15 +759,18 @@ def _timeout(request):
     lambda request: httpx.Response(503, text="unavailable"),
     _timeout,
 ], ids=["403", "400-other-field", "503", "timeout"])
-async def test_any_other_connector_key_failure_leaves_mcp_connections_out(monkeypatch, caplog, handler):
+async def test_any_other_connector_key_failure_leaves_mcp_connections_out(monkeypatch, handler):
     mint = _connector_mint_answered_by(monkeypatch, handler)
-    with caplog.at_level("WARNING", logger=prod.logger.name):
-        params = await _turn_params(monkeypatch, _MIXED_CONNECTIONS, mint)
+    # The module logger rather than caplog: another test in the suite
+    # reconfigures logging, and caplog then records nothing.
+    warnings: list[str] = []
+    monkeypatch.setattr(prod.logger, "warning", lambda msg, *args, **kw: warnings.append(msg % args))
+    params = await _turn_params(monkeypatch, _MIXED_CONNECTIONS, mint)
 
     assert params["oauth"]["connections"] == [{"engine": "google_drive", "name": "work"}]
     assert params["oauth"]["turn_key"] == "mdb_turnkey"
     assert "notion" not in params.get("connectors", {}) and "hubspot" not in params.get("connectors", {})
-    assert any("correlation_id=r" in rec.getMessage() for rec in caplog.records)
+    assert any("correlation_id=r" in w for w in warnings)
 
 
 @pytest.mark.asyncio
