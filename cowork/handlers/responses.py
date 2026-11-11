@@ -766,6 +766,7 @@ class ResponsesHandler:
     interactive: bool = True
     # Same reason: no language line unless a request named one.
     ui_locale: str | None = None
+    schedule_id: str | None = None
 
     def __init__(
         self,
@@ -774,6 +775,7 @@ class ResponsesHandler:
         interactive: bool = True,
         mindshub_bearer: str = "",
         ui_locale: str | None = None,
+        schedule_id: str | None = None,
     ) -> None:
         self.principal = principal
         # The app's language, normalized from Accept-Language
@@ -801,6 +803,10 @@ class ResponsesHandler:
         self.last_run_handle: RunHandle | None = None
         # Whether a person is watching this turn and can answer ask_user cards.
         self.interactive = interactive
+        # The schedule whose run this turn is. Set by the scheduler only, not
+        # read from the request or the conversation: a person chatting in a
+        # run's conversation makes ordinary edits.
+        self.schedule_id = schedule_id
         # The instant first take, started beside the gate by
         # _route_request and handed to the turn's producer if it delegates.
         self.first_take: FirstTake | None = None
@@ -1134,6 +1140,7 @@ class ResponsesHandler:
                     trace_tags=request.trace_tags,
                     trace_metadata=trace_metadata,
                     ui_locale=self.ui_locale,
+                    schedule_id=self.schedule_id,
                 )
                 return await self._collect(stream, start.conversation_id, request.model, original_content)
 
@@ -2227,6 +2234,7 @@ class ResponsesHandler:
                 input_text=prompt_text(harness_input),
                 original_content=original_content,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 harness_id=harness_id,
                 buffer=buffer,
                 turn_id=turn_id,
@@ -2655,6 +2663,7 @@ class ResponsesHandler:
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
         disabled: list[dict] | None = None,
+        reasoning_effort: str | None = None,
         first_take: FirstTake | None = None,
     ) -> None:
         """Remote-backend counterpart of _run_turn: pipe the pod's replies
@@ -2783,6 +2792,8 @@ class ResponsesHandler:
                             tracked_edits=touched,
                             completed_cleanly=completed_cleanly,
                             repair_slugs=repairs.slugs if repairs is not None else None,
+                            schedule_id=self.schedule_id,
+                            scope=scope,
                         ),
                         scope=scope,
                         deadline=False,
@@ -3061,6 +3072,7 @@ class ResponsesHandler:
                 user_id=self.scope.user_id,
                 input_text=input_text,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 turn_id=turn_id,
                 history=seed.history,
                 # Global memory uses a read-only mount. Project memory is
@@ -3538,6 +3550,7 @@ class ResponsesHandler:
                 model_wait=model_wait,
                 interactive=self.interactive,
                 ui_locale=self.ui_locale,
+                schedule_id=self.schedule_id,
             )
             event_count = 0
             completed_frame: str | None = None

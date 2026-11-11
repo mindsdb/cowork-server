@@ -326,6 +326,7 @@ async def _record_turn_artifacts(
                 tracked_edits=touched,
                 completed_cleanly=completed_cleanly,
                 repair_slugs=repairs.slugs if repairs is not None else None,
+                scope=scope,
             ),
             scope=scope,
             deadline=False,

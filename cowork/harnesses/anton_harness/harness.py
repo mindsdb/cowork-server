@@ -921,6 +921,8 @@ class AntonHarness:
         model_wait: ModelWaitTicker | None = None,
         interactive: bool = True,
         ui_locale: str | None = None,
+        # The scheduler's own turn (see HarnessProvider).
+        schedule_id: str | None = None,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -1041,6 +1043,8 @@ class AntonHarness:
                         before_mtimes=before_mtimes,
                         tracked_new=getattr(session, "artifacts_touched", None),
                         tracked_edits=getattr(session, "artifacts_touched", None),
+                        schedule_id=schedule_id,
+                        scope=_units_scope(),
                     ),
                     scope=_units_scope(),
                     deadline=False,
