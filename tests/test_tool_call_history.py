@@ -177,6 +177,8 @@ def test_history_round_trip_is_valid_tool_sequence(session, conversation):
 def test_is_tool_row_discriminates():
     assert _is_tool_row([{"type": "tool_use", "id": "x"}])
     assert _is_tool_row([{"type": "tool_result", "tool_use_id": "x"}])
+    assert _is_tool_row([{"type": "text", "text": "let me look"}, {"type": "tool_use", "id": "x"}])
+    assert not _is_tool_row([{"type": "text", "text": "let me look"}])
     assert not _is_tool_row("plain text")
     assert not _is_tool_row([{"type": "input_text", "text": "hi"}])
     assert not _is_tool_row([])

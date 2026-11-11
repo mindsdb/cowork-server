@@ -167,14 +167,15 @@ class ConversationDeleteStage:
 
 
 def _is_tool_row(content) -> bool:
-    """True for a history-only tool block-row (all blocks are tool_use /
-    tool_result). These carry prior tool calls for LLM-history replay and are
-    hidden from the UI, which renders tool activity from message events."""
+    """True for a history-only tool block-row: tool_use / tool_result blocks,
+    plus the text the assistant wrote beside its tool calls. These carry prior
+    tool calls for LLM-history replay and are hidden from the UI, which renders
+    tool activity from message events."""
     return (
         isinstance(content, list)
-        and len(content) > 0
+        and any(isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result") for block in content)
         and all(
-            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result")
+            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result", "text")
             for block in content
         )
     )
