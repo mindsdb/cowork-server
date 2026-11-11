@@ -398,6 +398,8 @@ class _TurnEvidence:
     acted: bool
     shutdown_interrupted: bool = False
     failure: _TurnFailure | None = None
+    # Why a turn that ended on its own stopped early (anton's `ended_by`).
+    stopped_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -424,12 +426,33 @@ _UNCERTAIN_ERROR = (
 )
 
 
+# The limits a turn can stop at, by the setting that controls each. In chat
+# the agent asks "Keep going?" there; a scheduled run has nobody to answer.
+_LIMIT_ERRORS = {
+    "round_cap": (
+        "Run reached its step limit and stopped before it finished. "
+        "Raise Max Steps per Task in Settings to let it do more."
+    ),
+    "spend_ceiling": (
+        "Run reached its token limit and stopped before it finished. "
+        "Raise Max Tokens per Task in Settings to let it do more."
+    ),
+    "handback_budget": (
+        "Run used all its automatic continuations and stopped before it finished. "
+        "Raise Max Auto-Continues in Settings to let it do more."
+    ),
+}
+
+
 def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
     """What the turn's ending says about whether its agent acted, and what to
     tell the user: the turn's own failure text when it gave one. When in doubt
     it says the agent may have acted."""
     reason = evidence.reason
     if reason == "completed":
+        limit_error = _LIMIT_ERRORS.get(evidence.stopped_by or "")
+        if limit_error:
+            return _AttemptEnd(outcome=AttemptOutcome.stopped_at_limit, error=limit_error)
         return _AttemptEnd(outcome=AttemptOutcome.completed)
     if reason == "cancelled":
         return _AttemptEnd(outcome=AttemptOutcome.cancelled)
@@ -645,7 +668,8 @@ def _record_turn_outcome(
         # for, so it neither suppresses the next slot nor ends a failure
         # streak. It doesn't extend the streak either: an unreadable record
         # says nothing about the task, and auto-pause is for tasks that keep
-        # failing.
+        # failing. A run stopped at a limit is left out of the streak for the
+        # same reason: it worked as far as its settings allowed.
         outcome = _RunOutcome(status=RunStatus.failed, error=end.error or _FAILED_DURING_ERROR)
         schedule.last_error = outcome.error
         session.add(schedule)
@@ -659,7 +683,11 @@ def _record_turn_outcome(
         # wouldn't block the restart).
         if not is_manual:
             _advance_next_run_at(schedule, session)
-            if outcome.status == RunStatus.failed and end.outcome != AttemptOutcome.uncertain and not shutdown_interrupted:
+            if (
+                outcome.status == RunStatus.failed
+                and end.outcome not in (AttemptOutcome.uncertain, AttemptOutcome.stopped_at_limit)
+                and not shutdown_interrupted
+            ):
                 count_settled_slot(session, schedule_id, failed=True)
         if trial:
             # A trial tries the task out: it leaves the streak and a one-off's
@@ -1425,7 +1453,40 @@ async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
         acted=acted,
         failure=failure,
         shutdown_interrupted=shutdown_interrupted,
+        stopped_by=await _turn_stopped_by(conversation_id) if reason == "completed" else None,
     )
+
+
+async def _turn_stopped_by(conversation_id: str) -> str | None:
+    """Why a turn that ended on its own stopped early, from its final
+    response frame: a hand-back still ends `completed`, and only that frame's
+    `incomplete` status says the work was not finished. None when the turn
+    finished, or when the frame can't be read.
+
+    Only call after the turn's stream has been fully drained."""
+    handle = registry.get(conversation_id)
+    if handle is None:
+        return None
+    stopped_by: str | None = None
+    try:
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for rec in handle.buffer.tail(0):
+                if rec.is_terminal:
+                    break
+                for event, data in _sse_frames(rec):
+                    if event != "response.completed":
+                        continue
+                    response = data.get("response")
+                    details = response.get("incomplete_details") if isinstance(response, dict) else None
+                    reason = details.get("reason") if isinstance(details, dict) else None
+                    stopped_by = reason if isinstance(reason, str) and reason else None
+    except Exception:
+        logger.exception(
+            "Could not read how the turn's response ended",
+            extra=log_context(conversation_id=conversation_id)
+        )
+        return None
+    return stopped_by
 
 
 async def _turn_activity(conversation_id: str) -> tuple[bool, _TurnFailure | None]:
