@@ -252,19 +252,19 @@ class ArtifactStatusView(CamelResponse):
     def of_card(cls, card: ArtifactCard) -> ArtifactStatusView:
         """The status part of ``card`` (cowork.services.artifacts.card_for_folder).
         A field the card doesn't carry reads as the card model's default."""
-        return cls._of(card, published_url=card.published_url, modified=card.modified)
+        return cls.of_access(card, published_url=card.published_url, modified=card.modified)
 
     @classmethod
-    def of_access(cls, access: ArtifactAccessView, *, published_url: str) -> ArtifactStatusView:
-        """The status of a file with no metadata.json, which has no card: its
-        published URL and its access state, never modified."""
-        return cls._of(access, published_url=published_url, modified=False)
-
-    @classmethod
-    def _of(
-        cls, access: ArtifactAccessView | ArtifactCard, *, published_url: str, modified: bool
+    def of_access(
+        cls,
+        access: ArtifactAccessView | ArtifactCard,
+        *,
+        published_url: str,
+        modified: bool = False,
     ) -> ArtifactStatusView:
-        # A card carries the access view's fields under the same names.
+        """The status of a file with ``access`` state: a file with no
+        metadata.json, which has no card, is never modified. A card carries
+        the access view's fields under the same names."""
         return cls(
             published_url=published_url,
             modified=modified,

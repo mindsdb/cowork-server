@@ -336,9 +336,8 @@ def origin_conversation_id(meta: ArtifactMetadata | None) -> str:
     Takes the already-parsed metadata so the card builder does not read
     `metadata.json` a second time; `task_objects` passes what it loaded.
     """
-    if meta is None or not meta.provenance or meta.provenance[0] is None:
-        return ""
-    return meta.provenance[0].conversation or ""
+    first = meta.provenance[0] if meta is not None and meta.provenance else None
+    return (first.conversation if first is not None else None) or ""
 
 
 def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
@@ -1537,15 +1536,11 @@ def _prepare_artifact_card(
 
     from cowork.services.artifact_identity import artifact_key
 
-    # Owner-side access state (lock badge + eye-reveal). accessPassword is the
-    # plaintext, returned only to the owner's own session.
     access = published_access_view(io_folder, primary, published_map=published_map)
-    # Dropped at the single card builder so inline chat cards are covered
-    # too: they call this function as well, and a filter applied only at the
-    # list endpoint would still hand the plaintext password to the chat.
-    # In org mode the owner reads the password and the emails from GET
-    # .../access, which can tell owner from co-member, so the card carries
-    # neither. `accessMode` stays: ArtifactStatus draws its badge from it.
+    # Left out here, at the one card builder, so inline chat cards are covered
+    # too. In org mode the owner reads the password and the emails from GET
+    # .../access, which can tell owner from co-member. `accessMode` stays:
+    # ArtifactStatus draws its badge from it.
     access_fields = access.model_dump(
         exclude={"access_password", "access_emails"} if _org_mode() else None
     )
@@ -1764,6 +1759,17 @@ def _pinned_directory_path(directory: PinnedDir | None) -> Path | None:
         return None
 
 
+def loose_file_status(
+    folder: Path, file: Path, *, published_map: dict | None = None
+) -> ArtifactStatusView:
+    """The status of a file with no metadata.json, from its folder's publish
+    record."""
+    return ArtifactStatusView.of_access(
+        published_access_view(folder, file, published_map=published_map),
+        published_url=_published_url_for(folder, file, published_map=published_map),
+    )
+
+
 def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -> ArtifactStatusView:
     """Fresh owner-side status for an already resolved artifact path.
 
@@ -1788,10 +1794,7 @@ def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -
     if card is None:
         # Loose / legacy file (no metadata.json anywhere up to the artifacts
         # container root).
-        return ArtifactStatusView.of_access(
-            published_access_view(folder, artifact),
-            published_url=_published_url_for(folder, artifact),
-        )
+        return loose_file_status(folder, artifact)
     # ArtifactStatusView has no field for the owner-only plaintext password,
     # so it never leaves this endpoint.
     return ArtifactStatusView.of_card(card)

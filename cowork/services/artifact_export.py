@@ -451,13 +451,9 @@ def _record_primary(*, folder: PinnedDir, primary: str) -> None:
     """
     try:
         latest = ArtifactMetadata.parse(_read_no_follow(folder, _METADATA))
-    except ValueError as exc:
-        logger.warning("Export records no primary for %s (%s)", folder.path, exc)
-        return
-    if _primary_names_a_file(folder=folder, primary=latest.primary):
-        return
-    before = dir_stat(folder, _METADATA, follow_symlinks=False)
-    try:
+        if _primary_names_a_file(folder=folder, primary=latest.primary):
+            return
+        before = dir_stat(folder, _METADATA, follow_symlinks=False)
         _write_metadata(folder, latest.with_value("primary", primary))
     except ValueError as exc:
         logger.warning("Export records no primary for %s (%s)", folder.path, exc)

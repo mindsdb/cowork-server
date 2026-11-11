@@ -134,12 +134,19 @@ class ArtifactMetadata(BaseModel):
 
     @classmethod
     def empty(cls) -> ArtifactMetadata:
-        return cls.model_validate({})
+        return _EMPTY
 
     def with_value(self, key: str, value: Any) -> ArtifactMetadata:
         """The document with ``key`` set to ``value``: an existing key keeps
         its place, a new one goes last."""
         return type(self).model_validate({**self._document, key: value})
+
+    def with_id(self, artifact_id: str) -> ArtifactMetadata:
+        """The document with its id widened: ``id`` set and the retired
+        ``stableId`` dropped, in one validation."""
+        document = {k: v for k, v in self._document.items() if k != "stableId"}
+        document["id"] = artifact_id
+        return type(self).model_validate(document)
 
     def without(self, key: str) -> ArtifactMetadata:
         return type(self).model_validate({k: v for k, v in self._document.items() if k != key})
@@ -162,3 +169,7 @@ class ArtifactMetadata(BaseModel):
         if update:
             raise TypeError("ArtifactMetadata changes only through with_value or without")
         return super().model_copy(deep=deep)
+
+
+# Frozen, so one instance serves every caller with no document.
+_EMPTY = ArtifactMetadata.model_validate({})

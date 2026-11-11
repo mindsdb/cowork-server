@@ -261,7 +261,7 @@ def read_full_id(folder: PinnedDir) -> tuple[str, ArtifactMetadata]:
     resolved = _resolved_id(metadata, folder.path)
     if _is_migrated(metadata, resolved):
         return resolved, metadata
-    return resolved, metadata.without("stableId").with_value("id", resolved)
+    return resolved, metadata.with_id(resolved)
 
 
 def _replaced_mode(folder: PinnedDir, name: str) -> int | None:
@@ -314,7 +314,7 @@ def _ensure_full_id(
     resolved = _resolved_id(latest, folder.path)
     if _is_migrated(latest, resolved):
         return resolved, latest
-    updated = latest.without("stableId").with_value("id", resolved)
+    updated = latest.with_id(resolved)
     # metadata.json's mtime is a recency signal: the artifacts list
     # (cowork.services.artifacts.list_artifacts) orders folders by it, newest
     # first. Widening an id changes no user-visible content, so restore the
@@ -333,8 +333,8 @@ def _ensure_full_id(
         # value on every read — exactly what anton does. Propagating would
         # drop the artifact from every listing (both callers treat an identity
         # error as "skip this folder"), which reads as a deletion of files
-        # that are sitting right there. A document that can't be written back
-        # fails the same way on every read, so it is logged without a stack.
+        # that are sitting right there. An unwritable document fails on every
+        # read, so it gets no stack.
         logger.warning(
             "Could not persist widened artifact id for %s (%s)",
             folder.path,

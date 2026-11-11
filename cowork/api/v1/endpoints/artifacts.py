@@ -191,8 +191,7 @@ def _artifact_cards(session, sources) -> list[ArtifactCard]:
     """The cards of ``sources``, with the file store and the database read in
     turn on the calling thread. The routes read the two halves in their own
     worker threads instead (``_cards_for``)."""
-    # Owner-side fields are left out of org-mode cards by the single card builder,
-    # `_prepare_artifact_card`, not here, so inline chat cards are covered too.
+    # Org-mode cards leave out owner-side fields in `_prepare_artifact_card`.
     found = _sources_and_cards(find_sources=lambda: sources)
     return _card_capabilities(session, sources=found.sources, cards=found.cards)
 
@@ -508,16 +507,10 @@ def _pinned_artifact_match(
 
 def _pinned_loose_status(directory, logical_file: Path) -> ArtifactStatusView:
     """Status for a metadata-less legacy file using its pinned parent record."""
-    from cowork.services.artifacts import (
-        _load_published_map_pinned,
-        _published_url_for,
-        published_access_view,
-    )
+    from cowork.services.artifacts import _load_published_map_pinned, loose_file_status
 
-    published_map = _load_published_map_pinned(directory)
-    return ArtifactStatusView.of_access(
-        published_access_view(directory.path, logical_file, published_map=published_map),
-        published_url=_published_url_for(directory.path, logical_file, published_map=published_map),
+    return loose_file_status(
+        directory.path, logical_file, published_map=_load_published_map_pinned(directory)
     )
 
 
