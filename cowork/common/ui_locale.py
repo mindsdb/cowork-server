@@ -1,7 +1,8 @@
 """The user's UI language, read from the request's Accept-Language (ENG-4149).
 
 The Cowork app sends its active language on every request as
-``Accept-Language`` (one of ``en``, ``es``, ``pt-BR``, ``de``, ``fr``, ``ja``, ``ko``). A turn passes the
+``Accept-Language`` (one of ``en``, ``es``, ``pt-BR``, ``de``, ``fr``, ``it``, ``ja``, ``ko``,
+``zh-CN``). A turn passes the
 normalized tag to anton as ``ChatSessionConfig.ui_locale`` (the in-process
 path) or as the queued job's ``ui_locale`` param (the remote path), and anton
 adds one language line to its system prompt. The fast responders that answer
@@ -22,13 +23,33 @@ UI_LOCALE_NAMES: dict[str, str] = {
     "pt-BR": "Brazilian Portuguese",
     "de": "German",
     "fr": "French",
+    "it": "Italian",
     "ja": "Japanese",
     "ko": "Korean",
+    "zh-CN": "Simplified Chinese",
 }
 
 #: Primary language subtag -> supported tag. Every Portuguese variant maps to
-#: pt-BR, the only Portuguese the app ships.
-_BY_PRIMARY = {"en": "en", "es": "es", "pt": "pt-BR", "de": "de", "fr": "fr", "ja": "ja", "ko": "ko"}
+#: pt-BR, the only Portuguese the app ships. Chinese is handled in
+#: :func:`_supported_tag`, since only Simplified is shipped.
+_BY_PRIMARY = {"en": "en", "es": "es", "pt": "pt-BR", "de": "de", "fr": "fr", "it": "it", "ja": "ja", "ko": "ko"}
+
+#: Subtags that mark a Chinese tag as Traditional, which the app does not ship.
+_TRADITIONAL_ZH = {"hant", "tw", "hk", "mo"}
+
+
+def _supported_tag(tag: str) -> str | None:
+    """The supported locale a single language tag maps to, else None.
+
+    Chinese maps to ``zh-CN`` unless it asks for Traditional script or a
+    Traditional region (``zh-TW``, ``zh-HK``, ``zh-Hant``); same rule as the
+    app's ``normalizeLocale``."""
+    parts = tag.replace("_", "-").lower().split("-")
+    if parts[0] == "zh":
+        if "hans" in parts or not _TRADITIONAL_ZH.intersection(parts):
+            return "zh-CN"
+        return None
+    return _BY_PRIMARY.get(parts[0])
 
 #: Bounds on what is parsed: a real header is a few short tags.
 _MAX_HEADER_CHARS = 1024
@@ -71,7 +92,7 @@ def normalize_ui_locale(accept_language: str | None) -> str | None:
         if q is None or q <= best_q:
             continue
         # "*" and languages the app does not ship never shadow one it does.
-        locale = _BY_PRIMARY.get(tag.replace("_", "-").split("-", 1)[0].lower())
+        locale = _supported_tag(tag)
         if locale is None:
             continue
         best, best_q = locale, q
