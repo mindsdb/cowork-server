@@ -52,6 +52,7 @@ from cowork.schemas.responses import (
     ResponseStatus,
     Role,
 )
+from cowork.streaming.addons import TurnAddon
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
 
 logger = logging.getLogger(__name__)
@@ -1267,6 +1268,12 @@ async def format_responses_stream(
 
         elif isinstance(event, TurnContext):
             turn_context = event
+
+        elif isinstance(event, TurnAddon):
+            # A message the person added mid-turn: accepted, read by the
+            # model, or returned to run next (cowork.streaming.addons).
+            seq += 1
+            yield _event("response.addon", {**event.payload(), "sequence_number": seq})
 
         elif isinstance(event, SkillCreated):
             seq += 1

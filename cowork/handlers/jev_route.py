@@ -8,6 +8,9 @@ leans direct. Its wording and the default threshold were chosen with
 ``scripts/eval_jev_route`` (results in that folder): rerun it before changing
 either.
 
+Jev also decides where a message sent while a turn runs goes
+(`ADDON_ROUTE_QUESTION`, `decide_addon`): into that turn, or the queue.
+
 Every failure, a refusal, a bad response, a timeout, a network error, comes
 back as an `error` on the decision, never raised. Jev bills like any MindsHub
 model, so a refusal (a spent allowance, a restriction on the organization) is
@@ -94,6 +97,40 @@ SEARCH_QUESTION: dict[str, Any] = {
         ),
     },
 }
+
+# Asked when the person sends a message while a turn is still running
+# (POST /responses/addon): fold it into that turn, or keep it as the next one.
+# Queueing is today's behaviour, so the question leans that way: only a clear
+# correction or refinement of the running task is added.
+_ADD_TO_CURRENT = "add_to_current_task"
+_ADDON_CHOICES = frozenset({_ADD_TO_CURRENT, "queue_as_next_task"})
+ADDON_ROUTE_QUESTION: dict[str, Any] = {
+    "type": "choice",
+    "instructions": (
+        "The assistant is in the middle of a task when the user sends a new "
+        "message. Decide whether the message belongs to the running task, so the "
+        "assistant should take it into account before it finishes, or is a request "
+        "to handle after the task is done. A line '[ran tool: X]' means the "
+        "assistant already did work with tool X in this task. Earlier messages the "
+        "user added to the task are listed too."
+    ),
+    "criteria": {
+        _ADD_TO_CURRENT: (
+            "The message corrects, narrows or adds detail to the running task: use "
+            "a different source, table, period or filter; also include or skip "
+            "something; change the format, length or style of the result; fix a "
+            "wrong assumption; answer something the running task needs; or follow "
+            "up on a message already added to it."
+        ),
+        "queue_as_next_task": (
+            "The message is a new, separate request; a question unrelated to the "
+            "running task; or something that needs the running task's result first, "
+            "such as sending, sharing, emailing, publishing or building on what the "
+            "task is producing."
+        ),
+    },
+}
+
 
 # Separates the gate's Jev traces from user turns in Langfuse; the same tag
 # the LLM gate's calls carry, since this is that gate.
@@ -338,29 +375,23 @@ def _needs_search(body: dict) -> bool:
         return True
 
 
-async def decide(
-    *,
-    target: JevTarget,
-    messages: list[dict],
-    model: str,
-    timeout_seconds: float,
-    min_p_direct: float,
-) -> JevRoute:
-    """One `/v1/decisions` call: direct when Jev gives a direct answer at
-    least `min_p_direct`, and whether the reply needs a web search. Never
-    raises.
+class _Failed(Exception):
+    """A decision call that got no usable response, with its error class."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__(error)
+        self.error = error
+
+
+async def _post_decision(target: JevTarget, payload: dict, *, timeout_seconds: float) -> dict:
+    """POST one `/v1/decisions` request and return its JSON body; raises
+    `_Failed` with the error class for every failure.
 
     Wrapped in `asyncio.timeout`, not just httpx's own timeout kwarg: httpx's
     applies per phase (connect/write/read/pool) and measures inactivity, not
     total elapsed time, so a trickling response could run past the budget
-    without tripping it. This call sits ahead of every turn on MindsHub.
+    without tripping it. The route call sits ahead of every turn on MindsHub.
     """
-    payload = {
-        "model": model,
-        "state": route_state(messages),
-        "questions": {"route": ROUTE_QUESTION, "search": SEARCH_QUESTION},
-    }
-    started = time.monotonic()
     try:
         async with asyncio.timeout(timeout_seconds):
             headers = {
@@ -377,21 +408,50 @@ async def decide(
                 )
     except _EndpointRefused:
         # Falls back to the LLM gate, as any failure but a timeout does.
-        return JevRoute(ms=_elapsed_ms(started), error="endpoint_refused")
+        raise _Failed("endpoint_refused")
     except (TimeoutError, httpx.TimeoutException):
         # httpx's own timeouts fire at the same budget: the gate's time is
         # spent either way, so both read as a timeout (no LLM gate after it).
-        return JevRoute(ms=_elapsed_ms(started), error="timeout")
+        raise _Failed("timeout")
     except httpx.HTTPError:
-        return JevRoute(ms=_elapsed_ms(started), error="transport_error")
+        raise _Failed("transport_error")
     except Exception as exc:  # the gate must never raise into the turn
-        return JevRoute(ms=_elapsed_ms(started), error=type(exc).__name__)
-
-    ms = _elapsed_ms(started)
+        raise _Failed(type(exc).__name__)
     if response.status_code != 200:
-        return JevRoute(ms=ms, error=f"http_{response.status_code}")
+        raise _Failed(f"http_{response.status_code}")
     try:
         body = response.json()
+    except Exception:
+        raise _Failed("malformed_response")
+    if not isinstance(body, dict):
+        raise _Failed("malformed_response")
+    return body
+
+
+async def decide(
+    *,
+    target: JevTarget,
+    messages: list[dict],
+    model: str,
+    timeout_seconds: float,
+    min_p_direct: float,
+) -> JevRoute:
+    """One `/v1/decisions` call: direct when Jev gives a direct answer at
+    least `min_p_direct`, and whether the reply needs a web search. Never
+    raises.
+    """
+    payload = {
+        "model": model,
+        "state": route_state(messages),
+        "questions": {"route": ROUTE_QUESTION, "search": SEARCH_QUESTION},
+    }
+    started = time.monotonic()
+    try:
+        body = await _post_decision(target, payload, timeout_seconds=timeout_seconds)
+    except _Failed as failed:
+        return JevRoute(ms=_elapsed_ms(started), error=failed.error)
+    ms = _elapsed_ms(started)
+    try:
         answer = body["answers"]["route"]
         if answer["choice"] not in _VALID_CHOICES:
             raise ValueError(f"unexpected choice {answer['choice']!r}")
@@ -400,5 +460,68 @@ async def decide(
         return JevRoute(ms=ms, error="malformed_response")
     return JevRoute(
         direct=p_direct >= min_p_direct, p_direct=p_direct, needs_search=_needs_search(body),
+        ms=ms, model=str(body.get("model") or ""),
+    )
+
+
+@dataclass(frozen=True)
+class AddonRoute:
+    """Jev's verdict on a message sent while a turn runs. Content-free, like
+    `JevRoute`."""
+
+    add: bool = False
+    # Whether Jev chose to add, whatever its confidence: an add below the
+    # threshold is queued as low confidence rather than as a new task.
+    chose_add: bool = False
+    p_add: float | None = None
+    ms: int = 0
+    model: str = ""
+    # Empty on a usable answer; otherwise why Jev could not decide. The
+    # message is queued either way.
+    error: str = ""
+
+
+def addon_state(
+    *, task: str, progress: list[str], added: list[str], message: str,
+) -> dict:
+    """What Jev reads for `ADDON_ROUTE_QUESTION`: the running task's request,
+    its recent steps as `[ran tool: X]` lines, the messages already added to
+    it, and the new message."""
+    return {
+        "running_task": task,
+        "recent_progress": progress,
+        "already_added_to_task": added,
+        "new_user_message": message,
+    }
+
+
+async def decide_addon(
+    *,
+    target: JevTarget,
+    state: dict,
+    model: str,
+    timeout_seconds: float,
+    min_p_add: float,
+) -> AddonRoute:
+    """One `/v1/decisions` call for `ADDON_ROUTE_QUESTION`: add when Jev
+    chooses to add with at least `min_p_add`. Never raises."""
+    payload = {"model": model, "state": state, "questions": {"addon_route": ADDON_ROUTE_QUESTION}}
+    started = time.monotonic()
+    try:
+        body = await _post_decision(target, payload, timeout_seconds=timeout_seconds)
+    except _Failed as failed:
+        return AddonRoute(ms=_elapsed_ms(started), error=failed.error)
+    ms = _elapsed_ms(started)
+    try:
+        answer = body["answers"]["addon_route"]
+        choice = answer["choice"]
+        if choice not in _ADDON_CHOICES:
+            raise ValueError(f"unexpected choice {choice!r}")
+        p_add = _probability(answer, _ADD_TO_CURRENT)
+    except Exception:
+        return AddonRoute(ms=ms, error="malformed_response")
+    return AddonRoute(
+        add=choice == _ADD_TO_CURRENT and p_add >= min_p_add,
+        chose_add=choice == _ADD_TO_CURRENT, p_add=p_add,
         ms=ms, model=str(body.get("model") or ""),
     )

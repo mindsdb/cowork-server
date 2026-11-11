@@ -30,10 +30,12 @@ from cowork.db.scoped import (
     get_tenant_scope,
     scope_from_principal,
 )
+from cowork.handlers.addon_route import queued, route_addon
 from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
 from cowork.principal import Principal, caller_bearer, get_principal
 from cowork.schemas.responses import ResponsesRequest
 from cowork.streaming import RunHandle, TurnInProgress, registry
+from cowork.streaming.addons import addons
 from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import cancel_disconnected_run, cancel_run, request_cancel
@@ -532,6 +534,88 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
         return _answer_response(remote_result)
 
     return _answer_response(broker.submit(req.conversation_id, req.question_id, payload))
+
+
+# A message typed into the composer, so a lot more room than an answer's free
+# text; past it the app queues the message as it does on any error.
+_MAX_ADDON_LENGTH = 64 * 1024
+
+
+class AddonRequest(BaseModel):
+    conversation_id: str
+    text: str = Field(max_length=_MAX_ADDON_LENGTH)
+    # The person picked "Add to current task" themselves: Jev is not asked.
+    force: bool = False
+
+
+@router.post("/addon", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
+    """A message sent while the conversation's turn runs: add it to that turn
+    or tell the app to queue it as the next one (ENG-4194).
+
+    Always 200 for a caller who may touch the turn: {"status": "added",
+    "addon_id", "decided_by"} when the running turn took it, else {"status":
+    "queued", "reason"}, and the app keeps it in its queue as today. 404 is
+    /answer's: no turn the caller may touch. The turn's stream carries a
+    `response.addon` event for each added message as it is added, read by the
+    model, or returned at turn end because the model never saw it.
+
+    On the remote backend the turn runs in a pod, which has no way to take a
+    message mid-turn yet: those are queued as not_supported.
+    """
+    _require_streaming_scope(scope)
+    text = req.text.strip()
+    settings = TurnQueueSettings()
+    if settings.is_remote:
+        found = await _shared_turn(req.conversation_id, scope)
+        if found is None:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
+        if not text:
+            return queued("empty")
+        if not settings.addon_routing_enabled:
+            return queued("disabled")
+        return queued("not_supported" if found.in_flight else "no_turn")
+    handle = _authorized_handle(registry.get(req.conversation_id), scope)
+    if handle is None:
+        return JSONResponse(status_code=404, content={"status": "not_found"})
+    if not text:
+        return queued("empty")
+    if not settings.addon_routing_enabled:
+        return queued("disabled")
+    if not handle.is_answering:
+        return queued("no_turn")
+    channel = addons.get(req.conversation_id)
+    if channel is None:
+        # The turn runs an anton that can't take messages mid-turn, or is not
+        # an agent turn.
+        return queued("not_supported")
+    return await route_addon(channel=channel, text=text, force=req.force, scope=scope)
+
+
+class AddonWithdrawRequest(BaseModel):
+    conversation_id: str
+    addon_id: str
+
+
+_WITHDRAW_RESPONSES: dict[str, tuple[int, dict]] = {
+    "withdrawn": (200, {"status": "withdrawn"}),
+    "already_read": (409, {"status": "already_read"}),
+    "not_found": (404, {"status": "not_found"}),
+}
+
+
+@router.post("/addon/withdraw", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def withdraw_addon(req: AddonWithdrawRequest, scope: TenantScopeDep):
+    """Take an added message back before the model reads it ("Move to
+    queue"). 409 once the model has it; 404 for no turn the caller may touch,
+    or an addon that turn does not hold (it ended and returned it)."""
+    _require_streaming_scope(scope)
+    handle = _authorized_handle(registry.get(req.conversation_id), scope)
+    channel = addons.get(req.conversation_id) if handle is not None else None
+    if channel is None:
+        return JSONResponse(status_code=404, content={"status": "not_found"})
+    status_code, content = _WITHDRAW_RESPONSES[channel.withdraw(req.addon_id)]
+    return JSONResponse(status_code=status_code, content=content)
 
 
 @router.get("/tail", dependencies=[Depends(require(AuthenticatedInOrgMode))])

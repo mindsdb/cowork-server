@@ -708,6 +708,23 @@ def jev_history(history: list[dict]) -> list[dict]:
     )
 
 
+# How many of a running turn's last steps Jev reads when it decides where a
+# message sent mid-turn goes (jev_route.ADDON_ROUTE_QUESTION).
+ADDON_PROGRESS_STEPS = 8
+
+
+def progress_lines(messages: list[dict], *, limit: int = ADDON_PROGRESS_STEPS) -> list[str]:
+    """A running turn's last steps as `[ran tool: X]` lines, the markers
+    `jev_history` shows Jev for earlier turns."""
+    lines: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        text = _condense_content(message.get("content")) or ""
+        lines.extend(line for line in text.splitlines() if line.startswith("[ran tool: "))
+    return lines[-limit:]
+
+
 def ineligible_reason(
     *,
     has_non_text_input: bool,

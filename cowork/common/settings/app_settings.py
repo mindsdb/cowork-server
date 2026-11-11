@@ -780,6 +780,22 @@ class TurnQueueSettings(Settings):
             "direct model can still delegate. See scripts/eval_jev_route before raising it."
         ),
     )  # COWORK_TURN_JEV_ROUTE_MIN_P_DIRECT
+    addon_routing_enabled: bool = Field(
+        default=False,
+        description=(
+            "Let Jev add a message sent while a turn runs to that turn (POST /responses/addon) "
+            "instead of queueing it as the next one. Off: every such message is queued."
+        ),
+    )  # COWORK_TURN_ADDON_ROUTING_ENABLED
+    addon_min_p_add: float = Field(
+        default=0.6,
+        ge=0,
+        le=1,
+        description=(
+            "Jev's probability of adding needed to add a mid-turn message to the running turn; "
+            "below it the message is queued, which is the behaviour without this feature."
+        ),
+    )  # COWORK_TURN_ADDON_MIN_P_ADD
     minds_coding_model: str = Field(
         default="",
         description=(
