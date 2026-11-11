@@ -19,7 +19,14 @@ import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
 from cowork.turnqueue.models import TurnReply
-from cowork.turnqueue.redis_client import answer_queue_key, get_redis, reply_stream_key
+from cowork.turnqueue.redis_client import (
+    REDIS_BLOCK_MS,
+    answer_queue_key,
+    get_redis,
+    redis_deadline,
+    reply_stream_key,
+    xread_blocking,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +36,11 @@ logger = logging.getLogger(__name__)
 ACK_TIMEOUT_S = 15.0
 #: A queued answer nobody pops (the turn ended) must not linger.
 ANSWER_TTL_S = 60
+#: How long past its BLOCK a verdict read may wait for Redis's reply. The
+#: client cuts a read's wait to the time left before its deadline, so a read
+#: whose deadline fell with its BLOCK would time out just as Redis answered
+#: an empty read, and the wait would end as a Redis error.
+_READ_GRACE_S = 0.1
 #: scratchpad-controller drops any stdin line over this many raw UTF-8 bytes
 #: (its own MAX_ANSWER_BYTES); past that /answer would wait the full ack
 #: timeout for a verdict that never comes. Reject it here instead.
@@ -107,6 +119,11 @@ async def submit_remote_answer(
     )
     if len(entry.encode("utf-8")) + _WRAP_HEADROOM_BYTES > MAX_ANSWER_BYTES:
         return RemoteAnswerResult.TOO_LARGE
+    # Retried like any other call. A transaction resent after its reply was
+    # lost queues this entry twice, with one answer_id: the pod answers the
+    # question once, and nothing renders its verdict on the copy. Raised, the
+    # lost reply would fail /answer, and the client would resend the typed
+    # text as a new message.
     async with r.pipeline(transaction=True) as pipe:
         pipe.rpush(key, entry)
         pipe.expire(key, ANSWER_TTL_S)
@@ -115,7 +132,10 @@ async def submit_remote_answer(
     try:
         deadline = time.monotonic() + ack_timeout_s
         while (left := deadline - time.monotonic()) > 0:
-            resp = await r.xread({stream: last_id}, count=50, block=max(1, int(left * 1000)))
+            block_ms = max(1, min(REDIS_BLOCK_MS, int(left * 1000)))
+            # A read's retries end with the wait, not after it.
+            with redis_deadline(budget_s=left + _READ_GRACE_S):
+                resp = await xread_blocking(r=r, streams={stream: last_id}, count=50, block_ms=block_ms)
             for _stream, entries in resp or []:
                 for entry_id, fields in entries:
                     last_id = entry_id

@@ -1,0 +1,78 @@
+name: Service Tests
+
+# The tests that need a real Redis or PostgreSQL: two replicas reading one
+# Redis, the Redis clients through a failover, and the migration and
+# launch-lock contracts on PostgreSQL, which is what every hosted environment
+# runs. The unit job has neither, so these skip there; here they run, and a
+# missing service fails the job instead of skipping (COWORK_REQUIRE_SERVICES,
+# tests/integration/prereq.py).
+#
+# The failover tests (tests/integration/test_redis_failover.py) change the
+# job's Redis while they run: REPLICAOF makes it a read-only replica, and they
+# add an ACL user and kill clients, then put it back. Run them alone against
+# their Redis: a second job or a parallel run on the same Redis would see it
+# refuse writes.
+#
+# No job that publishes the desktop wheel needs this one: these contracts are
+# hosted-only, and a red here should not hold up a desktop release.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  service-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      # The versions hosted runs: Redis 8.10.2 (one image in staging and prod)
+      # and PostgreSQL 16.13 (RDS in newdev and newprod). The Redis tests log
+      # the version they reached (tests/integration/prereq.py).
+      redis:
+        image: redis:8.10.2-alpine@sha256:9f8d2d789b9a1d1e3f283f979aa9cbf393373806472e1ccd460e2f9c869b833b
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      postgres:
+        image: postgres:16.13-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
+        # A throwaway database the job alone can reach, so it takes no password.
+        env:
+          POSTGRES_USER: cowork
+          POSTGRES_DB: cowork_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cowork -d cowork_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      COWORK_TEST_REDIS_URL: redis://localhost:6379/1
+      COWORK_TEST_POSTGRES_URI: postgresql://cowork@localhost:5432/cowork_test
+      COWORK_REQUIRE_SERVICES: "true"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.30"
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Run service tests
+        run: make test/services

@@ -13,7 +13,8 @@ from typing import Any
 import httpx
 
 from cowork.coding.context import classify_engine_failure, goal_status_text
-from cowork.coding.contracts import CodingEvent, EventType
+from cowork.coding.approvals import ApprovalBroker, read_only_refusal
+from cowork.coding.contracts import CodingEvent, EventType, PermissionMode
 from cowork.coding.control_models import RuntimeCommand
 from cowork.coding.engines.base import (
     EngineCredentials,
@@ -530,6 +531,12 @@ class CodeOnlyRuntime:
         # misrepresent an unsupported question as a remote security approval.
         if method == "item/tool/requestUserInput":
             return {"answers": {}}
+        if lease.execution.permission_mode == PermissionMode.read_only:
+            # Codex runs an accepted request outside the read-only sandbox,
+            # so a Read only task declines without offering a card.
+            refusal = read_only_refusal(ApprovalBroker.describe(method, params))
+            self.client.event(lease, "event", {"event": refusal.model_dump(mode="json")})
+            return {"decision": "decline"}
         approval_id = f"approval-{lease.run.id}-{uuid.uuid4()}"
         resolved = threading.Event()
         decision: dict[str, str] = {}

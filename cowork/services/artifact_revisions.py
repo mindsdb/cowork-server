@@ -8,18 +8,67 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import stat
 import uuid
+from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from anton.core.artifacts.internal_files import REVISIONS_DIRNAME
+from pydantic import ValidationError
+
+from cowork.common.logger import log_context
+from cowork.db.scoped import TenantScope
+from cowork.common.paths import (
+    O_NOFOLLOW,
+    O_NONBLOCK,
+    dir_fsync,
+    open_fd,
+    pinned_dir,
+    read_bounded,
+)
+from cowork.services.artifact_journal import (
+    COMMENTS_JOURNAL_NAME,
+    JOURNAL_DIRNAME,
+    MAX_JOURNAL_RECORD_BYTES,
+    JournalFileRefused,
+    iter_journal_json,
+    prune_journal_folder,
+    read_journal_file,
+    read_journal_json,
+    remove_journal_file,
+    write_journal_file,
+)
 from cowork.services.artifact_lock import artifact_lock
+from cowork.services.artifact_revision_records import (
+    AgentRepair,
+    JournalRecord,
+    Manifest,
+    PendingSourceWrite,
+    RepairStatus,
+    RevisionActor,
+    RevisionEntry,
+    is_content_hash,
+    is_repair_id,
+)
+
+logger = logging.getLogger(__name__)
 
 EDITABLE_EXTENSIONS = frozenset({".md", ".txt", ".html", ".htm"})
 MAX_SOURCE_BYTES = 2_000_000
 MAX_REVISIONS = 80
-JOURNAL_DIRNAME = REVISIONS_DIRNAME
+# Names inside the journal folder (artifact_journal.JOURNAL_DIRNAME).
+_MANIFEST = "manifest.json"
+_PENDING = "pending-source-write.json"
+_REPAIRS = "repairs"
+_BLOBS = "blobs"
+# The manifest holds at most MAX_REVISIONS entries, each a few kilobytes at
+# most (a 1,000-character path, a 240-character summary), so a larger one is
+# not the server's.
+_MAX_MANIFEST_BYTES = 1024 * 1024
 # A queued repair whose turn never reported inside this window is presumed
 # dead. Without it a turn killed between minting the handoff and starting the
 # agent gates that source path forever.
@@ -27,6 +76,8 @@ QUEUED_REPAIR_TTL_SECONDS = 3600
 
 
 class RevisionConflict(RuntimeError):
+    """``current`` is the head revision as the API shows it."""
+
     def __init__(self, current: dict, message: str = "Artifact changed since this edit began"):
         super().__init__(message)
         self.current = current
@@ -55,8 +106,9 @@ class RevisionValidationError(ValueError):
 class RepairAlreadyPending(RevisionValidationError):
     """The path already has a repair that still gates new agent work.
 
-    Carries the blocker so the caller can name the comment it belongs to and
-    offer to discard it, rather than reporting a fact with no way to act on it.
+    Carries the blocker, as the API shows it, so the caller can name the
+    comment it belongs to and offer to discard it, rather than reporting a
+    fact with no way to act on it.
     """
 
     def __init__(self, repair: dict):
@@ -72,32 +124,27 @@ def _sha(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _journal(folder: Path) -> Path:
-    return folder / JOURNAL_DIRNAME
-
-
-def _manifest_path(folder: Path) -> Path:
-    return _journal(folder) / "manifest.json"
-
-
-def _pending_path(folder: Path) -> Path:
-    return _journal(folder) / "pending-source-write.json"
-
-
-def _repairs_dir(folder: Path) -> Path:
-    return _journal(folder) / "repairs"
-
-
-def _read_manifest(folder: Path) -> dict:
+def _read_manifest(folder: Path) -> Manifest:
     try:
-        data = json.loads(_manifest_path(folder).read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {"version": 1, "revisions": []}
-    except (OSError, json.JSONDecodeError) as exc:
+        data = read_journal_json(folder, _MANIFEST, max_bytes=_MAX_MANIFEST_BYTES)
+    except (OSError, ValueError) as exc:
         raise RevisionValidationError("Artifact revision history is unreadable") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("revisions"), list):
-        raise RevisionValidationError("Artifact revision history is invalid")
-    return data
+    if data is None:
+        return Manifest(version=1, revisions=[])
+    try:
+        manifest = Manifest.model_validate(data)
+    except ValidationError as exc:
+        raise RevisionValidationError("Artifact revision history is invalid") from exc
+    if manifest.skipped:
+        logger.warning(
+            "Left out artifact revisions the server never wrote",
+            extra={
+                "event": "artifact_revision_entries_skipped",
+                "reason": "damaged_entry",
+                **log_context(artifact_slug=folder.name),
+            },
+        )
+    return manifest
 
 
 def _atomic_bytes(path: Path, content: bytes, *, mode: int | None = None) -> None:
@@ -112,17 +159,13 @@ def _atomic_bytes(path: Path, content: bytes, *, mode: int | None = None) -> Non
             os.chmod(tmp, mode)
         os.replace(tmp, path)
         # `fsync` above durably writes the file bytes; syncing the containing
-        # directory makes the rename itself durable across a host crash on
-        # filesystems that support directory descriptors. Windows does not,
-        # so it safely keeps the atomic-replace guarantee without this extra
-        # durability step.
+        # directory makes the rename itself durable across a host crash.
         try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            with pinned_dir(path.parent) as parent:
+                dir_fsync(parent)
         except OSError:
+            # The file is durable and the rename atomic; a filesystem that
+            # can't sync a folder only loses the rename's durability.
             pass
     finally:
         try:
@@ -131,65 +174,81 @@ def _atomic_bytes(path: Path, content: bytes, *, mode: int | None = None) -> Non
             pass
 
 
-def _write_manifest(folder: Path, payload: dict) -> None:
-    encoded = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-    _atomic_bytes(_manifest_path(folder), encoded)
+def _encoded(record: JournalRecord) -> bytes:
+    return (json.dumps(record.to_json(), indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def _write_pending(folder: Path, payload: dict) -> None:
-    encoded = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-    _atomic_bytes(_pending_path(folder), encoded, mode=0o600)
+def _write_manifest(folder: Path, manifest: Manifest) -> None:
+    write_journal_file(folder, _MANIFEST, content=_encoded(manifest))
+
+
+def _write_pending(folder: Path, pending: PendingSourceWrite) -> None:
+    write_journal_file(folder, _PENDING, content=_encoded(pending))
 
 
 def _clear_pending(folder: Path) -> None:
     try:
-        _pending_path(folder).unlink(missing_ok=True)
+        remove_journal_file(folder, _PENDING)
     except OSError:
         # The transaction is already committed or deliberately abandoned. A
         # stale marker is harmless and will be recognized on the next read.
         pass
 
 
-def _write_repair(folder: Path, repair: dict) -> None:
-    encoded = (json.dumps(repair, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-    _atomic_bytes(_repairs_dir(folder) / f"{repair['id']}.json", encoded, mode=0o600)
+def _write_repair(folder: Path, repair: AgentRepair) -> None:
+    # AgentRepair checked the id; it is checked again where it names a file.
+    if not is_repair_id(repair.id):
+        raise RevisionValidationError("Agent repair id is invalid")
+    write_journal_file(folder, _REPAIRS, f"{repair.id}.json", content=_encoded(repair))
 
 
-def _read_repair(folder: Path, repair_id: str) -> dict:
+def _own_record(repair_id: str, raw: object) -> AgentRepair | None:
+    """The record saved as ``repairs/<repair_id>.json``, when ``raw`` is one.
+
+    A record that fails AgentRepair is damaged. One whose own id isn't its
+    file name's is refused, so a copied or planted record can't be written
+    back under another name.
+    """
     try:
-        uuid.UUID(repair_id)
-        repair = json.loads(
-            (_repairs_dir(folder) / f"{repair_id}.json").read_text(encoding="utf-8")
-        )
-    except (ValueError, OSError, json.JSONDecodeError) as exc:
-        raise FileNotFoundError("Agent repair not found") from exc
-    if not isinstance(repair, dict) or repair.get("id") != repair_id:
+        repair = AgentRepair.model_validate(raw)
+    except ValidationError:
+        return None
+    return repair if repair.id == repair_id else None
+
+
+def _load_repair(folder: Path, repair_id: str) -> AgentRepair | None:
+    """The record saved as ``repairs/<repair_id>.json``, or None. A read that
+    couldn't be made raises."""
+    try:
+        raw = read_journal_json(folder, _REPAIRS, f"{repair_id}.json")
+    except (JournalFileRefused, ValueError):
+        return None
+    return _own_record(repair_id, raw)
+
+
+def _read_repair(folder: Path, repair_id: str) -> AgentRepair:
+    repair = _load_repair(folder, repair_id) if is_repair_id(repair_id) else None
+    if repair is None:
         raise FileNotFoundError("Agent repair not found")
     return repair
 
 
-def _repair_records(folder: Path) -> list[dict]:
-    try:
-        paths = sorted(_repairs_dir(folder).glob("*.json"))
-    except OSError:
-        return []
-    records: list[dict] = []
-    for path in paths:
-        try:
-            repair = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(repair, dict):
-            records.append(repair)
-    return records
+def _repair_records(folder: Path) -> Iterator[AgentRepair]:
+    """The repair records, one at a time, so a caller that stops early or
+    keeps only some holds no more than one parsed record."""
+    for repair_id, raw in iter_journal_json(
+        folder, _REPAIRS, suffix=".json", accept=is_repair_id
+    ):
+        record = _own_record(repair_id, raw)
+        if record is not None:
+            yield record
 
 
-def _actionable_repairs_for_path(folder: Path, rel_path: str) -> list[dict]:
+def _actionable_repairs_for_path(folder: Path, rel_path: str) -> list[AgentRepair]:
     return [
         repair
         for repair in _repair_records(folder)
-        if repair.get("status") in {"queued", "ready"}
-        and repair.get("path") == rel_path
+        if repair.status in {"queued", "ready"} and repair.path == rel_path
     ]
 
 
@@ -201,30 +260,43 @@ def _parse_timestamp(value: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _head_revision_id(manifest: dict, rel_path: str | None) -> str | None:
-    latest = next(
-        (entry for entry in reversed(manifest["revisions"]) if entry.get("path") == rel_path),
-        None,
-    )
-    return latest.get("id") if latest else None
+def _head_revision_id(manifest: Manifest, rel_path: str) -> str | None:
+    latest = manifest.head(rel_path)
+    return latest.id if latest else None
 
 
-def _is_superseded(manifest: dict, repair: dict) -> bool:
+def _is_superseded(manifest: Manifest, repair: AgentRepair) -> bool:
     """Whether the agent's revision is no longer head for the repair's path.
 
     Computed rather than stored, so an artifact wedged by an older build
     recovers on the first request instead of needing a migration.
     """
-    revision_id = repair.get("revisionId")
-    if not revision_id:
+    if not repair.revision_id:
         return False
-    head = _head_revision_id(manifest, repair.get("path"))
-    return head is not None and head != revision_id
+    head = _head_revision_id(manifest, repair.path)
+    return head is not None and head != repair.revision_id
+
+
+@dataclass(frozen=True)
+class _FinishedRepair:
+    """An actionable repair that can no longer gate, and the status that ends it."""
+
+    repair: AgentRepair
+    status: RepairStatus
+
+
+@dataclass(frozen=True)
+class _RepairPartition:
+    """One path's actionable repairs: those that still gate a new repair, and
+    those that cannot."""
+
+    blocking: list[AgentRepair]
+    finished: list[_FinishedRepair]
 
 
 def _partition_actionable_repairs(
-    folder: Path, manifest: dict, rel_path: str
-) -> tuple[list[dict], list[tuple[dict, str]]]:
+    folder: Path, manifest: Manifest, rel_path: str
+) -> _RepairPartition:
     """Split one path's actionable repairs into those that still gate a new
     repair, and those that cannot, each with the status that finishes it.
 
@@ -234,54 +306,51 @@ def _partition_actionable_repairs(
     """
     now = datetime.now(timezone.utc)
     head = _head_revision_id(manifest, rel_path)
-    blocking: list[dict] = []
-    dead: list[tuple[dict, str]] = []
+    blocking: list[AgentRepair] = []
+    finished: list[_FinishedRepair] = []
     for repair in _actionable_repairs_for_path(folder, rel_path):
         if _is_superseded(manifest, repair):
             continue
-        if repair.get("status") == "queued":
-            if head is not None and repair.get("baseRevisionId") != head:
+        if repair.status == "queued":
+            if head is not None and repair.base_revision_id != head:
                 # The turn is still running, but it can only land on conflict
                 # now, so it should not hold the path until it gets there.
-                dead.append((repair, "conflict"))
+                finished.append(_FinishedRepair(repair=repair, status="conflict"))
                 continue
-            created = _parse_timestamp(repair.get("createdAt"))
+            created = _parse_timestamp(repair.created_at)
             # An unreadable timestamp must not mean "blocks forever".
             if created is None or (now - created).total_seconds() > QUEUED_REPAIR_TTL_SECONDS:
-                dead.append((repair, "no_change"))
+                finished.append(_FinishedRepair(repair=repair, status="no_change"))
                 continue
         blocking.append(repair)
-    return blocking, dead
+    return _RepairPartition(blocking=blocking, finished=finished)
 
 
 def has_queued_agent_repair(folder: Path, conversation_id: str) -> bool:
     """Return whether this exact agent turn has a pending repair handoff."""
     return any(
-        (
-            repair.get("status") == "queued"
-            and repair.get("conversationId") == conversation_id
-        )
+        repair.status == "queued" and repair.conversation_id == conversation_id
         for repair in _repair_records(folder)
     )
 
 
 def _finish_queued_repairs(
     folder: Path,
-    repairs: list[dict],
+    repairs: list[AgentRepair],
     *,
     matching_base_id: str | None,
     revision_id: str | None,
 ) -> None:
     """Move repairs out of polling state after their attributed turn ends."""
     for repair in repairs:
-        if repair.get("baseRevisionId") != matching_base_id:
-            repair["status"] = "conflict"
+        if repair.base_revision_id != matching_base_id:
+            repair.status = "conflict"
         elif revision_id:
-            repair["status"] = "ready"
+            repair.status = "ready"
         else:
-            repair["status"] = "no_change"
-        repair["revisionId"] = revision_id
-        repair["updatedAt"] = _now()
+            repair.status = "no_change"
+        repair.revision_id = revision_id
+        repair.updated_at = _now()
         _write_repair(folder, repair)
 
 
@@ -313,23 +382,92 @@ def resolve_source(folder: Path, metadata: dict, rel_path: str | None = None) ->
             target.relative_to(canonical_folder)
         except ValueError as exc:
             raise RevisionValidationError("Invalid artifact source path") from exc
-    if not target.is_file() or target.is_symlink():
+    from cowork.services.artifacts import _is_the_projects_secrets
+
+    # The source route reads and writes the file in place, so the project's
+    # `.anton/.env` under a second name is refused too. Other hard-linked
+    # sources, such as one a backup tool made, still open.
+    if (
+        not target.is_file()
+        or target.is_symlink()
+        or _is_the_projects_secrets(target.lstat(), anton_dir=canonical_folder.parent.parent)
+    ):
         raise FileNotFoundError("Artifact source not found")
     if target.suffix.lower() not in EDITABLE_EXTENSIONS:
         raise RevisionValidationError("This artifact type is not source-editable")
     return target, target.resolve(strict=False).relative_to(canonical_folder).as_posix()
 
 
-def _content_for_revision(folder: Path, revision: dict) -> str:
-    blob = _journal(folder) / "blobs" / str(revision.get("contentHash", ""))
+def _read_source(target: Path) -> bytes:
+    """An editable source's bytes. One past MAX_SOURCE_BYTES is refused before
+    it's read, so a sparse file can't fill the server's memory."""
+    fd = open_fd(target, os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
     try:
-        return blob.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise RevisionValidationError("Revision content is unavailable") from exc
+        found = os.fstat(fd)
+        if not stat.S_ISREG(found.st_mode):
+            raise FileNotFoundError("Artifact source not found")
+        if found.st_size > MAX_SOURCE_BYTES:
+            raise RevisionValidationError("Artifact source is too large to edit")
+        return b"".join(read_bounded(fd, found.st_size))
+    finally:
+        os.close(fd)
+
+
+def _refused_blob(reason: str) -> None:
+    logger.warning(
+        "Refused an artifact revision blob",
+        extra={"event": "artifact_revision_blob_refused", "reason": reason},
+    )
+
+
+def _blob_bytes(folder: Path, content_hash: str) -> bytes | None:
+    """The saved bytes of one revision, or None when there are none to trust.
+
+    The manifest and the pending record that name a blob are files the agent's
+    code can write. So a blob is read only as ``blobs/<sha256>`` from this
+    artifact's own journal, and a name that isn't 64 lowercase hex characters
+    is never opened: RevisionEntry checks it, and it is checked again here,
+    where it names a file. The blob must be a regular file with one name, no
+    larger than an editable source, and its bytes must match its name.
+    Anything else answers None, as a missing blob does. A read that couldn't
+    be made raises.
+    """
+    if not is_content_hash(content_hash):
+        _refused_blob("invalid_name")
+        return None
+    try:
+        content = read_journal_file(folder, _BLOBS, content_hash, max_bytes=MAX_SOURCE_BYTES)
+    except JournalFileRefused:
+        # read_journal_file logged why.
+        return None
+    if content is not None and _sha(content) != content_hash:
+        _refused_blob("hash_mismatch")
+        return None
+    return content
+
+
+def _store_blob(folder: Path, content_hash: str, content: bytes) -> None:
+    """Save ``content``, whose sha256 is ``content_hash``, unless a blob the
+    server can trust already holds it. A refused blob at that name is replaced
+    by the server's own bytes; the name goes, not the file it pointed to."""
+    if _blob_bytes(folder, content_hash) is None:
+        write_journal_file(folder, _BLOBS, content_hash, content=content)
+
+
+def _content_for_revision(folder: Path, revision: RevisionEntry) -> str:
+    """A revision's saved text. A blob that is missing, refused or not UTF-8
+    answers as a missing revision does, so a route returns 404 and none of it."""
+    content = _blob_bytes(folder, revision.content_hash)
+    if content is not None:
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    raise FileNotFoundError("Revision not found")
 
 
 def _new_revision(
-    manifest: dict,
+    manifest: Manifest,
     *,
     artifact_id: str,
     rel_path: str,
@@ -340,62 +478,150 @@ def _new_revision(
     base_revision_id: str | None,
     conversation_id: str | None = None,
     comment_thread_ids: list[str] | None = None,
-) -> dict:
-    content_hash = _sha(content)
-    revisions = manifest["revisions"]
-    return {
-        "id": str(uuid.uuid4()),
-        "number": (int(revisions[-1].get("number", 0)) + 1) if revisions else 1,
-        "artifactId": artifact_id,
-        "path": rel_path,
-        "createdAt": _now(),
-        "actor": {"kind": actor_kind, "id": actor_id},
-        "summary": (summary or "Updated artifact").strip()[:240],
-        "baseRevisionId": base_revision_id,
-        "contentHash": content_hash,
-        "bytes": len(content),
-        "conversationId": conversation_id,
-        "commentThreadIds": list(dict.fromkeys(comment_thread_ids or [])),
-    }
+    schedule_id: str | None = None,
+) -> RevisionEntry:
+    revisions = manifest.revisions
+    # Set only when present, so other revisions keep writing no scheduleId.
+    extra = {"schedule_id": schedule_id} if schedule_id else {}
+    return RevisionEntry(
+        id=str(uuid.uuid4()),
+        number=revisions[-1].number + 1 if revisions else 1,
+        artifact_id=artifact_id,
+        path=rel_path,
+        created_at=_now(),
+        actor=RevisionActor(kind=actor_kind, id=actor_id),
+        summary=(summary or "Updated artifact").strip()[:240],
+        base_revision_id=base_revision_id,
+        content_hash=_sha(content),
+        size=len(content),
+        conversation_id=conversation_id,
+        comment_thread_ids=list(dict.fromkeys(comment_thread_ids or [])),
+        **extra,
+    )
 
 
-def _persist_revision(folder: Path, manifest: dict, entry: dict, content: bytes) -> dict:
+def _prune_orphan_blobs(folder: Path, revisions: list[RevisionEntry]) -> None:
+    retained_hashes = {item.content_hash for item in revisions}
+    try:
+        prune_journal_folder(folder, _BLOBS, keep=retained_hashes)
+    except OSError:
+        # The manifest is already durable; orphan cleanup is best-effort.
+        pass
+
+
+def _persist_revision(
+    folder: Path, manifest: Manifest, entry: RevisionEntry, content: bytes
+) -> RevisionEntry:
     """Persist an idempotent revision entry and its content-addressed blob."""
-    content_hash = str(entry.get("contentHash") or "")
-    if content_hash != _sha(content):
+    if entry.content_hash != _sha(content):
         raise RevisionValidationError("Revision content hash is invalid")
-    blob = _journal(folder) / "blobs" / content_hash
-    if not blob.exists():
-        _atomic_bytes(blob, content, mode=0o600)
-    elif _sha(blob.read_bytes()) != content_hash:
-        raise RevisionValidationError("Stored revision content is corrupt")
-    revisions = manifest["revisions"]
-    existing = next((item for item in revisions if item.get("id") == entry.get("id")), None)
+    _store_blob(folder, entry.content_hash, content)
+    existing = manifest.revision(entry.id)
     if existing is not None:
         return existing
-    if revisions and int(entry.get("number", 0)) <= int(revisions[-1].get("number", 0)):
-        entry = {**entry, "number": int(revisions[-1].get("number", 0)) + 1}
+    revisions = manifest.revisions
+    if revisions and entry.number <= revisions[-1].number:
+        entry = entry.model_copy(update={"number": revisions[-1].number + 1})
     revisions.append(entry)
     pruned = len(revisions) > MAX_REVISIONS
     if pruned:
         del revisions[:-MAX_REVISIONS]
     _write_manifest(folder, manifest)
     if pruned:
-        retained_hashes = {str(item.get("contentHash")) for item in revisions}
-        try:
-            blobs = (_journal(folder) / "blobs").iterdir()
-            for path in blobs:
-                if path.name not in retained_hashes:
-                    path.unlink(missing_ok=True)
-        except OSError:
-            # The manifest is already durable; orphan cleanup is best-effort.
-            pass
+        _prune_orphan_blobs(folder, revisions)
+    return entry
+
+
+def _has_comment_on(folder: Path, revision_id: str | None) -> bool:
+    """Whether a desktop comment thread was left on this revision.
+
+    An unreadable journal answers yes: keeping one revision too many is
+    cheaper than overwriting the content someone commented on.
+    """
+    try:
+        threads = read_journal_json(folder, COMMENTS_JOURNAL_NAME)
+    except (OSError, ValueError):
+        return True
+    if threads is None:
+        return False
+    if not isinstance(threads, list):
+        return True
+    return any(
+        isinstance(thread, dict)
+        and isinstance(thread.get("payload"), dict)
+        and thread["payload"].get("revision_id") == revision_id
+        for thread in threads
+    )
+
+
+def _comments_live_in_the_cloud(folder: Path, scope: TenantScope | None) -> bool:
+    """Keep revisions whenever the local journal cannot see their comments."""
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.services.comments_scope import published_comments_route
+
+    if get_app_settings().tenancy_mode == "org" or (scope is not None and scope.org_mode):
+        return True
+    try:
+        return published_comments_route(str(folder), scope=scope) is not None
+    except Exception:
+        logger.warning(
+            "Could not read an artifact's publication record; its refresh keeps the last revision",
+            exc_info=True,
+        )
+        return True
+
+
+def _refresh_replaces_head(
+    folder: Path, head: RevisionEntry | None, rel_path: str, schedule_id: str | None,
+    scope: TenantScope | None,
+) -> bool:
+    """Whether a scheduled refresh may overwrite the head instead of adding a
+    revision.
+
+    Only the same schedule's own previous refresh qualifies, so a person's
+    save, a chat edit or another schedule in between always keeps its
+    revision. A head that comments or a pending repair point at is kept too,
+    since replacing it would leave them referring to content that is gone.
+    So is every head of an artifact whose comments live in the cloud, where
+    the local journal can't tell.
+    """
+    if not schedule_id or head is None:
+        return False
+    if head.actor is None or head.actor.kind != "agent" or head.schedule_id != schedule_id:
+        return False
+    if head.comment_thread_ids:
+        return False
+    if any(
+        head.id in (repair.base_revision_id, repair.revision_id)
+        for repair in _actionable_repairs_for_path(folder, rel_path)
+    ):
+        return False
+    if _comments_live_in_the_cloud(folder, scope):
+        return False
+    return not _has_comment_on(folder, head.id)
+
+
+def _replace_head_revision(
+    folder: Path, manifest: Manifest, head: RevisionEntry, entry: RevisionEntry, content: bytes
+) -> RevisionEntry:
+    """Swap the head revision for `entry`, keeping its place in history.
+
+    The replacement gets a new id, so an editor still holding the old head
+    as its save token gets a conflict instead of overwriting fresher data.
+    """
+    _store_blob(folder, entry.content_hash, content)
+    entry = entry.model_copy(update={"number": head.number, "base_revision_id": head.base_revision_id})
+    revisions = manifest.revisions
+    index = next(i for i, item in enumerate(revisions) if item is head)
+    revisions[index] = entry
+    _write_manifest(folder, manifest)
+    _prune_orphan_blobs(folder, revisions)
     return entry
 
 
 def _append_revision(
     folder: Path,
-    manifest: dict,
+    manifest: Manifest,
     *,
     artifact_id: str,
     rel_path: str,
@@ -406,7 +632,7 @@ def _append_revision(
     base_revision_id: str | None,
     conversation_id: str | None = None,
     comment_thread_ids: list[str] | None = None,
-) -> dict:
+) -> RevisionEntry:
     entry = _new_revision(
         manifest,
         artifact_id=artifact_id,
@@ -422,58 +648,69 @@ def _append_revision(
     return _persist_revision(folder, manifest, entry, content)
 
 
+def _abandon_pending(folder: Path, reason: str) -> None:
+    logger.warning(
+        "Abandoned an artifact's pending source write",
+        extra={"event": "artifact_pending_write_abandoned", "reason": reason},
+    )
+    _clear_pending(folder)
+
+
 def _recover_pending_source_write(folder: Path) -> None:
     """Finish or safely abandon a source/revision transaction after a crash.
 
     The artifact lock must be held. A pending edit is completed only while its
     recorded base is still the manifest head and the source is either the old
     or intended content. An unrelated external write always wins.
+
+    The record is a file the agent's code can write, so it is checked before
+    anything it names is opened. One the server couldn't have written is
+    abandoned: a record that fails PendingSourceWrite, a source path outside
+    the artifact's editable files, or a blob the server doesn't trust. The
+    server saves the blob before the record, so a real crash never leaves one
+    of those behind. A read that couldn't be made raises and keeps the record
+    for the next request.
     """
-    pending_path = _pending_path(folder)
     try:
-        pending = json.loads(pending_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+        raw = read_journal_json(folder, _PENDING, max_bytes=MAX_JOURNAL_RECORD_BYTES)
+    except (JournalFileRefused, ValueError):
+        _abandon_pending(folder, "unreadable")
         return
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RevisionValidationError("Pending artifact edit is unreadable") from exc
-    if not isinstance(pending, dict) or pending.get("version") != 1:
-        raise RevisionValidationError("Pending artifact edit is invalid")
-    entry = pending.get("revision")
-    rel_path = pending.get("path")
-    before_hash = pending.get("beforeContentHash")
-    if not isinstance(entry, dict) or not isinstance(rel_path, str) or entry.get("path") != rel_path:
-        raise RevisionValidationError("Pending artifact edit is invalid")
-    parts = Path(rel_path).parts
-    if Path(rel_path).is_absolute() or ".." in parts or JOURNAL_DIRNAME in parts:
-        raise RevisionValidationError("Pending artifact edit path is invalid")
-    target = (folder / rel_path).resolve(strict=False)
+    if raw is None:
+        return
     try:
-        target.relative_to(folder.resolve())
-        content = (_journal(folder) / "blobs" / str(entry.get("contentHash") or "")).read_bytes()
-        current = target.read_bytes()
-    except (OSError, ValueError) as exc:
-        raise RevisionValidationError("Pending artifact edit cannot be recovered") from exc
-    if _sha(content) != entry.get("contentHash"):
-        raise RevisionValidationError("Pending artifact edit content is invalid")
+        pending = PendingSourceWrite.model_validate(raw)
+    except ValidationError:
+        _abandon_pending(folder, "invalid")
+        return
+    entry = pending.revision
+    content = _blob_bytes(folder, entry.content_hash)
+    if content is None:
+        _abandon_pending(folder, "blob_refused")
+        return
+    try:
+        target, _ = resolve_source(folder, {}, pending.path)
+        current = _read_source(target)
+    except (FileNotFoundError, ValueError):
+        _abandon_pending(folder, "source_unavailable")
+        return
 
     manifest = _read_manifest(folder)
-    revisions = manifest["revisions"]
-    if any(item.get("id") == entry.get("id") for item in revisions):
+    if manifest.revision(entry.id) is not None:
         # The commit reached the manifest. A later external source edit must not
         # be overwritten merely because cleanup was interrupted.
         _clear_pending(folder)
         return
 
-    latest = next((item for item in reversed(revisions) if item.get("path") == rel_path), None)
-    latest_id = latest.get("id") if latest else None
+    latest_id = _head_revision_id(manifest, pending.path)
     current_hash = _sha(current)
-    if latest_id != entry.get("baseRevisionId") or current_hash not in {
-        before_hash,
-        entry.get("contentHash"),
+    if latest_id != entry.base_revision_id or current_hash not in {
+        pending.before_content_hash,
+        entry.content_hash,
     }:
         _clear_pending(folder)
         return
-    if current_hash == before_hash:
+    if current_hash == pending.before_content_hash:
         _atomic_bytes(target, content, mode=target.stat().st_mode & 0o777)
     _persist_revision(folder, manifest, entry, content)
     _clear_pending(folder)
@@ -481,7 +718,7 @@ def _recover_pending_source_write(folder: Path) -> None:
 
 def _commit_source_revision(
     folder: Path,
-    manifest: dict,
+    manifest: Manifest,
     target: Path,
     *,
     artifact_id: str,
@@ -494,7 +731,7 @@ def _commit_source_revision(
     base_revision_id: str,
     conversation_id: str | None = None,
     comment_thread_ids: list[str] | None = None,
-) -> dict:
+) -> RevisionEntry:
     """Atomically couple a source replacement to its attributed revision."""
     entry = _new_revision(
         manifest,
@@ -508,17 +745,15 @@ def _commit_source_revision(
         conversation_id=conversation_id,
         comment_thread_ids=comment_thread_ids,
     )
-    blob = _journal(folder) / "blobs" / entry["contentHash"]
-    if not blob.exists():
-        _atomic_bytes(blob, content, mode=0o600)
+    _store_blob(folder, entry.content_hash, content)
     _write_pending(
         folder,
-        {
-            "version": 1,
-            "path": rel_path,
-            "beforeContentHash": _sha(before_content),
-            "revision": entry,
-        },
+        PendingSourceWrite(
+            version=1,
+            path=rel_path,
+            before_content_hash=_sha(before_content),
+            revision=entry,
+        ),
     )
     _atomic_bytes(target, content, mode=target.stat().st_mode & 0o777)
     _persist_revision(folder, manifest, entry, content)
@@ -526,25 +761,51 @@ def _commit_source_revision(
     return entry
 
 
+@dataclass(frozen=True)
+class _Source:
+    """An editable source as read under the lock, with its head revision."""
+
+    artifact_id: str
+    path: str
+    content: str
+    content_type: str
+    revision: RevisionEntry
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "artifactId": self.artifact_id,
+            "path": self.path,
+            "content": self.content,
+            "contentType": self.content_type,
+            "revision": self.revision.to_json(),
+        }
+
+
+@dataclass(frozen=True)
+class _RevisionText:
+    """One revision with its saved text."""
+
+    revision: RevisionEntry
+    content: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {**self.revision.to_json(), "content": self.content}
+
+
 def _current_source_locked(
     folder: Path, metadata: dict, artifact_id: str, rel_path: str | None = None
-) -> dict:
+) -> _Source:
     """Read/capture source while the caller holds the artifact revision lock."""
     _recover_pending_source_write(folder)
     target, relative = resolve_source(folder, metadata, rel_path)
-    content = target.read_bytes()
-    if len(content) > MAX_SOURCE_BYTES:
-        raise RevisionValidationError("Artifact source is too large to edit")
+    content = _read_source(target)
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise RevisionValidationError("Artifact source is not UTF-8 text") from exc
     manifest = _read_manifest(folder)
-    latest = next(
-        (r for r in reversed(manifest["revisions"]) if r.get("path") == relative),
-        None,
-    )
-    if latest is None or latest.get("contentHash") != _sha(content):
+    latest = manifest.head(relative)
+    if latest is None or latest.content_hash != _sha(content):
         latest = _append_revision(
             folder,
             manifest,
@@ -554,21 +815,21 @@ def _current_source_locked(
             actor_kind="system",
             actor_id=None,
             summary="Captured current draft",
-            base_revision_id=latest.get("id") if latest else None,
+            base_revision_id=latest.id if latest else None,
         )
-    return {
-        "artifactId": artifact_id,
-        "path": relative,
-        "content": text,
-        "contentType": target.suffix.lower().lstrip("."),
-        "revision": latest,
-    }
+    return _Source(
+        artifact_id=artifact_id,
+        path=relative,
+        content=text,
+        content_type=target.suffix.lower().lstrip("."),
+        revision=latest,
+    )
 
 
 def current_source(folder: Path, metadata: dict, artifact_id: str, rel_path: str | None = None) -> dict:
     """Read source plus the revision token required by a subsequent save."""
     with artifact_lock(folder):
-        return _current_source_locked(folder, metadata, artifact_id, rel_path)
+        return _current_source_locked(folder, metadata, artifact_id, rel_path).to_json()
 
 
 def current_workspace(
@@ -584,11 +845,11 @@ def current_workspace(
         source = _current_source_locked(folder, metadata, artifact_id, rel_path)
         manifest = _read_manifest(folder)
         revisions = [
-            revision
-            for revision in manifest["revisions"]
-            if revision.get("path") == source["path"]
+            revision.to_json()
+            for revision in reversed(manifest.revisions)
+            if revision.path == source.path
         ]
-        return {**source, "revisions": list(reversed(revisions))}
+        return {**source.to_json(), "revisions": revisions}
 
 
 def save_source(
@@ -611,13 +872,10 @@ def save_source(
     with artifact_lock(folder):
         _recover_pending_source_write(folder)
         target, relative = resolve_source(folder, metadata, rel_path)
-        existing = target.read_bytes()
+        existing = _read_source(target)
         manifest = _read_manifest(folder)
-        latest = next(
-            (r for r in reversed(manifest["revisions"]) if r.get("path") == relative),
-            None,
-        )
-        if latest is None or latest.get("contentHash") != _sha(existing):
+        latest = manifest.head(relative)
+        if latest is None or latest.content_hash != _sha(existing):
             latest = _append_revision(
                 folder,
                 manifest,
@@ -627,12 +885,17 @@ def save_source(
                 actor_kind="system",
                 actor_id=None,
                 summary="Captured concurrent draft change",
-                base_revision_id=latest.get("id") if latest else None,
+                base_revision_id=latest.id if latest else None,
             )
-        if latest.get("id") != expected_revision_id:
-            raise RevisionConflict(latest)
-        if latest.get("contentHash") == _sha(encoded):
-            return {"artifactId": artifact_id, "path": relative, "content": content, "revision": latest}
+        if latest.id != expected_revision_id:
+            raise RevisionConflict(latest.to_json())
+        if latest.content_hash == _sha(encoded):
+            return {
+                "artifactId": artifact_id,
+                "path": relative,
+                "content": content,
+                "revision": latest.to_json(),
+            }
 
         entry = _commit_source_revision(
             folder,
@@ -645,39 +908,53 @@ def save_source(
             actor_kind=actor_kind,
             actor_id=actor_id,
             summary=summary,
-            base_revision_id=latest.get("id"),
+            base_revision_id=latest.id,
             conversation_id=conversation_id,
             comment_thread_ids=comment_thread_ids,
         )
-        return {"artifactId": artifact_id, "path": relative, "content": content, "revision": entry}
+        return {
+            "artifactId": artifact_id,
+            "path": relative,
+            "content": content,
+            "revision": entry.to_json(),
+        }
 
 
 def list_revisions(folder: Path, *, rel_path: str | None = None) -> list[dict]:
     with artifact_lock(folder):
         _recover_pending_source_write(folder)
         manifest = _read_manifest(folder)
-        revisions = manifest["revisions"]
-        if rel_path is not None:
-            revisions = [r for r in revisions if r.get("path") == rel_path]
-        return list(reversed(revisions))
+        return [
+            revision.to_json()
+            for revision in reversed(manifest.revisions)
+            if rel_path is None or revision.path == rel_path
+        ]
 
 
-def _revision_with_content_locked(folder: Path, revision_id: str) -> dict:
-    manifest = _read_manifest(folder)
-    revision = next((r for r in manifest["revisions"] if r.get("id") == revision_id), None)
+def _revision_with_content_locked(folder: Path, revision_id: str | None) -> _RevisionText:
+    revision = _read_manifest(folder).revision(revision_id)
     if revision is None:
         raise FileNotFoundError("Revision not found")
-    return {**revision, "content": _content_for_revision(folder, revision)}
+    return _RevisionText(revision=revision, content=_content_for_revision(folder, revision))
 
 
 def revision_with_content(folder: Path, revision_id: str) -> dict:
     with artifact_lock(folder):
         _recover_pending_source_write(folder)
-        return _revision_with_content_locked(folder, revision_id)
+        return _revision_with_content_locked(folder, revision_id).to_json()
 
 
-def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) -> dict | None:
-    """Record an agent edit and finish repair handoffs attributed to this turn."""
+def capture_agent_revision(
+    folder: Path, *, conversation_id: str | None = None, schedule_id: str | None = None,
+    scope: TenantScope | None = None,
+) -> dict | None:
+    """Record an agent edit and finish repair handoffs attributed to this turn.
+
+    `schedule_id` is set only for a turn the scheduler started. Its edit is
+    recorded against that schedule, and replaces the schedule's own previous
+    refresh rather than adding to history, so a frequent refresh cannot push
+    real edits out of the bounded revision list.
+    """
     from cowork.services.artifact_identity import ensure_full_id
 
     try:
@@ -685,68 +962,86 @@ def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) 
         with artifact_lock(folder):
             _recover_pending_source_write(folder)
             target, relative = resolve_source(folder, metadata)
-            content = target.read_bytes()
-            if len(content) > MAX_SOURCE_BYTES:
-                return None
+            content = _read_source(target)
             content.decode("utf-8")
             manifest = _read_manifest(folder)
-            latest = next(
-                (r for r in reversed(manifest["revisions"]) if r.get("path") == relative),
-                None,
-            )
-            latest_id = latest.get("id") if latest else None
+            latest = manifest.head(relative)
+            latest_id = latest.id if latest else None
             turn_repairs = [
                 repair
                 for repair in _repair_records(folder)
-                if repair.get("status") == "queued"
-                and repair.get("conversationId") == conversation_id
+                if repair.status == "queued" and repair.conversation_id == conversation_id
             ]
-            queued = [r for r in turn_repairs if r.get("path") == relative]
+            queued = [r for r in turn_repairs if r.path == relative]
             # The primary can move between minting a handoff and this capture
             # (metadata["primary"] rewritten, or resolve_source's sorted
             # fallback picking a file the turn created). A handoff left on the
             # old path would never be finished by any later turn either, so it
             # ends here rather than gating that path forever.
-            for repair in (r for r in turn_repairs if r.get("path") != relative):
-                repair["status"] = "conflict"
-                repair["updatedAt"] = _now()
+            for repair in (r for r in turn_repairs if r.path != relative):
+                repair.status = "conflict"
+                repair.updated_at = _now()
                 _write_repair(folder, repair)
-            if latest is not None and latest.get("contentHash") == _sha(content):
+            if latest is not None and latest.content_hash == _sha(content):
+                if (
+                    schedule_id
+                    and latest.actor is not None
+                    and latest.actor.kind == "system"
+                    and latest.summary == "Captured current draft"
+                ):
+                    # A viewer may capture the write before the turn ends.
+                    # Keep its id: comments and editors may already hold it.
+                    previous = manifest.revision(latest.base_revision_id)
+                    latest.actor = RevisionActor(kind="agent", id=None)
+                    latest.schedule_id = schedule_id
+                    latest.conversation_id = conversation_id
+                    latest.summary = "Scheduled task updated artifact"
+                    if (
+                        not queued
+                        and previous is not None
+                        and previous.path == relative
+                        and _refresh_replaces_head(folder, previous, relative, schedule_id, scope)
+                    ):
+                        latest.number = previous.number
+                        latest.base_revision_id = previous.base_revision_id
+                        manifest.revisions.remove(previous)
+                    _write_manifest(folder, manifest)
+                    _prune_orphan_blobs(folder, manifest.revisions)
                 _finish_queued_repairs(
                     folder,
                     queued,
                     matching_base_id=latest_id,
                     revision_id=None,
                 )
-                return latest
-            matching = [
-                repair for repair in queued
-                if repair.get("baseRevisionId") == latest_id
-            ]
-            entry = _append_revision(
-                folder,
+                return latest.to_json()
+            matching = [repair for repair in queued if repair.base_revision_id == latest_id]
+            entry = _new_revision(
                 manifest,
                 artifact_id=artifact_id,
                 rel_path=relative,
                 content=content,
                 actor_kind="agent",
                 actor_id=None,
-                summary="Agent updated artifact",
+                summary="Scheduled task updated artifact" if schedule_id else "Agent updated artifact",
                 base_revision_id=latest_id,
                 conversation_id=conversation_id,
                 comment_thread_ids=[
-                    repair["commentThreadId"]
+                    repair.comment_thread_id
                     for repair in matching
-                    if repair.get("commentThreadId")
+                    if repair.comment_thread_id
                 ],
+                schedule_id=schedule_id,
             )
+            if not queued and _refresh_replaces_head(folder, latest, relative, schedule_id, scope):
+                return _replace_head_revision(folder, manifest, latest, entry, content).to_json()
+            entry = _persist_revision(folder, manifest, entry, content)
             _finish_queued_repairs(
                 folder,
                 queued,
                 matching_base_id=latest_id,
-                revision_id=entry["id"],
+                revision_id=entry.id,
             )
-            return entry
+            return entry.to_json()
     except (OSError, UnicodeDecodeError, ValueError, RevisionValidationError, TimeoutError):
         return None
 
@@ -819,35 +1114,35 @@ def create_agent_repair(
     """Persist a structured repair handoff and return the exact agent prompt."""
     with artifact_lock(folder):
         source = _current_source_locked(folder, metadata, artifact_id)
-        current = source["revision"]
-        if current.get("id") != expected_revision_id:
-            raise RevisionConflict(current)
+        current = source.revision
+        if current.id != expected_revision_id:
+            raise RevisionConflict(current.to_json())
         manifest = _read_manifest(folder)
-        blocking, dead = _partition_actionable_repairs(folder, manifest, source["path"])
-        if blocking:
-            raise RepairAlreadyPending(blocking[0])
-        for repair, finished_status in dead:
-            repair["status"] = finished_status
-            repair["updatedAt"] = _now()
-            _write_repair(folder, repair)
+        partition = _partition_actionable_repairs(folder, manifest, source.path)
+        if partition.blocking:
+            raise RepairAlreadyPending(partition.blocking[0].to_json())
+        for finished in partition.finished:
+            finished.repair.status = finished.status
+            finished.repair.updated_at = _now()
+            _write_repair(folder, finished.repair)
         repair_id = str(uuid.uuid4())
-        repair = {
-            "id": repair_id,
-            "artifactId": artifact_id,
-            "path": source["path"],
-            "baseRevisionId": current["id"],
-            "baseContentHash": current["contentHash"],
-            "commentThreadId": comment_thread_id,
-            "selector": selector,
-            "thread": thread,
-            "conversationId": conversation_id,
-            "status": "queued",
-            "revisionId": None,
-            "createdAt": _now(),
-            "updatedAt": _now(),
-        }
+        repair = AgentRepair(
+            id=repair_id,
+            artifact_id=artifact_id,
+            path=source.path,
+            base_revision_id=current.id,
+            base_content_hash=current.content_hash,
+            comment_thread_id=comment_thread_id,
+            selector=selector,
+            thread=thread,
+            conversation_id=conversation_id,
+            status="queued",
+            revision_id=None,
+            created_at=_now(),
+            updated_at=_now(),
+        )
         _write_repair(folder, repair)
-    preview_lines = _preview_error_lines(preview_errors, source["path"])
+    preview_lines = _preview_error_lines(preview_errors, source.path)
     preview_block = ""
     if preview_lines:
         preview_block = (
@@ -860,10 +1155,10 @@ def create_agent_repair(
         "Address this artifact review thread. Work on the existing artifact source; "
         "do not create a replacement artifact and do not resolve the comment yourself.\n\n"
         f"Artifact id: {artifact_id}\n"
-        f"Source path: {source['path']}\n"
+        f"Source path: {source.path}\n"
         "Find the artifact with `list_artifacts` by passing this artifact id in "
         "`match`; `Source path` is relative to the artifact folder.\n"
-        f"Base revision: {current['id']}\n"
+        f"Base revision: {current.id}\n"
         f"Repair id: {repair_id}\n"
         f"Selected element: {selector or 'General artifact feedback'}\n"
         f"{preview_block}"
@@ -872,7 +1167,7 @@ def create_agent_repair(
         "Make the smallest coherent fix, preserve unrelated behavior and styling, "
         "and verify the artifact still renders."
     )
-    return {"repair": repair, "prompt": prompt}
+    return {"repair": repair.to_json(), "prompt": prompt}
 
 
 def agent_repair_detail(folder: Path, repair_id: str) -> dict:
@@ -884,14 +1179,14 @@ def agent_repair_detail(folder: Path, repair_id: str) -> dict:
         # caller left to infer supersession from its own copy of head cannot:
         # a repair whose revision is NEWER than that copy looks identical to
         # one the artifact has moved past.
-        repair = {**repair, "superseded": _is_superseded(_read_manifest(folder), repair)}
-        result = {"repair": repair}
-        if repair.get("status") == "ready" and repair.get("revisionId"):
-            before = _revision_with_content_locked(folder, repair["baseRevisionId"])
-            after = _revision_with_content_locked(folder, repair["revisionId"])
-            if before.get("path") != repair.get("path") or after.get("path") != repair.get("path"):
+        superseded = _is_superseded(_read_manifest(folder), repair)
+        result: dict[str, Any] = {"repair": {**repair.to_json(), "superseded": superseded}}
+        if repair.status == "ready" and repair.revision_id:
+            before = _revision_with_content_locked(folder, repair.base_revision_id)
+            after = _revision_with_content_locked(folder, repair.revision_id)
+            if before.revision.path != repair.path or after.revision.path != repair.path:
                 raise RevisionValidationError("Agent repair revision path is inconsistent")
-            result["compare"] = {"before": before, "after": after}
+            result["compare"] = {"before": before.to_json(), "after": after.to_json()}
         return result
 
 
@@ -910,8 +1205,8 @@ def active_agent_repair(folder: Path, rel_path: str | None = None) -> dict | Non
     active = [
         repair
         for repair in _repair_records(folder)
-        if repair.get("status") in {"queued", "ready"}
-        and (rel_path is None or repair.get("path") == rel_path)
+        if repair.status in {"queued", "ready"}
+        and (rel_path is None or repair.path == rel_path)
     ]
     if not active:
         return None
@@ -919,12 +1214,12 @@ def active_agent_repair(folder: Path, rel_path: str | None = None) -> dict | Non
     # A superseded repair would otherwise stay the active one for good, since
     # nothing moves it on: prefer one the owner can still act on, and fall back
     # to a superseded record only when it is all there is.
-    def _newest(candidates: list[dict]) -> dict | None:
-        return max(candidates, key=lambda r: str(r.get("createdAt") or ""), default=None)
+    def _newest(candidates: list[AgentRepair]) -> AgentRepair | None:
+        return max(candidates, key=lambda r: r.created_at or "", default=None)
 
     live = [repair for repair in active if not _is_superseded(manifest, repair)]
     newest = _newest(live) or _newest(active)
-    return {**newest, "superseded": _is_superseded(manifest, newest)}
+    return {**newest.to_json(), "superseded": _is_superseded(manifest, newest)}
 
 
 def cancel_agent_repair(folder: Path, repair_id: str, *, discard_ready: bool = False) -> dict:
@@ -938,17 +1233,17 @@ def cancel_agent_repair(folder: Path, repair_id: str, *, discard_ready: bool = F
     """
     with artifact_lock(folder):
         repair = _read_repair(folder, repair_id)
-        if repair.get("status") in {"cancelled", "discarded"}:
-            return repair
-        if repair.get("status") == "queued":
-            repair["status"] = "cancelled"
-        elif discard_ready and repair.get("status") == "ready":
-            repair["status"] = "discarded"
+        if repair.status in {"cancelled", "discarded"}:
+            return repair.to_json()
+        if repair.status == "queued":
+            repair.status = "cancelled"
+        elif discard_ready and repair.status == "ready":
+            repair.status = "discarded"
         else:
             raise RevisionValidationError("Only a queued agent repair can be cancelled")
-        repair["updatedAt"] = _now()
+        repair.updated_at = _now()
         _write_repair(folder, repair)
-        return repair
+        return repair.to_json()
 
 
 def release_repairs_for_comment(folder: Path, comment_thread_id: str) -> list[dict]:
@@ -967,14 +1262,14 @@ def release_repairs_for_comment(folder: Path, comment_thread_id: str) -> list[di
     released: list[dict] = []
     with artifact_lock(folder):
         for repair in _repair_records(folder):
-            if repair.get("commentThreadId") != comment_thread_id:
+            if repair.comment_thread_id != comment_thread_id:
                 continue
-            if repair.get("status") != "ready":
+            if repair.status != "ready":
                 continue
-            repair["status"] = "discarded"
-            repair["updatedAt"] = _now()
+            repair.status = "discarded"
+            repair.updated_at = _now()
             _write_repair(folder, repair)
-            released.append(repair)
+            released.append(repair.to_json())
     return released
 
 
@@ -1001,34 +1296,33 @@ def finalize_agent_repair(
         raise RevisionValidationError("Invalid repair status")
     with artifact_lock(folder):
         repair = _read_repair(folder, repair_id)
-        if repair.get("status") == decision:
+        if repair.status == decision:
             # A retried or double-clicked decision that already landed must not
             # report a failure for work the user completed.
-            return repair
-        if repair.get("status") != "ready":
+            return repair.to_json()
+        if repair.status != "ready":
             raise RevisionValidationError("Agent repair is not ready for review")
-        source = _current_source_locked(folder, metadata, artifact_id, repair.get("path"))
-        current = source["revision"]
+        source = _current_source_locked(folder, metadata, artifact_id, repair.path)
+        current = source.revision
         if (
             decision == "rejected"
-            and current.get("baseRevisionId") == repair.get("revisionId")
-            and current.get("summary") == "Rejected agent suggestion"
-            and repair.get("commentThreadId") in current.get("commentThreadIds", [])
+            and current.base_revision_id == repair.revision_id
+            and current.summary == "Rejected agent suggestion"
+            and repair.comment_thread_id in current.comment_thread_ids
         ):
             # The source/revision transaction committed but a process failure
             # interrupted the final repair-status write. Retrying the decision
             # completes that last idempotent step instead of reporting a false
             # edit conflict and stranding the repair in `ready`.
-            repair["status"] = decision
-            repair["updatedAt"] = _now()
+            repair.status = decision
+            repair.updated_at = _now()
             _write_repair(folder, repair)
-            return repair
+            return repair.to_json()
         manifest = _read_manifest(folder)
         if decision == "accepted":
             if not any(
-                entry.get("id") == repair.get("revisionId")
-                and entry.get("path") == repair.get("path")
-                for entry in manifest["revisions"]
+                entry.id == repair.revision_id and entry.path == repair.path
+                for entry in manifest.revisions
             ):
                 # History is pruned past MAX_REVISIONS, so the agent's revision
                 # can age out. There is nothing left to keep, only to discard.
@@ -1042,37 +1336,36 @@ def finalize_agent_repair(
             # looking at", and an unconfirmed accept is refused.
             if _is_superseded(manifest, repair) and (
                 expected_head_revision_id is None
-                or expected_head_revision_id != current.get("id")
+                or expected_head_revision_id != current.id
             ):
-                raise RepairSupersededConflict(current)
+                raise RepairSupersededConflict(current.to_json())
         elif expected_head_revision_id is not None:
-            if current.get("id") != expected_head_revision_id:
-                raise RepairSupersededConflict(current)
-        elif current.get("id") != repair.get("revisionId"):
-            raise RepairSupersededConflict(current)
+            if current.id != expected_head_revision_id:
+                raise RepairSupersededConflict(current.to_json())
+        elif current.id != repair.revision_id:
+            raise RepairSupersededConflict(current.to_json())
 
         if decision == "rejected":
-            before = _revision_with_content_locked(folder, repair["baseRevisionId"])
-            if before.get("path") != repair.get("path"):
+            before = _revision_with_content_locked(folder, repair.base_revision_id)
+            if before.revision.path != repair.path:
                 raise RevisionValidationError("Agent repair revision path is inconsistent")
-            encoded = before["content"].encode("utf-8")
-            target, relative = resolve_source(folder, metadata, repair["path"])
+            target, relative = resolve_source(folder, metadata, repair.path)
             _commit_source_revision(
                 folder,
                 manifest,
                 target,
                 artifact_id=artifact_id,
                 rel_path=relative,
-                before_content=source["content"].encode("utf-8"),
-                content=encoded,
+                before_content=source.content.encode("utf-8"),
+                content=before.content.encode("utf-8"),
                 actor_kind="manual",
                 actor_id=actor_id,
                 summary="Rejected agent suggestion",
-                base_revision_id=current["id"],
-                comment_thread_ids=[repair["commentThreadId"]],
+                base_revision_id=current.id,
+                comment_thread_ids=[repair.comment_thread_id] if repair.comment_thread_id else [],
             )
 
-        repair["status"] = decision
-        repair["updatedAt"] = _now()
+        repair.status = decision
+        repair.updated_at = _now()
         _write_repair(folder, repair)
-        return repair
+        return repair.to_json()

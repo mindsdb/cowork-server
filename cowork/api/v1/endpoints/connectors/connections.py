@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import partial
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -11,6 +12,7 @@ from pydantic import BaseModel
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.units import run_db, run_efs, unit_session
 from cowork.schemas.connectors import (
     ConnectionDetailResponse,
     ConnectionSummaryResponse,
@@ -18,6 +20,7 @@ from cowork.schemas.connectors import (
     DirectSaveResponse,
     PatchPickedFilesBody,
 )
+from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
@@ -29,7 +32,7 @@ from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, 
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
-from cowork.services.connectors.specs._registry import registry
+from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 
 _log = logging.getLogger("cowork.connectors.connections")
 router = APIRouter()
@@ -66,12 +69,21 @@ async def list_connections(scope: ScopeDep, request: Request):
         # data ConnectWorkflowView's org-mode connector list reads), so no
         # separate "list connections" endpoint is needed on auth's side.
         catalogue = await auth_proxy.proxy_catalogue(request, OAuthSettings())
+        # The card reads a missing status as healthy, like the local vault's
+        # list, so only the one actionable state is passed on; auth's
+        # "active" would otherwise render as an unknown status.
         return [
-            ConnectionSummaryResponse(engine=c["engine"], name=c["name"], user_label=c.get("user_label"))
+            ConnectionSummaryResponse(
+                engine=c["engine"],
+                name=c["name"],
+                user_label=c.get("user_label"),
+                status="needs_reconnect" if c.get("status") == "needs_reconnect" else None,
+            )
             for item in catalogue.get("items", [])
             for c in item.get("connections", [])
         ]
-    return ConnectionsService(scope).list()
+    specs = await run_db(lambda session: ConnectorCatalog(session).get_connectors(), scope=scope)
+    return ConnectionsService(scope).list(specs)
 
 
 # Non-secret fields surfaced from auth's connection-detail response —
@@ -151,6 +163,7 @@ def validate_and_save_developer_connection(body: DirectSaveRequest, scope: Scope
     using ``/save``.  This route is for the personal-token fallback shown when
     a desktop build has no hosted OAuth client configured.
     """
+    _refuse_sharepoint(body.connector_id, scope)
     try:
         identity = validate_developer_connection(body.connector_id, body.method, body.values)
     except DeveloperCredentialError as exc:
@@ -162,12 +175,21 @@ def validate_and_save_developer_connection(body: DirectSaveRequest, scope: Scope
     return _persist_direct_connection(body, scope, values)
 
 
+def _refuse_sharepoint(connector_id: str, scope: TenantScope) -> None:
+    """Refuse SharePoint here: only its own routes save it, after checking the key with Microsoft."""
+    if connector_id == SHAREPOINT:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=generic_setup_refusal(scope.org_mode))
+
+
 def _persist_direct_connection(
     body: DirectSaveRequest,
     scope: TenantScope,
     values: dict,
 ) -> dict[str, object]:
-    if registry.get_connector(body.connector_id) is None:
+    _refuse_sharepoint(body.connector_id, scope)
+    with unit_session(scope=scope) as session:
+        known = ConnectorCatalog(session).get_connector(body.connector_id)
+    if known is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
     if body.name.strip():
         _refuse_unchangeable(scope, body.connector_id, body.name.strip())
@@ -190,6 +212,7 @@ def _persist_direct_connection(
             body.name,
             values,
             replace_existing=body.replace_existing,
+            spec_form=known.form.model_dump() if known.custom else None,
             default_label=oauth_default_label(values, body.connector_id),
             # HubSpot's MCP connector has no connect-time read/write/none
             # picker (see the HubSpot blueprint tab, Stage 0) — every new
@@ -334,17 +357,28 @@ async def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody,
     "/{engine}/{name}/picked-files/{file_id}",
     dependencies=[Depends(require(AuthenticatedInOrgMode))],
 )
-def delete_picked_file(engine: str, name: str, file_id: str, project: str, scope: ScopeDep):
+async def delete_picked_file(engine: str, name: str, file_id: str, project: str, scope: ScopeDep):
     """Untag one file from `project` — the "un-pick" counterpart to
     patch_picked_files, used by the Project files rail's delete action on
     a Drive reference row. Only removes the file from `project`'s rail;
     if the file is tagged to other projects too, it stays visible there
     (see remove_picked_file's docstring)."""
-    _refuse_unchangeable(scope, engine, name)
-    remaining = ConnectionsService(scope).remove_picked_file(engine, name, file_id, project)
+    # The caller's vault is files on disk, on the shared file store where
+    # hosted, so its read and write run on the file store's threads.
+    remaining = await run_efs(
+        partial(_remove_picked_file, scope=scope, engine=engine, name=name, file_id=file_id, project=project),
+        scope=scope,
+    )
     if remaining is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
     return {"ok": True, "files": remaining}
+
+
+def _remove_picked_file(
+    *, scope: TenantScope, engine: str, name: str, file_id: str, project: str
+) -> list[dict] | None:
+    _refuse_unchangeable(scope, engine, name)
+    return ConnectionsService(scope).remove_picked_file(engine, name, file_id, project)
 
 
 _ACCESS_MODES = {"read", "write", "none"}

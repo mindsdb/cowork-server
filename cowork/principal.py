@@ -68,6 +68,7 @@ HEADER_ORG_RELOAD = "X-Cowork-Organization-Reload"
 _EXEMPT_PATHS = frozenset({
     "/api/v1/health", "/api/v1/health/",
     "/api/v1/health/live",
+    "/api/v1/health/ready",
 })
 
 
@@ -266,24 +267,51 @@ def _is_browser_jwt_request(request: Request) -> bool:
     authorization = request.headers.get("Authorization", "").strip()
     if not authorization.lower().startswith("bearer "):
         return False
-    credential = authorization[7:].strip()
+    return is_session_jwt(authorization[7:].strip())
+
+
+def hub_credential_for(request: Request | None, *, org_mode: bool, org_id: str | None) -> str:
+    """The caller's MindsHub credential for a read or write this server makes
+    as them on a surface that works in hosted org mode and on a local server
+    alike (org branding, the org switcher's icons).
+
+    Hosted org mode: the ``Authorization`` the gateway validated
+    (``caller_bearer``), and only with an org in scope. Never the client-set
+    ``X-MindsHub-Authorization``, which may name another org of the caller's
+    than the one the request is scoped to. Local server: that header, which
+    the desktop app sends with its hub calls (``mindshub_credential``); this
+    server's own ``Authorization`` is never forwarded. Empty without one."""
+    if org_mode:
+        return caller_bearer(request) if org_id else ""
+    return mindshub_credential(request)
+
+
+def is_session_jwt(credential: str) -> bool:
+    """True only for a credential shaped like a user's Keycloak session JWT:
+    three segments, the first a JOSE header. A MindsDB API key (``mdb_``), a
+    turn key and every other opaque service credential are not. Shape only:
+    the service it is forwarded to verifies it."""
     if not credential or credential.lower().startswith("mdb_"):
         return False
     parts = credential.split(".")
     return len(parts) == 3 and all(parts) and _has_jose_header(parts[0])
 
 
-def get_principal(request: Request) -> Principal | None:
-    """FastAPI dependency: the request's Principal, or None in local mode."""
+async def get_principal(request: Request) -> Principal | None:
+    """FastAPI dependency: the request's Principal, or None in local mode.
+
+    A coroutine, so FastAPI runs it on the event loop: it does no I/O, and a
+    sync dependency would take one of anyio's default threads on every
+    authenticated request, the threads sync routes' file store work fills."""
     return getattr(request.state, "principal", None)
 
 
 # Where the desktop shell puts the caller's MindsHub credential, because it
-# cannot use Authorization. See `hub_credential`.
+# cannot use Authorization. See `mindshub_credential`.
 HEADER_HUB_CREDENTIAL = "X-MindsHub-Authorization"
 
 
-def hub_credential(request: Request | None) -> str:
+def mindshub_credential(request: Request | None) -> str:
     """The caller's MindsHub credential, for a read this server makes as them.
 
     Prefers ``X-MindsHub-Authorization`` over ``Authorization``, and the reason is
@@ -299,17 +327,35 @@ def hub_credential(request: Request | None) -> str:
     accepting an identity from one would not be. A caller can present their own
     token or a useless one; neither buys them anything they did not already have.
 
+    **Never for skill or artifact sharing.** The caller can present a
+    credential from another organization of theirs, and the service answers
+    for that organization: its permissions, teams and members. Sharing's reads
+    (skill sharing's viewer, the people and teams a share may name) take
+    ``caller_bearer``, the Authorization the gateway validated and took the
+    request's scope from. Three routes still take this credential: the
+    workspace selector's ``GET /hub/workspaces/`` and ``PUT
+    /hub/workspaces/active`` (cowork.api.v1.endpoints.mindshub_workspaces), and
+    ``GET /hub/usage/``. ``PUT /active`` (set_active_mindshub_workspace) answers
+    403 for a workspace missing from the listing this credential returns,
+    so that listing decides what it stores. The pick it stores grants
+    nothing: the menu shows it only while the listing has it
+    (cowork.services.mindshub_workspaces.resolve_active), and every key mint
+    sends it for the gateway's user and organization, where MindsHub
+    refuses a workspace they hold no grant on and the mint falls back to the
+    default workspace and clears the pick
+    (cowork.turnqueue.auth_keys._request_turn_key).
+
     Deliberately separate from ``caller_bearer``. Folding the header preference
     into that one would let any client steer the credential on the org model
-    catalog fetch too, which reads ``Authorization`` because in org mode the
-    gateway put it there.
+    catalog fetch too, which reads ``Authorization`` because in MindsHub mode
+    the gateway put it there.
 
-    **The fallback is org mode only, and that is a containment rule rather than a
-    tidiness one.** In org mode the ingress put the caller's own JWT in
+    **The fallback is MindsHub mode only, and that is a containment rule rather
+    than a tidiness one.** In MindsHub mode the ingress put the caller's own JWT in
     ``Authorization``, so reading it is correct. On a desktop install nothing
     does: the Electron main process assigns THIS server's bearer to that header
     on every loopback request, so falling back there would forward our own
-    credential to auth. It would be refused, and it would still have left the
+    credential to MindsHub. It would be refused, and it would still have left the
     machine, which is exactly what the main process's own "scoped to our loopback
     origin so it can't leak elsewhere" is supposed to prevent. Empty is the right
     answer instead: the caller has no MindsHub credential, and the surfaces this

@@ -430,6 +430,7 @@ def test_a_reason_from_another_host_is_not_trusted(monkeypatch):
         (429, "included_allowance_exhausted"),
         (429, "free_air_daily_spend_fuse_exceeded"),
         (402, "wallet_empty"),
+        (402, "budget_exceeded"),
     ],
 )
 def test_a_gateway_refusal_with_its_reason_header_stripped_classifies_from_the_body_code(

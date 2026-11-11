@@ -1,16 +1,23 @@
 """Which turn is current for each conversation, readable from any replica.
 
-A lookup table, not a lock. Nothing here decides who may run a turn:
-scratchpad-controller already serialises execution per conversation, and
-whether a turn is still going is answered by its buffer, whose terminal record
-any replica can read.
+A lookup table, not a lock. Nothing here decides who may run a turn: the
+conversation's turn claim does (turn_claim), and RunRegistry.start writes a
+run's entry only once that run holds the claim. Whether a turn is still going
+is answered by its buffer, whose terminal record any replica can read.
 
 This exists so a replica that did not start a turn can still find its turn_id,
 to open the right buffer, its correlation_id, to cancel it, and its org, to
-authorize the caller.
+authorize the caller. ``saved_question`` says the turn saved its question. The
+run stamps it as soon as it saves the question (registry.mark_question_saved)
+and again, with ``released_at``, before it releases its claim.
+RunRegistry.start and turn_claim.acquire read the stamp to refuse a start
+whose history read predates that save (TurnIndexEntry.makes_stale).
+
+Every reader gets the hash as a TurnIndexEntry (get_turn, list_turns).
 
 Keys:
-    cowork:turn:{conversation_id}   HASH turn_id, run_id, correlation_id, org_id, user_id, started_at
+    cowork:turn:{conversation_id}   HASH turn_id, run_id, correlation_id, org_id, user_id, started_at,
+                                         saved_question, released_at
     cowork:turns                    SET of conversation ids with a recorded turn
 """
 from __future__ import annotations
@@ -18,11 +25,14 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Mapping
+from typing import NamedTuple
 
 from pydantic import BaseModel, ConfigDict
 from redis.asyncio import Redis
+from redis.asyncio.client import Pipeline
 from redis.exceptions import WatchError
 
+from cowork.streaming.turn_claim import claim_key
 from cowork.turnqueue.redis_client import get_redis, get_sync_redis
 
 logger = logging.getLogger(__name__)
@@ -31,10 +41,24 @@ logger = logging.getLogger(__name__)
 # "no current turn" rather than as a turn with a missing buffer.
 TURN_INDEX_TTL_SECONDS = 3600
 
+# How long after a turn released its claim its saved-question stamp still
+# refuses a start at its number (TurnIndexEntry.makes_stale). Such a start's
+# request read the history before the save and has not reached
+# RunRegistry.start since. What runs between the two is its routing gate,
+# whose model calls are bounded at seconds (response_routing._GATE_TOTAL_SECONDS,
+# TurnQueueSettings.jev_route_timeout_seconds). A request slower than this
+# past the release is admitted at the stale number. Bounded so that an entry
+# a conversation delete could not forget refuses sends at its number for this
+# long after its turn released its claim, not until the entry expires. A turn
+# whose release wrote no stamp (its process died, or Redis did not answer)
+# has no release time, so its entry refuses them until it expires
+# (TURN_INDEX_TTL_SECONDS after the turn started).
+STALE_START_WINDOW_SECONDS = 300
+
 _TURNS_SET = "cowork:turns"
 
 
-def _turn_key(conversation_id: str) -> str:
+def turn_key(conversation_id: str) -> str:
     return f"cowork:turn:{conversation_id}"
 
 
@@ -42,8 +66,8 @@ class TurnOwner(BaseModel):
     """Who started a recorded turn: its org (a person's partition on a
     trusted-identity deployment) and its user, None where the turn had none.
 
-    Built from a turn's hash in one place (``from_index``), so the owner check
-    never reads the hash's keys itself.
+    A recorded turn's comes from its entry (TurnIndexEntry.owner), so the
+    owner check never reads the hash's keys itself.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -51,10 +75,83 @@ class TurnOwner(BaseModel):
     org_id: str | None
     user_id: str | None
 
+
+class TurnIndexEntry(BaseModel):
+    """A conversation's turn index entry, every field its hash holds. A
+    channel turn's entry has no ``run_id``: no registry handle covers it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    turn_id: int
+    run_id: str | None
+    correlation_id: str
+    org_id: str | None = None
+    user_id: str | None = None
+    # When the entry was recorded, as a Unix time.
+    started_at: float | None = None
+    saved_question: bool = False
+    # When the run released its claim, as a Unix time. None while it holds
+    # it, and when its release wrote no stamp (its process died, or Redis
+    # did not answer).
+    released_at: float | None = None
+
     @classmethod
-    def from_index(cls, turn: Mapping[str, str]) -> TurnOwner:
-        # record_turn writes "" for a missing id.
-        return cls(org_id=turn.get("org_id") or None, user_id=turn.get("user_id") or None)
+    def from_index(cls, turn: Mapping[str, str]) -> TurnIndexEntry:
+        # _queue_record writes "" for a missing org or user id.
+        return cls(
+            turn_id=int(turn["turn_id"]),
+            run_id=turn.get("run_id") or None,
+            correlation_id=turn["correlation_id"],
+            org_id=turn.get("org_id") or None,
+            user_id=turn.get("user_id") or None,
+            started_at=turn.get("started_at") or None,
+            saved_question=turn.get("saved_question") == "1",
+            released_at=turn.get("released_at") or None,
+        )
+
+    @property
+    def owner(self) -> TurnOwner:
+        return TurnOwner(org_id=self.org_id, user_id=self.user_id)
+
+    def makes_stale(self, *, turn_id: int, now: float) -> bool:
+        """Whether a start at ``turn_id`` read the history before this
+        entry's run saved its question: the run saved it at this entry's
+        number, and the start names that number or an earlier one. Only
+        until STALE_START_WINDOW_SECONDS after the run released its claim,
+        with ``now`` the caller's Unix time. A channel turn's entry names no
+        run, so it never does."""
+        return (
+            self.run_id is not None and self.saved_question and turn_id <= self.turn_id
+            and (self.released_at is None or now < self.released_at + STALE_START_WINDOW_SECONDS)
+        )
+
+
+def _queue_record(
+    *,
+    pipe: Pipeline,
+    conversation_id: str,
+    turn_id: int,
+    correlation_id: str,
+    org_id: str | None,
+    user_id: str | None,
+    run_id: str | None,
+) -> None:
+    """Queue the writes that replace a conversation's entry on a MULTI.
+
+    One MULTI, so no reader finds the hash empty between its DELETE and its
+    HSET, which list_turns would read as an expired turn."""
+    key = turn_key(conversation_id)
+    pipe.delete(key)
+    pipe.hset(key, mapping={
+        "turn_id": str(turn_id),
+        "correlation_id": correlation_id,
+        "org_id": org_id or "",
+        "user_id": user_id or "",
+        "started_at": str(time.time()),
+        **({"run_id": run_id} if run_id is not None else {}),
+    })
+    pipe.expire(key, TURN_INDEX_TTL_SECONDS)
+    pipe.sadd(_TURNS_SET, conversation_id)
 
 
 async def record_turn(
@@ -69,43 +166,97 @@ async def record_turn(
 ) -> None:
     """Note this turn as the conversation's current one, replacing any previous.
 
+    For a run that holds the conversation's turn claim (RunRegistry.start). A
+    turn no registry handle covers uses record_channel_turn.
+
     ``client`` lets a caller that already holds a Redis client reuse it, rather
     than this module reaching for a second one.
     """
     r = client or get_redis()
-    key = _turn_key(conversation_id)
-    # One MULTI, so no reader finds the hash empty between its DELETE and its
-    # HSET, which list_turns would read as an expired turn.
     async with r.pipeline(transaction=True) as pipe:
-        pipe.delete(key)
-        pipe.hset(key, mapping={
-            "turn_id": str(turn_id),
-            "correlation_id": correlation_id,
-            "org_id": org_id or "",
-            "user_id": user_id or "",
-            "started_at": str(time.time()),
-            **({"run_id": run_id} if run_id is not None else {}),
-        })
-        pipe.expire(key, TURN_INDEX_TTL_SECONDS)
-        pipe.sadd(_TURNS_SET, conversation_id)
+        _queue_record(
+            pipe=pipe, conversation_id=conversation_id, turn_id=turn_id, correlation_id=correlation_id,
+            org_id=org_id, user_id=user_id, run_id=run_id,
+        )
         await pipe.execute()
 
 
-async def get_turn(conversation_id: str) -> dict | None:
-    turn = await get_redis().hgetall(_turn_key(conversation_id))
-    return dict(turn) if turn else None
+async def record_channel_turn(
+    *,
+    conversation_id: str,
+    turn_id: int,
+    correlation_id: str,
+    org_id: str | None,
+    user_id: str | None,
+    client=None,
+) -> bool:
+    """record_turn for a turn no registry handle covers (a channel turn),
+    unless a run holds the conversation's turn claim. That run's entry is
+    what cancel and answer resolve through, so it is left as it is. True when
+    it wrote the entry."""
+    r = client or get_redis()
+    key = turn_key(conversation_id)
+    claim = claim_key(conversation_id)
+    for _attempt in range(3):
+        try:
+            async with r.pipeline(transaction=True) as pipe:
+                await pipe.watch(claim, key)
+                if await pipe.exists(claim):
+                    return False
+                pipe.multi()
+                _queue_record(
+                    pipe=pipe, conversation_id=conversation_id, turn_id=turn_id, correlation_id=correlation_id,
+                    org_id=org_id, user_id=user_id, run_id=None,
+                )
+                await pipe.execute()
+                return True
+        except WatchError:
+            continue
+    raise WatchError(f"the turn index entry of {conversation_id} kept changing while it was recorded")
+
+
+async def stamp_question(*, conversation_id: str, run_id: str, released: bool, client=None) -> bool:
+    """Note in ``run_id``'s entry that its turn saved its question.
+    ``released`` also notes the time as ``released_at``, for a run about to
+    release its claim. Leaves another run's entry alone, and writes no entry
+    that is gone. True when it wrote."""
+    r = client or get_redis()
+    key = turn_key(conversation_id)
+    fields = {
+        "saved_question": "1",
+        **({"released_at": str(time.time())} if released else {}),
+    }
+    for _attempt in range(3):
+        try:
+            async with r.pipeline(transaction=True) as pipe:
+                await pipe.watch(key)
+                if await pipe.hget(key, "run_id") != run_id:
+                    return False
+                pipe.multi()
+                pipe.hset(key, mapping=fields)
+                await pipe.execute()
+                return True
+        except WatchError:
+            continue
+    raise WatchError(f"the turn index entry of {conversation_id} kept changing while it was stamped")
+
+
+async def get_turn(conversation_id: str) -> TurnIndexEntry | None:
+    """The conversation's entry, or None when it has none."""
+    turn = await get_redis().hgetall(turn_key(conversation_id))
+    return TurnIndexEntry.from_index(turn) if turn else None
 
 
 async def forget_turn(conversation_id: str) -> None:
     r = get_redis()
-    await r.delete(_turn_key(conversation_id))
+    await r.delete(turn_key(conversation_id))
     await r.srem(_TURNS_SET, conversation_id)
 
 
 async def forget_run(conversation_id: str, run_id: str) -> None:
     """Remove abandoned admission without deleting a successor's index entry."""
     r = get_redis()
-    key = _turn_key(conversation_id)
+    key = turn_key(conversation_id)
     try:
         async with r.pipeline(transaction=True) as pipe:
             await pipe.watch(key)
@@ -128,13 +279,27 @@ def forget_turn_sync(conversation_id: str) -> None:
     """
     try:
         r = get_sync_redis()
-        r.delete(_turn_key(conversation_id))
+        r.delete(turn_key(conversation_id))
         r.srem(_TURNS_SET, conversation_id)
     except Exception:
-        logger.warning("Could not forget the turn index entry for %s", conversation_id, exc_info=True)
+        # The entry stays until its TTL. One its turn stamped with a saved
+        # question refuses sends at or below its turn number until
+        # STALE_START_WINDOW_SECONDS after that turn released its claim, or
+        # until the TTL when the release wrote no stamp
+        # (TurnIndexEntry.makes_stale); deleting the key clears it.
+        logger.warning(
+            "Could not forget a deleted conversation's turn index entry.",
+            exc_info=True,
+            extra={"event": "turn_index_forget_failed", "conversation_id": conversation_id},
+        )
 
 
-async def list_turns() -> list[dict]:
+class RecordedTurn(NamedTuple):
+    conversation_id: str
+    entry: TurnIndexEntry
+
+
+async def list_turns() -> list[RecordedTurn]:
     """Every recorded turn, pruning set members whose hash has expired.
 
     Every member's hash is read in one pipelined round trip rather than one
@@ -146,15 +311,15 @@ async def list_turns() -> list[dict]:
         return []
     async with r.pipeline(transaction=False) as pipe:
         for conversation_id in members:
-            pipe.hgetall(_turn_key(conversation_id))
+            pipe.hgetall(turn_key(conversation_id))
         turns = await pipe.execute()
-    out: list[dict] = []
+    out: list[RecordedTurn] = []
     expired: list[str] = []
     for conversation_id, turn in zip(members, turns, strict=True):
         if not turn:
             expired.append(conversation_id)
             continue
-        out.append({"conversation_id": conversation_id, **turn})
+        out.append(RecordedTurn(conversation_id=conversation_id, entry=TurnIndexEntry.from_index(turn)))
     if expired:
         await _prune(r, expired)
     return out
@@ -169,7 +334,7 @@ async def _prune(r: Redis, conversation_ids: list[str]) -> None:
     turn. So the SREM runs only while every hash is still missing, under a
     WATCH that aborts it if one is written before it lands. A prune that does
     not run leaves its members to the next list."""
-    keys = [_turn_key(conversation_id) for conversation_id in conversation_ids]
+    keys = [turn_key(conversation_id) for conversation_id in conversation_ids]
     try:
         async with r.pipeline(transaction=True) as pipe:
             await pipe.watch(*keys)

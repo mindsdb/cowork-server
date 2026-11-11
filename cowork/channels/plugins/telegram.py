@@ -8,7 +8,6 @@ import secrets
 import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -27,6 +26,7 @@ from cowork.channels.plugin import (
     CredentialSchema,
     WebhookRoute,
 )
+from cowork.channels.sharing import mark_shared
 from cowork.channels.webhooks import SignatureError, WebhookHandshake
 
 if TYPE_CHECKING:
@@ -101,6 +101,10 @@ def _split_for_limit(text: str, limit: int) -> list[str]:
 class TelegramBridge:
     """Telegram adapter: WebhookBridge (ingress) + ChannelAdapter (egress)."""
 
+    # The largest file send_attachment takes. A channel turn skips a larger
+    # artifact before it reads the file (AntonChannelRuntime.send_turn_artifacts).
+    max_attachment_bytes = TELEGRAM_MAX_UPLOAD_BYTES
+
     def __init__(self, credentials: Mapping[str, str]) -> None:
         self._secrets = dict(credentials)
         self._setup: ChannelSetup | None = None
@@ -157,21 +161,21 @@ class TelegramBridge:
             return None
         return await self.download_file(bot_token, file_path)
 
-    async def send_attachment(self, *, address: PlatformAddress, path: str, filename: str | None = None) -> str:
-        """Upload one file via sendDocument; returns the platform message id."""
+    async def send_attachment(self, *, address: PlatformAddress, data: bytes, filename: str) -> str:
+        """Upload ``data`` named ``filename`` via sendDocument; returns the
+        platform message id."""
         bot_token = (self._secrets.get("bot_token") or "").strip()
         if not bot_token:
             raise RuntimeError("telegram bot_token not configured")
-        source = Path(path)
-        if source.stat().st_size > TELEGRAM_MAX_UPLOAD_BYTES:
+        if len(data) > TELEGRAM_MAX_UPLOAD_BYTES:
             raise RuntimeError("telegram attachment exceeds the 50MB upload limit")
-        name = (filename or source.name).strip() or "file"
+        name = filename.strip() or "file"
         try:
             async with httpx.AsyncClient(timeout=60.0, headers={"User-Agent": "Cowork/1.0"}) as client:
                 resp = await client.post(
                     f"{TELEGRAM_API_BASE}{bot_token}/sendDocument",
                     data={"chat_id": address.platform_id},
-                    files={"document": (name, source.read_bytes())},
+                    files={"document": (name, data)},
                 )
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise ConnectionError(f"telegram sendDocument transport error: {exc!r}") from exc
@@ -351,6 +355,7 @@ class TelegramBridge:
             if update_id is not None
             else f"telegram:message:{chat_id}:{message_id}"
         )
+        mark_shared(event, is_group)
         return event
 
     async def poll(self, *, offset: int | None) -> tuple[list[InboundEvent], int | None]:
@@ -457,7 +462,7 @@ async def _setup(ctx: LifecycleContext) -> LifecycleResult:
     secret_token = (ctx.credentials.get("secret_token") or "").strip()
     if not secret_token:
         secret_token = secrets.token_urlsafe(32)
-        ctx.persist_credentials({"secret_token": secret_token})
+        await ctx.persist_credentials({"secret_token": secret_token})
 
     if not ctx.webhook_url:
         active = await ctx.refresh_adapter()

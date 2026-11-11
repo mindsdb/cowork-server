@@ -21,14 +21,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from weakref import WeakValueDictionary
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from cowork.common.logger import log_context
-from cowork.streaming.buffer import StreamBuffer
+from cowork.streaming import turn_claim
+from cowork.streaming.buffer import RedisStreamBuffer, StreamBuffer
+from cowork.streaming.turn_claim import TurnClaim, TurnClaimUnavailable
+from cowork.turnqueue.redis_client import DISCARDED_CANCEL_REASON, SYNC_CALL_BUDGET_S, redis_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -68,13 +72,25 @@ _IDLE_POLL_SECONDS = 15
 
 # Bound on RunRegistry.shutdown()'s wait for in-flight turns to persist their
 # partial answer before the process exits. The container's stop deadline must
-# cover Uvicorn's earlier request-drain budget (2s), this wait, and teardown.
+# cover Uvicorn's request-drain budget (2s), this wait, and teardown. With
+# remote turns the wait runs before that drain, from the SIGTERM handler
+# cowork.server installs, and the hosted chart's grace period counts it.
 #
 # A turn's end-of-turn save waits for a database connection only when the pool
 # is exhausted. If that happens during shutdown, the save can wait up to
-# POOL_TIMEOUT (5 s by default) and so use this whole grace; a turn still
-# saving when the grace runs out is left for the next boot's recovery.
+# POOL_TIMEOUT (5 s by default) and so use this whole grace. A turn still
+# saving when the grace runs out goes on saving until the process exits; what
+# happens to one that does not finish depends on the stream backend, see
+# RunRegistry.shutdown.
 TURN_SHUTDOWN_GRACE_SECONDS = 5
+
+# How long past RunRegistry.shutdown's own bound a turn it ended may wait for
+# its save before it writes its interrupted frame anyway. With remote turns,
+# Uvicorn's request drain starts once that bound passes, and about 2.2 s later
+# (its tick, its pause and --timeout-graceful-shutdown 2 in the image's
+# command) it cuts every stream still open. The frame goes out about a second
+# before that cut; the save goes on in the background.
+SHUTDOWN_FRAME_SECONDS_PAST_GRACE = 1.0
 
 
 class TurnInProgress(Exception):
@@ -89,6 +105,20 @@ class TurnInProgress(Exception):
         super().__init__(f"conversation {conversation_id} is still answering turn {turn_id}")
         self.conversation_id = conversation_id
         self.turn_id = turn_id
+
+
+class ServerShuttingDown(Exception):
+    """This server is ending its turns for a shutdown, so a new one is refused.
+
+    The app answers it with 503 and Retry-After, the refusal a server too busy
+    to take a turn gives (cowork.server), which reads ``status_code``. The
+    retry reaches another replica.
+    """
+
+    status_code = 503
+
+    def __init__(self) -> None:
+        super().__init__("the server is shutting down and starts no new turn")
 
 
 @dataclass(frozen=True)
@@ -117,9 +147,16 @@ class TurnLifecycle:
     thread (the delete endpoint is a sync ``def``); a plain attribute write is
     safe there, unlike ``Task.cancel()``.
 
+    ``discarded_elsewhere`` means the delete ran on another replica, which
+    reached this turn only through its cancel flag (``note_discarded_elsewhere``).
+    That delete removed the turn's stream before this turn heard of it, so
+    the turn deletes its stream again before it releases its claim.
+
     ``shutting_down`` means "the server is exiting, not the user's own Stop".
     Set BEFORE the cancel, same ordering as ``discarded``: a producer's
     ``CancelledError`` handler checks it to persist an interrupted turn.
+    ``shutdown_frame_deadline``, set with it, is the loop time by which that
+    turn writes its frame, saved or not (SHUTDOWN_FRAME_SECONDS_PAST_GRACE).
 
     ``stalled`` means "the UI heard nothing for its idle window and gave up",
     not the user's own Stop. Set BEFORE the cancel, same ordering again: the
@@ -131,16 +168,30 @@ class TurnLifecycle:
     a request that reads the history counts that row, so only a request that
     read it earlier can still name this turn's number; ``RunRegistry.start``
     refuses that request.
+
+    ``question_id`` is that row, once saved. A producer the turn is handed to
+    (a direct answer that delegates to the agent) reuses it rather than saving
+    the question a second time.
     """
 
     discarded: bool = False
+    discarded_elsewhere: bool = False
     shutting_down: bool = False
+    shutdown_frame_deadline: float | None = None
     # Watchdog expiry is an interruption, separate from deliberate user Stop.
     timed_out: bool = False
     saved_question: bool = False
+    question_id: UUID | None = None
     stalled: bool = False
     cancel_requested: bool = False
     identity: RunIdentity = field(default_factory=RunIdentity)
+
+    def note_discarded_elsewhere(self) -> None:
+        """Mark the turn discarded by a delete another replica served: a
+        cancel whose cause is ``discarded``. Set before the cancel lands, as
+        ``discarded`` is."""
+        self.discarded = True
+        self.discarded_elsewhere = True
 
 
 @dataclass
@@ -166,10 +217,18 @@ class RunHandle:
     user_id: str | None = None
     # Shared with the producer coroutine, see TurnLifecycle.
     lifecycle: TurnLifecycle = field(default_factory=TurnLifecycle)
+    # The cross-replica claim start() took, on the Redis backend only.
+    claim: TurnClaim | None = None
+    # The loop time the task ended at, set by start() when it ends.
+    ended_at_monotonic: float | None = None
 
     @property
     def run_id(self) -> str:
         return self.lifecycle.identity.run_id
+
+    def note_ended(self, task: asyncio.Task) -> None:
+        """Done callback of ``task``: note when it ended."""
+        self.ended_at_monotonic = task.get_loop().time()
 
     def request_cancel(self) -> bool:
         """Signal this captured task, without waiting for its persistence to finish."""
@@ -235,6 +294,263 @@ class RunHandle:
         return True
 
 
+async def _stop_controller_turns(handles: list[RunHandle], *, timeout_seconds: float) -> None:
+    """Write the controller's cancel flag for each remote turn, all at once.
+
+    Waits at most ``timeout_seconds``; a write still in flight then finishes
+    on its own, within request_cancel's own bound. A failed write is logged
+    and never holds up the turn's interrupted save.
+    """
+    from cowork.streaming.cancellation import stop_controller_turn
+
+    writes = [
+        asyncio.create_task(stop_controller_turn(
+            handle.lifecycle.identity.correlation_id, turn_id=handle.run_id, reason="shutdown",
+        ))
+        for handle in handles
+    ]
+    await asyncio.wait(writes, timeout=timeout_seconds)
+
+
+async def _publish_run(
+    *, conversation_id: str, turn_id: int, lifecycle: TurnLifecycle,
+    org_id: str | None, user_id: str | None,
+) -> None:
+    """Record a run start() admitted in the turn index, or remove it again
+    when that fails."""
+    from cowork.db.units import run_to_completion
+    from cowork.streaming.turn_index import record_turn
+
+    # Publish immutable identity before either the producer or its
+    # first reader can request cancellation. Dispatch never replaces it.
+    async def publish() -> None:
+        async with asyncio.timeout(5):
+            await record_turn(
+                conversation_id, turn_id=turn_id,
+                run_id=lifecycle.identity.run_id,
+                correlation_id=lifecycle.identity.correlation_id,
+                org_id=org_id, user_id=user_id,
+            )
+
+    try:
+        await run_to_completion(publish())
+    except BaseException:
+        # Setup can be cancelled while Redis has committed but not
+        # replied. Settle that write, then remove only this instance.
+        await _forget_unstarted_run(conversation_id, lifecycle.identity.run_id)
+        raise
+
+
+async def _forget_unstarted_run(conversation_id: str, run_id: str) -> None:
+    """Remove a run start() published to the turn index but never started."""
+    from cowork.streaming.turn_index import forget_run
+
+    try:
+        async with asyncio.timeout(5):
+            await forget_run(conversation_id, run_id)
+    except Exception:
+        logger.exception("Could not remove unstarted run %s", run_id)
+
+
+async def _stale_turn(
+    *, conversation_id: str, turn_id: int, existing: RunHandle | None, shared: bool,
+) -> int | None:
+    """The turn whose saved question makes a start at ``turn_id`` stale, or
+    None. See RunRegistry.start.
+
+    With one process the local handle answers. On the Redis backend the turn
+    index answers for every replica: a run stamps its entry as soon as it
+    saves its question (mark_question_saved) and again before it releases its
+    claim (_end_claim). This read is the early refusal. A start that passes it
+    while another replica's turn saves its question, writes its final frame
+    or has ended without releasing yet meets the same rule again in
+    turn_claim.acquire, which reads the stamp in the transaction that takes
+    the claim.
+
+    There the index entry decides. The local handle counts only where the
+    entry cannot say: when it names the handle's run with no saved-question
+    stamp (both of the run's stamps failed), or when it is a channel turn's,
+    which names no run. Even then it counts only until
+    STALE_START_WINDOW_SECONDS after the handle's task ended, the bound the
+    stamp would have set. An entry that names another run decides for that
+    run: another replica truncated the conversation, or ran a turn at this
+    number that saved nothing, and every replica admits the start. No entry
+    (a delete forgot it) refuses nothing. Refusing on the handle in those
+    cases would refuse sends at its number on this replica alone.
+    """
+    local = existing is not None and existing.lifecycle.saved_question and turn_id <= existing.turn_id
+    if not shared:
+        return existing.turn_id if local else None
+    from cowork.streaming import turn_index
+
+    try:
+        async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
+            entry = await turn_index.get_turn(conversation_id)
+    except Exception as exc:
+        raise TurnClaimUnavailable(conversation_id=conversation_id) from exc
+    if entry is None:
+        return None
+    if entry.makes_stale(turn_id=turn_id, now=time.time()):
+        return entry.turn_id
+    if (
+        local and entry.run_id in (None, existing.run_id) and not entry.saved_question
+        and _within_stale_window(existing)
+    ):
+        return existing.turn_id
+    return None
+
+
+def _within_stale_window(handle: RunHandle) -> bool:
+    """Whether ``handle``'s task is running or ended less than
+    STALE_START_WINDOW_SECONDS ago. A task that has ended before its done
+    callback ran counts as just ended."""
+    from cowork.streaming import turn_index
+
+    ended = handle.ended_at_monotonic
+    if handle.is_running or ended is None:
+        return True
+    return handle.task.get_loop().time() < ended + turn_index.STALE_START_WINDOW_SECONDS
+
+
+def _stale_refusal(*, conversation_id: str, turn_id: int, saved_turn_id: int, shared: bool) -> TurnInProgress:
+    """The refusal of a stale start, logged once: at WARNING on the Redis
+    backend (``shared``), where another replica's turn can be what refuses
+    it, and at INFO on the file backend, where only this process's own turn
+    can."""
+    logger.log(
+        logging.WARNING if shared else logging.INFO,
+        "Refused a turn; it read the history before an earlier turn saved its question.",
+        extra={
+            "event": "turn_stale_refused", "turn_id": turn_id, "saved_turn_id": saved_turn_id,
+            **log_context(conversation_id=conversation_id),
+        },
+    )
+    return TurnInProgress(conversation_id=conversation_id, turn_id=saved_turn_id)
+
+
+def claim_held_refusal(*, conversation_id: str, holder: TurnClaim) -> TurnInProgress:
+    """The refusal of a turn whose conversation's claim another live run
+    holds, logged once with that run and its pod. For RunRegistry.start and
+    the early check in POST /responses/, each the last word on the requests
+    it refuses."""
+    logger.warning(
+        "Refused a turn; another run holds the conversation's turn claim.",
+        extra={
+            "event": "turn_claim_held", "turn_id": holder.turn_id,
+            "holder_run_id": holder.run_id, "holder_pod": holder.pod,
+            **log_context(conversation_id=conversation_id),
+        },
+    )
+    return TurnInProgress(conversation_id=conversation_id, turn_id=holder.turn_id)
+
+
+async def _stamp_saved_question(*, conversation_id: str, run_id: str, released: bool) -> None:
+    """Note in ``run_id``'s turn index entry that its turn saved its
+    question (turn_index.stamp_question). Bounded; a failure is logged."""
+    from cowork.streaming.turn_index import stamp_question
+
+    try:
+        async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
+            await stamp_question(conversation_id=conversation_id, run_id=run_id, released=released)
+    except Exception:
+        logger.warning(
+            "Could not note a turn's saved question in the turn index.",
+            exc_info=True,
+            extra={
+                "event": "turn_index_question_failed", "run_id": run_id,
+                **log_context(conversation_id=conversation_id),
+            },
+        )
+
+
+async def mark_question_saved(*, lifecycle: TurnLifecycle, conversation_id: str) -> None:
+    """Note that a turn's question is now in the conversation: sets
+    ``lifecycle.saved_question``.
+
+    On the Redis backend this also stamps the run's turn index entry now, so
+    from the save on every replica refuses a start at this turn's number as
+    stale (turn_claim.acquire), however long this turn takes to end or to
+    release its claim. A failed stamp is logged, and the release stamps
+    again (_end_claim). A discarded turn's entry was forgotten with its
+    conversation's turns, so it is not stamped.
+    """
+    lifecycle.saved_question = True
+    from cowork.streaming.backend import get_backend
+
+    if get_backend() != "redis" or lifecycle.discarded:
+        return
+    await _stamp_saved_question(conversation_id=conversation_id, run_id=lifecycle.identity.run_id, released=False)
+
+
+async def _end_claim(*, conversation_id: str, claim: TurnClaim, lifecycle: TurnLifecycle) -> None:
+    """Release a turn's claim, once its stream has a terminal record or the
+    turn was discarded.
+
+    First notes in the turn index that the turn saved its question, again if
+    mark_question_saved already did, so the stamp is there from the moment
+    the claim is gone even when the first one failed. This stamp carries the
+    release time, from which the stamp refuses stale starts for
+    turn_index.STALE_START_WINDOW_SECONDS more. A discarded turn's entry is
+    normally gone with its conversation's turns, and stamp_question writes no
+    entry that is gone or names another run; the stamp lands only on an
+    entry the delete could not forget, and bounds how long it refuses sends.
+
+    Failures are logged; a release that fails is tried again until the claim
+    lapses (turn_claim.release_quietly).
+    """
+    if lifecycle.saved_question:
+        await _stamp_saved_question(conversation_id=conversation_id, run_id=claim.run_id, released=True)
+    await turn_claim.release_quietly(conversation_id=conversation_id, run_id=claim.run_id)
+
+
+async def _remove_stream_deleted_elsewhere(buffer: StreamBuffer, *, conversation_id: str) -> None:
+    """Delete the stream of a turn whose conversation another replica deleted.
+
+    That delete removed the stream before this turn heard of it, so a record
+    the turn wrote in between recreated the stream with no terminal record,
+    and the next turn at this number would keep it. Run before the turn's
+    claim is released, which keeps every other run off the stream until then.
+    Bounded; a failure is logged, and the stream expires with its TTL.
+    """
+    if not isinstance(buffer, RedisStreamBuffer):
+        return
+    try:
+        async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
+            await buffer.remove()
+    except Exception:
+        logger.warning(
+            "Could not remove the stream of a turn whose conversation another replica deleted.",
+            exc_info=True,
+            extra={"event": "turn_buffers_remove_failed", **log_context(conversation_id=conversation_id)},
+        )
+
+
+async def _seal_interrupted(handle: RunHandle) -> None:
+    """End the stream of a turn whose task ended at shutdown without a
+    terminal record, as a producer cancelled before its first step does: the
+    turn-lost frame, then the terminal record. A failure is logged, so the
+    other turns are still sealed."""
+    from cowork.handlers.turn_errors import (
+        TURN_LOST_CODE,
+        TURN_LOST_MESSAGE,
+        response_failed_sse,
+    )
+
+    request_id = handle.lifecycle.identity.correlation_id
+    context = log_context(request_id=request_id, conversation_id=handle.conversation_id)
+    logger.warning(
+        "A turn ended at shutdown without a terminal record; sealing its stream as interrupted.",
+        extra={"event": "shutdown_turn_sealed", **context},
+    )
+    try:
+        await handle.buffer.append("sse", {"sse": response_failed_sse(
+            TURN_LOST_MESSAGE, TURN_LOST_CODE, request_id=request_id,
+        )})
+        await handle.buffer.close("interrupted")
+    except Exception:
+        logger.exception("Could not seal the stream of a turn ended at shutdown", extra=context)
+
+
 class RunRegistry:
     """Process-wide map of in-flight turns. Single-threaded (asyncio loop)."""
 
@@ -242,6 +558,26 @@ class RunRegistry:
         self._by_cid: dict[str, RunHandle] = {}
         self._lock = asyncio.Lock()
         self._start_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._closed = False
+
+    def close(self) -> None:
+        """Refuse every later start() with ServerShuttingDown.
+
+        cowork.server calls it before it ends the turns in flight for a
+        shutdown, so none starts behind that. A start() already waiting on
+        its buffer or the earlier turn when this runs is refused too, at its
+        last check before it registers the turn. Calling it again does
+        nothing.
+        """
+        self._closed = True
+
+    @staticmethod
+    def _shutdown_refusal(conversation_id: str) -> ServerShuttingDown:
+        logger.info(
+            "Refused a turn; the server is shutting down.",
+            extra=log_context(conversation_id=conversation_id),
+        )
+        return ServerShuttingDown()
 
     async def start(
         self,
@@ -273,9 +609,33 @@ class RunRegistry:
         its question's position in the history, which this question does not
         hold. A start after a turn that saved nothing keeps the number.
 
-        A refused start creates no buffer and no producer coroutine. An
-        accepted one opens its buffer clear of the records of an earlier turn
-        at the same number (backend.new_buffer).
+        Raises ServerShuttingDown once close() has run, whether close() ran
+        before this start or while it waited on the earlier turn, its buffer
+        or the turn index. The last check runs with no await between it and
+        the turn's registration, so shutdown() sees every turn that starts.
+
+        A start refused before it opens its buffer creates no buffer and no
+        producer coroutine. One refused by that last check has opened an
+        empty buffer, which the next start at that number opens clean again,
+        and removes the run it published to the turn index. An accepted start
+        opens its buffer clear of the records of an earlier turn at the same
+        number (backend.new_buffer).
+
+        On the Redis backend this process's memory is not the whole picture,
+        since another replica may run the conversation's turn. After the
+        checks above, start() takes the conversation's turn claim
+        (turn_claim.claim_turn) before it opens the buffer, and raises
+        TurnInProgress when another live run holds it. The stale-number check
+        reads the turn index there (_stale_turn), and the claim's acquire
+        reads it again in the transaction that takes the claim, so a start
+        that waited for another replica's turn to end is still refused when
+        that turn saved its question. Raises TurnClaimUnavailable when Redis
+        cannot answer either, and when a Redis call fails or times out after
+        the claim was taken (the buffer's open, the turn index write). Only
+        the claim's winner writes the turn index, and every start refused
+        after taking the claim releases it. A claim this process's own last
+        turn still holds after its task ended is released here at once
+        (turn_claim.claim_turn's ``ended_here``).
         """
         loop = asyncio.get_running_loop()
         lock = self._start_locks.get(conversation_id)
@@ -283,6 +643,8 @@ class RunRegistry:
             lock = asyncio.Lock()
             self._start_locks[conversation_id] = lock
         async with lock:
+            if self._closed:
+                raise self._shutdown_refusal(conversation_id)
             existing = self._by_cid.get(conversation_id)
             if existing is not None and existing.is_answering:
                 logger.info(
@@ -290,52 +652,64 @@ class RunRegistry:
                     conversation_id, existing.turn_id,
                 )
                 raise TurnInProgress(conversation_id=conversation_id, turn_id=existing.turn_id)
-            if (
-                existing is not None and existing.lifecycle.saved_question
-                and turn_id <= existing.turn_id
-            ):
-                logger.info(
-                    "Refused turn %d for conversation %s; it read the history before "
-                    "turn %d saved its question.",
-                    turn_id, conversation_id, existing.turn_id,
+            from cowork.streaming.backend import get_backend
+            published = get_backend() == "redis"
+            stale = await _stale_turn(
+                conversation_id=conversation_id, turn_id=turn_id, existing=existing, shared=published,
+            )
+            if stale is not None:
+                raise _stale_refusal(
+                    conversation_id=conversation_id, turn_id=turn_id, saved_turn_id=stale, shared=published,
                 )
-                raise TurnInProgress(conversation_id=conversation_id, turn_id=existing.turn_id)
             if existing is not None and existing.is_running and not existing.buffer.is_closed:
                 # A final client frame is being written. Its reader can send
                 # the next question before the separate terminal record lands.
                 # Wait rather than refuse, and keep the old terminal out of a
                 # successor's buffer when a refused turn reused its number.
                 await asyncio.shield(asyncio.gather(existing.task, return_exceptions=True))
-            buffer = await open_buffer()
             lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
-            from cowork.streaming.backend import get_backend
-            if get_backend() == "redis":
-                from cowork.db.units import run_to_completion
-                from cowork.streaming.turn_index import forget_run, record_turn
-                # Publish immutable identity before either the producer or its
-                # first reader can request cancellation. Dispatch never replaces it.
-                async def publish() -> None:
-                    async with asyncio.timeout(5):
-                        await record_turn(
-                            conversation_id, turn_id=turn_id,
-                            run_id=lifecycle.identity.run_id,
-                            correlation_id=lifecycle.identity.correlation_id,
-                            org_id=org_id, user_id=user_id,
-                        )
-
-                try:
-                    await run_to_completion(publish())
-                except BaseException:
-                    # Setup can be cancelled while Redis has committed but not
-                    # replied. Settle that write, then remove only this instance.
-                    try:
-                        async with asyncio.timeout(5):
-                            await forget_run(conversation_id, lifecycle.identity.run_id)
-                    except Exception:
-                        logger.exception("Could not remove unstarted run %s", lifecycle.identity.run_id)
+            claim: TurnClaim | None = None
+            if published:
+                claim = turn_claim.new_claim(
+                    run_id=lifecycle.identity.run_id, turn_id=turn_id,
+                    correlation_id=lifecycle.identity.correlation_id,
+                )
+                claimed = await turn_claim.claim_turn(
+                    claim=claim, conversation_id=conversation_id,
+                    ended_here=existing.run_id if existing is not None and not existing.is_running else None,
+                )
+                if claimed.outcome is turn_claim.AcquireOutcome.STALE:
+                    raise _stale_refusal(
+                        conversation_id=conversation_id, turn_id=turn_id, saved_turn_id=claimed.saved_turn_id,
+                        shared=True,
+                    )
+                if claimed.outcome is turn_claim.AcquireOutcome.HELD:
+                    raise claim_held_refusal(conversation_id=conversation_id, holder=claimed.holder)
+            try:
+                buffer = await open_buffer()
+                if published:
+                    await _publish_run(
+                        conversation_id=conversation_id, turn_id=turn_id, lifecycle=lifecycle,
+                        org_id=org_id, user_id=user_id,
+                    )
+                # close() may have run during any await above. No await from this
+                # check to the registration below, so a shutdown that closed the
+                # registry either refuses this turn here or finds it in _by_cid.
+                if self._closed:
+                    if published:
+                        await _forget_unstarted_run(conversation_id, lifecycle.identity.run_id)
+                    raise self._shutdown_refusal(conversation_id)
+            except BaseException as exc:
+                if claim is None:
                     raise
+                await turn_claim.release_quietly(conversation_id=conversation_id, run_id=claim.run_id)
+                from redis.exceptions import RedisError
+
+                if isinstance(exc, (RedisError, TimeoutError)):
+                    raise TurnClaimUnavailable(conversation_id=conversation_id) from exc
+                raise
             task = asyncio.create_task(
-                self._run_bounded(produce(buffer), buffer, conversation_id, turn_id, lifecycle),
+                self._run_bounded(produce(buffer), buffer, conversation_id, turn_id, lifecycle, claim=claim),
                 name=f"turn[{conversation_id}/{turn_id}]",
             )
             handle = RunHandle(
@@ -349,13 +723,15 @@ class RunRegistry:
                 # The SAME object the producer coroutine closed over, so
                 # discard() can tell it to drop the turn on the floor.
                 lifecycle=lifecycle,
+                claim=claim,
             )
+            task.add_done_callback(handle.note_ended)
             self._by_cid[conversation_id] = handle
             return handle
 
     async def _run_bounded(
         self, producer_coro, buffer: StreamBuffer, conversation_id: str, turn_id: int,
-        lifecycle: TurnLifecycle,
+        lifecycle: TurnLifecycle, *, claim: TurnClaim | None = None,
     ) -> None:
         """Run a producer under the idle bound (see module comment).
 
@@ -366,6 +742,13 @@ class RunRegistry:
         the producer, so
         ``RunHandle.cancel``/``discard`` still work; a producer that raises on
         its own propagates unchanged.
+
+        A turn that took a claim renews it beside the cancel watch
+        (turn_claim.keep_claim) and releases it here once its stream has a
+        terminal record, or once the turn was discarded. A turn that ends with
+        its stream open keeps its claim: shutdown() releases it after sealing
+        the stream, this process's next start() in the conversation releases
+        it, and otherwise it lapses with its TTL.
         """
         loop = asyncio.get_running_loop()
         task = asyncio.ensure_future(producer_coro)
@@ -409,6 +792,12 @@ class RunRegistry:
             asyncio.create_task(watch_cancel(task, buffer, lifecycle))
             if get_backend() == "redis" and not lifecycle.identity.remote else None
         )
+        claim_keeper = (
+            asyncio.create_task(turn_claim.keep_claim(
+                claim=claim, conversation_id=conversation_id, buffer=buffer, lifecycle=lifecycle,
+            ))
+            if claim is not None else None
+        )
         try:
             await task
         except asyncio.CancelledError:
@@ -423,10 +812,28 @@ class RunRegistry:
             # RunHandle.cancel is waiting to observe).
             watchdog.cancel()
             watchers = [watchdog]
-            if cancel_watch is not None:
-                cancel_watch.cancel()
-                watchers.append(cancel_watch)
-            await asyncio.gather(*watchers, return_exceptions=True)
+            for watcher in (cancel_watch, claim_keeper):
+                if watcher is not None:
+                    watcher.cancel()
+                    watchers.append(watcher)
+            if claim is None:
+                await asyncio.gather(*watchers, return_exceptions=True)
+            else:
+                from cowork.db.units import run_to_completion
+
+                async def settle_claim() -> None:
+                    # The keeper ends before the release, so no renewal of
+                    # its lands after it.
+                    await asyncio.gather(*watchers, return_exceptions=True)
+                    if lifecycle.discarded_elsewhere:
+                        await _remove_stream_deleted_elsewhere(buffer, conversation_id=conversation_id)
+                    if buffer.is_closed or lifecycle.discarded:
+                        await _end_claim(conversation_id=conversation_id, claim=claim, lifecycle=lifecycle)
+
+                # One step a cancel cannot split: a Stop or a shutdown that
+                # reaches this task while the watchers unwind would skip the
+                # release otherwise.
+                await run_to_completion(settle_claim())
 
     def get(self, conversation_id: str) -> Optional[RunHandle]:
         """Current handle (incl. recently-finished, useful for replay)."""
@@ -486,24 +893,70 @@ class RunRegistry:
     async def shutdown(self, timeout_seconds: float = TURN_SHUTDOWN_GRACE_SECONDS) -> int:
         """Cancel every running turn so its partial answer persists instead of
         vanishing under a SIGKILL. Marks ``shutting_down`` before cancelling,
-        same ordering rule as ``discard``. Bounded by ``timeout_seconds``;
-        a turn still unwinding past it is left for the next boot's seal.
+        same ordering rule as ``discard``.
+
+        Cancelling a remote turn's relay stops only this server's side of it;
+        the sandbox controller would run the sandbox turn on with nobody
+        reading its replies. So each remote turn still answering first gets
+        the controller's cancel flag, written as ``/cancel`` writes it
+        (cancellation.request_cancel). ``cancel_run`` is not the way in: it
+        refuses a turn already marked ``shutting_down``. Whatever the
+        controller replies meanwhile, the relay's cancel branch sees
+        ``shutting_down`` and saves the turn as interrupted.
+
+        A task cancelled before its first step never runs its body, so a
+        producer cancelled that early saves no question and writes no
+        terminal record. Two loop passes before the cancel start the producer
+        of a turn that registered just before this call. A turn whose task
+        still ended with its stream open has the interrupted frame and
+        terminal record written here.
+
+        Bounded by ``timeout_seconds``, the flags and the unwinding together.
+        A turn already marked ``shutting_down`` is skipped, so a second call
+        leaves the turns the first one ended alone. Returns how many turns
+        this call cancelled.
         """
-        handles = self.in_flight()
+        handles = [h for h in self.in_flight() if not h.lifecycle.shutting_down]
         if not handles:
             return 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
         for handle in handles:
             handle.lifecycle.shutting_down = True
+            handle.lifecycle.shutdown_frame_deadline = deadline + SHUTDOWN_FRAME_SECONDS_PAST_GRACE
+        # One pass starts the _run_bounded task of a turn that registered in
+        # this loop pass, the next starts the producer task it creates.
+        for _ in range(2):
+            await asyncio.sleep(0)
+        # The identity the turn captured when it started, not a settings read:
+        # an in-process turn has no controller to stop. A turn that is only
+        # saving its finished answer has nothing left running there.
+        remote = [h for h in handles if h.lifecycle.identity.remote and h.is_answering]
+        if remote:
+            await _stop_controller_turns(remote, timeout_seconds=timeout_seconds)
         for handle in handles:
             handle.task.cancel()
         done, pending = await asyncio.wait(
-            [h.task for h in handles], timeout=timeout_seconds
+            [h.task for h in handles], timeout=max(0.0, deadline - loop.time())
         )
         if pending:
-            logger.warning(
-                "%d turn(s) still unwinding past the %ss shutdown budget; "
-                "left for boot recovery to seal.", len(pending), timeout_seconds,
-            )
+            from cowork.streaming.backend import get_backend
+            unfinished = {"event": "shutdown_turns_unfinished", "count": len(pending)}
+            if get_backend() == "redis":
+                logger.warning(
+                    "Turns still unwinding past the shutdown budget; each saves if it finishes "
+                    "before the process exits, and boot recovery does not read Redis buffers, so "
+                    "one that never finishes keeps its question pending, and its stream stays "
+                    "open until a reader's idle cut ends it.",
+                    extra=unfinished,
+                )
+            else:
+                logger.warning(
+                    "Turns still unwinding past the shutdown budget; each saves if it finishes "
+                    "before the process exits, and one that never finishes is sealed by the "
+                    "next boot's recovery.",
+                    extra=unfinished,
+                )
         for task in done:
             if task.cancelled():
                 continue
@@ -512,6 +965,16 @@ class RunRegistry:
                 logger.error(
                     "Turn raised while unwinding for shutdown", exc_info=exc,
                 )
+        for handle in handles:
+            if handle.task.done() and not handle.lifecycle.discarded and not handle.buffer.is_closed:
+                await _seal_interrupted(handle)
+                # The turn's own release found its stream open and kept the
+                # claim. Released only once the seal wrote the terminal.
+                if handle.claim is not None and handle.buffer.is_closed:
+                    await _end_claim(
+                        conversation_id=handle.conversation_id, claim=handle.claim,
+                        lifecycle=handle.lifecycle,
+                    )
         return len(handles)
 
     def reset(self) -> None:
@@ -520,9 +983,11 @@ class RunRegistry:
         For tests: this object is a process global, so a handle registered by
         one test stays visible to the next. Deliberately does NOT cancel the
         tasks — the caller owns those, and cancelling here would make a
-        cleanup helper a scheduling side effect.
+        cleanup helper a scheduling side effect. Admits starts again after
+        close(), for the same reason.
         """
         self._by_cid.clear()
+        self._closed = False
 
     async def gc_finished(self, max_age_seconds: float = 300.0) -> int:
         """Drop handles whose producer finished > max_age ago. The buffer
@@ -562,13 +1027,89 @@ def discard_conversation(conversation_id: str) -> None:
     which is precisely when a delete looks safe to the user — so the race is
     now normal, and `registry.discard` handles it by cancelling the producer
     and marking it discarded (see its docstring) before these files go away.
+
+    On the Redis backend the turn may run on another replica, which
+    `registry.discard` cannot reach. While the claim still names that run,
+    before the index entry is forgotten, this writes its cancel flag with the
+    `discarded` cause (_stop_the_turn_another_replica_runs).
     """
-    from cowork.streaming.backend import remove_conversation_buffers
+    from cowork.streaming.backend import get_backend, remove_conversation_buffers
     from cowork.streaming.turn_index import forget_turn_sync
 
     cid = str(conversation_id)
+    handle = registry.get(cid)
     registry.discard(cid)
-    remove_conversation_buffers(cid)
-    # The index outlives the buffers by an hour otherwise, so /in-flight would
-    # keep naming a turn whose buffer has just been deleted.
-    forget_turn_sync(cid)
+    # One deadline for every Redis call below, so a Redis that does not
+    # answer holds the deleting thread for one call budget, not one per call.
+    # A caller that discards many conversations opens one around them all
+    # (ProjectService.delete_project), and this one ends no later than it.
+    with redis_deadline(budget_s=SYNC_CALL_BUDGET_S):
+        # First, and whatever the buffer removal below does: an entry stamped
+        # with a saved question refuses sends at or below its turn number
+        # (TurnIndexEntry.makes_stale), and the truncation brings the next
+        # send back to that number. Left behind, it would also have
+        # /in-flight keep naming a turn whose buffer is gone. Logs its own
+        # failure. Only the Redis backend reads the index, so the file
+        # backend has nothing to forget and reaches no Redis here.
+        if get_backend() == "redis":
+            _stop_the_turn_another_replica_runs(conversation_id=cid, handle=handle)
+            forget_turn_sync(cid)
+        try:
+            remove_conversation_buffers(cid)
+        except Exception:
+            logger.warning(
+                "Could not remove a deleted conversation's turn buffers.",
+                exc_info=True,
+                extra={"event": "turn_buffers_remove_failed", **log_context(conversation_id=cid)},
+            )
+        if handle is not None and handle.claim is not None:
+            # Its stream is gone, so another replica would read the claim of
+            # a finished turn as one whose first record has not landed yet.
+            _release_claim_sync(conversation_id=cid, claim=handle.claim)
+
+
+def _stop_the_turn_another_replica_runs(*, conversation_id: str, handle: RunHandle | None) -> None:
+    """Write the cancel flag, with the ``discarded`` cause, of the run that
+    holds a deleted conversation's claim when this process does not run it.
+
+    That run reads the cause when the cancel reaches it, from its cancel
+    watch (cancellation.watch_cancel) or, for a remote turn, from the
+    controller's cancel reply. It then stops as a local delete stops a turn:
+    it saves nothing into the deleted history, writes no terminal record,
+    deletes the stream records it wrote after the delete, and releases its
+    claim, so the next send is admitted. Its sandbox turn stops
+    on the same flag. A failure is logged: that run then answers on, and every
+    replica refuses a send into the conversation until it ends.
+    """
+    from cowork.streaming.cancellation import request_cancel_sync
+
+    try:
+        holder = turn_claim.read_claim_sync(conversation_id=conversation_id)
+        if holder is None or holder.correlation_id is None:
+            return
+        if handle is not None and handle.claim is not None and handle.claim.run_id == holder.run_id:
+            return  # registry.discard stopped it
+        request_cancel_sync(holder.correlation_id, reason=DISCARDED_CANCEL_REASON)
+    except Exception:
+        logger.warning(
+            "Could not stop the turn another replica runs in a deleted conversation; "
+            "sends into it are refused until that turn ends.",
+            exc_info=True,
+            extra={"event": "turn_discard_cancel_failed", **log_context(conversation_id=conversation_id)},
+        )
+
+
+def _release_claim_sync(*, conversation_id: str, claim: TurnClaim) -> None:
+    """Release a discarded turn's claim. Logged on failure; the claim then
+    lapses with its TTL, and the turn's own task releases it as it ends."""
+    try:
+        turn_claim.release_sync(conversation_id=conversation_id, run_id=claim.run_id)
+    except Exception:
+        logger.warning(
+            "Could not release a deleted turn's claim; it lapses with its TTL.",
+            exc_info=True,
+            extra={
+                "event": "turn_claim_release_failed", "run_id": claim.run_id,
+                **log_context(conversation_id=conversation_id),
+            },
+        )

@@ -36,6 +36,18 @@ from anton.core.llm.provider import (
     FreeServingPausedError,
     WalletEmptyError,
 )
+
+try:
+    from anton.core.llm.provider import BudgetExceededError
+except ImportError:  # TODO(ENG-1585): import it above once uv.lock pins an anton that has it.
+
+    class BudgetExceededError(Exception):  # type: ignore[no-redef]
+        """Stand-in for an anton without the type, with anton's signature; anton never raises it."""
+
+        def __init__(self, message: str, *, reason: str = "", status_code: int | None = None, **_: object):
+            super().__init__(message)
+            self.reason = reason
+            self.status_code = status_code
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.settings.app_settings import default_minds_url
@@ -125,18 +137,18 @@ TOKEN_LIMIT_USER_MESSAGE = (
 TOKEN_LIMIT_CODE = "token_limit"
 
 # Curated copy + wire code for a spent or absent FREE allowance (gateway 429
-# `included_allowance_exhausted`). Split from `token_limit`: both denials used
-# to share the out-of-credits card, but they are different situations.
-# `access.py` in auth decides it, and the logic is exact. This reason fires
+# `included_allowance_exhausted`). Kept apart from `token_limit` and its
+# out-of-credits card: they are different situations.
+# MindsHub decides it, and the logic is exact. This reason fires
 # ONLY for a free-bucket model on an org that has NEVER topped up ("a non-free
 # model always needs the wallet"). So the person seeing this card has not spent
 # money. Credits genuinely unlock the rest of the catalogue for them, because
 # non-free models need a wallet they do not have.
-# The same reason also fires for an org with NO free grant at all: auth zeroes
+# The same reason also fires for an org with NO free grant at all: MindsHub zeroes
 # the allowance of an org that is not `free_grant_eligible`, so its first
 # free-bucket request lands here and nothing ever refills. The denial does not
-# say which case it is. The card learns that from the hub usage read instead:
-# `cowork/services/hub_usage.py` relays auth's `free_grant_eligible: false` as
+# say which case it is. The card learns that from the MindsHub usage read instead:
+# `cowork/services/mindshub_usage.py` relays MindsHub's `free_grant_eligible: false` as
 # `freeTokens.limit` 0, and the card says there is no grant when it reads that.
 # The failure frame's `reset_at` only supplies the refill time. This string is
 # the fallback for consumers that don't render the card, including the channel
@@ -162,6 +174,17 @@ FREE_SERVING_PAUSED_CODE = "free_serving_paused"
 FREE_SERVING_PAUSED_USER_MESSAGE = (
     "Free MindsHub Air is paused for everyone until the daily budget resets. "
     "Add credits to keep working now."
+)
+
+# Curated copy + wire code for a spent organization budget (gateway 402
+# `budget_exceeded`). An admin set a hard spending cap and paid requests hit it,
+# so credits do not lift it: the card sends the user to the console's Budgets
+# tab. MindsHub Air keeps working while its free allowance lasts. The gate sends
+# no reset instant, so this code is not in RESET_AT_CODES.
+BUDGET_EXCEEDED_CODE = "budget_exceeded"
+BUDGET_EXCEEDED_USER_MESSAGE = (
+    "Your organization's spending budget is used up. "
+    "An owner or admin can raise it in Budgets."
 )
 
 # Codes whose failure frame carries the gate's `X-MindsHub-Reset-At` instant as
@@ -312,12 +335,13 @@ MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
 # billing decision precisely. Preferred over status/message heuristics.
 #
 # mindshub_inference (`denial_error()` and `credential_rejected()` in
-# minds/inference/errors.py) emits eight reasons today: unknown_model,
+# minds/inference/errors.py) emits nine reasons today: unknown_model,
 # rate_limited, wallet_empty, included_allowance_exhausted,
-# free_air_daily_spend_fuse_exceeded, policy_unavailable, permission_denied and
-# invalid_credentials. Any other gate reason fails closed to policy_unavailable.
+# free_air_daily_spend_fuse_exceeded, budget_exceeded, policy_unavailable,
+# permission_denied and invalid_credentials. Any other gate reason fails closed
+# to policy_unavailable.
 #
-# This module maps the first six, below. permission_denied (403) and
+# This module maps the first seven, below. permission_denied (403) and
 # invalid_credentials (401) are credential rejections with no reason mapping
 # here: they fall through to the rest of `friendly_turn_error`'s ladder, where
 # `is_auth_error` picks up anton's typed ProviderAuthError for a 401 and a 403
@@ -326,6 +350,7 @@ MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
 _REASON_WALLET_EMPTY = "wallet_empty"
 _REASON_ALLOWANCE_EXHAUSTED = "included_allowance_exhausted"
 _REASON_FREE_AIR_FUSE = "free_air_daily_spend_fuse_exceeded"
+_REASON_BUDGET_EXCEEDED = "budget_exceeded"
 _REASON_POLICY_UNAVAILABLE = "policy_unavailable"
 _REASON_UNKNOWN_MODEL = "unknown_model"
 _REASON_RATE_LIMITED = "rate_limited"
@@ -358,10 +383,23 @@ GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
 # clients (which may branch on it) keep working after the migration.
 GENERIC_TURN_ERROR_CODE = "anton_error"
 
-# Message for a turn cut off by boot recovery or shutdown, not by the model,
-# provider, or user Stop. Paired with GENERIC_TURN_ERROR_CODE, not a code of
-# its own — same as TurnInterrupted below.
+# Message for a turn the watchdog ended after it made no progress
+# (TurnLifecycle.timed_out), not the model, provider, or user Stop. Paired
+# with GENERIC_TURN_ERROR_CODE, not a code of its own — same as
+# TurnInterrupted below.
 INTERRUPTED_TURN_MESSAGE = "The response was interrupted before it finished. Please try again."
+
+# The server stopped while the turn ran: a shutdown, or a crash that boot
+# recovery finds afterwards. A code of its own because the next step differs
+# from anton_error: nothing about the request or the agent failed, the answer
+# streamed so far is kept, and sending the question again works once the
+# server is back. A proxy that outlives the server can send the same frame to
+# a client whose stream the crash cut.
+TURN_LOST_CODE = "turn_lost"
+TURN_LOST_MESSAGE = (
+    "The server stopped before this answer finished. The answer ends where it "
+    "was cut off. Please send your question again."
+)
 
 # anton ended a model call that sent no output within its deadline. Its own
 # message names the deadline, so it passes through; this is the fallback for
@@ -443,11 +481,15 @@ REMOTE_CANCEL_LITERAL = "cancelled"
 # per-stream-line cancel check needs stream lines to run and none exist
 # before the pod is Running.
 #
-# Ambiguous on its own: a replica taking SIGTERM during a rolling deploy
-# unwinds through the same handler, and reading that as a cancel would end
-# the turn with partial text, no error frame and no lookup id — the one
-# failure class that would come out of this change LESS visible. Callers
-# confirm it against the cancel flag before treating it as a Stop.
+# Ambiguous on its own: a controller replica without a shutdown drain also
+# sends it when its whole process is cancelled, as SIGINT in a local run
+# cancels every job task (a draining controller ends those turns with
+# "TurnInterrupted" instead). A hosted SIGTERM never gets there: as PID 1
+# such a controller ignores it until the kubelet kills it, and a peer later
+# reports the turn as lost. Reading this string as a cancel would end the
+# turn with partial text, no error frame and no lookup id: the one failure
+# class that would come out of this change LESS visible. Callers confirm it
+# against the cancel flag before treating it as a Stop.
 REMOTE_CANCEL_VIA_FAIL_JOB = "RuntimeError: cancelled"
 
 # live_pod.py raises a bare RuntimeError from two places when the pod never
@@ -983,6 +1025,7 @@ def _gateway_body_denial(*, exc: BaseException) -> _BodyDenial | None:
         _REASON_WALLET_EMPTY,
         _REASON_ALLOWANCE_EXHAUSTED,
         _REASON_FREE_AIR_FUSE,
+        _REASON_BUDGET_EXCEEDED,
         _REASON_POLICY_UNAVAILABLE,
         _REASON_UNKNOWN_MODEL,
         _REASON_RATE_LIMITED,
@@ -1239,7 +1282,8 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     NOT, because that user has never paid, so it has its own code and copy.
     The free-Air spend fuse is neither: free serving is paused for
     every org whose wallet cannot pay, not just this one, so it has its own code
-    and copy too. A policy outage is transient. An unknown model can't be fixed
+    and copy too. A spent budget is not out of credits either: an admin
+    raises it. A policy outage is transient. An unknown model can't be fixed
     with credits.
 
     A velocity ``rate_limited`` is NOT out of credits and must never share that
@@ -1253,6 +1297,8 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
         return ALLOWANCE_EXHAUSTED_CODE, ALLOWANCE_EXHAUSTED_USER_MESSAGE
     if reason == _REASON_FREE_AIR_FUSE:
         return FREE_SERVING_PAUSED_CODE, FREE_SERVING_PAUSED_USER_MESSAGE
+    if reason == _REASON_BUDGET_EXCEEDED:
+        return BUDGET_EXCEEDED_CODE, BUDGET_EXCEEDED_USER_MESSAGE
     if reason == _REASON_WALLET_EMPTY:
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
     if reason == _REASON_POLICY_UNAVAILABLE:
@@ -1282,6 +1328,7 @@ PROBE_DENIAL_REASONS: frozenset[str] = frozenset(
         _REASON_WALLET_EMPTY,
         _REASON_ALLOWANCE_EXHAUSTED,
         _REASON_FREE_AIR_FUSE,
+        _REASON_BUDGET_EXCEEDED,
         _REASON_RATE_LIMITED,
         _REASON_POLICY_UNAVAILABLE,
     }
@@ -1439,6 +1486,8 @@ def friendly_turn_error(
         return _map_gateway_reason(_REASON_ALLOWANCE_EXHAUSTED)
     if isinstance(exc, FreeServingPausedError):
         return _map_gateway_reason(_REASON_FREE_AIR_FUSE)
+    if isinstance(exc, BudgetExceededError):
+        return _map_gateway_reason(_REASON_BUDGET_EXCEEDED)
 
     # Precedence per ENG-673: token_limit / the billing-status fallback /
     # provider_auth / the ENG-598 model gate all WIN over provider_overloaded
@@ -1517,7 +1566,7 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
     WORKER_UNRESPONSIVE_TYPE_NAME: _RemoteTypeMapping(
         WORKER_UNRESPONSIVE_CODE, WORKER_UNRESPONSIVE_MESSAGE
     ),
-    # The three MindsHub billing stops, each named by its own anton type so the
+    # The MindsHub billing stops, each named by its own anton type so the
     # hosted card matches the desktop one. The reset instant does not ride the
     # error string: the worker sends it as `reset_at` beside `error`, and
     # `turnqueue/producer.py` keeps it for the RESET_AT_CODES only.
@@ -1527,6 +1576,9 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
     ),
     "FreeServingPausedError": _RemoteTypeMapping(
         FREE_SERVING_PAUSED_CODE, FREE_SERVING_PAUSED_USER_MESSAGE
+    ),
+    "BudgetExceededError": _RemoteTypeMapping(
+        BUDGET_EXCEEDED_CODE, BUDGET_EXCEEDED_USER_MESSAGE
     ),
     # Older worker images raise the parent type for every billing stop, and so
     # does any plain raise of it. Both keep the out-of-credits card.
@@ -1705,7 +1757,8 @@ def response_failed_payload(
     every remote-backend and in-process failure regardless of code, including
     the fully generic ``anton_error`` bucket, so a user report of "An
     unexpected error occurred" can still be pinned to this turn's server-side
-    logs. The direct and channel producers have none to offer and omit it.
+    logs. Every producer that builds this payload sets one. Boot recovery,
+    which seals a turn a restart killed, has none to offer and omits it.
 
     ``assistant_message_id`` is the persisted assistant Message's
     id when the failed turn still produced one (e.g. partial text before an

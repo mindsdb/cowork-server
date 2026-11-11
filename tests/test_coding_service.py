@@ -25,6 +25,7 @@ from coding_service_fakes import (
     wait_for_status,
     wait_for_turn_thread,
     wait_for_workspace,
+    wait_for_steerable_turn,
     wait_for_steers,
 )
 
@@ -1783,6 +1784,25 @@ def test_task_controls_persist_and_restart_idle_runtime(tmp_path: Path) -> None:
     assert config.web_search is True
 
 
+
+def test_task_controls_clear_the_effort_only_on_an_explicit_null(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="First turn"), CREDS, "fake", "fake-model"
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+    service.update_session_config(created.id, SessionUpdateRequest(reasoning_effort="max"))
+
+    kept = service.update_session_config(created.id, SessionUpdateRequest(model="other-model"))
+    assert kept.reasoning_effort == "max"
+
+    cleared = service.update_session_config(
+        created.id, SessionUpdateRequest(model="no-levels-model", reasoning_effort=None)
+    )
+    assert cleared.model == "no-levels-model"
+    assert cleared.reasoning_effort is None
+
 def test_steering_reaches_active_engine_and_is_recorded(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     engine = FakeEngine(block_until_cancel=True)
@@ -2001,6 +2021,7 @@ def test_failed_queue_promotion_restores_the_instruction(tmp_path: Path) -> None
         SessionCreateRequest(path=str(repo), prompt="Long turn"), CREDS, "fake", "fake-model"
     )
     assert engine.started.wait(timeout=1)
+    wait_for_steerable_turn(service, created.id)
 
     queued = service.queue_turn(created.id, "Try this immediately")
     instruction_id = queued.queued_instructions[0].id
@@ -2060,6 +2081,69 @@ def test_turn_accepts_native_file_references_and_workspace_mentions(tmp_path: Pa
         "path": str(Path(created.workspace_path, "src")),
         "kind": "mention",
     }
+
+
+def test_a_messages_attachments_are_recorded_with_it(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    notes = tmp_path / "notes.txt"
+    notes.write_text("context\n", encoding="utf-8")
+    shot = tmp_path / "screen.png"
+    shot.write_bytes(b"png")
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+
+    def user_messages(session_id: str) -> list:
+        return [item for item in service.events(session_id).items if item.type == EventType.user_message]
+
+    created = service.create_session(
+        SessionCreateRequest(
+            path=str(repo),
+            prompt="Use the notes",
+            attachments=[
+                InputReference(name="notes.txt", path=str(notes)),
+                InputReference(name="screen.png", path=str(shot), kind="local_image"),
+            ],
+        ),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+    assert user_messages(created.id)[0].data == {"attachments": [
+        {"name": "notes.txt", "kind": "mention"},
+        {"name": "screen.png", "kind": "local_image"},
+    ]}
+
+    engine.block_until_release = True
+    engine.started.clear()
+    service.submit_turn(created.id, "Again", CREDS, [InputReference(name="notes.txt", path=str(notes))])
+    assert engine.started.wait(timeout=1)
+    assert user_messages(created.id)[-1].data == {"attachments": [{"name": "notes.txt", "kind": "mention"}]}
+
+    service.steer(created.id, "Look here too", [InputReference(name="screen.png", path=str(shot), kind="local_image")])
+    wait_for_steers(engine)
+    assert user_messages(created.id)[-1].data["attachments"] == [{"name": "screen.png", "kind": "local_image"}]
+
+    queued = service.queue_turn(created.id, "Then this", [InputReference(name="notes.txt", path=str(notes))])
+    assert user_messages(created.id)[-1].data == {
+        "queueId": queued.queued_instructions[0].id,
+        "attachments": [{"name": "notes.txt", "kind": "mention"}],
+    }
+    # Nothing beyond the label and kind: no disk path in the timeline.
+    assert all(str(tmp_path) not in str(item.data) for item in user_messages(created.id))
+    service.cancel(created.id)
+    wait_for_status(service, created.id, SessionStatus.cancelled)
+
+
+def test_a_message_without_attachments_records_none(tmp_path: Path) -> None:
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repository(tmp_path)), prompt="Plain"), CREDS, "fake", "fake-model"
+    )
+    wait_for_status(service, created.id, SessionStatus.completed)
+    first = next(item for item in service.events(created.id).items if item.type == EventType.user_message)
+    assert first.data == {}
 
 
 def test_missing_attachment_is_rejected_before_a_turn_starts(tmp_path: Path) -> None:

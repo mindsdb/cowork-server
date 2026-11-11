@@ -53,6 +53,39 @@ The chart references these Secrets in the target namespace:
   datasource turn is refused, so the bundle must exist before
   `COWORK_TURN_DATASOURCE_ENABLED` turns on, not before this deploys. PR
   environments get it from the keycloak chart's ephemeral secrets.
+- `mindsdb-secrets`, key `COWORK_DRAFT_LINK_KEYS` — the draft-link signing
+  keys, a JSON object `{"<kid>": "<secret>"}`. Each secret must be at least 32
+  characters. A shorter secret is ignored, and a value that is not a JSON
+  object counts as no keys. `COWORK_DRAFT_LINK_KID` (`v1`, in `values.yaml`)
+  names the kid that signs new links, and a link signed with any listed kid
+  still opens. So a rotation adds the new kid, moves `COWORK_DRAFT_LINK_KID`
+  to it, and drops the old kid once its links have expired (30 minutes). The
+  reference is optional: without the key, or without the signing kid in it,
+  the pod starts, logs `draft_host_misconfigured` at boot and keeps previews
+  on srcdoc. The pod reads the key at start, so a change needs a rollout
+  restart.
+
+## Draft-preview host
+
+Off in `values.yaml`. An environment turns it on in `values-<env>.yaml` with
+two names and one switch:
+
+```yaml
+deployment:
+  draftHost: draft-staging.mindshub.co
+  webOrigin: https://cowork.staging.mindshub.ai
+  ingress_secondary:
+    enabled: true
+```
+
+The draft Ingress, the draft port and the `COWORK_DRAFT_*` variables live in
+`values.yaml`, templated from these two names, so do not repeat them per
+environment. `draftHost` must be one of the hosts cowork's web build frames
+(`src/shared/draft-link-origins.ts` in the cowork repository), and `webOrigin`
+is `https://` plus the primary Ingress host, where the web app runs.
+`tests/test_chart_values.py` pins both. Links turn on once
+`COWORK_DRAFT_LINK_KEYS` holds the signing kid, and `/health` then reports
+`draft_links: true`.
 
 ## Datasource grants for hosted turns
 
@@ -80,9 +113,17 @@ inference Service by name, and the same in every environment.
 Turn the switches on only after auth serves the datasource endpoints with the
 bundle above, mindshub_inference serves `/v1/datasources/`, and a scratchpad
 image with the datasource helper is deployed and older pods are recycled.
-Rollback is `datasourceTurnsEnabled` off: no new grants are registered and no
-datasource block is queued; encrypted records stay in auth and OAuth
-connections are unaffected.
+Rollback removes both `datasourceTurnsEnabled` and `datasourceCapabilities`
+from the environment's values file, and drops the environment from both
+`ENABLED_ENVIRONMENTS` and `OFFERED_METHODS` in `tests/test_chart_values.py`
+in the same change; the test expects both keys absent, not `"false"`, outside
+enabled environments. Rolling back one engine instead drops only its pair
+(`mysql:host-password` or `postgres:host-port`) from `datasourceCapabilities`
+and from that environment's `OFFERED_METHODS` entry.
+Without grants no datasource block is queued, and without the capability list
+no new connection is accepted or edited through this server. Encrypted records
+stay in auth, where users can still delete them, and OAuth connections are
+unaffected.
 
 ## Required cluster permissions
 
@@ -95,6 +136,110 @@ in the namespaces listed under `runner_deploy_namespaces` in
 Kubernetes-Foundational-Services. See the `networkPolicy` block in `values.yaml`
 for the two selector checks to run alongside it, since getting either one wrong
 drops every real request without failing the release.
+
+## Probes
+
+The kubelet probes two routes, and neither reads the database, the file store or settings. A probe that can fail for an outside reason turns that outage into a pod restart, or into every replica leaving the service at once.
+
+| Probe | Path | Timing | Effect of failing |
+| -- | -- | -- | -- |
+| Readiness | `/api/v1/health/ready` | every 5 s, 3 failures | The pod leaves the Service's endpoints until it answers again |
+| Liveness | `/api/v1/health/live` | starts after 180 s, every 10 s, 6 failures | The kubelet restarts the container |
+
+Both answer as soon as the event loop does. A request that needs a busy database or a stuck file store is refused on its own, with `503` and `Retry-After`, so the probes stay green while it waits.
+
+The liveness delay covers the boot. The lifespan runs file store and database work before uvicorn binds the port, and the subchart renders no `startupProbe`. On 28 Oct 2026 staging pods booting under load served their first request about 120 s after start, the moment the old 60 s delay plus 60 s of failures killed them. With 180 s, a boot of up to about 230 s survives: the kubelet's first probe lands between 180 and 190 s after start, and the sixth failure 50 s after that, between 230 and 240 s. A process that hangs after it has started is still restarted after 60 s. Each boot logs `startup_finished` with its length, counted from the start of the container's server process, and each lifespan step's. That length is the number to compare when the delay is changed. A step still running 10 s after it starts logs `startup_step_running` then, once, and a step that took 10 s or more logs `startup_step_slow` as it ends. So a boot killed before `startup_finished` still names each step that ran for 10 s, including the step it was killed in if that step had run that long.
+
+The `deployment` subchart is pinned to one version in `requirements.yaml`, because these probes are its templates. `tests/test_chart_values.py` pins both paths, the delay and the subchart version.
+
+## What a shutdown does to answers in progress
+
+A rollout, an autoscaler scale-in, a node drain and a deleted pod all stop a
+pod the same way, so an answer can be interrupted outside a release too. The
+times below count from the pod's deletion.
+
+| Time | What happens |
+| --- | --- |
+| 0 to 15 s | The preStop hook sleeps. ingress-nginx drops the pod's endpoint and sends new requests, reconnects included, to the other pods. Answers already streaming from this pod keep streaming, and one that finishes now ends normally. |
+| About 15 s | The kubelet sends SIGTERM. Before uvicorn sees it, the server refuses new turns (503, code `server_busy`, `Retry-After: 1`) and stops its scheduler. A scheduled run whose turn it refuses is recorded as not started, and its slot stays due for the next poll on a pod still serving. Then it ends each answer still running: it writes the sandbox controller's cancel flag so the sandbox turn stops, saves the answer as it stands, and sends "The response was interrupted before it finished. Please try again." on the answer's open stream, which then ends cleanly. This takes at most 5 s (`TURN_SHUTDOWN_GRACE_SECONDS`). If an answer's save is still running a second after that, the message goes to its stream without waiting for the save, which goes on in the background. The pod logs `Cancelled in-flight turns for shutdown` at WARNING, with `event` `shutdown_turns_cancelled` and the number of answers it ended in `count`. |
+| Up to about 22 s | uvicorn closes its listener and waits at most 2 s (`--timeout-graceful-shutdown` in the Dockerfile's `CMD`) for responses still open, such as a `/tail` of an answer another pod runs, then cuts them. |
+| Up to about 44 s | The lifespan teardown's bounded waits, about 22 s: the draft listener's own drain when `COWORK_DRAFT_PORT` is set (2 s), another pass over turns and scheduled runs (5 s), the artifact location backfill's stop (2 s, `LOCATION_BACKFILL_SHUTDOWN_SECONDS`), channel tasks (3 s, then up to 5 s more) and scratchpad closes (5 s). The backfill's walk ends at its next root or id once the teardown sets its stop. When it is still running after 2 s, as during a file store stall, the pod logs `artifact location backfill still running at shutdown; going on` at WARNING, with `event` `shutdown_location_backfill_unfinished`, and the teardown goes on without it. The channel drain waits up to 3 s for the channel answers in flight, then cancels each one still running. The pod logs `Cancelled channel inbound tasks still running at the shutdown drain's timeout` at WARNING, with `event` `shutdown_channel_tasks_cancelled` and the number it cancelled in `count`. The drain then waits up to 5 s more while each cancelled answer writes its sandbox turn's cancel flag and records its artifacts. If an answer is still running after those 5 s, the pod logs `Cancelled channel inbound tasks still unwinding; shutdown goes on without them` at WARNING, with `event` `shutdown_channel_tasks_unfinished` and the number still running in `count`, and the teardown goes on without it. |
+| Up to about 52 s | Last, only while an answer's artifact diff or record is still running, as it is during a file store stall: the teardown waits up to 8 s more for those (`TURN_END_RECORD_DRAIN_SECONDS` in `cowork/db/units.py`). A stall that clears within that wait keeps the answer's artifact rows. For each one still running after it, the pod logs `A turn's artifact record was still running at shutdown; its rows are lost` at ERROR, with `event` `shutdown_turn_record_lost`, `conversation_id`, `project_id`, `touched` and `count`. `touched` holds the new artifacts' slugs its diff found, or, when the diff had not returned, the artifacts the pod named as its tools' (`artifacts_touched`; empty for a pod that sends no usable list), the first of them in sorted order, none longer than 255 characters, at most 50 (`TURN_END_RECORD_NAMES_LOGGED`) and only as many as fit in 12 KiB as the line encodes them (`TURN_END_RECORD_TOUCHED_BYTES`), so the line stays under the 16 KiB a container runtime splits a line at; `count` says how many the record held. |
+| 62 s | `terminationGracePeriodSeconds`. Outside a file store stall, the bounded waits above end by about 44 s, which leaves about 18 s before the kubelet's SIGKILL for the closes at the end of the teardown, which have no bound. During a stall they end by about 52 s, which leaves about 10 s. When the teardown ends, the event loop's close cancels every task still running. It cuts an artifact diff that has not returned and a record still waiting for its database slot, so that answer's artifact rows are lost. A web answer still streaming at SIGTERM is saved anyway, marked `turn_lost`, before the loop closes; its stream already ended with the turn-lost message. An answer that had finished streaming and was recording its artifacts at SIGTERM starts its save only once that record ends, and if that is in the last wait, the save starts as the loop closes and may not finish. A file store call already running on the stuck mount keeps its worker thread, which is not a daemon thread, so the process stays alive until the SIGKILL ends it. |
+
+The chart sets no `image.command` or `image.args`, so the image's `CMD` and its
+shutdown bound apply; `tests/test_chart_values.py` fails if a values file sets
+either again, and checks that the grace period covers the steps above.
+
+The rollout uses `maxSurge: 100%` and `maxUnavailable: 0`. It creates every new
+pod at once, as many as the Deployment runs when the rollout starts, and stops
+no old pod until a new one is Ready. When the cluster has room for every new
+pod, the old pods stop within seconds of each other, and the retry an
+interrupted answer asks for lands on a new pod rather than on an old one about
+to stop too. A new pod still waiting for a node keeps one old pod running until
+it turns Ready, as the default rollout does, so a retry that reaches that old
+pod can be interrupted a second time. During a rollout the namespace briefly
+holds twice the Deployment's current pod count, the old half until it finishes
+stopping, each pod requesting 1 CPU and 1Gi. Staging and prod autoscale
+between 2 and 4 pods (`values-staging.yaml`, `values-prod.yaml`), so a rollout
+there can hold up to 8.
+
+An answer is interrupted rather than continued on another replica because only
+the replica that took the request relays the controller's replies into the
+answer's stream and saves the answer when it ends. Nothing hands that relay
+over: another replica can replay what the stopping one already wrote, but it
+reads no reply the controller sends after that and saves nothing. Ending the
+answer, saving it and stopping its sandbox turn leaves the user a saved answer
+to retry from instead of one that never ends.
+
+Each answer holds its conversation's turn claim in Redis while it runs, so a
+second question that reaches another pod is refused with `409` (README.md, the
+`turn_in_progress` refusal). A pod that stops this way releases each claim once
+the answer's stream has its last frame. A pod that never runs the steps above
+(a SIGKILL, an OOM kill, a lost node) releases nothing, so a question sent into
+one of its conversations is refused with `409` until that claim lapses, 90 s
+after the pod's last renewal. A container restarted in place (an OOM kill or a
+crash) keeps the pod's name, and the new process releases the claims its pod
+left as it starts, and writes the controller's cancel flag for each of their
+turns, so their sandbox turns stop. That relies on one uvicorn process per pod,
+which `tests/test_turn_claim.py` pins for the image's command. The claims are
+still held only when the container starts again within 90 s. A liveness
+restart kills a stalled process only after its claims lapsed (the probe gives
+up after about 60 s, then the 62 s grace runs out), so it frees nothing sooner,
+but the new process still stops those sandbox turns.
+
+The first rollout of the claim mixes pods that take it with pods that predate
+it, for the readiness spread of the new pods plus about 20 s, and longer while
+a new pod waits for a node (the rollout timing above). Until the last older pod
+stops, an older pod admits a duplicate question as it always did, also one sent
+during a newer pod's turn, and its turn index write replaces the newer turn's
+entry. A Stop for that newer turn that reaches a pod other than the one running
+it then answers `404`, and a stale question at its number is not refused.
+
+Desktop and other non-hosted deployments are unchanged. They run turns in the
+server's own process, keep uvicorn's SIGTERM handling, and end their turns in
+the lifespan teardown, as before. A single-replica PR environment renders these
+values too, and they change only how its pod stops.
+
+## The agent's browser
+
+`COWORK_BROWSER_ROUTER_URL` turns on the agent's browser for the web app: it
+names the browser router, served on the same host under `/browser`.
+`values-dev.yaml`, `values-staging.yaml` and `values-prod.yaml` set it to
+their own host. The router must answer on that host's `/browser` path before
+the entry ships, since without it the path reaches the web frontend. PR
+environments get theirs from where they are deployed.
+`tests/test_chart_values.py` pins each value to its environment's host. What
+the router does with it is in the top-level README ("The agent's browser").
+
+The router's scope key is the `browser-scope-key` volume: the router's own
+Secret, `browser-proxy`, key `scope_key`, in the same namespace, mounted at
+`/etc/cowork/browser-scope/scope_key` (`COWORK_BROWSER_SCOPE_KEY_FILE`,
+`values.yaml`). The router takes a turn key's scope only with that key beside
+it, so the two must match, and reading one Secret keeps them so. cowork-server
+reads the file on every scope, and the kubelet fills it when the Secret first
+appears and rewrites it on rotation, so no restart is needed. The volume is
+optional: a namespace with no router has no such Secret and scopes no turn.
 
 ## Browser organization boundary
 
