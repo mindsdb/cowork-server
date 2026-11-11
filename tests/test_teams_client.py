@@ -6,6 +6,7 @@ other platforms; the no-SDK test runs everywhere.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -166,8 +167,24 @@ async def test_get_member_returns_the_verified_sign_in_name(sdk):
 
 
 def test_tenant_is_required(sdk):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="tenant_id is required"):
         sdk.TeamsClient(APP_ID, SECRET, "")
+
+
+def test_calls_to_microsofts_sign_in_have_a_timeout(sdk, monkeypatch):
+    # msal's default requests session waits forever unless given one.
+    import requests
+
+    login, timeouts = StandInLogin(), []
+
+    def request(session, method, url, **kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        return login.get(url) if method == "GET" else login.post(url, data=kwargs.get("data"))
+
+    monkeypatch.setattr(requests.Session, "request", request)
+    client = sdk.TeamsClient(APP_ID, SECRET, TENANT)
+    asyncio.run(client.bot_token())
+    assert timeouts and set(timeouts) == {15}
 
 
 def test_imports_without_the_teams_packages():
