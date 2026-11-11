@@ -63,13 +63,13 @@ def _turn_slice():
 
 # --- pure helpers -----------------------------------------------------------
 
-def test_split_strips_text_and_keeps_tool_blocks():
+def test_split_keeps_tool_blocks():
     rows = _split_turn_into_rows(_turn_slice())
     assert len(rows) == 2
-    # tool_use row: text block dropped, tool_use kept verbatim
+    # tool_use row: tool_use kept verbatim, with or without the text beside it
     assert rows[0]["role"] == "assistant"
-    assert [b["type"] for b in rows[0]["content"]] == ["tool_use"]
-    assert rows[0]["content"][0]["input"] == {"name": "pdf"}
+    tool_uses = [b for b in rows[0]["content"] if b["type"] == "tool_use"]
+    assert [b["input"] for b in tool_uses] == [{"name": "pdf"}]
     # tool_result row
     assert rows[1]["role"] == "user"
     assert rows[1]["content"][0]["type"] == "tool_result"
@@ -79,10 +79,8 @@ def test_split_strips_text_and_keeps_tool_blocks():
 def test_split_skips_pure_text_message():
     # The final "final answer" message carries no tool block -> no row for it.
     rows = _split_turn_into_rows(_turn_slice())
-    assert all(
-        b["type"] in ("tool_use", "tool_result")
-        for row in rows for b in row["content"]
-    )
+    assert all(_is_tool_row(row["content"]) for row in rows)
+    assert {"type": "text", "text": "final answer"} not in [b for row in rows for b in row["content"]]
 
 
 def test_sanitize_replaces_image_with_replay_marker():
