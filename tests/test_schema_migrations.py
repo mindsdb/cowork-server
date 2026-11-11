@@ -647,6 +647,52 @@ def test_held_artifact_roots_keep_one_row_per_root_and_take_their_sentinel_on_do
     assert (rows, sentinel) == (0, 0)
 
 
+def test_artifact_sort_times_keep_one_row_per_folder_and_take_their_sentinel_on_downgrade(tmp_path, monkeypatch):
+    """One row per folder: a shared root's folder (no conversation) and a
+    legacy root's folder each once. The sentinel that says the backfill read
+    every held root goes with the table on a downgrade, and the held roots
+    stay with theirs."""
+    from cowork.services.artifact_sort_times import SENTINEL_KEY
+    from cowork.services.held_artifact_roots import SENTINEL_KEY as HELD_KEY
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "sort-times.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    project, conversation = uuid.uuid4().hex, uuid.uuid4().hex
+    insert = text(
+        "INSERT INTO artifact_sort_times (id, org_id, project_id, conversation_id, slug, sort_time) "
+        "VALUES (:id, :org, :project, :conversation, :slug, 1.0)"
+    )
+
+    def add(conversation_id, slug="report") -> None:
+        with engine.begin() as connection:
+            connection.execute(
+                insert,
+                {"id": uuid.uuid4().hex, "org": _ORG, "project": project, "conversation": conversation_id, "slug": slug},
+            )
+
+    add(None)
+    add(conversation)
+    add(None, slug="chart")
+    for again in (None, conversation):
+        with pytest.raises(IntegrityError):
+            add(again)
+    with engine.begin() as connection:
+        _insert_setting(connection, key=SENTINEL_KEY, value="1")
+        _insert_setting(connection, key=HELD_KEY, value="1")
+
+    _downgrade_to(engine, uri, "7e636946b5f8")
+    with engine.connect() as connection:
+        keys = {row[0] for row in connection.execute(text("SELECT key FROM settings"))}
+    tables = inspect(engine).get_table_names()
+    assert "artifact_sort_times" not in tables and "held_artifact_roots" in tables
+    assert SENTINEL_KEY not in keys
+    assert HELD_KEY in keys
+
+
 def test_artifact_owner_choices_upgrade_and_downgrade(tmp_path, monkeypatch):
     """One row per artifact per organization, keyed by its authorization key;
     the downgrade drops the table, so a re-upgrade never judges a re-publish

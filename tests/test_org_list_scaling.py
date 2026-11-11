@@ -399,27 +399,34 @@ def test_the_callers_own_legacy_cards_stay_theirs_beside_a_co_members(client, or
 
 
 def _drop_held_sentinel() -> None:
+    from cowork.services.artifact_sort_times import SENTINEL_KEY as SORT_TIMES_KEY
     from cowork.services.held_artifact_roots import SENTINEL_KEY
 
     with Session(_engine()) as raw:
-        for row in raw.exec(select(Setting).where(Setting.key == SENTINEL_KEY, Setting.scope.is_(None))).all():
+        keys = (SENTINEL_KEY, SORT_TIMES_KEY)
+        for row in raw.exec(select(Setting).where(Setting.key.in_(keys), Setting.scope.is_(None))).all():
             raw.delete(row)
         raw.commit()
 
 
 @pytest.fixture()
 def held_roots(org):
-    """Fills ``org``'s held-root rows with the startup backfill, which writes
-    the sentinel the list trusts them by. The sentinel is global and the
-    database is shared across modules, so it goes again after the test."""
+    """Fills ``org``'s held-root rows, and then its sort times unless
+    ``times`` is false, with the startup backfills, which write the
+    sentinels the list trusts them by. The sentinels are global and the
+    database is shared across modules, so they go again after the test."""
+    from cowork.services.artifact_sort_times import run_sort_time_backfill
     from cowork.services.held_artifact_roots import run_held_root_backfill
 
-    def fill() -> None:
+    def fill(*, times: bool = True) -> None:
         _drop_held_sentinel()
         with Session(_engine()) as raw:
             project_ids = raw.exec(select(Project.id).where(Project.org_id == org)).all()
         summary = run_held_root_backfill(project_ids=project_ids)
         assert summary is not None and summary.unread == 0
+        if times:
+            recorded = run_sort_time_backfill(project_ids=project_ids)
+            assert recorded is not None and recorded.unread == 0
 
     yield fill
     _drop_held_sentinel()
@@ -529,9 +536,11 @@ def _seed_every_kind_of_root(client, org: str) -> list[Path]:
     return paths
 
 
-def test_the_list_shows_the_same_cards_through_the_held_rows(client, org, held_roots):
+@pytest.mark.parametrize("times", [False, True], ids=["held-roots", "and-sort-times"])
+def test_the_list_shows_the_same_cards_through_the_held_rows(client, org, held_roots, times):
     """Every form of the list, for every viewer, answers the same before the
-    held rows exist and after the backfill has filled them."""
+    rows exist and after the backfills have filled them: the held roots
+    alone, and with the sort times."""
     paths = _seed_every_kind_of_root(client, org)
     lists = ["/api/v1/artifacts/"] + [f"/api/v1/artifacts/?project_id={_project_id(org, path)}" for path in paths]
 
@@ -543,7 +552,7 @@ def test_the_list_shows_the_same_cards_through_the_held_rows(client, org, held_r
         }
 
     walked = answers()
-    held_roots()
+    held_roots(times=times)
     through_rows = answers()
 
     assert through_rows == walked
@@ -586,6 +595,92 @@ def test_a_held_row_never_shows_a_co_members_workspace_or_another_organizations_
     assert unfiltered.json() == []
     assert bobs_project.json() == []
     assert other_project.status_code == 404
+
+
+def _artifacts_at(org: str, project_path: Path, owner: str, times: dict[str, float]) -> None:
+    """One project-root artifact per name in ``times``, its metadata.json
+    modified at that time."""
+    for slug, at in times.items():
+        _project_root_artifact(org, project_path, owner, slug)
+        os.utime(project_path / ".anton" / "artifacts" / slug / "metadata.json", (at, at))
+
+
+def test_the_list_makes_no_more_file_store_calls_at_1000_artifacts_than_at_80(
+    client, org, held_roots, monkeypatch
+):
+    """One project's root with 1,000 artifacts against one with 80: with the
+    sort times recorded, the list opens only the folders it shows. A list
+    that read every folder's metadata.json fails here."""
+    [path] = _bulk_paths(client, org, 0, 1)
+    _artifacts_at(org, path, ALICE, {f"chart-{i:04d}": 1_000_000.0 + i for i in range(80)})
+    held_roots()
+    listed = f"/api/v1/artifacts/?project_id={_project_id(org, path)}"
+    small, small_calls = _file_store_get(client, monkeypatch, listed, _headers(org, ALICE))
+    _artifacts_at(org, path, ALICE, {f"chart-{i:04d}": 1_000_000.0 + i for i in range(80, 1000)})
+    held_roots()
+    large, large_calls = _file_store_get(client, monkeypatch, listed, _headers(org, ALICE))
+
+    assert (len(small), len(large)) == (80, 80)
+    assert [card["slug"] for card in large] == [f"chart-{i:04d}" for i in range(999, 919, -1)]
+    assert large_calls <= small_calls, f"{small_calls} file store calls at 80 artifacts, {large_calls} at 1,000"
+
+
+def test_the_list_follows_a_turns_edit_and_not_the_servers_own_rewrite(client, org, held_roots):
+    """The sort time is the one a turn end last read: a turn that changes an
+    artifact moves it up as a walk would, and a rewrite the server makes on
+    its own, such as an id widening, leaves the order as it was."""
+    from cowork.services.artifact_sort_times import sort_times_below
+    from cowork.services.task_objects import record_new_artifacts
+    from test_artifact_ownership import scoped
+
+    [path] = _bulk_paths(client, org, 0, 1)
+    _artifacts_at(org, path, ALICE, {"first": 1_000_100.0, "second": 1_000_200.0, "third": 1_000_300.0})
+    held_roots()
+    listed = f"/api/v1/artifacts/?project_id={_project_id(org, path)}"
+
+    def order() -> list[str]:
+        return [card["slug"] for card in client.get(listed, headers=_headers(org, ALICE)).json()]
+
+    assert order() == ["third", "second", "first"]
+    base = path / ".anton" / "artifacts"
+    os.utime(base / "first" / "metadata.json", (1_000_400.0, 1_000_400.0))
+    with scoped(org, ALICE) as session:
+        record_new_artifacts(
+            session, conversation_id=_legacy_workspace_conversation(org, path), project_id=_project_id(org, path),
+            slugs=[], creator=ALICE, sort_times=sort_times_below(base=base, slugs=["first"]),
+        )
+    assert order() == ["first", "third", "second"]
+    os.utime(base / "second" / "metadata.json", (1_000_500.0, 1_000_500.0))
+    assert order() == ["first", "third", "second"]
+
+
+def _legacy_workspace_conversation(org: str, project_path: Path):
+    with Session(_engine()) as raw:
+        conversation = Conversation(topic="turn", project_id=_project_id(org, project_path), org_id=org, created_by=ALICE)
+        raw.add(conversation)
+        raw.commit()
+        return conversation.id
+
+
+def test_a_list_whose_newest_rows_are_all_gone_reads_every_folder(client, org, held_roots):
+    """Rows for folders deleted behind the server's back fill the query's
+    limit: the list then reads every folder rather than come up short."""
+    from cowork.models.artifact_sort_time import ArtifactSortTime
+
+    [path] = _bulk_paths(client, org, 0, 1)
+    _artifacts_at(org, path, ALICE, {"kept-a": 1_000_100.0, "kept-b": 1_000_200.0})
+    held_roots()
+    project_id = _project_id(org, path)
+    with Session(_engine()) as raw:
+        raw.add_all(
+            ArtifactSortTime(org_id=org, project_id=project_id, slug=f"gone-{i:03d}", sort_time=2_000_000.0 + i)
+            for i in range(200)
+        )
+        raw.commit()
+
+    listed = client.get(f"/api/v1/artifacts/?project_id={project_id}", headers=_headers(org, ALICE)).json()
+
+    assert [card["slug"] for card in listed] == ["kept-b", "kept-a"]
 
 
 def _held_conversations(org: str) -> set:

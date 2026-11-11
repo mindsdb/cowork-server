@@ -60,6 +60,7 @@ from cowork.services.artifact_locations import forget_location
 from cowork.services.artifact_roots import (
     RootsPlan,
     artifacts_sources_for_scan,
+    held_root_of,
     plan_project_roots,
     plan_scope_roots,
     readable_sources,
@@ -67,13 +68,16 @@ from cowork.services.artifact_roots import (
     with_held_roots,
 )
 from cowork.services.artifacts import (
+    LIST_CARDS,
     BackendPreviewRefused,
     ExecutionRefused,
+    ListCandidate,
     ProjectArtifacts,
     _is_single_named_file,
     _org_mode,
     _project_artifacts_base,
     artifact_id_for_folder as _artifact_id_for_folder,
+    cards_for_candidates,
     delete_artifact as _delete_artifact,
     delete_artifact_from_source as _delete_artifact_from_source,
     list_artifacts as _list_artifacts,
@@ -87,6 +91,7 @@ from cowork.services.projects import ProjectService, is_comparison_sandbox
 
 if TYPE_CHECKING:
     from cowork.services.artifact_export import ExportSource
+    from cowork.services.artifact_sort_times import NewestFolders
     from cowork.services.live_apps import CopyOfShare
 
 logger = logging.getLogger(__name__)
@@ -215,16 +220,43 @@ class _SourcesAndCards(NamedTuple):
     cards: list[_FoundCard]
 
 
-def _sources_and_cards(*, find_sources: Callable[[], list[ProjectArtifacts]]) -> _SourcesAndCards:
+def _sources_and_cards(
+    *, find_sources: Callable[[], list[ProjectArtifacts]], newest: NewestFolders | None = None
+) -> _SourcesAndCards:
     """The roots ``find_sources`` finds and their cards, each with its export
-    source, on the calling thread."""
+    source, on the calling thread. With ``newest``, the plan's newest folders
+    (RootsPlan.newest), only those folders are opened."""
     from cowork.services.artifact_export import card_export_source
 
     sources = find_sources()
+    listed = _list_artifacts(sources) if newest is None else _newest_cards(sources, newest)
     return _SourcesAndCards(
         sources=sources,
-        cards=[_FoundCard(card, card_export_source(card)) for card in _list_artifacts(sources)],
+        cards=[_FoundCard(card, card_export_source(card)) for card in listed],
     )
+
+
+def _newest_cards(sources: list[ProjectArtifacts], newest: NewestFolders) -> list[dict]:
+    """The cards of the folders ``newest`` names, among ``sources``, in the
+    order a walk of every folder sorts them (cards_for_candidates). When
+    fewer than LIST_CARDS of them build a card and the rows were cut at the
+    query's limit, every folder of ``sources`` is read instead
+    (_list_artifacts), so a run of folders gone since their rows were
+    written never leaves the list short."""
+    index: dict[object, int] = {}
+    for position, source in enumerate(sources):
+        root = held_root_of(source)
+        if root is not None:
+            index.setdefault(root, position)
+    candidates = [
+        ListCandidate(row.sort_time, position, row.slug, sources[position])
+        for row in newest.rows
+        if (position := index.get((row.project_id, row.conversation_id))) is not None
+    ]
+    cards = cards_for_candidates(candidates)
+    if len(cards) < LIST_CARDS and not newest.complete:
+        return _list_artifacts(sources)
+    return cards
 
 
 def _browsable_sources(*, plan: RootsPlan) -> list[ProjectArtifacts]:
@@ -238,13 +270,19 @@ def _browsable_sources(*, plan: RootsPlan) -> list[ProjectArtifacts]:
 
 
 async def _cards_for(
-    scope: TenantScope, find_sources: Callable[[], list[ProjectArtifacts]]
+    scope: TenantScope,
+    find_sources: Callable[[], list[ProjectArtifacts]],
+    *,
+    newest: NewestFolders | None = None,
 ) -> list[dict]:
     """``_artifact_cards`` with the roots found and their folders walked in one
     file store call, then the owner reads in a database unit, so no pooled
     connection waits on the file server. ``find_sources`` runs in that file
-    store call."""
-    found = await run_efs(partial(_sources_and_cards, find_sources=find_sources), scope=scope)
+    store call, and ``newest``, a plan's newest folders, limits the walk to
+    those folders."""
+    found = await run_efs(
+        partial(_sources_and_cards, find_sources=find_sources, newest=newest), scope=scope
+    )
     return await run_db(
         partial(_card_capabilities, sources=found.sources, cards=found.cards), scope=scope
     )
@@ -336,19 +374,45 @@ def _plan_scoped_project(session, *, project_ref: str) -> RootsPlan:
     key, so root discovery receives the matching database value."""
     server_project_id = scoped_project_id_for_request(session, project_ref)
     try:
-        return with_held_roots(session, plan_project_roots(session, server_project_id))
+        plan = with_held_roots(session, plan_project_roots(session, server_project_id))
     except ValueError as exc:
         # The project can disappear between catalog recovery and root discovery.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Unknown project",
         ) from exc
+    return _with_newest(session, plan, sources_of=readable_sources)
+
+
+# Twice the cards a list shows: a folder deleted since its row was written
+# costs the list one of these, and a list left short reads every folder.
+_NEWEST_CANDIDATES = 2 * LIST_CARDS
+
+
+def _with_newest(
+    session, plan: RootsPlan, *, sources_of: Callable[[RootsPlan], list[ProjectArtifacts]]
+) -> RootsPlan:
+    """``plan`` with the newest folders of the roots ``sources_of`` expands it
+    to (artifact_sort_times.newest_folders), once the plan names its roots
+    from the held rows, which expands it with no file store call. Unchanged
+    otherwise, or before the sort times' backfill has finished."""
+    from dataclasses import replace
+
+    from cowork.services.artifact_sort_times import newest_folders
+
+    if plan.held is None:
+        return plan
+    roots = [root for source in sources_of(plan) if (root := held_root_of(source)) is not None]
+    newest = newest_folders(session, roots=roots, limit=_NEWEST_CANDIDATES)
+    return plan if newest is None else replace(plan, newest=newest)
 
 
 def _listed_scope_plan(session) -> RootsPlan:
     """The unfiltered list's plan: every project of the caller's scope, with
-    the roots the held rows name (with_held_roots), in one database unit."""
-    return with_held_roots(session, plan_scope_roots(session))
+    the roots the held rows name (with_held_roots) and the newest folders of
+    those it browses (_with_newest), in one database unit."""
+    plan = with_held_roots(session, plan_scope_roots(session))
+    return _with_newest(session, plan, sources_of=lambda listed: _browsable_sources(plan=listed))
 
 
 async def _scoped_project_plan(scope: TenantScope, project_id: UUID | str) -> RootsPlan:
@@ -735,9 +799,9 @@ async def list_artifacts(
                 detail="Invalid project",
             )
         plan = await _scoped_project_plan(scope, project_ref)
-        return await _cards_for(scope, partial(readable_sources, plan))
+        return await _cards_for(scope, partial(readable_sources, plan), newest=plan.newest)
     plan = await run_db(_listed_scope_plan, scope=scope)
-    return await _cards_for(scope, partial(_browsable_sources, plan=plan))
+    return await _cards_for(scope, partial(_browsable_sources, plan=plan), newest=plan.newest)
 
 
 
@@ -939,14 +1003,20 @@ async def delete_artifact_for_request(
             extra=log_context(project_id=source.project_id, artifact_slug=folder_name),
         )
 
-    # The location row goes with the folder (org mode; a no-op elsewhere).
-    # Best-effort: a row left behind names a folder that no longer holds the
-    # id, and the next lookup drops it.
+    # The location row and the sort time go with the folder (org mode; a
+    # no-op elsewhere). Best-effort: a location row left behind names a
+    # folder that no longer holds the id, and the next lookup drops it; a
+    # sort time left behind costs a list one failed open, and the project's
+    # next self-heal drops it.
     location = recorded_location(source, Path(source.base) / folder_name)
     if expected_artifact_id is not None and location is not None:
         try:
             await run_db(
-                partial(forget_location, artifact_id=canonical_artifact_id(expected_artifact_id), location=location),
+                partial(
+                    _forget_deleted_folder,
+                    artifact_id=canonical_artifact_id(expected_artifact_id),
+                    location=location,
+                ),
                 scope=scope,
             )
         except Exception:
@@ -955,6 +1025,15 @@ async def delete_artifact_for_request(
                 exc_info=True,
                 extra=log_context(project_id=source.project_id, artifact_slug=folder_name),
             )
+
+
+def _forget_deleted_folder(session, *, artifact_id: str, location) -> None:
+    """Drop the rows of a folder just deleted: its location row
+    (forget_location) and its sort time (forget_sort_time)."""
+    from cowork.services.artifact_sort_times import forget_sort_time
+
+    forget_location(session, artifact_id=artifact_id, location=location)
+    forget_sort_time(session, location=location)
 
 
 # The routes below (through delete_artifact_endpoint) are DesktopOnly, which

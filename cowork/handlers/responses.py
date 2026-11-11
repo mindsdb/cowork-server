@@ -2945,7 +2945,7 @@ class ResponsesHandler:
                     listing=changes.listed_ids, artifacts_base=directory.base, scope=scope,
                     project_id=directory.project_id,
                 )
-                if not (changes.created or changes.listed_ids.ids):
+                if not (changes.created or changes.listed_ids.ids or changes.sort_times):
                     return changes
                 note_turn_end_slugs(slugs=changes.created)
                 try:
@@ -2958,6 +2958,7 @@ class ResponsesHandler:
                             creator=directory.creator,
                             artifact_ids=changes.created_ids,
                             listed_ids=changes.listed_ids,
+                            sort_times=changes.sort_times,
                         ),
                         scope=scope,
                     )

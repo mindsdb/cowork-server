@@ -3336,7 +3336,7 @@ async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(m
     indexed = {"new": set()}
 
     def spy_index_new(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
     ):
         indexed["new"] = set(slugs)
 
@@ -3382,7 +3382,7 @@ async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(mon
     indexed = {"new": set()}
 
     def spy_index_new(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
     ):
         indexed["new"] = set(slugs)
 

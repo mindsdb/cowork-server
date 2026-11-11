@@ -116,10 +116,10 @@ def hold_root(session: ScopedSession, *, project_id: UUID, conversation_id: UUID
         session.rollback()
 
 
-def _backfill_finished(session: ScopedSession) -> bool:
-    """Whether the backfill wrote its sentinel, the global settings row
-    SENTINEL_KEY."""
-    query = session.select(Setting).where(Setting.key == SENTINEL_KEY, Setting.scope.is_(None))
+def sentinel_written(session: ScopedSession, *, key: str = SENTINEL_KEY) -> bool:
+    """Whether a backfill wrote its sentinel, the global settings row `key`:
+    this module's by default."""
+    query = session.select(Setting).where(Setting.key == key, Setting.scope.is_(None))
     return session.exec(query).first() is not None
 
 
@@ -127,7 +127,7 @@ def held_roots(session: ScopedSession, *, project_ids: Collection[UUID]) -> froz
     """The roots of `project_ids` the rows name, or None when the caller has
     to find its roots on the file store: this scope keeps no rows, or their
     backfill has not finished."""
-    if not keeps_locations(session.scope) or not _backfill_finished(session):
+    if not keeps_locations(session.scope) or not sentinel_written(session):
         return None
     ids = list(project_ids)
     if not ids:

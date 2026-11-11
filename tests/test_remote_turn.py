@@ -965,7 +965,7 @@ def _turn_with_a_new_artifact(monkeypatch, *, diff=None, snapshot=None):
     recorded: list[_Recorded] = []
 
     def record_new_artifacts(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
     ):
         recorded.append(_Recorded(slugs, project_id, creator, session.scope, on_efs_thread()))
 

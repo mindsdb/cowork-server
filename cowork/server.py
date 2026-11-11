@@ -448,19 +448,23 @@ async def _stop_location_backfill(*, task: asyncio.Task | None, stop: threading.
 
 async def _run_artifact_location_backfill(stop: threading.Event) -> None:
     """Background, one-time location backfill, then the held-root backfill
-    (cowork.services.held_artifact_roots): each one file store call with no
-    deadline, so the task holds one file store slot at a time for its walks.
+    (cowork.services.held_artifact_roots), then the sort-time backfill, which
+    reads the roots the held rows name (cowork.services.artifact_sort_times):
+    each one file store call with no deadline, so the task holds one file
+    store slot at a time for its walks.
     Never affects startup. Shutdown sets ``stop``, which both walks read,
     before it cancels the task, since a cancelled file store call waits for
     its work."""
     from cowork.db.scoped import SYSTEM_SCOPE
     from cowork.db.units import run_efs
     from cowork.services.artifact_location_backfill import run_artifact_location_backfill
+    from cowork.services.artifact_sort_times import run_sort_time_backfill
     from cowork.services.held_artifact_roots import run_held_root_backfill
 
     for operation, backfill in (
         ("artifact_location_backfill", run_artifact_location_backfill),
         ("held_artifact_roots_backfill", run_held_root_backfill),
+        ("artifact_sort_times_backfill", run_sort_time_backfill),
     ):
         try:
             await run_efs(partial(backfill, stop=stop), scope=SYSTEM_SCOPE, deadline=False)

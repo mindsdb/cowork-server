@@ -377,7 +377,7 @@ async def _record_turn_artifacts(
     request_self_heal_for_unread_folders(
         listing=changes.listed_ids, artifacts_base=artifacts.base, scope=scope, project_id=artifacts.project_id,
     )
-    if changes.created or changes.listed_ids.ids:
+    if changes.created or changes.listed_ids.ids or changes.sort_times:
         try:
             await run_db(
                 partial(
@@ -390,6 +390,7 @@ async def _record_turn_artifacts(
                     creator=artifacts.creator,
                     artifact_ids=changes.created_ids,
                     listed_ids=changes.listed_ids,
+                    sort_times=changes.sort_times,
                 ),
                 scope=scope,
             )

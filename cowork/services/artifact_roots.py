@@ -48,6 +48,7 @@ from cowork.services.artifacts import (
 
 if TYPE_CHECKING:
     from cowork.services.artifact_locations import Location
+    from cowork.services.artifact_sort_times import NewestFolders
     from cowork.services.held_artifact_roots import HeldRoot
 
 logger = logging.getLogger(__name__)
@@ -204,7 +205,9 @@ class RootsPlan:
     `held`, which only the artifacts routes' plans set (`with_held_roots`),
     names the roots of `projects` known to hold an artifact folder, so
     expanding the plan opens nothing on the file store; None finds the roots
-    there.
+    there. `newest`, set beside it once the sort times are recorded, holds
+    the newest folders of the roots the plan expands to
+    (artifact_sort_times.newest_folders), so the list opens only those.
     """
 
     projects: tuple[ProjectRow, ...] = ()
@@ -221,6 +224,7 @@ class RootsPlan:
     # without `held`.
     walk: frozenset[UUID] = frozenset()
     held: frozenset[HeldRoot] | None = None
+    newest: NewestFolders | None = None
 
 
 @dataclass(frozen=True)
@@ -441,25 +445,33 @@ def recorded_source(project: ProjectRow, conversation_id: UUID | None) -> Projec
     return _project_source(project, base)
 
 
-def recorded_location(source: ProjectArtifacts, folder: Path) -> Location | None:
-    """The location row for `folder`, found below `source`, or None for a root
-    no row describes (a desktop root, which has no project id). A folder name
-    that is not valid UTF-8 still gets its location, so it counts toward a
-    conflict; record_checked_folders never stores it in a row."""
-    from cowork.services.artifact_locations import Location
+def held_root_of(source: ProjectArtifacts) -> HeldRoot | None:
+    """The root `source` is, as the rows name it: its project, and its
+    conversation for a legacy root. None for a root no row describes: a
+    desktop root, which has no project id, or a legacy root whose folder
+    name is no conversation id."""
+    from cowork.services.held_artifact_roots import HeldRoot
 
     if source.project_id is None:
         return None
     parts = tuple(source.root_parts)
     if parts == _ARTIFACTS_SUBPATH:
-        conversation_id = None
-    elif len(parts) == 4 and parts[0] == CONVERSATIONS_DIRNAME and parts[2:] == _ARTIFACTS_SUBPATH:
+        return HeldRoot(UUID(source.project_id), None)
+    if len(parts) == 4 and parts[0] == CONVERSATIONS_DIRNAME and parts[2:] == _ARTIFACTS_SUBPATH:
         conversation_id = _conversation_id(Path(parts[1]))
-        if conversation_id is None:
-            return None
-    else:
-        return None
-    return Location(UUID(source.project_id), conversation_id, folder.name)
+        return HeldRoot(UUID(source.project_id), conversation_id) if conversation_id is not None else None
+    return None
+
+
+def recorded_location(source: ProjectArtifacts, folder: Path) -> Location | None:
+    """The location row for `folder`, found below `source`, or None for a root
+    no row describes (held_root_of). A folder name that is not valid UTF-8
+    still gets its location, so it counts toward a conflict;
+    record_checked_folders never stores it in a row."""
+    from cowork.services.artifact_locations import Location
+
+    root = held_root_of(source)
+    return Location(root.project_id, root.conversation_id, folder.name) if root is not None else None
 
 
 def project_roots(

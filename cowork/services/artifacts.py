@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import partial
@@ -1836,25 +1837,40 @@ def artifact_status(raw_path: str, *, scope: TenantScope | None) -> ArtifactStat
     return artifact_status_for_resolved(artifact, scope=scope)
 
 
+#: The cards a list shows, newest first.
+LIST_CARDS = 80
+
+
+class ListCandidate(NamedTuple):
+    """One folder a list may show: the time it sorts by, its root's place in
+    the list's roots (which breaks a tie), its name, and its root."""
+
+    sort_time: float
+    source_index: int
+    name: str
+    source: ProjectArtifacts
+
+
 def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
-    """Every artifact under the given roots, newest first, capped at 80.
+    """Every artifact under the given roots, newest first, capped at
+    LIST_CARDS.
 
     Roots come from the caller (see services.artifact_roots) — this function
     never discovers them, because a filesystem scan cannot tell which tenant is
-    asking. The 80-item cap is pre-existing but matters more in org mode, where
+    asking. The cap is pre-existing but matters more in org mode, where
     `sources` spans every project of the organization instead of one tree.
 
     Two passes so the cap is applied before card work, not after: a collect
     pass opens each artifact once and reads only its `metadata.json` mtime (no
-    card built), then a build pass walks the sorted candidates and stops once
-    80 cards have been produced.
+    card built), then a build pass (cards_for_candidates) walks the sorted
+    candidates and stops once LIST_CARDS cards have been produced. In org
+    mode, once the sort times are recorded, the list skips the collect pass
+    and passes the newest rows as candidates instead
+    (cowork.services.artifact_sort_times).
     """
-    from cowork.services.artifact_identity import (
-        _opened_child_directory,
-        opened_artifact_root,
-    )
+    from cowork.services.artifact_identity import opened_artifact_root
 
-    candidates: list[tuple[float, int, str, ProjectArtifacts]] = []
+    candidates: list[ListCandidate] = []
     for source_idx, source in enumerate(sources):
         try:
             with opened_artifact_root(source) as root:
@@ -1883,17 +1899,27 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                     # metadata.json (dir_child_stat), the least a sort by that
                     # time can cost on the file store. A folder that would not
                     # open, or holds no metadata.json, sorts last at 0; the
-                    # build pass below opens it no-follow again and skips it.
+                    # build pass opens it no-follow again and skips it.
                     try:
                         mtime = dir_child_stat(root, child_name, "metadata.json").st_mtime
                     except OSError:
                         mtime = 0.0
-                    candidates.append((mtime, source_idx, child_name, source))
+                    candidates.append(ListCandidate(mtime, source_idx, child_name, source))
         except (OSError, ValueError):
             continue
+    return cards_for_candidates(candidates)
 
-    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
 
+def cards_for_candidates(candidates: Iterable[ListCandidate]) -> list[dict]:
+    """The cards of `candidates`, newest first, then by root and name, capped
+    at LIST_CARDS: each folder opened without following a link, and one
+    that fails to open or holds no valid identity skipped."""
+    from cowork.services.artifact_identity import (
+        _opened_child_directory,
+        opened_artifact_root,
+    )
+
+    ordered = sorted(candidates, key=lambda item: (-item.sort_time, item.source_index, item.name))
     cards: list[dict] = []
     # One root open per source, not per surviving candidate: opening a root
     # costs an openat+stat per path component, so re-opening it per card
@@ -1911,8 +1937,8 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                     opened_roots[source_idx] = None
             return opened_roots[source_idx]
 
-        for _mtime, source_idx, child_name, source in candidates:
-            if len(cards) >= 80:
+        for _mtime, source_idx, child_name, source in ordered:
+            if len(cards) >= LIST_CARDS:
                 break
             root = _root_for(source_idx, source)
             if root is None:

@@ -773,16 +773,37 @@ def _listed_artifact_ids(*, artifacts_base: Path) -> ListedIds:
     return listed_folder_ids(base=base, listing=artifact_folders_below(base=base))
 
 
-def _record_listing(session, *, project_id: UUID, listing: ListedIds) -> None:
+def _listed_ids_and_times(*, artifacts_base: Path) -> tuple[ListedIds, dict[str, float]]:
+    """The listing _listed_artifact_ids makes, and the time each folder
+    holding an id sorts by in the artifacts list (artifact_sort_times)."""
+    from cowork.services.artifact_sort_times import sort_times_below
+
+    listing = _listed_artifact_ids(artifacts_base=artifacts_base)
+    return listing, sort_times_below(base=Path(artifacts_base), slugs=listing.ids)
+
+
+def _record_listing(
+    session, *, project_id: UUID, listing: ListedIds, times: dict[str, float] | None = None
+) -> None:
     """Record what a full listing of `project_id`'s shared root found: that
     the root holds a folder, when it does, so the artifacts list opens it
-    (held_artifact_roots), and each listed id's location
-    (artifact_locations.record_listed_folders)."""
+    (held_artifact_roots); the sort time of each folder no row names yet,
+    and the end of each row whose folder is gone (artifact_sort_times); and
+    each listed id's location (artifact_locations.record_listed_folders)."""
     from cowork.services.artifact_locations import record_listed_folders
+    from cowork.services.artifact_sort_times import reconcile_sort_times
     from cowork.services.held_artifact_roots import hold_root
 
     if listing.ids or listing.unreadable:
         hold_root(session, project_id=project_id)
+    if times is not None:
+        reconcile_sort_times(
+            session,
+            project_id=project_id,
+            listed=times,
+            kept=set(listing.ids) | set(listing.unreadable),
+            complete=not listing.base_unreadable,
+        )
     record_listed_folders(session, project_id=project_id, listing=listing)
 
 
@@ -805,15 +826,16 @@ async def _record_listed_locations(heal: SelfHeal) -> None:
     if not keeps_locations(heal.scope):
         return
     try:
-        listing = await run_efs(
-            partial(_listed_artifact_ids, artifacts_base=heal.artifacts_base), scope=heal.scope, deadline=False,
+        listing, times = await run_efs(
+            partial(_listed_ids_and_times, artifacts_base=heal.artifacts_base), scope=heal.scope, deadline=False,
         )
         # Asked for before the record, so a failed record cannot drop it.
         request_self_heal_for_unread_folders(
             listing=listing, artifacts_base=heal.artifacts_base, scope=heal.scope, project_id=heal.project_id,
         )
         await run_db(
-            partial(_record_listing, project_id=UUID(heal.project_id), listing=listing), scope=heal.scope,
+            partial(_record_listing, project_id=UUID(heal.project_id), listing=listing, times=times),
+            scope=heal.scope,
         )
     except Exception:
         logger.warning(

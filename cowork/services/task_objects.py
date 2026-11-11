@@ -282,15 +282,18 @@ class TaskObjectService:
                     extra=log_context(project_id=dest_id, conversation_id=conversation_id),
                 )
             # The destination's shared root holds the moved folders now, so
-            # the artifacts list opens it (held_artifact_roots).
+            # the artifacts list opens it (held_artifact_roots), and each
+            # moved folder keeps its sort time there (artifact_sort_times).
+            from cowork.services.artifact_sort_times import move_sort_times
             from cowork.services.held_artifact_roots import hold_root
 
             try:
+                move_sort_times(self.session, project_id=source_id, moved=dict(rekeys), to_project_id=dest_id)
                 hold_root(self.session, project_id=dest_id)
             except Exception:
                 self.session.rollback()
                 logger.warning(
-                    "Could not record that project %s's artifacts folder holds an artifact", dest_id, exc_info=True,
+                    "Could not record the moved artifacts' folder and sort times in project %s", dest_id, exc_info=True,
                     extra=log_context(project_id=dest_id, conversation_id=conversation_id),
                 )
                 # The move writes no message, and the heal sweep lists only
@@ -419,6 +422,7 @@ def record_new_artifacts(
     creator: str | None,
     artifact_ids: Mapping[str, str] | None = None,
     listed_ids: ListedIds | None = None,
+    sort_times: Mapping[str, float] | None = None,
 ) -> None:
     """Attribute freshly appeared artifacts to this conversation, in the
     caller's session. Best-effort.
@@ -478,6 +482,20 @@ def record_new_artifacts(
             session.rollback()
             logger.error(
                 "Could not record that a project's artifacts folder holds an artifact",
+                exc_info=True,
+                extra=log_context(project_id=project_id, conversation_id=conversation_id),
+            )
+    if org_mode and project_id and sort_times:
+        from cowork.services.artifact_sort_times import record_sort_times
+
+        # The time each folder the turn created or changed sorts by in the
+        # artifacts list (artifact_sort_times).
+        try:
+            record_sort_times(session, project_id=project_id, times=sort_times)
+        except Exception:
+            session.rollback()
+            logger.error(
+                "Could not record the sort times of a turn's artifacts",
                 exc_info=True,
                 extra=log_context(project_id=project_id, conversation_id=conversation_id),
             )
@@ -578,6 +596,11 @@ class ArtifactChanges:
     # project's location check (request_self_heal_for_unread_folders). Empty
     # when the diff opened only named folders.
     listed_ids: ListedIds = field(default_factory=lambda: ListedIds(ids={}, unreadable=frozenset()))
+    # The time of each touched folder's metadata.json, read once the
+    # captures ran, which the artifacts list sorts the folder by
+    # (artifact_sort_times). A folder whose metadata.json isn't a plain file
+    # has none.
+    sort_times: dict[str, float] = field(default_factory=dict)
 
 
 def tracked_artifacts_from_reply(data: Mapping) -> set[str] | None:
@@ -788,9 +811,12 @@ def turn_artifact_changes(
     # Read once the captures ran, which can write a folder's id. The listing
     # covers the created folders too, so a row naming one of them is never
     # taken for a row whose folder is gone (record_listed_folders).
+    from cowork.services.artifact_sort_times import sort_times_below
+
     return ArtifactChanges(
         created=new, touched=touched, created_ids=artifact_ids_below(base=base, slugs=new).ids,
         checked_repairs=checked_repairs,
+        sort_times=sort_times_below(base=base, slugs=touched),
         listed_ids=(
             listed_folder_ids(base=base, listing=whole_listing)
             if whole_listing is not None
