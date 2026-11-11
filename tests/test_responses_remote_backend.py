@@ -1522,6 +1522,10 @@ async def test_no_still_working_line_over_an_open_question(monkeypatch):
 @pytest.mark.parametrize("next_output", [
     ("turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}),
     ("turn_delta", {"text": "Working on it."}),
+    # A question asked after its cell's tool_start (the step or time limit, a
+    # write approval): the cell it gated runs on with no new start or text.
+    ("turn_step", {"step": "progress", "id": "t0", "message": "Reading the file"}),
+    ("turn_step", {"step": "tool_end", "id": "t0", "name": "scratchpad"}),
 ])
 async def test_a_lost_answered_reply_does_not_hide_still_working_for_the_rest_of_the_turn(
     monkeypatch, next_output,
@@ -1566,6 +1570,38 @@ async def test_a_lost_answered_reply_does_not_hide_still_working_for_the_rest_of
     )
 
     assert any("model_wait" in f for f in buffer.frames)
+
+
+@pytest.mark.asyncio
+async def test_a_question_with_a_malformed_id_does_not_fail_the_turn(monkeypatch):
+    """The pod is semi-trusted: an ask_user whose id is not a string must not
+    end the turn on an unhashable id."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", {"step": "ask_user", "id": {"not": "a string"}, "prompt": "Which one?"}
+        yield "turn_step", {"step": "ask_user_answered", "id": ["nor", "this"]}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    assert any("response.completed" in f for f in buffer.frames)
 
 
 @pytest.mark.asyncio

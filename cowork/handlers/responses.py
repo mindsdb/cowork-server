@@ -3112,12 +3112,19 @@ class ResponsesHandler:
                 elif kind == "turn_step":
                     if data.get("step") == "compacted":
                         compacted = True
-                    if data.get("step") == "ask_user" and data.get("id"):
-                        open_questions.add(data["id"])
-                    elif data.get("step") == "ask_user_answered":
-                        open_questions.discard(data.get("id"))
-                    elif data.get("step") == "tool_start":
-                        # As for text: a cell starts only once the question is over.
+                    step = data.get("step")
+                    question_id = data.get("id")
+                    if step == "ask_user":
+                        # Only an id step_stream_events renders as a card counts.
+                        if isinstance(question_id, str) and question_id:
+                            open_questions.add(question_id)
+                    elif step == "ask_user_answered":
+                        if isinstance(question_id, str):
+                            open_questions.discard(question_id)
+                    elif step != "ask_user_answer_rejected":
+                        # As for text: the pod writes nothing else while a
+                        # question waits, so a cell's start, progress or end
+                        # means it is over, even if the answered reply was lost.
                         open_questions.clear()
                     for event in step_stream_events(data):
                         yield event
