@@ -245,10 +245,27 @@ async def test_added_texts_come_back_oldest_first(r):
     assert await remote_added_texts("corr-1", r=r) == ["first", "second"]
 
 
-async def test_progress_is_this_turns_recent_tool_calls(r):
-    await r.xadd(STREAM, _reply("turn_step", {"step": "tool_start", "name": "old"}, corr="previous"))
+async def test_progress_is_this_turns_recent_steps(r):
+    await r.xadd(STREAM, _reply("turn_step", {"step": "tool_start", "id": "old", "name": "old"}, corr="previous"))
     for i in range(10):
         await r.xadd(STREAM, _reply("turn_step", {"step": "tool_start", "id": str(i), "name": f"tool{i}"}))
+        await r.xadd(STREAM, _reply("turn_step", {"step": "tool_result", "id": str(i), "name": f"tool{i}"}))
         await r.xadd(STREAM, _reply("turn_delta", {"text": "x"}))
     lines = await remote_progress(conversation_id="conv-1", correlation_id="corr-1", r=r)
-    assert lines == [f"[ran tool: tool{i}]" for i in range(2, 10)]
+    assert lines == [f"[done] tool{i}" for i in range(2, 10)]
+
+
+async def test_progress_carries_step_descriptions_and_flags_the_running_one(r):
+    args = json.dumps({"one_line_description": "Read the tuition pages", "code": "x" * 50})
+    await r.xadd(STREAM, _reply("turn_step", {"step": "tool_start", "id": "a", "name": "scratchpad"}))
+    await r.xadd(STREAM, _reply("turn_step", {"step": "tool_end", "id": "a", "args": args}))
+    await r.xadd(STREAM, _reply("turn_step", {"step": "tool_result", "id": "a", "name": "scratchpad"}))
+    # The pod truncates long args: the description is still found.
+    cut = '{"one_line_description": "Fill coverage gaps", "code": "' + "y" * 40
+    await r.xadd(STREAM, _reply("turn_step", {"step": "tool_start", "id": "b", "name": "scratchpad"}))
+    await r.xadd(STREAM, _reply("turn_step", {"step": "tool_end", "id": "b", "args": cut}))
+    lines = await remote_progress(conversation_id="conv-1", correlation_id="corr-1", r=r)
+    assert lines == [
+        "[done] Read the tuition pages (scratchpad)",
+        "[in progress] Fill coverage gaps (scratchpad)",
+    ]

@@ -116,7 +116,8 @@ async def _jev_refusal(
     # Scrubbed like the route gate's history: the state leaves this server.
     state = jev_route.addon_state(
         task=scrub_credentials(task),
-        progress=progress,
+        # Step descriptions are the model's own words, so scrubbed too.
+        progress=[scrub_credentials(line) for line in progress],
         added=[scrub_credentials(t) for t in added],
         message=scrub_credentials(text),
     )

@@ -1,7 +1,7 @@
 """Hand-written cases for Jev's `addon_route` question (ENG-4194).
 
 Each case is a message the person sent while a turn was running: the running
-task's request, its recent steps as `[ran tool: X]` lines (the state
+task's request, its recent steps as `[done] ...` / `[in progress] ...` lines (the state
 `jev_route.addon_state` builds), the messages already added to it, and the new
 message. `expect` is "add" (fold it into the running task) or "queue" (run it
 next); "either" cases are reported but never counted as errors. Queueing is
@@ -11,11 +11,21 @@ an unrelated request into the wrong task: `false_add` is the headline number.
 from __future__ import annotations
 
 _SALES = "Build me a dashboard of our 2025 sales from the warehouse connection."
-_SALES_STEPS = ["[ran tool: list_datasources]", "[ran tool: query_datasource]"]
+_SALES_STEPS = [
+    "[done] List the warehouse tables (list_datasources)",
+    "[in progress] Query 2025 sales by month and region (query_datasource)",
+]
 _REPORT = "Write a two-page summary of last quarter's churn for the board."
-_REPORT_STEPS = ["[ran tool: query_datasource]", "[ran tool: scratchpad]"]
+_REPORT_STEPS = [
+    "[done] Pull last quarter's cancellations and active accounts (query_datasource)",
+    "[in progress] Compute churn by segment and draft the summary (scratchpad)",
+]
 _RESEARCH = "Research our top 5 competitors' pricing pages and build a comparison table."
-_RESEARCH_STEPS = ["[ran tool: web_search]", "[ran tool: web_fetch]", "[ran tool: web_fetch]"]
+_RESEARCH_STEPS = [
+    "[done] Find the top 5 competitors (web_search)",
+    "[done] Read the first competitor's pricing page (web_fetch)",
+    "[in progress] Read the second competitor's pricing page (web_fetch)",
+]
 
 
 def case(id_: str, category: str, expect: str, message: str, *, task: str = _SALES,

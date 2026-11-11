@@ -9,6 +9,7 @@ unsupported shape delegates to Anton.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -713,16 +714,67 @@ def jev_history(history: list[dict]) -> list[dict]:
 ADDON_PROGRESS_STEPS = 8
 
 
+# A step's description as Jev reads it, at most this long. The steps list in
+# the app shows the same text (the tool call's `one_line_description`).
+ADDON_STEP_DESCRIPTION_CHARS = 200
+
+_DESCRIPTION_IN_ARGS = re.compile(r'"one_line_description"\s*:\s*"((?:[^"\\]|\\.)*)')
+
+
+def step_description(args) -> str:
+    """A tool call's `one_line_description`, the label the steps list shows,
+    from its input dict or its JSON args. The pod truncates long args, so a
+    string that no longer parses is searched for the field instead. "" when
+    the call has none."""
+    value = None
+    if isinstance(args, dict):
+        value = args.get("one_line_description")
+    elif isinstance(args, str) and args:
+        try:
+            parsed = json.loads(args)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            value = parsed.get("one_line_description")
+        else:
+            match = _DESCRIPTION_IN_ARGS.search(args)
+            if match:
+                try:
+                    value = json.loads(f'"{match.group(1)}"')
+                except ValueError:
+                    value = match.group(1)
+    return " ".join(value.split())[:ADDON_STEP_DESCRIPTION_CHARS] if isinstance(value, str) else ""
+
+
+def progress_line(name: str, description: str, *, in_progress: bool) -> str:
+    """One step of a running turn as Jev reads it:
+    `[done] Read the tuition pages (scratchpad)`, or `[in progress] ...` for a
+    step still running. The tool name alone when the step has no description."""
+    label = f"{description} ({name})" if description else name
+    return f"[{'in progress' if in_progress else 'done'}] {label}"
+
+
 def progress_lines(messages: list[dict], *, limit: int = ADDON_PROGRESS_STEPS) -> list[str]:
-    """A running turn's last steps as `[ran tool: X]` lines, the markers
-    `jev_history` shows Jev for earlier turns."""
-    lines: list[str] = []
+    """A running turn's last steps with what each one did, the newest still
+    running flagged, so Jev can tell a correction to work in flight from one
+    to work already done. A tool call with no result yet is in progress."""
+    calls: list[tuple[str, str, str]] = []
+    finished: set[str] = set()
     for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
             continue
-        text = _condense_content(message.get("content")) or ""
-        lines.extend(line for line in text.splitlines() if line.startswith("[ran tool: "))
-    return lines[-limit:]
+        for block in message["content"]:
+            if not isinstance(block, dict):
+                continue
+            if message.get("role") == "assistant" and block.get("type") == "tool_use":
+                calls.append((str(block.get("id") or ""), str(block.get("name") or "?"),
+                              step_description(block.get("input"))))
+            elif block.get("type") == "tool_result" and block.get("tool_use_id"):
+                finished.add(str(block["tool_use_id"]))
+    return [
+        progress_line(name, description, in_progress=bool(call_id) and call_id not in finished)
+        for call_id, name, description in calls
+    ][-limit:]
 
 
 def ineligible_reason(

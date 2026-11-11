@@ -248,18 +248,31 @@ async def remote_added_texts(correlation_id: str, *, r: aioredis.Redis | None = 
 async def remote_progress(
     *, conversation_id: str, correlation_id: str, r: aioredis.Redis | None = None,
 ) -> list[str]:
-    """The turn's last tool calls as ``[ran tool: X]`` lines, the in-process
-    channel's format, read from the replies the pod relayed. Raises RedisError."""
+    """The turn's last steps in the in-process channel's format
+    (response_routing.progress_line), read from the replies the pod relayed:
+    `tool_start` opens a step, `tool_end` carries its args (and so its
+    description), `tool_result` closes it. Raises RedisError."""
+    from cowork.handlers.response_routing import progress_line, step_description
+
     r = r or get_redis()
     tail = await r.xrevrange(reply_stream_key(conversation_id), count=_PROGRESS_SCAN)
-    lines: list[str] = []
+    steps: dict[str, dict] = {}  # insertion order is start order
     for _entry_id, fields in reversed(tail):  # oldest first
         reply = _own_reply(fields, correlation_id)
         if reply is None or reply.kind != "turn_step":
             continue
         data = reply.data or {}
-        if data.get("step") == "tool_start" and data.get("name"):
-            lines.append(f"[ran tool: {data['name']}]")
+        step, tool_id = data.get("step"), str(data.get("id") or "")
+        if step == "tool_start" and data.get("name"):
+            steps[tool_id or f"_{len(steps)}"] = {"name": data["name"], "description": "", "done": False}
+        elif step == "tool_end" and tool_id in steps:
+            steps[tool_id]["description"] = step_description(data.get("args") or "")
+        elif step == "tool_result" and tool_id in steps:
+            steps[tool_id]["done"] = True
+    lines = [
+        progress_line(s["name"], s["description"], in_progress=not s["done"])
+        for s in steps.values()
+    ]
     return lines[-_PROGRESS_STEPS:]
 
 

@@ -110,9 +110,11 @@ ADDON_ROUTE_QUESTION: dict[str, Any] = {
         "The assistant is in the middle of a task when the user sends a new "
         "message. Decide whether the message belongs to the running task, so the "
         "assistant should take it into account before it finishes, or is a request "
-        "to handle after the task is done. A line '[ran tool: X]' means the "
-        "assistant already did work with tool X in this task. Earlier messages the "
-        "user added to the task are listed too."
+        "to handle after the task is done. Each recent_progress line is a step of "
+        "the running task: '[done] what it did (tool)' finished, '[in progress] what "
+        "it is doing (tool)' is running now. A correction can still change steps in "
+        "progress and steps not started yet. Earlier messages the user added to the "
+        "task are listed too."
     ),
     "criteria": {
         _ADD_TO_CURRENT: (
@@ -485,8 +487,9 @@ def addon_state(
     *, task: str, progress: list[str], added: list[str], message: str,
 ) -> dict:
     """What Jev reads for `ADDON_ROUTE_QUESTION`: the running task's request,
-    its recent steps as `[ran tool: X]` lines, the messages already added to
-    it, and the new message."""
+    its recent steps as `[done] ...` / `[in progress] ...` lines
+    (response_routing.progress_line), the messages already added to it, and
+    the new message."""
     return {
         "running_task": task,
         "recent_progress": progress,
