@@ -14,12 +14,15 @@ from cowork.common.ui_locale import normalize_ui_locale, reply_language_line, wi
         ("pt", "pt-BR"),
         ("es-MX", "es"),
         ("EN_us", "en"),
-        ("fr-FR, es;q=0.8", "es"),  # fr unsupported: the best supported one wins
+        ("it-IT, es;q=0.8", "es"),  # it unsupported: the best supported one wins
         ("es;q=0.5, pt-BR;q=0.9", "pt-BR"),
         ("*, es;q=0.4", "es"),
         ("ja", "ja"),
         ("ja-JP", "ja"),
         ("zh-CN, ja;q=0.9", "ja"),
+        ("de-CH", "de"),
+        ("fr-CA", "fr"),
+        ("ko-KR", "ko"),
     ],
 )
 def test_normalize_supported(header, expected):
@@ -28,14 +31,14 @@ def test_normalize_supported(header, expected):
 
 @pytest.mark.parametrize(
     "header",
-    [None, "", "fr", "de-DE", "*", "es;q=abc", "es;q=2", "x" * 40, 123],
+    [None, "", "it", "nl-NL", "*", "es;q=abc", "es;q=2", "x" * 40, 123],
 )
 def test_normalize_unsupported_or_malformed(header):
     assert normalize_ui_locale(header) is None
 
 
 def test_q_zero_means_not_acceptable():
-    assert normalize_ui_locale("es;q=0, fr") is None
+    assert normalize_ui_locale("es;q=0, it") is None
 
 
 def test_header_length_is_bounded():
@@ -46,7 +49,7 @@ def test_reply_language_line():
     assert "Spanish (es)" in reply_language_line("es")
     assert "Reply in the language the user writes in" in reply_language_line("pt-BR")
     assert reply_language_line(None) == ""
-    assert reply_language_line("fr") == ""
+    assert reply_language_line("it") == ""
     assert "Japanese (ja)" in reply_language_line("ja")
 
 
