@@ -264,7 +264,7 @@ def _anton_draft(**overrides) -> dict:
         "usage_notes": "Base URL https://api.acme.example/v2. Send Authorization: Bearer <api_key>.",
         "fields": [
             {"name": "api_key", "label": "API key", "help": "Settings, then API."},
-            {"name": "region", "label": "Region", "secret": False, "required": False, "placeholder": "eu"},
+            {"name": "region", "label": "Region", "secret": False, "placeholder": "eu"},
         ],
         "auth": {"type": "header", "headers": {"Authorization": "Bearer {api_key}", "X-Region": "{region}"}},
         **overrides,
@@ -307,7 +307,7 @@ class TestSaveConnectorDraft:
         assert row.usage_notes.startswith("Base URL")
         spec = ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm")
         assert [(f.name, f.type, f.secret, f.required) for f in spec.form.fields] == [
-            ("api_key", "password", True, True), ("region", "text", False, False),
+            ("api_key", "password", True, True), ("region", "text", False, True),
         ]
         assert spec.form.methods is None
         assert ConnectorCatalog(_scoped(engine, ORG_A_OTHER)).get_connector("acme_crm") is None

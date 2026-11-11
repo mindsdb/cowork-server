@@ -21,7 +21,7 @@
             "name": "region",
             "label": "Region",
             "secret": false,
-            "required": false,
+            "required": true,
             "placeholder": "eu"
           }
         ],
