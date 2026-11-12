@@ -162,7 +162,9 @@ class AuthBranding:
 
     @property
     def reachable(self) -> bool:
-        """auth answered (the cache's TTL choice: a refusal is an answer)."""
+        """auth answered for the org: its branding, or its 403 (no org). The
+        cache's TTL choice, and the view's ``reachable``. A declined read
+        isn't reachable."""
         return self.answer in (MindsHubAnswer.OK, MindsHubAnswer.REFUSED)
 
     @property
@@ -183,8 +185,9 @@ class AuthBranding:
 
     @property
     def enabled(self) -> bool:
-        """Branding applies: auth answered for an org, or couldn't be asked
-        (the app then shows the stock look)."""
+        """Branding applies: auth answered for an org, or nothing is known
+        about the org (``reachable`` false, which the app reads as "keep the
+        look you show", never as the stock look)."""
         return self.answer is not MindsHubAnswer.REFUSED
 
 

@@ -450,10 +450,10 @@ def test_an_unknown_read_serves_the_callers_last_answer(org, monkeypatch, status
 @pytest.mark.parametrize("status_code", [401, 502])
 def test_a_failed_read_isnt_cached(org, status_code):
     org.auth.get_answer = _auth_answers(status_code)
-    try:
+    if status_code < 500:
         assert _get(org, ALICE)["reachable"] is False
-    except HTTPException as outage:
-        assert outage.status_code == 503
+    else:
+        _refused(lambda: _get(org, ALICE), 503)
     org.auth.get_answer = None
     out = _get(org, ALICE)
     assert (out["enabled"], out["reachable"]) == (True, True)

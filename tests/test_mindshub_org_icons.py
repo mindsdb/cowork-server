@@ -167,6 +167,17 @@ def test_any_other_refusal_is_unknown_and_not_cached(org_deployment, auth, caplo
     assert len(auth.calls) == 2
 
 
+@pytest.mark.parametrize("payload", [[], None], ids=["list", "null"])
+def test_a_200_that_isnt_an_object_is_unknown_and_not_cached(org_deployment, auth, caplog, payload):
+    auth.reply = MindsHubReply(MindsHubAnswer.OK, payload=payload, status_code=200)
+    with caplog.at_level("WARNING", logger=mindshub_org_icons.logger.name):
+        assert _get(_request(SESSION), _hosted()) == {"reachable": False, "orgs": []}
+    assert _read_unknown(caplog) == [("WARNING", 200)]
+    auth.reply = MindsHubReply(MindsHubAnswer.OK, payload=AVAILABLE, status_code=200)
+    assert _get(_request(SESSION), _hosted()) == EXPECTED
+    assert len(auth.calls) == 2
+
+
 def test_no_line_when_nothing_answered_or_auth_answered_usably(org_deployment, auth, caplog):
     with caplog.at_level("DEBUG", logger=mindshub_org_icons.logger.name):
         _get(_request(SESSION), _hosted())

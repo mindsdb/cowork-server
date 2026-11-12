@@ -50,9 +50,7 @@ class OrgIcons(BaseModel):
 _cache: CallerTtlCache[OrgIcons] = CallerTtlCache(ttl_ok_s=MINDSHUB_TTL_OK_S)
 
 
-def _parse(payload: Any) -> OrgIcons:
-    if not isinstance(payload, dict):
-        return OrgIcons()
+def _parse(payload: dict[str, Any]) -> OrgIcons:
     orgs: list[OrgIcon] = []
     seen: set[str] = set()
     for key in ("results", "blocked_organizations"):
@@ -85,7 +83,7 @@ async def fetch_org_icons(*, bearer_token: str, org_id: str, user_id: str) -> Or
     if cached is not None:
         return cached
     reply = await get_mindshub_reply(AVAILABLE_ORGS_PATH, bearer_token)
-    if reply.answer is MindsHubAnswer.OK:
+    if reply.answer is MindsHubAnswer.OK and isinstance(reply.payload, dict):
         value = _parse(reply.payload)
     elif reply.answer is MindsHubAnswer.REFUSED and reply.status_code == 403:
         value = OrgIcons(reachable=True)
