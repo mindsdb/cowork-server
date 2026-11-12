@@ -756,9 +756,10 @@ class UserSettings(Settings):
     # available, the browser router on the web or the desktop app's own
     # browser (cowork.services.browser).
     browser_enabled: bool = Field(
-        default=True,
+        # Beta: off until the person turns it on in Settings.
+        default=False,
         title="Browser Enabled",
-        description="Let the agent use a browser, shown beside the chat.",
+        description="Let the agent use a browser, shown beside the chat (beta).",
     )
     # `hub_workspace_id`, not `workspace_id`: in this repo `workspace` already
     # means a filesystem location (the per-conversation private directory, the

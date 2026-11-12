@@ -63,14 +63,17 @@ async def _ask(monkeypatch, harness: _SeesBrowser, **body) -> httpx.Response:
 
 async def test_a_turn_with_the_browser_off_runs_without_it_and_the_next_follows_the_setting(monkeypatch):
     """The copy is the one turn's: a turn without the key, and one that says
-    "on", read the user's own setting (on by default) again."""
+    "on", read the user's own setting again, which is off by default (beta)."""
     harness = _SeesBrowser()
-
     for body in ({"browser": "off"}, {}, {"browser": "on"}):
         answered = await _ask(monkeypatch, harness, **body)
         assert answered.status_code == 200 and "response.completed" in answered.text, answered.text
+    # Off by default: a turn that doesn't turn it off still runs without it.
+    assert harness.seen == [False, False, False]
 
-    assert harness.seen == [False, True, True]
+
+def test_the_browser_is_off_by_default():
+    assert user_settings.UserSettings.model_fields["browser_enabled"].default is False
 
 
 @pytest.mark.parametrize("value", ["OFF", "none", "", False, None])
