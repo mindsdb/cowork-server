@@ -6,6 +6,7 @@ category."""
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -327,6 +328,36 @@ class TestSaveConnectorDraft:
         spec = ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm")
         assert spec.check.model_dump() == check
 
+    @pytest.mark.parametrize(("fields", "auth", "summary"), [
+        (
+            [{"name": "api_key", "label": "API key"}],
+            {"type": "header", "headers": {"X-Api-Key": "{api_key}", "X-Api-Version": "2024-01"}},
+            {"type": "header", "names": ["X-Api-Key"]},
+        ),
+        (
+            [{"name": "email", "label": "Email", "secret": False}, {"name": "token", "label": "Token"}],
+            {"type": "basic", "username": "{email}/token", "password": "{token}"},
+            {"type": "basic", "names": []},
+        ),
+        (
+            [{"name": "access_key", "label": "Access key"}],
+            {"type": "query", "params": {"access_key": "{access_key}", "output": "json"}},
+            {"type": "query", "names": ["access_key"]},
+        ),
+    ], ids=["header", "basic", "query"])
+    def test_the_spec_names_where_the_key_goes_and_never_the_templates_text(
+        self, engine, org_tenancy, fields, auth, summary,
+    ):
+        draft = _anton_draft(fields=fields, auth=auth, check={"path": "/v2/me"})
+        assert _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=draft).status_code == 200
+
+        spec = ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm")
+
+        assert spec.auth_summary.model_dump() == summary
+        shown = json.dumps(spec.auth_summary.model_dump())
+        for text in ("{api_key}", "{email}", "{token}", "{access_key}", "2024-01", "json", "/token"):
+            assert text not in shown
+
     @pytest.mark.parametrize("change", [
         {"connection_auth": None},
         {"connection_check": {"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}}},
@@ -342,14 +373,16 @@ class TestSaveConnectorDraft:
         session.add(row)
         session.commit()
 
-        assert ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm").check is None
+        spec = ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm")
+        assert spec.check is None and spec.auth_summary is None
 
     def test_a_template_without_a_check_keeps_none(self, engine, org_tenancy):
         assert _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=_anton_draft()).status_code == 200
 
         [row] = _org_rows(engine)
         assert row.connection_check is None
-        assert ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm").check is None
+        spec = ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm")
+        assert spec.check is None and spec.auth_summary is None
 
     def test_a_check_the_parser_refuses_is_never_stored(self, engine, org_tenancy):
         """The card posts the draft back; a check edited on the way is parsed again, and refused."""

@@ -224,11 +224,21 @@ class ConnectorCheck(BaseModel):
     path: str
 
 
+class ConnectorAuthSummary(BaseModel):
+    """Where a custom connector puts the member's values: its auth type and the
+    header or query parameter names that carry one. Never a template's text."""
+
+    type: Literal["header", "basic", "query"]
+    names: list[str] = []
+
+
 class ConnectorSpecResponse(ConnectorMetadataResponse):
     keywords: list[str] = []
     form: ConnectorForm
     # Custom connectors only; None for every built-in and for a template saved without one.
     check: ConnectorCheck | None = None
+    # Custom connectors only, and only beside a usable check.
+    auth_summary: ConnectorAuthSummary | None = None
     # Agent-facing notes on using this connector's API once connected: traps,
     # efficient endpoints, auth quirks. The chat agent sees them only when a
     # connection of this engine exists; the credential prober sees them while

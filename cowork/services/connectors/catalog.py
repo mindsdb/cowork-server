@@ -14,7 +14,7 @@ from anton.utils.datasources import scrub_output
 from cowork.db.scoped import ScopedSession
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorSpecResponse
-from cowork.services.connectors.custom_connect import parse_stored
+from cowork.services.connectors.custom_connect import auth_summary, parse_stored
 from cowork.services.connectors.custom_connectors import scope_definitions, scope_is_one_persons
 from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
 
@@ -44,6 +44,7 @@ def custom_connector_spec(row: CustomConnector) -> dict[str, Any]:
         "usage_notes": row.usage_notes,
         "form": dict(row.spec),
         "check": {"path": template.path} if (template := parse_stored(row)) else None,
+        "auth_summary": auth_summary(template.auth) if template else None,
     }
 
 

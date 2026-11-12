@@ -221,6 +221,18 @@ def place_values(auth: Mapping[str, Any], values: Mapping[str, str]) -> PlacedRe
     return PlacedRequest(bare_headers, bare_params, headers, params)
 
 
+def auth_summary(auth: Mapping[str, Any]) -> dict[str, Any]:
+    """The auth type and the header or parameter names that carry a value, for the connect form.
+
+    Names only: a template's text can be model-written, so none of it is shown.
+    """
+    if auth["type"] == "basic":
+        return {"type": "basic", "names": []}
+    templates = auth.get("params" if auth["type"] == "query" else "headers", {})
+    slot_free = {name for name, _ in _slot_free(templates)}
+    return {"type": auth["type"], "names": [name for name in templates if name not in slot_free]}
+
+
 def _slot_free(templates: Mapping[str, str]) -> list[tuple[str, str]]:
     """The entries whose template places no value."""
     return [(name, text) for name, text in templates.items() if not connector_auth_rules.PLACEHOLDER.search(text)]
