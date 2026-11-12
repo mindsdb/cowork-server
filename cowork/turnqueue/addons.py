@@ -23,7 +23,9 @@ pushed to the pod, and the hash is also what the relay trusts: a pod's
 that turn and did not give up on (``relay_addon_step``). An addon /addon
 answered queued for after the push (no verdict in time, a refusal, the turn
 ending) is marked ``abandoned``, so a late verdict from the pod can't show
-it as added while the app also runs it as the next task.
+it as added while the app also runs it as the next task. Its ``read`` and
+``withdrawn`` are still relayed: the app queued it, so it must hear that the
+model read it anyway (it drops its queued copy) or that the withdraw landed.
 
 A pod whose anton takes messages mid-task says so once at turn start, with
 an ``addon`` step in state ``ready`` (``addon_ready_key``); a turn without
@@ -90,6 +92,11 @@ _ABANDONED = "abandoned"    # /addon answered queued after the push
 # The ones the turn holds: what Jev reads as already added, and what a
 # withdraw can take back. An entry from before statuses existed counts as added.
 _HELD = frozenset({_PENDING, _ADDED})
+# What still reaches the app for an abandoned addon, which the app queued:
+# "read" (the model saw it anyway, so the app drops its queued copy) and
+# "withdrawn" (the follow-up withdraw landed). A late "added" would show it
+# twice, and a "returned" would run it twice.
+_ABANDONED_RELAYED = frozenset({"read", "withdrawn"})
 
 
 class RemoteAddonResult(StrEnum):
@@ -210,7 +217,8 @@ async def submit_remote_addon(
     covers a verdict that never came and a Redis error once the entry may be
     queued; both also queue a withdraw of it. An older scratchpad-controller
     drops the entry, which reads as TIMEOUT. Every answer but ADDED after the
-    push marks the addon abandoned, so a late pod step for it is dropped.
+    push marks the addon abandoned, so a late "added" (or "returned") for it
+    is dropped; its "read" and "withdrawn" still reach the app.
 
     *deadline* (time.monotonic()) is the request's own: the wait for the
     pod ends by it too, as TIMEOUT, and one already past before the push
@@ -367,7 +375,8 @@ async def relay_addon_step(
     stream, which saves them with the answer.
 
     The pod is semi-trusted: a step is relayed only for an addon this server
-    recorded for this turn and did not abandon, and its text, decider and
+    recorded for this turn (for one it abandoned, only "read" and
+    "withdrawn", _ABANDONED_RELAYED), and its text, decider and
     ``local_key`` come from that record, not the pod. "ready" is recorded
     for /addon's support check and never relayed. Never raises: a step that
     can't be checked is dropped."""
@@ -390,7 +399,7 @@ async def relay_addon_step(
         logger.warning("addon step dropped: Redis failed correlation_id=%s addon_id=%s",
                        correlation_id, addon_id, exc_info=True)
         return []
-    if entry is None or _status(entry) == _ABANDONED:
+    if entry is None or (_status(entry) == _ABANDONED and state not in _ABANDONED_RELAYED):
         logger.info("addon step dropped: not an addon this turn holds correlation_id=%s addon_id=%s state=%s",
                     correlation_id, addon_id, state)
         return []

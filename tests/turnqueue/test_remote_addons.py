@@ -331,12 +331,26 @@ async def test_steps_for_an_addon_this_turn_never_took_are_dropped(r, state):
     }, r=r) == []
 
 
-async def test_a_late_verdict_for_an_abandoned_addon_is_dropped(r):
+@pytest.mark.parametrize("state", ["added", "returned"])
+async def test_a_late_add_for_an_abandoned_addon_is_dropped(r, state):
+    """/addon answered queued, so the app runs it next: an "added" would show
+    it twice and a "returned" would run it twice."""
     result, addon_id = await _submit(r, timeout=0.2)
     assert result is RemoteAddonResult.TIMEOUT
-    for state in ("added", "read", "withdrawn"):
-        assert await relay_addon_step(correlation_id="corr-1", data={
-            "step": "addon", "addon_id": addon_id, "state": state}, r=r) == []
+    assert await relay_addon_step(correlation_id="corr-1", data={
+        "step": "addon", "addon_id": addon_id, "state": state}, r=r) == []
+
+
+@pytest.mark.parametrize("state", ["read", "withdrawn"])
+async def test_read_and_withdrawn_still_reach_the_app_for_an_abandoned_addon(r, state):
+    """The app queued it: "read" tells it the model saw it anyway (it drops
+    its queued copy), "withdrawn" that the follow-up withdraw landed."""
+    result, addon_id = await _submit(r, text="use the sales DB", timeout=0.2, local_key="k-9")
+    assert result is RemoteAddonResult.TIMEOUT
+    assert await _status(r, addon_id) == "abandoned"
+    assert await relay_addon_step(correlation_id="corr-1", data={
+        "step": "addon", "addon_id": addon_id, "state": state, "text": "pod's words", "decided_by": "user"}, r=r) == [
+        TurnAddon(addon_id, state, "use the sales DB", "jev", "k-9")]
 
 
 async def test_another_turns_addon_is_not_relayed_here(r):

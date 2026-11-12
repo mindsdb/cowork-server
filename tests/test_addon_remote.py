@@ -632,6 +632,7 @@ async def test_the_web_relay_streams_and_saves_only_this_turns_addons(monkeypatc
         yield "turn_step", {"step": "addon", "type": "response.addon", "state": "ready"}
         yield "turn_step", _step("added", text="pod's own words", decided_by="user")
         yield "turn_step", {**_step("added"), "addon_id": "b" * 32}
+        yield "turn_step", {**_step("read"), "addon_id": "b" * 32}
         yield "turn_step", {**_step("added"), "addon_id": "f" * 32, "text": "injected"}
         yield "turn_step", _step("withdrawn", request_id="r" * 32)
         yield "turn_delta", {"text": "done"}
@@ -643,8 +644,10 @@ async def test_the_web_relay_streams_and_saves_only_this_turns_addons(monkeypatc
     )
 
     addon_events = [e for e in saved["events"] if e.get("type") == "response.addon"]
-    assert [(e["addon_id"], e["state"], e["text"], e["decided_by"], e["local_key"]) for e in addon_events] == [
+    assert [(e["addon_id"], e["state"], e["text"], e["decided_by"], e.get("local_key")) for e in addon_events] == [
         (ADDON_ID, "added", "use the sales DB", "jev", "k-1"),
+        # Abandoned: its late "added" is dropped, its "read" saved.
+        ("b" * 32, "read", "gave up on", "jev", None),
         (ADDON_ID, "withdrawn", "use the sales DB", "jev", "k-1"),
     ]
     # "ready" is recorded for /addon's support check, never streamed.
