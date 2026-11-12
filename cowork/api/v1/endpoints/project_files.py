@@ -55,6 +55,7 @@ from cowork.common.paths import (
     pinned_dir,
     read_bounded,
     safe_join,
+    write_all,
 )
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
@@ -83,7 +84,12 @@ from cowork.schemas.sharepoint import (
     SharePointImportResponse,
     SharePointSkippedItem,
 )
-from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME, SERVER_PROJECT_FOLDERS
+from cowork.services.artifact_roots import (
+    CONVERSATIONS_DIRNAME,
+    PROJECT_FILES_DIRNAME,
+    REMOVED_DIRNAME,
+    SERVER_PROJECT_FOLDERS,
+)
 from cowork.services.artifacts import _is_the_projects_secrets
 from cowork.services.connectors.sharepoint import (
     DownloadBudget,
@@ -91,6 +97,7 @@ from cowork.services.connectors.sharepoint import (
     SharePointError,
     SharePointErrorKind,
 )
+from cowork.services.project_file_view import ABSENT_ERRNOS, ordinary_path
 from cowork.services.projects import ProjectService
 from cowork.services.product_permissions import require_product_permission
 from cowork.services.shared_resources import (
@@ -662,6 +669,11 @@ _MAX_LISTED_FILES = 2000
 _MAX_EXAMINED_ENTRIES = 50_000
 
 
+#: The folders in a conversation's workspace that hold copies of the
+#: project's files, which the project's listing skips (_iter_project_files).
+_COPY_DIRNAMES = frozenset({PROJECT_FILES_DIRNAME, REMOVED_DIRNAME})
+
+
 @dataclass
 class _WalkBudget:
     """Whether the entry ceiling, rather than the file cap, stopped the walk."""
@@ -669,7 +681,7 @@ class _WalkBudget:
     exhausted: bool = False
 
 
-def _iter_project_files(base: Path, budget: _WalkBudget) -> Iterator[Path]:
+def _iter_project_files(base: Path, budget: _WalkBudget, *, skip_copies: bool = False) -> Iterator[Path]:
     """Candidate files under `base`, breadth-first, bounded by entries seen.
 
     Breadth-first so a truncated listing shows the user's own top-level files
@@ -681,7 +693,15 @@ def _iter_project_files(base: Path, budget: _WalkBudget) -> Iterator[Path]:
     directory. Every desktop project has `skills/<slug>` directory symlinks
     from `reconcile_project`, so descending would spend the budget on trees
     whose entries `_file_meta` then discards for resolving outside `base`.
+
+    With `skip_copies` (org mode), a conversation's copy of the project's
+    files (`conversations/<id>/project-files/`, stage_project_files) and what
+    that copy removed but has not deleted yet
+    (`conversations/<id>/.project-files-removed/`) are neither descended into
+    nor listed, so the listing shows each project file once and the copies
+    spend none of the budget.
     """
+    copies_parent = base / CONVERSATIONS_DIRNAME
     queue: deque[Path] = deque([base])
     examined = 0
     while queue:
@@ -699,7 +719,12 @@ def _iter_project_files(base: Path, budget: _WalkBudget) -> Iterator[Path]:
                     if entry.is_dir():
                         continue
                 elif entry.is_dir():
-                    queue.append(entry)
+                    if not (
+                        skip_copies
+                        and entry.name in _COPY_DIRNAMES
+                        and entry.parent.parent == copies_parent
+                    ):
+                        queue.append(entry)
                     continue
             except OSError:
                 continue
@@ -950,16 +975,6 @@ def _create_project_temp(parent: PinnedDir, prefix: str, mode: int) -> tuple[str
     return temporary, fd
 
 
-def _write_all(fd: int, data: bytes) -> None:
-    """Write every byte of ``data`` to ``fd``; a write that makes no progress is an error."""
-    remaining = memoryview(data)
-    while remaining:
-        written = os.write(fd, remaining)
-        if written == 0:
-            raise OSError("project file write made no progress")
-        remaining = remaining[written:]
-
-
 def _write_bytes_at_project_root(
     root: PinnedDir, path: _ValidatedProjectPath, data: bytes
 ) -> os.stat_result:
@@ -987,7 +1002,7 @@ def _write_bytes_at_project_root(
             try:
                 if existing is not None and hasattr(os, "fchmod"):
                     os.fchmod(fd, mode)
-                _write_all(fd, data)
+                write_all(fd, data)
                 result = os.fstat(fd)
             finally:
                 os.close(fd)
@@ -1166,7 +1181,7 @@ class _ProjectImport:
                 try:
                     if target.old_mode is not None and hasattr(os, "fchmod"):
                         os.fchmod(fd, mode)
-                    feed(lambda chunk: _write_all(fd, chunk))
+                    feed(lambda chunk: write_all(fd, chunk))
                 finally:
                     os.close(fd)
         except (OSError, ValueError) as exc:
@@ -1365,6 +1380,82 @@ def _delete_project_entry(
             if stat.S_ISDIR(target_stat.st_mode):
                 raise HTTPException(status_code=400, detail="Path is a directory")
             dir_unlink(parent, disk_name)
+        if scoped.scope.org_mode:
+            _remove_project_file_copies(directory, path)
+
+
+#: How long one delete spends removing a file's copies from the project's
+#: conversations, so a project with many conversations does not hold the
+#: request's file store slot for all of them.
+COPY_PURGE_SECONDS = 2.0
+
+
+def _remove_project_file_copies(project: PinnedDir, path: _ValidatedProjectPath) -> None:
+    """Remove a deleted project file's copy from every conversation's
+    project-files folder in the project (stage_project_files), so nobody
+    reads it there, whether or not that conversation runs another turn. Each
+    folder on the way is opened without following a link; a conversation
+    whose copy is missing or reached through a link is skipped, and one that
+    can't be cleared is logged. The file itself is already gone, so nothing
+    here fails the delete. The copy's folders are the pod's, so the path's
+    names, already validated, are opened directly: no folder there is ever
+    listed, and each conversation costs one open per path component.
+
+    Bounded by COPY_PURGE_SECONDS: the conversations it does not reach in
+    that time are logged with their count. A conversation's next turn removes
+    any copy left behind, since its project file is no longer there to copy."""
+    if not ordinary_path(path.parts):
+        return
+    deadline = time.monotonic() + COPY_PURGE_SECONDS
+    try:
+        conversations = open_pinned_child(project, CONVERSATIONS_DIRNAME)
+    except OSError as error:
+        if error.errno not in ABSENT_ERRNOS:
+            logger.warning("could not open the project's conversations to remove a deleted file's copies", exc_info=True)
+        return
+    try:
+        try:
+            with dir_scandir(conversations) as scan:
+                conversation_names = [entry.name for entry in scan]
+        except OSError:
+            logger.warning("could not list the project's conversations to remove a deleted file's copies", exc_info=True)
+            return
+        for reached, conversation_name in enumerate(conversation_names):
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "stopped removing a deleted project file's copies at the time limit; "
+                    "%d of %d conversation folders not reached", len(conversation_names) - reached,
+                    len(conversation_names),
+                )
+                return
+            try:
+                UUID(conversation_name)
+            except ValueError:
+                continue
+            try:
+                with ExitStack() as opened:
+                    conversation = open_pinned_child(conversations, conversation_name)
+                    opened.callback(conversation.close)
+                    copies = open_pinned_child(conversation, PROJECT_FILES_DIRNAME)
+                    opened.callback(copies.close)
+                    # The pod can fill these folders, so each name is opened
+                    # directly rather than looked up in a listing.
+                    parent = opened.enter_context(
+                        _opened_pinned_descendant(copies, path.parts[:-1], create=False)
+                    )
+                    name = os.path.basename(path.parts[-1])
+                    if not stat.S_ISDIR(dir_lstat(parent, name).st_mode):
+                        dir_unlink(parent, name)
+            except OSError as error:
+                if isinstance(error, FileNotFoundError) or error.errno in ABSENT_ERRNOS:
+                    continue
+                logger.warning(
+                    "could not remove a deleted project file's copy from conversation %s",
+                    conversation_name,
+                    exc_info=True,
+                )
+    finally:
+        conversations.close()
 
 
 def _read_project_bytes(
@@ -1563,7 +1654,7 @@ def _list_project_files(
     _conv_cache: dict = {}
     budget = _WalkBudget()
     truncated = False
-    for p in _iter_project_files(base, budget):
+    for p in _iter_project_files(base, budget, skip_copies=scoped.scope.org_mode):
         meta = _file_meta(p, base)
         if not (meta and _conversation_workspace_ok(meta["path"], scoped, _conv_cache)):
             continue

@@ -255,7 +255,8 @@ def _remote_handler(monkeypatch, saved):
             pass
 
         def get_conversation(self, conv_id):
-            return object()
+            # In no project, so staging copies no project files.
+            return SimpleNamespace(project=None)
 
         def save_user_message(self, conv_id, content, created_at=None, *, pending=False):
             saved["user"] = content
@@ -3366,7 +3367,8 @@ def _remote_handler_with_message_id(monkeypatch, saved, *, assistant_message_id)
             pass
 
         def get_conversation(self, conv_id):
-            return object()
+            # In no project, so staging copies no project files.
+            return SimpleNamespace(project=None)
 
         def save_user_message(self, conv_id, content, created_at=None, *, pending=False):
             saved["user"] = content
