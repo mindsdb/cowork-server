@@ -84,7 +84,7 @@
         "label": "Basic Authentication",
         "description": "Connect to a Zipkin server secured with HTTP Basic Auth — provide the server URL along with a username and password.",
         "recommended": false,
-        "how_to": "## Connect via Basic Authentication\n\nUse this method if your Zipkin server (or the reverse proxy in front of it) is protected with HTTP Basic Auth.\n\n### Steps\n\n1. Obtain the base URL of your Zipkin server, e.g. `https://zipkin.example.com`.\n2. Get the username and password configured on the server or proxy (check with your infrastructure or DevOps team).\n3. Paste the URL into **Server URL**, and enter the credentials in **Username** and **Password**.\n4. Click **Submit**. Anton will include an `Authorization: Basic ...` header on every request.\n\n### Notes\n\n- Basic Auth credentials are stored locally in Anton's encrypted vault.\n- If your proxy uses a different scheme (digest, mutual TLS, etc.), use the **Server URL** method with a token or contact your admin.\n- Disable **Verify SSL** only if you're on a private network with a self-signed cert — otherwise leave it on.\n",
+        "how_to": "## Connect via Basic Authentication\n\nUse this method if your Zipkin server (or the reverse proxy in front of it) is protected with HTTP Basic Auth.\n\n### Steps\n\n1. Obtain the base URL of your Zipkin server, e.g. `https://zipkin.example.com`.\n2. Get the username and password configured on the server or proxy (check with your infrastructure or DevOps team).\n3. Paste the URL into **Server URL**, and enter the credentials in **Username** and **Password**.\n4. Click **Submit**. Anton will include an `Authorization: Basic ...` header on every request.\n\n### Notes\n\n- If your proxy uses a different scheme (digest, mutual TLS, etc.), use the **Server URL** method with a token or contact your admin.\n- Disable **Verify SSL** only if you're on a private network with a self-signed cert — otherwise leave it on.\n",
         "help_url": "https://zipkin.io/zipkin-api/",
         "fields": [
           {
@@ -109,7 +109,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "description": "HTTP Basic Auth password. Stored encrypted in Anton's local vault."
+            "description": "HTTP Basic Auth password."
           },
           {
             "name": "api_version",
