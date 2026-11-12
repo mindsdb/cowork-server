@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import markdown
+import psutil
 import pytest
 
-from cowork.services import publish
+from cowork.services import artifact_export, export_runner, publish
 
 
 # ─── Renderer helpers (pure) ─────────────────────────────────────────────
@@ -47,6 +50,103 @@ def test_markdown_title_prefers_first_h1(tmp_path: Path):
     md = tmp_path / "x.md"
     text = "intro line\n\n# Real Title\n\nbody"
     assert publish._markdown_title(md, text) == "Real Title"
+
+
+# ─── The render runs in the export's conversion process ──────────────────
+
+HOSTILE = "[a][" * 8_000  # Python-Markdown is quadratic on it: 30 s and more.
+
+
+@pytest.fixture(autouse=True)
+def _no_cached_pages(monkeypatch):
+    monkeypatch.setattr(publish, "_RENDERED_PAGES", {})
+
+
+def test_a_published_page_is_what_rendering_in_the_server_made(tmp_path: Path):
+    """The page is byte for byte what Python-Markdown made in the server's
+    own process, a [TOC] marker's table of contents included."""
+    text = "# Q3\n\n[TOC]\n\n## Results\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```\nx\n```\n"
+    md = tmp_path / "report.md"
+    md.write_text(text)
+    body = markdown.markdown(
+        text, extensions=["fenced_code", "tables", "toc", "sane_lists"], output_format="html5"
+    )
+
+    page = publish._render_markdown_to_html(md, tmp_path).read_text()
+
+    assert page == publish._MD_HTML_TEMPLATE.format(title="Q3", body=body)
+    assert 'class="toc"' in page
+
+
+def test_a_hostile_file_is_refused_within_the_wall_clock_and_leaves_no_process(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(artifact_export, "CONVERSION_WALL_SECONDS", 3.0)
+    md = tmp_path / "report.md"
+    md.write_text(HOSTILE)
+    children = {process.pid for process in psutil.Process().children(recursive=True)}
+    started = time.monotonic()
+
+    with pytest.raises(publish.MarkdownNotPublishable):
+        publish._render_markdown_to_html(md, tmp_path / "out")
+
+    assert time.monotonic() - started < 3.0 + 1
+    assert {process.pid for process in psutil.Process().children(recursive=True)} == children
+    assert not (tmp_path / "out" / "index.html").exists()
+
+
+def test_a_render_while_another_conversion_runs_is_refused_as_busy(tmp_path: Path):
+    md = tmp_path / "report.md"
+    md.write_text("# R\n")
+    assert export_runner._child_slot.acquire(blocking=False)
+    try:
+        with pytest.raises(publish.MarkdownRenderBusy):
+            publish._render_markdown_to_html(md, tmp_path)
+    finally:
+        export_runner._child_slot.release()
+
+
+def test_the_same_markdown_renders_once(tmp_path: Path, monkeypatch):
+    """The "changed since publish" check renders on every listing of an
+    edited artifact; one render serves them all until the next edit."""
+    calls = []
+    convert = export_runner.convert_in_child
+
+    def counting(**kwargs):
+        calls.append(kwargs["request"])
+        return convert(**kwargs)
+
+    monkeypatch.setattr(export_runner, "convert_in_child", counting)
+    md = tmp_path / "report.md"
+    md.write_text("# R\n\ntext\n")
+    for name in ("a", "b", "c"):
+        (tmp_path / name).mkdir()
+
+    first = publish._render_markdown_to_html(md, tmp_path / "a")
+    second = publish._render_markdown_to_html(md, tmp_path / "b")
+    md.write_text("# R\n\nedited\n")
+    third = publish._render_markdown_to_html(md, tmp_path / "c")
+
+    assert first.read_text() == second.read_text() != third.read_text()
+    assert len(calls) == 2
+
+
+def test_the_changed_since_publish_check_cant_tell_for_a_hostile_file(tmp_path: Path, monkeypatch):
+    """A file the conversion can't render is "can't tell": no badge, no hold on the server."""
+    monkeypatch.setattr(artifact_export, "CONVERSION_WALL_SECONDS", 3.0)
+    root = tmp_path / "notes"
+    root.mkdir()
+    (root / "metadata.json").write_text(
+        json.dumps({"id": "notes", "type": "document", "primary": "report.md"}), encoding="utf-8"
+    )
+    # The same artifact with ordinary Markdown has a hash, so None below is the render's.
+    (root / "report.md").write_text("# R\n", encoding="utf-8")
+    assert publish.compute_publish_md5(root, artifacts_base=tmp_path) is not None
+    (root / "report.md").write_text(HOSTILE, encoding="utf-8")
+    started = time.monotonic()
+
+    assert publish.compute_publish_md5(root, artifacts_base=tmp_path) is None
+    assert time.monotonic() - started < 3.0 + 1
 
 
 # ─── publish_artifact() flow ─────────────────────────────────────────────

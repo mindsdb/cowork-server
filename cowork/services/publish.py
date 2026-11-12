@@ -72,9 +72,13 @@ from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
+from cowork.schemas.artifact_export import OmittedReason
+from cowork.schemas.export_child import ChildLimits, PublishMarkdownRequest
+from cowork.services.artifact_files import ArtifactFileContent, ArtifactFileRefused
 from cowork.services.artifacts import (
     _content_mtime,
     _load_published_map,
+    _org_mode,
     PUBLISHABLE_STATIC_SUFFIXES,
     _scan_artifact_dirs,
     html_artifacts,
@@ -172,6 +176,23 @@ class PublishRejected(RuntimeError):
     a shared-storage path, so org routes show this type's text and hide the
     other's.
     """
+
+
+class MarkdownNotPublishable(PublishRejected):
+    """Rendering the Markdown passed its time or memory limit, or failed. Nothing was published."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This Markdown file can't be published. "
+            "Converting it took too long or used too much memory."
+        )
+
+
+class MarkdownRenderBusy(PublishRejected):
+    """Another conversion holds this server process's one conversion slot."""
+
+    def __init__(self) -> None:
+        super().__init__("Another document is converting on this server. Try again in a moment.")
 
 
 # Sharing an artifact with everyone takes MindsHub's artifacts.share_org,
@@ -749,6 +770,15 @@ def _markdown_title(md_path: Path, md_text: str) -> str:
     return md_path.stem
 
 
+# Rendered pages, by a digest of their title and Markdown, newest last. The
+# "changed since publish" check renders a page each time it lists an edited
+# artifact, so one render per edit serves every listing until the next.
+_RENDERED_PAGES: dict[str, str] = {}
+_MAX_RENDERED_PAGES = 32
+# A page past this size isn't kept, so the cache can't grow past 32 of them.
+_MAX_RENDERED_PAGE_CHARS = 1024 * 1024
+
+
 def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     """Render a Markdown file to a standalone ``index.html`` in ``out_dir``.
 
@@ -756,24 +786,63 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     ``anton.publisher.publish`` (it zips it as index.html and serves it as a
     web page). The original ``.md`` is never modified — the registry and
     publish history still key off it, not this temp file.
-    """
-    # `markdown` is a direct dependency (pyproject.toml); the guard stays
-    # defensive so a broken install reports a clear error.
-    try:
-        import markdown
-    except Exception as exc:  # pragma: no cover - dependency guard
-        raise PublisherUnavailable("Markdown renderer is unavailable") from exc
 
+    Python-Markdown runs in the export's conversion process
+    (``cowork.services.export_runner``), which the server kills past its time
+    or memory limit, so a hostile file can't hold the server. Raises
+    ``MarkdownNotPublishable`` for one it killed or that failed, and
+    ``MarkdownRenderBusy`` while another conversion runs.
+    """
     md_text = md_path.read_text(encoding="utf-8", errors="replace")
-    body = markdown.markdown(
-        md_text,
-        extensions=["fenced_code", "tables", "toc", "sane_lists"],
-        output_format="html5",
-    )
-    page = _MD_HTML_TEMPLATE.format(title=_html.escape(_markdown_title(md_path, md_text)), body=body)
+    title = _markdown_title(md_path, md_text)
+    key = hashlib.sha256(f"{title}\0{md_text}".encode()).hexdigest()
+    page = _RENDERED_PAGES.get(key)
+    if page is None:
+        body = _publish_markdown_body(md_text)
+        page = _MD_HTML_TEMPLATE.format(title=_html.escape(title), body=body)
+        if len(page) <= _MAX_RENDERED_PAGE_CHARS:
+            _RENDERED_PAGES[key] = page
+            while len(_RENDERED_PAGES) > _MAX_RENDERED_PAGES:
+                _RENDERED_PAGES.pop(next(iter(_RENDERED_PAGES)))
     out_path = out_dir / "index.html"
     out_path.write_text(page, encoding="utf-8")
     return out_path
+
+
+def _publish_markdown_body(md_text: str) -> str:
+    """The page body Python-Markdown renders for *md_text*, in a conversion process."""
+    from cowork.services.artifact_export import (
+        CONVERSION_MEMORY_BYTES,
+        CONVERSION_WALL_SECONDS,
+        ORG_CONVERSION_MEMORY_BYTES,
+    )
+    from cowork.services.export_runner import (
+        ConversionBusy,
+        ConversionError,
+        ConversionOverrun,
+        convert_in_child,
+    )
+
+    limits = ChildLimits(
+        wall_seconds=CONVERSION_WALL_SECONDS,
+        memory_bytes=ORG_CONVERSION_MEMORY_BYTES if _org_mode() else CONVERSION_MEMORY_BYTES,
+    )
+    try:
+        conversion = convert_in_child(
+            request=PublishMarkdownRequest(),
+            source=md_text.encode("utf-8"),
+            read_asset=_no_reads,
+            limits=limits,
+        )
+    except ConversionBusy as exc:
+        raise MarkdownRenderBusy() from exc
+    except (ConversionOverrun, ConversionError) as exc:
+        raise MarkdownNotPublishable() from exc
+    return conversion.data.decode("utf-8")
+
+
+def _no_reads(parts: tuple[str, ...]) -> ArtifactFileContent:
+    raise ArtifactFileRefused(OmittedReason.MISSING, "a published page reads no file")
 
 
 def kept_access(entry: Any, *, org_mode: bool) -> ArtifactAccessRequest:

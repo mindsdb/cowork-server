@@ -24,7 +24,7 @@ from cowork.schemas.artifact_export import (
     RenderPdfRequest,
     RenderPdfResult,
 )
-from cowork.schemas.export_child import ChildLimits, ConvertRequest
+from cowork.schemas.export_child import ChildLimits, ConversionRequest, ConvertRequest
 from cowork.services.artifact_export import export_formats
 from cowork.services.artifact_files import read_artifact_file
 from cowork.services.artifact_inline import AssetReader, inline_artifact_html
@@ -143,7 +143,7 @@ def test_export_helpers_take_keyword_arguments_only(helper, names):
         (
             convert_in_child,
             {
-                "request": ConvertRequest,
+                "request": ConversionRequest,
                 "source": bytes,
                 "read_asset": AssetReader,
                 "limits": ChildLimits,

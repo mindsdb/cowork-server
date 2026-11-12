@@ -18,7 +18,8 @@ starts too. That is a check on our own code, not a sandbox: native code in a
 parser can bypass it, and the process runs as the server's user.
 
 ``convert`` is the conversion itself, and the server's tests call it in their
-own process too.
+own process too. Publishing a Markdown artifact renders its page here as well
+(``publish_markdown_body``), for the same reason.
 """
 from __future__ import annotations
 
@@ -32,6 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import BinaryIO, NamedTuple, NoReturn
 
+import markdown
 from pydantic import BaseModel, TypeAdapter
 
 from cowork.common.structured_logging import safe_exception_traceback
@@ -43,6 +45,7 @@ from cowork.schemas.export_child import (
     ConversionFailed,
     Converted,
     ConvertRequest,
+    PublishMarkdownRequest,
     ServerMessage,
 )
 from cowork.services.artifact_files import (
@@ -78,7 +81,9 @@ MAX_HEADER_BYTES = 64 * 1024
 MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 _LENGTH = struct.Struct(">I")
 
-_SERVER_MESSAGE: TypeAdapter[ConvertRequest | AssetReply] = TypeAdapter(ServerMessage)
+_SERVER_MESSAGE: TypeAdapter[ConvertRequest | PublishMarkdownRequest | AssetReply] = TypeAdapter(
+    ServerMessage
+)
 CHILD_MESSAGE: TypeAdapter[AssetRequest | Converted | ConversionFailed] = TypeAdapter(
     ChildMessage
 )
@@ -142,6 +147,13 @@ def convert(*, request: ConvertRequest, source: bytes, read_asset: AssetReader) 
         data = html_export(inlined.html)
     return Conversion(
         data=data, omitted_count=len(inlined.omitted), scripts_dropped=inlined.scripts_dropped
+    )
+
+
+def publish_markdown_body(*, text: str) -> str:
+    """A published Markdown page's body: Python-Markdown with the extensions publish has always used."""
+    return markdown.markdown(
+        text, extensions=["fenced_code", "tables", "toc", "sane_lists"], output_format="html5"
     )
 
 
@@ -362,13 +374,18 @@ def main() -> None:
         _limit_self(memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
         denied = _deny_network_and_processes()
         received = read_frame(stream=frames_in, adapter=_SERVER_MESSAGE)
-        if received is None or not isinstance(received.message, ConvertRequest):
+        if received is None or isinstance(received.message, AssetReply):
             raise FrameError("expected a conversion request")
-        conversion = convert(
-            request=received.message,
-            source=received.payload,
-            read_asset=_server_reader(frames_in=frames_in, frames_out=frames_out),
-        )
+        request, source = received
+        if isinstance(request, PublishMarkdownRequest):
+            body = publish_markdown_body(text=source.decode("utf-8"))
+            conversion = Conversion(data=body.encode("utf-8"), omitted_count=0, scripts_dropped=False)
+        else:
+            conversion = convert(
+                request=request,
+                source=source,
+                read_asset=_server_reader(frames_in=frames_in, frames_out=frames_out),
+            )
         if len(conversion.data) > MAX_PAYLOAD_BYTES:
             # More than the server reads in one frame: refused as too large.
             _exit_refused(why="the output is past the frame bound")
