@@ -25,6 +25,7 @@ from cowork.common.settings.app_settings import (
     get_app_settings,
 )
 from cowork.common.settings.runtime_credential import get_minds_credential
+from cowork.common.settings.secret_files import SecretFileSettingsSource
 
 
 class Provider(str, Enum):
@@ -525,9 +526,17 @@ class UserSettings(Settings):
     ):
         # Only local reads process env; a shared server's injected provider
         # secrets would otherwise leak into every tenant's settings. Fail closed:
-        # anything not local is DB-only.
+        # anything not local is DB-only. A credential whose file the process
+        # environment names wins over the environment and every .env
+        # (cowork.common.settings.secret_files).
         if get_app_settings().tenancy_mode == "local":
-            return (init_settings, env_settings, dotenv_settings, file_secret_settings)
+            return (
+                init_settings,
+                SecretFileSettingsSource(settings_cls),
+                env_settings,
+                dotenv_settings,
+                file_secret_settings,
+            )
         return (init_settings,)
 
     # ── Provider / model settings ──

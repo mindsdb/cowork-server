@@ -411,8 +411,25 @@ def test_identity_headers_never_copy_the_token(stack, tmp_path):
 def test_identity_headers_need_the_token_in_the_environment(stack):
     stack.setenv("COWORK_AUTH_TOKEN", "")
     assert _refusal().startswith(
-        "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN in the server's environment"
+        "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN or COWORK_AUTH_TOKEN_FILE "
+        "in the server's environment"
     )
+
+
+def test_identity_headers_take_the_token_from_its_file(stack, tmp_path):
+    token_file = tmp_path / "run" / "COWORK_AUTH_TOKEN"
+    token_file.parent.mkdir()
+    token_file.write_text("token-from-the-file\n", encoding="utf-8")
+    stack.delenv("COWORK_AUTH_TOKEN")
+    stack.setenv("COWORK_AUTH_TOKEN_FILE", str(token_file))
+    get_app_settings.cache_clear()
+
+    app = cowork_server.create_app()
+
+    bearer = [m for m in app.user_middleware if m.cls is cowork_server.BearerTokenMiddleware]
+    assert [m.kwargs["token"] for m in bearer] == ["token-from-the-file"]
+    env = tmp_path / "home" / ".env"
+    assert not env.exists() or "token-from-the-file" not in env.read_text(encoding="utf-8")
 
 
 def test_identity_headers_never_take_the_token_from_cowork_homes_env(stack, tmp_path):
@@ -430,7 +447,8 @@ def test_identity_headers_never_take_the_token_from_cowork_homes_env(stack, tmp_
     get_app_settings.cache_clear()
     assert get_app_settings().auth_token == "only-in-the-file"
     assert _refusal().startswith(
-        "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN in the server's environment"
+        "COWORK_TRUST_IDENTITY_HEADERS needs COWORK_AUTH_TOKEN or COWORK_AUTH_TOKEN_FILE "
+        "in the server's environment"
     )
 
 
