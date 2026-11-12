@@ -113,6 +113,40 @@ def test_turn_job_carries_a_versioned_datasource_block():
     assert TurnJob.model_validate_json(job.model_dump_json()).params["datasource"] == datasource
 
 
+def test_turn_job_carries_a_connection_label_and_engine():
+    datasource = {"protocol_version": 1, "connections": [
+        {"connection_id": 93, "credential_version": 2, "label": "données", "engine": "postgres"},
+        {"connection_id": 80, "credential_version": 1},
+    ]}
+    job = TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
+                  reply_stream="scratchpad:reply:c", params={"input": "hi", "datasource": datasource})
+    assert TurnJob.model_validate_json(job.model_dump_json()).params["datasource"] == datasource
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        {"connection_id": 7, "credential_version": 3, "label": ""},
+        {"connection_id": 7, "credential_version": 3, "label": "x" * 129},
+        {"connection_id": 7, "credential_version": 3, "label": 7},
+        {"connection_id": 7, "credential_version": 3, "engine": "postgres\n"},
+        {"connection_id": 7, "credential_version": 3, "engine": "Postgres"},
+        {"connection_id": 7, "credential_version": 3, "engine": None},
+    ],
+    ids=["empty_label", "label_over_the_cap", "label_not_text", "engine_with_newline", "engine_not_an_id",
+         "engine_null"],
+)
+def test_turn_job_refuses_a_label_or_engine_of_the_wrong_shape(reference):
+    """The producer leaves out a value it cannot use, so a value of the wrong
+    shape here is a producer bug and stops before Redis."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="datasource"):
+        TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
+                reply_stream="scratchpad:reply:c",
+                params={"input": "hi", "datasource": {"protocol_version": 1, "connections": [reference]}})
+
+
 @pytest.mark.parametrize(
     "datasource",
     [

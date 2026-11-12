@@ -59,9 +59,9 @@ annotated-types==0.7.0 \
 anthropic==1.8.0 \
     --hash=sha256:79a4516a21e64fd7b15be1a49ebf544bd6376c96a971a77365358823a2717bc6 \
     --hash=sha256:9c1783ed90f409617749a61c5ab98e20624a572626f2e0a15cea03ed8e1401e5
-anton-agent==2.26.11.9.1 \
-    --hash=sha256:46055041de9bd15b788b8bac4fc430e11a9ee40d9e98cd0f5b7ed5933550ec2d \
-    --hash=sha256:63d48466f590ee073cf2793401ee7232411baa8cc81d366ff189ccde61d1d7d4
+anton-agent==2.26.11.12.1rc7 \
+    --hash=sha256:0220360b59f600322ba4586bcf2afd2ceea42cf60e15725c4513c182fe230afe \
+    --hash=sha256:9b3f22b016418c699059df5fd51063a15c54fb457247bd6b99b71834fbf1b4cd
 anyio==4.15.1 \
     --hash=sha256:6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101 \
     --hash=sha256:9f28306018cbd6d329e64a36d58256edff76dd996fe423bc957326e578b82a94
@@ -269,6 +269,12 @@ google-re2==1.1.20251105 \
 h11==0.16.0 \
     --hash=sha256:4e35b956cf45792e4caa5885e69fba00bdbc6ffafbfa020300e549b208ee5ff1 \
     --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
+h2==4.4.1 \
+    --hash=sha256:0e25f1462b23c9cb82d9eb02e28bc706dac2a68cb457c6a0d74d63c8a2a5d0e6 \
+    --hash=sha256:4e866ffb1a869ae14dd9b5e6beb5c24a13da0495ad72b65925ded182521c1516
+hpack==4.2.0 \
+    --hash=sha256:0895cfa3b5531fc65fe439c05eb65144f123bf7a394fcaa56aa423548d8e45c0 \
+    --hash=sha256:858ac0b02280fa582b5080d68db0899c62a80375e0e5413a74970c5e518b6986
 html5lib==1.1 \
     --hash=sha256:0d78f8fde1c230e99fe37986a60526d7049ed4bf8a9fadbad5f00e22e58e041d \
     --hash=sha256:b2e5b40261e20f354d198eae92afc10d750afb487ed5e50f9c4eaf07c184146f
@@ -287,6 +293,9 @@ httpx2==2.12.0 \
 httpx2-jsfetch==1.0 ; sys_platform == 'emscripten' \
     --hash=sha256:70a0e3eabfef7cce5ad9c629f7d01ca05e418f586646f4ddf14782e4c1454c60 \
     --hash=sha256:cb916b707601e69a07721aabc8f3f6659be3a6893bc1ff5c6f9e02241df2da32
+hyperframe==6.1.0 \
+    --hash=sha256:b03380493a519fce58ea5af42e4a42317bf9bd425596f7a0835ffce80f1a42e5 \
+    --hash=sha256:f630908a00854a7adeabd6382b43923a4c4cd4b821fcb527e6ab9e15382a3b08
 idna==3.18 \
     --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2 \
     --hash=sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848
@@ -421,6 +430,18 @@ mcp-types==2.2.0 \
 mdurl==0.1.2 \
     --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \
     --hash=sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba
+microsoft-teams-api==2.1.1 ; sys_platform == 'linux' \
+    --hash=sha256:795602d6abc97e4dca334f2478fc0b07968fcc78f3aa5718e2d42fdd8f94dad6 \
+    --hash=sha256:b477006fc070d5315edd2042736c78cf52f5008167d9662804b7a0c5f07ac780
+microsoft-teams-cards==2.1.1 ; sys_platform == 'linux' \
+    --hash=sha256:22add69316354320fbea1ac31e7069c07ff920b01579d515f1778e52d9f56c75 \
+    --hash=sha256:5308d7f651b320be53b50b6ef9f9fa26710e69d894c21fe4c691d64c19636dd0
+microsoft-teams-common==2.1.1 ; sys_platform == 'linux' \
+    --hash=sha256:12b9866feaf41896b887189a7995d2923875db18c876db2a9afb8622a23f2ab8 \
+    --hash=sha256:506857ffcc1deadc0212ba9c633ae0d0052b5c702ae908f06485c9657d652f55
+msal==1.39.0 ; sys_platform == 'linux' \
+    --hash=sha256:2d2577886906cd7293850dffa2da29119966c213bfc6ec0cecf8bf7621e1ca77 \
+    --hash=sha256:6ab7de335e6d7f5717e2c7e1dbf86e4dda2f6acf3c56773b78dc53ebc6395b5f
 multidict==6.7.1 \
     --hash=sha256:03ede2a6ffbe8ef936b92cb4529f27f42be7f56afcdab5ab739cd5f27fb1cbf9 \
     --hash=sha256:0b4c48648d7649c9335cf1927a8b87fa692de3dcb15faa676c6a6f1f1aabda43 \
@@ -754,6 +775,9 @@ referencing==0.37.0 \
 reportlab==5.0.1 \
     --hash=sha256:1c36e6bb0e71780c72331eba60da7f602e8d4389a8723825af71342e49d791e8 \
     --hash=sha256:ebd13154be1c8515e665de70bd2d303ae9ddc3ef47e44afd5116441ca0283a26
+requests==2.34.2 ; sys_platform == 'linux' \
+    --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0 \
+    --hash=sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed
 rich==14.3.3 \
     --hash=sha256:793431c1f8619afa7d3b52b2cdec859562b950ea0d4b6b505397612db8d5362d \
     --hash=sha256:b8daa0b9e4eef54dd8cf7c86c03713f53241884e814f4e2f5fb342fe520f639b
@@ -860,6 +884,9 @@ tzdata==2025.3 ; sys_platform == 'win32' \
 tzlocal==5.4.3 \
     --hash=sha256:24ce97bb58e2a973f7640ec2553ab4e6f6d5a0d0d1aa9dc43bca21d89e1feb82 \
     --hash=sha256:3a8c9bc18cf47e1dcde252ea0e6a72a6cde320a400b6ac6db1f1f8cccd553c00
+urllib3==2.8.0 ; sys_platform == 'linux' \
+    --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3 \
+    --hash=sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63
 uvicorn==0.49.0 \
     --hash=sha256:ba3d14c3ee7e41c6c654c46c9eb489d33213cdd30aa1696eab1374337c13f68f \
     --hash=sha256:ebf4271aa580d9de97f93192d4595176df6e91f9aae919ca73e4fc07df1e66a3

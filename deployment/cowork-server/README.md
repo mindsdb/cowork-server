@@ -37,6 +37,14 @@ helm upgrade --namespace $K8S_NAMESPACE --install $CURRENT_HELM_CHART $HELM_CHAR
 
 Swap `CI_ENVIRONMENT_SLUG` / `K8S_NAMESPACE` for `staging` or `prod` to target those environments.
 
+## Who rolls out each environment
+
+- **staging and prod:** CI, on a push to `staging` or `main` (the `deploy` job in `.github/workflows/build-deploy.yml`).
+- **A PR's own environment:** CI, when the PR carries the `deploy` label. It gets a namespace of its own, `pr-cowork-server-<N>`.
+- **dev** (`cowork.dev.mindshub.ai`): CI, when a PR carries the `deploy-to-dev` label (the `deploy-dev` job). That PR's `development` image rolls into `dev` on every push while the label stays. Removing the label leaves the last rollout in place. Two labeled PRs take turns, so the last push wins.
+
+Each rollout runs `alembic upgrade head` on that environment's database first. A PR that adds a migration leaves `dev`'s database at its revision, so a later rollout from a branch without that revision fails its `db-migrate` init container until a branch that has it rolls out again. The running pods keep serving meanwhile.
+
 ## Required cluster secrets
 
 The chart references these Secrets in the target namespace:
@@ -98,6 +106,14 @@ environments are on.
 - `deployment.datasourceTurnsEnabled`, rendered as
   `COWORK_TURN_DATASOURCE_ENABLED`: `"true"` registers grants and queues the
   datasource block for hosted turns.
+- `deployment.datasourceLabelsEnabled`, rendered as
+  `COWORK_TURN_DATASOURCE_LABELS_ENABLED`: `"true"` in `values.yaml`, so every
+  environment sends each connection's name and connector id once its grants
+  are on; it does nothing where `datasourceTurnsEnabled` is off. An anton older
+  than the change refuses a block carrying them, so before an environment turns
+  grants on, its scratchpad image must have that anton and no live pod may
+  predate the image. Rollback for one environment sets the scalar to `"false"`
+  in its values file, the only value the chart test lets it set.
 - `deployment.datasourceCapabilities`, rendered as
   `COWORK_DATASOURCE_CAPABILITIES`: the methods this deployment may run, as a
   versioned manifest such as
