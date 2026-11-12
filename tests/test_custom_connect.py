@@ -60,6 +60,20 @@ QUERY_DRAFT = {
     "auth": {"type": "query", "params": {"access_key": "{access_key}", "output": "json"}},
     "check": {"path": "/v1/status?pretty"},
 }
+TWO_SLOT_DRAFT = {
+    "connector_id": "two_slot_api",
+    "label": "Two Slot API",
+    "fields": [{"name": "access_key", "label": "Access key"}, {"name": "account", "label": "Account"}],
+    "auth": {"type": "query", "params": {"access_key": "{access_key}", "account": "{account}"}},
+    "check": {"path": "/v1/status"},
+}
+HEADER_KEY_DRAFT = {
+    "connector_id": "header_key_api",
+    "label": "Header Key API",
+    "fields": [{"name": "api_key", "label": "API key"}],
+    "auth": {"type": "header", "headers": {"X-Api-Key": "{api_key}", "X-Api-Version": "2024-01"}},
+    "check": {"path": "/v1/status"},
+}
 STORED = {
     "id": 7, "connector_id": "acme_crm", "name": "Acme", "secure_keys": ["api_key"], "status": "verified",
     "credential_version": 1, "created_at": "2026-11-09T10:00:00Z", "updated_at": "2026-11-09T10:00:00Z",
@@ -76,7 +90,7 @@ def engine():
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(eng)
     service = CustomConnectorService(_scoped(eng, BUILDER))
-    for draft in (DRAFT, BASIC_DRAFT, QUERY_DRAFT):
+    for draft in (DRAFT, BASIC_DRAFT, QUERY_DRAFT, TWO_SLOT_DRAFT, HEADER_KEY_DRAFT):
         service.save_member_draft(parse_connector_draft(draft))
     service.save_member_draft(parse_connector_draft({k: v for k, v in DRAFT.items() if k != "check"} | {"connector_id": "no_check_api"}))
     return eng
@@ -372,21 +386,34 @@ def test_a_check_refused_without_the_key_then_answered_with_it_connects(engine, 
 
 
 @pytest.mark.parametrize("status", [400, 422])
-def test_a_bad_request_without_the_key_proves_it_when_every_slot_is_secret(engine, world, monkeypatch, status):
+@pytest.mark.parametrize(("connector_id", "values"), [
+    ("query_api", {"access_key": SECRET}),
+    ("header_key_api", {"api_key": SECRET}),
+])
+def test_a_bad_request_without_the_key_proves_it_when_the_key_is_the_one_value_placed(
+    engine, world, monkeypatch, status, connector_id, values
+):
     world["unprotected"] = (status, b'{"error_message":"Bad Request. Variable access_key is not set."}')
 
-    res = _connect(_client(engine, monkeypatch), "query_api", values={"access_key": SECRET})
+    res = _connect(_client(engine, monkeypatch), connector_id, values=values)
 
     assert res.status_code == 201, res.text
     assert len(world["provider"]) == 2
 
 
 @pytest.mark.parametrize("status", [400, 422])
-def test_a_bad_request_without_the_key_proves_nothing_when_a_slot_is_not_secret(engine, world, monkeypatch, status):
-    # The keyless send also lacks the workspace, which alone could be the request's fault.
-    world["unprotected"] = (status, b'{"error":"missing X-Workspace"}')
+@pytest.mark.parametrize(("connector_id", "values"), [
+    ("acme_crm", VALUES),
+    ("basic_api", {"email": "me@x.io", "api_token": SECRET}),
+    ("two_slot_api", {"access_key": SECRET, "account": "a1"}),
+])
+def test_a_bad_request_without_the_key_proves_nothing_when_another_value_is_missing(
+    engine, world, monkeypatch, status, connector_id, values
+):
+    # The keyless send also lacks the other placed value, which alone could be the request's fault.
+    world["unprotected"] = (status, b'{"error":"missing account"}')
 
-    res = _connect(_client(engine, monkeypatch))
+    res = _connect(_client(engine, monkeypatch), connector_id, values=values)
 
     assert res.json()["detail"] == {"code": "check_not_protected", "provider_status": status, "excerpt": ""}
     assert len(world["provider"]) == 1
