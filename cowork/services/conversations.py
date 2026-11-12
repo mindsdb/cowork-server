@@ -6,7 +6,7 @@ import logging
 import os
 import stat
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -164,6 +164,9 @@ class ConversationDeleteStage:
     conversation_id: UUID
     attachment_dirs: tuple[Path, ...]
     project_path: str | None
+    #: Org mode: the record of the conversation's copy of its project's files
+    #: (cowork.services.files.stage_project_files), kept outside the project.
+    copy_record: Path | None = None
 
 
 def _is_tool_row(content) -> bool:
@@ -698,9 +701,10 @@ class ConversationService:
         their own conversation.
 
         ``cleanup_project_files=False`` deletes the rows and the attachments'
-        files but leaves the conversation's folders in its project alone, for
-        a caller that knows none were made and runs off the file store's
-        threads, such as the scheduler's discard of a run that never started."""
+        files but leaves the conversation's folders in its project, and the
+        record of its project files copy, alone, for a caller that knows none
+        were made and runs off the file store's threads, such as the
+        scheduler's discard of a run that never started."""
         conversation = self._owned(conversation_id)
         if conversation is None:
             return False
@@ -749,6 +753,7 @@ class ConversationService:
         from cowork.services.files import (
             FileService,
             attachment_purpose,
+            copy_record_path,
         )
 
         file_service = FileService(self.session)
@@ -783,6 +788,10 @@ class ConversationService:
             conversation_id=conversation_id,
             attachment_dirs=tuple(attachment_dirs),
             project_path=session_project_path,
+            copy_record=(
+                copy_record_path(self.session.scope, conversation_id)
+                if self.session.scope.org_mode else None
+            ),
         )
 
     @staticmethod
@@ -794,6 +803,7 @@ class ConversationService:
         """Remove external state only after the staged DB transaction commits."""
         from cowork.services.files import (
             remove_conversation_workspace_dir,
+            remove_copy_record,
             unlink_file_dirs,
         )
 
@@ -802,6 +812,10 @@ class ConversationService:
         # gone, and a reused turn_id would replay a deleted turn's answer.
         _discard_conversation_streams(stage.conversation_id)
         unlink_file_dirs(list(stage.attachment_dirs))
+        # Outside the project, so a project delete, which skips the
+        # per-conversation cleanup below, removes it too.
+        if stage.copy_record is not None:
+            remove_copy_record(stage.copy_record)
         if cleanup_project_files:
             remove_conversation_sessions(stage.project_path, stage.conversation_id)
             # Also drop the per-conversation workspace (staged attachments +
@@ -819,6 +833,9 @@ class ConversationService:
                 conversation,
                 include_org_attachments=False,
             )
+            if not cleanup_project_files:
+                # Rows only: no turn ran, so no copy and no record were made.
+                stage = replace(stage, copy_record=None)
             self.session.commit()
         except Exception:
             self.session.rollback()

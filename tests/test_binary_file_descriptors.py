@@ -135,7 +135,7 @@ COWORK_ROOT = Path(paths.__file__).resolve().parents[1]
 # Limitation: only the ``os.open(...)`` form is detected, not
 # ``from os import open`` or ``posix.open``; the codebase uses neither.
 RAW_OS_OPEN_ALLOWED = {
-    "common/paths.py": 5,
+    "common/paths.py": 6,
     "services/artifact_revisions.py": 1,
 }
 

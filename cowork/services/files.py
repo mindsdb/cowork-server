@@ -1,24 +1,39 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import hashlib
 import logging
 import os
 import re
 import shutil
 import stat
+import time
+from collections.abc import Iterator
+from contextlib import ExitStack, closing, contextmanager
+from dataclasses import dataclass
+from enum import StrEnum
 from functools import partial
 from pathlib import Path
 from typing import NamedTuple
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import UploadFile
+from pydantic import BaseModel, ValidationError
 
+from cowork.common.logger import log_context
 from cowork.common.paths import (
     O_NOFOLLOW,
+    O_NONBLOCK,
     PinnedDir,
+    cowork_home,
+    dir_atomic_write,
+    dir_chmod_folder,
     dir_lstat,
     dir_mkdir,
     dir_open,
+    dir_rename,
+    dir_rmdir,
     dir_rmtree,
     dir_scandir,
     dir_stat,
@@ -26,13 +41,23 @@ from cowork.common.paths import (
     open_fd,
     open_pinned_child,
     pinned_dir,
+    read_bounded,
     safe_join,
+    write_all,
 )
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
 from cowork.db.scoped import ScopedSession, TenantScope, scoped_storage_root
 from cowork.db.units import run_db, run_efs
 from cowork.models.file import File
 from cowork.schemas.files import FileResponse, StoredFileContent
+from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME, PROJECT_FILES_DIRNAME, REMOVED_DIRNAME
+from cowork.services.project_file_view import (
+    ABSENT_ERRNOS,
+    OrdinaryFile,
+    WalkState,
+    utf8_path,
+    walk_ordinary_files,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -190,11 +215,28 @@ def stage_project_instructions(
 _OS_FILES = frozenset({"desktop.ini", "thumbs.db", "icon\r"})
 
 
-def project_holds_files(project_path: str | Path) -> bool:
-    """Whether a project folder holds anything the user or the agent put
-    there: a file, or a folder with something in it, other than hidden ones
-    (``.anton``), the server's own folders and OS files. Stops at the first.
-    A missing folder holds none."""
+def project_holds_files(project_path: str | Path, *, cloud: bool) -> bool:
+    """Whether a project folder holds files the turn's agent can read. Stops
+    at the first. A missing folder holds none; any other read error raises,
+    and the caller decides.
+
+    A cloud turn (``cloud``) reads the copy stage_project_files makes, so it
+    counts by the copy's own rule, an ordinary file
+    (``cowork.services.project_file_view``): a project routes as holding files
+    exactly when its turn gets one, copied, or named or counted as not copied
+    (a file whose path is not valid UTF-8 is counted). A turn in
+    this process works in the project folder itself, so anything there the
+    user or the agent put counts: a file, or a folder with something in it,
+    other than hidden ones (``.anton``), the server's own folders and OS
+    files."""
+    if cloud:
+        try:
+            with pinned_dir(project_path) as project, closing(
+                walk_ordinary_files(project, state=WalkState())
+            ) as walk:
+                return next(walk, None) is not None
+        except (FileNotFoundError, NotADirectoryError):
+            return False
     from cowork.services.artifact_roots import SERVER_PROJECT_FOLDERS
 
     try:
@@ -272,13 +314,14 @@ class ProjectContext(NamedTuple):
     has_instructions: bool
 
 
-def read_project_context(project_path: str | Path, *, files_known: bool) -> ProjectContext:
+def read_project_context(project_path: str | Path, *, files_known: bool, cloud: bool) -> ProjectContext:
     """Both routing facts about a project's folder in one pass on the file
     store. ``files_known`` says an attachment already counts as files, so
-    the folder is not listed. A missing folder holds neither; any read error
+    the folder is not listed; ``cloud`` says the turn runs in a pod
+    (project_holds_files). A missing folder holds neither; any read error
     other than a missing path raises, and the caller decides."""
     return ProjectContext(
-        has_files=files_known or project_holds_files(project_path),
+        has_files=files_known or project_holds_files(project_path, cloud=cloud),
         has_instructions=project_has_instructions(project_path),
     )
 
@@ -323,18 +366,94 @@ def _secure_attachments_dir(conv_dir: Path) -> PinnedDir | None:
         # state (the pod mounts INTO <conv>, it does not create it), so creating
         # them is trusted. Only the `attachments` child below is agent-reachable.
         with pinned_dir(conv_dir, create=True, nofollow_base=True) as conv:
-            try:
-                st = dir_lstat(conv, "attachments")
-                if not stat.S_ISDIR(st.st_mode):
-                    # A symlink (S_ISLNK, never S_ISDIR under lstat) or a plain
-                    # file squatting the name: remove it and recreate a real dir.
-                    dir_unlink(conv, "attachments")
-                    dir_mkdir(conv, "attachments")
-            except FileNotFoundError:
-                dir_mkdir(conv, "attachments")
-            return open_pinned_child(conv, "attachments")
+            return _secure_workspace_child(conv, "attachments")
     except OSError:
         return None
+
+
+def _secure_workspace_child(parent: PinnedDir, name: str) -> PinnedDir:
+    """Open the folder ``name`` in ``parent``, a folder the pod can write, as
+    a pinned handle the caller must ``close()``. A link or anything else that
+    is not a folder squatting the name is removed (the link only, never its
+    target) and a real folder made in its place. The folder is opened by
+    _open_workspace_folder, so one the pod made unreadable still opens, and a
+    link planted between the check and the open raises ``OSError``."""
+    try:
+        st = dir_lstat(parent, name)
+        if not stat.S_ISDIR(st.st_mode):
+            # A symlink (S_ISLNK, never S_ISDIR under lstat) or a plain
+            # file squatting the name: remove it and recreate a real dir.
+            dir_unlink(parent, name)
+            _make_dir(parent, name)
+    except FileNotFoundError:
+        _make_dir(parent, name)
+    return _open_workspace_folder(parent, name)
+
+
+#: The mode a folder the pod can write gets back when the pod took away any of
+#: its owner's read, write or search access. The pod runs as the server's own
+#: user, so it can chmod any folder in its conversation's folder, and a folder
+#: it made unreadable (``0o000``) or unwritable would refuse every later turn's
+#: open, copy or removal there.
+_WORKSPACE_FOLDER_MODE = 0o700
+
+
+def _lacks_owner_access(info: os.stat_result) -> bool:
+    return info.st_mode & stat.S_IRWXU != stat.S_IRWXU
+
+
+def _restore_folder_mode(parent: PinnedDir, name: str) -> os.stat_result:
+    """Give the folder ``name`` in ``parent`` _WORKSPACE_FOLDER_MODE when the
+    pod took its owner's access away, without opening it for reading and
+    never through a link (dir_chmod_folder), and return its stat. The folder
+    a later open finds may not be this one, so the caller compares their
+    ``st_dev`` and ``st_ino`` (_open_workspace_folder). Anything but a folder
+    is left alone, for the caller's open to refuse."""
+    info = dir_lstat(parent, name)
+    if parent.fd is not None and stat.S_ISDIR(info.st_mode) and _lacks_owner_access(info):
+        # Windows (no descriptor) runs local mode only, with no pod.
+        return dir_chmod_folder(parent, name, mode=_WORKSPACE_FOLDER_MODE)
+    return info
+
+
+def _open_workspace_folder(parent: PinnedDir, name: str) -> PinnedDir:
+    """Open the folder ``name`` in ``parent``, a folder the pod can write, as
+    a pinned handle the caller must ``close()``, giving its owner's access
+    back first (_restore_folder_mode) so a folder the pod made unreadable or
+    unwritable still opens and can be written. The open never follows a link,
+    and must find the folder whose mode was set: one the pod swapped in
+    between raises ``OSError``."""
+    if parent.fd is None:
+        # Windows runs local mode only, with no pod (cowork.common.paths).
+        return open_pinned_child(parent, name)
+    restored = _restore_folder_mode(parent, name)
+    folder = open_pinned_child(parent, name)
+    try:
+        info = os.fstat(folder.fd)
+        if (info.st_dev, info.st_ino) != (restored.st_dev, restored.st_ino):
+            raise OSError(errno.EAGAIN, "the folder was replaced while its mode was restored", name)
+        _own_folder(folder)
+    except BaseException:
+        folder.close()
+        raise
+    return folder
+
+
+def _own_folder(folder: PinnedDir) -> None:
+    """Give an open folder _WORKSPACE_FOLDER_MODE back when the pod took its
+    owner's access away after it was opened."""
+    if folder.fd is not None and _lacks_owner_access(os.fstat(folder.fd)):
+        os.fchmod(folder.fd, _WORKSPACE_FOLDER_MODE)
+
+
+def _make_dir(parent: PinnedDir, name: str) -> None:
+    """Make the folder ``name``. One that appears between the check and the
+    make (another staging of the same conversation, or the pod) is left to
+    the open that follows, which refuses anything but a real folder."""
+    try:
+        dir_mkdir(parent, name)
+    except FileExistsError:
+        pass
 
 
 def _stage_attachment(
@@ -346,14 +465,7 @@ def _stage_attachment(
     the file name (``O_NOFOLLOW`` on every component the agent can reach). Skips
     a copy already present at the right size so the caller stays idempotent.
     """
-    try:
-        st = dir_lstat(attach, file_id)
-        if not stat.S_ISDIR(st.st_mode):
-            dir_unlink(attach, file_id)
-            dir_mkdir(attach, file_id)
-    except FileNotFoundError:
-        dir_mkdir(attach, file_id)
-    id_dir = open_pinned_child(attach, file_id)
+    id_dir = _secure_workspace_child(attach, file_id)
     try:
         try:
             dst_st = dir_stat(id_dir, name, follow_symlinks=False)
@@ -712,3 +824,919 @@ class FileService:
         finally:
             attach.close()
         return staged
+
+
+# A cloud turn's copy of its project's files.
+#
+# The pod mounts its conversation's folder and not the project, so before each
+# cloud turn the server copies the project's ordinary files (the rule in
+# cowork.services.project_file_view, which routing uses too) into
+# ``conversations/<id>/project-files/``. The pod can write that folder, so
+# every step there is pinned and never follows a link, and what the server
+# copied is recorded outside it, where the pod can't reach.
+
+#: The list a copy writes into the project-files folder, naming the files it
+#: left out and why. A hidden name, so no project file can take it.
+NOT_COPIED_FILENAME = ".not-copied.json"
+#: The most left-out files the list names; it counts the rest.
+MAX_NAMED_NOT_COPIED = 1000
+_COPY_CHUNK_BYTES = 1 << 20
+#: The mode of every file in a copy.
+_COPY_FILE_MODE = 0o600
+#: How many entries one removal step examines, and for how long, before it
+#: stops (_RemovalBudget). Removing what a copy should not hold, and deleting
+#: what REMOVED_DIRNAME holds, each get this much per turn.
+_REMOVAL_MAX_ENTRIES = 10_000
+_REMOVAL_SECONDS = 2.0
+#: Errors from opening a copy that mean something the pod put at its name (a
+#: folder, a link, a pipe, a file it made unwritable), so the name is cleared
+#: and the copy made afresh.
+_REPLACEABLE_ERRNOS = frozenset({errno.ELOOP, errno.EISDIR, errno.ENXIO, errno.EACCES, errno.EPERM, errno.ETXTBSY})
+
+
+class ProjectFileCopyLimits(NamedTuple):
+    """How much of a project one conversation's copy holds, and how long one
+    turn spends walking the project and copying (TurnQueueSettings.project_files_*)."""
+
+    max_file_bytes: int
+    max_files: int
+    max_total_bytes: int
+    seconds: float
+
+    @classmethod
+    def from_settings(cls) -> ProjectFileCopyLimits:
+        settings = TurnQueueSettings()
+        return cls(
+            max_file_bytes=settings.project_files_max_file_bytes,
+            max_files=settings.project_files_max_files,
+            max_total_bytes=settings.project_files_max_total_bytes,
+            seconds=settings.project_files_copy_seconds,
+        )
+
+
+class NotCopiedReason(StrEnum):
+    TOO_LARGE = "too_large"
+    TOO_MANY_FILES = "too_many_files"
+    OVER_TOTAL_BYTES = "over_total_bytes"
+    OUT_OF_TIME = "out_of_time"
+
+
+class NotCopiedFile(BaseModel):
+    #: The file's path below the project folder, ``/``-separated.
+    path: str
+    size: int
+    reason: NotCopiedReason
+
+
+class NotCopiedFiles(BaseModel):
+    """The list a copy writes into the project-files folder as
+    NOT_COPIED_FILENAME, so the agent can name the project files it did not
+    get. Written only when a file was left out, the walk stopped early or the
+    copy failed."""
+
+    files: list[NotCopiedFile] = []
+    #: Files left out and counted, not named: those past
+    #: MAX_NAMED_NOT_COPIED, and those whose path is not valid UTF-8, which
+    #: the list can't hold.
+    unnamed: int = 0
+    #: The walk stopped before it saw every file: the project holds more
+    #: entries than one walk examines, folders deeper than it descends, or the
+    #: turn's copy time ran out. Files past that point were neither copied
+    #: nor named.
+    listing_truncated: bool = False
+    #: The copy could not finish, so the server emptied the folder.
+    copy_failed: bool = False
+
+
+class FileIdentity(BaseModel):
+    """What a stat says about one file. The change time is the kernel's: no
+    process can set it, so a copy the pod rewrote and then dated back still
+    differs here."""
+
+    ino: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+    @classmethod
+    def of(cls, info: os.stat_result) -> FileIdentity:
+        return cls(ino=info.st_ino, size=info.st_size, mtime_ns=info.st_mtime_ns, ctime_ns=info.st_ctime_ns)
+
+
+class StagedCopy(BaseModel):
+    """One project file the server copied, and its copy as the server left it."""
+
+    source: FileIdentity
+    staged: FileIdentity
+
+
+class CopyRecord(BaseModel):
+    """What the server copied into one conversation's project-files folder,
+    kept in the project-file-copies store (copy_records_root), which no pod
+    mounts and no route serves. A file is skipped as unchanged only when both
+    its source and its copy still match the record."""
+
+    #: By the file's path below the project folder, ``/``-separated.
+    files: dict[str, StagedCopy] = {}
+
+
+class ProjectFilesOutcome(StrEnum):
+    #: The copy finished, whatever it left out.
+    STAGED = "staged"
+    #: The copy could not finish. The folder was emptied and its list says so.
+    FAILED = "failed"
+    #: The folder may still hold copies the project no longer backs: the copy
+    #: could not finish and the folder could not be emptied, or the project is
+    #: not one of the turn's organization. The turn must not run.
+    REFUSED = "refused"
+
+
+class ProjectFilesStaged(NamedTuple):
+    """What one turn's copy did, for its log line."""
+
+    #: Files in the copy once staging ends, and their bytes.
+    files: int
+    bytes: int
+    #: Files written this turn, and their bytes; the rest were unchanged.
+    copied: int
+    copied_bytes: int
+    not_copied: int
+    outcome: ProjectFilesOutcome
+    elapsed_ms: int
+
+    @property
+    def failed(self) -> bool:
+        return self.outcome is not ProjectFilesOutcome.STAGED
+
+
+def _nothing_staged(outcome: ProjectFilesOutcome, elapsed_ms: int = 0) -> ProjectFilesStaged:
+    return ProjectFilesStaged(0, 0, 0, 0, 0, outcome=outcome, elapsed_ms=elapsed_ms)
+
+
+class ProjectFilesRefused(RuntimeError):
+    """A cloud turn's project-files folder may hold copies its project no
+    longer backs (ProjectFilesOutcome.REFUSED), so the turn is refused rather
+    than run on them."""
+
+
+class _Copied(NamedTuple):
+    staged: StagedCopy
+    #: The copy holds the bytes the server wrote and nothing changed it while
+    #: they were read back, so the record may trust it on a later turn.
+    verified: bool
+
+
+def copy_records_root(scope: TenantScope) -> Path:
+    """The store that keeps each conversation's CopyRecord:
+    ``<shared>/<org>/project-file-copies`` in org mode, beside the projects
+    store, so outside every pod's mounts and every project file route."""
+    return scoped_storage_root(cowork_home() / "project-file-copies", scope, store="project-file-copies")
+
+
+def copy_record_path(scope: TenantScope, conversation_id: str | UUID) -> Path:
+    """Where the conversation's CopyRecord is kept."""
+    return copy_records_root(scope) / f"{UUID(str(conversation_id))}.json"
+
+
+def remove_copy_record(path: Path) -> None:
+    """Remove a deleted conversation's CopyRecord. Best-effort, logged."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("could not remove the project files record %s", path.name, exc_info=True)
+
+
+def stage_project_files(
+    project_path: str | Path,
+    conversation_id: str | UUID,
+    *,
+    scope: TenantScope,
+    limits: ProjectFileCopyLimits | None = None,
+) -> ProjectFilesStaged:
+    """Copy the project's ordinary files into
+    ``<project>/conversations/<conv>/project-files/``, mirroring their folders,
+    for a cloud turn's pod, which mounts the conversation's folder only.
+
+    A file whose source and copy both still match the conversation's
+    CopyRecord is left as it is. A changed file is rewritten in place
+    (truncated, never removed and made again), so a pod that holds the copy
+    open keeps a valid handle. A copy whose project file is gone, or is now
+    left out, is removed. Files over ``limits`` are left out and named in
+    NOT_COPIED_FILENAME; a file whose path is not valid UTF-8 is left out
+    and counted there, not named.
+
+    ``limits.seconds`` bounds the walk and the copying: once it passes, the
+    walk stops, a file being copied is removed and named as out of time, and
+    the list says the walk stopped early. Copies the walk did not reach this
+    turn are removed with the rest, since nothing checked them against the
+    project, and a later turn copies them again. Removing those and saving
+    the record run after the budget.
+
+    Removing what the folder should not hold runs within a budget
+    (_RemovalBudget). A folder is removed by moving it into REMOVED_DIRNAME,
+    which each turn deletes within another budget after the copy, a level at
+    a time, so no tree the pod builds there, however deep or wide, costs a
+    turn more than its budgets. When the removal runs out of budget, the
+    whole project-files folder is moved there and the copy runs again into a
+    new one, with ``limits.seconds`` again, so the pod's leftovers never fail
+    a turn.
+
+    Fails closed: when the copy can't finish (a read or write error other
+    than a file that went away mid-copy), the project-files folder is emptied
+    and its list says the copy failed, so the turn never reads a copy the
+    project no longer backs. When even that fails, or the project is not in
+    the scope's projects store, the outcome is REFUSED and the caller must
+    not run the turn. Org mode only: the caller is the remote turn's staging
+    (stage_remote_workspace in cowork.handlers.responses), on the file
+    store's threads.
+    """
+    from cowork.services.projects import projects_root
+
+    started = time.monotonic()
+
+    def elapsed_ms() -> int:
+        return round((time.monotonic() - started) * 1000)
+
+    try:
+        conv_seg = str(UUID(str(conversation_id)))
+    except (ValueError, TypeError):
+        return _nothing_staged(ProjectFilesOutcome.REFUSED)
+    project = Path(project_path)
+    if project.parent != projects_root(scope=scope):
+        # Every other step trusts this path: the record is keyed by the
+        # conversation alone, and the copy reads whatever folder it names.
+        logger.error(
+            "refusing to copy project files from outside the organization's projects",
+            extra=log_context(conversation_id=conv_seg),
+        )
+        return _nothing_staged(ProjectFilesOutcome.REFUSED)
+    limits = limits or ProjectFileCopyLimits.from_settings()
+    try:
+        staged = _stage_project_files(
+            project, conv_seg, record_path=copy_record_path(scope, conv_seg), limits=limits,
+            deadline=started + limits.seconds,
+        )
+    except Exception:
+        logger.warning(
+            "could not copy the project's files for conversation %s; emptying its copy",
+            conv_seg,
+            exc_info=True,
+        )
+        emptied = _empty_project_files_copy(project, conv_seg)
+        outcome = ProjectFilesOutcome.FAILED if emptied else ProjectFilesOutcome.REFUSED
+        return _nothing_staged(outcome, elapsed_ms())
+    return staged._replace(elapsed_ms=elapsed_ms())
+
+
+def _stage_project_files(
+    project: Path, conv_seg: str, *, record_path: Path, limits: ProjectFileCopyLimits, deadline: float,
+) -> ProjectFilesStaged:
+    record = _read_copy_record(record_path)
+    with _opened_copy_folders(project, conv_seg) as place:
+        if place is None:
+            # No project folder, so no conversation folder inside it either.
+            return _nothing_staged(ProjectFilesOutcome.STAGED)
+        try:
+            copy = _copy_pass(place, record=record, limits=limits, deadline=deadline)
+        except _RemovalBudgetSpent:
+            # The pod left more in the folder than one turn removes: set the
+            # folder aside whole and copy again into a new one, with the
+            # copy's full time, since nothing copied so far is left.
+            logger.warning(
+                "the project files copy of conversation %s holds too much to remove; setting it aside",
+                conv_seg,
+            )
+            place.folders.set_aside()
+            copy = _copy_pass(place, record=record, limits=limits, deadline=time.monotonic() + limits.seconds)
+        place.folders.delete_removed(budget=_RemovalBudget.start())
+    _write_copy_record(record_path, copy.new_record)
+    return ProjectFilesStaged(
+        files=len(copy.kept), bytes=copy.total, copied=copy.copied, copied_bytes=copy.copied_bytes,
+        not_copied=len(copy.not_copied) + copy.unnameable, outcome=ProjectFilesOutcome.STAGED, elapsed_ms=0,
+    )
+
+
+def _copy_pass(
+    place: _CopyPlace, *, record: CopyRecord, limits: ProjectFileCopyLimits, deadline: float,
+) -> _Copy:
+    """Copy each ordinary file of the project into the project-files folder,
+    then remove everything else there and write the not-copied list when
+    something was left out. Raises _RemovalBudgetSpent, with the folder only
+    partly pruned, when the removal runs out of its budget."""
+    copy = _Copy(record=record, limits=limits, deadline=deadline)
+    state = WalkState()
+    with _MirrorFolders(place.folders) as mirror_folders, closing(
+        walk_ordinary_files(place.source, state=state)
+    ) as walk:
+        for found in walk:
+            if time.monotonic() >= deadline:
+                # Stop the walk too, so a large project holds the slot no
+                # longer than the budget.
+                state.truncated = True
+                break
+            copy.add(found, mirror_folders)
+    not_copied = NotCopiedFiles(
+        files=copy.not_copied[:MAX_NAMED_NOT_COPIED],
+        unnamed=max(0, len(copy.not_copied) - MAX_NAMED_NOT_COPIED) + copy.unnameable,
+        listing_truncated=state.truncated,
+    )
+    keep = set(copy.kept)
+    list_it = bool(copy.not_copied) or copy.unnameable > 0 or state.truncated
+    if list_it:
+        keep.add((NOT_COPIED_FILENAME,))
+    _prune_folder(place.folders, keep=keep, budget=_RemovalBudget.start())
+    if list_it:
+        _write_in_place(place.folders, NOT_COPIED_FILENAME, not_copied.model_dump_json().encode())
+    return copy
+
+
+class _RemovalBudgetSpent(Exception):
+    """A removal step examined as many entries, or ran as long, as its
+    _RemovalBudget allows."""
+
+
+@dataclass
+class _RemovalBudget:
+    """How much more one removal step may do: entries it may still examine,
+    and the time it must stop by."""
+
+    entries: int
+    deadline: float
+
+    @classmethod
+    def start(cls) -> _RemovalBudget:
+        return cls(entries=_REMOVAL_MAX_ENTRIES, deadline=time.monotonic() + _REMOVAL_SECONDS)
+
+    def out_of_time(self) -> bool:
+        return time.monotonic() >= self.deadline
+
+    def spend(self) -> bool:
+        """Count one entry examined: False, and nothing counted, once the
+        budget is spent."""
+        if self.entries <= 0 or self.out_of_time():
+            return False
+        self.entries -= 1
+        return True
+
+
+class _CopyFolders:
+    """The folders one staging works in, all inside the conversation's
+    folder, which the pod can write: the conversation's own, its
+    project-files folder (``mirror``), and REMOVED_DIRNAME, opened when first
+    needed. The caller must ``close()`` it."""
+
+    def __init__(self, conversation: PinnedDir) -> None:
+        self.conversation = conversation
+        self.mirror = _secure_workspace_child(conversation, PROJECT_FILES_DIRNAME)
+        self._removed: PinnedDir | None = None
+
+    def close(self) -> None:
+        self.mirror.close()
+        self.close_removed()
+
+    def removed(self) -> PinnedDir:
+        if self._removed is None:
+            self._removed = _secure_workspace_child(self.conversation, REMOVED_DIRNAME)
+        return self._removed
+
+    def remove(self, parent: PinnedDir, name: str) -> None:
+        """Remove ``name`` from ``parent``: anything but a folder by its name
+        alone (a link, never its target), and a folder by moving it, with
+        whatever it holds, into REMOVED_DIRNAME under a new name, which takes
+        one step however much the folder holds. delete_removed deletes it.
+
+        The open REMOVED_DIRNAME may be gone by the time the folder moves:
+        another staging of the conversation deleted it once it was empty, or
+        the pod removed it. The move then fails as if ``name`` were gone, so
+        a folder still at ``name`` is moved once more into REMOVED_DIRNAME
+        made afresh, and a second failure raises."""
+        try:
+            if not stat.S_ISDIR(dir_lstat(parent, name).st_mode):
+                dir_unlink(parent, name)
+                return
+            # Moving a folder to another folder rewrites its "..", which needs
+            # its owner's write access.
+            _restore_folder_mode(parent, name)
+        except FileNotFoundError:
+            return
+        for _attempt in range(2):
+            try:
+                dir_rename(parent, name, self.removed(), uuid4().hex)
+                return
+            except FileNotFoundError:
+                pass
+            try:
+                dir_lstat(parent, name)
+            except FileNotFoundError:
+                return
+            self.close_removed()
+        raise OSError(errno.ENOENT, "the removed folder went away twice while a folder moved into it", name)
+
+    def set_aside(self) -> None:
+        """Move the whole project-files folder into REMOVED_DIRNAME and make
+        a new, empty one in its place."""
+        self.remove(self.conversation, PROJECT_FILES_DIRNAME)
+        fresh = _secure_workspace_child(self.conversation, PROJECT_FILES_DIRNAME)
+        self.mirror.close()
+        self.mirror = fresh
+
+    def delete_removed(self, *, budget: _RemovalBudget) -> None:
+        """Delete what REMOVED_DIRNAME holds until it is empty, then the
+        folder itself, or until ``budget`` is spent; a later turn deletes the
+        rest. Each folder there is emptied one level at a time: its files are
+        removed and each folder in it is moved up into REMOVED_DIRNAME, so
+        however deep a tree the pod built, the deletion holds two folders
+        open and never recurses. Never raises: what the pod left there must
+        not fail the turn, so an error is logged and the rest left for later."""
+        try:
+            try:
+                dir_lstat(self.conversation, REMOVED_DIRNAME)
+            except FileNotFoundError:
+                return
+            emptied = False
+            while not emptied:
+                emptied = True
+                # self.removed() each time, never a handle kept from before:
+                # a move into it may have made it afresh (remove).
+                for name in _each_name(self.removed(), budget=budget):
+                    emptied = False
+                    self._empty_removed_entry(name, budget=budget)
+            self.close_removed()
+            dir_rmdir(self.conversation, REMOVED_DIRNAME)
+        except _RemovalBudgetSpent:
+            return
+        except OSError:
+            logger.warning(
+                "could not delete the removed project files of conversation %s",
+                self.conversation.path.name, exc_info=True,
+            )
+
+    def close_removed(self) -> None:
+        if self._removed is not None:
+            self._removed.close()
+            self._removed = None
+
+    def _empty_removed_entry(self, name: str, *, budget: _RemovalBudget) -> None:
+        removed = self.removed()
+        try:
+            if not stat.S_ISDIR(dir_lstat(removed, name).st_mode):
+                dir_unlink(removed, name)
+                return
+            folder = _open_workspace_folder(removed, name)
+        except FileNotFoundError:
+            return
+        try:
+            for child in _each_name(folder, budget=budget):
+                self.remove(folder, child)
+        finally:
+            folder.close()
+        try:
+            # A move into the removed folder may have made it afresh.
+            dir_rmdir(self.removed(), name)
+        except FileNotFoundError:
+            pass
+
+
+class _CopyPlace(NamedTuple):
+    #: The project folder the copy reads.
+    source: PinnedDir
+    folders: _CopyFolders
+
+
+@contextmanager
+def _opened_copy_folders(project: Path, conv_seg: str) -> Iterator[_CopyPlace | None]:
+    """The project folder and the conversation's copy folders (_CopyFolders),
+    the project-files folder made when missing; None when there is no project
+    folder. The conversations folder is the server's: the pod mounts its
+    conversation's folder inside it and can't reach it. The conversation's
+    folder is the pod's mount, so the pod can't replace it but can change its
+    mode, and is opened as one of its folders (_open_workspace_folder)."""
+    with ExitStack() as stack:
+        try:
+            parent = stack.enter_context(pinned_dir(project.parent, nofollow_base=True))
+            source: PinnedDir | None = open_pinned_child(parent, project.name)
+        except (FileNotFoundError, NotADirectoryError):
+            source = None
+        if source is None:
+            yield None
+            return
+        stack.callback(source.close)
+        conversations = _open_or_make_dir(source, CONVERSATIONS_DIRNAME)
+        stack.callback(conversations.close)
+        _make_dir(conversations, conv_seg)
+        conversation = _open_workspace_folder(conversations, conv_seg)
+        stack.callback(conversation.close)
+        folders = _CopyFolders(conversation)
+        stack.callback(folders.close)
+        yield _CopyPlace(source, folders)
+
+
+class _MirrorFolders:
+    """The copy's folders on the way to the file being copied. The walk is
+    depth first, so each folder is opened (and made, when missing) once, while
+    the walk is inside it, and closed when the walk leaves it."""
+
+    def __init__(self, folders: _CopyFolders) -> None:
+        self.folders = folders
+        self._open: list[tuple[str, PinnedDir]] = []
+
+    def __enter__(self) -> _MirrorFolders:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def folder(self, parts: tuple[str, ...]) -> PinnedDir:
+        """The copy's folder at ``parts`` below the project-files folder."""
+        depth = 0
+        while depth < min(len(parts), len(self._open)) and self._open[depth][0] == parts[depth]:
+            depth += 1
+        while len(self._open) > depth:
+            self._open.pop()[1].close()
+        for name in parts[depth:]:
+            parent = self._open[-1][1] if self._open else self.folders.mirror
+            self._open.append((name, _secure_workspace_child(parent, name)))
+        return self._open[-1][1] if self._open else self.folders.mirror
+
+    def close(self) -> None:
+        while self._open:
+            self._open.pop()[1].close()
+
+
+class _Copy:
+    """One turn's copy, file by file, in the order the walk finds them."""
+
+    def __init__(self, *, record: CopyRecord, limits: ProjectFileCopyLimits, deadline: float) -> None:
+        self.record = record
+        self.limits = limits
+        self.deadline = deadline
+        self.new_record = CopyRecord()
+        self.kept: list[tuple[str, ...]] = []
+        self.not_copied: list[NotCopiedFile] = []
+        #: Files left out because their path is not valid UTF-8: the list
+        #: and the record are JSON, which can't hold such a name, so they are
+        #: counted only (utf8_path).
+        self.unnameable = 0
+        self.total = 0
+        self.copied = 0
+        self.copied_bytes = 0
+
+    def _leave_out(self, found: OrdinaryFile, size: int, reason: NotCopiedReason) -> None:
+        self.not_copied.append(NotCopiedFile(path="/".join(found.parts), size=size, reason=reason))
+
+    def add(self, found: OrdinaryFile, folders: _MirrorFolders) -> None:
+        if not utf8_path(found.parts):
+            self.unnameable += 1
+            return None
+        size = found.info.st_size
+        if size > self.limits.max_file_bytes:
+            return self._leave_out(found, size, NotCopiedReason.TOO_LARGE)
+        if len(self.kept) >= self.limits.max_files:
+            return self._leave_out(found, size, NotCopiedReason.TOO_MANY_FILES)
+        if self.total + size > self.limits.max_total_bytes:
+            return self._leave_out(found, size, NotCopiedReason.OVER_TOTAL_BYTES)
+        previous = self.record.files.get("/".join(found.parts))
+        if previous is None and time.monotonic() >= self.deadline:
+            # Nothing to check, and no time to copy: no folder is opened.
+            return self._leave_out(found, size, NotCopiedReason.OUT_OF_TIME)
+        target = folders.folder(found.parts[:-1])
+        if previous is not None and _unchanged(previous, source=found.info, target=target, name=found.name):
+            self._keep(found, previous, record=True)
+            return None
+        if time.monotonic() >= self.deadline:
+            return self._leave_out(found, size, NotCopiedReason.OUT_OF_TIME)
+        outcome = _copy_file(
+            found, target, folders=folders.folders,
+            max_file_bytes=self.limits.max_file_bytes,
+            room=self.limits.max_total_bytes - self.total,
+            deadline=self.deadline,
+        )
+        if isinstance(outcome, NotCopiedReason):
+            return self._leave_out(found, size, outcome)
+        if outcome is not None:
+            self._keep(found, outcome.staged, record=outcome.verified)
+            self.copied += 1
+            self.copied_bytes += outcome.staged.staged.size
+        return None
+
+    def _keep(self, found: OrdinaryFile, staged: StagedCopy, *, record: bool) -> None:
+        if record:
+            self.new_record.files["/".join(found.parts)] = staged
+        self.kept.append(found.parts)
+        self.total += staged.staged.size
+
+
+def _unchanged(previous: StagedCopy, *, source: os.stat_result, target: PinnedDir, name: str) -> bool:
+    """Whether the source is the one the record copied and the copy is still
+    the file the server wrote: same inode, size, and modification and change
+    times on both, and the copy still readable at its mode. The pod can
+    change the mode while the server writes the copy, before the stat the
+    record keeps, so the mode is checked here too."""
+    if previous.source != FileIdentity.of(source):
+        return False
+    try:
+        info = dir_lstat(target, name)
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_nlink == 1
+        and stat.S_IMODE(info.st_mode) == _COPY_FILE_MODE
+        and FileIdentity.of(info) == previous.staged
+    )
+
+
+def _copy_file(
+    found: OrdinaryFile, target: PinnedDir, *, folders: _CopyFolders, max_file_bytes: int, room: int,
+    deadline: float,
+) -> _Copied | NotCopiedReason | None:
+    """Copy one project file into ``target`` under its own name. None when the
+    file went away, changed size or stopped being an ordinary file since the
+    walk saw it (its copy is then pruned); a reason when it no longer fits, or
+    the budget ran out mid-copy (the partial copy is removed)."""
+    try:
+        src = dir_open(found.directory, found.name, os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+    except OSError as error:
+        if error.errno in ABSENT_ERRNOS:
+            return None
+        raise
+    try:
+        source = os.fstat(src)
+        if not stat.S_ISREG(source.st_mode) or source.st_nlink != 1:
+            return None
+        if source.st_size > max_file_bytes:
+            return NotCopiedReason.TOO_LARGE
+        if source.st_size > room:
+            return NotCopiedReason.OVER_TOTAL_BYTES
+        dst = _open_copy_target(target, found.name, folders=folders)
+        out_of_time = False
+        try:
+            digest = hashlib.sha256()
+            written = 0
+            for chunk in read_bounded(src, source.st_size, _COPY_CHUNK_BYTES):
+                if time.monotonic() >= deadline:
+                    out_of_time = True
+                    break
+                digest.update(chunk)
+                write_all(dst, chunk)
+                written += len(chunk)
+            if not out_of_time:
+                if written != source.st_size:
+                    return None
+                os.fsync(dst)
+                checked = _read_back(dst, size=written, digest=digest.digest(), deadline=deadline)
+                staged = checked if checked is not None else os.fstat(dst)
+        finally:
+            os.close(dst)
+        if out_of_time:
+            folders.remove(target, found.name)
+            return NotCopiedReason.OUT_OF_TIME
+        return _Copied(
+            StagedCopy(source=FileIdentity.of(source), staged=FileIdentity.of(staged)),
+            verified=checked is not None,
+        )
+    finally:
+        os.close(src)
+
+
+def _read_back(fd: int, *, size: int, digest: bytes, deadline: float) -> os.stat_result | None:
+    """The copy's stat when it holds exactly the bytes the server wrote and
+    nothing changed it while they were read back; None otherwise, or when the
+    budget runs out first. The pod can write the copy while the server copies
+    it, and a stat taken after such a write would record the pod's bytes as
+    the server's: a copy that is not verified here is kept for this turn but
+    left out of the record, so the next turn copies it again."""
+    before = os.fstat(fd)
+    if before.st_size != size:
+        return None
+    os.lseek(fd, 0, os.SEEK_SET)
+    check = hashlib.sha256()
+    # One byte past the size, so bytes the pod appended show.
+    for chunk in read_bounded(fd, size + 1, _COPY_CHUNK_BYTES):
+        if time.monotonic() >= deadline:
+            return None
+        check.update(chunk)
+    after = os.fstat(fd)
+    if FileIdentity.of(after) != FileIdentity.of(before) or check.digest() != digest:
+        return None
+    return after
+
+
+def _open_copy_target(target: PinnedDir, name: str, *, folders: _CopyFolders) -> int:
+    """A descriptor for reading and writing the copy ``name`` in ``target``,
+    emptied.
+
+    An existing copy that is a regular file with one name is emptied in place,
+    keeping its inode for a pod that holds it open. Anything else the pod put
+    there (a link, a folder, a pipe, a second name for one of its own files,
+    a file it made unreadable) is removed (_CopyFolders.remove), never
+    written through, and a new private file made. A name
+    made between the check and the create (another staging of the same
+    conversation, or the pod) is checked once more."""
+    flags = os.O_RDWR | O_NOFOLLOW | O_NONBLOCK
+    for _attempt in range(2):
+        try:
+            fd = dir_open(target, name, flags)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            if error.errno not in _REPLACEABLE_ERRNOS:
+                raise
+            folders.remove(target, name)
+        else:
+            info = os.fstat(fd)
+            if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                try:
+                    os.ftruncate(fd, 0)
+                    os.fchmod(fd, _COPY_FILE_MODE)
+                except BaseException:
+                    os.close(fd)
+                    raise
+                return fd
+            os.close(fd)
+            folders.remove(target, name)
+        try:
+            return dir_open(target, name, flags | os.O_CREAT | os.O_EXCL, _COPY_FILE_MODE)
+        except FileExistsError:
+            continue
+    raise FileExistsError(errno.EEXIST, "a copy's name was taken twice while it was made", name)
+
+
+def _write_in_place(folders: _CopyFolders, name: str, data: bytes) -> None:
+    """Write ``data`` as the file ``name`` in the project-files folder."""
+    fd = _open_copy_target(folders.mirror, name, folders=folders)
+    try:
+        write_all(fd, data)
+    finally:
+        os.close(fd)
+
+
+def _folders_of(keep: set[tuple[str, ...]]) -> set[tuple[str, ...]]:
+    """Every folder on the way to a path in ``keep``."""
+    return {parts[:depth] for parts in keep for depth in range(1, len(parts))}
+
+
+def _each_name(folder: PinnedDir, *, budget: _RemovalBudget) -> Iterator[str]:
+    """Each name in ``folder``, for the caller to remove or keep, from a
+    listing taken first: removing names while a listing of the same folder
+    runs may skip others, on a network file store above all. Each name listed
+    spends ``budget``, so a folder the pod filled is never read past it, and
+    the names listed before it ran out are still handed out, so a later turn
+    always gets further. Raises _RemovalBudgetSpent before the next name once
+    the time is up, and after the last one when the listing was cut short."""
+    names: list[str] = []
+    complete = True
+    with dir_scandir(folder) as scan:
+        for entry in scan:
+            if not budget.spend():
+                complete = False
+                break
+            names.append(entry.name)
+    for name in names:
+        if budget.out_of_time():
+            raise _RemovalBudgetSpent
+        yield name
+    if not complete:
+        raise _RemovalBudgetSpent
+
+
+def _prune_folder(folders: _CopyFolders, *, keep: set[tuple[str, ...]], budget: _RemovalBudget) -> None:
+    """Remove every entry below the project-files folder whose path is not
+    in ``keep``, nor a folder on the way to one. A folder to remove is moved
+    out whole (_CopyFolders.remove), so the prune descends only into folders
+    on the way to a kept path, which the walk's depth bound keeps shallow. It
+    does so from a list, not by recursion, with one of them open at a time.
+    Each entry examined spends ``budget``, which raises _RemovalBudgetSpent
+    once spent."""
+    _own_folder(folders.mirror)
+    on_the_way = _folders_of(keep)
+    pending: list[tuple[str, ...]] = [()]
+    while pending:
+        prefix = pending.pop()
+        try:
+            folder = _open_copy_path(folders.mirror, prefix)
+        except FileNotFoundError:
+            continue
+        try:
+            for name in _each_name(folder, budget=budget):
+                parts = (*prefix, name)
+                if parts in keep:
+                    continue
+                if parts in on_the_way:
+                    try:
+                        is_folder = stat.S_ISDIR(dir_lstat(folder, name).st_mode)
+                    except FileNotFoundError:
+                        continue
+                    if is_folder:
+                        pending.append(parts)
+                        continue
+                folders.remove(folder, name)
+        finally:
+            if folder is not folders.mirror:
+                folder.close()
+
+
+def _open_copy_path(mirror: PinnedDir, parts: tuple[str, ...]) -> PinnedDir:
+    """The copy's folder at ``parts`` below ``mirror``, or ``mirror`` itself
+    for none, opening each folder on the way (_open_workspace_folder) and
+    closing it once the next is open, or once opening the next fails, since
+    the pod can remove or replace a folder on the way at any time. A new
+    handle is the caller's to close."""
+    current = mirror
+    for name in parts:
+        try:
+            child = _open_workspace_folder(current, name)
+        finally:
+            if current is not mirror:
+                current.close()
+        current = child
+    return current
+
+
+def _open_or_make_dir(parent: PinnedDir, name: str) -> PinnedDir:
+    _make_dir(parent, name)
+    return open_pinned_child(parent, name)
+
+
+#: How many times a copy that failed tries to empty its folder when the pod
+#: took a folder's access away. The pod runs as the server's user, so it can
+#: take that access away again right after the server gives it back
+#: (_open_workspace_folder), and each try opens the folders afresh, which
+#: gives it back once more.
+_EMPTY_ATTEMPTS = 3
+
+
+def _empty_project_files_copy(project: Path, conv_seg: str) -> bool:
+    """Remove everything in the conversation's project-files folder, making
+    the folder when missing, and write a list there that says the copy failed
+    (NotCopiedFiles.copy_failed), so the agent tells the user rather than
+    answering without the project's files. A folder that can't be emptied
+    within its budget is set aside whole (_CopyFolders.set_aside). A try
+    refused access is made again, up to _EMPTY_ATTEMPTS. True when that is
+    done, or there is no project folder to copy from; False when it could
+    not be, logged. The CopyRecord needs no change, since a removed copy
+    never matches it."""
+    for attempt in range(1, _EMPTY_ATTEMPTS + 1):
+        try:
+            _empty_project_files_copy_once(project, conv_seg)
+        except PermissionError:
+            if attempt < _EMPTY_ATTEMPTS:
+                logger.warning(
+                    "access refused while emptying the project files copy of conversation %s; trying again",
+                    conv_seg, exc_info=True,
+                )
+                continue
+            logger.error(
+                "could not empty the project files copy of conversation %s", conv_seg, exc_info=True,
+            )
+            return False
+        except Exception:
+            logger.error(
+                "could not empty the project files copy of conversation %s", conv_seg, exc_info=True,
+            )
+            return False
+        return True
+    return False
+
+
+def _empty_project_files_copy_once(project: Path, conv_seg: str) -> None:
+    """One try of _empty_project_files_copy, which raises when it fails."""
+    with _opened_copy_folders(project, conv_seg) as place:
+        if place is None:
+            return
+        try:
+            _prune_folder(place.folders, keep=set(), budget=_RemovalBudget.start())
+        except (_RemovalBudgetSpent, OSError):
+            logger.warning(
+                "could not empty the project files copy of conversation %s; setting it aside",
+                conv_seg, exc_info=True,
+            )
+            place.folders.set_aside()
+        _write_in_place(
+            place.folders, NOT_COPIED_FILENAME, NotCopiedFiles(copy_failed=True).model_dump_json().encode(),
+        )
+
+
+def _read_copy_record(record_path: Path) -> CopyRecord:
+    """The conversation's CopyRecord, or an empty one when there is none or it
+    does not parse. Any other read error raises."""
+    try:
+        raw = record_path.read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return CopyRecord()
+    try:
+        return CopyRecord.model_validate_json(raw)
+    except ValidationError:
+        logger.warning("discarding an unreadable project files record %s", record_path.name)
+        return CopyRecord()
+
+
+def _write_copy_record(record_path: Path, record: CopyRecord) -> None:
+    """Save the record. A record that could not be saved leaves the old one,
+    which is safe: every copy rewritten since has a new change time, so the
+    old record matches none of them, and they are copied again."""
+    try:
+        with pinned_dir(record_path.parent, create=True) as root:
+            dir_atomic_write(root, record_path.name, content=record.model_dump_json().encode())
+    except OSError:
+        logger.warning("could not save the project files record %s", record_path.name, exc_info=True)

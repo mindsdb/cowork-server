@@ -12,8 +12,7 @@ from uuid import UUID
 from sqlmodel import select
 
 from cowork.common.paths import (
-    O_NOFOLLOW, O_NONBLOCK, PinnedDir, dir_lstat, dir_open, dir_scandir,
-    open_pinned_child, pinned_dir, read_bounded,
+    O_NOFOLLOW, O_NONBLOCK, PinnedDir, dir_open, open_pinned_child, pinned_dir, read_bounded,
 )
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
@@ -23,29 +22,34 @@ from cowork.models.project import Project
 from cowork.schemas.project_files import ProjectFileListResponse, ProjectFileMetadata
 from cowork.schemas.projects import ProjectResponse
 from cowork.schemas.shared_resources import ProjectCapabilities, ResourceAttribution
+from cowork.services.project_file_view import (
+    MAX_LIST_ENTRIES, WalkState, ordinary_path, safe_component, utf8_path, walk_ordinary_files,
+)
 from cowork.shared_projects import SharedProject, read_shared_projects
 
-MAX_LIST_ENTRIES = 10_000
-MAX_DEPTH = 32
 TEXT_MAX_BYTES = 2 * 1024 * 1024
 DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024
-_PRIVATE_NAMES = frozenset({"conversations", "skills", "memory", "__pycache__", "node_modules"})
 # What a recipient sees as "not there": the walk skips such an entry, and the
 # routes answer 404.
 UNREADABLE_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM})
 
 
-def _safe_component(name: str) -> bool:
-    return bool(name) and not name.startswith(".") and not any(c in name for c in ("/", "\\", "\0", ":"))
+def _recipient_component(name: str) -> bool:
+    """A name a recipient's view of a shared project shows: an ordinary one
+    (cowork.services.project_file_view) with no ``:`` or ``\\`` either."""
+    return safe_component(name) and not any(c in name for c in ("\\", ":"))
 
 
-def _ordinary_component(name: str) -> bool:
-    return _safe_component(name) and name.casefold() not in _PRIVATE_NAMES
+def _recipient_path(parts: tuple[str, ...]) -> bool:
+    """A path a recipient's view shows. A name that is not valid UTF-8 can't
+    be sent in the listing's JSON, so it is left out, as the copy leaves it
+    out of a cloud turn's files (utf8_path)."""
+    return ordinary_path(parts) and utf8_path(parts) and all(_recipient_component(part) for part in parts)
 
 
 def _file_parts(path: str) -> tuple[str, ...]:
     parts = tuple(path.split("/"))
-    if len(parts) > MAX_DEPTH or not all(_ordinary_component(part) for part in parts):
+    if not _recipient_path(parts):
         raise FileNotFoundError("File not found")
     return parts
 
@@ -62,7 +66,7 @@ class SharedProjectFiles:
             Project.org_id == entry.partition_id,
             Project.created_by == entry.user_id,
         )).first()
-        if row is None or not _safe_component(row.name):
+        if row is None or not _recipient_component(row.name):
             return None
         expected = Path(get_app_settings().storage.shared_root) / entry.partition_id / "projects" / row.name
         if Path(row.path) != expected:
@@ -114,46 +118,17 @@ class SharedProjectFiles:
             yield directory
 
     def list_files(self, project_id: UUID) -> ProjectFileListResponse:
-        files = []
-        visited = 0
-        truncated = False
-
-        def walk(directory: PinnedDir, prefix: tuple[str, ...]) -> None:
-            nonlocal visited, truncated
-            with dir_scandir(directory) as entries:
-                for entry in entries:
-                    visited += 1
-                    if visited > MAX_LIST_ENTRIES:
-                        truncated = True
-                        return
-                    if not _ordinary_component(entry.name):
-                        continue
-                    parts = (*prefix, entry.name)
-                    try:
-                        info = dir_lstat(directory, entry.name)
-                        if stat.S_ISDIR(info.st_mode):
-                            if len(parts) >= MAX_DEPTH:
-                                truncated = True
-                                continue
-                            child = open_pinned_child(directory, entry.name)
-                            try:
-                                walk(child, parts)
-                            finally:
-                                child.close()
-                        elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
-                            files.append(ProjectFileMetadata(path="/".join(parts), name=entry.name,
-                                size=info.st_size, modified=info.st_mtime, is_dir=False))
-                    except OSError as error:
-                        # Moved, locked or swapped for a link by the owner mid-listing.
-                        if error.errno in UNREADABLE_ERRNOS:
-                            continue
-                        raise
-                    if truncated and visited > MAX_LIST_ENTRIES:
-                        return
-
+        state = WalkState()
         with self.directory(project_id) as directory:
-            walk(directory, ())
-        return ProjectFileListResponse(files=sorted(files, key=lambda file: file.path), truncated=truncated)
+            files = [
+                ProjectFileMetadata(path="/".join(found.parts), name=found.name,
+                    size=found.info.st_size, modified=found.info.st_mtime, is_dir=False)
+                for found in walk_ordinary_files(
+                    directory, state=state, max_entries=MAX_LIST_ENTRIES, unreadable=UNREADABLE_ERRNOS,
+                )
+                if _recipient_path(found.parts)
+            ]
+        return ProjectFileListResponse(files=sorted(files, key=lambda file: file.path), truncated=state.truncated)
 
     def read_file(self, project_id: UUID, path: str, *, limit: int) -> tuple[bytes, os.stat_result]:
         parts = _file_parts(path)

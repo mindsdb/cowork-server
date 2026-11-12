@@ -61,6 +61,14 @@ EVENT_FIELDS = frozenset(
         # (cowork.turnqueue.producer._fit_request).
         "request_bytes",
         "cap_bytes",
+        # A cloud turn's copy of its project's files: the files and bytes it
+        # holds, how many it wrote this turn and how many it left out
+        # (cowork.handlers.responses.stage_remote_workspace).
+        "files",
+        "bytes",
+        "copied",
+        "copied_bytes",
+        "not_copied",
         # A remote turn reply's number and the last one the relay applied
         # (cowork.turnqueue.producer.stream_remote_replies).
         "reply_n",

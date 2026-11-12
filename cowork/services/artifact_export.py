@@ -33,6 +33,7 @@ from cowork.common.paths import (
     dir_stat,
     dir_unlink,
     open_pinned_child,
+    write_all,
 )
 from cowork.common.settings.app_settings import get_export_pdf_settings
 from cowork.schemas.artifact_export import (
@@ -471,15 +472,6 @@ def _record_primary(*, folder: PinnedDir, primary: str) -> None:
         pass
 
 
-def _write_all(fd: int, data: bytes) -> None:
-    remaining = memoryview(data)
-    while remaining:
-        written = os.write(fd, remaining)
-        if written == 0:
-            raise OSError("export write made no progress")
-        remaining = remaining[written:]
-
-
 def _link_without_replacing(folder: PinnedDir, source_name: str, destination_name: str) -> None:
     """Give *source_name* a second name, refusing one that already exists.
 
@@ -510,7 +502,7 @@ def _create_without_replacing(folder: PinnedDir, name: str, data: bytes) -> None
     fd = dir_open(folder, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o644)
     try:
         try:
-            _write_all(fd, data)
+            write_all(fd, data)
         finally:
             os.close(fd)
     except BaseException:
@@ -576,7 +568,7 @@ def _write_beside(
         name = None
         try:
             try:
-                _write_all(fd, data)
+                write_all(fd, data)
             finally:
                 os.close(fd)
             before_placing()

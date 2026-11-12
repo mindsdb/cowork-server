@@ -323,7 +323,7 @@ def test_a_failed_write_without_hard_links_leaves_nothing(client, local_artifact
     folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
     before = _snapshot(folder)
     monkeypatch.setattr(os, "link", _no_hard_links(errno.ENOTSUP))
-    written = artifact_export._write_all
+    written = artifact_export.write_all
     calls: list[int] = []
 
     def full_disk(fd, data):
@@ -333,7 +333,7 @@ def test_a_failed_write_without_hard_links_leaves_nothing(client, local_artifact
             raise OSError(errno.ENOSPC, "No space left on device")
         written(fd, data)
 
-    monkeypatch.setattr(artifact_export, "_write_all", full_disk)
+    monkeypatch.setattr(artifact_export, "write_all", full_disk)
 
     response = client.post(EXPORT_URL, json={"format": "docx"})
 

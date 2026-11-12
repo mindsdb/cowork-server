@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -769,9 +770,13 @@ async def test_files_send_a_direct_route_that_would_search_to_the_agent(has_file
         (["research/"], False),
         (["research/notes.md"], True),
         ([".anton/", "conversations/", "notes.md"], True),
+        # An in-process agent reads the project folder itself, so a folder a
+        # cloud turn's copy skips still holds files it can read.
+        (["memory/notes.md"], True),
     ],
 )
 def test_project_holds_files_counts_only_files_there_are_to_read(tmp_path, entries, holds):
+    """An in-process turn's rule: its agent works in the project folder."""
     from cowork.services.files import project_holds_files
 
     for entry in entries:
@@ -782,13 +787,128 @@ def test_project_holds_files_counts_only_files_there_are_to_read(tmp_path, entri
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("x")
 
-    assert project_holds_files(tmp_path) is holds
+    assert project_holds_files(tmp_path, cloud=False) is holds
 
 
-def test_a_missing_project_folder_holds_no_files(tmp_path):
+_ORDINARY_FILE_LAYOUTS = [
+    [],
+    ["notes.md"],
+    ["research/"],
+    ["research/notes.md"],
+    [".anton/anton.md", ".hidden.md"],
+    ["conversations/c/notes.md", "skills/s/SKILL.md"],
+    ["memory/notes.md"],
+    ["data/memory/notes.md"],
+    ["node_modules/x.js", "__pycache__/m.pyc"],
+    ["desktop.ini", "Thumbs.db"],
+    ["Q3: results.csv"],
+    ["data/back\\slash.csv"],
+    ["<hard link>"],
+    ["<link>"],
+    ["<too large>"],
+    ["<pipe>"],
+]
+
+
+def _lay_out(project, outside, entries):
+    project.mkdir(parents=True, exist_ok=True)
+    outside.mkdir(parents=True, exist_ok=True)
+    for entry in entries:
+        if entry == "<hard link>":
+            (outside / "shared.md").write_text("x")
+            os.link(outside / "shared.md", project / "second-name.md")
+        elif entry == "<link>":
+            (outside / "target.md").write_text("x")
+            (project / "link.md").symlink_to(outside / "target.md")
+        elif entry == "<too large>":
+            (project / "big.csv").write_text("x" * 2000)
+        elif entry == "<pipe>":
+            os.mkfifo(project / "pipe")
+        elif entry.endswith("/"):
+            (project / entry).mkdir(parents=True, exist_ok=True)
+        else:
+            (project / entry).parent.mkdir(parents=True, exist_ok=True)
+            (project / entry).write_text("x")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="org mode runs on POSIX only")
+@pytest.mark.parametrize("entries", _ORDINARY_FILE_LAYOUTS)
+def test_routing_counts_exactly_the_files_a_cloud_turn_gets(tmp_path, org_deployment, entries):
+    """A turn in a project with files skips the web gate and goes to the
+    agent, so the agent must get those files: a project routes as holding
+    files exactly when the cloud copy copies, or names as not copied, at
+    least one file. The memory folder, caches and hard links counted for
+    routing and copied nothing before both used one rule."""
+    from uuid import uuid4
+
+    from cowork.db.scoped import TenantScope
+    from cowork.services.files import ProjectFileCopyLimits, project_holds_files, stage_project_files
+    from cowork.services.projects import projects_root
+
+    scope = TenantScope(org_mode=True, org_id=str(uuid4()), user_id=str(uuid4()))
+    project = projects_root(scope=scope) / "p"
+    _lay_out(project, tmp_path / "outside", entries)
+    holds = project_holds_files(project, cloud=True)
+
+    staged = stage_project_files(
+        project, uuid4(), scope=scope,
+        limits=ProjectFileCopyLimits(max_file_bytes=1000, max_files=10, max_total_bytes=10_000, seconds=30.0),
+    )
+
+    assert not staged.failed
+    assert holds is (staged.files + staged.not_copied > 0)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="org mode runs on POSIX only")
+@pytest.mark.parametrize(
+    ("entries", "in_process", "cloud"),
+    [
+        (["memory/notes.md"], True, False),
+        (["research/node_modules/x.js"], True, False),
+        (["<hard link>"], True, False),
+        (["notes.md"], True, True),
+    ],
+)
+def test_an_in_process_turn_counts_what_its_agent_reads_in_place(tmp_path, entries, in_process, cloud):
+    """A cloud turn counts by its copy's rule. An in-process turn's agent
+    reads the project folder itself, so a memory folder, a cache or a second
+    name for a file still holds something for it to read."""
     from cowork.services.files import project_holds_files
 
-    assert project_holds_files(tmp_path / "moved-away") is False
+    project = tmp_path / "project"
+    _lay_out(project, tmp_path / "outside", entries)
+
+    assert (project_holds_files(project, cloud=False), project_holds_files(project, cloud=True)) == (
+        in_process, cloud,
+    )
+
+
+@pytest.mark.parametrize("cloud", [False, True])
+def test_a_missing_project_folder_holds_no_files(tmp_path, cloud):
+    from cowork.services.files import project_holds_files
+
+    assert project_holds_files(tmp_path / "moved-away", cloud=cloud) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("backend", "cloud"), [("remote", True), ("inprocess", False)])
+async def test_routing_reads_the_project_by_where_the_turn_runs(monkeypatch, backend, cloud):
+    """The handler asks for the cloud rule exactly when turns run in a pod."""
+    import cowork.handlers.responses as responses
+    from cowork.services.files import ProjectContext
+
+    monkeypatch.setenv("COWORK_TURN_BACKEND", backend)
+    asked: list[dict] = []
+
+    async def efs(call, **_kwargs):
+        asked.append(call.keywords)
+        return ProjectContext(has_files=False, has_instructions=False)
+
+    monkeypatch.setattr(responses, "run_efs", efs)
+
+    await ResponsesHandler()._read_project_context("/projects/p", files_known=False)
+
+    assert asked == [{"files_known": False, "cloud": cloud}]
 
 
 @pytest.mark.parametrize(
@@ -816,7 +936,7 @@ def test_read_project_context_reads_files_and_instructions(tmp_path, entries, in
         (project / ".anton").mkdir()
         (project / ".anton" / "anton.md").write_text(instructions)
 
-    assert read_project_context(project, files_known=False) == ProjectContext(*expected)
+    assert read_project_context(project, files_known=False, cloud=False) == ProjectContext(*expected)
 
 
 @pytest.mark.parametrize(
@@ -850,9 +970,9 @@ def test_anton_template_alone_is_not_instructions(tmp_path, written, expected):
 def test_read_project_context_skips_the_listing_when_an_attachment_counts(monkeypatch, tmp_path):
     import cowork.services.files as files
 
-    monkeypatch.setattr(files, "project_holds_files", lambda _path: pytest.fail("listed the folder"))
+    monkeypatch.setattr(files, "project_holds_files", lambda _path, **_: pytest.fail("listed the folder"))
 
-    assert files.read_project_context(tmp_path, files_known=True) == files.ProjectContext(
+    assert files.read_project_context(tmp_path, files_known=True, cloud=False) == files.ProjectContext(
         has_files=True, has_instructions=False,
     )
 
@@ -872,7 +992,7 @@ def test_read_project_context_raises_a_failed_instructions_read(monkeypatch, tmp
     monkeypatch.setattr(Path, "read_bytes", denied)
 
     with pytest.raises(PermissionError):
-        read_project_context(tmp_path, files_known=False)
+        read_project_context(tmp_path, files_known=False, cloud=False)
 
 
 def test_a_project_path_that_is_a_file_holds_neither(tmp_path):
@@ -881,7 +1001,7 @@ def test_a_project_path_that_is_a_file_holds_neither(tmp_path):
     project = tmp_path / "project"
     project.write_text("x")
 
-    assert read_project_context(project, files_known=False) == ProjectContext(False, False)
+    assert read_project_context(project, files_known=False, cloud=False) == ProjectContext(False, False)
 
 
 def test_an_anton_entry_that_is_a_file_means_no_instructions(tmp_path):
@@ -889,7 +1009,7 @@ def test_an_anton_entry_that_is_a_file_means_no_instructions(tmp_path):
 
     (tmp_path / ".anton").write_text("x")
 
-    assert read_project_context(tmp_path, files_known=False) == ProjectContext(False, False)
+    assert read_project_context(tmp_path, files_known=False, cloud=False) == ProjectContext(False, False)
 
 
 @pytest.mark.parametrize("shape", ["directory", "fifo"])
@@ -909,7 +1029,7 @@ def test_instructions_that_are_not_a_regular_file_are_none(tmp_path, shape):
             pytest.skip("no named pipes on this platform")
         os.mkfifo(instructions)
 
-    assert read_project_context(tmp_path, files_known=True) == ProjectContext(True, False)
+    assert read_project_context(tmp_path, files_known=True, cloud=False) == ProjectContext(True, False)
 
 
 @pytest.mark.parametrize("gone", [FileNotFoundError, NotADirectoryError])
@@ -927,7 +1047,7 @@ def test_instructions_removed_after_the_file_check_are_none(monkeypatch, tmp_pat
 
     monkeypatch.setattr(Path, "read_bytes", removed)
 
-    assert read_project_context(tmp_path, files_known=True) == ProjectContext(True, False)
+    assert read_project_context(tmp_path, files_known=True, cloud=False) == ProjectContext(True, False)
 
 
 def test_read_project_context_raises_a_failed_instructions_stat(monkeypatch, tmp_path):
@@ -948,7 +1068,7 @@ def test_read_project_context_raises_a_failed_instructions_stat(monkeypatch, tmp
     monkeypatch.setattr(Path, "stat", denied)
 
     with pytest.raises(PermissionError):
-        read_project_context(tmp_path, files_known=True)
+        read_project_context(tmp_path, files_known=True, cloud=False)
 
 
 @pytest.mark.parametrize(("rows", "attached"), [([object()], True), ([], False)])

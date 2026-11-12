@@ -1359,7 +1359,11 @@ class ResponsesHandler:
         failures fail open to the agent."""
         try:
             return await run_efs(
-                partial(read_project_context, project_path, files_known=files_known), scope=self.scope,
+                partial(
+                    read_project_context, project_path, files_known=files_known,
+                    cloud=TurnQueueSettings().is_remote,
+                ),
+                scope=self.scope,
             )
         except Exception:
             logger.warning("[responses] could not read the project's files and instructions", exc_info=True)
@@ -2311,7 +2315,7 @@ class ResponsesHandler:
             self._skill_viewer = None
 
     @staticmethod
-    def _stage_remote_workspace_files(session: ScopedSession, conv_id: UUID) -> None:
+    def _stage_remote_workspace_files(session: ScopedSession, conv_id: UUID) -> str | None:
         """Stage the project-level files the pod can't otherwise see (the
         conversation's attachments and the project's anton.md instructions)
         into the conversation workspace on the shared mount, and seed this
@@ -2320,14 +2324,22 @@ class ResponsesHandler:
         The seeding call belongs here, not just behind ``GET /skills``: this
         runs before every remote turn, web or channel, and catches an org that
         chats before it ever opens the skills menu, as the turn's skills block
-        (remote_turn_skills) seeds again. Never fails the turn: a
-        staging error degrades to a turn without the missing piece."""
-        try:
-            from cowork.services.artifact_roots import project_artifacts_base
-            from cowork.services.files import stage_project_instructions
+        (remote_turn_skills) seeds again. A staging error degrades to a turn
+        without the missing piece.
 
-            conversation = ConversationService(session).get_conversation(conv_id)
-            project_path = conversation.project.path
+        Returns the project's folder, whose files stage_remote_workspace
+        copies next with no database session held (stage_project_files), or
+        None for a conversation in no project. A conversation that can't be
+        read raises: without its project, the copy an earlier turn left can't
+        be checked or emptied."""
+        from cowork.services.artifact_roots import project_artifacts_base
+        from cowork.services.files import stage_project_instructions
+
+        conversation = ConversationService(session).get_conversation(conv_id)
+        if conversation.project is None:
+            return None
+        project_path: str = conversation.project.path
+        try:
             # ENG-2056: the pod mounts the PROJECT-level artifacts base (subPath
             # `.anton/artifacts`) at /project-artifacts, and a subPath mount needs
             # the directory to exist before the pod starts. Project creation does
@@ -2340,6 +2352,7 @@ class ResponsesHandler:
             SkillService(session.scope).ensure_builtin_skills()
         except Exception:
             logger.exception("[responses] failed to stage workspace files", extra=log_context(conversation_id=conv_id))
+        return project_path
 
     @staticmethod
     def _remote_started_at(session: ScopedSession, conv_id: UUID) -> str | None:
@@ -4191,22 +4204,65 @@ async def stage_remote_workspace(*, conv_id: UUID, scope: TenantScope) -> None:
     hold at most EFS_UNIT_SLOTS of the database unit slots, so database units
     keep the rest.
 
+    Then it copies the project's files into the conversation's project-files
+    folder (stage_project_files) on the file store's threads with no database
+    session held, since a first copy can take seconds. The walk and the
+    copying stop at the time budget (TurnQueueSettings.project_files_copy_seconds);
+    removing stale copies and saving the copy's record run after it. It logs
+    one ``project_files_staged`` line per turn.
+
     A full pool or a busy file store is not a missing file: PoolTimeoutError
     and FilesystemBusy propagate, so the turn is refused rather than run
     without what the user sent. Staging itself degrades on its own, so any
-    other failure is the unit's own connect or commit; it is logged, and the
-    turn runs without the staged files.
+    other failure is the unit's own connect or commit, or a conversation
+    that can't be read. Once the project's folder is known, that is logged
+    and the copy still runs. When it is not known, the copy an earlier turn
+    left can't be checked or emptied, so the error propagates and the turn is
+    refused, as it is when the copy can't empty the folder
+    (ProjectFilesRefused).
     """
+    from cowork.services.files import ProjectFilesOutcome, ProjectFilesRefused, stage_project_files
+
+    resolved: list[str | None] = []
+
+    def staging(session: ScopedSession) -> None:
+        # Kept outside the unit, so a commit that fails after staging ran
+        # still leaves the copy its project's folder.
+        resolved.append(ResponsesHandler._stage_remote_workspace_files(session, conv_id))
+
     try:
-        await run_efs_unit(
-            partial(ResponsesHandler._stage_remote_workspace_files, conv_id=conv_id), scope=scope,
-        )
+        await run_efs_unit(staging, scope=scope)
     except (PoolTimeoutError, FilesystemBusy):
         raise
     except Exception:
         logger.exception(
             "[responses] failed to stage workspace files", extra=log_context(conversation_id=conv_id),
         )
+        if not resolved:
+            raise
+    project_path = resolved[0]
+    if project_path is None:
+        return
+    staged = await run_efs(partial(stage_project_files, project_path, conv_id, scope=scope), scope=scope)
+    # WARNING, not INFO: the hosted LOG_LEVEL is WARNING, and this line is
+    # the per-turn cost of the copy. Fields, not template values: the log
+    # formatter drops those.
+    logger.warning(
+        "Copied the project's files for a cloud turn",
+        extra={
+            "event": "project_files_staged",
+            "outcome": staged.outcome.value,
+            "files": staged.files,
+            "bytes": staged.bytes,
+            "copied": staged.copied,
+            "copied_bytes": staged.copied_bytes,
+            "not_copied": staged.not_copied,
+            "duration_ms": staged.elapsed_ms,
+            **log_context(conversation_id=conv_id),
+        },
+    )
+    if staged.outcome is ProjectFilesOutcome.REFUSED:
+        raise ProjectFilesRefused(f"the project files copy of conversation {conv_id} could not be emptied")
 
 
 async def save_turn_memory(

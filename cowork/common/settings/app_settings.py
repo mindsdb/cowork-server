@@ -749,6 +749,31 @@ class TurnQueueSettings(Settings):
             "<root>/<project path in the organization>/conversations/<conversation id>."
         ),
     )  # COWORK_TURN_POD_SHARED_MOUNT_ROOT
+    project_files_max_file_bytes: int = Field(
+        default=50 * 1024 * 1024,
+        description=(
+            "Before each cloud turn the server copies the project's files into the "
+            "conversation's project-files folder. A file larger than this many bytes is "
+            "left out and named in the folder's list of files not copied."
+        ),
+    )  # COWORK_TURN_PROJECT_FILES_MAX_FILE_BYTES
+    project_files_max_files: int = Field(
+        default=200,
+        description="The most project files one conversation's copy holds; the rest are named as not copied.",
+    )  # COWORK_TURN_PROJECT_FILES_MAX_FILES
+    project_files_max_total_bytes: int = Field(
+        default=128 * 1024 * 1024,
+        description="The most bytes one conversation's copy of the project's files holds; the rest are named as not copied.",
+    )  # COWORK_TURN_PROJECT_FILES_MAX_TOTAL_BYTES
+    project_files_copy_seconds: float = Field(
+        default=10.0,
+        description=(
+            "How long one turn may spend walking the project and copying its files. Once it "
+            "passes, the walk stops, a file being copied is left out, and the folder's list says "
+            "the walk stopped early; a later turn copies what was not reached. Removing stale "
+            "copies and saving the copy's record run after it."
+        ),
+    )  # COWORK_TURN_PROJECT_FILES_COPY_SECONDS
     minds_base_url: str = Field(
         default="",
         description=(

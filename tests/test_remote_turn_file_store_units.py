@@ -14,6 +14,7 @@ thread run_efs did not start.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import NamedTuple
@@ -46,22 +47,32 @@ class OrgConversation(NamedTuple):
     scope: TenantScope
 
 
-@pytest.fixture
-def org_conversation(org_deployment) -> OrgConversation:
-    """A member's conversation in a project of their own, made through the
-    app, so the project's folder is under COWORK_HOME."""
+def make_org_conversation(principal: Principal, project_name: str) -> OrgConversation:
+    """A member's conversation in a project of their organization, made
+    through the app, so the project's folder is under COWORK_HOME."""
+    member = {"X-User-Id": principal.user_id, "X-Organization-Id": principal.org_id}
     client = TestClient(create_app())
-    project = client.post("/api/v1/projects/", json={"name": f"staging-{uuid4().hex[:8]}"}, headers=MEMBER)
+    project = client.post("/api/v1/projects/", json={"name": project_name}, headers=member)
     assert project.status_code == 201, project.text
     conversation = client.post(
-        "/api/v1/conversations/", json={"title": "t", "projectId": project.json()["id"]}, headers=MEMBER,
+        "/api/v1/conversations/", json={"title": "t", "projectId": project.json()["id"]}, headers=member,
     )
     assert conversation.status_code == 201, conversation.text
     return OrgConversation(
         id=UUID(conversation.json()["id"]),
         project_path=Path(project.json()["path"]),
-        scope=scope_from_principal(PRINCIPAL),
+        scope=scope_from_principal(principal),
     )
+
+
+@pytest.fixture
+def org_conversation(org_deployment) -> OrgConversation:
+    """A member's conversation in a project of their own."""
+    return make_org_conversation(PRINCIPAL, f"staging-{uuid4().hex[:8]}")
+
+
+def copy_folder(conversation: OrgConversation) -> Path:
+    return conversation.project_path / "conversations" / str(conversation.id) / "project-files"
 
 
 @pytest.fixture
@@ -84,6 +95,212 @@ def test_a_remote_turns_staging_runs_on_the_file_store_threads(org_conversation)
     assert (org_conversation.project_path / ".anton" / "artifacts").is_dir()
     staged = org_conversation.project_path / "conversations" / str(org_conversation.id) / ".anton" / "anton.md"
     assert staged.read_text() == "Answer in charts."
+
+
+def test_a_remote_turns_project_file_copy_runs_on_the_file_store_threads_with_no_session(
+    org_conversation, monkeypatch, caplog,
+):
+    """The copy of the project's files can take seconds on a first turn, so it
+    runs after the staging unit, on the file store's threads, while no
+    database session is open: it never holds a pooled connection. It logs one
+    project_files_staged line with the turn's cost, at WARNING, which the
+    hosted LOG_LEVEL keeps."""
+    from contextlib import contextmanager
+
+    from cowork.db import units
+    from cowork.services import files
+
+    (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
+    open_sessions: list[int] = []
+    real_unit_session = units.unit_session
+
+    @contextmanager
+    def counted_unit_session(*, scope):
+        open_sessions.append(1)
+        try:
+            with real_unit_session(scope=scope) as session:
+                yield session
+        finally:
+            open_sessions.pop()
+
+    seen: list[tuple[bool, int]] = []
+    real_stage = files.stage_project_files
+
+    def watched_stage(*args, **kwargs):
+        seen.append((units.on_efs_thread(), len(open_sessions)))
+        return real_stage(*args, **kwargs)
+
+    monkeypatch.setattr(units, "unit_session", counted_unit_session)
+    monkeypatch.setattr(files, "stage_project_files", watched_stage)
+
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        with blocking_guard.watching() as found:
+            asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    assert sorted(found) == []
+    assert seen == [(True, 0)]
+    copy = org_conversation.project_path / "conversations" / str(org_conversation.id) / "project-files"
+    assert (copy / "chapter-1.md").read_text() == "The porter kept the keys."
+    [record] = [r for r in caplog.records if getattr(r, "event", None) == "project_files_staged"]
+    assert record.levelname == "WARNING"
+    # The deployments' JSON log keeps every field of the line.
+    from cowork.common.structured_logging import make_formatter
+
+    line = json.loads(make_formatter().format(record))
+    assert {key: line.get(key) for key in (
+        "event", "outcome", "files", "bytes", "copied", "copied_bytes", "not_copied", "conversation_id",
+    )} == {
+        "event": "project_files_staged", "outcome": "staged", "files": 1, "bytes": 25, "copied": 1,
+        "copied_bytes": 25, "not_copied": 0, "conversation_id": str(org_conversation.id),
+    }
+    assert isinstance(line["duration_ms"], int)
+
+
+def test_a_project_file_copy_that_cant_finish_empties_the_copy_and_the_turn_goes_on(
+    org_conversation, monkeypatch, caplog,
+):
+    """A failed copy never fails the turn. It leaves no file behind that the
+    project may no longer hold, only the list that tells the agent the copy
+    failed, so it says so rather than answering from the web."""
+    from cowork.services import files
+
+    (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
+    asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+    copy = org_conversation.project_path / "conversations" / str(org_conversation.id) / "project-files"
+    assert (copy / "chapter-1.md").exists()
+
+    def broken(*args, **kwargs):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(files, "_stage_project_files", broken)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    assert [path.name for path in copy.iterdir()] == [files.NOT_COPIED_FILENAME]
+    listed = files.NotCopiedFiles.model_validate_json((copy / files.NOT_COPIED_FILENAME).read_bytes())
+    assert listed == files.NotCopiedFiles(copy_failed=True)
+    [record] = [r for r in caplog.records if getattr(r, "event", None) == "project_files_staged"]
+    assert (record.outcome, record.files) == ("failed", 0)
+
+
+def test_a_copy_that_cant_empty_its_folder_refuses_the_turn(org_conversation, monkeypatch):
+    """A folder that may still hold a copy the project no longer backs is
+    never handed to a turn."""
+    from cowork.services import files
+
+    (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
+    asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    def broken(*args, **kwargs):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(files, "_prune_folder", broken)
+    monkeypatch.setattr(files._CopyFolders, "set_aside", broken)
+
+    with pytest.raises(files.ProjectFilesRefused):
+        asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+
+def test_a_conversation_staging_cant_read_refuses_the_turn(org_conversation, monkeypatch):
+    """Without the conversation, its project's folder is unknown, so the copy
+    an earlier turn left can be neither checked nor emptied: the turn is
+    refused rather than run on it."""
+    (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
+    asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    class Unreadable:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            raise RuntimeError("the conversation read failed")
+
+    monkeypatch.setattr(responses_mod, "ConversationService", Unreadable)
+    staged: list = []
+    monkeypatch.setattr("cowork.services.files.stage_project_files", lambda *a, **k: staged.append(a))
+
+    with pytest.raises(RuntimeError, match="conversation read failed"):
+        asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    assert staged == []
+
+
+def test_a_staging_unit_whose_commit_fails_still_copies_the_projects_files(
+    org_conversation, monkeypatch, caplog,
+):
+    """The project's folder was read before the commit failed, so the copy
+    still runs and the turn goes on with the project's files as they are."""
+    from contextlib import contextmanager
+
+    from cowork.db import units
+
+    project_file = org_conversation.project_path / "chapter-1.md"
+    project_file.write_text("first")
+    asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+    project_file.unlink()
+    (org_conversation.project_path / "chapter-2.md").write_text("second")
+    real_unit_session = units.unit_session
+
+    @contextmanager
+    def commit_fails(*, scope):
+        with real_unit_session(scope=scope) as session:
+            yield session
+        raise RuntimeError("the unit's commit failed")
+
+    monkeypatch.setattr(units, "unit_session", commit_fails)
+
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    assert sorted(path.name for path in copy_folder(org_conversation).iterdir()) == ["chapter-2.md"]
+    assert any(r.getMessage() == "[responses] failed to stage workspace files" for r in caplog.records)
+
+
+def test_a_busy_file_store_refuses_a_remote_turns_project_file_copy(org_conversation, monkeypatch):
+    """The copy waits for its own file store slot after the staging unit; a
+    busy store refuses the turn there too."""
+    from cowork.services import files
+
+    async def busy(call, **_kwargs):
+        if getattr(call, "func", None) is files.stage_project_files:
+            raise FilesystemBusy()
+        raise AssertionError(f"unexpected file store call {call!r}")
+
+    monkeypatch.setattr(responses_mod, "run_efs", busy)
+
+    with pytest.raises(FilesystemBusy):
+        asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+
+def test_a_turn_gets_only_its_own_organizations_project_files(org_deployment):
+    """Two organizations each hold a project of the same name with different
+    files. Each one's turn gets its own organization's files, in its own
+    organization's tree, and its copy's record sits in that organization's
+    store."""
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.services import files
+
+    name = f"research-{uuid4().hex[:8]}"
+    turns = {}
+    for label in ("a", "b"):
+        principal = Principal(user_id=str(uuid4()), org_id=str(uuid4()))
+        turns[label] = (principal, make_org_conversation(principal, name))
+        (turns[label][1].project_path / "notes.md").write_text(f"organization {label}'s notes")
+
+    for _principal, conversation in turns.values():
+        asyncio.run(stage_remote_workspace(conv_id=conversation.id, scope=conversation.scope))
+
+    shared = Path(get_app_settings().storage.shared_root)
+    for label, (principal, conversation) in turns.items():
+        own = shared / principal.org_id
+        copy = copy_folder(conversation)
+        assert own in copy.parents
+        assert sorted(path.name for path in copy.iterdir()) == ["notes.md"]
+        assert (copy / "notes.md").read_text() == f"organization {label}'s notes"
+        record = files.copy_record_path(conversation.scope, conversation.id)
+        assert own in record.parents and record.is_file()
+        assert sorted(files.CopyRecord.model_validate_json(record.read_bytes()).files) == ["notes.md"]
 
 
 def test_a_remote_turns_memory_save_runs_on_the_file_store_threads(org_conversation):

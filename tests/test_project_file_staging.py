@@ -18,7 +18,7 @@ def test_a_temporary_entry_is_new_empty_and_named_with_the_prefix(tmp_path):
     with project_files.pinned_dir(tmp_path) as root:
         name, fd = project_files._create_project_temp(root, ".cowork-import-", 0o640)
         try:
-            project_files._write_all(fd, b"bytes")
+            project_files.write_all(fd, b"bytes")
         finally:
             os.close(fd)
 
@@ -59,7 +59,7 @@ def test_a_write_that_makes_no_progress_is_an_error(tmp_path, monkeypatch):
         monkeypatch.setattr(project_files.os, "write", lambda *_args: 0)
         try:
             with pytest.raises(OSError, match="no progress"):
-                project_files._write_all(fd, b"bytes")
+                project_files.write_all(fd, b"bytes")
         finally:
             monkeypatch.undo()
             os.close(fd)
