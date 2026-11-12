@@ -938,6 +938,7 @@ class ResponsesHandler:
                     has_disabled_connections=bool(disabled),
                     has_always_on_skills=start.always_on_skills,
                     is_comparison_side=start.comparison_pin is not None,
+                    is_pinned_schedule=self.schedule_id is not None and request.model is not None,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
                 )
@@ -1281,6 +1282,7 @@ class ResponsesHandler:
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=comparison_pin is not None,
+            is_pinned_schedule=self.schedule_id is not None and request.model is not None,
         ) is None:
             rows = self._reads_always_on_rows(session, conversation_id=conversation_id)
             if rows is None:
@@ -1401,6 +1403,7 @@ class ResponsesHandler:
         has_disabled_connections: bool,
         has_always_on_skills: bool = False,
         is_comparison_side: bool = False,
+        is_pinned_schedule: bool = False,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
@@ -1428,6 +1431,7 @@ class ResponsesHandler:
             has_attachments=has_attachments,
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=is_comparison_side,
+            is_pinned_schedule=is_pinned_schedule,
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
