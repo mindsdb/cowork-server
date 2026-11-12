@@ -345,7 +345,49 @@ def test_a_check_that_ignores_the_credential_proves_nothing(engine, world, monke
     assert [json.loads(r.content)["dry_run"] for r in world["auth"]] == [True]
 
 
-@pytest.mark.parametrize(("status", "code"), [(401, "authentication_failed"), (403, "authentication_failed"), (500, "provider_error")])
+@pytest.mark.parametrize("status", [200, 500])
+def test_a_check_that_answers_other_than_401_or_403_without_the_key_is_not_protected(engine, world, monkeypatch, status):
+    world["unprotected"] = (status, b"internal status page")
+
+    res = _connect(_client(engine, monkeypatch))
+
+    assert res.json()["detail"] == {"code": "check_not_protected", "provider_status": status, "excerpt": ""}
+    assert len(world["provider"]) == 1
+
+
+def test_a_check_path_the_provider_does_not_have_says_so_before_the_key_is_sent(engine, world, monkeypatch):
+    world["unprotected"] = (404, b'{"message":"Route not found"}')
+
+    res = _connect(_client(engine, monkeypatch))
+
+    assert res.status_code == 422
+    assert res.json()["detail"] == {"code": "check_path_not_found", "provider_status": 404, "excerpt": ""}
+    assert "Route not found" not in res.text
+    assert len(world["provider"]) == 1
+    assert [json.loads(r.content)["dry_run"] for r in world["auth"]] == [True]
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["api.acme.example/v2", "https://api.acme.example/v2/", "https://api.acme.example/v2/eod?symbols=AAPL", "api.acme.example/v2#top"],
+)
+def test_an_address_with_a_path_says_where_the_version_goes(engine, world, monkeypatch, address):
+    res = _connect(_client(engine, monkeypatch), address=address)
+
+    assert (res.status_code, res.json()["detail"]["code"]) == (422, "invalid_address")
+    assert "ask Anton to build the connector again" in res.json()["detail"]["message"]
+    assert world["auth"] == [] and world["provider"] == []
+
+
+def test_a_slash_only_in_the_query_is_not_a_path(engine, world, monkeypatch):
+    res = _connect(_client(engine, monkeypatch), address="api.acme.example?next=/v2")
+
+    assert (res.status_code, res.json()["detail"]["message"]) == (422, "The API address is not valid.")
+
+
+@pytest.mark.parametrize(("status", "code"), [
+    (401, "authentication_failed"), (403, "authentication_failed"), (404, "check_path_not_found"), (500, "provider_error"),
+])
 def test_a_failed_check_shows_the_status_and_a_scrubbed_excerpt(engine, world, monkeypatch, status, code):
     world["protected"] = (status, f'{{"error":"bad key {SECRET}"}}'.encode())
 

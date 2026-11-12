@@ -43,6 +43,10 @@ BASE_URL_FIELD = "base_url"
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _TOP_LABEL = re.compile(r"[a-z]{2,63}")
 _ADDRESS_HINT = "type only the address, like api.example.com"
+_VERSION_HINT = (
+    "If your provider's address includes a path or version such as /v2, "
+    "ask Anton to build the connector again with it in the connector's paths."
+)
 
 
 class ConnectRefused(Exception):
@@ -136,12 +140,13 @@ def normalize_address(text: Any, refused_domains: Iterable[str]) -> str:
     # or escapes them into the host, where the label rules refuse them.
     if not isinstance(text, str) or not text:
         raise _refuse_address()
+    raw = text if "://" in text else f"https://{text}"
+    # A URL pasted from the docs carries a query too; it still gets the path hint.
+    remainder = raw.split("://", 1)[1].split("?", 1)[0].split("#", 1)[0].removesuffix("/")
+    if "/" in remainder:
+        raise _refuse_address(f"The API address cannot include a path; {_ADDRESS_HINT}. {_VERSION_HINT}")
     if any(c in text for c in "@?#\\"):
         raise _refuse_address()
-    raw = text if "://" in text else f"https://{text}"
-    remainder = raw.split("://", 1)[1].removesuffix("/")
-    if "/" in remainder:
-        raise _refuse_address(f"The API address cannot include a path; {_ADDRESS_HINT}.")
     try:
         url = httpx.URL(raw)
     except httpx.InvalidURL as exc:
@@ -317,8 +322,9 @@ async def run_check(origin: str, template: StoredTemplate, values: Mapping[str, 
 
     Without them it must answer 401 or 403, or a passing check would prove
     nothing. With them, 2xx passes, 401 or 403 is ``authentication_failed``
-    and any other status ``provider_error``. Only the answer to the request
-    that carried the credentials is excerpted.
+    and any other status ``provider_error``. A 404 to either send is
+    ``check_path_not_found``. Only the answer to the request that carried
+    the credentials is excerpted.
 
     Raises:
         ConnectRefused: 422 ``invalid_values`` when a value cannot be placed.
@@ -329,12 +335,18 @@ async def run_check(origin: str, template: StoredTemplate, values: Mapping[str, 
         return unprotected
     if unprotected.status_code not in (401, 403):
         # Its body is never shown: an excerpt would let connect read any page our egress can reach.
-        return CheckFailure("check_not_protected", unprotected.status_code, "")
+        code = "check_path_not_found" if unprotected.status_code == 404 else "check_not_protected"
+        return CheckFailure(code, unprotected.status_code, "")
     answer = await _send(origin, template.path, placed.headers, placed.params)
     if isinstance(answer, CheckFailure):
         return answer
     if 200 <= answer.status_code < 300:
         return None
-    code = "authentication_failed" if answer.status_code in (401, 403) else "provider_error"
+    if answer.status_code in (401, 403):
+        code = "authentication_failed"
+    elif answer.status_code == 404:
+        code = "check_path_not_found"
+    else:
+        code = "provider_error"
     scrubbed = scrub_excerpt(answer.body, sent_forms(template.auth, placed, values.values()))
     return CheckFailure(code, answer.status_code, scrubbed)
