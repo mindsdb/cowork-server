@@ -77,6 +77,7 @@ CAPABILITIES = "COWORK_DATASOURCE_CAPABILITIES"
 # gate's own change adds the environment here and sets both deployment scalars
 # in its values file.
 ENABLED_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
+LABELS_FLAG = "COWORK_TURN_DATASOURCE_LABELS_ENABLED"
 # The exact methods each enabled environment offers.
 OFFERED_METHODS: dict[str, frozenset[str]] = {"staging": frozenset({"mysql:host-password", "postgres:host-port"})}
 # The draft host of each environment. cowork's web build frames exactly these
@@ -153,6 +154,20 @@ def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed
         assert _deployment(env_values).get("datasourceTurnsEnabled") == expected, f"{env_values.name} flips the grants"
         assert not [e for e in _env(env_values) if e.name == FLAG], (
             f"{env_values.name} declares {FLAG}; set deployment.datasourceTurnsEnabled instead"
+        )
+
+
+def test_connection_labels_are_on_in_the_base_and_an_environment_may_only_opt_out(base):
+    """Labels act only where grants are on, so the base turns them on everywhere;
+    an environment's values file may set "false" as its rollback, nothing else."""
+    assert _deployment(BASE)["datasourceLabelsEnabled"] == "true"
+    assert _entry(base, LABELS_FLAG).value == "{{ $.Values.datasourceLabelsEnabled }}"
+    for env_values in ENVIRONMENTS:
+        assert _deployment(env_values).get("datasourceLabelsEnabled") in (None, "false"), (
+            f"{env_values.name} sets datasourceLabelsEnabled to something other than the \"false\" rollback"
+        )
+        assert not [e for e in _env(env_values) if e.name == LABELS_FLAG], (
+            f"{env_values.name} declares {LABELS_FLAG}; set deployment.datasourceLabelsEnabled instead"
         )
 
 
