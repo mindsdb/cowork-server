@@ -240,3 +240,8 @@ markers = [
     "redis_service: needs a Redis at COWORK_TEST_REDIS_URL; runs in make test/services",
     "postgres_service: needs a disposable PostgreSQL at COWORK_TEST_POSTGRES_URI; runs in make test/services",
 ]
+
+# TEMPORARY, DO NOT MERGE (ENG-4227): the dev deploy needs anton#790's code,
+# which isn't on PyPI yet. Remove this block and re-lock before merging.
+[tool.uv.sources]
+anton-agent = { git = "https://github.com/mindsdb/anton", rev = "3452ad85042a559c8cc6105fc50c9bdedb034ff5" }
