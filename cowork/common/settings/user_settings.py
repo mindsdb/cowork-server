@@ -697,6 +697,14 @@ class UserSettings(Settings):
         title="Show Figure Sources",
         description="Mark each figure in an answer with the steps it came from, and flag figures with no source.",
     )
+    schedule_keep_awake: bool = Field(
+        default=True,
+        title="Keep Awake For Scheduled Tasks",
+        description=(
+            "Keep the desktop from idle-sleeping while a scheduled task is running "
+            "or about to run."
+        ),
+    )
     nav_title: str = Field(
         default="",
         title="Nav Title",
@@ -741,6 +749,16 @@ class UserSettings(Settings):
         default=True,
         title="Memory Enabled",
         description="Enable conversation memory.",
+    )
+    # The agent's browser. Untagged, so per-user in org mode and the single
+    # global row on desktop, like `hub_workspace_id`: whether the agent may use
+    # a browser is the person's own choice. On by default: it only does something where a browser is
+    # available, the browser router on the web or the desktop app's own
+    # browser (cowork.services.browser).
+    browser_enabled: bool = Field(
+        default=True,
+        title="Browser Enabled",
+        description="Let the agent use a browser, shown beside the chat.",
     )
     # `hub_workspace_id`, not `workspace_id`: in this repo `workspace` already
     # means a filesystem location (the per-conversation private directory, the

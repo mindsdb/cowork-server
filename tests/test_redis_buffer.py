@@ -391,3 +391,26 @@ async def test_a_reader_never_closes_the_buffer_object_its_writer_holds(fake_red
     assert seen[-1].type == "Interrupted"
     assert writer.is_closed is False
     assert writer.latest_seq == 1
+
+
+@pytest.mark.asyncio
+async def test_every_write_keeps_the_turn_index_alive(fake_redis):
+    """A time-limited turn runs past the index's hour; reconnect, Stop and the
+    in-flight list find the turn through it, so writes keep it alive."""
+    from cowork.streaming.turn_index import TURN_INDEX_TTL_SECONDS, turn_key
+
+    await fake_redis.hset(turn_key("c1"), mapping={"turn_id": "1"})
+    await fake_redis.expire(turn_key("c1"), 5)
+    buf = RedisStreamBuffer(conversation_id="c1", turn_id=1)
+    await buf.append("Delta", {"text": "a"})
+    assert await fake_redis.ttl(turn_key("c1")) > 5
+    assert await fake_redis.ttl(turn_key("c1")) <= TURN_INDEX_TTL_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_write_does_not_create_a_turn_index(fake_redis):
+    from cowork.streaming.turn_index import turn_key
+
+    buf = RedisStreamBuffer(conversation_id="c1", turn_id=1)
+    await buf.append("Delta", {"text": "a"})
+    assert not await fake_redis.exists(turn_key("c1"))

@@ -58,6 +58,17 @@ def workspace_files(session: CodingSession, query: str = "", limit: int = 40) ->
     return matches
 
 
+def message_attachments(attachments: list[InputReference] | tuple[InputReference, ...]) -> dict:
+    """What the timeline shows of a message's attachments, as event data.
+
+    Only the label the composer showed and the kind: the transcript needs no
+    disk path, so none is stored with the message.
+    """
+    if not attachments:
+        return {}
+    return {"attachments": [{"name": item.name, "kind": item.kind} for item in attachments]}
+
+
 def require_attachments_exist(attachments: list[InputReference] | tuple[InputReference, ...]) -> None:
     """Reject absolute attachment paths that are already missing.
 
@@ -172,6 +183,10 @@ FAILURE_MESSAGES = {
     "included_allowance_exhausted": "Your included allowance is used up. Add credits to continue now, or wait for it to refill.",
     "free_air_daily_spend_fuse_exceeded": (
         "Free MindsHub Air is paused until the daily budget resets. Add credits to continue now."
+    ),
+    "budget_exceeded": (
+        "Your organization's spending budget is used up. An owner or admin can raise it in Budgets, "
+        "or choose a model that is still available."
     ),
 }
 

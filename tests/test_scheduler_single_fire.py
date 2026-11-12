@@ -88,7 +88,7 @@ def turns(monkeypatch):
     release = asyncio.Event()
 
     class CountingHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -316,7 +316,7 @@ async def test_a_paused_schedule_whose_run_failed_runs_the_slot_it_left_due_once
     started: list[str] = []
 
     class PausedThenFailingHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):

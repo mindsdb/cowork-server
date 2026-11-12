@@ -875,7 +875,9 @@ async def _execute_schedule(
             # The schedule-derived principal is what lets the turn (and the
             # remote backend's per-tenant key mint) run in org mode with no
             # request in flight. The handler opens its own short sessions.
-            stream = await ResponsesHandler(principal=scheduled.principal, interactive=False).handle(request)
+            stream = await ResponsesHandler(
+                principal=scheduled.principal, interactive=False, schedule_id=str(schedule_id),
+            ).handle(request)
             # handle() returns once it has started the turn's producer, which
             # saves the question first. A refusal before that, such as the
             # vault restore's or the turn start's read, leaves nothing done.
@@ -1362,13 +1364,22 @@ def _run_duration_limit() -> float:
     this catches one that keeps going without finishing. Set by
     COWORK_SCHEDULED_RUN_MAX_SECONDS. When turns run in pods, never shorter
     than the controller's own bound on a turn plus the setup before it, so a
-    turn that used its whole budget ends on the controller's terms.
+    turn that used its whole budget ends on the controller's terms. With a
+    turn time limit set, that bound is the turn key's window: a scheduled turn
+    can't answer "Keep going", so anton hands back at the limit, after a last
+    cell and the summary, all inside one window.
     """
-    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
 
     limit = get_app_settings().scheduled_run_max_seconds
     if get_backend() == "redis":
-        return max(limit, _REMOTE_TURN_BUDGET_SECONDS + _REMOTE_SETUP_MARGIN_SECONDS)
+        turnqueue = TurnQueueSettings()
+        turn_bound = (
+            turnqueue.turn_key_lifetime_seconds
+            if turnqueue.time_limit_seconds > 0
+            else _REMOTE_TURN_BUDGET_SECONDS
+        )
+        return max(limit, turn_bound + _REMOTE_SETUP_MARGIN_SECONDS)
     return limit
 
 

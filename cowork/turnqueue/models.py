@@ -78,7 +78,7 @@ class TurnJob(BaseModel):
     """Mirror of scratchpad-controller ScratchpadJobPayload (job the controller consumes).
 
     ``params`` carries an ``llm`` block minted per turn by
-    ``cowork.turnqueue.producer._mint_llm_block``:
+    ``cowork.turnqueue.producer.mint_llm_block``:
     ``{"provider": "minds-cloud", "api_key": <short-TTL mdb_ turn key>,
     "base_url": <MindsHub chat base URL>}``. MVP is MindsHub-inference-only, so
     this is the only provider/credential shape carried here. The key is scoped
