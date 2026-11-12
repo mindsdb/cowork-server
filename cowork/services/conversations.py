@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import stat
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
@@ -32,7 +32,7 @@ from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.conversations import ConversationItemsPage
 from cowork.schemas.figure_sources import EarlierAnswer
-from cowork.schemas.responses import Role
+from cowork.schemas.responses import Role, TurnPick
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
@@ -646,6 +646,36 @@ class ConversationService:
         self.session.commit()
         self.session.refresh(conversation)
         return conversation
+
+    def record_turn_picks(
+        self,
+        *,
+        conversation: Conversation,
+        model: str | None,
+        reasoning_effort: str | None,
+        reset: Collection[TurnPick] = (),
+    ) -> None:
+        """Save a turn's model and reasoning-effort picks as the conversation's
+        own, so a reopened chat comes back on the latest ones.
+
+        A pick the turn leaves out keeps the saved value. Cowork's renderer
+        sends no model for a pinned model its picker no longer offers
+        (`offeredModelId`, e.g. one the wallet locks), and that turn must not
+        wipe the pin a top-up brings back. A pick named in `reset` that the
+        turn leaves out is cleared instead: the user went back to Model Router
+        or the default effort. A pick the turn sends wins over its reset.
+        Commits only on a change.
+        """
+        picks = (
+            model or (None if "model" in reset else conversation.model),
+            reasoning_effort or (None if "reasoning_effort" in reset else conversation.reasoning_effort),
+        )
+        if picks == (conversation.model, conversation.reasoning_effort):
+            return
+        conversation.model, conversation.reasoning_effort = picks
+        self.session.add(conversation)
+        self.session.commit()
+        self.session.refresh(conversation)
 
     def update_history_compaction(
         self,
