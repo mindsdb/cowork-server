@@ -15,8 +15,8 @@ app and self-hosted deployments; only the credential differs.
 | `PATCH /api/v1/schedules/{id}` | Changes the fields you send. `PUT` does the same |
 | `DELETE /api/v1/schedules/{id}` | Deletes the task and its run history. Answers 204 |
 | `POST /api/v1/schedules/{id}/pause` | Stops it running until resumed |
-| `POST /api/v1/schedules/{id}/resume` | Starts it running again |
-| `POST /api/v1/schedules/{id}/run-now` | Starts a run now. Answers 202 with the run's `conversation_id` |
+| `POST /api/v1/schedules/{id}/resume` | Starts it running again. Answers 409 for a one-time task whose time has passed |
+| `POST /api/v1/schedules/{id}/run-now` | Starts a run now. Answers 202 with the run's `conversation_id`, or 409 if the task is already running or too many tasks are running |
 | `GET /api/v1/schedules/{id}/runs` | Its runs, newest first: `{"runs": [...]}`. `?limit=` defaults to 100 |
 | `GET /api/v1/conversations/{conversation_id}/items` | What a run wrote: the prompt, then the agent's answer |
 
@@ -37,9 +37,29 @@ A task has:
   general project.
 - `model` (optional): leave it out to run on your account's default models.
 
-A run has a `status` of `running`, `success`, `failed` or `cancelled`, its
-`conversationId`, `startedAt`, `finishedAt`, `durationMs` and, when it failed,
-`error`.
+A task in a response also has:
+
+- `state`: `active`, `paused`, `auto_paused`, `missed` or `done`. A task
+  pauses itself (`auto_paused`) after three failed runs in a row. A one-time
+  task is `missed` when its time passed while nothing could run it, and `done`
+  once it has run. Resume a paused task with `/resume`.
+- `running`: whether a run is going now.
+- `runCount` and `lastRun`: how many runs it has had, and the latest finished
+  one.
+
+A run has:
+
+- `status`: `running`, `success`, `failed` or `cancelled`.
+- `outcome`, once it ends: `completed`, `failed_before_execution`,
+  `failed_during_execution`, `interrupted`, `cancelled` or `uncertain`. Only
+  `failed_before_execution` means the agent did nothing, so a failed run with
+  any other outcome may have acted.
+- `trigger`: `cron`, `manual` (run-now) or `trial`.
+- `conversationId`, `startedAt`, `finishedAt`, `durationMs` and, when it
+  failed, `error`.
+
+A run is stopped once it passes the deployment's time limit, 30 minutes by
+default. It then ends `failed` with outcome `interrupted`.
 
 ## Credentials
 
@@ -122,7 +142,6 @@ The server describes every route in OpenAPI.
   run finishes.
 - **No cost on a run.** A run doesn't report its cost or tokens, and its output
   is only in its conversation.
-- **Only four statuses.** A run is `success`, `failed`, `cancelled` or
-  `running`. It doesn't yet say whether a failed run acted before it failed, or
-  which version of the task it ran. The scheduled-task reliability work adds
-  both.
+- **No task version on a run.** A run doesn't say which version of the
+  task's prompt and settings it ran, so an edit made after a run isn't
+  visible from that run.
