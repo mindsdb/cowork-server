@@ -33,6 +33,7 @@ from cowork.db.scoped import (
     scope_from_principal,
 )
 from cowork.handlers.addon_route import (
+    budget_deadline,
     clean_local_key,
     queued,
     rate_limit_refusal,
@@ -645,11 +646,15 @@ async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
     takes messages mid-task (its "ready" step) is offered one; Jev decides
     here, before anything reaches the pod; then the message is queued for the
     pod's stdin on the turn's answer queue and the status is the pod's own
-    verdict, waited for up to turnqueue.addons.ADDON_ACK_TIMEOUT_S: "added",
+    verdict, waited for up to turnqueue.addons.ADDON_ACK_TIMEOUT_S (and never
+    past the request's budget, addon_route.ADDON_BUDGET_S): "added",
     or queued as no_turn when the pod's turn refused it (it is ending) and as
     pod_timeout when no verdict came (a withdraw of it is queued too, so a
     late add can't also run as the next task).
     """
+    # Every stage below answers within ADDON_BUDGET_S of here (the app waits
+    # 10 s): out of time, it answers queued with that stage's reason.
+    deadline = budget_deadline()
     _require_streaming_scope(scope)
     settings = TurnQueueSettings()
     remote = settings.is_remote
@@ -708,8 +713,11 @@ async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
             force=req.force,
             scope=scope,
             local_key=local_key,
+            deadline=deadline,
         )
-    return await route_addon(channel=channel, text=text, force=req.force, scope=scope, local_key=local_key)
+    return await route_addon(
+        channel=channel, text=text, force=req.force, scope=scope, local_key=local_key, deadline=deadline,
+    )
 
 
 class AddonWithdrawRequest(BaseModel):

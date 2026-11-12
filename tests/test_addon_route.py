@@ -386,6 +386,14 @@ async def test_a_held_decision_lock_queues_as_busy(client, session, monkeypatch)
     assert session.inputs == []
 
 
+async def test_a_slow_jev_is_jev_timeout_within_the_budget(client, session, jev, monkeypatch):
+    """Jev's own timeout is cut to what is left of the request's 8 s."""
+    monkeypatch.setattr(addon_route, "ADDON_BUDGET_S", 0.2)
+    jev(_Client(response=_Response(200, _verdict()), delay=2.0))
+    assert _post(client).json() == {"status": "queued", "reason": "jev_timeout"}
+    assert session.inputs == []
+
+
 # ── The app's ids ──────────────────────────────────────────────────────────
 
 

@@ -198,6 +198,7 @@ async def submit_remote_addon(
     text: str,
     decided_by: str,
     local_key: str | None = None,
+    deadline: float | None = None,
     r: aioredis.Redis | None = None,
     ack_timeout_s: float = ADDON_ACK_TIMEOUT_S,
 ) -> tuple[RemoteAddonResult, str]:
@@ -209,7 +210,11 @@ async def submit_remote_addon(
     covers a verdict that never came and a Redis error once the entry may be
     queued; both also queue a withdraw of it. An older scratchpad-controller
     drops the entry, which reads as TIMEOUT. Every answer but ADDED after the
-    push marks the addon abandoned, so a late pod step for it is dropped."""
+    push marks the addon abandoned, so a late pod step for it is dropped.
+
+    *deadline* (time.monotonic()) is the request's own: the wait for the
+    pod ends by it too, as TIMEOUT, and one already past before the push
+    pushes nothing."""
     r = r or get_redis()
     addon_id = uuid.uuid4().hex
     entry = addon_entry(addon_id=addon_id, text=text, decided_by=decided_by)
@@ -226,6 +231,11 @@ async def submit_remote_addon(
         logger.warning("addon not queued: Redis failed conversation=%s correlation_id=%s",
                        conversation_id, correlation_id, exc_info=True)
         return RemoteAddonResult.REDIS_ERROR, addon_id
+    if deadline is not None:
+        ack_timeout_s = min(ack_timeout_s, deadline - time.monotonic())
+        if ack_timeout_s <= 0:
+            await _set_status_quietly(r, correlation_id, addon_id, _ABANDONED)
+            return RemoteAddonResult.TIMEOUT, addon_id
     try:
         await _push(r, correlation_id, entry)
         verdict = await _wait_for(

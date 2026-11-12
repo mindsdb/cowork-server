@@ -109,6 +109,7 @@ def pod(monkeypatch):
     state = {"result": RemoteAddonResult.ADDED, "withdraw": RemoteWithdrawResult.WITHDRAWN, "calls": calls}
 
     async def fake_submit(**kwargs):
+        kwargs.pop("deadline")
         calls.append(kwargs)
         return state["result"], ADDON_ID
 
@@ -394,7 +395,7 @@ async def test_the_decision_lock_times_out_as_busy(monkeypatch):
     from cowork.db.scoped import LOCAL_SCOPE
 
     monkeypatch.setattr(addon_route, "DECIDE_LOCK_TIMEOUT_S", 0.05)
-    async with addon_route._deciding("corr-1"):
+    async with addon_route._deciding("corr-1", addon_route.budget_deadline()):
         result = await addon_route.route_remote_addon(
             conversation_id=CID, correlation_id="corr-1", text="x", force=True, scope=LOCAL_SCOPE,
         )
@@ -408,7 +409,7 @@ async def test_the_lock_entry_outlives_a_waiter():
     order = []
 
     async def hold(name, delay):
-        async with addon_route._deciding("corr-1"):
+        async with addon_route._deciding("corr-1", addon_route.budget_deadline()):
             order.append(name)
             await asyncio.sleep(delay)
 
@@ -648,3 +649,102 @@ async def test_the_web_relay_streams_and_saves_only_this_turns_addons(monkeypatc
     ]
     # "ready" is recorded for /addon's support check, never streamed.
     assert await remote_addons.remote_addons_ready(seen["corr"], r=fake) is True
+
+
+# ── One budget for the whole request (8 s; the app waits 10 s) ─────────────
+
+
+async def test_the_lock_wait_never_passes_the_budget(monkeypatch):
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    async with addon_route._deciding("corr-1", addon_route.budget_deadline()):
+        started = asyncio.get_running_loop().time()
+        result = await addon_route.route_remote_addon(
+            conversation_id=CID, correlation_id="corr-1", text="x", force=True, scope=LOCAL_SCOPE,
+            deadline=addon_route.time.monotonic() + 0.05,
+        )
+    assert result == {"status": "queued", "reason": "busy"}
+    assert asyncio.get_running_loop().time() - started < 1
+
+
+def test_the_budget_fits_inside_the_apps_wait():
+    assert addon_route.ADDON_BUDGET_S == 8
+    assert addon_route.DECIDE_LOCK_TIMEOUT_S < addon_route.ADDON_BUDGET_S
+
+
+async def test_a_slow_jev_stage_is_jev_timeout_and_reaches_no_pod(monkeypatch, redis_side):
+    """Reading Jev's inputs, minting and asking Jev share what is left."""
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    submitted = []
+
+    async def slow_inputs(**kwargs):
+        await asyncio.sleep(5)
+
+    async def submit(**kwargs):
+        submitted.append(kwargs)
+        return RemoteAddonResult.ADDED, ADDON_ID
+
+    monkeypatch.setattr(addon_route, "_remote_jev_inputs", slow_inputs)
+    monkeypatch.setattr(addon_route, "submit_remote_addon", submit)
+    result = await addon_route.route_remote_addon(
+        conversation_id=CID, correlation_id="corr-1", text="x", force=False, scope=LOCAL_SCOPE,
+        deadline=addon_route.time.monotonic() + 0.1,
+    )
+    assert result == {"status": "queued", "reason": "jev_timeout"}
+    assert submitted == []
+
+
+async def test_jevs_own_timeout_is_cut_to_the_budget(monkeypatch):
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    seen = {}
+
+    async def decide(**kwargs):
+        seen["timeout"] = kwargs["timeout_seconds"]
+        return jev_route.AddonRoute(error="timeout")
+
+    async def target(fn):
+        return TARGET, "jev"
+
+    monkeypatch.setattr("cowork.db.units.run_on_unit_threads", target)
+    monkeypatch.setattr(jev_route, "decide_addon", decide)
+    result = await addon_route._jev_refusal(
+        conversation_id=CID, task="t", progress=[], added=[], text="x", scope=LOCAL_SCOPE,
+        deadline=addon_route.time.monotonic() + 1.0,
+    )
+    assert result == {"status": "queued", "reason": "jev_timeout"}
+    assert 0 < seen["timeout"] <= 1.0
+
+
+async def test_the_pod_wait_ends_with_the_budget_and_withdraws(monkeypatch):
+    import fakeredis.aioredis
+
+    from cowork.turnqueue.addons import submit_remote_addon
+
+    r = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    started = asyncio.get_running_loop().time()
+    result, addon_id = await submit_remote_addon(
+        conversation_id="conv-1", correlation_id="corr-1", text="x", decided_by="user", r=r,
+        deadline=addon_route.time.monotonic() + 0.2,
+    )
+    assert result is RemoteAddonResult.TIMEOUT
+    assert asyncio.get_running_loop().time() - started < 2
+    kinds = [json.loads(raw)["kind"] for raw in await r.lrange("cowork:answer:corr-1", 0, -1)]
+    assert kinds == ["addon", "addon_withdraw"]
+    assert json.loads(await r.hget("cowork:addons:corr-1", addon_id))["status"] == "abandoned"
+
+
+async def test_no_budget_left_before_the_push_pushes_nothing():
+    import fakeredis.aioredis
+
+    from cowork.turnqueue.addons import submit_remote_addon
+
+    r = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    result, addon_id = await submit_remote_addon(
+        conversation_id="conv-1", correlation_id="corr-1", text="x", decided_by="user", r=r,
+        deadline=addon_route.time.monotonic() - 1,
+    )
+    assert result is RemoteAddonResult.TIMEOUT
+    assert await r.llen("cowork:answer:corr-1") == 0
+    assert json.loads(await r.hget("cowork:addons:corr-1", addon_id))["status"] == "abandoned"

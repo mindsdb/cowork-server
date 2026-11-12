@@ -78,9 +78,14 @@ QueuedReason = Literal[
     "internal",        # anything else (settings, minting a key, anton raised)
 ]
 
+#: The whole of one POST /addon, from the endpoint to its answer: lock wait,
+#: Jev (with any key mint) and, remote, the pod's ack. The app gives up
+#: after 10 s, so the server answers first: a stage the budget runs out in
+#: answers queued with that stage's reason (busy, jev_timeout, pod_timeout).
+ADDON_BUDGET_S = 8.0
 #: How long a message waits for the one before it on the same turn to be
-#: decided. A decision is a Jev call (seconds) plus, remote, the pod's ack.
-DECIDE_LOCK_TIMEOUT_S = 10.0
+#: decided, at most: half the budget, leaving the rest for its own decision.
+DECIDE_LOCK_TIMEOUT_S = 4.0
 #: POST /addon calls one person may make per window, across their turns.
 ADDON_RATE_LIMIT = 30
 ADDON_RATE_WINDOW_S = 60
@@ -235,15 +240,41 @@ async def rate_limit_refusal(scope: TenantScope, *, remote: bool) -> dict | None
     return queued("rate_limited") if over else None
 
 
+def budget_deadline() -> float:
+    """The loop-clock time one POST /addon must answer by (ADDON_BUDGET_S)."""
+    return time.monotonic() + ADDON_BUDGET_S
+
+
+def _left(deadline: float) -> float:
+    return deadline - time.monotonic()
+
+
+async def _staged(deadline: float, reason: QueuedReason, make) -> dict | None:
+    """Run the stage ``make()`` in what is left of the budget; queued with
+    *reason* when the budget runs out first."""
+    left = _left(deadline)
+    if left <= 0:
+        return queued(reason)
+    try:
+        async with asyncio.timeout(left) as stage:
+            return await make()
+    except TimeoutError:
+        if not stage.expired():
+            raise
+        logger.info("[addon] the request's budget ran out; queueing as %s", reason)
+        return queued(reason)
+
+
 class _Busy(Exception):
-    """The turn's decision lock did not free within DECIDE_LOCK_TIMEOUT_S."""
+    """The turn's decision lock did not free in time."""
 
 
 @asynccontextmanager
-async def _holding(lock: asyncio.Lock):
-    """Hold *lock*, waiting at most DECIDE_LOCK_TIMEOUT_S for it (_Busy)."""
+async def _holding(lock: asyncio.Lock, deadline: float):
+    """Hold *lock*, waiting at most DECIDE_LOCK_TIMEOUT_S for it, and never
+    past *deadline* (_Busy)."""
     try:
-        async with asyncio.timeout(DECIDE_LOCK_TIMEOUT_S):
+        async with asyncio.timeout(min(DECIDE_LOCK_TIMEOUT_S, _left(deadline))):
             await lock.acquire()
     except TimeoutError:
         raise _Busy from None
@@ -258,18 +289,20 @@ async def _holding(lock: asyncio.Lock):
 
 async def route_addon(
     *, channel: AddonChannel, text: str, force: bool, scope: TenantScope, local_key: str | None = None,
+    deadline: float | None = None,
 ) -> dict:
-    """Add *text* to the turn *channel* belongs to, or say why it is queued.
-    Never raises."""
+    """Add *text* to the turn *channel* belongs to, or say why it is queued,
+    by *deadline* (budget_deadline() when not given). Never raises."""
+    deadline = budget_deadline() if deadline is None else deadline
     try:
-        async with _holding(channel.deciding):
+        async with _holding(channel.deciding, deadline):
             limit = channel.limit_reason(text)
             if limit is not None:
                 return queued(limit)
             if force:
                 addon_id = channel.add(text, decided_by="user", local_key=local_key)
                 return added(addon_id, "user") if addon_id else queued("no_turn")
-            return await _ask_jev(channel=channel, text=text, scope=scope, local_key=local_key)
+            return await _ask_jev(channel=channel, text=text, scope=scope, local_key=local_key, deadline=deadline)
     except _Busy:
         return queued("busy")
     except Exception:
@@ -279,15 +312,19 @@ async def route_addon(
         return queued("internal")
 
 
-async def _ask_jev(*, channel: AddonChannel, text: str, scope: TenantScope, local_key: str | None) -> dict:
-    refusal = await _jev_refusal(
+async def _ask_jev(
+    *, channel: AddonChannel, text: str, scope: TenantScope, local_key: str | None, deadline: float,
+) -> dict:
+    refusal = await _staged(deadline, "jev_timeout", partial(
+        _jev_refusal,
         conversation_id=channel.conversation_id,
         task=channel.task,
         progress=channel.progress(),
         added=channel.added_texts(),
         text=text,
         scope=scope,
-    )
+        deadline=deadline,
+    ))
     if refusal is not None:
         return refusal
     addon_id = channel.add(text, decided_by="jev", local_key=local_key)
@@ -296,6 +333,7 @@ async def _ask_jev(*, channel: AddonChannel, text: str, scope: TenantScope, loca
 
 async def _jev_refusal(
     *, conversation_id: str, task: str, progress: list[str], added: list[str], text: str, scope: TenantScope,
+    deadline: float | None = None,
 ) -> dict | None:
     """Ask Jev whether *text* belongs to the running task. None when it does,
     else the queued response saying why not."""
@@ -330,9 +368,15 @@ async def _jev_refusal(
             target, model = jev_route.JevTarget.mindshub(block["base_url"], block["api_key"]), found.model
         else:
             target, model = found
+        timeout_s = queue_settings.jev_route_timeout_seconds
+        if deadline is not None:
+            # Jev's own timeout, cut to the request's budget, so a slow Jev
+            # comes back as its own timeout verdict rather than a cancel.
+            timeout_s = max(0.001, min(timeout_s, _left(deadline)))
         return await _ask_jev_with(
             target=target, model=model, conversation_id=conversation_id,
             task=task, progress=progress, added=added, text=text, queue_settings=queue_settings,
+            timeout_s=timeout_s,
         )
     finally:
         if minted_for is not None:
@@ -352,7 +396,7 @@ def minted_key_ttl(settings: TurnQueueSettings) -> int:
 
 async def _ask_jev_with(
     *, target: jev_route.JevTarget, model: str, conversation_id: str, task: str,
-    progress: list[str], added: list[str], text: str, queue_settings: TurnQueueSettings,
+    progress: list[str], added: list[str], text: str, queue_settings: TurnQueueSettings, timeout_s: float,
 ) -> dict | None:
     # Scrubbed like the route gate's history: the state leaves this server.
     # The task and each added message are cut to MAX_ADDON_CHARS (the new
@@ -376,7 +420,7 @@ async def _ask_jev_with(
             target=target,
             state=state,
             model=model,
-            timeout_seconds=queue_settings.jev_route_timeout_seconds,
+            timeout_seconds=timeout_s,
             min_p_add=queue_settings.addon_min_p_add,
         )
     finally:
@@ -412,13 +456,13 @@ _remote_deciding: dict[str, _TurnLock] = {}
 
 
 @asynccontextmanager
-async def _deciding(correlation_id: str):
+async def _deciding(correlation_id: str, deadline: float):
     entry = _remote_deciding.get(correlation_id)
     if entry is None:
         entry = _remote_deciding[correlation_id] = _TurnLock(asyncio.Lock())
     entry.users += 1
     try:
-        async with _holding(entry.lock):
+        async with _holding(entry.lock, deadline):
             yield
     finally:
         entry.users -= 1
@@ -491,15 +535,29 @@ _REMOTE_ADD_FAILURES: dict[RemoteAddonResult, QueuedReason] = {
 }
 
 
+async def _remote_jev_refusal(
+    *, conversation_id: str, correlation_id: str, text: str, scope: TenantScope, deadline: float,
+) -> dict | None:
+    task, progress, already = await _remote_jev_inputs(
+        conversation_id=conversation_id, correlation_id=correlation_id, scope=scope,
+    )
+    return await _jev_refusal(
+        conversation_id=conversation_id, task=task, progress=progress,
+        added=already, text=text, scope=scope, deadline=deadline,
+    )
+
+
 async def route_remote_addon(
     *, conversation_id: str, correlation_id: str, text: str, force: bool, scope: TenantScope,
-    local_key: str | None = None,
+    local_key: str | None = None, deadline: float | None = None,
 ) -> dict:
     """``route_addon`` for a turn that runs in a pod: decide with Jev here
     (``force`` skips it), then hand the message to the pod and return its
-    verdict (``turnqueue/addons.py``). Never raises."""
+    verdict (``turnqueue/addons.py``), all by *deadline* (budget_deadline()
+    when not given). Never raises."""
+    deadline = budget_deadline() if deadline is None else deadline
     try:
-        async with _deciding(correlation_id):
+        async with _deciding(correlation_id, deadline):
             count, total_bytes = await remote_addon_totals(correlation_id)
             limit = turn_limit_reason(count=count, total_bytes=total_bytes, text=text)
             if limit is not None:
@@ -507,19 +565,17 @@ async def route_remote_addon(
             if force:
                 decided_by = "user"
             else:
-                task, progress, already = await _remote_jev_inputs(
-                    conversation_id=conversation_id, correlation_id=correlation_id, scope=scope,
-                )
-                refusal = await _jev_refusal(
-                    conversation_id=conversation_id, task=task, progress=progress,
-                    added=already, text=text, scope=scope,
-                )
+                # What Jev reads, a minted key and Jev itself: one stage.
+                refusal = await _staged(deadline, "jev_timeout", partial(
+                    _remote_jev_refusal, conversation_id=conversation_id, correlation_id=correlation_id,
+                    text=text, scope=scope, deadline=deadline,
+                ))
                 if refusal is not None:
                     return refusal
                 decided_by = "jev"
             result, addon_id = await submit_remote_addon(
                 conversation_id=conversation_id, correlation_id=correlation_id,
-                text=text, decided_by=decided_by, local_key=local_key,
+                text=text, decided_by=decided_by, local_key=local_key, deadline=deadline,
             )
     except _Busy:
         return queued("busy")
