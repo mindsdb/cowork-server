@@ -525,9 +525,14 @@ def test_a_stale_revision_is_409_in_the_draft_puts_shape(client, fake_anton, art
 
 
 def test_without_anton_support_the_route_is_501_and_the_capability_false(client, artifact, monkeypatch):
-    # The anton this repo pins today has no quick editor: no fakes here.
+    # An anton without the quick editor: hide its modules from the import, so
+    # this holds whichever anton is installed.
+    import sys
+
     folder, metadata, artifact_id = artifact
     monkeypatch.setattr(quick_ep, "_owner_workspace", awaitable(lambda *_a: (None, folder, metadata, {"canEdit": True})))
+    monkeypatch.setitem(sys.modules, "anton.core.artifact_editor.quick", None)
+    monkeypatch.setitem(sys.modules, "anton.core.artifact_editor.router", None)
     assert quick_edit_service.anton_quick_edit() is None
 
     response = post(client, artifact_id)
