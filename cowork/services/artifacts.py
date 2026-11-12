@@ -526,6 +526,23 @@ def _published_url_for(
     return ""
 
 
+def _report_id_for(
+    folder: Path,
+    primary: Path | None,
+    *,
+    published_map: dict | None = None,
+) -> str:
+    """The publish service's id for the artifact's live page, "" when it has
+    none. Read beside the URL and under the same rule, so a soft-deleted record
+    that keeps its report_id for a later re-publish reports none. The id is
+    already in the page's URL; the client sends it with its sharing analytics."""
+    pmap = published_map if published_map is not None else _load_published_map(folder)
+    if primary is None or not _published_url_for(folder, primary, published_map=pmap):
+        return ""
+    report_id = pmap[primary.name].get("report_id")
+    return report_id if isinstance(report_id, str) else ""
+
+
 def _modified_state(
     folder: Path,
     primary: Path | None,
@@ -1574,6 +1591,7 @@ def _prepare_artifact_card(
         "publishedUrl": _published_url_for(
             io_folder, primary, published_map=published_map
         ),
+        "reportId": _report_id_for(io_folder, primary, published_map=published_map),
         # Filled by one of the two callers below. Keeping the slot here preserves
         # the canonical response shape and key order.
         "modified": False,
@@ -2233,6 +2251,7 @@ def html_artifacts(*, scope: TenantScope | None) -> list[dict]:
             "path": str(c.path),
             "bytes": c.size,
             "publishedUrl": _published_url_for(c.published_dir, c.path),
+            "reportId": _report_id_for(c.published_dir, c.path),
         }
         for c in newest
     ]

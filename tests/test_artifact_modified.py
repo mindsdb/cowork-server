@@ -695,3 +695,33 @@ def test_fullstack_binary_touch_self_heals(tmp_path: Path):
     assert card["modified"] is False
     healed = json.loads(pub.read_text(encoding="utf-8"))["index.html"]["published_mtime"]
     assert healed >= old + 100
+
+
+# ---------------------------------------------------------------------------
+# The card names the live page's report id, for the client's sharing analytics
+# ---------------------------------------------------------------------------
+
+def _record(root: Path, **entry) -> None:
+    (root / ".published.json").write_text(json.dumps({"index.html": {
+        "report_id": "rid-1", "url": "https://4nton.ai/view/u/rid-1", "published": True, **entry,
+    }}), encoding="utf-8")
+
+
+def test_card_names_the_live_pages_report_id(tmp_path: Path):
+    root = _make_static_html(tmp_path)
+    _record(root)
+    with _patch_scan(tmp_path):
+        card = card_for_folder(root, scope=LOCAL_SCOPE)
+    assert card["reportId"] == "rid-1"
+    assert card["publishedUrl"] == "https://4nton.ai/view/u/rid-1"
+
+
+def test_card_names_no_report_id_without_a_live_page(tmp_path: Path):
+    root = _make_static_html(tmp_path)
+    with _patch_scan(tmp_path):
+        assert card_for_folder(root, scope=LOCAL_SCOPE)["reportId"] == ""
+    # A soft-deleted record keeps its report_id for a later re-publish; the
+    # page is down, so the card names none.
+    _record(root, published=False)
+    with _patch_scan(tmp_path):
+        assert card_for_folder(root, scope=LOCAL_SCOPE)["reportId"] == ""
