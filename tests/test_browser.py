@@ -200,6 +200,19 @@ def app_browser():
 
 
 @pytest.fixture(autouse=True)
+def decisions(monkeypatch):
+    """A person whose LLM is MindsHub, with Jev on: the browser has a
+    decisions model. ``model`` and ``mindshub`` change that for one test."""
+    from cowork.handlers import jev_route
+
+    state = SimpleNamespace(model="mindshub", mindshub=True, own=None)
+    monkeypatch.setattr(jev_route, "decisions_model", lambda settings: state.model)
+    monkeypatch.setattr(jev_route, "own_decision_target", lambda settings: state.own)
+    monkeypatch.setattr(svc, "llm_on_mindshub", lambda settings: state.mindshub)
+    return state
+
+
+@pytest.fixture(autouse=True)
 def no_app_browser():
     runtime_credential.clear_browser_host()
     yield
@@ -255,6 +268,11 @@ def web_client(web):
 
 def _as(user: str) -> dict[str, str]:
     return {"X-Test-User": user, "Authorization": f"Bearer jwt-{user}"}
+
+
+def _core(answer: dict) -> dict:
+    """A status answer without what picks the browser's steps."""
+    return {k: answer[k] for k in ("enabled", "available", "status")}
 
 
 def _detail(response) -> tuple[int, str]:
@@ -462,6 +480,76 @@ def test_the_harness_gives_a_desktop_turn_the_apps_browser(app_browser):
     assert asyncio.run(_browser_config(off, channel_context=None, conversation_id="conv-1", project_id=None)) is None
 
 
+def test_without_a_decisions_model_no_turn_gets_the_browser(app_browser, web, decisions):
+    """Every browser step would go back to the model, too slow to offer: the
+    switch stays on, and the browser is off until there is one again."""
+    from cowork.harnesses.anton_harness.harness import _browser_config
+
+    decisions.model = None
+    on = SimpleNamespace(browser_enabled=True)
+    assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)) is None
+    assert svc.turn_block(on, user_id="u", conversation_id="c", project_id=None) is None
+
+
+def test_the_web_offers_the_browser_only_on_mindshub(web, decisions):
+    """The router takes only a MindsHub credential."""
+    decisions.mindshub = False
+    assert svc.turn_block(SimpleNamespace(browser_enabled=True), user_id="u", conversation_id="c", project_id=None) is None
+
+
+def test_the_harness_hands_anton_the_organizations_own_decision_model(app_browser, decisions):
+    """It picks the browser's steps, in this process only, as the launch key
+    stays: the model name is the organization's, or the gate's default."""
+    from anton.core.browser import config as anton_config
+
+    if not hasattr(anton_config, "DecisionsTarget"):
+        pytest.skip("the installed anton predates the host's own decision model")
+    from cowork.handlers.jev_route import JevTarget
+    from cowork.harnesses.anton_harness.harness import _browser_config
+
+    decisions.own = JevTarget(url="https://decide.example.test/v1/systemone", api_key="own-key")
+    for model, expected in (("jev-own", "jev-own"), ("", "jev")):
+        user = SimpleNamespace(browser_enabled=True, decision_model=model)
+        config = asyncio.run(_browser_config(user, channel_context=None, conversation_id="c", project_id=None))
+        assert (config.decisions.url, config.decisions.api_key.get_secret_value(), config.decisions.model) == (
+            "https://decide.example.test/v1/systemone", "own-key", expected,
+        )
+    decisions.own = None
+    config = asyncio.run(_browser_config(user, channel_context=None, conversation_id="c", project_id=None))
+    assert config.decisions is None
+
+
+def test_desktop_status_says_what_picks_the_steps(client, decisions):
+    runtime_credential.set_browser_host(APP_BROWSER)
+    # Anyone on a desktop may set it up.
+    assert client.put("/api/v1/settings/browser_enabled", json={"value": "true"}).status_code == 200
+    answer = client.get("/api/v1/browse/status").json()
+    assert (answer["enabled"], answer["decisions_model"], answer["can_set_decisions_model"]) == (True, "mindshub", True)
+    # Cleared later: the switch stays on, and the browser reads as off.
+    decisions.model = None
+    answer = client.get("/api/v1/browse/status").json()
+    assert (answer["enabled"], answer["available"], answer["decisions_model"]) == (False, True, None)
+
+
+def test_on_the_web_only_an_organization_admin_may_set_up_a_decisions_model(web_client, router, mindshub):
+    from cowork.principal import ORG_MANAGE_ROLE
+
+    member = web_client.get("/api/v1/browse/status", headers=_as("alice")).json()
+    assert member["can_set_decisions_model"] is False
+    web_client.app.dependency_overrides[get_principal] = lambda: Principal(
+        user_id="alice", org_id=ORG, roles=frozenset({ORG_MANAGE_ROLE}),
+    )
+    admin = web_client.get("/api/v1/browse/status", headers=_as("alice")).json()
+    assert admin["can_set_decisions_model"] is True
+
+
+def test_web_status_is_unavailable_off_mindshub_and_asks_nothing(web_client, nothing_goes_out, decisions):
+    decisions.mindshub = False
+    status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
+    assert _core(status.json()) == {"enabled": False, "available": False, "status": "unavailable"}
+    assert nothing_goes_out == []
+
+
 def test_a_channel_turn_gets_no_browser(app_browser):
     """A chat anyone can write to must never drive the desktop owner's
     signed-in browser."""
@@ -542,16 +630,16 @@ def test_a_refused_app_browser_is_logged_without_its_key(caplog):
 def test_desktop_routes_answer_from_the_app_and_call_nothing(client, nothing_goes_out):
     status = client.get("/api/v1/browse/status")
     assert status.status_code == 200
-    assert status.json() == {"enabled": False, "available": False, "status": "unavailable"}
+    assert _core(status.json()) == {"enabled": False, "available": False, "status": "unavailable"}
     svc.BrowseStatus.model_validate(status.json())
 
     runtime_credential.set_browser_host(APP_BROWSER)
-    assert client.get("/api/v1/browse/status").json() == {"enabled": False, "available": True, "status": "running"}
+    assert _core(client.get("/api/v1/browse/status").json()) == {"enabled": False, "available": True, "status": "running"}
     # Available whatever the switch says, so the person can turn it on and off.
     assert client.put("/api/v1/settings/browser_enabled", json={"value": "true"}).status_code == 200
-    assert client.get("/api/v1/browse/status").json() == {"enabled": True, "available": True, "status": "running"}
+    assert _core(client.get("/api/v1/browse/status").json()) == {"enabled": True, "available": True, "status": "running"}
     assert client.put("/api/v1/settings/browser_enabled", json={"value": "false"}).status_code == 200
-    assert client.get("/api/v1/browse/status").json() == {"enabled": False, "available": True, "status": "running"}
+    assert _core(client.get("/api/v1/browse/status").json()) == {"enabled": False, "available": True, "status": "running"}
 
     assert _detail(client.post("/api/v1/browse/provision")) == (409, "unavailable")
     assert _detail(client.post("/api/v1/browse/embed", json={"session_id": "t-abc"})) == (409, "unavailable")
@@ -574,7 +662,7 @@ def test_without_a_router_nothing_goes_out(web_client, monkeypatch, nothing_goes
 
     status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
     assert status.status_code == 200
-    assert status.json() == {"enabled": False, "available": False, "status": "unavailable"}
+    assert _core(status.json()) == {"enabled": False, "available": False, "status": "unavailable"}
     assert _detail(web_client.post("/api/v1/browse/provision", headers=_as("alice"))) == (409, "unavailable")
     embed = web_client.post("/api/v1/browse/embed", headers=_as("alice"), json={"session_id": "t-abc"})
     assert _detail(embed) == (409, "unavailable")
@@ -595,7 +683,7 @@ def test_web_status_reads_the_entitlement_then_the_router(web_client, router, mi
     router.status = "running"
     status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
     assert status.status_code == 200
-    assert status.json() == {"enabled": False, "available": True, "status": "running"}
+    assert _core(status.json()) == {"enabled": False, "available": True, "status": "running"}
     assert mindshub.asked == [("/entitlements/me/", "jwt-alice")]
     assert router.calls == [Call("GET", f"{ROUTER}/_status", None, "Bearer jwt-alice")]
 
@@ -606,7 +694,7 @@ def test_an_account_without_the_browser_is_not_entitled(web_client, router, mind
     mindshub.replies["jwt-alice"] = MindsHubReply(MindsHubAnswer.OK, payload=_entitlements(False))
     status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
     assert status.status_code == 200
-    assert status.json() == {"enabled": False, "available": False, "status": "not_entitled"}
+    assert _core(status.json()) == {"enabled": False, "available": False, "status": "not_entitled"}
     # Read from MindsHub: the router isn't asked.
     assert router.calls == []
 
@@ -634,7 +722,7 @@ def test_web_status_fails_closed_when_mindshub_cant_say(web_client, router, mind
 
 def test_web_status_answers_match_the_model(web_client, router, mindshub):
     answer = web_client.get("/api/v1/browse/status", headers=_as("alice")).json()
-    assert set(answer) == {"enabled", "available", "status"}
+    assert set(answer) == {"enabled", "available", "status", "decisions_model", "can_set_decisions_model"}
     svc.BrowseStatus.model_validate(answer)
 
 
@@ -645,7 +733,7 @@ def test_an_organization_that_turned_the_browser_off_reads_as_organization_off(w
         MindsHubAnswer.OK, payload=_entitlements(False, reason="organization_off"),
     )
     status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
-    assert status.json() == {"enabled": False, "available": False, "status": "organization_off"}
+    assert _core(status.json()) == {"enabled": False, "available": False, "status": "organization_off"}
     assert router.calls == []
 
 
@@ -671,7 +759,7 @@ def test_a_signed_in_desktop_whose_organization_turned_the_browser_off_gets_none
 
     mindshub_teams.reset_caches_for_tests()
     assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)) is None
-    assert client.get("/api/v1/browse/status").json() == {"enabled": False, "available": False, "status": "organization_off"}
+    assert _core(client.get("/api/v1/browse/status").json()) == {"enabled": False, "available": False, "status": "organization_off"}
     assert ("/entitlements/me/", "desktop-jwt") in signed_in_desktop.asked
 
 
@@ -695,7 +783,7 @@ def test_a_desktop_ignores_not_permitted_and_keeps_its_answer_through_an_outage(
 def test_a_desktop_on_the_persons_own_model_key_asks_mindshub_nothing(client, nothing_goes_out, monkeypatch):
     monkeypatch.setattr(svc, "get_minds_credential", lambda: None)
     runtime_credential.set_browser_host(APP_BROWSER)
-    assert client.get("/api/v1/browse/status").json() == {"enabled": False, "available": True, "status": "running"}
+    assert _core(client.get("/api/v1/browse/status").json()) == {"enabled": False, "available": True, "status": "running"}
     assert nothing_goes_out == []
 
 
@@ -730,7 +818,7 @@ def test_provision_hands_the_router_the_prefs_and_answers_like_status(web_client
     # No body still works.
     plain = web_client.post("/api/v1/browse/provision", headers=_as("alice"))
     assert plain.status_code == 200
-    assert plain.json() == {"enabled": False, "available": True, "status": "starting"}
+    assert _core(plain.json()) == {"enabled": False, "available": True, "status": "starting"}
     hinted = web_client.post(
         "/api/v1/browse/provision", headers=_as("alice"),
         json={"timezone": "America/Los_Angeles", "locale": "en-US"},

@@ -2146,19 +2146,30 @@ async def _browser_config(
 
     None for a channel turn: it comes from a chat where people other than the
     desktop's owner can write, and the browser holds the owner's sign-ins.
-    None when the person turned the browser off, when the app registered no
-    browser, which is always the case where more than one person shares this
-    process (cowork.common.settings.runtime_credential.get_browser_host), and
-    when a signed-in desktop's organization turned the browser off, read
-    before each turn (cowork.services.browser.desktop_organization_off).
+    None when the person turned the browser off or there is no decisions
+    model to pick its steps (cowork.services.browser.browser_runs), when the
+    app registered no browser, which is always the case where more than one
+    person shares this process
+    (cowork.common.settings.runtime_credential.get_browser_host), and when a
+    signed-in desktop's organization turned the browser off, read before each
+    turn (cowork.services.browser.desktop_organization_off).
     The web's browser never reaches an in-process turn: web turns run
     remotely, and the producer gives them the router.
-    """
-    if channel_context is not None or not getattr(user, "browser_enabled", False):
-        return None
-    from cowork.services.browser import desktop_browser_config, desktop_organization_off
 
-    config = desktop_browser_config(conversation_id=conversation_id, project_id=project_id)
+    The organization's own decision model, when it set one up, goes with the
+    config: anton then asks it for the browser's steps rather than Jev on
+    MindsHub, as the route gate does (jev_route.gate_mode).
+    """
+    from cowork.services.browser import browser_runs, desktop_browser_config, desktop_organization_off
+
+    if channel_context is not None or not browser_runs(user):
+        return None
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.handlers.jev_route import own_decision_target
+
+    target = own_decision_target(user)
+    decisions = (target, user.decision_model or TurnQueueSettings().jev_route_model) if target else None
+    config = desktop_browser_config(conversation_id=conversation_id, project_id=project_id, decisions=decisions)
     if config is None or await desktop_organization_off():
         return None
     return config

@@ -296,6 +296,42 @@ def test_gate_mode(fields, mode):
     assert jev_route.gate_mode(_user(**fields)) == mode
 
 
+@pytest.mark.parametrize(("fields", "model"), [
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k"}, "mindshub"),
+    # Jev turned off, and no decision model of the organization's own.
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k", "jev_decisions_enabled": False}, None),
+    ({"planning_provider": "anthropic", "anthropic_api_key": "k"}, None),
+    ({"planning_provider": "anthropic", "anthropic_api_key": "k",
+      "decision_model_url": "https://api.typesafe.ai/v1/systemone", "decision_model_api_key": "own"}, "own"),
+    # The organization's own wins over Jev on MindsHub, as in the gate.
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k",
+      "decision_model_url": "https://api.typesafe.ai/v1/systemone", "decision_model_api_key": "own"}, "own"),
+    ({"planning_provider": "anthropic", "anthropic_api_key": "k", "decision_model_api_key": "own"}, None),
+])
+def test_the_browsers_decisions_model(fields, model):
+    settings = _user(**fields)
+    assert jev_route.decisions_model(settings) == model
+    assert jev_route.decisions_available(settings) is (model is not None)
+
+
+@pytest.mark.asyncio
+async def test_probe_sends_one_minimal_decision_to_the_endpoint_as_given(monkeypatch):
+    captured = {}
+    client = _FakeAsyncClient(response=_FakeResponse(200, _body()), captured=captured)
+    monkeypatch.setattr(jev_route, "_http_client", lambda: client)
+    target = jev_route.JevTarget(url="https://api.typesafe.ai/v1/systemone", api_key="own")
+
+    result = await jev_route.probe(target, model="jev", timeout_seconds=1.0)
+
+    assert result.error == ""
+    assert captured["url"] == "https://api.typesafe.ai/v1/systemone"
+    assert captured["headers"] == {"Authorization": "Bearer own"}
+    assert captured["json"]["state"] == {"latest_user_message": "Hello", "earlier_conversation": []}
+    bad = _FakeAsyncClient(response=_FakeResponse(401, {}))
+    monkeypatch.setattr(jev_route, "_http_client", lambda: bad)
+    assert (await jev_route.probe(target, model="jev", timeout_seconds=1.0)).error == "http_401"
+
+
 def test_own_decision_target_unwraps_the_key_and_trims_the_url():
     settings = _user(decision_model_url=" https://api.typesafe.ai/v1/systemone ", decision_model_api_key="own-key")
 

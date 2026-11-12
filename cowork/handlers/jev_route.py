@@ -217,6 +217,37 @@ def gate_mode(settings) -> GateMode:
     return "jev" if settings.jev_decisions_enabled else "off"
 
 
+DecisionsModel = Literal["mindshub", "own"]
+
+
+def decisions_model(settings) -> "DecisionsModel | None":
+    """What picks the shared browser's steps, from settings alone: the
+    organization's own decision model ("own"), Jev on MindsHub for an LLM on
+    MindsHub that the organization didn't turn Jev off for ("mindshub"), or
+    None. The same precedence as `gate_mode`. Without one every browser step
+    goes back to the LLM, which is too slow to offer, so the browser is off
+    (`decisions_available`)."""
+    mode = gate_mode(settings)
+    if mode == "own":
+        return "own"
+    return "mindshub" if mode == "jev" else None
+
+
+def decisions_available(settings) -> bool:
+    """Whether the shared browser may run: it needs a decisions model."""
+    return decisions_model(settings) is not None
+
+
+async def probe(target: JevTarget, *, model: str, timeout_seconds: float) -> JevRoute:
+    """One minimal route decision, to check a decision endpoint answers
+    before the organization relies on it (Settings' test). Never raises; the
+    result's `error` is empty when the endpoint answered a usable decision."""
+    return await decide(
+        target=target, messages=[{"role": "user", "content": "Hello"}], model=model,
+        timeout_seconds=timeout_seconds, min_p_direct=0.5,
+    )
+
+
 def _elapsed_ms(started: float) -> int:
     return round((time.monotonic() - started) * 1000)
 

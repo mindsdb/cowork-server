@@ -53,6 +53,7 @@ import asyncio
 import hashlib
 import logging
 import re
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
@@ -136,14 +137,22 @@ BrowseState = Literal["none", "starting", "running", "unavailable", "not_entitle
 
 
 class BrowseStatus(BaseModel):
-    """``GET /browse/status``. ``enabled`` is the person's own switch.
-    ``available`` is whether this deployment offers the browser to them,
-    whatever the switch says, so a person who turned it off can turn it back
-    on."""
+    """``GET /browse/status``. ``enabled`` is the person's own switch, read as
+    off while there is no decisions model. ``available`` is whether this
+    deployment offers the browser to them, whatever the switch says, so a
+    person who turned it off can turn it back on.
+
+    ``decisions_model`` is what picks the browser's steps
+    (``jev_route.decisions_model``): None means the browser can't run until
+    someone who may (``can_set_decisions_model``: an organization admin, or
+    anyone on a desktop) sets up a decision model of the organization's own.
+    """
 
     enabled: bool
     available: bool
     status: BrowseState
+    decisions_model: Literal["mindshub", "own"] | None = None
+    can_set_decisions_model: bool = False
 
 
 class RouterStatus(BaseModel):
@@ -648,32 +657,60 @@ async def desktop_organization_off() -> bool:
     return _desktop_organization_off
 
 
-async def browse_status(user_settings: UserSettings, *, bearer: str, org_id: str, user_id: str) -> BrowseStatus:
+def llm_on_mindshub(user_settings: UserSettings) -> bool:
+    """Whether the person's LLM is MindsHub. The web's browser router takes
+    only a MindsHub credential, so the web offers the browser only then."""
+    from cowork.common.settings.user_settings import Provider
+
+    return user_settings.resolved_planning_provider is Provider.MINDS_CLOUD
+
+
+def browser_runs(user_settings: UserSettings) -> bool:
+    """Whether the person's switch is on and the browser can run with it: a
+    decisions model picks its steps (``jev_route.decisions_available``), and
+    on the web the LLM is MindsHub. Otherwise a turn gets no browser,
+    whatever the switch says."""
+    from cowork.handlers.jev_route import decisions_available
+
+    if not user_settings.browser_enabled or not decisions_available(user_settings):
+        return False
+    return llm_on_mindshub(user_settings) if on_web() else True
+
+
+async def browse_status(
+    user_settings: UserSettings, *, bearer: str, org_id: str, user_id: str, can_set_decisions_model: bool = False,
+) -> BrowseStatus:
     """``GET /browse/status`` for the caller.
 
     The desktop answers from the browser the app registered, and a signed-in
     desktop also from its organization's switch (``desktop_organization_off``).
-    On the web without a router there is no browser, and nothing is asked. An
-    account whose organization turned the browser off is ``organization_off``,
-    and one whose entitlement is otherwise off ``not_entitled``, both read from
-    MindsHub before the router is asked. Otherwise the router says how the
-    caller's browser is.
+    On the web without a router, or for a person whose LLM isn't MindsHub,
+    there is no browser, and nothing is asked. An account whose organization
+    turned the browser off is ``organization_off``, and one whose entitlement
+    is otherwise off ``not_entitled``, both read from MindsHub before the
+    router is asked. Otherwise the router says how the caller's browser is.
+    Every answer says what picks the browser's steps, if anything.
     """
-    enabled = user_settings.browser_enabled
+    from cowork.handlers.jev_route import decisions_model
+
+    status = partial(
+        BrowseStatus, enabled=browser_runs(user_settings), decisions_model=decisions_model(user_settings),
+        can_set_decisions_model=can_set_decisions_model,
+    )
     if not on_web():
         if get_browser_host() is None:
-            return BrowseStatus(enabled=enabled, available=False, status="unavailable")
+            return status(available=False, status="unavailable")
         if await desktop_organization_off():
-            return BrowseStatus(enabled=enabled, available=False, status=ORGANIZATION_OFF)
-        return BrowseStatus(enabled=enabled, available=True, status="running")
-    if not router_url():
-        return BrowseStatus(enabled=enabled, available=False, status="unavailable")
+            return status(available=False, status=ORGANIZATION_OFF)
+        return status(available=True, status="running")
+    if not router_url() or not llm_on_mindshub(user_settings):
+        return status(available=False, status="unavailable")
     entitlement = await browser_entitlement(bearer=bearer, org_id=org_id, user_id=user_id)
     if entitlement.disabled_reason == BrowserDisabledReason.ORGANIZATION_OFF:
-        return BrowseStatus(enabled=enabled, available=False, status=ORGANIZATION_OFF)
+        return status(available=False, status=ORGANIZATION_OFF)
     if not entitlement.enabled:
-        return BrowseStatus(enabled=enabled, available=False, status=NOT_ENTITLED)
-    return BrowseStatus(enabled=enabled, available=True, status=(await router_status(bearer)).status)
+        return status(available=False, status=NOT_ENTITLED)
+    return status(available=True, status=(await router_status(bearer)).status)
 
 
 # ── A turn's browser ───────────────────────────────────────────────────────
@@ -688,12 +725,12 @@ def turn_block(
     ``to_dict()`` in the job, which anton reads back with ``from_dict``.
 
     None when this deployment has no router, when the person turned the
-    browser off, and for a turn with no person behind it: an organization's
-    channel turn, which comes from a chat anyone in it can write to, while the
-    browser holds one person's sign-ins.
+    browser off or it can't run (``browser_runs``), and for a turn with no
+    person behind it: an organization's channel turn, which comes from a chat
+    anyone in it can write to, while the browser holds one person's sign-ins.
     """
     router = router_url()
-    if not router or not user_id or not user_settings.browser_enabled:
+    if not router or not user_id or not browser_runs(user_settings):
         return None
     return BrowserConfig(
         base_url=router,
@@ -702,11 +739,31 @@ def turn_block(
     )
 
 
-def desktop_browser_config(*, conversation_id: str, project_id: Any) -> BrowserConfig | None:
+def _decisions_block(decisions: Any) -> dict:
+    """The organization's own decision model as anton's browser takes it,
+    or nothing for none, or for an anton that predates it (its browser then
+    asks Jev on MindsHub, or the model, as before)."""
+    if decisions is None:
+        return {}
+    try:
+        from anton.core.browser.config import DecisionsTarget
+    except ImportError:
+        return {}
+    target, model = decisions
+    return {"decisions": DecisionsTarget(url=target.url, api_key=target.api_key, model=model)}
+
+
+def desktop_browser_config(
+    *, conversation_id: str, project_id: Any, decisions: "tuple[Any, str] | None" = None,
+) -> BrowserConfig | None:
     """An in-process turn's browser: the one the desktop app registered, with
     the task's own session. None when the app registered none. anton's own
     check refuses a malformed address or key; that is logged without either
-    and the turn runs without a browser."""
+    and the turn runs without a browser.
+
+    ``decisions`` is the organization's own decision model, a
+    ``jev_route.JevTarget`` and its model name, which then picks the
+    browser's steps. It stays in this process, as the launch key does."""
     host = get_browser_host()
     if host is None:
         return None
@@ -716,6 +773,7 @@ def desktop_browser_config(*, conversation_id: str, project_id: Any) -> BrowserC
             profile=task_session(None, conversation_id),
             project=project_key(None, project_id),
             token=host.token,
+            **_decisions_block(decisions),
         )
     except ValidationError:
         logger.warning(

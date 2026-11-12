@@ -15,6 +15,10 @@ the router. A refusal from the router keeps its 401, 403 or 429 and its code in
 ``detail``; any other router failure is 424 with the router's code. The router
 answers a turn key ``person_only`` on every route here.
 
+Status also says what picks the browser's steps, its decisions model, and
+whether the caller may set one up: without one the browser doesn't run, and
+its switch reads as off.
+
 Approve doesn't answer the chat card: the web app calls it first and answers
 the card only once the browser recorded the approval. The card's Skip, and any
 answer but Approve, sends decline, best effort: the step stays held either way.
@@ -37,13 +41,15 @@ from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_on_unit_threads
-from cowork.principal import mindshub_credential
+from cowork.handlers.jev_route import decisions_model
+from cowork.principal import Principal, can_manage_org, get_principal, mindshub_credential
 from cowork.services import browser as browser_service
 from cowork.services.browser_contract import SESSION_ID
 
 router = APIRouter()
 
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+PrincipalDep = Annotated[Principal | None, Depends(get_principal)]
 
 
 class ProvisionRequest(BaseModel):
@@ -93,11 +99,14 @@ def _raise(exc: browser_service.BrowserServiceError) -> NoReturn:
     "/status", response_model=browser_service.BrowseStatus,
     dependencies=[Depends(require(AuthenticatedInOrgMode))],
 )
-async def browse_status(request: Request, scope: ScopeDep) -> browser_service.BrowseStatus:
+async def browse_status(request: Request, scope: ScopeDep, principal: PrincipalDep) -> browser_service.BrowseStatus:
     try:
         return await browser_service.browse_status(
             await run_on_unit_threads(partial(get_user_settings, scope)), bearer=mindshub_credential(request),
             org_id=scope.org_id or "", user_id=scope.user_id or "",
+            # Who may set the decision model, as the settings routes decide
+            # who may write an organization setting.
+            can_set_decisions_model=not scope.org_mode or can_manage_org(principal),
         )
     except browser_service.BrowserServiceError as exc:
         _raise(exc)
@@ -118,7 +127,10 @@ async def browse_provision(
     except browser_service.BrowserServiceError as exc:
         _raise(exc)
     # The router started it for the caller, so it is theirs to use.
-    return browser_service.BrowseStatus(enabled=bool(user.browser_enabled), available=True, status=warmed.status)
+    return browser_service.BrowseStatus(
+        enabled=browser_service.browser_runs(user), available=True, status=warmed.status,
+        decisions_model=decisions_model(user),
+    )
 
 
 @router.post(

@@ -1971,7 +1971,12 @@ def browser_router(monkeypatch, org_deployment):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
-    settings = SimpleNamespace(browser_enabled=True, resolved_planning_model="m", hub_workspace_id="")
+    # On MindsHub with Jev on: the browser has a decisions model.
+    settings = SimpleNamespace(
+        browser_enabled=True, resolved_planning_model="m", hub_workspace_id="",
+        resolved_planning_provider=user_settings.Provider.MINDS_CLOUD, jev_decisions_enabled=True,
+        decision_model_url="", decision_model_api_key=None,
+    )
     monkeypatch.setattr(user_settings, "get_user_settings", lambda scope=None: settings)
     state = SimpleNamespace(fake=fake, settings=settings, scoped=[], refuse=None)
 
@@ -2060,14 +2065,21 @@ async def test_an_unexpected_scope_error_still_queues_the_turn_without_a_browser
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["no person", "browser off"])
+@pytest.mark.parametrize("case", ["no person", "browser off", "no decisions model", "not on MindsHub"])
 async def test_a_turn_without_a_browser_scopes_its_key_to_nothing(browser_router, case):
-    """A channel turn has no person behind it, and a person can turn the
-    browser off: neither carries a block, and each still binds its key to no
-    session first, so code in the turn holding the key can't scope it to a
-    session of its own."""
+    """A channel turn has no person behind it, a person can turn the browser
+    off, and with Jev turned off and no decision model of the organization's
+    own, or an LLM other than MindsHub, it can't run: none carries a block,
+    and each still binds its key to no session first, so code in the turn
+    holding the key can't scope it to a session of its own."""
+    from cowork.common.settings.user_settings import Provider
+
     if case == "browser off":
         browser_router.settings.browser_enabled = False
+    elif case == "no decisions model":
+        browser_router.settings.jev_decisions_enabled = False
+    elif case == "not on MindsHub":
+        browser_router.settings.resolved_planning_provider = Provider.ANTHROPIC
     await _web_turn(user_id=None if case == "no person" else "u1")
 
     assert browser_router.scoped == [("mdb_turnkey", None, 0)]
