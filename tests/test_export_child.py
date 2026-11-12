@@ -67,7 +67,13 @@ MIB = 1024 * 1024
 RUNNER_LOGGER = "cowork.services.export_runner"
 LIVE = "/api/v1/health/live"
 
-HOSTILE_TIME_CASES = ("md-unclosed-fences", "md-reference-brackets", "md-open-brackets")
+# Repeated headings cost TocExtension quadratic time: 256 KiB of them runs for minutes.
+HOSTILE_TIME_CASES = (
+    "md-unclosed-fences",
+    "md-reference-brackets",
+    "md-open-brackets",
+    "md-headings",
+)
 
 # Every test here starts real conversion processes, which import cowork from
 # the interpreter's own site-packages.
