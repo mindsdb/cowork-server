@@ -80,10 +80,15 @@ Formats:
 Steps:
 1. Open the artifact and read how it is built before changing anything.
 2. Fetch each data source above.
-3. Replace the old values with the new ones in place, in the formats above,
-   and update its "last updated" time if it shows one.
-4. If a source fails or returns nothing, keep that section's previous data and
-   say which source failed. Don't remove sections or leave charts empty.
+3. Replace the old values with the new ones in place, in the formats above.
+   A successful query with no rows is valid data: remove stale rows and show
+   an empty state in the existing table or chart. Use zero for counts when
+   appropriate; don't turn missing or undefined measurements into zero.
+4. If fetching a source fails, keep that section's previous data, visibly mark
+   it as stale, and say which source failed. Preserve its last successful
+   update time. Update "last updated" only for successfully refreshed data;
+   don't advance an artifact-wide freshness time when any section is stale.
+   Keep the sections and chart layout even when their data is empty.
 ```
 
 If the artifact is published, add a step: "5. Publish it again with
@@ -100,6 +105,8 @@ keeps the shared link current.
   choose this artifact's project.
 
 Once the task exists, suggest Run now on its page to check one refresh before
-the first scheduled run. Refreshes don't usually crowd the artifact's version
-history: each one replaces the task's previous refresh, but one that someone
-commented on is kept.
+the first scheduled run. When comments are stored locally, a refresh can
+replace the same task's previous refresh. Revisions referenced by comments or
+pending repairs are kept. Org-mode artifacts and restricted publications keep
+each refresh because their comments are stored in the cloud. Their history
+still uses the existing revision retention limit.
