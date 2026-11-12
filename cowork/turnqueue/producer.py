@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import time
+import unicodedata
 import uuid
 from datetime import datetime
 from functools import partial
@@ -398,13 +399,15 @@ def _connection_names(connection: dict) -> dict[str, str]:
     """The ``label`` and ``engine`` a connection reference may carry, each left out when unusable.
 
     Input: one verified connection from auth's listing. Output: its name cleaned
-    for one prompt line (printable characters only, cut to auth's cap, trimmed)
+    for one prompt line (each space character a plain space, other non-printable
+    characters removed, cut to auth's cap, trimmed)
     and its connector id when it has that shape. anton applies the same rule and
     re-checks both, so a value that would fail the queue check never reaches it
     and a name never fails the turn. No side effects.
     """
     names: dict[str, str] = {}
-    label = "".join(ch for ch in connection["name"] if ch.isprintable()).strip()
+    spaced = "".join(" " if unicodedata.category(ch) == "Zs" else ch for ch in connection["name"])
+    label = "".join(ch for ch in spaced if ch.isprintable()).strip()
     label = label[:MAX_CONNECTION_LABEL_CHARS].strip()
     if label:
         names["label"] = label

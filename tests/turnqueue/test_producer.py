@@ -1591,6 +1591,7 @@ async def _queued_datasource(monkeypatch, listing, *, labels: bool) -> dict | No
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_LABELS_ENABLED", "true" if labels else "false")
+    monkeypatch.setattr(prod, "list_active_connections", AsyncMock(return_value=[]))
     monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=listing))
     refs = [(c["id"], c["credential_version"]) for c in listing]
     monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(return_value=_echo(refs, turn_key_id="mdb_gate")))
@@ -1629,6 +1630,22 @@ async def test_an_unusable_name_or_engine_is_left_out_and_the_turn_still_queues(
         {"connection_id": 93, "credential_version": 2, "engine": "postgres"},
         {"connection_id": 80, "credential_version": 1, "label": "ops"},
     ]}
+
+
+@pytest.mark.asyncio
+async def test_a_space_in_a_name_stays_a_space(monkeypatch):
+    listing = [_verified(93, "postgres", "qa\u00a0db", version=2), _verified(80, "mysql", "日本\u3000DB", version=1)]
+    queued = await _queued_datasource(monkeypatch, listing, labels=True)
+    assert [ref["label"] for ref in queued["connections"]] == ["qa db", "日本 DB"]
+
+
+@pytest.mark.asyncio
+async def test_a_name_past_the_cap_is_cut_and_trimmed(monkeypatch):
+    """Auth refuses a name over 128 characters today; this guards a listing
+    that ever sends one, since the queue check would refuse it and fail the turn."""
+    listing = [_verified(93, "postgres", "x" * 127 + " " + "y" * 10, version=2)]
+    queued = await _queued_datasource(monkeypatch, listing, labels=True)
+    assert queued["connections"][0]["label"] == "x" * 127
 
 
 @pytest.mark.asyncio
