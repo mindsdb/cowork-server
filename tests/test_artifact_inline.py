@@ -41,7 +41,7 @@ from cowork.schemas.artifact_export import (
     InlineMode,
     OmittedReason,
 )
-from cowork.services import artifact_files, artifact_inline
+from cowork.services import artifact_css, artifact_files, artifact_inline
 from cowork.services.artifact_inline import TRUNCATION_NOTE, inline_artifact_html
 from cowork.services.markdown_render import render_markdown
 from tests._no_fetch import RecordingServer, no_fetch, recording_server
@@ -415,7 +415,7 @@ def test_links_into_another_partition_are_refused(tmp_path, outside):
 def test_a_segment_holding_a_colon_is_refused_before_the_file_walk(reference):
     """The file walk refuses ':' too, so only a direct call shows this step holds."""
     with pytest.raises(artifact_inline.ArtifactFileRefused) as refused:
-        artifact_inline._reference_parts(reference=reference)
+        artifact_inline.reference_parts(reference=reference)
 
     assert refused.value.reason is OmittedReason.TRAVERSAL
 
@@ -426,7 +426,7 @@ def test_a_request_path_and_a_reference_refuse_the_same_segments(path):
     with pytest.raises(ValueError):
         artifact_files.relative_file_parts(path)
     with pytest.raises(artifact_files.ArtifactFileRefused):
-        artifact_inline._reference_parts(reference=path)
+        artifact_inline.reference_parts(reference=path)
 
 
 def test_the_drafts_path_a_reference_and_the_read_share_one_segment_rule(monkeypatch):
@@ -435,7 +435,7 @@ def test_the_drafts_path_a_reference_and_the_read_share_one_segment_rule(monkeyp
     with pytest.raises(ValueError):
         artifact_files.relative_file_parts("sub/blocked")
     with pytest.raises(artifact_files.ArtifactFileRefused):
-        artifact_inline._reference_parts(reference="sub/blocked")
+        artifact_inline.reference_parts(reference="sub/blocked")
     with pytest.raises(artifact_files.ArtifactFileRefused):
         artifact_files.refuse_unsafe_parts(parts=("sub", "blocked"))
 
@@ -480,13 +480,14 @@ def test_an_event_handler_goes_even_where_an_allowlist_would_keep_it(
     def no_read(parts):
         raise AssertionError(f"the walk read {parts}")
 
-    inliner = artifact_inline._Inliner(
+    state = artifact_inline.InlineState(
         read_asset=no_read,
         base_parts=(),
         mode=InlineMode.PDF,
         limits=_limits(),
         deadline=time.monotonic() + artifact_inline.DEADLINE_SECONDS,
     )
+    inliner = artifact_inline._Inliner(state=state, css=artifact_css.CssRewriter(state=state))
 
     kept = inliner._kept_attribute(tag=tag, namespace=namespace, name=name, value="alert(1)")
 
@@ -942,7 +943,7 @@ def test_omitted_list_stops_growing_but_drops_continue(artifact, outside):
 
 
 def test_css_nesting_past_the_cap_is_dropped(artifact, outside):
-    depth = artifact_inline._MAX_CSS_NESTING
+    depth = artifact_css._MAX_CSS_NESTING
     nested = "a{" * (depth + 5) + "color:red" + "}" * (depth + 5)
     deep_value = ".b{width:" + "calc(" * 500 + "1px" + ")" * 500 + ";color:blue}"
     html = f"<style>{nested}{deep_value}</style>".encode()
@@ -1101,7 +1102,7 @@ def _css(*, rules: int) -> str:
 
 def test_css_past_the_document_cap_is_dropped_and_the_text_stays(artifact):
     """A style that fits is kept; once too little of the cap is left, later CSS goes."""
-    kept = _css(rules=40_000).ljust(artifact_inline._MAX_CSS_BYTES - 8)
+    kept = _css(rules=40_000).ljust(artifact_css._MAX_CSS_BYTES - 8)
     html = (
         f"<html><head><style>{kept}</style><style>.late{{color:blue}}</style></head>"
         f'<body><p style="color:green">END</p></body></html>'
@@ -1117,7 +1118,7 @@ def test_css_past_the_document_cap_is_dropped_and_the_text_stays(artifact):
 def test_a_style_over_the_cap_alone_leaves_room_for_the_rest(artifact):
     """A refused style costs nothing, so smaller CSS after it still fits."""
     huge = _css(rules=80_000)
-    assert len(huge) > artifact_inline._MAX_CSS_BYTES
+    assert len(huge) > artifact_css._MAX_CSS_BYTES
     html = (
         f"<html><head><style>{huge}</style></head>"
         f'<body><p style="color:green">END</p></body></html>'
