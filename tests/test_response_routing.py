@@ -2769,6 +2769,7 @@ async def test_a_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -2930,6 +2931,7 @@ async def test_a_jev_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -2986,6 +2988,7 @@ async def test_a_refused_or_cancelled_start_revokes_the_gate_key(monkeypatch, re
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
