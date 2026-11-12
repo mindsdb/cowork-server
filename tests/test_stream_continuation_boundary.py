@@ -215,3 +215,53 @@ async def test_a_second_boundary_sets_aside_the_answer_it_supersedes():
     ])
     restore = next(p for p in payloads if p["type"] == "response.answer_restore")
     assert restore["text"] == "SECOND"
+
+
+async def test_a_handback_gives_back_the_answer_not_the_narration_before_it():
+    """ENG-4194. The answer the boundary set aside is the final round's text:
+    what anton said before its tool calls ("Let me pull the prices.") was
+    narration, which the app already shows as a step. Giving back every round
+    joined put that narration at the top of the restored answer.
+
+    The shape a message the person adds while the answer is being written
+    takes: anton reads it after its final answer, takes another round
+    (`continuation`), narrates, calls a tool, then hands back."""
+    payloads, completed = await _drain([
+        StreamTextDelta(text="Let me pull the prices."),
+        StreamToolUseStart(id="t1", name="scratchpad"),
+        StreamToolUseEnd(id="t1"),
+        _round_end(stop_reason="tool_use"),
+        StreamTextDelta(text="THE ANSWER THE USER READ"),
+        _round_end(),
+        _BOUNDARY,
+        StreamTextDelta(text="Got it, six months instead."),
+        StreamToolUseStart(id="t2", name="scratchpad"),
+        StreamToolUseEnd(id="t2"),
+        _round_end(stop_reason="tool_use"),
+        _HANDBACK,
+        StreamTextDelta(text="I ran out of budget; shall I continue?"),
+        _round_end(),
+    ])
+    restore = next(p for p in payloads if p["type"] == "response.answer_restore")
+    assert restore["text"] == "THE ANSWER THE USER READ"
+    assert completed.startswith("THE ANSWER THE USER READ")
+    assert "Let me pull the prices." not in completed
+
+
+async def test_a_boundary_after_a_round_with_no_text_keeps_every_round():
+    """Nothing after the last tool call to call the answer: the whole text is
+    set aside, as before, rather than nothing."""
+    payloads, _ = await _drain([
+        StreamTextDelta(text="Only text."),
+        StreamToolUseStart(id="t1", name="scratchpad"),
+        StreamToolUseEnd(id="t1"),
+        _round_end(stop_reason="tool_use"),
+        _BOUNDARY,
+        StreamTextDelta(text="Continuing."),
+        _round_end(),
+        _HANDBACK,
+        StreamTextDelta(text="giving up"),
+        _round_end(),
+    ])
+    restore = next(p for p in payloads if p["type"] == "response.answer_restore")
+    assert restore["text"] == "Only text."

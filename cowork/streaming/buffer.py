@@ -326,6 +326,9 @@ class RedisStreamBuffer(StreamBuffer):
             # leave a stream with no TTL. The client resends the transaction
             # when its reply is lost, which can write this seq twice; tail()
             # yields each seq once.
+            # Imported here: turn_index imports turn_claim, which imports this module.
+            from cowork.streaming.turn_index import TURN_INDEX_TTL_SECONDS, turn_key
+
             async with get_redis().pipeline(transaction=True) as pipe:
                 pipe.xadd(self.key, {
                     "seq": str(seq),
@@ -334,6 +337,10 @@ class RedisStreamBuffer(StreamBuffer):
                     "data": json.dumps(data or {}),
                 })
                 pipe.expire(self.key, REDIS_BUFFER_TTL_SECONDS)
+                # A turn can now outlast the index's TTL (a time-limited turn
+                # runs past an hour), and reconnect, Stop and the in-flight list
+                # all find the turn through the index. A no-op once it's gone.
+                pipe.expire(turn_key(self._conversation_id), TURN_INDEX_TTL_SECONDS)
                 await pipe.execute()
             return seq
 
