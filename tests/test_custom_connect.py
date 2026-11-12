@@ -351,14 +351,45 @@ def test_a_check_that_ignores_the_credential_proves_nothing(engine, world, monke
     assert [json.loads(r.content)["dry_run"] for r in world["auth"]] == [True]
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 422])
-def test_a_check_refused_without_the_key_then_answered_with_it_connects(engine, world, monkeypatch, status):
-    world["unprotected"] = (status, b'{"error_message":"Bad Request. Variable api_key is not set."}')
+def test_the_connection_name_is_stored_trimmed_and_a_blank_one_is_refused(engine, world, monkeypatch):
+    client = _client(engine, monkeypatch)
+
+    assert _connect(client, name="   ").status_code == 422
+    assert world["auth"] == []
+    assert _connect(client, name="  Rates  ").status_code == 201
+    assert json.loads(world["auth"][-1].content)["name"] == "Rates"
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize(("connector_id", "values"), [("acme_crm", VALUES), ("query_api", {"access_key": SECRET})])
+def test_a_check_refused_without_the_key_then_answered_with_it_connects(engine, world, monkeypatch, status, connector_id, values):
+    world["unprotected"] = (status, b'{"error":"no key"}')
+
+    res = _connect(_client(engine, monkeypatch), connector_id, values=values)
+
+    assert res.status_code == 201, res.text
+    assert len(world["provider"]) == 2
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_a_bad_request_without_the_key_proves_it_when_every_slot_is_secret(engine, world, monkeypatch, status):
+    world["unprotected"] = (status, b'{"error_message":"Bad Request. Variable access_key is not set."}')
+
+    res = _connect(_client(engine, monkeypatch), "query_api", values={"access_key": SECRET})
+
+    assert res.status_code == 201, res.text
+    assert len(world["provider"]) == 2
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_a_bad_request_without_the_key_proves_nothing_when_a_slot_is_not_secret(engine, world, monkeypatch, status):
+    # The keyless send also lacks the workspace, which alone could be the request's fault.
+    world["unprotected"] = (status, b'{"error":"missing X-Workspace"}')
 
     res = _connect(_client(engine, monkeypatch))
 
-    assert res.status_code == 201
-    assert len(world["provider"]) == 2
+    assert res.json()["detail"] == {"code": "check_not_protected", "provider_status": status, "excerpt": ""}
+    assert len(world["provider"]) == 1
 
 
 @pytest.mark.parametrize("status", [200, 429, 500])

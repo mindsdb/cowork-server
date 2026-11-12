@@ -283,6 +283,15 @@ class CustomConnectRequest(BaseModel):
     address: str = Field(min_length=1, max_length=300)
     values: dict[str, Any] = Field(default_factory=dict, repr=False)
 
+    @field_validator("name")
+    @classmethod
+    def _name_trimmed(cls, value: str) -> str:
+        """Store the name trimmed: a chat's toggle and the producer match it exactly, and the form trims."""
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("name must not be blank")
+        return trimmed
+
 
 class CustomConnectorAvailability(BaseModel):
     """Whether the caller can build a custom connector that is kept for reuse."""
