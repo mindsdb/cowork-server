@@ -351,8 +351,18 @@ def test_a_check_that_ignores_the_credential_proves_nothing(engine, world, monke
     assert [json.loads(r.content)["dry_run"] for r in world["auth"]] == [True]
 
 
-@pytest.mark.parametrize("status", [200, 500])
-def test_a_check_that_answers_other_than_401_or_403_without_the_key_is_not_protected(engine, world, monkeypatch, status):
+@pytest.mark.parametrize("status", [400, 401, 403, 422])
+def test_a_check_refused_without_the_key_then_answered_with_it_connects(engine, world, monkeypatch, status):
+    world["unprotected"] = (status, b'{"error_message":"Bad Request. Variable api_key is not set."}')
+
+    res = _connect(_client(engine, monkeypatch))
+
+    assert res.status_code == 201
+    assert len(world["provider"]) == 2
+
+
+@pytest.mark.parametrize("status", [200, 429, 500])
+def test_a_check_that_answers_otherwise_without_the_key_is_not_protected(engine, world, monkeypatch, status):
     world["unprotected"] = (status, b"internal status page")
 
     res = _connect(_client(engine, monkeypatch))
@@ -385,8 +395,9 @@ def test_an_address_with_a_path_says_where_the_version_goes(engine, world, monke
     assert world["auth"] == [] and world["provider"] == []
 
 
-def test_a_slash_only_in_the_query_is_not_a_path(engine, world, monkeypatch):
-    res = _connect(_client(engine, monkeypatch), address="api.acme.example?next=/v2")
+@pytest.mark.parametrize("address", ["api.acme.example?next=/v2", "api.acme.example#/v2"])
+def test_a_slash_only_in_the_query_or_fragment_is_not_a_path(engine, world, monkeypatch, address):
+    res = _connect(_client(engine, monkeypatch), address=address)
 
     assert (res.status_code, res.json()["detail"]["message"]) == (422, "The API address is not valid.")
 

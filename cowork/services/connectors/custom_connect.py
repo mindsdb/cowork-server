@@ -44,6 +44,9 @@ _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _TOP_LABEL = re.compile(r"[a-z]{2,63}")
 _NO_CHECK_NEXT = "If the API takes a key, ask Anton to build it again; if it takes none, Anton can use it without a connector."
 _ADDRESS_HINT = "type only the address, like api.example.com"
+# A query-key API often refuses a missing key as a bad request. The two sends
+# differ only by the placed values, so a refusal here and a 2xx with them still proves the key.
+_REFUSED_WITHOUT_KEY = frozenset({400, 401, 403, 422})
 _VERSION_HINT = (
     "If your provider's address includes a path or version such as /v2, "
     "ask Anton to build the connector again with it in the connector's paths."
@@ -321,7 +324,7 @@ async def _send(
 async def run_check(origin: str, template: StoredTemplate, values: Mapping[str, str]) -> CheckFailure | None:
     """Send the check without the placed credentials, then with them; None when it passed.
 
-    Without them it must answer 401 or 403, or a passing check would prove
+    Without them it must answer 400, 401, 403 or 422, or a passing check would prove
     nothing. With them, 2xx passes, 401 or 403 is ``authentication_failed``
     and any other status ``provider_error``. A 404 to either send is
     ``check_path_not_found``. Only the answer to the request that carried
@@ -334,7 +337,7 @@ async def run_check(origin: str, template: StoredTemplate, values: Mapping[str, 
     unprotected = await _send(origin, template.path, placed.bare_headers, placed.bare_params)
     if isinstance(unprotected, CheckFailure):
         return unprotected
-    if unprotected.status_code not in (401, 403):
+    if unprotected.status_code not in _REFUSED_WITHOUT_KEY:
         # Its body is never shown: an excerpt would let connect read any page our egress can reach.
         code = "check_path_not_found" if unprotected.status_code == 404 else "check_not_protected"
         return CheckFailure(code, unprotected.status_code, "")
