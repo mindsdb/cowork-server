@@ -359,6 +359,25 @@ def test_a_check_that_ignores_the_credential_proves_nothing(engine, world, monke
     assert [json.loads(r.content)["dry_run"] for r in world["auth"]] == [True]
 
 
+@pytest.mark.parametrize(("token_length", "refused"), [(2035, False), (2038, True)])
+def test_a_rendered_value_over_the_gateways_8_kib_is_refused_before_any_send(
+    engine, world, monkeypatch, token_length, refused
+):
+    # Basic sends "Basic " plus base64 of "{email}/token:{api_token}": 6138 bytes encode to 8190, 6141 to 8194.
+    values = {"email": "e" * custom_connect.VALUE_MAX, "api_token": "t" * token_length}
+
+    res = _connect(_client(engine, monkeypatch), "basic_api", values=values)
+
+    if refused:
+        assert res.status_code == 422
+        assert res.json()["detail"]["code"] == "invalid_values"
+        assert world["provider"] == []
+    else:
+        sent = world["provider"][-1].headers["authorization"]
+        assert len(sent) == 8190
+        assert res.json()["detail"]["code"] != "invalid_values"
+
+
 def test_the_connection_name_is_stored_trimmed_and_a_blank_one_is_refused(engine, world, monkeypatch):
     client = _client(engine, monkeypatch)
 

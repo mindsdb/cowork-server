@@ -38,6 +38,8 @@ CHECK_SECONDS = 10.0
 CHECK_BODY_BYTES = 16 * 1024
 EXCERPT_MAX = 300
 VALUE_MAX = 4096
+# The gateway refuses a call whose rendered header or query value is longer, so connect does too.
+RENDERED_VALUE_MAX = 8 * 1024
 BASE_URL_FIELD = "base_url"
 
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
@@ -219,12 +221,18 @@ def place_values(auth: Mapping[str, Any], values: Mapping[str, str]) -> PlacedRe
     ``{field}`` slot; ``basic`` has none.
 
     Raises:
-        ConnectRefused: 422 ``invalid_values`` when the rules refuse a value.
+        ConnectRefused: 422 ``invalid_values`` when the rules refuse a value, or
+            a rendered header or query value is over ``RENDERED_VALUE_MAX`` bytes.
     """
     try:
         headers, params = connector_auth_rules.render(auth, values)
     except connector_auth_rules.AuthRuleError as exc:
         raise ConnectRefused("invalid_values", 422, "A value cannot be placed on the request.") from exc
+    rendered = [*headers.values(), *(value for _, value in params)]
+    if any(len(value.encode()) > RENDERED_VALUE_MAX for value in rendered):
+        raise ConnectRefused(
+            "invalid_values", 422, "These values make a header or query value longer than 8 KiB, which is not sent."
+        )
     bare_headers = dict(_slot_free(auth.get("headers", {}))) if auth["type"] == "header" else {}
     bare_params = _slot_free(auth.get("params", {})) if auth["type"] == "query" else []
     return PlacedRequest(bare_headers, bare_params, headers, params)
