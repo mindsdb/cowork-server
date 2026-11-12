@@ -306,7 +306,7 @@ with tempfile.TemporaryDirectory() as tmp:
         project_name="general", trusted_anchor=project, root_parts=(".anton", "artifacts"))
 
     def peak_from_here():
-        """The peak RSS from now on, in MiB, reading the peak as it moves."""
+        # The peak RSS from now on, in MiB.
         if sys.platform.startswith("linux"):
             # Linux resets the high-water mark on request: an import's peak
             # could otherwise hide the export's.
@@ -578,11 +578,11 @@ def test_a_folder_and_title_holding_a_lone_surrogate_cross_the_pipe(tmp_path):
     """A folder name that isn't UTF-8 reaches the server as a lone surrogate,
     in the source's folder and title alike, and the request still converts."""
     name = "caf\udce9"
-    request = _request(suffix=".md").model_copy(update={"base_parts": (name,), "title": name})
+    request = _request(suffix=".html").model_copy(update={"base_parts": (name,), "title": name})
     with pinned_dir(tmp_path) as folder:
         conversion = export_runner.convert_in_child(
             request=request,
-            source=b"# R\n\n![x](missing.png)\n",
+            source=b'<html><body><p>R</p><img src="missing.png"></body></html>',
             read_asset=folder_reader(folder=folder, max_bytes=1024),
             limits=ChildLimits(wall_seconds=WALL_SECONDS, memory_bytes=2048 * MIB),
         )
