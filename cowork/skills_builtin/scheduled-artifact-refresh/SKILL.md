@@ -60,6 +60,11 @@ Use the cadence the user asked for. Ask only if they gave none. Don't refresh
 faster than the source changes: a daily export needs a daily task. The fastest
 cadence is every 15 minutes.
 
+Unless the user specifies a later start, choose the next occurrence of the
+requested cadence in their timezone. For example, an hourly refresh requested
+at 11:48 starts at 12:00 that day. Convert the current time into their timezone
+before choosing the first run; do not treat a UTC clock reading as local time.
+
 ## 5. Write the task prompt
 
 Fill in this shape. Name everything explicitly.
