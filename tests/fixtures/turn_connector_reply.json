@@ -21,15 +21,19 @@
             "name": "region",
             "label": "Region",
             "secret": false,
-            "required": false,
+            "required": true,
             "placeholder": "eu"
           }
         ],
-        "check": {
-          "path": "/v2/me",
+        "auth": {
+          "type": "header",
           "headers": {
-            "Authorization": "Bearer {api_key}"
+            "Authorization": "Bearer {api_key}",
+            "X-Region": "{region}"
           }
+        },
+        "check": {
+          "path": "/v2/me"
         }
       }
     ]

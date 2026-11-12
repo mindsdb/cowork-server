@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import socket
+from urllib.parse import quote, quote_plus
 
 import fakeredis
 import httpx
 import pytest
+from anton.core.tools import connector_auth_rules
 from anton.core.tools.connector_draft import parse_connector_draft
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -33,10 +36,29 @@ DRAFT = {
     "connector_id": "acme_crm",
     "label": "Acme CRM",
     "fields": [
-        {"name": "api_key", "label": "API key", "secret": True, "required": True},
-        {"name": "workspace", "label": "Workspace", "secret": False, "required": False},
+        {"name": "api_key", "label": "API key", "secret": True},
+        {"name": "workspace", "label": "Workspace", "secret": False},
     ],
-    "check": {"path": "/v1/me", "headers": {"Authorization": "Bearer {api_key}", "Accept": "application/json"}},
+    "auth": {
+        "type": "header",
+        "headers": {"Authorization": "Bearer {api_key}", "X-Workspace": "{workspace}", "X-Api-Version": "2024-01"},
+    },
+    "check": {"path": "/v1/me"},
+}
+VALUES = {"api_key": SECRET, "workspace": "w1"}
+BASIC_DRAFT = {
+    "connector_id": "basic_api",
+    "label": "Basic API",
+    "fields": [{"name": "email", "label": "Email", "secret": False}, {"name": "api_token", "label": "Token"}],
+    "auth": {"type": "basic", "username": "{email}/token", "password": "{api_token}"},
+    "check": {"path": "/api/v2/me"},
+}
+QUERY_DRAFT = {
+    "connector_id": "query_api",
+    "label": "Query API",
+    "fields": [{"name": "access_key", "label": "Access key"}],
+    "auth": {"type": "query", "params": {"access_key": "{access_key}", "output": "json"}},
+    "check": {"path": "/v1/status?pretty"},
 }
 STORED = {
     "id": 7, "connector_id": "acme_crm", "name": "Acme", "secure_keys": ["api_key"], "status": "verified",
@@ -50,13 +72,26 @@ def _scoped(engine, scope) -> ScopedSession:
 
 @pytest.fixture()
 def engine():
-    """One database holding the builder's two templates: one with a check, one without."""
+    """One database holding the builder's templates: one per auth type, and one without a check."""
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(eng)
     service = CustomConnectorService(_scoped(eng, BUILDER))
-    service.save_member_draft(parse_connector_draft(DRAFT))
+    for draft in (DRAFT, BASIC_DRAFT, QUERY_DRAFT):
+        service.save_member_draft(parse_connector_draft(draft))
     service.save_member_draft(parse_connector_draft({k: v for k, v in DRAFT.items() if k != "check"} | {"connector_id": "no_check_api"}))
     return eng
+
+
+def _carries_the_credential(request: httpx.Request) -> bool:
+    """Whether the member's key is on the request, wherever the template put it."""
+    if SECRET in request.url.raw_path.decode() or quote(SECRET, safe="") in request.url.raw_path.decode():
+        return True
+    for name, value in request.headers.items():
+        if SECRET in value:
+            return True
+        if name == "authorization" and value.startswith("Basic "):
+            return SECRET in base64.b64decode(value.removeprefix("Basic ")).decode()
+    return False
 
 
 @pytest.fixture()
@@ -83,7 +118,7 @@ def world(engine, monkeypatch):
 
     async def provider(request: httpx.Request) -> httpx.Response:
         state["provider"].append(request)
-        answer = state["protected"] if "authorization" in request.headers else state["unprotected"]
+        answer = state["protected"] if _carries_the_credential(request) else state["unprotected"]
         if callable(answer):
             return await answer(request)
         status, body = answer
@@ -111,40 +146,66 @@ def _client(engine, monkeypatch, scope=BUILDER) -> TestClient:
 
 
 def _connect(client, connector_id="acme_crm", **body):
-    payload = {"name": "Acme", "address": "api.acme.example", "values": {"api_key": SECRET}} | body
+    payload = {"name": "Acme", "address": "api.acme.example", "values": VALUES} | body
     return client.post(f"/custom/{connector_id}/connect", json=payload)
 
 
 def test_a_passing_check_stores_the_connection_verified_with_the_typed_address(engine, world, monkeypatch):
-    res = _connect(_client(engine, monkeypatch), address="https://API.Acme.Example./", values={"api_key": SECRET, "workspace": "w1"})
+    res = _connect(_client(engine, monkeypatch), address="https://API.Acme.Example./")
 
     assert res.status_code == 201, res.text
     assert res.json()["id"] == 7
     unprotected, protected = world["provider"]
     assert str(unprotected.url) == "https://93.184.216.34/v1/me"
     assert unprotected.headers["host"] == "api.acme.example"
-    assert "authorization" not in unprotected.headers and unprotected.headers["accept"] == "application/json"
-    assert protected.headers["authorization"] == f"Bearer {SECRET}"
+    # The first send keeps the slot-free header and leaves out every placed one.
+    assert unprotected.headers["x-api-version"] == "2024-01"
+    assert "authorization" not in unprotected.headers and "x-workspace" not in unprotected.headers
+    assert protected.headers["authorization"] == f"Bearer {SECRET}" and protected.headers["x-workspace"] == "w1"
     dry, create = world["auth"]
     sent = json.loads(create.content)
     assert json.loads(dry.content)["dry_run"] is True and sent["dry_run"] is False
     assert sent["fields"] == {"api_key": SECRET, "workspace": "w1", "base_url": "https://api.acme.example"}
-    assert sent["secure_keys"] == ["api_key"] and sent["organization_id"] == "org-a"
+    assert sent["secure_keys"] == ["api_key", "workspace"] and sent["organization_id"] == "org-a"
+    assert sent["auth"] == DRAFT["auth"]
     assert create.headers["authorization"] == BEARER
     assert SECRET not in res.text
 
 
-def test_a_field_the_check_places_is_stored_secret_whatever_the_template_says(engine, world, monkeypatch):
-    draft = {**DRAFT, "connector_id": "tenant_api"}
-    draft["check"] = {"path": "/me", "headers": {"Authorization": "Bearer {api_key}", "X-Workspace": "{workspace}"}}
-    CustomConnectorService(_scoped(engine, BUILDER)).save_member_draft(parse_connector_draft(draft))
-    world["unprotected"] = (403, b"")
+def test_the_auth_section_sent_is_one_auths_create_accepts_as_sent(engine, world, monkeypatch):
+    for connector_id, values in (("acme_crm", VALUES), ("basic_api", {"email": "me@x.io", "api_token": SECRET}),
+                                 ("query_api", {"access_key": SECRET})):
+        assert _connect(_client(engine, monkeypatch), connector_id, values=values).status_code == 201
+    for create in world["auth"][1::2]:
+        sent = json.loads(create.content)
+        held = [value for name, value in sent["fields"].items() if name != "base_url" and len(value) >= 8]
+        placed = [(name, True) for name in sent["fields"] if name != "base_url"]
 
-    res = _connect(_client(engine, monkeypatch), "tenant_api", values={"api_key": SECRET, "workspace": "w1"})
+        # The arguments auth's create passes to the same shared rules.
+        rebuilt = connector_auth_rules.parse_auth(sent["auth"], placed, lambda text: any(v in text for v in held))
 
-    assert res.status_code == 201
-    assert json.loads(world["auth"][-1].content)["secure_keys"] == ["api_key", "workspace"]
-    assert "x-workspace" not in world["provider"][0].headers
+        assert rebuilt == sent["auth"]
+
+
+def test_a_basic_template_signs_in_only_on_the_second_send(engine, world, monkeypatch):
+    res = _connect(_client(engine, monkeypatch), "basic_api", values={"email": "me@x.io", "api_token": SECRET})
+
+    assert res.status_code == 201, res.text
+    unprotected, protected = world["provider"]
+    assert "authorization" not in unprotected.headers
+    token = base64.b64encode(f"me@x.io/token:{SECRET}".encode()).decode()
+    assert protected.headers["authorization"] == f"Basic {token}"
+    assert unprotected.url.raw_path == protected.url.raw_path == b"/api/v2/me"
+
+
+def test_a_query_template_adds_its_parameters_after_the_paths_own_query(engine, world, monkeypatch):
+    res = _connect(_client(engine, monkeypatch), "query_api", values={"access_key": SECRET})
+
+    assert res.status_code == 201, res.text
+    unprotected, protected = world["provider"]
+    assert unprotected.url.raw_path == b"/v1/status?pretty&output=json"
+    assert protected.url.raw_path == f"/v1/status?pretty&access_key={quote(SECRET, safe='')}&output=json".encode()
+    assert "authorization" not in protected.headers
 
 
 @pytest.mark.parametrize("scope", [SAME_ORG, OTHER_ORG], ids=["same-org-member", "other-org"])
@@ -165,10 +226,20 @@ def test_a_template_without_a_check_cannot_connect(engine, world, monkeypatch):
     assert world["auth"] == [] and world["provider"] == []
 
 
-def test_a_stored_check_that_no_longer_parses_cannot_connect(engine, world, monkeypatch):
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"connection_check": {"path": "/v1/me", "headers": {"Authorization": "Bearer {api_key}"}}},
+        {"connection_auth": None},
+        {"connection_auth": {"type": "header", "headers": {"Authorization": "Bearer {undeclared}"}}},
+    ],
+    ids=["old-check-shape", "saved-without-auth", "auth-no-longer-parses"],
+)
+def test_a_template_saved_in_a_shape_the_parser_refuses_cannot_connect(engine, world, monkeypatch, change):
     session = _scoped(engine, BUILDER)
     row = CustomConnectorService(session).get("acme_crm")
-    row.connection_check = {"path": "/v1/me", "headers": {"Authorization": "Bearer {undeclared}"}}
+    for column, value in change.items():
+        setattr(row, column, value)
     session.add(row)
     session.commit()
 
@@ -176,7 +247,7 @@ def test_a_stored_check_that_no_longer_parses_cannot_connect(engine, world, monk
 
     assert (res.status_code, res.json()["detail"]["code"]) == (409, "no_check")
     message = res.json()["detail"]["message"]
-    assert message.startswith("This connector's connection check is not usable")
+    assert message.startswith("This connector cannot be connected as saved")
     assert "if it takes none, Anton can use it without a connector" in message
     assert world["auth"] == [] and world["provider"] == []
 
@@ -216,10 +287,14 @@ def test_a_name_that_only_contains_our_domain_is_not_ours(engine, world, monkeyp
 @pytest.mark.parametrize(
     "values",
     [
-        {}, {"api_key": ""}, {"api_key": SECRET, "other": "x"}, {"api_key": SECRET + "\n"},
-        {"api_key": SECRET + "é"}, {"api_key": "a" * 4097}, {"api_key": 12345},
+        {}, {"api_key": SECRET}, {**VALUES, "api_key": ""}, {**VALUES, "other": "x"}, {**VALUES, "api_key": SECRET + "\n"},
+        {**VALUES, "api_key": SECRET + "é"}, {**VALUES, "api_key": "a" * 4097}, {**VALUES, "api_key": 12345},
+        {**VALUES, "api_key": " " + SECRET}, {**VALUES, "api_key": SECRET + " "},
     ],
-    ids=["missing", "empty", "unknown-field", "newline", "non-ascii", "too-long", "not-text"],
+    ids=[
+        "none", "one-field-missing", "empty", "unknown-field", "newline", "non-ascii", "too-long", "not-text",
+        "leading-space", "trailing-space",
+    ],
 )
 def test_a_value_outside_the_rules_is_refused_by_field_never_by_value(engine, world, monkeypatch, values):
     res = _connect(_client(engine, monkeypatch), values=values)
@@ -229,25 +304,39 @@ def test_a_value_outside_the_rules_is_refused_by_field_never_by_value(engine, wo
     assert world["auth"] == [] and world["provider"] == []
 
 
-@pytest.mark.parametrize(
-    ("fields", "values"),
-    [
-        # A required field the check does not place.
-        ([{"name": "api_key", "label": "API key"}, {"name": "region", "label": "Region", "secret": False}], {"api_key": SECRET}),
-        # An optional field the check places.
-        ([{"name": "api_key", "label": "API key"}, {"name": "tenant", "label": "Tenant", "required": False}], {"api_key": SECRET}),
-    ],
-    ids=["required-not-placed", "optional-but-placed"],
-)
-def test_every_needed_value_is_present_before_anything_is_sent(engine, world, monkeypatch, fields, values):
-    headers = {"Authorization": "Bearer {api_key}"} | ({"X-Tenant": "{tenant}"} if fields[1]["name"] == "tenant" else {})
-    draft = {"connector_id": "needs_api", "label": "Needs", "fields": fields, "check": {"path": "/me", "headers": headers}}
-    CustomConnectorService(_scoped(engine, BUILDER)).save_member_draft(parse_connector_draft(draft))
+def test_a_missing_value_is_named_by_its_field(engine, world, monkeypatch):
+    res = _connect(_client(engine, monkeypatch), values={"api_key": SECRET})
 
-    res = _connect(_client(engine, monkeypatch), "needs_api", values=values)
+    assert res.json()["detail"] == {"code": "invalid_values", "message": "workspace is required."}
+
+
+def test_a_value_our_rules_pass_but_the_shared_rules_refuse_is_a_422_before_any_send(engine, world, monkeypatch):
+    real = custom_connect.check_values
+    monkeypatch.setattr(custom_connect, "check_values", lambda fields, values: {**real(fields, values), "workspace": "w\x01"})
+
+    res = _connect(_client(engine, monkeypatch))
 
     assert (res.status_code, res.json()["detail"]["code"]) == (422, "invalid_values")
     assert world["auth"] == [] and world["provider"] == []
+
+
+def test_a_failed_basic_check_replaces_the_echoed_sign_in_token(engine, world, monkeypatch):
+    token = base64.b64encode(f"me@x.io/token:{SECRET}".encode()).decode()
+    world["protected"] = (401, f'{{"seen": "{token.rstrip("=")}"}}'.encode())
+
+    res = _connect(_client(engine, monkeypatch), "basic_api", values={"email": "me@x.io", "api_token": SECRET})
+
+    assert res.json()["detail"] == {"code": "authentication_failed", "provider_status": 401, "excerpt": '{"seen": "***"}'}
+
+
+def test_a_value_the_shared_rules_cannot_place_is_a_422_not_an_error():
+    auth = DRAFT["auth"]
+
+    with pytest.raises(custom_connect.ConnectRefused) as refused:
+        custom_connect.place_values(auth, {"api_key": SECRET})
+
+    assert (refused.value.status_code, refused.value.code) == (422, "invalid_values")
+    assert SECRET not in refused.value.message
 
 
 def test_a_check_that_ignores_the_credential_proves_nothing(engine, world, monkeypatch):
@@ -365,6 +454,7 @@ def test_outside_org_mode_or_with_the_setting_off_the_route_is_404(engine, world
         with Session(engine) as session:
             session.add(CustomConnector(
                 connector_id="acme_crm", label="Acme CRM", spec=row.spec, connection_check=row.connection_check,
+                connection_auth=row.connection_auth,
             ))
             session.commit()
     if setting == "flag":
@@ -381,3 +471,36 @@ def test_the_excerpt_removes_controls_then_replaces_values_longest_first_then_cu
     near_the_end = ("a" * 295 + SECRET).encode()
     assert custom_connect.scrub_excerpt(near_the_end, [SECRET]) == "a" * 295 + "***"
     assert custom_connect.scrub_excerpt(b"\xff" + b"b" * 400, []) == "�" + "b" * 299
+
+
+def test_the_excerpt_also_replaces_every_form_of_a_value_that_went_on_the_request():
+    basic = BASIC_DRAFT["auth"]
+    values = {"email": "me@x.io", "api_token": "hunter2+hunter2/x"}
+    placed = custom_connect.place_values(basic, values)
+    token = base64.b64encode(b"me@x.io/token:hunter2+hunter2/x").decode()
+    forms = custom_connect.sent_forms(basic, placed, values.values())
+
+    body = f"bare {token} unpadded {token.rstrip('=')} encoded {quote(values['api_token'], safe='')}"
+
+    assert custom_connect.scrub_excerpt(body.encode(), forms) == "bare *** unpadded *** encoded ***"
+
+
+def test_the_excerpt_replaces_a_value_in_its_form_encoded_spelling():
+    auth = QUERY_DRAFT["auth"]
+    values = {"access_key": "a b+c0123456"}
+    placed = custom_connect.place_values(auth, values)
+    forms = custom_connect.sent_forms(auth, placed, values.values())
+
+    body = f"echo access_key={quote_plus(values['access_key'])}"
+
+    assert custom_connect.scrub_excerpt(body.encode(), forms) == "echo access_key=***"
+
+
+def test_the_excerpt_keeps_template_text_that_places_no_value():
+    auth = DRAFT["auth"]
+    placed = custom_connect.place_values(auth, VALUES)
+
+    forms = custom_connect.sent_forms(auth, placed, VALUES.values())
+
+    assert "2024-01" not in forms
+    assert {SECRET, f"Bearer {SECRET}", "w1"} <= forms

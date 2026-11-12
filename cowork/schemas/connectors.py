@@ -220,12 +220,19 @@ class CustomConnectorUpdate(BaseModel):
 class ConnectorCheck(BaseModel):
     """How a custom connector tests its credentials: a GET of ``path`` on the address the member types.
 
-    ``headers`` maps a header name to its value, where ``{field}`` stands for
-    that field's value. There is no host: the member supplies it.
+    The template's auth section places the values. There is no host: the
+    member supplies it.
     """
 
     path: str
-    headers: dict[str, str]
+
+
+class ConnectorAuthSummary(BaseModel):
+    """Where a custom connector puts the member's values: its auth type and the
+    header or query parameter names that carry one. Never a template's text."""
+
+    type: Literal["header", "basic", "query"]
+    names: list[str] = []
 
 
 class ConnectorSpecResponse(ConnectorMetadataResponse):
@@ -233,6 +240,8 @@ class ConnectorSpecResponse(ConnectorMetadataResponse):
     form: ConnectorForm
     # Custom connectors only; None for every built-in and for a template saved without one.
     check: ConnectorCheck | None = None
+    # Custom connectors only, and only beside a usable check.
+    auth_summary: ConnectorAuthSummary | None = None
     # Agent-facing notes on using this connector's API once connected: traps,
     # efficient endpoints, auth quirks. The chat agent sees them only when a
     # connection of this engine exists; the credential prober sees them while
