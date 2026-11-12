@@ -79,7 +79,7 @@ async def test_a_turn_carries_the_time_limit_and_a_key_that_covers_it(time_limit
 
 
 @pytest.mark.asyncio
-async def test_without_a_time_limit_nothing_changes(remote_turn):
+async def test_without_a_time_limit_the_block_has_no_max_turn_seconds(remote_turn):
     fake, minted, _ = remote_turn
     await _drain(_run())
     assert "max_turn_seconds" not in _params(fake)["limits"]

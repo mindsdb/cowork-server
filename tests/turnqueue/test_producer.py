@@ -530,10 +530,7 @@ def org_settings(monkeypatch, org_deployment):
         for scope in written:
             svc = SettingService(s, scope)
             for key in (*_STORED_LIMITS, "limits_enabled"):
-                try:
-                    svc.delete_setting(key)
-                except Exception:
-                    pass
+                svc.delete_setting(key)
     finally:
         s.close()
     us.invalidate_user_settings_cache()
