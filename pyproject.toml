@@ -245,4 +245,4 @@ markers = [
 # Temporary, for this PR's environment only: anton from the connector template
 # branch (mindsdb/anton#764), which no release carries yet. Replaced by a floor
 # on the anton release before this merges.
-anton-agent = { git = "https://github.com/mindsdb/anton", rev = "8a60e8e69d242ca9674bb77228e3f595bf54cd13" }
+anton-agent = { git = "https://github.com/mindsdb/anton", rev = "4ce1b82896f039be390750beb3817002005ac36c" }
