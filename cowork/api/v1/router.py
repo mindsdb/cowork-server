@@ -9,6 +9,7 @@ from fastapi import APIRouter
 
 from cowork.api.v1.endpoints import (
     artifact_checks,
+    artifact_quick_edit,
     artifacts,
     artifact_workspace,
     browse,
@@ -101,6 +102,7 @@ api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifact
 api_router.include_router(artifacts.live_app_router, prefix="/artifacts", tags=["artifacts", "live-apps"])
 api_router.include_router(artifact_workspace.router, prefix="/artifacts", tags=["artifact-workspace"])
 api_router.include_router(artifact_checks.router, prefix="/artifacts", tags=["artifact-checks"])
+api_router.include_router(artifact_quick_edit.router, prefix="/artifacts", tags=["artifact-workspace"])
 api_router.include_router(comments.router, prefix="/artifact-comments", tags=["artifact-comments"])
 api_router.include_router(live_apps.router, prefix="/live-apps", tags=["live-apps"])
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])

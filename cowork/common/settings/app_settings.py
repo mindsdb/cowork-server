@@ -1064,6 +1064,19 @@ class AppSettings(Settings):
             "out. Set to false to degrade to plain-text questions (ENG-1984)."
         ),
     )
+    quick_edit_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_QUICK_EDIT_ENABLED"),
+        description=(
+            "Whether the artifact viewer's chat bar may edit an artifact "
+            "directly with anton's artifact editor, without a chat turn "
+            "(POST .../quick-edits, ENG-4227). Exposed to the app as the "
+            "artifact capability `canQuickEdit`, which is also false while "
+            "the installed anton has no quick editor. A kill switch: off, "
+            "the route answers 501 and the app sends every bar message to "
+            "the artifact's chat instead."
+        ),
+    )
     surface_override: str = Field(
         default="",
         validation_alias=AliasChoices("COWORK_SURFACE"),

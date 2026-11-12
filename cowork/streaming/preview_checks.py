@@ -20,6 +20,12 @@ future, and an in-memory map is enough. Unlike a question, a check is
 addressed by its id alone (the web app's POST carries no conversation id),
 so the id is random and unguessable and the endpoint still checks that the
 caller may touch the conversation the check belongs to.
+
+A quick edit from the artifact viewer (ENG-4227) asks the same question
+outside any turn: its check is opened with an ``owner``, the person whose
+request runs the edit, and the endpoint authorizes against that owner instead
+of a live turn. Its key is the quick edit's own (``quick-edit:<artifact>``),
+never a conversation id, so a turn's end never closes it.
 """
 
 from __future__ import annotations
@@ -28,6 +34,10 @@ import asyncio
 import secrets
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cowork.streaming.turn_index import TurnOwner
 
 __all__ = [
     "CHECK_ID_PREFIX",
@@ -54,6 +64,8 @@ class CheckSubmitResult(Enum):
 class _PendingCheck:
     conversation_id: str
     future: asyncio.Future
+    # Set for a check no turn holds (a quick edit): who may answer it.
+    owner: "TurnOwner | None" = None
 
 
 class PreviewCheckBroker:
@@ -62,13 +74,20 @@ class PreviewCheckBroker:
     def __init__(self) -> None:
         self._pending: dict[str, _PendingCheck] = {}
 
-    def open(self, conversation_id: str) -> tuple[str, asyncio.Future]:
+    def open(self, conversation_id: str, *, owner: "TurnOwner | None" = None) -> tuple[str, asyncio.Future]:
         """Register a new check for *conversation_id*: its id and the future
-        its answer resolves."""
+        its answer resolves. ``owner`` marks a check no turn holds; the
+        endpoint then authorizes the answer against it."""
         check_id = f"{CHECK_ID_PREFIX}{secrets.token_hex(16)}"
         future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending[check_id] = _PendingCheck(conversation_id=conversation_id, future=future)
+        self._pending[check_id] = _PendingCheck(conversation_id=conversation_id, future=future, owner=owner)
         return check_id, future
+
+    def owner_of(self, check_id: str) -> "TurnOwner | None":
+        """The owner a check was opened with, or None for a turn's check (and
+        for no check at all: ``conversation_of`` tells those apart)."""
+        pending = self._pending.get(check_id)
+        return pending.owner if pending is not None else None
 
     def conversation_of(self, check_id: str) -> str | None:
         """The conversation an open check belongs to, or None if there is no

@@ -25,9 +25,13 @@ import asyncio
 import logging
 import math
 from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING
 
 from cowork.streaming.preview_checks import PreviewCheckBroker, preview_checks
 from cowork.streaming.sse import sse_frame
+
+if TYPE_CHECKING:
+    from cowork.streaming.turn_index import TurnOwner
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,7 @@ __all__ = [
     "MIN_TIMEOUT_S",
     "PreviewChecker",
     "artifact_check_sse",
+    "ask_preview",
     "build_preview_checker",
     "preview_checker_kwargs",
 ]
@@ -90,6 +95,48 @@ def _default_buffer_for(conversation_id: str):
     return handle.buffer
 
 
+async def ask_preview(
+    *,
+    broker: PreviewCheckBroker,
+    key: str,
+    artifact_slug: object,
+    timeout_s: object,
+    publish: Callable[[str, str, int], Awaitable[bool]],
+    owner: "TurnOwner | None" = None,
+) -> dict | None:
+    """Open a check under *key*, publish it, and await the app's answer.
+
+    ``publish(check_id, slug, timeout)`` writes the question to whatever
+    stream the app reads and says whether it went out. The answer dict when
+    the preview passed or failed; None for no answer, "unavailable", a slug
+    that cannot be one, or a question that could not be published.
+    """
+    slug = str(artifact_slug or "").strip()
+    if not slug or len(slug) > _MAX_SLUG:
+        return None
+    timeout = _clamp_timeout(timeout_s)
+    check_id, future = broker.open(key, owner=owner)
+    try:
+        try:
+            published = await publish(check_id, slug, timeout)
+        except Exception:
+            logger.warning("Could not publish preview check %s", check_id, exc_info=True)
+            return None
+        if not published:
+            return None
+        try:
+            answer = await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.info("Preview check %s for %s got no answer in %ss", check_id, slug, timeout)
+            return None
+    finally:
+        broker.close(check_id)
+    if not isinstance(answer, dict) or answer.get("status") not in ("passed", "failed"):
+        # None (turn ended) or "unavailable" (no viewer for this artifact).
+        return None
+    return answer
+
+
 def build_preview_checker(
     conversation_id: str,
     *,
@@ -107,27 +154,16 @@ def build_preview_checker(
             # Nothing tails this turn here (a remote turn, or the turn is
             # already finishing), so no app could answer.
             return None
-        timeout = _clamp_timeout(timeout_s)
-        check_id, future = broker.open(conversation_id)
-        try:
-            try:
-                await buffer.append("sse", {"sse": artifact_check_sse(
-                    check_id=check_id, artifact_slug=slug, timeout_s=timeout,
-                )})
-            except Exception:
-                logger.warning("Could not publish preview check %s", check_id, exc_info=True)
-                return None
-            try:
-                answer = await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.info("Preview check %s for %s got no answer in %ss", check_id, slug, timeout)
-                return None
-        finally:
-            broker.close(check_id)
-        if not isinstance(answer, dict) or answer.get("status") not in ("passed", "failed"):
-            # None (turn ended) or "unavailable" (no viewer for this artifact).
-            return None
-        return answer
+
+        async def publish(check_id: str, slug: str, timeout: int) -> bool:
+            await buffer.append("sse", {"sse": artifact_check_sse(
+                check_id=check_id, artifact_slug=slug, timeout_s=timeout,
+            )})
+            return True
+
+        return await ask_preview(
+            broker=broker, key=conversation_id, artifact_slug=slug, timeout_s=timeout_s, publish=publish,
+        )
 
     return preview_checker
 

@@ -244,6 +244,54 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     return applied
 
 
+def _apply_user_credentials(anton_settings, user) -> None:
+    """Copy the caller's provider keys, URLs and router role onto anton's
+    settings, as every in-process turn does after ``_overlay_user_settings``.
+    Shared with the quick edit (``anton_settings_for_user``)."""
+    from pydantic import SecretStr
+
+    # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
+    for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
+        db_val = getattr(user, attr, None)
+        if db_val is not None:
+            setattr(anton_settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
+
+    # URLs (skip empty strings so AntonSettings.model_post_init derivations
+    # and AntonSettings' own publish_url default are preserved)
+    for attr in ("minds_url", "openai_base_url", "publish_url"):
+        db_val = getattr(user, attr, None)
+        if db_val:
+            setattr(anton_settings, attr, db_val)
+
+    # Routing & summarization role → anton's router_* fields. The LLM
+    # client is actually built by build_llm_client (which reads the
+    # resolved router model directly), so this only keeps AntonSettings
+    # consistent for any path that reads it. Guarded so an anton build
+    # predating ENG-648 (no router_* fields) doesn't raise.
+    router_provider = getattr(user, "router_provider", None)
+    if router_provider is not None and hasattr(anton_settings, "router_provider"):
+        anton_settings.router_provider = (
+            router_provider.value.replace("_", "-")
+            if hasattr(router_provider, "value") else router_provider
+        )
+    router_model = getattr(user, "router_model", None)
+    if router_model is not None and hasattr(anton_settings, "router_model"):
+        anton_settings.router_model = router_model
+
+
+def anton_settings_for_user(user):
+    """``AntonSettings`` for *user* (their ``UserSettings``) the way a turn of
+    theirs builds them, minus the workspace paths: the DB overlay, then the
+    keys and URLs. For callers outside a turn that need anton's view of the
+    person's providers, such as the quick edit's decisions-model check."""
+    from anton.config.settings import AntonSettings
+
+    anton_settings = AntonSettings()
+    _overlay_user_settings(anton_settings, user)
+    _apply_user_credentials(anton_settings, user)
+    return anton_settings
+
+
 def _apply_client_models(anton_settings, llm_client) -> list[str]:
     """Keep runtime context consistent with the models the client will use.
 
@@ -1567,33 +1615,7 @@ class AntonHarness:
             else []
         )
 
-        # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
-        for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
-            db_val = getattr(user, attr, None)
-            if db_val is not None:
-                setattr(anton_settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
-
-        # URLs (skip empty strings so AntonSettings.model_post_init derivations
-        # and AntonSettings' own publish_url default are preserved)
-        for attr in ("minds_url", "openai_base_url", "publish_url"):
-            db_val = getattr(user, attr, None)
-            if db_val:
-                setattr(anton_settings, attr, db_val)
-
-        # Routing & summarization role → anton's router_* fields. The LLM
-        # client is actually built by build_llm_client (which reads the
-        # resolved router model directly), so this only keeps AntonSettings
-        # consistent for any path that reads it. Guarded so an anton build
-        # predating ENG-648 (no router_* fields) doesn't raise.
-        router_provider = getattr(user, "router_provider", None)
-        if router_provider is not None and hasattr(anton_settings, "router_provider"):
-            anton_settings.router_provider = (
-                router_provider.value.replace("_", "-")
-                if hasattr(router_provider, "value") else router_provider
-            )
-        router_model = getattr(user, "router_model", None)
-        if router_model is not None and hasattr(anton_settings, "router_model"):
-            anton_settings.router_model = router_model
+        _apply_user_credentials(anton_settings, user)
 
         workspace = Workspace(base)
         if sandboxed:

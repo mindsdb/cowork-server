@@ -1046,6 +1046,93 @@ def capture_agent_revision(
         return None
 
 
+def begin_quick_edit(
+    folder: Path, metadata: dict, artifact_id: str, *, expected_revision_id: str | None
+) -> dict:
+    """The source a quick edit (ENG-4227) starts from, or why it may not start.
+
+    Same gates, under the same lock, as ``create_agent_repair``: the head the
+    viewer saw must still be the head (``RevisionConflict``), and a repair
+    that still gates new agent work refuses the edit (``RepairAlreadyPending``),
+    since its turn may be writing the same file. A head moved by a write the
+    journal has not seen yet is captured first, as any read does. Returns
+    ``{"path", "revision"}``: the tracked source and the revision the edit's
+    own revision will follow (its ``previousRevisionId``).
+    """
+    with artifact_lock(folder):
+        source = _current_source_locked(folder, metadata, artifact_id)
+        if expected_revision_id is not None and source.revision.id != expected_revision_id:
+            raise RevisionConflict(source.revision.to_json())
+        partition = _partition_actionable_repairs(folder, _read_manifest(folder), source.path)
+        if partition.blocking:
+            raise RepairAlreadyPending(partition.blocking[0].to_json())
+        return {"path": source.path, "revision": source.revision.to_json()}
+
+
+QUICK_EDIT_SUMMARY_PREFIX = "Quick edit: "
+
+
+def record_quick_edit(
+    folder: Path,
+    metadata: dict,
+    artifact_id: str,
+    *,
+    rel_path: str,
+    base_revision_id: str,
+    summary: str,
+    conversation_id: str | None = None,
+) -> dict | None:
+    """Record the source a quick edit left on disk as ONE new draft revision.
+
+    anton's editor has already written the files (all-or-nothing, no-follow),
+    so unlike ``save_source`` this only journals what is there: the blob and a
+    manifest entry whose base is the revision the edit started from. Undo is
+    then the ordinary restore of that base.
+
+    None when the tracked source is unchanged (the edit touched only other
+    files). When a viewer's read captured the edit first (a "Captured current
+    draft" system revision on top of the base, with these exact bytes), that
+    revision is relabelled in place rather than duplicated: its id may already
+    be an editor's save token.
+    """
+    with artifact_lock(folder):
+        _recover_pending_source_write(folder)
+        target, relative = resolve_source(folder, metadata, rel_path)
+        content = _read_source(target)
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RevisionValidationError("Artifact source is not UTF-8 text") from exc
+        manifest = _read_manifest(folder)
+        head = manifest.head(relative)
+        label = (QUICK_EDIT_SUMMARY_PREFIX + " ".join((summary or "").split())).strip()
+        if head is not None and head.content_hash == _sha(content):
+            if head.id == base_revision_id:
+                return None
+            if (
+                head.actor is not None
+                and head.actor.kind == "system"
+                and head.base_revision_id == base_revision_id
+            ):
+                head.actor = RevisionActor(kind="agent", id=None)
+                head.summary = label[:240]
+                head.conversation_id = conversation_id
+                _write_manifest(folder, manifest)
+            return head.to_json()
+        return _append_revision(
+            folder,
+            manifest,
+            artifact_id=artifact_id,
+            rel_path=relative,
+            content=content,
+            actor_kind="agent",
+            actor_id=None,
+            summary=label,
+            base_revision_id=head.id if head is not None else None,
+            conversation_id=conversation_id,
+        ).to_json()
+
+
 _MAX_PREVIEW_ERRORS = 10
 _MAX_PREVIEW_MESSAGE = 300
 _MAX_PREVIEW_FILE = 200

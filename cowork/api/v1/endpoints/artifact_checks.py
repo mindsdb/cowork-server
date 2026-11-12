@@ -6,8 +6,12 @@ check belongs to a conversation, and a caller who may not touch that
 conversation's turn gets the same 404 as for an id that does not exist, so
 nothing leaks.
 
-On the remote turn backend no check is ever opened in this process (the pod
-runs anton), so every id is a 404 there. That is the intended degradation
+A quick edit's check (ENG-4227) is held by no turn: it carries the owner of
+the request that runs the edit, and the caller must be that owner, by the
+same rule a turn's owner is matched with.
+
+On the remote turn backend no turn's check is ever opened in this process (the pod
+runs anton), so every turn's id is a 404 there. That is the intended degradation
 until the pod side exists: anton reads no answer as "unverified".
 """
 
@@ -19,7 +23,12 @@ from fastapi import APIRouter, Depends, Path
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 from starlette.responses import JSONResponse
 
-from cowork.api.v1.endpoints.responses import TenantScopeDep, _authorized_handle, _require_streaming_scope
+from cowork.api.v1.endpoints.responses import (
+    TenantScopeDep,
+    _authorized_handle,
+    _owner_matches,
+    _require_streaming_scope,
+)
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.streaming.preview_checks import CHECK_ID_PREFIX, CheckSubmitResult, preview_checks
 from cowork.streaming.registry import registry
@@ -96,7 +105,14 @@ async def answer_preview_check(
     """
     _require_streaming_scope(scope)
     conversation_id = preview_checks.conversation_of(check_id) if check_id.startswith(CHECK_ID_PREFIX) else None
-    if conversation_id is None or _authorized_handle(registry.get(conversation_id), scope) is None:
+    owner = preview_checks.owner_of(check_id) if conversation_id is not None else None
+    if conversation_id is None:
+        authorized = False
+    elif owner is not None:
+        authorized = _owner_matches(owner, scope)
+    else:
+        authorized = _authorized_handle(registry.get(conversation_id), scope) is not None
+    if not authorized:
         status_code, content = _NOT_FOUND
         return JSONResponse(status_code=status_code, content=content)
 
