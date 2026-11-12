@@ -606,3 +606,22 @@ def pytest_sessionstart(session):
         _blocking_guard.StaleEntryCheck(tests_dir=Path(__file__).parent, reached=_GUARD_REACHED),
         "cowork-blocking-guard-stale-entries",
     )
+
+
+@pytest.fixture
+def key_file(monkeypatch, tmp_path):
+    """COWORK_KEY_FILE naming a new one-key file, as the host's key unit
+    writes it, with the server's cached keys read again on each side."""
+    from cryptography.fernet import Fernet
+
+    from cowork.common.encryption import get_fernet, sealing_keys
+
+    path = tmp_path / "run" / "key"
+    path.parent.mkdir()
+    path.write_bytes(Fernet.generate_key() + b"\n")
+    monkeypatch.setenv("COWORK_KEY_FILE", str(path))
+    sealing_keys.cache_clear()
+    get_fernet.cache_clear()
+    yield path
+    sealing_keys.cache_clear()
+    get_fernet.cache_clear()

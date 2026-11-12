@@ -1758,6 +1758,29 @@ class AntonHarness:
                 )
             else:
                 data_vault = source_vault
+            # anton builds the cell's DS_* environment one connection at a
+            # time and leaves out one that fails, so a sealed connection that
+            # won't open stops the turn here, naming it, instead.
+            from cowork.common.encryption import sealing_keys
+
+            if sealing_keys() is not None:
+                from cowork.services.connectors.sealed_vault import (
+                    SealedRecordError,
+                    refuse_unopenable_connections,
+                )
+
+                try:
+                    refuse_unopenable_connections(vault=data_vault)
+                except SealedRecordError as error:
+                    logger.error(
+                        "A saved connection can't be opened, so the turn stops",
+                        extra={
+                            "event": "sealed_connection_unopenable",
+                            "connection": error.connection,
+                            "reason": error.cause,
+                        },
+                    )
+                    raise
             # Registers this turn's DS_* names and values for scrubbing, and
             # touches no process state, so a concurrent turn's are left alone.
             from anton.utils.datasources import restore_namespaced_env
