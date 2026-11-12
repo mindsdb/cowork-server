@@ -58,6 +58,39 @@ def mocked(monkeypatch):
     return use
 
 
+class _Chunks(httpx.AsyncByteStream):
+    """A body sent in many chunks, so a capped read stops before its end."""
+
+    async def __aiter__(self):
+        for _ in range(50):
+            yield b"chunk"
+
+
+async def test_a_send_closes_its_response_and_its_own_transport(monkeypatch):
+    responses: list[httpx.Response] = []
+    closed: list[httpx.AsyncBaseTransport] = []
+
+    def answer(request):
+        responses.append(httpx.Response(200, stream=_Chunks()))
+        return responses[-1]
+
+    class PerSend(httpx.MockTransport):
+        def __init__(self, **kwargs):
+            super().__init__(answer)
+
+        async def aclose(self):
+            closed.append(self)
+
+    monkeypatch.setattr(egress, "_RESOLVER", _resolve_to("93.184.216.34"))
+    monkeypatch.setattr(egress.httpx, "AsyncHTTPTransport", PerSend)
+
+    got = await pinned_get("https://api.example.com", "/v1/me", {}, total_seconds=2.0, max_body_bytes=8)
+
+    assert got.truncated
+    assert responses[0].is_closed
+    assert len(closed) == 1
+
+
 async def test_the_request_carries_exactly_the_callers_headers_and_ours(mocked):
     requests = mocked()
 

@@ -6,7 +6,7 @@ import asyncio
 import base64
 import json
 import socket
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 
 import fakeredis
 import httpx
@@ -477,6 +477,17 @@ def test_the_excerpt_also_replaces_every_form_of_a_value_that_went_on_the_reques
     body = f"bare {token} unpadded {token.rstrip('=')} encoded {quote(values['api_token'], safe='')}"
 
     assert custom_connect.scrub_excerpt(body.encode(), forms) == "bare *** unpadded *** encoded ***"
+
+
+def test_the_excerpt_replaces_a_value_in_its_form_encoded_spelling():
+    auth = QUERY_DRAFT["auth"]
+    values = {"access_key": "a b+c0123456"}
+    placed = custom_connect.place_values(auth, values)
+    forms = custom_connect.sent_forms(auth, placed, values.values())
+
+    body = f"echo access_key={quote_plus(values['access_key'])}"
+
+    assert custom_connect.scrub_excerpt(body.encode(), forms) == "echo access_key=***"
 
 
 def test_the_excerpt_keeps_template_text_that_places_no_value():
