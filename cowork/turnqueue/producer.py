@@ -203,9 +203,9 @@ def _new_correlation_id() -> str:
     return str(uuid.uuid4())
 
 
-async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
-                          correlation_id: str, settings: TurnQueueSettings,
-                          workspace_id: str | None = None) -> dict:
+async def mint_llm_block(*, org_id: str | None, user_id: str | None,
+                         correlation_id: str, settings: TurnQueueSettings,
+                         workspace_id: str | None = None, ttl_seconds: int | None = None) -> dict:
     """Mint a short-TTL MindsHub turn key and build the job's `llm` block.
 
     The mint call is authenticated with the internal shared secret
@@ -215,14 +215,20 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
     per-user provider key is needed or read here. `workspace_id` is the
     caller's active MindsHub workspace (`UserSettings.hub_workspace_id`), if
     they have picked one; omitted otherwise, so the key binds to the
-    organization's Default the way it always has.
+    organization's Default the way it always has. `ttl_seconds` overrides
+    the turn's key lifetime for a key minted for something shorter than a
+    turn (the mid-task message check, ENG-4194).
     """
     api_key = await mint_turn_key(
         user_id=user_id, org_id=org_id, correlation_id=correlation_id,
-        ttl_seconds=settings.turn_key_lifetime_seconds, settings=settings,
+        ttl_seconds=ttl_seconds or settings.turn_key_lifetime_seconds, settings=settings,
         workspace_id=workspace_id,
     )
     return _build_llm_block(api_key, settings)
+
+
+# The name the turn's own code and its tests use (they patch it here).
+_mint_llm_block = mint_llm_block
 
 
 def _build_llm_block(api_key: str, settings: TurnQueueSettings) -> dict:
@@ -628,35 +634,13 @@ def step_stream_events(data: dict) -> list:
     if step == "turn_ended":
         ended_by = data.get("ended_by")
         return [StreamTurnEnded(ended_by=ended_by)] if isinstance(ended_by, str) and ended_by else []
-    if step == "addon":
-        return _addon_stream_events(data)
+    # `addon` steps (ENG-4194) are relayed only after a check this sync
+    # mapping can't make: that the addon is one this server accepted for the
+    # turn (turnqueue.addons.relay_addon_step, which the web turn's relay
+    # calls). A channel turn takes no mid-task messages, so it renders none.
     # `ask_user_answer_rejected` is the pod's verdict on one answer; only
     # /answer reads it (turnqueue/answers.py), nothing renders it.
     return []
-
-
-# The pod's addon states the app renders, as the in-process channel streams
-# them. "refused", "withdrawn" and "already_read" are verdicts on one POST
-# /addon or /addon/withdraw, which answers the person itself
-# (turnqueue/addons.py); the in-process path streams nothing for them either.
-_STREAMED_ADDON_STATES = frozenset({"added", "read", "returned"})
-
-
-def _addon_stream_events(data: dict) -> list:
-    from cowork.streaming.addons import TurnAddon
-
-    addon_id = data.get("addon_id")
-    state = data.get("state")
-    if not isinstance(addon_id, str) or not addon_id or state not in _STREAMED_ADDON_STATES:
-        return []
-    text = data.get("text")
-    decided_by = data.get("decided_by")
-    return [TurnAddon(
-        addon_id=addon_id,
-        state=state,
-        text=text if isinstance(text, str) else None,
-        decided_by=decided_by if decided_by in ("jev", "user") else None,
-    )]
 
 
 def _offered_effort(model: str, effort: str | None, *, org_id: str | None,
@@ -747,10 +731,14 @@ async def _scoped_browser_block(
     return config.to_dict() if config is not None else None
 
 
-async def _revoke_turn_key_quietly(correlation_id: str) -> None:
+async def revoke_turn_key_quietly(correlation_id: str) -> None:
     """Revoke the key the routing gate minted for a turn that never runs,
     logging rather than raising: a failed revoke leaves it to its own expiry."""
     await _revoke_turn_key_at_turn_end(correlation_id, TurnQueueSettings())
+
+
+# The name handlers/responses.py imports (its tests patch it there).
+_revoke_turn_key_quietly = revoke_turn_key_quietly
 
 
 async def stream_remote_replies(*, conversation_id: str, org_id: str | None,

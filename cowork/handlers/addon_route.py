@@ -10,33 +10,88 @@ so nothing here raises.
 A turn that runs in a pod (``COWORK_TURN_BACKEND=remote``) has no in-process
 channel: ``route_remote_addon`` reads what Jev needs from the database and
 Redis, then hands the message to the pod (``turnqueue/addons.py``).
+
+The checks before any of that (the per-person rate limit, the app's
+``response_id`` and ``local_key``, valid text) are here too, for the endpoint.
 """
 from __future__ import annotations
 
 import asyncio
+import itertools
+import json
 import logging
+import math
+import re
+import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
+from redis.exceptions import RedisError
+
 from cowork.common.history_scrub import scrub_credentials
 from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.db.scoped import TenantScope
 from cowork.handlers import jev_route
-from cowork.streaming.addons import AddonChannel
-from cowork.turnqueue.addons import RemoteAddonResult, remote_added_texts, remote_progress, submit_remote_addon
+from cowork.streaming.addons import MAX_ADDON_CHARS, AddonChannel, turn_limit_reason
+from cowork.turnqueue.addons import (
+    RemoteAddonResult,
+    remote_added_texts,
+    remote_addon_totals,
+    remote_progress,
+    remote_rate_limited,
+    submit_remote_addon,
+)
 
 logger = logging.getLogger(__name__)
 
+# Why POST /addon queued a message rather than add it to the running turn.
+# The app keeps a queued message as the next task either way; the reason is
+# for its copy and for logs.
 QueuedReason = Literal[
-    "disabled", "no_turn", "not_supported", "jev_off", "jev_timeout", "jev_error",
-    "low_confidence", "next_task", "empty",
-    # Remote (pod) turns only: the pod did not answer in time, and the
-    # message did not fit the pod's stdin line.
-    "pod_timeout", "too_large",
+    # The request itself.
+    "empty",           # blank text
+    "too_large",       # over MAX_ADDON_CHARS, over the turn's total added
+                       # text, or (remote) over the pod's stdin line
+    # The turn.
+    "disabled",        # COWORK_TURN_ADDON_ROUTING_ENABLED is off
+    "no_turn",         # no running turn, a response_id that isn't it, or the
+                       # turn stopped taking messages (it is ending)
+    "not_supported",   # the turn's anton can't take messages mid-task (no
+                       # channel in-process; no "ready" from the pod)
+    "too_many",        # the turn already took MAX_ADDONS_PER_TURN
+    "rate_limited",    # over ADDON_RATE_LIMIT for this person
+    "busy",            # another message for the turn is still being decided
+    # Jev.
+    "jev_off",         # no decision model to ask
+    "jev_timeout",     # Jev did not answer in time
+    "jev_error",       # Jev answered with an error or nothing usable
+    "low_confidence",  # Jev leaned add, below COWORK_TURN_ADDON_MIN_P_ADD
+    "next_task",       # Jev chose the queue
+    # Remote (pod) turns: the pod did not answer in time.
+    "pod_timeout",
+    # Failures outside Jev.
+    "redis_error",     # Redis failed
+    "internal",        # anything else (settings, minting a key, anton raised)
 ]
+
+#: How long a message waits for the one before it on the same turn to be
+#: decided. A decision is a Jev call (seconds) plus, remote, the pod's ack.
+DECIDE_LOCK_TIMEOUT_S = 10.0
+#: POST /addon calls one person may make per window, across their turns.
+ADDON_RATE_LIMIT = 30
+ADDON_RATE_WINDOW_S = 60
+#: A minted key outlives the Jev call it is for by this much, at least
+#: _MINTED_KEY_MIN_TTL_S in all; it is revoked right after anyway.
+_MINTED_KEY_HEADROOM_S = 10
+_MINTED_KEY_MIN_TTL_S = 30
+#: The app's own id for a message (POST /addon's local_key).
+_LOCAL_KEY = re.compile(r"[A-Za-z0-9_-]{1,64}")
+#: How many of the turn's first records are searched for its response.created.
+_RESPONSE_ID_SCAN = 64
 
 
 def queued(reason: QueuedReason) -> dict:
@@ -85,21 +140,146 @@ def _jev_target(scope: TenantScope) -> tuple[jev_route.JevTarget, str] | _MintKe
     return None
 
 
-async def route_addon(*, channel: AddonChannel, text: str, force: bool, scope: TenantScope) -> dict:
+# ── Checks before a turn is asked ──────────────────────────────────────────
+
+
+def valid_text(text: str) -> bool:
+    """Whether *text* is valid Unicode the turn can carry: a lone surrogate
+    can't be encoded for Jev, Redis or the pod's stdin. Request validation
+    already refuses one (422) and body parsing refuses bytes that are not
+    UTF-8 (400); this guards the handler should a parser ever let one by."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def clean_local_key(value: str | None) -> str | None:
+    """The app's ``local_key`` when it is 1-64 of [A-Za-z0-9_-], else None:
+    an invalid one is ignored, not an error, so the message still goes."""
+    return value if isinstance(value, str) and _LOCAL_KEY.fullmatch(value) else None
+
+
+async def turn_response_ids(buffer: Any) -> set[str] | None:
+    """The ids of the ``response.created`` frames among the turn's first
+    records: the response id the app saw for it. None for a buffer this
+    can't read (then there is nothing to compare). Raises RedisError."""
+    from cowork.streaming.buffer import FileStreamBuffer, RedisStreamBuffer, read_records
+    from cowork.turnqueue.redis_client import get_redis
+
+    if isinstance(buffer, RedisStreamBuffer):
+        entries = await get_redis().xrange(buffer.key, count=_RESPONSE_ID_SCAN)
+        records = [RedisStreamBuffer._record(fields) for _entry_id, fields in entries]
+    elif isinstance(buffer, FileStreamBuffer):
+        records = await asyncio.to_thread(
+            lambda: list(itertools.islice(read_records(buffer.path), _RESPONSE_ID_SCAN))
+        )
+    else:
+        return None
+    ids: set[str] = set()
+    for record in records:
+        sse = record.data.get("sse") if record.type == "sse" else None
+        if not isinstance(sse, str) or not sse.startswith("event: response.created"):
+            continue
+        for line in sse.splitlines():
+            if not line.startswith("data:"):
+                continue
+            try:
+                response_id = json.loads(line[len("data:"):])["response"]["id"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            if isinstance(response_id, str):
+                ids.add(response_id)
+    return ids
+
+
+class _RateWindow:
+    """ADDON_RATE_LIMIT in one process, for a server with no shared Redis
+    (the in-process backend): a sliding window of each person's calls."""
+
+    def __init__(self) -> None:
+        self._calls: dict[str, deque[float]] = {}
+
+    def hit(self, user_key: str, *, limit: int, window_s: float) -> bool:
+        """Count one call and say whether it is over *limit*."""
+        now = time.monotonic()
+        calls = self._calls.setdefault(user_key, deque())
+        while calls and calls[0] <= now - window_s:
+            calls.popleft()
+        if len(calls) >= limit:
+            return True
+        calls.append(now)
+        return False
+
+    def reset(self) -> None:
+        """For tests: this object is a process global."""
+        self._calls.clear()
+
+
+_local_rate = _RateWindow()
+
+
+async def rate_limit_refusal(scope: TenantScope, *, remote: bool) -> dict | None:
+    """The queued response for a person over ADDON_RATE_LIMIT, else None.
+    Shared across replicas through Redis on the remote backend."""
+    user_key = f"{scope.org_id or '-'}:{scope.user_id or '-'}"
+    if not remote:
+        over = _local_rate.hit(user_key, limit=ADDON_RATE_LIMIT, window_s=ADDON_RATE_WINDOW_S)
+        return queued("rate_limited") if over else None
+    try:
+        over = await remote_rate_limited(user_key, limit=ADDON_RATE_LIMIT, window_s=ADDON_RATE_WINDOW_S)
+    except RedisError:
+        logger.warning("[addon] rate limit check failed; queueing", exc_info=True)
+        return queued("redis_error")
+    return queued("rate_limited") if over else None
+
+
+class _Busy(Exception):
+    """The turn's decision lock did not free within DECIDE_LOCK_TIMEOUT_S."""
+
+
+@asynccontextmanager
+async def _holding(lock: asyncio.Lock):
+    """Hold *lock*, waiting at most DECIDE_LOCK_TIMEOUT_S for it (_Busy)."""
+    try:
+        async with asyncio.timeout(DECIDE_LOCK_TIMEOUT_S):
+            await lock.acquire()
+    except TimeoutError:
+        raise _Busy from None
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+# ── In-process turns ───────────────────────────────────────────────────────
+
+
+async def route_addon(
+    *, channel: AddonChannel, text: str, force: bool, scope: TenantScope, local_key: str | None = None,
+) -> dict:
     """Add *text* to the turn *channel* belongs to, or say why it is queued.
     Never raises."""
     try:
-        async with channel.deciding:
+        async with _holding(channel.deciding):
+            limit = channel.limit_reason(text)
+            if limit is not None:
+                return queued(limit)
             if force:
-                addon_id = channel.add(text, decided_by="user")
+                addon_id = channel.add(text, decided_by="user", local_key=local_key)
                 return added(addon_id, "user") if addon_id else queued("no_turn")
-            return await _ask_jev(channel=channel, text=text, scope=scope)
+            return await _ask_jev(channel=channel, text=text, scope=scope, local_key=local_key)
+    except _Busy:
+        return queued("busy")
     except Exception:
+        # Not Jev: its failures come back as a verdict. anton raising from
+        # add_user_input lands here too.
         logger.exception("[addon] routing failed; queueing", extra={"conversation_id": channel.conversation_id})
-        return queued("jev_error")
+        return queued("internal")
 
 
-async def _ask_jev(*, channel: AddonChannel, text: str, scope: TenantScope) -> dict:
+async def _ask_jev(*, channel: AddonChannel, text: str, scope: TenantScope, local_key: str | None) -> dict:
     refusal = await _jev_refusal(
         conversation_id=channel.conversation_id,
         task=channel.task,
@@ -110,7 +290,7 @@ async def _ask_jev(*, channel: AddonChannel, text: str, scope: TenantScope) -> d
     )
     if refusal is not None:
         return refusal
-    addon_id = channel.add(text, decided_by="jev")
+    addon_id = channel.add(text, decided_by="jev", local_key=local_key)
     return added(addon_id, "jev") if addon_id else queued("no_turn")
 
 
@@ -125,38 +305,49 @@ async def _jev_refusal(
         found = await run_on_unit_threads(partial(_jev_target, scope))
     except Exception:
         logger.warning("[addon] could not resolve the decision target; queueing", exc_info=True)
-        return queued("jev_error")
+        return queued("internal")
     if found is None:
         return queued("jev_off")
     queue_settings = TurnQueueSettings()
+    # The correlation id of a key minted for this decision, set before the
+    # mint: one that failed or was cancelled may still have issued a key, and
+    # revoking by correlation id is a no-op when none was.
     minted_for: str | None = None
-    if isinstance(found, _MintKey):
-        from cowork.turnqueue.producer import _mint_llm_block
-
-        minted_for = str(uuid4())
-        try:
-            block = await _mint_llm_block(
-                org_id=scope.org_id, user_id=scope.user_id, correlation_id=minted_for,
-                settings=queue_settings, workspace_id=found.workspace_id,
-            )
-        except Exception:
-            logger.warning("[addon] could not mint a key to ask Jev with; queueing", exc_info=True)
-            return queued("jev_error")
-        target, model = jev_route.JevTarget.mindshub(block["base_url"], block["api_key"]), found.model
-    else:
-        target, model = found
     try:
+        if isinstance(found, _MintKey):
+            from cowork.turnqueue import producer
+
+            minted_for = str(uuid4())
+            try:
+                block = await producer.mint_llm_block(
+                    org_id=scope.org_id, user_id=scope.user_id, correlation_id=minted_for,
+                    settings=queue_settings, workspace_id=found.workspace_id,
+                    ttl_seconds=minted_key_ttl(queue_settings),
+                )
+            except Exception:
+                logger.warning("[addon] could not mint a key to ask Jev with; queueing", exc_info=True)
+                return queued("internal")
+            target, model = jev_route.JevTarget.mindshub(block["base_url"], block["api_key"]), found.model
+        else:
+            target, model = found
         return await _ask_jev_with(
             target=target, model=model, conversation_id=conversation_id,
             task=task, progress=progress, added=added, text=text, queue_settings=queue_settings,
         )
     finally:
         if minted_for is not None:
-            from cowork.turnqueue.producer import _revoke_turn_key_quietly
+            from cowork.turnqueue import producer
 
-            # Used for this one decision only. Shielded, so a cancelled send
-            # can't stop the revoke; a failed one leaves it to its short expiry.
-            await asyncio.shield(_revoke_turn_key_quietly(minted_for))
+            # Used for this one decision only, and revoked on every way out,
+            # cancellation included. Shielded, so a second cancel can't stop
+            # the revoke; a failed one leaves the key to its short expiry.
+            await asyncio.shield(producer.revoke_turn_key_quietly(minted_for))
+
+
+def minted_key_ttl(settings: TurnQueueSettings) -> int:
+    """How long a key minted for one decision lives: just past the Jev call's
+    own timeout, so a revoke that fails leaves it usable for seconds."""
+    return max(_MINTED_KEY_MIN_TTL_S, math.ceil(settings.jev_route_timeout_seconds) + _MINTED_KEY_HEADROOM_S)
 
 
 async def _ask_jev_with(
@@ -164,11 +355,13 @@ async def _ask_jev_with(
     progress: list[str], added: list[str], text: str, queue_settings: TurnQueueSettings,
 ) -> dict | None:
     # Scrubbed like the route gate's history: the state leaves this server.
+    # The task and each added message are cut to MAX_ADDON_CHARS (the new
+    # message already fits it), so a long question can't blow up the call.
     state = jev_route.addon_state(
-        task=scrub_credentials(task),
+        task=scrub_credentials(task[:MAX_ADDON_CHARS]),
         # Step descriptions are the model's own words, so scrubbed too.
         progress=[scrub_credentials(line) for line in progress],
-        added=[scrub_credentials(t) for t in added],
+        added=[scrub_credentials(t[:MAX_ADDON_CHARS]) for t in added],
         message=scrub_credentials(text),
     )
     from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
@@ -207,17 +400,29 @@ async def _ask_jev_with(
 # two replicas deciding for one turn at once is a person sending from two
 # tabs within a Jev call, and the worst case is a follow-up judged without
 # its predecessor.
-_remote_deciding: dict[str, asyncio.Lock] = {}
+@dataclass
+class _TurnLock:
+    lock: asyncio.Lock
+    # Holders and waiters: the entry goes only when none remain, so a waiter
+    # never ends up on a lock a newcomer no longer finds.
+    users: int = 0
+
+
+_remote_deciding: dict[str, _TurnLock] = {}
 
 
 @asynccontextmanager
 async def _deciding(correlation_id: str):
-    lock = _remote_deciding.setdefault(correlation_id, asyncio.Lock())
+    entry = _remote_deciding.get(correlation_id)
+    if entry is None:
+        entry = _remote_deciding[correlation_id] = _TurnLock(asyncio.Lock())
+    entry.users += 1
     try:
-        async with lock:
+        async with _holding(entry.lock):
             yield
     finally:
-        if not lock.locked() and _remote_deciding.get(correlation_id) is lock:
+        entry.users -= 1
+        if entry.users == 0 and _remote_deciding.get(correlation_id) is entry:
             del _remote_deciding[correlation_id]
 
 
@@ -258,7 +463,7 @@ async def _remote_jev_inputs(
     pod relayed, and the messages it already took. A part that can't be read
     is left empty rather than failing the decision; the already-added
     messages are the exception, since without them a follow-up is judged
-    as if it were the first."""
+    as if it were the first (raises RedisError)."""
     from cowork.db.units import run_db
 
     task = ""
@@ -282,17 +487,23 @@ _REMOTE_ADD_FAILURES: dict[RemoteAddonResult, QueuedReason] = {
     RemoteAddonResult.NOT_FOUND: "no_turn",
     RemoteAddonResult.TIMEOUT: "pod_timeout",
     RemoteAddonResult.TOO_LARGE: "too_large",
+    RemoteAddonResult.REDIS_ERROR: "redis_error",
 }
 
 
 async def route_remote_addon(
     *, conversation_id: str, correlation_id: str, text: str, force: bool, scope: TenantScope,
+    local_key: str | None = None,
 ) -> dict:
     """``route_addon`` for a turn that runs in a pod: decide with Jev here
     (``force`` skips it), then hand the message to the pod and return its
     verdict (``turnqueue/addons.py``). Never raises."""
     try:
         async with _deciding(correlation_id):
+            count, total_bytes = await remote_addon_totals(correlation_id)
+            limit = turn_limit_reason(count=count, total_bytes=total_bytes, text=text)
+            if limit is not None:
+                return queued(limit)
             if force:
                 decided_by = "user"
             else:
@@ -308,11 +519,17 @@ async def route_remote_addon(
                 decided_by = "jev"
             result, addon_id = await submit_remote_addon(
                 conversation_id=conversation_id, correlation_id=correlation_id,
-                text=text, decided_by=decided_by,
+                text=text, decided_by=decided_by, local_key=local_key,
             )
+    except _Busy:
+        return queued("busy")
+    except RedisError:
+        logger.warning("[addon] remote routing hit a Redis error; queueing", exc_info=True,
+                       extra={"conversation_id": conversation_id})
+        return queued("redis_error")
     except Exception:
         logger.exception("[addon] remote routing failed; queueing", extra={"conversation_id": conversation_id})
-        return queued("jev_error")
+        return queued("internal")
     if result is RemoteAddonResult.ADDED:
         return added(addon_id, decided_by)
     return queued(_REMOTE_ADD_FAILURES[result])

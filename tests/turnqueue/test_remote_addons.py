@@ -14,12 +14,17 @@ from cowork.turnqueue import addons as remote
 from cowork.turnqueue.addons import (
     RemoteAddonResult,
     RemoteWithdrawResult,
+    relay_addon_step,
     remote_added_texts,
+    remote_addon_totals,
+    remote_addons_ready,
     remote_progress,
+    remote_rate_limited,
     submit_remote_addon,
     withdraw_remote_addon,
 )
-from cowork.turnqueue.answers import MAX_ANSWER_BYTES
+from cowork.streaming.addons import TurnAddon
+from cowork.turnqueue.answers import MAX_ANSWER_BYTES, WRAP_HEADROOM_BYTES
 
 STREAM = "scratchpad:reply:conv-1"
 KEY = "cowork:answer:corr-1"
@@ -60,9 +65,14 @@ async def _pod_answers_withdraw(r, state):
     }))
 
 
-def _submit(r, text="use the sales DB", decided_by="jev", timeout=2.0):
+def _submit(r, text="use the sales DB", decided_by="jev", timeout=2.0, local_key=None):
     return submit_remote_addon(conversation_id="conv-1", correlation_id="corr-1", text=text,
-                               decided_by=decided_by, r=r, ack_timeout_s=timeout)
+                               decided_by=decided_by, local_key=local_key, r=r, ack_timeout_s=timeout)
+
+
+async def _status(r, addon_id):
+    raw = await r.hget(INDEX, addon_id)
+    return json.loads(raw)["status"] if raw else None
 
 
 def _withdraw(r, addon_id, timeout=2.0):
@@ -99,10 +109,12 @@ async def test_a_user_decision_is_sent_as_such(r):
 
 async def test_refused_is_not_remembered(r):
     pod = asyncio.create_task(_pod_answers_addon(r, "refused"))
-    result, _ = await _submit(r)
+    result, addon_id = await _submit(r)
     await pod
     assert result is RemoteAddonResult.REFUSED
-    assert await r.exists(INDEX) == 0
+    # Abandoned, not held: Jev never reads it, and no pod step is relayed for it.
+    assert await _status(r, addon_id) == "abandoned"
+    assert await remote_added_texts("corr-1", r=r) == []
     assert await r.llen(KEY) == 1   # no withdraw for a refusal
 
 
@@ -115,7 +127,8 @@ async def test_no_verdict_queues_a_withdraw_of_it(r):
     assert set(withdraw) == {"kind", "addon_id", "request_id"}
     assert withdraw["addon_id"] == addon_id
     assert len(withdraw["request_id"]) == 32
-    assert await r.exists(INDEX) == 0
+    assert await _status(r, addon_id) == "abandoned"
+    assert await remote_added_texts("corr-1", r=r) == []
 
 
 async def test_verdicts_for_another_addon_or_turn_are_ignored(r):
@@ -169,10 +182,10 @@ async def test_an_entry_over_the_stdin_bound_is_rejected_unqueued(r):
 
 async def test_an_entry_just_under_the_bound_is_queued(r):
     overhead = len(remote.addon_entry(addon_id="a" * 32, text="", decided_by="jev").encode())
-    text = "a" * (MAX_ANSWER_BYTES - remote._WRAP_HEADROOM_BYTES - overhead)
+    text = "a" * (MAX_ANSWER_BYTES - WRAP_HEADROOM_BYTES - overhead)
     result, _ = await _submit(r, text=text, timeout=0.1)
     assert result is RemoteAddonResult.TIMEOUT   # queued; nobody answers
-    assert len((await r.lindex(KEY, 0)).encode()) + remote._WRAP_HEADROOM_BYTES == MAX_ANSWER_BYTES
+    assert len((await r.lindex(KEY, 0)).encode()) + WRAP_HEADROOM_BYTES == MAX_ANSWER_BYTES
     result, _ = await _submit(r, text=text + "a")
     assert result is RemoteAddonResult.TOO_LARGE
 
@@ -198,6 +211,10 @@ async def test_withdrawn_before_the_model_reads_it(r):
     request_id = json.loads(entry)["request_id"]
     assert entry == '{"kind":"addon_withdraw","addon_id":"%s","request_id":"%s"}' % (addon_id, request_id)
     assert await remote_added_texts("corr-1", r=r) == []
+    # Kept as withdrawn: the pod's "withdrawn" step is relayed against it,
+    # and a second withdraw finds nothing to take back.
+    assert await _status(r, addon_id) == "withdrawn"
+    assert await _withdraw(r, addon_id) is RemoteWithdrawResult.NOT_FOUND
 
 
 async def test_already_read_keeps_it_added(r):
@@ -269,3 +286,114 @@ async def test_progress_carries_step_descriptions_and_flags_the_running_one(r):
         "[done] Read the tuition pages (scratchpad)",
         "[in progress] Fill coverage gaps (scratchpad)",
     ]
+
+
+# ── Recorded before the push; the relay trusts only what was recorded ──────
+
+
+async def test_the_addon_is_recorded_before_it_reaches_the_pod(r):
+    seen = {}
+
+    async def pod():
+        entry = json.loads(await _queued(r))
+        # By the time the pod can read the entry, the relay can trust it.
+        seen["status"] = await _status(r, entry["addon_id"])
+        seen["relayed"] = await relay_addon_step(correlation_id="corr-1", data={
+            "step": "addon", "addon_id": entry["addon_id"], "state": "added",
+            "text": "something else", "decided_by": "user",
+        }, r=r)
+        await r.xadd(STREAM, _reply("turn_step", {"step": "addon", "addon_id": entry["addon_id"], "state": "added"}))
+
+    task = asyncio.create_task(pod())
+    result, addon_id = await _submit(r, local_key="k-1")
+    await task
+    assert result is RemoteAddonResult.ADDED
+    assert seen["status"] == "pending"
+    # Text and decider from the record, not the pod; the app's local_key added.
+    assert seen["relayed"] == [TurnAddon(addon_id, "added", "use the sales DB", "jev", "k-1")]
+    assert await _status(r, addon_id) == "added"
+
+
+async def test_a_redis_error_before_the_push_reaches_nothing(r, monkeypatch):
+    async def boom(*args, **kwargs):
+        raise RedisError("connection lost")
+
+    monkeypatch.setattr(r, "xrevrange", boom)
+    result, _ = await _submit(r)
+    assert result is RemoteAddonResult.REDIS_ERROR
+    assert await r.llen(KEY) == 0
+
+
+@pytest.mark.parametrize("state", ["added", "read", "returned", "withdrawn"])
+async def test_steps_for_an_addon_this_turn_never_took_are_dropped(r, state):
+    assert await relay_addon_step(correlation_id="corr-1", data={
+        "step": "addon", "addon_id": "f" * 32, "state": state, "text": "injected", "decided_by": "jev",
+    }, r=r) == []
+
+
+async def test_a_late_verdict_for_an_abandoned_addon_is_dropped(r):
+    result, addon_id = await _submit(r, timeout=0.2)
+    assert result is RemoteAddonResult.TIMEOUT
+    for state in ("added", "read", "withdrawn"):
+        assert await relay_addon_step(correlation_id="corr-1", data={
+            "step": "addon", "addon_id": addon_id, "state": state}, r=r) == []
+
+
+async def test_another_turns_addon_is_not_relayed_here(r):
+    addon_id = await _added(r)
+    assert await relay_addon_step(correlation_id="corr-2", data={
+        "step": "addon", "addon_id": addon_id, "state": "read"}, r=r) == []
+
+
+@pytest.mark.parametrize("state", ["added", "read", "returned", "withdrawn"])
+async def test_the_states_the_app_renders_are_relayed(r, state):
+    addon_id = await _added(r)
+    assert await relay_addon_step(correlation_id="corr-1", data={
+        "step": "addon", "addon_id": addon_id, "state": state}, r=r) == [
+        TurnAddon(addon_id, state, "use the sales DB", "jev", None)]
+
+
+@pytest.mark.parametrize("state", ["refused", "already_read", "something_new"])
+async def test_verdicts_on_one_request_are_not_relayed(r, state):
+    addon_id = await _added(r)
+    assert await relay_addon_step(correlation_id="corr-1", data={
+        "step": "addon", "addon_id": addon_id, "state": state, "request_id": "r" * 32}, r=r) == []
+
+
+async def test_ready_is_recorded_and_never_relayed(r):
+    assert await remote_addons_ready("corr-1", r=r) is False
+    assert await relay_addon_step(correlation_id="corr-1", data={
+        "kind": "addon", "type": "response.addon", "step": "addon", "state": "ready"}, r=r) == []
+    assert await remote_addons_ready("corr-1", r=r) is True
+    assert await remote_addons_ready("corr-2", r=r) is False
+    assert 0 < await r.ttl("cowork:addons-ready:corr-1") <= remote.ADDON_INDEX_TTL_S
+
+
+async def test_a_redis_error_drops_the_step(r, monkeypatch):
+    addon_id = await _added(r)
+
+    async def boom(*args, **kwargs):
+        raise RedisError("connection lost")
+
+    monkeypatch.setattr(r, "hget", boom)
+    assert await relay_addon_step(correlation_id="corr-1", data={
+        "step": "addon", "addon_id": addon_id, "state": "read"}, r=r) == []
+
+
+# ── Per-turn totals and the shared rate limit ──────────────────────────────
+
+
+async def test_totals_count_withdrawn_but_not_abandoned(r):
+    kept = await _added(r, text="éé")
+    pod = asyncio.create_task(_pod_answers_withdraw(r, "withdrawn"))
+    assert await _withdraw(r, kept) is RemoteWithdrawResult.WITHDRAWN
+    await pod
+    await r.delete(KEY)
+    await _submit(r, text="never confirmed", timeout=0.1)
+    assert await remote_addon_totals("corr-1", r=r) == (1, 4)
+
+
+async def test_the_rate_limit_is_per_person_and_per_window(r):
+    hits = [await remote_rate_limited("o:u", limit=3, window_s=60, r=r) for _ in range(4)]
+    assert hits == [False, False, False, True]
+    assert await remote_rate_limited("o:someone-else", limit=3, window_s=60, r=r) is False

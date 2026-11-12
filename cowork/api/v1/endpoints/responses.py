@@ -17,6 +17,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StringConstraints
+from redis.exceptions import RedisError
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response as HTTPResponse
 
@@ -31,12 +32,20 @@ from cowork.db.scoped import (
     get_tenant_scope,
     scope_from_principal,
 )
-from cowork.handlers.addon_route import queued, route_addon, route_remote_addon
+from cowork.handlers.addon_route import (
+    clean_local_key,
+    queued,
+    rate_limit_refusal,
+    route_addon,
+    route_remote_addon,
+    turn_response_ids,
+    valid_text,
+)
 from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
 from cowork.principal import Principal, caller_bearer, get_principal
 from cowork.schemas.responses import ResponsesRequest
 from cowork.streaming import RunHandle, TurnInProgress, registry
-from cowork.streaming.addons import addons
+from cowork.streaming.addons import MAX_ADDON_CHARS, addons
 from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import cancel_disconnected_run, cancel_run, request_cancel
@@ -45,7 +54,7 @@ from cowork.streaming.buffer import RedisStreamBuffer
 from cowork.streaming.registry import claim_held_refusal
 from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, TurnClaimUnavailable, live_holder
 from cowork.streaming.turn_index import TurnIndexEntry, TurnOwner, get_turn, list_turns
-from cowork.turnqueue.addons import RemoteWithdrawResult, withdraw_remote_addon
+from cowork.turnqueue.addons import RemoteWithdrawResult, remote_addons_ready, withdraw_remote_addon
 from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
 from cowork.turnqueue.auth_keys import extend_turn_key
 from cowork.turnqueue.redis_client import (
@@ -595,8 +604,8 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     return _answer_response(broker.submit(req.conversation_id, req.question_id, payload))
 
 
-# A message typed into the composer, so a lot more room than an answer's free
-# text; past it the app queues the message as it does on any error.
+# The request bound (422 past it). A message over MAX_ADDON_CHARS but under
+# this is answered queued as too_large, so the app keeps it as the next task.
 _MAX_ADDON_LENGTH = 64 * 1024
 
 
@@ -605,6 +614,13 @@ class AddonRequest(BaseModel):
     text: str = Field(max_length=_MAX_ADDON_LENGTH)
     # The person picked "Add to current task" themselves: Jev is not asked.
     force: bool = False
+    # The running turn's response id as the app saw it (its response.created).
+    # When sent and it is not the in-flight turn's, the message is queued as
+    # no_turn: it was typed against a turn that is over.
+    response_id: str | None = None
+    # The app's own id for the message, echoed on every response.addon event
+    # for it. Ignored, not refused, unless 1-64 of [A-Za-z0-9_-].
+    local_key: str | None = None
 
 
 @router.post("/addon", dependencies=[Depends(require(AuthenticatedInOrgMode))])
@@ -614,54 +630,86 @@ async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
 
     Always 200 for a caller who may touch the turn: {"status": "added",
     "addon_id", "decided_by"} when the running turn took it, else {"status":
-    "queued", "reason"}, and the app keeps it in its queue as today. 404 is
-    /answer's: no turn the caller may touch. The turn's stream carries a
-    `response.addon` event for each added message as it is added, read by the
-    model, or returned at turn end because the model never saw it.
+    "queued", "reason"} (addon_route.QueuedReason), and the app keeps it in
+    its queue as today. 404 is /answer's: no turn the caller may touch. Text
+    that is not valid Unicode is refused like any malformed request: bytes
+    that are not UTF-8 fail body parsing (400), a lone surrogate escape fails
+    request validation (422); the handler answers 400 {"status":
+    "invalid_text"} should one ever get past them. The turn's stream
+    carries a `response.addon` event for each added message as it is added,
+    read by the model, withdrawn, or returned at turn end because the model
+    never saw it; each carries the request's `local_key` when it had a valid
+    one.
 
-    On the remote backend the turn runs in a pod. Jev decides here, before
-    anything reaches the pod; then the message is queued for the pod's stdin
-    on the turn's answer queue and the status is the pod's own verdict,
-    waited for up to turnqueue.addons.ADDON_ACK_TIMEOUT_S: "added", or queued
-    as no_turn when the pod's turn refused it (it is ending) and as
+    On the remote backend the turn runs in a pod. Only a pod that said it
+    takes messages mid-task (its "ready" step) is offered one; Jev decides
+    here, before anything reaches the pod; then the message is queued for the
+    pod's stdin on the turn's answer queue and the status is the pod's own
+    verdict, waited for up to turnqueue.addons.ADDON_ACK_TIMEOUT_S: "added",
+    or queued as no_turn when the pod's turn refused it (it is ending) and as
     pod_timeout when no verdict came (a withdraw of it is queued too, so a
     late add can't also run as the next task).
     """
     _require_streaming_scope(scope)
-    text = req.text.strip()
     settings = TurnQueueSettings()
-    if settings.is_remote:
+    remote = settings.is_remote
+    if remote:
         found = await _shared_turn(req.conversation_id, scope)
         if found is None:
             return JSONResponse(status_code=404, content={"status": "not_found"})
-        if not text:
-            return queued("empty")
-        if not settings.addon_routing_enabled:
-            return queued("disabled")
-        if not found.in_flight:
+    else:
+        handle = _authorized_handle(registry.get(req.conversation_id), scope)
+        if handle is None:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
+    if not valid_text(req.text):
+        return JSONResponse(status_code=400, content={"status": "invalid_text"})
+    text = req.text.strip()
+    if not text:
+        return queued("empty")
+    if not settings.addon_routing_enabled:
+        return queued("disabled")
+    if len(text) > MAX_ADDON_CHARS:
+        return queued("too_large")
+    if not (found.in_flight if remote else handle.is_answering):
+        return queued("no_turn")
+    if req.response_id is not None:
+        try:
+            response_ids = await turn_response_ids(found.buffer if remote else handle.buffer)
+        except RedisError:
+            logger.warning("[addon] could not read the turn's response id", exc_info=True)
+            return queued("redis_error")
+        if response_ids is not None and req.response_id not in response_ids:
             return queued("no_turn")
+    if remote:
+        # Before Jev or a minted key: a pod whose anton can't take the
+        # message would only refuse it after both.
+        try:
+            ready = await remote_addons_ready(found.index.correlation_id)
+        except RedisError:
+            logger.warning("[addon] could not read the turn's support marker", exc_info=True)
+            return queued("redis_error")
+        if not ready:
+            return queued("not_supported")
+    else:
+        channel = addons.get(req.conversation_id)
+        if channel is None:
+            # The turn runs an anton that can't take messages mid-turn, or is
+            # not an agent turn.
+            return queued("not_supported")
+    refusal = await rate_limit_refusal(scope, remote=remote)
+    if refusal is not None:
+        return refusal
+    local_key = clean_local_key(req.local_key)
+    if remote:
         return await route_remote_addon(
             conversation_id=req.conversation_id,
             correlation_id=found.index.correlation_id,
             text=text,
             force=req.force,
             scope=scope,
+            local_key=local_key,
         )
-    handle = _authorized_handle(registry.get(req.conversation_id), scope)
-    if handle is None:
-        return JSONResponse(status_code=404, content={"status": "not_found"})
-    if not text:
-        return queued("empty")
-    if not settings.addon_routing_enabled:
-        return queued("disabled")
-    if not handle.is_answering:
-        return queued("no_turn")
-    channel = addons.get(req.conversation_id)
-    if channel is None:
-        # The turn runs an anton that can't take messages mid-turn, or is not
-        # an agent turn.
-        return queued("not_supported")
-    return await route_addon(channel=channel, text=text, force=req.force, scope=scope)
+    return await route_addon(channel=channel, text=text, force=req.force, scope=scope, local_key=local_key)
 
 
 class AddonWithdrawRequest(BaseModel):
@@ -673,11 +721,15 @@ _WITHDRAW_RESPONSES: dict[str, tuple[int, dict]] = {
     "withdrawn": (200, {"status": "withdrawn"}),
     "already_read": (409, {"status": "already_read"}),
     "not_found": (404, {"status": "not_found"}),
+    # anton raised: whether the model has it is unknown, so the app leaves
+    # the message where it is, as for a pod that did not answer.
+    "internal": (503, {"status": "unavailable"}),
 }
 
 
 _REMOTE_WITHDRAW_RESPONSES: dict[RemoteWithdrawResult, tuple[int, dict]] = {
-    **{RemoteWithdrawResult(value): response for value, response in _WITHDRAW_RESPONSES.items()},
+    **{RemoteWithdrawResult(value): response for value, response in _WITHDRAW_RESPONSES.items()
+       if value in {result.value for result in RemoteWithdrawResult}},
     RemoteWithdrawResult.UNAVAILABLE: (503, {"status": "unavailable"}),
 }
 

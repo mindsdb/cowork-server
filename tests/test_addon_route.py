@@ -104,6 +104,7 @@ def _clean_globals(monkeypatch):
     yield
     addons.reset()
     registry.reset()
+    addon_route._local_rate.reset()
     get_app_settings.cache_clear()
 
 
@@ -297,6 +298,127 @@ async def test_a_turn_that_stops_taking_messages_queues_as_no_turn(client, sessi
     assert _post(client, force=True).json() == {"status": "queued", "reason": "no_turn"}
 
 
+async def test_an_anton_exception_is_internal_not_no_turn(client, session, monkeypatch):
+    """anton raising is a bug, not a turn that is ending: logged, and queued
+    as internal."""
+    def boom(addon_id, text):
+        raise RuntimeError("anton bug")
+
+    monkeypatch.setattr(session, "add_user_input", boom)
+    assert _post(client, force=True).json() == {"status": "queued", "reason": "internal"}
+
+
+async def test_a_failed_target_lookup_is_internal(client, session, monkeypatch):
+    def boom(scope):
+        raise RuntimeError("settings unreadable")
+
+    monkeypatch.setattr(addon_route, "_jev_target", boom)
+    assert _post(client).json() == {"status": "queued", "reason": "internal"}
+
+
+# ── Limits ─────────────────────────────────────────────────────────────────
+
+
+async def test_a_message_over_the_character_limit_is_too_large(client, session):
+    assert _post(client, force=True, text="a" * 4001).json() == {"status": "queued", "reason": "too_large"}
+    assert session.inputs == []
+    assert _post(client, force=True, text="a" * 4000).json()["status"] == "added"
+
+
+async def test_a_turn_takes_at_most_twenty_messages(client, session):
+    for i in range(20):
+        assert _post(client, force=True, text=f"m{i}").json()["status"] == "added"
+    assert _post(client, force=True, text="one more").json() == {"status": "queued", "reason": "too_many"}
+
+
+async def test_withdrawn_messages_still_count_toward_the_turn(client, session):
+    for i in range(20):
+        addon_id = _post(client, force=True, text=f"m{i}").json()["addon_id"]
+        assert _withdraw(client, addon_id).status_code == 200
+    assert _post(client, force=True).json() == {"status": "queued", "reason": "too_many"}
+
+
+async def test_a_turn_takes_at_most_64_kb_of_text(client, session):
+    for _ in range(16):
+        assert _post(client, force=True, text="a" * 4000).json()["status"] == "added"
+    # 64,000 bytes taken: 1,537 more would pass 64 KB.
+    assert _post(client, force=True, text="a" * 1537).json() == {"status": "queued", "reason": "too_large"}
+    assert _post(client, force=True, text="a" * 1536).json()["status"] == "added"
+
+
+async def test_jev_reads_the_task_and_added_messages_cut_to_the_limit(client, session, jev):
+    captured: dict = {}
+    jev(_Client(response=_Response(200, _verdict()), captured=captured))
+    addons.get(CID).task = "t" * 10_000
+    _post(client, force=True, text="b" * 4000)
+    _post(client, text="and EMEA")
+    state = captured["json"]["state"]
+    assert state["running_task"] == "t" * 4000
+    assert state["already_added_to_task"] == ["b" * 4000]
+
+
+async def test_the_rate_limit_is_per_person(client, session, monkeypatch):
+    monkeypatch.setattr(addon_route, "ADDON_RATE_LIMIT", 3)
+    bodies = [_post(client, force=True, text=f"m{i}").json() for i in range(4)]
+    assert [b["status"] for b in bodies[:3]] == ["added"] * 3
+    assert bodies[3] == {"status": "queued", "reason": "rate_limited"}
+
+
+def test_the_in_process_rate_window_slides(monkeypatch):
+    window = addon_route._RateWindow()
+    now = [100.0]
+    monkeypatch.setattr(addon_route.time, "monotonic", lambda: now[0])
+    assert [window.hit("u", limit=2, window_s=60) for _ in range(3)] == [False, False, True]
+    assert window.hit("v", limit=2, window_s=60) is False
+    now[0] += 60.1
+    assert window.hit("u", limit=2, window_s=60) is False
+
+
+async def test_a_held_decision_lock_queues_as_busy(client, session, monkeypatch):
+    monkeypatch.setattr(addon_route, "DECIDE_LOCK_TIMEOUT_S", 0.05)
+    channel = addons.get(CID)
+    await channel.deciding.acquire()
+    try:
+        result = await addon_route.route_addon(channel=channel, text="x", force=True, scope=None)
+    finally:
+        channel.deciding.release()
+    assert result == {"status": "queued", "reason": "busy"}
+    assert session.inputs == []
+
+
+# ── The app's ids ──────────────────────────────────────────────────────────
+
+
+async def test_local_key_rides_every_event_of_its_addon(client, session):
+    body = _post(client, force=True, local_key="draft-7").json()
+    session.step_boundary()
+    events = addons.get(CID).drain()
+    assert [(e.state, e.payload().get("local_key")) for e in events] == [("added", "draft-7"), ("read", "draft-7")]
+    assert all(e.addon_id == body["addon_id"] for e in events)
+
+
+@pytest.mark.parametrize("local_key", ["k" * 65, "no spaces", "é", ""])
+async def test_an_invalid_local_key_is_ignored(client, session, local_key):
+    assert _post(client, force=True, local_key=local_key).json()["status"] == "added"
+    (event,) = addons.get(CID).drain()
+    assert "local_key" not in event.payload()
+
+
+async def test_a_response_id_from_another_turn_is_no_turn(client, run, session, tmp_path):
+    from cowork.streaming.buffer import FileStreamBuffer
+    from cowork.streaming.sse import sse_frame
+
+    buffer = FileStreamBuffer(tmp_path / "turn.jsonl")
+    await buffer.append("sse", {"sse": sse_frame("response.created", {
+        "type": "response.created", "response": {"id": "resp-current"}})})
+    run.buffer = buffer
+    assert _post(client, force=True, response_id="resp-old").json() == {"status": "queued", "reason": "no_turn"}
+    assert session.inputs == []
+    assert _post(client, force=True, response_id="resp-current").json()["status"] == "added"
+    # Leaving it out skips the check, as before.
+    assert _post(client, force=True).json()["status"] == "added"
+
+
 # ── POST /responses/addon/withdraw ─────────────────────────────────────────
 
 
@@ -306,6 +428,36 @@ async def test_withdraw_before_the_model_reads_it(client, session):
     assert resp.status_code == 200
     assert resp.json() == {"status": "withdrawn"}
     assert session.inputs == []
+
+
+async def test_a_withdraw_is_saved_once_the_add_was_streamed(client, session):
+    """B1: a reload must show the message moved back to the queue."""
+    addon_id = _post(client, force=True, local_key="k1").json()["addon_id"]
+    channel = addons.get(CID)
+    assert [e.state for e in channel.drain()] == ["added"]
+    assert _withdraw(client, addon_id).status_code == 200
+    (event,) = channel.drain()
+    assert event.payload() == {"type": "response.addon", "addon_id": addon_id, "state": "withdrawn",
+                               "text": "actually use the sales DB", "decided_by": "user", "local_key": "k1"}
+
+
+async def test_a_withdraw_before_the_add_was_streamed_drops_it(client, session):
+    addon_id = _post(client, force=True).json()["addon_id"]
+    other = _post(client, force=True, text="keep me").json()["addon_id"]
+    assert _withdraw(client, addon_id).status_code == 200
+    # Neither its "added" nor a "withdrawn": the stream never shows it.
+    assert [(e.addon_id, e.state) for e in addons.get(CID).drain()] == [(other, "added")]
+
+
+async def test_an_anton_exception_on_withdraw_leaves_it_in_place(client, session, monkeypatch):
+    addon_id = _post(client, force=True).json()["addon_id"]
+
+    def boom(addon_id):
+        raise RuntimeError("anton bug")
+
+    monkeypatch.setattr(session, "withdraw_user_input", boom)
+    resp = _withdraw(client, addon_id)
+    assert (resp.status_code, resp.json()) == (503, {"status": "unavailable"})
 
 
 async def test_withdraw_after_the_model_read_it_is_409(client, session):
@@ -359,6 +511,14 @@ def test_unread_messages_are_returned_at_turn_end(run):
         (read, "added", "jev"), (read, "read", "jev"), (unread, "added", "user"), (unread, "returned", "user"),
     ]
     assert events[-1].text == "and EMEA"
+
+
+def test_only_ids_the_channel_accepted_are_returned(run):
+    session = _Session()
+    channel = addons.open(CID, session, task="t", progress=list)
+    kept = channel.add("use the sales DB", decided_by="jev")
+    session.inputs.append({"id": "not-ours", "text": "injected"})
+    assert [(e.addon_id, e.state) for e in channel.take_returned()] == [(kept, "added"), (kept, "returned")]
 
 
 def test_closing_a_channel_unhooks_the_session(run):

@@ -25,7 +25,7 @@ import math
 import socket
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import httpx
@@ -147,7 +147,9 @@ class JevTarget:
     (MindsHub ``/v1/decisions``, TypeSafe ``/v1/systemone``)."""
 
     url: str
-    api_key: str
+    # Kept out of repr: a target that reaches a log line or a traceback must
+    # not carry the key (often one minted for the decision, ENG-4194).
+    api_key: str = field(repr=False)
     # MindsHub's own endpoint: only it reads the Langfuse trace headers, and
     # they carry user, organization and conversation ids, so an organization's
     # own decision endpoint never receives them.

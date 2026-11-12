@@ -4,9 +4,11 @@ status. The Redis side is tests/turnqueue/test_remote_addons.py."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
+from redis.exceptions import RedisError
 from fastapi.testclient import TestClient
 
 import cowork.api.v1.endpoints.responses as endpoints
@@ -18,6 +20,7 @@ from cowork.server import create_app
 from cowork.streaming.addons import TurnAddon
 from cowork.streaming.turn_index import TurnIndexEntry
 from cowork.turnqueue.addons import RemoteAddonResult, RemoteWithdrawResult
+from cowork.turnqueue import addons as remote_addons
 from cowork.turnqueue.producer import step_stream_events
 from anton.core.llm.provider import StreamTextDelta
 from tests.test_addon_route import TARGET, _Client, _Response, _verdict
@@ -32,6 +35,32 @@ def _remote_backend(monkeypatch):
     monkeypatch.setenv("COWORK_TURN_ADDON_ROUTING_ENABLED", "true")
     yield
     get_app_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def redis_side(monkeypatch):
+    """The Redis reads the route makes before the pod, scripted: the pod said
+    "ready", nobody is over the rate limit, and the turn took nothing yet."""
+    state = {"ready": True, "rate_limited": False, "totals": (0, 0), "rate_calls": 0}
+
+    async def ready(correlation_id):
+        if isinstance(state["ready"], Exception):
+            raise state["ready"]
+        return state["ready"]
+
+    async def rate_limited(user_key, *, limit, window_s):
+        state["rate_calls"] += 1
+        if isinstance(state["rate_limited"], Exception):
+            raise state["rate_limited"]
+        return state["rate_limited"]
+
+    async def totals(correlation_id):
+        return state["totals"]
+
+    monkeypatch.setattr(endpoints, "remote_addons_ready", ready)
+    monkeypatch.setattr(addon_route, "remote_rate_limited", rate_limited)
+    monkeypatch.setattr(addon_route, "remote_addon_totals", totals)
+    return state
 
 
 @pytest.fixture()
@@ -124,7 +153,7 @@ def test_jev_adds_and_the_pod_takes_it(client, turn, inputs, pod, jev):
     assert resp.status_code == 200
     assert resp.json() == {"status": "added", "addon_id": ADDON_ID, "decided_by": "jev"}
     assert pod["calls"] == [{"conversation_id": CID, "correlation_id": "corr-1",
-                             "text": "and the same for EMEA", "decided_by": "jev"}]
+                             "text": "and the same for EMEA", "decided_by": "jev", "local_key": None}]
     assert captured["json"]["state"] == {
         "running_task": "Build the 2025 sales dashboard.",
         "recent_progress": ["[ran tool: scratchpad]"],
@@ -166,12 +195,16 @@ def test_pod_verdicts_that_queue(client, turn, inputs, pod, result, reason):
     assert _post(client, force=True).json() == {"status": "queued", "reason": reason}
 
 
-def test_a_failure_reading_what_was_added_queues(client, turn, inputs, pod, jev, monkeypatch):
+@pytest.mark.parametrize(("error", "reason"), [
+    (RedisError("redis down"), "redis_error"),
+    (RuntimeError("bug"), "internal"),
+])
+def test_a_failure_reading_what_was_added_queues(client, turn, inputs, pod, jev, monkeypatch, error, reason):
     async def boom(correlation_id):
-        raise RuntimeError("redis down")
+        raise error
 
     monkeypatch.setattr(addon_route, "remote_added_texts", boom)
-    assert _post(client).json() == {"status": "queued", "reason": "jev_error"}
+    assert _post(client).json() == {"status": "queued", "reason": reason}
     assert pod["calls"] == []
 
 
@@ -203,26 +236,192 @@ def test_a_hosted_org_without_a_stored_key_asks_on_a_minted_key(client, turn, in
         revoked.append(correlation_id)
 
     monkeypatch.setattr(addon_route, "_jev_target", lambda scope: addon_route._MintKey(workspace_id="ws1", model="jev"))
-    monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
-    monkeypatch.setattr(producer, "_revoke_turn_key_quietly", fake_revoke)
+    monkeypatch.setattr(producer, "mint_llm_block", fake_mint)
+    monkeypatch.setattr(producer, "revoke_turn_key_quietly", fake_revoke)
     monkeypatch.setattr(jev_route, "_http_client",
                         lambda: _Client(response=_Response(200, _verdict(p_add=0.9)), captured=captured))
 
     assert _post(client).json() == {"status": "added", "addon_id": ADDON_ID, "decided_by": "jev"}
     assert len(minted) == 1 and minted[0]["workspace_id"] == "ws1"
+    # Lives just past the Jev call, not a whole turn.
+    assert minted[0]["ttl_seconds"] == 30
     assert revoked == [minted[0]["correlation_id"]]
 
 
-def test_a_failed_mint_queues_as_unchecked(client, turn, inputs, pod, monkeypatch):
+@pytest.mark.parametrize("error", [RuntimeError("auth down"), asyncio.CancelledError()], ids=["failed", "cancelled"])
+async def test_a_failed_or_cancelled_mint_still_revokes(monkeypatch, error):
+    """The mint may have issued a key before it failed or was cancelled:
+    revoked by its correlation id either way."""
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.turnqueue import producer
+
+    minted, revoked = [], []
+
+    async def mint(**kwargs):
+        minted.append(kwargs)
+        raise error
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    async def target(fn):
+        return addon_route._MintKey(workspace_id=None, model="jev")
+
+    monkeypatch.setattr("cowork.db.units.run_on_unit_threads", target)
+    monkeypatch.setattr(producer, "mint_llm_block", mint)
+    monkeypatch.setattr(producer, "revoke_turn_key_quietly", revoke)
+    call = addon_route._jev_refusal(conversation_id=CID, task="t", progress=[], added=[], text="x", scope=LOCAL_SCOPE)
+    if isinstance(error, asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            await call
+    else:
+        assert await call == {"status": "queued", "reason": "internal"}
+    assert revoked == [minted[0]["correlation_id"]]
+
+
+def test_minted_key_ttl_tracks_the_jev_timeout(monkeypatch):
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    assert addon_route.minted_key_ttl(TurnQueueSettings()) == 30
+    monkeypatch.setenv("COWORK_TURN_JEV_ROUTE_TIMEOUT_SECONDS", "25.5")
+    assert addon_route.minted_key_ttl(TurnQueueSettings()) == 36
+
+
+def test_a_jev_target_never_shows_its_key():
+    assert "turn-key" not in repr(TARGET)
+
+
+def test_a_failed_mint_queues_as_internal(client, turn, inputs, pod, monkeypatch):
     from cowork.turnqueue import producer
 
     async def boom(**kwargs):
         raise RuntimeError("auth down")
 
     monkeypatch.setattr(addon_route, "_jev_target", lambda scope: addon_route._MintKey(workspace_id=None, model="jev"))
-    monkeypatch.setattr(producer, "_mint_llm_block", boom)
-    assert _post(client).json() == {"status": "queued", "reason": "jev_error"}
+    monkeypatch.setattr(producer, "mint_llm_block", boom)
+    monkeypatch.setattr(producer, "revoke_turn_key_quietly", lambda correlation_id: asyncio.sleep(0))
+    assert _post(client).json() == {"status": "queued", "reason": "internal"}
     assert pod["calls"] == []
+
+
+# ── Support, limits and the app's ids ──────────────────────────────────────
+
+
+def test_a_pod_that_never_said_ready_is_not_supported(client, turn, inputs, pod, monkeypatch, redis_side):
+    """Checked before Jev and before any key is minted."""
+    from cowork.turnqueue import producer
+
+    async def never(**kwargs):
+        raise AssertionError("must not be called")
+
+    redis_side["ready"] = False
+    monkeypatch.setattr(addon_route, "_jev_refusal", never)
+    monkeypatch.setattr(producer, "mint_llm_block", never)
+    assert _post(client).json() == {"status": "queued", "reason": "not_supported"}
+    assert pod["calls"] == []
+
+
+def test_a_redis_error_reading_ready_queues_as_redis_error(client, turn, pod, redis_side):
+    redis_side["ready"] = RedisError("down")
+    assert _post(client, force=True).json() == {"status": "queued", "reason": "redis_error"}
+
+
+@pytest.mark.parametrize(("over", "reason"), [(True, "rate_limited"), (RedisError("down"), "redis_error")])
+def test_the_shared_rate_limit(client, turn, pod, redis_side, over, reason):
+    redis_side["rate_limited"] = over
+    assert _post(client, force=True).json() == {"status": "queued", "reason": reason}
+    assert pod["calls"] == []
+
+
+@pytest.mark.parametrize(("totals", "reason"), [
+    ((20, 100), "too_many"),
+    ((3, 64 * 1024 - 5), "too_large"),
+])
+def test_the_per_turn_limits(client, turn, pod, redis_side, totals, reason):
+    redis_side["totals"] = totals
+    assert _post(client, force=True, text="hello world").json() == {"status": "queued", "reason": reason}
+    assert pod["calls"] == []
+
+
+def test_a_message_over_the_character_limit_is_too_large(client, turn, pod, redis_side):
+    assert _post(client, force=True, text="a" * 4001).json() == {"status": "queued", "reason": "too_large"}
+    assert redis_side["rate_calls"] == 0
+    assert _post(client, force=True, text="a" * 4000).json()["status"] == "added"
+
+
+@pytest.mark.parametrize(("body", "status"), [
+    # A JSON escape for a lone surrogate: refused by request validation, as
+    # any malformed field is.
+    (b'{"conversation_id":"%s","text":"a\\ud800"}' % CID.encode(), 422),
+    # Bytes that are not UTF-8: refused when the body is parsed.
+    (b'{"conversation_id":"%s","text":"a\xff"}' % CID.encode(), 400),
+], ids=["lone-surrogate", "invalid-utf8"])
+def test_text_that_is_not_valid_unicode_is_refused(client, turn, pod, body, status):
+    resp = client.post("/api/v1/responses/addon", content=body, headers={"content-type": "application/json"})
+    assert resp.status_code == status
+    assert pod["calls"] == []
+
+
+def test_the_handler_guards_against_a_lone_surrogate_too():
+    """Behind request validation, in case a parser ever lets one through."""
+    assert addon_route.valid_text("usá la base") is True
+    assert addon_route.valid_text("a\ud800") is False
+
+
+@pytest.mark.parametrize(("local_key", "kept"), [
+    ("draft-42_A", "draft-42_A"),
+    ("k" * 64, "k" * 64),
+    ("k" * 65, None),
+    ("has space", None),
+    ("", None),
+])
+def test_local_key_is_passed_on_only_when_valid(client, turn, pod, local_key, kept):
+    assert _post(client, force=True, local_key=local_key).json()["status"] == "added"
+    assert pod["calls"][0]["local_key"] == kept
+
+
+def test_a_response_id_for_another_turn_is_no_turn(client, turn, pod, monkeypatch):
+    async def ids(buffer):
+        return {"resp-current"}
+
+    monkeypatch.setattr(endpoints, "turn_response_ids", ids)
+    assert _post(client, force=True, response_id="resp-old").json() == {"status": "queued", "reason": "no_turn"}
+    assert pod["calls"] == []
+    assert _post(client, force=True, response_id="resp-current").json()["status"] == "added"
+
+
+async def test_the_decision_lock_times_out_as_busy(monkeypatch):
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    monkeypatch.setattr(addon_route, "DECIDE_LOCK_TIMEOUT_S", 0.05)
+    async with addon_route._deciding("corr-1"):
+        result = await addon_route.route_remote_addon(
+            conversation_id=CID, correlation_id="corr-1", text="x", force=True, scope=LOCAL_SCOPE,
+        )
+    assert result == {"status": "queued", "reason": "busy"}
+    assert addon_route._remote_deciding == {}
+
+
+async def test_the_lock_entry_outlives_a_waiter():
+    """A waiter keeps the entry: a third caller queues on the same lock
+    instead of a fresh one, and the entry goes with the last of them."""
+    order = []
+
+    async def hold(name, delay):
+        async with addon_route._deciding("corr-1"):
+            order.append(name)
+            await asyncio.sleep(delay)
+
+    first = asyncio.create_task(hold("first", 0.05))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(hold("second", 0))
+    await asyncio.sleep(0)
+    assert addon_route._remote_deciding["corr-1"].users == 2
+    await first
+    third = asyncio.create_task(hold("third", 0))
+    await asyncio.gather(second, third)
+    assert order == ["first", "second", "third"]
+    assert addon_route._remote_deciding == {}
 
 
 def test_finished_turn_queues_as_no_turn(client, turn, pod):
@@ -273,27 +472,23 @@ def _step(state, **extra):
     return {"step": "addon", "type": "response.addon", "addon_id": ADDON_ID, "state": state, **extra}
 
 
-@pytest.mark.parametrize("state", ["added", "read", "returned"])
-def test_the_states_the_app_renders_are_relayed(state):
-    events = step_stream_events(_step(state, text="use the sales DB", decided_by="jev"))
-    assert events == [TurnAddon(ADDON_ID, state, "use the sales DB", "jev")]
+@pytest.mark.parametrize("state", ["added", "read", "returned", "withdrawn", "ready"])
+def test_the_sync_step_mapping_renders_no_addon_step(state):
+    """Addon steps go through relay_addon_step (tests/turnqueue/test_remote_addons.py),
+    which checks the addon is this turn's; a channel turn renders none."""
+    assert step_stream_events(_step(state, text="use the sales DB", decided_by="jev")) == []
 
 
-@pytest.mark.parametrize("state", ["refused", "withdrawn", "already_read", "something_new"])
-def test_verdicts_on_one_request_are_not_relayed(state):
-    assert step_stream_events(_step(state, request_id="r" * 32)) == []
-
-
-def test_a_returned_message_the_pod_no_longer_knows_leaves_out_what_it_lacks():
-    (event,) = step_stream_events(_step("returned", text="and EMEA", decided_by=None))
+def test_an_event_without_what_it_lacks_leaves_it_out():
+    event = TurnAddon(ADDON_ID, "returned", "and EMEA", None)
     assert event.payload() == {"type": "response.addon", "addon_id": ADDON_ID,
                                "state": "returned", "text": "and EMEA"}
+    assert TurnAddon(ADDON_ID, "withdrawn", "x", "jev", "k-1").payload()["local_key"] == "k-1"
 
 
 async def test_a_relayed_addon_is_streamed_and_saved_as_response_addon():
     async def _events():
-        for event in step_stream_events(_step("read", text="use the sales DB", decided_by="user")):
-            yield event
+        yield TurnAddon(ADDON_ID, "read", "use the sales DB", "user", "k-1")
 
     recorded: list[tuple[str, dict]] = []
     chunks = [c async for c in format_responses_stream(
@@ -302,8 +497,8 @@ async def test_a_relayed_addon_is_streamed_and_saved_as_response_addon():
     frames = [json.loads(line[len("data:"):]) for chunk in chunks
               for line in chunk.splitlines() if line.startswith("data:")]
     addon = next(f for f in frames if f.get("type") == "response.addon")
-    assert {k: addon[k] for k in ("addon_id", "state", "text", "decided_by")} == {
-        "addon_id": ADDON_ID, "state": "read", "text": "use the sales DB", "decided_by": "user",
+    assert {k: addon[k] for k in ("addon_id", "state", "text", "decided_by", "local_key")} == {
+        "addon_id": ADDON_ID, "state": "read", "text": "use the sales DB", "decided_by": "user", "local_key": "k-1",
     }
     assert any(t == "response.addon" for t, _ in recorded)
 
@@ -356,6 +551,9 @@ async def test_a_message_read_mid_turn_leaves_the_narration_before_each_tool():
         for line in _mid_turn_pod_lines():
             if line["kind"] == "delta":
                 yield StreamTextDelta(text=line["text"])
+            elif line["kind"] == "addon":
+                # What relay_addon_step yields for an addon this turn holds.
+                yield TurnAddon(line["addon_id"], line["state"], line["text"], line["decided_by"])
             else:
                 for event in step_stream_events({**line, "step": line["kind"]}):
                     yield event
@@ -406,3 +604,47 @@ def test_the_running_task_is_the_pending_question(tmp_path):
             conv.id, [{"type": "input_text", "text": "Build the 2025 sales dashboard."}], pending=True,
         )
         assert addon_route._running_task(session, conversation_id=conv.id) == "Build the 2025 sales dashboard."
+
+
+# ── The web turn's relay: only addons this turn holds reach the app ────────
+
+
+async def test_the_web_relay_streams_and_saves_only_this_turns_addons(monkeypatch):
+    import fakeredis.aioredis
+
+    from cowork.handlers import responses as responses_mod
+    from cowork.turnqueue.redis_client import addon_index_key
+    from tests.test_responses_remote_backend import _FakeBuffer, _remote_handler
+
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(remote_addons, "get_redis", lambda: fake)
+    saved: dict = {}
+    handler = _remote_handler(monkeypatch, saved)
+    seen: dict = {}
+
+    async def fake_replies(**kwargs):
+        corr = seen["corr"] = kwargs["correlation_id"]
+        await fake.hset(addon_index_key(corr), ADDON_ID, json.dumps(
+            {"text": "use the sales DB", "decided_by": "jev", "at": 1, "status": "added", "local_key": "k-1"}))
+        await fake.hset(addon_index_key(corr), "b" * 32, json.dumps(
+            {"text": "gave up on", "decided_by": "jev", "at": 2, "status": "abandoned"}))
+        yield "turn_step", {"step": "addon", "type": "response.addon", "state": "ready"}
+        yield "turn_step", _step("added", text="pod's own words", decided_by="user")
+        yield "turn_step", {**_step("added"), "addon_id": "b" * 32}
+        yield "turn_step", {**_step("added"), "addon_id": "f" * 32, "text": "injected"}
+        yield "turn_step", _step("withdrawn", request_id="r" * 32)
+        yield "turn_delta", {"text": "done"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    await handler._produce_remote(
+        conv_id=CID, input_text="hi", original_content="hi", model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    addon_events = [e for e in saved["events"] if e.get("type") == "response.addon"]
+    assert [(e["addon_id"], e["state"], e["text"], e["decided_by"], e["local_key"]) for e in addon_events] == [
+        (ADDON_ID, "added", "use the sales DB", "jev", "k-1"),
+        (ADDON_ID, "withdrawn", "use the sales DB", "jev", "k-1"),
+    ]
+    # "ready" is recorded for /addon's support check, never streamed.
+    assert await remote_addons.remote_addons_ready(seen["corr"], r=fake) is True

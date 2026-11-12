@@ -33,11 +33,37 @@ from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["AddonChannel", "AddonRegistry", "TurnAddon", "addons", "supports_addons"]
+__all__ = [
+    "AddonChannel", "AddonRegistry", "TurnAddon", "addons", "supports_addons", "turn_limit_reason",
+    "MAX_ADDON_CHARS", "MAX_ADDONS_PER_TURN", "MAX_ADDED_BYTES_PER_TURN",
+]
 
-AddonState = Literal["added", "read", "returned"]
+AddonState = Literal["added", "read", "returned", "withdrawn"]
 DecidedBy = Literal["jev", "user"]
-WithdrawResult = Literal["withdrawn", "already_read", "not_found"]
+# "internal": anton raised; the message stays where it is (503 at the route).
+WithdrawResult = Literal["withdrawn", "already_read", "not_found", "internal"]
+
+# Limits on what one turn takes mid-task, in both backends: each message is
+# typed into the composer, and everything added is read by Jev and by the
+# model on every later step, so a runaway client can't grow either without
+# bound. Past them the message is queued as the next task, as without this
+# feature.
+#: Characters in one added message (POST /addon queues it as too_large).
+MAX_ADDON_CHARS = 4000
+#: Messages one turn takes (too_many), withdrawn ones included.
+MAX_ADDONS_PER_TURN = 20
+#: UTF-8 bytes of text one turn takes, withdrawn ones included (too_large).
+MAX_ADDED_BYTES_PER_TURN = 64 * 1024
+
+
+def turn_limit_reason(*, count: int, total_bytes: int, text: str) -> Literal["too_many", "too_large"] | None:
+    """Why a turn that already took *count* messages totalling *total_bytes*
+    can't take *text* too, or None when it can."""
+    if count >= MAX_ADDONS_PER_TURN:
+        return "too_many"
+    if total_bytes + len(text.encode("utf-8")) > MAX_ADDED_BYTES_PER_TURN:
+        return "too_large"
+    return None
 
 # What the installed anton must have. Older builds lack them; their turns get
 # no channel, and every message sent during them is queued.
@@ -59,6 +85,11 @@ class TurnAddon:
     - ``read``: anton showed it to the model.
     - ``returned``: the turn ended before the model saw it; the app runs it
       as the next task, so nothing is lost.
+    - ``withdrawn``: the person moved it back to the queue ("Move to queue")
+      before the model saw it; saved so a reload shows it moved.
+
+    ``local_key`` is the app's own id for the message (POST /addon's
+    ``local_key``), on every event of an addon that sent one.
     """
 
     addon_id: str
@@ -68,6 +99,7 @@ class TurnAddon:
     # payload then.
     text: str | None
     decided_by: DecidedBy | None
+    local_key: str | None = None
 
     def payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -79,6 +111,8 @@ class TurnAddon:
             payload["text"] = self.text
         if self.decided_by is not None:
             payload["decided_by"] = self.decided_by
+        if self.local_key is not None:
+            payload["local_key"] = self.local_key
         return payload
 
 
@@ -86,7 +120,11 @@ class TurnAddon:
 class _Addon:
     text: str
     decided_by: DecidedBy
+    local_key: str | None = None
     read: bool = False
+
+    def event(self, addon_id: str, state: AddonState) -> TurnAddon:
+        return TurnAddon(addon_id, state, self.text, self.decided_by, self.local_key)
 
 
 class AddonChannel:
@@ -106,6 +144,10 @@ class AddonChannel:
         self._progress = progress
         self._addons: dict[str, _Addon] = {}
         self._events: list[TurnAddon] = []
+        # Every message the turn took, withdrawn ones included, for the
+        # per-turn limits (turn_limit_reason).
+        self.accepted_count = 0
+        self.accepted_bytes = 0
         # Messages are decided one at a time, in the order they arrive, so a
         # follow-up is judged with the one before it already added.
         self.deciding = asyncio.Lock()
@@ -122,19 +164,22 @@ class AddonChannel:
     def added_texts(self) -> list[str]:
         return [addon.text for addon in self._addons.values()]
 
-    def add(self, text: str, *, decided_by: DecidedBy) -> str | None:
+    def limit_reason(self, text: str) -> Literal["too_many", "too_large"] | None:
+        return turn_limit_reason(count=self.accepted_count, total_bytes=self.accepted_bytes, text=text)
+
+    def add(self, text: str, *, decided_by: DecidedBy, local_key: str | None = None) -> str | None:
         """Hand *text* to the running turn. Its addon id, or None when the
-        turn no longer takes messages (it is ending)."""
+        turn no longer takes messages (it is ending). An exception from
+        anton propagates: it is not a refusal, and the route reports it as
+        ``internal``."""
         addon_id = str(uuid.uuid4())
-        try:
-            accepted = self._session.add_user_input(addon_id, text)
-        except Exception:
-            logger.warning("anton refused an added message", exc_info=True)
+        if not self._session.add_user_input(addon_id, text):
             return None
-        if not accepted:
-            return None
-        self._addons[addon_id] = _Addon(text=text, decided_by=decided_by)
-        self._events.append(TurnAddon(addon_id, "added", text, decided_by))
+        addon = _Addon(text=text, decided_by=decided_by, local_key=local_key)
+        self._addons[addon_id] = addon
+        self.accepted_count += 1
+        self.accepted_bytes += len(text.encode("utf-8"))
+        self._events.append(addon.event(addon_id, "added"))
         return addon_id
 
     def withdraw(self, addon_id: str) -> WithdrawResult:
@@ -148,13 +193,24 @@ class AddonChannel:
         try:
             withdrawn = self._session.withdraw_user_input(addon_id)
         except Exception:
-            logger.warning("anton could not withdraw an added message", exc_info=True)
-            withdrawn = False
+            # Not a verdict: whether the model has it is unknown, so the
+            # message stays where it is rather than reading as already read.
+            logger.exception("anton failed to withdraw an added message",
+                             extra={"conversation_id": self.conversation_id})
+            return "internal"
         if not withdrawn:
             # anton took it at a step boundary and has not reported it read
             # yet: the model has it either way.
             return "already_read"
         del self._addons[addon_id]
+        # Saved with the turn's events, so a reload shows the message moved
+        # back to the queue. An "added" the stream has not carried yet is
+        # dropped instead: then the stream never shows it at all.
+        undrained = [e for e in self._events if e.addon_id == addon_id and e.state == "added"]
+        if undrained:
+            self._events = [e for e in self._events if e.addon_id != addon_id]
+        else:
+            self._events.append(addon.event(addon_id, "withdrawn"))
         return "withdrawn"
 
     def _mark_read(self, ids: list[str]) -> None:
@@ -165,7 +221,7 @@ class AddonChannel:
             if addon is None or addon.read:
                 continue
             addon.read = True
-            self._events.append(TurnAddon(addon_id, "read", addon.text, addon.decided_by))
+            self._events.append(addon.event(addon_id, "read"))
 
     def drain(self) -> list[TurnAddon]:
         """The events since the last drain, oldest first."""
@@ -184,8 +240,12 @@ class AddonChannel:
         for entry in unread:
             addon_id = str(entry.get("id") or "")
             addon = self._addons.pop(addon_id, None)
-            decided_by: DecidedBy = addon.decided_by if addon is not None else "jev"
-            events.append(TurnAddon(addon_id, "returned", str(entry.get("text") or ""), decided_by))
+            if addon is None:
+                # Only ids this channel accepted reach the stream.
+                logger.warning("anton returned an added message this turn never took",
+                               extra={"conversation_id": self.conversation_id})
+                continue
+            events.append(addon.event(addon_id, "returned"))
         return events
 
     def detach(self) -> None:
