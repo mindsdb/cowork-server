@@ -902,6 +902,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # them through a session of its own.
     turn_settings = await run_on_unit_threads(partial(get_user_settings, scope))
     jev_decisions = getattr(turn_settings, "jev_decisions_enabled", True) is not False
+    jev_classify = getattr(turn_settings, "jev_classify_enabled", True) is not False
     time_limit = settings.time_limit_seconds
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
@@ -916,6 +917,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # completion check then never asks it. A controller that
               # predates the field drops it, and the pod keeps Jev on.
               "jev_decisions": jev_decisions,
+              # False when the organization turned off labelling texts with
+              # Jev: the pod's scratchpad then has no classify(). A controller
+              # that predates the field drops it, and the pod keeps it on.
+              "jev_classify": jev_classify,
               # The app's language (ENG-4149), read by anton's TurnRequestV1.
               # Absent without one. scratchpad-controller relays it to the pod
               # (mindsdb/scratchpad-controller#124, which merges first).
