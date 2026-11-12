@@ -185,6 +185,23 @@ def _kill(process: subprocess.Popen) -> None:
         pass
 
 
+def _held_bytes(*, watched: psutil.Process) -> int:
+    """The memory the conversion holds: its resident set, or on Windows its private bytes.
+
+    On Windows a venv's ``python.exe`` can be a launcher whose child does the
+    work, so the launcher and every process under it count together.
+    """
+    if sys.platform != "win32":
+        return watched.memory_info().rss
+    held = watched.memory_info().private
+    for child in watched.children(recursive=True):
+        try:
+            held += child.memory_info().private
+        except psutil.Error:
+            pass
+    return held
+
+
 def _close_quietly(*, stream: IO[bytes]) -> None:
     """Close one end of a pipe whose other end may be gone."""
     try:
@@ -278,11 +295,10 @@ def _outcome(*, exchange: _Exchange, returncode: int, cause: str | None) -> Conv
 class _Watch:
     """Kills the conversion process past its wall clock or its memory limit.
 
-    The wall clock counts from the start, imports included. Memory is the
-    process's resident set, or its private bytes on Windows, checked every
-    ``_WATCH_SECONDS``, so a fast allocation can pass the limit by what it
-    takes in one check. On Linux the process's own address-space limit is
-    the hard bound.
+    The wall clock counts from the start, imports included. Memory is what
+    ``_held_bytes`` reads, checked every ``_WATCH_SECONDS``, so a fast
+    allocation can pass the limit by what it takes in one check. On Linux the
+    process's own address-space limit is the hard bound.
     """
 
     def __init__(self, *, process: subprocess.Popen, limits: ChildLimits) -> None:
@@ -312,25 +328,12 @@ class _Watch:
                 self._stop(cause="wall clock")
                 return
             try:
-                watched = self._interpreter(watched=watched)
-                memory = watched.memory_info()
+                held = _held_bytes(watched=watched)
             except psutil.Error:
                 return
-            held = memory.private if sys.platform == "win32" else memory.rss
             if held > self._limits.memory_bytes:
                 self._stop(cause="memory")
                 return
-
-    def _interpreter(self, *, watched: psutil.Process) -> psutil.Process:
-        """The process holding the conversion's memory.
-
-        On Windows a venv's ``python.exe`` is a launcher whose child does the
-        work, so the watch moves to that child once it appears.
-        """
-        if sys.platform != "win32" or watched.pid != self._process.pid:
-            return watched
-        children = watched.children()
-        return children[0] if children else watched
 
     def _stop(self, *, cause: str) -> None:
         self.cause = cause

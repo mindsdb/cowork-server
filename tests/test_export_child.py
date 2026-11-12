@@ -489,6 +489,29 @@ def test_each_way_a_process_ends_maps_to_its_answer(monkeypatch, tmp_path, code,
     assert _descendants() == children
 
 
+def test_the_watch_kills_a_process_that_holds_more_than_its_memory_limit(monkeypatch, tmp_path):
+    """The server's own watch, with no limit the process sets on itself: the
+    only memory limit on macOS and Windows."""
+    _fake_child(
+        monkeypatch, "import time; held = b'x' * (400 * 1024 * 1024); time.sleep(60)"
+    )
+    children = _descendants()
+    started = time.monotonic()
+
+    with pytest.raises(export_runner.ConversionOverrun) as overrun:
+        with pinned_dir(tmp_path) as folder:
+            export_runner.convert_in_child(
+                request=_request(suffix=".md"),
+                source=b"# R\n",
+                read_asset=folder_reader(folder=folder, max_bytes=1024),
+                limits=ChildLimits(wall_seconds=30.0, memory_bytes=200 * MIB),
+            )
+
+    assert overrun.value.cause == "memory"
+    assert time.monotonic() - started < 15
+    assert _descendants() == children
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows has no signals")
 def test_a_process_killed_by_a_signal_is_an_overrun(monkeypatch, tmp_path):
     _fake_child(monkeypatch, "import os, signal; os.kill(os.getpid(), signal.SIGKILL)")

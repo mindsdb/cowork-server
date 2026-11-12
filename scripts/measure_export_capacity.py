@@ -146,11 +146,9 @@ def _report_html(*, target_bytes: int, images: int) -> str:
 
 
 def _write(folder: Path, name: str, data: str | bytes) -> None:
+    """Write *data* as given: text as UTF-8 with its line ends kept, so a case is its size on Windows too."""
     path = folder / name
-    if isinstance(data, str):
-        path.write_text(data, encoding="utf-8")
-    else:
-        path.write_bytes(data)
+    path.write_bytes(data.encode("utf-8") if isinstance(data, str) else data)
 
 
 def _with_images(folder: Path, *, count: int) -> None:
