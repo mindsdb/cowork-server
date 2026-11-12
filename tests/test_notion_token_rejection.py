@@ -9,9 +9,6 @@ import pytest
 from fastapi import HTTPException
 
 errors = pytest.importorskip("anton.core.mcp.errors")
-pytestmark = pytest.mark.skipif(
-    not hasattr(errors, "McpTokenRejected"), reason="installed anton has no McpTokenRejected"
-)
 httpx2 = pytest.importorskip("httpx2")
 
 from anton.core.datasources.data_vault import LocalDataVault  # noqa: E402
