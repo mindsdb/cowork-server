@@ -97,7 +97,7 @@ _MINTED_KEY_MIN_TTL_S = 30
 #: The app's own id for a message (POST /addon's local_key).
 _LOCAL_KEY = re.compile(r"[A-Za-z0-9_-]{1,64}")
 #: How many of the turn's first records are searched for its response.created.
-_RESPONSE_ID_SCAN = 64
+_RESPONSE_ID_SCAN = 1000
 
 
 def queued(reason: QueuedReason) -> dict:

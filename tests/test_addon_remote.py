@@ -391,6 +391,17 @@ def test_a_response_id_for_another_turn_is_no_turn(client, turn, pod, monkeypatc
     assert _post(client, force=True, response_id="resp-current").json()["status"] == "added"
 
 
+def test_a_turn_whose_response_id_was_not_found_is_not_refused(client, turn, pod, monkeypatch):
+    # The scan found no response.created (it came after the first take's
+    # frames): that says nothing about which turn this is, so the message
+    # goes on to be added rather than refused as another turn's.
+    async def ids(buffer):
+        return set()
+
+    monkeypatch.setattr(endpoints, "turn_response_ids", ids)
+    assert _post(client, force=True, response_id="resp-current").json()["status"] == "added"
+
+
 async def test_the_decision_lock_times_out_as_busy(monkeypatch):
     from cowork.db.scoped import LOCAL_SCOPE
 
