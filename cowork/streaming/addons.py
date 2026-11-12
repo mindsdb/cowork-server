@@ -158,7 +158,10 @@ class AddonChannel:
         try:
             return list(self._progress())
         except Exception:
-            logger.warning("Could not read the running turn's progress", exc_info=True)
+            # Kept broad: the harness's callable reads the running turn's
+            # state; whatever it raises, Jev decides without the steps.
+            logger.warning("Could not read the running turn's progress", exc_info=True,
+                           extra={"conversation_id": self.conversation_id})
             return []
 
     def added_texts(self) -> list[str]:
@@ -193,7 +196,8 @@ class AddonChannel:
         try:
             withdrawn = self._session.withdraw_user_input(addon_id)
         except Exception:
-            # Not a verdict: whether the model has it is unknown, so the
+            # Kept broad: anton's own code on the running turn's session. Not
+            # a verdict: whether the model has it is unknown, so the
             # message stays where it is rather than reading as already read.
             logger.exception("anton failed to withdraw an added message",
                              extra={"conversation_id": self.conversation_id})
@@ -234,7 +238,10 @@ class AddonChannel:
         try:
             unread = self._session.take_unread_user_inputs() or []
         except Exception:
-            logger.warning("Could not read the turn's unread added messages", exc_info=True)
+            # Kept broad: runs as the turn ends, so an anton bug here must
+            # not fail the turn; the app then shows no "returned" rows.
+            logger.warning("Could not read the turn's unread added messages", exc_info=True,
+                           extra={"conversation_id": self.conversation_id})
             unread = []
         events = self.drain()
         for entry in unread:

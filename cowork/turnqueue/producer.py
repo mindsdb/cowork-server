@@ -227,10 +227,6 @@ async def mint_llm_block(*, org_id: str | None, user_id: str | None,
     return _build_llm_block(api_key, settings)
 
 
-# The name the turn's own code and its tests use (they patch it here).
-_mint_llm_block = mint_llm_block
-
-
 def _build_llm_block(api_key: str, settings: TurnQueueSettings) -> dict:
     base_url = settings.minds_base_url or minds_chat_base_url(default_turn_minds_api_host())
     block = {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
@@ -247,7 +243,7 @@ async def _mint_llm_block_with_turn_key_id(
     *, org_id: str | None, user_id: str | None, correlation_id: str, settings: TurnQueueSettings,
     workspace_id: str | None = None,
 ) -> tuple[dict, str]:
-    """As _mint_llm_block, also returning the key's public prefix the datasource grants bind to."""
+    """As mint_llm_block, also returning the key's public prefix the datasource grants bind to."""
     minted = await mint_turn_key_details(
         user_id=user_id,
         org_id=org_id,
@@ -264,7 +260,7 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
                             settings: TurnQueueSettings) -> dict | None:
     """Build everything the job's `oauth` block needs except the turn key —
     the list of connections anton is allowed to use this turn. Deliberately
-    doesn't take the turn key `_mint_llm_block` mints: this function's own
+    doesn't take the turn key `mint_llm_block` mints: this function's own
     network call (listing active connections) never uses it, only the final
     block does, so the caller runs the two mints concurrently and folds the
     turn key in afterward instead of sequencing this behind the llm mint.
@@ -737,10 +733,6 @@ async def revoke_turn_key_quietly(correlation_id: str) -> None:
     await _revoke_turn_key_at_turn_end(correlation_id, TurnQueueSettings())
 
 
-# The name handlers/responses.py imports (its tests patch it there).
-_revoke_turn_key_quietly = revoke_turn_key_quietly
-
-
 async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 user_id: str | None, input_text: str,
                                 model: str | None,
@@ -839,7 +831,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                 )
             else:
                 llm_block, oauth_connections = await asyncio.gather(
-                    _mint_llm_block(
+                    mint_llm_block(
                         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
                         workspace_id=workspace_id,
                     ),

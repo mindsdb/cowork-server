@@ -80,7 +80,7 @@ from cowork.streaming.registry import RunHandle, RunIdentity, mark_question_save
 from cowork.turnqueue.addons import ADDON_STEP, relay_addon_step
 from cowork.turnqueue.producer import (
     RemoteWorkspace,
-    _revoke_turn_key_quietly,
+    revoke_turn_key_quietly,
     step_stream_events,
     stream_remote_replies,
 )
@@ -770,7 +770,7 @@ def _carries_attachments(request: ResponsesRequest) -> bool:
 async def _drop_gate_key(turn_llm: dict | None) -> None:
     """Revoke the turn key the routing gate minted, for a turn that won't run."""
     if turn_llm and turn_llm.get("correlation_id"):
-        await _revoke_turn_key_quietly(turn_llm["correlation_id"])
+        await revoke_turn_key_quietly(turn_llm["correlation_id"])
 
 
 class ResponsesHandler:
@@ -1658,7 +1658,7 @@ class ResponsesHandler:
                 or provider_api_key(settings, Provider.MINDS_CLOUD) is not None):
             return None, None
         from anton.core.llm.openai import OpenAIProvider
-        from cowork.turnqueue.producer import _mint_llm_block, _mint_llm_block_with_turn_key_id
+        from cowork.turnqueue.producer import _mint_llm_block_with_turn_key_id, mint_llm_block
 
         corr = str(uuid4())
         queue_settings = TurnQueueSettings()
@@ -1673,7 +1673,7 @@ class ResponsesHandler:
                 workspace_id=workspace_id,
             )
         else:
-            block = await _mint_llm_block(
+            block = await mint_llm_block(
                 org_id=self.scope.org_id,
                 user_id=self.scope.user_id,
                 correlation_id=corr,

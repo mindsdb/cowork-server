@@ -714,9 +714,11 @@ async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
             scope=scope,
             local_key=local_key,
             deadline=deadline,
+            queue_settings=settings,
         )
     return await route_addon(
         channel=channel, text=text, force=req.force, scope=scope, local_key=local_key, deadline=deadline,
+        queue_settings=settings,
     )
 
 
