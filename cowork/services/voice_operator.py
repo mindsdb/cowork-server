@@ -77,8 +77,8 @@ _TASK_ID = {"type": "string", "description": "A task id from the snapshot."}
 TOOLS: list[dict[str, Any]] = [
     _tool(
         "ask_anton",
-        "Give Anton work and wait for the answer. Starts a new task when task_id is 'new'. Long work keeps going "
-        "in the task after this returns.",
+        "Give Anton work. Returns once he has it, not with his answer: tell the user he is on it and you'll get "
+        "back to them when it's done. Starts a new task when task_id is 'new'.",
         {
             "request": {"type": "string", "description": "The request, in the person's words, complete."},
             "task_id": {"type": "string", "description": "A task id from the snapshot, or 'new'."},
