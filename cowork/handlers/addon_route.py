@@ -31,6 +31,7 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from redis.exceptions import RedisError
+from sqlalchemy.exc import SQLAlchemyError
 
 from cowork.common.history_scrub import scrub_credentials
 from cowork.common.settings.app_settings import TurnQueueSettings
@@ -96,7 +97,7 @@ _MINTED_KEY_MIN_TTL_S = 30
 #: The app's own id for a message (POST /addon's local_key).
 _LOCAL_KEY = re.compile(r"[A-Za-z0-9_-]{1,64}")
 #: How many of the turn's first records are searched for its response.created.
-_RESPONSE_ID_SCAN = 64
+_RESPONSE_ID_SCAN = 1000
 
 
 def queued(reason: QueuedReason) -> dict:
@@ -116,18 +117,20 @@ class _MintKey:
     model: str
 
 
-def _jev_target(scope: TenantScope) -> tuple[jev_route.JevTarget, str] | _MintKey | None:
+def _jev_target(
+    scope: TenantScope, queue_settings: TurnQueueSettings | None = None,
+) -> tuple[jev_route.JevTarget, str] | _MintKey | None:
     """Who to ask and with which model, from the caller's settings: the
     organization's own decision model, else Jev on MindsHub on the stored key,
     else, on a hosted (remote) deployment, on a key minted for the decision.
     None when none applies (the LLM gate's providers, Jev turned off, no
     MindsHub key to use or mint). Sync: it reads settings through a session of
-    its own."""
+    its own. *queue_settings* is the request's; read here when not given."""
     from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key_str
     from cowork.services.providers import minds_chat_base_url
 
     settings = get_user_settings(scope)
-    queue_settings = TurnQueueSettings()
+    queue_settings = queue_settings or TurnQueueSettings()
     mode = jev_route.gate_mode(settings)
     if mode == "own":
         target = jev_route.own_decision_target(settings)
@@ -289,11 +292,14 @@ async def _holding(lock: asyncio.Lock, deadline: float):
 
 async def route_addon(
     *, channel: AddonChannel, text: str, force: bool, scope: TenantScope, local_key: str | None = None,
-    deadline: float | None = None,
+    deadline: float | None = None, queue_settings: TurnQueueSettings | None = None,
 ) -> dict:
     """Add *text* to the turn *channel* belongs to, or say why it is queued,
-    by *deadline* (budget_deadline() when not given). Never raises."""
+    by *deadline* (budget_deadline() when not given). *queue_settings* is the
+    request's (the endpoint reads it once); read here when not given. Never
+    raises."""
     deadline = budget_deadline() if deadline is None else deadline
+    queue_settings = queue_settings or TurnQueueSettings()
     try:
         async with _holding(channel.deciding, deadline):
             limit = channel.limit_reason(text)
@@ -302,18 +308,24 @@ async def route_addon(
             if force:
                 addon_id = channel.add(text, decided_by="user", local_key=local_key)
                 return added(addon_id, "user") if addon_id else queued("no_turn")
-            return await _ask_jev(channel=channel, text=text, scope=scope, local_key=local_key, deadline=deadline)
+            return await _ask_jev(
+                channel=channel, text=text, scope=scope, local_key=local_key, deadline=deadline,
+                queue_settings=queue_settings,
+            )
     except _Busy:
         return queued("busy")
     except Exception:
-        # Not Jev: its failures come back as a verdict. anton raising from
-        # add_user_input lands here too.
+        # Kept broad: the endpoint's contract is that nothing raises (a
+        # failure queues the message, as without this feature), and anton
+        # raising from add_user_input lands here. Not Jev: its failures come
+        # back as a verdict.
         logger.exception("[addon] routing failed; queueing", extra={"conversation_id": channel.conversation_id})
         return queued("internal")
 
 
 async def _ask_jev(
     *, channel: AddonChannel, text: str, scope: TenantScope, local_key: str | None, deadline: float,
+    queue_settings: TurnQueueSettings,
 ) -> dict:
     refusal = await _staged(deadline, "jev_timeout", partial(
         _jev_refusal,
@@ -324,6 +336,7 @@ async def _ask_jev(
         text=text,
         scope=scope,
         deadline=deadline,
+        queue_settings=queue_settings,
     ))
     if refusal is not None:
         return refusal
@@ -333,20 +346,24 @@ async def _ask_jev(
 
 async def _jev_refusal(
     *, conversation_id: str, task: str, progress: list[str], added: list[str], text: str, scope: TenantScope,
-    deadline: float | None = None,
+    deadline: float | None = None, queue_settings: TurnQueueSettings | None = None,
 ) -> dict | None:
     """Ask Jev whether *text* belongs to the running task. None when it does,
-    else the queued response saying why not."""
+    else the queued response saying why not. *queue_settings* is the
+    request's; read here when not given."""
     from cowork.db.units import run_on_unit_threads
 
+    queue_settings = queue_settings or TurnQueueSettings()
     try:
-        found = await run_on_unit_threads(partial(_jev_target, scope))
-    except Exception:
+        found = await run_on_unit_threads(partial(_jev_target, scope, queue_settings))
+    except SQLAlchemyError:
+        # The settings read failed. Anything else is a bug: it reaches the
+        # route's own handler, which logs it as an error and queues it as
+        # internal too.
         logger.warning("[addon] could not resolve the decision target; queueing", exc_info=True)
         return queued("internal")
     if found is None:
         return queued("jev_off")
-    queue_settings = TurnQueueSettings()
     # The correlation id of a key minted for this decision, set before the
     # mint: one that failed or was cancelled may still have issued a key, and
     # revoking by correlation id is a no-op when none was.
@@ -363,6 +380,11 @@ async def _jev_refusal(
                     ttl_seconds=minted_key_ttl(queue_settings),
                 )
             except Exception:
+                # Kept broad: the mint calls the auth service, whose failures
+                # (transport, a refusal, a bad answer) are no one family, and
+                # this function answers for itself (it is called directly, not
+                # only from the routes). The finally below revokes whatever it
+                # may have issued.
                 logger.warning("[addon] could not mint a key to ask Jev with; queueing", exc_info=True)
                 return queued("internal")
             target, model = jev_route.JevTarget.mindshub(block["base_url"], block["api_key"]), found.model
@@ -510,6 +532,8 @@ async def _remote_jev_inputs(
     as if it were the first (raises RedisError)."""
     from cowork.db.units import run_db
 
+    # Both reads below are kept broad: each only adds context for Jev, and a
+    # decision made without it beats none (the docstring's contract).
     task = ""
     try:
         task = await run_db(partial(_running_task, conversation_id=UUID(conversation_id)), scope=scope)
@@ -537,25 +561,29 @@ _REMOTE_ADD_FAILURES: dict[RemoteAddonResult, QueuedReason] = {
 
 async def _remote_jev_refusal(
     *, conversation_id: str, correlation_id: str, text: str, scope: TenantScope, deadline: float,
+    queue_settings: TurnQueueSettings,
 ) -> dict | None:
     task, progress, already = await _remote_jev_inputs(
         conversation_id=conversation_id, correlation_id=correlation_id, scope=scope,
     )
     return await _jev_refusal(
         conversation_id=conversation_id, task=task, progress=progress,
-        added=already, text=text, scope=scope, deadline=deadline,
+        added=already, text=text, scope=scope, deadline=deadline, queue_settings=queue_settings,
     )
 
 
 async def route_remote_addon(
     *, conversation_id: str, correlation_id: str, text: str, force: bool, scope: TenantScope,
     local_key: str | None = None, deadline: float | None = None,
+    queue_settings: TurnQueueSettings | None = None,
 ) -> dict:
     """``route_addon`` for a turn that runs in a pod: decide with Jev here
     (``force`` skips it), then hand the message to the pod and return its
     verdict (``turnqueue/addons.py``), all by *deadline* (budget_deadline()
-    when not given). Never raises."""
+    when not given). *queue_settings* is the request's; read here when not
+    given. Never raises."""
     deadline = budget_deadline() if deadline is None else deadline
+    queue_settings = queue_settings or TurnQueueSettings()
     try:
         async with _deciding(correlation_id, deadline):
             count, total_bytes = await remote_addon_totals(correlation_id)
@@ -568,7 +596,7 @@ async def route_remote_addon(
                 # What Jev reads, a minted key and Jev itself: one stage.
                 refusal = await _staged(deadline, "jev_timeout", partial(
                     _remote_jev_refusal, conversation_id=conversation_id, correlation_id=correlation_id,
-                    text=text, scope=scope, deadline=deadline,
+                    text=text, scope=scope, deadline=deadline, queue_settings=queue_settings,
                 ))
                 if refusal is not None:
                     return refusal
@@ -584,6 +612,7 @@ async def route_remote_addon(
                        extra={"conversation_id": conversation_id})
         return queued("redis_error")
     except Exception:
+        # Kept broad, as in route_addon: nothing here raises to the endpoint.
         logger.exception("[addon] remote routing failed; queueing", extra={"conversation_id": conversation_id})
         return queued("internal")
     if result is RemoteAddonResult.ADDED:

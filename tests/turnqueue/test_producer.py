@@ -1062,7 +1062,7 @@ async def test_mint_llm_block_uses_minds_coding_default():
     from cowork.common.settings.app_settings import TurnQueueSettings, MINDS_FREE_MODEL
 
     settings = TurnQueueSettings(minds_base_url="https://api.example.dev/v1")
-    block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
+    block = await prod.mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
     assert block["coding_model"] == MINDS_FREE_MODEL
 
 
@@ -1071,7 +1071,7 @@ async def test_mint_llm_block_coding_model_override():
     from cowork.common.settings.app_settings import TurnQueueSettings
 
     settings = TurnQueueSettings(minds_base_url="https://x/v1", minds_coding_model="sonnet")
-    block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
+    block = await prod.mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
     assert block["coding_model"] == "sonnet"
 
 
@@ -1082,7 +1082,7 @@ async def test_mint_llm_block_uses_base_url_override():
     from cowork.common.settings.app_settings import TurnQueueSettings
 
     settings = TurnQueueSettings(minds_base_url="https://api-pr-cowork-server-243.dev.mindshub.ai/v1")
-    block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
+    block = await prod.mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
     assert block["base_url"] == "https://api-pr-cowork-server-243.dev.mindshub.ai/v1"
     assert block["provider"] == "minds-cloud" and block["api_key"] == "mdb_turnkey"
 
@@ -1092,7 +1092,7 @@ async def test_mint_llm_block_derives_base_url_when_override_empty():
     from cowork.common.settings.app_settings import TurnQueueSettings
 
     settings = TurnQueueSettings(minds_base_url="")
-    block = await prod._mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
+    block = await prod.mint_llm_block(org_id="o", user_id="u", correlation_id="c", settings=settings)
     assert "mindshub.ai" in block["base_url"] and block["base_url"].endswith("/v1")
 
 
@@ -1565,7 +1565,7 @@ async def test_a_hosted_turn_registers_grants_against_the_gate_minted_key(monkey
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
     assert TurnQueueSettings().datasource_enabled is True
-    for name in ("mint_turn_key", "mint_turn_key_details", "_mint_llm_block", "_mint_llm_block_with_turn_key_id"):
+    for name in ("mint_turn_key", "mint_turn_key_details", "mint_llm_block", "_mint_llm_block_with_turn_key_id"):
         monkeypatch.setattr(prod, name, AsyncMock(side_effect=AssertionError(f"{name} minted a second key")))
     monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[_verified(7)]))
     register = AsyncMock(return_value=_echo([(7, 3)], turn_key_id="mdb_gate"))
