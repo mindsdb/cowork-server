@@ -304,16 +304,32 @@ with tempfile.TemporaryDirectory() as tmp:
     (folder / "metadata.json").write_text(json.dumps({"id": "a" * 32, "primary": "report.md"}))
     source = ProjectArtifacts(base=project / ".anton" / "artifacts", project_id=None,
         project_name="general", trusted_anchor=project, root_parts=(".anton", "artifacts"))
-    before = capacity._peak_rss_mib()
+
+    def peak_from_here():
+        """The peak RSS from now on, in MiB, reading the peak as it moves."""
+        if sys.platform.startswith("linux"):
+            # Linux resets the high-water mark on request: an import's peak
+            # could otherwise hide the export's.
+            Path("/proc/self/clear_refs").write_text("5")
+            def read():
+                status = Path("/proc/self/status").read_text()
+                return int(status.split("VmHWM:")[1].split()[0]) / 1024
+        else:
+            read = capacity._peak_rss_mib
+        start = read()
+        return lambda: read() - start
+
+    server = peak_from_here()
     artifact_export.export_primary_file(source=source, folder_name="report",
         metadata={"id": "a" * 32, "primary": "report.md", "type": "document"},
         artifact_id="a" * 32, export_format="docx", can_edit=True)
-    server = capacity._peak_rss_mib() - before
+    server = server()
     # The same conversion in this process, as before it moved out.
+    in_process = peak_from_here()
     request = ConvertRequest(export_format="docx", suffix=".md", title="report",
         base_parts=(), limits=InlineLimits(max_total_bytes=25 * 1024 * 1024))
     convert(request=request, source=table.encode(), read_asset=lambda parts: None)
-    print(json.dumps({"server": server, "in_process": capacity._peak_rss_mib() - before}))
+    print(json.dumps({"server": server, "in_process": in_process()}))
 """
 
 
@@ -558,24 +574,21 @@ def test_a_name_holding_a_lone_surrogate_crosses_the_pipe(local_mode, tmp_path):
     assert result.omitted_count == 2
 
 
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"), reason="only Linux takes a file name that isn't UTF-8"
-)
-def test_a_source_in_a_folder_whose_name_isnt_utf8_exports(local_mode, tmp_path):
-    name = os.fsdecode(b"caf\xe9")
-    case = capacity.Case(
-        primary=f"{name}/report.md",
-        build=lambda folder: (
-            (folder / name).mkdir(),
-            capacity._write(folder / name, "report.md", "# R\n"),
-        ),
-        note="",
-    )
-    source, folder, metadata = _artifact(tmp_path / "general", case)
+def test_a_folder_and_title_holding_a_lone_surrogate_cross_the_pipe(tmp_path):
+    """A folder name that isn't UTF-8 reaches the server as a lone surrogate,
+    in the source's folder and title alike, and the request still converts."""
+    name = "caf\udce9"
+    request = _request(suffix=".md").model_copy(update={"base_parts": (name,), "title": name})
+    with pinned_dir(tmp_path) as folder:
+        conversion = export_runner.convert_in_child(
+            request=request,
+            source=b"# R\n\n![x](missing.png)\n",
+            read_asset=folder_reader(folder=folder, max_bytes=1024),
+            limits=ChildLimits(wall_seconds=WALL_SECONDS, memory_bytes=2048 * MIB),
+        )
 
-    result = _export(source, folder, metadata, export_format="html")
-
-    assert (folder / name / result.filename).read_bytes().startswith(b"<!DOCTYPE html>")
+    assert conversion.omitted_count == 1
+    assert docx.Document(io.BytesIO(conversion.data)).paragraphs
 
 
 _GUARD_PROBE = """
@@ -601,10 +614,11 @@ def test_the_process_refuses_a_connection_and_a_process_start():
         )
         finished = subprocess.run(
             [command[0], "-I", "-B", "-c", _GUARD_PROBE, str(server.server_port)],
-            env=environment, capture_output=True, text=True, check=True, timeout=60,
+            env=environment, capture_output=True, text=True, timeout=60,
         )
         hits = server.hits()
 
+    assert finished.returncode == 0, finished.stderr
     assert finished.stdout.strip() == "2"
     assert hits == []
 
@@ -637,8 +651,9 @@ def test_the_process_runs_the_servers_own_cowork_and_loads_none_of_its_server_si
     )
     finished = subprocess.run(
         [command[0], "-I", "-B", "-c", _CLOSURE_PROBE],
-        env=environment, capture_output=True, text=True, check=True, timeout=60,
+        env=environment, capture_output=True, text=True, timeout=60,
     )
+    assert finished.returncode == 0, finished.stderr
     probe = json.loads(finished.stdout)
 
     assert Path(probe["cowork"]).resolve() == Path(cowork.__file__).resolve()

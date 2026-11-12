@@ -886,6 +886,22 @@ def test_a_stopped_parse_is_recognized_in_every_libxml2_version(case):
         assert artifact_inline.parse_stopped(error_log=[entry]) is case["stopped"]
 
 
+def _out_of_memory_parse(*_args, **_kwargs):
+    """What lxml raises when libxml2 runs out of memory mid-parse."""
+    failed = lxml.etree.XMLSyntaxError("Memory allocation failed", 2, 1, 1)
+    failed.error_log = [types.SimpleNamespace(type_name="ERR_NO_MEMORY", message="Memory allocation failed")]
+    raise failed
+
+
+def test_a_parse_libxml2_fails_for_want_of_memory_raises_memory_error(artifact, monkeypatch):
+    """Under the conversion's memory limit libxml2 fails the parse; the
+    export refuses the document rather than answering 500."""
+    monkeypatch.setattr(lxml.html, "document_fromstring", _out_of_memory_parse)
+
+    with pytest.raises(MemoryError):
+        _inline(artifact=artifact, html=b"<p>x</p>")
+
+
 def test_a_source_parse_cut_short_by_libxml2_ends_with_the_note(artifact, outside):
     """Past 256 levels of nesting libxml2 stops reading and keeps only what came before."""
     html = b"<p>start</p>" + b"<div>" * 300 + b"<p>LOST</p>"

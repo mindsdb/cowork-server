@@ -1149,6 +1149,10 @@ def _parse_html(*, data: bytes) -> _ParsedHtml:
         root = lxml.html.document_fromstring(data, parser=parser)
     except ParserError:
         root = None
+    except lxml.etree.XMLSyntaxError as failed:
+        # Out of memory, libxml2 fails the parse rather than stopping it.
+        parse_stopped(error_log=failed.error_log)
+        raise
     stopped = parse_stopped(error_log=parser.error_log)
     if root is None:
         # Nothing but whitespace, or nothing before a limit: an empty document.

@@ -96,15 +96,18 @@ def child_command(*, limits: ChildLimits) -> tuple[list[str], dict[str, str]]:
 
     ``-I`` keeps the server's environment, the user's site folder and the
     current directory out of the process, and ``-B`` keeps it from writing
-    bytecode. It gets no environment of its own, so no credential; Windows
-    needs ``SYSTEMROOT`` to start one. It runs the server's own interpreter,
+    bytecode. It gets no environment of its own, so no credential. Windows
+    needs ``SYSTEMROOT`` to start an interpreter and ``USERPROFILE`` to find
+    the home folder ``cowork.common.paths`` reads at import; neither holds a
+    secret. It runs the server's own interpreter,
     so it imports the same ``cowork``. On Windows a venv's ``python.exe``
     starts the base interpreter as its own child, which ``_kill`` and the
     watch reach too.
     """
     environment: dict[str, str] = {}
     if sys.platform == "win32":
-        environment["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+        for name in ("SYSTEMROOT", "USERPROFILE"):
+            environment[name] = os.environ[name]
     cpu_seconds = math.ceil(limits.wall_seconds) + 1
     command = [
         sys.executable, "-I", "-B", "-m", CHILD_MODULE, str(limits.memory_bytes), str(cpu_seconds)
