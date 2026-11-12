@@ -77,6 +77,7 @@ from cowork.streaming import liveness
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, WORKER_ALIVE_PHASE, ModelWaitTicker
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.registry import RunHandle, RunIdentity, mark_question_saved
+from cowork.turnqueue.addons import ADDON_STEP, relay_addon_step
 from cowork.turnqueue.producer import (
     RemoteWorkspace,
     _revoke_turn_key_quietly,
@@ -3198,6 +3199,11 @@ class ResponsesHandler:
                         # question waits, so a cell's start, progress or end
                         # means it is over, even if the answered reply was lost.
                         open_questions.clear()
+                    if step == ADDON_STEP:
+                        # A message added mid-task (ENG-4194): relayed only for
+                        # an addon /addon accepted for this turn.
+                        for event in await relay_addon_step(correlation_id=corr, data=data):
+                            yield event
                     for event in step_stream_events(data):
                         yield event
                 elif kind == "turn_memory":

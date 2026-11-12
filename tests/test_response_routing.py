@@ -2717,6 +2717,38 @@ async def test_only_the_latest_prompt_is_checked_for_file_names(monkeypatch):
     assert decision.route == DIRECT_CONTEXT and seen
 
 
+
+def test_progress_lines_describe_each_step_and_flag_the_running_one():
+    from cowork.handlers.response_routing import progress_lines
+
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Starting."},
+            {"type": "tool_use", "id": "t1", "name": "scratchpad",
+             "input": {"one_line_description": "Read the tuition pages", "code": "..."}},
+        ]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t2", "name": "web_search", "input": {"query": "dates"}},
+            {"type": "tool_use", "id": "t3", "name": "scratchpad",
+             "input": {"one_line_description": "  Fill   coverage gaps  "}},
+        ]},
+    ]
+    assert progress_lines(messages) == [
+        "[done] Read the tuition pages (scratchpad)",
+        "[in progress] web_search",
+        "[in progress] Fill coverage gaps (scratchpad)",
+    ]
+
+
+def test_step_description_caps_its_length():
+    from cowork.handlers.response_routing import ADDON_STEP_DESCRIPTION_CHARS, step_description
+
+    assert len(step_description({"one_line_description": "x" * 500})) == ADDON_STEP_DESCRIPTION_CHARS
+    assert step_description({"code": "1"}) == ""
+    assert step_description("not json") == ""
+
+
 @pytest.mark.asyncio
 async def test_a_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
     """The gate mints a turn key for a delegated turn to reuse. When the

@@ -152,6 +152,25 @@ def answer_queue_key(correlation_id: str) -> str:
     return f"cowork:answer:{correlation_id}"
 
 
+def addon_index_key(correlation_id: str) -> str:
+    """The hash of the messages a remote turn took mid-task (ENG-4194),
+    addon_id -> {text, decided_by, at}. Only this server reads and writes it
+    (``turnqueue/addons.py``)."""
+    return f"cowork:addons:{correlation_id}"
+
+
+def addon_ready_key(correlation_id: str) -> str:
+    """Set when a remote turn's pod says it takes messages mid-task (its
+    ``addon`` step in state ``ready``, ENG-4194); /addon offers a message
+    only to a turn that has it. Lives as long as ``addon_index_key``."""
+    return f"cowork:addons-ready:{correlation_id}"
+
+
+def addon_rate_key(user_key: str, window: int) -> str:
+    """One person's POST /addon count in one fixed rate-limit window."""
+    return f"cowork:addon-rate:{user_key}:{window}"
+
+
 def reply_stream_key(conversation_id: str) -> str:
     """The stream scratchpad-controller relays a turn's replies onto.
 
