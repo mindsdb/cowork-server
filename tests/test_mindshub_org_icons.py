@@ -145,14 +145,36 @@ def test_auths_403_is_no_orgs_reachable(org_deployment, auth):
     assert _get(_request(SESSION), _hosted()) == {"reachable": True, "orgs": []}
 
 
+def _read_unknown(caplog) -> list[tuple[str, int]]:
+    return [
+        (record.levelname, record.status_code)
+        for record in caplog.records
+        if record.name == mindshub_org_icons.logger.name
+        and getattr(record, "event", None) == "org_icons_read_unknown"
+    ]
+
+
 @pytest.mark.parametrize("status_code", [401, 404, 429])
-def test_any_other_refusal_is_unknown_and_not_cached(org_deployment, auth, status_code):
+def test_any_other_refusal_is_unknown_and_not_cached(org_deployment, auth, caplog, status_code):
     answer = MindsHubAnswer.THROTTLED if status_code == 429 else MindsHubAnswer.REFUSED
     auth.reply = MindsHubReply(answer, status_code=status_code)
-    assert _get(_request(SESSION), _hosted()) == {"reachable": False, "orgs": []}
+    # The same answer as the branding read gives these: 200, reachable false.
+    with caplog.at_level("WARNING", logger=mindshub_org_icons.logger.name):
+        assert _get(_request(SESSION), _hosted()) == {"reachable": False, "orgs": []}
+    assert _read_unknown(caplog) == [("WARNING", status_code)]
     auth.reply = MindsHubReply(MindsHubAnswer.OK, payload=AVAILABLE, status_code=200)
     assert _get(_request(SESSION), _hosted()) == EXPECTED
     assert len(auth.calls) == 2
+
+
+def test_no_line_when_nothing_answered_or_auth_answered_usably(org_deployment, auth, caplog):
+    with caplog.at_level("DEBUG", logger=mindshub_org_icons.logger.name):
+        _get(_request(SESSION), _hosted())
+        auth.reply = MindsHubReply(MindsHubAnswer.REFUSED, status_code=403)
+        _get(_request(OTHER_SESSION), _hosted())
+        auth.reply = MindsHubReply(MindsHubAnswer.UNREACHABLE)
+        _get(_request(HUB_SESSION), _hosted())
+    assert _read_unknown(caplog) == []
 
 
 def test_the_answer_is_cached_per_caller(org_deployment, auth):

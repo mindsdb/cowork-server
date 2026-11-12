@@ -6,10 +6,14 @@ read with the caller's own credential and cached per caller for at most 60 s
 (cowork.services.org_branding.fetch_auth_branding), answered in camelCase.
 No credential, or auth answering that the caller has no current org, is
 ``enabled: false``; only auth's 403 says the caller has no current org.
-When auth can't be asked (no answer, a 5xx, a throttle, a 401 or a 404)
-the caller's last answer is served for up to 10 minutes, and without one
-the route answers 503, which the app takes as "keep the look you have",
-so an outage or an expired session never flips the look to stock.
+When auth answers nothing usable (no answer, a 5xx, a 429, a 401 or a 404)
+the caller's last answer is served for up to 10 minutes. Without one, any
+4xx from auth but its 403 answers 200 with ``reachable: false``, and no
+answer, a 5xx or a body that isn't the branding answers 503. The app takes
+both as "keep the look you have" (mindsdb/cowork's useOrgBranding hook), so
+an outage or an expired session never flips the look to stock. Only the
+outage is a 5xx: auth answering 404 while its release trails this
+server's, or a 401 for an expired desktop session, isn't one.
 
 ``PUT /org-branding/appearance``: the snake_case body (camelCase too)
 passed to auth's ``PATCH /v1/organizations/current/branding/appearance/``,
@@ -51,7 +55,6 @@ from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.units import run_efs_unit
 from cowork.principal import hub_credential_for, is_session_jwt
 from cowork.schemas.org_branding import OrgAppearanceUpdate, OrgAppearanceView, OrgBrandingView
-from cowork.services.mindshub_client import MindsHubAnswer
 from cowork.services.org_branding import (
     AuthAppearanceError,
     AuthBranding,
@@ -118,6 +121,7 @@ def _view(branding: AuthBranding) -> dict:
             guidelines=look.guidelines,
         ),
         can_edit=branding.can_edit,
+        reachable=branding.reachable,
     ).model_dump(by_alias=True)
 
 
@@ -132,11 +136,15 @@ def _settle(scoped: ScopedSession, *, branding: AuthBranding) -> dict:
 @router.get("", response_model=OrgBrandingView)
 async def get_org_branding(request: Request, scope: ScopeDep):
     branding = await fetch_auth_branding(bearer_token=_credential(request, scope), **_who(scope))
-    if branding.answer is MindsHubAnswer.UNREACHABLE:
-        # auth couldn't be asked and there is no recent answer to serve. A
-        # 503, which the app takes as "keep the look you have", rather than
-        # the stock look or enabled: false, which would flip it.
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=READ_UNREACHABLE)
+    if not branding.reachable:
+        # Nothing is known about the org and there is no recent answer to
+        # serve. Never the stock look or enabled: false, which would flip it.
+        if not branding.declined:
+            # auth couldn't be asked: an outage, which the ingress alerts see.
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=READ_UNREACHABLE)
+        # auth is up and answered a 4xx. reachable: false keeps the look, and
+        # nothing about the org reaches the Brand guidelines skill.
+        return _view(branding)
     return await run_efs_unit(partial(_settle, branding=branding), scope=scope)
 
 
@@ -157,7 +165,7 @@ async def put_org_appearance(body: OrgAppearanceUpdate, request: Request, scope:
         if refused.status_code >= 500:
             logger.warning(
                 "auth couldn't take an appearance change",
-                extra={"event": "org_branding_appearance_save_failed", "status": refused.status_code},
+                extra={"event": "org_branding_appearance_save_failed", "status_code": refused.status_code},
             )
         raise HTTPException(status_code=refused.status_code, detail=refused.detail)
     return await run_efs_unit(partial(_settle, branding=branding), scope=scope)

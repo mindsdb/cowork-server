@@ -134,6 +134,11 @@ class AuthBranding:
     a 401 or 404 too, which say nothing about the org (an expired desktop
     session, a route missing).
 
+    ``auth_status`` is auth's HTTP status when auth answered with nothing
+    usable (any status but its 403, or a body that isn't the branding), and
+    None otherwise, including when nothing answered. ``declined`` tells a
+    4xx among those apart from an outage.
+
     ``fresh``: read from auth in this request (or answered by the caller's
     own write), not served from the cache. Only a fresh answer may change
     the skill (sync_brand_skill), so a member's cached answer, up to 60 s
@@ -153,11 +158,23 @@ class AuthBranding:
     look_updated_at: str | None = None
     fresh: bool = False
     stale: bool = False
+    auth_status: int | None = None
 
     @property
     def reachable(self) -> bool:
         """auth answered (the cache's TTL choice: a refusal is an answer)."""
         return self.answer in (MindsHubAnswer.OK, MindsHubAnswer.REFUSED)
+
+    @property
+    def declined(self) -> bool:
+        """auth answered the read with a 4xx other than its 403: a 401, a
+        429, or a 404 while auth runs a release without the route. Nothing
+        is known about the org, but auth is up, so it isn't an outage."""
+        return (
+            self.answer is MindsHubAnswer.UNREACHABLE
+            and self.auth_status is not None
+            and 400 <= self.auth_status < 500
+        )
 
     @property
     def known(self) -> bool:
@@ -273,12 +290,12 @@ async def _read_auth_branding(bearer_token: str) -> AuthBranding:
         return parse_auth_branding(reply.payload)
     if reply.answer is MindsHubAnswer.REFUSED and reply.status_code == _NO_ORG_STATUS:
         return AuthBranding(answer=MindsHubAnswer.REFUSED)
-    if reply.answer is not MindsHubAnswer.UNREACHABLE:
-        logger.info(
+    if reply.status_code is not None:
+        logger.warning(
             "auth's branding read answered nothing usable",
-            extra={"event": "org_branding_read_unknown", "status": reply.status_code},
+            extra={"event": "org_branding_read_unknown", "status_code": reply.status_code},
         )
-    return AuthBranding()
+    return AuthBranding(auth_status=reply.status_code)
 
 
 async def fetch_auth_branding(*, bearer_token: str, org_id: str, user_id: str) -> AuthBranding:
