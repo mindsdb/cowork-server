@@ -65,21 +65,26 @@ AUTOPUBLISH_ACCESS = ArtifactAccessRequest(mode=AccessMode.RESTRICTED, allowed_e
 # thread and a held lock.
 _MIN_START_BUDGET_S = 5.0
 
-# Time budgets. Three numbers must agree:
+# Time budgets. These numbers must agree:
 #   PUBLISH_POST_TIMEOUT_S      anton's urllib timeout on the POST /upload itself
 #                               (imported, so a change in anton moves the budget)
+#   PUBLISH_THREAD_SLACK_S      the thread's work outside the POST and the poll:
+#                               zipping and owner lookups before the upload,
+#                               writing .published.json after it, and the last
+#                               poll request running past the budget
 #   job_budget_for(ttl, t)      how long anton polls an accepted (202) job
 #   lock_ttl_for(t)             how long the slug lock is held
 # The publish runs in a thread that asyncio.wait_for(...) abandons but cannot
-# cancel; it may still write .published.json up to
-# PUBLISH_POST_TIMEOUT_S + job_budget after it started, plus the wait_for
-# window itself. The lock must outlive all of it:
-#   timeout_s + PUBLISH_POST_TIMEOUT_S + job_budget <= lock_ttl
+# cancel, so it may still write .published.json after the wait_for window.
+# The lock must outlive all of it:
+#   timeout_s + PUBLISH_POST_TIMEOUT_S + job_budget + PUBLISH_THREAD_SLACK_S <= lock_ttl
 # The budget is computed ONCE per reconciliation from the full timeout_s
 # (not from the per-slug min(timeout_s, remaining), which can be as small as
-# _MIN_START_BUDGET_S and would make the budget negative).
-# Enforced by tests/test_autopublish_budgets.py. Defaults: 60 + 30 + 90 = 180.
+# _MIN_START_BUDGET_S and would make the budget negative). Live sync holds its
+# lock for the same factor of its own timeout and uses these helpers too.
+# Enforced by tests/test_autopublish_budgets.py. Defaults: 60 + 30 + 75 + 15 = 180.
 PUBLISH_POST_TIMEOUT_S = float(DEFAULT_REQUEST_TIMEOUT_S)
+PUBLISH_THREAD_SLACK_S = 15.0
 DEFAULT_TIMEOUT_S = 60.0
 LOCK_TTL_FACTOR = 3
 
@@ -89,7 +94,7 @@ def lock_ttl_for(timeout_s: float) -> float:
 
 
 def job_budget_for(lock_ttl: float, timeout_s: float) -> float:
-    return lock_ttl - timeout_s - PUBLISH_POST_TIMEOUT_S
+    return lock_ttl - timeout_s - PUBLISH_POST_TIMEOUT_S - PUBLISH_THREAD_SLACK_S
 
 
 # Reasons a candidate is skipped. Kept distinct because a single None would make
@@ -396,6 +401,7 @@ async def _publish_one(
     project_id: str | None = None,
     *,
     job_budget_s: float,
+    abandoned: set[str] | None = None,
 ) -> bool:
     """Publish one artifact. True when it landed. Never raises.
 
@@ -405,6 +411,9 @@ async def _publish_one(
     `job_budget_s` is the caller's per-reconciliation budget for polling an
     asynchronously accepted (202) publish job; it is threaded through to
     `publish_artifact` unchanged.
+
+    `abandoned` receives the slug when the publish thread is left running
+    (a timeout or a cancel), so the caller keeps its key alive for it.
     """
     folder = Path(artifacts_base) / slug
     # Which phase the abandoned thread was in when wait_for gave up: "upload"
@@ -431,7 +440,13 @@ async def _publish_one(
             ),
             timeout=timeout_s,
         )
+    except asyncio.CancelledError:
+        if abandoned is not None:
+            abandoned.add(slug)
+        raise
     except asyncio.TimeoutError:
+        if abandoned is not None:
+            abandoned.add(slug)
         # to_thread is not cancellable: an upload already running goes on and
         # may yet write .published.json. So the lock is deliberately NOT
         # released and no retry is attempted: the next turn reads the record
@@ -561,13 +576,16 @@ async def autopublish_project_artifacts(
     # Settings reads, each through a session of its own: off the loop.
     publish_url = await run_on_unit_threads(partial(_publish_url, scope))
     workspace_id = await run_on_unit_threads(partial(_active_workspace_id, scope))
+    lock_ttl = lock_ttl_for(timeout_s)
+    job_budget_s = job_budget_for(lock_ttl, timeout_s)
+    # An abandoned publish thread polls its job with this key until it ends,
+    # which the lock TTL bounds.
     key = PublishKey(
-        scope.user_id, scope.org_id, min_ttl_s=timeout_s + 60.0, workspace_id=workspace_id
+        scope.user_id, scope.org_id, min_ttl_s=lock_ttl + 60.0, workspace_id=workspace_id
     )
     started = time.monotonic()
     published: set[str] = set()
-    lock_ttl = lock_ttl_for(timeout_s)
-    job_budget_s = job_budget_for(lock_ttl, timeout_s)
+    abandoned: set[str] = set()
 
     try:
         for phase_slugs, phase_deadline in (
@@ -628,7 +646,7 @@ async def autopublish_project_artifacts(
                     return published
                 if await _publish_one(
                     base, slug, api_key, publish_url, min(timeout_s, remaining), scope,
-                    access, project_id=project_id, job_budget_s=job_budget_s,
+                    access, project_id=project_id, job_budget_s=job_budget_s, abandoned=abandoned,
                 ):
                     published.add(slug)
     except asyncio.CancelledError:
@@ -636,7 +654,11 @@ async def autopublish_project_artifacts(
     except Exception:
         logger.warning("artifact autopublish reconciliation failed", exc_info=True)
     finally:
-        await key.revoke()
+        # A revoked key would fail an abandoned thread's next job poll, and
+        # that thread would then never record a publish the server finishes.
+        # Such a key expires with its TTL instead, as live sync's does.
+        if not abandoned:
+            await key.revoke()
     return published
 
 

@@ -507,6 +507,7 @@ async def _sync_live_artifact(
         published_artifact_access,
     )
     from cowork.services.artifact_locks import release
+    from cowork.services.artifact_autopublish import job_budget_for
 
     artifacts_base = folder.parent
     if not await _acquire_live_publish_lock(folder, scope):
@@ -557,6 +558,7 @@ async def _sync_live_artifact(
                     access=access,
                     scope=scope,
                     project_id=project_id,
+                    job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S, _LIVE_PUBLISH_TIMEOUT_S),
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -1171,7 +1173,7 @@ def _owner_publish_context(scope: TenantScope, folder: Path):
         _publish_url(scope),
         PublishKey(
             str(scope.user_id), str(scope.org_id),
-            min_ttl_s=_LIVE_PUBLISH_TIMEOUT_S + 60.0,
+            min_ttl_s=_LIVE_PUBLISH_LOCK_TTL_S + 60.0,
             workspace_id=_active_workspace_id(scope),
         ),
     )
@@ -1294,6 +1296,7 @@ async def set_artifact_access(
     from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
+    from cowork.services.artifact_autopublish import job_budget_for
 
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
@@ -1364,6 +1367,7 @@ async def set_artifact_access(
                     notify=notify or None,
                     stored=checked.stored,
                     owner_save=True,
+                    job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S, _LIVE_PUBLISH_TIMEOUT_S),
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )

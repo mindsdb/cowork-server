@@ -281,7 +281,10 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     UploadError; a failure that got no HTTP answer returns None.
 
     A failed asynchronous job (`PublishJobFailed`) carries the status /upload
-    would have answered, but no code, so its 503 is the upload service itself.
+    would have answered. The server records the answer's code too, but anton
+    does not pass it on, so a job's refusal maps by status alone: its 503 is
+    the upload service itself, and a 403 share_org_required or permission_denied
+    comes back as an UploadError.
     """
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
@@ -298,6 +301,12 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
         raise exc
     if isinstance(exc, PublishJobFailed):
         if exc.status_code == 503:
+            # Leaves publish_artifact before its failure log, like the typed
+            # refusals below; str(exc) names the job to find in the worker's log.
+            logger.warning(
+                "Publish service answered HTTP %s code=%s body=%r", 503, None, str(exc)[:200],
+                extra={"status_code": 503, "reason": "publish_job_failed"},
+            )
             raise UploadServiceUnavailable() from exc
         return UploadError(exc.status_code, None, exc.message)
     if not isinstance(exc, urllib.error.HTTPError):

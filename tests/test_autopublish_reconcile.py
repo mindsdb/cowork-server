@@ -299,6 +299,32 @@ async def test_key_is_revoked_after_reconciliation(base, enabled, key, published
     assert key.revoked is True
 
 
+async def test_key_outlives_a_publish_thread_left_polling(base, enabled, key, monkeypatch):
+    """A timed-out publish thread keeps polling its job with the key, so the
+    key is left to its TTL rather than revoked under it."""
+    import threading
+
+    release = threading.Event()
+
+    def polling_publish(artifact, **kwargs):
+        kwargs["on_job_accepted"]({"job_id": "j"})
+        release.wait(5.0)
+
+    monkeypatch.setattr(ap, "publish_artifact", polling_publish)
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+
+    try:
+        out = await ap.autopublish_project_artifacts(
+            base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"}, timeout_s=0.2,
+        )
+    finally:
+        release.set()
+
+    assert out == set()
+    assert key.revoked is False
+
+
 async def test_nothing_to_publish_mints_no_key(base, enabled, published, monkeypatch):
     minted = []
 
