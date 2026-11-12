@@ -29,11 +29,12 @@ def router(monkeypatch):
     calls: list[tuple[str, str, dict | None]] = []
 
     class Fake:
-        created = True
+        resumed = False
 
     async def call(method, url, bearer, *, json=None, headers=None):
         calls.append((method, url, json))
-        return {"created": Fake.created, "url": None} if url.endswith("/sessions") else {}
+        # The router's own answer (browser contract sessions.json).
+        return {"session_id": "t-x", "resumed": Fake.resumed, "url": None} if url.endswith("/sessions") else {}
 
     monkeypatch.setattr(browser, "_call", call)
     monkeypatch.setattr(browser, "router_url", lambda: "https://cowork.test/browser")
@@ -50,7 +51,7 @@ async def test_opens_the_tasks_own_session_at_the_address(router):
 
 
 async def test_an_open_session_goes_to_the_address(router):
-    router.created = False
+    router.resumed = True
 
     await browser.person_open("Bearer jwt", user_id="u1", conversation_id="c1", url="https://example.com")
 
@@ -61,7 +62,7 @@ async def test_an_open_session_goes_to_the_address(router):
 
 
 async def test_no_address_opens_a_blank_tab_and_leaves_an_open_one_be(router):
-    router.created = False
+    router.resumed = True
 
     await browser.person_open("Bearer jwt", user_id="u1", conversation_id="c1", url=None)
 

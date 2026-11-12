@@ -396,7 +396,8 @@ async def person_open(bearer: str, *, user_id: str | None, conversation_id: str,
     router = _require_router()
     session_id = task_session(user_id, conversation_id)
     opened = await _call("POST", f"{router}/sessions", bearer, json={"session_id": session_id, **({"url": url} if url else {})})
-    if url and isinstance(opened, dict) and opened.get("created") is False:
+    # The router answers {session_id, resumed, url}: a resumed session stays where it was.
+    if url and isinstance(opened, dict) and opened.get("resumed") is True:
         await _call("POST", f"{router}/sessions/{session_id}/action", bearer, json={"action": "navigate", "url": url})
     return OpenedSession(session_id=session_id)
 
