@@ -110,7 +110,7 @@ async def test_a_refused_or_failed_jev_falls_back_to_the_llm_gate(monkeypatch, e
 
     asked = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, **_kwargs):
         asked.append((binding.model, history))
         return "Hello! How can I help?"
 
@@ -580,12 +580,13 @@ async def _answer(chunks, *, raise_after=None, delay=0.0):
 
 async def _produce(
     monkeypatch, conversation_id, answer, *, delegate=None, lifecycle=None, started=None, first_take=None,
+    gate_key=None,
 ):
     from cowork.streaming.registry import TurnLifecycle
 
     lifecycle = lifecycle or TurnLifecycle()
 
-    async def fake_start(_binding, *, history, needs_search=True):
+    async def fake_start(_binding, *, history, needs_search=True, ui_locale=None):
         if started is not None:
             # An answer that has not started yet: wait to be stopped.
             started.set()
@@ -608,6 +609,7 @@ async def _produce(
         buffer=buffer,
         delegate=delegate or (lambda: pytest.fail("must not delegate")),
         first_take=first_take,
+        gate_key=gate_key,
     )
     return handler, buffer, coro
 
@@ -643,6 +645,40 @@ async def test_produce_answer_streams_then_saves_the_turn(monkeypatch):
         ("assistant", "Revenue was $4.81M, up 14.2%.", False, "cowork-direct"),
     ]
     assert created["user_message_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delegates", [False, True, "fails"])
+async def test_produce_answer_revokes_the_gate_key_unless_the_agent_takes_the_turn(monkeypatch, delegates):
+    """An answered turn runs no agent turn to revoke the gate's key; a
+    delegated one runs on that key, and the agent's producer revokes it. A
+    hand-off that fails before the agent's turn ends runs nothing on it."""
+    import cowork.handlers.responses as responses
+
+    conversation_id = await _conversation()
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    buffers = []
+
+    async def delegate():
+        if delegates == "fails":
+            raise RuntimeError("harness no longer resolves")
+        await buffers[0].close("completed")
+
+    answer = None if delegates else await _answer(["Revenue was ", "$4.81M."])
+    _handler, buffer, coro = await _produce(
+        monkeypatch, conversation_id, answer, delegate=delegate if delegates else None,
+        gate_key={"correlation_id": "corr-gate"},
+    )
+    buffers.append(buffer)
+
+    await coro
+
+    assert revoked == ([] if delegates is True else ["corr-gate"])
 
 
 @pytest.mark.asyncio
