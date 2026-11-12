@@ -434,6 +434,40 @@ class TaskBrowsers(BaseModel):
 
 #: The most tasks one listing looks up: a project's recent ones.
 MAX_LISTED_TASKS = 100
+#: Tabs lookups one listing runs at once, and how long each may take: a slow
+#: browser is listed without its tabs rather than holding up the list.
+_TABS_CONCURRENCY = 6
+_TABS_TIMEOUT_S = 3.0
+
+
+async def _task_tabs(router: str, session_id: str, bearer: str, gate: asyncio.Semaphore) -> list[TaskTab]:
+    """A browser's tabs, or none when they can't be read now."""
+    async with gate:
+        try:
+            answer = await asyncio.wait_for(_call("GET", f"{router}/sessions/{session_id}/tabs", bearer), _TABS_TIMEOUT_S)
+            return [TaskTab.model_validate(t) for t in (answer or {}).get("tabs") or []]
+        except (BrowserServiceError, ValidationError, asyncio.TimeoutError, AttributeError, TypeError):
+            return []
+
+
+def _task_browser(row: dict, conversation_id: str, tabs: list[TaskTab]) -> TaskBrowser | None:
+    """One listed browser, or None for a row that doesn't parse."""
+    try:
+        control = row.get("control") if isinstance(row.get("control"), dict) else {}
+        parked = row.get("parked_tabs") or []
+        return TaskBrowser(
+            conversation_id=conversation_id,
+            session_id=row["session_id"],
+            url=row.get("url"),
+            viewers=int(row.get("viewers") or 0),
+            holder="human" if control.get("holder") == "human" else "agent",
+            last_active_at=row.get("last_active_at"),
+            tabs=tabs,
+            parked_tabs=[ParkedTab.model_validate(t) for t in parked if isinstance(t, dict)],
+        )
+    except (ValidationError, ValueError, TypeError):
+        logger.warning("browser router listed a malformed session", extra={"event": "browser_router_bad_session"})
+        return None
 
 
 async def task_browsers(bearer: str, *, user_id: str | None, conversation_ids: list[str]) -> TaskBrowsers:
@@ -441,33 +475,22 @@ async def task_browsers(bearer: str, *, user_id: str | None, conversation_ids: l
     The router lists only the caller's own sessions, and each task's session
     is named from the caller (``task_session``), so ids of anyone else's
     tasks match nothing. A browser whose tabs can't be read now (the person
-    holds it, a dialog is up) is listed without them. Raises BrowserServiceError."""
+    holds it, a dialog is up, it is slow) is listed without them, and a row
+    that doesn't parse is left out. Raises BrowserServiceError."""
     router = _require_router()
     by_session = {task_session(user_id, c): c for c in conversation_ids[:MAX_LISTED_TASKS]}
     listed = await _call("GET", f"{router}/sessions", bearer)
     rows = listed.get("sessions") if isinstance(listed, dict) else None
-    browsers: list[TaskBrowser] = []
-    for row in rows if isinstance(rows, list) else []:
-        if not isinstance(row, dict) or row.get("session_id") not in by_session or row.get("running") is False:
-            continue
-        session_id = row["session_id"]
-        tabs: list[TaskTab] = []
-        try:
-            answer = await _call("GET", f"{router}/sessions/{session_id}/tabs", bearer)
-            tabs = [TaskTab.model_validate(t) for t in (answer or {}).get("tabs") or []]
-        except (BrowserServiceError, ValidationError):
-            pass
-        control = row.get("control") if isinstance(row.get("control"), dict) else {}
-        browsers.append(TaskBrowser(
-            conversation_id=by_session[session_id],
-            session_id=session_id,
-            url=row.get("url"),
-            viewers=int(row.get("viewers") or 0),
-            holder="human" if control.get("holder") == "human" else "agent",
-            last_active_at=row.get("last_active_at"),
-            tabs=tabs,
-            parked_tabs=[ParkedTab.model_validate(t) for t in row.get("parked_tabs") or [] if isinstance(t, dict)],
-        ))
+    open_rows = [
+        row for row in (rows if isinstance(rows, list) else [])
+        if isinstance(row, dict) and row.get("session_id") in by_session and row.get("running") is not False
+    ]
+    gate = asyncio.Semaphore(_TABS_CONCURRENCY)
+    all_tabs = await asyncio.gather(*(_task_tabs(router, row["session_id"], bearer, gate) for row in open_rows))
+    browsers = [
+        browser for row, tabs in zip(open_rows, all_tabs)
+        if (browser := _task_browser(row, by_session[row["session_id"]], tabs)) is not None
+    ]
     browsers.sort(key=lambda b: b.last_active_at or "", reverse=True)
     return TaskBrowsers(browsers=browsers)
 

@@ -138,3 +138,30 @@ async def test_a_caller_inference_refuses_is_not_cached_for_everyone(inference):
 
     inference.answer = httpx.Response(400, json={"error": {"code": "invalid_request"}})
     assert (await _call("GET", "/status")).json() == {"available": True}
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503])
+async def test_a_busy_or_failing_inference_is_not_cached_for_everyone(inference, status):
+    inference.answer = httpx.Response(status, json={"error": {"code": "x"}})
+    assert (await _call("GET", "/status")).json() == {"available": False}
+
+    inference.answer = httpx.Response(400, json={"error": {"code": "invalid_request"}})
+    assert (await _call("GET", "/status")).json() == {"available": True}
+
+
+async def test_an_unreachable_inference_is_not_cached(monkeypatch, inference):
+    def down(request):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(voice, "_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(down)))
+    assert (await _call("GET", "/status")).json() == {"available": False}
+    assert voice._status_cache == {}
+
+
+async def test_a_session_answer_that_isnt_json_is_a_bad_answer(inference):
+    inference.answer = httpx.Response(201, content=b"<html>oops</html>")
+
+    answered = await _call("POST", "/session", json={"sdp": "offer-sdp"})
+
+    assert answered.status_code == 424
+    assert answered.json()["detail"]["code"] == "bad_answer"

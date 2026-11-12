@@ -4,8 +4,10 @@ GET  /voice/status   whether this deployment's MindsHub Inference serves live vo
 POST /voice/session  the browser's SDP offer in, GPT-Live's answer out (cowork.services.voice)
 POST /voice/operate  a request from the call in, the app actions to take out (cowork.services.voice_operator)
 
-Both act as the caller, with their own MindsHub credential. A refusal keeps
-MindsHub's 401, 403, 409 or 429, with a code and a sentence for the person in
+All three act as the caller, with their own MindsHub credential. Status
+answers ``available: false`` for any refusal or failure. Session keeps
+MindsHub's 401, 403 or 429, and answers 409 where live voice is off; operate
+keeps 401, 403 or 429. Either puts a code and a sentence for the person in
 ``detail``; any other failure is 424.
 """
 

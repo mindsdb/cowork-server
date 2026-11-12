@@ -64,3 +64,53 @@ async def test_switch_close_and_close_all_act_on_the_tasks_own_session(router):
         ("DELETE", f"{ROUTER}/sessions/{session}/tabs/t2?park=true"),
         ("DELETE", f"{ROUTER}/sessions/{session}"),
     ]
+
+
+async def test_tabs_are_read_at_once_and_a_slow_browser_is_listed_without_them(monkeypatch):
+    import asyncio
+
+    sessions = [browser.task_session("u1", f"c{i}") for i in range(4)]
+    running = 0
+    peak = 0
+
+    async def call(method, url, bearer, *, json=None, headers=None):
+        nonlocal running, peak
+        if url == f"{ROUTER}/sessions":
+            return {"sessions": [{"session_id": s, "running": True} for s in sessions]}
+        running += 1
+        peak = max(peak, running)
+        try:
+            await asyncio.sleep(10 if sessions[0] in url else 0.05)
+        finally:
+            running -= 1
+        return {"tabs": [{"id": "t1", "url": "https://shop.test/"}]}
+
+    monkeypatch.setattr(browser, "_call", call)
+    monkeypatch.setattr(browser, "router_url", lambda: ROUTER)
+    monkeypatch.setattr(browser, "_TABS_TIMEOUT_S", 0.2)
+
+    listed = await browser.task_browsers("Bearer jwt", user_id="u1", conversation_ids=[f"c{i}" for i in range(4)])
+
+    tabs = {b.conversation_id: [t.id for t in b.tabs] for b in listed.browsers}
+    assert tabs == {"c0": [], "c1": ["t1"], "c2": ["t1"], "c3": ["t1"]}
+    assert peak > 1
+
+
+async def test_a_malformed_row_is_left_out_not_a_failure(monkeypatch):
+    good, bad_viewers, bad_parked = (browser.task_session("u1", c) for c in ("c1", "c2", "c3"))
+
+    async def call(method, url, bearer, *, json=None, headers=None):
+        if url == f"{ROUTER}/sessions":
+            return {"sessions": [
+                {"session_id": good, "running": True, "viewers": 2},
+                {"session_id": bad_viewers, "running": True, "viewers": "many"},
+                {"session_id": bad_parked, "running": True, "parked_tabs": [{"title": "no url"}]},
+            ]}
+        return {"tabs": "not a list"}
+
+    monkeypatch.setattr(browser, "_call", call)
+    monkeypatch.setattr(browser, "router_url", lambda: ROUTER)
+
+    listed = await browser.task_browsers("Bearer jwt", user_id="u1", conversation_ids=["c1", "c2", "c3"])
+
+    assert [(b.conversation_id, b.viewers, b.tabs) for b in listed.browsers] == [("c1", 2, [])]

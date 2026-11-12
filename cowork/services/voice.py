@@ -135,8 +135,9 @@ async def available(bearer: str) -> bool:
             )
     except Exception:
         return False
-    if response.status_code in (401, 403):
-        # Says nothing about the deployment: don't cache this caller's answer.
+    if response.status_code not in (400, 404):
+        # A refused caller, a rate limit or an outage says nothing about the
+        # deployment: don't cache it for everyone.
         return False
     on = response.status_code == 400
     _status_cache[url] = (time.monotonic(), on)
@@ -222,7 +223,10 @@ async def start_session(bearer: str, sdp: str, voice: str | None = None, context
         if code == "live_not_enabled":
             status = 409
         raise VoiceError(status, code or "refused", _REFUSALS.get(code, "Couldn't start the voice call. Try again."))
-    created = response.json()
+    try:
+        created = response.json()
+    except ValueError as exc:
+        raise VoiceError(424, "bad_answer", "MindsHub answered without a call.") from exc
     if not isinstance(created, dict) or not (created.get("transport") or {}).get("sdp"):
         raise VoiceError(424, "bad_answer", "MindsHub answered without a call.")
     return created
