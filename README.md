@@ -433,6 +433,20 @@ The job `XADD` that queues a remote turn is sent at most once (`send_once`), sin
 
 Conversation, turn and project delete clear a conversation's Redis buffers and its turn index entry only with `COWORK_STREAM_BACKEND=redis`, so desktop and the single-container server never call Redis on a delete. The buffer walk (`SCAN`) holds one connection of the pool for all its pages, and starts again from cursor 0 when a page went out on a new connection, since after a failover that connection can reach a server the cursor means nothing to. Holding the connection keeps another threadpool thread from reconnecting it unseen between two pages.
 
+## Mobile push notifications
+
+In org mode (`COWORK_TENANCY_MODE=org`) the server pushes to the MindsHub Cowork mobile app through APNs (iOS) and FCM HTTP v1 (Android); everywhere else push does nothing. The app registers each phone with `POST /api/v1/push/devices` (`{"token", "platform": "ios"|"android", "app_version", "environment": "production"|"sandbox"|null}`, 204) and removes it on sign-out with `DELETE /api/v1/push/devices` (`{"token"}`, 204, only the caller's own token). Outside org mode both answer 404. A token names one phone, so registering it again moves it to whoever registered it last. Rows live in `push_devices`.
+
+Three events push, each carrying `kind`, and `path` (an in-app route, `/c/<conversation_id>`) or `url` (the artifact's shared view):
+
+- `task_finished`: a task someone started in the app ends, to its owner: "Finished.", or "Didn't finish." on an error, an interruption, a stall or the idle reaper. A Stop, a server restart and a deleted conversation send nothing, and neither does a turn someone was watching live when it ended: a reader of its stream (the POST that started it or `GET /responses/tail`, on any replica) holds it back, for 15 seconds after it streamed the end (`cowork/streaming/watchers.py`).
+- `scheduled_run_finished`: a scheduled run ends, to the schedule's owner, finished or not. A trial run (`?trial=true`), a cancelled run and a run whose slot fires again send nothing. A run another replica reaped is pushed by the reaper.
+- `artifact_shared`: someone saves an artifact's sharing with "Notify people", to each person they named by id, the same people MindsHub emails. Members of a team or organization the share opens to get no push.
+
+Every push is sent off the path of the work that caused it, with short timeouts, and a failure is logged (`push_*` events) and dropped. A token APNs or FCM reports as gone (410, `Unregistered`, `BadDeviceToken` in both environments, FCM `UNREGISTERED` or 404) is deleted. An iOS token production refuses as `BadDeviceToken` is tried once in sandbox, and the environment that took it is kept.
+
+Settings, all optional, from the `cowork-push` Secret in the chart: `COWORK_PUSH_APNS_KEY_P8` (the `.p8` auth key from Apple Developer > Keys, PEM or base64), `COWORK_PUSH_APNS_KEY_ID`, `COWORK_PUSH_APNS_TEAM_ID`, `COWORK_PUSH_APNS_TOPIC` (default `ai.mindshub.cowork`), and `COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON` (a Firebase service account allowed to send messages, JSON or base64). A platform whose settings are missing sends nothing. The optional `COWORK_PUSH_ENABLED` key in the same Secret is the kill switch: set it to `false` to turn push off (default `true`). Restart the pods after changing these environment-backed settings.
+
 ## Data Layer
 
 Data lives in two places: a **SQLite database** for structured records and the **filesystem** for project files and agent workspaces. Understanding both is essential.
@@ -457,6 +471,7 @@ Key tables:
 | `schedules` / `schedule_runs` | Recurring prompts and their execution history |
 | `settings` | Key-value user settings; sensitive values Fernet-encrypted |
 | `pins` | User-pinned items (conversations, artifacts, etc.) |
+| `push_devices` | Phones the mobile app registered for push (org mode) |
 | `channel_*` | Channel installations, bindings, sessions, and events |
 | `shared_resource_attributions` | Creator and latest-editor user IDs for org-shared filesystem resources |
 | `shared_resource_mutations` | Append-only actor trail for allowed org-shared mutations, including deletes |
@@ -567,7 +582,7 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/conversations` | Conversation threads and message history |
 | `/responses` | Streaming agent responses (SSE) |
 | `/files` | OpenAI-compatible file uploads |
-| `/schedules` | Recurring task scheduling |
+| `/schedules` | Recurring task scheduling; scripting it with an API key: [docs/SCHEDULED_TASKS_API.md](docs/SCHEDULED_TASKS_API.md) |
 | `/skills` | Agent skill definitions |
 | `/memory` | Persistent agent memory |
 | `/artifacts` | Agent-produced file previews |

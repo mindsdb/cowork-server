@@ -5,7 +5,7 @@ members of one org may each keep a definition under the same connector id.
 Local rows (org_id NULL) keep their one-per-id rule.
 
 Revision ID: d4b8e2f6a9c1
-Revises: c1d7e2a94f60
+Revises: 1d5fe417cc0a
 Create Date: 2026-11-07 00:00:00.000000
 
 """
@@ -17,7 +17,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "d4b8e2f6a9c1"
-down_revision: Union[str, Sequence[str], None] = "c1d7e2a94f60"
+down_revision: Union[str, Sequence[str], None] = "1d5fe417cc0a"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
