@@ -96,21 +96,18 @@ def child_command(*, limits: ChildLimits) -> tuple[list[str], dict[str, str]]:
 
     ``-I`` keeps the server's environment, the user's site folder and the
     current directory out of the process, and ``-B`` keeps it from writing
-    bytecode. It gets no environment of its own, so no credential. A Windows
-    venv's ``python.exe`` only redirects to the base interpreter, which a kill
-    wouldn't reach, so the process starts as the base interpreter told about
-    the venv, as ``multiprocessing`` starts its workers there.
+    bytecode. It gets no environment of its own, so no credential; Windows
+    needs ``SYSTEMROOT`` to start one. It runs the server's own interpreter,
+    so it imports the same ``cowork``. On Windows a venv's ``python.exe``
+    starts the base interpreter as its own child, which ``_kill`` and the
+    watch reach too.
     """
-    executable = sys.executable
     environment: dict[str, str] = {}
     if sys.platform == "win32":
         environment["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
-        if os.path.normcase(sys.executable) != os.path.normcase(sys._base_executable):
-            executable = sys._base_executable
-            environment["__PYVENV_LAUNCHER__"] = sys.executable
     cpu_seconds = math.ceil(limits.wall_seconds) + 1
     command = [
-        executable, "-I", "-B", "-m", CHILD_MODULE, str(limits.memory_bytes), str(cpu_seconds)
+        sys.executable, "-I", "-B", "-m", CHILD_MODULE, str(limits.memory_bytes), str(cpu_seconds)
     ]
     return command, environment
 
@@ -154,10 +151,10 @@ def _run(
             try:
                 process.wait(timeout=_EXIT_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
-                process.kill()
+                _kill(process)
                 exchange = exchange._replace(killed_for_protocol=True)
     except BaseException:
-        process.kill()
+        _kill(process)
         raise
     finally:
         _close_quietly(stream=process.stdin)
@@ -166,6 +163,23 @@ def _run(
         watch.stop()
         _close_quietly(stream=process.stdout)
     return _outcome(exchange=exchange, returncode=process.returncode, cause=watch.cause)
+
+
+def _kill(process: subprocess.Popen) -> None:
+    """Kill the conversion process, and on Windows the interpreter a venv's launcher started.
+
+    On Linux and macOS the process can start no other: its process limit is 0.
+    """
+    if sys.platform == "win32":
+        try:
+            for child in psutil.Process(process.pid).children(recursive=True):
+                child.kill()
+        except psutil.Error:
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
 
 
 def _close_quietly(*, stream: IO[bytes]) -> None:
@@ -292,20 +306,29 @@ class _Watch:
             if self._process.poll() is not None:
                 return
             if time.monotonic() >= self._deadline:
-                self._kill(cause="wall clock")
+                self._stop(cause="wall clock")
                 return
             try:
+                watched = self._interpreter(watched=watched)
                 memory = watched.memory_info()
             except psutil.Error:
                 return
             held = memory.private if sys.platform == "win32" else memory.rss
             if held > self._limits.memory_bytes:
-                self._kill(cause="memory")
+                self._stop(cause="memory")
                 return
 
-    def _kill(self, *, cause: str) -> None:
+    def _interpreter(self, *, watched: psutil.Process) -> psutil.Process:
+        """The process holding the conversion's memory.
+
+        On Windows a venv's ``python.exe`` is a launcher whose child does the
+        work, so the watch moves to that child once it appears.
+        """
+        if sys.platform != "win32" or watched.pid != self._process.pid:
+            return watched
+        children = watched.children()
+        return children[0] if children else watched
+
+    def _stop(self, *, cause: str) -> None:
         self.cause = cause
-        try:
-            self._process.kill()
-        except OSError:
-            pass
+        _kill(self._process)
