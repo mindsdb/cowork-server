@@ -284,6 +284,9 @@ class ArtifactPublishResult(ArtifactAudienceView):
     # The old link, when this publish shared a new one because no owner
     # record names the old page, which stays live with the earlier version.
     replaced_link: str | None = None
+    # The page this publish answers for, also under `result`; here so a client
+    # need not read the publisher's own answer for it.
+    report_id: str = ""
     result: dict[str, Any] = Field(default_factory=dict)
 
 

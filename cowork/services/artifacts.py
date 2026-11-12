@@ -1594,7 +1594,6 @@ def _prepare_artifact_card(
         "publishedUrl": _published_url_for(
             io_folder, primary, published_map=published_map
         ),
-        "reportId": _report_id_for(io_folder, primary, published_map=published_map),
         # Filled by one of the two callers below. Keeping the slot here preserves
         # the canonical response shape and key order.
         "modified": False,

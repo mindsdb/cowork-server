@@ -1558,6 +1558,7 @@ def publish_artifact(
             access_protected=bool(owner_side.get("requires_password")),
             artifact_key=response_key or "",
             replaced_link=replaced_link,
+            report_id=returned_report_id if isinstance(returned_report_id, str) else "",
             result={k: v for k, v in result.items() if k != "file_payload"},
             **ArtifactAudienceView.of(audience).model_dump(),
         ).model_dump(by_alias=True, mode="json")

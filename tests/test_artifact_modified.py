@@ -766,3 +766,20 @@ def test_access_view_names_the_live_pages_report_id_in_every_mode(tmp_path: Path
     assert unknown.report_id == "rid-1"
     rule = ArtifactRule(org_allowed=True, allowed_team_ids=[], allowed_user_ids=[], allowed_emails=[])
     assert unknown.restricted_to(rule).model_dump(by_alias=True)["reportId"] == "rid-1"
+
+
+def test_card_names_no_report_id_for_a_record_without_a_live_link(tmp_path: Path):
+    """The card reads the id through the access fields; a record that keeps
+    its report_id but has no URL names no page."""
+    root = _make_static_html(tmp_path)
+    _record(root, url="")
+    with _patch_scan(tmp_path):
+        assert card_for_folder(root, scope=LOCAL_SCOPE)["reportId"] == ""
+
+
+def test_publish_answer_names_its_page_at_the_top_level(tmp_path: Path):
+    root = _make_static_html(tmp_path)
+    with _patched_publish(tmp_path, report_id="rid-top"):
+        answer = _publish(root, tmp_path)
+    assert answer["reportId"] == "rid-top"
+    assert answer["result"]["report_id"] == "rid-top"
