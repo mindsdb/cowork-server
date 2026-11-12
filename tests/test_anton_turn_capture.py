@@ -222,7 +222,7 @@ def _stream(monkeypatch, session, *, question: str = "hi", read_earlier_answers=
 
     async def _fake_build(
         self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
-        tool_messages=False, interactive=True,
+        tool_messages=False, interactive=True, ui_locale=None,
     ):
         return BuiltChatSession(session=session, turn_scratch_dir=None, seed_info=None, learns=True)
 
