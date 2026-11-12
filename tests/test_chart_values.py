@@ -79,7 +79,7 @@ CAPABILITIES = "COWORK_DATASOURCE_CAPABILITIES"
 ENABLED_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
 LABELS_FLAG = "COWORK_TURN_DATASOURCE_LABELS_ENABLED"
 # Environments whose scratchpad pods all run an anton that accepts connection names.
-LABELS_ENABLED_ENVIRONMENTS: frozenset[str] = frozenset()
+LABELS_ENABLED_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
 # The exact methods each enabled environment offers.
 OFFERED_METHODS: dict[str, frozenset[str]] = {"staging": frozenset({"mysql:host-password", "postgres:host-port"})}
 # The draft host of each environment. cowork's web build frames exactly these
