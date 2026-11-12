@@ -50,7 +50,12 @@ class CustomConnector(BaseSQLModel, table=True):
     connection_check: dict[str, Any] | None = Field(
         default=None,
         sa_column=sa.Column(sa.JSON, nullable=True),
-        description="The template's check, {path, headers}, as anton's parser accepted it; never a host",
+        description="The template's check, {path}, as anton's parser accepted it; never a host",
+    )
+    connection_auth: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=sa.Column(sa.JSON, nullable=True),
+        description="How the member's values go on a request, as anton's parser accepted it; slots, never a value",
     )
     featured: bool = Field(default=True, description="Shown in the picker's Featured section")
     org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")

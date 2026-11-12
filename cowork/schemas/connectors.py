@@ -217,12 +217,11 @@ class CustomConnectorUpdate(BaseModel):
 class ConnectorCheck(BaseModel):
     """How a custom connector tests its credentials: a GET of ``path`` on the address the member types.
 
-    ``headers`` maps a header name to its value, where ``{field}`` stands for
-    that field's value. There is no host: the member supplies it.
+    The template's auth section places the values. There is no host: the
+    member supplies it.
     """
 
     path: str
-    headers: dict[str, str]
 
 
 class ConnectorSpecResponse(ConnectorMetadataResponse):

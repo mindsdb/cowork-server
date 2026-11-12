@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from anton.core.tools.connector_draft import ConnectorDraftCheck, ConnectorDraftError, check_draft_text, parse_connector_draft
+from anton.core.tools.connector_draft import ConnectorDraftError, check_draft_text, parse_connector_draft
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 
@@ -136,17 +136,19 @@ def delete_custom_connector(connector_id: str, session: ScopedSessionDep) -> Res
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-def _connect_template(connector_id: str, session: ScopedSession) -> tuple[list[dict[str, Any]], ConnectorDraftCheck]:
-    """The caller's own template's fields and its check, parsed again.
+def _connect_template(
+    connector_id: str, session: ScopedSession
+) -> tuple[list[dict[str, Any]], custom_connect.StoredTemplate]:
+    """The caller's own template's fields, and its check path and auth section parsed again.
 
     Raises:
         custom_connect.ConnectRefused: 404 when the caller has no such
-            template, 409 ``no_check`` when it has no usable check.
+            template, 409 ``no_check`` when it has no usable check or auth section.
     """
     row = CustomConnectorService(session).get(connector_id)
     if row is None:
         raise custom_connect.ConnectRefused("not_found", 404, "Custom connector not found.")
-    return list(row.spec.get("fields", [])), custom_connect.stored_check(row)
+    return list(row.spec.get("fields", [])), custom_connect.stored_template(row)
 
 
 #: What auth's refusals mean to the member; any other code reads as the fallback.
@@ -189,24 +191,25 @@ async def connect_custom_connector(
         if not settings.is_remote:
             raise custom_connect.ConnectRefused("unavailable", 503, "Connecting is unavailable on this deployment.")
         await custom_connect.take_attempt(get_redis(), f"cowork:custom-connect:{scope.org_id}:{scope.user_id}")
-        fields, check = await run_db(lambda session: _connect_template(connector_id, session), scope=scope)
+        fields, template = await run_db(lambda session: _connect_template(connector_id, session), scope=scope)
         origin = custom_connect.normalize_address(body.address, settings.custom_connect_refused_domains)
         values = custom_connect.check_values(fields, body.values)
-        custom_connect.check_headers(check, values)
+        custom_connect.place_values(template.auth, values)
     except custom_connect.ConnectRefused as refused:
         return _refusal(refused.code, refused.status_code, refused.message)
     payload = {
         "connector_id": connector_id,
         "name": body.name,
         "fields": {**values, custom_connect.BASE_URL_FIELD: origin},
-        "secure_keys": custom_connect.secure_keys(fields, check, values),
+        "secure_keys": sorted(values),
+        "auth": template.auth,
     }
     credential = request.headers.get("authorization", "")
     try:
         await create_custom_connection(
             credential=credential, organization_id=str(scope.org_id), payload=payload, dry_run=True, settings=settings,
         )
-        failure = await custom_connect.run_check(origin, check, values)
+        failure = await custom_connect.run_check(origin, template, values)
         if failure is not None:
             return JSONResponse(
                 {"detail": {"code": failure.code, "provider_status": failure.provider_status, "excerpt": failure.excerpt}},

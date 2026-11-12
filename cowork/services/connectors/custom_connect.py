@@ -1,24 +1,29 @@
 """Connecting a member's custom API connector: the address they type, the values, and the check.
 
-The template only says which path to GET and how to lay out the headers; the
-member types the API's address, and only that origin is dialed, through the
-pinned public-only helper. The check must first be refused without the
-credential headers, then pass with them. Nothing here logs or raises a
-submitted value: errors name a field or a code, and a failure's excerpt has
-every submitted value replaced before it leaves.
+The template says which path to GET and, in its auth section, how the
+member's values go on a request; the member types the API's address, and
+only that origin is dialed, through the pinned public-only helper. The
+values are filled in by anton's shared rules, as the gateway fills them.
+The check must first be refused without the placed credentials, then pass
+with them. Nothing here logs or raises a submitted value: errors name a
+field or a code, and a failure's excerpt has every submitted value, and
+every form of it that went on the request, replaced before it leaves.
 """
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote, quote_plus
 
 import httpx
-from anton.core.tools.connector_draft import ConnectorDraftCheck, ConnectorDraftError, parse_connector_draft
+from anton.core.tools import connector_auth_rules
+from anton.core.tools.connector_draft import ConnectorDraftError, parse_connector_draft
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
@@ -37,7 +42,6 @@ BASE_URL_FIELD = "base_url"
 
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _TOP_LABEL = re.compile(r"[a-z]{2,63}")
-_PLACEHOLDER = re.compile(r"\{([a-z][a-z0-9_]{0,39})\}")
 _ADDRESS_HINT = "type only the address, like api.example.com"
 
 
@@ -60,25 +64,56 @@ class CheckFailure:
     excerpt: str
 
 
-def stored_check(row: CustomConnector) -> ConnectorDraftCheck:
-    """Parse the row's stored check again with anton's parser, against the row's own fields.
+@dataclass(frozen=True)
+class StoredTemplate:
+    """What connect needs of a saved template, parsed again: its check path and auth section."""
 
-    Raises:
-        ConnectRefused: 409 ``no_check`` when the template has none, or one
-            that no longer passes the parser.
+    path: str
+    auth: dict[str, Any]
+
+
+def parse_stored(row: CustomConnector) -> StoredTemplate | None:
+    """Parse the row's fields, auth section and check again with anton's parser.
+
+    Returns None for a template saved without an auth section, without a
+    check, or in a shape the parser no longer accepts.
     """
     fields = [
-        {"name": f["name"], "label": f.get("label") or f["name"], "secret": bool(f.get("secret")), "required": bool(f.get("required"))}
+        {
+            "name": f["name"],
+            "label": f.get("label") or f["name"],
+            "secret": bool(f.get("secret")),
+            "required": f.get("required", True),
+        }
         for f in row.spec.get("fields", [])
     ]
-    draft = {"connector_id": row.connector_id, "label": row.label, "fields": fields, "check": row.connection_check}
+    draft = {
+        "connector_id": row.connector_id,
+        "label": row.label,
+        "fields": fields,
+        "auth": row.connection_auth,
+        "check": row.connection_check,
+    }
     try:
         parsed = parse_connector_draft(draft)
-    except ConnectorDraftError as exc:
-        raise ConnectRefused("no_check", 409, "This connector's connection check is not usable; ask Anton to build it again.") from exc
+    except ConnectorDraftError:
+        return None
     if parsed.check is None:
-        raise ConnectRefused("no_check", 409, "This connector has no connection check; ask Anton to build it again.")
-    return parsed.check
+        return None
+    return StoredTemplate(path=parsed.check.path, auth=parsed.auth.to_dict())
+
+
+def stored_template(row: CustomConnector) -> StoredTemplate:
+    """The row's template as connect uses it.
+
+    Raises:
+        ConnectRefused: 409 ``no_check`` when it has no check or auth
+            section, or one the parser no longer accepts.
+    """
+    template = parse_stored(row)
+    if template is None:
+        raise ConnectRefused("no_check", 409, "This connector cannot be connected as saved; ask Anton to build it again.")
+    return template
 
 
 def _refuse_address(message: str = "The API address is not valid.") -> ConnectRefused:
@@ -143,47 +178,71 @@ def check_values(fields: list[dict[str, Any]], values: Any) -> dict[str, str]:
     if any(name not in known for name in values):
         raise ConnectRefused("invalid_values", 422, "values has a field this connector does not declare.")
     accepted: dict[str, str] = {}
-    for name, field in known.items():
+    for name in known:
         value = values.get(name)
         if value is None or value == "":
-            if field.get("required"):
-                raise ConnectRefused("invalid_values", 422, f"{name} is required.")
-            continue
+            raise ConnectRefused("invalid_values", 422, f"{name} is required.")
         if not isinstance(value, str) or len(value) > VALUE_MAX or not all(0x20 <= ord(c) <= 0x7E for c in value):
             raise ConnectRefused(
                 "invalid_values", 422, f"{name} must be printable ASCII text of at most {VALUE_MAX} characters."
             )
+        # The HTTP library refuses such a header value with an error that quotes it.
+        if value != value.strip():
+            raise ConnectRefused("invalid_values", 422, f"{name} cannot start or end with a space.")
         accepted[name] = value
     return accepted
 
 
-def check_headers(check: ConnectorDraftCheck, values: Mapping[str, str]) -> tuple[dict[str, str], dict[str, str]]:
-    """Split the check's headers into the fixed ones and the ones that place a value, filled in.
+@dataclass(frozen=True, repr=False)
+class PlacedRequest:
+    """What the check sends: the credential-free part first, then everything ``render`` placed."""
 
-    A placeholder is replaced by an exact ``{name}`` match only.
+    bare_headers: dict[str, str]
+    bare_params: list[tuple[str, str]]
+    headers: dict[str, str]
+    params: list[tuple[str, str]]
+
+
+def place_values(auth: Mapping[str, Any], values: Mapping[str, str]) -> PlacedRequest:
+    """Fill the auth section with the values by anton's shared rules, as the gateway will.
+
+    The bare request keeps only the headers and params whose template has no
+    ``{field}`` slot; ``basic`` has none.
 
     Raises:
-        ConnectRefused: 422 ``invalid_values`` when a placed field has no value.
+        ConnectRefused: 422 ``invalid_values`` when the rules refuse a value.
     """
-    fixed: dict[str, str] = {}
-    placed: dict[str, str] = {}
-    for name, template in check.headers:
-        names = _PLACEHOLDER.findall(template)
-        if not names:
-            fixed[name] = template
-            continue
-        missing = [field for field in names if field not in values]
-        if missing:
-            raise ConnectRefused("invalid_values", 422, f"{missing[0]} is needed to check the connection.")
-        placed[name] = _PLACEHOLDER.sub(lambda m: values[m.group(1)], template)
-    return fixed, placed
+    try:
+        headers, params = connector_auth_rules.render(auth, values)
+    except connector_auth_rules.AuthRuleError as exc:
+        raise ConnectRefused("invalid_values", 422, "A value cannot be placed on the request.") from exc
+    bare_headers = dict(_slot_free(auth.get("headers", {}))) if auth["type"] == "header" else {}
+    bare_params = _slot_free(auth.get("params", {})) if auth["type"] == "query" else []
+    return PlacedRequest(bare_headers, bare_params, headers, params)
 
 
-def secure_keys(fields: list[dict[str, Any]], check: ConnectorDraftCheck, values: Mapping[str, str]) -> list[str]:
-    """The fields stored as secrets: the secret fields given, plus every field the check places."""
-    placed = {name for _, template in check.headers for name in _PLACEHOLDER.findall(template)}
-    secret = {f["name"] for f in fields if f.get("secret")}
-    return sorted(name for name in values if name in secret or name in placed)
+def _slot_free(templates: Mapping[str, str]) -> list[tuple[str, str]]:
+    """The entries whose template places no value."""
+    return [(name, text) for name, text in templates.items() if not connector_auth_rules.PLACEHOLDER.search(text)]
+
+
+def sent_forms(auth: Mapping[str, Any], request: PlacedRequest, values: Iterable[str]) -> set[str]:
+    """Every form of a submitted value that went on the request, for the excerpt scrub.
+
+    The values themselves, their percent-encodings, each placed header and
+    param value, and for ``basic`` the bare base64 credential with and without
+    its padding.
+    """
+    forms = {value for value in values if value}
+    forms |= {quote(value, safe="") for value in list(forms)} | {quote_plus(value) for value in list(forms)}
+    forms |= {value for value in request.headers.values() if value}
+    forms |= {value for _, value in request.params if value}
+    if auth["type"] == "basic":
+        token = request.headers["Authorization"].removeprefix("Basic ")
+        forms |= {token, token.rstrip("=")}
+    # A slot-free header or param is template text, not a member's value.
+    forms -= set(request.bare_headers.values()) | {value for _, value in request.bare_params}
+    return {form for form in forms if form}
 
 
 def scrub_excerpt(body: bytes, values: Iterable[str]) -> str:
@@ -219,11 +278,13 @@ async def take_attempt(redis: Redis, key: str) -> None:
         raise ConnectRefused("rate_limited", 429, "Too many connection attempts; wait a few minutes and try again.")
 
 
-async def _send(origin: str, path: str, headers: dict[str, str]) -> egress.PinnedResponse | CheckFailure:
+async def _send(
+    origin: str, path: str, headers: dict[str, str], params: list[tuple[str, str]]
+) -> egress.PinnedResponse | CheckFailure:
     """One pinned GET of the check, or the failure its error stands for, logged by type only."""
     try:
         return await egress.pinned_get(
-            origin, path, headers, total_seconds=CHECK_SECONDS, max_body_bytes=CHECK_BODY_BYTES
+            origin, path, headers, total_seconds=CHECK_SECONDS, max_body_bytes=CHECK_BODY_BYTES, params=params
         )
     except egress.EgressRefused as exc:
         code, error = "address_refused", exc
@@ -239,25 +300,29 @@ async def _send(origin: str, path: str, headers: dict[str, str]) -> egress.Pinne
     return CheckFailure(code, None, "")
 
 
-async def run_check(origin: str, check: ConnectorDraftCheck, values: Mapping[str, str]) -> CheckFailure | None:
-    """Send the check without its credential headers, then with them; None when it passed.
+async def run_check(origin: str, template: StoredTemplate, values: Mapping[str, str]) -> CheckFailure | None:
+    """Send the check without the placed credentials, then with them; None when it passed.
 
     Without them it must answer 401 or 403, or a passing check would prove
     nothing. With them, 2xx passes, 401 or 403 is ``authentication_failed``
     and any other status ``provider_error``. Only the answer to the request
     that carried the credentials is excerpted.
+
+    Raises:
+        ConnectRefused: 422 ``invalid_values`` when a value cannot be placed.
     """
-    fixed, placed = check_headers(check, values)
-    unprotected = await _send(origin, check.path, fixed)
+    placed = place_values(template.auth, values)
+    unprotected = await _send(origin, template.path, placed.bare_headers, placed.bare_params)
     if isinstance(unprotected, CheckFailure):
         return unprotected
     if unprotected.status_code not in (401, 403):
         # Its body is never shown: an excerpt would let connect read any page our egress can reach.
         return CheckFailure("check_not_protected", unprotected.status_code, "")
-    answer = await _send(origin, check.path, {**fixed, **placed})
+    answer = await _send(origin, template.path, placed.headers, placed.params)
     if isinstance(answer, CheckFailure):
         return answer
     if 200 <= answer.status_code < 300:
         return None
     code = "authentication_failed" if answer.status_code in (401, 403) else "provider_error"
-    return CheckFailure(code, answer.status_code, scrub_excerpt(answer.body, values.values()))
+    scrubbed = scrub_excerpt(answer.body, sent_forms(template.auth, placed, values.values()))
+    return CheckFailure(code, answer.status_code, scrubbed)

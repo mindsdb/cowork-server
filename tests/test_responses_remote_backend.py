@@ -3789,8 +3789,9 @@ def _anton_connector_entries() -> list[dict]:
         "help_url": "https://docs.acme.example/api-keys",
         "usage_notes": "Base URL https://api.acme.example/v2. Send the key as Authorization: Bearer <api_key>.",
         "fields": [{"name": "api_key", "label": "API key", "help": "Settings, then API."},
-                   {"name": "region", "label": "Region", "secret": False, "required": False, "placeholder": "eu"}],
-        "check": {"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}},
+                   {"name": "region", "label": "Region", "secret": False, "placeholder": "eu"}],
+        "auth": {"type": "header", "headers": {"Authorization": "Bearer {api_key}", "X-Region": "{region}"}},
+        "check": {"path": "/v2/me"},
     }))
     return drain_pending_connectors(SimpleNamespace(_connector_drafts=box))
 
@@ -3879,6 +3880,19 @@ async def test_a_refused_draft_is_a_notice_without_its_value(monkeypatch):
     assert "label" in notices[0] and "built-in" in notices[1] and "not allowed" in notices[2]
     assert not any(token in f for f in frames)
     assert frames[-1] == "CLOSE:completed"
+
+
+@pytest.mark.asyncio
+async def test_a_draft_from_a_pod_without_auth_is_a_notice_not_a_card(monkeypatch):
+    entry = _TURN_CONNECTOR_REPLY["data"]["entries"][0]
+    older = {key: value for key, value in entry.items() if key != "auth"}
+
+    frames, _ = await _connector_frames(monkeypatch, ("turn_connector", {"entries": [older]}))
+
+    assert _payloads(frames, "response.connector_drafted") == []
+    notices = [p["message"] for p in _payloads(frames, "response.in_progress")
+               if p.get("phase") == "connector_draft_dropped"]
+    assert len(notices) == 1 and "auth" in notices[0]
 
 
 class _QueueRedis:
