@@ -1058,3 +1058,82 @@ def test_openai_compatible_on_mindshub_is_direct_and_elsewhere_goes_to_the_chat(
     else:
         assert fake_anton.route_calls == []
         assert events[0][1]["reason"] == "no_decisions_model"
+
+
+# ── the bar's model picker ───────────────────────────────────────────────
+
+CATALOG = {
+    "recommendedModels": {"minds-cloud": ["sonnet", "mini", "locked", "two-level"]},
+    "modelEfforts": {
+        "sonnet": {"efforts": ["low", "medium", "high"], "default": "high"},
+        "two-level": {"efforts": ["low", "high"], "default": "low"},
+    },
+    "modelEnabled": {"locked": False},
+}
+
+
+@pytest.fixture
+def picker(monkeypatch, fake_anton):
+    """The composer's catalog (GET /settings/recommended-models) for a
+    MindsHub person, and a backend that records the model it was built with."""
+    from cowork.api.v1.endpoints import settings as settings_ep
+    from cowork.common.settings.user_settings import Provider, UserSettings
+
+    user = UserSettings(planning_provider=Provider.MINDS_CLOUD, minds_api_key="k", planning_model="sonnet")
+    monkeypatch.setattr(settings_ep, "recommended_models", awaitable(lambda request, scope: CATALOG))
+    monkeypatch.setattr(quick_edit_service, "load_user_settings", awaitable(lambda scope: user))
+    built = []
+
+    def backend(scope, user=None, decisions=None, *, model=None, reasoning_effort=None):
+        built.append({"model": model, "effort": reasoning_effort})
+        return QuickEditBackend(llm="the-llm", route_base_url="https://hub.example/v1", route_api_key="k")
+
+    monkeypatch.setattr(quick_edit_service, "resolve_backend", awaitable(backend))
+    fake_anton.route = RouteDecision("agent", 0.9)
+    return built
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ({"model": "sonnet"}, {"model": "sonnet", "effort": "medium"}),  # medium by default
+        ({"model": "sonnet", "reasoningEffort": "low"}, {"model": "sonnet", "effort": "low"}),
+        ({"model": "mini", "reasoningEffort": "high"}, {"model": "mini", "effort": None}),  # no effort levels: ignored
+        ({"model": "mini"}, {"model": "mini", "effort": None}),
+        ({"model": "two-level"}, {"model": "two-level", "effort": "low"}),  # no medium: its own default
+        ({}, {"model": None, "effort": "medium"}),  # the person's default model, which takes effort
+    ],
+)
+def test_the_bar_s_model_and_effort_reach_the_editor_s_llm(client, artifact, picker, body, expected):
+    _folder, _metadata, artifact_id = artifact
+    response = post(client, artifact_id, **body)
+    assert response.status_code == 200, response.text
+    assert picker == [expected]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"model": "locked"},  # the catalog marks it unavailable (admin restriction, wallet)
+        {"model": "gpt-from-nowhere"},  # not offered to this person
+        {"model": "two-level", "reasoningEffort": "medium"},  # a level the model doesn't take
+        {"model": "sonnet", "reasoningEffort": "extreme"},
+    ],
+)
+def test_a_model_the_composer_would_not_offer_is_422(client, artifact, picker, fake_anton, body):
+    _folder, _metadata, artifact_id = artifact
+    response = post(client, artifact_id, **body)
+    assert response.status_code == 422, response.text
+    assert picker == [] and fake_anton.route_calls == []
+    assert not quick_edit_service.quick_edit_locks._held
+
+
+async def test_the_pick_goes_through_build_llm_client_like_a_turn(monkeypatch):
+    from cowork.common.settings.user_settings import Provider, UserSettings
+
+    calls = []
+    monkeypatch.setattr("cowork.services.providers.build_llm_client", lambda **kw: calls.append(kw) or "llm")
+    user = UserSettings(planning_provider=Provider.ANTHROPIC, anthropic_api_key="k")
+    backend = await quick_edit_service.resolve_backend(LOCAL_SCOPE, user, None, model="claude-x", reasoning_effort="medium")
+    assert backend.llm == "llm"
+    assert calls == [{"effort_override": "medium", "model_override": "claude-x", "settings": user}]

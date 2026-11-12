@@ -85,8 +85,14 @@ class AntonQuickEdit:
 def anton_quick_edit() -> AntonQuickEdit | None:
     """The installed anton's router and quick editor, or None when it has
     neither. Never raises: an anton that fails to import them is one without."""
+    import importlib
+
     try:
-        from anton.core.artifact_editor import quick, router
+        # import_module, not `from package import quick`: it honours
+        # sys.modules, so a module that is absent (or hidden) reads as absent
+        # even after the package was imported.
+        quick = importlib.import_module("anton.core.artifact_editor.quick")
+        router = importlib.import_module("anton.core.artifact_editor.router")
     except Exception:
         return None
     route_request = getattr(router, "route_request", None)
@@ -306,7 +312,14 @@ class QuickEditBackend:
             self.minted_correlation_id = None
 
 
-async def resolve_backend(scope: TenantScope, user=None, decisions: Decisions | None = None) -> QuickEditBackend:
+async def resolve_backend(
+    scope: TenantScope,
+    user=None,
+    decisions: Decisions | None = None,
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> QuickEditBackend:
     """The editor's LLM and the router's endpoint, for the caller.
 
     The caller's own settings, as their turns read them; the router's
@@ -315,6 +328,12 @@ async def resolve_backend(scope: TenantScope, user=None, decisions: Decisions | 
     turn key is minted here the same way, routes too, and is revoked by
     ``close()``. Raises when no LLM can be built (no provider key): the route
     reports it as an error event.
+
+    ``model`` / ``reasoning_effort`` are the bar's pick, already checked
+    against the composer's catalog (``artifact_quick_edit._model_choice``),
+    applied the way a turn applies the composer's: ``build_llm_client``'s
+    ``model_override`` and ``effort_override``. None keeps the person's own
+    settings. Routing never uses them: Jev is ``decisions_config``'s.
     """
     from cowork.common.settings.app_settings import TurnQueueSettings
     from cowork.services.providers import build_llm_client
@@ -322,16 +341,21 @@ async def resolve_backend(scope: TenantScope, user=None, decisions: Decisions | 
     settings = user if user is not None else await load_user_settings(scope)
     decisions = decisions or NO_DECISIONS
     if _hosted_minted(settings):
-        return await _minted_backend(scope, settings, TurnQueueSettings(), decisions)
+        return await _minted_backend(
+            scope, settings, TurnQueueSettings(), decisions, model=model, reasoning_effort=reasoning_effort,
+        )
     return QuickEditBackend(
-        llm=build_llm_client(settings=settings),
+        llm=build_llm_client(effort_override=reasoning_effort, model_override=model, settings=settings),
         route_base_url=decisions.base_url,
         route_api_key=decisions.api_key,
         route_model=decisions.model,
     )
 
 
-async def _minted_backend(scope: TenantScope, settings, queue_settings, decisions: Decisions) -> QuickEditBackend:
+async def _minted_backend(
+    scope: TenantScope, settings, queue_settings, decisions: Decisions,
+    *, model: str | None = None, reasoning_effort: str | None = None,
+) -> QuickEditBackend:
     """A MindsHub LLM on a turn key minted for this edit (hosted orgs keep no
     stored key), as the routing gate mints one (``_router_binding``)."""
     from anton.core.llm.client import LLMClient
@@ -354,13 +378,14 @@ async def _minted_backend(scope: TenantScope, settings, queue_settings, decision
             api_key=block["api_key"],
             base_url=block["base_url"],
             flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
+            **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
         )
-        planning_model = settings.resolved_planning_model or MINDS_FREE_MODEL
+        planning_model = model or settings.resolved_planning_model or MINDS_FREE_MODEL
         backend.llm = LLMClient(
             planning_provider=provider,
             planning_model=planning_model,
             coding_provider=provider,
-            coding_model=block.get("coding_model") or planning_model,
+            coding_model=model or block.get("coding_model") or planning_model,
         )
         if decisions.available:
             backend.route_base_url = block["base_url"]

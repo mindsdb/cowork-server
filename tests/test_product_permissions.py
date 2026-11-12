@@ -420,6 +420,8 @@ async def test_artifact_capabilities_reflect_current_role_and_execution(
         return can_edit if permission == "artifact.manage" else can_execute
 
     monkeypatch.setattr(artifact_workspace, "has_product_permission", allowed)
+    # Whichever anton is installed: quick edits are tested on their own.
+    monkeypatch.setattr(artifact_workspace, "quick_edit_available", lambda: False)
     original = {
         "canEdit": True,
         "canAddressWithAgent": True,
@@ -434,8 +436,8 @@ async def test_artifact_capabilities_reflect_current_role_and_execution(
         "canAddressWithAgent": can_edit and can_execute,
         "canResolveComments": can_edit,
         "canPreview": True,
-        # The installed anton has no quick editor, so this is false whatever
-        # the permissions (ENG-4227; tests/test_artifact_quick_edit.py).
+        # No quick editor here (patched above), so false whatever the
+        # permissions (ENG-4227; tests/test_artifact_quick_edit.py).
         "canQuickEdit": False,
         "quickEditDirect": False,
     }

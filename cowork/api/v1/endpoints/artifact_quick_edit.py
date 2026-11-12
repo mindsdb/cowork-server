@@ -120,6 +120,61 @@ class _QuickEditBody(BaseModel):
     expectedRevisionId: str | None = Field(default=None, min_length=1, max_length=80)
     conversationId: UUID | None = None
     forceRoute: Literal["edit", "agent"] | None = None
+    # The bar's model picker. A model the composer offers this person (GET
+    # /api/v1/settings/recommended-models), else 422; null is their default.
+    model: str | None = Field(default=None, min_length=1, max_length=200)
+    # Ignored for a model without effort levels; null on one that has them
+    # means "medium" (or the model's own default when it has no medium).
+    reasoningEffort: Literal["low", "medium", "high"] | None = None
+
+
+#: The bar's effort when it sends none, on a model that takes one.
+DEFAULT_EFFORT = "medium"
+
+
+async def _model_choice(request: Request, scope: TenantScope, body: _QuickEditBody) -> tuple[str | None, str | None]:
+    """The editor's (model, reasoning effort) for this request.
+
+    The model is checked the way the composer offers it: one of the models
+    GET /settings/recommended-models lists for the person's planning
+    provider (or their configured default), and not one the catalog marks
+    unavailable (an admin restriction, an empty wallet). A provider whose
+    list is empty (an openai-compatible endpoint that lists nothing) takes a
+    typed model, as the composer's free-text input does. The effort applies
+    only to a model the catalog gives effort levels (``modelEfforts``): on
+    one without, it is ignored; on one with, it must be one of them, and
+    none means ``DEFAULT_EFFORT``. Raises 422 for anything else.
+    """
+    from cowork.api.v1.endpoints import settings as settings_ep
+
+    user = await quick_edit_service.load_user_settings(scope)
+    default_model = user.resolved_planning_model
+    try:
+        catalog = await settings_ep.recommended_models(request, scope)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning("Could not read the model catalog for a quick edit", exc_info=True)
+        if body.model is not None:
+            raise HTTPException(status_code=422, detail="Couldn't check that model; try again.")
+        return None, None
+    provider = user.resolved_planning_provider.value.replace("_", "-")
+    if body.model is not None:
+        listed = list((catalog.get("recommendedModels") or {}).get(provider) or [])
+        offered = body.model in listed or body.model == default_model or not listed
+        if not offered or (catalog.get("modelEnabled") or {}).get(body.model) is False:
+            raise HTTPException(status_code=422, detail="That model isn't available to you.")
+    chosen = body.model or default_model
+    entry = (catalog.get("modelEfforts") or {}).get(chosen) if chosen else None
+    efforts = [str(e) for e in (entry or {}).get("efforts") or []]
+    if not efforts:
+        return body.model, None
+    effort = body.reasoningEffort
+    if effort is None:
+        effort = DEFAULT_EFFORT if DEFAULT_EFFORT in efforts else (entry.get("default") or None)
+    elif effort not in efforts:
+        raise HTTPException(status_code=422, detail="That model doesn't take this reasoning effort.")
+    return body.model, effort
 
 
 def _lock_key(scope: TenantScope, artifact_id: str) -> str:
@@ -283,6 +338,9 @@ class QuickEditRun:
     started: float
     lock_key: str
     broker: PreviewCheckBroker = preview_checks
+    # The bar's model pick and effort (``_model_choice``); None: the person's own.
+    model: str | None = None
+    reasoning_effort: str | None = None
     # Tests replace it; None reads quick_edit.resolve_backend at call time.
     resolve_backend: Callable[[TenantScope], Any] | None = None
     # None reads EDIT_TIMEOUT_S at call time.
@@ -403,7 +461,9 @@ class QuickEditRun:
                 emit(sse_frame("route", {"route": "agent", "confidence": 1.0, "ms": 0, "reason": NO_DECISIONS_REASON}))
                 emit(_done(status_="agent", started=self.started))
                 return
-            backend = await (self.resolve_backend or quick_edit_service.resolve_backend)(self.scope, user, decisions)
+            backend = await (self.resolve_backend or quick_edit_service.resolve_backend)(
+                self.scope, user, decisions, model=self.model, reasoning_effort=self.reasoning_effort,
+            )
             route_started = time.monotonic()
             route, confidence, reason = await self._route(backend, decisions)
             emit(sse_frame("route", {"route": route, "confidence": confidence, "ms": _ms(route_started), "reason": reason}))
@@ -537,6 +597,7 @@ async def quick_edit_artifact(
         )
     started = time.monotonic()
     _source, folder, metadata, _capabilities = await _owner_workspace(scope, project_ref, artifact_id)
+    model, reasoning_effort = await _model_choice(request, scope, body)
 
     lock_key = _lock_key(scope, artifact_id)
     if not quick_edit_service.quick_edit_locks.acquire(lock_key):
@@ -576,6 +637,8 @@ async def quick_edit_artifact(
 
     run = QuickEditRun(
         anton=anton,
+        model=model,
+        reasoning_effort=reasoning_effort,
         scope=scope,
         folder=folder,
         metadata=metadata,
