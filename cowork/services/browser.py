@@ -401,6 +401,95 @@ async def person_open(bearer: str, *, user_id: str | None, conversation_id: str,
     return OpenedSession(session_id=session_id)
 
 
+class TaskTab(BaseModel):
+    id: str
+    url: str
+    title: str = ""
+    active: bool = False
+
+
+class ParkedTab(BaseModel):
+    url: str
+    title: str = ""
+
+
+class TaskBrowser(BaseModel):
+    """One task's open browser, for the project's browser list."""
+
+    conversation_id: str
+    session_id: str
+    url: str | None = None
+    viewers: int = 0
+    #: Who holds it: 'agent', or 'human' while the agent handed it to the person.
+    holder: str = "agent"
+    last_active_at: str | None = None
+    tabs: list[TaskTab] = Field(default_factory=list)
+    parked_tabs: list[ParkedTab] = Field(default_factory=list)
+
+
+class TaskBrowsers(BaseModel):
+    browsers: list[TaskBrowser]
+
+
+#: The most tasks one listing looks up: a project's recent ones.
+MAX_LISTED_TASKS = 100
+
+
+async def task_browsers(bearer: str, *, user_id: str | None, conversation_ids: list[str]) -> TaskBrowsers:
+    """The open browsers among these tasks, each with its tabs, as the caller.
+    The router lists only the caller's own sessions, and each task's session
+    is named from the caller (``task_session``), so ids of anyone else's
+    tasks match nothing. A browser whose tabs can't be read now (the person
+    holds it, a dialog is up) is listed without them. Raises BrowserServiceError."""
+    router = _require_router()
+    by_session = {task_session(user_id, c): c for c in conversation_ids[:MAX_LISTED_TASKS]}
+    listed = await _call("GET", f"{router}/sessions", bearer)
+    rows = listed.get("sessions") if isinstance(listed, dict) else None
+    browsers: list[TaskBrowser] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or row.get("session_id") not in by_session or row.get("running") is False:
+            continue
+        session_id = row["session_id"]
+        tabs: list[TaskTab] = []
+        try:
+            answer = await _call("GET", f"{router}/sessions/{session_id}/tabs", bearer)
+            tabs = [TaskTab.model_validate(t) for t in (answer or {}).get("tabs") or []]
+        except (BrowserServiceError, ValidationError):
+            pass
+        control = row.get("control") if isinstance(row.get("control"), dict) else {}
+        browsers.append(TaskBrowser(
+            conversation_id=by_session[session_id],
+            session_id=session_id,
+            url=row.get("url"),
+            viewers=int(row.get("viewers") or 0),
+            holder="human" if control.get("holder") == "human" else "agent",
+            last_active_at=row.get("last_active_at"),
+            tabs=tabs,
+            parked_tabs=[ParkedTab.model_validate(t) for t in row.get("parked_tabs") or [] if isinstance(t, dict)],
+        ))
+    browsers.sort(key=lambda b: b.last_active_at or "", reverse=True)
+    return TaskBrowsers(browsers=browsers)
+
+
+async def switch_tab(bearer: str, *, user_id: str | None, conversation_id: str, tab_id: str) -> None:
+    """Brings one of a task's tabs to the front, where the pane shows it."""
+    session_id = task_session(user_id, conversation_id)
+    await _call("POST", f"{_require_router()}/sessions/{session_id}/tabs/{tab_id}/activate", bearer)
+
+
+async def close_tab(bearer: str, *, user_id: str | None, conversation_id: str, tab_id: str, park: bool) -> None:
+    """Closes one of a task's tabs; ``park`` keeps a note of it to reopen later."""
+    session_id = task_session(user_id, conversation_id)
+    suffix = "?park=true" if park else ""
+    await _call("DELETE", f"{_require_router()}/sessions/{session_id}/tabs/{tab_id}{suffix}", bearer)
+
+
+async def close_task_browser(bearer: str, *, user_id: str | None, conversation_id: str) -> None:
+    """Closes a task's browser. Its tabs are noted and reopen when the task needs them."""
+    session_id = task_session(user_id, conversation_id)
+    await _call("DELETE", f"{_require_router()}/sessions/{session_id}", bearer)
+
+
 async def embed(bearer: str, session_id: str) -> BrowserEmbed:
     """A viewer link for one of the caller's sessions, minted by the router
     with their own credential. The router routes by that credential, so a

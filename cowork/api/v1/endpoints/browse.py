@@ -63,6 +63,24 @@ class OpenRequest(BaseModel):
     url: str | None = Field(default=None, max_length=4096)
 
 
+class TaskBrowsersRequest(BaseModel):
+    # The project's tasks, from the app's own list; the server names their sessions.
+    conversation_ids: list[Annotated[str, Field(pattern=SESSION_ID.pattern)]] = Field(
+        max_length=browser_service.MAX_LISTED_TASKS,
+    )
+
+
+class TaskTabRequest(BaseModel):
+    conversation_id: str = Field(pattern=SESSION_ID.pattern)
+    tab_id: str = Field(pattern=r"^t[1-9]\d{0,8}$")
+    # Closing: keep a note of it, to reopen when the task needs it.
+    park: bool = True
+
+
+class TaskBrowserRequest(BaseModel):
+    conversation_id: str = Field(pattern=SESSION_ID.pattern)
+
+
 def _raise(exc: browser_service.BrowserServiceError) -> NoReturn:
     raise HTTPException(status_code=exc.status, detail=exc.detail.model_dump()) from exc
 
@@ -164,3 +182,52 @@ async def browse_clear_logins(request: Request) -> browser_service.LoginsCleared
         return await browser_service.clear_logins(mindshub_credential(request))
     except browser_service.BrowserServiceError as exc:
         _raise(exc)
+
+
+# The project's browsers (ENG-4138, prototype): the open ones among a
+# project's tasks, with their tabs, and the person's switch and close.
+@router.post(
+    "/browsers", response_model=browser_service.TaskBrowsers,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def browse_task_browsers(body: TaskBrowsersRequest, request: Request, scope: ScopeDep) -> browser_service.TaskBrowsers:
+    try:
+        return await browser_service.task_browsers(
+            mindshub_credential(request), user_id=scope.user_id, conversation_ids=body.conversation_ids,
+        )
+    except browser_service.BrowserServiceError as exc:
+        _raise(exc)
+
+
+@router.post("/tabs/switch", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def browse_switch_tab(body: TaskTabRequest, request: Request, scope: ScopeDep) -> dict:
+    try:
+        await browser_service.switch_tab(
+            mindshub_credential(request), user_id=scope.user_id, conversation_id=body.conversation_id, tab_id=body.tab_id,
+        )
+    except browser_service.BrowserServiceError as exc:
+        _raise(exc)
+    return {"ok": True}
+
+
+@router.post("/tabs/close", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def browse_close_tab(body: TaskTabRequest, request: Request, scope: ScopeDep) -> dict:
+    try:
+        await browser_service.close_tab(
+            mindshub_credential(request), user_id=scope.user_id, conversation_id=body.conversation_id,
+            tab_id=body.tab_id, park=body.park,
+        )
+    except browser_service.BrowserServiceError as exc:
+        _raise(exc)
+    return {"ok": True}
+
+
+@router.post("/close", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def browse_close(body: TaskBrowserRequest, request: Request, scope: ScopeDep) -> dict:
+    try:
+        await browser_service.close_task_browser(
+            mindshub_credential(request), user_id=scope.user_id, conversation_id=body.conversation_id,
+        )
+    except browser_service.BrowserServiceError as exc:
+        _raise(exc)
+    return {"ok": True}
