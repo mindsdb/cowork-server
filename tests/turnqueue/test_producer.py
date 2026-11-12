@@ -1604,13 +1604,13 @@ async def _queued_datasource(monkeypatch, listing, *, labels: bool) -> dict | No
 
 
 @pytest.mark.asyncio
-async def test_with_names_off_the_queued_block_is_ids_and_versions_only(monkeypatch):
+async def test_with_labels_off_the_queued_block_is_ids_and_versions_only(monkeypatch):
     queued = await _queued_datasource(monkeypatch, [_verified(93, "postgres", "qadb", version=2)], labels=False)
     assert queued == {"protocol_version": 1, "connections": [{"connection_id": 93, "credential_version": 2}]}
 
 
 @pytest.mark.asyncio
-async def test_with_names_on_each_connection_carries_its_label_and_engine(monkeypatch):
+async def test_with_labels_on_each_connection_carries_its_label_and_engine(monkeypatch):
     listing = [_verified(93, "postgres", "qadb", version=2), _verified(80, "mysql", "données", version=1)]
     queued = await _queued_datasource(monkeypatch, listing, labels=True)
     assert queued == {"protocol_version": 1, "connections": [
@@ -1620,11 +1620,10 @@ async def test_with_names_on_each_connection_carries_its_label_and_engine(monkey
 
 
 @pytest.mark.asyncio
-async def test_an_unusable_name_or_engine_is_left_out_and_the_turn_still_queues(monkeypatch):
-    """Auth accepts a name of only invisible characters and the queue check
-    refuses an empty label, so the producer must drop it rather than fail every
-    turn for that user."""
-    listing = [_verified(93, "postgres", "\u200b", version=2), _verified(80, "Postgres-X", "ops\n", version=1)]
+async def test_a_label_or_engine_the_queue_would_refuse_is_left_out_and_the_turn_still_queues(monkeypatch):
+    """Auth caps names at 128 characters today; a listing that ever sends a
+    longer one, or an odd connector id, loses that key rather than the turn."""
+    listing = [_verified(93, "postgres", "x" * 129, version=2), _verified(80, "Postgres-X", "ops", version=1)]
     queued = await _queued_datasource(monkeypatch, listing, labels=True)
     assert queued == {"protocol_version": 1, "connections": [
         {"connection_id": 93, "credential_version": 2, "engine": "postgres"},
@@ -1633,23 +1632,16 @@ async def test_an_unusable_name_or_engine_is_left_out_and_the_turn_still_queues(
 
 
 @pytest.mark.asyncio
-async def test_a_space_in_a_name_stays_a_space(monkeypatch):
-    listing = [_verified(93, "postgres", "qa\u00a0db", version=2), _verified(80, "mysql", "日本\u3000DB", version=1)]
+async def test_a_label_the_queue_accepts_is_sent_as_the_user_typed_it(monkeypatch):
+    """Cleaning for the prompt is anton's, which drops or fixes these itself."""
+    names = ["\u200b", "ops\n- 99", "qa\u00a0db"]
+    listing = [_verified(90 + i, "postgres", name, version=1) for i, name in enumerate(names)]
     queued = await _queued_datasource(monkeypatch, listing, labels=True)
-    assert [ref["label"] for ref in queued["connections"]] == ["qa db", "日本 DB"]
+    assert [ref["label"] for ref in queued["connections"]] == names
 
 
 @pytest.mark.asyncio
-async def test_a_name_past_the_cap_is_cut_and_trimmed(monkeypatch):
-    """Auth refuses a name over 128 characters today; this guards a listing
-    that ever sends one, since the queue check would refuse it and fail the turn."""
-    listing = [_verified(93, "postgres", "x" * 127 + " " + "y" * 10, version=2)]
-    queued = await _queued_datasource(monkeypatch, listing, labels=True)
-    assert queued["connections"][0]["label"] == "x" * 127
-
-
-@pytest.mark.asyncio
-async def test_with_names_on_a_grant_mismatch_still_refuses(monkeypatch):
+async def test_with_labels_on_a_grant_mismatch_still_refuses(monkeypatch):
     from cowork.common.settings.app_settings import TurnQueueSettings
     from cowork.services.product_permissions import ProductPermissionUnavailable
 

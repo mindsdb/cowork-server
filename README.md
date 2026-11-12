@@ -967,7 +967,7 @@ Publishing uses a separate `artifact_publish` mint purpose. It requires artifact
 
 Turn the flag on only after MindsHub serves the datasource producer and resolver endpoints, the inference deployment serves `/v1/datasources/`, the turn controller passes the `datasource` block on, and the scratchpad image includes the typed helper that reads the gateway from the turn's inference host, with live pods from an older image recycled first. With the flag off nothing in this path runs, so the flag is also the rollback.
 
-`COWORK_TURN_DATASOURCE_LABELS_ENABLED` (default `false`) adds each connection's name and connector id to its reference, so the agent can tell the connections apart and match the name the user uses. A name that is unusable for one prompt line is left out, never fails the turn. An anton older than this change refuses a block that carries them, so turn it on only after the scratchpad image has that anton and no live pod started before the image update; turning it off is the rollback.
+`COWORK_TURN_DATASOURCE_LABELS_ENABLED` (default `false`) adds each connection's name and connector id to its reference, so the agent can tell the connections apart and match the name the user uses. A name or connector id the queue would refuse is left out and anton cleans the rest for the prompt, so neither fails the turn. An anton older than this change refuses a block that carries them, so turn it on only after the scratchpad image has that anton and no live pod started before the image update; turning it off is the rollback.
 
 ### Sharing selected projects
 

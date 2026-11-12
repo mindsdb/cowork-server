@@ -12,7 +12,6 @@ import asyncio
 import json
 import logging
 import time
-import unicodedata
 import uuid
 from datetime import datetime
 from functools import partial
@@ -43,13 +42,13 @@ from cowork.turnqueue.auth_keys import (
     revoke_turn_key,
 )
 from cowork.turnqueue.models import (
-    CONNECTION_ENGINE_PATTERN,
-    MAX_CONNECTION_LABEL_CHARS,
     MAX_DATASOURCE_CONNECTIONS,
     TurnJob,
     TurnJobHeader,
     TurnReply,
     TurnReplyHeader,
+    is_connection_engine,
+    is_connection_label,
 )
 from cowork.streaming.cancellation import stop_controller_turn
 from cowork.streaming.turn_index import record_channel_turn
@@ -339,7 +338,7 @@ def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermiss
 
 
 def _datasource_connection_refs(
-    connections: list[dict], disabled: list[dict] | None, *, with_names: bool = False
+    connections: list[dict], disabled: list[dict] | None, *, with_labels: bool = False
 ) -> list[dict]:
     """The grant set: every verified connection auth listed, minus the
     conversation's disabled ones. A disabled entry carries ``engine`` and
@@ -376,8 +375,8 @@ def _datasource_connection_refs(
             raise _refuse_datasource_grants("listing carries a malformed or repeated connection reference")
         seen.add(connection_id)
         ref = {"connection_id": connection_id, "credential_version": credential_version}
-        if with_names:
-            ref.update(_connection_names(connection))
+        if with_labels:
+            ref.update(_connection_labels(connection))
         refs.append(ref)
     # Auth caps what is registered, so the cap applies after the disabled ones are gone.
     if len(refs) > MAX_DATASOURCE_CONNECTIONS:
@@ -395,25 +394,14 @@ def _same_identifier(echoed: object, ours: str) -> bool:
         return echoed == ours
 
 
-def _connection_names(connection: dict) -> dict[str, str]:
-    """The ``label`` and ``engine`` a connection reference may carry, each left out when unusable.
-
-    Input: one verified connection from auth's listing. Output: its name cleaned
-    for one prompt line (each space character a plain space, other non-printable
-    characters removed, cut to auth's cap, trimmed)
-    and its connector id when it has that shape. anton applies the same rule and
-    re-checks both, so a value that would fail the queue check never reaches it
-    and a name never fails the turn. No side effects.
-    """
-    names: dict[str, str] = {}
-    spaced = "".join(" " if unicodedata.category(ch) == "Zs" else ch for ch in connection["name"])
-    label = "".join(ch for ch in spaced if ch.isprintable()).strip()
-    label = label[:MAX_CONNECTION_LABEL_CHARS].strip()
-    if label:
-        names["label"] = label
-    if CONNECTION_ENGINE_PATTERN.fullmatch(connection["connector_id"]):
-        names["engine"] = connection["connector_id"]
-    return names
+def _connection_labels(connection: dict) -> dict[str, str]:
+    """The connection's ``label`` and ``engine``, each only when the queue check accepts it; anton cleans them for the prompt."""
+    labels: dict[str, str] = {}
+    if is_connection_label(connection["name"]):
+        labels["label"] = connection["name"]
+    if is_connection_engine(connection["connector_id"]):
+        labels["engine"] = connection["connector_id"]
+    return labels
 
 
 async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
@@ -442,7 +430,7 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
             org_id, exc_info=True,
         )
         return None
-    refs = _datasource_connection_refs(connections, disabled, with_names=settings.datasource_labels_enabled)
+    refs = _datasource_connection_refs(connections, disabled, with_labels=settings.datasource_labels_enabled)
     if not refs:
         return None
     response = await register_datasource_grants(

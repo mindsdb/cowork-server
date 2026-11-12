@@ -147,33 +147,31 @@ def base() -> list[_Env]:
     return _env(BASE)
 
 
-def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed(base):
-    assert _deployment(BASE)["datasourceTurnsEnabled"] == "false"
-    assert _entry(base, FLAG).value == "{{ $.Values.datasourceTurnsEnabled }}"
+@pytest.mark.parametrize(
+    ("scalar", "env_name", "enabled"),
+    [
+        ("datasourceTurnsEnabled", FLAG, ENABLED_ENVIRONMENTS),
+        ("datasourceLabelsEnabled", LABELS_FLAG, LABELS_ENABLED_ENVIRONMENTS),
+    ],
+    ids=["grants", "labels"],
+)
+def test_a_datasource_switch_is_off_in_the_base_and_on_only_where_listed(base, scalar, env_name, enabled):
+    """Each switch is one `deployment:` scalar rendered into one env entry, off in
+    the base, set to "true" only in the listed environments and absent elsewhere."""
+    assert _deployment(BASE)[scalar] == "false"
+    assert _entry(base, env_name).value == "{{ $.Values.%s }}" % scalar
     for env_values in ENVIRONMENTS:
         environment = env_values.stem.removeprefix("values-")
-        expected = "true" if environment in ENABLED_ENVIRONMENTS else None
-        assert _deployment(env_values).get("datasourceTurnsEnabled") == expected, f"{env_values.name} flips the grants"
-        assert not [e for e in _env(env_values) if e.name == FLAG], (
-            f"{env_values.name} declares {FLAG}; set deployment.datasourceTurnsEnabled instead"
+        expected = "true" if environment in enabled else None
+        assert _deployment(env_values).get(scalar) == expected, f"{env_values.name} flips {scalar}"
+        assert not [e for e in _env(env_values) if e.name == env_name], (
+            f"{env_values.name} declares {env_name}; set deployment.{scalar} instead"
         )
 
 
-def test_datasource_connection_names_are_off_in_the_base_and_on_only_where_listed(base):
-    """An anton older than the names refuses a block that carries them, so the
-    switch turns on per environment only after its scratchpad image has that anton."""
-    assert _deployment(BASE)["datasourceLabelsEnabled"] == "false"
-    assert _entry(base, LABELS_FLAG).value == "{{ $.Values.datasourceLabelsEnabled }}"
+def test_connection_labels_are_on_only_where_grants_are():
+    """An older anton refuses a block carrying labels, and labels mean nothing without grants."""
     assert LABELS_ENABLED_ENVIRONMENTS <= ENABLED_ENVIRONMENTS
-    for env_values in ENVIRONMENTS:
-        environment = env_values.stem.removeprefix("values-")
-        expected = "true" if environment in LABELS_ENABLED_ENVIRONMENTS else None
-        assert _deployment(env_values).get("datasourceLabelsEnabled") == expected, (
-            f"{env_values.name} flips the connection names"
-        )
-        assert not [e for e in _env(env_values) if e.name == LABELS_FLAG], (
-            f"{env_values.name} declares {LABELS_FLAG}; set deployment.datasourceLabelsEnabled instead"
-        )
 
 
 def test_datasource_methods_are_offered_exactly_where_the_gate_passed(base):
