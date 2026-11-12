@@ -266,6 +266,7 @@ def _finish_applied(
             folder, edit_id=edit_id, before=before, changed=changed, source_path=source_path,
             revision_id=revision["id"] if revision else None,
             previous_revision_id=base_revision_id if revision else None,
+            conversation_id=conversation_id,
         )
     except (OSError, ValueError):
         logger.warning("Could not keep the undo of a quick edit", exc_info=True)
@@ -507,12 +508,19 @@ class QuickEditRun:
             if status_ == "applied":
                 revision, edit_id = await self._save(result, before)
                 if self.body.conversationId is not None:
-                    await quick_edit_service.record_conversation_note(
+                    await quick_edit_service.record_quick_edit_in_conversation(
                         self.scope,
                         conversation_id=self.body.conversationId,
-                        message=self.body.message,
-                        text=quick_edit_service.conversation_note_text(
-                            summary=summary, changed=changed, revision=revision,
+                        artifact_id=self.artifact_id,
+                        artifact_slug=self.folder.name,
+                        artifact_title=str(self.metadata.get("name") or "") if isinstance(self.metadata, dict) else "",
+                        edit=quick_edit_service.quick_edit_entry(
+                            edit_id=edit_id,
+                            request=self.body.message,
+                            summary=summary,
+                            changed=changed,
+                            revision_id=revision["id"] if revision else None,
+                            model=self.model or getattr(user, "resolved_planning_model", None),
                         ),
                     )
             emit(_done(
@@ -692,13 +700,24 @@ async def undo_quick_edit(
         )
     try:
         actor_id = str(scope.user_id) if scope and scope.user_id else None
-        return await run_efs(
+        undone = await run_efs(
             partial(
                 artifact_quick_edits.undo, folder, metadata, artifact_id, edit_id,
                 expected_revision_id=body.expectedRevisionId, actor_id=actor_id,
             ),
             scope=scope,
         )
+        conversation_id = undone.pop("conversationId", None)
+        if conversation_id:
+            try:
+                conversation_uuid = UUID(str(conversation_id))
+            except ValueError:
+                conversation_uuid = None
+            if conversation_uuid is not None:
+                await quick_edit_service.record_undo_in_conversation(
+                    scope, conversation_id=conversation_uuid, edit_id=edit_id,
+                )
+        return undone
     except artifact_quick_edits.QuickEditFilesChanged as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

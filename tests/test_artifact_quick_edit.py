@@ -305,15 +305,15 @@ def test_a_failed_preview_answer_reaches_done_with_its_findings(client, fake_ant
     assert done["check"]["findings"] == [{"kind": "error", "message": "x is undefined", "source": "index.html"}]
 
 
-def test_an_applied_edit_is_noted_in_the_artifacts_conversation(client, fake_anton, artifact, monkeypatch):
-    _folder, _metadata, artifact_id = artifact
-    notes = []
+def test_an_applied_edit_joins_the_artifacts_conversation_group(client, fake_anton, artifact, monkeypatch):
+    folder, _metadata, artifact_id = artifact
+    recorded = []
 
-    async def note(scope, *, conversation_id, message, text):
-        notes.append((str(conversation_id), message, text))
+    async def record(scope, **kw):
+        recorded.append(kw)
         return True
 
-    monkeypatch.setattr(quick_edit_service, "record_conversation_note", note)
+    monkeypatch.setattr(quick_edit_service, "record_quick_edit_in_conversation", record)
 
     async def edit(folder, checker, on_progress):
         (folder / "index.html").write_text(EDITED, encoding="utf-8")
@@ -322,10 +322,16 @@ def test_an_applied_edit_is_noted_in_the_artifacts_conversation(client, fake_ant
     fake_anton.edit = edit
     done = events_of(post(client, artifact_id, conversationId=CONVERSATION).text)[-1][1]
     assert done["status"] == "applied"
-    assert len(notes) == 1
-    conversation_id, message, text = notes[0]
-    assert (conversation_id, message) == (CONVERSATION, "Make the title blue")
-    assert "Made the title blue." in text and "index.html" in text and "revision 2" in text
+    assert len(recorded) == 1
+    kw = recorded[0]
+    assert str(kw["conversation_id"]) == CONVERSATION
+    assert (kw["artifact_id"], kw["artifact_slug"], kw["artifact_title"]) == (artifact_id, folder.name, "Sales")
+    entry = kw["edit"]
+    assert entry["editId"] == done["editId"] and entry["revisionId"] == done["revisionId"]
+    assert (entry["request"], entry["summary"], entry["changed"], entry["undone"]) == (
+        "Make the title blue", "Made the title blue.", ["index.html"], False,
+    )
+    assert entry["at"].endswith("+00:00")
 
 
 # ── the other outcomes ───────────────────────────────────────────────────
@@ -772,35 +778,141 @@ def db(tmp_path):
         yield session, conversation
 
 
-def test_the_note_is_a_turn_the_agent_replays(db):
+def _edit(n, edit_id=None, changed=("index.html",)):
+    return quick_edit_service.quick_edit_entry(
+        edit_id=edit_id or f"{n:032x}", request=f"change {n}", summary=f"Changed {n}.",
+        changed=list(changed), revision_id=f"rev-{n}", model="sonnet",
+    )
+
+
+def _save(session, conversation, edit, artifact_id="art-1", slug="sales"):
+    return quick_edit_service._save_group_edit(
+        session, conversation_id=conversation.id, artifact_id=artifact_id, artifact_slug=slug,
+        artifact_title="Sales", edit=edit,
+    )
+
+
+def _items(session, conversation):
+    from cowork.services.conversations import ConversationService
+
+    return ConversationService(session).get_messages(conversation.id)
+
+
+def _group(item):
+    return next(e for e in item["events"] if e.get("type") == quick_edit_service.QUICK_EDIT_GROUP_EVENT)
+
+
+def test_consecutive_edits_are_one_group_message(db):
+    session, conversation = db
+    for n in (1, 2, 3):
+        assert _save(session, conversation, _edit(n, changed=("index.html", "app.js") if n == 2 else ("index.html",)))
+
+    items = _items(session, conversation)
+    assert len(items) == 1
+    item = items[0]
+    assert (item["role"], item["harness"]) == ("assistant", quick_edit_service.QUICK_EDIT_HARNESS)
+    group = _group(item)
+    assert group["kind"] == "quick_edit_group"
+    assert (group["artifactId"], group["artifactSlug"], group["artifactTitle"]) == ("art-1", "sales", "Sales")
+    assert [e["request"] for e in group["edits"]] == ["change 1", "change 2", "change 3"]
+    assert set(group["edits"][0]) == {"editId", "request", "summary", "changed", "revisionId", "at", "model", "undone"}
+    assert item["content"] == (
+        "Changes made directly in the viewer of artifact `sales`:\n"
+        '1. Asked: "change 1" → Changed 1. (index.html)\n'
+        '2. Asked: "change 2" → Changed 2. (index.html, app.js)\n'
+        '3. Asked: "change 3" → Changed 3. (index.html)\n'
+        "These are draft changes; nothing was published."
+    )
+
+
+def test_a_message_in_between_starts_a_new_group(db):
     from cowork.services.conversations import ConversationService
 
     session, conversation = db
-    text = quick_edit_service.conversation_note_text(
-        summary="Made the title blue.", changed=["index.html"], revision={"number": 3},
-    )
-    assert quick_edit_service._save_note(session, conversation_id=conversation.id, message="Make the title blue", text=text)
+    _save(session, conversation, _edit(1))
+    ConversationService(session).save_user_message(conversation.id, "Now analyse Q3")
+    _save(session, conversation, _edit(2))
 
-    messages = ConversationService(session).get_ordered_messages(conversation.id)
-    assert [(m.role, m.harness) for m in messages] == [("user", None), ("assistant", quick_edit_service.QUICK_EDIT_HARNESS)]
-    assert messages[0].content == "Make the title blue"
-    assert "Made the title blue." in messages[1].content and "revision 3" in messages[1].content
+    items = _items(session, conversation)
+    assert [i["role"] for i in items] == ["assistant", "user", "assistant"]
+    assert [len(_group(i)["edits"]) for i in (items[0], items[2])] == [1, 1]
 
 
-def test_no_note_lands_in_the_middle_of_a_running_turn(db):
+def test_another_artifact_starts_a_new_group(db):
+    session, conversation = db
+    _save(session, conversation, _edit(1))
+    _save(session, conversation, _edit(2), artifact_id="art-2", slug="costs")
+    _save(session, conversation, _edit(3), artifact_id="art-2", slug="costs")
+
+    items = _items(session, conversation)
+    assert [(_group(i)["artifactId"], len(_group(i)["edits"])) for i in items] == [("art-1", 1), ("art-2", 2)]
+
+
+def test_undo_marks_the_edit_and_rebuilds_the_text(db):
+    session, conversation = db
+    _save(session, conversation, _edit(1))
+    _save(session, conversation, _edit(2))
+
+    assert quick_edit_service._mark_undone(session, conversation_id=conversation.id, edit_id=f"{1:032x}")
+    item = _items(session, conversation)[0]
+    assert [e["undone"] for e in _group(item)["edits"]] == [True, False]
+    assert '1. Asked: "change 1" → Changed 1. (index.html) (undone)' in item["content"]
+    assert not quick_edit_service._mark_undone(session, conversation_id=conversation.id, edit_id="f" * 32)
+
+
+def test_the_group_text_is_what_the_agent_replays(db):
+    from cowork.services.conversations import ConversationService
+
+    session, conversation = db
+    _save(session, conversation, _edit(1))
+    replay = ConversationService(session).get_replay_history(conversation.id, event_roles=("thinking",))
+    assert [m.content for m in replay.messages][0].startswith("Changes made directly in the viewer of artifact `sales`:")
+    # The structured event is for the app; it never reaches the model.
+    assert replay.events == []
+
+
+def test_no_group_is_written_while_a_turn_runs(db):
     from cowork.services.conversations import ConversationService
 
     session, conversation = db
     service = ConversationService(session)
     service.save_user_message(conversation.id, "Analyse sales", pending=True)
-    assert not quick_edit_service._save_note(session, conversation_id=conversation.id, message="m", text="t")
+    assert not _save(session, conversation, _edit(1))
     assert len(service.get_ordered_messages(conversation.id, include_pending=True)) == 1
 
 
-def test_no_note_in_a_conversation_the_caller_does_not_own(db):
+def test_no_group_in_a_conversation_the_caller_does_not_own(db):
     session, _conversation = db
     with pytest.raises(ValueError):
-        quick_edit_service._save_note(session, conversation_id=uuid.uuid4(), message="m", text="t")
+        quick_edit_service._save_group_edit(
+            session, conversation_id=uuid.uuid4(), artifact_id="a", artifact_slug="s", artifact_title="", edit=_edit(1),
+        )
+
+
+def test_undo_over_http_marks_the_conversation_group(client, fake_anton, artifact, monkeypatch):
+    folder, _metadata, artifact_id = artifact
+    marked = []
+
+    async def mark(scope, *, conversation_id, edit_id):
+        marked.append((str(conversation_id), edit_id))
+        return True
+
+    monkeypatch.setattr(quick_edit_service, "record_quick_edit_in_conversation", awaitable(lambda *a, **k: True))
+    monkeypatch.setattr(quick_edit_service, "record_undo_in_conversation", mark)
+
+    async def edit(folder, checker, on_progress):
+        (folder / "index.html").write_text(EDITED, encoding="utf-8")
+        return QuickEditResult("applied", ["index.html"], "Made the title blue.")
+
+    fake_anton.edit = edit
+    done = events_of(post(client, artifact_id, conversationId=CONVERSATION).text)[-1][1]
+    response = client.post(
+        f"/api/v1/artifacts/workspace/project/{artifact_id}/quick-edits/{done['editId']}/undo",
+        json={"expectedRevisionId": done["revisionId"]},
+    )
+    assert response.status_code == 200, response.text
+    assert "conversationId" not in response.json()
+    assert marked == [(CONVERSATION, done["editId"])]
 
 
 # ── undo: every file the edit changed ────────────────────────────────────
@@ -1137,3 +1249,16 @@ async def test_the_pick_goes_through_build_llm_client_like_a_turn(monkeypatch):
     backend = await quick_edit_service.resolve_backend(LOCAL_SCOPE, user, None, model="claude-x", reasoning_effort="medium")
     assert backend.llm == "llm"
     assert calls == [{"effort_override": "medium", "model_override": "claude-x", "settings": user}]
+
+
+def test_the_paged_messages_api_carries_the_group_too(db):
+    from cowork.services.conversations import ConversationService
+
+    session, conversation = db
+    _save(session, conversation, _edit(1))
+    _save(session, conversation, _edit(2))
+    page = ConversationService(session).get_messages_page(conversation.id, limit=10).model_dump(by_alias=True)
+    items = page["items"]
+    assert len(items) == 1 and items[0]["harness"] == quick_edit_service.QUICK_EDIT_HARNESS
+    group = next(e for e in items[0]["events"] if e["type"] == "response.quick_edit_group")
+    assert [e["editId"] for e in group["edits"]] == [f"{1:032x}", f"{2:032x}"]

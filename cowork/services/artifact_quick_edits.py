@@ -194,6 +194,7 @@ def save_undo(
     source_path: str | None,
     revision_id: str | None,
     previous_revision_id: str | None,
+    conversation_id: str | None = None,
 ) -> list[str] | None:
     """Keep the undo of an applied edit: the files it changed or created.
 
@@ -238,6 +239,9 @@ def save_undo(
             "sourcePath": source_path,
             "revisionId": revision_id,
             "previousRevisionId": previous_revision_id,
+            # The conversation whose quick-edit group lists this edit, so an
+            # undo can mark it there.
+            "conversationId": conversation_id,
             "files": entries,
             "undone": False,
         }
@@ -384,6 +388,8 @@ def undo(
         write_journal_file(folder, _FOLDER, f"{edit_id}.json", content=json.dumps(record).encode("utf-8"))
         return {
             "editId": edit_id,
+            # Popped by the route, which marks the edit undone there.
+            "conversationId": record.get("conversationId"),
             "restored": [p for p, r, _c in plan if r is not None],
             "removed": [p for p, r, _c in plan if r is None],
             "revision": revision,

@@ -16,13 +16,15 @@ This module holds what the route needs around that:
 * ``QuickEditLocks``: one quick edit per artifact at a time in this process.
 * ``resolve_backend()``: the editor's LLM and the router's Jev endpoint for
   the caller, from the same settings and keys a turn of theirs would use.
-* ``record_conversation_note()``: what the artifact's conversation keeps of
-  an applied edit, so the agent's later turns know about it.
+* ``record_quick_edit_in_conversation()`` / ``record_undo_in_conversation()``:
+  the artifact's conversation keeps ONE message per run of quick edits, so
+  the agent's later turns know what changed and the chat shows one card.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -43,13 +45,16 @@ __all__ = [
     "QuickEditLocks",
     "anton_quick_edit",
     "Decisions",
-    "conversation_note_text",
     "decisions_for",
     "decisions_for_scope",
     "direct_edit_available",
     "quick_edit_available",
     "quick_edit_locks",
-    "record_conversation_note",
+    "QUICK_EDIT_GROUP_EVENT",
+    "group_text",
+    "quick_edit_entry",
+    "record_quick_edit_in_conversation",
+    "record_undo_in_conversation",
     "resolve_backend",
 ]
 
@@ -85,14 +90,17 @@ class AntonQuickEdit:
 def anton_quick_edit() -> AntonQuickEdit | None:
     """The installed anton's router and quick editor, or None when it has
     neither. Never raises: an anton that fails to import them is one without."""
-    import importlib
-
     try:
-        # import_module, not `from package import quick`: it honours
+        # The dotted import, not `from package import quick`: it consults
         # sys.modules, so a module that is absent (or hidden) reads as absent
         # even after the package was imported.
-        quick = importlib.import_module("anton.core.artifact_editor.quick")
-        router = importlib.import_module("anton.core.artifact_editor.router")
+        import anton.core.artifact_editor.quick
+        import anton.core.artifact_editor.router
+
+        quick = sys.modules["anton.core.artifact_editor.quick"]
+        router = sys.modules["anton.core.artifact_editor.router"]
+        if quick is None or router is None:
+            return None
     except Exception:
         return None
     route_request = getattr(router, "route_request", None)
@@ -397,76 +405,208 @@ async def _minted_backend(
         raise
 
 
-# ── the conversation note ────────────────────────────────────────────────
+# ── the conversation's record of quick edits ──────────────────────────────
+#
+# Consecutive quick edits on one artifact in one conversation, with no other
+# message between them, are ONE assistant message (harness
+# ``cowork-quick-edit``): a "group". Its content is compact model-facing
+# text, rebuilt on every change, so the agent's later turns (which replay
+# saved messages) know what changed. Its structured data rides as one event
+# on the message, ``{"type": QUICK_EDIT_GROUP_EVENT, "kind":
+# "quick_edit_group", ...}``: the messages API already returns each
+# message's events, and an event without ``thought_role`` is never replayed
+# to the model. No new column.
 
-_MAX_NOTE_MESSAGE = 4000
-_MAX_NOTE_SUMMARY = 500
-_MAX_NOTE_FILES = 10
+QUICK_EDIT_GROUP_EVENT = "response.quick_edit_group"
+QUICK_EDIT_GROUP_KIND = "quick_edit_group"
+#: A group past this many edits is closed and the next edit starts another,
+#: so one message and its text stay small.
+MAX_GROUP_EDITS = 50
+_MAX_REQUEST = 4000
+_MAX_TEXT_REQUEST = 200
+_MAX_SUMMARY = 500
+_MAX_TEXT_FILES = 6
 
 
-def conversation_note_text(*, summary: str, changed: list[str], revision: dict | None) -> str:
-    """The assistant side of the note: what changed, where, and how to undo."""
-    lines = [f"I edited this artifact directly from its viewer (quick edit): {' '.join(summary.split())[:_MAX_NOTE_SUMMARY]}"]
-    if changed:
-        shown = ", ".join(changed[:_MAX_NOTE_FILES])
-        more = f" and {len(changed) - _MAX_NOTE_FILES} more" if len(changed) > _MAX_NOTE_FILES else ""
-        lines.append(f"Files changed: {shown}{more}.")
-    if revision and revision.get("number"):
-        lines.append(f"Saved as draft revision {revision['number']}; not published.")
+def _clip(text: object, limit: int) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def quick_edit_entry(
+    *, edit_id: str | None, request: str, summary: str, changed: list[str],
+    revision_id: str | None, model: str | None, at: str | None = None,
+) -> dict:
+    """One edit as the group lists it."""
+    from datetime import datetime, timezone
+
+    return {
+        "editId": edit_id,
+        "request": str(request or "")[:_MAX_REQUEST],
+        "summary": _clip(summary, _MAX_SUMMARY),
+        "changed": [str(p) for p in changed][:200],
+        "revisionId": revision_id,
+        "at": at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "model": model,
+        "undone": False,
+    }
+
+
+def group_text(group: dict) -> str:
+    """The model-facing text of a group: what was asked, what changed."""
+    lines = [f"Changes made directly in the viewer of artifact `{group.get('artifactSlug') or group.get('artifactId')}`:"]
+    for number, edit in enumerate(group.get("edits") or [], start=1):
+        files = list(edit.get("changed") or [])
+        shown = ", ".join(files[:_MAX_TEXT_FILES]) + (f" +{len(files) - _MAX_TEXT_FILES} more" if len(files) > _MAX_TEXT_FILES else "")
+        where = f" ({shown})" if shown else ""
+        undone = " (undone)" if edit.get("undone") else ""
+        lines.append(
+            f'{number}. Asked: "{_clip(edit.get("request"), _MAX_TEXT_REQUEST)}" → {_clip(edit.get("summary"), _MAX_SUMMARY)}{where}{undone}'
+        )
+    lines.append("These are draft changes; nothing was published.")
     return "\n".join(lines)
 
 
-def _save_note(session: ScopedSession, *, conversation_id: UUID, message: str, text: str) -> bool:
+def _group_event(message, session):
+    """The group event of *message*, or None."""
+    from cowork.models.message_event import MessageEvent
+
+    for event in session.exec(
+        session.select(MessageEvent).where(MessageEvent.message_id == message.id)
+    ).all():
+        data = event.event_data
+        if isinstance(data, dict) and data.get("type") == QUICK_EDIT_GROUP_EVENT:
+            return event
+    return None
+
+
+def _turn_in_flight(session, conversation_id: UUID) -> bool:
     from cowork.models.message import Message
+
+    return session.exec(
+        session.select(Message)
+        .where(Message.conversation_id == conversation_id)
+        .where(Message.pending == True)  # noqa: E712 — SQL boolean column
+        .limit(1)
+    ).first() is not None
+
+
+def _save_group_edit(
+    session: ScopedSession, *, conversation_id: UUID, artifact_id: str, artifact_slug: str,
+    artifact_title: str, edit: dict,
+) -> bool:
+    """Add *edit* to the conversation's quick-edit group for the artifact:
+    the latest message when it is that group, else a new one. False (nothing
+    written) while a turn runs in the conversation: its question is saved
+    pending, and a message now would land between it and its answer."""
     from cowork.services.conversations import ConversationService
 
     service = ConversationService(session)
     # Raises ValueError for a conversation the caller does not own.
     service.get_conversation(conversation_id)
-    in_flight = session.exec(
-        session.select(Message)
-        .where(Message.conversation_id == conversation_id)
-        .where(Message.pending == True)  # noqa: E712 — SQL boolean column
-        .limit(1)
-    ).first()
-    if in_flight is not None:
-        # A turn is running (its question is saved pending until it ends).
-        # A note written now would land between its question and its answer.
+    if _turn_in_flight(session, conversation_id):
         return False
-    service.save_user_message(conversation_id, message[:_MAX_NOTE_MESSAGE])
-    service.save_assistant_turn(
-        conversation_id,
-        text,
-        [
-            {"type": "response.output_text.delta", "delta": text},
-            {"type": "response.completed"},
-        ],
-        harness=QUICK_EDIT_HARNESS,
-    )
+    latest = session.exec(
+        service._ordered_messages(conversation_id, include_pending=True, newest_first=True).limit(1)
+    ).first()
+    event = None
+    if latest is not None and latest.role == "assistant" and latest.harness == QUICK_EDIT_HARNESS:
+        event = _group_event(latest, session)
+        data = event.event_data if event is not None else None
+        if not (
+            isinstance(data, dict)
+            and data.get("artifactId") == artifact_id
+            and len(data.get("edits") or []) < MAX_GROUP_EDITS
+        ):
+            event = None
+    if event is not None:
+        group = dict(event.event_data)
+        group["edits"] = [*group.get("edits", []), edit]
+        group["artifactSlug"], group["artifactTitle"] = artifact_slug, artifact_title
+        # Reassigned, not mutated: the JSON columns see a new value.
+        event.event_data = group
+        latest.content = group_text(group)
+        session.add(event)
+        session.add(latest)
+        session.commit()
+        return True
+    group = {
+        "type": QUICK_EDIT_GROUP_EVENT,
+        "kind": QUICK_EDIT_GROUP_KIND,
+        "artifactId": artifact_id,
+        "artifactSlug": artifact_slug,
+        "artifactTitle": artifact_title,
+        "edits": [edit],
+    }
+    service.save_assistant_turn(conversation_id, group_text(group), [group], harness=QUICK_EDIT_HARNESS)
     return True
 
 
-async def record_conversation_note(
-    scope: TenantScope, *, conversation_id: UUID, message: str, text: str,
-) -> bool:
-    """Save an applied quick edit in the artifact's conversation, as the turn
-    it replaced: the person's message and a short answer saying what changed.
+#: How many of a conversation's newest quick-edit groups an undo looks in.
+_UNDO_LOOKBACK = 50
 
-    The same mechanism a direct answer uses (``_handle_direct_response``):
-    later agent turns replay the conversation's saved messages, so the agent
-    sees the edit, and the person sees it in the chat. Under the
-    conversation's write lock. Skipped (False) while a turn runs in that
-    conversation, for a conversation the caller does not own, and on any
-    failure: the edit is saved either way.
-    """
+
+def _mark_undone(session: ScopedSession, *, conversation_id: UUID, edit_id: str) -> bool:
+    """Mark *edit_id* undone in the group that lists it, and rebuild its
+    text. False when no recent group lists it."""
+    from cowork.models.message import Message
+    from cowork.services.conversations import ConversationService
+
+    service = ConversationService(session)
+    service.get_conversation(conversation_id)
+    groups = session.exec(
+        service._ordered_messages(conversation_id, include_pending=True, newest_first=True)
+        .where(Message.harness == QUICK_EDIT_HARNESS)
+        .limit(_UNDO_LOOKBACK)
+    ).all()
+    for message in groups:
+        event = _group_event(message, session)
+        if event is None or not isinstance(event.event_data, dict):
+            continue
+        edits = event.event_data.get("edits") or []
+        if not any(isinstance(e, dict) and e.get("editId") == edit_id for e in edits):
+            continue
+        group = dict(event.event_data)
+        group["edits"] = [
+            {**e, "undone": True} if isinstance(e, dict) and e.get("editId") == edit_id else e for e in edits
+        ]
+        event.event_data = group
+        message.content = group_text(group)
+        session.add(event)
+        session.add(message)
+        session.commit()
+        return True
+    return False
+
+
+async def _conversation_write(conversation_id: UUID, scope: TenantScope, fn) -> bool:
     from cowork.db.units import conversation_writes, run_db
 
     try:
         async with conversation_writes(conversation_id):
-            return await run_db(
-                partial(_save_note, conversation_id=conversation_id, message=message, text=text),
-                scope=scope,
-            )
+            return await run_db(fn, scope=scope)
     except Exception:
-        logger.warning("Could not record the quick edit in conversation %s", conversation_id, exc_info=True)
+        logger.warning("Could not update the quick edits of conversation %s", conversation_id, exc_info=True)
         return False
+
+
+async def record_quick_edit_in_conversation(
+    scope: TenantScope, *, conversation_id: UUID, artifact_id: str, artifact_slug: str,
+    artifact_title: str, edit: dict,
+) -> bool:
+    """Add an applied quick edit to the artifact's conversation (see the
+    section comment). Under the conversation's write lock, as a direct
+    answer is saved. Skipped (False) while a turn runs there, for a
+    conversation the caller does not own, and on any failure: the edit is
+    saved either way."""
+    return await _conversation_write(conversation_id, scope, partial(
+        _save_group_edit, conversation_id=conversation_id, artifact_id=artifact_id,
+        artifact_slug=artifact_slug, artifact_title=artifact_title, edit=edit,
+    ))
+
+
+async def record_undo_in_conversation(scope: TenantScope, *, conversation_id: UUID, edit_id: str) -> bool:
+    """Mark an undone quick edit in its conversation's group."""
+    return await _conversation_write(conversation_id, scope, partial(
+        _mark_undone, conversation_id=conversation_id, edit_id=edit_id,
+    ))
