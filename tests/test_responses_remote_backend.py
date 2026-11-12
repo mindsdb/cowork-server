@@ -1380,6 +1380,234 @@ async def test_produce_remote_persists_pending_user_then_finalizes_and_saves_ass
 
 
 @pytest.mark.asyncio
+async def test_a_relayed_liveness_reply_after_a_quiet_stretch_reaches_the_buffer(monkeypatch):
+    """The controller relays `worker_alive` on a timer while the pod is busy.
+    After a quiet stretch it becomes one model_wait frame, which resets the
+    UI's and the registry's idle bounds; right after other output it shows
+    nothing. Neither is saved with the turn."""
+    import asyncio
+
+    from cowork.streaming import liveness
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    monkeypatch.setattr(liveness, "MODEL_WAIT_TICK_SECONDS", 0.05)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "he"}
+        yield "progress", {"phase": "worker_alive"}
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_delta", {"text": "llo"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    waits = [f for f in buffer.frames if '"phase": "model_wait"' in f or '"phase":"model_wait"' in f]
+    assert len(waits) == 1
+    assert '"message": "Still working"' in waits[0] or '"message":"Still working"' in waits[0]
+    assert saved["assistant"] == "hello"
+    assert not any(e.get("phase") == "model_wait" for e in saved["events"])
+
+
+@pytest.mark.asyncio
+async def test_a_relayed_liveness_reply_right_after_output_shows_nothing(monkeypatch):
+    """Quiet means quiet since the pod's last output, not since the turn
+    started: a relay that lands just after text that followed a long pause
+    must not flash "Still working" over the answer."""
+    import asyncio
+
+    from cowork.streaming import liveness
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    monkeypatch.setattr(liveness, "MODEL_WAIT_TICK_SECONDS", 0.05)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        await asyncio.sleep(0.1)
+        yield "turn_delta", {"text": "hello"}
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    assert not [f for f in buffer.frames if "model_wait" in f]
+    assert saved["assistant"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_no_still_working_line_over_an_open_question(monkeypatch):
+    """The pod heartbeats while a question waits on the user. A relay then must
+    not put "Still working" over the question card; once it's answered, a
+    quiet stretch shows the line again."""
+    import asyncio
+
+    from cowork.streaming import liveness
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    monkeypatch.setattr(liveness, "MODEL_WAIT_TICK_SECONDS", 0.05)
+    asked = {"step": "ask_user", "id": "q1", "prompt": "Which one?", "timeout_s": 300,
+             "options": [{"value": "a", "label": "A"}, {"value": "b", "label": "B"}]}
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", asked
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_step", {"step": "ask_user_answered", "id": "q1", "status": "answered", "values": ["a"]}
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_delta", {"text": "done"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    kinds = [
+        "question" if "response.ask_user\"" in f or '"type": "response.ask_user"' in f
+        else "answered" if "ask_user_answered" in f
+        else "wait" if "model_wait" in f
+        else None
+        for f in buffer.frames
+    ]
+    kinds = [k for k in kinds if k]
+    assert kinds == ["question", "answered", "wait"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_output", [
+    ("turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}),
+    ("turn_delta", {"text": "Working on it."}),
+    # A question asked after its cell's tool_start (the step or time limit, a
+    # write approval): the cell it gated runs on with no new start or text.
+    ("turn_step", {"step": "progress", "id": "t0", "message": "Reading the file"}),
+    ("turn_step", {"step": "tool_end", "id": "t0", "name": "scratchpad"}),
+])
+async def test_a_lost_answered_reply_does_not_hide_still_working_for_the_rest_of_the_turn(
+    monkeypatch, next_output,
+):
+    """The producer applies a turn whose reply numbers skip one. If the skipped
+    reply is the question's ask_user_answered, the pod's next text or cell
+    still shows the question is over, and a later quiet stretch shows
+    "Still working"."""
+    import asyncio
+
+    from cowork.streaming import liveness
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    monkeypatch.setattr(liveness, "MODEL_WAIT_TICK_SECONDS", 0.05)
+    asked = {"step": "ask_user", "id": "q1", "prompt": "Which one?", "timeout_s": 300,
+             "options": [{"value": "a", "label": "A"}, {"value": "b", "label": "B"}]}
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", asked
+        # ask_user_answered never arrives.
+        yield next_output
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    assert any("model_wait" in f for f in buffer.frames)
+
+
+@pytest.mark.asyncio
+async def test_a_question_with_a_malformed_id_does_not_fail_the_turn(monkeypatch):
+    """The pod is semi-trusted: an ask_user whose id is not a string must not
+    end the turn on an unhashable id."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", {"step": "ask_user", "id": {"not": "a string"}, "prompt": "Which one?"}
+        yield "turn_step", {"step": "ask_user_answered", "id": ["nor", "this"]}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    assert any("response.completed" in f for f in buffer.frames)
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_persists_on_failure(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)

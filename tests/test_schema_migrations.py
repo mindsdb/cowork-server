@@ -1021,7 +1021,7 @@ def test_custom_connector_id_is_unique_per_scope(tmp_path, monkeypatch):
 
 
 #: The revision before org custom connectors became one per builder.
-PRIOR_TO_PER_BUILDER = "e2a7c4f9b613"
+PRIOR_TO_PER_BUILDER = "c1d7e2a94f60"
 
 
 def test_custom_connector_id_is_unique_per_builder_in_an_org(tmp_path, monkeypatch):

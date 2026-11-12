@@ -423,6 +423,9 @@ STALLED_TURN_MESSAGE = "The response stalled and was ended. Please try sending a
 POD_STREAM_ENDED_PREFIX = "pod stream ended without a terminal event"
 POD_STREAM_ENDED_USER_MESSAGE = "The turn ended unexpectedly. Please try again."
 TURN_ABORTED_TIMEOUT_PREFIX = "turn aborted: hard turn timeout"
+# The controller's other turn ceiling, which also counts time a question waited
+# on the user. Same outcome for the user, so the same copy.
+TURN_ABORTED_WALL_CLOCK_PREFIX = "turn aborted: wall-clock limit"
 TURN_ABORTED_TIMEOUT_USER_MESSAGE = (
     "This turn took too long and was stopped. Try again with a smaller request."
 )
@@ -1666,7 +1669,7 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
     # returned rather than any part of the wire text.
     if text.startswith(POD_STREAM_ENDED_PREFIX):
         return GENERIC_TURN_ERROR_CODE, POD_STREAM_ENDED_USER_MESSAGE
-    if text.startswith(TURN_ABORTED_TIMEOUT_PREFIX):
+    if text.startswith((TURN_ABORTED_TIMEOUT_PREFIX, TURN_ABORTED_WALL_CLOCK_PREFIX)):
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_TIMEOUT_USER_MESSAGE
     if text.startswith(TURN_ABORTED_STALL_PREFIX):
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_STALL_USER_MESSAGE
@@ -1710,7 +1713,7 @@ def remote_error_label(*, error: str | None) -> str:
         return text.partition(":")[0]
     if text.startswith(POD_STREAM_ENDED_PREFIX):
         return "pod_stream_ended"
-    if text.startswith(TURN_ABORTED_TIMEOUT_PREFIX):
+    if text.startswith((TURN_ABORTED_TIMEOUT_PREFIX, TURN_ABORTED_WALL_CLOCK_PREFIX)):
         return "turn_aborted_timeout"
     if text.startswith(TURN_ABORTED_STALL_PREFIX):
         return "turn_aborted_stall"
