@@ -865,7 +865,9 @@ def test_deadline_stops_a_stylesheet_with_its_blocks_closed(artifact, monkeypatc
 
 
 def test_deadline_stops_a_style_attribute(artifact, monkeypatch):
-    monkeypatch.setattr(artifact_inline, "time", _clock_past_the_deadline_after(readings=4))
+    # One reading more than the walk takes before it: the attribute checks the
+    # deadline before it parses, then again before each declaration.
+    monkeypatch.setattr(artifact_inline, "time", _clock_past_the_deadline_after(readings=5))
     declarations = ";".join(f"--d{index}:1" for index in range(200))
     document = _inline(artifact=artifact, html=f'<p style="{declarations}">x</p>'.encode())
     _assert_output_invariants(text=document.html, mode=InlineMode.WORD)
@@ -1101,7 +1103,8 @@ def _css(*, rules: int) -> str:
 
 
 def test_css_past_the_document_cap_is_dropped_and_the_text_stays(artifact):
-    """A style that fits is kept; once too little of the cap is left, later CSS goes."""
+    """A style that fits is kept; once too little of the cap is left, later
+    style elements go. Attributes draw on no total, so a later one stays."""
     kept = _css(rules=40_000).ljust(artifact_css._MAX_CSS_BYTES - 8)
     html = (
         f"<html><head><style>{kept}</style><style>.late{{color:blue}}</style></head>"
@@ -1110,9 +1113,45 @@ def test_css_past_the_document_cap_is_dropped_and_the_text_stays(artifact):
     document = _inline(artifact=artifact, html=html)
     assert ".r39999{color:red;}" in document.html
     assert ".late" not in document.html
-    assert "color:green" not in document.html
+    assert "color:green" in document.html
     assert ">END</p>" in document.html
     assert TRUNCATION_NOTE not in document.html
+
+
+def test_attributes_past_the_document_css_cap_keep_their_values(artifact):
+    """A chart's later transform and clip path, and an alt holding "(", stay
+    after the style elements spent the document's cap; nothing is listed."""
+    spent = _css(rules=40_000).ljust(artifact_css._MAX_CSS_BYTES - 8)
+    html = (
+        f"<html><head><style>{spent}</style></head><body>"
+        '<svg><defs><clipPath id="p1"><rect width="1" height="1"/></clipPath></defs>'
+        '<g transform="translate(1,2)" clip-path="url(#p1)"><rect width="1" height="1"/></g></svg>'
+        f'<img alt="Revenue (USD)" src="data:image/png;base64,{base64.b64encode(CHART_PNG).decode()}">'
+        "</body></html>"
+    ).encode()
+    document = _inline(artifact=artifact, html=html)
+    assert 'transform="translate(1,2)"' in document.html
+    assert 'clip-path="url(#p1)"' in document.html
+    assert 'alt="Revenue (USD)"' in document.html
+    assert document.omitted == []
+
+
+def test_an_attribute_over_its_own_css_bound_is_dropped_and_listed(artifact):
+    value = "translate(1,2)" + " " * artifact_css._MAX_ATTRIBUTE_CSS_BYTES
+    html = f'<html><body><svg><g transform="{value}"><rect/></g></svg><p>END</p></body></html>'
+    document = _inline(artifact=artifact, html=html.encode())
+    assert "transform=" not in document.html
+    assert ">END</p>" in document.html
+    assert [entry.reason for entry in document.omitted] == [OmittedReason.TOO_LARGE]
+
+
+def test_the_deadline_stops_each_attribute_before_its_css_parses(artifact, monkeypatch):
+    """Attributes have no total, so the deadline is checked before every one."""
+    monkeypatch.setattr(artifact_inline, "time", _clock_past_the_deadline_after(readings=2))
+    attributes = "".join(f'<g transform="translate({index},0)"></g>' for index in range(50))
+    document = _inline(artifact=artifact, html=f"<html><body><svg>{attributes}</svg></body></html>".encode())
+    assert document.html.count("transform=") < 50
+    assert document.html.endswith(f"<p>{TRUNCATION_NOTE}</p></body></html>")
 
 
 def test_a_style_over_the_cap_alone_leaves_room_for_the_rest(artifact):

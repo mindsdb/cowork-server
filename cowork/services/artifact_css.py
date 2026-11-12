@@ -60,12 +60,16 @@ _GREATER_THAN_DELIM = "\x00"
 _CSS_UNSAFE = re.compile(r"\\(.)|([<>\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff])", re.DOTALL)
 _CSS_HEX_ESCAPED = re.compile(r"[<>\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 # tinycss2 keeps every token as a Python object, which takes about 130 times
-# the text's size in memory. So a document parses at most this much CSS in
-# all: its style elements, its style attributes, every other kept attribute
-# whose value holds "(", which could hide an escaped url(, and the
-# stylesheets it links or imports. Past it, inline CSS and each such
-# attribute are dropped, and a stylesheet is left out as BUDGET.
+# the text's size in memory. So a document's style elements and the
+# stylesheets it links or imports parse at most this much CSS in all. Past
+# it, a style element's CSS is dropped and a stylesheet is left out as BUDGET.
 _MAX_CSS_BYTES = 1024 * 1024
+# Each attribute's CSS is bounded on its own: a style attribute, or another
+# kept attribute whose value holds "(", which could hide an escaped url(,
+# parses at most this much, and a longer one is dropped and listed as
+# TOO_LARGE. Attributes have no total, so a chart's thousandth transform keeps
+# working: the inliner's deadline, checked before each one, bounds them all.
+_MAX_ATTRIBUTE_CSS_BYTES = _MAX_CSS_BYTES
 
 
 class _CssReference(NamedTuple):
@@ -143,7 +147,7 @@ class CssRewriter:
         """
         if "(" not in value:
             return True
-        if not self.take_css(size=len(value)):
+        if not self._attribute_parses(value=value):
             return False
         nodes = tinycss2.parse_component_value_list(value, skip_comments=True)
         scan = _scan_css(nodes=nodes, strict=False)
@@ -157,7 +161,7 @@ class CssRewriter:
         return True
 
     def rewrite_style_attribute(self, *, value: str) -> str:
-        if not self.take_css(size=len(value)):
+        if not self._attribute_parses(value=value):
             return ""
         pieces = []
         nodes = tinycss2.parse_blocks_contents(value, skip_comments=True, skip_whitespace=True)
@@ -169,6 +173,18 @@ class CssRewriter:
             ):
                 pieces.append(_serialize_css(nodes=[node]))
         return _escape_css(text="".join(pieces))
+
+    def _attribute_parses(self, *, value: str) -> bool:
+        """Whether one attribute's CSS may parse: before the deadline, and within its own bound.
+
+        One over the bound is listed as left out, so the export counts it.
+        """
+        if self.state.out_of_time():
+            return False
+        if len(value) > _MAX_ATTRIBUTE_CSS_BYTES:
+            self.state.omit(reference=value, reason=OmittedReason.TOO_LARGE)
+            return False
+        return True
 
     def rewrite_stylesheet(self, *, text: str) -> str:
         if not self.take_css(size=len(text)):
