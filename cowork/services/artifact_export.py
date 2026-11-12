@@ -113,15 +113,15 @@ _BUSY = "An export is already running; try again in a moment."
 _NOT_OFFERED = "This file can't be exported to that format."
 _CANT_EXPORT = "This file can't be exported."
 
-# Org mode offers no export format, and the route answers 403 there. Measured
-# with docker --cpus=1 --memory=1g from a server's own baseline, single exports
-# within the org caps peak past 300 MiB: a 10 MiB page of one-word paragraphs
-# past 500 MiB, and a 512 KiB Markdown table or a report with five 2 MiB
-# images at 330 to 350 MiB. Short unclosed code fences still stall the event
-# loop for seconds and grow faster than their size;
-# scripts/measure_export_capacity.py holds the cases. A replica serves many
-# people at once, so org export waits until the conversion runs in a process
-# of its own that can be killed.
+# Org mode offers no export format, and the route answers 403 there. With the
+# conversion in a process of its own (export_runner), measured with
+# scripts/measure_export_capacity.py in the server's image at docker --cpus=1
+# --memory=1g: the server's longest event-loop stall is 25 ms, and it adds at
+# most 30 MiB to its own 251 MiB. The heaviest case the org caps allow, a
+# 10 MiB page of one-word paragraphs, peaks at 532 MiB in the conversion
+# process, under its 640 MiB limit, so the server and its one conversion fit
+# a 1 GiB replica. Turning org export on is a change of its own, once a live
+# replica's own memory is read.
 ORG_EXPORT_ENABLED = False
 
 # HTML and Word export share one conversion at a time, PDF export has its own,
