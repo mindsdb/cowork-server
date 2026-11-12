@@ -50,6 +50,7 @@ from cowork.models.skill import (
     META_CREATED_BY,
     META_DISPLAY_NAME,
     META_ENABLED,
+    META_MANAGED_BY,
     META_PROJECTS,
     META_UPDATED_AT,
     Skill,
@@ -158,6 +159,28 @@ CODE_ONLY_BUILTIN_SKILL_NAMES = frozenset({
 })
 CODE_BUILTIN_SKILLS_VERSION = 1
 CODE_BUILTIN_SKILLS_MARKER = ".builtins_seeded"
+
+
+# The org's Brand guidelines skill: generated from the org's branding in
+# auth by cowork.services.org_branding. In MindsHub mode it is shared with
+# everyone and always on; on a local server it is an ordinary skill
+# recalled on demand. In every mode it is told from a person's own skill of
+# that name only by its META_MANAGED_BY. Nobody edits, renames, deletes or
+# shares the generated one as a skill; an org admin changes it through the
+# org's appearance (its ``guidelines``). Each person may still turn it off
+# for themselves. In MindsHub mode a new skill may not take the name, but a
+# member's skill that already had it stays theirs.
+BRAND_GUIDELINES_SLUG = "brand-guidelines"
+BRAND_GUIDELINES_MANAGER = "org-branding"
+BRAND_GUIDELINES_NAME_RESERVED = (
+    f"The name {BRAND_GUIDELINES_SLUG!r} is kept for your organization's Brand guidelines "
+    "skill. Choose another name."
+)
+BRAND_GUIDELINES_REFUSAL = (
+    "The Brand guidelines skill is generated from your organization's branding and can't "
+    "be changed, renamed, shared or deleted here. An organization admin edits it in "
+    "Settings > Branding (Brand guidelines for Anton). You can still turn it off for yourself."
+)
 
 
 def is_builtin_skill(slug: str) -> bool:
@@ -431,6 +454,24 @@ def _turn_skill_service(
     if sharing_applies(scope):
         viewer = (viewer or fail_closed_viewer(scope)).for_turns()
     return SkillService(scope, viewer=viewer, session=session)
+
+
+def has_always_on_rows(*, session: ScopedSession) -> bool:
+    """Whether any of the org's skill_access rows is always on: the database
+    half of has_always_on_skills, which reads no SKILL.md and lists no store.
+    No turn has an always-on skill when it is False. Never outside MindsHub
+    mode.
+
+    It reads the rows as they stand, without the backfill that gives each
+    skill from before sharing its row (backfill_legacy_access). That backfill
+    lists the store on the file store, and every row it writes is shared with
+    everyone and never always on, so it can't change this answer;
+    has_always_on_skills runs it once this read finds an always-on row."""
+    if not sharing_applies(session.scope):
+        return False
+    from cowork.services.skill_access import access_rows
+
+    return any(row.always_on for row in access_rows(session).values())
 
 
 def has_always_on_skills(
@@ -737,6 +778,10 @@ class SkillService:
         # a skill with neither: nobody's.
         self._session = session
         self._rows: dict[str, SkillAccess] | None = None
+        # The creator each skill's attribution row records, read in one query
+        # the first time a skill with no skill_access row needs it
+        # (access_rule), so a listing doesn't read one row per such skill.
+        self._creators: dict[str, str | None] | None = None
         self._backfilled = False
         # The slugs the scope's person turned off for themselves
         # (cowork.services.skill_user_settings): given, as an in-process
@@ -805,16 +850,25 @@ class SkillService:
             return BUILTIN_RULE
         row = self._access_rows().get(skill.name)
         if row is None and self._session is not None and self.org_sharing:
-            from cowork.services.shared_resources import SKILL, SharedResourceAccess
-
-            creator_id = SharedResourceAccess(self._session).creator_id(SKILL, skill.name)
-            return access_rule_for(None, creator_id)
+            return access_rule_for(None, self._creator_ids().get(skill.name))
         return access_rule_for(row)
 
+    def _creator_ids(self) -> dict[str, str | None]:
+        """Every skill's recorded creator in the org, by slug, read once per
+        instance (SharedResourceAccess.snapshots)."""
+        if self._creators is None:
+            from cowork.services.shared_resources import SKILL, SharedResourceAccess
+
+            snapshots = SharedResourceAccess(self._session).snapshots(SKILL)
+            self._creators = {slug: snapshot.created_by_id for slug, snapshot in snapshots.items()}
+        return self._creators
+
     def forget_access(self) -> None:
-        """Drop the rows read so far: the next read asks the database again,
-        after a change to them or under a lock another change waited on."""
+        """Drop the rows and creators read so far: the next read asks the
+        database again, after a change to them or under a lock another change
+        waited on."""
         self._rows = None
+        self._creators = None
 
     def off_for_me(self) -> frozenset[str]:
         """The slugs this scope's person turned off for themselves, read in
@@ -933,6 +987,20 @@ class SkillService:
     def is_managed_skill(self, slug: str) -> bool:
         return slug in self.managed_skill_slugs()
 
+    def is_brand_guidelines(self, slug: str) -> bool:
+        """Whether ``slug`` is the org's generated Brand guidelines skill:
+        BRAND_GUIDELINES_SLUG while the store's folder by that name is the
+        generated one (META_MANAGED_BY), in every mode. A person's own skill
+        of that name is theirs to change."""
+        if slug != BRAND_GUIDELINES_SLUG or self.store_name != "skills":
+            return False
+        try:
+            skill_dir = self._skill_entry(slug)
+        except ValueError:
+            return False
+        skill = _skill_from_dir(skill_dir) if (skill_dir / SKILL_FILE).is_file() else None
+        return skill is not None and skill.metadata.get(META_MANAGED_BY) == BRAND_GUIDELINES_MANAGER
+
     @cached_property
     def _sharing(self) -> _Sharing:
         """What this store's owner shares and is shared, read live from the
@@ -1019,6 +1087,15 @@ class SkillService:
         """
         if any(self.is_managed_skill(slug) for slug in slugs):
             raise SkillImmutableError(SHARED_SKILL_REFUSAL)
+        if any(self.is_brand_guidelines(slug) for slug in slugs):
+            raise SkillImmutableError(BRAND_GUIDELINES_REFUSAL)
+        if (
+            creating
+            and self.org_sharing
+            and BRAND_GUIDELINES_SLUG in slugs
+            and not self._skill_entry(BRAND_GUIDELINES_SLUG).exists()
+        ):
+            raise SkillImmutableError(BRAND_GUIDELINES_NAME_RESERVED)
         shared = self.shared_with_owner()
         taken = [slug for slug in slugs if slug in shared]
         if taken:

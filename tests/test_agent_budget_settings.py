@@ -1,11 +1,10 @@
 """Agent budget settings (max_tool_rounds / max_continuations / max_turn_tokens).
 
-Cowork defaults these HIGHER than anton's own CoreSettings defaults (25/3):
-long knowledge-work tasks routinely need 30-50 tool rounds, and at anton's
-defaults the agent stops mid-task to ask "want me to continue?" — which in
-unattended contexts (evals, channels, scheduled work) is a dead end. The DB
-value is overlaid onto AntonSettings per conversation, so it must round-trip
-the settings service as an int and reject junk that would break sessions.
+The defaults are safety limits for a turn that never finishes, the values
+anton's own CoreSettings defaults move to; a normal task never reaches them,
+so it doesn't stop mid-task to ask "want me to continue?". The DB value is overlaid onto
+AntonSettings per conversation, so it must round-trip the settings service as
+an int and reject junk that would break sessions.
 """
 
 import pytest
@@ -43,10 +42,9 @@ def _clear_app_settings_cache():
         get_app_settings.cache_clear()
 
 
-def test_defaults_are_50_and_5():
+def test_defaults_are_the_safety_limits():
     s = UserSettings()
-    assert s.max_tool_rounds == 50
-    assert s.max_continuations == 5
+    assert (s.max_tool_rounds, s.max_continuations, s.max_turn_tokens) == (250, 10, 25_000_000)
 
 
 def test_hosted_deployments_can_lower_defaults_via_env(monkeypatch):
@@ -117,12 +115,14 @@ def test_settings_service_round_trip():
         # The test DB is shared session-wide — never leak the 75 row (or the
         # cache invalidation that goes with it) into later tests, even when
         # an assertion above fails.
-        try:
-            service.delete_setting("max_tool_rounds")
-        except ValueError:
-            pass
+        # Saving a budget also stores limits_enabled; remove it too.
+        for key in ("max_tool_rounds", "limits_enabled"):
+            try:
+                service.delete_setting(key)
+            except ValueError:
+                pass
         session.close()
-    assert UserSettings().max_tool_rounds == 50  # back to Cowork default
+    assert UserSettings().max_tool_rounds == 250  # back to the default
 
 
 def test_budget_env_vars_not_synced_from_dotenv():
@@ -156,22 +156,22 @@ def test_anton_settings_accepts_overlay():
 # ── Per-turn spend ceiling (ENG-1286) ──────────────────────────────────────
 
 
-def test_turn_token_ceiling_default_is_1_25m():
-    assert UserSettings().max_turn_tokens == 1_250_000
-
-
-def test_turn_token_ceiling_default_matches_anton_rather_than_exceeding_it():
-    """Deliberately EQUAL to anton's default, unlike the other two budgets.
-
-    max_tool_rounds/max_continuations run looser here than anton's CLI defaults
-    on purpose. This one must not: the per-turn distribution that produced
-    1,250,000 was measured on Cowork traffic, so it already reflects those
-    looser round budgets. Raising it here would loosen the ceiling against the
-    exact population it was sized on.
-    """
+def test_defaults_match_antons_own():
+    """Desktop and the web pod, which runs anton's defaults, get the same limits."""
     from anton.core.settings import CoreSettings
 
-    assert UserSettings().max_turn_tokens == CoreSettings().max_turn_tokens
+    core = CoreSettings(_env_file=None)
+    if core.max_turn_tokens == 1_250_000:
+        pytest.skip(
+            "the anton this environment resolves predates the safety-limit "
+            "defaults; this assertion activates once the anton-agent release "
+            "uv.lock pins (images, uv sync --frozen) and the floor in "
+            "pyproject.toml (desktop installs) carry them"
+        )
+    s = UserSettings()
+    assert (s.max_tool_rounds, s.max_continuations, s.max_turn_tokens) == (
+        core.max_tool_rounds, core.max_continuations, core.max_turn_tokens
+    )
 
 
 def test_hosted_deployments_can_lower_the_ceiling_via_env(monkeypatch):
@@ -195,12 +195,12 @@ def test_turn_token_ceiling_out_of_bounds_rejected(bad):
 def test_the_top_of_the_range_is_the_no_limit_setting():
     """"No limit" in the UI writes the MAX, not a sentinel.
 
-    At 50_000_000 the ceiling is effectively — not literally — off. A turn makes
-    roughly `max_tool_rounds x (max_continuations + 1)` LLM calls; at this
-    repo's defaults (50 x 6 = ~306) that reaches 50M at ~163k per call, which is
-    BELOW the ~190k a long conversation carries. It has never happened (largest
-    turn in 30 days: 8.26M) because real turns end and compaction intervenes,
-    but "the step cap always lands first" is not a guarantee.
+    At 50_000_000 the ceiling is effectively, not literally, off.
+    `max_tool_rounds` counts across the whole turn, continuations included, so
+    a turn makes roughly `max_tool_rounds + max_continuations + 1` LLM calls:
+    ~260 at the defaults, which reaches 50M at ~190k per call, the context a
+    long conversation carries; ~530 at the maxima (500 + 26), where the ceiling
+    lands first on a long conversation.
 
     The top of the range being the off switch used to be a problem because it
     was undiscoverable; the checkbox fixes that, which is why the
@@ -278,6 +278,7 @@ def test_overlay_applies_every_budget_to_a_real_anton_settings():
 
     a = AntonSettings(_env_file=None)
     user = UserSettings.model_validate({
+        "limits_enabled": "true",
         "max_tool_rounds": "80", "max_continuations": "2",
         "max_turn_tokens": "900000",
     })
@@ -317,7 +318,7 @@ def test_overlay_survives_a_field_the_pinned_anton_does_not_have():
         setattr(old, "max_turn_tokens", 1_250_000)
 
     applied = _overlay_user_settings(
-        old, UserSettings.model_validate({"max_tool_rounds": "80"})
+        old, UserSettings.model_validate({"limits_enabled": "true", "max_tool_rounds": "80"})
     )
     assert applied == ["max_tool_rounds"]
     assert old.max_tool_rounds == 80

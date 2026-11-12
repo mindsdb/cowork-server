@@ -20,6 +20,7 @@ from cowork.api.v1.endpoints import artifact_workspace as aw
 from cowork.db.scoped import TenantScope
 from cowork.services import artifact_locks, artifact_stats
 from cowork.services.product_permissions import ProductPermissionDenied
+from _async_stub import awaitable
 from tests._fakes import StatsUpstream
 
 ORG_SCOPE = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
@@ -34,10 +35,6 @@ STATS_BODY = {
     "unique_viewers": 1,
     "viewers": [],
 }
-
-
-class _Session:
-    scope = ORG_SCOPE
 
 
 @pytest.fixture
@@ -64,7 +61,7 @@ async def test_lock_helper_gives_up_after_a_short_timeout(folder):
     loop = asyncio.get_running_loop()
     started = loop.time()
     try:
-        assert await aw._acquire_live_publish_lock(folder, timeout_s=0.2) is False
+        assert await aw._acquire_live_publish_lock(folder, ORG_SCOPE, timeout_s=0.2) is False
     finally:
         artifact_locks.release(folder.parent, folder.name)
     assert loop.time() - started < 2.0
@@ -76,14 +73,14 @@ async def test_lock_helper_default_follows_the_publish_timeout(folder, monkeypat
     loop = asyncio.get_running_loop()
     started = loop.time()
     try:
-        assert await aw._acquire_live_publish_lock(folder) is False
+        assert await aw._acquire_live_publish_lock(folder, ORG_SCOPE) is False
     finally:
         artifact_locks.release(folder.parent, folder.name)
     assert loop.time() - started < 2.0
 
 
 async def test_lock_helper_takes_a_free_lock(folder):
-    assert await aw._acquire_live_publish_lock(folder, timeout_s=0.2) is True
+    assert await aw._acquire_live_publish_lock(folder, ORG_SCOPE, timeout_s=0.2) is True
     assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is False
     artifact_locks.release(folder.parent, folder.name)
 
@@ -99,9 +96,9 @@ async def test_stats_toggle_waits_five_seconds_at_most():
 def as_owner(monkeypatch, folder):
     monkeypatch.setattr(
         aw, "_owner_workspace",
-        lambda session, project_ref, artifact_id: (
+        awaitable(lambda scope, project_ref, artifact_id: (
             SimpleNamespace(project_id="proj-1"), folder, {"slug": "rep"}, {},
-        ),
+        )),
     )
     return folder
 
@@ -155,12 +152,12 @@ def _upstream(monkeypatch, status, body=None):
 
 
 async def _read():
-    return await aw.read_artifact_stats("proj", ARTIFACT_ID, _Session())
+    return await aw.read_artifact_stats("proj", ARTIFACT_ID, ORG_SCOPE)
 
 
 async def _toggle(enabled: bool = False):
     return await aw.set_artifact_stats_tracking(
-        "proj", ARTIFACT_ID, aw._StatsTrackingBody(enabled=enabled), _Session(),
+        "proj", ARTIFACT_ID, aw._StatsTrackingBody(enabled=enabled), ORG_SCOPE,
     )
 
 
@@ -284,7 +281,7 @@ async def test_busy_publish_lock_answers_503_quickly(as_owner, keys, stats_calls
 async def test_tracking_toggle_passes_the_short_lock_timeout(as_owner, keys, stats_calls, monkeypatch):
     seen = []
 
-    async def spy(folder, *, timeout_s=None):
+    async def spy(folder, scope, *, timeout_s=None):
         seen.append(timeout_s)
         return True
 

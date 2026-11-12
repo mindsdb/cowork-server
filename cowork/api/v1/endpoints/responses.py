@@ -9,6 +9,7 @@ An originating POST with cancel_on_disconnect=true owns its run and cancels
 that instance on transport loss. Tail readers never own the run. Explicit
 POST /responses/cancel remains available with an optional run-instance guard.
 """
+import asyncio
 import time
 from typing import Annotated, NamedTuple
 from uuid import UUID
@@ -16,12 +17,14 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StringConstraints
+from redis.exceptions import RedisError
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response as HTTPResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import TurnQueueSettings
+from cowork.common.ui_locale import UI_LOCALE_HEADER, normalize_ui_locale
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     MissingTenantScopeError,
@@ -29,17 +32,32 @@ from cowork.db.scoped import (
     get_tenant_scope,
     scope_from_principal,
 )
+from cowork.handlers.addon_route import (
+    budget_deadline,
+    clean_local_key,
+    queued,
+    rate_limit_refusal,
+    route_addon,
+    route_remote_addon,
+    turn_response_ids,
+    valid_text,
+)
 from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
 from cowork.principal import Principal, caller_bearer, get_principal
 from cowork.schemas.responses import ResponsesRequest
 from cowork.streaming import RunHandle, TurnInProgress, registry
+from cowork.streaming.addons import MAX_ADDON_CHARS, addons
 from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.backend import get_backend
 from cowork.streaming.cancellation import cancel_disconnected_run, cancel_run, request_cancel
 from cowork.streaming.disconnect import DisconnectStreamingResponse, DisconnectWatch
 from cowork.streaming.buffer import RedisStreamBuffer
-from cowork.streaming.turn_index import TurnOwner, get_turn, list_turns
+from cowork.streaming.registry import claim_held_refusal
+from cowork.streaming.turn_claim import REDIS_CALL_SECONDS, TurnClaimUnavailable, live_holder
+from cowork.streaming.turn_index import TurnIndexEntry, TurnOwner, get_turn, list_turns
+from cowork.turnqueue.addons import RemoteWithdrawResult, remote_addons_ready, withdraw_remote_addon
 from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
+from cowork.turnqueue.auth_keys import extend_turn_key
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
     get_redis,
@@ -119,7 +137,7 @@ class SharedTurn(NamedTuple):
     enqueued moments ago.
     """
 
-    index: dict
+    index: TurnIndexEntry
     buffer: RedisStreamBuffer
     in_flight: bool
 
@@ -138,9 +156,9 @@ async def _shared_turn(
     if not conversation_id or get_backend() != "redis":
         return None
     turn = await get_turn(conversation_id)
-    if turn is None or not _owner_matches(TurnOwner.from_index(turn), scope):
+    if turn is None or not _owner_matches(turn.owner, scope):
         return None
-    buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=int(turn["turn_id"]))
+    buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=turn.turn_id)
     await buf.refresh()
     # Admission publishes the index before starting the producer. Until the
     # grace period is up, an empty stream means "not started yet" rather than
@@ -149,13 +167,10 @@ async def _shared_turn(
     return SharedTurn(index=turn, buffer=buf, in_flight=(not buf.is_closed) or starting)
 
 
-def _just_started(turn: dict) -> bool:
+def _just_started(turn: TurnIndexEntry) -> bool:
     """Whether the turn was recorded too recently for an empty stream to mean
     anything. Enqueue to first record covers pod startup, so this is generous."""
-    try:
-        return (time.time() - float(turn.get("started_at") or 0)) < TURN_START_GRACE_SECONDS
-    except (TypeError, ValueError):
-        return False
+    return (time.time() - (turn.started_at or 0)) < TURN_START_GRACE_SECONDS
 
 
 # Enqueue to first record: the controller has to lock the conversation, find or
@@ -206,14 +221,24 @@ async def options_handler():
     )
 
 
-def _refuse_while_answering(*, conversation: str | None, scope: TenantScope) -> None:
+async def _refuse_while_answering(*, conversation: str | None, scope: TenantScope) -> None:
     """Refuse a question into a conversation whose turn is still answering.
 
     Runs before any database read and before the routing gate, so the refusal
-    costs nothing. RunRegistry.start repeats the check under its lock for a
+    costs no more than two Redis reads, the claim and its stream's last
+    record, and a third, the turn index entry, where conversations are
+    partitioned. RunRegistry.start repeats the check under its lock for a
     request that gets past this one while the running turn is still in its
     own gate. Where conversations are partitioned only the caller's own turn
     counts, so the refusal never reveals someone else's.
+
+    On the Redis backend a turn another replica runs counts too, read from the
+    conversation's turn claim (turn_claim.live_holder). Its owner comes from
+    the turn index entry its run wrote, so where conversations are partitioned
+    a claim whose entry does not name that run yet is left to start(). So is
+    a claim this process's own last turn still holds after its task ended,
+    which start() releases. Raises TurnClaimUnavailable when Redis cannot
+    answer.
     """
     if not conversation:
         return
@@ -222,9 +247,24 @@ def _refuse_while_answering(*, conversation: str | None, scope: TenantScope) -> 
     except ValueError:
         return  # not a conversation id: handle() starts a new conversation
     _require_streaming_scope(scope)
-    handle = _authorized_handle(registry.get(conversation_id), scope)
+    local = registry.get(conversation_id)
+    handle = _authorized_handle(local, scope)
     if handle is not None and handle.is_answering:
         raise TurnInProgress(conversation_id=conversation_id, turn_id=handle.turn_id)
+    if get_backend() != "redis":
+        return
+    holder = await live_holder(conversation_id=conversation_id)
+    if holder is None or (local is not None and local.run_id == holder.run_id and not local.is_running):
+        return
+    if scope.partitioned_for(PersonalResource.CONVERSATIONS):
+        try:
+            async with asyncio.timeout(REDIS_CALL_SECONDS):
+                turn = await get_turn(conversation_id)
+        except Exception as exc:
+            raise TurnClaimUnavailable(conversation_id=conversation_id) from exc
+        if turn is None or turn.run_id != holder.run_id or not _owner_matches(turn.owner, scope):
+            return
+    raise claim_held_refusal(conversation_id=conversation_id, holder=holder)
 
 
 @router.post("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
@@ -235,10 +275,17 @@ async def responses(
 ):
     # No request session: the handler runs its reads as short units, so no
     # connection stays checked out for the stream this returns.
-    _refuse_while_answering(
+    await _refuse_while_answering(
         conversation=responses_request.conversation, scope=scope_from_principal(principal)
     )
-    handler = ResponsesHandler(principal=principal, mindshub_bearer=caller_bearer(request))
+    handler = ResponsesHandler(
+        principal=principal,
+        mindshub_bearer=caller_bearer(request),
+        # The app's language (ENG-4149): the agent replies in it when the
+        # user's own message does not say which language to use. The app's
+        # own header, never Accept-Language, which every browser sends.
+        ui_locale=normalize_ui_locale(request.headers.get(UI_LOCALE_HEADER)),
+    )
     if responses_request.cancel_on_disconnect:
         watch = DisconnectWatch(request.receive)
         try:
@@ -282,17 +329,16 @@ async def in_flight_list(scope: TenantScopeDep):
     ]
     if get_backend() == "redis":
         seen = {row["conversation_id"] for row in out}
-        for turn in await list_turns():
-            cid = turn["conversation_id"]
-            if cid in seen or not _owner_matches(TurnOwner.from_index(turn), scope):
+        for cid, turn in await list_turns():
+            if cid in seen or not _owner_matches(turn.owner, scope):
                 continue
-            buf = RedisStreamBuffer(conversation_id=cid, turn_id=int(turn["turn_id"]))
+            buf = RedisStreamBuffer(conversation_id=cid, turn_id=turn.turn_id)
             await buf.refresh()
             if buf.is_closed:
                 continue   # finished; only the replay buffer is left
             out.append({
                 "conversation_id": cid,
-                "turn_id": int(turn["turn_id"]),
+                "turn_id": turn.turn_id,
                 "latest_seq": buf.latest_seq,
             })
     return {"in_flight": out}
@@ -319,7 +365,7 @@ async def in_flight(scope: TenantScopeDep, conversation_id: str | None = None):
             "in_flight": found.in_flight,
             "has_buffer": True,
             "latest_seq": found.buffer.latest_seq,
-            "turn_id": int(found.index["turn_id"]),
+            "turn_id": found.index.turn_id,
         }
     return {
         "in_flight": handle.is_running,
@@ -365,15 +411,15 @@ async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
             cancelled = await cancel_run(handle, reason=req.reason)
             return {"cancelled": cancelled, "conversation_id": req.conversation_id}
         found = await _shared_turn(req.conversation_id, scope)
-        if found is None or found.index.get("run_id") != expected:
+        if found is None or found.index.run_id != expected:
             return JSONResponse(status_code=404, content={"status": "not_found"})
         if not found.in_flight or found.buffer.is_finishing:
             return {"cancelled": False, "conversation_id": req.conversation_id}
-        await request_cancel(found.index["correlation_id"], reason=req.reason, client=get_redis())
+        await request_cancel(found.index.correlation_id, reason=req.reason, client=get_redis())
         return {"cancelled": True, "conversation_id": req.conversation_id}
     if handle is not None and get_backend() == "redis":
         turn = await get_turn(req.conversation_id)
-        if turn is not None and turn["correlation_id"] != handle.lifecycle.identity.correlation_id:
+        if turn is not None and turn.correlation_id != handle.lifecycle.identity.correlation_id:
             # RunRegistry retains finished handles for replay. A successor may
             # run on another replica; _shared_turn below authorizes its owner.
             handle = None
@@ -391,7 +437,7 @@ async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
     found = await _shared_turn(req.conversation_id, scope)
     if found is None or not found.in_flight:
         return JSONResponse(status_code=404, content={"status": "not_found"})
-    await _request_cancel(found.index["correlation_id"], stalled=stalled)
+    await _request_cancel(found.index.correlation_id, stalled=stalled)
     return {"cancelled": True, "conversation_id": req.conversation_id}
 
 
@@ -447,6 +493,51 @@ def _answer_response(result: SubmitResult | RemoteAnswerResult):
     return JSONResponse(status_code=status_code, content=content)
 
 
+#: anton asks its time-limit "Keep going / Stop here" question under this id
+#: prefix (ChatSession._continue_question), with this value for Keep going. Its
+#: step-limit and spend-ceiling questions use plain ``limit:``: those don't
+#: lengthen the turn, so their answers go to the pod as given.
+_TIME_LIMIT_QUESTION_PREFIX = "limit:time:"
+_KEEP_GOING = "continue"
+_STOP_HERE = "stop"
+
+
+def _keeps_going_past_a_limit(question_id: str, values: list[str]) -> bool:
+    return question_id.startswith(_TIME_LIMIT_QUESTION_PREFIX) and values == [_KEEP_GOING]
+
+
+# Between the two tries of a key extension, so one blip in auth doesn't turn
+# the user's Keep going into Stop here.
+_KEY_EXTENSION_RETRY_PAUSE_SECONDS = 1.0
+
+
+async def _extend_turn_key_window(correlation_id: str) -> bool:
+    """Give a time-limited turn's key one more window before its "Keep going"
+    reaches the pod. False when auth refused twice, or couldn't be reached.
+
+    auth bounds each window, and clamps the last one to the key's lifetime,
+    which covers the turn's whole time budget. Asked before the answer is
+    delivered, so a duplicate answer the pod rejects extends the key to the
+    same window again, which is harmless. True with no time limit: there is
+    nothing to extend.
+    """
+    settings = TurnQueueSettings()
+    if settings.time_limit_seconds <= 0:
+        return True
+    for attempt in range(2):
+        if attempt:
+            await asyncio.sleep(_KEY_EXTENSION_RETRY_PAUSE_SECONDS)
+        if await extend_turn_key(
+            instance_id=correlation_id, ttl_seconds=settings.turn_key_lifetime_seconds, settings=settings,
+        ):
+            return True
+    logger.error(
+        "turn key extension failed twice; answering Stop here instead of Keep going: correlation_id=%s",
+        correlation_id,
+    )
+    return False
+
+
 @router.post("/answer", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     """Deliver the user's answer to a question a turn is blocked on.
@@ -476,7 +567,7 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
         found = await _shared_turn(req.conversation_id, scope)
         if found is None or not found.in_flight:
             return JSONResponse(status_code=404, content={"status": "not_found"})
-        correlation_id = found.index["correlation_id"]
+        correlation_id = found.index.correlation_id
     else:
         handle = _authorized_handle(registry.get(req.conversation_id), scope)
         if handle is None:
@@ -499,6 +590,10 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
         payload["skipped"] = True
 
     if remote:
+        if _keeps_going_past_a_limit(req.question_id, values) and not await _extend_turn_key_window(correlation_id):
+            # Keep going on a key that won't last ends the turn on a model
+            # 401 later; Stop here ends it now, with the time-limit summary.
+            payload = {**payload, "values": [_STOP_HERE]}
         remote_result = await submit_remote_answer(
             conversation_id=req.conversation_id,
             correlation_id=correlation_id,
@@ -508,6 +603,180 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
         return _answer_response(remote_result)
 
     return _answer_response(broker.submit(req.conversation_id, req.question_id, payload))
+
+
+# The request bound (422 past it). A message over MAX_ADDON_CHARS but under
+# this is answered queued as too_large, so the app keeps it as the next task.
+_MAX_ADDON_LENGTH = 64 * 1024
+
+
+class AddonRequest(BaseModel):
+    conversation_id: str
+    text: str = Field(max_length=_MAX_ADDON_LENGTH)
+    # The person picked "Add to current task" themselves: Jev is not asked.
+    force: bool = False
+    # The running turn's response id as the app saw it (its response.created).
+    # When sent and it is not the in-flight turn's, the message is queued as
+    # no_turn: it was typed against a turn that is over.
+    response_id: str | None = None
+    # The app's own id for the message, echoed on every response.addon event
+    # for it. Ignored, not refused, unless 1-64 of [A-Za-z0-9_-].
+    local_key: str | None = None
+
+
+@router.post("/addon", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
+    """A message sent while the conversation's turn runs: add it to that turn
+    or tell the app to queue it as the next one (ENG-4194).
+
+    Always 200 for a caller who may touch the turn: {"status": "added",
+    "addon_id", "decided_by"} when the running turn took it, else {"status":
+    "queued", "reason"} (addon_route.QueuedReason), and the app keeps it in
+    its queue as today. 404 is /answer's: no turn the caller may touch. Text
+    that is not valid Unicode is refused like any malformed request: bytes
+    that are not UTF-8 fail body parsing (400), a lone surrogate escape fails
+    request validation (422); the handler answers 400 {"status":
+    "invalid_text"} should one ever get past them. The turn's stream
+    carries a `response.addon` event for each added message as it is added,
+    read by the model, withdrawn, or returned at turn end because the model
+    never saw it; each carries the request's `local_key` when it had a valid
+    one.
+
+    On the remote backend the turn runs in a pod. Only a pod that said it
+    takes messages mid-task (its "ready" step) is offered one; Jev decides
+    here, before anything reaches the pod; then the message is queued for the
+    pod's stdin on the turn's answer queue and the status is the pod's own
+    verdict, waited for up to turnqueue.addons.ADDON_ACK_TIMEOUT_S (and never
+    past the request's budget, addon_route.ADDON_BUDGET_S): "added",
+    or queued as no_turn when the pod's turn refused it (it is ending) and as
+    pod_timeout when no verdict came (a withdraw of it is queued too, so a
+    late add can't also run as the next task).
+    """
+    # Every stage below answers within ADDON_BUDGET_S of here (the app waits
+    # 10 s): out of time, it answers queued with that stage's reason.
+    deadline = budget_deadline()
+    _require_streaming_scope(scope)
+    settings = TurnQueueSettings()
+    remote = settings.is_remote
+    if remote:
+        found = await _shared_turn(req.conversation_id, scope)
+        if found is None:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
+    else:
+        handle = _authorized_handle(registry.get(req.conversation_id), scope)
+        if handle is None:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
+    if not valid_text(req.text):
+        return JSONResponse(status_code=400, content={"status": "invalid_text"})
+    text = req.text.strip()
+    if not text:
+        return queued("empty")
+    if not settings.addon_routing_enabled:
+        return queued("disabled")
+    if len(text) > MAX_ADDON_CHARS:
+        return queued("too_large")
+    if not (found.in_flight if remote else handle.is_answering):
+        return queued("no_turn")
+    if req.response_id is not None:
+        try:
+            response_ids = await turn_response_ids(found.buffer if remote else handle.buffer)
+        except RedisError:
+            logger.warning("[addon] could not read the turn's response id", exc_info=True)
+            return queued("redis_error")
+        # Only a turn whose own response id is known, and differs, is refused:
+        # a buffer whose response.created this scan did not reach (the first
+        # take's frames come first) says nothing about which turn it is.
+        if response_ids and req.response_id not in response_ids:
+            return queued("no_turn")
+    if remote:
+        # Before Jev or a minted key: a pod whose anton can't take the
+        # message would only refuse it after both.
+        try:
+            ready = await remote_addons_ready(found.index.correlation_id)
+        except RedisError:
+            logger.warning("[addon] could not read the turn's support marker", exc_info=True)
+            return queued("redis_error")
+        if not ready:
+            return queued("not_supported")
+    else:
+        channel = addons.get(req.conversation_id)
+        if channel is None:
+            # The turn runs an anton that can't take messages mid-turn, or is
+            # not an agent turn.
+            return queued("not_supported")
+    refusal = await rate_limit_refusal(scope, remote=remote)
+    if refusal is not None:
+        return refusal
+    local_key = clean_local_key(req.local_key)
+    if remote:
+        return await route_remote_addon(
+            conversation_id=req.conversation_id,
+            correlation_id=found.index.correlation_id,
+            text=text,
+            force=req.force,
+            scope=scope,
+            local_key=local_key,
+            deadline=deadline,
+            queue_settings=settings,
+        )
+    return await route_addon(
+        channel=channel, text=text, force=req.force, scope=scope, local_key=local_key, deadline=deadline,
+        queue_settings=settings,
+    )
+
+
+class AddonWithdrawRequest(BaseModel):
+    conversation_id: str
+    addon_id: str
+
+
+_WITHDRAW_RESPONSES: dict[str, tuple[int, dict]] = {
+    "withdrawn": (200, {"status": "withdrawn"}),
+    "already_read": (409, {"status": "already_read"}),
+    "not_found": (404, {"status": "not_found"}),
+    # anton raised: whether the model has it is unknown, so the app leaves
+    # the message where it is, as for a pod that did not answer.
+    "internal": (503, {"status": "unavailable"}),
+}
+
+
+_REMOTE_WITHDRAW_RESPONSES: dict[RemoteWithdrawResult, tuple[int, dict]] = {
+    **{RemoteWithdrawResult(value): response for value, response in _WITHDRAW_RESPONSES.items()
+       if value in {result.value for result in RemoteWithdrawResult}},
+    RemoteWithdrawResult.UNAVAILABLE: (503, {"status": "unavailable"}),
+}
+
+
+@router.post("/addon/withdraw", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def withdraw_addon(req: AddonWithdrawRequest, scope: TenantScopeDep):
+    """Take an added message back before the model reads it ("Move to
+    queue"). 409 once the model has it; 404 for no turn the caller may touch,
+    or an addon that turn does not hold (it ended and returned it).
+
+    On the remote backend the withdraw is queued for the pod like the addon,
+    and the status is the pod's verdict. When it does not come in time (or
+    Redis fails) the answer is 503 {"status": "unavailable"}: the withdraw
+    may still land, so the app should leave the message where it is and let
+    the turn's response.addon events settle it.
+    """
+    _require_streaming_scope(scope)
+    if TurnQueueSettings().is_remote:
+        found = await _shared_turn(req.conversation_id, scope)
+        if found is None or not found.in_flight:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
+        result = await withdraw_remote_addon(
+            conversation_id=req.conversation_id,
+            correlation_id=found.index.correlation_id,
+            addon_id=req.addon_id,
+        )
+        status_code, content = _REMOTE_WITHDRAW_RESPONSES[result]
+        return JSONResponse(status_code=status_code, content=content)
+    handle = _authorized_handle(registry.get(req.conversation_id), scope)
+    channel = addons.get(req.conversation_id) if handle is not None else None
+    if channel is None:
+        return JSONResponse(status_code=404, content={"status": "not_found"})
+    status_code, content = _WITHDRAW_RESPONSES[channel.withdraw(req.addon_id)]
+    return JSONResponse(status_code=status_code, content=content)
 
 
 @router.get("/tail", dependencies=[Depends(require(AuthenticatedInOrgMode))])

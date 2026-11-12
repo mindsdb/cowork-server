@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from cowork.api.v1.endpoints import responses
 from cowork.db.scoped import TenantScope
 from cowork.schemas.responses import ResponsesRequest
-from cowork.streaming import backend, buffer, cancellation, turn_index
+from cowork.streaming import backend, buffer, cancellation, turn_claim, turn_index
 from cowork.streaming.registry import RunIdentity, RunRegistry, TurnLifecycle
 
 LOCAL = TenantScope(org_mode=False)
@@ -21,7 +21,7 @@ LOCAL = TenantScope(org_mode=False)
 @pytest.fixture
 def redis(monkeypatch):
     client = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    for module in (responses, buffer, cancellation, turn_index):
+    for module in (responses, buffer, cancellation, turn_claim, turn_index):
         monkeypatch.setattr(module, "get_redis", lambda: client)
     monkeypatch.setattr(cancellation, "CANCEL_POLL_SECONDS", 0.01)
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
@@ -96,6 +96,9 @@ async def test_reused_turn_number_cannot_match_an_old_cancellation(redis, monkey
 async def test_exact_cancel_uses_captured_handle_not_a_new_shared_index(redis, monkeypatch):
     old_owner, new_owner = RunRegistry(), RunRegistry()
     old = await start(old_owner, turn=0)
+    # The old run's claim lapsed (an eviction, or a stall past its TTL), so
+    # another replica admitted a new run while the old one still runs.
+    await redis.delete(turn_claim.claim_key("c"))
     new = await start(new_owner, turn=1)
     monkeypatch.setattr(responses, "registry", old_owner)
     try:
@@ -262,6 +265,7 @@ async def test_cancelled_admission_removes_its_index_without_starting_work(redis
     with pytest.raises(asyncio.CancelledError):
         await admitting
     assert await turn_index.get_turn("c") is None
+    assert await redis.exists(turn_claim.claim_key("c"), turn_claim.CLAIMS_KEY) == 0
     assert owner.get("c") is None
     assert started is False
 
@@ -270,7 +274,7 @@ async def test_abandoned_admission_cleanup_does_not_remove_a_successor(redis):
     old, new = str(uuid4()), str(uuid4())
     await turn_index.record_turn("c", turn_id=0, correlation_id="new", run_id=new, org_id=None, user_id=None)
     await turn_index.forget_run("c", old)
-    assert (await turn_index.get_turn("c"))["run_id"] == new
+    assert (await turn_index.get_turn("c")).run_id == new
 
 
 async def test_remote_cancellation_signals_its_worker_with_a_file_buffer(redis, monkeypatch, tmp_path):

@@ -156,7 +156,7 @@ def org_tenancy(monkeypatch):
 
 
 def _view(session, scope, bearer: str = "jwt-abc"):
-    return asyncio.run(ep._build_view(FakeRequest(bearer), session, scope))
+    return asyncio.run(ep._build_view(FakeRequest(bearer), scope))
 
 
 # ── The bearer ───────────────────────────────────────────────────────
@@ -255,7 +255,6 @@ def _activate(session, scope, workspace_id: str, bearer: str = "jwt-abc"):
         ep.set_active_mindshub_workspace(
             MindsHubWorkspaceActivateRequest(workspace_id=workspace_id),
             FakeRequest(bearer),
-            session,
             scope,
         )
     )
@@ -572,7 +571,7 @@ def test_the_route_answers_the_same_view_its_builder_does(session, calls):
     calls.answers[WORKSPACES] = _rows()
 
     view = asyncio.run(
-        ep.get_mindshub_workspaces(FakeRequest(), session, _scope())
+        ep.get_mindshub_workspaces(FakeRequest(), _scope())
     )
 
     assert view.enabled is True
@@ -933,4 +932,5 @@ def test_the_mindshub_routes_are_listed_under_mindshubs_name():
         "/api/v1/hub/usage/": ["mindshub-usage"],
         "/api/v1/hub/teams/": ["mindshub-teams"],
         "/api/v1/hub/people/": ["mindshub-people"],
+        "/api/v1/hub/org-icons": ["mindshub-org-icons"],
     }

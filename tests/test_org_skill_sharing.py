@@ -6,7 +6,7 @@ rule names (``org_allowed``, ``allowed_team_ids``, ``allowed_user_ids``),
 plus ``always_on``: only its owner (a new skill's row), people by user id,
 teams, or everyone at the org. A skill from before sharing gets a row
 shared with everyone once, owned by its attribution's creator, the first
-time its org's rows are read; a folder with no row after that is its
+time SkillService reads its org's rows; a folder with no row after that is its
 recorded creator's alone, or nobody's with none. Skills shared with
 everyone or a team are recalled on demand like any other unless marked
 always on, which puts them in every turn's prompt of the org or the team
@@ -33,7 +33,7 @@ import httpx
 import pytest
 from anton.core.tools.skill_format import dump_skill
 from fastapi import HTTPException
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.pool import StaticPool
@@ -43,6 +43,7 @@ from cowork.api.v1.endpoints import mindshub_people as mindshub_people_ep
 from cowork.api.v1.endpoints import mindshub_teams as mindshub_teams_ep
 from cowork.api.v1.endpoints import skill_sharing as sharing_ep
 from cowork.api.v1.endpoints import skills as skills_ep
+from cowork.handlers import responses as responses_mod
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import (
     LOCAL_SCOPE,
@@ -61,10 +62,10 @@ from cowork.schemas.skills import (
     SkillSharingRequest,
     SkillUpdateRequest,
 )
-from cowork.models.shared_resource import SharedResourceAttribution
+from cowork.models.shared_resource import SharedResourceAttribution, SharedResourceMutation
 from cowork.services import mindshub_people, mindshub_teams
 from cowork.services.publish import ARTIFACT_ORG_REFUSAL, ShareOrgRequired
-from cowork.services.shared_resources import SKILL, SharedResourceAccess
+from cowork.services.shared_resources import SKILL, SKILL_PROJECT_REFERENCES, SharedResourceAccess
 from cowork.services.skill_access import (
     access_row,
     access_rows,
@@ -164,6 +165,15 @@ def org(org_deployment, monkeypatch, tmp_path):
         sessions.append(session)
         return session
 
+    async def unit(work, *, scope):
+        # A unit on this org's database, as the member the scope names.
+        return work(as_(scope.user_id, scope.org_id))
+
+    # Every unit the skills routes and a turn's start run, on this database.
+    monkeypatch.setattr(skills_ep, "run_efs_unit", unit)
+    monkeypatch.setattr(sharing_ep, "run_efs_unit", unit)
+    monkeypatch.setattr(responses_mod, "run_db", unit)
+    monkeypatch.setattr(responses_mod, "run_efs_unit", unit)
     try:
         yield SimpleNamespace(as_=as_)
     finally:
@@ -172,13 +182,26 @@ def org(org_deployment, monkeypatch, tmp_path):
         get_app_settings.cache_clear()
 
 
+def _await(coroutine):
+    """A route's coroutine, run to its end on the caller's thread. The org
+    fixture runs its units inline, so a skills route never suspends, and it
+    runs here inside another route's unit too, as a change injected while
+    that route waits on a lock (_race_on) does, where asyncio.run can't."""
+    try:
+        coroutine.send(None)
+    except StopIteration as done:
+        return done.value
+    coroutine.close()
+    raise AssertionError("the route waited on something the org fixture doesn't run inline")
+
+
 def _create(org, user: str, label: str, **viewer_kwargs) -> dict:
-    return skills_ep.create_skill(
+    return _await(skills_ep.create_skill(
         SkillCreateRequest(label=label, instructions=f"Body of {label}."),
-        org.as_(user),
+        org.as_(user).scope,
         _principal(user),
         _viewer(user, **viewer_kwargs),
-    )
+    ))
 
 
 def _members(*user_ids: str, calls: list | None = None):
@@ -202,15 +225,15 @@ def _share(
     request = SkillSharingRequest(**body)
     scoped = ctx.as_(user)
     viewer = viewer or _viewer(user, teams=(TEAM_ENG,), admin=admin)
-    stored = asyncio.run(sharing_ep.stored_sharing_rule(slug, scoped, viewer))
-    verified = asyncio.run(
+    stored = _await(sharing_ep.stored_sharing_rule(slug, scoped.scope, viewer))
+    verified = _await(
         sharing_ep.verify_people_in_org(request, viewer, stored, members or _members())
     )
-    return sharing_ep.set_skill_sharing(slug, request, scoped, _principal(user, admin=admin), viewer, verified)
+    return _await(sharing_ep.set_skill_sharing(slug, request, scoped.scope, _principal(user, admin=admin), viewer, verified))
 
 
 def _listed(org, user: str, viewer: SkillViewer) -> dict[str, dict]:
-    listing = skills_ep.list_skills(org.as_(user), _principal(user), viewer)
+    listing = _await(skills_ep.list_skills(org.as_(user).scope, _principal(user), viewer))
     return {s["id"]: s for s in listing["skills"] if s["id"] not in BUILTIN_SKILL_SLUGS}
 
 
@@ -338,7 +361,7 @@ def test_a_new_skill_is_only_its_creators(org):
         metadata
     )
     assert "alice-notes" not in _listed(org, BOB, _viewer(BOB, teams=(TEAM_ENG,)))
-    _refused(lambda: skills_ep.get_skill("alice-notes", org.as_(BOB), _principal(BOB), _viewer(BOB)), 404)
+    _refused(lambda: _await(skills_ep.get_skill("alice-notes", org.as_(BOB).scope, _principal(BOB), _viewer(BOB))), 404)
 
 
 def test_an_upload_gets_a_row_shared_with_nobody_whatever_its_file_claims(org):
@@ -442,17 +465,17 @@ def test_an_uploaded_skill_from_before_sharing_stays_shared_with_everyone_and_it
         "org", True, ALICE, False,
     )
     _refused(
-        lambda: skills_ep.update_skill(
-            "uploaded-guide", SkillUpdateRequest(instructions="Bob's edit."), org.as_(BOB), _principal(BOB),
+        lambda: _await(skills_ep.update_skill(
+            "uploaded-guide", SkillUpdateRequest(instructions="Bob's edit."), org.as_(BOB).scope, _principal(BOB),
             _viewer(BOB),
-        ),
+        )),
         403,
         skills_ep.ORG_ALLOWED_EDIT_REFUSAL,
     )
     assert _listed(org, ALICE, alice)["uploaded-guide"]["canEdit"] is True
-    edited = skills_ep.update_skill(
-        "uploaded-guide", SkillUpdateRequest(instructions="Alice's edit."), org.as_(ALICE), _principal(ALICE), alice,
-    )
+    edited = _await(skills_ep.update_skill(
+        "uploaded-guide", SkillUpdateRequest(instructions="Alice's edit."), org.as_(ALICE).scope, _principal(ALICE), alice,
+    ))
     assert edited["declarative"] == "Alice's edit."
 
     out = _share(org, ALICE, "uploaded-guide", alice, org_allowed=False)
@@ -461,7 +484,7 @@ def test_an_uploaded_skill_from_before_sharing_stays_shared_with_everyone_and_it
     # Sharing it with everyone again still takes skills.share_org.
     _refused(lambda: _share(org, ALICE, "uploaded-guide", alice, org_allowed=True), 403, "skills.share_org")
 
-    skills_ep.delete_skill("uploaded-notes", org.as_(ALICE), _principal(ALICE), alice)
+    _await(skills_ep.delete_skill("uploaded-notes", org.as_(ALICE).scope, _principal(ALICE), alice))
     assert _row(org, "uploaded-notes") is None
     assert "uploaded-notes" not in _listed(org, CAROL, _viewer(CAROL))
 
@@ -536,6 +559,165 @@ def test_a_create_a_crash_cut_short_is_its_creators_and_recovery_gives_it_its_ro
     row = _row(org, "crashed")
     assert (row.owner_user_id, row.org_allowed, row.allowed_team_ids, row.allowed_user_ids) == (UUID(ALICE), False, [], [])
     assert "crashed" not in _listed(org, BOB, _viewer(BOB, write_org=True))
+
+
+def _record_coordination_locks(
+    monkeypatch, held: list[tuple[str, str]] | None = None
+) -> list[tuple[str, str]]:
+    """Every coordination lock a call takes, in the order it takes them.
+    ``held``, when given, holds the locks taken and not yet released."""
+    taken: list[tuple[str, str]] = []
+    real = SharedResourceAccess.coordination_lock
+
+    @contextmanager
+    def recording(self, namespace, key):
+        taken.append((namespace, key))
+        with real(self, namespace, key):
+            if held is not None:
+                held.append((namespace, key))
+            try:
+                yield
+            finally:
+                if held is not None:
+                    held.pop()
+
+    monkeypatch.setattr(SharedResourceAccess, "coordination_lock", recording)
+    return taken
+
+
+def test_a_listing_with_no_expired_claim_takes_no_coordination_lock(org, monkeypatch):
+    """Project creates hold the org-wide project-references lock, so a
+    listing that took it for every skill waited behind each of them. Only a
+    claim whose lease ran out can need recovery, and a live one stays read-only."""
+    for label in ("one", "two", "three"):
+        _create(org, ALICE, label)
+    _legacy_skill(org.as_(ALICE).scope, "being-made")
+    _attributed(org, "being-made", ALICE, pending=True)
+    taken = _record_coordination_locks(monkeypatch)
+
+    for user, viewer in ((ALICE, _viewer(ALICE)), (BOB, _viewer(BOB)), (ADMIN, _viewer(ADMIN, admin=True))):
+        listed = _listed(org, user, viewer)
+        if user != BOB:
+            assert {"one", "two", "three"} <= set(listed)
+    assert _listed(org, ALICE, _viewer(ALICE))["being-made"]["canEdit"] is False
+
+    assert taken == []
+
+
+def test_a_listing_recovers_an_expired_claim_under_both_locks_in_order(org, monkeypatch):
+    """The project-references lock comes first and the skill's second, the
+    order every skill writer takes them in."""
+    _create(org, ALICE, "steady")
+    _legacy_skill(org.as_(ALICE).scope, "crashed")
+    _attributed(org, "crashed", ALICE, pending=True, expired=True)
+    held: list[tuple[str, str]] = []
+    taken = _record_coordination_locks(monkeypatch, held)
+    held_at_recovery: list[list[tuple[str, str]]] = []
+    real_recover = SharedResourceAccess.recover_stale_claim
+
+    def recover(self, kind, key, **kwargs):
+        held_at_recovery.append(list(held))
+        return real_recover(self, kind, key, **kwargs)
+
+    monkeypatch.setattr(SharedResourceAccess, "recover_stale_claim", recover)
+
+    seen = _listed(org, ALICE, _viewer(ALICE))["crashed"]
+
+    # recover_stale_claim takes the skill's lock again inside, reentrantly.
+    assert list(dict.fromkeys(taken)) == [(SKILL_PROJECT_REFERENCES, "all"), (SKILL, "crashed")]
+    assert held_at_recovery == [[(SKILL_PROJECT_REFERENCES, "all"), (SKILL, "crashed")]]
+    assert (seen["canEdit"], seen["attribution"]["createdBy"]["userId"]) == (True, ALICE)
+
+
+@pytest.mark.parametrize("access_rows", [True, False], ids=["with-access-rows", "with-no-access-row"])
+def test_the_skill_list_runs_the_same_statements_at_3_and_30_skills(org, access_rows):
+    """A skill with no skill_access row, as one written after the one-time
+    backfill by a server from before sharing has, takes its owner from the
+    attribution rows, which the list reads once for every such skill."""
+
+    def add(start: int, count: int) -> None:
+        session = org.as_(ALICE)
+        for i in range(start, start + count):
+            slug = f"skill-{i:03d}"
+            _legacy_skill(session.scope, slug)
+            if access_rows:
+                stage_only_owner(session, slug=slug, owner_user_id=ALICE)
+            session.add(SharedResourceAttribution(
+                resource_kind=SKILL, resource_key=slug, created_by_id=ALICE, updated_by_id=ALICE,
+            ))
+        session.commit()
+
+    def counted() -> tuple[int, int]:
+        session = org.as_(ALICE)
+        statements: list[str] = []
+
+        def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(statement)
+
+        engine = session.get_bind()
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            listing = skills_ep._list_skills(session, principal=_principal(ALICE), viewer=_viewer(ALICE))
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+        return len(listing["skills"]), len(statements)
+
+    # Warm-up: seeds the built-ins and, with a skill of the org's own to read,
+    # runs the one-time backfill, so the skills added after it keep no row.
+    _create(org, BOB, "bobs-first")
+    counted()
+    add(0, 3)
+    small_skills, small = counted()
+    add(3, 27)
+    large_skills, large = counted()
+
+    assert large_skills - small_skills == 27
+    assert large == small, f"{small} statements at 3 skills, {large} at 30"
+
+
+def test_a_claim_another_replica_recovered_keeps_the_sharing_set_since(org):
+    """A recovery under production's session settings (rows outlive a
+    commit) must judge the claim as the database holds it now. Judged from a
+    row this session read earlier, it would finalize the skill a second time
+    and put its sharing back to its creator alone."""
+    from cowork.db.session import get_session_factory
+
+    engine = org.as_(ALICE).get_bind()
+
+    def production_session() -> ScopedSession:
+        return ScopedSession(
+            get_session_factory(engine)(),
+            TenantScope(org_mode=True, org_id=ORG_ID, user_id=ALICE),
+        )
+
+    _legacy_skill(org.as_(ALICE).scope, "crashed")
+    _attributed(org, "crashed", ALICE, pending=True, expired=True)
+    listing = production_session()
+    listing_access = SharedResourceAccess(listing, _principal(ALICE))
+    held = listing_access._find(SKILL, "crashed")
+    assert held is not None and held.pending_claim_token
+
+    replica = production_session()
+    assert skills_ep._recover_skill_claim(
+        SharedResourceAccess(replica, _principal(ALICE)),
+        SkillService(replica.scope, viewer=_viewer(ALICE), session=replica),
+        "crashed",
+    )
+    _share(org, ALICE, "crashed", _viewer(ALICE, share_org=True), org_allowed=True)
+
+    again = skills_ep._recover_skill_claim(
+        listing_access,
+        SkillService(listing.scope, viewer=_viewer(ALICE), session=listing),
+        "crashed",
+    )
+
+    assert again is False
+    assert _row(org, "crashed").org_allowed is True
+    check = org.as_(ALICE)
+    events = check.exec(check.select(SharedResourceMutation)).all()
+    assert [e.action for e in events if e.resource_key == "crashed"].count("recover") == 1
+    for session in (listing, replica):
+        session.close()
 
 
 def test_a_skill_made_after_the_backfill_with_no_row_is_its_creators(org):
@@ -887,20 +1069,20 @@ def test_team_members_change_a_team_skill_and_recipients_only_read(org):
     _create(org, ALICE, "team-skill")
     _share(org, ALICE, "team-skill", allowed_team_ids=[TEAM_ENG], allowed_user_ids=[CAROL])
 
-    edited = skills_ep.update_skill(
-        "team-skill", SkillUpdateRequest(instructions="Bob's edit."), org.as_(BOB), _principal(BOB),
+    edited = _await(skills_ep.update_skill(
+        "team-skill", SkillUpdateRequest(instructions="Bob's edit."), org.as_(BOB).scope, _principal(BOB),
         _viewer(BOB, teams=(TEAM_ENG,)),
-    )
+    ))
     assert edited["declarative"] == "Bob's edit."
     _refused(
-        lambda: skills_ep.update_skill(
-            "team-skill", SkillUpdateRequest(enabled=False), org.as_(CAROL), _principal(CAROL), _viewer(CAROL),
-        ),
+        lambda: _await(skills_ep.update_skill(
+            "team-skill", SkillUpdateRequest(enabled=False), org.as_(CAROL).scope, _principal(CAROL), _viewer(CAROL),
+        )),
         403,
         skills_ep.SKILL_EDIT_REFUSAL,
     )
-    _refused(lambda: skills_ep.delete_skill("team-skill", org.as_(CAROL), _principal(CAROL), _viewer(CAROL)), 403)
-    _refused(lambda: skills_ep.delete_skill("team-skill", org.as_(DAVE), _principal(DAVE), _viewer(DAVE)), 404)
+    _refused(lambda: _await(skills_ep.delete_skill("team-skill", org.as_(CAROL).scope, _principal(CAROL), _viewer(CAROL))), 403)
+    _refused(lambda: _await(skills_ep.delete_skill("team-skill", org.as_(DAVE).scope, _principal(DAVE), _viewer(DAVE))), 404)
 
 
 def test_a_rename_moves_the_row_and_a_delete_removes_it(org):
@@ -908,16 +1090,16 @@ def test_a_rename_moves_the_row_and_a_delete_removes_it(org):
     _share(org, ALICE, "team-skill", allowed_team_ids=[TEAM_ENG], allowed_user_ids=[CAROL])
     bob = _viewer(BOB, teams=(TEAM_ENG,))
 
-    renamed = skills_ep.update_skill(
-        "team-skill", SkillUpdateRequest(label="eng-skill"), org.as_(BOB), _principal(BOB), bob,
-    )
+    renamed = _await(skills_ep.update_skill(
+        "team-skill", SkillUpdateRequest(label="eng-skill"), org.as_(BOB).scope, _principal(BOB), bob,
+    ))
     assert renamed["access"]["allowedTeamIds"] == [TEAM_ENG]
     assert _row(org, "team-skill") is None
     row = _row(org, "eng-skill")
     assert (row.owner_user_id, row.allowed_team_ids, row.allowed_user_ids) == (UUID(ALICE), [TEAM_ENG], [CAROL])
     assert "eng-skill" in _listed(org, CAROL, _viewer(CAROL))
 
-    skills_ep.delete_skill("eng-skill", org.as_(BOB), _principal(BOB), bob)
+    _await(skills_ep.delete_skill("eng-skill", org.as_(BOB).scope, _principal(BOB), bob))
     assert _row(org, "eng-skill") is None
     # A new skill of the old name starts over as its creator's alone.
     _create(org, DAVE, "eng-skill")
@@ -930,17 +1112,17 @@ def test_a_skill_shared_with_everyone_takes_write_org_to_change_unless_you_own_i
     _share(org, ALICE, "policy", _viewer(ALICE, share_org=True), org_allowed=True)
 
     def edit(user, viewer):
-        return skills_ep.update_skill(
-            "policy", SkillUpdateRequest(instructions=f"{user} edit"), org.as_(user), _principal(user), viewer,
-        )
+        return _await(skills_ep.update_skill(
+            "policy", SkillUpdateRequest(instructions=f"{user} edit"), org.as_(user).scope, _principal(user), viewer,
+        ))
 
     # Its owner keeps changing it, whoever it is shared with.
     assert edit(ALICE, _viewer(ALICE))["declarative"] == f"{ALICE} edit"
     _refused(lambda: edit(CAROL, _viewer(CAROL)), 403, "skills.write_org")
     _refused(
-        lambda: skills_ep.update_skill(
-            "policy", SkillUpdateRequest(enabled=False), org.as_(BOB), _principal(BOB), _viewer(BOB),
-        ),
+        lambda: _await(skills_ep.update_skill(
+            "policy", SkillUpdateRequest(enabled=False), org.as_(BOB).scope, _principal(BOB), _viewer(BOB),
+        )),
         403,
         "skills.write_org",
     )
@@ -1017,10 +1199,10 @@ def test_an_edit_rechecks_a_sharing_change_made_while_it_waited(org, monkeypatch
     )
 
     _refused(
-        lambda: skills_ep.update_skill(
-            "team-skill", SkillUpdateRequest(instructions="Bob's edit."), org.as_(BOB), _principal(BOB),
+        lambda: _await(skills_ep.update_skill(
+            "team-skill", SkillUpdateRequest(instructions="Bob's edit."), org.as_(BOB).scope, _principal(BOB),
             _viewer(BOB, teams=(TEAM_ENG,)),
-        ),
+        )),
         403,
         skills_ep.SKILL_EDIT_REFUSAL,
     )
@@ -1067,12 +1249,15 @@ def test_the_turn_reads_the_callers_teams_with_the_gateway_credential(monkeypatc
     built: list[str] = []
 
     class _Handler:
-        def __init__(self, *, principal, mindshub_bearer):
+        def __init__(self, *, principal, mindshub_bearer, ui_locale=None):
             built.append(mindshub_bearer)
             raise RuntimeError("stop here")
 
+    async def _admit(**_kwargs) -> None:
+        return None
+
     monkeypatch.setattr(responses_ep, "ResponsesHandler", _Handler)
-    monkeypatch.setattr(responses_ep, "_refuse_while_answering", lambda **kwargs: None)
+    monkeypatch.setattr(responses_ep, "_refuse_while_answering", _admit)
     with pytest.raises(RuntimeError):
         asyncio.run(responses_ep.responses(SimpleNamespace(conversation=None), member_request(), None))
     assert built == [MEMBER_BEARER]
@@ -1099,10 +1284,10 @@ def test_an_unreachable_permissions_read_is_a_503_not_a_403(org):
         _share(org, BOB, "shared", _viewer(BOB, perms_known=False), always_on=True)
     assert (caught.value.status_code, caught.value.detail["code"]) == (503, MINDSHUB_UNREACHABLE)
     with pytest.raises(HTTPException) as caught:
-        skills_ep.update_skill(
-            "shared", SkillUpdateRequest(instructions="Bob's edit."), org.as_(BOB), _principal(BOB),
+        _await(skills_ep.update_skill(
+            "shared", SkillUpdateRequest(instructions="Bob's edit."), org.as_(BOB).scope, _principal(BOB),
             _viewer(BOB, perms_known=False),
-        )
+        ))
     assert (caught.value.status_code, caught.value.detail["code"]) == (503, MINDSHUB_UNREACHABLE)
 
 
@@ -1261,9 +1446,9 @@ def test_the_sharing_body_accepts_the_camel_case_spelling(org):
     _create(org, ALICE, "team-skill")
     body = SkillSharingRequest.model_validate({"allowedTeamIds": [TEAM_ENG], "alwaysOn": True, "orgAllowed": None})
     assert (body.allowed_team_ids, body.always_on) == ([TEAM_ENG], True)
-    out = sharing_ep.set_skill_sharing(
-        "team-skill", body, org.as_(ALICE), _principal(ALICE), _viewer(ALICE, teams=(TEAM_ENG,)),
-    )
+    out = _await(sharing_ep.set_skill_sharing(
+        "team-skill", body, org.as_(ALICE).scope, _principal(ALICE), _viewer(ALICE, teams=(TEAM_ENG,)),
+    ))
     assert out["access"]["alwaysOn"] is True
 
 
@@ -1272,14 +1457,14 @@ def test_always_on_survives_edits_renames_and_toggles(org):
     _share(org, ALICE, "team-skill", allowed_team_ids=[TEAM_ENG], always_on=True)
     alice = _viewer(ALICE, teams=(TEAM_ENG,))
 
-    skills_ep.update_skill(
+    _await(skills_ep.update_skill(
         "team-skill", SkillUpdateRequest(label="renamed", instructions="New body."),
-        org.as_(ALICE), _principal(ALICE), alice,
-    )
-    skills_ep.update_skill("renamed", SkillUpdateRequest(enabled=False), org.as_(ALICE), _principal(ALICE), alice)
-    out = skills_ep.update_skill(
-        "renamed", SkillUpdateRequest(enabled=True), org.as_(ALICE), _principal(ALICE), alice,
-    )
+        org.as_(ALICE).scope, _principal(ALICE), alice,
+    ))
+    _await(skills_ep.update_skill("renamed", SkillUpdateRequest(enabled=False), org.as_(ALICE).scope, _principal(ALICE), alice))
+    out = _await(skills_ep.update_skill(
+        "renamed", SkillUpdateRequest(enabled=True), org.as_(ALICE).scope, _principal(ALICE), alice,
+    ))
     assert out["access"]["alwaysOn"] is True
     assert _stored_always_on(org, "renamed") is True
     out = _share(org, ALICE, "renamed", allowed_user_ids=[CAROL])
@@ -1309,10 +1494,10 @@ def _turn_fixture(org):
     _create(org, DAVE, "dave-private")
     _create(org, ALICE, "off-org")
     _share(org, ALICE, "off-org", _viewer(ALICE, share_org=True), org_allowed=True)
-    skills_ep.update_skill(
-        "off-org", SkillUpdateRequest(enabled=False), org.as_(ALICE), _principal(ALICE),
+    _await(skills_ep.update_skill(
+        "off-org", SkillUpdateRequest(enabled=False), org.as_(ALICE).scope, _principal(ALICE),
         _viewer(ALICE, write_org=True),
-    )
+    ))
     _create(org, ALICE, "elsewhere-team")
     _share(org, ALICE, "elsewhere-team", allowed_team_ids=[TEAM_ENG])
     SkillService(alice).update_skill("elsewhere-team", projects=["other"])
@@ -1388,8 +1573,8 @@ def _refuse_to_parse(*_args, **_kwargs):
 
 
 def _turn_start(org, user: str, viewer: SkillViewer, question: str, *, session: ScopedSession | None = None):
-    """The request's first unit, as handle() runs it for ``user``, with the
-    viewer handle() resolved before it."""
+    """The request's first unit, and the always-on read after it, as handle()
+    runs them for ``user``, with the viewer handle() resolved before them."""
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
 
@@ -1399,6 +1584,9 @@ def _turn_start(org, user: str, viewer: SkillViewer, question: str, *, session: 
     start = handler._read_turn_start(
         session or org.as_(user), request=ResponsesRequest(input=question), has_disabled_connections=False,
     )
+    if start.always_on_unread:
+        # handle()'s next step: the SKILL.md read, in a unit of its own.
+        start = asyncio.run(handler._settle_always_on(start))
     return handler, start
 
 
@@ -1493,7 +1681,9 @@ def test_handle_sends_a_plain_question_to_the_agent_without_the_gate_or_a_first_
     monkeypatch.setattr(responses, "run_db", unit)
     monkeypatch.setattr(responses, "decide_route", gate)
     monkeypatch.setattr(responses, "_start_first_take", first_take)
-    monkeypatch.setattr(responses, "_spawn_jev_shadow_probe", lambda **_kwargs: None)
+    # The LLM gate, whatever the org's provider: this test is about the skill,
+    # not which gate decides.
+    monkeypatch.setattr(ResponsesHandler, "_jev_gate", lambda _self, _turn_llm: None)
 
     def ask() -> None:
         handler = ResponsesHandler(principal=_principal(BOB), mindshub_bearer=MEMBER_BEARER)
@@ -1542,7 +1732,8 @@ def test_a_failed_always_on_read_sends_the_turn_to_the_agent(org, monkeypatch, c
     def broken(*_args, **_kwargs):
         raise RuntimeError("store unreadable")
 
-    monkeypatch.setattr(responses, "has_always_on_skills", broken)
+    # The database half, which the turn start's own unit reads.
+    monkeypatch.setattr(responses, "has_always_on_rows", broken)
     session = org.as_(BOB)
     rollbacks: list[bool] = []
     rollback = session.rollback
@@ -1588,7 +1779,7 @@ def test_a_full_pool_during_the_always_on_read_refuses_the_request(org, monkeypa
     def pool_full(*_args, **_kwargs):
         raise PoolTimeoutError("pool full")
 
-    monkeypatch.setattr(responses, "has_always_on_skills", pool_full)
+    monkeypatch.setattr(responses, "has_always_on_rows", pool_full)
     with pytest.raises(PoolTimeoutError):
         _turn_start(org, BOB, _viewer(BOB, teams=(TEAM_ENG,)), "What is 12 times 7?")
 
@@ -1777,7 +1968,7 @@ def test_local_deployments_are_unchanged(monkeypatch, tmp_path):
             "desk": TurnSkillEntry(files={"SKILL.md": (service.root / "desk" / "SKILL.md").read_text()})
         }
         # Nothing to ask outside MindsHub mode, so nothing is unknown.
-        assert sharing_ep.skill_sharing_capabilities(None) == {
+        assert asyncio.run(sharing_ep.skill_sharing_capabilities(None)) == {
             "enabled": False, "canShareSkillsOrg": False, "canWriteSkillsOrg": False,
             "canShareArtifactsOrg": False, "permissionsKnown": True, "teamsKnown": True,
         }
@@ -1786,15 +1977,15 @@ def test_local_deployments_are_unchanged(monkeypatch, tmp_path):
 
 
 def test_sharing_capabilities_report_the_viewer():
-    assert sharing_ep.skill_sharing_capabilities(_viewer(BOB, share_org=True)) == {
+    assert asyncio.run(sharing_ep.skill_sharing_capabilities(_viewer(BOB, share_org=True))) == {
         "enabled": True, "canShareSkillsOrg": True, "canWriteSkillsOrg": False,
         "canShareArtifactsOrg": False, "permissionsKnown": True, "teamsKnown": True,
     }
-    admin = sharing_ep.skill_sharing_capabilities(_viewer(ADMIN, admin=True))
+    admin = asyncio.run(sharing_ep.skill_sharing_capabilities(_viewer(ADMIN, admin=True)))
     assert (admin["canShareSkillsOrg"], admin["canWriteSkillsOrg"], admin["canShareArtifactsOrg"]) == (
         True, True, True,
     )
-    artifacts_only = sharing_ep.skill_sharing_capabilities(_viewer(BOB, share_artifacts_org=True))
+    artifacts_only = asyncio.run(sharing_ep.skill_sharing_capabilities(_viewer(BOB, share_artifacts_org=True)))
     assert (artifacts_only["canShareSkillsOrg"], artifacts_only["canShareArtifactsOrg"]) == (False, True)
 
 
@@ -1805,13 +1996,13 @@ def test_sharing_capabilities_say_when_mindshub_could_not_be_asked(monkeypatch):
     mindshub_sharing_answers(monkeypatch, teams=None, permissions=None)
     scope = TenantScope(org_mode=True, org_id=ORG_ID, user_id=BOB)
     viewer = asyncio.run(resolve_skill_viewer(scope=scope, principal=_principal(BOB), bearer_token=MEMBER_BEARER))
-    answer = sharing_ep.skill_sharing_capabilities(viewer)
+    answer = asyncio.run(sharing_ep.skill_sharing_capabilities(viewer))
     assert (answer["enabled"], answer["canShareSkillsOrg"], answer["permissionsKnown"], answer["teamsKnown"]) == (
         True, False, False, False,
     )
     mindshub_sharing_answers(monkeypatch, permissions=("skills.share_org",))
     viewer = asyncio.run(resolve_skill_viewer(scope=scope, principal=_principal(BOB), bearer_token=MEMBER_BEARER))
-    answer = sharing_ep.skill_sharing_capabilities(viewer)
+    answer = asyncio.run(sharing_ep.skill_sharing_capabilities(viewer))
     assert (answer["canShareSkillsOrg"], answer["permissionsKnown"], answer["teamsKnown"]) == (True, True, True)
     mindshub_teams.reset_caches_for_tests()
 
@@ -1872,10 +2063,10 @@ def test_an_id_added_without_the_check_is_a_conflict(org):
     confirm (the skill changed in between) isn't written."""
     _create(org, ALICE, "shared")
     _refused(
-        lambda: sharing_ep.set_skill_sharing(
-            "shared", SkillSharingRequest(allowed_user_ids=[BOB]), org.as_(ALICE), _principal(ALICE),
+        lambda: _await(sharing_ep.set_skill_sharing(
+            "shared", SkillSharingRequest(allowed_user_ids=[BOB]), org.as_(ALICE).scope, _principal(ALICE),
             _viewer(ALICE), frozenset(),
-        ),
+        )),
         409,
     )
 
@@ -1890,18 +2081,18 @@ def test_the_stored_rule_read_lets_a_database_failure_through(org, monkeypatch):
 
     _create(org, ALICE, "shared")
     viewer = _viewer(ALICE)
-    assert asyncio.run(sharing_ep.stored_sharing_rule("shared", org.as_(ALICE), viewer)) == SkillAccessRule(
+    assert asyncio.run(sharing_ep.stored_sharing_rule("shared", org.as_(ALICE).scope, viewer)) == SkillAccessRule(
         owner_user_id=ALICE,
     )
-    assert asyncio.run(sharing_ep.stored_sharing_rule("missing", org.as_(ALICE), viewer)) is None
-    assert asyncio.run(sharing_ep.stored_sharing_rule("Not A Slug", org.as_(ALICE), viewer)) is None
+    assert asyncio.run(sharing_ep.stored_sharing_rule("missing", org.as_(ALICE).scope, viewer)) is None
+    assert asyncio.run(sharing_ep.stored_sharing_rule("Not A Slug", org.as_(ALICE).scope, viewer)) is None
 
     def database_down(self, skill):
         raise OperationalError("SELECT", {}, Exception("database is down"))
 
     monkeypatch.setattr(SkillService, "access_rule", database_down)
     with pytest.raises(OperationalError):
-        asyncio.run(sharing_ep.stored_sharing_rule("shared", org.as_(ALICE), viewer))
+        asyncio.run(sharing_ep.stored_sharing_rule("shared", org.as_(ALICE).scope, viewer))
 
 
 def test_the_route_lookup_asks_mindshub_by_id(monkeypatch):
@@ -1912,7 +2103,7 @@ def test_the_route_lookup_asks_mindshub_by_id(monkeypatch):
         return {"results": [{"id": BOB.upper(), "name": "Bob", "email": "bob@x.com"}]}
 
     monkeypatch.setattr(mindshub_people, "get_mindshub_reply", auth_replies(mindshub_read))
-    lookup = get_org_member_lookup(member_request())
+    lookup = asyncio.run(get_org_member_lookup(member_request()))
     assert asyncio.run(lookup([BOB, EVE])) == frozenset({BOB})
     # With the gateway's credential, never the client-set one.
     assert calls == [(f"/me/org-members/?ids={BOB}%2C{EVE}", MEMBER_BEARER)]
@@ -2854,9 +3045,9 @@ def _check(access, *, principal=None, stored=None, scope=None, reads=None):
         parsed = ArtifactAccessRequest.model_validate(access)
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail=access_refusal(exc.errors(include_url=False))) from exc
-    session = SimpleNamespace(scope=scope or _ORG_SCOPE)
+    caller = principal or _principal(ALICE)
     return asyncio.run(aw._checked_team_audience(
-        parsed, request=member_request(principal or _principal(ALICE)), session=session, stored_rule=stored_rule,
+        parsed, request=member_request(caller), scope=scope or _ORG_SCOPE, principal=caller, stored_rule=stored_rule,
     )).access.publisher_access()
 
 
@@ -3054,10 +3245,10 @@ def test_sharing_an_artifact_with_everyone_takes_share_org_only_to_turn_it_on(mo
 
 def _me(org, user: str, slug: str, enabled: bool, viewer: SkillViewer | None = None) -> dict:
     """PUT /skills/{slug}/me as ``user``."""
-    return sharing_ep.set_skill_enabled_for_me(
-        slug, SkillEnabledForMeRequest(enabled=enabled), org.as_(user), _principal(user),
+    return _await(sharing_ep.set_skill_enabled_for_me(
+        slug, SkillEnabledForMeRequest(enabled=enabled), org.as_(user).scope, _principal(user),
         viewer or _viewer(user, teams=(TEAM_ENG,)),
-    )
+    ))
 
 
 def _off_rows(org, user: str) -> set[str]:
@@ -3136,18 +3327,18 @@ def test_disabling_for_everyone_still_takes_edit_rights(org):
     carol = _listed(org, CAROL, _viewer(CAROL))["team-skill"]
     assert (carol["canDisableForEveryone"], carol["visibleToOthers"]) == (False, True)
     _refused(
-        lambda: skills_ep.update_skill(
-            "team-skill", SkillUpdateRequest(enabled=False), org.as_(CAROL), _principal(CAROL), _viewer(CAROL),
-        ),
+        lambda: _await(skills_ep.update_skill(
+            "team-skill", SkillUpdateRequest(enabled=False), org.as_(CAROL).scope, _principal(CAROL), _viewer(CAROL),
+        )),
         403,
         skills_ep.SKILL_EDIT_REFUSAL,
     )
     assert _me(org, CAROL, "team-skill", False, _viewer(CAROL))["enabledForMe"] is False
     assert _listed(org, BOB, _viewer(BOB))["policy"]["canDisableForEveryone"] is False
     _refused(
-        lambda: skills_ep.update_skill(
-            "policy", SkillUpdateRequest(enabled=False), org.as_(BOB), _principal(BOB), _viewer(BOB),
-        ),
+        lambda: _await(skills_ep.update_skill(
+            "policy", SkillUpdateRequest(enabled=False), org.as_(BOB).scope, _principal(BOB), _viewer(BOB),
+        )),
         403,
         "skills.write_org",
     )
@@ -3155,12 +3346,12 @@ def test_disabling_for_everyone_still_takes_edit_rights(org):
     # A team member edits the team skill, so may turn it off for everyone.
     bob = _viewer(BOB, teams=(TEAM_ENG,))
     assert _listed(org, BOB, bob)["team-skill"]["canDisableForEveryone"] is True
-    out = skills_ep.update_skill("team-skill", SkillUpdateRequest(enabled=False), org.as_(BOB), _principal(BOB), bob)
+    out = _await(skills_ep.update_skill("team-skill", SkillUpdateRequest(enabled=False), org.as_(BOB).scope, _principal(BOB), bob))
     assert (out["enabled"], out["enabledForMe"]) == (False, True)
     assert "team-skill" not in _turn(org, ALICE, _viewer(ALICE, teams=(TEAM_ENG,)))
     # Turning it on for everyone turns it on for its editor too.
     _me(org, BOB, "team-skill", False, bob)
-    out = skills_ep.update_skill("team-skill", SkillUpdateRequest(enabled=True), org.as_(BOB), _principal(BOB), bob)
+    out = _await(skills_ep.update_skill("team-skill", SkillUpdateRequest(enabled=True), org.as_(BOB).scope, _principal(BOB), bob))
     assert (out["enabled"], out["enabledForMe"]) == (True, True)
     # Carol's own off is hers and stays.
     assert _off_rows(org, CAROL) == {"team-skill"}
@@ -3185,11 +3376,11 @@ def test_off_for_me_follows_a_rename_and_goes_with_a_delete(org):
     stage_enabled_for_me(stale, "eng-skill", False)
     stale.commit()
 
-    skills_ep.update_skill("team-skill", SkillUpdateRequest(label="eng-skill"), org.as_(BOB), _principal(BOB), bob)
+    _await(skills_ep.update_skill("team-skill", SkillUpdateRequest(label="eng-skill"), org.as_(BOB).scope, _principal(BOB), bob))
     assert (_off_rows(org, CAROL), _off_rows(org, BOB), _off_rows(org, DAVE)) == ({"eng-skill"}, {"eng-skill"}, set())
     assert _listed(org, CAROL, _viewer(CAROL))["eng-skill"]["enabledForMe"] is False
 
-    skills_ep.delete_skill("eng-skill", org.as_(BOB), _principal(BOB), bob)
+    _await(skills_ep.delete_skill("eng-skill", org.as_(BOB).scope, _principal(BOB), bob))
     assert (_off_rows(org, CAROL), _off_rows(org, BOB)) == (set(), set())
     # A new skill of the old name starts on for everyone.
     _create(org, CAROL, "eng-skill")
@@ -3220,15 +3411,17 @@ def test_off_for_me_on_the_desktop(monkeypatch, tmp_path):
         SkillService(LOCAL_SCOPE).create_skill("desk", "Desk body.")
         with Session(engine) as raw:
             scoped = ScopedSession(raw, LOCAL_SCOPE)
-            listed = {s["id"]: s for s in skills_ep.list_skills(scoped, None, None)["skills"]}
+            listed = {s["id"]: s for s in skills_ep._list_skills(scoped, principal=None, viewer=None)["skills"]}
             assert (listed["desk"]["visibleToOthers"], listed["desk"]["enabledForMe"]) == (False, True)
-            out = sharing_ep.set_skill_enabled_for_me("desk", SkillEnabledForMeRequest(enabled=False), scoped, None, None)
+            out = sharing_ep._set_skill_enabled_for_me(
+                scoped, skill_id="desk", body=SkillEnabledForMeRequest(enabled=False), principal=None, viewer=None
+            )
             assert out["enabledForMe"] is False
             assert user_off_for_me(scoped) == frozenset({"desk"})
             assert "desk" not in build_turn_skills(LOCAL_SCOPE, project_name="general", session=scoped)
             assert "desk" in build_turn_skills(LOCAL_SCOPE, project_name="general")
             # A delete takes the setting with it.
-            skills_ep.delete_skill("desk", scoped, None, None)
+            skills_ep._delete_skill(scoped, skill_id="desk", principal=None, viewer=None)
             assert user_off_for_me(scoped) == frozenset()
     finally:
         get_app_settings.cache_clear()

@@ -1,10 +1,11 @@
 import logging
+from collections.abc import Mapping
 from contextlib import ExitStack, nullcontext
+from functools import partial
 from typing import Annotated, NamedTuple
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy.exc import IntegrityError
-from starlette.concurrency import run_in_threadpool
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.personal_resources import PersonalResource
@@ -14,7 +15,7 @@ from cowork.db.scoped import (
     TenantScope,
     get_tenant_scope,
 )
-from cowork.db.session import get_open_session
+from cowork.db.units import run_efs_unit
 from cowork.models.skill import Skill
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.principal import Principal, caller_bearer, get_principal
@@ -32,6 +33,7 @@ from cowork.services.projects import ProjectService
 from cowork.services.shared_resources import (
     SKILL,
     SKILL_PROJECT_REFERENCES,
+    AttributionSnapshot,
     SharedResourceAccess,
 )
 from cowork.services.skills import (
@@ -72,6 +74,8 @@ from cowork.services.skill_sharing import (
 # requirement visible to a route walker instead of something only
 # discoverable by reading scoped.py.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 logger = logging.getLogger(__name__)
 
 
@@ -162,12 +166,22 @@ def _builtins_immutable(scope: TenantScope) -> bool:
 
 
 def _skill_response(
-    visible: VisibleSkill, *, access: SharedResourceAccess, service: SkillService
+    visible: VisibleSkill,
+    *,
+    access: SharedResourceAccess,
+    service: SkillService,
+    snapshots: Mapping[str, AttributionSnapshot] | None = None,
 ) -> SkillResponse:
+    """One skill as the API returns it.
+
+    ``snapshots`` is every skill attribution row, as a listing reads them once
+    (SharedResourceAccess.snapshots); without it, this reads the one row.
+    """
     skill = visible.skill
     shared = visible.shared
     viewer = service.viewer if service.org_sharing else None
     rule: SkillAccessRule | None = None
+    snapshot = access.listed_snapshot(SKILL, skill.name, snapshots)
     if visible.origin is SkillOrigin.MANAGED:
         # The operator's managed skill: built-in and read-only for every
         # caller, and authored by nobody here.
@@ -181,12 +195,21 @@ def _skill_response(
         builtin = False
         can_change = False
     else:
-        if access.org_mode and access.has_trusted_actor:
+        # Only a claim that may have expired takes the locks: a false answer
+        # is final (AttributionSnapshot.may_be_recoverable), and
+        # recover_stale_claim re-decides under them.
+        if (
+            access.org_mode
+            and access.has_trusted_actor
+            and snapshot is not None
+            and snapshot.may_be_recoverable()
+        ):
             with access.coordination_lock(SKILL_PROJECT_REFERENCES, "all"):
                 with access.coordination_lock(SKILL, skill.name):
                     _recover_skill_claim(access, service, skill.name)
-        pending = access.claim_is_pending(SKILL, skill.name)
-        creator_id = access.creator_id(SKILL, skill.name)
+            snapshot = access.snapshot(SKILL, skill.name)
+        pending = snapshot is not None and snapshot.pending
+        creator_id = access.creator_id_of(snapshot)
         if viewer is not None:
             rule = service.access_rule(skill)
         builtin = is_builtin_skill(skill.name)
@@ -199,6 +222,9 @@ def _skill_response(
         can_change = (
             not pending
             and not (builtin and _builtins_immutable(access.session.scope))
+            # Generated from the org's branding; only its per-person switch
+            # (PUT /skills/{slug}/me) is the caller's.
+            and not service.is_brand_guidelines(skill.name)
             and may_change
             and not theirs
         )
@@ -220,9 +246,8 @@ def _skill_response(
         can_disable_for_everyone=can_change and not builtin,
         visible_to_others=_visible_to_others(visible, service=service, viewer=viewer, rule=rule),
         projects=skill.projects,
-        attribution=access.attribution(
-            SKILL,
-            skill.name,
+        attribution=access.attribution_of(
+            snapshot,
             fallback_creator_id=creator_id,
             fallback_modified_at=skill.updated_at,
         ),
@@ -238,6 +263,7 @@ def _skill_response(
             can_share=(
                 visible.origin is SkillOrigin.OWN
                 and not is_builtin_skill(skill.name)
+                and not service.is_brand_guidelines(skill.name)
                 and (
                     viewer.can_manage_sharing(rule)
                     if viewer is not None
@@ -457,10 +483,19 @@ def _reserve_free_slug(
 
 
 @router.get("/", response_model=SkillListResponse)
-def list_skills(
-    scoped: ScopedSessionDep,
+async def list_skills(
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
     viewer: SkillViewerDep = None,
+):
+    return await run_efs_unit(partial(_list_skills, principal=principal, viewer=viewer), scope=scope)
+
+
+def _list_skills(
+    scoped: ScopedSession,
+    *,
+    principal: Principal | None,
+    viewer: SkillViewer | None,
 ):
     # Seeded here for an org that opens this menu before it has ever chatted.
     # The turn payload seeds too, so whichever comes first wins; see
@@ -468,11 +503,18 @@ def list_skills(
     skill_service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     skill_service.ensure_builtin_skills()
     access = SharedResourceAccess(scoped, principal)
+    visible_skills = skill_service.list_visible_skills()
+    # Read after the skills: a create or upload commits its claim
+    # (_reserve_free_slug) before it writes the folder, so every listed skill's
+    # claim is in this read. A rename moves the folder first and its
+    # attribution row in a later commit (update_skill), so a listing in between
+    # shows the new name with no attribution until the rename commits.
+    snapshots = access.snapshots(SKILL)
     # The typed response carries can_share's "canShare" alias from the model.
     return SkillListResponse(
         skills=[
-            _skill_response(visible, access=access, service=skill_service)
-            for visible in skill_service.list_visible_skills()
+            _skill_response(visible, access=access, service=skill_service, snapshots=snapshots)
+            for visible in visible_skills
         ],
         can_share=skill_service.sharing_available,
     ).model_dump(by_alias=True)
@@ -484,11 +526,23 @@ def list_skills(
     status_code=status.HTTP_201_CREATED,
     response_model=SkillResponse,
 )
-def create_skill(
+async def create_skill(
     body: SkillCreateRequest,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
     viewer: SkillViewerDep = None,
+):
+    return await run_efs_unit(
+        partial(_create_skill, body=body, principal=principal, viewer=viewer), scope=scope
+    )
+
+
+def _create_skill(
+    scoped: ScopedSession,
+    *,
+    body: SkillCreateRequest,
+    principal: Principal | None,
+    viewer: SkillViewer | None,
 ):
     access = SharedResourceAccess(scoped, principal)
     access.require_actor()
@@ -627,48 +681,36 @@ def _upload_skill_bytes(
 )
 async def upload_skill(
     file: UploadFile,
-    scope: Annotated[TenantScope, Depends(get_tenant_scope)],
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
     shared: Annotated[bool, Form()] = False,
     viewer: SkillViewerDep = None,
 ):
     raw = await file.read()
-    return await run_in_threadpool(
-        _upload_skill_in_new_session,
-        raw,
-        file.filename,
-        scope,
-        principal,
-        shared=shared,
-        viewer=viewer,
+    return await run_efs_unit(
+        lambda session: _upload_skill_bytes(raw, file.filename, session, principal, shared=shared, viewer=viewer),
+        scope=scope,
     )
 
 
-def _upload_skill_in_new_session(
-    raw: bytes,
-    filename: str | None,
-    scope: TenantScope,
-    principal: Principal | None,
-    *,
-    shared: bool = False,
-    viewer: SkillViewer | None = None,
-) -> dict:
-    raw_session = get_open_session()
-    try:
-        scoped = ScopedSession(raw_session, scope)
-        return _upload_skill_bytes(
-            raw, filename, scoped, principal, shared=shared, viewer=viewer
-        )
-    finally:
-        raw_session.close()
-
-
 @router.get("/{skill_id}", response_model=SkillResponse)
-def get_skill(
+async def get_skill(
     skill_id: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
     viewer: SkillViewerDep = None,
+):
+    return await run_efs_unit(
+        partial(_get_skill, skill_id=skill_id, principal=principal, viewer=viewer), scope=scope
+    )
+
+
+def _get_skill(
+    scoped: ScopedSession,
+    *,
+    skill_id: str,
+    principal: Principal | None,
+    viewer: SkillViewer | None,
 ):
     service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     try:
@@ -681,12 +723,26 @@ def get_skill(
 
 
 @router.put("/{skill_id}", response_model=SkillResponse)
-def update_skill(
+async def update_skill(
     skill_id: str,
     body: SkillUpdateRequest,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
     viewer: SkillViewerDep = None,
+):
+    return await run_efs_unit(
+        partial(_update_skill, skill_id=skill_id, body=body, principal=principal, viewer=viewer),
+        scope=scope,
+    )
+
+
+def _update_skill(
+    scoped: ScopedSession,
+    *,
+    skill_id: str,
+    body: SkillUpdateRequest,
+    principal: Principal | None,
+    viewer: SkillViewer | None,
 ):
     service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     access = SharedResourceAccess(scoped, principal)
@@ -910,11 +966,23 @@ def _set_personal_skill_sharing(
 
 
 @router.delete("/{skill_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_skill(
+async def delete_skill(
     skill_id: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
     viewer: SkillViewerDep = None,
+):
+    return await run_efs_unit(
+        partial(_delete_skill, skill_id=skill_id, principal=principal, viewer=viewer), scope=scope
+    )
+
+
+def _delete_skill(
+    scoped: ScopedSession,
+    *,
+    skill_id: str,
+    principal: Principal | None,
+    viewer: SkillViewer | None,
 ):
     service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     access = SharedResourceAccess(scoped, principal)
