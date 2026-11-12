@@ -770,6 +770,14 @@ class UserSettings(Settings):
         title="Approve Browser Steps",
         description="Ask before the agent's browser steps run.",
     )
+    # Untagged like browser_enabled. The app reads it (as
+    # browserOnlyWhenNeeded): on, the browser pane opens by itself only when
+    # it is the person's turn, and a turn's browser steps show as one row.
+    browser_only_when_needed: bool = Field(
+        default=True,
+        title="Show The Browser Only When Needed",
+        description="Show the agent's browser only when it needs the person.",
+    )
     # `hub_workspace_id`, not `workspace_id`: in this repo `workspace` already
     # means a filesystem location (the per-conversation private directory, the
     # project tree, the paths on AntonSettings), and that meaning is load-bearing

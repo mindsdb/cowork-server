@@ -268,7 +268,7 @@ def test_removed_browser_settings_are_gone(client):
     from cowork.common.settings.user_settings import UserSettings
 
     browser_keys = {k for k in UserSettings.model_fields if k.startswith("browser_")}
-    assert browser_keys == {"browser_enabled", "browser_approve_steps"}
+    assert browser_keys == {"browser_enabled", "browser_approve_steps", "browser_only_when_needed"}
     gone_keys = ("browser_mode", "browser_service_url", "browser_service_api_key", "browser_url", "browser_proxy", "browser_city")
     for gone in gone_keys:
         assert client.put(f"/api/v1/settings/{gone}", json={"value": "x"}).status_code == 400, gone
@@ -294,6 +294,18 @@ def test_browser_steps_wait_for_approval_by_default_and_the_person_can_say_other
     from cowork.db.scoped import LOCAL_SCOPE
 
     assert get_user_settings(LOCAL_SCOPE).browser_approve_steps is False
+
+
+def test_the_browser_shows_only_when_needed_by_default_and_the_person_can_say_otherwise(client):
+    from cowork.common.settings.user_settings import UserSettings, get_user_settings, setting_is_org_scoped
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    assert UserSettings().browser_only_when_needed is True
+    assert setting_is_org_scoped("browser_only_when_needed") is False
+    assert client.put("/api/v1/settings/browser_only_when_needed", json={"value": "false"}).status_code == 200
+    stored = {row["key"]: row["value"] for row in client.get("/api/v1/settings/").json()}
+    assert stored["browser_only_when_needed"].lower() == "false"
+    assert get_user_settings(LOCAL_SCOPE).browser_only_when_needed is False
 
 
 def test_no_setting_offers_an_exit_city_or_a_proxy():
