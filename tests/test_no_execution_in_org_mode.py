@@ -472,6 +472,9 @@ async def test_handle_refuses_non_streaming_turn_in_org_mode(org_mode, granted_p
         def message_count(self, conversation):
             return 0
 
+        def record_turn_picks(self, *, conversation, model, reasoning_effort, reset=()):
+            pass
+
         def get_recent_messages(self, conversation_id, *, roles, limit):
             return []
 
