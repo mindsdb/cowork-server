@@ -1,7 +1,6 @@
 """Voice calls with the agent: OpenAI GPT-Live through MindsHub Inference (ENG-4138, prototype).
 
-The voice-only sibling of the video call (``cowork.services.facetime``). The
-person talks; GPT-Live listens and speaks; every request for work is handed
+The person talks; GPT-Live listens and speaks; every request for work is handed
 back to the web app (client delegation), which sends it to Anton in the task
 the way a typed message goes, and returns Anton's answer to be said.
 
