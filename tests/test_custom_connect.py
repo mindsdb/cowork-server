@@ -379,8 +379,9 @@ def test_an_address_with_a_path_says_where_the_version_goes(engine, world, monke
     assert world["auth"] == [] and world["provider"] == []
 
 
-def test_a_slash_only_in_the_query_is_not_a_path(engine, world, monkeypatch):
-    res = _connect(_client(engine, monkeypatch), address="api.acme.example?next=/v2")
+@pytest.mark.parametrize("address", ["api.acme.example?next=/v2", "api.acme.example#/v2"])
+def test_a_slash_only_in_the_query_or_fragment_is_not_a_path(engine, world, monkeypatch, address):
+    res = _connect(_client(engine, monkeypatch), address=address)
 
     assert (res.status_code, res.json()["detail"]["message"]) == (422, "The API address is not valid.")
 
