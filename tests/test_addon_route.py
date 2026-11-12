@@ -505,3 +505,20 @@ def test_addon_routing_is_on_by_default(monkeypatch):
     # anyway (see test_no_decision_model_queues_as_jev_off).
     monkeypatch.delenv("COWORK_TURN_ADDON_ROUTING_ENABLED", raising=False)
     assert TurnQueueSettings().addon_routing_enabled is True
+
+
+
+@pytest.mark.parametrize(("remote", "expect_mint"), [(True, True), (False, False)])
+def test_jev_target_mints_for_a_hosted_org_without_a_stored_key(monkeypatch, remote, expect_mint):
+    from cowork.common.settings import user_settings
+
+    settings = SimpleNamespace(decision_model="", minds_url="https://minds.example", hub_workspace_id="ws1")
+    monkeypatch.setattr(user_settings, "get_user_settings", lambda scope: settings)
+    monkeypatch.setattr(user_settings, "provider_api_key_str", lambda s, p: None)
+    monkeypatch.setattr(jev_route, "gate_mode", lambda s: "jev")
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote" if remote else "inprocess")
+    found = addon_route._jev_target(None)
+    if expect_mint:
+        assert found == addon_route._MintKey(workspace_id="ws1", model="jev")
+    else:
+        assert found is None

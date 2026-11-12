@@ -188,6 +188,43 @@ def test_unreadable_task_and_progress_still_ask_jev(client, turn, inputs, pod, j
     assert captured["json"]["state"]["recent_progress"] == []
 
 
+def test_a_hosted_org_without_a_stored_key_asks_on_a_minted_key(client, turn, inputs, pod, monkeypatch):
+    # Hosted orgs keep no stored MindsHub key: the check mints one, asks, and
+    # revokes it, like the route gate does for the turn itself.
+    from cowork.turnqueue import producer
+
+    minted, revoked, captured = [], [], {}
+
+    async def fake_mint(**kwargs):
+        minted.append(kwargs)
+        return {"base_url": "https://minds.example/v1", "api_key": "turn-key"}
+
+    async def fake_revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(addon_route, "_jev_target", lambda scope: addon_route._MintKey(workspace_id="ws1", model="jev"))
+    monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
+    monkeypatch.setattr(producer, "_revoke_turn_key_quietly", fake_revoke)
+    monkeypatch.setattr(jev_route, "_http_client",
+                        lambda: _Client(response=_Response(200, _verdict(p_add=0.9)), captured=captured))
+
+    assert _post(client).json() == {"status": "added", "addon_id": ADDON_ID, "decided_by": "jev"}
+    assert len(minted) == 1 and minted[0]["workspace_id"] == "ws1"
+    assert revoked == [minted[0]["correlation_id"]]
+
+
+def test_a_failed_mint_queues_as_unchecked(client, turn, inputs, pod, monkeypatch):
+    from cowork.turnqueue import producer
+
+    async def boom(**kwargs):
+        raise RuntimeError("auth down")
+
+    monkeypatch.setattr(addon_route, "_jev_target", lambda scope: addon_route._MintKey(workspace_id=None, model="jev"))
+    monkeypatch.setattr(producer, "_mint_llm_block", boom)
+    assert _post(client).json() == {"status": "queued", "reason": "jev_error"}
+    assert pod["calls"] == []
+
+
 def test_finished_turn_queues_as_no_turn(client, turn, pod):
     turn["found"] = turn["found"]._replace(in_flight=False)
     assert _post(client, force=True).json() == {"status": "queued", "reason": "no_turn"}

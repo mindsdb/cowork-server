@@ -16,9 +16,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from cowork.common.history_scrub import scrub_credentials
 from cowork.common.settings.app_settings import TurnQueueSettings
@@ -46,11 +47,22 @@ def added(addon_id: str, decided_by: str) -> dict:
     return {"status": "added", "addon_id": addon_id, "decided_by": decided_by}
 
 
-def _jev_target(scope: TenantScope) -> tuple[jev_route.JevTarget, str] | None:
+@dataclass(frozen=True)
+class _MintKey:
+    """Jev on MindsHub, on a key minted for this one decision: a hosted org
+    keeps no stored MindsHub key (its turns mint one), like the route gate's
+    `_router_binding`. Carries what the mint needs from the caller's settings."""
+    workspace_id: str | None
+    model: str
+
+
+def _jev_target(scope: TenantScope) -> tuple[jev_route.JevTarget, str] | _MintKey | None:
     """Who to ask and with which model, from the caller's settings: the
-    organization's own decision model, else Jev on MindsHub on the stored key.
-    None when neither applies (the LLM gate's providers, Jev turned off, no
-    MindsHub key). Sync: it reads settings through a session of its own."""
+    organization's own decision model, else Jev on MindsHub on the stored key,
+    else, on a hosted (remote) deployment, on a key minted for the decision.
+    None when none applies (the LLM gate's providers, Jev turned off, no
+    MindsHub key to use or mint). Sync: it reads settings through a session of
+    its own."""
     from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key_str
     from cowork.services.providers import minds_chat_base_url
 
@@ -63,9 +75,14 @@ def _jev_target(scope: TenantScope) -> tuple[jev_route.JevTarget, str] | None:
     if mode != "jev":
         return None
     key = provider_api_key_str(settings, Provider.MINDS_CLOUD)
-    if not key:
-        return None
-    return jev_route.JevTarget.mindshub(minds_chat_base_url(settings.minds_url), key), queue_settings.jev_route_model
+    if key:
+        return jev_route.JevTarget.mindshub(minds_chat_base_url(settings.minds_url), key), queue_settings.jev_route_model
+    if queue_settings.is_remote:
+        return _MintKey(
+            workspace_id=getattr(settings, "hub_workspace_id", "") or None,
+            model=queue_settings.jev_route_model,
+        )
+    return None
 
 
 async def route_addon(*, channel: AddonChannel, text: str, force: bool, scope: TenantScope) -> dict:
@@ -111,8 +128,41 @@ async def _jev_refusal(
         return queued("jev_error")
     if found is None:
         return queued("jev_off")
-    target, model = found
     queue_settings = TurnQueueSettings()
+    minted_for: str | None = None
+    if isinstance(found, _MintKey):
+        from cowork.turnqueue.producer import _mint_llm_block
+
+        minted_for = str(uuid4())
+        try:
+            block = await _mint_llm_block(
+                org_id=scope.org_id, user_id=scope.user_id, correlation_id=minted_for,
+                settings=queue_settings, workspace_id=found.workspace_id,
+            )
+        except Exception:
+            logger.warning("[addon] could not mint a key to ask Jev with; queueing", exc_info=True)
+            return queued("jev_error")
+        target, model = jev_route.JevTarget.mindshub(block["base_url"], block["api_key"]), found.model
+    else:
+        target, model = found
+    try:
+        return await _ask_jev_with(
+            target=target, model=model, conversation_id=conversation_id,
+            task=task, progress=progress, added=added, text=text, queue_settings=queue_settings,
+        )
+    finally:
+        if minted_for is not None:
+            from cowork.turnqueue.producer import _revoke_turn_key_quietly
+
+            # Used for this one decision only. Shielded, so a cancelled send
+            # can't stop the revoke; a failed one leaves it to its short expiry.
+            await asyncio.shield(_revoke_turn_key_quietly(minted_for))
+
+
+async def _ask_jev_with(
+    *, target: jev_route.JevTarget, model: str, conversation_id: str, task: str,
+    progress: list[str], added: list[str], text: str, queue_settings: TurnQueueSettings,
+) -> dict | None:
     # Scrubbed like the route gate's history: the state leaves this server.
     state = jev_route.addon_state(
         task=scrub_credentials(task),
