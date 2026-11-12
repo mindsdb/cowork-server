@@ -688,24 +688,27 @@ def published_access_view(
         recorded = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
         mode = AccessMode(recorded) if recorded in set(AccessMode) else AccessMode.PUBLIC
         artifact_key = entry.get("artifact_key", "") or ""
+        report_id = _report_id_for(folder, primary, published_map=pmap)
         if mode is AccessMode.PASSWORD:
             return ArtifactAccessView(
                 access_mode=mode,
                 artifact_key=artifact_key,
+                report_id=report_id,
                 access_protected=True,
                 access_password=entry.get("access_password", "") or "",
             )
         if mode is AccessMode.RESTRICTED and _org_mode():
-            return ArtifactAccessView.audience_unknown(artifact_key=artifact_key)
+            return ArtifactAccessView.audience_unknown(artifact_key=artifact_key, report_id=report_id)
         if mode is AccessMode.RESTRICTED:
             return ArtifactAccessView(
                 access_mode=mode,
                 artifact_key=artifact_key,
+                report_id=report_id,
                 access_emails=entry.get("emails", []) or [],
                 org_allowed=bool(entry.get("org_allowed")),
                 owner_only=bool(entry.get("owner_only")),
             )
-        return ArtifactAccessView(access_mode=mode, artifact_key=artifact_key)
+        return ArtifactAccessView(access_mode=mode, artifact_key=artifact_key, report_id=report_id)
     except Exception:
         return ArtifactAccessView()
 

@@ -725,3 +725,44 @@ def test_card_names_no_report_id_without_a_live_page(tmp_path: Path):
     _record(root, published=False)
     with _patch_scan(tmp_path):
         assert card_for_folder(root, scope=LOCAL_SCOPE)["reportId"] == ""
+
+
+def test_status_names_the_live_pages_report_id(tmp_path: Path):
+    """The viewer's on-open status read carries the id, so an artifact opened
+    from a chat message, whose card is built from the stream, learns it."""
+    root = _make_static_html(tmp_path)
+    _record(root)
+    with _patch_scan(tmp_path):
+        assert artifact_status(str(root), scope=LOCAL_SCOPE)["reportId"] == "rid-1"
+    _record(root, published=False)
+    with _patch_scan(tmp_path):
+        assert artifact_status(str(root), scope=LOCAL_SCOPE)["reportId"] == ""
+
+
+def test_loose_file_status_names_the_live_pages_report_id(tmp_path: Path):
+    f = tmp_path / "page.html"
+    f.write_text("<h1>hi</h1>", encoding="utf-8")
+    (tmp_path / ".published.json").write_text(json.dumps({"page.html": {
+        "report_id": "rid-loose", "url": "https://4nton.ai/view/u/rid-loose", "published": True,
+    }}), encoding="utf-8")
+    with _patch_scan(tmp_path):
+        assert artifact_status(str(f), scope=LOCAL_SCOPE)["reportId"] == "rid-loose"
+
+
+def test_access_view_names_the_live_pages_report_id_in_every_mode(tmp_path: Path, monkeypatch):
+    """GET .../access (MindsHub mode's on-open read) is built from this view,
+    restricted to MindsHub's rule when there is one; every branch keeps the id."""
+    from cowork.services.artifact_access import ArtifactRule
+    from cowork.services import artifacts
+    from cowork.services.artifacts import published_access_view
+
+    root = _make_static_html(tmp_path)
+    primary = root / "index.html"
+    for mode in ({}, {"mode": "password", "access_password": "x"}, {"mode": "restricted", "emails": []}):
+        _record(root, **mode)
+        assert published_access_view(root, primary).report_id == "rid-1"
+    monkeypatch.setattr(artifacts, "_org_mode", lambda: True)
+    unknown = published_access_view(root, primary)
+    assert unknown.report_id == "rid-1"
+    rule = ArtifactRule(org_allowed=True, allowed_team_ids=[], allowed_user_ids=[], allowed_emails=[])
+    assert unknown.restricted_to(rule).model_dump(by_alias=True)["reportId"] == "rid-1"
