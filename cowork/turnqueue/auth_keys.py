@@ -207,3 +207,31 @@ async def revoke_turn_key(*, instance_id: str, settings) -> None:
     async with httpx.AsyncClient(timeout=5.0) as client:
         resp = await client.delete(url, headers=headers)
         resp.raise_for_status()
+
+
+async def extend_turn_key(*, instance_id: str, ttl_seconds: int, settings) -> bool:
+    """Move the execution key of turn `instance_id` to expire `ttl_seconds` from now.
+
+    The key string stays the same, so the running pod keeps using it. auth
+    re-checks the key owner's permission and bounds the expiry (per window and
+    over the key's whole life). Returns False, after logging, when auth refuses
+    or can't be reached: the turn then runs on until its current expiry.
+    """
+    if not settings.auth_internal_base_url or not settings.auth_internal_secret:
+        return False
+    expiry = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+    url = f"{settings.auth_internal_base_url.rstrip('/')}/internal/turn-keys/{instance_id}/"
+    headers = {"X-Internal-Auth": settings.auth_internal_secret}
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            resp = await client.patch(url, json={"expiry_date": expiry}, headers=headers)
+    except (httpx.HTTPError, TimeoutError):
+        logger.warning("turn key extend failed: instance_id=%s", instance_id, exc_info=True)
+        return False
+    if resp.status_code != 200:
+        logger.warning(
+            "turn key extend refused: instance_id=%s status=%s code=%s",
+            instance_id, resp.status_code, _error_code(resp),
+        )
+        return False
+    return True

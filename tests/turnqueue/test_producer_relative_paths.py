@@ -42,7 +42,7 @@ def captured(monkeypatch):
     async def _fake_llm(**_kw):
         return {"provider": "minds-cloud", "api_key": "k", "base_url": "u"}
 
-    monkeypatch.setattr(prod, "_mint_llm_block", _fake_llm)
+    monkeypatch.setattr(prod, "mint_llm_block", _fake_llm)
     return box
 
 

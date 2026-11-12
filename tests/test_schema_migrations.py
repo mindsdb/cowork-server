@@ -193,7 +193,7 @@ def test_push_devices_upgrade_from_staging_head(tmp_path, monkeypatch):
     uri = _sqlite_uri(db_path)
     engine = create_engine(uri)
 
-    _upgrade_to(engine, uri, "e2a7c4f9b613")
+    _upgrade_to(engine, uri, "c1d7e2a94f60")
     assert not _has_table(db_path, "push_devices")
     _upgrade_to(engine, uri, "head")
 

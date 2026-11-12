@@ -581,6 +581,7 @@ class ScheduleRunService:
         release_slot: bool = False,
         outcome: AttemptOutcome | None = None,
         commit: bool = True,
+        unavailable_model: str | None = None,
     ) -> ScheduleRun | None:
         """Record how the run ended. ``release_slot`` gives its cron slot back,
         for a run that left the slot due: the next poll can then claim it."""
@@ -596,6 +597,7 @@ class ScheduleRunService:
         run.lease_expires_at = None
         if outcome is not None:
             run.outcome = outcome
+        run.unavailable_model = unavailable_model
         if release_slot:
             run.slot_at = None
         if conversation_id is not None:
@@ -613,6 +615,7 @@ class ScheduleRunService:
             self.session.rollback()
             return self.finish_run(
                 run_id, error=error, status=status, release_slot=release_slot, outcome=outcome,
+                unavailable_model=unavailable_model,
             )
         self.session.refresh(run)
         return run
@@ -658,6 +661,37 @@ class ScheduleRunService:
             self.session.add(run)
         self.session.commit()
         return len(runs)
+
+    def schedules_for_conversations(self, conversation_ids: list[UUID]) -> dict[UUID, UUID]:
+        """The schedule each of these conversations is a run of, for the
+        conversations that are runs: ``{conversation_id: schedule_id}``.
+
+        One indexed lookup for the conversations a page returns, however long
+        the schedules' history. Limited to schedules the caller owns, as the
+        conversations themselves are.
+        """
+        if not conversation_ids:
+            return {}
+        stmt = (
+            sa.select(ScheduleRun.conversation_id, ScheduleRun.schedule_id)
+            .join(Schedule, Schedule.id == ScheduleRun.schedule_id)
+            .where(ScheduleRun.conversation_id.in_(conversation_ids))  # type: ignore[union-attr]
+        )
+        scope = self.session.scope
+        if scope.org_mode:
+            stmt = stmt.where(Schedule.org_id == scope.org_id, Schedule.created_by == scope.user_id)
+        return {row[0]: row[1] for row in unsafe_unscoped_session(self.session).execute(stmt)}
+
+    def run_counts(self, schedule_ids: list[UUID]) -> dict[UUID, int]:
+        """How many runs each schedule has had, over its whole history."""
+        if not schedule_ids:
+            return {}
+        rows = unsafe_unscoped_session(self.session).execute(
+            sa.select(ScheduleRun.schedule_id, sa.func.count())
+            .where(ScheduleRun.schedule_id.in_(schedule_ids))  # type: ignore[attr-defined]
+            .group_by(ScheduleRun.schedule_id)
+        ).all()
+        return {row[0]: row[1] for row in rows}
 
     def org_runs_in_flight(self, org_id: str, *, lock: bool = False) -> int:
         """How many of the organization's scheduled runs are going now, on any
