@@ -371,6 +371,22 @@ _MEMORY_RE = _whole_words((
     "bear in mind", "from now on", "going forward", "later chats",
     "future chats", "later conversations", "future conversations",
 ))
+# Only the agent has the shared browser the person watches beside the chat. A
+# router answer to "open this page" reads it with a fetch the person never
+# sees, or says it can't, so the browser never opens. A page request is a page
+# verb with a page named beside it: an address, or a word for a page. Whole
+# words, English only, as above.
+_PAGE_VERB_RE = _whole_words((
+    "open", "go to", "navigate to", "visit", "browse", "pull up", "bring up",
+    "show me", "take me to",
+))
+_PAGE_TARGET_RE = re.compile(
+    r"https?://|(?<![\w.@-])www\."
+    r"|(?<![\w.@-])[a-z0-9-]+(?:\.[a-z0-9-]+)*\."
+    r"(?:com|org|net|io|ai|co|dev|app|gov|edu|info|me|us|uk|ca|de|fr|es|it|nl|br|jp|in|au)(?![\w-])"
+    r"|(?<![\w])(?:page|pages|site|website|webpage|web\s+page|link|url|tab)(?![\w])",
+    re.IGNORECASE,
+)
 # A message that is only a yes or a no answers a question someone asked, and
 # the router can only act the answer out.
 _BARE_REPLIES = frozenset({
@@ -416,6 +432,17 @@ def names_memory_request(text: str) -> str | None:
     """
     match = _MEMORY_RE.search(text or "")
     return " ".join(match.group(0).lower().split()) if match else None
+
+
+def names_page_request(text: str) -> str | None:
+    """The page verb in ``text`` when a page is named beside it, or None.
+
+    Exported for the same reason as :func:`names_foreign_product`.
+    """
+    verb = _PAGE_VERB_RE.search(text or "")
+    if verb is None or _PAGE_TARGET_RE.search(text or "") is None:
+        return None
+    return " ".join(verb.group(0).lower().split())
 
 
 def imitates_approval(text: str) -> str | None:
@@ -889,6 +916,9 @@ async def decide_route(
     A request to remember or forget something goes to the agent too: only it
     keeps anything past this conversation.
 
+    So does a request to open, go to or show a page: only the agent has the
+    shared browser the person watches.
+
     `binding` lets the caller supply a pre-built gate target (org mode mints a
     per-turn key); when None the binding comes from stored settings or the
     request's lazy `binding_factory`. Resolve only after the eligibility checks.
@@ -924,6 +954,9 @@ async def decide_route(
 
     if names_memory_request(_latest_text(history, "user")) is not None:
         return RouteDecision(route=DELEGATED_AGENTIC, reason="memory_request")
+
+    if names_page_request(_latest_text(history, "user")) is not None:
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="page_request")
 
     messages = _text_history(history)
     if not messages:
