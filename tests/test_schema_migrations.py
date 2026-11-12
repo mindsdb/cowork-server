@@ -186,6 +186,33 @@ def test_schema_migrations_create_new_database(tmp_path, monkeypatch):
     assert _alembic_version(db_path) == expected_head()
 
 
+def test_push_devices_upgrade_from_staging_head(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "push-upgrade.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+
+    _upgrade_to(engine, uri, "c1d7e2a94f60")
+    assert not _has_table(db_path, "push_devices")
+    _upgrade_to(engine, uri, "head")
+
+    schema = inspect(engine)
+    assert {"org_id", "user_id", "token", "platform"} <= {
+        column["name"] for column in schema.get_columns("push_devices")
+    }
+    assert any(
+        constraint["column_names"] == ["token"]
+        for constraint in schema.get_unique_constraints("push_devices")
+    )
+    assert any(
+        index["column_names"] == ["org_id", "user_id"]
+        for index in schema.get_indexes("push_devices")
+    )
+    _upgrade_to(engine, uri, "head")
+    assert _alembic_versions(db_path) == {expected_head()}
+
+
 def test_schema_migrations_rerun_on_up_to_date_database_is_noop(tmp_path, monkeypatch):
     # A database already at head must upgrade cleanly a second time (no raise).
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))

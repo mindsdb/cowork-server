@@ -722,6 +722,7 @@ class ScheduleRunService:
     def reap_lapsed_runs(
         self, *, now: datetime, error: str, abandoned: list[AbandonedTurn] | None = None,
         exclude_run_ids: frozenset[UUID] = frozenset(),
+        executed: list[ScheduleRun] | None = None,
     ) -> list[ScheduleRun]:
         """Fail every running run whose lease ran out: its process stopped
         renewing it, so it died without recording how the run ended.
@@ -739,6 +740,9 @@ class ScheduleRunService:
         Each reaped run that linked a conversation, manual runs included, goes
         on ``abandoned`` (AbandonedTurn): its turn may still be running in a
         pod that nobody is recording.
+
+        Each reaped run that claimed execution, manual runs included, goes on
+        ``executed``: its slot doesn't run again, so it ended for good.
         """
         runs = self.session.exec(
             self.session.select(ScheduleRun)
@@ -765,8 +769,11 @@ class ScheduleRunService:
                 ))
             if run.execution_claimed_at is None:
                 run.slot_at = None
-            elif run.slot_at is not None:
-                kept.append(run)
+            else:
+                if executed is not None:
+                    executed.append(run)
+                if run.slot_at is not None:
+                    kept.append(run)
             self.session.add(run)
         return kept
 

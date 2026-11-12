@@ -685,6 +685,50 @@ class StreamSettings(Settings):
     )
 
 
+class PushSettings(Settings):
+    """Mobile push credentials (cowork.services.push). Every field is optional:
+    a platform whose credentials are missing sends nothing, and push as a whole
+    runs only in org mode. The two secrets take their contents as they are or
+    base64-encoded, so a Kubernetes secret can hold either."""
+
+    enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_PUSH_ENABLED"),
+        description="Kill switch for mobile push. On by default; sends only where credentials are set.",
+    )
+    apns_key_p8: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_KEY_P8"),
+        description="APNs auth key (.p8 PEM from Apple Developer > Keys), as PEM or base64 of it.",
+    )
+    apns_key_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_KEY_ID"),
+        description="Key ID of the APNs auth key.",
+    )
+    apns_team_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_TEAM_ID"),
+        description="Apple Developer team ID that owns the APNs key.",
+    )
+    apns_topic: str = Field(
+        default="ai.mindshub.cowork",
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_TOPIC"),
+        description="APNs topic: the iOS app's bundle id.",
+    )
+    fcm_service_account_json: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON"),
+        description="Firebase service-account JSON for FCM HTTP v1, as JSON or base64 of it.",
+    )
+
+
+@lru_cache
+def get_push_settings() -> PushSettings:
+    """Cached push settings; tests clear the cache after changing the env."""
+    return PushSettings()
+
+
 #: auth's turn_key_max_ttl_seconds (API_KEYS__TURN_KEY_MAX_TTL_SECONDS in
 #: mindsdb/auth): the longest a turn key may live from now, at mint and at each
 #: extension. Mirrored here only to refuse a time limit whose key window auth
