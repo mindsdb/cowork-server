@@ -33,6 +33,7 @@ from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_sco
 from cowork.db.units import run_db, run_efs, run_on_unit_threads, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
+from cowork.harnesses.anton_harness.preview_checker import build_preview_checker, preview_checker_kwargs
 from cowork.harnesses.memory.policy import memory_policy
 from cowork.harnesses.memory.turn_layout import (
     TurnMemoryLayout,
@@ -67,6 +68,7 @@ from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
 from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_shared_skills
 from cowork.streaming.addons import AddonChannel, addons
 from cowork.streaming.liveness import ModelWaitTicker
+from cowork.streaming.preview_checks import preview_checks
 
 if TYPE_CHECKING:
     from anton.core.browser.config import BrowserConfig
@@ -1195,6 +1197,9 @@ class AntonHarness:
         finally:
             if addon_channel is not None:
                 addons.close(str(conv_id), addon_channel)
+            # A preview check still open when the turn ends resolves to "no
+            # answer", and a late answer from the app is a 404.
+            preview_checks.close_conversation(str(conv_id))
             if model_wait is not None:
                 model_wait.detach()
             if turn_scratch_dir:
@@ -1544,6 +1549,14 @@ class AntonHarness:
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
         elicitor = build_elicitor(str(conversation.id))
+        # Asks the user's open preview whether an edited artifact runs. Only
+        # where the cowork app tails the turn: a scheduled run or a channel
+        # bot has no preview to answer, and would only wait out the timeout.
+        preview_checker = (
+            build_preview_checker(str(conversation.id))
+            if interactive and channel_context is None
+            else None
+        )
         # Every change to a scheduled task waits on a card the user confirms,
         # so the tools exist only where someone can: not in a scheduled run
         # (a task must not rewrite itself unattended), a channel bot, or a
@@ -2044,6 +2057,10 @@ class AntonHarness:
                 # Dropped by an anton without the field, which then answers
                 # in the user's language as it always has.
                 **supported_kwargs(ChatSessionConfig, ui_locale=ui_locale),
+                # The artifact editor's "does it run in the open preview?"
+                # check (ENG-4207). Dropped by an anton without the field,
+                # whose editor then has no preview check at all.
+                **preview_checker_kwargs(ChatSessionConfig, preview_checker),
                 # The desktop app's own browser, when it registered one and the
                 # person turned the browser on: anton registers its `browser`
                 # tool only then. Never for a channel turn. Passed directly:

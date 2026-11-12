@@ -5,7 +5,10 @@
  * Two independent halves:
  *   1. An error reporter, installed ALWAYS. It is the only way a page's own
  *      failure reaches the user or the agent — the viewer never sees the
- *      frame's console.
+ *      frame's console. Report types: error (uncaught), resource (a file
+ *      that failed to load), csp (a policy violation), rejection (an
+ *      unhandled promise rejection), console (console.error with an Error or
+ *      "XxxError:" text), http (a fetch or XHR answered 5xx).
  *   2. Storage substitutes, installed ONLY when the native ones throw. The
  *      preview frame runs at an opaque origin, where localStorage,
  *      sessionStorage, document.cookie, indexedDB.open(), navigator.
@@ -14,8 +17,9 @@
  *      aborts its script before any listener is bound and every control on
  *      the rendered page is dead.
  *
- * Verified by hand against a real browser; no automated test exercises this
- * file in a sandbox, so re-check manually after any edit here.
+ * Verified by hand against a real browser. tests/test_preview_shim.py runs
+ * the reporters in node against stand-in browser objects, which proves the
+ * wiring but not a real sandbox, so re-check manually after any edit here.
  */
 (function () {
   'use strict';
@@ -26,6 +30,11 @@
   var TAG = 'anton-preview';
   var LINE_OFFSET = __LINE_OFFSET__;
   var MAX_REPORTS = 20;
+  /* What the new report types carry at most. The app and the server cut a
+     message to 300 characters again; this only keeps one huge console line
+     or error body from crossing postMessage whole. */
+  var MAX_TEXT = 1000;
+  var MAX_BODY = 300;
   var seen = Object.create(null);
   var sent = 0;
   /* A report names what the agent can open, and never a draft link's token.
@@ -57,11 +66,76 @@
     } catch (e) { /* frame detached mid-report */ }
   }
 
+  /* One report per key for the life of the document: a page that fails the
+     same way in a loop (a polling fetch, a render that logs each frame)
+     sends it once, and MAX_REPORTS bounds the distinct ones. */
   function report(key, payload) {
     if (sent >= MAX_REPORTS || seen[key]) return;
     seen[key] = true;
     sent += 1;
     post(payload);
+  }
+
+  function clip(value, limit) {
+    return String(value == null ? '' : value).replace(/\s+/g, ' ').trim().slice(0, limit);
+  }
+
+  /* Cross-realm safe: an Error from another frame fails instanceof. */
+  function isError(value) {
+    if (value instanceof Error) return true;
+    return !!value && typeof value === 'object' &&
+      typeof value.message === 'string' && typeof value.stack === 'string';
+  }
+
+  function describe(value) {
+    if (isError(value)) return (value.name || 'Error') + ': ' + value.message;
+    if (typeof value === 'string') return value;
+    try { return String(value); } catch (e) { return ''; }
+  }
+
+  /* console.error is the page's own opinion that something broke. Report it
+     only when it carries an Error, or text shaped like one ("TypeError: x");
+     framework chatter (React's warnings, Chrome's [Violation] notes) is not
+     breakage and would bury the one report that matters. */
+  var ERROR_TEXT = /\b[A-Z][A-Za-z0-9]*(Error|Exception):/;
+  var CONSOLE_NOISE = /\[violation\]|^\s*warning:|download the react devtools/i;
+
+  function reportConsole(args) {
+    var error = null, parts = [];
+    for (var i = 0; i < args.length; i++) {
+      if (!error && isError(args[i])) error = args[i];
+      parts.push(describe(args[i]));
+    }
+    var text = parts.join(' ');
+    if (CONSOLE_NOISE.test(text)) return;
+    if (!error && !ERROR_TEXT.test(text)) return;
+    var message = clip(local(text), MAX_TEXT);
+    if (!message) return;
+    report('k|' + message, {
+      type: 'console',
+      message: message,
+      file: '',
+      line: 0,
+      stack: error && error.stack ? local(error.stack) : ''
+    });
+  }
+
+  /* A server error a page asked for. The page may never surface it (a
+     dashboard that shows an empty chart on a 500), so it is reported here,
+     with the start of the body the server sent: usually the traceback line
+     that says what broke. */
+  function reportHttp(method, url, status, body) {
+    var where = local(url);
+    var verb = String(method || 'GET').toUpperCase();
+    report('h|' + verb + '|' + where.split('?')[0] + '|' + status, {
+      type: 'http',
+      message: clip(verb + ' ' + where + ' \u2192 ' + status + ': ' + clip(body, MAX_BODY), MAX_TEXT),
+      file: '',
+      line: 0,
+      url: where,
+      method: verb,
+      status: status
+    });
   }
 
   post({ type: 'document-start' });
@@ -120,7 +194,7 @@
         var reason = ev.reason;
         var message = reason && reason.message ? reason.message : String(reason);
         report('p|' + message, {
-          type: 'error',
+          type: 'rejection',
           message: 'Unhandled promise rejection: ' + local(message),
           file: '',
           line: 0,
@@ -142,6 +216,79 @@
       } catch (inner) { /* a reporter must never break the page */ }
     });
   } catch (e) { /* no listeners available: the page still runs */ }
+
+  /* The wrappers below call the page's own function first-class and only
+     look at what came back: a page must behave exactly as without them. */
+  try {
+    var CONSOLE = window.console;
+    var nativeConsoleError = CONSOLE && CONSOLE.error;
+    if (typeof nativeConsoleError === 'function') {
+      CONSOLE.error = function () {
+        try { reportConsole(arguments); } catch (inner) { /* never break the page */ }
+        return nativeConsoleError.apply(this, arguments);
+      };
+    }
+  } catch (e) { /* console not writable: no console reports */ }
+
+  try {
+    var nativeFetch = window.fetch;
+    if (typeof nativeFetch === 'function') {
+      window.fetch = function (input, init) {
+        var method = 'GET', url = '';
+        try {
+          method = (init && init.method) || (input && typeof input === 'object' && input.method) || 'GET';
+          url = typeof input === 'string' ? input : (input && input.url) || String(input);
+        } catch (inner) { /* an exotic input: report with what we have */ }
+        /* The page gets the chained promise: it settles exactly as the native
+           one does, and the page's own handlers run after ours, so the clone
+           below is taken before the page reads the body. A rejection passes
+           through untouched, unhandled where the page leaves it unhandled. */
+        return nativeFetch.apply(this, arguments).then(function (response) {
+          try {
+            if (response && response.status >= 500) {
+              var status = response.status, where = response.url || url;
+              response.clone().text().then(function (body) {
+                reportHttp(method, where, status, body);
+              }, function () {
+                reportHttp(method, where, status, '');
+              });
+            }
+          } catch (inner) { /* never break the page */ }
+          return response;
+        });
+      };
+    }
+  } catch (e) { /* fetch not writable: no fetch reports */ }
+
+  try {
+    var XHR = window.XMLHttpRequest;
+    if (XHR && XHR.prototype && typeof XHR.prototype.open === 'function') {
+      var nativeOpen = XHR.prototype.open, nativeSend = XHR.prototype.send;
+      var requests = typeof WeakMap === 'function' ? new WeakMap() : null;
+      XHR.prototype.open = function (method, url) {
+        try { if (requests) requests.set(this, [method, url]); } catch (inner) { /* never break the page */ }
+        return nativeOpen.apply(this, arguments);
+      };
+      XHR.prototype.send = function () {
+        try {
+          var xhr = this;
+          xhr.addEventListener('loadend', function () {
+            try {
+              if (!(xhr.status >= 500)) return;
+              var request = (requests && requests.get(xhr)) || ['GET', ''];
+              var body = '';
+              /* responseText throws for any other responseType. */
+              try {
+                if (!xhr.responseType || xhr.responseType === 'text') body = xhr.responseText;
+              } catch (inner) { /* no text body */ }
+              reportHttp(request[0], xhr.responseURL || String(request[1] || ''), xhr.status, body);
+            } catch (inner) { /* never break the page */ }
+          });
+        } catch (inner) { /* never break the page */ }
+        return nativeSend.apply(this, arguments);
+      };
+    }
+  } catch (e) { /* XMLHttpRequest not patchable: no XHR reports */ }
 
   var nativeStorageWorks = true;
   try { void window.localStorage; } catch (e) { nativeStorageWorks = false; }
