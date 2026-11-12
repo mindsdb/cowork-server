@@ -45,7 +45,7 @@ _TOP_LABEL = re.compile(r"[a-z]{2,63}")
 _ADDRESS_HINT = "type only the address, like api.example.com"
 _REFUSED_WITHOUT_KEY = frozenset({401, 403})
 # A query-key API often refuses a missing key as a bad request. That proves the key only
-# when every slot is a secret: a missing non-secret value could be the request's only fault.
+# when the key is the one value placed: another missing value could be the request's only fault.
 _BAD_REQUEST_WITHOUT_KEY = frozenset({400, 422})
 _VERSION_HINT = (
     "If your provider's address includes a path or version such as /v2, "
@@ -78,7 +78,6 @@ class StoredTemplate:
 
     path: str
     auth: dict[str, Any]
-    secret_fields: frozenset[str] = frozenset()
 
 
 def parse_stored(row: CustomConnector) -> StoredTemplate | None:
@@ -109,11 +108,7 @@ def parse_stored(row: CustomConnector) -> StoredTemplate | None:
         return None
     if parsed.check is None:
         return None
-    return StoredTemplate(
-        path=parsed.check.path,
-        auth=parsed.auth.to_dict(),
-        secret_fields=frozenset(field.name for field in parsed.fields if field.secret),
-    )
+    return StoredTemplate(path=parsed.check.path, auth=parsed.auth.to_dict())
 
 
 def stored_template(row: CustomConnector) -> StoredTemplate:
@@ -338,8 +333,9 @@ async def _send(
 async def run_check(origin: str, template: StoredTemplate, values: Mapping[str, str]) -> CheckFailure | None:
     """Send the check without the placed credentials, then with them; None when it passed.
 
-    Without them it must answer 401 or 403, or 400 or 422 when every slot
-    holds a secret field, or a passing check would prove nothing. With them, 2xx passes, 401 or 403 is ``authentication_failed``
+    Without them it must answer 401 or 403, or 400 or 422 when the auth
+    places a single field, or a passing check would prove
+    nothing. With them, 2xx passes, 401 or 403 is ``authentication_failed``
     and any other status ``provider_error``. A 404 to either send is
     ``check_path_not_found``. Only the answer to the request that carried
     the credentials is excerpted.
@@ -352,7 +348,9 @@ async def run_check(origin: str, template: StoredTemplate, values: Mapping[str, 
     if isinstance(unprotected, CheckFailure):
         return unprotected
     refused = _REFUSED_WITHOUT_KEY
-    if _slot_names(template.auth) <= template.secret_fields:
+    # The auth rules make every auth place a secret field, so a lone slot is the key; with a second
+    # slot the 400 could be about that value, whatever its secret flag says.
+    if len(_slot_names(template.auth)) == 1:
         refused = refused | _BAD_REQUEST_WITHOUT_KEY
     if unprotected.status_code not in refused:
         # Its body is never shown: an excerpt would let connect read any page our egress can reach.
