@@ -41,6 +41,10 @@ ORIGINAL = "<!doctype html><h1>Sales</h1>\n"
 EDITED = "<!doctype html><h1 style=\"color:blue\">Sales</h1>\n"
 
 
+_real_decisions_for_scope = quick_edit_service.decisions_for_scope
+_real_resolve_backend = quick_edit_service.resolve_backend
+
+
 # ── fakes for anton's API ────────────────────────────────────────────────
 
 
@@ -101,8 +105,10 @@ class FakeAnton:
     route_calls: list = field(default_factory=list)
     edit_calls: list = field(default_factory=list)
 
-    async def route_request(self, message, *, files, kind, base_url, api_key, model="jev-1.13.0", timeout_s=3.0, http=None):
-        self.route_calls.append(dict(message=message, files=files, kind=kind, base_url=base_url, api_key=api_key, model=model))
+    async def route_request(self, message, *, files, kind, base_url, api_key, model="jev-1.13.0", timeout_s=3.0,
+                            http=None, name="", description="", data="", history=None):
+        self.route_calls.append(dict(message=message, files=files, kind=kind, base_url=base_url, api_key=api_key,
+                                     model=model, name=name, description=description, data=data, history=history))
         return self.route
 
     async def run_quick_edit(self, folder, message, *, kind, llm, checker, history=None, on_progress=None, max_fix_rounds=2):
@@ -120,9 +126,12 @@ class FakeAnton:
             checkers=checkers,
             workspace_cls=workspace_cls,
             # anton's rule: a decisions model only on MindsHub here.
+            describe_artifact=lambda folder: {"name": "Sales", "description": "Revenue by region", "data": "{rows: [...]}"},
+            route_extras=frozenset({"name", "description", "data", "history"}),
             decisions_available=lambda settings: settings.planning_provider == "minds-cloud",
             decisions_config=lambda settings: (
-                {"model": "jev-1.13.0"} if settings.planning_provider == "minds-cloud" else None
+                ("https://hub.example/v1", settings.minds_api_key, "jev-1.13.0")
+                if settings.planning_provider == "minds-cloud" else None
             ),
         )
 
@@ -184,7 +193,7 @@ def fake_anton(monkeypatch, artifact):
     monkeypatch.setattr(
         quick_edit_service,
         "resolve_backend",
-        awaitable(lambda scope, user=None: QuickEditBackend(llm="the-llm", route_base_url="https://hub.example/v1", route_api_key="k")),
+        awaitable(lambda *_a, **_k: QuickEditBackend(llm="the-llm", route_base_url="https://hub.example/v1", route_api_key="k")),
     )
     monkeypatch.setattr(
         quick_edit_service, "decisions_for_scope",
@@ -333,7 +342,7 @@ def test_the_agent_route_ends_the_stream_without_editing(client, fake_anton, art
     assert events[0][1]["route"] == "agent"
     assert events[1][1] == {
         "status": "agent", "summary": "", "revisionId": None, "previousRevisionId": None,
-        "changed": [], "check": None, "ms": events[1][1]["ms"],
+        "changed": [], "check": None, "editId": None, "undoable": False, "ms": events[1][1]["ms"],
     }
     assert fake_anton.edit_calls == []
     assert (folder / "index.html").read_text(encoding="utf-8") == ORIGINAL
@@ -348,7 +357,7 @@ def test_force_route_skips_the_router(client, fake_anton, artifact):
 
 def test_without_a_decision_endpoint_the_message_goes_to_the_agent(client, fake_anton, artifact, monkeypatch):
     _folder, _metadata, artifact_id = artifact
-    monkeypatch.setattr(quick_edit_service, "resolve_backend", awaitable(lambda scope, user=None: QuickEditBackend(llm="the-llm")))
+    monkeypatch.setattr(quick_edit_service, "resolve_backend", awaitable(lambda *_a, **_k: QuickEditBackend(llm="the-llm")))
     events = events_of(post(client, artifact_id).text)
     assert events[0][1]["route"] == "agent"
     assert events[0][1]["reason"] == "no_decisions_model"
@@ -377,11 +386,22 @@ def test_no_decisions_model_goes_straight_to_the_chat(client, fake_anton, artifa
     assert (folder / "index.html").read_text(encoding="utf-8") == ORIGINAL
 
 
+def test_an_organization_that_turned_jev_off_has_no_decisions():
+    from cowork.common.settings.user_settings import Provider, UserSettings
+
+    user = UserSettings(planning_provider=Provider.MINDS_CLOUD, minds_api_key="k", jev_decisions_enabled=False)
+    assert quick_edit_service.decisions_for(FakeAnton().api(), user).available is False
+
+
 def test_on_mindshub_the_router_gets_anton_s_decisions_model(client, fake_anton, artifact):
     _folder, _metadata, artifact_id = artifact
     fake_anton.route = RouteDecision("agent", 0.6, reason="uncertain")
-    events = events_of(post(client, artifact_id).text)
-    assert fake_anton.route_calls[0]["model"] == "jev-1.13.0"
+    events = events_of(post(client, artifact_id, history=[{"role": "user", "text": "Add a title"}]).text)
+    call = fake_anton.route_calls[0]
+    assert call["model"] == "jev-1.13.0"
+    # The artifact's context (anton's describe_artifact) and the bar's thread.
+    assert (call["name"], call["description"], call["data"]) == ("Sales", "Revenue by region", "{rows: [...]}")
+    assert call["history"] == [{"role": "user", "text": "Add a title"}]
     assert events[0][1]["reason"] == "uncertain"
 
 
@@ -590,7 +610,7 @@ async def test_a_client_that_goes_away_cancels_the_edit_and_frees_the_artifact(a
         anton=anton.api(), scope=LOCAL_SCOPE, folder=folder, metadata=metadata, artifact_id=artifact_id,
         body=quick_ep._QuickEditBody(message="Make the title blue"), source_path="index.html",
         base_revision_id="rev", started=0.0, lock_key=key,
-        resolve_backend=awaitable(lambda scope, user=None: QuickEditBackend(llm="llm", route_base_url="https://h/v1", route_api_key="k")),
+        resolve_backend=awaitable(lambda *_a, **_k: QuickEditBackend(llm="llm", route_base_url="https://h/v1", route_api_key="k")),
     )
 
     class Request:
@@ -625,7 +645,7 @@ async def test_a_closed_response_body_cancels_the_edit_too(artifact, monkeypatch
         anton=FakeAnton(edit=edit).api(), scope=LOCAL_SCOPE, folder=folder, metadata=metadata,
         artifact_id=artifact_id, body=quick_ep._QuickEditBody(message="x"), source_path="index.html",
         base_revision_id="rev", started=0.0, lock_key=key,
-        resolve_backend=awaitable(lambda scope, user=None: QuickEditBackend(llm="llm", route_base_url="https://h/v1", route_api_key="k")),
+        resolve_backend=awaitable(lambda *_a, **_k: QuickEditBackend(llm="llm", route_base_url="https://h/v1", route_api_key="k")),
     )
 
     class Request:
@@ -776,3 +796,260 @@ def test_no_note_in_a_conversation_the_caller_does_not_own(db):
     session, _conversation = db
     with pytest.raises(ValueError):
         quick_edit_service._save_note(session, conversation_id=uuid.uuid4(), message="m", text="t")
+
+
+# ── undo: every file the edit changed ────────────────────────────────────
+
+
+def _multi_file_edit(folder, checker, on_progress):
+    """A fullstack-style edit: the tracked page, a script, and a new file."""
+
+    async def edit(*_a):
+        (folder / "index.html").write_text(EDITED, encoding="utf-8")
+        (folder / "app.js").write_text("render('blue');\n", encoding="utf-8")
+        (folder / "lib").mkdir(exist_ok=True)
+        (folder / "lib" / "theme.js").write_text("export const blue = 1;\n", encoding="utf-8")
+        return QuickEditResult("applied", ["index.html", "app.js", "lib/theme.js"], "Made it blue.")
+
+    return edit
+
+
+@pytest.fixture
+def fullstack(artifact):
+    folder, metadata, artifact_id = artifact
+    (folder / "app.js").write_text("render('black');\n", encoding="utf-8")
+    return folder, metadata, artifact_id
+
+
+def _apply(client, fake_anton, folder, artifact_id):
+    async def edit(f, checker, on_progress):
+        return await _multi_file_edit(f, checker, on_progress)()
+
+    fake_anton.edit = edit
+    return events_of(post(client, artifact_id).text)[-1][1]
+
+
+def undo(client, artifact_id, edit_id, **body):
+    return client.post(f"/api/v1/artifacts/workspace/project/{artifact_id}/quick-edits/{edit_id}/undo", json=body)
+
+
+def test_undo_restores_every_file_and_removes_created_ones(client, fake_anton, fullstack):
+    folder, metadata, artifact_id = fullstack
+    done = _apply(client, fake_anton, folder, artifact_id)
+    assert done["undoable"] is True and len(done["editId"]) == 32
+    assert (folder / "app.js").read_text() == "render('blue');\n"
+
+    response = undo(client, artifact_id, done["editId"], expectedRevisionId=done["revisionId"])
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert sorted(body["restored"]) == ["app.js", "index.html"]
+    assert body["removed"] == ["lib/theme.js"]
+    assert body["revision"]["summary"] == "Undid quick edit"
+    assert (folder / "index.html").read_text() == ORIGINAL
+    assert (folder / "app.js").read_text() == "render('black');\n"
+    assert not (folder / "lib" / "theme.js").exists()
+    assert list_revisions(folder)[0]["id"] == body["revision"]["id"]
+    # Once only.
+    again = undo(client, artifact_id, done["editId"], expectedRevisionId=body["revision"]["id"])
+    assert again.status_code == 409 and again.json()["detail"]["reason"] == "already_undone"
+
+
+def test_undo_of_an_edit_that_left_the_source_alone_records_no_revision(client, fake_anton, fullstack):
+    folder, metadata, artifact_id = fullstack
+
+    async def edit(f, checker, on_progress):
+        (f / "app.js").write_text("render('blue');\n", encoding="utf-8")
+        return QuickEditResult("applied", ["app.js"], "Script only.")
+
+    fake_anton.edit = edit
+    done = events_of(post(client, artifact_id).text)[-1][1]
+    assert done["revisionId"] is None and done["undoable"] is True
+    revisions = len(list_revisions(folder))
+
+    response = undo(client, artifact_id, done["editId"])
+
+    assert response.status_code == 200, response.text
+    assert response.json()["revision"] is None
+    assert (folder / "app.js").read_text() == "render('black');\n"
+    assert len(list_revisions(folder)) == revisions
+
+
+def test_undo_refuses_when_a_file_changed_since_and_changes_nothing(client, fake_anton, fullstack):
+    folder, metadata, artifact_id = fullstack
+    done = _apply(client, fake_anton, folder, artifact_id)
+    (folder / "app.js").write_text("render('green');\n", encoding="utf-8")  # a later edit
+
+    response = undo(client, artifact_id, done["editId"], expectedRevisionId=done["revisionId"])
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["reason"] == "files_changed"
+    assert response.json()["detail"]["paths"] == ["app.js"]
+    assert (folder / "index.html").read_text() == EDITED
+    assert (folder / "lib" / "theme.js").exists()
+
+
+def test_undo_with_a_stale_head_is_409(client, fake_anton, fullstack):
+    folder, metadata, artifact_id = fullstack
+    done = _apply(client, fake_anton, folder, artifact_id)
+    response = undo(client, artifact_id, done["editId"], expectedRevisionId="stale")
+    assert response.status_code == 409
+    assert set(response.json()["detail"]) == {"message", "currentRevision"}
+    assert (folder / "app.js").read_text() == "render('blue');\n"
+
+
+def test_undo_of_an_unknown_edit_is_404(client, fake_anton, fullstack):
+    _folder, _metadata, artifact_id = fullstack
+    assert undo(client, artifact_id, "0" * 32).status_code == 404
+    assert undo(client, artifact_id, "../../etc").status_code == 404
+
+
+def test_undo_is_refused_while_a_quick_edit_runs(client, fake_anton, fullstack):
+    _folder, _metadata, artifact_id = fullstack
+    quick_edit_service.quick_edit_locks.acquire(quick_ep._lock_key(LOCAL_SCOPE, artifact_id))
+    response = undo(client, artifact_id, "0" * 32)
+    assert response.status_code == 409 and response.json()["detail"]["reason"] == "quick_edit_running"
+
+
+def test_undo_failing_midway_puts_back_what_it_changed(fullstack, monkeypatch):
+    """All or nothing: a write that fails rolls back the files already restored."""
+    from cowork.services import artifact_quick_edits as undo_store
+
+    folder, metadata, artifact_id = fullstack
+    paths = ["index.html", "app.js"]
+    before = undo_store.capture(folder, paths)
+    (folder / "index.html").write_text(EDITED, encoding="utf-8")
+    (folder / "app.js").write_text("render('blue');\n", encoding="utf-8")
+    edit_id = undo_store.new_edit_id()
+    assert undo_store.save_undo(
+        folder, edit_id=edit_id, before=before, changed=paths, source_path="index.html",
+        revision_id=None, previous_revision_id=None,
+    ) == paths
+
+    real_write = undo_store._write
+    calls = []
+
+    def flaky(root, rel_path, file):
+        calls.append(rel_path)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        real_write(root, rel_path, file)
+
+    monkeypatch.setattr(undo_store, "_write", flaky)
+    with pytest.raises(OSError):
+        undo_store.undo(folder, metadata, artifact_id, edit_id, expected_revision_id=None, actor_id=None)
+    assert (folder / "index.html").read_text() == EDITED
+    assert (folder / "app.js").read_text() == "render('blue');\n"
+
+
+def test_only_the_last_ten_undos_are_kept(artifact):
+    from cowork.services import artifact_quick_edits as undo_store
+
+    folder, _metadata, _artifact_id = artifact
+    ids = []
+    for i in range(12):
+        before = undo_store.capture(folder, ["index.html"])
+        (folder / "index.html").write_text(f"v{i}\n", encoding="utf-8")
+        edit_id = undo_store.new_edit_id()
+        undo_store.save_undo(folder, edit_id=edit_id, before=before, changed=["index.html"],
+                             source_path="index.html", revision_id=None, previous_revision_id=None)
+        ids.append(edit_id)
+    kept = {r["id"] for r in undo_store._records(folder)}
+    assert kept == set(ids[2:])
+    blobs = list((folder / ".revisions" / "quick-edits" / "blobs").iterdir())
+    assert len(blobs) == 10
+
+
+def test_a_link_planted_in_the_artifact_is_never_followed(fullstack, tmp_path):
+    from cowork.services import artifact_quick_edits as undo_store
+
+    folder, _metadata, _artifact_id = fullstack
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    (folder / "link.js").symlink_to(outside)
+    assert undo_store.capture(folder, ["index.html", "link.js"]) is None
+
+
+def test_ambient_mindshub_config_does_not_make_a_byok_user_look_like_mindshub(monkeypatch):
+    """AntonSettings reads ANTON_* and ~/.anton/.env; only what the person
+    configured may decide whether the bar can edit directly."""
+    from cowork.common.settings.user_settings import Provider, UserSettings
+
+    monkeypatch.setenv("ANTON_MINDS_API_KEY", "left-over")
+    monkeypatch.setenv("ANTON_OPENAI_BASE_URL", "https://api.mindshub.ai/v1")
+
+    def mindshub_rule(settings):  # anton's: a MindsHub base URL and a key
+        return bool(settings.minds_api_key) and "mindshub" in (settings.openai_base_url or "")
+
+    api = FakeAnton().api()
+    api = AntonQuickEdit(
+        route_request=api.route_request, run_quick_edit=api.run_quick_edit, checkers=None, workspace_cls=None,
+        decisions_available=mindshub_rule,
+        decisions_config=lambda s: ("https://api.mindshub.ai/v1", s.minds_api_key, "jev-1.13.0") if mindshub_rule(s) else None,
+    )
+    byok = UserSettings(planning_provider=Provider.ANTHROPIC, anthropic_api_key="k")
+    assert quick_edit_service.decisions_for(api, byok).available is False
+    hub = UserSettings(planning_provider=Provider.OPENAI_COMPATIBLE, openai_base_url="https://api.mindshub.ai/v1", minds_api_key="mk")
+    assert quick_edit_service.decisions_for(api, hub).available is True
+
+
+def _anton_rule_api(anton: FakeAnton) -> AntonQuickEdit:
+    """anton's decisions rule (anton.core.llm.jev): ANTON_DECISIONS_MODEL, a
+    MindsHub host, and a key; the installed anton predates it."""
+    import os
+    from urllib.parse import urlparse
+
+    def config(settings):
+        model = os.environ.get("ANTON_DECISIONS_MODEL")
+        base = (settings.openai_base_url or "").rstrip("/")
+        if not model or urlparse(base).hostname != "api.mindshub.ai":
+            return None
+        key = settings.minds_api_key or settings.openai_api_key
+        return (base, key, model) if key else None
+
+    api = anton.api()
+    return AntonQuickEdit(
+        route_request=api.route_request, run_quick_edit=api.run_quick_edit, checkers=api.checkers,
+        workspace_cls=api.workspace_cls, decisions_available=lambda s: config(s) is not None, decisions_config=config,
+    )
+
+
+@pytest.mark.parametrize("host,direct", [("https://api.mindshub.ai/v1", True), ("https://llm.example.com/v1", False)])
+def test_openai_compatible_on_mindshub_is_direct_and_elsewhere_goes_to_the_chat(
+    client, fake_anton, artifact, monkeypatch, host, direct,
+):
+    """A self-hosted deployment pointed straight at MindsHub as an
+    openai-compatible provider: anton's decisions_config alone decides."""
+    from cowork.common.settings.user_settings import Provider, UserSettings
+
+    _folder, _metadata, artifact_id = artifact
+    monkeypatch.setenv("ANTON_DECISIONS_MODEL", "jev-1.13.0")
+    user = UserSettings(planning_provider=Provider.OPENAI_COMPATIBLE, openai_base_url=host, openai_api_key="ok")
+    api = _anton_rule_api(fake_anton)
+    monkeypatch.setattr(quick_edit_service, "anton_quick_edit", lambda: api)
+    monkeypatch.setattr(quick_edit_service, "load_user_settings", awaitable(lambda scope: user))
+    # The real decisions_for_scope and resolve_backend: only the LLM build is stubbed.
+    monkeypatch.setattr(quick_edit_service, "decisions_for_scope", _real_decisions_for_scope)
+    monkeypatch.setattr(quick_edit_service, "resolve_backend", _real_resolve_backend)
+    monkeypatch.setattr("cowork.services.providers.build_llm_client", lambda **_k: "the-llm")
+    fake_anton.route = RouteDecision("agent", 0.9)
+
+    async def allowed(scope, permission):
+        return True
+
+    monkeypatch.setattr(workspace_ep, "has_product_permission", allowed)
+    caps = asyncio.run(workspace_ep._current_capabilities(
+        LOCAL_SCOPE, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True},
+    ))
+    assert caps["canQuickEdit"] is True
+    assert caps["quickEditDirect"] is direct
+
+    events = events_of(post(client, artifact_id).text)
+    if direct:
+        assert fake_anton.route_calls[0]["base_url"] == "https://api.mindshub.ai/v1"
+        assert fake_anton.route_calls[0]["api_key"] == "ok"
+        assert fake_anton.route_calls[0]["model"] == "jev-1.13.0"
+        assert events[0][1]["reason"] == "jev"
+    else:
+        assert fake_anton.route_calls == []
+        assert events[0][1]["reason"] == "no_decisions_model"

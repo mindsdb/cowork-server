@@ -308,6 +308,7 @@ async def test_model_selection_cannot_bypass_admission(monkeypatch, model):
         ("/agent-repairs/repair/cancel", "post", {}),
         ("/agent-repairs/repair/decision", "post", {"status": "accepted"}),
         ("/quick-edits", "post", {"message": "Make the title blue"}),
+        ("/quick-edits/" + "0" * 32 + "/undo", "post", {}),
     ],
 )
 @pytest.mark.parametrize("allowed,status", [(False, 403), (None, 503)])

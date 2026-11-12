@@ -17,8 +17,14 @@ The response is ``text/event-stream``:
 * ``check_request`` ``{"check_id": "acheck:<hex>", "artifact_slug": str, "timeout_s": int}``,
   answered with the existing ``POST /api/v1/artifacts/checks/{check_id}``
   (same broker as a turn's checks, authorized against this request's owner)
-* ``done``          ``{"status", "summary", "revisionId", "previousRevisionId", "changed", "check", "ms"}``
+* ``done``          ``{"status", "summary", "revisionId", "previousRevisionId", "changed", "check",
+  "editId", "undoable", "ms"}``
 * ``error``         ``{"message": str}``
+
+``POST .../quick-edits/{edit_id}/undo`` puts back every file an applied
+edit changed and removes those it created, all or nothing
+(``services/artifact_quick_edits.py``); the tracked source's restore is
+journalled as a revision.
 
 Everything that can refuse the request does so before the stream starts, as
 an ordinary HTTP error: 403 (permissions, owner), 501 (quick edits off or the
@@ -55,6 +61,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import TenantScope
 from cowork.db.units import run_efs, run_to_completion
 from cowork.harnesses.anton_harness.preview_checker import ask_preview
+from cowork.services import artifact_quick_edits
 from cowork.services import quick_edit as quick_edit_service
 from cowork.services.artifact_revisions import (
     RepairAlreadyPending,
@@ -158,6 +165,59 @@ def _router_input(anton: AntonQuickEdit, folder: Path, kind: str) -> tuple[list[
     return files, context
 
 
+def _capture_for_undo(anton: AntonQuickEdit, folder: Path, kind: str, source_path: str) -> dict | None:
+    """Every file the editor may change, as it is now: the content files
+    anton's workspace lists, the tracked source, and anton's presentation
+    program (the editor snapshots it too)."""
+    paths: list[str] = [source_path]
+    if anton.workspace_cls is not None:
+        try:
+            paths += [str(getattr(e, "path", e)) for e in anton.workspace_cls(folder, kind=kind).map()]
+        except Exception:
+            logger.warning("Could not list the artifact's files for the quick edit's undo", exc_info=True)
+            return None
+    try:
+        from anton.core.artifacts.internal_files import PRESENTATION_PROGRAM_FILENAME
+
+        paths.append(PRESENTATION_PROGRAM_FILENAME)
+    except ImportError:
+        pass
+    return artifact_quick_edits.capture(folder, paths)
+
+
+def _finish_applied(
+    folder: Path,
+    metadata: dict,
+    artifact_id: str,
+    *,
+    source_path: str,
+    base_revision_id: str,
+    summary: str,
+    conversation_id: str | None,
+    before: dict | None,
+    changed: list[str],
+) -> tuple[dict | None, str | None]:
+    """An applied edit's file store work, in one hop: the tracked source's
+    revision, then the undo of every file the edit changed."""
+    revision = record_quick_edit(
+        folder, metadata, artifact_id, rel_path=source_path, base_revision_id=base_revision_id,
+        summary=summary, conversation_id=conversation_id,
+    )
+    if before is None:
+        return revision, None
+    edit_id = artifact_quick_edits.new_edit_id()
+    try:
+        kept = artifact_quick_edits.save_undo(
+            folder, edit_id=edit_id, before=before, changed=changed, source_path=source_path,
+            revision_id=revision["id"] if revision else None,
+            previous_revision_id=base_revision_id if revision else None,
+        )
+    except (OSError, ValueError):
+        logger.warning("Could not keep the undo of a quick edit", exc_info=True)
+        kept = None
+    return revision, edit_id if kept else None
+
+
 def _check_json(check: Any) -> dict | None:
     """The final check as the app shows it: never the screenshot."""
     if check is None:
@@ -185,6 +245,7 @@ def _done(
     previous_revision_id: str | None = None,
     changed: list[str] | None = None,
     check: dict | None = None,
+    edit_id: str | None = None,
     started: float,
 ) -> str:
     return sse_frame("done", {
@@ -194,6 +255,10 @@ def _done(
         "previousRevisionId": previous_revision_id,
         "changed": list(changed or []),
         "check": check,
+        # The id POST .../quick-edits/{editId}/undo takes; set when this
+        # edit applied and its undo was kept.
+        "editId": edit_id,
+        "undoable": edit_id is not None,
         "ms": _ms(started),
     })
 
@@ -293,20 +358,29 @@ class QuickEditRun:
             return checkers.PreviewChecker(preview_checker, slug=slug)
         return None
 
-    async def _save(self, result: Any) -> dict | None:
-        """The applied edit's revision. Run to completion even when the client
-        goes away now: the files are already written."""
+    async def _capture(self) -> dict | None:
+        """The artifact's content files as they are before the edit, for its
+        undo; None when they are too many or too large to keep."""
+        return await run_efs(
+            partial(_capture_for_undo, self.anton, self.folder, self.kind, self.source_path), scope=self.scope,
+        )
+
+    async def _save(self, result: Any, before: dict | None) -> tuple[dict | None, str | None]:
+        """The applied edit's revision and its undo. Run to completion even
+        when the client goes away now: the files are already written."""
         conversation_id = str(self.body.conversationId) if self.body.conversationId else None
         return await run_to_completion(run_efs(
             partial(
-                record_quick_edit,
+                _finish_applied,
                 self.folder,
                 self.metadata,
                 self.artifact_id,
-                rel_path=self.source_path,
+                source_path=self.source_path,
                 base_revision_id=self.base_revision_id,
                 summary=str(getattr(result, "summary", "") or ""),
                 conversation_id=conversation_id,
+                before=before,
+                changed=[str(path) for path in (getattr(result, "changed", None) or [])],
             ),
             scope=self.scope,
             deadline=False,
@@ -329,13 +403,15 @@ class QuickEditRun:
                 emit(sse_frame("route", {"route": "agent", "confidence": 1.0, "ms": 0, "reason": NO_DECISIONS_REASON}))
                 emit(_done(status_="agent", started=self.started))
                 return
-            backend = await (self.resolve_backend or quick_edit_service.resolve_backend)(self.scope, user)
+            backend = await (self.resolve_backend or quick_edit_service.resolve_backend)(self.scope, user, decisions)
             route_started = time.monotonic()
             route, confidence, reason = await self._route(backend, decisions)
             emit(sse_frame("route", {"route": route, "confidence": confidence, "ms": _ms(route_started), "reason": reason}))
             if route == "agent":
                 emit(_done(status_="agent", started=self.started))
                 return
+
+            before = await self._capture()
 
             def on_progress(event: dict) -> None:
                 stage = event.get("stage") if isinstance(event, dict) else None
@@ -367,9 +443,9 @@ class QuickEditRun:
                 status_ = "failed"
             changed = [str(path) for path in (getattr(result, "changed", None) or [])]
             summary = str(getattr(result, "summary", "") or "")
-            revision = None
+            revision = edit_id = None
             if status_ == "applied":
-                revision = await self._save(result)
+                revision, edit_id = await self._save(result, before)
                 if self.body.conversationId is not None:
                     await quick_edit_service.record_conversation_note(
                         self.scope,
@@ -386,6 +462,7 @@ class QuickEditRun:
                 previous_revision_id=self.base_revision_id if revision else None,
                 changed=changed,
                 check=_check_json(getattr(result, "check", None)),
+                edit_id=edit_id,
                 started=self.started,
             ))
         except asyncio.CancelledError:
@@ -516,3 +593,66 @@ async def quick_edit_artifact(
     except BaseException:
         run.release()
         raise
+
+
+class _UndoBody(BaseModel):
+    # The tracked source's head as the viewer has it (the done event's
+    # revisionId, or the head it already held when the edit left the source
+    # alone). Null skips that check; changed files are refused either way.
+    expectedRevisionId: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+@router.post("/workspace/{project_ref}/{artifact_id}/quick-edits/{edit_id}/undo")
+async def undo_quick_edit(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    edit_id: str,
+    body: _UndoBody,
+    scope: ScopeDep,
+):
+    """Undo one quick edit: every file it changed goes back, every file it
+    created goes, all or nothing.
+
+    409: a quick edit is running on the artifact, a file the edit changed was
+    changed again since (``reason: files_changed`` with ``paths``), it was
+    already undone, or ``expectedRevisionId`` is stale (the draft PUT's
+    shape). 404: no such edit, or its undo is no longer kept (only the last
+    ten are).
+    """
+    await require_product_permission(scope, "artifact.manage")
+    _source, folder, metadata, _capabilities = await _owner_workspace(scope, project_ref, artifact_id)
+    lock_key = _lock_key(scope, artifact_id)
+    if not quick_edit_service.quick_edit_locks.acquire(lock_key):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": "A quick edit is already running on this artifact", "reason": "quick_edit_running"},
+        )
+    try:
+        actor_id = str(scope.user_id) if scope and scope.user_id else None
+        return await run_efs(
+            partial(
+                artifact_quick_edits.undo, folder, metadata, artifact_id, edit_id,
+                expected_revision_id=body.expectedRevisionId, actor_id=actor_id,
+            ),
+            scope=scope,
+        )
+    except artifact_quick_edits.QuickEditFilesChanged as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": str(exc), "reason": "files_changed", "paths": exc.paths},
+        ) from exc
+    except artifact_quick_edits.QuickEditAlreadyUndone as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail={"message": str(exc), "reason": "already_undone"},
+        ) from exc
+    except RevisionConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": str(exc), "currentRevision": exc.current},
+        ) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_not_found_detail(exc)) from exc
+    except (RevisionValidationError, TimeoutError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        quick_edit_service.quick_edit_locks.release(lock_key)

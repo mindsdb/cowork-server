@@ -178,46 +178,79 @@ quick_edit_locks = QuickEditLocks()
 
 @dataclass(frozen=True)
 class Decisions:
-    """Whether a decisions model (Jev) can route this person's bar messages,
-    and which model anton names for it."""
+    """Whether a decisions model (Jev) can route this person's bar messages:
+    anton's ``decisions_config`` answer, ``(base_url, api_key, model)``."""
 
     available: bool
     model: str | None = None
+    base_url: str | None = None
+    api_key: str | None = field(default=None, repr=False)
 
 
 NO_DECISIONS = Decisions(available=False)
 
+#: Stands in for the MindsHub key a hosted org's edit mints only once it runs
+#: (it keeps no stored key), so anton can say whether a model would serve it.
+_MINTED_KEY = "minted-for-this-edit"
 
-def _config_model(config: object) -> str | None:
-    if isinstance(config, str):
-        return config or None
-    if isinstance(config, dict):
-        model = config.get("model")
-    else:
-        model = getattr(config, "model", None)
-    return model if isinstance(model, str) and model else None
+
+def _hosted_minted(user) -> bool:
+    """Whether this person's MindsHub calls run on a key minted per call:
+    a hosted org on MindsHub with no stored key, as remote turns are."""
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.common.settings.user_settings import Provider, provider_api_key_str
+
+    return (
+        user.resolved_planning_provider is Provider.MINDS_CLOUD
+        and not provider_api_key_str(user, Provider.MINDS_CLOUD)
+        and TurnQueueSettings().is_remote
+    )
 
 
 def decisions_for(anton: AntonQuickEdit | None, user) -> Decisions:
     """anton's answer for *user* (their ``UserSettings``), read from
     ``AntonSettings`` built the way their turns build them, so a person on
-    their own OpenAI or Anthropic keys gets "unavailable". An anton without
-    ``decisions_available`` is unavailable too. Never raises."""
-    if anton is None or anton.decisions_available is None:
+    their own OpenAI or Anthropic keys gets "unavailable". Unavailable too
+    for an anton without ``decisions_available`` / ``decisions_config``, and
+    for an organization that turned Jev off (``jev_decisions_enabled``: it
+    must not receive their text). Never raises."""
+    if anton is None or anton.decisions_available is None or anton.decisions_config is None:
         return NO_DECISIONS
     try:
+        if getattr(user, "jev_decisions_enabled", True) is False:
+            return NO_DECISIONS
         from cowork.harnesses.anton_harness.harness import anton_settings_for_user
 
+        from cowork.common.settings.user_settings import Provider, provider_api_key_str
+
         settings = anton_settings_for_user(user)
+        # Only what the person configured decides. AntonSettings also reads
+        # the process's ANTON_* environment and ~/.anton/.env, and derives an
+        # OpenAI base URL from the MindsHub URL; on a machine that once used
+        # MindsHub that made a person on their own Anthropic key look like a
+        # MindsHub one. A turn overlays only non-empty values; this gate
+        # clears the two that decide "MindsHub" when the person has none.
+        if hasattr(settings, "openai_base_url"):
+            settings.openai_base_url = getattr(user, "openai_base_url", None) or ""
+        if hasattr(settings, "minds_api_key"):
+            settings.minds_api_key = provider_api_key_str(user, Provider.MINDS_CLOUD) or ""
+            if _hosted_minted(user):
+                settings.minds_api_key = _MINTED_KEY
         if not anton.decisions_available(settings):
             return NO_DECISIONS
-        config = anton.decisions_config(settings) if anton.decisions_config is not None else None
+        config = anton.decisions_config(settings)
     except Exception:
         logger.warning("Could not tell whether a decisions model serves this person", exc_info=True)
         return NO_DECISIONS
-    if config is None and anton.decisions_config is not None:
+    if not isinstance(config, (tuple, list)) or len(config) != 3:
         return NO_DECISIONS
-    return Decisions(available=True, model=_config_model(config))
+    base_url, api_key, model = (str(v) if v else None for v in config)
+    if not model:
+        return NO_DECISIONS
+    if api_key == _MINTED_KEY:
+        # The edit's minted key and its base replace these (resolve_backend).
+        base_url, api_key = None, None
+    return Decisions(available=True, model=model, base_url=base_url, api_key=api_key)
 
 
 async def load_user_settings(scope: TenantScope):
@@ -273,66 +306,32 @@ class QuickEditBackend:
             self.minted_correlation_id = None
 
 
-_DECISIONS_SUFFIX = "/decisions"
-
-
-def _route_target(settings, *, minds_base_url: str | None, minds_key: str | None) -> tuple[str | None, str | None, str | None]:
-    """(base_url, api_key, model) of the decision endpoint, or Nones.
-
-    The turn gate's own choice (``jev_route.gate_mode``): the organization's
-    own decision model when configured, else Jev on MindsHub for a MindsHub
-    caller who did not opt out. An own endpoint is used only where it is a
-    ``.../decisions`` endpoint (route_request appends the path) and never
-    from the hosted server, which dials an organization's own URL only
-    through the turn gate's pinned transport.
-    """
-    from cowork.handlers import jev_route
-
-    mode = jev_route.gate_mode(settings)
-    if mode == "own":
-        target = jev_route.own_decision_target(settings)
-        if target is None or get_app_settings().tenancy_mode == "org":
-            return None, None, None
-        url = target.url.rstrip("/")
-        if not url.endswith(_DECISIONS_SUFFIX):
-            return None, None, None
-        return url[: -len(_DECISIONS_SUFFIX)], target.api_key, settings.decision_model or None
-    if mode == "jev" and minds_base_url and minds_key:
-        # anton's route_request defaults to the Jev model the router was
-        # evaluated with.
-        return minds_base_url, minds_key, None
-    return None, None, None
-
-
-async def resolve_backend(scope: TenantScope, user=None) -> QuickEditBackend:
+async def resolve_backend(scope: TenantScope, user=None, decisions: Decisions | None = None) -> QuickEditBackend:
     """The editor's LLM and the router's endpoint, for the caller.
 
-    The caller's own settings, as their turns read them. Where the hosted
+    The caller's own settings, as their turns read them; the router's
+    endpoint and model are anton's ``decisions_config``. Where the hosted
     server keeps no MindsHub key (remote turns mint one per turn), a short
-    turn key is minted here the same way and revoked by ``close()``.
-    Raises when no LLM can be built (no provider key): the route reports it
-    as an error event.
+    turn key is minted here the same way, routes too, and is revoked by
+    ``close()``. Raises when no LLM can be built (no provider key): the route
+    reports it as an error event.
     """
     from cowork.common.settings.app_settings import TurnQueueSettings
-    from cowork.common.settings.user_settings import Provider, provider_api_key_str
-    from cowork.services.providers import build_llm_client, minds_chat_base_url
+    from cowork.services.providers import build_llm_client
 
     settings = user if user is not None else await load_user_settings(scope)
-    queue_settings = TurnQueueSettings()
-    minds_key = provider_api_key_str(settings, Provider.MINDS_CLOUD)
-    on_minds = settings.resolved_planning_provider is Provider.MINDS_CLOUD
-    if on_minds and not minds_key and queue_settings.is_remote:
-        return await _minted_backend(scope, settings, queue_settings)
-    llm = build_llm_client(settings=settings)
-    base, key, model = _route_target(
-        settings,
-        minds_base_url=minds_chat_base_url(settings.minds_url) if minds_key else None,
-        minds_key=minds_key or None,
+    decisions = decisions or NO_DECISIONS
+    if _hosted_minted(settings):
+        return await _minted_backend(scope, settings, TurnQueueSettings(), decisions)
+    return QuickEditBackend(
+        llm=build_llm_client(settings=settings),
+        route_base_url=decisions.base_url,
+        route_api_key=decisions.api_key,
+        route_model=decisions.model,
     )
-    return QuickEditBackend(llm=llm, route_base_url=base, route_api_key=key, route_model=model)
 
 
-async def _minted_backend(scope: TenantScope, settings, queue_settings) -> QuickEditBackend:
+async def _minted_backend(scope: TenantScope, settings, queue_settings, decisions: Decisions) -> QuickEditBackend:
     """A MindsHub LLM on a turn key minted for this edit (hosted orgs keep no
     stored key), as the routing gate mints one (``_router_binding``)."""
     from anton.core.llm.client import LLMClient
@@ -363,8 +362,10 @@ async def _minted_backend(scope: TenantScope, settings, queue_settings) -> Quick
             coding_provider=provider,
             coding_model=block.get("coding_model") or planning_model,
         )
-        base, key, model = _route_target(settings, minds_base_url=block["base_url"], minds_key=block["api_key"])
-        backend.route_base_url, backend.route_api_key, backend.route_model = base, key, model
+        if decisions.available:
+            backend.route_base_url = block["base_url"]
+            backend.route_api_key = block["api_key"]
+            backend.route_model = decisions.model
         return backend
     except BaseException:
         await backend.close()
