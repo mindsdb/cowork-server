@@ -136,7 +136,7 @@ def session(run):
 @pytest.fixture()
 def jev(monkeypatch):
     """Point the decision at a scripted client; returns a setter."""
-    monkeypatch.setattr(addon_route, "_jev_target", lambda scope: (TARGET, "jev"))
+    monkeypatch.setattr(addon_route, "_jev_target", lambda scope, queue_settings=None: (TARGET, "jev"))
 
     def script(client):
         monkeypatch.setattr(jev_route, "_http_client", lambda: client)
@@ -275,7 +275,7 @@ async def test_a_jev_error_queues(client, session, jev, scripted):
 
 
 async def test_no_decision_model_queues_as_jev_off(client, session, monkeypatch):
-    monkeypatch.setattr(addon_route, "_jev_target", lambda scope: None)
+    monkeypatch.setattr(addon_route, "_jev_target", lambda scope, queue_settings=None: None)
     assert _post(client).json() == {"status": "queued", "reason": "jev_off"}
 
 
@@ -309,7 +309,7 @@ async def test_an_anton_exception_is_internal_not_no_turn(client, session, monke
 
 
 async def test_a_failed_target_lookup_is_internal(client, session, monkeypatch):
-    def boom(scope):
+    def boom(scope, queue_settings=None):
         raise RuntimeError("settings unreadable")
 
     monkeypatch.setattr(addon_route, "_jev_target", boom)

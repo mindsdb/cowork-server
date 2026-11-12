@@ -124,7 +124,7 @@ def pod(monkeypatch):
 
 @pytest.fixture()
 def jev(monkeypatch):
-    monkeypatch.setattr(addon_route, "_jev_target", lambda scope: (TARGET, "jev"))
+    monkeypatch.setattr(addon_route, "_jev_target", lambda scope, queue_settings=None: (TARGET, "jev"))
 
     def script(client):
         monkeypatch.setattr(jev_route, "_http_client", lambda: client)
@@ -236,7 +236,7 @@ def test_a_hosted_org_without_a_stored_key_asks_on_a_minted_key(client, turn, in
     async def fake_revoke(correlation_id):
         revoked.append(correlation_id)
 
-    monkeypatch.setattr(addon_route, "_jev_target", lambda scope: addon_route._MintKey(workspace_id="ws1", model="jev"))
+    monkeypatch.setattr(addon_route, "_jev_target", lambda scope, queue_settings=None: addon_route._MintKey(workspace_id="ws1", model="jev"))
     monkeypatch.setattr(producer, "mint_llm_block", fake_mint)
     monkeypatch.setattr(producer, "revoke_turn_key_quietly", fake_revoke)
     monkeypatch.setattr(jev_route, "_http_client",
@@ -298,7 +298,7 @@ def test_a_failed_mint_queues_as_internal(client, turn, inputs, pod, monkeypatch
     async def boom(**kwargs):
         raise RuntimeError("auth down")
 
-    monkeypatch.setattr(addon_route, "_jev_target", lambda scope: addon_route._MintKey(workspace_id=None, model="jev"))
+    monkeypatch.setattr(addon_route, "_jev_target", lambda scope, queue_settings=None: addon_route._MintKey(workspace_id=None, model="jev"))
     monkeypatch.setattr(producer, "mint_llm_block", boom)
     monkeypatch.setattr(producer, "revoke_turn_key_quietly", lambda correlation_id: asyncio.sleep(0))
     assert _post(client).json() == {"status": "queued", "reason": "internal"}
@@ -388,6 +388,17 @@ def test_a_response_id_for_another_turn_is_no_turn(client, turn, pod, monkeypatc
     monkeypatch.setattr(endpoints, "turn_response_ids", ids)
     assert _post(client, force=True, response_id="resp-old").json() == {"status": "queued", "reason": "no_turn"}
     assert pod["calls"] == []
+    assert _post(client, force=True, response_id="resp-current").json()["status"] == "added"
+
+
+def test_a_turn_whose_response_id_was_not_found_is_not_refused(client, turn, pod, monkeypatch):
+    # The scan found no response.created (it came after the first take's
+    # frames): that says nothing about which turn this is, so the message
+    # goes on to be added rather than refused as another turn's.
+    async def ids(buffer):
+        return set()
+
+    monkeypatch.setattr(endpoints, "turn_response_ids", ids)
     assert _post(client, force=True, response_id="resp-current").json()["status"] == "added"
 
 

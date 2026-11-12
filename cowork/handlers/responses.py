@@ -80,7 +80,7 @@ from cowork.streaming.registry import RunHandle, RunIdentity, mark_question_save
 from cowork.turnqueue.addons import ADDON_STEP, relay_addon_step
 from cowork.turnqueue.producer import (
     RemoteWorkspace,
-    _revoke_turn_key_quietly,
+    revoke_turn_key_quietly,
     step_stream_events,
     stream_remote_replies,
 )
@@ -770,7 +770,7 @@ def _carries_attachments(request: ResponsesRequest) -> bool:
 async def _drop_gate_key(turn_llm: dict | None) -> None:
     """Revoke the turn key the routing gate minted, for a turn that won't run."""
     if turn_llm and turn_llm.get("correlation_id"):
-        await _revoke_turn_key_quietly(turn_llm["correlation_id"])
+        await revoke_turn_key_quietly(turn_llm["correlation_id"])
 
 
 class ResponsesHandler:
@@ -938,6 +938,7 @@ class ResponsesHandler:
                     has_disabled_connections=bool(disabled),
                     has_always_on_skills=start.always_on_skills,
                     is_comparison_side=start.comparison_pin is not None,
+                    is_pinned_schedule=self.schedule_id is not None and request.model is not None,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
                 )
@@ -1260,6 +1261,12 @@ class ResponsesHandler:
         conversation_id = conversation.id
         side = ComparisonService(session).contained_side(conversation)
         comparison_pin = _ComparisonPin(side.model, side.reasoning_effort) if side is not None else None
+        if comparison_pin is None:
+            # A side runs on its own pin, so the request's picks never ran there.
+            conversation_service.record_turn_picks(
+                conversation=conversation, model=request.model, reasoning_effort=request.reasoning_effort,
+                reset=request.reset_picks,
+            )
         # turn_id: prior message count. The current user message is NOT
         # persisted yet (deferred to the producer for the streaming path), so
         # this is a stable per-conversation index for the buffer file.
@@ -1275,6 +1282,7 @@ class ResponsesHandler:
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=comparison_pin is not None,
+            is_pinned_schedule=self.schedule_id is not None and request.model is not None,
         ) is None:
             rows = self._reads_always_on_rows(session, conversation_id=conversation_id)
             if rows is None:
@@ -1395,6 +1403,7 @@ class ResponsesHandler:
         has_disabled_connections: bool,
         has_always_on_skills: bool = False,
         is_comparison_side: bool = False,
+        is_pinned_schedule: bool = False,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
@@ -1422,6 +1431,7 @@ class ResponsesHandler:
             has_attachments=has_attachments,
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=is_comparison_side,
+            is_pinned_schedule=is_pinned_schedule,
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
@@ -1658,7 +1668,7 @@ class ResponsesHandler:
                 or provider_api_key(settings, Provider.MINDS_CLOUD) is not None):
             return None, None
         from anton.core.llm.openai import OpenAIProvider
-        from cowork.turnqueue.producer import _mint_llm_block, _mint_llm_block_with_turn_key_id
+        from cowork.turnqueue.producer import _mint_llm_block_with_turn_key_id, mint_llm_block
 
         corr = str(uuid4())
         queue_settings = TurnQueueSettings()
@@ -1673,7 +1683,7 @@ class ResponsesHandler:
                 workspace_id=workspace_id,
             )
         else:
-            block = await _mint_llm_block(
+            block = await mint_llm_block(
                 org_id=self.scope.org_id,
                 user_id=self.scope.user_id,
                 correlation_id=corr,

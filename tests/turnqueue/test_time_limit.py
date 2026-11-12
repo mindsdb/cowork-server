@@ -71,15 +71,18 @@ def test_the_key_lives_one_time_limit_window_and_the_old_twenty_minutes_without_
 async def test_a_turn_carries_the_time_limit_and_a_key_that_covers_it(time_limit, remote_turn):
     fake, minted, _ = remote_turn
     await _drain(_run())
-    assert _params(fake)["limits"] == {"max_turn_seconds": 3600}
+    # One block: the time limit sits beside the tenant's per-task limits.
+    limits = _params(fake)["limits"]
+    assert limits["max_turn_seconds"] == 3600
+    assert set(limits) == {"max_tool_rounds", "max_continuations", "max_turn_tokens", "max_turn_seconds"}
     assert minted[0]["ttl_seconds"] == 6000
 
 
 @pytest.mark.asyncio
-async def test_without_a_time_limit_nothing_changes(remote_turn):
+async def test_without_a_time_limit_the_block_has_no_max_turn_seconds(remote_turn):
     fake, minted, _ = remote_turn
     await _drain(_run())
-    assert "limits" not in _params(fake)
+    assert "max_turn_seconds" not in _params(fake)["limits"]
     assert minted[0]["ttl_seconds"] == 1200
 
 
