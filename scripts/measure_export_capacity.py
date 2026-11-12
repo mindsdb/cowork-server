@@ -13,8 +13,9 @@ reports ready, so each case does both before it reads its baseline, and
 reads it before it builds the artifact. Peak RSS is then what a replica peaks
 at before its database and caches, which only add more. RSS added counts
 building the case as well as the export, so it errs high. The conversion
-process's peak is its own column; on Linux it also reports the most address
-space it mapped, which its address-space limit counts. A case still running
+process's peak RSS and the most address space it mapped, which its
+address-space limit counts, are columns of their own, read on Linux every
+~100 ms. A case still running
 at its time budget stops itself and reports the longest stall it saw. Only a
 single stall past the grace period keeps it from doing that; the parent then
 kills it and reports the grace as a lower bound.
@@ -269,26 +270,32 @@ CASES: dict[str, Case] = {
 }
 
 
-def _peak_rss_mib(*, who: str = "self") -> float:
-    """This process's peak RSS, or with *who* "children" the largest of its finished children's."""
+def _peak_rss_mib() -> float:
+    """This process's peak RSS."""
     import resource
 
-    usage = resource.RUSAGE_CHILDREN if who == "children" else resource.RUSAGE_SELF
-    peak = resource.getrusage(usage).ru_maxrss
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     # Linux reports KiB; macOS reports bytes.
     return peak / (MIB if sys.platform == "darwin" else 1024)
 
 
-def _child_peak_vm_mib(*, pid: int) -> float:
-    """The most address space process *pid* has mapped so far, on Linux; 0 elsewhere."""
+def _child_peaks_mib(*, pid: int) -> tuple[float, float]:
+    """Process *pid*'s peak RSS and peak address space so far, on Linux; zeros elsewhere.
+
+    Read from /proc, which counts from the process's own start. A finished
+    child's rusage doesn't: on Linux it begins at the size of the server it
+    was started from.
+    """
     try:
         status = Path(f"/proc/{pid}/status").read_text()
     except OSError:
-        return 0.0
+        return 0.0, 0.0
+    peaks = {}
     for line in status.splitlines():
-        if line.startswith("VmPeak:"):
-            return int(line.split()[1]) / 1024
-    return 0.0
+        name, _, value = line.partition(":")
+        if name in ("VmHWM", "VmPeak"):
+            peaks[name] = int(value.split()[0]) / 1024
+    return peaks.get("VmHWM", 0.0), peaks.get("VmPeak", 0.0)
 
 
 def _replica_baseline_mib() -> float:
@@ -303,6 +310,7 @@ def _replica_baseline_mib() -> float:
 @dataclass
 class _Watch:
     longest: float = 0.0
+    child_peak_rss_mib: float = 0.0
     child_peak_vm_mib: float = 0.0
 
 
@@ -316,13 +324,13 @@ async def _watch_loop(*, watch: _Watch, stop: anyio.Event, on_overrun: Callable[
         await anyio.sleep(WATCH_INTERVAL_SECONDS)
         watch.longest = max(watch.longest, time.perf_counter() - start - WATCH_INTERVAL_SECONDS)
         ticks += 1
-        # VmPeak only grows, so a reading every ~100 ms finds the peak but the
+        # Both peaks only grow, so a reading every ~100 ms finds them but the
         # last moments, and keeps the process-table scan off most ticks.
         if ticks % 10 == 0:
             for child in me.children():
-                watch.child_peak_vm_mib = max(
-                    watch.child_peak_vm_mib, _child_peak_vm_mib(pid=child.pid)
-                )
+                rss, vm = _child_peaks_mib(pid=child.pid)
+                watch.child_peak_rss_mib = max(watch.child_peak_rss_mib, rss)
+                watch.child_peak_vm_mib = max(watch.child_peak_vm_mib, vm)
         on_overrun()
 
 
@@ -364,7 +372,7 @@ def _measure_case(*, case_id: str, budget_seconds: float) -> Row:
                 baseline_rss_mib=round(baseline, 1),
                 peak_rss_mib=round(peak, 1),
                 rss_added_mib=round(peak - baseline, 1),
-                child_peak_rss_mib=round(_peak_rss_mib(who="children"), 1),
+                child_peak_rss_mib=round(watch.child_peak_rss_mib, 1),
                 child_peak_vm_mib=round(watch.child_peak_vm_mib, 1),
                 result=outcome,
             )

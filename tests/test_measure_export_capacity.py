@@ -33,9 +33,7 @@ def test_a_case_reads_its_baseline_before_it_builds_the_artifact(monkeypatch):
         capacity._write(folder, "report.md", "# R\n")
 
     monkeypatch.setattr(capacity, "_replica_baseline_mib", baseline)
-    monkeypatch.setattr(
-        capacity, "_peak_rss_mib", lambda *, who="self": 260.0 if who == "self" else 90.0
-    )
+    monkeypatch.setattr(capacity, "_peak_rss_mib", lambda: 260.0)
     monkeypatch.setitem(capacity.CASES, "probe", capacity.Case(primary="report.md", build=build, note="probe"))
 
     row = capacity._measure_case(case_id="probe", budget_seconds=60.0)
@@ -43,7 +41,6 @@ def test_a_case_reads_its_baseline_before_it_builds_the_artifact(monkeypatch):
     assert steps == ["baseline", "build"]
     assert row.result.startswith("ok"), row.result
     assert (row.baseline_rss_mib, row.peak_rss_mib, row.rss_added_mib) == (200.0, 260.0, 60.0)
-    assert row.child_peak_rss_mib == 90.0
 
 
 def test_the_baseline_is_read_with_the_server_imported_and_its_agent_runtime_warmed():

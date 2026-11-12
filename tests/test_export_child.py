@@ -287,8 +287,11 @@ _PEAK_PROBE = """
 import json, sys, tempfile
 from pathlib import Path
 from scripts import measure_export_capacity as capacity
+from cowork.schemas.artifact_export import InlineLimits
+from cowork.schemas.export_child import ConvertRequest
 from cowork.services import artifact_export
 from cowork.services.artifacts import ProjectArtifacts
+from cowork.services.export_child import convert
 
 artifact_export._org_mode = lambda: False
 size = int(sys.argv[1])
@@ -305,14 +308,22 @@ with tempfile.TemporaryDirectory() as tmp:
     artifact_export.export_primary_file(source=source, folder_name="report",
         metadata={"id": "a" * 32, "primary": "report.md", "type": "document"},
         artifact_id="a" * 32, export_format="docx", can_edit=True)
-    print(json.dumps({"server": capacity._peak_rss_mib() - before,
-                      "conversion": capacity._peak_rss_mib(who="children")}))
+    server = capacity._peak_rss_mib() - before
+    # The same conversion in this process, as before it moved out.
+    request = ConvertRequest(export_format="docx", suffix=".md", title="report",
+        base_parts=(), limits=InlineLimits(max_total_bytes=25 * 1024 * 1024))
+    convert(request=request, source=table.encode(), read_asset=lambda parts: None)
+    print(json.dumps({"server": server, "in_process": capacity._peak_rss_mib() - before}))
 """
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Windows reports no peak RSS for a finished process")
+@pytest.mark.skipif(sys.platform == "win32", reason="Python reports no peak RSS on Windows")
 def test_the_servers_own_peak_memory_does_not_grow_with_the_input(local_mode):
-    """Each size runs in a fresh interpreter, so each peak is that export's own."""
+    """Each size runs in a fresh interpreter, so each peak is that export's own.
+
+    The same conversion run in the server's own process afterwards grows with
+    the input, which shows the input is large enough to tell the two apart.
+    """
     peaks = {}
     for size in (64 * 1024, 500 * 1024):
         finished = subprocess.run(
@@ -322,8 +333,8 @@ def test_the_servers_own_peak_memory_does_not_grow_with_the_input(local_mode):
         peaks[size] = json.loads(finished.stdout.strip().splitlines()[-1])
 
     small, large = peaks[64 * 1024], peaks[500 * 1024]
-    assert large["conversion"] - small["conversion"] > 40, peaks
     assert large["server"] - small["server"] < 15, peaks
+    assert large["in_process"] - small["in_process"] > 40, peaks
 
 
 async def _heartbeat(counter: list[int]) -> None:
