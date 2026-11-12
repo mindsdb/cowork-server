@@ -196,7 +196,7 @@
               "required": true,
               "secret": true,
               "placeholder": "••••••••",
-              "description": "Password for the above role. Stored encrypted and never shown again."
+              "description": "Password for the above role. Never shown again."
             },
             {
               "name": "tls_verify",
