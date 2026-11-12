@@ -137,8 +137,10 @@ deployment:
   datasourceTurnsEnabled: "false"
   datasourceCapabilities: ""
   # Names each datasource connection for the agent (COWORK_TURN_DATASOURCE_LABELS_ENABLED).
-  # Turn on only where every scratchpad pod runs an anton that accepts the names.
-  datasourceLabelsEnabled: "false"
+  # On everywhere, but it acts only where datasourceTurnsEnabled is on. Its anton
+  # must be in the scratchpad image before an environment turns grants on; an
+  # environment opts out with "false" in its own values file.
+  datasourceLabelsEnabled: "true"
 
   # The draft-preview host name and the one page allowed to frame a draft. The
   # draft Ingress and the COWORK_DRAFT_* variables below are templated from

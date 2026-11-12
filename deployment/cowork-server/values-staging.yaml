@@ -37,11 +37,6 @@ deployment:
   # release gate. Rollback removes both lines; see the chart README.
   datasourceTurnsEnabled: "true"
   datasourceCapabilities: '{"manifest_version": 1, "enabled": ["mysql:host-password", "postgres:host-port"]}'
-  # Names each datasource connection for the agent. Deploy only once staging's
-  # scratchpad image has an anton that accepts names and no older pod is left;
-  # rollback removes this line and drops staging from LABELS_ENABLED_ENVIRONMENTS
-  # in tests/test_chart_values.py, in the same change.
-  datasourceLabelsEnabled: "true"
 
   ingress:
     enabled: true
