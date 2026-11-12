@@ -15,6 +15,7 @@ import time
 import uuid
 from datetime import datetime
 from functools import partial
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from redis.exceptions import RedisError
@@ -55,6 +56,9 @@ from cowork.turnqueue.redis_client import (
     xread_blocking,
 )
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
+
+if TYPE_CHECKING:
+    from cowork.common.settings.user_settings import UserSettings
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +115,16 @@ def _trace_block(*, user_id: str | None = None, org_id: str | None = None) -> di
     except Exception:  # pragma: no cover - defensive: never block a turn
         logger.warning("could not build the turn's trace attribution", exc_info=True)
         return {}
+
+
+def _limits_block(settings: UserSettings) -> dict[str, int]:
+    """The per-task limits this tenant's turns run under, for the job's params:
+    the same values the desktop harness overlays for an in-process turn, the
+    deployment defaults while the tenant's limits switch is off and its own
+    values once it's on."""
+    from cowork.common.settings.user_settings import effective_turn_limits
+
+    return effective_turn_limits(settings)._asdict()
 
 
 def _request_wire_size(params: dict) -> int:
@@ -227,10 +241,6 @@ async def mint_llm_block(*, org_id: str | None, user_id: str | None,
     return _build_llm_block(api_key, settings)
 
 
-# The name the turn's own code and its tests use (they patch it here).
-_mint_llm_block = mint_llm_block
-
-
 def _build_llm_block(api_key: str, settings: TurnQueueSettings) -> dict:
     base_url = settings.minds_base_url or minds_chat_base_url(default_turn_minds_api_host())
     block = {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
@@ -247,7 +257,7 @@ async def _mint_llm_block_with_turn_key_id(
     *, org_id: str | None, user_id: str | None, correlation_id: str, settings: TurnQueueSettings,
     workspace_id: str | None = None,
 ) -> tuple[dict, str]:
-    """As _mint_llm_block, also returning the key's public prefix the datasource grants bind to."""
+    """As mint_llm_block, also returning the key's public prefix the datasource grants bind to."""
     minted = await mint_turn_key_details(
         user_id=user_id,
         org_id=org_id,
@@ -264,7 +274,7 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
                             settings: TurnQueueSettings) -> dict | None:
     """Build everything the job's `oauth` block needs except the turn key —
     the list of connections anton is allowed to use this turn. Deliberately
-    doesn't take the turn key `_mint_llm_block` mints: this function's own
+    doesn't take the turn key `mint_llm_block` mints: this function's own
     network call (listing active connections) never uses it, only the final
     block does, so the caller runs the two mints concurrently and folds the
     turn key in afterward instead of sequencing this behind the llm mint.
@@ -766,10 +776,6 @@ async def revoke_turn_key_quietly(correlation_id: str) -> None:
     await _revoke_turn_key_at_turn_end(correlation_id, TurnQueueSettings())
 
 
-# The name handlers/responses.py imports (its tests patch it there).
-_revoke_turn_key_quietly = revoke_turn_key_quietly
-
-
 async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 user_id: str | None, input_text: str,
                                 model: str | None,
@@ -868,7 +874,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                 )
             else:
                 llm_block, oauth_connections = await asyncio.gather(
-                    _mint_llm_block(
+                    mint_llm_block(
                         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
                         workspace_id=workspace_id,
                     ),
@@ -923,12 +929,12 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.db.units import run_on_unit_threads
 
-    # The organization's Jev opt-out, read here so every remote turn carries
-    # it: web UI, scheduled and channel turns alike. Off the loop: a turn
-    # with no settings snapshot, such as a channel turn, reads it through a
-    # session of its own.
-    jev_settings = await run_on_unit_threads(partial(get_user_settings, scope))
-    jev_decisions = getattr(jev_settings, "jev_decisions_enabled", True) is not False
+    # The organization's Jev opt-out and per-task limits, read here so every
+    # remote turn carries them: web UI, scheduled and channel turns alike. Off
+    # the loop: a turn with no settings snapshot, such as a channel turn, reads
+    # them through a session of its own.
+    turn_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+    jev_decisions = getattr(turn_settings, "jev_decisions_enabled", True) is not False
     time_limit = settings.time_limit_seconds
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
@@ -970,9 +976,15 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # with the `llm` turn key, which _scoped_browser_block scoped to
               # this session and project. Absent when the turn has no browser.
               **({"browser": browser_block} if browser_block else {}),
-              # The turn's time limit: anton asks at it and ends with a
-              # summary, and the controller raises its backstop above it.
-              **({"limits": {"max_turn_seconds": time_limit}} if time_limit else {}),
+              # The per-task limits (steps, auto-continues, tokens) this turn
+              # runs under, and its time limit when one is set: anton asks at it
+              # and ends with a summary, and the controller raises its backstop
+              # above it. Without them the pod runs on anton's built-in defaults,
+              # whatever the tenant set.
+              "limits": {
+                  **_limits_block(turn_settings),
+                  **({"max_turn_seconds": time_limit} if time_limit else {}),
+              },
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
               # there can derive the surface, this server's version, or its

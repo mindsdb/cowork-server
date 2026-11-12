@@ -690,7 +690,10 @@ async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
         except RedisError:
             logger.warning("[addon] could not read the turn's response id", exc_info=True)
             return queued("redis_error")
-        if response_ids is not None and req.response_id not in response_ids:
+        # Only a turn whose own response id is known, and differs, is refused:
+        # a buffer whose response.created this scan did not reach (the first
+        # take's frames come first) says nothing about which turn it is.
+        if response_ids and req.response_id not in response_ids:
             return queued("no_turn")
     if remote:
         # Before Jev or a minted key: a pod whose anton can't take the
@@ -721,9 +724,11 @@ async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
             scope=scope,
             local_key=local_key,
             deadline=deadline,
+            queue_settings=settings,
         )
     return await route_addon(
         channel=channel, text=text, force=req.force, scope=scope, local_key=local_key, deadline=deadline,
+        queue_settings=settings,
     )
 
 

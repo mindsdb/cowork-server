@@ -93,6 +93,15 @@ deployment:
     - name: COWORK_TURN_MINDS_BASE_URL
       value: "https://api.mindshub.ai/v1"
 
+    # Per-task time limit for web turns, in seconds: at it anton asks
+    # "Keep going / Stop here" and ends with a summary. 0 or unset turns it
+    # off. Needs auth's turn-key extension and the controller's time-limited
+    # backstop live first. Above 3600 also needs auth's turn-key limits and
+    # the controller's ceiling raised; see time_limit_seconds in
+    # cowork/common/settings/app_settings.py.
+    - name: COWORK_TURN_TIME_LIMIT_SECONDS
+      value: "3600"
+
     # Agent tool budgets — deployment-level DEFAULTS for users who never set
     # the per-user setting (hosted has no Settings UI; inference cost lands on
     # the operator). Uncommented values below equal the code defaults, so

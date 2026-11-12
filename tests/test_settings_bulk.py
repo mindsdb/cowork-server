@@ -116,6 +116,29 @@ async def test_bulk_endpoint_400s_on_invalid_and_writes_nothing():
         session.close()
 
 
+async def test_bulk_endpoint_turns_the_limits_switch_on_with_new_budgets():
+    """First save with the limits switch on, through the app's own session:
+    it used to stage the switch twice and answer 500."""
+    keys = ("limits_enabled", "max_tool_rounds", "max_continuations")
+    session = get_open_session()
+    try:
+        _cleanup(session, *keys)
+        await bulk_upsert_settings(
+            SettingsBulkUpsertRequest(
+                values={"limits_enabled": "true", "max_tool_rounds": "5", "max_continuations": "2"}
+            ),
+            LOCAL_SCOPE,
+            None,
+        )
+        loaded = SettingService(session).load()
+        assert loaded.limits_enabled is True
+        assert loaded.max_tool_rounds == 5
+        assert loaded.max_continuations == 2
+    finally:
+        _cleanup(session, *keys)
+        session.close()
+
+
 async def test_test_providers_does_not_persist(monkeypatch):
     from cowork.api.v1.endpoints import settings as ep
 

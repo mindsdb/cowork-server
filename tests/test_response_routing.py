@@ -438,6 +438,7 @@ async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -537,6 +538,7 @@ async def test_handle_logs_every_router_fallback_at_default_level(
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: SimpleNamespace(id=conv_id),
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=history,
         ),
     )
@@ -864,7 +866,7 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
         minted["workspace_id"] = workspace_id
         return block
 
-    monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
+    monkeypatch.setattr(producer, "mint_llm_block", fake_mint)
 
     trace_token = set_trace_context(TraceContext(session_id="conv-router"))
     try:
@@ -925,7 +927,7 @@ async def test_router_binding_omits_workspace_id_when_none_picked(monkeypatch):
         minted["workspace_id"] = workspace_id
         return {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
 
-    monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
+    monkeypatch.setattr(producer, "mint_llm_block", fake_mint)
 
     await handler._router_binding()
 
@@ -964,7 +966,7 @@ async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_
         return block, "mdb_gate"
 
     monkeypatch.setattr(producer, "_mint_llm_block_with_turn_key_id", fake_mint)
-    monkeypatch.setattr(producer, "_mint_llm_block", AsyncMock(side_effect=AssertionError("minted without the prefix")))
+    monkeypatch.setattr(producer, "mint_llm_block", AsyncMock(side_effect=AssertionError("minted without the prefix")))
 
     _, turn_llm = await handler._router_binding()
 
@@ -2767,6 +2769,7 @@ async def test_a_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -2790,7 +2793,7 @@ async def test_a_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
     async def revoke(correlation_id):
         revoked.append(correlation_id)
 
-    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
 
     assert await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id))) == "answered"
     assert revoked == ["corr-gate"]
@@ -2819,7 +2822,7 @@ async def test_a_failed_gate_revokes_the_key_it_minted(monkeypatch):
     async def revoke(correlation_id):
         revoked.append(correlation_id)
 
-    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
     decision, turn_llm = await handler._route_request(
         conversation_id="conv-1",
         gate_rows=[],
@@ -2862,7 +2865,7 @@ async def test_a_failed_gate_cancels_the_first_take_before_revoking_its_key(monk
     async def revoke(correlation_id):
         events.append(f"revoked {correlation_id}")
 
-    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
     decision, _turn_llm = await handler._route_request(
         conversation_id="conv-1",
         gate_rows=[],
@@ -2898,7 +2901,7 @@ async def test_a_gate_cancelled_after_its_mint_revokes_the_key(monkeypatch):
     async def revoke(correlation_id):
         revoked.append(correlation_id)
 
-    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
     with pytest.raises(asyncio.CancelledError):
         await handler._route_request(
             conversation_id="conv-1",
@@ -2928,6 +2931,7 @@ async def test_a_jev_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -2958,7 +2962,7 @@ async def test_a_jev_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
     async def revoke(correlation_id):
         revoked.append(correlation_id)
 
-    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
 
     assert await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id))) == "answered"
     assert revoked == ["corr-gate"]
@@ -2984,6 +2988,7 @@ async def test_a_refused_or_cancelled_start_revokes_the_gate_key(monkeypatch, re
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -3008,7 +3013,7 @@ async def test_a_refused_or_cancelled_start_revokes_the_gate_key(monkeypatch, re
     async def revoke(correlation_id):
         revoked.append(correlation_id)
 
-    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
     with pytest.raises(type(refusal)):
         await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id), stream=True))
     assert revoked == ["corr-gate"]

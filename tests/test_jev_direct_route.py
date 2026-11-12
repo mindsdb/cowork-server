@@ -661,7 +661,7 @@ async def test_produce_answer_revokes_the_gate_key_unless_the_agent_takes_the_tu
     async def revoke(correlation_id):
         revoked.append(correlation_id)
 
-    monkeypatch.setattr(responses, "_revoke_turn_key_quietly", revoke)
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
     buffers = []
 
     async def delegate():
