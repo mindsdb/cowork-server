@@ -66,6 +66,7 @@ from cowork.services.live_apps import (
 from cowork.services.projects import display_label, is_comparison_sandbox
 from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
 from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_shared_skills
+from cowork.streaming.addons import AddonChannel, addons
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
@@ -443,6 +444,19 @@ def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, comp
     if not rows:
         return None
     return TurnHistory(rows=[], read=rows) if compacted else TurnHistory(rows=rows)
+
+
+def _turn_progress(*, session: "ChatSession", seed_len: int | None) -> list[str]:
+    """The running turn's last steps as Jev reads them when it decides where
+    a message sent mid-turn goes. Read from the same messages
+    `_captured_turn_history` stores."""
+    from cowork.handlers.response_routing import progress_lines
+
+    if hasattr(session, "turn_messages"):
+        return progress_lines(session.turn_messages())
+    if seed_len is not None:
+        return progress_lines(session.history[seed_len:])
+    return []
 
 
 def _turn_memory_read(*, session: "ChatSession", learns: bool) -> TurnMemoryRead | None:
@@ -921,6 +935,7 @@ class AntonHarness:
         # Keeps the turn alive while a model call is quiet (see HarnessProvider).
         model_wait: ModelWaitTicker | None = None,
         interactive: bool = True,
+        ui_locale: str | None = None,
         # The scheduler's own turn (see HarnessProvider).
         schedule_id: str | None = None,
     ) -> AsyncIterator[str]:
@@ -998,6 +1013,9 @@ class AntonHarness:
         memory_read: TurnMemoryRead | None = None
         session = None
         seed_info: dict | None = None
+        # Messages the person adds while the turn runs (ENG-4194); None when
+        # the installed anton can't take them.
+        addon_channel: AddonChannel | None = None
         # The live-app stops this turn's prompt tells (built.live_app_notices)
         # go back unless the turn finishes, so the person's next turn tells them.
         built: BuiltChatSession | None = None
@@ -1081,6 +1099,7 @@ class AntonHarness:
                 channel_context=channel_context,
                 tool_messages=tool_messages,
                 interactive=interactive,
+                ui_locale=ui_locale,
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1094,6 +1113,11 @@ class AntonHarness:
             # falls back to text-only replay.
             seed_len = len(session.history) if hasattr(session, "history") else None
             compacted = False  # set if anton compacts or hard-truncates history mid-turn
+            addon_channel = addons.open(
+                str(conv_id), session,
+                task=prompt_text(input),
+                progress=partial(_turn_progress, session=session, seed_len=seed_len),
+            )
             # Forward trace annotations only if the installed anton's
             # turn_stream accepts them. Every anton this server can start with
             # does (anton #218 predates the anton.core.artifacts.internal_files
@@ -1134,6 +1158,9 @@ class AntonHarness:
                         memory_read = _turn_memory_read(session=session, learns=built.learns)
                         if memory_read is not None:
                             yield memory_read
+                    if addon_channel is not None:
+                        for addon_event in addon_channel.drain():
+                            yield addon_event
             except (Exception, asyncio.CancelledError):
                 # A turn that fails or is stopped after anton builds its prompt,
                 # before any event after it: the stop usually lands on the first
@@ -1145,12 +1172,20 @@ class AntonHarness:
                     memory_read = _turn_memory_read(session=session, learns=built.learns)
                     if memory_read is not None:
                         yield memory_read
+                # Added messages the model never saw go back to the app, which
+                # runs them next, however the turn ended.
+                if addon_channel is not None:
+                    for addon_event in addon_channel.take_returned():
+                        yield addon_event
                 raise
             # A turn that built its prompt and sent no event after it.
             if memory_read is None:
                 memory_read = _turn_memory_read(session=session, learns=built.learns)
                 if memory_read is not None:
                     yield memory_read
+            if addon_channel is not None:
+                for addon_event in addon_channel.take_returned():
+                    yield addon_event
             # Turn completed cleanly: capture its tool block-rows. Skipped on
             # cancel/error (this line never runs), so a partial turn falls
             # back to text-only replay and anton's own dangling-tool_use
@@ -1159,6 +1194,8 @@ class AntonHarness:
             turn_history = _captured_turn_history(session=session, seed_len=seed_len, compacted=compacted)
             turn_finished = True
         finally:
+            if addon_channel is not None:
+                addons.close(str(conv_id), addon_channel)
             if model_wait is not None:
                 model_wait.detach()
             if turn_scratch_dir:
@@ -1385,6 +1422,7 @@ class AntonHarness:
         channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
         interactive: bool = True,
+        ui_locale: str | None = None,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
         (_build_turn_session). The live-app stops its prompt tells ride on the
@@ -1399,6 +1437,7 @@ class AntonHarness:
                 channel_context=channel_context,
                 tool_messages=tool_messages,
                 interactive=interactive,
+                ui_locale=ui_locale,
                 live_app_notices=notices,
             )
         except BaseException:
@@ -1428,6 +1467,7 @@ class AntonHarness:
         tool_messages: bool,
         interactive: bool,
         live_app_notices: list[UUID],
+        ui_locale: str | None = None,
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
         records whose stop the turn's prompt tells, which the turn claimed
@@ -2010,6 +2050,10 @@ class AntonHarness:
                 # brief when the agent acts first); without it the tool hands
                 # the content to the agent. Dropped by an anton without the field.
                 **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
+                # The app's language (ENG-4149): one line in anton's prompt.
+                # Dropped by an anton without the field, which then answers
+                # in the user's language as it always has.
+                **supported_kwargs(ChatSessionConfig, ui_locale=ui_locale),
                 # The desktop app's own browser, when it registered one and the
                 # person turned the browser on: anton registers its `browser`
                 # tool only then. Never for a channel turn. Passed directly:

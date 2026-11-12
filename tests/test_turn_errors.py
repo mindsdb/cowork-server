@@ -346,7 +346,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
 
     async def _stream_response(
         *, conversation, input, model=None, reasoning_effort=None, disabled_connections=None,
-        trace_tags=None, trace_metadata=None, tool_messages=False, model_wait=None, interactive=True, schedule_id=None,
+        trace_tags=None, trace_metadata=None, tool_messages=False, model_wait=None, interactive=True, ui_locale=None, schedule_id=None,
     ):
         if False:
             yield
@@ -2219,6 +2219,16 @@ def test_remote_error_turn_aborted_on_hard_timeout_gets_curated_copy():
     code, msg = remote_turn_error("turn aborted: hard turn timeout")
     assert code == GENERIC_TURN_ERROR_CODE
     assert "too long" in msg
+
+
+def test_remote_error_turn_aborted_on_the_wall_clock_ceiling_gets_the_same_copy():
+    """The controller's wall-clock ceiling, which also counts time a question
+    waited on the user, used to fall through to the generic error."""
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE, remote_error_label
+    code, msg = remote_turn_error("turn aborted: wall-clock limit")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "too long" in msg
+    assert remote_error_label(error="turn aborted: wall-clock limit") == "turn_aborted_timeout"
 
 
 def test_remote_error_turn_aborted_on_stall_gets_curated_copy():

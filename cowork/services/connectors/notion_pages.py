@@ -171,6 +171,8 @@ MAX_PAGE_URL_CHARS = 500
 
 
 def _capped(text: str, limit: int) -> str:
+    # One line per page: a newline in a name would start a line of its own.
+    text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 

@@ -37,6 +37,14 @@ helm upgrade --namespace $K8S_NAMESPACE --install $CURRENT_HELM_CHART $HELM_CHAR
 
 Swap `CI_ENVIRONMENT_SLUG` / `K8S_NAMESPACE` for `staging` or `prod` to target those environments.
 
+## Who rolls out each environment
+
+- **staging and prod:** CI, on a push to `staging` or `main` (the `deploy` job in `.github/workflows/build-deploy.yml`).
+- **A PR's own environment:** CI, when the PR carries the `deploy` label. It gets a namespace of its own, `pr-cowork-server-<N>`.
+- **dev** (`cowork.dev.mindshub.ai`): CI, when a PR carries the `deploy-to-dev` label (the `deploy-dev` job). That PR's `development` image rolls into `dev` on every push while the label stays. Removing the label leaves the last rollout in place. Two labeled PRs take turns, so the last push wins.
+
+Each rollout runs `alembic upgrade head` on that environment's database first. A PR that adds a migration leaves `dev`'s database at its revision, so a later rollout from a branch without that revision fails its `db-migrate` init container until a branch that has it rolls out again. The running pods keep serving meanwhile.
+
 ## Required cluster secrets
 
 The chart references these Secrets in the target namespace:
