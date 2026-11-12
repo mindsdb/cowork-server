@@ -30,7 +30,7 @@ from cowork.coding.reasoning import advertised_levels
 from cowork.schemas.turn_skills import TurnSkillEntry, TurnSkills, turn_skills_wire
 from cowork.services.providers import cached_org_model_catalog, minds_chat_base_url
 from cowork.db.scoped import scope_for_identity
-from cowork.services import product_permissions
+from cowork.services import decisions_proxy, product_permissions
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
@@ -731,6 +731,35 @@ async def _scoped_browser_block(
     return config.to_dict() if config is not None else None
 
 
+async def _admit_decisions_proxy(
+    r, browser_block: dict | None, *, turn_key: str, org_id: str | None, user_id: str | None,
+    correlation_id: str, settings: TurnQueueSettings,
+) -> dict | None:
+    """The browser block as the job carries it. One that names the decisions
+    proxy (the organization's own decision model, through this server) needs
+    the turn's key recorded first, which is how the proxy knows the key and
+    its organization (cowork.services.decisions_proxy). If that fails the
+    block goes without the proxy, and the pod's browser asks Jev on MindsHub
+    rather than a proxy that would refuse its key."""
+    if not browser_block or not browser_block.get("decisions_proxy"):
+        return browser_block
+    try:
+        if not turn_key or not org_id or not user_id:
+            raise ValueError("no turn key or identity to record")
+        await decisions_proxy.admit(
+            r, turn_key=turn_key, org_id=org_id, user_id=user_id, correlation_id=correlation_id,
+            ttl_seconds=settings.turn_key_lifetime_seconds,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[producer] could not record the turn for the decisions proxy; its browser asks Jev on MindsHub",
+            extra={"event": "decisions_proxy_admit_failed", "correlation_id": correlation_id,
+                   "error_type": type(exc).__name__},
+        )
+        return {k: v for k, v in browser_block.items() if k != "decisions_proxy"}
+    return browser_block
+
+
 async def revoke_turn_key_quietly(correlation_id: str) -> None:
     """Revoke the key the routing gate minted for a turn that never runs,
     logging rather than raising: a failed revoke leaves it to its own expiry."""
@@ -869,6 +898,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     browser_block = await _scoped_browser_block(
         scope=scope, conversation_id=conversation_id, turn_key=llm_block.get("api_key", ""),
         project_id=workspace.project_id if workspace is not None else None,
+    )
+    browser_block = await _admit_decisions_proxy(
+        r, browser_block, turn_key=llm_block.get("api_key", ""), org_id=org_id, user_id=user_id,
+        correlation_id=corr, settings=settings,
     )
 
     # Org-relative, never absolute. cowork-server sees the shared tree at
@@ -1136,6 +1169,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     finally:
         if llm_block.get("api_key") and (ended or await _stopped(r, corr)):
             await _revoke_turn_key_at_turn_end(corr, settings)
+            if browser_block and browser_block.get("decisions_proxy"):
+                await decisions_proxy.forget(r, correlation_id=corr)
 
 
 async def _stopped(r, corr: str) -> bool:

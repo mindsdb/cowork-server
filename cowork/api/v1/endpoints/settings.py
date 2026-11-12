@@ -748,7 +748,9 @@ def _persist_catalog_maps(
 # `?refresh=true` bypasses its cache every time. So this is not a static
 # catalog read for an anonymous caller, and it should not read as one.
 @router.get("/recommended-models", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def recommended_models(request: Request, scope: ScopeDep, refresh: bool = False):
+async def recommended_models(
+    request: Request, scope: ScopeDep, refresh: bool = False, principal: PrincipalDep = None,
+):
     """Per-provider model picker options for the Settings UI.
 
     Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
@@ -1006,10 +1008,14 @@ async def recommended_models(request: Request, scope: ScopeDep, refresh: bool = 
     from cowork.handlers.jev_route import decisions_model, gate_mode
 
     # `decisions`: what picks the shared browser's steps ("mindshub", "own"),
-    # or None, and the browser doesn't run.
+    # or None, and the browser doesn't run. `canSetDecisionModel`: whether
+    # the caller may edit the organization's own decision model, as for the
+    # provider and its keys (`_require_org_admin_for`): an organization admin,
+    # or anyone on a local server, where the person is the admin.
     routing = {
         "mode": gate_mode(gate_settings), "routerProvider": gate["provider"],
         "decisions": decisions_model(gate_settings),
+        "canSetDecisionModel": not scope.org_mode or can_manage_org(principal),
     }
 
     return {

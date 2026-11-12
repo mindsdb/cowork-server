@@ -19,6 +19,10 @@ Status also says what picks the browser's steps, its decisions model, and
 whether the caller may set one up: without one the browser doesn't run, and
 its switch reads as off.
 
+``POST /decisions`` is the one route a cloud pod calls, with its turn's key:
+the organization's own decision model, through this server, so its key never
+reaches the pod (cowork.services.decisions_proxy).
+
 Approve doesn't answer the chat card: the web app calls it first and answers
 the card only once the browser recorded the approval. The card's Skip, and any
 answer but Approve, sends decline, best effort: the step stays held either way.
@@ -31,13 +35,15 @@ other routes answer 409, as the web does without a router.
 
 from __future__ import annotations
 
+import json
 from functools import partial
-from typing import Annotated, NoReturn
+from typing import Annotated, Any, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, TurnKey, require
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_on_unit_threads
@@ -243,3 +249,68 @@ async def browse_close(body: TaskBrowserRequest, request: Request, scope: ScopeD
     except browser_service.BrowserServiceError as exc:
         _raise(exc)
     return {"ok": True}
+
+
+def _proxy_error(status_code: int, code: str, message: str, **extra) -> HTTPException:
+    return HTTPException(status_code=status_code, detail={"code": code, "message": message, **extra})
+
+
+async def _decision_body(request: Request) -> dict:
+    """The decision anton posts, read up to MAX_BODY_BYTES: ``state`` and
+    ``questions`` objects. 413 past the limit, 400 for anything else."""
+    from cowork.services.decisions_proxy import MAX_BODY_BYTES
+
+    too_large = _proxy_error(413, "too_large", "The decision is too large.")
+    try:
+        if int(request.headers.get("content-length") or 0) > MAX_BODY_BYTES:
+            raise too_large
+    except ValueError:
+        raise _proxy_error(400, "bad_request", "Bad Content-Length.") from None
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > MAX_BODY_BYTES:
+            raise too_large
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        raise _proxy_error(400, "bad_request", "The decision isn't JSON.") from None
+    if not isinstance(body, dict) or not isinstance(body.get("state"), dict) or not isinstance(body.get("questions"), dict):
+        raise _proxy_error(400, "bad_request", "A decision needs its state and questions.")
+    return body
+
+
+# TurnKey: the caller is a cloud pod, with the key minted for its turn, which
+# this server recorded when it queued a turn whose browser asks through here
+# (cowork.services.decisions_proxy). Not AuthenticatedInOrgMode: a person's
+# own credential must not reach the organization's decision model this way.
+@router.post("/decisions")
+async def browse_decisions(request: Request, holder: Annotated[Any, Depends(require(TurnKey))]) -> JSONResponse:
+    """One browser decision for a web turn, forwarded to the organization's
+    own decision model with the key it stored, so the key never reaches the
+    pod. Only the stored endpoint is ever dialed, out through the route
+    gate's vetted egress, and only ``state`` and ``questions`` go on, under
+    the organization's model name. The answer comes back as the endpoint
+    gave it. 404 ``no_decision_model`` once the organization removed it; 504
+    when the endpoint took longer than ``UPSTREAM_TIMEOUT_S``; 502 for any
+    other failure, with the gate's error class."""
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.db.scoped import scope_for_identity
+    from cowork.handlers import jev_route
+    from cowork.services.decisions_proxy import UPSTREAM_TIMEOUT_S
+
+    body = await _decision_body(request)
+    scope = scope_for_identity(org_id=holder.org_id, user_id=holder.user_id)
+    settings = await run_on_unit_threads(partial(get_user_settings, scope))
+    target = jev_route.own_decision_target(settings)
+    if target is None:
+        raise _proxy_error(404, "no_decision_model", "The organization has no decision model of its own.")
+    model = (settings.decision_model or "").strip() or TurnQueueSettings().jev_route_model
+    payload = {"model": model, "state": body["state"], "questions": body["questions"]}
+    try:
+        answer = await jev_route.forward_decision(target, payload, timeout_seconds=UPSTREAM_TIMEOUT_S)
+    except jev_route.DecisionFailed as exc:
+        if exc.error == "timeout":
+            raise _proxy_error(504, "timeout", "The decision model took too long.") from None
+        raise _proxy_error(502, "decision_model_failed", "The decision model didn't answer.", error=exc.error) from None
+    return JSONResponse(answer)

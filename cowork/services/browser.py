@@ -728,6 +728,14 @@ def turn_block(
     browser off or it can't run (``browser_runs``), and for a turn with no
     person behind it: an organization's channel turn, which comes from a chat
     anyone in it can write to, while the browser holds one person's sign-ins.
+
+    When the organization set up a decision model of its own, the block also
+    names this server's decisions proxy (``decisions_proxy``: its URL and the
+    model name, never the key): the pod must not hold the organization's key,
+    so anton asks the model through the proxy with the turn's key
+    (cowork.services.decisions_proxy). Not for a deployment without a proxy
+    URL, nor for an anton that predates it; its browser then asks Jev on
+    MindsHub.
     """
     router = router_url()
     if not router or not user_id or not browser_runs(user_settings):
@@ -736,7 +744,22 @@ def turn_block(
         base_url=router,
         profile=task_session(user_id, conversation_id),
         project=project_key(user_id, project_id),
+        **_decisions_proxy_block(user_settings),
     )
+
+
+def _decisions_proxy_block(user_settings: UserSettings) -> dict:
+    from cowork.handlers.jev_route import decisions_model
+    from cowork.services.decisions_proxy import proxy_url
+
+    url = proxy_url()
+    if not url or decisions_model(user_settings) != "own" or "decisions_proxy" not in BrowserConfig.model_fields:
+        return {}
+    from anton.core.browser.config import DecisionsProxy
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    model = (getattr(user_settings, "decision_model", "") or "").strip() or TurnQueueSettings().jev_route_model
+    return {"decisions_proxy": DecisionsProxy(url=url, model=model)}
 
 
 def _decisions_block(decisions: Any) -> dict:

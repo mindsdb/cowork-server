@@ -463,6 +463,28 @@ async def _post_decision(target: JevTarget, payload: dict, *, timeout_seconds: f
     return body
 
 
+class DecisionFailed(Exception):
+    """A forwarded decision that got no usable answer, with its error class
+    (``http_401``, ``timeout``, ``endpoint_refused``, ...)."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__(error)
+        self.error = error
+
+
+async def forward_decision(target: JevTarget, payload: dict, *, timeout_seconds: float) -> dict:
+    """POST a decision body as given (model, state, questions) to ``target``
+    and return the answer's JSON object, out through the gate's own egress:
+    on the hosted server an organization's endpoint is dialed only at a
+    vetted public address over https (`_post_pinned`), within
+    ``timeout_seconds`` overall. For the browser's decisions proxy
+    (cowork.services.decisions_proxy). Raises `DecisionFailed`."""
+    try:
+        return await _post_decision(target, payload, timeout_seconds=timeout_seconds)
+    except _Failed as exc:
+        raise DecisionFailed(exc.error) from None
+
+
 async def decide(
     *,
     target: JevTarget,

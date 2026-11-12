@@ -701,7 +701,9 @@ def test_settings_are_told_which_gate_decides_turns(monkeypatch):
         payload = endpoint.call()
 
     # `decisions`: what picks the shared browser's steps.
-    assert payload["routing"] == {"mode": "jev", "routerProvider": "minds-cloud", "decisions": "mindshub"}
+    assert payload["routing"] == {
+        "mode": "jev", "routerProvider": "minds-cloud", "decisions": "mindshub", "canSetDecisionModel": True,
+    }
     # Kept for UIs that predate `routing`.
     assert "gate" in payload
 

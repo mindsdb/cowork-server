@@ -491,6 +491,36 @@ def test_without_a_decisions_model_no_turn_gets_the_browser(app_browser, web, de
     assert svc.turn_block(on, user_id="u", conversation_id="c", project_id=None) is None
 
 
+def test_a_web_turn_asks_the_organizations_own_model_through_this_server(web, decisions, monkeypatch):
+    """The pod must not hold the organization's key: its block names this
+    server's proxy and the model name, with no key, and anton reads it back."""
+    from anton.core.browser import config as anton_config
+
+    if "decisions_proxy" not in anton_config.BrowserConfig.model_fields:
+        pytest.skip("the installed anton predates the decisions proxy")
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.handlers.jev_route import JevTarget
+
+    monkeypatch.setenv("COWORK_BROWSER_DECISIONS_URL", "https://cowork.example.test/api/v1/browse/decisions")
+    get_app_settings.cache_clear()
+    decisions.model = "own"
+    decisions.own = JevTarget(url="https://decide.example.test/v1/systemone", api_key="org-own-key")
+    on = SimpleNamespace(browser_enabled=True, decision_model="jev-own",
+                         decision_model_api_key="org-own-key", decision_model_url=decisions.own.url)
+    block = svc.turn_block(on, user_id="u", conversation_id="c", project_id=None).to_dict()
+    assert block["decisions_proxy"] == {"url": "https://cowork.example.test/api/v1/browse/decisions", "model": "jev-own"}
+    assert "org-own-key" not in json.dumps(block) and "decide.example.test" not in json.dumps(block)
+    assert anton_config.BrowserConfig.from_dict(block).decisions_proxy.model == "jev-own"
+    # Jev on MindsHub needs no proxy, and nor does a deployment without one.
+    decisions.model = "mindshub"
+    assert "decisions_proxy" not in svc.turn_block(on, user_id="u", conversation_id="c", project_id=None).to_dict()
+    decisions.model = "own"
+    monkeypatch.delenv("COWORK_BROWSER_DECISIONS_URL")
+    monkeypatch.setenv("COWORK_PUBLIC_BASE_URL", "")
+    get_app_settings.cache_clear()
+    assert "decisions_proxy" not in svc.turn_block(on, user_id="u", conversation_id="c", project_id=None).to_dict()
+
+
 def test_the_web_offers_the_browser_only_on_mindshub(web, decisions):
     """The router takes only a MindsHub credential."""
     decisions.mindshub = False

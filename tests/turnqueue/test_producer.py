@@ -2022,6 +2022,72 @@ async def test_a_web_turn_scopes_its_key_before_it_queues(browser_router):
     assert BrowserConfig.from_dict(params["browser"]) == config
 
 
+@pytest.fixture
+def own_decision_model(browser_router, monkeypatch):
+    """The organization set up its own decision model, and this deployment
+    serves the decisions proxy. ``admitted`` and ``forgotten`` record the
+    turn keys the proxy is told about; ``refuse`` makes recording fail."""
+    from pydantic import SecretStr
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.services import decisions_proxy
+
+    monkeypatch.setenv("COWORK_BROWSER_DECISIONS_URL", "https://app.example.test/api/v1/browse/decisions")
+    get_app_settings.cache_clear()
+    browser_router.settings.decision_model_url = "https://decide.example.test/v1/systemone"
+    browser_router.settings.decision_model_api_key = SecretStr("org-own-key")
+    browser_router.settings.decision_model = "jev-own"
+    state = SimpleNamespace(admitted=[], forgotten=[], refuse=None)
+
+    async def admit(r, **kwargs):
+        if state.refuse is not None:
+            raise state.refuse
+        state.admitted.append(kwargs)
+
+    async def forget(r, **kwargs):
+        state.forgotten.append(kwargs)
+
+    monkeypatch.setattr(decisions_proxy, "admit", admit)
+    monkeypatch.setattr(decisions_proxy, "forget", forget)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_the_organizations_key_never_reaches_the_pod(browser_router, own_decision_model):
+    """A web turn's browser asks the organization's own decision model
+    through this server: the job names the proxy and the model, never the key
+    or the endpoint, and the turn's key is recorded for the proxy until the
+    turn ends."""
+    from anton.core.browser import config as anton_config
+
+    if "decisions_proxy" not in anton_config.BrowserConfig.model_fields:
+        pytest.skip("the installed anton predates the decisions proxy")
+    await _web_turn()
+    payload = browser_router.fake.added[0][1]["payload"]
+    assert "org-own-key" not in payload and "decide.example.test" not in payload
+    params = json.loads(payload)["params"]
+    assert params["browser"]["decisions_proxy"] == {
+        "url": "https://app.example.test/api/v1/browse/decisions", "model": "jev-own",
+    }
+    [admitted] = own_decision_model.admitted
+    assert (admitted["turn_key"], admitted["org_id"], admitted["user_id"], admitted["correlation_id"]) == (
+        "mdb_turnkey", "o1", "u1", "r",
+    )
+    assert own_decision_model.forgotten == [{"correlation_id": "r"}]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_the_proxy_cant_record_asks_jev_on_mindshub(browser_router, own_decision_model):
+    from anton.core.browser import config as anton_config
+
+    if "decisions_proxy" not in anton_config.BrowserConfig.model_fields:
+        pytest.skip("the installed anton predates the decisions proxy")
+    own_decision_model.refuse = ConnectionError("redis down")
+    await _web_turn()
+    params = json.loads(browser_router.fake.added[0][1]["payload"])["params"]
+    assert "decisions_proxy" not in params["browser"] and params["browser"]["base_url"] == ROUTER
+
+
 @pytest.mark.asyncio
 async def test_a_refused_scope_queues_the_turn_without_a_browser(browser_router):
     from cowork.services import browser
