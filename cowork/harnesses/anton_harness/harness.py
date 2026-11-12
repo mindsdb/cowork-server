@@ -1678,6 +1678,13 @@ class AntonHarness:
             backends_rule = _SANDBOXED_BACKENDS_RULE
         else:
             backends_rule = "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
+        # The desktop app's own browser, when it registered one and the
+        # person turned the browser on: anton registers its `browser` tool
+        # only then. Never for a channel turn.
+        turn_browser = await _browser_config(
+            user, channel_context=channel_context,
+            conversation_id=str(conversation.id), project_id=conversation.project_id,
+        )
         project_context = (
             # Conversational only. The next line hands the agent the real path,
             # so the name here never has to resolve to anything (ENG-1676).
@@ -1696,11 +1703,15 @@ class AntonHarness:
             " Processes and threads a scratchpad cell starts are stopped when your reply ends: "
             "variables carry over to the next turn, running servers do not. "
             + backends_rule
-            # The browser runs clicks and drags by position without the
-            # person's approval; only a step that commits something waits.
-            + " In the browser, when no listed element fits (a slider, a map, a date grid, a canvas, a drag "
-            "handle), click or drag by position (x, y) right away instead of reading the page again: steps by "
-            "position don't wait for the person's approval."
+            # Only a turn with a browser hears about it. Where no listed
+            # element fits, a step by position is the way in; whether a step
+            # waits for the person is the browser tool's own prompt's to say.
+            + (
+                " In the browser, when no listed element fits (a slider, a map, a date grid, a canvas, a drag "
+                "handle), click or drag by position (x, y) right away instead of reading the page again."
+                if turn_browser is not None
+                else ""
+            )
             + attachment_context
         )
         output_context = (
@@ -2049,14 +2060,9 @@ class AntonHarness:
                 # Dropped by an anton without the field, which then answers
                 # in the user's language as it always has.
                 **supported_kwargs(ChatSessionConfig, ui_locale=ui_locale),
-                # The desktop app's own browser, when it registered one and the
-                # person turned the browser on: anton registers its `browser`
-                # tool only then. Never for a channel turn. Passed directly:
+                # Read above, with the prompt line it brings. Passed directly:
                 # every anton the floor admits has the field.
-                browser=await _browser_config(
-                    user, channel_context=channel_context,
-                    conversation_id=str(conversation.id), project_id=conversation.project_id,
-                ),
+                browser=turn_browser,
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API

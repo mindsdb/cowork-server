@@ -6,23 +6,23 @@ POST /voice/operate  a request from the call in, the app actions to take out (co
 
 All three act as the caller, with their own MindsHub credential. Status
 answers ``available: false`` for any refusal or failure. Session keeps
-MindsHub's 401, 403 or 429, and answers 409 where live voice is off; operate
-keeps 401, 403 or 429. Either puts a code and a sentence for the person in
-``detail``; any other failure is 424.
+MindsHub's 401, 402, 403 or 429, and answers 409 where live voice is off;
+operate keeps 401, 402, 403 or 429. Either puts a code and a sentence for the
+person in ``detail`` (inference's own sentence for a 402 or 429); any other
+failure is 424.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from functools import partial
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-import asyncio
-import logging
-
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.units import FilesystemBusy, run_efs
 from cowork.harnesses.memory.policy import resolve_memory_policy
 from cowork.principal import mindshub_credential
 from cowork.services import voice, voice_operator
@@ -53,7 +53,7 @@ def _person_memory(scope: TenantScope) -> dict[str, str]:
 
 
 class VoiceOperateRequest(BaseModel):
-    messages: list[dict[str, Any]] = Field(min_length=1, max_length=200)
+    messages: list[voice_operator.OperatorMessage] = Field(min_length=1, max_length=200)
     snapshot: str = Field(default="", max_length=voice_operator.MAX_SNAPSHOT_CHARS * 2)
     # The person's IANA time zone, from their browser, so dates are counted from their today.
     timezone: str | None = Field(default=None, max_length=64)
@@ -68,7 +68,13 @@ async def voice_status(request: Request) -> voice.VoiceStatus:
 async def voice_session(
     body: VoiceSessionRequest, request: Request, scope: TenantScope = Depends(get_tenant_scope)
 ) -> dict:
-    memory = await asyncio.to_thread(_person_memory, scope)
+    # Memory lives on the shared file store: read it in run_efs's slots and the
+    # person's share of them. A busy store starts the call without memory.
+    try:
+        memory = await run_efs(partial(_person_memory, scope), scope=scope)
+    except FilesystemBusy:
+        logger.warning("voice: the file store is busy, so the call starts without memory")
+        memory = {}
     context = voice.voice_context(tz_name=body.timezone, memory=memory)
     try:
         return await voice.start_session(mindshub_credential(request), body.sdp, body.voice, context)

@@ -268,17 +268,32 @@ def test_removed_browser_settings_are_gone(client):
     from cowork.common.settings.user_settings import UserSettings
 
     browser_keys = {k for k in UserSettings.model_fields if k.startswith("browser_")}
-    assert browser_keys == {"browser_enabled"}
+    assert browser_keys == {"browser_enabled", "browser_approve_steps"}
     gone_keys = ("browser_mode", "browser_service_url", "browser_service_api_key", "browser_url", "browser_proxy", "browser_city")
     for gone in gone_keys:
         assert client.put(f"/api/v1/settings/{gone}", json={"value": "x"}).status_code == 400, gone
 
 
-def test_the_browser_switch_defaults_on_and_is_the_persons_own():
+def test_the_browser_switch_defaults_off_and_is_the_persons_own():
+    """Beta: the browser stays off until the person turns it on."""
     from cowork.common.settings.user_settings import UserSettings, setting_is_org_scoped
 
-    assert UserSettings().browser_enabled is True
+    assert UserSettings().browser_enabled is False
     assert setting_is_org_scoped("browser_enabled") is False
+
+
+def test_browser_steps_wait_for_approval_by_default_and_the_person_can_say_otherwise(client):
+    from cowork.common.settings.user_settings import UserSettings, setting_is_org_scoped
+
+    assert UserSettings().browser_approve_steps is True
+    assert setting_is_org_scoped("browser_approve_steps") is False
+    assert client.put("/api/v1/settings/browser_approve_steps", json={"value": "false"}).status_code == 200
+    stored = {row["key"]: row["value"] for row in client.get("/api/v1/settings/").json()}
+    assert stored["browser_approve_steps"].lower() == "false"
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    assert get_user_settings(LOCAL_SCOPE).browser_approve_steps is False
 
 
 def test_no_setting_offers_an_exit_city_or_a_proxy():
@@ -452,8 +467,21 @@ def test_the_session_builder_passes_the_channel_to_the_browser():
     from cowork.harnesses.anton_harness import harness
 
     source = inspect.getsource(harness.AntonHarness._build_turn_session)
-    assert re.search(r"browser=await _browser_config\(\s*user, channel_context=channel_context,", source)
+    assert re.search(r"turn_browser = await _browser_config\(\s*user, channel_context=channel_context,", source)
+    assert "browser=turn_browser," in source
     assert "supported_kwargs(ChatSessionConfig, browser=" not in source
+
+
+def test_only_a_turn_with_a_browser_hears_about_steps_by_position():
+    """The prompt line about clicking by position joins only a turn that has a
+    browser, and says nothing about approval: the browser tool's own prompt
+    says which steps wait for the person."""
+    from cowork.harnesses.anton_harness import harness
+
+    source = inspect.getsource(harness.AntonHarness._build_turn_session)
+    line = re.search(r'" In the browser, when no listed element fits.*?"\s*"[^"]*"\s*if turn_browser is not None', source, re.S)
+    assert line, "the position line must depend on the turn's browser"
+    assert "approval" not in line.group(0)
 
 
 def test_in_process_turn_never_gets_the_router(monkeypatch, nothing_goes_out):
@@ -502,12 +530,14 @@ def test_a_refused_app_browser_is_logged_without_its_key(caplog):
 def test_desktop_routes_answer_from_the_app_and_call_nothing(client, nothing_goes_out):
     status = client.get("/api/v1/browse/status")
     assert status.status_code == 200
-    assert status.json() == {"enabled": True, "available": False, "status": "unavailable"}
+    assert status.json() == {"enabled": False, "available": False, "status": "unavailable"}
     svc.BrowseStatus.model_validate(status.json())
 
     runtime_credential.set_browser_host(APP_BROWSER)
+    assert client.get("/api/v1/browse/status").json() == {"enabled": False, "available": True, "status": "running"}
+    # Available whatever the switch says, so the person can turn it on and off.
+    assert client.put("/api/v1/settings/browser_enabled", json={"value": "true"}).status_code == 200
     assert client.get("/api/v1/browse/status").json() == {"enabled": True, "available": True, "status": "running"}
-    # Available whatever the switch says, so the person can turn it back on.
     assert client.put("/api/v1/settings/browser_enabled", json={"value": "false"}).status_code == 200
     assert client.get("/api/v1/browse/status").json() == {"enabled": False, "available": True, "status": "running"}
 
@@ -532,7 +562,7 @@ def test_without_a_router_nothing_goes_out(web_client, monkeypatch, nothing_goes
 
     status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
     assert status.status_code == 200
-    assert status.json() == {"enabled": True, "available": False, "status": "unavailable"}
+    assert status.json() == {"enabled": False, "available": False, "status": "unavailable"}
     assert _detail(web_client.post("/api/v1/browse/provision", headers=_as("alice"))) == (409, "unavailable")
     embed = web_client.post("/api/v1/browse/embed", headers=_as("alice"), json={"session_id": "t-abc"})
     assert _detail(embed) == (409, "unavailable")
@@ -553,7 +583,7 @@ def test_web_status_reads_the_entitlement_then_the_router(web_client, router, mi
     router.status = "running"
     status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
     assert status.status_code == 200
-    assert status.json() == {"enabled": True, "available": True, "status": "running"}
+    assert status.json() == {"enabled": False, "available": True, "status": "running"}
     assert mindshub.asked == [("/entitlements/me/", "jwt-alice")]
     assert router.calls == [Call("GET", f"{ROUTER}/_status", None, "Bearer jwt-alice")]
 
@@ -564,7 +594,7 @@ def test_an_account_without_the_browser_is_not_entitled(web_client, router, mind
     mindshub.replies["jwt-alice"] = MindsHubReply(MindsHubAnswer.OK, payload=_entitlements(False))
     status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
     assert status.status_code == 200
-    assert status.json() == {"enabled": True, "available": False, "status": "not_entitled"}
+    assert status.json() == {"enabled": False, "available": False, "status": "not_entitled"}
     # Read from MindsHub: the router isn't asked.
     assert router.calls == []
 
@@ -603,7 +633,7 @@ def test_an_organization_that_turned_the_browser_off_reads_as_organization_off(w
         MindsHubAnswer.OK, payload=_entitlements(False, reason="organization_off"),
     )
     status = web_client.get("/api/v1/browse/status", headers=_as("alice"))
-    assert status.json() == {"enabled": True, "available": False, "status": "organization_off"}
+    assert status.json() == {"enabled": False, "available": False, "status": "organization_off"}
     assert router.calls == []
 
 
@@ -629,7 +659,7 @@ def test_a_signed_in_desktop_whose_organization_turned_the_browser_off_gets_none
 
     mindshub_teams.reset_caches_for_tests()
     assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)) is None
-    assert client.get("/api/v1/browse/status").json() == {"enabled": True, "available": False, "status": "organization_off"}
+    assert client.get("/api/v1/browse/status").json() == {"enabled": False, "available": False, "status": "organization_off"}
     assert ("/entitlements/me/", "desktop-jwt") in signed_in_desktop.asked
 
 
@@ -653,7 +683,7 @@ def test_a_desktop_ignores_not_permitted_and_keeps_its_answer_through_an_outage(
 def test_a_desktop_on_the_persons_own_model_key_asks_mindshub_nothing(client, nothing_goes_out, monkeypatch):
     monkeypatch.setattr(svc, "get_minds_credential", lambda: None)
     runtime_credential.set_browser_host(APP_BROWSER)
-    assert client.get("/api/v1/browse/status").json() == {"enabled": True, "available": True, "status": "running"}
+    assert client.get("/api/v1/browse/status").json() == {"enabled": False, "available": True, "status": "running"}
     assert nothing_goes_out == []
 
 
@@ -688,7 +718,7 @@ def test_provision_hands_the_router_the_prefs_and_answers_like_status(web_client
     # No body still works.
     plain = web_client.post("/api/v1/browse/provision", headers=_as("alice"))
     assert plain.status_code == 200
-    assert plain.json() == {"enabled": True, "available": True, "status": "starting"}
+    assert plain.json() == {"enabled": False, "available": True, "status": "starting"}
     hinted = web_client.post(
         "/api/v1/browse/provision", headers=_as("alice"),
         json={"timezone": "America/Los_Angeles", "locale": "en-US"},

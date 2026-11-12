@@ -80,6 +80,21 @@ async def test_the_call_knows_the_persons_date_and_time_and_what_memory_holds_ab
     assert "The user's standing preferences:\nAlways use metric." in instructions
 
 
+async def test_a_busy_file_store_starts_the_call_without_memory(inference, monkeypatch):
+    import cowork.api.v1.endpoints.voice as endpoint
+    from cowork.db.units import FilesystemBusy
+
+    async def busy(fn, *, scope, deadline=True):
+        raise FilesystemBusy("no slot")
+
+    monkeypatch.setattr(endpoint, "run_efs", busy)
+    started = await _call("POST", "/session", json={"sdp": "offer-sdp"})
+
+    assert started.status_code == 200, started.text
+    instructions = json.loads(inference.seen[0].content)["session"]["instructions"]
+    assert "What you know about the user" not in instructions
+
+
 def test_local_now_reads_the_persons_zone_or_falls_back_to_utc():
     from datetime import datetime, timezone
 
@@ -105,6 +120,10 @@ async def test_the_session_speaks_in_the_chosen_voice_or_the_default(inference, 
         (404, {"code": "live_not_enabled", "message": "x"}, 409, "aren't available"),
         (429, {"code": "rate_limit_exceeded", "message": "x"}, 429, "Too many"),
         (401, {"code": "unauthorized", "message": "x"}, 401, "Couldn't start"),
+        # Inference words an empty wallet and too many open sessions for the person.
+        (402, {"code": "wallet_empty", "message": "Your organization's balance is empty."}, 402, "balance is empty"),
+        (402, {"code": "wallet_empty"}, 402, "balance can't cover"),
+        (429, {"code": "too_many_live_sessions", "message": "You have 3 voice calls open."}, 429, "3 voice calls open"),
         (502, {"code": "upstream_error", "message": "x"}, 424, "Couldn't start"),
     ],
 )
@@ -120,8 +139,8 @@ async def test_a_refusal_says_why(inference, status, error, expected, words):
 async def test_status_asks_inference_once_whether_live_voice_is_on(inference):
     inference.answer = httpx.Response(400, json={"error": {"code": "invalid_request", "param": "transport.type"}})
 
-    assert (await _call("GET", "/status")).json() == {"available": True}
-    assert (await _call("GET", "/status")).json() == {"available": True}
+    assert (await _call("GET", "/status")).json()["available"] is True
+    assert (await _call("GET", "/status")).json()["available"] is True
     assert len(inference.seen) == 1
     assert json.loads(inference.seen[0].content) == {}
 
@@ -129,24 +148,24 @@ async def test_status_asks_inference_once_whether_live_voice_is_on(inference):
 async def test_status_is_off_where_inference_does_not_serve_it(inference):
     inference.answer = httpx.Response(404, json={"error": {"code": "live_not_enabled"}})
 
-    assert (await _call("GET", "/status")).json() == {"available": False}
+    assert (await _call("GET", "/status")).json()["available"] is False
 
 
 async def test_a_caller_inference_refuses_is_not_cached_for_everyone(inference):
     inference.answer = httpx.Response(401, json={"error": {"code": "unauthorized"}})
-    assert (await _call("GET", "/status")).json() == {"available": False}
+    assert (await _call("GET", "/status")).json()["available"] is False
 
     inference.answer = httpx.Response(400, json={"error": {"code": "invalid_request"}})
-    assert (await _call("GET", "/status")).json() == {"available": True}
+    assert (await _call("GET", "/status")).json()["available"] is True
 
 
 @pytest.mark.parametrize("status", [429, 500, 502, 503])
 async def test_a_busy_or_failing_inference_is_not_cached_for_everyone(inference, status):
     inference.answer = httpx.Response(status, json={"error": {"code": "x"}})
-    assert (await _call("GET", "/status")).json() == {"available": False}
+    assert (await _call("GET", "/status")).json()["available"] is False
 
     inference.answer = httpx.Response(400, json={"error": {"code": "invalid_request"}})
-    assert (await _call("GET", "/status")).json() == {"available": True}
+    assert (await _call("GET", "/status")).json()["available"] is True
 
 
 async def test_an_unreachable_inference_is_not_cached(monkeypatch, inference):
@@ -154,7 +173,7 @@ async def test_an_unreachable_inference_is_not_cached(monkeypatch, inference):
         raise httpx.ConnectError("down")
 
     monkeypatch.setattr(voice, "_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(down)))
-    assert (await _call("GET", "/status")).json() == {"available": False}
+    assert (await _call("GET", "/status")).json()["available"] is False
     assert voice._status_cache == {}
 
 
@@ -165,3 +184,11 @@ async def test_a_session_answer_that_isnt_json_is_a_bad_answer(inference):
 
     assert answered.status_code == 424
     assert answered.json()["detail"]["code"] == "bad_answer"
+
+
+async def test_status_lists_the_voices_a_call_can_speak_in(inference):
+    status = (await _call("GET", "/status")).json()
+
+    assert status["defaultVoice"] == voice.DEFAULT_VOICE
+    assert status["voices"][0] == {"name": "cinder", "style": voice.VOICE_STYLES["cinder"]}
+    assert [v["name"] for v in status["voices"]] == list(voice.VOICE_STYLES)

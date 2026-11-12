@@ -752,7 +752,8 @@ class UserSettings(Settings):
     )
     # The agent's browser. Untagged, so per-user in org mode and the single
     # global row on desktop, like `hub_workspace_id`: whether the agent may use
-    # a browser is the person's own choice. On by default: it only does something where a browser is
+    # a browser is the person's own choice. Off by default while the browser
+    # is in beta; once on, it only does something where a browser is
     # available, the browser router on the web or the desktop app's own
     # browser (cowork.services.browser).
     browser_enabled: bool = Field(
@@ -760,6 +761,14 @@ class UserSettings(Settings):
         default=False,
         title="Browser Enabled",
         description="Let the agent use a browser, shown beside the chat (beta).",
+    )
+    # Untagged like browser_enabled: the person's own choice. The app reads it
+    # (as browserApproveSteps) to decide whether a browser step waits for the
+    # person's approval; this server only stores it.
+    browser_approve_steps: bool = Field(
+        default=True,
+        title="Approve Browser Steps",
+        description="Ask before the agent's browser steps run.",
     )
     # `hub_workspace_id`, not `workspace_id`: in this repo `workspace` already
     # means a filesystem location (the per-conversation private directory, the

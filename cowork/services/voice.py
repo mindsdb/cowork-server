@@ -28,9 +28,10 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-from pydantic import BaseModel
+from pydantic import Field
 
 from cowork.common.settings.app_settings import default_turn_minds_api_host
+from cowork.schemas.base import CamelResponse
 from cowork.services.providers import minds_chat_base_url
 
 logger = logging.getLogger(__name__)
@@ -90,8 +91,25 @@ VOICE_PROMPT = (
 )
 
 
-class VoiceStatus(BaseModel):
+class VoiceOption(CamelResponse):
+    """One of GPT-Live's voices: its API name and how it sounds."""
+
+    name: str
+    style: str
+
+
+def _voice_options() -> list[VoiceOption]:
+    return [VoiceOption(name=name, style=style) for name, style in VOICE_STYLES.items()]
+
+
+class VoiceStatus(CamelResponse):
+    """Whether calls are available, and the voices a call can speak in, so the
+    app's picker can read this list instead of keeping its own copy. No OpenAI
+    endpoint lists GPT-Live's voices: VOICE_STYLES is the source."""
+
     available: bool
+    default_voice: str = DEFAULT_VOICE
+    voices: list[VoiceOption] = Field(default_factory=_voice_options)
 
 
 class VoiceError(Exception):
@@ -191,6 +209,23 @@ _REFUSALS = {
     "live_not_enabled": "Voice calls aren't available on this deployment.",
     "rate_limit_exceeded": "Too many voice calls right now. Try again in a minute.",
 }
+# A 402 or 429 without inference's own sentence.
+_BY_STATUS = {
+    402: "Your organization's MindsHub balance can't cover a voice call.",
+    429: "Too many voice calls are open right now.",
+}
+#: Inference's own sentence, at most this long, is what a 402 or 429 shows.
+MAX_REFUSAL_CHARS = 300
+
+
+def said_by_inference(error: Any) -> str:
+    """Inference's sentence for the person from an ``{error: {message}}`` body,
+    on one line and capped, or "" when it sent none. Inference words its 402
+    (an empty wallet, a spent budget) and 429 (too many open sessions, an
+    allowance) for the person, and "try again" fixes neither."""
+    if not isinstance(error, dict):
+        return ""
+    return " ".join(str(error.get("message") or "").split())[:MAX_REFUSAL_CHARS]
 
 
 async def start_session(bearer: str, sdp: str, voice: str | None = None, context: str = "") -> dict:
@@ -213,15 +248,19 @@ async def start_session(bearer: str, sdp: str, voice: str | None = None, context
             error = response.json().get("error") or {}
         except (ValueError, AttributeError):
             error = {}
+        if not isinstance(error, dict):
+            error = {}
         code = str(error.get("code") or "")
         logger.warning(
             "MindsHub refused a voice session",
             extra={"event": "voice_refused", "status_code": response.status_code, "reason": code},
         )
-        status = response.status_code if response.status_code in (401, 403, 409, 429) else 424
+        status = response.status_code if response.status_code in (401, 402, 403, 409, 429) else 424
         if code == "live_not_enabled":
             status = 409
-        raise VoiceError(status, code or "refused", _REFUSALS.get(code, "Couldn't start the voice call. Try again."))
+        said = said_by_inference(error) if status in (402, 429) else ""
+        fallback = _BY_STATUS.get(status, "Couldn't start the voice call. Try again.")
+        raise VoiceError(status, code or "refused", _REFUSALS.get(code) or said or fallback)
     try:
         created = response.json()
     except ValueError as exc:
