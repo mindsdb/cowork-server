@@ -103,7 +103,10 @@ environments are on.
   name and connector id to the block, so the agent can tell connections
   apart. An anton older than the change refuses a block carrying them, so
   turn it on only once the scratchpad image has that anton and no live pod
-  started before the image update. Rollback is `"false"`.
+  started before the image update. Rollback removes the scalar from the
+  environment's values file and drops the environment from
+  `LABELS_ENABLED_ENVIRONMENTS` in `tests/test_chart_values.py`, in the same
+  change; the test expects the key absent, not `"false"`, outside that list.
 - `deployment.datasourceCapabilities`, rendered as
   `COWORK_DATASOURCE_CAPABILITIES`: the methods this deployment may run, as a
   versioned manifest such as
