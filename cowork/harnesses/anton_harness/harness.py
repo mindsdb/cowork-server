@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import timezone
 from functools import partial
 import inspect
 import os
@@ -76,6 +77,16 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+# Anton stamps live input in UTC but older versions omit its offset. Keep this
+# interpretation cache-stable and shared by live turns and persisted history.
+_MESSAGE_TIME_CONTEXT = (
+    "\n\nMESSAGE TIMES: Message send-time prefixes are UTC, including live and "
+    "historical prefixes formatted as [YYYY-MM-DD HH:MM] without a timezone label. "
+    "Use the latest message timestamp as the current time, and convert that instant "
+    "to the user's timezone before reasoning about local dates or scheduling. "
+    "Never attach a local UTC offset to the unchanged UTC clock reading."
+)
 
 
 def _anton_mcp_wiring():
@@ -1256,7 +1267,14 @@ class AntonHarness:
         directly against fake messages, same reasoning as _seed_history.
         """
         om = scrubbed_openai_dump(m)
-        ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
+        created_at = getattr(m, "created_at", None)
+        # Naive database timestamps are UTC; aware timestamps must be converted.
+        if created_at is not None:
+            created_at = (
+                created_at.replace(tzinfo=timezone.utc)
+                if created_at.tzinfo is None else created_at.astimezone(timezone.utc)
+            )
+        ts = created_at.strftime("%Y-%m-%d %H:%M UTC") if created_at else None
         if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
             om["content"] = f"[{ts}] {om['content']}"
         return om
@@ -2003,6 +2021,7 @@ class AntonHarness:
                     runtime_context=build_runtime_context(anton_settings),
                     suffix=(
                         _turn_style_context(channel_context)
+                        + _MESSAGE_TIME_CONTEXT
                         + f"{project_context}"
                         + f"{output_context}"
                         + f"{skill_output_context}"

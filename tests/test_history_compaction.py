@@ -7,7 +7,7 @@ and `AntonHarness._stamp_message` (per-message timestamp prefix).
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -175,8 +175,15 @@ class TestStampMessage:
         m = self._msg("user", "who are you?", ts)
 
         assert AntonHarness._stamp_message(m) == {
-            "role": "user", "content": "[2026-08-18 17:41] who are you?",
+            "role": "user", "content": "[2026-08-18 17:41 UTC] who are you?",
         }
+
+    def test_converts_an_aware_timestamp_before_labelling_it_utc(self):
+        local = datetime(2026, 11, 12, 11, 48, tzinfo=timezone(timedelta(hours=-8)))
+        m = self._msg("user", "refresh every hour", local)
+        assert AntonHarness._stamp_message(m)["content"] == (
+            "[2026-11-12 19:48 UTC] refresh every hour"
+        )
 
     def test_does_not_stamp_an_assistant_message(self):
         """The regression: an assistant reply replayed back to Anton must
@@ -210,7 +217,7 @@ class TestStampMessage:
         assert "SuperSecret123!" not in result["content"]
         assert "[DS_POSTGRES_ABC12__PASSWORD]" in result["content"]
         # Timestamp prefix still applies on top of the scrubbed text.
-        assert result["content"].startswith("[2026-08-18 17:41] ")
+        assert result["content"].startswith("[2026-08-18 17:41 UTC] ")
 
     def test_scrubs_a_vaulted_secret_from_replayed_assistant_content(self, monkeypatch):
         """Same protection for assistant text — no timestamp prefix here,
