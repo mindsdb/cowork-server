@@ -171,10 +171,28 @@ async def test_a_turn_that_stops_at_a_limit_is_not_a_success(schedule_id, turns,
     assert setting in run.error
     schedule = _schedule(schedule_id)
     assert schedule.last_error == run.error
-    # It worked as far as its settings allowed: the slot is used up, and the
-    # run neither extends the failure streak nor pauses the task.
+    # The slot is used up, and the run counts toward the failure streak: a
+    # task that stops at its limit every time would keep spending otherwise.
     assert ensure_utc(schedule.next_run_at) > SLOT
-    assert (schedule.consecutive_failures, schedule.auto_paused_at) == (0, None)
+    assert (schedule.consecutive_failures, schedule.auto_paused_at) == (1, None)
+
+
+async def test_a_task_that_keeps_stopping_at_a_limit_pauses_itself(schedule_id, turns):
+    session = get_open_session()
+    try:
+        schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).get_schedule(schedule_id)
+        schedule.consecutive_failures = 2
+        session.add(schedule)
+        session.commit()
+    finally:
+        session.close()
+    turns.ending.stopped_by = "round_cap"
+    (first,) = _poll(schedule_id)
+    await _run(first)
+
+    schedule = _schedule(schedule_id)
+    assert schedule.consecutive_failures == 3
+    assert schedule.auto_paused_at is not None
 
 
 async def test_a_hand_back_that_is_not_a_limit_stays_completed(schedule_id, turns):

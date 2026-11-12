@@ -685,7 +685,7 @@ def _record_turn_outcome(
             _advance_next_run_at(schedule, session)
             if (
                 outcome.status == RunStatus.failed
-                and end.outcome not in (AttemptOutcome.uncertain, AttemptOutcome.stopped_at_limit)
+                and end.outcome != AttemptOutcome.uncertain
                 and not shutdown_interrupted
             ):
                 count_settled_slot(session, schedule_id, failed=True)
@@ -1136,6 +1136,7 @@ async def _execute_schedule(
                             AttemptOutcome.failed_before_execution,
                             AttemptOutcome.failed_during_execution,
                             AttemptOutcome.interrupted,
+                            AttemptOutcome.stopped_at_limit,
                         }
                         and not shutdown_interrupted
                     ),
