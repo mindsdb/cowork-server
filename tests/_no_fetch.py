@@ -11,11 +11,19 @@ started before the guard opens, which records every connection it accepts,
 whatever made it. Point the hostile references at ``server.url`` and assert
 both ``recorder.calls`` and ``server.hits()`` are empty. Native code that
 reaches any other host is seen by neither.
+
+An export converts in a process of its own, and ``allowed_command`` lets a
+guard pass that one start: the exact command, compared in full, so any other
+argument, module or program is still recorded. The guard can't see inside
+that process; the process refuses network and process starts itself, and
+fails the export if it ever had to, and the ``RecordingServer`` still sees
+any connection it makes.
 """
 from __future__ import annotations
 
 import multiprocessing.process
 import socket
+import subprocess
 import sys
 import threading
 from collections.abc import Iterator
@@ -68,6 +76,18 @@ class AuditCall:
 @dataclass
 class FetchRecorder:
     calls: list[AuditCall] = field(default_factory=list)
+    # The one process start this guard lets through, as subprocess.Popen's
+    # audit event carries it: the argument list, or on Windows the command
+    # line it becomes.
+    allowed_command: list[str] | str | None = None
+
+    def allows(self, *, event: str, args: tuple) -> bool:
+        return (
+            event == "subprocess.Popen"
+            and self.allowed_command is not None
+            and len(args) > 1
+            and args[1] == self.allowed_command
+        )
 
 
 _lock = threading.Lock()
@@ -82,7 +102,8 @@ def _audit(event: str, args: tuple) -> None:
     call = AuditCall(event=event, args=repr(args)[:_ARGS_REPR_MAX_CHARS])
     with _lock:
         for recorder in _active:
-            recorder.calls.append(call)
+            if not recorder.allows(event=event, args=args):
+                recorder.calls.append(call)
 
 
 def _recording_start(process: multiprocessing.process.BaseProcess) -> None:
@@ -91,15 +112,18 @@ def _recording_start(process: multiprocessing.process.BaseProcess) -> None:
 
 
 @contextmanager
-def no_fetch() -> Iterator[FetchRecorder]:
+def no_fetch(*, allowed_command: list[str] | None = None) -> Iterator[FetchRecorder]:
     """Record the watched calls made from any thread until the block ends.
 
     An audit hook can't be removed, so one hook, and the wrapper of
     ``BaseProcess.start``, stay installed for the whole run and record only
-    while a guard is open.
+    while a guard is open. A start of exactly *allowed_command* isn't recorded.
     """
     global _hook_installed
-    recorder = FetchRecorder()
+    if allowed_command is not None and sys.platform == "win32":
+        recorder = FetchRecorder(allowed_command=subprocess.list2cmdline(allowed_command))
+    else:
+        recorder = FetchRecorder(allowed_command=allowed_command)
     with _lock:
         if not _hook_installed:
             sys.addaudithook(_audit)

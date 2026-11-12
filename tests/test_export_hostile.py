@@ -61,8 +61,10 @@ from cowork.schemas.artifact_export import (
     InlineLimits,
     InlineMode,
 )
+from cowork.schemas.export_child import ChildLimits, ConvertRequest
+from cowork.services import export_runner
 from cowork.services.artifact_files import read_artifact_file
-from cowork.services.artifact_inline import inline_artifact_html
+from cowork.services.artifact_inline import folder_reader, inline_artifact_html
 from cowork.services.docx_writer import write_docx
 from cowork.services.markdown_render import render_markdown
 from tests._no_fetch import RecordingServer, no_fetch, recording_server
@@ -317,6 +319,71 @@ def test_hostile_case_exports_only_the_artifacts_own_content(case, source, mode,
     media = [
         body
         for name, body in _members(package=export.package).items()
+        if name.startswith("word/media/")
+    ]
+    assert (CHART_PNG in media) is bool(case.get("kept_image"))
+
+
+def _case_list() -> list:
+    return [
+        pytest.param(case, id=case["id"])
+        for file_name in CASE_FILES
+        for case in yaml.safe_load((FIXTURES / file_name).read_text(encoding="utf-8"))
+    ]
+
+
+# The limits a desktop export's conversion process runs with.
+CHILD_LIMITS = ChildLimits(wall_seconds=30.0, memory_bytes=2 * 1024 * 1024 * 1024)
+
+
+@pytest.mark.parametrize("case", _case_list())
+def test_hostile_case_through_the_conversion_process_exports_only_the_artifacts_own_content(
+    case, tmp_path
+):
+    """The Markdown source to Word, converted in its own process.
+
+    The process reads every file through the server, so the server's pinned
+    reads still decide what it gets. The guard lets only the process's own
+    start through and can't see inside it; the process refuses connections
+    itself, and the recording server sees any it makes.
+    """
+    partitions = _partitions(tmp_path=tmp_path)
+    command, _environment = export_runner.child_command(limits=CHILD_LIMITS)
+    with recording_server() as server:
+        values = _placeholders(server=server, partitions=partitions)
+        extra = {
+            name: _fill(text=text, values=values).encode("utf-8")
+            for name, text in case.get("files", {}).items()
+        }
+        _write_tree(base=partitions.art, files=extra)
+        source = _fill(text=case[Source.MARKDOWN.value], values=values).encode("utf-8")
+        with pinned_dir(partitions.art) as folder, no_fetch(allowed_command=command) as recorder:
+            request = ConvertRequest(
+                export_format="docx",
+                suffix=".md",
+                title="report",
+                base_parts=(),
+                limits=InlineLimits(max_total_bytes=INLINE_BUDGETS[InlineMode.WORD]),
+            )
+            conversion = export_runner.convert_in_child(
+                request=request,
+                source=source,
+                read_asset=folder_reader(folder=folder, max_bytes=request.limits.max_asset_bytes),
+                limits=CHILD_LIMITS,
+            )
+        assert recorder.calls == []
+        assert server.hits() == []
+
+    pairs = case["omitted"]
+    if os.name == "nt" and "windows_omitted" in case:
+        pairs = case["windows_omitted"]
+    assert conversion.omitted_count >= sum(_expected_omitted(pairs=pairs, values=values).values())
+    document = _assert_package_is_clean(package=conversion.data, server_url=server.url)
+    if "text" in case:
+        assert case["text"] in _docx_text(document=document)
+    media = [
+        body
+        for name, body in _members(package=conversion.data).items()
         if name.startswith("word/media/")
     ]
     assert (CHART_PNG in media) is bool(case.get("kept_image"))

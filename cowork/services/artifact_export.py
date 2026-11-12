@@ -1,19 +1,19 @@
 """Export a document artifact's primary file to HTML, Word or PDF, beside the source.
 
 The export reads the primary through the pinned artifact folder, bounded by
-size. Markdown and text become HTML first. ``inline_artifact_html`` then makes
-the document self-contained: it keeps only files from the artifact's own folder
-and never reaches the network. A PDF comes from the render service the process
-environment names, and from nothing else. The result is written as a new file
-next to the source, under a name nothing else holds, so an export never
-replaces a file.
+size, and converts it in a process of its own that the server kills past its
+time or memory limit (``cowork.services.export_runner``). There Markdown and
+text become HTML first, and the inliner makes the document self-contained: it
+keeps only files from the artifact's own folder, which the server reads for
+it, and never reaches the network. A PDF comes from the render service the
+process environment names, and from nothing else. The result is written as a
+new file next to the source, under a name nothing else holds, so an export
+never replaces a file.
 """
 
 from __future__ import annotations
 
-import codecs
 import errno
-import html
 import json
 import os
 import secrets
@@ -40,16 +40,16 @@ from cowork.schemas.artifact_export import (
     ExportPdfSettings,
     ExportResult,
     InlineLimits,
-    InlineMode,
     OmittedReason,
 )
+from cowork.schemas.export_child import ChildLimits, ConvertRequest
 from cowork.services import artifact_files
 from cowork.services.artifact_identity import (
     _atomic_json,
     _read_no_follow,
     opened_artifact_folder,
 )
-from cowork.services.artifact_inline import inline_artifact_html
+from cowork.services.artifact_inline import folder_reader
 from cowork.services.artifacts import (
     ProjectArtifacts,
     _is_single_named_file,
@@ -60,20 +60,18 @@ from cowork.services.artifacts import (
     draft_url_for,
     serve_url_for,
 )
-from cowork.services.docx_writer import write_docx
-from cowork.services.markdown_render import MarkdownRefused, render_markdown
+from cowork.services.export_child import HTML_SOURCES, MARKDOWN_SOURCES, Conversion
+from cowork.services.export_runner import ConversionBusy, ConversionOverrun, convert_in_child
 from cowork.services.render_pdf_client import RenderServicePdf, pdf_request
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
 
 
-_MARKDOWN_SOURCES = frozenset({".md", ".markdown"})
-_HTML_SOURCES = frozenset({".html", ".htm"})
 # HTML export is offered only where it makes a new document: an HTML source
 # would only be copied.
-_HTML_EXPORT_SOURCES = _MARKDOWN_SOURCES | {".txt"}
-_WORD_EXPORT_SOURCES = _HTML_EXPORT_SOURCES | _HTML_SOURCES
+_HTML_EXPORT_SOURCES = MARKDOWN_SOURCES | {".txt"}
+_WORD_EXPORT_SOURCES = _HTML_EXPORT_SOURCES | HTML_SOURCES
 
 # The most of a source an export reads. A page carries its own markup and
 # styles, so HTML gets more room than Markdown or text. Python-Markdown's slow
@@ -88,6 +86,17 @@ ORG_INLINE_BUDGET_BYTES = 10 * 1024 * 1024
 # A PDF's document travels to the render service as base64 inside JSON, so it
 # embeds less.
 PDF_INLINE_BUDGET_BYTES = 5 * 1024 * 1024
+# How long one conversion may run, its start included, before the server
+# kills it. The inliner and the Word writer each stop at 10 s and still write
+# the file with a note, and Markdown has no such stop, so a slow but ordinary
+# document needs more than 20 s on one CPU.
+CONVERSION_WALL_SECONDS = 30.0
+# The memory one conversion may hold. On the desktop and on a self-hosted
+# server it only stops a runaway: the largest ordinary export, with a 25 MiB
+# inline budget, stays well under it. In org mode the server and its one
+# conversion share a 1 GiB replica.
+CONVERSION_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
+ORG_CONVERSION_MEMORY_BYTES = 640 * 1024 * 1024
 # How many "name (n).ext" spellings an export tries before it gives up.
 _MAX_OUTPUT_NAMES = 100
 # The longest file name the volumes Cowork runs on all take: Linux allows 255
@@ -99,14 +108,10 @@ _MAX_NAME_BYTES = 255
 _NO_HARD_LINKS = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM})
 
 _OUTPUT_EXTENSIONS: dict[ExportFormat, str] = {"html": ".html", "docx": ".docx", "pdf": ".pdf"}
-_INLINE_MODES: dict[ExportFormat, InlineMode] = {
-    "html": InlineMode.HTML,
-    "docx": InlineMode.WORD,
-    "pdf": InlineMode.PDF,
-}
 _METADATA = "metadata.json"
 _BUSY = "An export is already running; try again in a moment."
 _NOT_OFFERED = "This file can't be exported to that format."
+_CANT_EXPORT = "This file can't be exported."
 
 # Org mode offers no export format, and the route answers 403 there. Measured
 # with docker --cpus=1 --memory=1g from a server's own baseline, single exports
@@ -121,8 +126,9 @@ ORG_EXPORT_ENABLED = False
 
 # HTML and Word export share one conversion at a time, PDF export has its own,
 # and each user and each organization runs one export at a time. All of them
-# hold per process, so every replica admits its own. Nothing waits for a slot:
-# a busy server answers at once.
+# hold per process, so every replica admits its own, and so does the one
+# conversion process a server runs at a time (export_runner). Nothing waits
+# for a slot: a busy server answers at once.
 _conversion_limiter = anyio.CapacityLimiter(1)
 _pdf_limiter = anyio.CapacityLimiter(1)
 _running_jobs: set[str] = set()
@@ -347,7 +353,7 @@ def _render_pdf(*, source_name: str, html: str) -> bytes:
 
 
 def _read_source(*, folder: PinnedDir, parts: tuple[str, ...], suffix: str) -> bytes:
-    max_bytes = HTML_SOURCE_MAX_BYTES if suffix in _HTML_SOURCES else TEXT_SOURCE_MAX_BYTES
+    max_bytes = HTML_SOURCE_MAX_BYTES if suffix in HTML_SOURCES else TEXT_SOURCE_MAX_BYTES
     try:
         return artifact_files.read_artifact_file(folder=folder, parts=parts, max_bytes=max_bytes)
     except artifact_files.ArtifactFileRefused as exc:
@@ -358,71 +364,30 @@ def _read_source(*, folder: PinnedDir, parts: tuple[str, ...], suffix: str) -> b
         raise ExportRefused(ExportRefusal.NOT_FOUND, "Artifact source not found") from exc
 
 
-def _source_html(*, data: bytes, suffix: str, title: str) -> bytes:
-    """The source as one HTML document for the inliner.
+def _convert(
+    *, request: ConvertRequest, source: bytes, folder: PinnedDir, org_mode: bool
+) -> Conversion:
+    """Convert *source* in a conversion process that reads the artifact's files through *folder*.
 
-    An HTML page stays as it is. Markdown is rendered and text becomes a
-    ``pre`` block, and either is wrapped as the body of a minimal document
-    titled *title*, which is what an HTML export of it writes. Markdown that
-    ``render_markdown`` refuses is answered as a source over its read bound
-    is, before anything is written.
+    A busy conversion slot answers as a busy export. A conversion a limit
+    stopped, or Markdown ``render_markdown`` refuses, is answered as a source
+    over its read bound is, and nothing is written.
     """
-    if suffix in _HTML_SOURCES:
-        return data
-    text = _source_text(data)
-    if suffix in _MARKDOWN_SOURCES:
-        try:
-            body = render_markdown(text=text)
-        except MarkdownRefused as exc:
-            raise ExportRefused(ExportRefusal.TOO_LARGE, "This file can't be exported.") from exc
-    else:
-        body = f"<pre>{html.escape(text)}</pre>"
-    return _wrap_html_document(body, title).encode("utf-8")
-
-
-def _source_text(data: bytes) -> str:
-    """A Markdown or text source's bytes as text.
-
-    They are read as UTF-8, and a UTF-8 byte order mark is dropped, so a first
-    line such as ``# Title`` stays a heading. A UTF-16 byte order mark, which
-    Windows editors write for "Unicode" text, reads the rest as UTF-16. Bytes
-    that don't decode become U+FFFD.
-    """
-    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
-        return data.decode("utf-16", errors="replace")
-    return data.decode("utf-8-sig", errors="replace")
-
-
-def _html_export(document: str) -> bytes:
-    """The inlined document as the bytes of an ``.html`` file.
-
-    Written as the inliner serialized it, never parsed again: lxml's HTML
-    parser stops at about 10 MB unless its limits are lifted, and inlined
-    images can take a document past that.
-    """
-    if not document.lstrip()[:9].lower().startswith("<!doctype"):
-        document = "<!DOCTYPE html>" + document
-    return document.encode("utf-8")
-
-
-def _wrap_html_document(body_html: str, title: str) -> str:
-    """Wrap rendered body HTML in a minimal, print-friendly document."""
-    safe_title = html.escape(title or "Document")
-    return (
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        f"<title>{safe_title}</title>"
-        "<style>"
-        "body{font-family:'Helvetica','Arial',sans-serif;font-size:11pt;"
-        "line-height:1.5;color:#1a1a1a;margin:2.5em;}"
-        "h1,h2,h3{line-height:1.25;}"
-        "table{border-collapse:collapse;width:100%;}"
-        "th,td{border:1px solid #ccc;padding:6px 10px;text-align:left;}"
-        "code,pre{font-family:'Courier New',monospace;background:#f5f5f5;}"
-        "pre{padding:10px;overflow-x:auto;white-space:pre-wrap;}"
-        "</style></head><body>"
-        f"{body_html}"
-        "</body></html>"
+    limits = ChildLimits(
+        wall_seconds=CONVERSION_WALL_SECONDS,
+        memory_bytes=ORG_CONVERSION_MEMORY_BYTES if org_mode else CONVERSION_MEMORY_BYTES,
     )
+    try:
+        return convert_in_child(
+            request=request,
+            source=source,
+            read_asset=folder_reader(folder=folder, max_bytes=request.limits.max_asset_bytes),
+            limits=limits,
+        )
+    except ConversionBusy as exc:
+        raise ExportRefused(ExportRefusal.BUSY, _BUSY) from exc
+    except ConversionOverrun as exc:
+        raise ExportRefused(ExportRefusal.TOO_LARGE, _CANT_EXPORT) from exc
 
 
 def _primary_names_a_file(*, folder: PinnedDir, primary: object) -> bool:
@@ -654,12 +619,12 @@ def export_primary_file(
 ) -> ExportResult:
     """Export the artifact's primary file, writing the result beside it.
 
-    Blocking: the route runs it in an anyio worker thread (``run_in_threadpool``),
+    Blocking: the route runs it in an anyio worker thread (``run_efs``),
     which a PDF export needs to reach the event loop. Raises ``ExportRefused``
-    for a format the artifact doesn't offer, a source over its size bound,
-    Markdown that ``render_markdown`` refuses or a source that can't be
-    opened, and ``RenderPdfFailed`` when no usable PDF came back, and writes
-    nothing then.
+    for a format the artifact doesn't offer, a source over its size bound, a
+    conversion that passed its limits or refused its source, a busy
+    conversion or a source that can't be opened, and ``RenderPdfFailed`` when
+    no usable PDF came back, and writes nothing then.
     """
     org_mode = _org_mode()
     with opened_artifact_folder(source, folder_name) as folder:
@@ -685,19 +650,21 @@ def export_primary_file(
             budget = PDF_INLINE_BUDGET_BYTES
         else:
             budget = ORG_INLINE_BUDGET_BYTES if org_mode else INLINE_BUDGET_BYTES
-        inlined = inline_artifact_html(
-            html=_source_html(data=data, suffix=suffix, title=title),
+        conversion = _convert(
+            request=ConvertRequest(
+                export_format=export_format,
+                suffix=suffix,
+                title=title,
+                base_parts=parts[:-1],
+                limits=InlineLimits(max_total_bytes=budget),
+            ),
+            source=data,
             folder=folder,
-            base_parts=parts[:-1],
-            mode=_INLINE_MODES[export_format],
-            limits=InlineLimits(max_total_bytes=budget),
+            org_mode=org_mode,
         )
-        if export_format == "docx":
-            output = write_docx(document=inlined, title=title)
-        elif export_format == "pdf":
-            output = _render_pdf(source_name=parts[-1], html=inlined.html)
-        else:
-            output = _html_export(inlined.html)
+        output = conversion.data
+        if export_format == "pdf":
+            output = _render_pdf(source_name=parts[-1], html=output.decode("utf-8"))
         name = _write_beside(
             folder=folder,
             parts=parts,
@@ -718,6 +685,6 @@ def export_primary_file(
             artifacts_base=Path(source.base),
             project_name=source.project_name,
         ),
-        omitted_count=len(inlined.omitted),
-        scripts_dropped=inlined.scripts_dropped,
+        omitted_count=conversion.omitted_count,
+        scripts_dropped=conversion.scripts_dropped,
     )

@@ -26,7 +26,8 @@ from cowork.common.paths import PinnedDir
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.schemas.artifact_export import OmittedReason
-from cowork.services import artifact_export, artifact_identity
+from cowork.schemas.export_child import ChildLimits
+from cowork.services import artifact_export, artifact_identity, export_runner
 from cowork.services.artifact_export import ExportRefusal, ExportRefused, export_slot
 from cowork.services.artifact_files import ArtifactFileRefused
 from cowork.services.artifacts import ProjectArtifacts
@@ -63,6 +64,17 @@ def partitions(tmp_path):
     return mine, secret
 
 
+def _conversion_command() -> list[str]:
+    """The command a local export starts its conversion process with."""
+    command, _environment = export_runner.child_command(
+        limits=ChildLimits(
+            wall_seconds=artifact_export.CONVERSION_WALL_SECONDS,
+            memory_bytes=artifact_export.CONVERSION_MEMORY_BYTES,
+        )
+    )
+    return command
+
+
 def _write_report(project: Path, primary: str, source: str) -> tuple[ProjectArtifacts, Path, str]:
     artifact_id = uuid4().hex
     folder = project / ".anton" / "artifacts" / "report"
@@ -97,7 +109,7 @@ def test_a_word_export_fetches_nothing_and_takes_nothing_from_another_partition(
         )
         source, folder, artifact_id = _write_report(mine, case["primary"], source_text)
 
-        with no_fetch() as recorder:
+        with no_fetch(allowed_command=_conversion_command()) as recorder:
             result = artifact_export.export_primary_file(
                 source=source,
                 folder_name=folder.name,
@@ -214,15 +226,15 @@ def test_a_parent_folder_swapped_for_a_link_mid_export_is_never_written_through(
     )
     outside = tmp_path / "outside"
     outside.mkdir()
-    inline = artifact_export.inline_artifact_html
+    convert = artifact_export.convert_in_child
 
-    def swap_after_inlining(**kwargs):
-        inlined = inline(**kwargs)
+    def swap_after_converting(**kwargs):
+        conversion = convert(**kwargs)
         (folder / "docs").rename(folder / "docs-moved")
         (folder / "docs").symlink_to(outside, target_is_directory=True)
-        return inlined
+        return conversion
 
-    monkeypatch.setattr(artifact_export, "inline_artifact_html", swap_after_inlining)
+    monkeypatch.setattr(artifact_export, "convert_in_child", swap_after_converting)
 
     with pytest.raises(OSError):
         artifact_export.export_primary_file(

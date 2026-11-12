@@ -477,8 +477,11 @@ def test_an_event_handler_goes_even_where_an_allowlist_would_keep_it(
 ):
     """The allowlists drop every on* name today; this check must not lean on them."""
     monkeypatch.setattr(artifact_inline, "_attribute_allowed", lambda **_: True)
+    def no_read(parts):
+        raise AssertionError(f"the walk read {parts}")
+
     inliner = artifact_inline._Inliner(
-        folder=None,
+        read_asset=no_read,
         base_parts=(),
         mode=InlineMode.PDF,
         limits=_limits(),
@@ -730,9 +733,9 @@ def test_a_refused_asset_is_read_once_per_kind(artifact, monkeypatch):
     reads = []
     read = artifact_inline.read_artifact_file_entry
 
-    def counting_read(*, folder, parts, max_bytes):
+    def counting_read(*, folder, parts, max_bytes, scan_budget):
         reads.append(parts)
-        return read(folder=folder, parts=parts, max_bytes=max_bytes)
+        return read(folder=folder, parts=parts, max_bytes=max_bytes, scan_budget=scan_budget)
 
     monkeypatch.setattr(artifact_inline, "read_artifact_file_entry", counting_read)
     html = (
@@ -788,9 +791,9 @@ def test_a_file_past_the_spent_budget_is_still_read_then_left_out(artifact, monk
     reads = []
     read = artifact_inline.read_artifact_file_entry
 
-    def counting_read(*, folder, parts, max_bytes):
+    def counting_read(*, folder, parts, max_bytes, scan_budget):
         reads.append(parts)
-        return read(folder=folder, parts=parts, max_bytes=max_bytes)
+        return read(folder=folder, parts=parts, max_bytes=max_bytes, scan_budget=scan_budget)
 
     monkeypatch.setattr(artifact_inline, "read_artifact_file_entry", counting_read)
     html = b'<img src="chart.png"><img src="photo.jpg"><img src="anim.gif">'
@@ -876,7 +879,11 @@ STOPPED_PARSES = _cases(name="stopped_parses.yaml")
 def test_a_stopped_parse_is_recognized_in_every_libxml2_version(case):
     entry = types.SimpleNamespace(type_name=case["type_name"], message=case["message"])
 
-    assert artifact_inline.parse_stopped(error_log=[entry]) is case["stopped"]
+    if case.get("out_of_memory"):
+        with pytest.raises(MemoryError):
+            artifact_inline.parse_stopped(error_log=[entry])
+    else:
+        assert artifact_inline.parse_stopped(error_log=[entry]) is case["stopped"]
 
 
 def test_a_source_parse_cut_short_by_libxml2_ends_with_the_note(artifact, outside):

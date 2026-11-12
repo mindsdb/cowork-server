@@ -27,7 +27,7 @@ import codecs
 import re
 import secrets
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import NamedTuple
@@ -49,11 +49,17 @@ from cowork.schemas.artifact_export import (
     OmittedReference,
 )
 from cowork.services.artifact_files import (
+    EXPORT_SCANNED_ENTRIES,
     ArtifactFileContent,
     ArtifactFileRefused,
+    ScanBudget,
     read_artifact_file_entry,
     split_relative_path,
 )
+
+# Reads one file of the artifact by its path inside the folder, or raises
+# ``ArtifactFileRefused`` with the reason the export records.
+AssetReader = Callable[[tuple[str, ...]], ArtifactFileContent]
 
 # The paragraph that ends a document whose rest was left out.
 TRUNCATION_NOTE = "The rest of this document was left out because it was too large to convert."
@@ -467,6 +473,25 @@ class UriPlaceholders:
         return placeholder.sub(lambda match: self.uris[int(match.group(1))], text)
 
 
+def folder_reader(*, folder: PinnedDir, max_bytes: int) -> AssetReader:
+    """Read files below *folder* through the pinned walk, all reads sharing one scan budget.
+
+    A read that fails for any other reason than a refusal, such as an I/O
+    error, is a missing file: the export leaves that reference out.
+    """
+    scan_budget = ScanBudget(remaining=EXPORT_SCANNED_ENTRIES)
+
+    def read(parts: tuple[str, ...]) -> ArtifactFileContent:
+        try:
+            return read_artifact_file_entry(
+                folder=folder, parts=parts, max_bytes=max_bytes, scan_budget=scan_budget
+            )
+        except (OSError, ValueError) as exc:
+            raise ArtifactFileRefused(OmittedReason.MISSING, "read failed") from exc
+
+    return read
+
+
 def inline_artifact_html(
     *,
     html: bytes,
@@ -481,8 +506,30 @@ def inline_artifact_html(
     references resolve against it. Going over a limit drops an asset, a
     declaration or the rest of the tree, and never raises.
     """
+    return inline_html(
+        html=html,
+        read_asset=folder_reader(folder=folder, max_bytes=limits.max_asset_bytes),
+        base_parts=base_parts,
+        mode=mode,
+        limits=limits,
+    )
+
+
+def inline_html(
+    *,
+    html: bytes,
+    read_asset: AssetReader,
+    base_parts: tuple[str, ...],
+    mode: InlineMode,
+    limits: InlineLimits,
+) -> InlinedDocument:
+    """``inline_artifact_html``, reading each file through *read_asset*.
+
+    The export's conversion process reads through the server this way, since
+    it gets no path and no folder of its own.
+    """
     inliner = _Inliner(
-        folder=folder,
+        read_asset=read_asset,
         base_parts=base_parts,
         mode=mode,
         limits=limits,
@@ -504,7 +551,7 @@ def inline_artifact_html(
 
 @dataclass
 class _Inliner:
-    folder: PinnedDir
+    read_asset: AssetReader
     base_parts: tuple[str, ...]
     mode: InlineMode
     limits: InlineLimits
@@ -886,12 +933,7 @@ class _Inliner:
         return True
 
     def _read(self, *, parts: tuple[str, ...]) -> ArtifactFileContent:
-        try:
-            return read_artifact_file_entry(
-                folder=self.folder, parts=parts, max_bytes=self.limits.max_asset_bytes
-            )
-        except (OSError, ValueError) as exc:
-            raise ArtifactFileRefused(OmittedReason.MISSING, "read failed") from exc
+        return self.read_asset(parts)
 
     def _rewrite_style_attribute(self, *, value: str) -> str:
         if not self._take_css(size=len(value)):
@@ -1123,12 +1165,23 @@ _STOPPED_PARSE_MESSAGES = ("XML_PARSE_HUGE", "huge text node", "attribute value 
 
 
 def parse_stopped(*, error_log: Iterable[lxml.etree._LogEntry]) -> bool:
-    """Whether libxml2 stopped reading at a resource limit and dropped the rest."""
-    return any(
-        entry.type_name == "ERR_RESOURCE_LIMIT"
-        or any(message in entry.message for message in _STOPPED_PARSE_MESSAGES)
-        for entry in error_log
-    )
+    """Whether libxml2 stopped reading at a resource limit and dropped the rest.
+
+    Raises ``MemoryError`` when libxml2 ran out of memory instead: the rest
+    went for want of memory, not for size, so the document is refused rather
+    than written short. Under the export's memory limit this is how an
+    oversized parse ends. libxml2 2.11 logs its huge-text-node limit as
+    ``ERR_NO_MEMORY`` too, so a known limit message decides first.
+    """
+    stopped = False
+    for entry in error_log:
+        if entry.type_name == "ERR_RESOURCE_LIMIT" or any(
+            message in entry.message for message in _STOPPED_PARSE_MESSAGES
+        ):
+            stopped = True
+        elif entry.type_name == "ERR_NO_MEMORY":
+            raise MemoryError("libxml2 ran out of memory")
+    return stopped
 
 
 def _is_utf8(*, data: bytes) -> bool:
