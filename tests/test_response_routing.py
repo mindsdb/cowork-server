@@ -819,6 +819,34 @@ def test_read_project_context_reads_files_and_instructions(tmp_path, entries, in
     assert read_project_context(project, files_known=False) == ProjectContext(*expected)
 
 
+@pytest.mark.parametrize(
+    ("written", "expected"),
+    [
+        # The template anton writes when it sets up a workspace, untouched.
+        ("{template}", False),
+        # The same template from another anton version: a BOM, CRLF, no heading.
+        ("\ufeff# Anton Workspace\r\n\r\nCreated: 2025-01-02\r\n", False),
+        ("Created: 2025-01-02\n\n<!-- Add project context, conventions, and notes below.\n"
+         "Anton reads this file at the start of every conversation. -->\n", False),
+        # Text the user added under the template is instructions.
+        ("{template}\narranca: send today's campaign email.\n", True),
+    ],
+)
+def test_anton_template_alone_is_not_instructions(tmp_path, written, expected):
+    """Pinned to the installed anton's own template, so a change to it fails
+    here instead of sending every turn in a used project to the agent."""
+    from anton.workspace import ANTON_MD_TEMPLATE
+
+    from cowork.services.files import project_has_instructions
+
+    (tmp_path / ".anton").mkdir()
+    (tmp_path / ".anton" / "anton.md").write_text(
+        written.replace("{template}", ANTON_MD_TEMPLATE.format(date="2026-11-12")), newline="",
+    )
+
+    assert project_has_instructions(tmp_path) is expected
+
+
 def test_read_project_context_skips_the_listing_when_an_attachment_counts(monkeypatch, tmp_path):
     import cowork.services.files as files
 

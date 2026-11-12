@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import stat
 from functools import partial
@@ -220,20 +221,46 @@ def _instructions_path(project_path: str | Path) -> Path:
     return Path(project_path) / ".anton" / "anton.md"
 
 
+# The boilerplate of the template anton writes into ``.anton/anton.md`` when it
+# sets up a workspace (``anton.workspace.ANTON_MD_TEMPLATE``), matched as
+# loosely as anton matches it: any date, CRLF, a BOM, a reflowed comment, and
+# the heading or the date line deleted. Mirrors ``anton.workspace.
+# anton_md_user_text``, which the locked anton-agent does not ship yet;
+# tests/test_response_routing.py pins it to the installed anton's template.
+_TEMPLATE_HEADER_RE = re.compile(
+    r"\A\ufeff?\s*(?:# Anton Workspace[ \t\r]*$)?"
+    r"(?:\s*Created:[ \t]*\d{4}-\d{2}-\d{2}[ \t\r]*$)?",
+    re.MULTILINE,
+)
+_TEMPLATE_COMMENT_RE = re.compile(
+    r"<!--\s*Add project context, conventions, and notes below\.\s*"
+    r"Anton reads this file at the start of every conversation\.\s*-->"
+)
+
+
+def instructions_user_text(content: str) -> str:
+    """What the user wrote in an ``anton.md``, without anton's template
+    boilerplate: "" for a blank file or the untouched template."""
+    text = _TEMPLATE_HEADER_RE.sub("", content)
+    return _TEMPLATE_COMMENT_RE.sub("", text).strip()
+
+
 def project_has_instructions(project_path: str | Path) -> bool:
     """Whether the project has instructions: a regular ``.anton/anton.md``
-    with something other than whitespace in it (``stage_project_instructions``
-    gives the agent that file, and only when it is a regular file). A missing
-    path or a non-file there means none; any other read error raises.
-    ``is_file`` comes first so a pipe or a device at that path is never
-    opened."""
+    holding text the user wrote (``stage_project_instructions`` gives the
+    agent that file, and only when it is a regular file). The template anton
+    writes when it sets up a workspace is not instructions, so a project the
+    agent has worked in once still routes like one with none. A missing path
+    or a non-file there means none; any other read error raises. ``is_file``
+    comes first so a pipe or a device at that path is never opened."""
     path = _instructions_path(project_path)
     try:
         if not path.is_file():
             return False
-        return bool(path.read_bytes().strip())
+        content = path.read_bytes().decode("utf-8", errors="replace")
     except (FileNotFoundError, NotADirectoryError):
         return False
+    return bool(instructions_user_text(content))
 
 
 class ProjectContext(NamedTuple):
