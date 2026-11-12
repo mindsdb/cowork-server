@@ -1,7 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import timezone
+from datetime import datetime, timezone
 from functools import partial
 import inspect
 import os
@@ -1428,6 +1428,13 @@ class AntonHarness:
                     "type": "text",
                     "text": f"[Attached file '{block['filename']}' is at: {block['path']}]",
                 })
+        # Anton stamps plain strings, but leaves image/file block lists alone.
+        # Put the clock on this turn too, so a resumed chat cannot mistake the
+        # last historical message's timestamp for now. Keep it out of the
+        # system prompt so the settled prompt prefix remains cache-stable.
+        if anton_blocks:
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            anton_blocks.insert(0, {"type": "text", "text": f"[{stamp}]"})
         return anton_blocks
         
     async def _build_chat_session(
