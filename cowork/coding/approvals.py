@@ -189,7 +189,7 @@ def read_only_refusal(pending: PendingApproval) -> CodingEvent:
     return CodingEvent(
         type=EventType.command_result,
         title="Declined: this task is Read only",
-        text=f"Cowork declined the agent's request ({pending.title}). Switch the task to Ask first to allow changes.",
+        text=f"Cowork declined the agent's request ({pending.title}). Switch the task to Ask for approval to allow changes.",
         phase="failed",
         data={"kind": pending.kind, "detail": pending.detail, "permissionMode": "read_only"},
     )

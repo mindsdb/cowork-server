@@ -40,6 +40,16 @@ class PermissionMode(str, Enum):
     full_access = "full_access"
 
 
+# The names people see for each mode, matching the pickers in the app. Read
+# only is no longer offered for new work, but saved projects and tasks keep it.
+PERMISSION_LABELS: dict[PermissionMode, str] = {
+    PermissionMode.read_only: "Read only",
+    PermissionMode.supervised: "Ask for approval",
+    PermissionMode.workspace: "Approve for me",
+    PermissionMode.full_access: "Full access",
+}
+
+
 # A reasoning effort is the model gateway's word for a level, advertised per
 # model by MindsHub's /v1/models (GPT 5.6 Sol: none … max; Claude: low … max;
 # Gemini: low … high). The server passes it through, so this only pins the shape

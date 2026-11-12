@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from cowork.coding.contracts import EventType, ExtensionInventory, PermissionMode
+from cowork.coding.contracts import PERMISSION_LABELS, EventType, ExtensionInventory, PermissionMode
 from cowork.coding.engines import codex as codex_module
 from cowork.coding.engines import codex_config, codex_events
 from cowork.coding.engines.base import (
@@ -31,8 +31,15 @@ def test_mindshub_responses_base_url_is_normalized_once() -> None:
 def test_permission_mode_maps_to_codex_approval_policy() -> None:
     assert codex_config.approval_policy(PermissionMode.read_only) == "on-request"
     assert codex_config.approval_policy(PermissionMode.supervised) == "on-request"
-    assert codex_config.approval_policy(PermissionMode.workspace) == "never"
+    assert codex_config.approval_policy(PermissionMode.workspace) == "on-request"
     assert codex_config.approval_policy(PermissionMode.full_access) == "never"
+
+
+def test_only_approve_for_me_hands_approvals_to_the_codex_reviewer() -> None:
+    assert codex_config.approvals_reviewer(PermissionMode.read_only) == "user"
+    assert codex_config.approvals_reviewer(PermissionMode.supervised) == "user"
+    assert codex_config.approvals_reviewer(PermissionMode.workspace) == "auto_review"
+    assert codex_config.approvals_reviewer(PermissionMode.full_access) == "user"
     assert codex_config.sandbox_mode(PermissionMode.read_only) == "read-only"
     assert codex_config.sandbox_mode(PermissionMode.supervised) == "workspace-write"
     assert codex_config.sandbox_mode(PermissionMode.full_access) == "danger-full-access"
@@ -273,7 +280,8 @@ def test_codex_launch_policy_is_resolved_once_for_client_and_thread(monkeypatch)
         "http://127.0.0.1:26866/api/v1/coding/inference",
     )
 
-    assert launch.approval_policy == "never"
+    assert launch.approval_policy == "on-request"
+    assert launch.approvals_reviewer == "auto_review"
     assert launch.sandbox_policy == {
         "type": "workspaceWrite",
         "networkAccess": True,
@@ -291,6 +299,7 @@ def test_codex_launch_policy_is_resolved_once_for_client_and_thread(monkeypatch)
     assert any('"cowork.coding.integration_mcp","/cowork-data","task-123"' in item for item in launch.config_overrides)
     assert launch.thread_params["developerInstructions"] == "Use the project playbook."
     assert launch.thread_params["approvalPolicy"] == launch.approval_policy
+    assert launch.thread_params["approvalsReviewer"] == "auto_review"
     assert launch.thread_params["sandbox"] == "workspace-write"
 
 
@@ -568,6 +577,83 @@ def test_plain_dict_notification_payload_is_supported() -> None:
     event = codex_events.map_codex_notification("item/agentMessage/delta", {"delta": "hello"})
     assert event is not None
     assert event.text == "hello"
+
+
+def _auto_review(status: str, action: dict, rationale: str | None = None) -> dict:
+    review = {"status": status, "riskLevel": "high"}
+    if rationale:
+        review["rationale"] = rationale
+    return {"reviewId": "review-1", "turnId": "turn-1", "targetItemId": "item-1", "action": action, "review": review}
+
+
+def test_a_reviewer_approval_is_recorded_like_one_the_person_granted() -> None:
+    event = codex_events.map_codex_notification(
+        "item/autoApprovalReview/completed",
+        _auto_review("approved", {"type": "command", "command": "npm install", "cwd": "/w", "source": "shell"}, "Routine install."),
+    )
+
+    assert event.type == EventType.approval
+    assert event.phase == "completed"
+    assert event.text == "npm install"
+    assert event.turn_id == "turn-1"
+    assert event.data["decision"] == "approve_once"
+    assert event.data["reviewer"] == "auto_review"
+    assert event.data["approvalId"] == "review-1"
+    assert event.data["rationale"] == "Routine install."
+
+
+@pytest.mark.parametrize(("status", "title"), [
+    ("denied", "The reviewer blocked this: Network access to evil.example:443"),
+    ("timedOut", "The review timed out, so this was blocked: Network access to evil.example:443"),
+    ("aborted", "The review was cancelled, so this was blocked: Network access to evil.example:443"),
+])
+def test_a_blocked_review_is_a_visible_notice_with_the_reviewers_reason(status: str, title: str) -> None:
+    action = {"type": "networkAccess", "host": "evil.example", "port": 443, "protocol": "https", "target": "evil.example:443"}
+    event = codex_events.map_codex_notification(
+        "item/autoApprovalReview/completed", _auto_review(status, action, "Sends the repository to an unknown host."),
+    )
+
+    assert event.type == EventType.command_result
+    assert event.phase == "failed"
+    assert event.title == title
+    assert event.text == "Sends the repository to an unknown host."
+    assert event.data["status"] == status
+    assert event.data["riskLevel"] == "high"
+
+
+def test_a_blocked_review_without_a_reason_still_says_what_happens_next() -> None:
+    event = codex_events.map_codex_notification(
+        "item/autoApprovalReview/completed",
+        _auto_review("denied", {"type": "applyPatch", "cwd": "/w", "files": ["/etc/hosts"]}),
+    )
+
+    assert event.title == "The reviewer blocked this: Edit /etc/hosts"
+    assert event.text == "The agent was told to find a safer way or stop."
+
+
+def test_a_review_still_in_progress_adds_nothing_to_the_timeline() -> None:
+    action = {"type": "command", "command": "ls", "cwd": "/w", "source": "shell"}
+
+    assert codex_events.map_codex_notification("item/autoApprovalReview/started", _auto_review("inProgress", action)) is None
+    assert codex_events.map_codex_notification("item/autoApprovalReview/completed", _auto_review("inProgress", action)) is None
+
+
+def test_a_reviewed_action_is_redacted_like_any_other_event_text() -> None:
+    event = codex_events.map_codex_notification(
+        "item/autoApprovalReview/completed",
+        _auto_review("denied", {"type": "command", "command": "curl -H 'Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz123456' x", "cwd": "/w", "source": "shell"}),
+    )
+
+    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in event.title
+
+
+def test_status_text_names_permission_modes_as_the_picker_does() -> None:
+    assert PERMISSION_LABELS == {
+        PermissionMode.read_only: "Read only",
+        PermissionMode.supervised: "Ask for approval",
+        PermissionMode.workspace: "Approve for me",
+        PermissionMode.full_access: "Full access",
+    }
 
 
 def test_collaboration_items_map_to_visible_child_work() -> None:
