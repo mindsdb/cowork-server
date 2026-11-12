@@ -1012,6 +1012,24 @@ async def test_an_opening_the_gate_would_reject_delegates(text):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("text", [
+    "I can't save preferences for later chats here, but you can note: preferred chart color teal (#008080).",
+    "I don't have access to information about specific staff members at the Riverside Auction House or other "
+    "businesses... I'd recommend visiting their official website.",
+])
+async def test_an_opening_that_denies_what_the_agent_can_do_delegates(caplog, text):
+    """The agent would have done it, so the turn goes to the agent and nothing is shown."""
+    import logging
+
+    provider = _Provider([_text(text), _complete()])
+    caplog.set_level(logging.INFO, logger=direct_answer.__name__)
+
+    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) is None
+    assert [row.why for row in caplog.records if hasattr(row, "why")] == ["router_answer_denied_capability"]
+    assert provider.closed
+
+
+@pytest.mark.asyncio
 async def test_a_cut_off_answer_delegates():
     provider = _Provider([_text("Revenue was"), _complete(stop_reason="max_tokens")])
 

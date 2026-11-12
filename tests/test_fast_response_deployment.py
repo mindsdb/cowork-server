@@ -15,10 +15,11 @@ from cowork.server import create_app
 
 
 PRODUCT = "Acme & Co's $workbench"
-# Exact unbranded prompts: the gate's since it delegates write, approval and
-# reply-to-a-question turns, the take's since staging 8b1ecf4. These
-# compatibility assertions exercise provider requests, not just the constants.
-DEFAULT_GATE_SHA256 = "473e669f1b741110e9ed69b163b449b5b5ac4dd25fb6733d5214d9418edf84a4"
+# Exact unbranded prompts: the gate's since it delegates write, approval,
+# reply-to-a-question, remember, recall and files turns and never says it
+# can't, the take's since staging 8b1ecf4. These compatibility assertions exercise
+# provider requests, not just the constants.
+DEFAULT_GATE_SHA256 = "4a90091f541d9412f6bd7548b7ebe623618ce3719521e3a60af6392302da4bcb"
 DEFAULT_TAKE_SHA256 = "423cf10dd88589f84adadb158b7851a89cfd32da4bad967c473062f07a51427a"
 
 

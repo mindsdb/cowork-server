@@ -11,9 +11,10 @@ Nothing is shown until the answer's opening (`_HOLD_CHARS`, or the whole
 answer when shorter) has arrived and passed the gate's own checks
 (`response_routing.answer_rejection`). A model that writes a preamble and then
 delegates does so inside that window almost always, and an answer that imitates
-an approval card or names another AI product shows it there. Before the
-opening is released, a tool call, a failure, a timeout, an empty or cut-off
-reply, or a rejected opening delegates, so a broken fast path only costs time.
+an approval card, names another AI product or says it cannot do what the agent
+can shows it there. Before the opening is released, a tool call, a failure, a
+timeout, an empty or cut-off reply, or a rejected opening delegates, so a
+broken fast path only costs time.
 After it, the answer streams, and a failure ends the turn like any other.
 """
 from __future__ import annotations
@@ -74,9 +75,11 @@ visible replies say. Call the delegate tool, before writing anything, when the
 reply needs any of the user's data, files, connections or account, a value that
 is not stated in the visible conversation, new or changed analysis, charts,
 dashboards, files or code, a multi-step plan, any request to change, send,
-confirm or approve something, or a reply to a question asked earlier in this
-conversation. Never guess a number. Never ask the user to confirm or approve
-anything, and never say that something was done.
+confirm or approve something, any request to remember or forget something, or
+a reply to a question asked earlier in this conversation. Never guess a number.
+Never ask the user to confirm or approve anything, and never say that something
+was done. Never say you can't do something the user asked; call the delegate
+tool instead.
 
 Never present yourself or this product as another AI product or company's
 assistant, and name other AI products only when the user asks about them or

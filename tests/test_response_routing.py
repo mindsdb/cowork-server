@@ -680,7 +680,7 @@ async def test_handle_keeps_answers_about_a_projects_files_off_the_web(
 
 
 @pytest.mark.asyncio
-async def test_route_request_hands_has_files_to_decide_route(monkeypatch):
+async def test_route_request_hands_files_to_decide_route(monkeypatch):
     import cowork.handlers.responses as responses
 
     handler = _routing_handler(monkeypatch)
@@ -701,6 +701,36 @@ async def test_route_request_hands_has_files_to_decide_route(monkeypatch):
     )
 
     assert seen["has_files"] is True
+    assert "has_instructions" not in seen
+
+
+@pytest.mark.asyncio
+async def test_route_request_sends_project_instructions_to_the_agent_before_any_router(monkeypatch):
+    """No gate key, no first take and no router: only the agent's prompt carries the instructions."""
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+
+    async def no_router(**_kwargs):
+        pytest.fail("decide_route must not run")
+
+    async def no_mint():
+        pytest.fail("no gate key is minted")
+
+    monkeypatch.setattr(responses, "decide_route", no_router)
+    monkeypatch.setattr(handler, "_router_binding", no_mint)
+    decision, turn_llm = await handler._route_request(
+        conversation_id=None,
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        has_instructions=True,
+        first_take=True,
+    )
+
+    assert (decision, turn_llm) == (RouteDecision(route=DELEGATED_AGENTIC, reason="project_instructions"), None)
+    assert getattr(handler, "first_take", None) is None
 
 
 @pytest.mark.asyncio
@@ -761,6 +791,138 @@ def test_a_missing_project_folder_holds_no_files(tmp_path):
     assert project_holds_files(tmp_path / "moved-away") is False
 
 
+@pytest.mark.parametrize(
+    ("entries", "instructions", "expected"),
+    [
+        # A missing folder holds neither.
+        (None, None, (False, False)),
+        # The new project's empty instructions file, or one with only blank lines, is none.
+        ([], "", (False, False)),
+        ([], "\n  \n", (False, False)),
+        ([], "Answer in French.", (False, True)),
+        (["notes.md"], None, (True, False)),
+        (["notes.md"], "Answer in French.", (True, True)),
+    ],
+)
+def test_read_project_context_reads_files_and_instructions(tmp_path, entries, instructions, expected):
+    from cowork.services.files import ProjectContext, read_project_context
+
+    project = tmp_path / "project"
+    if entries is not None:
+        project.mkdir()
+        for entry in entries:
+            (project / entry).write_text("x")
+    if instructions is not None:
+        (project / ".anton").mkdir()
+        (project / ".anton" / "anton.md").write_text(instructions)
+
+    assert read_project_context(project, files_known=False) == ProjectContext(*expected)
+
+
+def test_read_project_context_skips_the_listing_when_an_attachment_counts(monkeypatch, tmp_path):
+    import cowork.services.files as files
+
+    monkeypatch.setattr(files, "project_holds_files", lambda _path: pytest.fail("listed the folder"))
+
+    assert files.read_project_context(tmp_path, files_known=True) == files.ProjectContext(
+        has_files=True, has_instructions=False,
+    )
+
+
+def test_read_project_context_raises_a_failed_instructions_read(monkeypatch, tmp_path):
+    """Only a missing file means no instructions; the caller decides the rest."""
+    from pathlib import Path
+
+    from cowork.services.files import read_project_context
+
+    (tmp_path / ".anton").mkdir()
+    (tmp_path / ".anton" / "anton.md").write_text("Answer in French.")
+
+    def denied(self):
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(Path, "read_bytes", denied)
+
+    with pytest.raises(PermissionError):
+        read_project_context(tmp_path, files_known=False)
+
+
+def test_a_project_path_that_is_a_file_holds_neither(tmp_path):
+    from cowork.services.files import ProjectContext, read_project_context
+
+    project = tmp_path / "project"
+    project.write_text("x")
+
+    assert read_project_context(project, files_known=False) == ProjectContext(False, False)
+
+
+def test_an_anton_entry_that_is_a_file_means_no_instructions(tmp_path):
+    from cowork.services.files import ProjectContext, read_project_context
+
+    (tmp_path / ".anton").write_text("x")
+
+    assert read_project_context(tmp_path, files_known=False) == ProjectContext(False, False)
+
+
+@pytest.mark.parametrize("shape", ["directory", "fifo"])
+def test_instructions_that_are_not_a_regular_file_are_none(tmp_path, shape):
+    """As in ``stage_project_instructions``: only a regular file gives the agent instructions,
+    and a pipe at that path is never opened, so the read cannot block."""
+    import os
+
+    from cowork.services.files import ProjectContext, read_project_context
+
+    instructions = tmp_path / ".anton" / "anton.md"
+    instructions.parent.mkdir()
+    if shape == "directory":
+        instructions.mkdir()
+    else:
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("no named pipes on this platform")
+        os.mkfifo(instructions)
+
+    assert read_project_context(tmp_path, files_known=True) == ProjectContext(True, False)
+
+
+@pytest.mark.parametrize("gone", [FileNotFoundError, NotADirectoryError])
+def test_instructions_removed_after_the_file_check_are_none(monkeypatch, tmp_path, gone):
+    """The file, or its ``.anton`` folder, can go between the check and the read."""
+    from pathlib import Path
+
+    from cowork.services.files import ProjectContext, read_project_context
+
+    (tmp_path / ".anton").mkdir()
+    (tmp_path / ".anton" / "anton.md").write_text("Answer in French.")
+
+    def removed(self):
+        raise gone(2, "gone", str(self))
+
+    monkeypatch.setattr(Path, "read_bytes", removed)
+
+    assert read_project_context(tmp_path, files_known=True) == ProjectContext(True, False)
+
+
+def test_read_project_context_raises_a_failed_instructions_stat(monkeypatch, tmp_path):
+    """A stat that fails for any reason but a missing path raises too."""
+    from pathlib import Path
+
+    from cowork.services.files import read_project_context
+
+    (tmp_path / ".anton").mkdir()
+    (tmp_path / ".anton" / "anton.md").write_text("Answer in French.")
+    real_stat = Path.stat
+
+    def denied(self, *args, **kwargs):
+        if self.name == "anton.md":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied)
+
+    with pytest.raises(PermissionError):
+        read_project_context(tmp_path, files_known=True)
+
+
 @pytest.mark.parametrize(("rows", "attached"), [([object()], True), ([], False)])
 def test_reads_attached_files_counts_an_attachment_from_any_turn(monkeypatch, rows, attached):
     from uuid import uuid4
@@ -792,7 +954,22 @@ async def test_failed_files_reads_count_as_files(monkeypatch):
 
     assert ResponsesHandler._reads_attached_files(session, conversation_id=uuid4()) is True
     assert rolled_back == [True]
-    assert await ResponsesHandler()._project_has_files("/projects/p") is True
+
+
+@pytest.mark.asyncio
+async def test_a_failed_project_read_counts_as_files_and_instructions(monkeypatch):
+    """Routing failures fail open to the agent: the turn goes there."""
+    import cowork.handlers.responses as responses
+    from cowork.services.files import ProjectContext
+
+    async def efs_fails(*_args, **_kwargs):
+        raise PermissionError("store gone")
+
+    monkeypatch.setattr(responses, "run_efs", efs_fails)
+
+    assert await ResponsesHandler()._read_project_context("/projects/p", files_known=False) == ProjectContext(
+        has_files=True, has_instructions=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -2905,3 +3082,231 @@ async def test_only_the_latest_prompt_is_checked_for_file_names(monkeypatch):
     ]
     decision = await _route(history)
     assert decision.route == DIRECT_CONTEXT and seen
+
+
+# --- turns that need the agent, on both routers -------------------------------
+#
+# Jev decides on MindsHub and the LLM gate on other providers (and when Jev
+# refuses or fails). Each rule below holds on both.
+
+
+_MEMORY_PROMPT = "Please remember this for my later chats: my preferred chart color is teal (#008080)."
+
+
+def _jev_must_not_run():
+    async def ask(_messages):
+        pytest.fail("Jev must not be asked")
+
+    return ask
+
+
+def _jev_answers(**fields):
+    from cowork.handlers import jev_route
+
+    async def ask(_messages):
+        return jev_route.JevRoute(**fields)
+
+    return ask
+
+
+async def _route_turn(prompt, **kwargs):
+    return await decide_route(
+        history=[{"role": "user", "content": prompt}],
+        has_non_text_input=False, has_attachments=False, has_disabled_connections=False,
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("on_jev", [False, True], ids=["llm_gate", "jev"])
+async def test_a_memory_request_goes_to_the_agent_without_a_router_call(monkeypatch, on_jev):
+    _no_gate(monkeypatch)
+    decision = await _route_turn(_MEMORY_PROMPT, jev=_jev_must_not_run() if on_jev else None)
+    assert decision == RouteDecision(route=DELEGATED_AGENTIC, reason="memory_request")
+
+
+@pytest.mark.parametrize("prompt", [
+    _MEMORY_PROMPT,
+    "From now on, answer in Spanish.",
+    "Keep in mind that our fiscal year starts in April.",
+    "Forget what I said about the budget.",
+    "Use this in future conversations too.",
+])
+def test_memory_requests_are_named(prompt):
+    from cowork.handlers.response_routing import names_memory_request
+
+    assert names_memory_request(prompt) is not None
+
+
+@pytest.mark.parametrize("prompt", [
+    "Hi", "thanks!", "explain a p-value", "What is the capital of France?", "Is Remembrance Day a holiday?",
+])
+def test_plain_questions_are_not_memory_requests(prompt):
+    from cowork.handlers.response_routing import names_memory_request
+
+    assert names_memory_request(prompt) is None
+
+
+@pytest.mark.asyncio
+async def test_a_change_word_keeps_its_reason_beside_a_memory_word(monkeypatch):
+    _no_gate(monkeypatch)
+    decision = await _route_turn("Remember to email the summary to the planning team.")
+    assert decision.reason == "write_or_approval_request"
+
+
+_DENYING_ANSWERS = [
+    "I can't save preferences for later chats here, but you can note: preferred chart color teal (#008080).",
+    "I don't have access to information about specific staff members at the Riverside Auction House or other "
+    "businesses... I'd recommend visiting their official website.",
+    "I can’t remember anything between chats.",
+    "I’m unable to open links.",
+    "I am not able to look at your files.",
+    "I won't be able to recall this next time.",
+    "I have no access to your project.",
+    "I don't retain information between sessions.",
+    "I have no memory of previous conversations.",
+    "I don't currently have access to your files.",
+    "I don't have real-time access to the web.",
+    "As an AI, I don't have personal memories.",
+]
+_PLAIN_ANSWERS = [
+    "Hello! How can I help you today?",
+    "Paris is the capital of France.",
+    "You can't divide by zero.",
+    "A p-value is the probability of seeing results at least as extreme as yours if the null hypothesis is true.",
+]
+
+
+@pytest.mark.parametrize("answer", _DENYING_ANSWERS)
+def test_capability_denials_are_named(answer):
+    from cowork.handlers.response_routing import denies_agent_capability
+
+    assert denies_agent_capability(answer) is not None
+
+
+@pytest.mark.parametrize("answer", _PLAIN_ANSWERS)
+def test_plain_answers_deny_nothing(answer):
+    from cowork.handlers.response_routing import denies_agent_capability
+
+    assert denies_agent_capability(answer) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", _DENYING_ANSWERS)
+async def test_an_llm_gate_answer_denying_what_the_agent_can_do_is_not_shipped(answer):
+    """Through the real gate, streamed in two pieces, so the check reads the whole answer."""
+    provider = _StreamProvider([_text(answer[:10]), _text(answer[10:]), _complete()])
+    decision = await _route_turn("Who works at the auction house?", binding=_binding(provider))
+    assert (decision.route, decision.reason, decision.text) == (
+        DELEGATED_AGENTIC, "router_answer_denied_capability", "",
+    )
+    assert decision.fallback is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", _PLAIN_ANSWERS)
+async def test_a_plain_llm_gate_answer_still_ships(answer):
+    provider = _StreamProvider([_text(answer), _complete()])
+    decision = await _route_turn("hello there", binding=_binding(provider))
+    assert (decision.route, decision.text) == (DIRECT_CONTEXT, answer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("jev_error", [None, "http_403"], ids=["llm_gate", "jev_fallback"])
+async def test_files_send_an_llm_gate_turn_to_the_agent(monkeypatch, jev_error):
+    _no_gate(monkeypatch)
+    jev = _jev_answers(error=jev_error) if jev_error else None
+    decision = await _route_turn("Hi", has_files=True, jev=jev)
+    assert decision == RouteDecision(route=DELEGATED_AGENTIC, reason="files_present")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", ["Hi", "explain a p-value"])
+async def test_plain_turns_stay_direct_on_the_llm_gate(monkeypatch, prompt):
+    seen = _gate_spy(monkeypatch)
+    decision = await _route_turn(prompt)
+    assert decision.reason == "router_direct_response" and seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("prompt", "has_files"), [("Hi", False), ("explain a p-value", False), ("Hi", True)])
+async def test_plain_turns_stay_direct_on_jev(monkeypatch, prompt, has_files):
+    _no_gate(monkeypatch)
+    decision = await _route_turn(
+        prompt, has_files=has_files, jev=_jev_answers(direct=True, p_direct=0.95, needs_search=False),
+    )
+    assert (decision.route, decision.reason) == (DIRECT_CONTEXT, "jev_direct")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("on_jev", [False, True], ids=["llm_gate", "jev"])
+@pytest.mark.parametrize("stream", [False, True], ids=["whole", "streamed"])
+async def test_handle_sends_a_turn_in_a_project_with_instructions_to_the_agent(
+    monkeypatch, caplog, tmp_path, on_jev, stream,
+):
+    """A real `.anton/anton.md`, read by `handle()` on the file store's threads."""
+    import logging
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    (tmp_path / ".anton").mkdir()
+    (tmp_path / ".anton" / "anton.md").write_text("Always answer in French.")
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path))),
+            message_count=lambda _conversation: 0,
+            get_recent_messages=lambda *_a, **_k: [],
+        ),
+    )
+
+    calls: list[str] = []
+
+    async def mint():
+        calls.append("mint")
+        return None, None
+
+    def first_take(*_args, **_kwargs):
+        calls.append("first_take")
+
+    if on_jev:
+        handler._jev_gate = lambda _turn_llm: _jev_must_not_run()
+    monkeypatch.setattr(handler, "_router_binding", mint)
+    monkeypatch.setattr(responses, "_start_first_take", first_take)
+    _no_gate(monkeypatch)
+
+    class StopBeforeAgent(Exception):
+        pass
+
+    def stop_before_agent():
+        raise StopBeforeAgent
+
+    monkeypatch.setattr(handler, "_get_harness", stop_before_agent)
+    caplog.set_level(logging.INFO, logger=responses.__name__)
+    with pytest.raises(StopBeforeAgent):
+        await handler.handle(ResponsesRequest(input="Hi", conversation=str(conv_id), stream=stream))
+
+    (record,) = [row for row in caplog.records if getattr(row, "event", None) == "router_route"]
+    assert record.reason == "project_instructions"
+    # As with an always-on skill: no gate key minted and no first take written
+    # without the instructions, streamed or not.
+    assert calls == []
+
+
+def test_both_routers_are_told_to_hand_these_turns_over():
+    from cowork.handlers import direct_answer
+    from cowork.handlers.response_routing import _SYSTEM_PROMPT
+
+    gate = " ".join(_SYSTEM_PROMPT.split())
+    answer = " ".join(direct_answer._SYSTEM_PROMPT.split())
+    assert "Delegate any request to remember, save or forget something for later" in gate
+    assert "could be in the user's own files or project" in gate
+    assert "about the user's own preferences or about something they said in another conversation" in gate
+    assert "Never say you can't do something: delegate it instead." in gate
+    assert "any request to remember or forget something" in answer
+    assert "Never say you can't do something the user asked; call the delegate tool instead." in answer

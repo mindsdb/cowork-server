@@ -7,6 +7,7 @@ import shutil
 import stat
 from functools import partial
 from pathlib import Path
+from typing import NamedTuple
 from uuid import UUID
 
 from fastapi import UploadFile
@@ -145,7 +146,7 @@ def stage_project_instructions(
             conversation_id,
         )
         return False
-    src = Path(project_path) / ".anton" / "anton.md"
+    src = _instructions_path(project_path)
     if not src.is_file():
         # Instructions removed at the project → clear the stale staged copy so
         # the agent stops seeing them. Cleared by truncating IN PLACE, never by
@@ -207,11 +208,52 @@ def project_holds_files(project_path: str | Path) -> bool:
                     with os.scandir(entry.path) as inner:
                         if next(inner, None) is not None:
                             return True
-                except FileNotFoundError:
+                except (FileNotFoundError, NotADirectoryError):
                     continue
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
     return False
+
+
+def _instructions_path(project_path: str | Path) -> Path:
+    """Where a project keeps its instructions for the agent."""
+    return Path(project_path) / ".anton" / "anton.md"
+
+
+def project_has_instructions(project_path: str | Path) -> bool:
+    """Whether the project has instructions: a regular ``.anton/anton.md``
+    with something other than whitespace in it (``stage_project_instructions``
+    gives the agent that file, and only when it is a regular file). A missing
+    path or a non-file there means none; any other read error raises.
+    ``is_file`` comes first so a pipe or a device at that path is never
+    opened."""
+    path = _instructions_path(project_path)
+    try:
+        if not path.is_file():
+            return False
+        return bool(path.read_bytes().strip())
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+
+class ProjectContext(NamedTuple):
+    """What a project's folder says about routing a turn."""
+
+    #: Files the user or the agent put there, or an attachment on any turn.
+    has_files: bool
+    #: Project instructions, which only the agent's prompt carries.
+    has_instructions: bool
+
+
+def read_project_context(project_path: str | Path, *, files_known: bool) -> ProjectContext:
+    """Both routing facts about a project's folder in one pass on the file
+    store. ``files_known`` says an attachment already counts as files, so
+    the folder is not listed. A missing folder holds neither; any read error
+    other than a missing path raises, and the caller decides."""
+    return ProjectContext(
+        has_files=files_known or project_holds_files(project_path),
+        has_instructions=project_has_instructions(project_path),
+    )
 
 
 def attachment_purpose(session_id: str) -> str:

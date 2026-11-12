@@ -143,7 +143,7 @@ from cowork.services.comparisons import (
 )
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
-from cowork.services.files import FileService, attachment_purpose, project_holds_files
+from cowork.services.files import FileService, ProjectContext, attachment_purpose, read_project_context
 from cowork.services.live_apps import use_live_app_launcher
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
@@ -406,7 +406,8 @@ class _TurnStart:
     # (ResponsesHandler._settle_always_on). gate_rows is unread until then.
     always_on_unread: bool = False
     # Set when the gate could run: whether a file was attached on any turn,
-    # and the project's folder, which handle() checks for files after this unit.
+    # and the project's folder, which handle() reads for files and
+    # instructions after this unit (read_project_context).
     attached_files: bool = False
     project_path: str | None = None
     # Set when the conversation is a contained model-comparison side: what it
@@ -857,9 +858,9 @@ class ResponsesHandler:
         )
         if start.always_on_unread:
             start = await self._settle_always_on(start)
-        has_files = start.attached_files
-        if not has_files and start.project_path and start.gate_rows is not None and not start.always_on_skills:
-            has_files = await self._project_has_files(start.project_path)
+        project = ProjectContext(has_files=start.attached_files, has_instructions=False)
+        if start.project_path and start.gate_rows is not None and not start.always_on_skills:
+            project = await self._read_project_context(start.project_path, files_known=start.attached_files)
         self.harness_name = start.harness_name
         self.last_conversation_id = str(start.conversation_id)
 
@@ -913,7 +914,8 @@ class ResponsesHandler:
                     has_attachments=bool(request.attachment_ids),
                     has_disabled_connections=bool(disabled),
                     has_always_on_skills=start.always_on_skills,
-                    has_files=has_files,
+                    has_files=project.has_files,
+                    has_instructions=project.has_instructions,
                     is_comparison_side=start.comparison_pin is not None,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
@@ -974,7 +976,7 @@ class ResponsesHandler:
                 # With files, the answer never comes from the web: the files may hold it.
                 answer_binding = self._answer_binding(
                     model=request.model, reasoning_effort=request.reasoning_effort, turn_llm=turn_llm,
-                    web=not has_files,
+                    web=not project.has_files,
                 )
                 answer_history = self.routing_history or _routing_history(
                     start.gate_rows or [], start.harness_input,
@@ -1350,14 +1352,18 @@ class ResponsesHandler:
             session.rollback()
             return True
 
-    async def _project_has_files(self, project_path: str) -> bool:
-        """project_holds_files on the file store's threads, with no database
-        session held. True when the read fails, as _reads_attached_files."""
+    async def _read_project_context(self, project_path: str, *, files_known: bool) -> ProjectContext:
+        """read_project_context on the file store's threads, with no database
+        session held. When the read fails, the project counts as having both
+        files and instructions, so the turn goes to the agent: routing
+        failures fail open to the agent."""
         try:
-            return await run_efs(partial(project_holds_files, project_path), scope=self.scope)
+            return await run_efs(
+                partial(read_project_context, project_path, files_known=files_known), scope=self.scope,
+            )
         except Exception:
-            logger.warning("[responses] could not check the project's files", exc_info=True)
-            return True
+            logger.warning("[responses] could not read the project's files and instructions", exc_info=True)
+            return ProjectContext(has_files=True, has_instructions=True)
 
     @staticmethod
     def _read_gate_rows(session: ScopedSession, *, conversation_id: UUID) -> list[Message] | None:
@@ -1390,6 +1396,7 @@ class ResponsesHandler:
         has_disabled_connections: bool,
         has_always_on_skills: bool = False,
         has_files: bool = False,
+        has_instructions: bool = False,
         is_comparison_side: bool = False,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
@@ -1403,7 +1410,9 @@ class ResponsesHandler:
         `gate_rows` is the history handle()'s first unit read for the gate
         (see _TurnStart). `has_always_on_skills` delegates the turn without a
         gate call: an always-on skill applies to every answer, and only the
-        agent's prompt carries it. `has_files` goes to decide_route.
+        agent's prompt carries it, and `has_instructions` does the same for
+        the project's instructions. `has_files` (read_project_context) goes to
+        decide_route.
 
         The composer's per-conversation model pick (`request.model`) is
         deliberately not passed down: it drives Anton's turn, not the gate
@@ -1423,6 +1432,11 @@ class ResponsesHandler:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
         if has_always_on_skills:
             return RouteDecision(route=DELEGATED_AGENTIC, reason="always_on_skills"), None
+        if has_instructions:
+            # Like an always-on skill: the instructions apply to every answer
+            # and only the agent's prompt carries them, so no gate key is
+            # minted and no first take is written without them.
+            return RouteDecision(route=DELEGATED_AGENTIC, reason="project_instructions"), None
         if gate_rows is None:
             # The history read failed. Like any other gate failure, the turn
             # goes to the agent rather than failing.
