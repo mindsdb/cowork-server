@@ -125,6 +125,7 @@ class ScheduleRun(BaseSQLModel, table=True):
     conversation_id: UUID | None = Field(
         default=None,
         foreign_key="conversations.id",
+        index=True,
         description="Conversation created during this run",
     )
     is_manual: bool = Field(default=False, description="True if triggered via run-now endpoint")
@@ -151,4 +152,8 @@ class ScheduleRun(BaseSQLModel, table=True):
     outcome: str | None = Field(
         default=None,
         description="What is known about the run's execution when it ended (AttemptOutcome); NULL while running and on runs from before outcomes were recorded",
+    )
+    unavailable_model: str | None = Field(
+        default=None,
+        description="The task's pinned model, when it could not be served and the run used the account default",
     )

@@ -5,6 +5,7 @@ import base64
 import json
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import aclosing
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import cache, partial
@@ -938,6 +939,7 @@ class ResponsesHandler:
                     has_disabled_connections=bool(disabled),
                     has_always_on_skills=start.always_on_skills,
                     is_comparison_side=start.comparison_pin is not None,
+                    is_pinned_schedule=self.schedule_id is not None and request.model is not None,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
                 )
@@ -1059,10 +1061,13 @@ class ResponsesHandler:
                 # the only channel by which a turn delete can tell this producer
                 # that the history it is writing into no longer exists (the handle
                 # it will be registered under does not exist yet).
-                lifecycle = TurnLifecycle(identity=RunIdentity(
-                    correlation_id=(turn_llm or {}).get("correlation_id") or str(uuid4()),
-                    remote=TurnQueueSettings().is_remote,
-                ))
+                lifecycle = TurnLifecycle(
+                    identity=RunIdentity(
+                        correlation_id=(turn_llm or {}).get("correlation_id") or str(uuid4()),
+                        remote=TurnQueueSettings().is_remote,
+                    ),
+                    interactive=self.interactive,
+                )
 
                 def delegated(buffer: StreamBuffer, metadata: dict[str, str]):
                     return self._select_producer(
@@ -1121,7 +1126,9 @@ class ResponsesHandler:
                     await asyncio.shield(_drop_gate_key(turn_llm))
                     raise
                 self.last_run_handle = handle
-                return sse_from_buffer(handle.buffer, 0)
+                return sse_from_buffer(
+                    handle.buffer, 0, watching=(str(start.conversation_id), start.turn_id),
+                )
 
             if first_take is not None:
                 first_take.cancel()
@@ -1281,6 +1288,7 @@ class ResponsesHandler:
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=comparison_pin is not None,
+            is_pinned_schedule=self.schedule_id is not None and request.model is not None,
         ) is None:
             rows = self._reads_always_on_rows(session, conversation_id=conversation_id)
             if rows is None:
@@ -1401,6 +1409,7 @@ class ResponsesHandler:
         has_disabled_connections: bool,
         has_always_on_skills: bool = False,
         is_comparison_side: bool = False,
+        is_pinned_schedule: bool = False,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
@@ -1428,6 +1437,7 @@ class ResponsesHandler:
             has_attachments=has_attachments,
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=is_comparison_side,
+            is_pinned_schedule=is_pinned_schedule,
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
@@ -1777,7 +1787,7 @@ class ResponsesHandler:
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
-        lifecycle = TurnLifecycle(identity=RunIdentity(correlation_id=corr))
+        lifecycle = TurnLifecycle(identity=RunIdentity(correlation_id=corr), interactive=self.interactive)
         handle = await registry.start(
             conversation_id=str(conversation_id),
             turn_id=turn_id,
@@ -1796,7 +1806,7 @@ class ResponsesHandler:
             lifecycle=lifecycle,
         )
         self.last_run_handle = handle
-        return sse_from_buffer(handle.buffer, 0)
+        return sse_from_buffer(handle.buffer, 0, watching=(str(conversation_id), turn_id))
 
     async def _direct_figure_sources(
         self, *, conversation_id: UUID, answer: str, question: str,
@@ -2620,7 +2630,7 @@ class ResponsesHandler:
         Unlike in-process, messages are not timestamp-stamped here; that
         divergence is tracked separately.
         """
-        from cowork.harnesses.anton_harness.harness import AntonHarness
+        from cowork.harnesses.anton_harness.harness import AntonHarness, _without_repeated_narration
 
         service = ConversationService(session)
         replayable = [
@@ -2629,7 +2639,7 @@ class ResponsesHandler:
         ]
         fmt = partial(scrubbed_openai_dump, mode="json")
         if not get_user_settings(session.scope).history_compaction_enabled:
-            return [fmt(m) for m in replayable], None
+            return _without_repeated_narration([fmt(m) for m in replayable]), None
 
         conversation = service.get_conversation(conv_id)
         history, seed_info = AntonHarness._seed_history(
@@ -4376,7 +4386,39 @@ async def save_turn_compaction(
 SSE_KEEPALIVE_SECONDS = 20.0
 
 
-async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None]:
+def sse_from_buffer(
+    buffer, from_seq: int = 0, *, watching: tuple[str, int] | None = None,
+) -> AsyncGenerator[str, None]:
+    """``_sse_from_buffer``. With ``watching`` (conversation id, turn id) the
+    reader also counts as watching that turn while it streams, which holds
+    back the turn's "task finished" push (cowork.streaming.watchers). Where
+    push is off nothing reads that signal, so the stream skips recording it."""
+    if watching is None or not _push_reads_watchers():
+        return _sse_from_buffer(buffer, from_seq)
+    return _watched_sse_from_buffer(buffer, from_seq, watching)
+
+
+def _push_reads_watchers() -> bool:
+    from cowork.services.push.dispatch import push_enabled
+
+    return push_enabled()
+
+
+async def _watched_sse_from_buffer(
+    buffer, from_seq: int, watching: tuple[str, int],
+) -> AsyncGenerator[str, None]:
+    from cowork.streaming import watchers
+
+    async with watchers.watch(*watching) as held:
+        # aclosing: closing this generator closes the inner one at once, so
+        # its own finally (which settles the prefetch) runs before the watch
+        # is released.
+        async with aclosing(_sse_from_buffer(buffer, from_seq, held)) as frames:
+            async for frame in frames:
+                yield frame
+
+
+async def _sse_from_buffer(buffer, from_seq: int = 0, held=None) -> AsyncGenerator[str, None]:
     """Serialize a turn buffer to the SSE wire, replaying from ``from_seq``
     then live-tailing. Used by both the initial POST /responses stream
     (from_seq=0) and reconnects via GET /responses/tail. The terminal record
@@ -4412,6 +4454,8 @@ async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None
             # Checked BEFORE prefetching: the terminal record ends the stream,
             # so scheduling another __anext__() here would only be cancelled.
             if rec.is_terminal:
+                if held is not None:
+                    held.saw_end = True
                 if rec.data.get("reason") == "cancelled":
                     yield sse_frame("response.cancelled", {"type": "response.cancelled"})
                 return
