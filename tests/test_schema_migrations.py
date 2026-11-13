@@ -213,6 +213,47 @@ def test_push_devices_upgrade_from_staging_head(tmp_path, monkeypatch):
     assert _alembic_versions(db_path) == {expected_head()}
 
 
+def test_channel_senders_upgrade_holds_existing_bindings_and_downgrade_drops_it(tmp_path, monkeypatch):
+    """A binding made before the sender gate gets every switch off through the
+    server default and no allowed sender; the downgrade removes all of it."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "channel-senders.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+
+    _upgrade_to(engine, uri, "1d5fe417cc0a")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO channel_bindings (id, channel_type, external_group_id, external_thread_key, trigger_rule) "
+                "VALUES ('b0000000000000000000000000000001', 'telegram', '555', '__default__', 'always')"
+            )
+        )
+    _upgrade_to(engine, uri, "head")
+
+    with engine.connect() as connection:
+        switches = connection.execute(
+            text(
+                "SELECT allow_scratchpad, allow_connectors, allow_memory_writes, allow_file_replies "
+                "FROM channel_bindings"
+            )
+        ).one()
+        senders = connection.execute(text("SELECT count(*) FROM channel_senders")).scalar_one()
+    assert tuple(switches) == (0, 0, 0, 0)
+    assert senders == 0
+    assert _has_table(db_path, "channel_pairing_codes")
+
+    _downgrade_to(engine, uri, "1d5fe417cc0a")
+
+    assert not _has_table(db_path, "channel_senders")
+    assert not _has_table(db_path, "channel_pairing_codes")
+    columns = {column["name"] for column in inspect(engine).get_columns("channel_bindings")}
+    assert not columns & {"allow_scratchpad", "allow_connectors", "allow_memory_writes", "allow_file_replies"}
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM channel_bindings")).scalar_one() == 1
+
+
 def test_schema_migrations_rerun_on_up_to_date_database_is_noop(tmp_path, monkeypatch):
     # A database already at head must upgrade cleanly a second time (no raise).
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))

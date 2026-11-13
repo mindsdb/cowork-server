@@ -109,6 +109,103 @@ class ChannelBinding(BaseSQLModel, table=True):
         foreign_key="conversations.id",
         description="Conversation this binding is pinned to, when one external chat == one conversation",
     )
+    allow_scratchpad: bool = Field(
+        default=False,
+        sa_column_kwargs={"server_default": sa.false()},
+        description="Whether turns through this binding may run code, read local files, publish and use the web",
+    )
+    allow_connectors: bool = Field(
+        default=False,
+        sa_column_kwargs={"server_default": sa.false()},
+        description="Whether turns through this binding see the owner's connections; needs allow_scratchpad",
+    )
+    allow_memory_writes: bool = Field(
+        default=False,
+        sa_column_kwargs={"server_default": sa.false()},
+        description="Whether turns through this binding may write memory or draft skills",
+    )
+    allow_file_replies: bool = Field(
+        default=False,
+        sa_column_kwargs={"server_default": sa.false()},
+        description="Whether the files a turn creates are sent back to the chat",
+    )
+
+
+SENDER_PENDING = "pending"
+SENDER_ALLOWED = "allowed"
+SENDER_BLOCKED = "blocked"
+SENDER_DISPLAY_NAME_MAX = 64
+
+
+class ChannelSender(BaseSQLModel, table=True):
+    """One person in one external chat, and whether the owner lets them run turns.
+
+    Keyed per chat, not per binding: one approval covers every thread of the chat.
+    """
+
+    __tablename__ = "channel_senders"
+    __table_args__ = (
+        sa.Index(
+            "uq_channel_senders_chat_sender_global",
+            "channel_type",
+            "external_group_id",
+            "external_sender_id",
+            unique=True,
+            sqlite_where=sa.text("org_id IS NULL"),
+            postgresql_where=sa.text("org_id IS NULL"),
+        ),
+        sa.Index(
+            "uq_channel_senders_chat_sender_org",
+            "channel_type",
+            "external_group_id",
+            "external_sender_id",
+            "org_id",
+            unique=True,
+            sqlite_where=sa.text("org_id IS NOT NULL"),
+            postgresql_where=sa.text("org_id IS NOT NULL"),
+        ),
+    )
+
+    channel_type: str = Field(description="Stable adapter name")
+    external_group_id: str = Field(description="Platform conversation id (chat/channel id)")
+    external_sender_id: str = Field(max_length=255, description="Platform user id of the sender")
+    is_group: bool = Field(default=False, description="Whether the chat is a group rather than a direct message")
+    status: str = Field(default=SENDER_PENDING, description="pending | allowed | blocked")
+    display_name: str | None = Field(
+        default=None,
+        max_length=SENDER_DISPLAY_NAME_MAX,
+        description="Sender's name as the platform reported it; set by the sender, untrusted",
+    )
+    last_seen_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="UTC time of the sender's most recent message in this chat",
+    )
+    org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
+
+
+class ChannelPairingCode(BaseSQLModel, table=True):
+    """A one-time code the owner hands out; a sender who sends it is allowed in that chat."""
+
+    __tablename__ = "channel_pairing_codes"
+
+    channel_type: str = Field(index=True, description="Stable adapter name the code works on")
+    code_hash: str = Field(
+        max_length=64,
+        sa_column_kwargs={"unique": True},
+        description="sha256 hex of the code; the code itself is never stored",
+    )
+    expires_at: datetime = Field(
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="UTC time after which the code no longer works",
+    )
+    used_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="UTC time the code was redeemed; NULL while unused",
+    )
+    org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
+    created_by: str | None = Field(default=None, max_length=36, description="User who created the code; NULL on local/desktop rows")
 
 
 class ChannelSession(BaseSQLModel, table=True):

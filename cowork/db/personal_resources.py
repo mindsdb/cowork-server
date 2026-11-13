@@ -78,6 +78,8 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     "channel_installations": PersonalResource.CONVERSATIONS,
     "channel_bindings": PersonalResource.CONVERSATIONS,
     "channel_events": PersonalResource.CONVERSATIONS,
+    "channel_senders": PersonalResource.CONVERSATIONS,
+    "channel_pairing_codes": PersonalResource.CONVERSATIONS,
     # Which artifact folders hold a repair queued to a conversation, so they
     # follow conversations.
     "queued_agent_repairs": PersonalResource.CONVERSATIONS,

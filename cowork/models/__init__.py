@@ -4,6 +4,8 @@ from cowork.models.channel import (  # noqa: F401
     ChannelBinding,
     ChannelEvent,
     ChannelInstallation,
+    ChannelPairingCode,
+    ChannelSender,
     ChannelSession,
 )
 from cowork.models.code_control import CodeControlRecord  # noqa: F401
