@@ -5,6 +5,7 @@ module is imported (settings/engine are read at import time), then builds the
 schema directly and seeds the ``general`` project the runtime depends on.
 """
 import copy
+import gc
 import importlib
 import io
 import logging
@@ -606,3 +607,19 @@ def pytest_sessionstart(session):
         _blocking_guard.StaleEntryCheck(tests_dir=Path(__file__).parent, reached=_GUARD_REACHED),
         "cowork-blocking-guard-stale-entries",
     )
+
+
+@pytest.fixture
+def without_gc_pauses():
+    """Collect now, then hold the cyclic garbage collector off for the test.
+
+    Late in a full run the heap is large, and one full collection stops the
+    event loop for over a second on a CI runner. A test that times the loop
+    would then blame the code under test for the collector's pause.
+    """
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()
