@@ -59,7 +59,7 @@ from cowork.api.v1.endpoints.artifact_workspace import ArtifactIdDep, ScopeDep, 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import TenantScope
-from cowork.db.units import run_efs, run_to_completion
+from cowork.db.units import run_db, run_efs, run_to_completion
 from cowork.harnesses.anton_harness.preview_checker import ask_preview
 from cowork.services import artifact_quick_edits
 from cowork.services import quick_edit as quick_edit_service
@@ -68,6 +68,7 @@ from cowork.services.artifact_revisions import (
     RevisionConflict,
     RevisionValidationError,
     begin_quick_edit,
+    list_revisions,
     record_quick_edit,
 )
 from cowork.services.product_permissions import require_product_permission
@@ -192,12 +193,15 @@ def _artifact_kind(metadata: dict) -> str:
     return kind if isinstance(kind, str) and kind else "html-app"
 
 
-def _router_input(anton: AntonQuickEdit, folder: Path, kind: str) -> tuple[list[str], dict]:
+def _router_input(
+    anton: AntonQuickEdit, folder: Path, kind: str, source_path: str,
+) -> tuple[list[str], dict]:
     """What the router reads from the folder, in one file store hop: the
-    artifact's content files as anton's editor sees them, and the optional
-    context (name, description, the shape of its data) when this anton's
-    router takes it. An empty file list makes the router send the message to
-    the agent."""
+    artifact's content files as anton's editor sees them, the optional
+    context describe_artifact gives (name, description, the shape of its
+    data, its outline) and the summaries of its latest revisions, each only
+    when this anton's router takes it. An empty file list makes the router
+    send the message to the agent."""
     files: list[str] = []
     if anton.workspace_cls is not None:
         try:
@@ -214,10 +218,26 @@ def _router_input(anton: AntonQuickEdit, folder: Path, kind: str) -> tuple[list[
         if isinstance(described, dict):
             context = {
                 key: str(described.get(key) or "")
-                for key in ("name", "description", "data")
-                if key in anton.route_extras
+                for key in quick_edit_service.DESCRIBED_EXTRAS
+                if key in anton.route_extras and key in described
             }
+    if "recent_changes" in anton.route_extras:
+        context["recent_changes"] = _recent_changes(folder, source_path)
     return files, context
+
+
+def _recent_changes(folder: Path, source_path: str) -> list[str]:
+    """The summaries of the artifact's latest revisions, oldest first,
+    without the journal's own captures, which say nothing about a change."""
+    try:
+        revisions = list_revisions(folder, rel_path=source_path)
+    except (OSError, ValueError, TimeoutError):
+        return []
+    summaries = [
+        str(r.get("summary") or "") for r in revisions
+        if (r.get("actor") or {}).get("kind") != "system" and r.get("summary")
+    ]
+    return list(reversed(summaries[: quick_edit_service.MAX_RECENT_CHANGES]))
 
 
 def _capture_for_undo(anton: AntonQuickEdit, folder: Path, kind: str, source_path: str) -> dict | None:
@@ -366,13 +386,24 @@ class QuickEditRun:
             # to ask it on (Jev opted out, or no key): the chat, as for no
             # decisions model at all.
             return "agent", 1.0, NO_DECISIONS_REASON
-        files, context = await run_efs(partial(_router_input, self.anton, self.folder, self.kind), scope=self.scope)
+        files, context = await run_efs(
+            partial(_router_input, self.anton, self.folder, self.kind, self.source_path), scope=self.scope,
+        )
         extra: dict = {**context}
         model = backend.route_model or decisions.model
         if model:
             extra["model"] = model
         if "history" in self.anton.route_extras and body.history:
+            # As the bar sent it: its own earlier messages, and the summaries
+            # of its earlier edits as assistant entries.
             extra["history"] = [entry.model_dump() for entry in body.history]
+        if "chat" in self.anton.route_extras and body.conversationId is not None:
+            try:
+                extra["chat"] = await run_db(
+                    partial(quick_edit_service.router_chat, conversation_id=body.conversationId), scope=self.scope,
+                )
+            except Exception:
+                logger.warning("Could not read the conversation for the quick edit router", exc_info=True)
         decision = await self.anton.route_request(
             body.message,
             files=files,

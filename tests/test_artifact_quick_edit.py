@@ -106,9 +106,11 @@ class FakeAnton:
     edit_calls: list = field(default_factory=list)
 
     async def route_request(self, message, *, files, kind, base_url, api_key, model="jev-1.13.0", timeout_s=3.0,
-                            http=None, name="", description="", data="", history=None):
+                            http=None, name="", description="", data="", history=None,
+                            outline="", recent_changes=None, chat=None):
         self.route_calls.append(dict(message=message, files=files, kind=kind, base_url=base_url, api_key=api_key,
-                                     model=model, name=name, description=description, data=data, history=history))
+                                     model=model, name=name, description=description, data=data, history=history,
+                                     outline=outline, recent_changes=recent_changes, chat=chat))
         return self.route
 
     async def run_quick_edit(self, folder, message, *, kind, llm, checker, history=None, on_progress=None, max_fix_rounds=2):
@@ -126,8 +128,11 @@ class FakeAnton:
             checkers=checkers,
             workspace_cls=workspace_cls,
             # anton's rule: a decisions model only on MindsHub here.
-            describe_artifact=lambda folder: {"name": "Sales", "description": "Revenue by region", "data": "{rows: [...]}"},
-            route_extras=frozenset({"name", "description", "data", "history"}),
+            describe_artifact=lambda folder: {
+                "name": "Sales", "description": "Revenue by region", "data": "{rows: [...]}",
+                "outline": "h1 Sales; section#unicorns (3 svg unicorns)",
+            },
+            route_extras=quick_edit_service.ROUTE_EXTRAS,
             decisions_available=lambda settings: settings.planning_provider == "minds-cloud",
             decisions_config=lambda settings: (
                 ("https://hub.example/v1", settings.minds_api_key, "jev-1.13.0")
@@ -1262,3 +1267,78 @@ def test_the_paged_messages_api_carries_the_group_too(db):
     assert len(items) == 1 and items[0]["harness"] == quick_edit_service.QUICK_EDIT_HARNESS
     group = next(e for e in items[0]["events"] if e["type"] == "response.quick_edit_group")
     assert [e["editId"] for e in group["edits"]] == [f"{1:032x}", f"{2:032x}"]
+
+
+
+# ── more context for the router ──────────────────────────────────────────
+
+
+def test_the_router_gets_the_outline_and_the_artifact_s_recent_changes(client, fake_anton, artifact):
+    folder, metadata, artifact_id = artifact
+    # Two earlier quick edits on this artifact.
+    for n, summary in ((1, "Added unicorns."), (2, "Made the unicorns pink.")):
+        async def edit(f, checker, on_progress, n=n, summary=summary):
+            (f / "index.html").write_text(f"<h1>v{n}</h1>", encoding="utf-8")
+            return QuickEditResult("applied", ["index.html"], summary)
+
+        fake_anton.edit = edit
+        fake_anton.route = RouteDecision("edit", 0.95)
+        assert events_of(post(client, artifact_id).text)[-1][1]["status"] == "applied"
+
+    fake_anton.route = RouteDecision("agent", 0.6, reason="uncertain")
+    post(client, artifact_id, message="make the unicorns poop rainbow",
+         history=[{"role": "user", "text": "make them pink"}, {"role": "assistant", "text": "Made the unicorns pink."}])
+    call = fake_anton.route_calls[-1]
+    assert call["outline"] == "h1 Sales; section#unicorns (3 svg unicorns)"
+    assert call["recent_changes"] == ["Quick edit: Added unicorns.", "Quick edit: Made the unicorns pink."]
+    assert call["history"][-1] == {"role": "assistant", "text": "Made the unicorns pink."}
+    # No conversation given: no chat.
+    assert call["chat"] is None
+
+
+def test_an_anton_without_the_new_context_gets_none_of_it(client, fake_anton, artifact, monkeypatch):
+    _folder, _metadata, artifact_id = artifact
+    api = fake_anton.api()
+
+    async def old_route_request(message, *, files, kind, base_url, api_key, model="jev-1.13.0",
+                                timeout_s=3.0, http=None, name="", description="", data="", history=None):
+        fake_anton.route_calls.append({"name": name, "data": data})
+        return RouteDecision("agent", 0.6)
+
+    old = AntonQuickEdit(
+        route_request=old_route_request, run_quick_edit=api.run_quick_edit, checkers=api.checkers,
+        workspace_cls=api.workspace_cls, describe_artifact=api.describe_artifact,
+        route_extras=frozenset({"name", "description", "data", "history"}),
+        decisions_available=api.decisions_available, decisions_config=api.decisions_config,
+    )
+    monkeypatch.setattr(quick_edit_service, "anton_quick_edit", lambda: old)
+    response = post(client, artifact_id, conversationId=CONVERSATION)
+    assert response.status_code == 200 and fake_anton.route_calls == [{"name": "Sales", "data": "{rows: [...]}"}]
+
+
+def test_the_router_chat_is_the_conversation_s_last_text_messages(db):
+    from cowork.services.conversations import ConversationService
+
+    session, conversation = db
+    service = ConversationService(session)
+    service.save_user_message(conversation.id, "old question")
+    service.save_assistant_turn(conversation.id, "old answer", [])
+    service.save_user_message(conversation.id, "add unicorns to the sales page")
+    service.save_assistant_turn(
+        conversation.id, "I added three unicorns. " + "x" * 600, [],
+        tool_rows=[
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "edit_artifact", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Edited"}]},
+        ],
+    )
+    _save(session, conversation, _edit(1))  # a quick-edit group record
+    service.save_user_message(conversation.id, [{"type": "input_text", "text": "thanks"}])
+
+    chat = quick_edit_service.router_chat(session, conversation_id=conversation.id)
+
+    assert [c["role"] for c in chat] == ["assistant", "user", "assistant", "user"]
+    assert chat[0]["text"] == "old answer"
+    assert chat[1]["text"] == "add unicorns to the sales page"
+    assert chat[2]["text"].startswith("I added three unicorns.") and len(chat[2]["text"]) == 300
+    assert chat[3]["text"] == "thanks"
+    assert quick_edit_service.router_chat(session, conversation_id=uuid.uuid4()) == []

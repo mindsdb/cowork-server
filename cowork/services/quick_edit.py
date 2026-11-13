@@ -128,10 +128,59 @@ def anton_quick_edit() -> AntonQuickEdit | None:
         checkers=checkers,
         workspace_cls=ArtifactWorkspace,
         describe_artifact=describe if callable(describe) else None,
-        route_extras=frozenset(params & {"name", "description", "data", "history"}),
+        route_extras=frozenset(params & ROUTE_EXTRAS),
         decisions_available=_callable(router, "decisions_available"),
         decisions_config=_callable(router, "decisions_config"),
     )
+
+
+#: route_request's optional context, passed only when this anton takes it.
+ROUTE_EXTRAS = frozenset({"name", "description", "data", "outline", "history", "recent_changes", "chat"})
+#: From describe_artifact(folder).
+DESCRIBED_EXTRAS = ("name", "description", "data", "outline")
+#: The artifact's latest revision summaries the router reads.
+MAX_RECENT_CHANGES = 6
+#: The conversation's latest text messages the router reads, and their size.
+MAX_CHAT = 4
+MAX_CHAT_TEXT = 300
+
+
+def _message_text(content: object) -> str:
+    """A saved message's visible text: a string, or its text blocks. Tool
+    blocks give nothing, so a tool row reads as empty."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b["text"] for b in content
+            if isinstance(b, dict) and b.get("type") in ("text", "input_text", "output_text")
+            and isinstance(b.get("text"), str)
+        )
+    return ""
+
+
+def router_chat(session: ScopedSession, *, conversation_id: UUID) -> list[dict]:
+    """The conversation's last MAX_CHAT text messages, oldest first, as
+    ``[{role, text}]`` clipped to MAX_CHAT_TEXT: what the person and the
+    agent said just before the bar message. Tool rows and quick-edit group
+    records are skipped. Empty for a conversation the caller does not own."""
+    from cowork.services.conversations import ConversationService
+
+    try:
+        rows = ConversationService(session).get_recent_messages(
+            conversation_id, roles=("user", "assistant"), limit=MAX_CHAT * 6,
+        )
+    except ValueError:
+        return []
+    chat: list[dict] = []
+    for message in rows:
+        if message.harness == QUICK_EDIT_HARNESS:
+            continue
+        text = " ".join(_message_text(message.content).split())
+        if text:
+            role = getattr(message.role, "value", message.role)
+            chat.append({"role": str(role), "text": text[:MAX_CHAT_TEXT]})
+    return chat[-MAX_CHAT:]
 
 
 def _callable(module: object, name: str) -> Callable[..., Any] | None:
