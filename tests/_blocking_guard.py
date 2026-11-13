@@ -194,7 +194,6 @@ class Allowed(NamedTuple):
 ALLOWLIST: tuple[Allowed, ...] = (
     Allowed('cowork/handlers/responses.py', 'ResponsesHandler._route_request', LOOP_POOL_CHECKOUT, ('cowork/services/settings.py:SettingService._fetch_all_rows',), "loads the caller's settings with get_user_settings, which checks out a connection on the loop"),
     Allowed('cowork/server.py', 'lifespan', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'startup work before uvicorn binds the port, when no request waits on the loop'),
-    Allowed('cowork/api/v1/endpoints/artifacts.py', 'artifact_status', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only (DesktopOnly on GET /api/v1/artifacts/status)'),
     Allowed('cowork/api/v1/endpoints/coding.py', 'inference_proxy', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only (LoopbackDesktopOnly on the router)'),
     Allowed('cowork/api/v1/endpoints/publish.py', 'activate_version_endpoint', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only (DesktopOnly on the publish router)'),
     Allowed('cowork/api/v1/endpoints/publish.py', 'list_publishable_endpoint', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only (DesktopOnly on the publish router)'),

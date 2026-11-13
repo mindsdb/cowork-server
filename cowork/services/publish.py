@@ -7,12 +7,17 @@ from __future__ import annotations
 
 import hashlib
 import html as _html
+import io
 import json
 import logging
 import os
+import re
 import stat
+import sys
 import tempfile
+import threading
 import urllib.error
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -72,9 +77,7 @@ from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
-from cowork.schemas.artifact_export import OmittedReason
-from cowork.schemas.export_child import ChildLimits, PublishMarkdownRequest
-from cowork.services.artifact_files import ArtifactFileContent, ArtifactFileRefused
+from cowork.schemas.export_child import PublishMarkdownRequest
 from cowork.services.artifacts import (
     _content_mtime,
     _load_published_map,
@@ -178,21 +181,44 @@ class PublishRejected(RuntimeError):
     """
 
 
-class MarkdownNotPublishable(PublishRejected):
-    """Rendering the Markdown passed its time or memory limit, or failed. Nothing was published."""
+# A published Markdown page renders in the conversion process
+# (_publish_markdown_body). Its refusals are typed, like PublishTooLarge, so a
+# route answers with the status and the app reads the code.
+MARKDOWN_NOT_PUBLISHABLE_CODE = "markdown_not_publishable"
+MARKDOWN_TOO_LARGE_MESSAGE = (
+    "This Markdown file is too large to publish. Publish a file under 2 MiB."
+)
+MARKDOWN_TOO_SLOW_MESSAGE = (
+    "This Markdown file can't be published. "
+    "Converting it took too long or used too much memory."
+)
+CONVERSION_BUSY_CODE = "conversion_busy"
+CONVERSION_BUSY_MESSAGE = "Another document is converting on this server. Try again in a moment."
+MARKDOWN_CONVERSION_FAILED_CODE = "markdown_conversion_failed"
+MARKDOWN_CONVERSION_FAILED_MESSAGE = "This Markdown file couldn't be converted for publishing."
 
-    def __init__(self) -> None:
-        super().__init__(
-            "This Markdown file can't be published. "
-            "Converting it took too long or used too much memory."
-        )
+
+class MarkdownNotPublishable(_CodedRefusal):
+    """The file is past publish's Markdown bound, or rendering it passed the
+    conversion's time or memory limit. Nothing was published, and the same
+    file is refused again, so callers report it instead of retrying."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(413, MARKDOWN_NOT_PUBLISHABLE_CODE, message)
 
 
-class MarkdownRenderBusy(PublishRejected):
+class MarkdownRenderBusy(_CodedRefusal):
     """Another conversion holds this server process's one conversion slot."""
 
     def __init__(self) -> None:
-        super().__init__("Another document is converting on this server. Try again in a moment.")
+        super().__init__(429, CONVERSION_BUSY_CODE, CONVERSION_BUSY_MESSAGE)
+
+
+class MarkdownConversionFailed(_CodedRefusal):
+    """The conversion process failed without passing a limit: a fault on this server."""
+
+    def __init__(self) -> None:
+        super().__init__(500, MARKDOWN_CONVERSION_FAILED_CODE, MARKDOWN_CONVERSION_FAILED_MESSAGE)
 
 
 # Sharing an artifact with everyone takes MindsHub's artifacts.share_org,
@@ -761,25 +787,100 @@ _MD_HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 
+# The line boundaries str.splitlines uses, so the title scan finds the same
+# first heading without building a list of every line.
+_LINE = re.compile(r"[^\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]*")
+
+
 def _markdown_title(md_path: Path, md_text: str) -> str:
     """Page <title>: the first ATX `# ` heading if present, else the filename."""
-    for line in md_text.splitlines():
-        stripped = line.strip()
+    for line in _LINE.finditer(md_text):
+        stripped = line.group().strip()
         if stripped.startswith("# "):
             return stripped[2:].strip() or md_path.stem
     return md_path.stem
 
 
-# Rendered pages, by a digest of their title and Markdown, newest last. The
-# "changed since publish" check renders a page each time it lists an edited
-# artifact, so one render per edit serves every listing until the next.
-_RENDERED_PAGES: dict[str, str] = {}
-_MAX_RENDERED_PAGES = 32
-# A page past this size isn't kept, so the cache can't grow past 32 of them.
-_MAX_RENDERED_PAGE_CHARS = 1024 * 1024
+# The most of a Markdown file publish reads. Python-Markdown renders an
+# ordinary 2 MiB report in about 3 s on one fast core, leaving room for a
+# replica's slower one inside the conversion's 30 s; real agent-written
+# reports stay far below it.
+PUBLISH_MARKDOWN_MAX_BYTES = 2 * 1024 * 1024
 
 
-def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
+class _KeptPage(NamedTuple):
+    page: str
+    size: int
+
+
+class _RenderedPages:
+    """Pages publish rendered, and texts whose render the conversion stopped, by content digest.
+
+    The "changed since publish" check renders a page each time it lists an
+    edited artifact, so one render per edit serves every listing until the
+    next, and one stopped render isn't run again by the next listing. Pages
+    are bounded by the memory they hold (a str with one emoji takes four
+    bytes a character), least recently used out first.
+    Listings run in several threads, so every read and write takes the lock.
+    """
+
+    def __init__(self, *, max_bytes: int, max_refused: int) -> None:
+        self._max_bytes = max_bytes
+        self._max_refused = max_refused
+        self._pages: OrderedDict[str, _KeptPage] = OrderedDict()
+        self._held_bytes = 0
+        self._refused: OrderedDict[str, None] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def page(self, key: str) -> str | None:
+        with self._lock:
+            kept = self._pages.get(key)
+            if kept is None:
+                return None
+            self._pages.move_to_end(key)
+            return kept.page
+
+    def keep(self, key: str, page: str) -> None:
+        size = sys.getsizeof(page)
+        if size > self._max_bytes:
+            return
+        with self._lock:
+            if key in self._pages:
+                return
+            self._pages[key] = _KeptPage(page=page, size=size)
+            self._held_bytes += size
+            while self._held_bytes > self._max_bytes:
+                _key, dropped = self._pages.popitem(last=False)
+                self._held_bytes -= dropped.size
+
+    def was_refused(self, key: str) -> bool:
+        with self._lock:
+            return key in self._refused
+
+    def refuse(self, key: str) -> None:
+        with self._lock:
+            self._refused[key] = None
+            self._refused.move_to_end(key)
+            while len(self._refused) > self._max_refused:
+                self._refused.popitem(last=False)
+
+
+_RENDERED_PAGES = _RenderedPages(max_bytes=8 * 1024 * 1024, max_refused=256)
+
+
+def _read_markdown(md_path: Path) -> str:
+    """The file's text as ``Path.read_text`` reads it, refused past ``PUBLISH_MARKDOWN_MAX_BYTES``.
+
+    The bound is checked on the bytes, before any decoding or copy.
+    """
+    with md_path.open("rb") as source:
+        data = source.read(PUBLISH_MARKDOWN_MAX_BYTES + 1)
+    if len(data) > PUBLISH_MARKDOWN_MAX_BYTES:
+        raise MarkdownNotPublishable(MARKDOWN_TOO_LARGE_MESSAGE)
+    return io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace").read()
+
+
+def _render_markdown_to_html(md_path: Path, out_dir: Path, *, background: bool = False) -> Path:
     """Render a Markdown file to a standalone ``index.html`` in ``out_dir``.
 
     Returns the path to the generated file, which is what we hand to
@@ -790,20 +891,26 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     Python-Markdown runs in the export's conversion process
     (``cowork.services.export_runner``), which the server kills past its time
     or memory limit, so a hostile file can't hold the server. Raises
-    ``MarkdownNotPublishable`` for one it killed or that failed, and
-    ``MarkdownRenderBusy`` while another conversion runs.
+    ``MarkdownNotPublishable`` for a file past the bound or one the process
+    stopped, ``MarkdownRenderBusy`` while another conversion runs, and
+    ``MarkdownConversionFailed`` for one that failed. A *background* render,
+    the "changed since publish" check, refuses at once a text whose render
+    was stopped before; a person's publish always tries again.
     """
-    md_text = md_path.read_text(encoding="utf-8", errors="replace")
+    md_text = _read_markdown(md_path)
     title = _markdown_title(md_path, md_text)
     key = hashlib.sha256(f"{title}\0{md_text}".encode()).hexdigest()
-    page = _RENDERED_PAGES.get(key)
+    page = _RENDERED_PAGES.page(key)
     if page is None:
-        body = _publish_markdown_body(md_text)
+        if background and _RENDERED_PAGES.was_refused(key):
+            raise MarkdownNotPublishable(MARKDOWN_TOO_SLOW_MESSAGE)
+        try:
+            body = _publish_markdown_body(md_text)
+        except MarkdownNotPublishable:
+            _RENDERED_PAGES.refuse(key)
+            raise
         page = _MD_HTML_TEMPLATE.format(title=_html.escape(title), body=body)
-        if len(page) <= _MAX_RENDERED_PAGE_CHARS:
-            _RENDERED_PAGES[key] = page
-            while len(_RENDERED_PAGES) > _MAX_RENDERED_PAGES:
-                _RENDERED_PAGES.pop(next(iter(_RENDERED_PAGES)))
+        _RENDERED_PAGES.keep(key, page)
     out_path = out_dir / "index.html"
     out_path.write_text(page, encoding="utf-8")
     return out_path
@@ -811,11 +918,7 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
 
 def _publish_markdown_body(md_text: str) -> str:
     """The page body Python-Markdown renders for *md_text*, in a conversion process."""
-    from cowork.services.artifact_export import (
-        CONVERSION_MEMORY_BYTES,
-        CONVERSION_WALL_SECONDS,
-        ORG_CONVERSION_MEMORY_BYTES,
-    )
+    from cowork.services.artifact_export import conversion_limits
     from cowork.services.export_runner import (
         ConversionBusy,
         ConversionError,
@@ -823,26 +926,19 @@ def _publish_markdown_body(md_text: str) -> str:
         convert_in_child,
     )
 
-    limits = ChildLimits(
-        wall_seconds=CONVERSION_WALL_SECONDS,
-        memory_bytes=ORG_CONVERSION_MEMORY_BYTES if _org_mode() else CONVERSION_MEMORY_BYTES,
-    )
     try:
         conversion = convert_in_child(
             request=PublishMarkdownRequest(),
             source=md_text.encode("utf-8"),
-            read_asset=_no_reads,
-            limits=limits,
+            limits=conversion_limits(org_mode=_org_mode()),
         )
     except ConversionBusy as exc:
         raise MarkdownRenderBusy() from exc
-    except (ConversionOverrun, ConversionError) as exc:
-        raise MarkdownNotPublishable() from exc
+    except ConversionOverrun as exc:
+        raise MarkdownNotPublishable(MARKDOWN_TOO_SLOW_MESSAGE) from exc
+    except ConversionError as exc:
+        raise MarkdownConversionFailed() from exc
     return conversion.data.decode("utf-8")
-
-
-def _no_reads(parts: tuple[str, ...]) -> ArtifactFileContent:
-    raise ArtifactFileRefused(OmittedReason.MISSING, "a published page reads no file")
 
 
 def kept_access(entry: Any, *, org_mode: bool) -> ArtifactAccessRequest:
@@ -1209,8 +1305,12 @@ def publish_artifact(
     stored: ArtifactRule | None = None,
     owner_save: bool = False,
     notices: list[ShareNotice] | None = None,
+    background: bool = False,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
+
+    A *background* publish, one no person asked for (autopublish), refuses at
+    once a Markdown page whose render the conversion process stopped before.
 
     `artifact` is the artifact folder or a single legacy loose file (loose-HTML /
     chat-bubble / the Utilities per-page list); `_resolve_publish_target`
@@ -1431,7 +1531,9 @@ def publish_artifact(
         try:
             if not is_fullstack and publish_target.suffix.lower() == ".md":
                 md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
-                publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
+                publish_source = _render_markdown_to_html(
+                    publish_target, Path(md_tmp_dir.name), background=background
+                )
 
             # Narrowed after the render, so a render that fails leaves the
             # record as it was.
@@ -1649,6 +1751,8 @@ def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
 
     Returns None when the artifact can't be resolved or bundled — the caller
     treats None as "can't tell" and does not flag the artifact as modified.
+    Raises ``MarkdownRenderBusy`` while another conversion holds the slot, so
+    a caller that would act on the answer can come back for it.
     """
     try:
         publish_target, _published_dir, _key, is_fullstack = _resolve_publish_target(
@@ -1668,11 +1772,15 @@ def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
         publish_source = publish_target
         if not is_fullstack and publish_target.suffix.lower() == ".md":
             md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-md5-")
-            publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
+            publish_source = _render_markdown_to_html(
+                publish_target, Path(md_tmp_dir.name), background=True
+            )
         if is_fullstack:
             zipped, _included = _zip_fullstack(publish_source)
         else:
             zipped = _zip_html(publish_source)
+    except MarkdownRenderBusy:
+        raise
     except Exception:
         return None
     finally:

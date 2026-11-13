@@ -145,7 +145,7 @@ def test_export_helpers_take_keyword_arguments_only(helper, names):
             {
                 "request": ConversionRequest,
                 "source": bytes,
-                "read_asset": AssetReader,
+                "read_asset": AssetReader | None,
                 "limits": ChildLimits,
                 "return": Conversion,
             },

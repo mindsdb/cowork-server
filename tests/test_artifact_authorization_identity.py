@@ -1913,7 +1913,7 @@ def test_a_markdown_render_that_fails_leaves_the_owners_choice_as_it_was(
     run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
     key = run({"mode": "public"}, owner_save=True)["artifactKey"]
 
-    def render_fails(_md_path, _out_dir):
+    def render_fails(_md_path, _out_dir, **_kwargs):
         raise OSError("Could not read notes.md")
 
     monkeypatch.setattr("cowork.services.publish._render_markdown_to_html", render_fails)
@@ -1942,9 +1942,9 @@ def test_a_markdown_save_whose_narrowing_fails_removes_its_rendered_page(
     rendered = []
     render = publish_module._render_markdown_to_html
 
-    def render_and_note(md_path, out_dir):
+    def render_and_note(md_path, out_dir, **kwargs):
         rendered.append(out_dir)
-        return render(md_path, out_dir)
+        return render(md_path, out_dir, **kwargs)
 
     def narrowing_fails(**_kwargs):
         raise ArtifactAccessUnavailable("Could not record the sharing the artifact's owner chose")

@@ -35,6 +35,8 @@ from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.services.publish import (
+    MarkdownNotPublishable,
+    MarkdownRenderBusy,
     PublishOwnedByOtherUser,
     PublishRejected,
     PublishTooLarge,
@@ -75,6 +77,9 @@ REASON_NO_CONTENT = "no_content"
 REASON_NOT_PUBLISHABLE = "not_publishable"
 REASON_UNPUBLISHED = "unpublished"
 REASON_UNCHANGED = "unchanged"
+# Another conversion held the server's one slot, so whether a Markdown page
+# changed is unknown: the project's self-heal asks again later.
+REASON_CONVERSION_BUSY = "conversion_busy"
 
 
 @dataclass(frozen=True)
@@ -159,7 +164,10 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
     if isinstance(published_mtime, (int, float)) and current_mtime <= published_mtime:
         return PublishDecision(None, REASON_UNCHANGED, is_fullstack, current_mtime)
 
-    digest = compute_publish_md5(folder, artifacts_base=artifacts_base)
+    try:
+        digest = compute_publish_md5(folder, artifacts_base=artifacts_base)
+    except MarkdownRenderBusy:
+        return PublishDecision(None, REASON_CONVERSION_BUSY, is_fullstack, current_mtime)
     if digest is None or digest == entry.get("last_md5"):
         # None means "can't tell" — never republish on a guess.
         return PublishDecision(None, REASON_UNCHANGED, is_fullstack, current_mtime)
@@ -302,7 +310,14 @@ def _candidate_slugs(*, artifacts_base: Path) -> list[str]:
     return sorted(artifact_folders_below(base=Path(artifacts_base)).found)
 
 
-def _plan(artifacts_base: Path, slugs: list[str]) -> list[tuple[str, PublishDecision]]:
+class PlannedPhase(NamedTuple):
+    """One phase's work, and how many candidates a busy conversion slot left undecided."""
+
+    planned: list[tuple[str, PublishDecision]]
+    conversion_busy: int
+
+
+def _plan(artifacts_base: Path, slugs: list[str]) -> PlannedPhase:
     """Decide and order one phase's work: static before fullstack, newest first.
 
     Static goes first because publishing a fullstack artifact triggers a dependency
@@ -326,7 +341,16 @@ def _plan(artifacts_base: Path, slugs: list[str]) -> list[tuple[str, PublishDeci
     if skipped:
         _record("skipped", **skipped)
     planned.sort(key=lambda item: (item[1].is_fullstack, -item[1].content_mtime))
-    return planned
+    return PlannedPhase(planned=planned, conversion_busy=skipped.get(REASON_CONVERSION_BUSY, 0))
+
+
+def _ask_again_later(*, artifacts_base: Path, scope, project_id: str | None) -> None:
+    """Ask for the project's self-heal, which plans its artifacts again once
+    SELF_HEAL_INTERVAL_S has passed: for a page a busy conversion slot left
+    unknown, which would otherwise wait for the next turn to touch it."""
+    heal = _project_self_heal(artifacts_base=artifacts_base, scope=scope, project_id=project_id)
+    if heal is not None:
+        request_self_heal(heal)
 
 
 async def _release(artifacts_base: Path, slug: str, *, scope) -> None:
@@ -392,6 +416,9 @@ async def _publish_one(
                 # get here with an org scope in hand (see the caller's guard).
                 scope=scope,
                 project_id=project_id,
+                # No person asked for this publish: a Markdown page the
+                # conversion stopped before is refused without a new render.
+                background=True,
             ),
             timeout=timeout_s,
         )
@@ -418,6 +445,18 @@ async def _publish_one(
         # already logged by the classifier: a skip, not a failure.
         await _release(artifacts_base, slug, scope=scope)
         _record("skipped", slug=slug, reason="too_large")
+        return False
+    except MarkdownNotPublishable:
+        # The same Markdown is refused again until it changes: a skip.
+        await _release(artifacts_base, slug, scope=scope)
+        _record("skipped", slug=slug, reason="markdown_not_publishable")
+        return False
+    except MarkdownRenderBusy:
+        # Another conversion held the server's one slot: nothing was tried,
+        # so the project's self-heal tries again.
+        await _release(artifacts_base, slug, scope=scope)
+        _record("deferred", slug=slug, reason=REASON_CONVERSION_BUSY)
+        _ask_again_later(artifacts_base=Path(artifacts_base), scope=scope, project_id=project_id)
         return False
     except Exception as exc:
         # A synchronous failure (a 502 a second in, ValueError from the target
@@ -546,8 +585,10 @@ async def autopublish_project_artifacts(
             if (started + budget_s) - time.monotonic() < _MIN_START_BUDGET_S:
                 _record("deferred", reason="budget", slugs=len(phase_slugs))
                 continue
-            plans = await run_efs(partial(_plan, base, phase_slugs), scope=scope, deadline=False)
-            for slug, decision in plans:
+            phase = await run_efs(partial(_plan, base, phase_slugs), scope=scope, deadline=False)
+            if phase.conversion_busy:
+                _ask_again_later(artifacts_base=base, scope=scope, project_id=project_id)
+            for slug, decision in phase.planned:
                 if len(published) >= limit:
                     _record("deferred", slug=slug, reason="limit")
                     continue

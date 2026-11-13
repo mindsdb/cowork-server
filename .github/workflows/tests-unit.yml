@@ -84,3 +84,4 @@ jobs:
           tests/test_artifact_export_contracts.py
           tests/test_artifact_export_service.py
           tests/test_export_child.py
+          tests/test_publish_markdown.py

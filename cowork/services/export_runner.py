@@ -153,12 +153,16 @@ def child_command(*, limits: ChildLimits) -> ChildCommand:
 
 
 def convert_in_child(
-    *, request: ConversionRequest, source: bytes, read_asset: AssetReader, limits: ChildLimits
+    *,
+    request: ConversionRequest,
+    source: bytes,
+    read_asset: AssetReader | None = None,
+    limits: ChildLimits,
 ) -> Conversion:
     """Convert *source* in a conversion process, serving its reads through *read_asset*.
 
-    A ``PublishMarkdownRequest`` reads nothing, so a read it asks for breaks
-    the protocol.
+    A ``PublishMarkdownRequest`` reads nothing and takes no *read_asset*, so
+    a read it asks for breaks the protocol.
 
     Blocking: it runs in the export's worker thread, which holds the pinned
     folder *read_asset* reads. Raises ``ConversionBusy`` while another
@@ -174,7 +178,11 @@ def convert_in_child(
 
 
 def _run(
-    *, request: ConversionRequest, source: bytes, read_asset: AssetReader, limits: ChildLimits
+    *,
+    request: ConversionRequest,
+    source: bytes,
+    read_asset: AssetReader | None,
+    limits: ChildLimits,
 ) -> Conversion:
     command = child_command(limits=limits)
     process = subprocess.Popen(
@@ -261,7 +269,7 @@ def _talk(
     process: subprocess.Popen,
     request: ConversionRequest,
     source: bytes,
-    read_asset: AssetReader,
+    read_asset: AssetReader | None,
 ) -> _Exchange:
     """Send the request and answer reads until the process sends its result or stops."""
     served = 0
@@ -277,7 +285,7 @@ def _talk(
             message, payload = received
             if not isinstance(message, AssetRequest):
                 return _Exchange(message=message, payload=payload, broken=None)
-            if not isinstance(request, ConvertRequest):
+            if not isinstance(request, ConvertRequest) or read_asset is None:
                 return _Exchange(message=None, payload=b"", broken="a read this request never makes")
             reply, data = _serve(
                 asked=message, request=request, read_asset=read_asset, served=served
