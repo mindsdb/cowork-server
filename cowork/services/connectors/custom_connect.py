@@ -40,6 +40,13 @@ EXCERPT_MAX = 300
 VALUE_MAX = 4096
 # The gateway refuses a call whose rendered header or query value is longer, so connect does too.
 RENDERED_VALUE_MAX = 8 * 1024
+# The gateway searches each answer for every encoded form of what it sent and refuses a
+# connection whose forms pass 1.5 MiB. A value's forms are at most about 28 times its bytes,
+# so connect refuses a connection whose searched values could pass that, using the same rules
+# for what is searched: values of 8 or more characters and a placed value holding a shorter one.
+SCRUBBED_MIN = 8
+FORMS_PER_BYTE = 28
+FORMS_MAX = 1536 * 1024
 BASE_URL_FIELD = "base_url"
 
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
@@ -221,8 +228,9 @@ def place_values(auth: Mapping[str, Any], values: Mapping[str, str]) -> PlacedRe
     ``{field}`` slot; ``basic`` has none.
 
     Raises:
-        ConnectRefused: 422 ``invalid_values`` when the rules refuse a value, or
-            a rendered header or query value is over ``RENDERED_VALUE_MAX`` bytes.
+        ConnectRefused: 422 ``invalid_values`` when the rules refuse a value, a
+            rendered header or query value is over ``RENDERED_VALUE_MAX`` bytes,
+            or the values the gateway would search for could pass ``FORMS_MAX``.
     """
     try:
         headers, params = connector_auth_rules.render(auth, values)
@@ -233,9 +241,40 @@ def place_values(auth: Mapping[str, Any], values: Mapping[str, str]) -> PlacedRe
         raise ConnectRefused(
             "invalid_values", 422, "These values make a header or query value longer than 8 KiB, which is not sent."
         )
+    if _searched_bytes(auth, values, headers, params) * FORMS_PER_BYTE > FORMS_MAX:
+        raise ConnectRefused("invalid_values", 422, "These values are too long together for the gateway to use.")
     bare_headers = dict(_slot_free(auth.get("headers", {}))) if auth["type"] == "header" else {}
     bare_params = _slot_free(auth.get("params", {})) if auth["type"] == "query" else []
     return PlacedRequest(bare_headers, bare_params, headers, params)
+
+
+def _searched_bytes(
+    auth: Mapping[str, Any], values: Mapping[str, str], headers: Mapping[str, str], params: list[tuple[str, str]]
+) -> int:
+    """Bytes of the values the gateway searches an answer for, by its rules for which values count.
+
+    Args:
+        auth: The template's auth section.
+        values: The member's values by field name.
+        headers: The headers ``render`` placed.
+        params: The query parameters ``render`` placed.
+
+    Returns:
+        The summed UTF-8 length of every value of ``SCRUBBED_MIN`` or more
+        characters and every placed header or query value that holds a
+        shorter one. ``basic`` adds its token and ``user:password``, but two
+        values of at most ``VALUE_MAX`` stay far under ``FORMS_MAX``, so its
+        values alone are counted.
+    """
+    searched = [value for value in values.values() if len(value) >= SCRUBBED_MIN]
+    if auth["type"] != "basic":
+        templates = auth.get("params" if auth["type"] == "query" else "headers", {})
+        placed = dict(params) if auth["type"] == "query" else headers
+        for name, template in templates.items():
+            slots = connector_auth_rules.PLACEHOLDER.findall(template)
+            if any(len(values.get(slot, "")) < SCRUBBED_MIN for slot in slots):
+                searched.append(placed[name])
+    return sum(len(value.encode()) for value in searched)
 
 
 def auth_summary(auth: Mapping[str, Any]) -> dict[str, Any]:
