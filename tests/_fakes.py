@@ -14,6 +14,29 @@ MANAGED_RULE = "Name Python packages by their package names only"
 MANAGED_LESSON = "The orders table is keyed by order_id"
 
 
+def fake_anton_upload(monkeypatch, answer) -> None:
+    """Replace the HTTP call that sends anton's POST /upload.
+
+    anton through 2.26.11.9.1 sends it with ``minds_request``, which returns
+    the body; later releases use ``minds_request_with_status``, which returns
+    ``(status, body)``. ``answer`` takes the call's arguments and returns the
+    body as bytes, or raises. Both names are replaced, so a fake holds on
+    either anton and a change of the anton pin cannot route a test's upload
+    to the network.
+    """
+    import anton.publisher
+
+    def body(url, api_key, *args, **kwargs):
+        return answer(url, api_key, *args, **kwargs)
+
+    def status_and_body(url, api_key, *args, **kwargs):
+        return 200, answer(url, api_key, *args, **kwargs)
+
+    monkeypatch.setattr(anton.publisher, "minds_request", body)
+    if hasattr(anton.publisher, "minds_request_with_status"):
+        monkeypatch.setattr(anton.publisher, "minds_request_with_status", status_and_body)
+
+
 class FakeRequest:
     """Minimal Request stub for calling route handlers directly. `headers` is
     empty unless a test sets it (only the org-mode bearer path reads it)."""

@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.services import publish
 from cowork.services.publish import PublisherUnavailable, PublishOwnedByOtherUser
+from tests._fakes import fake_anton_upload
 
 
 def _client() -> TestClient:
@@ -313,7 +314,7 @@ def _upload_refusing_the_share(monkeypatch, tmp_path) -> Path:
     def refuse(*args, **kwargs):
         raise _upstream(403, {"error": SHARE_ORG_REASON, "code": "share_org_required"}, "Forbidden")
 
-    monkeypatch.setattr("anton.publisher.minds_request", refuse)
+    fake_anton_upload(monkeypatch, refuse)
     return page
 
 

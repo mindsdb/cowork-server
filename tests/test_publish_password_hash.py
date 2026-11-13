@@ -15,6 +15,7 @@ import pytest
 import cowork.services.publish as publish_mod
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.schemas.artifact_access import ArtifactAccessRequest
+from tests._fakes import fake_anton_upload
 
 HASH = "pbkdf2_sha256$200000$c2FsdHNhbHRzYWx0c2FsdA==$ZGVyaXZlZGtleQ=="
 PUBLISH_URL = "https://view.example"
@@ -129,11 +130,11 @@ def test_the_real_publisher_resends_the_hash_while_the_password_is_unchanged(pag
     """
     sent: list[dict] = []
 
-    def fake_request(url, api_key, method="GET", payload=None, verify=True):
+    def fake_request(url, api_key, method="GET", payload=None, verify=True, **_kwargs):
         sent.append(json.loads(payload))
-        return json.dumps({"view_url": "https://view.example/a/r1", "report_id": "r1", "md5": "m1"})
+        return json.dumps({"view_url": "https://view.example/a/r1", "report_id": "r1", "md5": "m1"}).encode()
 
-    monkeypatch.setattr("anton.publisher.minds_request", fake_request)
+    fake_anton_upload(monkeypatch, fake_request)
 
     _publish(page, {"mode": "password", "password": "hunter2"})
     _publish(page, {"mode": "password", "password": "hunter2"})
