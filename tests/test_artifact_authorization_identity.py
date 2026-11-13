@@ -1757,7 +1757,7 @@ def _upload_ends(monkeypatch, ending: UploadEnding, *, meanwhile=None) -> None:
         if ending.raises == "connection_error":
             raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
         if ending.status == 200:
-            return (ending.raw_body or "").encode()
+            return 200, (ending.raw_body or "").encode()
         body = io.BytesIO(json.dumps(ending.body).encode())
         raise urllib.error.HTTPError(url, ending.status, "Refused", {}, body)
 
@@ -1768,7 +1768,7 @@ def _upload_ends(monkeypatch, ending: UploadEnding, *, meanwhile=None) -> None:
 
     local = ending.raises in ("state_publish_blocked", "os_error")
     monkeypatch.setattr("anton.publisher.publish", publish_fails_before_sending if local else _ANTON_PUBLISH)
-    monkeypatch.setattr("anton.publisher.minds_request", request)
+    monkeypatch.setattr("anton.publisher.minds_request_with_status", request)
 
 
 def _owner_choice(key, scope):
