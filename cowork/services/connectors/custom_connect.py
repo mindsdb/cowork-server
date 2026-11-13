@@ -41,9 +41,10 @@ VALUE_MAX = 4096
 # The gateway refuses a call whose rendered header or query value is longer, so connect does too.
 RENDERED_VALUE_MAX = 8 * 1024
 # The gateway searches each answer for every encoded form of what it sent and refuses a
-# connection whose forms pass 1.5 MiB. A value's forms are at most about 28 times its bytes,
-# so connect refuses a connection whose searched values could pass that, using the same rules
-# for what is searched: values of 8 or more characters and a placed value holding a shorter one.
+# connection whose forms pass 1.5 MiB. A value's forms are at most about 28 times its bytes
+# (the measured worst for printable ASCII is about 26). Connect uses that upper estimate, so it
+# can refuse a few connections the gateway would take but never accepts one it refuses. The
+# searched values follow the gateway's rules: 8 or more characters, or a placed value holding a shorter one.
 SCRUBBED_MIN = 8
 FORMS_PER_BYTE = 28
 FORMS_MAX = 1536 * 1024
@@ -263,9 +264,9 @@ def _searched_bytes(
     Returns:
         The summed UTF-8 length of every value of ``SCRUBBED_MIN`` or more
         characters and every placed header or query value that holds a
-        shorter one. ``basic`` adds its token and ``user:password``, but two
-        values of at most ``VALUE_MAX`` stay far under ``FORMS_MAX``, so its
-        values alone are counted.
+        shorter one. ``basic`` adds its token and ``user:password``, which are left
+        out: the 8 KiB cap on the ``Authorization`` value bounds them to about
+        0.75 MiB of forms, so counting its values alone stays a safe estimate.
     """
     searched = [value for value in values.values() if len(value) >= SCRUBBED_MIN]
     if auth["type"] != "basic":

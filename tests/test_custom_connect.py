@@ -399,8 +399,9 @@ def test_values_the_gateway_could_not_search_for_together_are_refused_before_any
     engine, world, monkeypatch, short, refused
 ):
     # Every header stays under 8 KiB. A short field makes the gateway also search each whole
-    # header value, which takes the searched bytes past what its 1.5 MiB of forms allows.
-    values = {"s": short, **{f"f{i}": chr(ord("a") + i) * 4090 for i in range(10)}}
+    # header value, and with these costly characters its forms pass 1.5 MiB (2.1 MB for "abc",
+    # 1.06 MB for "abcdefgh"). Plain letters would not: the gateway takes those.
+    values = {"s": short, **{f"f{i}": '"' * (4086 - i) + "/ !~" + "a" * i for i in range(10)}}
 
     res = _connect(_client(engine, monkeypatch), "paired_api", values=values)
 
@@ -411,6 +412,15 @@ def test_values_the_gateway_could_not_search_for_together_are_refused_before_any
     else:
         assert world["provider"]
         assert res.json()["detail"]["code"] != "invalid_values"
+
+
+def test_the_bounds_connect_mirrors_are_the_gateways():
+    # Hand copies of mindshub_inference at 889f84d4: minds/custom_api/gateway.py holds
+    # MAX_RENDERED_VALUE_BYTES and MAX_FORM_BYTES, minds/custom_api/scrub.py holds MIN_SCRUBBED.
+    # Change both sides together; this test fails when only connect moves.
+    assert custom_connect.RENDERED_VALUE_MAX == 8192
+    assert custom_connect.FORMS_MAX == 1536 * 1024
+    assert custom_connect.SCRUBBED_MIN == 8
 
 
 def test_the_connection_name_is_stored_trimmed_and_a_blank_one_is_refused(engine, world, monkeypatch):
