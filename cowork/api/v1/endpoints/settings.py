@@ -918,6 +918,11 @@ async def recommended_models(
     from cowork.handlers.jev_route import gate_mode
 
     routing = {"mode": gate_mode(gate_settings), "routerProvider": gate["provider"]}
+    # Under ZDR turns skip Jev whatever the switch says, so Settings shows it off and disabled.
+    if routing["mode"] == "jev":
+        from cowork.services.mindshub_zdr import zdr_on_for
+
+        routing["zdr"] = await zdr_on_for(scope=scope, settings=gate_settings, org_bearer=caller_bearer(request))
 
     return {
         "recommendedModels": recommended,

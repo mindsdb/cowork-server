@@ -9,7 +9,7 @@ import pytest
 
 from cowork.services import mindshub_teams
 from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
-from cowork.services.mindshub_zdr import zdr_on
+from cowork.services.mindshub_zdr import zdr_on, zdr_on_for
 
 _BROWSER = {"permitted": True, "enabled": True, "daily_bytes": 1073741824, "disabled_reason": None}
 
@@ -86,3 +86,22 @@ def test_an_unreadable_answer_is_kept_only_as_long_as_a_failure(mindshub):
     cache = mindshub_teams._permissions_cache
     entry = cache._entries[key]
     assert entry.fresh_until - entry.stored_at == pytest.approx(cache.ttl_fail_s)
+
+
+@pytest.mark.parametrize(
+    ("org_mode", "org_bearer", "turn_key", "expected"),
+    [
+        (True, "jwt-alice", "turn-key", "jwt-alice"),
+        (True, "", "turn-key", "turn-key"),
+        (False, "jwt-alice", "turn-key", "turn-key"),
+        (False, "", "", "mdb_stored"),
+    ],
+)
+def test_zdr_on_for_asks_with_the_callers_credential(mindshub, monkeypatch, org_mode, org_bearer, turn_key, expected):
+    # The web caller's bearer first, else the turn's minted key, else the stored MindsHub key.
+    import cowork.common.settings.user_settings as user_settings
+
+    monkeypatch.setattr(user_settings, "provider_api_key_str", lambda _settings, _provider: "mdb_stored")
+    scope = SimpleNamespace(org_mode=org_mode, org_id="o", user_id="u")
+    asyncio.run(zdr_on_for(scope=scope, settings=None, org_bearer=org_bearer, turn_key=turn_key))
+    assert mindshub.asked[-1][1] == expected

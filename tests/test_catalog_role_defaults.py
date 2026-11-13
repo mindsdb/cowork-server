@@ -697,12 +697,39 @@ def test_settings_are_told_which_gate_decides_turns(monkeypatch):
         role_defaults={"planning": "sonnet", "coding": "haiku", "router": "kimi"},
     )
 
+    async def zdr_off(**_kwargs):
+        return False
+
+    monkeypatch.setattr("cowork.services.mindshub_zdr.zdr_on_for", zdr_off)
     with _Endpoint() as endpoint:
         payload = endpoint.call()
 
-    assert payload["routing"] == {"mode": "jev", "routerProvider": "minds-cloud"}
+    assert payload["routing"] == {"mode": "jev", "routerProvider": "minds-cloud", "zdr": False}
     # Kept for UIs that predate `routing`.
     assert "gate" in payload
+
+
+def test_settings_are_told_when_zdr_keeps_jev_off(monkeypatch):
+    """Under ZDR turns skip Jev, so Settings can show the switch off and disabled."""
+    _stub_listing(
+        monkeypatch,
+        ids=["mindshub_air", "kimi"],
+        enabled={"mindshub_air": False, "kimi": True},
+        role_defaults={"planning": "kimi", "coding": "kimi", "router": "kimi"},
+    )
+    asked = {}
+
+    async def zdr_on(**kwargs):
+        asked.update(kwargs)
+        return True
+
+    monkeypatch.setattr("cowork.services.mindshub_zdr.zdr_on_for", zdr_on)
+    with _Endpoint() as endpoint:
+        payload = endpoint.call()
+
+    assert payload["routing"]["zdr"] is True
+    # Asked with the stored settings, the same answer a turn gets.
+    assert asked["settings"].minds_api_key is not None
 
 
 def test_the_gate_model_is_availability_adjusted_like_resolution_is(monkeypatch):
