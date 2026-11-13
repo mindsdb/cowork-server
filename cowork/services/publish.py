@@ -1301,11 +1301,11 @@ def publish_artifact(
     access: ArtifactAccessRequest | None = None,
     scope: TenantScope | None = None,
     project_id: str | None = None,
+    background: bool = False,
     notify: ShareNotify | None = None,
     stored: ArtifactRule | None = None,
     owner_save: bool = False,
     notices: list[ShareNotice] | None = None,
-    background: bool = False,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
