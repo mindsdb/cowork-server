@@ -1947,7 +1947,13 @@ def test_queued_instruction_runs_as_the_next_turn_and_is_persisted(tmp_path: Pat
         time.sleep(0.01)
     assert engine.prompts == ["First turn", "Long second turn", "Run this after the current work"]
     wait_for_status(service, created.id, SessionStatus.completed)
+    # The run's status follows the session's in a separate save, so a read
+    # between the two sees the session completed and the run still running.
+    deadline = time.monotonic() + 3
     finished = service.get_session(created.id)
+    while time.monotonic() < deadline and finished.run_status != "completed":
+        time.sleep(0.01)
+        finished = service.get_session(created.id)
     assert finished.queued_instructions == []
     assert finished.run_id != queued.run_id
     assert finished.run_status == "completed"
