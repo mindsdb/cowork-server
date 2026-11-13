@@ -946,9 +946,13 @@ def revision_with_content(folder: Path, revision_id: str) -> dict:
 
 def capture_agent_revision(
     folder: Path, *, conversation_id: str | None = None, schedule_id: str | None = None,
-    scope: TenantScope | None = None,
+    scope: TenantScope | None = None, summary: str | None = None,
 ) -> dict | None:
     """Record an agent edit and finish repair handoffs attributed to this turn.
+
+    `summary` is the revision's label for a chat turn's edit
+    (``revision_summaries``: "Agent: Added a pricing section"); without one
+    it reads "Agent updated artifact". A scheduled refresh keeps its own.
 
     `schedule_id` is set only for a turn the scheduler started. Its edit is
     recorded against that schedule, and replaces the schedule's own previous
@@ -1007,6 +1011,20 @@ def capture_agent_revision(
                         manifest.revisions.remove(previous)
                     _write_manifest(folder, manifest)
                     _prune_orphan_blobs(folder, manifest.revisions)
+                elif (
+                    summary
+                    and not schedule_id
+                    and latest.actor is not None
+                    and latest.actor.kind == "system"
+                    and latest.summary == "Captured current draft"
+                ):
+                    # A viewer read captured this turn's write before the turn
+                    # ended; it is the agent's change, so it says so. Keeps
+                    # its id: comments and editors may already hold it.
+                    latest.actor = RevisionActor(kind="agent", id=None)
+                    latest.conversation_id = conversation_id
+                    latest.summary = summary.strip()[:240]
+                    _write_manifest(folder, manifest)
                 _finish_queued_repairs(
                     folder,
                     queued,
@@ -1022,7 +1040,7 @@ def capture_agent_revision(
                 content=content,
                 actor_kind="agent",
                 actor_id=None,
-                summary="Scheduled task updated artifact" if schedule_id else "Agent updated artifact",
+                summary="Scheduled task updated artifact" if schedule_id else (summary or "Agent updated artifact"),
                 base_revision_id=latest_id,
                 conversation_id=conversation_id,
                 comment_thread_ids=[

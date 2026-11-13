@@ -495,6 +495,23 @@ def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, comp
     return TurnHistory(rows=[], read=rows) if compacted else TurnHistory(rows=rows)
 
 
+def _turn_revision_summaries(session, seed_len: int | None, request: str):
+    """What this turn says about the artifacts it changed, for their revision
+    labels (revision_summaries): the editor's summaries and the final reply
+    from the turn's part of session.history, and the request. None when the
+    history can't be read; the revisions then keep the generic label."""
+    from cowork.services.revision_summaries import summaries_from_messages
+
+    try:
+        history = list(getattr(session, "history", None) or [])
+        # A compaction mid-turn replaces the list; its tail is then the turn.
+        turn = history[seed_len:] if seed_len is not None and seed_len <= len(history) else history[-40:]
+        return summaries_from_messages(turn, request=request)
+    except Exception:
+        logger.warning("Could not read this turn's edits for the revision labels", exc_info=True)
+        return None
+
+
 def _turn_progress(*, session: "ChatSession", seed_len: int | None) -> list[str]:
     """The running turn's last steps as Jev reads them when it decides where
     a message sent mid-turn goes. Read from the same messages
@@ -1069,6 +1086,9 @@ class AntonHarness:
         # go back unless the turn finishes, so the person's next turn tells them.
         built: BuiltChatSession | None = None
         turn_finished = False
+        # Where this turn's part of session.history starts, once known: the
+        # turn end reads its edits and reply there for the revision labels.
+        turn_seed_len: int | None = None
 
         async def record_turn_cleanup():
             nonlocal new_slugs, touched_slugs, turn_scope, skill_drafts
@@ -1099,6 +1119,7 @@ class AntonHarness:
                         extra=log_context(conversation_id=conv_id),
                     )
             try:
+                summaries = _turn_revision_summaries(session, turn_seed_len, prompt_text(input))
                 # It waits on each touched artifact's lock and parses its
                 # journal, so it runs off the event loop the server shares.
                 changes = await run_efs(
@@ -1112,6 +1133,7 @@ class AntonHarness:
                         tracked_edits=getattr(session, "artifacts_touched", None),
                         schedule_id=schedule_id,
                         scope=_units_scope(),
+                        summaries=summaries,
                     ),
                     scope=_units_scope(),
                     deadline=False,
@@ -1161,6 +1183,7 @@ class AntonHarness:
             # with neither `turn_messages` nor `.history` skips capture and
             # falls back to text-only replay.
             seed_len = len(session.history) if hasattr(session, "history") else None
+            turn_seed_len = seed_len
             compacted = False  # set if anton compacts or hard-truncates history mid-turn
             addon_channel = addons.open(
                 str(conv_id), session,

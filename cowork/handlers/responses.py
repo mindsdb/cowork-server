@@ -2810,6 +2810,7 @@ class ResponsesHandler:
                 request_self_heal_for_unread_folders,
                 request_turn_end_self_heal,
             )
+            from cowork.services.revision_summaries import summaries_from_messages
             from cowork.services.task_objects import (
                 ListedLocationsUnchecked,
                 record_new_artifacts,
@@ -2851,6 +2852,11 @@ class ResponsesHandler:
                             repair_slugs=repairs.slugs if repairs is not None else None,
                             schedule_id=self.schedule_id,
                             scope=scope,
+                            # Each revision's label: the editor's summary in
+                            # the pod's tool rows, the reply, or the request.
+                            summaries=summaries_from_messages(
+                                turn_rows, reply="".join(collected_text), request=input_text,
+                            ),
                         ),
                         scope=scope,
                         deadline=False,

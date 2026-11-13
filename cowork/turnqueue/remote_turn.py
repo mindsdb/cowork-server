@@ -243,6 +243,7 @@ async def remote_turn_events(
                     completed_cleanly=completed_cleanly,
                     touched=pod_touched,
                     repairs=repairs,
+                    summaries=_summaries(turn_rows, input_text),
                 ),
                 record=TurnEndRecord(
                     conversation_id=conv_id, project_id=artifacts.project_id, touched=tuple(sorted(pod_touched or ())),
@@ -269,6 +270,19 @@ async def remote_turn_events(
         )
 
 
+def _summaries(turn_rows: list, input_text: str):
+    """The revision labels' sources a channel turn has: the editor's
+    summaries in the pod's tool rows and the request. Its reply is not kept
+    here, so a turn without the editor is labelled by its request."""
+    from cowork.services.revision_summaries import summaries_from_messages
+
+    try:
+        return summaries_from_messages(turn_rows, reply="", request=input_text)
+    except Exception:
+        logger.warning("Could not read the turn's edits for the revision labels", exc_info=True)
+        return None
+
+
 async def _record_turn_artifacts(
     artifacts: _RemoteArtifactsDir,
     *,
@@ -279,6 +293,7 @@ async def _record_turn_artifacts(
     completed_cleanly: bool,
     touched: set[str] | None = None,
     repairs: QueuedRepairs | None = None,
+    summaries=None,
 ) -> ArtifactChanges:
     """What the turn did to the project's artifacts. The folders it created
     are indexed as this conversation's (and, in org mode, its creator's), in
@@ -327,6 +342,7 @@ async def _record_turn_artifacts(
                 completed_cleanly=completed_cleanly,
                 repair_slugs=repairs.slugs if repairs is not None else None,
                 scope=scope,
+                summaries=summaries,
             ),
             scope=scope,
             deadline=False,
