@@ -1146,11 +1146,18 @@ def test_an_attribute_over_its_own_css_bound_is_dropped_and_listed(artifact):
 
 
 def test_the_deadline_stops_each_attribute_before_its_css_parses(artifact, monkeypatch):
-    """Attributes have no total, so the deadline is checked before every one."""
-    monkeypatch.setattr(artifact_inline, "time", _clock_past_the_deadline_after(readings=2))
+    """Attributes have no total, so the deadline is checked before every one.
+
+    Readings: the deadline, then the walk's checks for body, svg and the
+    first g, all in time. The fifth, the first g's attribute check, is past
+    the deadline: the g stays without its transform, and the walk stops at
+    the next element.
+    """
+    monkeypatch.setattr(artifact_inline, "time", _clock_past_the_deadline_after(readings=4))
     attributes = "".join(f'<g transform="translate({index},0)"></g>' for index in range(50))
     document = _inline(artifact=artifact, html=f"<html><body><svg>{attributes}</svg></body></html>".encode())
-    assert document.html.count("transform=") < 50
+    assert "<g></g>" in document.html
+    assert "transform=" not in document.html
     assert document.html.endswith(f"<p>{TRUNCATION_NOTE}</p></body></html>")
 
 
