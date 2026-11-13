@@ -67,6 +67,16 @@ TWO_SLOT_DRAFT = {
     "auth": {"type": "query", "params": {"access_key": "{access_key}", "account": "{account}"}},
     "check": {"path": "/v1/status"},
 }
+PAIRED_DRAFT = {
+    "connector_id": "paired_api",
+    "label": "Paired API",
+    "fields": [{"name": "s", "label": "Short"}, *({"name": f"f{i}", "label": f"Part {i}"} for i in range(10))],
+    "auth": {
+        "type": "header",
+        "headers": {f"X-Acme-Part-{i}": f"{{s}}{{f{2 * i}}}{{f{2 * i + 1}}}" for i in range(5)},
+    },
+    "check": {"path": "/v1/status"},
+}
 HEADER_KEY_DRAFT = {
     "connector_id": "header_key_api",
     "label": "Header Key API",
@@ -90,7 +100,7 @@ def engine():
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(eng)
     service = CustomConnectorService(_scoped(eng, BUILDER))
-    for draft in (DRAFT, BASIC_DRAFT, QUERY_DRAFT, TWO_SLOT_DRAFT, HEADER_KEY_DRAFT):
+    for draft in (DRAFT, BASIC_DRAFT, QUERY_DRAFT, TWO_SLOT_DRAFT, HEADER_KEY_DRAFT, PAIRED_DRAFT):
         service.save_member_draft(parse_connector_draft(draft))
     service.save_member_draft(parse_connector_draft({k: v for k, v in DRAFT.items() if k != "check"} | {"connector_id": "no_check_api"}))
     return eng
@@ -365,6 +375,44 @@ def test_a_check_that_ignores_the_credential_proves_nothing(engine, world, monke
     assert [json.loads(r.content)["dry_run"] for r in world["auth"]] == [True]
 
 
+@pytest.mark.parametrize(("token_length", "refused"), [(2035, False), (2038, True)])
+def test_a_rendered_value_over_the_gateways_8_kib_is_refused_before_any_send(
+    engine, world, monkeypatch, token_length, refused
+):
+    # Basic sends "Basic " plus base64 of "{email}/token:{api_token}": 6138 bytes encode to 8190, 6141 to 8194.
+    values = {"email": "e" * custom_connect.VALUE_MAX, "api_token": "t" * token_length}
+
+    res = _connect(_client(engine, monkeypatch), "basic_api", values=values)
+
+    if refused:
+        assert res.status_code == 422
+        assert res.json()["detail"]["code"] == "invalid_values"
+        assert world["provider"] == []
+    else:
+        sent = world["provider"][-1].headers["authorization"]
+        assert len(sent) == 8190
+        assert res.json()["detail"]["code"] != "invalid_values"
+
+
+@pytest.mark.parametrize(("short", "refused"), [("abcdefgh", False), ("abc", True)])
+def test_values_the_gateway_could_not_search_for_together_are_refused_before_any_send(
+    engine, world, monkeypatch, short, refused
+):
+    # Every header stays under 8 KiB. A short field makes the gateway also search each whole
+    # header value, which takes the searched bytes past what its 1.5 MiB of forms allows.
+    values = {"s": short, **{f"f{i}": chr(ord("a") + i) * 4090 for i in range(10)}}
+
+    res = _connect(_client(engine, monkeypatch), "paired_api", values=values)
+
+    if refused:
+        assert res.status_code == 422
+        assert res.json()["detail"]["code"] == "invalid_values"
+        assert world["provider"] == []
+    else:
+        assert world["provider"]
+        assert res.json()["detail"]["code"] != "invalid_values"
+
+
 def test_the_connection_name_is_stored_trimmed_and_a_blank_one_is_refused(engine, world, monkeypatch):
     client = _client(engine, monkeypatch)
 
@@ -372,6 +420,16 @@ def test_the_connection_name_is_stored_trimmed_and_a_blank_one_is_refused(engine
     assert world["auth"] == []
     assert _connect(client, name="  Rates  ").status_code == 201
     assert json.loads(world["auth"][-1].content)["name"] == "Rates"
+
+
+def test_a_name_longer_than_auth_stores_is_refused_before_auth_is_asked(engine, world, monkeypatch):
+    client = _client(engine, monkeypatch)
+
+    assert _connect(client, name="n" * 129).status_code == 422
+    assert world["auth"] == []
+    assert world["provider"] == []
+    assert _connect(client, name=" " + "n" * 128 + " ").status_code == 201
+    assert json.loads(world["auth"][-1].content)["name"] == "n" * 128
 
 
 @pytest.mark.parametrize("status", [401, 403])
@@ -500,7 +558,8 @@ def test_an_address_that_resolves_privately_is_not_dialed(engine, world, monkeyp
     ("status", "code", "says"),
     [
         (409, "conflict", "already have a connection with this name"),
-        (429, "quota_exceeded", "limit of custom connections"),
+        (429, "quota_exceeded", "Remove one in Connect Apps and Data"),
+        (429, "organization_quota_exceeded", "organization has reached its limit"),
         (409, "organization_mismatch", "organization changed"),
         (503, "disabled", "turned off on this deployment"),
         (400, "invalid_connection", "could not be stored"),
