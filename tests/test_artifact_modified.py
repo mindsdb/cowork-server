@@ -777,9 +777,14 @@ def test_card_names_no_report_id_for_a_record_without_a_live_link(tmp_path: Path
         assert card_for_folder(root, scope=LOCAL_SCOPE)["reportId"] == ""
 
 
-def test_publish_answer_names_its_page_at_the_top_level(tmp_path: Path):
+def test_publish_answer_names_its_page_only_under_result(tmp_path: Path):
+    """The app reads a publish's page id from ``result``. A top-level
+    ``reportId`` would change what the viewer's ``artifact_published`` sends as
+    its ``artifact_id`` (it reads ``r.report_id || r.reportId`` first), so the
+    event's history would stop being comparable."""
     root = _make_static_html(tmp_path)
     with _patched_publish(tmp_path, report_id="rid-top"):
         answer = _publish(root, tmp_path)
-    assert answer["reportId"] == "rid-top"
     assert answer["result"]["report_id"] == "rid-top"
+    assert "reportId" not in answer
+    assert "report_id" not in answer
