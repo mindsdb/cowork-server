@@ -9,6 +9,7 @@ import stat
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from datetime import datetime, timezone
 from functools import partial
@@ -45,6 +46,7 @@ from cowork.common.settings.app_settings import TurnQueueSettings, get_app_setti
 from cowork.common.settings.user_settings import UserSettings, use_settings_scope, use_turn_settings
 from cowork.services.artifact_roots import project_artifacts_base
 from cowork.services.channel_bindings import ChannelBindingService
+from cowork.services.channel_pairing import PAIRED_NOTICE, ChannelPairingService, code_in
 from cowork.services.channel_senders import ChannelSenderService
 from cowork.services.channels import ChannelConfigService, resolve_installation_by_external_account
 from cowork.services.conversations import ConversationService
@@ -160,6 +162,14 @@ class TurnFile:
 
     filename: str
     data: bytes
+
+
+class Admission(Enum):
+    """What the sender gate decided for one inbound message."""
+
+    ADMIT = "admit"
+    HOLD = "hold"
+    PAIRED = "paired"
 
 
 @dataclass(frozen=True)
@@ -440,11 +450,15 @@ class AntonChannelRuntime:
         # The sender comes first: nothing below, not even a busy notice, may
         # answer someone the owner has not allowed.
         try:
-            admitted = await run_db(partial(self._admit_sender, channel_type=channel_type, event=event), scope=scope)
+            admission = await run_db(partial(self._admit_sender, channel_type=channel_type, event=event), scope=scope)
         except PoolTimeoutError:
             log.warning("channel %s: no database connection to check the sender; the message was dropped", channel_type)
             raise
-        if not admitted:
+        if admission is Admission.PAIRED:
+            log.info("channel %s: a sender paired with a one-time code", channel_type)
+            await self._deliver(channel_type, event, PAIRED_NOTICE, org_id)
+            return
+        if admission is Admission.HOLD:
             log.info("channel %s: held a message from a sender the owner has not allowed", channel_type)
             return
         try:
@@ -555,26 +569,38 @@ class AntonChannelRuntime:
         return project.name if project else "general"
 
     @staticmethod
-    def _admit_sender(scoped: ScopedSession, *, channel_type: str, event: Any) -> bool:
+    def _admit_sender(scoped: ScopedSession, *, channel_type: str, event: Any) -> Admission:
         """Whether the event's sender may run a turn in its chat, as a unit.
 
-        A message with no sender id is refused. A DM, or a group message that
-        mentions the bot, from a sender neither allowed nor blocked records a
-        pending request for the owner; other group chatter records nothing.
+        A message with no sender id is refused. A sender neither allowed nor
+        blocked whose message is a valid pairing code is allowed and the
+        message runs no turn. Otherwise a DM, or a group message that mentions
+        the bot, records a pending request for the owner; other group chatter
+        records nothing.
         """
         message = event.message
         sender_id = message.sender_id
         if not sender_id:
-            return False
+            return Admission.HOLD
         service = ChannelSenderService(scoped)
         group_id = event.address.platform_id
         status = service.status_of(channel_type, group_id, sender_id)
         if status == SENDER_ALLOWED:
-            return True
+            return Admission.ADMIT
         if status == SENDER_BLOCKED:
-            return False
+            return Admission.HOLD
+        code = code_in(str(message.content))
+        if code is not None and ChannelPairingService(scoped).redeem(
+            channel_type=channel_type,
+            code=code,
+            group_id=group_id,
+            sender_id=sender_id,
+            sender_name=message.sender_name,
+            is_group=bool(message.is_group),
+        ):
+            return Admission.PAIRED
         if message.is_group and not message.is_mention:
-            return False
+            return Admission.HOLD
         service.record_request(
             channel_type=channel_type,
             group_id=group_id,
@@ -582,7 +608,7 @@ class AntonChannelRuntime:
             sender_name=message.sender_name,
             is_group=bool(message.is_group),
         )
-        return False
+        return Admission.HOLD
 
     @staticmethod
     def _find_binding(scoped: ScopedSession, *, channel_type: str, event: Any) -> ChannelBinding | None:

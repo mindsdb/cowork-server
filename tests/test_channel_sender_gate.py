@@ -1,4 +1,5 @@
-"""The channel runtime's sender gate: only senders the owner allowed start a turn.
+"""The channel runtime's sender gate: only senders the owner allowed, or who
+paired with a one-time code, start a turn.
 
 Events come from the real Telegram parser; the harness and the platform are faked.
 """
@@ -6,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -24,10 +26,19 @@ from cowork.models.channel import (
     SENDER_BLOCKED,
     SENDER_PENDING,
     ChannelBinding,
+    ChannelPairingCode,
     ChannelSender,
     ChannelSession,
 )
 from cowork.services import channel_senders as senders_mod
+from cowork.services.channel_pairing import (
+    PAIRED_NOTICE,
+    UNUSED_CODES_MAX,
+    ChannelPairingService,
+    PairingCodeLimitError,
+    code_in,
+    hash_code,
+)
 from cowork.services.channel_senders import ChannelSenderService
 
 REPLY = "hello from anton"
@@ -342,3 +353,174 @@ def test_display_name_from_the_sender_is_cut_to_its_limit(chat_id, harness):
 
     [row] = _senders(chat_id)
     assert row.display_name == "x" * 64
+
+
+@pytest.fixture
+def pairing():
+    """A pairing service on the local scope; every code made in the test is removed after."""
+    raw = get_open_session()
+    yield ChannelPairingService(ScopedSession(raw, LOCAL_SCOPE))
+    raw.close()
+    with get_open_session() as session:
+        session.exec(delete(ChannelPairingCode))
+        session.commit()
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("7K3M9QXZ", "7K3M9QXZ"),
+        ("  7k3m9qxz ", "7K3M9QXZ"),
+        ("@antonbot 7K3M9QXZ", "7K3M9QXZ"),
+        ("<@U0BOT|anton> 7K3M9QXZ", "7K3M9QXZ"),
+        ("<@!1234567890> 7K3M9QXZ", "7K3M9QXZ"),
+        ("/start 7K3M9QXZ", "7K3M9QXZ"),
+        ("/start@antonbot 7K3M9QXZ", "7K3M9QXZ"),
+        ("my code is 7K3M9QXZ", None),
+        ("7K3M9QX", None),
+        ("7K3M9QXZZ", None),
+        ("7K3M9QXI", None),
+        ("", None),
+    ],
+)
+def test_code_in_reads_only_a_message_that_is_the_code(text, expected):
+    assert code_in(text) == expected
+
+
+def test_a_code_is_stored_only_as_its_hash(pairing):
+    issued = pairing.create("telegram")
+
+    with get_open_session() as session:
+        [row] = session.exec(select(ChannelPairingCode)).all()
+    assert row.code_hash == hash_code(issued.code)
+    assert issued.code not in row.code_hash
+
+
+def test_live_codes_per_channel_are_capped(pairing):
+    for _ in range(UNUSED_CODES_MAX):
+        pairing.create("telegram")
+
+    with pytest.raises(PairingCodeLimitError):
+        pairing.create("telegram")
+    pairing.create("slack")
+
+
+def test_dm_with_a_valid_code_pairs_that_sender_and_runs_no_turn(chat_id, harness, pairing):
+    issued = pairing.create("telegram")
+
+    adapter = _handle(_event(chat_id, issued.code.lower()))
+
+    assert harness.turns == 0
+    assert adapter.delivered == [(str(chat_id), PAIRED_NOTICE)]
+    [row] = _senders(chat_id)
+    assert (row.status, row.external_sender_id) == (SENDER_ALLOWED, "4242")
+
+    adapter = _handle(_event(chat_id, "now answer me"))
+    assert harness.turns == 1
+    assert adapter.delivered == [(str(chat_id), REPLY)]
+
+
+def test_a_code_works_once(chat_id, harness, pairing):
+    issued = pairing.create("telegram")
+    _handle(_event(chat_id, issued.code))
+
+    adapter = _handle(_event(chat_id, issued.code, sender={"id": 5151, "is_bot": False}))
+
+    assert adapter.delivered == []
+    statuses = {row.external_sender_id: row.status for row in _senders(chat_id)}
+    assert statuses == {"4242": SENDER_ALLOWED, "5151": SENDER_PENDING}
+
+
+def test_an_expired_code_does_not_pair(chat_id, harness, pairing):
+    issued = pairing.create("telegram")
+    with get_open_session() as session:
+        row = session.exec(select(ChannelPairingCode)).one()
+        row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        session.add(row)
+        session.commit()
+
+    adapter = _handle(_event(chat_id, issued.code))
+
+    assert adapter.delivered == []
+    assert [row.status for row in _senders(chat_id)] == [SENDER_PENDING]
+
+
+def test_a_code_made_for_another_channel_does_not_pair(chat_id, harness, pairing):
+    issued = pairing.create("slack")
+
+    adapter = _handle(_event(chat_id, issued.code))
+
+    assert adapter.delivered == []
+    assert [row.status for row in _senders(chat_id)] == [SENDER_PENDING]
+
+
+def test_a_blocked_sender_stays_blocked_and_leaves_the_code_unused(chat_id, harness, pairing):
+    _set_sender(chat_id, SENDER_BLOCKED)
+    issued = pairing.create("telegram")
+
+    adapter = _handle(_event(chat_id, issued.code))
+
+    assert adapter.delivered == []
+    assert [row.status for row in _senders(chat_id)] == [SENDER_BLOCKED]
+    with get_open_session() as session:
+        assert session.exec(select(ChannelPairingCode)).one().used_at is None
+
+
+def test_the_telegram_linked_channel_account_cannot_pair_and_leaves_the_code_unused(chat_id, harness, pairing):
+    issued = pairing.create("telegram")
+
+    redeemed = pairing.redeem(
+        channel_type="telegram", code=issued.code, group_id=str(-chat_id),
+        sender_id="777000", sender_name=None, is_group=True,
+    )
+    adapter = _handle(_event(-chat_id, issued.code, sender={"id": 777000, "is_bot": False}, chat_type="group"))
+
+    assert redeemed is False
+    assert adapter.delivered == []
+    assert _senders(-chat_id) == []
+    with get_open_session() as session:
+        assert session.exec(select(ChannelPairingCode)).one().used_at is None
+
+
+def test_a_code_in_a_group_pairs_only_its_sender_even_without_a_mention(chat_id, harness, pairing):
+    issued = pairing.create("telegram")
+
+    adapter = _handle(_event(-chat_id, issued.code, chat_type="group"))
+
+    assert adapter.delivered == [(str(-chat_id), PAIRED_NOTICE)]
+    [row] = _senders(-chat_id)
+    assert (row.status, row.external_sender_id, row.is_group) == (SENDER_ALLOWED, "4242", True)
+    other = _handle(_event(-chat_id, "@b me too", sender={"id": 5151, "is_bot": False}, chat_type="group"))
+    assert other.delivered == []
+    assert harness.turns == 0
+
+
+def test_two_chats_redeeming_one_code_at_once_let_in_exactly_one(chat_id, pairing, monkeypatch):
+    """Both callers find the unused code before either claims it."""
+    issued = pairing.create("telegram")
+    both_found = threading.Barrier(2, timeout=10)
+    real_claim = ChannelPairingService._claim
+
+    def claim_after_both_found(self, code_id):
+        both_found.wait()
+        return real_claim(self, code_id)
+
+    monkeypatch.setattr(ChannelPairingService, "_claim", claim_after_both_found)
+    results: dict[str, bool] = {}
+
+    def redeem(group_id: str) -> None:
+        with get_open_session() as raw:
+            results[group_id] = ChannelPairingService(ScopedSession(raw, LOCAL_SCOPE)).redeem(
+                channel_type="telegram", code=issued.code, group_id=group_id,
+                sender_id="4242", sender_name=None, is_group=False,
+            )
+
+    threads = [threading.Thread(target=redeem, args=(str(group),)) for group in (chat_id, -chat_id)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert sorted(results.values()) == [False, True]
+    allowed = [row for row in _senders(chat_id) + _senders(-chat_id) if row.status == SENDER_ALLOWED]
+    assert len(allowed) == 1
