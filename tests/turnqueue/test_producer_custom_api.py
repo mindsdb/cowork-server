@@ -1,5 +1,5 @@
 """A member's custom API connections in a cloud turn's job: listed by auth for the
-turn key's owner, with fetch grants bound to that key, never a field value."""
+turn key's owner, with grants bound to that key, never a field value."""
 from __future__ import annotations
 
 import json
@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from anton.cloud_turn.contract import TurnRequestV1
+from anton.core.llm.identity import render_custom_api_notes
 
 import test_producer as base
 from cowork.common.settings.app_settings import get_app_settings
@@ -507,3 +509,21 @@ async def test_an_answer_carrying_values_puts_none_of_them_in_the_job_or_a_log(t
 
     assert planted not in json.dumps(params)
     assert not [line for line in lines if planted in line]
+
+
+# ── the job as the pod reads it (milestone 4 step 9) ─────────────────────────
+
+
+async def test_the_pod_parses_and_renders_the_job_this_producer_queues(turn, templates):
+    """The producer's real params, as scratchpad-controller forwards them, through anton's own public names."""
+    params, _ = await _run(turn)
+    request = TurnRequestV1.from_json(json.dumps({
+        "protocol_version": 1, "conversation_id": "conv-1", "input": "hi",
+        "custom_api": params["custom_api"], "connectors": params["connectors"],
+    }))
+
+    assert [(ref.connection_id, ref.connector_id, ref.credential_version)
+            for ref in request.custom_api.connections] == [(3, "beta_api", 1), (5, "acme_crm", 2)]
+    lines = render_custom_api_notes(request.custom_api, request.connectors).splitlines()
+    assert f"- beta_api: {json.dumps(_BETA_PREFIX)}" in lines
+    assert f"- acme_crm: {json.dumps(_ACME_PREFIX + chr(10) * 2 + 'Call /v1/me first.')}" in lines
