@@ -1688,6 +1688,11 @@ def test_handle_sends_a_plain_question_to_the_agent_without_the_gate_or_a_first_
 
     monkeypatch.setattr(ResponsesHandler, "_turn_gate", llm_gate)
 
+    async def zdr_off(_self, *_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(ResponsesHandler, "zdr_on", zdr_off)
+
     def ask() -> None:
         handler = ResponsesHandler(principal=_principal(BOB), mindshub_bearer=MEMBER_BEARER)
         routed = handler._route_request

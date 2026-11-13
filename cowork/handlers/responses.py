@@ -1423,7 +1423,7 @@ class ResponsesHandler:
                         return binding if binding is not None else _settings_binding()
 
                     correlation_id = (turn_llm or {}).get("correlation_id")
-                    if first_take:
+                    if first_take and await self._first_take_allowed(turn_llm):
                         self.first_take = _start_first_take(
                             binding,
                             binding_factory=binding_for_turn,
@@ -1521,6 +1521,13 @@ class ResponsesHandler:
 
             return jev, may_fall_back
         return jev, None
+
+    async def _first_take_allowed(self, turn_llm: dict | None) -> bool:
+        """The take runs on the gate's model, so under ZDR it is skipped when that model is on MindsHub."""
+        settings = await run_on_unit_threads(partial(get_user_settings, self.scope))
+        if settings.resolved_router_provider is not Provider.MINDS_CLOUD:
+            return True
+        return not await self.zdr_on(turn_llm, settings)
 
     async def zdr_on(self, turn_llm: dict | None = None, settings: UserSettings | None = None) -> bool:
         """Whether ZDR is on for this turn's organization (unknown counts as on).
