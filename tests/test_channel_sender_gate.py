@@ -47,11 +47,15 @@ REPLY = "hello from anton"
 class RecordingHarness:
     """Stands in for the Anton harness and records whether a turn started."""
 
+    enforces_channel_capabilities = True
+
     def __init__(self) -> None:
         self.turns = 0
+        self.contexts: list = []
 
     async def stream_response(self, *, conversation, input, channel_context=None, trace_metadata=None):
         self.turns += 1
+        self.contexts.append(channel_context)
         if False:
             yield
 
@@ -524,3 +528,35 @@ def test_two_chats_redeeming_one_code_at_once_let_in_exactly_one(chat_id, pairin
     assert sorted(results.values()) == [False, True]
     allowed = [row for row in _senders(chat_id) + _senders(-chat_id) if row.status == SENDER_ALLOWED]
     assert len(allowed) == 1
+
+
+def test_a_harness_that_does_not_enforce_the_switches_runs_no_channel_turn(chat_id, monkeypatch):
+    class UnawareHarness(RecordingHarness):
+        enforces_channel_capabilities = False
+
+    unaware = UnawareHarness()
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: unaware)
+    _set_sender(chat_id, SENDER_ALLOWED)
+
+    adapter = _handle(_event(chat_id, "hello"))
+
+    assert unaware.turns == 0
+    assert adapter.delivered == []
+
+
+def test_a_turn_gets_its_bindings_switches(chat_id, harness):
+    _set_sender(chat_id, SENDER_ALLOWED)
+    _handle(_event(chat_id, "first"))
+    with get_open_session() as session:
+        binding = session.exec(select(ChannelBinding).where(ChannelBinding.external_group_id == str(chat_id))).one()
+        binding.allow_scratchpad = True
+        binding.allow_file_replies = True
+        session.add(binding)
+        session.commit()
+
+    _handle(_event(chat_id, "second"))
+
+    first, second = harness.contexts
+    switches = ("allow_scratchpad", "allow_connectors", "allow_memory_writes", "allow_file_replies")
+    assert [getattr(first, name) for name in switches] == [False, False, False, False]
+    assert [getattr(second, name) for name in switches] == [True, False, False, True]

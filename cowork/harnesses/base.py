@@ -39,6 +39,12 @@ class ChannelContext:
     is_group: bool = False
     display_name: str | None = None
     instructions: str | None = None
+    # The binding's capability switches; False unless the owner turned one on,
+    # so a context built without them is a restricted turn.
+    allow_scratchpad: bool = False
+    allow_connectors: bool = False
+    allow_memory_writes: bool = False
+    allow_file_replies: bool = False
 
 
 class HarnessProvider(Protocol):
@@ -50,6 +56,9 @@ class HarnessProvider(Protocol):
     # Whether this harness is offered in org (multi-tenant) deployments.
     # Defaults True for implementers that don't set it (see _harness_options).
     supports_org_mode: bool
+    # Whether the harness enforces a ChannelContext's capability switches. A
+    # channel turn runs in-process only on a harness that sets it True.
+    enforces_channel_capabilities: bool
 
     async def stream_response(
         self,

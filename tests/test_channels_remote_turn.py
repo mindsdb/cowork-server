@@ -18,6 +18,7 @@ pytestmark = pytest.mark.usefixtures("allow_channel_senders")
 
 
 class _FakeHarnessLocal:
+    enforces_channel_capabilities = True
     def stream_response(self, **kwargs):
         async def gen():
             yield "local-sentinel"

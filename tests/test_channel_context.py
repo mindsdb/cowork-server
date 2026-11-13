@@ -64,13 +64,19 @@ def test_desktop_lead_names_artifact_retrieval_path():
 
 
 def test_channel_variant_swaps_desktop_guidance():
-    text = _turn_style_context(ChannelContext(channel_type="telegram", is_group=True))
+    text = _turn_style_context(ChannelContext(channel_type="telegram", is_group=True, allow_file_replies=True))
     assert "telegram" in text
     assert "group chat" in text
     assert "plain-text" in text
     assert "sent into this chat automatically" in text
     assert "prefixed with the sender's name" in text
     assert "desktop UI displays" not in text and "activity rows" not in text
+
+
+def test_channel_without_file_replies_is_told_it_cannot_send_files():
+    text = _turn_style_context(ChannelContext(channel_type="telegram"))
+    assert "sent into this chat automatically" not in text
+    assert "Files cannot be sent into this chat" in text
 
 
 def test_dm_variant_includes_display_name():

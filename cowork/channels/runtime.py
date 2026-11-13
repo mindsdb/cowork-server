@@ -164,6 +164,11 @@ class TurnFile:
     data: bytes
 
 
+class ChannelHarnessRefused(Exception):
+    """The channel's harness does not enforce a binding's capability switches,
+    so an in-process channel turn is not run on it."""
+
+
 class Admission(Enum):
     """What the sender gate decided for one inbound message."""
 
@@ -504,6 +509,10 @@ class AntonChannelRuntime:
                 is_group=bool(event.message.is_group),
                 display_name=binding.display_name,
                 instructions=binding.instructions,
+                allow_scratchpad=binding.allow_scratchpad,
+                allow_connectors=binding.allow_connectors,
+                allow_memory_writes=binding.allow_memory_writes,
+                allow_file_replies=binding.allow_file_replies,
             )
             # Nested get_user_settings() reads (model/provider) must resolve
             # against this org, not fall back to local/global.
@@ -511,6 +520,12 @@ class AntonChannelRuntime:
                 outcome = await self._run_anton(
                     scope, conversation, event, adapter, channel_context=channel_context
                 )
+        except ChannelHarnessRefused as exc:
+            log.warning(
+                "channel %s: harness %s does not enforce channel capability switches; the message was dropped",
+                channel_type, exc,
+            )
+            return
         except (PoolTimeoutError, FilesystemBusy):
             await self._send_busy_notice(channel_type=channel_type, event=event, org_id=org_id)
             raise
@@ -764,6 +779,8 @@ class AntonChannelRuntime:
         """The one place a channel turn picks in-process vs remote-worker
         execution; the rest of _run_anton is identical either way."""
         if not TurnQueueSettings().is_remote:
+            if not getattr(harness, "enforces_channel_capabilities", False):
+                raise ChannelHarnessRefused(harness_id)
             return harness.stream_response(
                 conversation=conversation, input=blocks, channel_context=channel_context,
                 trace_metadata=build_trace_metadata(),

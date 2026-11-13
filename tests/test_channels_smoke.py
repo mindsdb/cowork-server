@@ -37,6 +37,8 @@ LINK_PREFIX = "https://app.example.com/c/"
 class FakeHarness:
     """Stands in for the Anton harness — one assistant delta, no LLM."""
 
+    enforces_channel_capabilities = True
+
     def __init__(
         self, tool_event: bool = False, delay: float = 0.0, turn_history: list | None = None,
         artifacts: list[dict] | None = None,

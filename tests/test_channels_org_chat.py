@@ -38,6 +38,7 @@ SIGNING_SECRET = "test-signing-secret-org-chat"
 
 
 class FakeHarness:
+    enforces_channel_capabilities = True
     """One assistant delta, no LLM — records what it was asked to run."""
 
     def __init__(self):

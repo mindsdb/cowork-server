@@ -24,6 +24,7 @@ ORG_A = "8f14e45f-ceea-467e-adde-3fb5ba9302f0"
 
 
 class FakeHarness:
+    enforces_channel_capabilities = True
     def __init__(self):
         self.calls: list[dict] = []
 

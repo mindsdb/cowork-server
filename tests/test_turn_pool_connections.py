@@ -745,6 +745,7 @@ async def test_a_channel_turns_saves_wait_for_the_conversations_write_lock(monke
     saved: list[str] = []
 
     class _Answers:
+        enforces_channel_capabilities = True
         def stream_response(self, **_kwargs):
             return None
 
@@ -814,6 +815,7 @@ async def test_a_channel_turn_does_not_load_the_conversations_history(monkeypatc
     event = SimpleNamespace(message=SimpleNamespace(content="hi", is_group=False, sender_name=None, attachments=[]))
 
     class _Answers:
+        enforces_channel_capabilities = True
         def stream_response(self, **_kwargs):
             return None
 

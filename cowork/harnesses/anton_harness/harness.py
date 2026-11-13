@@ -583,6 +583,34 @@ def _learns_this_turn(conversation, learns: bool) -> bool:
     return learns
 
 
+@dataclass(frozen=True)
+class _TurnCapabilities:
+    """What a turn may use. A UI turn may use everything; a channel turn only
+    what its binding's switches allow."""
+
+    scratchpad: bool
+    connectors: bool
+    memory_writes: bool
+
+    @property
+    def tool_allowlist(self) -> frozenset[str] | None:
+        """Two states only, so no name can be missing on some install:
+        everything (None), or ``recall_skill``, which anton always registers."""
+        return None if self.scratchpad else frozenset({"recall_skill"})
+
+
+def _turn_capabilities(channel: ChannelContext | None) -> _TurnCapabilities:
+    """The turn's capabilities from its channel context; connectors count only
+    with the scratchpad on, since their data is used from cells."""
+    if channel is None:
+        return _TurnCapabilities(scratchpad=True, connectors=True, memory_writes=True)
+    return _TurnCapabilities(
+        scratchpad=channel.allow_scratchpad,
+        connectors=channel.allow_connectors and channel.allow_scratchpad,
+        memory_writes=channel.allow_memory_writes,
+    )
+
+
 def _turn_style_context(channel: ChannelContext | None) -> str:
     """Lead block of the system-prompt suffix: desktop guidance for UI turns,
     support-chat guidance for channel turns.
@@ -643,10 +671,14 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
             "address the person who asked.\n"
             if channel.is_group else ""
         )
-        + "- Files you create as artifacts are sent into this chat automatically right after "
-        "your reply — tell the user you're sending the file rather than describing where it "
-        "lives.\n"
-        f"{operator}"
+        + (
+            "- Files you create as artifacts are sent into this chat automatically right after "
+            "your reply — tell the user you're sending the file rather than describing where it "
+            "lives.\n"
+            if channel.allow_file_replies
+            else "- Files cannot be sent into this chat; never say you are sending one.\n"
+        )
+        + f"{operator}"
     )
 
 
@@ -967,6 +999,7 @@ class AntonHarness:
     id: str = "anton"
     label: str = "Anton"
     formatter = staticmethod(format_responses_stream)
+    enforces_channel_capabilities: bool = True
 
     async def stream_response(
         self,
@@ -1601,7 +1634,10 @@ class AntonHarness:
         _overlay_user_settings(anton_settings, user)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
-        elicitor = build_elicitor(str(conversation.id))
+        capabilities = _turn_capabilities(channel_context)
+        # No card can be answered from a chat, and a card would pop up in the
+        # owner's window for a sender's turn.
+        elicitor = None if channel_context is not None else build_elicitor(str(conversation.id))
         # Every change to a scheduled task waits on a card the user confirms,
         # so the tools exist only where someone can: not in a scheduled run
         # (a task must not rewrite itself unattended), a channel bot, or a
@@ -1648,7 +1684,9 @@ class AntonHarness:
             workspace.initialize(refuse_links=True)
         else:
             workspace.initialize()
-        workspace_env_overlay = _load_workspace_env_if_safe(workspace)
+        # The project's .env holds connection values, so a turn without
+        # connectors gets none of it.
+        workspace_env_overlay = _load_workspace_env_if_safe(workspace) if capabilities.connectors else {}
 
         overlay_kwargs = supported_kwargs(
             ChatSessionConfig, workspace_env_overlay=workspace_env_overlay
@@ -1809,7 +1847,12 @@ class AntonHarness:
             # base vault. A connection the agent saves through it lands in
             # the asker's own vault, stamped with its creator.
             source_vault = turn_vault_for_scope(current_settings_scope())
-            if disabled_connections:
+            if not capabilities.connectors:
+                # An empty vault, never None: a tool handed None falls back to
+                # the home vault (~/.anton/data_vault).
+                turn_scratch_dir = _new_turn_scratch_dir()
+                data_vault = LocalDataVault(vault_dir=turn_scratch_dir / "vault")
+            elif disabled_connections:
                 data_vault = FilteredDataVault(
                     source=source_vault,
                     hidden=frozenset((d["engine"], d["name"]) for d in disabled_connections),
@@ -1923,7 +1966,7 @@ class AntonHarness:
                 mode=(
                     anton_settings.memory_mode
                     if anton_settings.memory_enabled
-                    and _learns_this_turn(conversation, memory_layout.learns)
+                    and _learns_this_turn(conversation, memory_layout.learns and capabilities.memory_writes)
                     else "off"
                 ),
                 llm_client=llm_client,
@@ -2032,7 +2075,8 @@ class AntonHarness:
             # None with live apps off, for a turn that names nobody with an
             # email, or on a comparison side, and then not passed at all.
             live_app_host = (
-                None if comparison_side else live_app_host_for_turn(project_id=conversation.project.id)
+                None if comparison_side or channel_context is not None
+                else live_app_host_for_turn(project_id=conversation.project.id)
             )
 
             deployment = identity_for_turn()
@@ -2055,7 +2099,7 @@ class AntonHarness:
                 # either. Passed directly, as _turn_cortex passes managed_hc:
                 # every anton the floor admits has the field, and a dropped
                 # one would silently bring the memory passes back.
-                background_memory=_learns_this_turn(conversation, memory_layout.learns),
+                background_memory=_learns_this_turn(conversation, memory_layout.learns and capabilities.memory_writes),
                 # episodic=episodic,
                 system_prompt_context=SystemPromptContext(
                     runtime_context=build_runtime_context(anton_settings),
@@ -2115,24 +2159,34 @@ class AntonHarness:
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
                 # puts planning on the Responses API. The client above uses
                 # this same settings snapshot, even if settings change mid-build.
-                **web_tool_kwargs_for(user.resolved_planning_provider),
+                **{
+                    **web_tool_kwargs_for(user.resolved_planning_provider),
+                    **({} if capabilities.scratchpad else {"web_search_enabled": False, "web_fetch_enabled": False}),
+                },
                 # "Conversation started" stamp for the cache-stable prompt prefix
                 # (anton 2a). The live current time is rendered separately in the
                 # volatile tail, so resuming days later still reports the real "now".
                 started_at=conversation.created_at,
+                # Connector tools are left out, not hidden: a skill unlock
+                # registers them mid-round, past the allowlist.
                 tools=[
-                    CONNECT_DATASOURCE_TOOL,
+                    *(
+                        [CONNECT_DATASOURCE_TOOL, LOOKUP_CONNECTOR_TOOL, REQUEST_CREDENTIALS_TOOL, LABEL_CONNECTION_TOOL]
+                        if capabilities.connectors else []
+                    ),
                     PUBLISH_TOOL,
-                    LOOKUP_CONNECTOR_TOOL,
-                    REQUEST_CREDENTIALS_TOOL,
-                    LABEL_CONNECTION_TOOL,
-                    CREATE_SKILL_DRAFT_TOOL,
+                    *([CREATE_SKILL_DRAFT_TOOL] if capabilities.memory_writes else []),
                     # FETCH_SUBMISSION_TOOL,
                     # UPDATE_FORM_TOOL,
                     *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
                     *schedule_tools,
-                    *mcp_tool_defs,
+                    *(mcp_tool_defs if capabilities.connectors else []),
                 ],
+                **(
+                    {"tool_allowlist": capabilities.tool_allowlist | ({"recall_history"} if RECALL_HISTORY_TOOL else set())}
+                    if capabilities.tool_allowlist is not None
+                    else {}
+                ),
                 # Same gate as the discovery call above, not a second one:
                 # `ChatSessionConfig.mcp_sessions` and `anton.core.mcp` ship
                 # together (anton#478), so an anton without the wiring module
