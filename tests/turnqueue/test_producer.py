@@ -1183,6 +1183,44 @@ async def test_mint_llm_block_coding_model_override():
 
 
 @pytest.mark.asyncio
+async def test_mint_llm_block_uses_the_callers_coding_model():
+    # The pod's coding calls and its summaries run on the caller's resolved coding model.
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    settings = TurnQueueSettings(minds_base_url="https://x/v1", minds_coding_model="")
+    block = await prod.mint_llm_block(
+        org_id="o", user_id="u", correlation_id="c", settings=settings, coding_model="kimi",
+    )
+    assert block["coding_model"] == "kimi"
+
+
+@pytest.mark.asyncio
+async def test_the_deployment_override_beats_the_callers_coding_model():
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    settings = TurnQueueSettings(minds_base_url="https://x/v1", minds_coding_model="sonnet")
+    block = await prod.mint_llm_block(
+        org_id="o", user_id="u", correlation_id="c", settings=settings, coding_model="kimi",
+    )
+    assert block["coding_model"] == "sonnet"
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "expected"),
+    [("minds_cloud", "kimi", "kimi"), ("anthropic", "claude-haiku-4-5-20251001", None)],
+)
+def test_turn_coding_model_only_names_a_mindshub_model(provider, model, expected):
+    # The pod runs on MindsHub, so a coding model on another provider is never sent.
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import Provider
+
+    user_settings = SimpleNamespace(resolved_coding_provider=Provider(provider), resolved_coding_model=model)
+    assert prod.turn_coding_model(user_settings) == expected
+    assert prod.turn_coding_model(None) is None
+
+
+@pytest.mark.asyncio
 async def test_mint_llm_block_uses_base_url_override():
     """An explicit minds_base_url (per-PR / non-standard env) overrides the
     env-slug derivation, so the pod calls the right environment's inference."""

@@ -225,9 +225,20 @@ def _new_correlation_id() -> str:
     return str(uuid.uuid4())
 
 
+def turn_coding_model(user_settings) -> str | None:
+    """The caller's resolved coding model when it runs on MindsHub, else None.
+    Resolved like the desktop's, so a model the org can't use is swapped for one it can."""
+    from cowork.common.settings.user_settings import Provider
+
+    if getattr(user_settings, "resolved_coding_provider", None) is not Provider.MINDS_CLOUD:
+        return None
+    return user_settings.resolved_coding_model
+
+
 async def mint_llm_block(*, org_id: str | None, user_id: str | None,
                          correlation_id: str, settings: TurnQueueSettings,
-                         workspace_id: str | None = None, ttl_seconds: int | None = None) -> dict:
+                         workspace_id: str | None = None, ttl_seconds: int | None = None,
+                         coding_model: str | None = None) -> dict:
     """Mint a short-TTL MindsHub turn key and build the job's `llm` block.
 
     The mint call is authenticated with the internal shared secret
@@ -246,16 +257,16 @@ async def mint_llm_block(*, org_id: str | None, user_id: str | None,
         ttl_seconds=ttl_seconds or settings.turn_key_lifetime_seconds, settings=settings,
         workspace_id=workspace_id,
     )
-    return _build_llm_block(api_key, settings)
+    return _build_llm_block(api_key, settings, coding_model)
 
 
-def _build_llm_block(api_key: str, settings: TurnQueueSettings) -> dict:
+def _build_llm_block(api_key: str, settings: TurnQueueSettings, user_coding_model: str | None = None) -> dict:
     base_url = settings.minds_base_url or minds_chat_base_url(default_turn_minds_api_host())
     block = {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
-    # Must be a MINDS alias (the pod runs on minds-cloud). Default to the
-    # free-bucket model: a fresh org has no wallet balance, so premium 402s.
+    # Must be a MINDS alias (the pod runs on minds-cloud). The deployment override wins, then the
+    # caller's resolved coding model, then the free-bucket model. Anton also summarizes on it.
     from cowork.common.settings.app_settings import MINDS_FREE_MODEL
-    coding_model = settings.minds_coding_model or MINDS_FREE_MODEL
+    coding_model = settings.minds_coding_model or user_coding_model or MINDS_FREE_MODEL
     if coding_model:
         block["coding_model"] = coding_model
     return block
@@ -263,7 +274,7 @@ def _build_llm_block(api_key: str, settings: TurnQueueSettings) -> dict:
 
 async def _mint_llm_block_with_turn_key_id(
     *, org_id: str | None, user_id: str | None, correlation_id: str, settings: TurnQueueSettings,
-    workspace_id: str | None = None,
+    workspace_id: str | None = None, coding_model: str | None = None,
 ) -> tuple[dict, str]:
     """As mint_llm_block, also returning the key's public prefix the datasource grants bind to."""
     minted = await mint_turn_key_details(
@@ -274,7 +285,7 @@ async def _mint_llm_block_with_turn_key_id(
         settings=settings,
         workspace_id=workspace_id,
     )
-    return _build_llm_block(minted.key, settings), minted.prefix
+    return _build_llm_block(minted.key, settings, coding_model), minted.prefix
 
 
 async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
@@ -867,7 +878,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                 (llm_block, turn_key_id), oauth_connections = await asyncio.gather(
                     _mint_llm_block_with_turn_key_id(
                         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
-                        workspace_id=workspace_id,
+                        workspace_id=workspace_id, coding_model=turn_coding_model(user_settings),
                     ),
                     oauth_connections_coro,
                 )
@@ -875,7 +886,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                 llm_block, oauth_connections = await asyncio.gather(
                     mint_llm_block(
                         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
-                        workspace_id=workspace_id,
+                        workspace_id=workspace_id, coding_model=turn_coding_model(user_settings),
                     ),
                     oauth_connections_coro,
                 )

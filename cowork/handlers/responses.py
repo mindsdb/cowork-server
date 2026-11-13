@@ -1770,7 +1770,7 @@ class ResponsesHandler:
                 or provider_api_key(settings, Provider.MINDS_CLOUD) is not None):
             return None, None
         from anton.core.llm.openai import OpenAIProvider
-        from cowork.turnqueue.producer import _mint_llm_block_with_turn_key_id, mint_llm_block
+        from cowork.turnqueue.producer import _mint_llm_block_with_turn_key_id, mint_llm_block, turn_coding_model
 
         corr = str(uuid4())
         queue_settings = TurnQueueSettings()
@@ -1783,6 +1783,7 @@ class ResponsesHandler:
                 correlation_id=corr,
                 settings=queue_settings,
                 workspace_id=workspace_id,
+                coding_model=turn_coding_model(settings),
             )
         else:
             block = await mint_llm_block(
@@ -1791,6 +1792,7 @@ class ResponsesHandler:
                 correlation_id=corr,
                 settings=queue_settings,
                 workspace_id=workspace_id,
+                coding_model=turn_coding_model(settings),
             )
         provider = OpenAIProvider(
             api_key=block["api_key"],

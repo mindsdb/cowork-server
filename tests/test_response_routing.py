@@ -1059,7 +1059,7 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
         lambda **kwargs: real_client(http_client=http_client, max_retries=0, **kwargs),
     )
 
-    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
+    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None, coding_model=None):
         minted["corr"] = correlation_id
         minted["workspace_id"] = workspace_id
         return block
@@ -1121,7 +1121,7 @@ async def test_router_binding_omits_workspace_id_when_none_picked(monkeypatch):
     )
     minted = {}
 
-    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
+    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None, coding_model=None):
         minted["workspace_id"] = workspace_id
         return {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
 
@@ -1159,7 +1159,7 @@ async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_
     block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "http://gw/v1"}
     minted = {}
 
-    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
+    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None, coding_model=None):
         minted["workspace_id"] = workspace_id
         return block, "mdb_gate"
 
