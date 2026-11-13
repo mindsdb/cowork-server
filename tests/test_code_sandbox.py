@@ -432,6 +432,30 @@ def test_identity_headers_take_the_token_from_its_file(stack, tmp_path):
     assert not env.exists() or "token-from-the-file" not in env.read_text(encoding="utf-8")
 
 
+def test_a_token_from_its_file_gets_no_copy_with_identity_headers_off(stack, tmp_path):
+    """A token the file COWORK_AUTH_TOKEN_FILE names stays off the disk with
+    identity headers off too: no copy goes in cowork-home's .env, and a copy
+    an earlier start wrote there is removed."""
+    token_file = tmp_path / "run" / "COWORK_AUTH_TOKEN"
+    token_file.parent.mkdir()
+    token_file.write_text("token-from-the-file\n", encoding="utf-8")
+    env = tmp_path / "home" / ".env"
+    env.parent.mkdir(parents=True)
+    env.write_text("A=1\nCOWORK_AUTH_TOKEN=an-earlier-copy\n", encoding="utf-8")
+    stack.setenv("COWORK_TRUST_IDENTITY_HEADERS", "false")
+    stack.setenv("COWORK_AUTH_TOKEN", "")
+    stack.setenv("COWORK_AUTH_TOKEN_FILE", str(token_file))
+    get_app_settings.cache_clear()
+
+    app = cowork_server.create_app()
+
+    bearer = [m for m in app.user_middleware if m.cls is cowork_server.BearerTokenMiddleware]
+    assert [m.kwargs["token"] for m in bearer] == ["token-from-the-file"]
+    left = env.read_text(encoding="utf-8")
+    assert "COWORK_AUTH_TOKEN" not in left
+    assert "A=1" in left
+
+
 def test_identity_headers_never_take_the_token_from_cowork_homes_env(stack, tmp_path):
     """AppSettings also fills auth_token from cowork-home's .env, which every
     cell could read before the sandbox. A token only there is the copy the
