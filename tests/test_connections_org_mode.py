@@ -115,6 +115,35 @@ async def test_get_connection_includes_picked_files_as_json_string(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["notion", "hubspot"])
+async def test_get_connection_carries_an_mcp_connections_method_and_access_mode(monkeypatch, engine):
+    """The panel shows its Tool access control only for `method == "mcp"`
+    and reads the current mode from `fields._access_mode`, as on desktop."""
+    async def fake_proxy_connection_detail(engine, name, request, settings):
+        return {"status": "active", "account_email": "a@b.com", "picked_files": [], "_method": "mcp", "_access_mode": "write"}
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_connection_detail", fake_proxy_connection_detail)
+
+    detail = await connections_endpoints.get_connection(engine, "work", ORG_SCOPE, FakeRequest())
+
+    assert detail.method == "mcp"
+    assert detail.fields["_access_mode"] == "write"
+
+
+@pytest.mark.asyncio
+async def test_get_connection_of_a_non_mcp_connector_has_no_method(monkeypatch):
+    async def fake_proxy_connection_detail(engine, name, request, settings):
+        return {"status": "active", "account_email": "a@b.com", "picked_files": []}
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_connection_detail", fake_proxy_connection_detail)
+
+    detail = await connections_endpoints.get_connection("google_drive", "work", ORG_SCOPE, FakeRequest())
+
+    assert detail.method is None
+    assert "_access_mode" not in detail.fields
+
+
+@pytest.mark.asyncio
 async def test_get_connection_surfaces_needs_reconnect_status(monkeypatch):
     """The other half of ENG-2097's fix: proxy_connection_detail (unlike the
     proxy_token this replaced) never raises on a stuck connection, so its
@@ -184,3 +213,58 @@ def test_patch_connection_token_is_a_501_in_org_mode():
     with pytest.raises(HTTPException) as exc_info:
         connections_endpoints.patch_connection_token("google_drive", "work", body, ORG_SCOPE)
     assert exc_info.value.status_code == 501
+
+
+@pytest.mark.asyncio
+async def test_removing_a_notion_page_in_org_mode_untags_it_in_auth(monkeypatch):
+    calls = []
+
+    async def fake_proxy_remove(engine, name, file_id, project, request, settings):
+        calls.append((engine, name, file_id, project))
+        return [{"id": "p2", "projects": ["beta"]}]
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_remove_picked_file", fake_proxy_remove)
+
+    result = await connections_endpoints.delete_picked_file("notion", "ws-a", "p1", "alpha", ORG_SCOPE, FakeRequest())
+
+    assert calls == [("notion", "ws-a", "p1", "alpha")]
+    assert result == {"ok": True, "files": [{"id": "p2", "projects": ["beta"]}]}
+
+
+@pytest.mark.asyncio
+async def test_removing_an_already_removed_notion_page_in_org_mode_is_done(monkeypatch):
+    async def fake_proxy_remove(*args):
+        raise HTTPException(status_code=404, detail="No picked file 'p1' in project 'alpha'.")
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_remove_picked_file", fake_proxy_remove)
+
+    result = await connections_endpoints.delete_picked_file("notion", "ws-a", "p1", "alpha", ORG_SCOPE, FakeRequest())
+    assert result == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_removing_a_notion_page_in_org_mode_relays_other_auth_errors(monkeypatch):
+    async def fake_proxy_remove(*args):
+        raise HTTPException(status_code=502, detail="auth service unreachable")
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_remove_picked_file", fake_proxy_remove)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await connections_endpoints.delete_picked_file("notion", "ws-a", "p1", "alpha", ORG_SCOPE, FakeRequest())
+    assert exc_info.value.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_removing_a_drive_file_in_org_mode_does_not_call_auth(monkeypatch):
+    async def fail(*args):
+        raise AssertionError("auth has no removal route for Drive yet")
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_remove_picked_file", fail)
+    monkeypatch.setattr(connections_endpoints, "_refuse_unchangeable", lambda *a: None)
+    monkeypatch.setattr(
+        connections_endpoints.ConnectionsService, "remove_picked_file", lambda self, *a: [],
+    )
+
+    result = await connections_endpoints.delete_picked_file("google_drive", "work", "f1", "alpha", ORG_SCOPE, FakeRequest())
+
+    assert result == {"ok": True, "files": []}
