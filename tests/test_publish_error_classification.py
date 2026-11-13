@@ -313,7 +313,7 @@ def _upload_refusing_the_share(monkeypatch, tmp_path) -> Path:
     def refuse(*args, **kwargs):
         raise _upstream(403, {"error": SHARE_ORG_REASON, "code": "share_org_required"}, "Forbidden")
 
-    monkeypatch.setattr("anton.publisher.minds_request", refuse)
+    monkeypatch.setattr("anton.publisher.minds_request_with_status", refuse)
     return page
 
 
