@@ -14,6 +14,7 @@ import os
 import re
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from sqlmodel import Session, select
@@ -27,7 +28,7 @@ from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorTestAnswer
 from cowork.server import create_app
 from cowork.services.connectors import connector_test_run, pending_tests as pending_module
-from cowork.services.connectors.connector_test_flow import CANCELLED, NOT_ALLOWED
+from cowork.services.connectors.connector_test_flow import CANCELLED, ENDED, NOT_ALLOWED
 from cowork.services.connectors.pending_tests import PendingTest, PendingTests
 # The mock API and the local vault, database and saved turn are the probe stream's own fixtures.
 from tests.test_probe_test_request import ISSUED, PLANNER_FORM, SECRET, VALUES, api, connect, of, saved
@@ -190,6 +191,57 @@ class TestTheMemberAnswers:
         with pytest.raises(HTTPException) as exc:
             await confirm_route(ConnectorTestAnswer(confirm_id="nope"), LOCAL_SCOPE)
         assert exc.value.status_code == 404
+
+
+CANCEL_URL = "/api/v1/connectors/submissions/cancel"
+CONFIRM_URL = "/api/v1/connectors/submissions/confirm"
+# The api fixture swaps httpx.AsyncClient for the mock provider; the app is called with the real one.
+_APP_CLIENT = httpx.AsyncClient
+
+
+async def _post(url: str, body: dict) -> httpx.Response:
+    """POST through the real app, so the query string and body are parsed as a client sends them."""
+    transport = httpx.ASGITransport(app=create_app())
+    async with _APP_CLIENT(transport=transport, base_url="http://cowork.test") as client:
+        return await client.post(url, json=body)
+
+
+class TestWhyAWaitingTestEnded:
+    """The cancel route records whether the member declined or the test ended another way."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("query", "text"), [
+        ("?reason=declined", CANCELLED),
+        ("", CANCELLED),
+        ("?reason=ended", ENDED),
+        ("?reason=something_newer", ENDED),
+    ], ids=["declined", "no-reason", "ended", "unknown"])
+    async def test_a_waiting_confirmation(self, api, saved, query, text):
+        [preview] = of(await connect(PLANNER_FORM, VALUES, saved), "connector.test_preview")
+        body = {"confirm_id": preview["confirm_id"]}
+
+        assert (await _post(CANCEL_URL + query, body)).status_code == 204
+
+        assert saved.turns[-1]["text"] == text
+        assert (await _post(CONFIRM_URL, body)).status_code == 404
+        assert saved.vault.list_connections() == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("query", "text"), [
+        ("?reason=declined", NOT_ALLOWED),
+        ("", NOT_ALLOWED),
+        ("?reason=ended", ENDED),
+        ("?reason=something_newer", ENDED),
+    ], ids=["declined", "no-reason", "ended", "unknown"])
+    async def test_a_waiting_private_address(self, api, saved, monkeypatch, query, text):
+        monkeypatch.setattr(connector_test_run, "_RESOLVER", lambda host, port, type=None: [(None, None, None, "", ("10.0.0.5", 443))])
+        [ask] = of(await connect(PLANNER_FORM, VALUES, saved), "connector.private_host_request")
+
+        assert (await _post(CANCEL_URL + query, {"approval_id": ask["approval_id"]})).status_code == 204
+
+        assert saved.turns[-1]["text"] == text and api.requests == []
+        with pytest.raises(HTTPException):
+            await allow_private_route(ConnectorTestAnswer(approval_id=ask["approval_id"]), LOCAL_SCOPE)
 
 
 @pytest.fixture(autouse=True)
