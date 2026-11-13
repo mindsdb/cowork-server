@@ -18,6 +18,7 @@ from cowork.services.artifact_identity import (
 )
 from cowork.db.scoped import TenantScope
 from cowork.services.artifact_journal import (
+    COMMENTS_JOURNAL_NAME,
     journal_file_mtime_ns,
     read_journal_json,
     write_journal_file,
@@ -25,7 +26,6 @@ from cowork.services.artifact_journal import (
 from cowork.services.artifact_lock import artifact_lock
 from cowork.services.artifact_roots import artifacts_sources_for_scan
 
-_JOURNAL_NAME = "comments.json"
 _VIEWER = {"user_id": "desktop-owner", "email": "You", "role": "owner"}
 _CAPABILITIES = {
     "canComment": True,
@@ -63,18 +63,18 @@ class LocalArtifactComments:
         # The journal is opened without following links: a `.revisions` that
         # is a link reads as no comments, and the next write replaces it.
         try:
-            raw = read_journal_json(self.folder, _JOURNAL_NAME)
+            raw = read_journal_json(self.folder, COMMENTS_JOURNAL_NAME)
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail="Comment journal is unreadable") from exc
         return raw if isinstance(raw, list) else []
 
     def _write(self, threads: list[dict]) -> None:
         encoded = json.dumps(threads, ensure_ascii=False, separators=(",", ":"))
-        write_journal_file(self.folder, _JOURNAL_NAME, content=encoded.encode("utf-8"))
+        write_journal_file(self.folder, COMMENTS_JOURNAL_NAME, content=encoded.encode("utf-8"))
 
     def mtime_ns(self) -> int:
         """When the comment journal last changed, or 0 when there is none."""
-        return journal_file_mtime_ns(self.folder, _JOURNAL_NAME)
+        return journal_file_mtime_ns(self.folder, COMMENTS_JOURNAL_NAME)
 
     def _mutate(self, mutation):
         with artifact_lock(self.folder):

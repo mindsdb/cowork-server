@@ -65,6 +65,7 @@ from cowork.services.live_apps import (
 from cowork.services.projects import display_label, is_comparison_sandbox
 from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
 from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_shared_skills
+from cowork.streaming.addons import AddonChannel, addons
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
@@ -405,6 +406,64 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     return split_turn_into_rows(history_slice)
 
 
+def _narration(message: dict) -> list[str]:
+    content = message.get("content")
+    if message.get("role") != "assistant" or not isinstance(content, list):
+        return []
+    return [b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)]
+
+
+def _joined_rounds(texts: list[str]) -> str:
+    """The rounds' text as the stream formatter joins it into the answer."""
+    joined = ""
+    for text in texts:
+        if joined and not joined.endswith("\n\n"):
+            joined += "\n\n"
+        joined += text
+    return joined
+
+
+def _without_repeated_narration(history: list[dict]) -> list[dict]:
+    """Replay each turn as the model saw it live.
+
+    A turn's tool rows keep the text written beside each tool call, and its
+    answer row repeats all of that text before the final reply. When the answer
+    starts with exactly those rounds, only the final reply is replayed, which
+    makes the history byte-identical to the live one and keeps the prompt cache
+    valid across turns. Otherwise the text is dropped from the tool rows, so
+    they replay like rows saved before this change.
+    """
+    out: list[dict] = []
+    narrated_at: list[int] = []
+    for message in history:
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result") for b in content
+        ):
+            if _narration(message):
+                narrated_at.append(len(out))
+            out.append(message)
+            continue
+        if message.get("role") == "assistant" and isinstance(content, str) and narrated_at:
+            lead = _joined_rounds([t for i in narrated_at for t in _narration(out[i])])
+            rest = content[len(lead):] if content.startswith(lead) else None
+            if rest is not None and lead and not lead.endswith("\n\n") and rest:
+                rest = rest[2:] if rest.startswith("\n\n") else None
+            # Live anton appends no empty reply, so an empty one cannot match.
+            if not rest:
+                for i in narrated_at:
+                    out[i] = {**out[i], "content": [
+                        b for b in out[i]["content"] if not (isinstance(b, dict) and b.get("type") == "text")
+                    ]}
+            else:
+                message = {**message, "content": rest}
+            narrated_at = []
+        elif message.get("role") == "user":
+            narrated_at = []
+        out.append(message)
+    return out
+
+
 def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, compacted: bool) -> TurnHistory | None:
     """The tool block-rows of a turn that completed cleanly, or None when it
     has none.
@@ -442,6 +501,19 @@ def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, comp
     if not rows:
         return None
     return TurnHistory(rows=[], read=rows) if compacted else TurnHistory(rows=rows)
+
+
+def _turn_progress(*, session: "ChatSession", seed_len: int | None) -> list[str]:
+    """The running turn's last steps as Jev reads them when it decides where
+    a message sent mid-turn goes. Read from the same messages
+    `_captured_turn_history` stores."""
+    from cowork.handlers.response_routing import progress_lines
+
+    if hasattr(session, "turn_messages"):
+        return progress_lines(session.turn_messages())
+    if seed_len is not None:
+        return progress_lines(session.history[seed_len:])
+    return []
 
 
 def _turn_memory_read(*, session: "ChatSession", learns: bool) -> TurnMemoryRead | None:
@@ -920,6 +992,9 @@ class AntonHarness:
         # Keeps the turn alive while a model call is quiet (see HarnessProvider).
         model_wait: ModelWaitTicker | None = None,
         interactive: bool = True,
+        ui_locale: str | None = None,
+        # The scheduler's own turn (see HarnessProvider).
+        schedule_id: str | None = None,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -995,6 +1070,9 @@ class AntonHarness:
         memory_read: TurnMemoryRead | None = None
         session = None
         seed_info: dict | None = None
+        # Messages the person adds while the turn runs (ENG-4194); None when
+        # the installed anton can't take them.
+        addon_channel: AddonChannel | None = None
         # The live-app stops this turn's prompt tells (built.live_app_notices)
         # go back unless the turn finishes, so the person's next turn tells them.
         built: BuiltChatSession | None = None
@@ -1040,6 +1118,8 @@ class AntonHarness:
                         before_mtimes=before_mtimes,
                         tracked_new=getattr(session, "artifacts_touched", None),
                         tracked_edits=getattr(session, "artifacts_touched", None),
+                        schedule_id=schedule_id,
+                        scope=_units_scope(),
                     ),
                     scope=_units_scope(),
                     deadline=False,
@@ -1076,6 +1156,7 @@ class AntonHarness:
                 channel_context=channel_context,
                 tool_messages=tool_messages,
                 interactive=interactive,
+                ui_locale=ui_locale,
             )
             session, turn_scratch_dir, seed_info = built.session, built.turn_scratch_dir, built.seed_info
             if model_wait is not None:
@@ -1089,6 +1170,11 @@ class AntonHarness:
             # falls back to text-only replay.
             seed_len = len(session.history) if hasattr(session, "history") else None
             compacted = False  # set if anton compacts or hard-truncates history mid-turn
+            addon_channel = addons.open(
+                str(conv_id), session,
+                task=prompt_text(input),
+                progress=partial(_turn_progress, session=session, seed_len=seed_len),
+            )
             # Forward trace annotations only if the installed anton's
             # turn_stream accepts them. Every anton this server can start with
             # does (anton #218 predates the anton.core.artifacts.internal_files
@@ -1129,6 +1215,9 @@ class AntonHarness:
                         memory_read = _turn_memory_read(session=session, learns=built.learns)
                         if memory_read is not None:
                             yield memory_read
+                    if addon_channel is not None:
+                        for addon_event in addon_channel.drain():
+                            yield addon_event
             except (Exception, asyncio.CancelledError):
                 # A turn that fails or is stopped after anton builds its prompt,
                 # before any event after it: the stop usually lands on the first
@@ -1140,12 +1229,20 @@ class AntonHarness:
                     memory_read = _turn_memory_read(session=session, learns=built.learns)
                     if memory_read is not None:
                         yield memory_read
+                # Added messages the model never saw go back to the app, which
+                # runs them next, however the turn ended.
+                if addon_channel is not None:
+                    for addon_event in addon_channel.take_returned():
+                        yield addon_event
                 raise
             # A turn that built its prompt and sent no event after it.
             if memory_read is None:
                 memory_read = _turn_memory_read(session=session, learns=built.learns)
                 if memory_read is not None:
                     yield memory_read
+            if addon_channel is not None:
+                for addon_event in addon_channel.take_returned():
+                    yield addon_event
             # Turn completed cleanly: capture its tool block-rows. Skipped on
             # cancel/error (this line never runs), so a partial turn falls
             # back to text-only replay and anton's own dangling-tool_use
@@ -1154,6 +1251,8 @@ class AntonHarness:
             turn_history = _captured_turn_history(session=session, seed_len=seed_len, compacted=compacted)
             turn_finished = True
         finally:
+            if addon_channel is not None:
+                addons.close(str(conv_id), addon_channel)
             if model_wait is not None:
                 model_wait.detach()
             if turn_scratch_dir:
@@ -1244,7 +1343,7 @@ class AntonHarness:
             else:
                 history_summary = None  # cutoff message is gone — stale
 
-        tail = [stamp(m) for m in ordered_messages[tail_start:]]
+        tail = _without_repeated_narration([stamp(m) for m in ordered_messages[tail_start:]])
         if history_summary:
             summary_msg = {"role": "user", "content": scrub_credentials(history_summary)}
             if tail and tail[0].get("role") == "user":
@@ -1380,6 +1479,7 @@ class AntonHarness:
         channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
         interactive: bool = True,
+        ui_locale: str | None = None,
     ) -> BuiltChatSession:
         """Build the same core runtime the Anton CLI uses, scoped to one project
         (_build_turn_session). The live-app stops its prompt tells ride on the
@@ -1394,6 +1494,7 @@ class AntonHarness:
                 channel_context=channel_context,
                 tool_messages=tool_messages,
                 interactive=interactive,
+                ui_locale=ui_locale,
                 live_app_notices=notices,
             )
         except BaseException:
@@ -1423,6 +1524,7 @@ class AntonHarness:
         tool_messages: bool,
         interactive: bool,
         live_app_notices: list[UUID],
+        ui_locale: str | None = None,
     ) -> BuiltChatSession:
         """_build_chat_session's work. ``live_app_notices`` gets the launch
         records whose stop the turn's prompt tells, which the turn claimed
@@ -1645,7 +1747,7 @@ class AntonHarness:
             "You can perform operations on these files via the scratchpad. "
             + _project_file_actions_rule(anton_settings.act_first)
             + _other_files_rule(sandboxed=sandboxed)
-            + "You can read text files with `read_text_file`, or in the scratchpad when that is more efficient (for example, when the data goes straight into scratchpad code or the file needs special parsing). Use the scratchpad for everything else you do with files. "
+            + "Read text files with `read_text_file` (`end_line=-1` returns the whole file), several in one step. Read in the scratchpad only data that goes straight into scratchpad code or a file that needs special parsing: printed scratchpad output stops at 10,000 characters. Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
             # (close_session_scratchpads), with their whole process group.
@@ -1777,7 +1879,7 @@ class AntonHarness:
                     self._stamp_message,
                 )
             else:
-                initial_history = [self._stamp_message(m) for m in replayable]
+                initial_history = _without_repeated_narration([self._stamp_message(m) for m in replayable])
                 seed_info = None
 
             # The memory of the person who asked: their own tiers, or the
@@ -1996,6 +2098,10 @@ class AntonHarness:
                 # brief when the agent acts first); without it the tool hands
                 # the content to the agent. Dropped by an anton without the field.
                 **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
+                # The app's language (ENG-4149): one line in anton's prompt.
+                # Dropped by an anton without the field, which then answers
+                # in the user's language as it always has.
+                **supported_kwargs(ChatSessionConfig, ui_locale=ui_locale),
                 # The desktop app's own browser, when it registered one and the
                 # person turned the browser on: anton registers its `browser`
                 # tool only then. Never for a channel turn. Passed directly:

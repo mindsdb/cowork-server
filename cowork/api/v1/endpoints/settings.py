@@ -58,6 +58,7 @@ from cowork.services.providers import (
     validate_provider as validate_provider_svc,
     warm_enabled_model_map,
 )
+from cowork.services.org_branding import remove_brand_skill
 from cowork.services.settings import SettingService, unit_setting_service
 
 logger = logging.getLogger(__name__)
@@ -345,6 +346,14 @@ def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     if scope.org_mode:
         return {"ok": True, "deleted": []}
     deleted = SettingService(session, scope).clear_credentials()
+    # The org's Brand guidelines skill was the signed-in org's.
+    try:
+        remove_brand_skill(scope)
+    except Exception:
+        logger.exception(
+            "Could not remove the Brand guidelines skill on sign-out",
+            extra={"event": "org_branding_skill_remove_failed"},
+        )
     return {"ok": True, "deleted": deleted}
 
 
@@ -637,15 +646,23 @@ def _persist_catalog_maps(
     persist_role_defaults_map(raw, scope, prior.minds_role_defaults, listing.role_defaults)
 
 
+_REFRESH_SCOPES = ("all", "minds")
+
+
 # AuthenticatedInOrgMode, not OpenByDesign: the MindsHub overlay does need
 # the caller's own bearer, scope.org_id and scope.user_id
 # (fetch_org_model_catalog below),
 # but the openai-compatible overlay further down does not — it resolves the
 # stored key and fetches the stored baseUrl on any caller's behalf, and
-# `?refresh=true` bypasses its cache every time. So this is not a static
+# `?refresh=true` (unless `refresh_scope=minds`) bypasses its cache. So this is not a static
 # catalog read for an anonymous caller, and it should not read as one.
 @router.get("/recommended-models", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def recommended_models(request: Request, scope: ScopeDep, refresh: bool = False):
+async def recommended_models(
+    request: Request,
+    scope: ScopeDep,
+    refresh: bool = False,
+    refresh_scope: str = "all",
+):
     """Per-provider model picker options for the Settings UI.
 
     Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
@@ -654,12 +671,8 @@ async def recommended_models(request: Request, scope: ScopeDep, refresh: bool = 
     (the `latest:*` aliases) when the key is absent or the endpoint can't
     be reached.
 
-    `refresh=true` bypasses fetch_minds_models's cache (`force_refresh`) — the
-    Settings UI passes it when the model dropdown is opened, since the cached
-    `enabled` map can otherwise mask a wallet top-up for its 5-minute TTL. The
-    plain mount-time load omits it and stays cache-eligible. A cached *failure*
-    is honored either way, so an unreachable MindsHub doesn't cost every open
-    the full HTTP timeout."""
+    `refresh=true` bypasses the listing caches so a top-up shows at once;
+    `refresh_scope=minds` limits that to MindsHub, any other value means all."""
     recommended = {k: list(v) for k, v in RECOMMENDED_MODELS.items()}
     pair = {k: list(v) for k, v in RECOMMENDED_PAIR.items()}
 
@@ -679,8 +692,9 @@ async def recommended_models(request: Request, scope: ScopeDep, refresh: bool = 
 
     # `modelDisabledReasons` maps a model id that `modelEnabled` marks false to
     # the gateway's reason for it: "model_restricted" (an admin in the org
-    # restricted it, so credits cannot unlock it), "wallet_empty" or
-    # "included_allowance_exhausted". Filled from the MindsHub listing only,
+    # restricted it, so credits cannot unlock it), "wallet_empty",
+    # "included_allowance_exhausted" or "budget_exceeded" (an org budget is
+    # spent, which credits cannot lift either). Filled from the MindsHub listing only,
     # never from a custom endpoint: a BYO base URL must not be able to label a
     # model "restricted by your admin". A model absent from this map keeps
     # today's locked, add-credits treatment.
@@ -733,7 +747,8 @@ async def recommended_models(request: Request, scope: ScopeDep, refresh: bool = 
     elif s.minds_api_key is not None and s.minds_url:
         # Desktop / BYOK: the user's stored key against its configured URL.
         listing = await fetch_minds_models(
-            s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
+            s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh,
+            mindshub=True,
         )
     if listing is not None:
         live = listing.ids
@@ -831,7 +846,8 @@ async def recommended_models(request: Request, scope: ScopeDep, refresh: bool = 
         # shared openai_api_key), matching how the provider is actually built.
         oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
         oc_listing = await fetch_minds_models(
-            oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh,
+            oc_card["baseUrl"].strip(), oc_key,
+            force_refresh=refresh and refresh_scope != "minds",
             tenant_key=scope.org_id if scope.org_mode else None,
         )
         live = oc_listing.ids
@@ -909,6 +925,8 @@ async def recommended_models(request: Request, scope: ScopeDep, refresh: bool = 
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
         "modelDisabledReasons": model_disabled_reasons,
+        # The refresh_scope values this server honours, for a newer UI on an older server.
+        "refreshScopes": list(_REFRESH_SCOPES),
         "modelLabels": model_labels,
         "modelProviders": model_providers,
         "modelFamilies": model_families,

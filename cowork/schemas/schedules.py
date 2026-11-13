@@ -10,9 +10,8 @@ from cowork.schemas.base import CamelRequest, CamelResponse
 
 
 # The `model` value a schedule stores when it should run on the account's
-# configured default models rather than a pinned id. The scheduler UI removed
-# the per-task model picker (see ScheduleTaskModal), so the frontend always
-# sends `model: null` and every schedule carries this sentinel.
+# configured default models rather than a pinned id. The task form sends it
+# for "Account default", and a create without a model stores it too.
 #
 # It is NOT a servable model id. Passing it into a turn makes the harness
 # override every model role with the literal string "default"
@@ -27,11 +26,11 @@ def resolve_schedule_model(stored: str | None) -> str | None:
     """The model to run a schedule with, or None to follow the account defaults.
 
     A schedule stores ``DEFAULT_MODEL_SENTINEL`` when it should track the
-    account's configured default model — the only mode the UI offers. That
-    sentinel is not a real model id, so it must become None (a no-op override)
-    before the turn is built, or the gateway rejects it (ENG-2353). A schedule
-    that pinned a concrete id (legacy rows, or a future picker) is passed
-    through unchanged.
+    account's configured default model. That sentinel is not a real model id,
+    so it must become None (a no-op override) before the turn is built, or the
+    gateway rejects it. A schedule that pinned a concrete id is passed through
+    unchanged; a run whose pin can't be served falls back to the default (see
+    cowork.scheduler).
     """
     if not stored or stored == DEFAULT_MODEL_SENTINEL:
         return None
@@ -158,6 +157,7 @@ class ScheduleResponse(CamelResponse):
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False
+    run_count: int = 0
     # Filled by the endpoints: the latest finished run (ScheduleRunResponse
     # shape), so a failure shows on the schedule before any auto-pause.
     last_run: ScheduleRunResponse | None = None
@@ -189,6 +189,8 @@ class ScheduleRunResponse(CamelResponse):
     # A run-now that tried the task out (POST .../run-now?trial=true).
     trial: bool = False
     outcome: AttemptOutcome | None = None
+    # The pinned model that could not be served before using the account default.
+    unavailable_model: str | None = None
     created_at: datetime | None
 
     @computed_field
