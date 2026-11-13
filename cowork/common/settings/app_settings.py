@@ -926,8 +926,8 @@ class TurnQueueSettings(Settings):
         default=False,
         description=(
             "Let cloud turns build custom connector templates a member saves "
-            "from a card, connects and uses on their turns. Keep false until the "
-            "security review of the whole feature is done."
+            "from a card, connects and uses on their turns. The code default is false; "
+            "the Helm chart turns it on in every environment (connectorDraftsEnabled)."
         ),
     )  # COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
     custom_connect_refused_domains: list[str] = Field(
