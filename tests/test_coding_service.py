@@ -1224,7 +1224,7 @@ def test_local_context_exhaustion_recovers_ready_with_a_fresh_agent_session(tmp_
         "fake-model",
     )
     wait_for_status(service, created.id, SessionStatus.failed)
-    failed = service.get_session(created.id)
+    failed = wait_for_run_to_follow(service, created.id)
     original_workspace = failed.workspace_path
     assert failed.engine_session_id == "engine-session-1"
     context_error = (
