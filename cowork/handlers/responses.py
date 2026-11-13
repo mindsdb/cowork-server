@@ -62,6 +62,7 @@ from cowork.harnesses.anton_harness.figure_sources import has_figures
 from cowork.harnesses.memory.policy import memory_policy
 from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
 from cowork.harnesses.anton_harness.stream_formatter import (
+    PreviewCheckRequest,
     SkillCreated,
     TurnContext,
     TurnEvidence,
@@ -78,6 +79,7 @@ from cowork.streaming.liveness import MODEL_WAIT_PHASE, WORKER_ALIVE_PHASE, Mode
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.registry import RunHandle, RunIdentity, mark_question_saved
 from cowork.turnqueue.addons import ADDON_STEP, relay_addon_step
+from cowork.turnqueue.preview_checks import ARTIFACT_CHECK_STEP, register_remote_check
 from cowork.turnqueue.producer import (
     RemoteWorkspace,
     revoke_turn_key_quietly,
@@ -3210,6 +3212,20 @@ class ResponsesHandler:
                         # an addon /addon accepted for this turn.
                         for event in await relay_addon_step(correlation_id=corr, data=data):
                             yield event
+                    if step == ARTIFACT_CHECK_STEP:
+                        # The pod's anton asks the open preview (ENG-4227):
+                        # recorded with this turn's owner for the app's
+                        # answer, and sent to the app as an in-process turn's.
+                        check = await register_remote_check(
+                            data, conversation_id=str(conv_id), correlation_id=corr,
+                            org_id=self.scope.org_id, user_id=self.scope.user_id,
+                        )
+                        if check is not None:
+                            yield PreviewCheckRequest(
+                                check_id=check["check_id"], artifact_slug=check["artifact_slug"],
+                                timeout_s=check["timeout_s"],
+                            )
+                        continue
                     for event in step_stream_events(data):
                         yield event
                 elif kind == "turn_memory":

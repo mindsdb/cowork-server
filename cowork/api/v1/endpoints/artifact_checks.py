@@ -21,6 +21,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Path
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from redis.exceptions import RedisError
 from starlette.responses import JSONResponse
 
 from cowork.api.v1.endpoints.responses import (
@@ -106,6 +107,10 @@ async def answer_preview_check(
     _require_streaming_scope(scope)
     conversation_id = preview_checks.conversation_of(check_id) if check_id.startswith(CHECK_ID_PREFIX) else None
     owner = preview_checks.owner_of(check_id) if conversation_id is not None else None
+    if conversation_id is None and check_id.startswith(CHECK_ID_PREFIX):
+        # Not this process's: a remote (pod) turn's check, recorded in Redis
+        # by whichever replica relays that turn (turnqueue/preview_checks.py).
+        return await _answer_remote_check(check_id, body, scope)
     if conversation_id is None:
         authorized = False
     elif owner is not None:
@@ -117,6 +122,29 @@ async def answer_preview_check(
         return JSONResponse(status_code=status_code, content=content)
 
     result = preview_checks.submit(check_id, body.model_dump())
+    if result is CheckSubmitResult.ACCEPTED:
+        return {"accepted": True}
+    status_code, content = _RESPONSES[result]
+    return JSONResponse(status_code=status_code, content=content)
+
+
+async def _answer_remote_check(check_id: str, body: PreviewCheckAnswer, scope) -> JSONResponse | dict:
+    """A remote turn's check: authorized against the turn's owner, then
+    queued for the pod's stdin. 404 as for an unknown id when there is none,
+    it expired, or the caller may not touch that turn."""
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.turnqueue.preview_checks import load_remote_check, submit_remote_check
+
+    status_code, content = _NOT_FOUND
+    if not TurnQueueSettings().is_remote:
+        return JSONResponse(status_code=status_code, content=content)
+    try:
+        check = await load_remote_check(check_id)
+        if check is None or not _owner_matches(check["owner"], scope):
+            return JSONResponse(status_code=status_code, content=content)
+        result = await submit_remote_check(check, body.model_dump())
+    except RedisError:
+        return JSONResponse(status_code=503, content={"status": "unavailable"})
     if result is CheckSubmitResult.ACCEPTED:
         return {"accepted": True}
     status_code, content = _RESPONSES[result]

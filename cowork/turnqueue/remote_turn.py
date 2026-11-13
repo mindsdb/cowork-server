@@ -29,6 +29,8 @@ from cowork.turnqueue import producer
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 
 
+from cowork.turnqueue.preview_checks import ARTIFACT_CHECK_STEP, CHECK_ID, queue_check_result  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 
@@ -159,6 +161,16 @@ async def remote_turn_events(
             elif kind == "turn_step":
                 if data.get("step") == "compacted":
                     compacted = True
+                if data.get("step") == ARTIFACT_CHECK_STEP:
+                    # No app watches a channel turn, so no preview can answer:
+                    # say so at once rather than leave the pod to time out.
+                    check_id = data.get("check_id")
+                    if isinstance(check_id, str) and CHECK_ID.fullmatch(check_id) and correlation_id:
+                        try:
+                            await queue_check_result(correlation_id=correlation_id, check_id=check_id, body=None)
+                        except Exception:
+                            logger.warning("Could not answer a channel turn's preview check", exc_info=True)
+                    continue
                 for event in step_stream_events(data):
                     yield event
             elif kind == "turn_memory":
