@@ -2626,7 +2626,7 @@ class ResponsesHandler:
         Unlike in-process, messages are not timestamp-stamped here; that
         divergence is tracked separately.
         """
-        from cowork.harnesses.anton_harness.harness import AntonHarness
+        from cowork.harnesses.anton_harness.harness import AntonHarness, _without_repeated_narration
 
         service = ConversationService(session)
         replayable = [
@@ -2635,7 +2635,7 @@ class ResponsesHandler:
         ]
         fmt = partial(scrubbed_openai_dump, mode="json")
         if not get_user_settings(session.scope).history_compaction_enabled:
-            return [fmt(m) for m in replayable], None
+            return _without_repeated_narration([fmt(m) for m in replayable]), None
 
         conversation = service.get_conversation(conv_id)
         history, seed_info = AntonHarness._seed_history(
