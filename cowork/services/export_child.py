@@ -10,10 +10,10 @@ or memory limit (``cowork.services.export_runner``).
 The process gets no path and no folder. It reads the source from its standard
 input, asks the server for each file the document names, and writes the
 result back, one frame per message (``cowork.schemas.export_child``). It
-limits itself first where the OS lets it: no core dump, no file written, no
-process started, a CPU-time limit just past the server's wall clock, and on
-Linux an address-space limit, the first process the kernel kills when memory
-runs out, and a lower CPU priority. An audit hook refuses network and process
+limits itself first where the OS lets it: no core dump, no data written to a
+file, no process started, a CPU-time limit just past the server's wall clock,
+and on Linux an address-space limit, the first process the kernel kills when
+memory runs out, and a lower CPU priority. An audit hook refuses network and process
 starts too. That is a check on our own code, not a sandbox: native code in a
 parser can bypass it, and the process runs as the server's user.
 
@@ -28,14 +28,14 @@ import json
 import os
 import struct
 import sys
-import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import BinaryIO
+from typing import BinaryIO, NamedTuple
 
 from pydantic import BaseModel, TypeAdapter
 
-from cowork.schemas.artifact_export import ExportFormat, InlineMode
+from cowork.common.structured_logging import safe_exception_traceback
+from cowork.schemas.artifact_export import ExportFormat, InlineMode, OmittedReason
 from cowork.schemas.export_child import (
     AssetReply,
     AssetRequest,
@@ -45,7 +45,11 @@ from cowork.schemas.export_child import (
     ConvertRequest,
     ServerMessage,
 )
-from cowork.services.artifact_files import ArtifactFileContent, ArtifactFileRefused
+from cowork.services.artifact_files import (
+    MAX_PATH_PARTS,
+    ArtifactFileContent,
+    ArtifactFileRefused,
+)
 from cowork.services.artifact_inline import AssetReader, inline_html
 from cowork.services.docx_writer import write_docx
 from cowork.services.markdown_render import MarkdownRefused, render_markdown
@@ -69,6 +73,8 @@ EXIT_FAILED = 4
 MAX_HEADER_BYTES = 64 * 1024
 # The largest payload either side accepts. The largest is an HTML export: a
 # 10 MiB source plus a 25 MiB inline budget, which base64 grows by a third.
+# Serializing the page again can grow its text up to five times ("&" becomes
+# "&amp;"), so an output past this bound is refused (413), never sent.
 MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 _LENGTH = struct.Struct(">I")
 
@@ -89,6 +95,8 @@ _DENIED_EVENTS = (
     "os.fork",
     "os.forkpty",
     "os.startfile",
+    # Windows starts a multiprocessing worker through this, not subprocess.
+    "_winapi.CreateProcess",
 )
 
 
@@ -103,6 +111,13 @@ class Conversion:
 
 class FrameError(Exception):
     """A frame that breaks the protocol: too long, cut short, or not a known message."""
+
+
+class Frame[MessageT](NamedTuple):
+    """One frame read: its validated message and the raw bytes it carries."""
+
+    message: MessageT
+    payload: bytes
 
 
 def convert(*, request: ConvertRequest, source: bytes, read_asset: AssetReader) -> Conversion:
@@ -200,7 +215,7 @@ def write_frame(*, stream: BinaryIO, message: BaseModel, payload: bytes = b"") -
     name holding a lone surrogate, which a document or a disk name can carry,
     survives the trip.
     """
-    header = json.dumps(message.model_dump(mode="python"), ensure_ascii=True).encode("ascii")
+    header = _header(message)
     stream.write(_LENGTH.pack(len(header)))
     stream.write(header)
     stream.write(_LENGTH.pack(len(payload)))
@@ -208,9 +223,13 @@ def write_frame(*, stream: BinaryIO, message: BaseModel, payload: bytes = b"") -
     stream.flush()
 
 
+def _header(message: BaseModel) -> bytes:
+    return json.dumps(message.model_dump(mode="python"), ensure_ascii=True).encode("ascii")
+
+
 def read_frame[MessageT](
     *, stream: BinaryIO, adapter: TypeAdapter[MessageT]
-) -> tuple[MessageT, bytes] | None:
+) -> Frame[MessageT] | None:
     """The next frame's message, validated by *adapter*, and its payload.
 
     None when the stream ends between frames. Raises ``FrameError`` for a
@@ -227,7 +246,7 @@ def read_frame[MessageT](
     )
     payload = _read_exact(stream=stream, size=payload_size)
     try:
-        return adapter.validate_python(json.loads(header)), payload
+        return Frame(message=adapter.validate_python(json.loads(header)), payload=payload)
     except ValueError as exc:
         raise FrameError("not a known message") from exc
 
@@ -249,12 +268,22 @@ def _read_exact(*, stream: BinaryIO, size: int) -> bytes:
 
 
 def _server_reader(*, frames_in: BinaryIO, frames_out: BinaryIO) -> AssetReader:
-    """Read each file the document names by asking the server for it."""
+    """Read each file the document names by asking the server for it.
+
+    A name the server would refuse by its text alone is refused here, before
+    it is asked for: one nested past the server's depth, or one too long for
+    a frame, which would otherwise break the protocol and fail the export.
+    """
 
     def read(parts: tuple[str, ...]) -> ArtifactFileContent:
-        write_frame(stream=frames_out, message=AssetRequest(parts=parts))
+        if len(parts) > MAX_PATH_PARTS:
+            raise ArtifactFileRefused(OmittedReason.BUDGET, "path nests too deep")
+        asked = AssetRequest(parts=parts)
+        if len(_header(asked)) > MAX_HEADER_BYTES:
+            raise ArtifactFileRefused(OmittedReason.MISSING, "name too long")
+        write_frame(stream=frames_out, message=asked)
         received = read_frame(stream=frames_in, adapter=_SERVER_MESSAGE)
-        if received is None or not isinstance(received[0], AssetReply):
+        if received is None or not isinstance(received.message, AssetReply):
             raise FrameError("expected the server's answer to a read")
         reply, data = received
         if reply.refused is not None:
@@ -313,21 +342,27 @@ def _deny_network_and_processes() -> Callable[[], int]:
 
 
 def main() -> None:
-    """Run one conversion: ``argv`` gives the memory and CPU-time limits, in bytes and seconds."""
-    memory_bytes, cpu_seconds = (int(value) for value in sys.argv[1:3])
-    _limit_self(memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
-    denied = _deny_network_and_processes()
+    """Run one conversion: ``argv`` gives the memory and CPU-time limits, in bytes and seconds.
+
+    Everything after the imports runs inside the ``try``, so a limit the host
+    refuses is reported like any other failure, and the server logs why.
+    """
     frames_in, frames_out = sys.stdin.buffer, sys.stdout.buffer
     try:
+        memory_bytes, cpu_seconds = (int(value) for value in sys.argv[1:3])
+        _limit_self(memory_bytes=memory_bytes, cpu_seconds=cpu_seconds)
+        denied = _deny_network_and_processes()
         received = read_frame(stream=frames_in, adapter=_SERVER_MESSAGE)
-        if received is None or not isinstance(received[0], ConvertRequest):
+        if received is None or not isinstance(received.message, ConvertRequest):
             raise FrameError("expected a conversion request")
-        request, source = received
         conversion = convert(
-            request=request,
-            source=source,
+            request=received.message,
+            source=received.payload,
             read_asset=_server_reader(frames_in=frames_in, frames_out=frames_out),
         )
+        if len(conversion.data) > MAX_PAYLOAD_BYTES:
+            # More than the server reads in one frame: refused as too large.
+            os._exit(EXIT_REFUSED)
         write_frame(
             stream=frames_out,
             message=Converted(
@@ -339,12 +374,14 @@ def main() -> None:
         )
     except (MarkdownRefused, MemoryError):
         os._exit(EXIT_REFUSED)
-    except BaseException as exc:
+    except BaseException:
         try:
+            # Types and locations only: an exception's values can repeat the document.
             write_frame(
                 stream=frames_out,
                 message=ConversionFailed(
-                    error_type=type(exc).__name__, detail=traceback.format_exc()[-4000:]
+                    error_type=sys.exc_info()[0].__name__,
+                    detail=safe_exception_traceback(sys.exc_info()) or "",
                 ),
             )
         finally:

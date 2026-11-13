@@ -78,16 +78,16 @@ class FetchRecorder:
     calls: list[AuditCall] = field(default_factory=list)
     # The one process start this guard lets through, as subprocess.Popen's
     # audit event carries it: the argument list, or on Windows the command
-    # line it becomes.
+    # line it becomes. Python 3.13 on Linux starts it through os.posix_spawn,
+    # whose event carries the same argument list.
     allowed_command: list[str] | str | None = None
 
     def allows(self, *, event: str, args: tuple) -> bool:
-        return (
-            event == "subprocess.Popen"
-            and self.allowed_command is not None
-            and len(args) > 1
-            and args[1] == self.allowed_command
-        )
+        if self.allowed_command is None or len(args) < 2:
+            return False
+        if event == "subprocess.Popen":
+            return args[1] == self.allowed_command
+        return event == "os.posix_spawn" and list(args[1]) == self.allowed_command
 
 
 _lock = threading.Lock()

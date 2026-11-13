@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import site
 import subprocess
 import sys
 import threading
@@ -55,6 +56,9 @@ _WATCH_SECONDS = 0.1
 # How long a process whose frames stopped short gets to exit on its own, so
 # its exit, such as a signal at its CPU-time limit, explains the short frame.
 _EXIT_GRACE_SECONDS = 1.0
+# How much of the process's error output the server keeps for its log: the
+# end of a traceback from a process that failed before it could report.
+_ERROR_TAIL_BYTES = 2048
 # One conversion process per server process: a hosted replica has 1 GiB for
 # the server and its conversion together.
 _child_slot = threading.BoundedSemaphore(1)
@@ -91,28 +95,56 @@ class _Exchange(NamedTuple):
     killed_for_protocol: bool = False
 
 
-def child_command(*, limits: ChildLimits) -> tuple[list[str], dict[str, str]]:
+class ChildCommand(NamedTuple):
+    """The command line a conversion process starts with, and its whole environment."""
+
+    argv: list[str]
+    environment: dict[str, str]
+
+
+class ServedRead(NamedTuple):
+    """The server's answer to one read, and the bytes it carries."""
+
+    reply: AssetReply
+    data: bytes
+
+
+def child_command(*, limits: ChildLimits) -> ChildCommand:
     """The command and environment a conversion process starts with.
 
     ``-I`` keeps the server's environment, the user's site folder and the
     current directory out of the process, and ``-B`` keeps it from writing
-    bytecode. It gets no environment of its own, so no credential. Windows
-    needs ``SYSTEMROOT`` to start an interpreter and ``USERPROFILE`` to find
-    the home folder ``cowork.common.paths`` reads at import; neither holds a
-    secret. It runs the server's own interpreter,
-    so it imports the same ``cowork``. On Windows a venv's ``python.exe``
-    starts the base interpreter as its own child, which ``_kill`` and the
-    watch reach too.
+    bytecode. A server whose interpreter uses the user's site folder, such as
+    one installed with ``pip install --user``, may import ``cowork`` from
+    there, so its process keeps that folder (``-E -P`` in place of ``-I``)
+    and gets ``PYTHONUSERBASE`` set to the server's own user base, a custom
+    one included.
+
+    Otherwise it gets only the variables that find the home folder, which
+    ``cowork.common.paths`` reads at import: ``HOME``, and on Windows
+    ``USERPROFILE``, plus ``SYSTEMROOT`` to start an interpreter. None holds
+    a secret.
+    It runs the server's own interpreter, so it imports the same ``cowork``.
+    On Windows a venv's ``python.exe`` starts the base interpreter as its own
+    child, which ``_kill`` and the watch reach too.
     """
-    environment: dict[str, str] = {}
-    if sys.platform == "win32":
-        for name in ("SYSTEMROOT", "USERPROFILE"):
-            environment[name] = os.environ[name]
+    user_site = bool(site.ENABLE_USER_SITE)
+    names = ["HOME"] + (["SYSTEMROOT", "USERPROFILE"] if sys.platform == "win32" else [])
+    environment = {name: os.environ[name] for name in names if name in os.environ}
+    if user_site:
+        environment["PYTHONUSERBASE"] = site.getuserbase()
+    isolation = ["-E", "-P"] if user_site else ["-I"]
     cpu_seconds = math.ceil(limits.wall_seconds) + 1
-    command = [
-        sys.executable, "-I", "-B", "-m", CHILD_MODULE, str(limits.memory_bytes), str(cpu_seconds)
+    argv = [
+        sys.executable,
+        *isolation,
+        "-B",
+        "-m",
+        CHILD_MODULE,
+        str(limits.memory_bytes),
+        str(cpu_seconds),
     ]
-    return command, environment
+    return ChildCommand(argv=argv, environment=environment)
 
 
 def convert_in_child(
@@ -136,16 +168,18 @@ def convert_in_child(
 def _run(
     *, request: ConvertRequest, source: bytes, read_asset: AssetReader, limits: ChildLimits
 ) -> Conversion:
-    command, environment = child_command(limits=limits)
+    command = child_command(limits=limits)
     process = subprocess.Popen(
-        command,
+        command.argv,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         close_fds=True,
-        env=environment,
+        env=command.environment,
         creationflags=_CREATION_FLAGS,
     )
+    errors = _ErrorTail(stream=process.stderr)
+    errors.start()
     watch = _Watch(process=process, limits=limits)
     watch.start()
     try:
@@ -165,7 +199,10 @@ def _run(
         process.wait()
         watch.stop()
         _close_quietly(stream=process.stdout)
-    return _outcome(exchange=exchange, returncode=process.returncode, cause=watch.cause)
+        error_tail = errors.finish()
+    return _outcome(
+        exchange=exchange, returncode=process.returncode, cause=watch.cause, error_tail=error_tail
+    )
 
 
 def _kill(process: subprocess.Popen) -> None:
@@ -216,7 +253,10 @@ def _talk(
     """Send the request and answer reads until the process sends its result or stops."""
     served = 0
     try:
-        write_frame(stream=process.stdin, message=request, payload=source)
+        try:
+            write_frame(stream=process.stdin, message=request, payload=source)
+        except OSError:
+            return _report_before_reading(process=process)
         while True:
             received = read_frame(stream=process.stdout, adapter=CHILD_MESSAGE)
             if received is None:
@@ -236,9 +276,25 @@ def _talk(
         return _Exchange(message=None, payload=b"", broken=None)
 
 
+def _report_before_reading(*, process: subprocess.Popen) -> _Exchange:
+    """The report of a process that closed its input before it read the request.
+
+    One that failed while it set its limits reports and exits without reading,
+    and a request larger than the pipe then fails to write. Its exit closes
+    its output, and the watch bounds the read, so this can't hang.
+    """
+    try:
+        received = read_frame(stream=process.stdout, adapter=CHILD_MESSAGE)
+    except (FrameError, OSError):
+        received = None
+    if received is not None and isinstance(received.message, ConversionFailed):
+        return _Exchange(message=received.message, payload=b"", broken=None)
+    return _Exchange(message=None, payload=b"", broken=None)
+
+
 def _serve(
     *, asked: AssetRequest, request: ConvertRequest, read_asset: AssetReader, served: int
-) -> tuple[AssetReply, bytes]:
+) -> ServedRead:
     """Answer one read. Every legitimate read sits below the source's folder.
 
     The inliner reads each asset at most once, after counting the reference,
@@ -246,20 +302,27 @@ def _serve(
     """
     base = request.base_parts
     if served >= request.limits.max_references:
-        return AssetReply(refused=OmittedReason.BUDGET), b""
+        return ServedRead(reply=AssetReply(refused=OmittedReason.BUDGET), data=b"")
     if asked.parts[: len(base)] != base:
-        return AssetReply(refused=OmittedReason.MISSING), b""
+        return ServedRead(reply=AssetReply(refused=OmittedReason.MISSING), data=b"")
     try:
         content = read_asset(asked.parts)
     except ArtifactFileRefused as exc:
-        return AssetReply(refused=exc.reason), b""
-    return AssetReply(device=content.device, inode=content.inode), content.data
+        return ServedRead(reply=AssetReply(refused=exc.reason), data=b"")
+    return ServedRead(
+        reply=AssetReply(device=content.device, inode=content.inode), data=content.data
+    )
 
 
-def _outcome(*, exchange: _Exchange, returncode: int, cause: str | None) -> Conversion:
+def _outcome(
+    *, exchange: _Exchange, returncode: int, cause: str | None, error_tail: str
+) -> Conversion:
     """The conversion, or the exception that answers for it.
 
-    A complete result counts whatever ended the process afterwards.
+    A complete result counts whatever ended the process afterwards. The log
+    lines use the fields the server's log formatter keeps (``reason``,
+    ``error_type``, ``stack``); a process that failed before it could report
+    leaves the end of its error output in ``stack``.
     """
     message = exchange.message
     if isinstance(message, Converted):
@@ -277,19 +340,62 @@ def _outcome(*, exchange: _Exchange, returncode: int, cause: str | None) -> Conv
             # A signal: SIGXCPU or SIGKILL at the CPU-time limit, or a crash.
             cause = f"signal {-returncode}"
     if cause is not None:
-        logger.warning("Export conversion stopped", extra={"cause": cause})
+        logger.warning(
+            "Export conversion stopped",
+            extra={"event": "export_conversion_stopped", "reason": cause},
+        )
         raise ConversionOverrun(cause)
     if isinstance(message, ConversionFailed):
         logger.warning(
             "Export conversion failed",
-            extra={"error_type": message.error_type, "detail": message.detail},
+            extra={
+                "event": "export_conversion_failed",
+                "error_type": message.error_type,
+                "stack": message.detail,
+            },
         )
         raise ConversionError(message.error_type)
+    ended = f"exited {returncode}"
+    if exchange.broken is not None:
+        ended = f"{ended} after {exchange.broken}"
     logger.warning(
         "Export conversion ended without a result",
-        extra={"returncode": returncode, "protocol": exchange.broken},
+        extra={"event": "export_conversion_no_result", "reason": ended, "stack": error_tail},
     )
     raise ConversionError(f"the conversion process exited {returncode} without a result")
+
+
+class _ErrorTail:
+    """Drains the process's error output in a thread of its own and keeps its end.
+
+    Drained, a flood of error output can't block the process; kept, the end
+    of a traceback from a process that failed before it could report, such as
+    an import that failed, reaches the log.
+    """
+
+    def __init__(self, *, stream: IO[bytes]) -> None:
+        self._stream = stream
+        self._tail = b""
+        self._thread = threading.Thread(
+            target=self._run, name="export-conversion-errors", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def finish(self) -> str:
+        """The kept end, once the process has exited and its error output closed."""
+        self._thread.join(timeout=_EXIT_GRACE_SECONDS)
+        _close_quietly(stream=self._stream)
+        return self._tail.decode("utf-8", errors="replace")
+
+    def _run(self) -> None:
+        try:
+            while chunk := self._stream.read1(64 * 1024):
+                self._tail = (self._tail + chunk)[-_ERROR_TAIL_BYTES:]
+        except (OSError, ValueError):
+            # Closed under the read: the process is gone.
+            return
 
 
 class _Watch:

@@ -28,8 +28,11 @@ Run it in the server's own image with 1 CPU and 1 GiB of memory, so the
 conversion process starts and imports as it does in production:
 
     docker build -t cowork-server:capacity .
-    docker run --rm --cpus=1 --memory=1g cowork-server:capacity \\
+    docker run --rm --cpus=1 --memory=1g --memory-swap=1g cowork-server:capacity \\
       python scripts/measure_export_capacity.py
+
+``--memory-swap`` equal to ``--memory`` gives the container no swap, as a
+replica has none, so passing 1 GiB ends in the OOM killer, not in swapping.
 
 It prints one Markdown table row per case.
 """
@@ -256,6 +259,7 @@ CASES: dict[str, Case] = {
     "md-backtick-run": _markdown_case(lambda: "`" * 2_000, "2 KB of backticks"),
     "md-code-spans": _markdown_case(lambda: "`a` " * 20_000, "80 KB of inline code spans"),
     "md-reference-brackets": _markdown_case(lambda: "[a][" * 8_000, "32 KB of '[a]['"),
+    "md-open-brackets": _markdown_case(lambda: "[" * 20_000, "20 KB of '['"),
     "md-image-brackets": _markdown_case(lambda: "![" * 8_000, "16 KB of '!['"),
     "md-fence-ladder": _markdown_case(
         lambda: "\n".join("`" * (3 + n) for n in range(1_000)), "1,000 fence lines of growing length"

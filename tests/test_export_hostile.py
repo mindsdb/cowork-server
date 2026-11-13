@@ -61,8 +61,8 @@ from cowork.schemas.artifact_export import (
     InlineLimits,
     InlineMode,
 )
-from cowork.schemas.export_child import ChildLimits, ConvertRequest
-from cowork.services import export_runner
+from cowork.schemas.export_child import ConvertRequest
+from cowork.services import artifact_export, export_runner
 from cowork.services.artifact_files import read_artifact_file
 from cowork.services.artifact_inline import folder_reader, inline_artifact_html
 from cowork.services.docx_writer import write_docx
@@ -326,21 +326,23 @@ def test_hostile_case_exports_only_the_artifacts_own_content(case, source, mode,
 
 def _case_list() -> list:
     return [
-        pytest.param(case, id=case["id"])
+        pytest.param(case, source, id=f"{case['id']}-{source}")
         for file_name in CASE_FILES
         for case in yaml.safe_load((FIXTURES / file_name).read_text(encoding="utf-8"))
+        for source in Source
     ]
 
 
 # The limits a desktop export's conversion process runs with.
-CHILD_LIMITS = ChildLimits(wall_seconds=30.0, memory_bytes=2 * 1024 * 1024 * 1024)
+CHILD_LIMITS = artifact_export.conversion_limits(org_mode=False)
 
 
-@pytest.mark.parametrize("case", _case_list())
+@pytest.mark.usefixtures("child_runs_this_checkout")
+@pytest.mark.parametrize(("case", "source"), _case_list())
 def test_hostile_case_through_the_conversion_process_exports_only_the_artifacts_own_content(
-    case, tmp_path
+    case, source, tmp_path
 ):
-    """The Markdown source to Word, converted in its own process.
+    """Each source to Word, converted in its own process.
 
     The process reads every file through the server, so the server's pinned
     reads still decide what it gets. The guard lets only the process's own
@@ -356,18 +358,18 @@ def test_hostile_case_through_the_conversion_process_exports_only_the_artifacts_
             for name, text in case.get("files", {}).items()
         }
         _write_tree(base=partitions.art, files=extra)
-        source = _fill(text=case[Source.MARKDOWN.value], values=values).encode("utf-8")
+        source_bytes = _fill(text=case[source.value], values=values).encode("utf-8")
         with pinned_dir(partitions.art) as folder, no_fetch(allowed_command=command) as recorder:
             request = ConvertRequest(
                 export_format="docx",
-                suffix=".md",
+                suffix=Path(source.file_name).suffix,
                 title="report",
                 base_parts=(),
                 limits=InlineLimits(max_total_bytes=INLINE_BUDGETS[InlineMode.WORD]),
             )
             conversion = export_runner.convert_in_child(
                 request=request,
-                source=source,
+                source=source_bytes,
                 read_asset=folder_reader(folder=folder, max_bytes=request.limits.max_asset_bytes),
                 limits=CHILD_LIMITS,
             )

@@ -14,6 +14,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cowork.schemas.artifact_export import ExportFormat, InlineLimits, OmittedReason
 
+# The most items a conversion can report left out: far past what one
+# document's node and reference caps allow, so only a broken process passes it.
+MAX_OMITTED = 1_000_000
+
 
 class _Message(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -63,13 +67,16 @@ class Converted(_Message):
     """
 
     type: Literal["converted"] = "converted"
-    omitted_count: int
+    omitted_count: int = Field(ge=0, le=MAX_OMITTED)
     scripts_dropped: bool
-    denied_events: int
+    denied_events: int = Field(ge=0)
 
 
 class ConversionFailed(_Message):
-    """The conversion raised. The server logs it and answers 500."""
+    """The conversion raised. The server logs it and answers 500.
+
+    ``detail`` is the traceback's types and locations, never its values.
+    """
 
     type: Literal["failed"] = "failed"
     error_type: str

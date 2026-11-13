@@ -180,6 +180,35 @@ def shared_root_resolved_at_startup():
     resolve_shared_root()
 
 
+@pytest.fixture(scope="session")
+def child_runs_this_checkout():
+    """Fail at once when a conversion process would import another checkout's cowork.
+
+    The process starts with ``-I``, which drops ``PYTHONPATH`` and the current
+    folder, so it imports cowork from the interpreter's own site-packages. A
+    venv whose editable install points at another checkout would test that
+    checkout's conversion.
+    """
+    import subprocess
+
+    import cowork
+    from cowork.schemas.export_child import ChildLimits
+    from cowork.services import export_runner
+
+    command = export_runner.child_command(limits=ChildLimits(wall_seconds=30.0, memory_bytes=1))
+    interpreter = command.argv[: command.argv.index("-m")]
+    finished = subprocess.run(
+        [*interpreter, "-c", "import cowork; print(cowork.__file__)"],
+        env=command.environment, capture_output=True, text=True, timeout=60,
+    )
+    found = finished.stdout.strip()
+    if finished.returncode != 0 or Path(found).resolve() != Path(cowork.__file__).resolve():
+        pytest.fail(
+            f"a conversion process imports cowork from {found or finished.stderr!r}, "
+            f"not {cowork.__file__}: reinstall this checkout into the venv (uv sync)"
+        )
+
+
 @pytest.fixture
 def cleanup_tmp_projects(tmp_path):
     """Delete Project rows created under this test's `tmp_path`, plus their

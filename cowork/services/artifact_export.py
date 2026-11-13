@@ -97,6 +97,16 @@ CONVERSION_WALL_SECONDS = 30.0
 # conversion share a 1 GiB replica.
 CONVERSION_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
 ORG_CONVERSION_MEMORY_BYTES = 640 * 1024 * 1024
+
+
+def conversion_limits(*, org_mode: bool) -> ChildLimits:
+    """What one conversion process may spend: the same for export and for publish."""
+    return ChildLimits(
+        wall_seconds=CONVERSION_WALL_SECONDS,
+        memory_bytes=ORG_CONVERSION_MEMORY_BYTES if org_mode else CONVERSION_MEMORY_BYTES,
+    )
+
+
 # How many "name (n).ext" spellings an export tries before it gives up.
 _MAX_OUTPUT_NAMES = 100
 # The longest file name the volumes Cowork runs on all take: Linux allows 255
@@ -373,16 +383,12 @@ def _convert(
     stopped, or Markdown ``render_markdown`` refuses, is answered as a source
     over its read bound is, and nothing is written.
     """
-    limits = ChildLimits(
-        wall_seconds=CONVERSION_WALL_SECONDS,
-        memory_bytes=ORG_CONVERSION_MEMORY_BYTES if org_mode else CONVERSION_MEMORY_BYTES,
-    )
     try:
         return convert_in_child(
             request=request,
             source=source,
             read_asset=folder_reader(folder=folder, max_bytes=request.limits.max_asset_bytes),
-            limits=limits,
+            limits=conversion_limits(org_mode=org_mode),
         )
     except ConversionBusy as exc:
         raise ExportRefused(ExportRefusal.BUSY, _BUSY) from exc
