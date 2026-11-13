@@ -72,17 +72,16 @@ _MIN_START_BUDGET_S = 5.0
 #                               zipping and owner lookups before the upload,
 #                               writing .published.json after it, and the last
 #                               poll request running past the budget
-#   job_budget_for(ttl, t)      how long anton polls an accepted (202) job
+#   job_budget_for(ttl)         how long anton polls an accepted (202) job
 #   lock_ttl_for(t)             how long the slug lock is held
 # The publish runs in a thread that asyncio.wait_for(...) abandons but cannot
 # cancel, so it may still write .published.json after the wait_for window.
-# The lock must outlive all of it:
-#   timeout_s + PUBLISH_POST_TIMEOUT_S + job_budget + PUBLISH_THREAD_SLACK_S <= lock_ttl
-# The budget is computed ONCE per reconciliation from the full timeout_s
-# (not from the per-slug min(timeout_s, remaining), which can be as small as
-# _MIN_START_BUDGET_S and would make the budget negative). Live sync holds its
-# lock for the same factor of its own timeout and uses these helpers too.
-# Enforced by tests/test_autopublish_budgets.py. Defaults: 60 + 30 + 75 + 15 = 180.
+# That window runs alongside the thread, which starts right after the lock is
+# taken, so counted from the lock's acquire the lock must outlive:
+#   PUBLISH_POST_TIMEOUT_S + job_budget + PUBLISH_THREAD_SLACK_S <= lock_ttl
+# Live sync holds its lock for the same factor of its own timeout and uses
+# these helpers too.
+# Enforced by tests/test_autopublish_budgets.py. Defaults: 30 + 135 + 15 = 180.
 PUBLISH_POST_TIMEOUT_S = float(DEFAULT_REQUEST_TIMEOUT_S)
 PUBLISH_THREAD_SLACK_S = 15.0
 DEFAULT_TIMEOUT_S = 60.0
@@ -93,8 +92,8 @@ def lock_ttl_for(timeout_s: float) -> float:
     return timeout_s * LOCK_TTL_FACTOR
 
 
-def job_budget_for(lock_ttl: float, timeout_s: float) -> float:
-    return lock_ttl - timeout_s - PUBLISH_POST_TIMEOUT_S - PUBLISH_THREAD_SLACK_S
+def job_budget_for(lock_ttl: float) -> float:
+    return lock_ttl - PUBLISH_POST_TIMEOUT_S - PUBLISH_THREAD_SLACK_S
 
 
 # Reasons a candidate is skipped. Kept distinct because a single None would make
@@ -577,7 +576,7 @@ async def autopublish_project_artifacts(
     publish_url = await run_on_unit_threads(partial(_publish_url, scope))
     workspace_id = await run_on_unit_threads(partial(_active_workspace_id, scope))
     lock_ttl = lock_ttl_for(timeout_s)
-    job_budget_s = job_budget_for(lock_ttl, timeout_s)
+    job_budget_s = job_budget_for(lock_ttl)
     # An abandoned publish thread polls its job with this key until it ends,
     # which the lock TTL bounds.
     key = PublishKey(

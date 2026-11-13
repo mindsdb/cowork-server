@@ -14,15 +14,18 @@ import pytest
 from cowork.services import artifact_autopublish as ap
 
 
-def test_default_job_budget_is_75s():
-    assert ap.job_budget_for(ap.lock_ttl_for(ap.DEFAULT_TIMEOUT_S), ap.DEFAULT_TIMEOUT_S) == 75.0
+def test_default_job_budget_fits_a_slow_dependency_install():
+    # anton expects a heavy fullstack build to take one to two minutes.
+    assert ap.job_budget_for(ap.lock_ttl_for(ap.DEFAULT_TIMEOUT_S)) == 135.0
 
 
 @pytest.mark.parametrize("timeout_s", [30.0, ap.DEFAULT_TIMEOUT_S, 120.0])
 def test_invariant_holds_for_supported_timeouts(timeout_s):
+    # Counted from the lock's acquire: the wait_for window runs alongside the
+    # thread, so it is not part of the sum.
     ttl = ap.lock_ttl_for(timeout_s)
-    budget = ap.job_budget_for(ttl, timeout_s)
-    assert timeout_s + ap.PUBLISH_POST_TIMEOUT_S + budget + ap.PUBLISH_THREAD_SLACK_S <= ttl
+    budget = ap.job_budget_for(ttl)
+    assert ap.PUBLISH_POST_TIMEOUT_S + budget + ap.PUBLISH_THREAD_SLACK_S <= ttl
     assert budget > 0
 
 

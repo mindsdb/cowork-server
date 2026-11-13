@@ -558,7 +558,7 @@ async def _sync_live_artifact(
                     access=access,
                     scope=scope,
                     project_id=project_id,
-                    job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S, _LIVE_PUBLISH_TIMEOUT_S),
+                    job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S),
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -1389,7 +1389,7 @@ async def set_artifact_access(
                     notify=notify or None,
                     stored=checked.stored,
                     owner_save=True,
-                    job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S, _LIVE_PUBLISH_TIMEOUT_S),
+                    job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S),
                     notices=notices,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,

@@ -14,6 +14,7 @@ Two things the ad-hoc string-matching used to get wrong:
 """
 from __future__ import annotations
 
+import json
 import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
@@ -395,3 +396,72 @@ def test_job_5xx_and_timeout_show_the_job_id(tmp_path, monkeypatch, exc):
     with pytest.raises(publish.PublishRejected) as error:
         run()
     assert "b" * 32 in str(error.value)
+
+
+def test_a_first_publish_whose_job_outlives_the_poll_keeps_its_report(tmp_path, monkeypatch):
+    """The server named the report when it accepted the job; the retry must
+    republish that report, not mint another one."""
+    timeout = PublishJobTimeout(job_id="c" * 32, report_id="r-building", waited_s=135)
+    run = _publish_failing_with(tmp_path, monkeypatch, timeout)
+    with pytest.raises(publish.PublishRejected):
+        run()
+
+    entry = json.loads((tmp_path / ".published.json").read_text())["report.html"]
+    assert entry["report_id"] == "r-building"
+    assert entry["url"] == "" and entry["published"] is True
+    assert "last_md5" not in entry
+
+    sent = {}
+
+    def lands(src, **kw):
+        sent.update(kw)
+        return {"view_url": "https://view.example/a/r-building", "report_id": "r-building", "md5": "m1"}
+
+    monkeypatch.setattr("anton.publisher.publish", lands)
+    run()
+    assert sent["report_id"] == "r-building"
+
+
+def test_a_timed_out_republish_leaves_the_entry_as_it_was(tmp_path, monkeypatch):
+    page = tmp_path / "report.html"
+    page.write_text("<html></html>")
+    before = {"report.html": {"report_id": "r-live", "url": "https://view.example/a/r-live", "published": True,
+                              "last_md5": "m0", "mode": "public"}}
+    (tmp_path / ".published.json").write_text(json.dumps(before))
+    timeout = PublishJobTimeout(job_id="d" * 32, report_id="r-live", waited_s=135)
+    run = _publish_failing_with(tmp_path, monkeypatch, timeout)
+    with pytest.raises(publish.PublishRejected):
+        run()
+    assert json.loads((tmp_path / ".published.json").read_text()) == before
+
+
+def test_a_kept_report_gets_its_owner_record_before_the_entry(tmp_path):
+    recorded = []
+
+    class Owner:
+        def record(self, report_id):
+            recorded.append(report_id)
+
+    published_json = tmp_path / ".published.json"
+    publish._keep_timed_out_report(
+        "r-building", ownership=Owner(), published_json=published_json, published_map={},
+        published_key="report.html", artifact_key="k", owner_side={"mode": "restricted"},
+    )
+    assert recorded == ["r-building"]
+    entry = json.loads(published_json.read_text())["report.html"]
+    assert entry["mode"] == "restricted" and entry["artifact_key"] == "k"
+
+
+def test_a_report_the_owner_record_refuses_is_logged_orphaned_and_not_kept(tmp_path, caplog):
+    class Owner:
+        def record(self, report_id):
+            raise RuntimeError("database unavailable")
+
+    published_json = tmp_path / ".published.json"
+    with caplog.at_level("WARNING", logger="cowork.services.publish"):
+        publish._keep_timed_out_report(
+            "r-building", ownership=Owner(), published_json=published_json, published_map={},
+            published_key="report.html", artifact_key="k", owner_side={},
+        )
+    assert not published_json.exists()
+    assert any("orphaned_publish" in r.getMessage() for r in caplog.records)

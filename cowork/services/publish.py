@@ -518,6 +518,43 @@ def _write_published_map(published_json: Path, published_map: dict[str, Any]) ->
             pass
 
 
+def _keep_timed_out_report(
+    report_id: str,
+    *,
+    ownership,
+    published_json: Path,
+    published_map: dict[str, Any],
+    published_key: str,
+    artifact_key: str | None,
+    owner_side: dict,
+) -> None:
+    """Record the report a first publish's job is still building.
+
+    The server named `report_id` when it accepted the job, and the build goes
+    on after the poll gave up. Without a record every retry, autopublish's
+    included, would publish the artifact as new and mint another report. The
+    entry has the report and no url, md5 or mtime: no card shows a link, and
+    the next publish sees a change and republishes that report. A failure to
+    record leaves the report orphaned, as the logged prefix says.
+    """
+    try:
+        if ownership is not None:
+            ownership.record(report_id)
+        published_map[published_key] = {
+            "report_id": report_id,
+            "url": "",
+            "artifact_key": artifact_key or "",
+            "lambda_artifact_key": "",
+            "published": True,
+            **owner_side,
+        }
+        _write_published_map(published_json, published_map)
+    except Exception:
+        logger.warning(
+            "orphaned_publish identifier=%s url= reason=job_timeout_unrecorded", report_id, exc_info=True,
+        )
+
+
 class DesktopArtifact(NamedTuple):
     """An artifact and the artifacts root it sits under (desktop_artifact_and_base)."""
 
@@ -1444,6 +1481,16 @@ def publish_artifact(
                 narrowing=narrowing, exc=exc, publish_url=publish_url, scope=org_scope,
                 project_id=project_id, artifact_slug=published_dir.name,
             )
+            if isinstance(exc, PublishJobTimeout) and exc.report_id and report_id is None:
+                _keep_timed_out_report(
+                    exc.report_id,
+                    ownership=ownership,
+                    published_json=published_json,
+                    published_map=published_map,
+                    published_key=published_key,
+                    artifact_key=canonical_artifact_key,
+                    owner_side=owner_side,
+                )
             upload_error = classify_upload_error(exc)
             logger.exception("Publishing failed")
             # A 401's text ("Invalid token") says less than the credentials advice below.
