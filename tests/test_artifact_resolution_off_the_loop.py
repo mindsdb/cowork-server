@@ -385,6 +385,12 @@ def stuck_lookup(monkeypatch, seeded_artifact):
 
 async def test_a_stuck_file_store_refuses_artifact_reviews_and_nothing_else(stuck_lookup, monkeypatch):
     state, released = stuck_lookup
+    # Each review runs one database unit before it asks for a file store slot,
+    # and SQLite runs units one at a time. The whole burst must clear them
+    # within the 1 s POOL_TIMEOUT, or the tail is refused as DatabaseBusy with
+    # the same 503 body. A small burst leaves a loaded CI runner over 100 ms
+    # per unit; the default 100 slots left it 10 ms.
+    monkeypatch.setattr(db_session.settings.storage, "efs_slots", 4)
     await _plan_once(monkeypatch, "local", LOCAL_SCOPE)
     loop = asyncio.get_running_loop()
     extra = 4

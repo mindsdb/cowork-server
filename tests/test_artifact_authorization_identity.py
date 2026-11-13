@@ -36,6 +36,7 @@ from cowork.services import (
 from cowork.services.artifact_access import ArtifactAccessUnavailable
 from cowork.services.artifact_identity import artifact_key
 from cowork.services.publish import publish_artifact
+from tests._fakes import fake_anton_upload
 from tests._org_sharing import TEAM_ELSEWHERE, TEAM_ENG, TEAM_OPS, TEAM_QA, member_request, mindshub_sharing_answers
 
 
@@ -1768,7 +1769,7 @@ def _upload_ends(monkeypatch, ending: UploadEnding, *, meanwhile=None) -> None:
 
     local = ending.raises in ("state_publish_blocked", "os_error")
     monkeypatch.setattr("anton.publisher.publish", publish_fails_before_sending if local else _ANTON_PUBLISH)
-    monkeypatch.setattr("anton.publisher.minds_request", request)
+    fake_anton_upload(monkeypatch, request)
 
 
 def _owner_choice(key, scope):
