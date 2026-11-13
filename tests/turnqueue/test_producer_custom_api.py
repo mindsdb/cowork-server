@@ -273,11 +273,117 @@ def templates(monkeypatch):
     return engine
 
 
-async def test_the_turn_carries_the_notes_of_the_members_own_template(turn, templates):
+#: What every prefix ends with, after the call example.
+_TAIL = (
+    "and the gateway adds the credentials. Every path starts at the API's host and includes any version, "
+    "such as /v2/eod; a ?name=value part goes in query. The user typed only the host."
+)
+_ACME_PREFIX = (
+    "Custom connection 5 (acme_crm). Fields: api_key. No credential value reaches this turn: "
+    f"call it with call_minds_api(5, path, query=None, headers=None) {_TAIL}"
+)
+_BETA_PREFIX = (
+    "Custom connection 3 (beta_api). No credential value reaches this turn: "
+    f"call it with call_minds_api(3, path, query=None, headers=None) {_TAIL}"
+)
+
+
+def _template_row(engine, connector_id="acme_crm", org_id="o1", user_id="u1"):
+    """The stored row of one member's template, to change it as an older or damaged save would have."""
+    from sqlmodel import Session, select
+
+    from cowork.models.custom_connector import CustomConnector
+
+    session = Session(engine)
+    row = session.exec(select(CustomConnector).where(
+        CustomConnector.connector_id == connector_id, CustomConnector.created_by == user_id,
+        CustomConnector.org_id == org_id,
+    )).one()
+    return session, row
+
+
+async def test_the_turn_carries_the_prefix_and_the_notes_of_the_members_own_template(turn, templates):
     params, _ = await _run(turn)
 
-    assert params["connectors"]["acme_crm"] == {"usage_notes": "Call /v1/me first."}
-    assert "beta_api" not in params["connectors"]
+    assert params["connectors"]["acme_crm"] == {"usage_notes": f"{_ACME_PREFIX}\n\nCall /v1/me first."}
+    assert params["connectors"]["beta_api"] == {"usage_notes": _BETA_PREFIX}
+
+
+async def test_two_connections_of_one_connector_share_one_prefix(turn, templates):
+    turn["list"].return_value = [_listed(5), _listed(7, name="Prod 2")]
+    turn["grant"].return_value = _granted({5: 2, 7: 1})
+
+    params, _ = await _run(turn)
+
+    assert params["connectors"] == {"acme_crm": {"usage_notes": (
+        "Custom connections 5, 7 (acme_crm). Fields: api_key. No credential value reaches this turn: "
+        f"call it with call_minds_api(connection_id, path, query=None, headers=None) {_TAIL}"
+        "\n\nCall /v1/me first."
+    )}}
+
+
+async def test_the_address_field_is_never_listed(turn, templates):
+    session, row = _template_row(templates)
+    row.spec = {**row.spec, "fields": [*row.spec["fields"], {"name": "base_url", "label": "Address"}]}
+    session.add(row)
+    session.commit()
+
+    params, _ = await _run(turn)
+
+    assert "base_url" not in params["connectors"]["acme_crm"]["usage_notes"]
+
+
+async def test_a_template_that_no_longer_parses_keeps_its_notes_but_names_no_field(turn, templates):
+    session, row = _template_row(templates)
+    row.connection_auth = None
+    session.add(row)
+    session.commit()
+
+    params, _ = await _run(turn)
+
+    notes = params["connectors"]["acme_crm"]["usage_notes"]
+    assert notes.startswith("Custom connection 5 (acme_crm). No credential value reaches this turn: ")
+    assert "Fields:" not in notes
+    assert notes.endswith("\n\nCall /v1/me first.")
+
+
+async def test_a_malformed_stored_field_costs_only_its_own_connectors_names(turn, templates):
+    from anton.core.tools.connector_draft import parse_connector_draft
+    from sqlmodel import Session
+
+    from cowork.db.scoped import ScopedSession, TenantScope
+    from cowork.services.connectors.custom_connectors import CustomConnectorService
+
+    beta = {"connector_id": "beta_api", "label": "Beta", "usage_notes": "GET /v1/tickets.",
+            "fields": [{"name": "token", "label": "Token"}],
+            "auth": {"type": "header", "headers": {"Authorization": "Bearer {token}"}},
+            "check": {"path": "/v1/me"}}
+    scope = TenantScope(org_mode=True, org_id="o1", user_id="u1")
+    CustomConnectorService(ScopedSession(Session(templates), scope)).save_member_draft(parse_connector_draft(beta))
+    session, row = _template_row(templates)
+    row.spec = {**row.spec, "fields": [{"label": "No name"}]}
+    session.add(row)
+    session.commit()
+
+    params, _ = await _run(turn)
+
+    acme = params["connectors"]["acme_crm"]["usage_notes"]
+    assert "Fields:" not in acme and acme.endswith("\n\nCall /v1/me first.")
+    assert params["connectors"]["beta_api"]["usage_notes"] == (
+        "Custom connection 3 (beta_api). Fields: token. No credential value reaches this turn: "
+        f"call it with call_minds_api(3, path, query=None, headers=None) {_TAIL}\n\nGET /v1/tickets."
+    )
+
+
+async def test_a_template_with_empty_notes_still_gets_its_prefix_and_fields(turn, templates):
+    session, row = _template_row(templates)
+    row.usage_notes = ""
+    session.add(row)
+    session.commit()
+
+    params, _ = await _run(turn)
+
+    assert params["connectors"]["acme_crm"] == {"usage_notes": _ACME_PREFIX}
 
 
 @pytest.mark.parametrize(("org_id", "user_id", "expected"), [
@@ -288,16 +394,16 @@ async def test_each_member_gets_only_their_own_templates_notes(turn, templates, 
 
     params, _ = await _run(turn, org_id=org_id, user_id=user_id)
 
-    assert params["connectors"]["acme_crm"] == {"usage_notes": expected}
+    assert params["connectors"]["acme_crm"] == {"usage_notes": f"{_ACME_PREFIX}\n\n{expected}"}
 
 
-async def test_a_connection_whose_template_is_gone_gets_no_notes(turn, templates):
+async def test_a_connection_whose_template_is_gone_gets_the_prefix_alone(turn, templates):
     turn["list"].return_value = [_listed(3, "beta_api", "Ops")]
     turn["grant"].return_value = _granted({3: 1})
 
     params, _ = await _run(turn)
 
-    assert "connectors" not in params
+    assert params["connectors"] == {"beta_api": {"usage_notes": _BETA_PREFIX}}
     assert params["custom_api"]["connections"][0]["connector_id"] == "beta_api"
 
 
@@ -318,7 +424,8 @@ async def test_notes_are_scrubbed_and_cut(turn, templates):
 
     params, _ = await _run(turn)
 
-    notes = params["connectors"]["acme_crm"]["usage_notes"]
+    prefix, notes = params["connectors"]["acme_crm"]["usage_notes"].split("\n\n", 1)
+    assert prefix == _ACME_PREFIX
     assert planted not in notes
     assert len(notes) <= USAGE_NOTES_MAX
 
@@ -331,11 +438,24 @@ async def test_built_in_notes_stay_beside_the_custom_ones(turn, templates, monke
     params, _ = await _run(turn)
 
     assert params["connectors"] == {
-        "acme_crm": {"usage_notes": "Call /v1/me first."}, "hubspot": {"usage_notes": "Built-in notes."},
+        "acme_crm": {"usage_notes": f"{_ACME_PREFIX}\n\nCall /v1/me first."},
+        "beta_api": {"usage_notes": _BETA_PREFIX},
+        "hubspot": {"usage_notes": "Built-in notes."},
     }
 
 
-async def test_a_database_that_cannot_answer_costs_the_notes_not_the_turn(turn, monkeypatch):
+async def test_built_in_notes_win_a_connector_id_clash(turn, templates, monkeypatch):
+    """A built-in's notes are never replaced by a member's template of the same id."""
+    monkeypatch.setattr(prod, "_mint_oauth_block",
+                        AsyncMock(return_value={"connections": [{"engine": "acme_crm", "name": "main"}]}))
+    monkeypatch.setattr(prod.registry, "usage_notes_for", lambda engines: {"acme_crm": "Built-in notes."})
+
+    params, _ = await _run(turn)
+
+    assert params["connectors"]["acme_crm"] == {"usage_notes": "Built-in notes."}
+
+
+async def test_a_database_that_cannot_answer_costs_the_names_and_notes_not_the_prefix(turn, monkeypatch):
     async def broken(fn, *, scope):
         raise RuntimeError("database down")
 
@@ -344,28 +464,31 @@ async def test_a_database_that_cannot_answer_costs_the_notes_not_the_turn(turn, 
     params, _ = await _run(turn)
 
     assert params["custom_api"]["connections"]
-    assert "connectors" not in params
+    assert params["connectors"] == {
+        "acme_crm": {"usage_notes": _ACME_PREFIX.replace(" Fields: api_key.", "")},
+        "beta_api": {"usage_notes": _BETA_PREFIX},
+    }
 
 
 def test_the_notes_read_nothing_outside_a_members_org_scope(templates):
     from sqlmodel import Session
 
     from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
-    from cowork.services.connectors.custom_connectors import member_turn_usage_notes
+    from cowork.services.connectors.custom_connectors import member_turn_templates
 
     from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
     from cowork.models.custom_connector import CustomConnector
 
-    assert member_turn_usage_notes(ScopedSession(Session(templates), LOCAL_SCOPE), ["acme_crm"]) == {}
+    assert member_turn_templates(ScopedSession(Session(templates), LOCAL_SCOPE), ["acme_crm"]) == {}
     no_user = TenantScope(org_mode=True, org_id="o1", user_id=None)
-    assert member_turn_usage_notes(ScopedSession(Session(templates), no_user), ["acme_crm"]) == {}
+    assert member_turn_templates(ScopedSession(Session(templates), no_user), ["acme_crm"]) == {}
     # One person's partition sees its own definitions, but is not an org member's turn.
     personal = TenantScope(personal=True, org_id="p1", user_id="u1", personal_resources=ALL_PERSONAL_RESOURCES)
     with Session(templates) as session:
         session.add(CustomConnector(connector_id="acme_crm", label="Acme", spec={"fields": []},
                                     usage_notes="Personal notes.", org_id="p1", created_by="u1"))
         session.commit()
-    assert member_turn_usage_notes(ScopedSession(Session(templates), personal), ["acme_crm"]) == {}
+    assert member_turn_templates(ScopedSession(Session(templates), personal), ["acme_crm"]) == {}
 
 
 # ── no value in the job or a log (step 6) ────────────────────────────────────

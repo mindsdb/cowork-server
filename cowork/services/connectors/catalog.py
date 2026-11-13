@@ -89,7 +89,7 @@ class ConnectorCatalog(ConnectorSpecRegistry):
         caller's credentials in reach, so they are used only in one person's
         scope (scope_is_one_persons) and pass anton's output scrubber first.
         Otherwise only the built-ins' notes. An org-mode member's own notes
-        reach their own cloud turns through member_turn_usage_notes instead.
+        reach their own cloud turns through member_turn_templates instead.
         """
         wanted = list(engines)
         notes = self._base.usage_notes_for(wanted)

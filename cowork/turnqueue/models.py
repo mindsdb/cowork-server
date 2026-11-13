@@ -20,8 +20,7 @@ from pydantic import BaseModel, Field, StrictStr, field_validator, model_validat
 MAX_DEADLINE_MS = 24 * 60 * 60 * 1000
 DATASOURCE_PROTOCOL_VERSION = 1
 MAX_DATASOURCE_CONNECTIONS = 100
-#: The most custom API connections one turn carries. The pod fetches every one
-#: while its session starts, so the cap bounds that start (anton holds the same).
+#: The most custom API connections one turn carries (anton holds the same).
 MAX_CUSTOM_API_CONNECTIONS = 25
 _REQUIRED_REF_KEYS = frozenset({"connection_id", "credential_version"})
 #: Names for the prompt only. anton's `anton/cloud_turn/contract.py` allows the
