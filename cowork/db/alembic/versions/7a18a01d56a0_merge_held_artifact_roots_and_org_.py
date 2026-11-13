@@ -1,6 +1,6 @@
 """merge the held artifact roots and the org appearance heads
 
-``7e636946b5f8`` (the held_artifact_roots table, ENG-4082) and
+``7e636946b5f8`` (the held_artifact_roots table) and
 ``e2a7c4f9b613`` (staging's merge of the drop-org-appearance and artifact
 locations heads) both descend from ``f93151b5bad1``. Two heads make
 ``alembic upgrade head`` fail everywhere, server startup included, so this
