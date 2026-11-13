@@ -10,16 +10,20 @@ import hashlib
 import hmac
 import json
 import time
+from functools import partial
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from sqlmodel import select
 
 import cowork.turnqueue.remote_turn as remote_turn_mod
+from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
 from cowork.channels.webhooks import drain_background_tasks
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_open_session
+from cowork.db.units import run_efs_unit
 from cowork.models.channel import ChannelBinding, ChannelEvent, ChannelSession
 from cowork.services.channels import ChannelConfigService
 
@@ -36,6 +40,27 @@ def _signed_slack_headers(body: bytes, signing_secret: str) -> dict:
     base = f"v0:{ts}:".encode() + body
     sig = "v0=" + hmac.new(signing_secret.encode(), base, hashlib.sha256).hexdigest()
     return {"x-slack-request-timestamp": ts, "x-slack-signature": sig}
+
+
+def _allow_file_replies_on_slack_d1(org_id: str) -> None:
+    """Make the D1 binding the way the runtime does, in a file store unit, then
+    turn its file replies switch on."""
+    event = SimpleNamespace(
+        address=SimpleNamespace(platform_id="D1", thread_id=None), message=SimpleNamespace(is_group=False),
+    )
+    scope = TenantScope(org_mode=True, org_id=org_id)
+    binding = asyncio.run(run_efs_unit(
+        partial(AntonChannelRuntime(LiveAdapterRegistry())._resolve_or_create_binding, channel_type="slack", event=event),
+        scope=scope,
+    ))
+    session = get_open_session()
+    try:
+        row = session.get(ChannelBinding, binding.id)
+        row.allow_file_replies = True
+        session.add(row)
+        session.commit()
+    finally:
+        session.close()
 
 
 def _slack_event_body(team_id: str, event_id: str) -> bytes:
@@ -488,6 +513,7 @@ def test_a_turn_sends_only_its_own_artifacts_from_the_shared_project_base(monkey
         svc.set_external_account_id("slack", "T-ORG-A-ARTIFACTS")
     finally:
         session.close()
+    _allow_file_replies_on_slack_d1(ORG_A)
 
     try:
         async def flow():

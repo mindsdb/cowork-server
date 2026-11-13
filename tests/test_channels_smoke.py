@@ -562,6 +562,38 @@ class ArtifactAdapter(FakeAdapter):
         return "1"
 
 
+def _allow_file_replies(chat_id: int) -> None:
+    """Turn on the file replies switch of the chat's binding, making the binding if needed."""
+    with get_open_session() as session:
+        binding = session.exec(select(ChannelBinding).where(
+            ChannelBinding.channel_type == "telegram", ChannelBinding.external_group_id == str(chat_id),
+        )).first() or ChannelBinding(channel_type="telegram", external_group_id=str(chat_id))
+        binding.allow_file_replies = True
+        session.add(binding)
+        session.commit()
+
+
+def test_turn_artifacts_are_not_sent_without_the_file_replies_switch(monkeypatch):
+    """With the binding's defaults the reply goes out and no file follows it."""
+    import os
+    import shutil
+
+    made = os.path.join(_general_project_dir(), ".anton", "artifacts", "demo-withheld")
+    os.makedirs(made, exist_ok=True)
+    with open(os.path.join(made, "dashboard.html"), "w") as f:
+        f.write("<html/>")
+    card = {"path": os.path.join(made, "dashboard.html"), "folder": made}
+    monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: FakeHarness(tool_event=True, artifacts=[card]))
+    adapter = ArtifactAdapter()
+    try:
+        asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(93, 558, "make a dashboard")))
+    finally:
+        shutil.rmtree(made, ignore_errors=True)
+
+    assert [chat for chat, _text in adapter.delivered] == ["558"]
+    assert adapter.sent == []
+
+
 def test_turn_artifacts_delivered(monkeypatch):
     """The turn sends the files of the artifact cards it emitted, and no other
     artifact in the project, however recent."""
@@ -585,6 +617,7 @@ def test_turn_artifacts_delivered(monkeypatch):
     card = {"path": os.path.join(made, "dashboard.html"), "folder": made}
     monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: FakeHarness(tool_event=True, artifacts=[card]))
     adapter = ArtifactAdapter()
+    _allow_file_replies(555)
     try:
         asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(90, 555, "make a dashboard")))
     finally:
@@ -662,6 +695,7 @@ def test_a_turn_never_reads_a_file_past_its_adapters_upload_cap(monkeypatch):
         max_attachment_bytes = 10
 
     adapter = CappedAdapter()
+    _allow_file_replies(557)
     try:
         asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(92, 557, "make a file")))
     finally:
@@ -696,6 +730,7 @@ def test_a_file_store_that_refuses_the_turns_files_still_ends_the_turn_well(monk
 
     monkeypatch.setattr(runtime_mod, "run_efs", refused)
     adapter = ArtifactAdapter()
+    _allow_file_replies(556)
     with caplog.at_level(logging.WARNING, logger=runtime_mod.log.name):
         asyncio.run(_runtime_with(adapter).handle("telegram", _telegram_event(91, 556, "make a dashboard")))
 

@@ -550,7 +550,7 @@ class AntonChannelRuntime:
                 if link:
                     outbound = f"{reply}\n\n{link}"
             await self._deliver(channel_type, event, outbound, org_id)
-        if outcome.artifact_paths:
+        if outcome.artifact_paths and binding.allow_file_replies:
             await self.send_turn_artifacts(
                 adapter=adapter, event=event, conversation=conversation, paths=outcome.artifact_paths, scope=scope,
             )
