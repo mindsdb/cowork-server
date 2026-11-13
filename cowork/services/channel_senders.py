@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
 
 from cowork.db.scoped import ScopedSession
 from cowork.models.channel import (
+    SENDER_ALLOWED,
     SENDER_BLOCKED,
     SENDER_DISPLAY_NAME_MAX,
     SENDER_PENDING,
+    ChannelPairingCode,
     ChannelSender,
 )
 
@@ -61,6 +64,53 @@ class ChannelSenderService:
             return SENDER_BLOCKED
         row = self.find(channel_type, group_id, sender_id)
         return row.status if row is not None else None
+
+    def list(self, *, status: str | None = None, channel_type: str | None = None) -> list[ChannelSender]:
+        """Senders the owner can act on, newest first; expired pending requests are left out."""
+        stmt = self.session.select(ChannelSender)
+        if status is not None:
+            stmt = stmt.where(ChannelSender.status == status)
+        if channel_type is not None:
+            stmt = stmt.where(ChannelSender.channel_type == channel_type)
+        now = datetime.now(timezone.utc)
+        rows = [
+            row for row in self.session.exec(stmt).all()
+            if not never_allowed(row.channel_type, row.external_sender_id)
+            and not (row.status == SENDER_PENDING and _expired(row, now))
+        ]
+        return sorted(rows, key=lambda row: _aware(row.created_at) or now, reverse=True)
+
+    def set_status(self, sender_row_id: UUID, status: str) -> ChannelSender | None:
+        """Approve or block one sender in their chat; None when no such row is in scope. Commits."""
+        row = self.session.get(ChannelSender, sender_row_id)
+        if row is None:
+            return None
+        if status == SENDER_ALLOWED and never_allowed(row.channel_type, row.external_sender_id):
+            raise ValueError("this platform account stands for many people and cannot be allowed")
+        row.status = status
+        self.session.add(row)
+        self.session.commit()
+        self.session.refresh(row)
+        return row
+
+    def delete(self, sender_row_id: UUID) -> bool:
+        """Forget one sender; their next message is a new pending request. Commits."""
+        row = self.session.get(ChannelSender, sender_row_id)
+        if row is None:
+            return False
+        self.session.delete(row)
+        self.session.commit()
+        return True
+
+    def drop_channel(self, channel_type: str) -> None:
+        """Stage the removal of every sender and pairing code of a channel type.
+
+        Called when the channel's bot is disconnected, so a different bot of
+        the same type inherits no approvals. The caller commits.
+        """
+        for model in (ChannelSender, ChannelPairingCode):
+            for row in self.session.exec(self.session.select(model).where(model.channel_type == channel_type)).all():
+                self.session.delete(row)
 
     def record_request(
         self,
@@ -154,11 +204,14 @@ class ChannelSenderService:
             self.session.commit()
 
 
+def _aware(value: datetime | None) -> datetime | None:
+    """A stored time as UTC-aware; SQLite returns it naive."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=timezone.utc)
+
+
 def _expired(row: ChannelSender, now: datetime) -> bool:
     """Whether a pending request is older than PENDING_TTL, by its creation time."""
-    created = row.created_at
-    if created is None:
-        return False
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    return now - created > PENDING_TTL
+    created = _aware(row.created_at)
+    return created is not None and now - created > PENDING_TTL

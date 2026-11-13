@@ -78,6 +78,14 @@ class BindingUpdateRequest(BaseModel):
     instructions: str | None = None
     anton_project_id: UUID | None = None
     anton_conversation_id: UUID | None = None
+    # What turns through the binding may use. Setting any needs an org admin in org mode.
+    allow_scratchpad: bool | None = None
+    allow_connectors: bool | None = None
+    allow_memory_writes: bool | None = None
+    allow_file_replies: bool | None = None
+
+
+BINDING_SWITCH_FIELDS = frozenset({"allow_scratchpad", "allow_connectors", "allow_memory_writes", "allow_file_replies"})
 
 
 class BindingResponse(BaseModel):
@@ -91,8 +99,41 @@ class BindingResponse(BaseModel):
     instructions: str | None = None
     anton_project_id: UUID | None = None
     anton_conversation_id: UUID | None = None
+    allow_scratchpad: bool = False
+    allow_connectors: bool = False
+    allow_memory_writes: bool = False
+    allow_file_replies: bool = False
     created_at: datetime | None = None
     modified_at: datetime | None = None
+
+
+class SenderStatus(str, Enum):
+    pending = "pending"
+    allowed = "allowed"
+    blocked = "blocked"
+
+
+class ChannelSenderResponse(BaseModel):
+    """One sender in one external chat. ``display_name`` is set by the sender
+    on their platform and must be shown as plain text."""
+
+    id: UUID
+    channel_type: str
+    external_group_id: str
+    external_sender_id: str
+    is_group: bool
+    status: SenderStatus
+    display_name: str | None = None
+    last_seen_at: datetime | None = None
+    created_at: datetime | None = None
+
+
+class PairingCodeResponse(BaseModel):
+    """A new pairing code, returned once; only its hash is stored."""
+
+    channel_type: str
+    code: str
+    expires_at: datetime
 
 
 class ChannelSessionResponse(BaseModel):

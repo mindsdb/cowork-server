@@ -12,6 +12,7 @@ from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.schemas.channels import (
+    BINDING_SWITCH_FIELDS,
     BindingCreateRequest,
     BindingResponse,
     BindingUpdateRequest,
@@ -116,6 +117,10 @@ class ChannelBindingService:
                 self._drop_sessions(binding.id)
         if "anton_conversation_id" in provided:
             binding.anton_conversation_id = req.anton_conversation_id
+        for name in BINDING_SWITCH_FIELDS & provided:
+            value = getattr(req, name)
+            if value is not None:
+                setattr(binding, name, value)
 
         self.session.add(binding)
         self.session.commit()

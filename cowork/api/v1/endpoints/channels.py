@@ -3,14 +3,17 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlmodel import Session
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin, require
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSessionDep, TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.db.units import run_db
+from cowork.principal import Principal, can_manage_org, get_principal
 from cowork.schemas.channels import (
+    BINDING_SWITCH_FIELDS,
     ChannelAgentResponse,
     ChannelAgentUpdateRequest,
     BindingCreateRequest,
@@ -21,17 +24,23 @@ from cowork.schemas.channels import (
     ChannelInstallationResponse,
     ChannelLifecycleResponse,
     ChannelReloadResponse,
+    ChannelSenderResponse,
     ChannelStatusResponse,
     ChannelTestConnectionResponse,
+    PairingCodeResponse,
     PluginResponse,
+    SenderStatus,
 )
 from cowork.channels.lifecycle import LifecycleError
+from cowork.channels.registry import get_registry
 from cowork.channels.ingress import sync_channel_ingress
 from cowork.services.channel_bindings import (
     BindingConflictError,
     BindingNotFoundError,
     ChannelBindingService,
 )
+from cowork.services.channel_pairing import ChannelPairingService, PairingCodeLimitError
+from cowork.services.channel_senders import ChannelSenderService
 from cowork.services.channel_lifecycle import (
     ChannelLifecycleService,
     LifecycleNotImplementedError,
@@ -255,7 +264,20 @@ def create_binding(body: BindingCreateRequest, scoped: ScopedSessionDep) -> Bind
 
 
 @router.patch("/bindings/{binding_id}", response_model=BindingResponse)
-def update_binding(binding_id: UUID, body: BindingUpdateRequest, scoped: ScopedSessionDep) -> BindingResponse:
+def update_binding(
+    binding_id: UUID,
+    body: BindingUpdateRequest,
+    scoped: ScopedSessionDep,
+    principal: Annotated[Principal | None, Depends(get_principal)],
+) -> BindingResponse:
+    """Edit a binding. Its capability switches decide what senders' turns may
+    use, so setting them needs an org admin in org mode."""
+    if (
+        body.model_fields_set & BINDING_SWITCH_FIELDS
+        and get_app_settings().tenancy_mode == "org"
+        and not can_manage_org(principal)
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="requires an org admin")
     try:
         return ChannelBindingService(scoped).update(binding_id, body)
     except BindingNotFoundError:
@@ -268,6 +290,81 @@ def update_binding(binding_id: UUID, body: BindingUpdateRequest, scoped: ScopedS
 def delete_binding(binding_id: UUID, scoped: ScopedSessionDep) -> None:
     if not ChannelBindingService(scoped).delete(binding_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"binding not found: {binding_id}")
+
+
+@router.get(
+    "/senders",
+    response_model=list[ChannelSenderResponse],
+    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+)
+def list_senders(
+    scoped: ScopedSessionDep, status_filter: Annotated[SenderStatus | None, Query(alias="status")] = None,
+    channel_type: str | None = None,
+) -> list[ChannelSenderResponse]:
+    """Senders who wrote to a bot, newest first: pending requests, and those allowed or blocked."""
+    rows = ChannelSenderService(scoped).list(
+        status=status_filter.value if status_filter is not None else None, channel_type=channel_type,
+    )
+    return [ChannelSenderResponse.model_validate(row, from_attributes=True) for row in rows]
+
+
+def _set_sender_status(scoped, sender_id: UUID, new_status: SenderStatus) -> ChannelSenderResponse:
+    """Apply an approve or block, mapping a missing row to 404 and a refused one to 400."""
+    try:
+        row = ChannelSenderService(scoped).set_status(sender_id, new_status.value)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"sender not found: {sender_id}")
+    return ChannelSenderResponse.model_validate(row, from_attributes=True)
+
+
+@router.post(
+    "/senders/{sender_id}/approve",
+    response_model=ChannelSenderResponse,
+    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+)
+def approve_sender(sender_id: UUID, scoped: ScopedSessionDep) -> ChannelSenderResponse:
+    """Let one sender run turns in the chat they wrote from."""
+    return _set_sender_status(scoped, sender_id, SenderStatus.allowed)
+
+
+@router.post(
+    "/senders/{sender_id}/block",
+    response_model=ChannelSenderResponse,
+    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+)
+def block_sender(sender_id: UUID, scoped: ScopedSessionDep) -> ChannelSenderResponse:
+    """Stop one sender in that chat; their messages start nothing and record nothing."""
+    return _set_sender_status(scoped, sender_id, SenderStatus.blocked)
+
+
+@router.delete(
+    "/senders/{sender_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+)
+def delete_sender(sender_id: UUID, scoped: ScopedSessionDep) -> None:
+    """Forget a sender; a later message from them is a new pending request."""
+    if not ChannelSenderService(scoped).delete(sender_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"sender not found: {sender_id}")
+
+
+@router.post(
+    "/{channel_type}/pairing-codes",
+    response_model=PairingCodeResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+)
+def create_pairing_code(channel_type: str, scoped: ScopedSessionDep) -> PairingCodeResponse:
+    """A one-time code for the channel, shown once; a sender who sends it to the bot is let in."""
+    if get_registry().get(channel_type) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
+    try:
+        issued = ChannelPairingService(scoped).create(channel_type)
+    except PairingCodeLimitError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    return PairingCodeResponse(channel_type=channel_type, code=issued.code, expires_at=issued.expires_at)
 
 
 def _lifecycle_service(request: Request, scope: TenantScope) -> ChannelLifecycleService:

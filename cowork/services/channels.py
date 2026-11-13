@@ -10,6 +10,7 @@ from cowork.db.scoped import MissingTenantScopeError, ScopedSession, TenantScope
 from cowork.db.units import run_db
 from cowork.models.channel import ChannelInstallation
 from cowork.models.setting import Setting
+from cowork.services.channel_senders import ChannelSenderService
 from cowork.schemas.channels import (
     ChannelConfigResponse,
     ChannelInstallationResponse,
@@ -158,6 +159,7 @@ class ChannelConfigService:
             self.session.delete(install)
             removed = True
         if removed:
+            ChannelSenderService(self.session).drop_channel(channel_type)
             self.session.commit()
         return removed
 
