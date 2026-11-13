@@ -126,7 +126,9 @@ dependencies = [
     "cryptography>=48.0.0,<51",
     "cryptography<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "fastapi>=0.136.1",
-    "httpx>=0.27",
+    # The http2 extra (h2) is for APNs, which only speaks HTTP/2
+    # (cowork/services/push/apns.py).
+    "httpx[http2]>=0.27",
     # Structured app-server integration with a pinned, bundled Codex runtime;
     # users do not need to install a separate CLI.
     "openai-codex==0.147.0",

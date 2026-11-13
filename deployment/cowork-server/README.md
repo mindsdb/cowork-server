@@ -106,6 +106,14 @@ environments are on.
 - `deployment.datasourceTurnsEnabled`, rendered as
   `COWORK_TURN_DATASOURCE_ENABLED`: `"true"` registers grants and queues the
   datasource block for hosted turns.
+- `deployment.datasourceLabelsEnabled`, rendered as
+  `COWORK_TURN_DATASOURCE_LABELS_ENABLED`: `"true"` in `values.yaml`, so every
+  environment sends each connection's name and connector id once its grants
+  are on; it does nothing where `datasourceTurnsEnabled` is off. An anton older
+  than the change refuses a block carrying them, so before an environment turns
+  grants on, its scratchpad image must have that anton and no live pod may
+  predate the image. Rollback for one environment sets the scalar to `"false"`
+  in its values file, the only value the chart test lets it set.
 - `deployment.datasourceCapabilities`, rendered as
   `COWORK_DATASOURCE_CAPABILITIES`: the methods this deployment may run, as a
   versioned manifest such as
