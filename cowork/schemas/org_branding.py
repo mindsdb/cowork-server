@@ -65,8 +65,11 @@ class OrgBrandingView(CamelResponse):
     no credential, or auth's 403 (no current org). The image URLs are
     auth's, absolute https (with ``?v=<hash>``). ``sidebar_title`` is auth's
     resolved title: the company name, the custom text, or null for no title
-    (only the logo). ``can_edit`` is auth's ``can_edit``. When auth can't be
-    asked the caller's last answer is served, or the route answers 503."""
+    (only the logo). ``can_edit`` is auth's ``can_edit``. When auth answers
+    nothing usable the caller's last answer is served. Without one, a 4xx
+    from auth other than its 403 answers ``reachable: false`` with the
+    stock values, which a client must not read as the org's look: it keeps
+    the look it shows. No answer or a 5xx from auth answers 503 instead."""
 
     enabled: bool = False
     org_name: str | None = None
@@ -76,6 +79,7 @@ class OrgBrandingView(CamelResponse):
     logo_dark_url: str | None = None
     appearance: OrgAppearanceView | None = None
     can_edit: bool = False
+    reachable: bool = True
 
 
 # The fields a PUT passes to auth, as auth names them.
