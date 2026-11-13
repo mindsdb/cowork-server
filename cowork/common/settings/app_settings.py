@@ -22,6 +22,7 @@ from pydantic import (
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from cowork.common.paths import cowork_home
+from cowork.common.settings.secret_files import SecretFileSettingsSource, require_process_secrets
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.schemas.artifact_export import ExportPdfSettings
 
@@ -903,6 +904,20 @@ class AppSettings(Settings):
     _deployment_identity: DeploymentIdentity | None = PrivateAttr(default=None)
     _deployment_identity_initialized: bool = PrivateAttr(default=False)
 
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+    ):
+        # A credential whose file the process environment names wins over the
+        # environment and every .env (cowork.common.settings.secret_files).
+        return (
+            init_settings,
+            SecretFileSettingsSource(settings_cls),
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )
+
     deployment_kind: Literal["self-hosted"] | None = Field(
         default=None,
         validation_alias=AliasChoices("COWORK_DEPLOYMENT_KIND"),
@@ -916,6 +931,14 @@ class AppSettings(Settings):
             "agent's product name when COWORK_DEPLOYMENT_KIND=self-hosted. Read once at startup."
         ),
     )
+
+    @model_validator(mode="after")
+    def _self_hosted_credentials_come_from_the_process(self) -> "AppSettings":
+        """A self-hosted process stops rather than fall back to SQLite, a generated
+        token or a credential in cowork-home's .env (secret_files.require_process_secrets)."""
+        if self.deployment_kind == "self-hosted":
+            require_process_secrets()
+        return self
 
     env: str = Field(default="local", description="The environment (local, dev, prod, etc.)")  # ENV
 

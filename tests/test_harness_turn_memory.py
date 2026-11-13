@@ -31,6 +31,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.principal import personal_partition_id
 from tests._turns import built_turn
+from _self_hosted import enable_self_hosted
 
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
 SUB = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
@@ -422,7 +423,7 @@ async def test_a_persons_scheduled_run_gets_its_creators_tiers(
     if self_hosted:
         pack = trusted / "pack.json"
         pack.write_text('{"name":"Scheduled Workbench"}', encoding="utf-8")
-        monkeypatch.setenv("COWORK_DEPLOYMENT_KIND", "self-hosted")
+        enable_self_hosted(monkeypatch)
         monkeypatch.setenv("COWORK_DEPLOYMENT_BRAND_FILE", str(pack))
         get_app_settings.cache_clear()
         initialize_deployment_identity(get_app_settings(), remote_turns=False)

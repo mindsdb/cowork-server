@@ -12,6 +12,7 @@ from cowork.deployment_identity import identity_for_turn
 from cowork.handlers import first_take, response_routing, responses
 from cowork.schemas.responses import ResponsesRequest
 from cowork.server import create_app
+from _self_hosted import enable_self_hosted
 
 
 PRODUCT = "Acme & Co's $workbench"
@@ -35,7 +36,7 @@ def _initialize(monkeypatch, tmp_path, *, branded: bool, name: str = PRODUCT):
     if branded:
         pack = tmp_path / "pack.json"
         pack.write_text(json.dumps({"name": name}), encoding="utf-8")
-        monkeypatch.setenv("COWORK_DEPLOYMENT_KIND", "self-hosted")
+        enable_self_hosted(monkeypatch)
         monkeypatch.setenv("COWORK_DEPLOYMENT_BRAND_FILE", str(pack))
         get_app_settings.cache_clear()
     else:
