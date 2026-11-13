@@ -1377,6 +1377,14 @@ def friendly_turn_error(
     if isinstance(exc, PoolTimeoutError):
         return SERVER_BUSY_CODE, server_busy_message(busy_retry_seconds())
 
+    # Not a provider failure either: a sealed connection that won't open. Its
+    # message names the connection and the cause, never a value, so it reaches
+    # the person in the generic frame, which shows the message as it is.
+    from cowork.services.connectors.sealed_vault import SealedRecordError
+
+    if isinstance(exc, SealedRecordError):
+        return GENERIC_TURN_ERROR_CODE, f"{exc} Ask your operator: Cowork's log names it too."
+
     # anton's model-call deadline. Its message is curated copy that names the
     # deadline, so it passes through. Checked before every rung that walks the
     # cause chain: anton raises it `from None` inside the deadline's handler,

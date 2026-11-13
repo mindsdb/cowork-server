@@ -488,8 +488,18 @@ async def lifespan(app: FastAPI):
     # still log it as running once _SLOW_STEP_S passed. The end of the task
     # that runs the lifespan stops that timer.
     asyncio.current_task().add_done_callback(lambda _task: clock.stop_timer())
+    clock.begin("sealing_check")
+    # Before anything reads a setting or could make a legacy key: a deployment
+    # sealed under a key file doesn't start without one.
+    from cowork.services.sealing import refuse_sealed_state_without_key_file, refuse_unopenable_sealed_data
+
+    await asyncio.to_thread(refuse_sealed_state_without_key_file)
     clock.begin("dev_setup")
     run_dev_setup()
+    clock.begin("sealed_data_check")
+    # After migrations, before anything serves: every sealed setting and
+    # connection opens with the key file, or the start stops naming each one.
+    await asyncio.to_thread(refuse_unopenable_sealed_data)
     clock.begin("credential_clear")
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
@@ -855,6 +865,16 @@ def create_app() -> FastAPI:
     # PDF export settings come from the process environment alone. An engine
     # other than "render", or "render" without an http(s) URL, stops the start.
     get_export_pdf_settings()
+    # So does COWORK_KEY_FILE: a key file that is missing, unreadable or
+    # malformed stops the start, naming the cause and never a key.
+    from cowork.common.encryption import sealing_keys, warn_ignored_key_settings
+
+    sealing_keys()
+    warn_ignored_key_settings(
+        master_key=settings.master_key,
+        master_key_path_set="master_key_path" in settings.model_fields_set,
+        code_sandbox=settings.code_sandbox,
+    )
 
     from cowork.deployment_identity import initialize_deployment_identity
 
@@ -1026,13 +1046,13 @@ def create_app() -> FastAPI:
                 f"COWORK_MANAGED_DIR's shared registry is malformed: {error}. "
                 "Fix or remove the file; a missing one shares nothing."
             ) from error
-        from anton.core.datasources.data_vault import LocalDataVault
+        from cowork.services.connectors.persist import data_vault_at
 
         logger.info(
             "managed folder: %s (%d skills, %d connections, %d shared connections)",
             managed.root,
             len(managed.skill_slugs()),
-            len(LocalDataVault(managed.vault_dir).list_connections()),
+            len(data_vault_at(managed.vault_dir).list_connections()),
             len(shared_connections.root),
         )
 

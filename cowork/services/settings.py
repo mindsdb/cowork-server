@@ -7,7 +7,7 @@ from cryptography.fernet import InvalidToken
 from pydantic import SecretStr, ValidationError
 from sqlmodel import Session, select
 
-from cowork.common.encryption import decrypt, encrypt
+from cowork.common.encryption import UnopenableSettingError, decrypt, encrypt, sealing_keys
 from cowork.common.settings.runtime_credential import get_minds_credential
 from cowork.common.settings.user_settings import (
     BUDGET_SETTING_KEYS,
@@ -212,6 +212,10 @@ class SettingService:
                 try:
                     decrypted = decrypt(row.value)
                 except InvalidToken:
+                    # Under a key file, a secret the key doesn't open is an
+                    # error, never an unset setting the server then fills in.
+                    if sealing_keys() is not None:
+                        raise UnopenableSettingError(key=row.key) from None
                     # Wrong master key → treat as unset, not a load-wide failure.
                     logger.warning(
                         "settings: %r could not be decrypted (master key mismatch); treating as unset",

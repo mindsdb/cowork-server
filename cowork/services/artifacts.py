@@ -43,6 +43,7 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.services.connectors.sealed_vault import SealedRecordError
 from cowork.db.personal_resources import PersonalResource
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
@@ -2483,6 +2484,14 @@ async def _launch_backend_locked(
                     )
                     continue
                 extra_env.update(env)
+    except SealedRecordError as error:
+        # A sealed connection that won't open keeps the backend down, naming
+        # it, rather than starting it without that connection.
+        logger.error(
+            "A saved connection can't be opened, so the app backend doesn't start",
+            extra={"event": "sealed_connection_unopenable", "connection": error.connection, "reason": error.cause},
+        )
+        return BackendStatus(running=False, detail=str(error), port=0)
     except Exception:
         logger.warning(
             "Could not build datasource env for backend launch of %s", slug, exc_info=True

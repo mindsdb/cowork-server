@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from cryptography.fernet import InvalidToken
 from sqlmodel import Session, select
 
 from cowork.channels.plugin import ChannelPlugin, VerifyResult
 from cowork.channels.registry import PluginRegistry, get_registry
-from cowork.common.encryption import decrypt, encrypt
+from cowork.common.encryption import UnopenableSettingError, decrypt, encrypt
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import MissingTenantScopeError, ScopedSession, TenantScope
 from cowork.db.units import run_db
@@ -26,6 +27,18 @@ _KEY_PREFIX = "channel."
 
 def _cred_key(channel_type: str, field: str) -> str:
     return f"{_KEY_PREFIX}{channel_type}.{field}"
+
+
+def secret_credential_keys(*, registry: PluginRegistry | None = None) -> frozenset[str]:
+    """The settings keys that hold a channel's secret credential, each stored
+    sealed by ChannelConfigService.set_config."""
+    registry = registry if registry is not None else get_registry()
+    return frozenset(
+        _cred_key(plugin.channel_type, field.name)
+        for plugin in registry.all()
+        for field in plugin.credentials.fields
+        if field.secret
+    )
 
 
 class UnknownChannelError(Exception):
@@ -111,7 +124,13 @@ class ChannelConfigService:
             row = self._fetch_setting(_cred_key(channel_type, field.name))
             if row is None:
                 continue
-            creds[field.name] = decrypt(row.value) if field.secret else row.value
+            if not field.secret:
+                creds[field.name] = row.value
+                continue
+            try:
+                creds[field.name] = decrypt(row.value)
+            except InvalidToken:
+                raise UnopenableSettingError(key=row.key) from None
         return creds
 
     def set_config(self, channel_type: str, values: dict[str, str]) -> ChannelConfigResponse:
