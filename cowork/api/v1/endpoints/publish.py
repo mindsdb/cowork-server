@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictBool
 
@@ -90,7 +91,10 @@ async def publish_artifact(req: _PublishBody, scope: ScopeDep):
         # without it the publisher would look in the shared root. This router
         # is local-only, so the scope is LOCAL_SCOPE (the unkeyed vault) or a
         # person's own partition.
-        return _publish(
+        # Off the loop: a fullstack publish polls its server-side job for
+        # minutes, and the loop answers every other request meanwhile.
+        return await run_in_threadpool(
+            _publish,
             artifact,
             artifacts_base=artifacts_base,
             api_key=api_key,
@@ -115,7 +119,7 @@ async def publish_artifact(req: _PublishBody, scope: ScopeDep):
 @router.post("/update")
 async def update_artifact(req: _UpdateBody, scope: ScopeDep):
     try:
-        return _update(req.path, scope=scope)
+        return await run_in_threadpool(_update, req.path, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:

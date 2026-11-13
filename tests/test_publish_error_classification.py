@@ -14,6 +14,7 @@ Two things the ad-hoc string-matching used to get wrong:
 """
 from __future__ import annotations
 
+import json
 import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,8 @@ from unittest.mock import patch
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+from anton.publisher import PublishJobFailed, PublishJobTimeout
 
 from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.services import publish
@@ -313,7 +316,7 @@ def _upload_refusing_the_share(monkeypatch, tmp_path) -> Path:
     def refuse(*args, **kwargs):
         raise _upstream(403, {"error": SHARE_ORG_REASON, "code": "share_org_required"}, "Forbidden")
 
-    monkeypatch.setattr("anton.publisher.minds_request", refuse)
+    monkeypatch.setattr("anton.publisher.minds_request_with_status", refuse)
     return page
 
 
@@ -362,3 +365,103 @@ def test_both_desktop_publish_routes_answer_a_refused_share_403_with_its_code(ro
     with _patch_context(), patch.object(publish_ep, target, side_effect=refused):
         res = _client().post(route, json={"path": "/some/art"})
     assert (res.status_code, res.json()) == (403, SHARE_ORG_REFUSAL)
+
+
+def test_job_failed_503_is_the_upload_service_not_an_auth_outage():
+    exc = PublishJobFailed(503, "publish worker did not start", job_id="a" * 32, report_id="r")
+    with pytest.raises(publish.UploadServiceUnavailable):
+        publish.classify_upload_error(exc)
+
+
+def test_other_job_failures_come_back_as_upload_errors():
+    exc = PublishJobFailed(400, "pip install failed: x", job_id="a" * 32, report_id="r")
+    assert publish.classify_upload_error(exc) == publish.UploadError(400, None, "pip install failed: x")
+    assert publish.classify_upload_error(PublishJobTimeout(job_id="a" * 32, report_id="r", waited_s=180)) is None
+
+
+def test_job_failed_400_shows_the_server_text(tmp_path, monkeypatch):
+    exc = PublishJobFailed(400, "pip install failed: no wheel", job_id="a" * 32, report_id="r")
+    run = _publish_failing_with(tmp_path, monkeypatch, exc)
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert str(error.value) == "Publishing failed: pip install failed: no wheel"
+
+
+@pytest.mark.parametrize("exc", [
+    PublishJobFailed(504, "publish worker timed out", job_id="b" * 32, report_id="r"),
+    PublishJobTimeout(job_id="b" * 32, report_id="r", waited_s=180),
+])
+def test_job_5xx_and_timeout_show_the_job_id(tmp_path, monkeypatch, exc):
+    run = _publish_failing_with(tmp_path, monkeypatch, exc)
+    with pytest.raises(publish.PublishRejected) as error:
+        run()
+    assert "b" * 32 in str(error.value)
+
+
+def test_a_first_publish_whose_job_outlives_the_poll_keeps_its_report(tmp_path, monkeypatch):
+    """The server named the report when it accepted the job; the retry must
+    republish that report, not mint another one."""
+    timeout = PublishJobTimeout(job_id="c" * 32, report_id="r-building", waited_s=135)
+    run = _publish_failing_with(tmp_path, monkeypatch, timeout)
+    with pytest.raises(publish.PublishRejected):
+        run()
+
+    entry = json.loads((tmp_path / ".published.json").read_text())["report.html"]
+    assert entry["report_id"] == "r-building"
+    assert entry["url"] == "" and entry["published"] is True
+    assert "last_md5" not in entry
+
+    sent = {}
+
+    def lands(src, **kw):
+        sent.update(kw)
+        return {"view_url": "https://view.example/a/r-building", "report_id": "r-building", "md5": "m1"}
+
+    monkeypatch.setattr("anton.publisher.publish", lands)
+    run()
+    assert sent["report_id"] == "r-building"
+
+
+def test_a_timed_out_republish_leaves_the_entry_as_it_was(tmp_path, monkeypatch):
+    page = tmp_path / "report.html"
+    page.write_text("<html></html>")
+    before = {"report.html": {"report_id": "r-live", "url": "https://view.example/a/r-live", "published": True,
+                              "last_md5": "m0", "mode": "public"}}
+    (tmp_path / ".published.json").write_text(json.dumps(before))
+    timeout = PublishJobTimeout(job_id="d" * 32, report_id="r-live", waited_s=135)
+    run = _publish_failing_with(tmp_path, monkeypatch, timeout)
+    with pytest.raises(publish.PublishRejected):
+        run()
+    assert json.loads((tmp_path / ".published.json").read_text()) == before
+
+
+def test_a_kept_report_gets_its_owner_record_before_the_entry(tmp_path):
+    recorded = []
+
+    class Owner:
+        def record(self, report_id):
+            recorded.append(report_id)
+
+    published_json = tmp_path / ".published.json"
+    publish._keep_timed_out_report(
+        "r-building", ownership=Owner(), published_json=published_json, published_map={},
+        published_key="report.html", artifact_key="k", owner_side={"mode": "restricted"},
+    )
+    assert recorded == ["r-building"]
+    entry = json.loads(published_json.read_text())["report.html"]
+    assert entry["mode"] == "restricted" and entry["artifact_key"] == "k"
+
+
+def test_a_report_the_owner_record_refuses_is_logged_orphaned_and_not_kept(tmp_path, caplog):
+    class Owner:
+        def record(self, report_id):
+            raise RuntimeError("database unavailable")
+
+    published_json = tmp_path / ".published.json"
+    with caplog.at_level("WARNING", logger="cowork.services.publish"):
+        publish._keep_timed_out_report(
+            "r-building", ownership=Owner(), published_json=published_json, published_map={},
+            published_key="report.html", artifact_key="k", owner_side={},
+        )
+    assert not published_json.exists()
+    assert any("orphaned_publish" in r.getMessage() for r in caplog.records)

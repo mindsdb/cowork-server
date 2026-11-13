@@ -13,6 +13,7 @@ import os
 import stat
 import tempfile
 import urllib.error
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -69,6 +70,7 @@ from cowork.services.providers import (
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.core.artifacts.internal_files import REVISIONS_DIRNAME
 from anton.minds_client import describe_minds_connection_error
+from anton.publisher import PUBLISH_JOB_BUDGET_S, PublishJobFailed, PublishJobTimeout
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
@@ -278,6 +280,12 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     everyone with SHARE_ORG_REQUIRED_CODE (ShareOrgRequired, its reason,
     clipped, as the text). Every other HTTP answer comes back as an
     UploadError; a failure that got no HTTP answer returns None.
+
+    A failed asynchronous job (`PublishJobFailed`) carries the status /upload
+    would have answered. The server records the answer's code too, but anton
+    does not pass it on, so a job's refusal maps by status alone: its 503 is
+    the upload service itself, and a 403 share_org_required or permission_denied
+    comes back as an UploadError.
     """
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
@@ -292,6 +300,16 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
         ),
     ):
         raise exc
+    if isinstance(exc, PublishJobFailed):
+        if exc.status_code == 503:
+            # Leaves publish_artifact before its failure log, like the typed
+            # refusals below; str(exc) names the job to find in the worker's log.
+            logger.warning(
+                "Publish service answered HTTP %s code=%s body=%r", 503, None, str(exc)[:200],
+                extra={"status_code": 503, "reason": "publish_job_failed"},
+            )
+            raise UploadServiceUnavailable() from exc
+        return UploadError(exc.status_code, None, exc.message)
     if not isinstance(exc, urllib.error.HTTPError):
         return None
     status = exc.code
@@ -498,6 +516,43 @@ def _write_published_map(published_json: Path, published_map: dict[str, Any]) ->
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _keep_timed_out_report(
+    report_id: str,
+    *,
+    ownership,
+    published_json: Path,
+    published_map: dict[str, Any],
+    published_key: str,
+    artifact_key: str | None,
+    owner_side: dict,
+) -> None:
+    """Record the report a first publish's job is still building.
+
+    The server named `report_id` when it accepted the job, and the build goes
+    on after the poll gave up. Without a record every retry, autopublish's
+    included, would publish the artifact as new and mint another report. The
+    entry has the report and no url, md5 or mtime: no card shows a link, and
+    the next publish sees a change and republishes that report. A failure to
+    record leaves the report orphaned, as the logged prefix says.
+    """
+    try:
+        if ownership is not None:
+            ownership.record(report_id)
+        published_map[published_key] = {
+            "report_id": report_id,
+            "url": "",
+            "artifact_key": artifact_key or "",
+            "lambda_artifact_key": "",
+            "published": True,
+            **owner_side,
+        }
+        _write_published_map(published_json, published_map)
+    except Exception:
+        logger.warning(
+            "orphaned_publish identifier=%s url= reason=job_timeout_unrecorded", report_id, exc_info=True,
+        )
 
 
 class DesktopArtifact(NamedTuple):
@@ -1140,6 +1195,8 @@ def publish_artifact(
     stored: ArtifactRule | None = None,
     owner_save: bool = False,
     notices: list[ShareNotice] | None = None,
+    job_budget_s: float = PUBLISH_JOB_BUDGET_S,
+    on_job_accepted: Callable[[dict], None] | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -1160,6 +1217,12 @@ def publish_artifact(
     datasources at all, and because `vault_for_scope` fail-closes on an org
     deployment when it is missing - a caller that forgets it gets an error, not
     another org's secrets.
+
+    `job_budget_s` caps how long an asynchronously accepted publish (server
+    202) is polled; defaults to anton's. `on_job_accepted` is
+    anton's callback, invoked with the 202 body the moment the server accepts
+    the job, so a caller that abandons the thread on its own timeout can tell
+    "upload still in flight" from "job accepted, still polling".
 
     `project_id` is the artifact's project; required in organization mode,
     where the owner lookup is keyed by it.
@@ -1401,6 +1464,8 @@ def publish_artifact(
                 # While the password is unchanged anton re-sends the hash stored
                 # here, so a content-only re-publish keeps viewers' password grants.
                 previous_access=previous if isinstance(previous, dict) else None,
+                job_budget_s=job_budget_s,
+                on_job_accepted=on_job_accepted,
             )
         except ArtifactOwnedByOtherUserError as exc:
             # Not a failure to log or wrap: the upload service holds this
@@ -1416,6 +1481,16 @@ def publish_artifact(
                 narrowing=narrowing, exc=exc, publish_url=publish_url, scope=org_scope,
                 project_id=project_id, artifact_slug=published_dir.name,
             )
+            if isinstance(exc, PublishJobTimeout) and exc.report_id and report_id is None:
+                _keep_timed_out_report(
+                    exc.report_id,
+                    ownership=ownership,
+                    published_json=published_json,
+                    published_map=published_map,
+                    published_key=published_key,
+                    artifact_key=canonical_artifact_key,
+                    owner_side=owner_side,
+                )
             upload_error = classify_upload_error(exc)
             logger.exception("Publishing failed")
             # A 401's text ("Invalid token") says less than the credentials advice below.
@@ -1436,7 +1511,8 @@ def publish_artifact(
             if isinstance(exc, urllib.error.URLError):
                 headline, advice = describe_minds_connection_error(exc)
                 raise PublishRejected(f"Publishing failed. {headline} {advice}") from exc
-            if isinstance(exc, StatePublishBlocked):
+            # These texts come from the upload service or anton, never local paths.
+            if isinstance(exc, (StatePublishBlocked, PublishJobFailed, PublishJobTimeout)):
                 raise PublishRejected(f"Publishing failed: {exc}") from exc
             raise RuntimeError(f"Publishing failed: {exc}") from exc
         finally:
