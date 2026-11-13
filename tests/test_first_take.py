@@ -578,6 +578,8 @@ async def test_shared_openai_provider_keeps_streams_and_trace_contexts_separate(
         )
         assert decision.text == "Hello."
         assert sorted(initial_calls) == ["cowork-first-take", "cowork-gate"]
+        # The gate can finish before the take retries, since its settings read now leaves the loop.
+        await _settle()
         assert len(calls) == 4
         assert closed == ["cowork-gate"]
         handler.first_take.cancel()

@@ -270,7 +270,10 @@ def _routing_handler(monkeypatch):
     handler.harness_name = "anton"  # handle() sets it from the turn's settings
     # The LLM gate, as on a provider other than MindsHub; tests of the Jev
     # gate replace this.
-    handler._jev_gate = lambda _turn_llm: None
+    async def llm_gate(_turn_llm):
+        return None, None
+
+    handler._turn_gate = llm_gate
     return handler
 
 

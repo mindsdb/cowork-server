@@ -148,6 +148,7 @@ from cowork.services.live_apps import use_live_app_launcher
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
+from cowork.services import mindshub_zdr
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectNotFoundError, ProjectService, is_comparison_sandbox
 from cowork.services.queued_repairs import QueuedRepairs
@@ -1444,12 +1445,15 @@ class ResponsesHandler:
                         },
                     ))
                     gate_started = time.monotonic()
-                    jev = self._jev_gate(turn_llm)
+                    jev, jev_may_fall_back = await self._turn_gate(turn_llm)
                     if jev == "off":
                         # The organization opted out of Jev: no fast path on
                         # MindsHub, and no LLM gate in its place, so every
                         # turn runs the agent.
                         decision = RouteDecision(route=DELEGATED_AGENTIC, reason="jev_disabled")
+                    elif jev == "zdr_on":
+                        # ZDR: MindsHub refuses Jev and the LLM gate's model, so the agent decides.
+                        decision = RouteDecision(route=DELEGATED_AGENTIC, reason="zdr_on")
                     else:
                         decision = await decide_route(
                             history=history,
@@ -1460,6 +1464,7 @@ class ResponsesHandler:
                             binding=binding,
                             binding_factory=binding_for_turn,
                             jev=jev,
+                            jev_may_fall_back=jev_may_fall_back,
                         )
                     gate_ms = round((time.monotonic() - gate_started) * 1000)
                     # warning, not info: this deployment's LOG_LEVEL defaults to
@@ -1498,7 +1503,42 @@ class ResponsesHandler:
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None
 
-    def _jev_gate(self, turn_llm: dict | None):
+    async def _turn_gate(self, turn_llm: dict | None):
+        """`_jev_gate` with the organization's ZDR applied, plus whether a failed
+        decision may fall back to the LLM gate (None: it may). Jev under ZDR is
+        "zdr_on"; the org's own model keeps deciding, but not the MindsHub LLM gate."""
+        settings = await run_on_unit_threads(partial(get_user_settings, self.scope))
+        jev = self._jev_gate(turn_llm, settings)
+        if not callable(jev):
+            return jev, None
+        mode = jev_route.gate_mode(settings)
+        if mode == "jev":
+            return ("zdr_on" if await self.zdr_on(turn_llm, settings) else jev), None
+        if mode == "own" and settings.resolved_router_provider is Provider.MINDS_CLOUD:
+
+            async def may_fall_back() -> bool:
+                return not await self.zdr_on(turn_llm, settings)
+
+            return jev, may_fall_back
+        return jev, None
+
+    async def zdr_on(self, turn_llm: dict | None = None, settings: UserSettings | None = None) -> bool:
+        """Whether ZDR is on for this turn's organization (unknown counts as on).
+        Asks as the caller on the web, else on the MindsHub key the turn uses."""
+        if self.scope.org_mode and self.mindshub_bearer:
+            bearer = self.mindshub_bearer
+        else:
+            # A remote turn's minted key, else the stored key (on the desktop, the held credential).
+            bearer = ((turn_llm or {}).get("llm") or {}).get("api_key")
+            if not bearer:
+                if settings is None:
+                    settings = await run_on_unit_threads(partial(get_user_settings, self.scope))
+                bearer = provider_api_key_str(settings, Provider.MINDS_CLOUD)
+        return await mindshub_zdr.zdr_on(
+            bearer_token=bearer or "", org_id=self.scope.org_id or "", user_id=self.scope.user_id or "",
+        )
+
+    def _jev_gate(self, turn_llm: dict | None, settings: UserSettings | None = None):
         """How this turn is gated: a decision callable, "off" when the turn
         answers on MindsHub and the organization opted out of Jev there, or
         None for the LLM gate. A decision MindsHub refuses falls back to the
@@ -1510,7 +1550,7 @@ class ResponsesHandler:
         on MindsHub, on the turn's minted key when the gate minted one, else
         on the stored MindsHub key. Turns on other providers, or on MindsHub
         with no key to ask Jev with, keep the LLM gate."""
-        settings = get_user_settings(self.scope)
+        settings = settings or get_user_settings(self.scope)
         queue_settings = TurnQueueSettings()
         mode = jev_route.gate_mode(settings)
         if mode == "llm":
