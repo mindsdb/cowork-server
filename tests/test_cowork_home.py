@@ -6,6 +6,7 @@ setting one env var. These tests pin that contract.
 """
 import ast
 import os
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -223,6 +224,17 @@ def test_pod_local_only_honors_explicit_scratch_dir_override(monkeypatch, tmp_pa
     assert pod_local_only(home / "tmp", "tmp") == scratch / "tmp"
 
     get_app_settings.cache_clear()
+
+
+def test_the_suites_org_mode_scratch_stores_belong_to_this_test_process(org_deployment):
+    """Each pytest-xdist worker is its own process. Org mode's pod-local stores
+    under the shared system temp default let one worker's publish state.json
+    rename remove another's."""
+    home = Path(os.environ["COWORK_HOME"])
+    resolved = pod_local_only(home / "publish", "publish")
+
+    assert Path(tempfile.gettempdir()) / "cowork" not in resolved.parents
+    assert home not in resolved.parents
 
 
 def test_bearer_auth_token_env_derives_from_cowork_home(monkeypatch, tmp_path):
