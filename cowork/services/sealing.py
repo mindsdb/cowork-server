@@ -118,7 +118,9 @@ def refuse_sealed_state_without_key_file() -> None:
                 )
 
 
-def _sealed_setting_keys() -> frozenset[str]:
+def sealed_setting_keys() -> frozenset[str]:
+    """The settings keys whose rows the server stores sealed: each sensitive setting and each
+    channel's secret credential."""
     from cowork.services.channels import secret_credential_keys
 
     sensitive = frozenset(key for key in UserSettings.model_fields if UserSettings.field_is_sensitive(key))
@@ -141,7 +143,7 @@ def refuse_unopenable_sealed_data() -> None:
     if keys is None:
         return
     failures: list[str] = []
-    sealed_keys = _sealed_setting_keys()
+    sealed_keys = sealed_setting_keys()
     engine = get_engine(get_app_settings().database.uri)
     with SQLSession(engine) as session:
         rows = session.exec(select(Setting).where(Setting.key.in_(sealed_keys))).all()

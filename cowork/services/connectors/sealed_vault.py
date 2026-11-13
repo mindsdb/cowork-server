@@ -87,7 +87,7 @@ class SealedDataVault(LocalDataVault):
         record = read_record_file(path=self._path_for(engine, name), connection=connection)
         if record is None:
             return None
-        return {**record, "fields": self._open(fields=record["fields"], connection=connection)}
+        return {**record, "fields": open_fields(fields=record["fields"], keys=self._keys, connection=connection)}
 
     def load(self, engine: str, name: str) -> dict[str, Any] | None:
         record = self.read_record(engine, name)
@@ -119,7 +119,7 @@ class SealedDataVault(LocalDataVault):
                 record = read_record_file(path=path, connection=path.name)
                 if record is not None:
                     connection = f"{record.get('engine', '')}/{record.get('name', '')}"
-                    self._open(fields=record["fields"], connection=connection)
+                    open_fields(fields=record["fields"], keys=self._keys, connection=connection)
             except SealedRecordError as error:
                 failures.append(error)
         return failures
@@ -140,28 +140,31 @@ class SealedDataVault(LocalDataVault):
     def _seal(self, *, value: Any) -> str:
         return self._keys.encrypt(json.dumps(value).encode()).decode()
 
-    def _open(self, *, fields: dict[str, Any], connection: str) -> dict[str, Any]:
-        if fields.get(SEALED_FIELD) != SEALED_VERSION:
+
+def open_fields(*, fields: dict[str, Any], keys: MultiFernet, connection: str) -> dict[str, Any]:
+    """A sealed record's fields, each value opened with ``keys``. A record without the sealed
+    mark, or a value that isn't a token ``keys`` opens, raises."""
+    if fields.get(SEALED_FIELD) != SEALED_VERSION:
+        raise SealedRecordError(
+            connection=connection,
+            cause="its record isn't sealed; stop Cowork and run the re-seal command",
+        )
+    opened: dict[str, Any] = {}
+    for key, value in fields.items():
+        if key == SEALED_FIELD:
+            continue
+        if key in BOOKKEEPING_FIELDS:
+            opened[key] = value
+            continue
+        if not isinstance(value, str):
+            raise SealedRecordError(connection=connection, cause=f"its {key} field isn't sealed")
+        try:
+            opened[key] = json.loads(keys.decrypt(value.encode()))
+        except (InvalidToken, ValueError):
             raise SealedRecordError(
-                connection=connection,
-                cause="its record isn't sealed; stop Cowork and run the re-seal command",
-            )
-        opened: dict[str, Any] = {}
-        for key, value in fields.items():
-            if key == SEALED_FIELD:
-                continue
-            if key in BOOKKEEPING_FIELDS:
-                opened[key] = value
-                continue
-            if not isinstance(value, str):
-                raise SealedRecordError(connection=connection, cause=f"its {key} field isn't sealed")
-            try:
-                opened[key] = json.loads(self._keys.decrypt(value.encode()))
-            except (InvalidToken, ValueError):
-                raise SealedRecordError(
-                    connection=connection, cause=f"its {key} field doesn't open with the server's key"
-                ) from None
-        return opened
+                connection=connection, cause=f"its {key} field doesn't open with the server's key"
+            ) from None
+    return opened
 
 
 def read_record_file(*, path: Path, connection: str) -> dict[str, Any] | None:
