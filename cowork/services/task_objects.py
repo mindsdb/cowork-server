@@ -860,31 +860,41 @@ def turn_artifact_changes(
     # covers the created folders too, so a row naming one of them is never
     # taken for a row whose folder is gone (record_listed_folders).
     from cowork.services.artifact_locations import keeps_locations
-    from cowork.services.artifact_sort_times import SortTimesRead, sort_times_below
+    from cowork.services.artifact_sort_times import SortTimesRead, id_holder_times
 
+    created = artifact_ids_below(base=base, slugs=new)
+    listed_ids = (
+        listed_folder_ids(base=base, listing=whole_listing)
+        if whole_listing is not None
+        else ListedIds(ids={}, unreadable=frozenset())
+    )
     # Every folder the turn may have edited is timed, not only the touched
     # ones: content_mtime_ns skips metadata.json, so a turn whose only
     # change is a metadata.json rewrite, as anton's update_artifact_metadata
     # makes, touches nothing, yet a walk moves its card up. Without the
     # pod's list that is every folder, whose metadata.json the listing above
     # already stat'ed, and record_sort_times writes only the times that moved.
+    # Only the folders holding an id are timed, as the self-heal times them
+    # (id_holder_times): the ids the whole listing read, or else those of
+    # the created folders and one read of the other named ones.
     # Only where artifacts have rows: elsewhere no time is written, so none
     # is read, and an edit alone opens no record unit (needs_record).
-    timed = (
-        sort_times_below(base=base, slugs=touched | editable)
-        if scope is not None and keeps_locations(scope)
-        else SortTimesRead(times={}, unreadable=frozenset())
-    )
+    if scope is not None and keeps_locations(scope):
+        timed_slugs = touched | editable
+        if whole_listing is not None:
+            ids = listed_ids
+        else:
+            others = artifact_ids_below(base=base, slugs=sorted(timed_slugs.difference(new)))
+            ids = ListedIds(ids={**created.ids, **others.ids}, unreadable=created.unreadable | others.unreadable)
+        timed = id_holder_times(base=base, slugs=timed_slugs, ids=ids)
+    else:
+        timed = SortTimesRead(times={}, unreadable=frozenset())
     return ArtifactChanges(
-        created=new, touched=touched, created_ids=artifact_ids_below(base=base, slugs=new).ids,
+        created=new, touched=touched, created_ids=created.ids,
         checked_repairs=checked_repairs,
         sort_times=timed.times,
         untimed=timed.unreadable,
-        listed_ids=(
-            listed_folder_ids(base=base, listing=whole_listing)
-            if whole_listing is not None
-            else ListedIds(ids={}, unreadable=frozenset())
-        ),
+        listed_ids=listed_ids,
     )
 
 

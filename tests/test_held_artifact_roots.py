@@ -1321,10 +1321,10 @@ async def test_the_startup_task_runs_again_while_either_sentinel_alone_lists_an_
     else:
         real_child_stat = artifact_sort_times.dir_child_stat
 
-        def child_stat(root, *names):
+        def child_stat(root, *names, **kwargs):
             if not waits:
                 raise OSError(errno.EIO, "the file server did not answer")
-            return real_child_stat(root, *names)
+            return real_child_stat(root, *names, **kwargs)
 
         monkeypatch.setattr(artifact_sort_times, "dir_child_stat", child_stat)
 

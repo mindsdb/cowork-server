@@ -20,9 +20,11 @@ found gone or holding no id (artifact_autopublish._record_listing,
 reconcile_sort_times), from the project files PUT
 (project_files._record_artifact_folder_write), from a comparison side's
 carry (ComparisonService._hold_carried_workspace), and from the backfill
-below. Only the self-heal's listing moves a row back, to the older time a
-folder replaced by an older copy now holds, and only a row no writer
-changed while it listed. A rewrite of `metadata.json` the server makes on
+below. Every writer times only the folders that hold an id, as the
+self-heal does (id_holder_times): a folder that holds none builds no card.
+Only the self-heal's listing moves a row back, to the older time a folder
+replaced by an older copy now holds, and only a row no writer changed while
+it listed. A rewrite of `metadata.json` the server makes on
 its own, such as an id widening (artifact_identity.ensure_full_id), puts
 the file's time back, so an old artifact does not move up the list. A row
 moves with a task's folders (move_sort_times) and goes with a folder the
@@ -58,8 +60,10 @@ from cowork.models.artifact_sort_time import ArtifactSortTime
 from cowork.models.held_artifact_root import HeldArtifactRoot
 from cowork.models.project import Project
 from cowork.services.artifact_identity import (
+    ListedIds,
     _opened_from_trusted_root,
     _strictly_holds_no_id,
+    artifact_ids_below,
     is_listable_folder_name,
     opened_artifact_root,
 )
@@ -162,10 +166,11 @@ class SortTimesRead(NamedTuple):
 
 def _folder_time(root, name: str) -> float | None:
     """The modification time of `name`'s `metadata.json`, `name` a direct
-    child folder of the pinned `root`, opened without following a link in its
-    place (dir_child_stat). None when `metadata.json` is not a regular file:
-    the list shows no card for such a folder."""
-    found = dir_child_stat(root, name, "metadata.json")
+    child folder of the pinned `root`, both stat'ed without following a link
+    in their place (dir_child_stat). None when `metadata.json` is not a
+    regular file, a link to one included: the id reader refuses it, so the
+    list shows no card for such a folder."""
+    found = dir_child_stat(root, name, "metadata.json", follow_symlinks=False)
     return found.st_mtime if stat.S_ISREG(found.st_mode) else None
 
 
@@ -201,6 +206,25 @@ def sort_times_below(*, base: Path, slugs: Iterable[str]) -> SortTimesRead:
             return SortTimesRead(times={}, unreadable=frozenset())
         return SortTimesRead(times={}, unreadable=frozenset(names))
     return SortTimesRead(times=times, unreadable=frozenset(unreadable))
+
+
+def id_holder_times(*, base: Path, slugs: Iterable[str], ids: ListedIds | None = None) -> SortTimesRead:
+    """sort_times_below for the folders among `slugs` that hold an id, the
+    only ones the self-heal times (artifact_autopublish._listed_ids_and_times).
+    A folder that holds no id builds no card, so its row would only take one
+    of the list's newest slots until the next self-heal dropped it, and the
+    list would read every folder meanwhile when too few of its newest rows
+    build a card. `ids` is the caller's read of those folders' ids
+    (artifact_identity.ListedIds); without it they are read here
+    (artifact_ids_below). A folder whose id could not be read gets no time
+    and is in `unreadable`, as one whose time could not be read is."""
+    names = {slug for slug in slugs if is_listable_folder_name(slug)}
+    if not names:
+        return SortTimesRead(times={}, unreadable=frozenset())
+    if ids is None:
+        ids = artifact_ids_below(base=base, slugs=sorted(names))
+    read = sort_times_below(base=base, slugs=names.intersection(ids.ids))
+    return SortTimesRead(times=read.times, unreadable=read.unreadable | (ids.unreadable & names))
 
 
 def _in_root(query, *, project_id: UUID, conversation_id: UUID | None, slugs: Collection[str]):

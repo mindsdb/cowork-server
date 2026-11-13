@@ -52,9 +52,9 @@ def test_a_continued_side_records_the_sort_time_of_each_folder_its_workspace_bro
     root's folders from their rows alone, newest first, so the carry records
     the time of each folder the list would open, read from its
     metadata.json. The carry moves the workspace, so each file keeps its
-    time. A folder with no metadata.json, for which the list shows no card,
-    gets no time, and neither does a dot-named one, which the list never
-    opens. A missing metadata.json is no failed read, so nothing is
+    time. A folder with no metadata.json, or one whose metadata.json does
+    not parse, so it holds no id, for which the list shows no card, gets no time, and neither does
+    a dot-named one, which the list never opens. A missing metadata.json is no failed read, so nothing is
     logged."""
     held_roots()
     logged = owned_logger(comparisons.logger.name, level=logging.WARNING)
@@ -64,6 +64,8 @@ def test_a_continued_side_records_the_sort_time_of_each_folder_its_workspace_bro
             _write_artifact(artifacts, slug)
             os.utime(artifacts / slug / "metadata.json", (mtime, mtime))
         (artifacts / "no-metadata").mkdir()
+        (artifacts / "no-id").mkdir()
+        (artifacts / "no-id" / "metadata.json").write_text("{")
 
     destination_id, conversation_id = _continue_a_side(client, org, artifact=False, fill=fill)
 

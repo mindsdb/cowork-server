@@ -504,7 +504,8 @@ class ComparisonService:
         that the root holds one (held_artifact_roots.hold_root), so the list
         opens it, and the sort time of each of those folders
         (artifact_sort_times.record_sort_times, with the times
-        sort_times_below reads), so the list counts them among the newest.
+        id_holder_times reads of those holding an id), so the list counts
+        them among the newest.
         The list trusts both rows once their backfills have finished, so
         without them it never shows those folders. A workspace with no
         artifacts folder gets no row. Org tenancy only, where the rows are
@@ -527,7 +528,7 @@ class ComparisonService:
         records that folder."""
         from cowork.services.artifact_locations import keeps_locations
         from cowork.services.artifact_roots import ProjectRow, recorded_source
-        from cowork.services.artifact_sort_times import record_sort_times, sort_times_below
+        from cowork.services.artifact_sort_times import id_holder_times, record_sort_times
         from cowork.services.held_artifact_roots import hold_root, listable_folder_names
 
         if not keeps_locations(self.session.scope):
@@ -562,7 +563,7 @@ class ComparisonService:
                 extra={"event": "held_artifact_root_not_recorded", **context},
             )
         try:
-            read = sort_times_below(base=source.base, slugs=folders)
+            read = id_holder_times(base=source.base, slugs=folders)
             record_sort_times(self.session, project_id=project_id, times=read.times, conversation_id=conversation_id)
         except Exception:
             self.session.rollback()

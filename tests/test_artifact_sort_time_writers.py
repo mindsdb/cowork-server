@@ -69,6 +69,7 @@ from test_org_list_scaling import (  # noqa: F401  (fixtures)
     _alices_conversation,
     _project_id,
     client,
+    _read_in_full,
     held_roots,
     org,
 )
@@ -116,10 +117,10 @@ def _times_that_fail_for(monkeypatch, *names: str) -> Callable[[], None]:
     makes it answer again."""
     real = artifact_sort_times.dir_child_stat
 
-    def child_stat(root, name, child):
+    def child_stat(root, name, child, **kwargs):
         if name in names:
             raise OSError(errno.EIO, "the file server did not answer")
-        return real(root, name, child)
+        return real(root, name, child, **kwargs)
 
     monkeypatch.setattr(artifact_sort_times, "dir_child_stat", child_stat)
     return lambda: monkeypatch.setattr(artifact_sort_times, "dir_child_stat", real)
@@ -832,6 +833,70 @@ async def test_an_edit_only_turn_end_holds_its_root_and_writes_the_time(tmp_path
 
     assert held_roots_of(org_id) == {HeldRoot(project.id, None)}
     assert sort_times_of(org_id) == {(project.id, None, "report"): 1_000_200.0}
+
+
+def _idless_folder(base: Path, slug: str, at: float) -> Path:
+    """A folder whose metadata.json does not parse, last changed at `at`:
+    it holds no id, so the list builds no card for it."""
+    folder = base / slug
+    folder.mkdir(parents=True)
+    (folder / "metadata.json").write_text("{")
+    os.utime(folder / "metadata.json", (at, at))
+    return folder
+
+
+@pytest.mark.parametrize("named", [True, False], ids=["pod-list", "no-list"])
+@pytest.mark.parametrize("producer", list(_PRODUCERS))
+async def test_a_turn_end_times_no_folder_that_holds_no_id(tmp_path, monkeypatch, producer, named):
+    """The turn rewrites `report` and leaves `scratch`, whose metadata.json
+    does not parse, so it holds no id, newer still. Its pod names both, or sends no list. The turn
+    end times only `report`, as the self-heal would: `scratch` builds no
+    card, so its row would only take one of the list's newest slots."""
+    org_id, creator = str(uuid4()), str(uuid4())
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, creator)
+    base = project_root(project).base
+    folder = timed_artifact(base, "report", 1_000_100.0)
+
+    def during_turn() -> None:
+        _rewrite_metadata(folder, 1_000_200.0)
+        _idless_folder(base, "scratch", 1_000_300.0)
+
+    await _turn_end(
+        monkeypatch, producer, project=project, scope=TenantScope(org_mode=True, org_id=org_id, user_id=creator),
+        conversation_id=conversation_id, during_turn=during_turn, touched=["report", "scratch"] if named else None,
+    )
+
+    assert sort_times_of(org_id) == {(project.id, None, "report"): 1_000_200.0}
+
+
+async def test_newest_folders_that_hold_no_id_leave_the_list_on_its_rows(
+    client, org, held_roots, monkeypatch,  # noqa: F811
+):
+    """A pod that sends no list leaves 100 folders whose metadata.json does
+    not parse, so they hold no id, newer than the project's 90 artifacts. The turn end times only
+    the folders that hold an id, so the list's 160 newest rows still name 80
+    folders that build a card, and it reads no root in full."""
+    [path] = _bulk_paths(client, org, 0, 1)
+    _artifacts_at(org, path, ALICE, {f"art-{index:03d}": 1_000_000.0 + index for index in range(90)})
+    held_roots()
+    base = path / ".anton" / "artifacts"
+
+    def during_turn() -> None:
+        for index in range(100):
+            _idless_folder(base, f"scratch-{index:03d}", 2_000_000.0 + index)
+
+    _remote_turn_end(monkeypatch, during_turn=during_turn, touched=None)
+    await _run_turn(
+        scope=TenantScope(org_mode=True, org_id=org, user_id=ALICE),
+        conversation_id=_alices_conversation(org, path),
+    )
+    reads = _read_in_full(monkeypatch)
+
+    response = client.get(f"/api/v1/artifacts/?project_id={_project_id(org, path)}", headers=_headers(org, ALICE))
+
+    assert [card["slug"] for card in response.json()] == [f"art-{index:03d}" for index in range(89, 9, -1)]
+    assert reads and not any(reads)
 
 
 def _records_counted(monkeypatch) -> list[dict]:

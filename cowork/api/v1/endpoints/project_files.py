@@ -1852,19 +1852,19 @@ def _artifact_folder_project(scoped: ScopedSession, project_name: str) -> Projec
 def _record_folder_time(scoped: ScopedSession, *, project: ProjectRow, folder: _ArtifactFolder) -> None:
     """Record `folder`'s sort time in `project` (artifact_sort_times.
     record_sort_times): the modification time of its `metadata.json`, read
-    here (sort_times_below), since the project files units run on the file
-    store's threads (run_efs_unit). A folder with no `metadata.json` gets no
-    time, and a row only moves to a newer time.
+    here (id_holder_times), since the project files units run on the file
+    store's threads (run_efs_unit). A folder with no `metadata.json`, or one
+    that holds no id, gets no time, and a row only moves to a newer time.
 
     Best-effort: a failed write is rolled back and logged at ERROR. A
     `metadata.json` the read could not reach, such as on EIO, is logged at
     WARNING and leaves the folder's row as it was. For a shared root either
     one asks for the project's location check (_ask_for_location_check),
     whose listing records the time of every folder it reads."""
-    from cowork.services.artifact_sort_times import record_sort_times, sort_times_below
+    from cowork.services.artifact_sort_times import id_holder_times, record_sort_times
 
     try:
-        read = sort_times_below(base=recorded_source(project, folder.conversation_id).base, slugs=[folder.slug])
+        read = id_holder_times(base=recorded_source(project, folder.conversation_id).base, slugs=[folder.slug])
         record_sort_times(scoped, project_id=project.id, times=read.times, conversation_id=folder.conversation_id)
     except Exception:
         scoped.rollback()

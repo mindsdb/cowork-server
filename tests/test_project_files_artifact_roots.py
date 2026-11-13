@@ -200,6 +200,31 @@ def test_a_folders_time_is_recorded_by_the_put_that_writes_its_metadata_json(
 
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["shared-root", "legacy-root"])
+def test_a_put_of_a_metadata_json_that_does_not_parse_records_no_time(
+    client, org, held_roots, owned_logger, legacy  # noqa: F811
+):
+    """A metadata.json that does not parse holds no id and builds no card,
+    so the PUT that
+    writes it holds the root but records no time for its folder, as the
+    self-heal records none. Nothing failed, so nothing is logged and no
+    location check is asked for."""
+    path = _project(client, org)
+    conversation_id = _conversation(org, path, ALICE) if legacy else None
+    root = _artifacts_root(conversation_id)
+    project_id = _project_id(org, path)
+    held_roots()
+    logged = owned_logger(project_files.logger.name, level=logging.WARNING)
+
+    response = _put(client, org, ALICE, path, f"{root}/scratch/metadata.json", "{")
+
+    assert response.status_code == 200, response.text
+    assert held_roots_of(org) == {HeldRoot(project_id, conversation_id)}
+    assert _sort_times(org) == set()
+    assert logged.output() == ""
+    assert _requested_location_checks() == set()
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["shared-root", "legacy-root"])
 def test_a_later_put_of_metadata_json_moves_its_folder_to_the_top_of_the_list(
     client, org, held_roots, owned_logger, legacy  # noqa: F811
 ):

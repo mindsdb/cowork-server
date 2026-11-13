@@ -30,6 +30,7 @@ from cowork.services.artifact_identity import is_listable_folder_name
 from cowork.services.artifact_locations import Location
 from cowork.services.artifact_owner_backfill import BackfillProgress, read_progress, write_sentinel
 from cowork.services.artifact_roots import plan_scope_roots, with_held_roots
+from cowork.services.artifact_identity import ListedIds
 from cowork.services.artifact_sort_times import (
     PROGRESS_KEY,
     SENTINEL_KEY,
@@ -37,6 +38,7 @@ from cowork.services.artifact_sort_times import (
     SortTimeRow,
     SortTimeSentinel,
     SortTimesRead,
+    id_holder_times,
     move_sort_times,
     newest_folders,
     reconcile_sort_times,
@@ -1405,6 +1407,48 @@ def test_sort_times_below_reads_only_folders_the_list_would_open_without_followi
     assert sort_times_below(base=Path("/"), slugs=["report"]) == SortTimesRead(times={}, unreadable=frozenset())
 
 
+def test_sort_times_below_gives_no_time_to_a_folder_whose_metadata_json_is_a_link(tmp_path):
+    """The id reader refuses a linked metadata.json, so the list builds no
+    card for its folder: it gets no time, even when the link names a regular
+    file."""
+    project = make_project(tmp_path, str(uuid4()))
+    base = project_root(project).base
+    timed_artifact(base, "report", 1_000_100.0)
+    outside = timed_artifact(tmp_path / "outside", "planted", 1_000_900.0)
+    (base / "relinked").mkdir()
+    (base / "relinked" / "metadata.json").symlink_to(outside / "metadata.json")
+
+    assert sort_times_below(base=base, slugs=["report", "relinked"]) == SortTimesRead(
+        times={"report": 1_000_100.0}, unreadable=frozenset()
+    )
+
+
+def test_id_holder_times_times_only_the_folders_that_hold_an_id(tmp_path):
+    """A folder whose metadata.json does not parse, or is no JSON object,
+    holds no id and builds no card, so it gets no time, as the self-heal
+    gives it none. One with no id field holds the id the reader derives, so
+    it is timed. Ids the caller
+    read already are used as they are: a folder whose id it could not read
+    gets no time and comes back unreadable."""
+    project = make_project(tmp_path, str(uuid4()))
+    base = project_root(project).base
+    timed_artifact(base, "report", 1_000_100.0)
+    timed_artifact(base, "stalled", 1_000_200.0)
+    for slug, text in (("derived-id", '{"title": "scratch"}'), ("not-json", "{"), ("not-object", "[]")):
+        (base / slug).mkdir()
+        (base / slug / "metadata.json").write_text(text)
+        os.utime(base / slug / "metadata.json", (1_000_300.0, 1_000_300.0))
+
+    assert id_holder_times(
+        base=base, slugs=["report", "derived-id", "not-json", "not-object", ".hidden", "missing"]
+    ) == SortTimesRead(times={"report": 1_000_100.0, "derived-id": 1_000_300.0}, unreadable=frozenset())
+    read = ListedIds(ids={"report": str(uuid4())}, unreadable=frozenset({"stalled", "elsewhere"}))
+    assert id_holder_times(base=base, slugs=["report", "stalled"], ids=read) == SortTimesRead(
+        times={"report": 1_000_100.0}, unreadable=frozenset({"stalled"})
+    )
+    assert id_holder_times(base=base, slugs=[]) == SortTimesRead(times={}, unreadable=frozenset())
+
+
 def test_sort_times_below_returns_the_folders_it_could_not_read(tmp_path, monkeypatch):
     """An EIO is no answer: the folder is returned as unreadable, never
     taken for one with no time, and every folder is when the root itself
@@ -1416,12 +1460,12 @@ def test_sort_times_below_returns_the_folders_it_could_not_read(tmp_path, monkey
         timed_artifact(base, slug, 1_000_100.0)
     real_stat = artifact_sort_times.dir_child_stat
 
-    def child_stat(root, name, child):
+    def child_stat(root, name, child, **kwargs):
         if name == "stalled":
             raise OSError(errno.EIO, "the file server did not answer")
         if name == "refused":
             raise PermissionError(errno.EACCES, "permission denied")
-        return real_stat(root, name, child)
+        return real_stat(root, name, child, **kwargs)
 
     monkeypatch.setattr(artifact_sort_times, "dir_child_stat", child_stat)
 
