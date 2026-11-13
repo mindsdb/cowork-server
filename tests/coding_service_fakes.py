@@ -50,6 +50,21 @@ def wait_for_status(service: CodingService, session_id: str, status: SessionStat
     return session
 
 
+def wait_for_run_to_follow(service: CodingService, session_id: str) -> CodingSession:
+    """Wait for a local task's run status to match its session status, and
+    return the task as it is then.
+
+    The run follows the session in a separate save, so a read between the two
+    sees them disagree. A remote runtime owns its run's status; not for those.
+    """
+    deadline = time.monotonic() + 3
+    session = service.get_session(session_id)
+    while time.monotonic() < deadline and session.run_status != session.status.value:
+        time.sleep(0.01)
+        session = service.get_session(session_id)
+    return session
+
+
 def wait_for_turn_thread(session_id: str) -> None:
     """Wait for a task's turn thread to exit.
 
