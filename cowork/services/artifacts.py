@@ -526,6 +526,23 @@ def _published_url_for(
     return ""
 
 
+def _report_id_for(
+    folder: Path,
+    primary: Path | None,
+    *,
+    published_map: dict | None = None,
+) -> str:
+    """The publish service's id for the artifact's live page, "" when it has
+    none. Read beside the URL and under the same rule, so a soft-deleted record
+    that keeps its report_id for a later re-publish reports none. The id is
+    already in the page's URL; the client sends it with its sharing analytics."""
+    pmap = published_map if published_map is not None else _load_published_map(folder)
+    if primary is None or not _published_url_for(folder, primary, published_map=pmap):
+        return ""
+    report_id = pmap[primary.name].get("report_id")
+    return report_id if isinstance(report_id, str) else ""
+
+
 def _modified_state(
     folder: Path,
     primary: Path | None,
@@ -671,24 +688,27 @@ def published_access_view(
         recorded = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
         mode = AccessMode(recorded) if recorded in set(AccessMode) else AccessMode.PUBLIC
         artifact_key = entry.get("artifact_key", "") or ""
+        report_id = _report_id_for(folder, primary, published_map=pmap)
         if mode is AccessMode.PASSWORD:
             return ArtifactAccessView(
                 access_mode=mode,
                 artifact_key=artifact_key,
+                report_id=report_id,
                 access_protected=True,
                 access_password=entry.get("access_password", "") or "",
             )
         if mode is AccessMode.RESTRICTED and _org_mode():
-            return ArtifactAccessView.audience_unknown(artifact_key=artifact_key)
+            return ArtifactAccessView.audience_unknown(artifact_key=artifact_key, report_id=report_id)
         if mode is AccessMode.RESTRICTED:
             return ArtifactAccessView(
                 access_mode=mode,
                 artifact_key=artifact_key,
+                report_id=report_id,
                 access_emails=entry.get("emails", []) or [],
                 org_allowed=bool(entry.get("org_allowed")),
                 owner_only=bool(entry.get("owner_only")),
             )
-        return ArtifactAccessView(access_mode=mode, artifact_key=artifact_key)
+        return ArtifactAccessView(access_mode=mode, artifact_key=artifact_key, report_id=report_id)
     except Exception:
         return ArtifactAccessView()
 
@@ -2233,6 +2253,7 @@ def html_artifacts(*, scope: TenantScope | None) -> list[dict]:
             "path": str(c.path),
             "bytes": c.size,
             "publishedUrl": _published_url_for(c.published_dir, c.path),
+            "reportId": _report_id_for(c.published_dir, c.path),
         }
         for c in newest
     ]
