@@ -135,7 +135,8 @@ class AuthBranding:
     session, a route missing).
 
     ``auth_status`` is auth's HTTP status when auth answered with nothing
-    usable (any status but its 403, or a body that isn't the branding), and
+    usable (any status but its 403, or a body that isn't auth's branding
+    body: not a JSON object with an ``appearance`` object), and
     None otherwise, including when nothing answered. ``declined`` tells a
     4xx among those apart from an outage.
 
@@ -287,9 +288,16 @@ def _cache_key(*, bearer_token: str, org_id: str, user_id: str) -> CallerCacheKe
 _NO_ORG_STATUS = 403
 
 
+def _is_branding_body(payload: Any) -> bool:
+    """auth's branding body, from the GET or a PATCH that answers it whole:
+    a JSON object with its ``appearance`` object, which auth always sends.
+    Anything else, ``{}`` included, says nothing about the org."""
+    return isinstance(payload, dict) and isinstance(payload.get("appearance"), dict)
+
+
 async def _read_auth_branding(bearer_token: str) -> AuthBranding:
     reply = await get_mindshub_reply(AUTH_BRANDING_PATH, bearer_token)
-    if reply.answer is MindsHubAnswer.OK and isinstance(reply.payload, dict):
+    if reply.answer is MindsHubAnswer.OK and _is_branding_body(reply.payload):
         return parse_auth_branding(reply.payload)
     if reply.answer is MindsHubAnswer.REFUSED and reply.status_code == _NO_ORG_STATUS:
         return AuthBranding(answer=MindsHubAnswer.REFUSED)
@@ -391,7 +399,7 @@ async def update_auth_appearance(
         raise _refusal(reply)
     if reply.answer is not MindsHubAnswer.OK:
         raise AuthAppearanceError(502, APPEARANCE_UNREACHABLE)
-    if isinstance(reply.payload, dict) and "appearance" in reply.payload:
+    if _is_branding_body(reply.payload):
         value = parse_auth_branding(reply.payload)
     else:
         # A PATCH that answers less than the whole body: read it again.

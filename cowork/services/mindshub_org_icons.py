@@ -73,9 +73,10 @@ async def fetch_org_icons(*, bearer_token: str, org_id: str, user_id: str) -> Or
     organizations, reachable, and so is auth's 403. Any other refusal (a 401
     for an expired session, a 404) says nothing about the caller's orgs, so
     it is ``reachable`` false, as an outage is, and not cached: the switcher
-    keeps the icons it has. Any answer from auth with nothing usable logs
-    ``org_icons_read_unknown`` with auth's status, at WARNING so every
-    deployment prints it, as the branding read does. Never raises."""
+    keeps the icons it has. So is a 200 whose body isn't auth's list (a
+    JSON object with a ``results`` list). Any answer from auth with nothing
+    usable logs ``org_icons_read_unknown`` with auth's status, at WARNING so
+    every deployment prints it, as the branding read does. Never raises."""
     if not is_session_jwt(bearer_token):
         return OrgIcons(reachable=True)
     key = CallerCacheKey.for_caller(org_id=org_id, user_id=user_id, bearer_token=bearer_token)
@@ -83,7 +84,11 @@ async def fetch_org_icons(*, bearer_token: str, org_id: str, user_id: str) -> Or
     if cached is not None:
         return cached
     reply = await get_mindshub_reply(AVAILABLE_ORGS_PATH, bearer_token)
-    if reply.answer is MindsHubAnswer.OK and isinstance(reply.payload, dict):
+    if (
+        reply.answer is MindsHubAnswer.OK
+        and isinstance(reply.payload, dict)
+        and isinstance(reply.payload.get("results"), list)
+    ):
         value = _parse(reply.payload)
     elif reply.answer is MindsHubAnswer.REFUSED and reply.status_code == 403:
         value = OrgIcons(reachable=True)

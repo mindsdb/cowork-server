@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
+import logging
 import os
 from dataclasses import replace
 from functools import partial
@@ -26,6 +28,7 @@ from cowork.api.v1.endpoints import settings as settings_ep
 from cowork.api.v1.endpoints import skill_sharing as sharing_ep
 from cowork.api.v1.endpoints import skills as skills_ep
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.structured_logging import make_formatter
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.units import run_efs
 from cowork.models.skill import Skill
@@ -360,8 +363,11 @@ KEEP_THE_LOOK = {"enabled": True, "reachable": False}
         _auth_answers(502),
         # A 200 whose body isn't JSON.
         MindsHubReply(MindsHubAnswer.UNREACHABLE, status_code=200),
+        # A 200 whose JSON isn't auth's branding body: no appearance object.
+        MindsHubReply(MindsHubAnswer.OK, payload={}, status_code=200),
+        MindsHubReply(MindsHubAnswer.OK, payload={**BRANDING, "appearance": None}, status_code=200),
     ],
-    ids=["no-answer", "500", "502", "200-not-json"],
+    ids=["no-answer", "500", "502", "200-not-json", "200-empty-object", "200-no-appearance"],
 )
 def test_an_outage_with_nothing_cached_is_a_503_not_the_stock_look(org, reply):
     org.auth.get_answer = reply
@@ -409,11 +415,6 @@ def test_each_unusable_read_logs_auths_status_once_at_warning(org, caplog, statu
 
 
 def test_the_unusable_read_line_keeps_auths_status_in_the_json_log(org, caplog, monkeypatch):
-    import json
-    import logging
-
-    from cowork.common.structured_logging import make_formatter
-
     monkeypatch.setenv("LOG_FORMAT", "json")
     org.auth.get_answer = _auth_answers(404)
     with caplog.at_level(logging.WARNING, logger=org_branding.logger.name):
@@ -421,6 +422,17 @@ def test_the_unusable_read_line_keeps_auths_status_in_the_json_log(org, caplog, 
     (record,) = _read_unknown_records(caplog)
     line = json.loads(make_formatter().format(record))
     assert (line["log_level"], line["event"], line["status_code"]) == ("WARNING", "org_branding_read_unknown", 404)
+
+
+def test_a_200_that_isnt_auths_branding_is_logged_and_not_cached(org, caplog):
+    org.auth.get_answer = MindsHubReply(MindsHubAnswer.OK, payload={}, status_code=200)
+    with caplog.at_level("WARNING", logger=org_branding.logger.name):
+        _refused(lambda: _get(org, ALICE), 503, ep.READ_UNREACHABLE)
+    assert [(record.levelname, record.status_code) for record in _read_unknown_records(caplog)] == [("WARNING", 200)]
+    org.auth.get_answer = None
+    out = _get(org, ALICE)
+    assert (out["enabled"], out["reachable"], out["logoUrl"]) == (True, True, BRANDING["logo_url"])
+    assert len(org.auth.gets()) == 2
 
 
 def test_no_line_when_nothing_answered_or_auth_answered_usably(org, caplog):
@@ -699,6 +711,7 @@ def test_hosted_a_members_refused_or_unknown_read_leaves_the_org_skill(org):
         MindsHubReply(MindsHubAnswer.REFUSED, status_code=401),
         MindsHubReply(MindsHubAnswer.REFUSED, status_code=404),
         MindsHubReply(MindsHubAnswer.UNREACHABLE),
+        MindsHubReply(MindsHubAnswer.OK, payload={}, status_code=200),
     ):
         org.auth.get_answer = answer
         org_branding._branding_cache.clear()

@@ -1056,8 +1056,8 @@ Both read MindsHub with the Authorization the gateway validated (`caller_bearer`
 
 - The branding read serves the caller's last answer for up to 10 minutes.
 - Without one, a 4xx from auth (a 401 for an expired desktop session, a 429, or a 404 while auth runs a release without the route) answers 200 with `reachable: false` and the stock values. The app keeps the look it shows, and the Brand guidelines skill doesn't change.
-- No answer, a 5xx or a body that isn't the branding answers 503, since auth being down is an outage the ingress alerts should see. The app keeps its look on the 503 too.
-- The icons read answers 200 with `reachable: false` for all of these, and the org switcher keeps the icons it has.
+- No answer, a 5xx or a body that isn't auth's branding (not a JSON object with an `appearance` object, such as `{}`) answers 503, since auth being down is an outage the ingress alerts should see. The app keeps its look on the 503 too.
+- The icons read answers 200 with `reachable: false` for all of these, a body without auth's `results` list included, and the org switcher keeps the icons it has.
 - Each reply from auth with nothing usable logs one WARNING line, `org_branding_read_unknown` or `org_icons_read_unknown`, with auth's HTTP status in `status_code`. No answer at all logs no such line.
 
 ### Sharing limits

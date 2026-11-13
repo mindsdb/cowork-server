@@ -9,7 +9,8 @@ No credential, or auth answering that the caller has no current org, is
 When auth answers nothing usable (no answer, a 5xx, a 429, a 401 or a 404)
 the caller's last answer is served for up to 10 minutes. Without one, any
 4xx from auth but its 403 answers 200 with ``reachable: false``, and no
-answer, a 5xx or a body that isn't the branding answers 503. The app takes
+answer, a 5xx or a body that isn't auth's branding (not a JSON object
+with an ``appearance`` object) answers 503. The app takes
 both as "keep the look you have" (mindsdb/cowork's useOrgBranding hook), so
 an outage or an expired session never flips the look to stock. Only the
 outage is a 5xx: auth answering 404 while its release trails this
