@@ -634,7 +634,6 @@ class StaleEntryCheck:
         self.reached = reached
         self.collected: set[Path] = set()
         self.deselected = False
-        self.worker_stopped_early = False
         self.workers_lost: list[str] = []
         self.skipped_because: str | None = None
         self.stale: list[Allowed] = []
@@ -659,7 +658,6 @@ class StaleEntryCheck:
         self.reached.update(Site(*site) for site in output["reached"])
         self.collected.update(Path(path) for path in output["collected"])
         self.deselected = self.deselected or output["deselected"]
-        self.worker_stopped_early = self.worker_stopped_early or output["stopped_early"]
 
     def hand_over_to_controller(self, session: pytest.Session) -> None:
         """On an xdist worker: put what this worker saw where the controller's
@@ -668,7 +666,6 @@ class StaleEntryCheck:
             "reached": [tuple(site) for site in self.reached],
             "collected": [str(path) for path in self.collected],
             "deselected": self.deselected,
-            "stopped_early": bool(session.shouldstop or session.shouldfail),
         }
 
     def not_a_full_run(self, session: pytest.Session, *, exitstatus: int) -> str | None:
@@ -685,7 +682,7 @@ class StaleEntryCheck:
             return f"pytest-xdist worker {', '.join(self.workers_lost)} ended without handing over its sites"
         if self.deselected or option.keyword or option.markexpr:
             return "tests were deselected"
-        if session.shouldstop or session.shouldfail or self.worker_stopped_early:
+        if session.shouldstop or session.shouldfail:
             return "the run stopped early"
         every_file = {
             path
