@@ -1065,6 +1065,16 @@ Both read MindsHub with the Authorization the gateway validated (`caller_bearer`
 - Every value is checked first, by the rule MindsHub applies, because MindsHub refuses a whole lookup for one value it doesn't take. An id that isn't a UUID answers 400 `{"code": "invalid_id", "detail", "ids": [...]}`; an address MindsHub wouldn't take (Django's `validate_email`, ported in `cowork/services/mindshub_people.py`) answers 400 `{"code": "invalid_email", "detail", "emails": [...]}`. MindsHub is not asked in either case.
 - A 4xx from MindsHub answers 403 or 400 `mindshub_refused`, or 429 `mindshub_throttled`, never `reachable: false`.
 
+### The org branding and org icons reads
+
+`GET /api/v1/org-branding` and `GET /api/v1/hub/org-icons` read auth with the caller's own credential (`hub_credential_for`) and cache each answer per caller for 60 s. Besides the branding or the organizations themselves, auth's 403 is the only reply that answers for the caller: no current organization, which answers `enabled: false` for branding and no organizations for icons. Any other reply says nothing about the organization:
+
+- The branding read serves the caller's last answer for up to 10 minutes.
+- Without one, a 4xx from auth (a 401 for an expired desktop session, a 429, or a 404 while auth runs a release without the route) answers 200 with `reachable: false` and the stock values. The app keeps the look it shows, and the Brand guidelines skill doesn't change.
+- No answer, a 5xx or a body that isn't auth's branding (not a JSON object with an `appearance` object, such as `{}`) answers 503, since auth being down is an outage the ingress alerts should see. The app keeps its look on the 503 too.
+- The icons read answers 200 with `reachable: false` for all of these, a body without auth's `results` list included, and the org switcher keeps the icons it has.
+- Each reply from auth with nothing usable logs one WARNING line, `org_branding_read_unknown` or `org_icons_read_unknown`, with auth's HTTP status in `status_code`. No answer at all logs no such line.
+
 ### Sharing limits
 
 `cowork/services/sharing_contract.py` holds every bound sharing applies, beside the audience names, the MindsHub capabilities, the MindsHub reads, the code of a refused share, what the agent is told after one, and how an artifact's rule was keyed before it had a stable id. A bound MindsHub owns is mirrored here so a share it would refuse is refused before anything is published. MindsHub's sharing contract module and the app's `lib/sharingContract.js` give the bounds they share the same names, and the upload service gives `LEGACY_RULE_USER_DIR_CHARS` and `REPORT_ID_PATTERN` the same names. MindsHub, the upload service, the app and anton's publisher give the refusal code the same name, and anton's publisher gives the sentence its agent is told the same name; `tests/test_sharing_contract.py` pins every name and value against `tests/fixtures/sharing_contract.yaml`.
