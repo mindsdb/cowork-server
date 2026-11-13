@@ -866,8 +866,10 @@ def test_the_process_limits_itself_before_it_reads_a_document(tmp_path):
     assert not target.exists() or target.stat().st_size == 0
     assert seen["core"] == [0, 0]
     assert seen["cpu"] == [31, 32]
-    assert seen["nice"] >= 10
     if sys.platform.startswith("linux"):
+        # GitHub's macOS runners leave a process's priority at 0 after
+        # os.nice, so it is checked where the self-hosted stack runs.
+        assert seen["nice"] >= 10
         assert seen["oom_score_adj"] == 1000
         assert seen["address_space"] == [2048 * MIB, 2048 * MIB]
 

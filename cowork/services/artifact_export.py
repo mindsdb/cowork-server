@@ -126,12 +126,12 @@ _CANT_EXPORT = "This file can't be exported."
 # Org mode offers no export format, and the route answers 403 there. With the
 # conversion in a process of its own (export_runner), measured with
 # scripts/measure_export_capacity.py in the server's image at docker --cpus=1
-# --memory=1g: the server's longest event-loop stall is 25 ms, and it adds at
-# most 30 MiB to its own 251 MiB. The heaviest case the org caps allow, a
-# 10 MiB page of one-word paragraphs, peaks at 532 MiB in the conversion
-# process, under its 640 MiB limit, so the server and its one conversion fit
-# a 1 GiB replica. Turning org export on is a change of its own, once a live
-# replica's own memory is read.
+# --memory=1g, three runs, the last with no swap: the server's longest
+# event-loop stall stays under 80 ms, and it adds at most 30 MiB to its own
+# 251 MiB. The heaviest case the org caps allow, a 10 MiB page of one-word
+# paragraphs, peaks at 539 MiB in the conversion process, under its 640 MiB
+# limit, so the server and its one conversion fit a 1 GiB replica. Turning org
+# export on is a change of its own, once a live replica's own memory is read.
 ORG_EXPORT_ENABLED = False
 
 # HTML and Word export share one conversion at a time, PDF export has its own,
