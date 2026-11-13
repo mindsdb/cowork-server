@@ -501,8 +501,8 @@ All models use UUID primary keys with auto-tracked `created_at`/`modified_at` ti
 │           └── context/            # Project context for agent runs
 ├── files/                          # COWORK_FILES_DIR — uploaded files
 │   └── <file-id>/<filename>
-└── data-vault/                     # COWORK_VAULT_DIR — encrypted connector creds
-    └── <engine>/<connection-name>/
+└── data-vault/                     # COWORK_VAULT_DIR: saved connections
+    └── <engine>-<name>             # one JSON file per connection, its secrets included
 ```
 
 ### How the two layers relate
