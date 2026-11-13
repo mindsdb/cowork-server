@@ -37,6 +37,14 @@ helm upgrade --namespace $K8S_NAMESPACE --install $CURRENT_HELM_CHART $HELM_CHAR
 
 Swap `CI_ENVIRONMENT_SLUG` / `K8S_NAMESPACE` for `staging` or `prod` to target those environments.
 
+## Who rolls out each environment
+
+- **staging and prod:** CI, on a push to `staging` or `main` (the `deploy` job in `.github/workflows/build-deploy.yml`).
+- **A PR's own environment:** CI, when the PR carries the `deploy` label. It gets a namespace of its own, `pr-cowork-server-<N>`.
+- **dev** (`cowork.dev.mindshub.ai`): CI, when a PR carries the `deploy-to-dev` label (the `deploy-dev` job). That PR's `development` image rolls into `dev` on every push while the label stays. Removing the label leaves the last rollout in place. Two labeled PRs take turns, so the last push wins.
+
+Each rollout runs `alembic upgrade head` on that environment's database first. A PR that adds a migration leaves `dev`'s database at its revision, so a later rollout from a branch without that revision fails its `db-migrate` init container until a branch that has it rolls out again. The running pods keep serving meanwhile.
+
 ## Required cluster secrets
 
 The chart references these Secrets in the target namespace:
@@ -98,6 +106,14 @@ environments are on.
 - `deployment.datasourceTurnsEnabled`, rendered as
   `COWORK_TURN_DATASOURCE_ENABLED`: `"true"` registers grants and queues the
   datasource block for hosted turns.
+- `deployment.datasourceLabelsEnabled`, rendered as
+  `COWORK_TURN_DATASOURCE_LABELS_ENABLED`: `"true"` in `values.yaml`, so every
+  environment sends each connection's name and connector id once its grants
+  are on; it does nothing where `datasourceTurnsEnabled` is off. An anton older
+  than the change refuses a block carrying them, so before an environment turns
+  grants on, its scratchpad image must have that anton and no live pod may
+  predate the image. Rollback for one environment sets the scalar to `"false"`
+  in its values file, the only value the chart test lets it set.
 - `deployment.datasourceCapabilities`, rendered as
   `COWORK_DATASOURCE_CAPABILITIES`: the methods this deployment may run, as a
   versioned manifest such as
@@ -225,11 +241,10 @@ values too, and they change only how its pod stops.
 
 `COWORK_BROWSER_ROUTER_URL` turns on the agent's browser for the web app: it
 names the browser router, served on the same host under `/browser`.
-`values-dev.yaml` and `values-staging.yaml` set it to their own host.
-`values-prod.yaml` sets none, so production offers no browser and makes no
-browser call; add the entry there only once the production router answers on
-`https://cowork.mindshub.ai/browser`, since until then that path reaches the
-web frontend. PR environments get theirs from where they are deployed.
+`values-dev.yaml`, `values-staging.yaml` and `values-prod.yaml` set it to
+their own host. The router must answer on that host's `/browser` path before
+the entry ships, since without it the path reaches the web frontend. PR
+environments get theirs from where they are deployed.
 `tests/test_chart_values.py` pins each value to its environment's host. What
 the router does with it is in the top-level README ("The agent's browser").
 

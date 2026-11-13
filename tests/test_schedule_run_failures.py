@@ -84,7 +84,7 @@ def turns(monkeypatch):
     ending = SimpleNamespace(reason="completed", acted=True, failure=None)
 
     class RecordingHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -164,7 +164,7 @@ def test_the_failure_frame_is_read_with_whether_the_turn_acted(tmp_path, monkeyp
     ])
     acted, failure = asyncio.run(scheduler._turn_activity("c1"))
     assert acted is False
-    assert failure == "The model isn't available."
+    assert failure.message == "The model isn't available."
 
 
 def test_a_turn_that_acted_still_reports_its_failure(tmp_path, monkeypatch):
@@ -175,7 +175,7 @@ def test_a_turn_that_acted_still_reports_its_failure(tmp_path, monkeypatch):
     ])
     acted, failure = asyncio.run(scheduler._turn_activity("c1"))
     assert acted is True
-    assert failure == "The provider timed out."
+    assert failure.message == "The provider timed out."
 
 
 def test_a_blank_failure_text_falls_back_to_the_generic_one():
@@ -188,7 +188,7 @@ def test_a_blank_failure_text_falls_back_to_the_generic_one():
 
 async def test_a_run_records_the_turns_own_failure_text(schedule_id, turns):
     turns.ending.reason, turns.ending.acted = "error", True
-    turns.ending.failure = "The Linear connection needs reconnecting."
+    turns.ending.failure = scheduler._TurnFailure(message="The Linear connection needs reconnecting.")
     (slot,) = _poll(schedule_id)
     await _run(slot)
 
@@ -201,7 +201,7 @@ async def test_a_run_records_the_turns_own_failure_text(schedule_id, turns):
 
 async def test_a_failure_before_acting_uses_its_slot_up(schedule_id, turns):
     turns.ending.reason, turns.ending.acted = "error", False
-    turns.ending.failure = "That model isn't available."
+    turns.ending.failure = scheduler._TurnFailure(message="That model isn't available.")
     (slot,) = _poll(schedule_id)
     await _run(slot)
 
@@ -268,7 +268,7 @@ async def test_a_schedule_reports_its_last_finished_run(schedule_id, turns):
         assert (await client.get(f"/api/v1/schedules/{schedule_id}")).json()["lastRun"] is None
 
     turns.ending.reason, turns.ending.acted = "error", True
-    turns.ending.failure = "The sheet was not found."
+    turns.ending.failure = scheduler._TurnFailure(message="The sheet was not found.")
     (slot,) = _poll(schedule_id)
     await _run(slot)
 
@@ -355,7 +355,7 @@ async def test_exception_details_never_reach_run_responses(schedule_id, turns, m
 @pytest.mark.parametrize("reason", ["error", "completed"])
 async def test_bookkeeping_exception_preserves_confirmed_failures_only(schedule_id, turns, monkeypatch, reason):
     turns.ending.reason = reason
-    turns.ending.failure = "The sheet was not found." if reason == "error" else None
+    turns.ending.failure = scheduler._TurnFailure(message="The sheet was not found.") if reason == "error" else None
 
     def broken_record(*args, **kwargs):
         raise RuntimeError("private database diagnostics")
@@ -364,7 +364,7 @@ async def test_bookkeeping_exception_preserves_confirmed_failures_only(schedule_
     await _run(_poll(schedule_id)[0])
     run = _runs(schedule_id)[0]
     assert run.outcome == (AttemptOutcome.failed_during_execution if reason == "error" else AttemptOutcome.uncertain)
-    assert run.error == (turns.ending.failure if reason == "error" else scheduler._UNCERTAIN_ERROR)
+    assert run.error == (turns.ending.failure.message if reason == "error" else scheduler._UNCERTAIN_ERROR)
     assert _schedule(schedule_id).consecutive_failures == (1 if reason == "error" else 0)
 
 

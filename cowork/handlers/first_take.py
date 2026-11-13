@@ -33,6 +33,7 @@ import logging
 import re
 import time
 
+from cowork.common.ui_locale import with_reply_language
 from cowork.handlers.response_routing import (
     RouterBinding,
     _close,
@@ -164,8 +165,10 @@ class FirstTake:
     then) on every way out of the turn.
     """
 
-    def __init__(self, binding: RouterBinding, history: list[dict]) -> None:
+    def __init__(self, binding: RouterBinding, history: list[dict], *, ui_locale: str | None = None) -> None:
         self._binding = binding
+        # The app's language: the take follows the same rule as the agent.
+        self._ui_locale = ui_locale
         self._messages = take_history(history)
         self._queue: asyncio.Queue = asyncio.Queue()
         self._writer: asyncio.Task | None = None
@@ -261,7 +264,7 @@ class FirstTake:
 
         events = self._binding.provider.stream(
             model=self._binding.model,
-            system=with_deployment_identity(_SYSTEM_PROMPT),
+            system=with_reply_language(with_deployment_identity(_SYSTEM_PROMPT), self._ui_locale),
             messages=self._messages,
             max_tokens=_MAX_TOKENS,
         )
