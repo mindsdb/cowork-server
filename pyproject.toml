@@ -250,4 +250,4 @@ markers = [
 # Integration branch only, never merged: anton from the anton integration branch
 # (connector templates, custom API sections), which no release carries yet.
 # Not for merging.
-anton-agent = { git = "https://github.com/mindsdb/anton", rev = "49a763476a4966eda1f457736f0d2233c728ac26" }
+anton-agent = { git = "https://github.com/mindsdb/anton", rev = "aa0267203cf9d04f5341fba2869df1fc89e6d7de" }
