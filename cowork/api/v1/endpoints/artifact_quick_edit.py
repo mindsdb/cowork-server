@@ -240,6 +240,51 @@ def _recent_changes(folder: Path, source_path: str) -> list[str]:
     return list(reversed(summaries[: quick_edit_service.MAX_RECENT_CHANGES]))
 
 
+#: What a refusal's body may say, kept short in the log.
+_MAX_REFUSAL_TEXT = 200
+
+
+def _refusal_reason(payload: object) -> tuple[str, str]:
+    """(code, message) from a MindsHub error body, wherever it puts them
+    ({"error": {...}}, {"detail": {...}} or top level)."""
+    candidates = [payload]
+    if isinstance(payload, dict):
+        candidates += [payload.get("error"), payload.get("detail")]
+    code = message = ""
+    for item in candidates:
+        if isinstance(item, dict):
+            code = code or str(item.get("code") or item.get("type") or item.get("reason") or "")
+            message = message or str(item.get("message") or item.get("detail") or "")
+        elif isinstance(item, str) and not message:
+            message = item
+    return code[:_MAX_REFUSAL_TEXT], " ".join(message.split())[:_MAX_REFUSAL_TEXT]
+
+
+def _jev_client(refusals: list[dict], *, transport=None):
+    """An HTTP client for anton's route_request that notes every refused
+    decision (status >= 400) with MindsHub's reason, or None when anton's
+    HTTP library isn't importable (route_request then makes its own)."""
+    try:
+        import httpx2 as httpx
+    except ImportError:
+        return None
+
+    async def note(response) -> None:
+        if response.status_code < 400:
+            return
+        try:
+            await response.aread()
+            payload = response.json()
+        except Exception:
+            payload = None
+        code, message = _refusal_reason(payload)
+        refusals.append({"status": response.status_code, "code": code, "message": message})
+
+    return httpx.AsyncClient(
+        timeout=10.0, event_hooks={"response": [note]}, **({"transport": transport} if transport is not None else {}),
+    )
+
+
 def _capture_for_undo(anton: AntonQuickEdit, folder: Path, kind: str, source_path: str) -> dict | None:
     """Every file the editor may change, as it is now: the content files
     anton's workspace lists, the tracked source, and anton's presentation
@@ -404,14 +449,21 @@ class QuickEditRun:
                 )
             except Exception:
                 logger.warning("Could not read the conversation for the quick edit router", exc_info=True)
-        decision = await self.anton.route_request(
-            body.message,
-            files=files,
-            kind=self.kind,
-            base_url=backend.route_base_url,
-            api_key=backend.route_api_key,
-            **extra,
-        )
+        refusals: list[dict] = []
+        http = _jev_client(refusals)
+        try:
+            decision = await self.anton.route_request(
+                body.message,
+                files=files,
+                kind=self.kind,
+                base_url=backend.route_base_url,
+                api_key=backend.route_api_key,
+                **({"http": http} if http is not None else {}),
+                **extra,
+            )
+        finally:
+            if http is not None:
+                await http.aclose()
         route = getattr(decision, "route", "agent")
         if route not in ("edit", "agent"):
             route = "agent"
@@ -419,7 +471,19 @@ class QuickEditRun:
             confidence = float(getattr(decision, "confidence", 0.0) or 0.0)
         except (TypeError, ValueError):
             confidence = 0.0
-        return route, confidence, str(getattr(decision, "reason", "") or "")
+        reason = str(getattr(decision, "reason", "") or "")
+        if refusals and route == "agent":
+            refusal = refusals[-1]
+            # anton reports any refusal as "router_error"; the status and
+            # MindsHub's reason (402 wallet_empty: no decision allowance left)
+            # are only here, so they are logged here.
+            logger.warning(
+                "Quick edit router: Jev refused the decision with HTTP %s (%s: %s); the message goes to the agent",
+                refusal["status"], refusal["code"] or "no code", refusal["message"] or "no message",
+                extra={"event": "quick_edit_jev_refused", "status_code": refusal["status"],
+                       "jev_error_code": refusal["code"], "artifact_id": self.artifact_id},
+            )
+        return route, confidence, reason
 
     def _checker(self, emit: Callable[[str], None]):
         """The editor's checker chain, ending in the viewer's preview, asked

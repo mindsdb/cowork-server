@@ -1342,3 +1342,41 @@ def test_the_router_chat_is_the_conversation_s_last_text_messages(db):
     assert chat[2]["text"].startswith("I added three unicorns.") and len(chat[2]["text"]) == 300
     assert chat[3]["text"] == "thanks"
     assert quick_edit_service.router_chat(session, conversation_id=uuid.uuid4()) == []
+
+
+def test_a_jev_402_is_logged_with_mindshub_s_reason_and_goes_to_the_agent(client, fake_anton, artifact, monkeypatch, caplog):
+    """anton's real router against a MindsHub that answers 402 wallet_empty:
+    the route is agent (router_error), and the log says why."""
+    import logging
+
+    import httpx2
+
+    from anton.core.artifact_editor.router import route_request
+
+    _folder, _metadata, artifact_id = artifact
+    api = fake_anton.api()
+    real = AntonQuickEdit(
+        route_request=route_request, run_quick_edit=api.run_quick_edit, checkers=api.checkers,
+        workspace_cls=api.workspace_cls, describe_artifact=api.describe_artifact,
+        route_extras=quick_edit_service.ROUTE_EXTRAS,
+        decisions_available=api.decisions_available, decisions_config=api.decisions_config,
+    )
+    monkeypatch.setattr(quick_edit_service, "anton_quick_edit", lambda: real)
+    asked = []
+
+    def mindshub(request):
+        asked.append(json.loads(request.content))
+        return httpx2.Response(402, json={"error": {"code": "wallet_empty", "message": "no free decision allowance left"}})
+
+    original = quick_ep._jev_client
+    monkeypatch.setattr(quick_ep, "_jev_client", lambda refusals: original(refusals, transport=httpx2.MockTransport(mindshub)))
+    fake_anton.edit = None
+
+    with caplog.at_level(logging.WARNING, logger=quick_ep.logger.name):
+        events = events_of(post(client, artifact_id).text)
+
+    assert [name for name, _ in events] == ["route", "done"]
+    assert events[0][1]["route"] == "agent" and events[0][1]["reason"] == "router_error"
+    assert events[1][1]["status"] == "agent"
+    assert asked and asked[0]["state"]["artifact"]["outline"].startswith("h1 Sales")
+    assert "HTTP 402 (wallet_empty: no free decision allowance left)" in caplog.text

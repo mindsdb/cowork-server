@@ -3162,6 +3162,10 @@ class ResponsesHandler:
                 # Questions need someone to answer them: this path serves
                 # the web UI, which renders the card and posts /answer.
                 interactive=self.interactive and get_app_settings().ask_user_enabled,
+                # The web app answers response.artifact_check from the open
+                # viewer (ENG-4227); the producer sends it only with
+                # interactive, whose stdin the answer comes back on.
+                preview_checks=self.interactive and self.schedule_id is None,
                 # This handler serves the cowork UI (scheduled turns show
                 # there too), which renders a tool's message whether or
                 # not it can answer questions. Channel turns build their
