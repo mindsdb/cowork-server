@@ -18,6 +18,9 @@ _METHOD_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
 # rewritten. No hyphen: the vault joins "{engine}-{name}" into one file name.
 _ENGINE_ID_PATTERN = re.compile(r"[a-z][a-z0-9_]{1,63}")
 _SYNTHESIZED_FORM_ID_PATTERN = re.compile(r"fm_[0-9a-f]+")
+# Characters of a custom connection's trimmed name. Mirrors auth's ``MAX_NAME_LENGTH``
+# (``auth/datavault/custom_api_contract.py``); both change in one release.
+CUSTOM_CONNECTION_NAME_MAX = 128
 
 
 class InvalidConnectorIdError(ValueError):
@@ -220,12 +223,19 @@ class CustomConnectorUpdate(BaseModel):
 class ConnectorCheck(BaseModel):
     """How a custom connector tests its credentials: a GET of ``path`` on the address the member types.
 
-    ``headers`` maps a header name to its value, where ``{field}`` stands for
-    that field's value. There is no host: the member supplies it.
+    The template's auth section places the values. There is no host: the
+    member supplies it.
     """
 
     path: str
-    headers: dict[str, str]
+
+
+class ConnectorAuthSummary(BaseModel):
+    """Where a custom connector puts the member's values: its auth type and the
+    header or query parameter names that carry one. Never a template's text."""
+
+    type: Literal["header", "basic", "query"]
+    names: list[str] = []
 
 
 class ConnectorSpecResponse(ConnectorMetadataResponse):
@@ -233,6 +243,8 @@ class ConnectorSpecResponse(ConnectorMetadataResponse):
     form: ConnectorForm
     # Custom connectors only; None for every built-in and for a template saved without one.
     check: ConnectorCheck | None = None
+    # Custom connectors only, and only beside a usable check.
+    auth_summary: ConnectorAuthSummary | None = None
     # Agent-facing notes on using this connector's API once connected: traps,
     # efficient endpoints, auth quirks. The chat agent sees them only when a
     # connection of this engine exists; the credential prober sees them while
@@ -270,9 +282,23 @@ class CustomConnectRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1, max_length=255)
+    name: str = Field(min_length=1)
     address: str = Field(min_length=1, max_length=300)
     values: dict[str, Any] = Field(default_factory=dict, repr=False)
+
+    @field_validator("name")
+    @classmethod
+    def _name_trimmed(cls, value: str) -> str:
+        """Store the name trimmed: a chat's toggle and the producer match it exactly, and the form trims.
+
+        Measured after trimming, as auth measures it, so a name auth would refuse is refused here.
+        """
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("name must not be blank")
+        if len(trimmed) > CUSTOM_CONNECTION_NAME_MAX:
+            raise ValueError(f"name must be at most {CUSTOM_CONNECTION_NAME_MAX} characters")
+        return trimmed
 
 
 class CustomConnectorAvailability(BaseModel):

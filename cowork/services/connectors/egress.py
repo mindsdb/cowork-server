@@ -10,11 +10,15 @@ from these, because the host it is talking about is the caller's concept.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import ipaddress
+import logging
 import socket
-from collections.abc import Callable
+import ssl
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from urllib.parse import quote
 
 import httpx
 
@@ -140,7 +144,45 @@ def connection_attempts(
 _RESOLVER_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="egress-resolve")
 # Replaced in tests.
 _RESOLVER: Callable[..., list[tuple]] = socket.getaddrinfo
+#: A fake transport for tests; None builds a fresh real one for each send.
 _TRANSPORT: httpx.AsyncBaseTransport | None = None
+#: Certificate verification for the real transport; a test points it at its own CA.
+_VERIFY: ssl.SSLContext | bool = True
+
+PINNED_USER_AGENT = "MindsHub-Connector/1"
+#: Sent unless the caller sets the same header, in any case.
+_DEFAULT_HEADERS = {"Accept": "*/*", "User-Agent": PINNED_USER_AGENT}
+#: Always ours: a caller header of either name, in any case, is dropped.
+_FIXED_HEADER_NAMES = frozenset({"host", "accept-encoding"})
+
+#: Every logger httpx and httpcore write to; a test checks this against their source.
+LIBRARY_LOGGERS = (
+    "httpx",
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+)
+_PINNED_SEND = contextvars.ContextVar("egress_pinned_send", default=False)
+
+
+class _QuietDuringPinnedSend(logging.Filter):
+    """Drop library records while a pinned send runs in this context.
+
+    Those records hold the URL and response headers, which carry a key sent
+    in a query or echoed back. A filter on ``httpcore`` would not see its
+    children's records, so each logger gets this filter itself.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Keep the record unless a pinned send is running in the current context."""
+        return not _PINNED_SEND.get()
+
+
+_QUIET_FILTER = _QuietDuringPinnedSend()
+for _name in LIBRARY_LOGGERS:
+    logging.getLogger(_name).addFilter(_QUIET_FILTER)
 
 
 @dataclass(frozen=True, repr=False)
@@ -156,6 +198,36 @@ class PinnedResponse:
     truncated: bool
 
 
+def _with_params(path: str, params: Sequence[tuple[str, str]]) -> str:
+    """Append ``params`` to the path's own query, which is kept byte for byte."""
+    if not params:
+        return path
+    pairs = "&".join(f"{quote(name, safe='')}={quote(value, safe='')}" for name, value in params)
+    if "?" not in path:
+        return f"{path}?{pairs}"
+    return f"{path}{'' if path.endswith(('?', '&')) else '&'}{pairs}"
+
+
+def _request_headers(headers: dict[str, str], netloc: str) -> list[tuple[str, str]]:
+    """The exact headers sent: the caller's, our defaults it did not set, and ours that it may not set."""
+    given = {name.lower() for name in headers}
+    sent = [(name, value) for name, value in headers.items() if name.lower() not in _FIXED_HEADER_NAMES]
+    sent += [(name, value) for name, value in _DEFAULT_HEADERS.items() if name.lower() not in given]
+    return [*sent, ("Host", netloc), ("Accept-Encoding", "identity")]
+
+
+async def _read_capped(response: httpx.Response, max_body_bytes: int) -> PinnedResponse:
+    """Read at most ``max_body_bytes`` of the raw body."""
+    body = bytearray()
+    truncated = False
+    async for chunk in response.aiter_raw():
+        body.extend(chunk[: max_body_bytes - len(body)])
+        if len(body) >= max_body_bytes:
+            truncated = True
+            break
+    return PinnedResponse(response.status_code, response.reason_phrase, bytes(body), truncated)
+
+
 async def pinned_get(
     origin: str,
     path: str,
@@ -163,22 +235,35 @@ async def pinned_get(
     *,
     total_seconds: float,
     max_body_bytes: int,
+    params: Sequence[tuple[str, str]] = (),
 ) -> PinnedResponse:
     """GET ``origin`` + ``path`` at a vetted public address, within one deadline.
 
-    ``origin`` is ``https://host[:port]``. The URL is built from it and the
-    path, and refused unless it keeps the origin's scheme, host and port.
-    The name is resolved with a trailing dot, so a search domain is never
-    tried, and every address must be public (``is_public_address``). The
-    vetted address is dialed with the hostname on SNI and ``Host``; no
-    redirect is followed and no proxy used. The body is asked for without
-    compression and read raw, at most ``max_body_bytes``, so a compressed
-    or endless answer cannot grow in memory. One ``total_seconds`` covers
-    resolution and every attempt.
+    ``origin`` is ``https://host[:port]``. ``params`` are appended to the
+    path's query, which is otherwise sent as written. The URL is refused
+    unless it keeps the origin's scheme, host and port. The name is resolved
+    with a trailing dot, so a search domain is never tried, and every address
+    must be public (``is_public_address``). The vetted address is dialed with
+    the hostname on SNI and ``Host``, through a transport of its own, so no
+    redirect is followed, no proxy used and no header added beyond
+    ``_request_headers``. The body is asked for without compression and read
+    raw, at most ``max_body_bytes``. One ``total_seconds`` covers resolution
+    and every attempt. No httpx or httpcore record is written meanwhile.
 
     Raises ``EgressRefused``, ``EgressHostUnresolved``, ``EgressHostNotPublic``,
     ``EgressTimeout`` or the last attempt's ``httpx`` connect error.
     """
+    token = _PINNED_SEND.set(True)
+    try:
+        return await _pinned_get(origin, _with_params(path, params), headers, total_seconds, max_body_bytes)
+    finally:
+        _PINNED_SEND.reset(token)
+
+
+async def _pinned_get(
+    origin: str, path: str, headers: dict[str, str], total_seconds: float, max_body_bytes: int
+) -> PinnedResponse:
+    """The send ``pinned_get`` describes, run while its records are dropped."""
     base = httpx.URL(origin)
     url = httpx.URL(origin + path)
     if (
@@ -187,35 +272,37 @@ async def pinned_get(
         or (url.scheme, url.host, url.port) != (base.scheme, base.host, base.port)
     ):
         raise EgressRefused("the request would leave its origin")
-    request_headers = {**headers, "Host": url.netloc.decode("ascii"), "Accept-Encoding": "identity"}
-    extensions = {"sni_hostname": url.host}
+    request_headers = _request_headers(headers, url.netloc.decode("ascii"))
     loop = asyncio.get_running_loop()
+    transport = _TRANSPORT or httpx.AsyncHTTPTransport(verify=_VERIFY, trust_env=False)
     try:
         async with asyncio.timeout(total_seconds):
             addresses = await loop.run_in_executor(_RESOLVER_POOL, vetted_public_addresses, url.host + ".", _RESOLVER)
             attempts = connection_attempts(addresses, total_seconds=total_seconds, fallback_seconds=1.0)
-            async with httpx.AsyncClient(follow_redirects=False, trust_env=False, transport=_TRANSPORT) as client:
-                for index, (address, connect_seconds) in enumerate(attempts):
-                    try:
-                        async with client.stream(
-                            "GET",
-                            url.copy_with(host=str(address)),
-                            headers=request_headers,
-                            extensions=extensions,
-                            timeout=httpx.Timeout(total_seconds, connect=connect_seconds),
-                        ) as response:
-                            body = bytearray()
-                            truncated = False
-                            async for chunk in response.aiter_raw():
-                                body.extend(chunk[: max_body_bytes - len(body)])
-                                if len(body) >= max_body_bytes:
-                                    truncated = True
-                                    break
-                            return PinnedResponse(response.status_code, response.reason_phrase, bytes(body), truncated)
-                    except (httpx.ConnectError, httpx.ConnectTimeout):
-                        # Only a failed connect moves on: the headers are sent after it.
-                        if index == len(attempts) - 1:
-                            raise
+            for index, (address, connect_seconds) in enumerate(attempts):
+                request = httpx.Request(
+                    "GET",
+                    url.copy_with(host=str(address)),
+                    headers=request_headers,
+                    extensions={
+                        "sni_hostname": url.host,
+                        "timeout": httpx.Timeout(total_seconds, connect=connect_seconds).as_dict(),
+                    },
+                )
+                try:
+                    response = await transport.handle_async_request(request)
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    # Only a failed connect moves on: the headers are sent after it.
+                    if index == len(attempts) - 1:
+                        raise
+                    continue
+                try:
+                    return await _read_capped(response, max_body_bytes)
+                finally:
+                    await response.aclose()
     except TimeoutError as exc:
         raise EgressTimeout("the request outlasted its deadline") from exc
+    finally:
+        if transport is not _TRANSPORT:
+            await transport.aclose()
     raise EgressHostNotPublic(url.host)

@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import uuid
 from types import SimpleNamespace
@@ -184,6 +185,33 @@ def test_schema_migrations_create_new_database(tmp_path, monkeypatch):
 
     assert "harness" in _message_columns(db_path)
     assert _alembic_version(db_path) == expected_head()
+
+
+def test_push_devices_upgrade_from_staging_head(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "push-upgrade.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+
+    _upgrade_to(engine, uri, "c1d7e2a94f60")
+    assert not _has_table(db_path, "push_devices")
+    _upgrade_to(engine, uri, "head")
+
+    schema = inspect(engine)
+    assert {"org_id", "user_id", "token", "platform"} <= {
+        column["name"] for column in schema.get_columns("push_devices")
+    }
+    assert any(
+        constraint["column_names"] == ["token"]
+        for constraint in schema.get_unique_constraints("push_devices")
+    )
+    assert any(
+        index["column_names"] == ["org_id", "user_id"]
+        for index in schema.get_indexes("push_devices")
+    )
+    _upgrade_to(engine, uri, "head")
+    assert _alembic_versions(db_path) == {expected_head()}
 
 
 def test_schema_migrations_rerun_on_up_to_date_database_is_noop(tmp_path, monkeypatch):
@@ -1021,7 +1049,7 @@ def test_custom_connector_id_is_unique_per_scope(tmp_path, monkeypatch):
 
 
 #: The revision before org custom connectors became one per builder.
-PRIOR_TO_PER_BUILDER = "e2a7c4f9b613"
+PRIOR_TO_PER_BUILDER = "1d5fe417cc0a"
 
 
 def test_custom_connector_id_is_unique_per_builder_in_an_org(tmp_path, monkeypatch):
@@ -1576,3 +1604,35 @@ def test_the_custom_connector_check_column_upgrades_and_downgrades(tmp_path, mon
         kept = connection.execute(text("select count(*) from custom_connectors")).scalar()
     assert "connection_check" not in columns
     assert kept == 1
+
+
+def test_the_custom_connector_auth_column_upgrades_and_downgrades(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db = tmp_path / "custom_connector_auth.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "e5f1a3c7b9d2")
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+        connection.execute(
+            text("update custom_connectors set connection_check = :check where connector_id = 'acme'"),
+            {"check": '{"path": "/v1/me"}'},
+        )
+    _upgrade_to(engine, uri, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            text("update custom_connectors set connection_auth = :auth where connector_id = 'acme'"),
+            {"auth": '{"type": "header", "headers": {"X-Key": "{api_key}"}}'},
+        )
+        stored = connection.execute(text("select connection_auth from custom_connectors")).scalar()
+    assert json.loads(stored) == {"type": "header", "headers": {"X-Key": "{api_key}"}}
+
+    _downgrade_to(engine, uri, "e5f1a3c7b9d2")
+
+    with engine.begin() as connection:
+        columns = {row[1] for row in connection.execute(text("pragma table_info(custom_connectors)"))}
+        check = connection.execute(text("select connection_check from custom_connectors")).scalar()
+    assert "connection_auth" not in columns
+    assert json.loads(check) == {"path": "/v1/me"}

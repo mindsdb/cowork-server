@@ -6,6 +6,7 @@ category."""
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -265,9 +266,10 @@ def _anton_draft(**overrides) -> dict:
         "usage_notes": "Base URL https://api.acme.example/v2. Send Authorization: Bearer <api_key>.",
         "fields": [
             {"name": "api_key", "label": "API key", "help": "Settings, then API."},
-            {"name": "region", "label": "Region", "secret": False, "required": False, "placeholder": "eu"},
+            {"name": "region", "label": "Region", "secret": False, "placeholder": "eu"},
         ],
-        "check": {"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}},
+        "auth": {"type": "header", "headers": {"Authorization": "Bearer {api_key}", "X-Region": "{region}"}},
+        "check": {"path": "/v2/me"},
         **overrides,
     }
     outcome = asyncio.run(connector_draft_tool(box).handler(None, data))
@@ -308,21 +310,72 @@ class TestSaveConnectorDraft:
         assert row.usage_notes.startswith("Base URL")
         spec = ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm")
         assert [(f.name, f.type, f.secret, f.required) for f in spec.form.fields] == [
-            ("api_key", "password", True, True), ("region", "text", False, False),
+            ("api_key", "password", True, True), ("region", "text", False, True),
         ]
         assert spec.form.methods is None
         assert ConnectorCatalog(_scoped(engine, ORG_A_OTHER)).get_connector("acme_crm") is None
 
-    def test_the_templates_check_is_kept_and_served_without_a_host(self, engine, org_tenancy):
-        check = {"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}}
+    def test_the_templates_check_and_auth_are_kept_and_the_check_served_without_a_host(self, engine, org_tenancy):
+        check = {"path": "/v2/me"}
         client = _org_client(engine, _member(ORG_A), ORG_A)
 
         assert client.post("/custom", json=_anton_draft(check=check)).status_code == 200
 
         [row] = _org_rows(engine)
         assert row.connection_check == check
+        assert row.connection_auth == {
+            "type": "header", "headers": {"Authorization": "Bearer {api_key}", "X-Region": "{region}"},
+        }
         spec = ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm")
         assert spec.check.model_dump() == check
+
+    @pytest.mark.parametrize(("fields", "auth", "summary"), [
+        (
+            [{"name": "api_key", "label": "API key"}],
+            {"type": "header", "headers": {"X-Api-Key": "{api_key}", "X-Api-Version": "2024-01"}},
+            {"type": "header", "names": ["X-Api-Key"]},
+        ),
+        (
+            [{"name": "email", "label": "Email", "secret": False}, {"name": "token", "label": "Token"}],
+            {"type": "basic", "username": "{email}/token", "password": "{token}"},
+            {"type": "basic", "names": []},
+        ),
+        (
+            [{"name": "access_key", "label": "Access key"}],
+            {"type": "query", "params": {"access_key": "{access_key}", "output": "json"}},
+            {"type": "query", "names": ["access_key"]},
+        ),
+    ], ids=["header", "basic", "query"])
+    def test_the_spec_names_where_the_key_goes_and_never_the_templates_text(
+        self, engine, org_tenancy, fields, auth, summary,
+    ):
+        draft = _anton_draft(fields=fields, auth=auth, check={"path": "/v2/me"})
+        assert _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=draft).status_code == 200
+
+        spec = ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm")
+
+        assert spec.auth_summary.model_dump() == summary
+        shown = json.dumps(spec.auth_summary.model_dump())
+        for text in ("{api_key}", "{email}", "{token}", "{access_key}", "2024-01", "json", "/token"):
+            assert text not in shown
+
+    @pytest.mark.parametrize("change", [
+        {"connection_auth": None},
+        {"connection_check": {"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}}},
+    ], ids=["saved-without-auth", "old-check-shape"])
+    def test_a_template_saved_in_an_old_shape_is_served_without_a_check(self, engine, org_tenancy, change):
+        assert _org_client(engine, _member(ORG_A), ORG_A).post(
+            "/custom", json=_anton_draft(check={"path": "/v2/me"})
+        ).status_code == 200
+        session = _scoped(engine, ORG_A)
+        row = CustomConnectorService(session).get("acme_crm")
+        for column, value in change.items():
+            setattr(row, column, value)
+        session.add(row)
+        session.commit()
+
+        spec = ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm")
+        assert spec.check is None and spec.auth_summary is None
 
     def test_a_template_without_a_check_is_never_stored(self, engine, org_tenancy):
         """The card posts the draft back; one sent without its check could never connect."""
@@ -337,20 +390,20 @@ class TestSaveConnectorDraft:
 
     def test_a_check_the_parser_refuses_is_never_stored(self, engine, org_tenancy):
         """The card posts the draft back; a check edited on the way is parsed again, and refused."""
-        draft = _anton_draft(check={"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}})
-        draft["check"] = {"path": "//evil.example/me", "headers": {"Authorization": "Bearer {api_key}"}}
+        draft = _anton_draft(check={"path": "/v2/me"})
+        draft["check"] = {"path": "//evil.example/me"}
 
         assert _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=draft).status_code == 422
         assert _org_rows(engine) == []
 
     def test_a_resave_replaces_the_check(self, engine, org_tenancy):
         client = _org_client(engine, _member(ORG_A), ORG_A)
-        client.post("/custom", json=_anton_draft(check={"path": "/v1/me", "headers": {"X-Key": "{api_key}"}}))
+        client.post("/custom", json=_anton_draft(check={"path": "/v1/me"}))
 
         client.post("/custom", json=_anton_draft())
 
         [row] = _org_rows(engine)
-        assert row.connection_check == {"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}}
+        assert row.connection_check == {"path": "/v2/me"}
 
     def test_two_members_keep_the_same_id_and_a_resave_updates_in_place(self, engine, org_tenancy):
         assert _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=_anton_draft()).status_code == 200
@@ -368,7 +421,9 @@ class TestSaveConnectorDraft:
         {"methods": [{"id": "oauth", "oauth": {"auth_url": "https://acme.example/auth"}}]},
         {"connector_id": "acme_crm\n"},
         {"fields": []},
-    ], ids=["token label", "oauth method", "trailing newline id", "no fields"])
+        {"auth": None},
+        {"check": {"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}}},
+    ], ids=["token label", "oauth method", "trailing newline id", "no fields", "no auth", "check headers"])
     def test_a_draft_outside_the_allowlist_is_a_422_without_the_value(self, engine, org_tenancy, change):
         resp = _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json={**_anton_draft(), **change})
 

@@ -77,6 +77,8 @@ CAPABILITIES = "COWORK_DATASOURCE_CAPABILITIES"
 # gate's own change adds the environment here and sets both deployment scalars
 # in its values file.
 ENABLED_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
+LABELS_FLAG = "COWORK_TURN_DATASOURCE_LABELS_ENABLED"
+DRAFTS_FLAG = "COWORK_TURN_CONNECTOR_DRAFTS_ENABLED"
 # The exact methods each enabled environment offers.
 OFFERED_METHODS: dict[str, frozenset[str]] = {"staging": frozenset({"mysql:host-password", "postgres:host-port"})}
 # The draft host of each environment. cowork's web build frames exactly these
@@ -144,6 +146,24 @@ def base() -> list[_Env]:
     return _env(BASE)
 
 
+@pytest.mark.parametrize("name", [
+    "COWORK_PUSH_ENABLED",
+    "COWORK_PUSH_APNS_TOPIC",
+    "COWORK_PUSH_APNS_KEY_P8",
+    "COWORK_PUSH_APNS_KEY_ID",
+    "COWORK_PUSH_APNS_TEAM_ID",
+    "COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON",
+])
+def test_push_settings_use_optional_secret_keys(base, name):
+    assert _entry(base, name) == _Env(
+        name=name, secret="cowork-push", key=name, optional=True,
+    )
+    for env_values in ENVIRONMENTS:
+        assert not [entry for entry in _env(env_values) if entry.name == name], (
+            f"{env_values.name} overrides the shared push secret reference"
+        )
+
+
 def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed(base):
     assert _deployment(BASE)["datasourceTurnsEnabled"] == "false"
     assert _entry(base, FLAG).value == "{{ $.Values.datasourceTurnsEnabled }}"
@@ -153,6 +173,34 @@ def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed
         assert _deployment(env_values).get("datasourceTurnsEnabled") == expected, f"{env_values.name} flips the grants"
         assert not [e for e in _env(env_values) if e.name == FLAG], (
             f"{env_values.name} declares {FLAG}; set deployment.datasourceTurnsEnabled instead"
+        )
+
+
+def test_connection_labels_are_on_in_the_base_and_an_environment_may_only_opt_out(base):
+    """Labels act only where grants are on, so the base turns them on everywhere;
+    an environment's values file may set "false" as its rollback, nothing else."""
+    assert _deployment(BASE)["datasourceLabelsEnabled"] == "true"
+    assert _entry(base, LABELS_FLAG).value == "{{ $.Values.datasourceLabelsEnabled }}"
+    for env_values in ENVIRONMENTS:
+        assert _deployment(env_values).get("datasourceLabelsEnabled") in (None, "false"), (
+            f"{env_values.name} sets datasourceLabelsEnabled to something other than the \"false\" rollback"
+        )
+        assert not [e for e in _env(env_values) if e.name == LABELS_FLAG], (
+            f"{env_values.name} declares {LABELS_FLAG}; set deployment.datasourceLabelsEnabled instead"
+        )
+
+
+def test_connector_drafts_are_on_in_the_base_and_an_environment_may_only_opt_out(base):
+    """Templates are on in every environment from the base; an environment's
+    values file may set "false" as its rollback, nothing else."""
+    assert _deployment(BASE)["connectorDraftsEnabled"] == "true"
+    assert _entry(base, DRAFTS_FLAG).value == "{{ $.Values.connectorDraftsEnabled }}"
+    for env_values in ENVIRONMENTS:
+        assert _deployment(env_values).get("connectorDraftsEnabled") in (None, "false"), (
+            f"{env_values.name} sets connectorDraftsEnabled to something other than the \"false\" rollback"
+        )
+        assert not [e for e in _env(env_values) if e.name == DRAFTS_FLAG], (
+            f"{env_values.name} declares {DRAFTS_FLAG}; set deployment.connectorDraftsEnabled instead"
         )
 
 

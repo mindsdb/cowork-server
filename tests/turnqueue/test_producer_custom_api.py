@@ -54,7 +54,8 @@ def turn(monkeypatch):
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
     monkeypatch.setattr(user_settings, "get_user_settings",
-                        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id=""))
+                        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m",
+                                                      hub_workspace_id=""))
     state["list"] = AsyncMock(return_value=[_listed(5), _listed(3, "beta_api", "Ops")])
     state["grant"] = AsyncMock(return_value=_granted({3: 1, 5: 2}))
     monkeypatch.setattr(prod, "list_custom_api_connections", state["list"])
@@ -259,7 +260,9 @@ def templates(monkeypatch):
     for org, user, notes in (("o1", "u1", "Call /v1/me first."), ("o1", "u2", "Other member's notes."),
                              ("o2", "u1", "Other org's notes.")):
         draft = {"connector_id": "acme_crm", "label": "Acme CRM", "usage_notes": notes,
-                 "fields": [{"name": "api_key", "label": "API key"}]}
+                 "fields": [{"name": "api_key", "label": "API key"}],
+                 "auth": {"type": "header", "headers": {"Authorization": "Bearer {api_key}"}},
+                 "check": {"path": "/v1/me"}}
         scope = TenantScope(org_mode=True, org_id=org, user_id=user)
         CustomConnectorService(ScopedSession(Session(engine), scope)).save_member_draft(parse_connector_draft(draft))
 

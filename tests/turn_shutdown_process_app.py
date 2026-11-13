@@ -97,7 +97,7 @@ async def _no_connections(**kwargs):
     return None
 
 
-producer._mint_llm_block = _turn_key
+producer.mint_llm_block = _turn_key
 producer._mint_oauth_block = _no_connections
 
 # Held because the event loop keeps only a weak reference to a task.

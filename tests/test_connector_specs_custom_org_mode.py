@@ -21,7 +21,8 @@ DRAFT = {
     "connector_id": "acme_crm",
     "label": "Acme CRM",
     "fields": [{"name": "api_key", "label": "API key"}],
-    "check": {"path": "/v1/me", "headers": {"Authorization": "Bearer {api_key}"}},
+    "auth": {"type": "header", "headers": {"Authorization": "Bearer {api_key}"}},
+    "check": {"path": "/v1/me"},
 }
 
 

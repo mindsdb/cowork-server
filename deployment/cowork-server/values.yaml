@@ -136,6 +136,15 @@ deployment:
   # environment, which renders this file alone, stays off.
   datasourceTurnsEnabled: "false"
   datasourceCapabilities: ""
+  # Names each datasource connection for the agent (COWORK_TURN_DATASOURCE_LABELS_ENABLED).
+  # On everywhere, but it acts only where datasourceTurnsEnabled is on. Its anton
+  # must be in the scratchpad image before an environment turns grants on; an
+  # environment opts out with "false" in its own values file.
+  datasourceLabelsEnabled: "true"
+  # Lets cloud turns build custom connector templates a member saves from a card
+  # (COWORK_TURN_CONNECTOR_DRAFTS_ENABLED). On everywhere; an environment opts
+  # out with "false" in its own values file.
+  connectorDraftsEnabled: "true"
 
   # The draft-preview host name and the one page allowed to frame a draft. The
   # draft Ingress and the COWORK_DRAFT_* variables below are templated from
@@ -501,6 +510,10 @@ deployment:
     # per environment; tests/test_chart_values.py pins which environments are on.
     - name: COWORK_TURN_DATASOURCE_ENABLED
       value: '{{ $.Values.datasourceTurnsEnabled }}'
+    - name: COWORK_TURN_DATASOURCE_LABELS_ENABLED
+      value: '{{ $.Values.datasourceLabelsEnabled }}'
+    - name: COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
+      value: '{{ $.Values.connectorDraftsEnabled }}'
     - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
       valueFrom:
         secretKeyRef:
@@ -569,6 +582,54 @@ deployment:
         secretKeyRef:
           name: mindsdb-secrets
           key: COWORK_DRAFT_LINK_KEYS
+          optional: true
+
+    # ====================================
+    # MOBILE PUSH
+    # ====================================
+
+    # Push notifications to the MindsHub Cowork mobile app (cowork.services.push).
+    # All optional: a platform whose keys are missing from the cowork-push
+    # Secret sends nothing, and a namespace without the Secret still deploys.
+    # APNs: the .p8 auth key (PEM or base64 of it) from Apple Developer > Keys,
+    # its Key ID and the team ID. FCM: a Firebase service-account JSON (or
+    # base64 of it) allowed to send through FCM HTTP v1.
+    # COWORK_PUSH_ENABLED=false is the kill switch.
+    - name: COWORK_PUSH_ENABLED
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_ENABLED
+          optional: true
+    - name: COWORK_PUSH_APNS_TOPIC
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_APNS_TOPIC
+          optional: true
+    - name: COWORK_PUSH_APNS_KEY_P8
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_APNS_KEY_P8
+          optional: true
+    - name: COWORK_PUSH_APNS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_APNS_KEY_ID
+          optional: true
+    - name: COWORK_PUSH_APNS_TEAM_ID
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_APNS_TEAM_ID
+          optional: true
+    - name: COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON
+      valueFrom:
+        secretKeyRef:
+          name: cowork-push
+          key: COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON
           optional: true
 
     # ====================================
