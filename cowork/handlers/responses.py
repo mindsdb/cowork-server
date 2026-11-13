@@ -151,7 +151,7 @@ from cowork.services.comparisons import (
 )
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
-from cowork.services.files import FileService
+from cowork.services.files import FileService, attachment_purpose, project_holds_files
 from cowork.services.live_apps import use_live_app_launcher
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
@@ -413,6 +413,10 @@ class _TurnStart:
     # threads, and the gate's history after that
     # (ResponsesHandler._settle_always_on). gate_rows is unread until then.
     always_on_unread: bool = False
+    # Set when the gate could run: whether a file was attached on any turn,
+    # and the project's folder, which handle() checks for files after this unit.
+    attached_files: bool = False
+    project_path: str | None = None
     # Set when the conversation is a contained model-comparison side: what it
     # was set up with, read here because the side row stays in the unit.
     comparison_pin: "_ComparisonPin | None" = None
@@ -885,6 +889,9 @@ class ResponsesHandler:
         )
         if start.always_on_unread:
             start = await self._settle_always_on(start)
+        has_files = start.attached_files
+        if not has_files and start.project_path and start.gate_rows is not None and not start.always_on_skills:
+            has_files = await self._project_has_files(start.project_path)
         self.harness_name = start.harness_name
         self.last_conversation_id = str(start.conversation_id)
 
@@ -938,6 +945,7 @@ class ResponsesHandler:
                     has_attachments=bool(request.attachment_ids),
                     has_disabled_connections=bool(disabled),
                     has_always_on_skills=start.always_on_skills,
+                    has_files=has_files,
                     is_comparison_side=start.comparison_pin is not None,
                     is_pinned_schedule=self.schedule_id is not None and request.model is not None,
                     trace_metadata=trace_metadata,
@@ -1000,8 +1008,10 @@ class ResponsesHandler:
             answer_binding: RouterBinding | None = None
             answer_history: list[dict] = []
             if route.route == DIRECT_CONTEXT:
+                # With files, the answer never comes from the web: the files may hold it.
                 answer_binding = self._answer_binding(
                     model=request.model, reasoning_effort=request.reasoning_effort, turn_llm=turn_llm,
+                    web=not has_files,
                 )
                 answer_history = self.routing_history or _routing_history(
                     start.gate_rows or [], start.harness_input,
@@ -1283,13 +1293,18 @@ class ResponsesHandler:
         has_non_text_input = any(block.get("type") != "text" for block in harness_input)
         gate_rows: list[Message] | None = []
         always_on_unread = False
-        if ineligible_reason(
+        gate_eligible = ineligible_reason(
             has_non_text_input=has_non_text_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=comparison_pin is not None,
             is_pinned_schedule=self.schedule_id is not None and request.model is not None,
-        ) is None:
+        ) is None
+        attached_files = False
+        project_path = None
+        if gate_eligible:
+            attached_files = self._reads_attached_files(session, conversation_id=conversation_id)
+            project_path = conversation.project.path
             rows = self._reads_always_on_rows(session, conversation_id=conversation_id)
             if rows is None:
                 # The read failed: the turn goes to the agent as when the
@@ -1310,6 +1325,8 @@ class ResponsesHandler:
             turn_id=turn_id,
             gate_rows=gate_rows,
             always_on_unread=always_on_unread,
+            attached_files=attached_files,
+            project_path=project_path,
             comparison_pin=comparison_pin,
         )
 
@@ -1379,6 +1396,32 @@ class ResponsesHandler:
             return None
 
     @staticmethod
+    def _reads_attached_files(session: ScopedSession, *, conversation_id: UUID) -> bool:
+        """Whether a file was attached to the conversation on any turn. True
+        when the read fails: the direct answer then only loses web search."""
+        try:
+            return bool(FileService(session).list_file_rows(attachment_purpose(str(conversation_id))))
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.warning(
+                "[responses] could not read the conversation's attachments", exc_info=True,
+                extra=log_context(conversation_id=conversation_id),
+            )
+            # Rolling back loses nothing: creating or relinking above committed already.
+            session.rollback()
+            return True
+
+    async def _project_has_files(self, project_path: str) -> bool:
+        """project_holds_files on the file store's threads, with no database
+        session held. True when the read fails, as _reads_attached_files."""
+        try:
+            return await run_efs(partial(project_holds_files, project_path), scope=self.scope)
+        except Exception:
+            logger.warning("[responses] could not check the project's files", exc_info=True)
+            return True
+
+    @staticmethod
     def _read_gate_rows(session: ScopedSession, *, conversation_id: UUID) -> list[Message] | None:
         """The rows decide_route and the direct answer can use: user and
         assistant messages, at most the direct answer's window (the gate reads
@@ -1408,6 +1451,7 @@ class ResponsesHandler:
         has_attachments: bool,
         has_disabled_connections: bool,
         has_always_on_skills: bool = False,
+        has_files: bool = False,
         is_comparison_side: bool = False,
         is_pinned_schedule: bool = False,
         trace_metadata: dict[str, str] | None = None,
@@ -1422,7 +1466,7 @@ class ResponsesHandler:
         `gate_rows` is the history handle()'s first unit read for the gate
         (see _TurnStart). `has_always_on_skills` delegates the turn without a
         gate call: an always-on skill applies to every answer, and only the
-        agent's prompt carries it.
+        agent's prompt carries it. `has_files` goes to decide_route.
 
         The composer's per-conversation model pick (`request.model`) is
         deliberately not passed down: it drives Anton's turn, not the gate
@@ -1525,6 +1569,7 @@ class ResponsesHandler:
                             has_attachments=has_attachments,
                             has_disabled_connections=has_disabled_connections,
                             after_router_answer=_last_answer_harness(gate_rows) == DIRECT_HARNESS,
+                            has_files=has_files,
                             binding=binding,
                             binding_factory=binding_for_turn,
                             jev=jev,
@@ -1631,13 +1676,15 @@ class ResponsesHandler:
 
     def _answer_binding(
         self, *, model: str | None, reasoning_effort: str | None = None, turn_llm: dict | None,
+        web: bool = True,
     ) -> RouterBinding | None:
         """The model that writes a direct answer the gate routed: the
         composer's pick, else the planning model, on the planning provider,
         which is the user's own keys when they brought them, at the reasoning
         effort the composer picked. A MindsHub turn uses the key the gate
         minted for it when there is one. None when no model resolves, which
-        delegates."""
+        delegates. Without `web`, it has no web tools and delegates what
+        needs them."""
         settings = get_user_settings(self.scope)
         answer_model = model or settings.resolved_planning_model
         if not answer_model:
@@ -1660,7 +1707,7 @@ class ResponsesHandler:
             return None
         return RouterBinding(
             provider=provider, model=answer_model, label=provider_kind.value,
-            reasoning_effort=reasoning_effort, web_tools=_allowed_web_tools(provider_kind),
+            reasoning_effort=reasoning_effort, web_tools=_allowed_web_tools(provider_kind) if web else frozenset(),
         )
 
     async def _router_binding(self) -> tuple[RouterBinding | None, dict | None]:
