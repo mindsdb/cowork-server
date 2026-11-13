@@ -18,6 +18,9 @@ _METHOD_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
 # rewritten. No hyphen: the vault joins "{engine}-{name}" into one file name.
 _ENGINE_ID_PATTERN = re.compile(r"[a-z][a-z0-9_]{1,63}")
 _SYNTHESIZED_FORM_ID_PATTERN = re.compile(r"fm_[0-9a-f]+")
+# Characters of a custom connection's trimmed name. Mirrors auth's ``MAX_NAME_LENGTH``
+# (``auth/datavault/custom_api_contract.py``); both change in one release.
+CUSTOM_CONNECTION_NAME_MAX = 128
 
 
 class InvalidConnectorIdError(ValueError):
@@ -276,17 +279,22 @@ class CustomConnectRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1, max_length=255)
+    name: str = Field(min_length=1)
     address: str = Field(min_length=1, max_length=300)
     values: dict[str, Any] = Field(default_factory=dict, repr=False)
 
     @field_validator("name")
     @classmethod
     def _name_trimmed(cls, value: str) -> str:
-        """Store the name trimmed: a chat's toggle and the producer match it exactly, and the form trims."""
+        """Store the name trimmed: a chat's toggle and the producer match it exactly, and the form trims.
+
+        Measured after trimming, as auth measures it, so a name auth would refuse is refused here.
+        """
         trimmed = value.strip()
         if not trimmed:
             raise ValueError("name must not be blank")
+        if len(trimmed) > CUSTOM_CONNECTION_NAME_MAX:
+            raise ValueError(f"name must be at most {CUSTOM_CONNECTION_NAME_MAX} characters")
         return trimmed
 
 

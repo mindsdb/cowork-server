@@ -155,6 +155,7 @@ def _connect_template(
 _AUTH_REFUSALS = {
     "conflict": "You already have a connection with this name. Choose another name, or remove the old one in Connect Apps and Data.",
     "quota_exceeded": "You have reached the limit of custom connections. Remove one in Connect Apps and Data to connect another.",
+    "organization_quota_exceeded": "Your organization has reached its limit of custom connections. An admin or another member must remove one before you can connect another.",
     "organization_mismatch": "Your active organization changed while connecting. Reload and try again.",
     "disabled": "Custom connections are turned off on this deployment.",
 }

@@ -416,6 +416,16 @@ def test_the_connection_name_is_stored_trimmed_and_a_blank_one_is_refused(engine
     assert json.loads(world["auth"][-1].content)["name"] == "Rates"
 
 
+def test_a_name_longer_than_auth_stores_is_refused_before_auth_is_asked(engine, world, monkeypatch):
+    client = _client(engine, monkeypatch)
+
+    assert _connect(client, name="n" * 129).status_code == 422
+    assert world["auth"] == []
+    assert world["provider"] == []
+    assert _connect(client, name=" " + "n" * 128 + " ").status_code == 201
+    assert json.loads(world["auth"][-1].content)["name"] == "n" * 128
+
+
 @pytest.mark.parametrize("status", [401, 403])
 @pytest.mark.parametrize(("connector_id", "values"), [("acme_crm", VALUES), ("query_api", {"access_key": SECRET})])
 def test_a_check_refused_without_the_key_then_answered_with_it_connects(engine, world, monkeypatch, status, connector_id, values):
@@ -542,7 +552,8 @@ def test_an_address_that_resolves_privately_is_not_dialed(engine, world, monkeyp
     ("status", "code", "says"),
     [
         (409, "conflict", "already have a connection with this name"),
-        (429, "quota_exceeded", "limit of custom connections"),
+        (429, "quota_exceeded", "Remove one in Connect Apps and Data"),
+        (429, "organization_quota_exceeded", "organization has reached its limit"),
         (409, "organization_mismatch", "organization changed"),
         (503, "disabled", "turned off on this deployment"),
         (400, "invalid_connection", "could not be stored"),
