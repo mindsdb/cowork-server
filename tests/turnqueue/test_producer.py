@@ -2319,9 +2319,42 @@ async def test_the_job_carries_the_organizations_jev_opt_out(monkeypatch, enable
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr_on=False))
 
     assert json.loads(fake.added[0][1]["payload"])["params"]["jev_decisions"] is enabled
+
+
+@pytest.mark.parametrize(("handed", "read", "sent"), [
+    (True, None, False),
+    (False, None, True),
+    (None, True, False),
+    (None, False, True),
+])
+@pytest.mark.asyncio
+async def test_zdr_keeps_the_pods_completion_check_off_jev(monkeypatch, handed, read, sent):
+    # Under ZDR MindsHub refuses Jev; the handler's answer is used, else it's read with the turn key.
+    from cowork.common.settings import user_settings
+    from cowork.services import mindshub_zdr
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id="", jev_decisions_enabled=True),
+    )
+    asked = []
+
+    async def zdr_on_for(**kwargs):
+        asked.append(kwargs["turn_key"])
+        return read
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_on_for", zdr_on_for)
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", zdr_on=handed))
+
+    assert json.loads(fake.added[0][1]["payload"])["params"]["jev_decisions"] is sent
+    assert asked == ([] if handed is not None else ["mdb_turnkey"])
 
 
 @pytest.fixture

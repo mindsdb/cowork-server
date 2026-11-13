@@ -910,6 +910,39 @@ def test_jev_opt_out_turns_off_antons_completion_check(enabled, verifier_jev):
     assert ("verifier_jev" in applied) is (not enabled)
 
 
+def test_zdr_turns_off_antons_completion_check_whatever_the_switch():
+    # Under ZDR MindsHub refuses Jev, so an org that left the switch on still sends it nothing.
+    from anton.config.settings import AntonSettings
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = AntonSettings(_env_file=None)
+    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_decisions_enabled": True}), zdr_on=True)
+
+    assert anton.verifier_jev == "off"
+    assert "verifier_jev" in applied
+
+
+@pytest.mark.asyncio
+async def test_an_in_process_turn_asks_zdr_with_the_stored_key(monkeypatch):
+    from cowork.harnesses.anton_harness import harness
+    from cowork.services import mindshub_zdr
+
+    asked = {}
+
+    async def zdr_on_for(**kwargs):
+        asked.update(kwargs)
+        return True
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_on_for", zdr_on_for)
+    user = object()
+
+    assert await harness._turn_zdr_on(user) is True
+    assert asked["settings"] is user
+    assert "org_bearer" not in asked and "turn_key" not in asked
+
+
 def test_route_state_puts_the_latest_message_apart():
     messages = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}]
 
@@ -1450,3 +1483,21 @@ async def test_complete_answer_delegates_what_a_streamed_answer_could_only_log(m
     provider = _Provider([_text("Revenue was $4.81M. "), *ending])
 
     assert await direct_answer.complete_answer(_binding(provider), history=_RECALL) is None
+
+
+@pytest.mark.asyncio
+async def test_the_remote_turns_zdr_read_never_fails_the_turn(monkeypatch):
+    # No credential: left to the producer. A failing read: None, not an exception.
+    from cowork.db.scoped import TenantScope
+
+    handler = ResponsesHandler()
+    handler.scope = TenantScope(org_mode=True, org_id="o", user_id="u")
+    handler.mindshub_bearer = ""
+    assert await handler._zdr_on_quietly(None) is None
+
+    async def broken(*_args, **_kwargs):
+        raise RuntimeError("auth down")
+
+    monkeypatch.setattr(handler, "zdr_on", broken)
+    handler.mindshub_bearer = "jwt"
+    assert await handler._zdr_on_quietly(None) is None

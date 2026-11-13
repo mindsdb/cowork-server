@@ -799,7 +799,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 tool_messages: bool = False,
                                 preview_checks: bool = False,
                                 ui_locale: str | None = None,
-                                reasoning_effort: str | None = None):
+                                reasoning_effort: str | None = None,
+                                zdr_on: bool | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -827,7 +828,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     one would let it fall back to a mounted org skills tree
     (cowork.handlers.responses.remote_turn_skills).
     `reasoning_effort` is the composer's pick for this turn; None leaves the
-    pod's configured default."""
+    pod's configured default.
+    `zdr_on` is the caller's ZDR answer when the handler already has it; None reads it here."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
@@ -941,6 +943,18 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # them through a session of its own.
     turn_settings = await run_on_unit_threads(partial(get_user_settings, scope))
     jev_decisions = getattr(turn_settings, "jev_decisions_enabled", True) is not False
+    # Under ZDR MindsHub refuses Jev, so the pod's completion check never asks it.
+    if jev_decisions:
+        if zdr_on is None:
+            from cowork.services.mindshub_zdr import zdr_on_for
+
+            try:
+                zdr_on = await zdr_on_for(scope=scope, settings=turn_settings, turn_key=llm_block.get("api_key", ""))
+            except Exception:
+                # Unknown counts as on: the check only skips Jev, which MindsHub refuses under ZDR.
+                logger.warning("Could not read ZDR for the remote turn", exc_info=True)
+                zdr_on = True
+        jev_decisions = not zdr_on
     time_limit = settings.time_limit_seconds
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,

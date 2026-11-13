@@ -1663,6 +1663,20 @@ class ResponsesHandler:
             return True
         return not await self.zdr_on(turn_llm, settings)
 
+    async def _zdr_on_quietly(self, turn_llm: dict | None) -> bool | None:
+        """``zdr_on`` for a path that must not fail the turn: None when it can't be asked
+        without a settings read, which the producer then makes from the turn's snapshot."""
+        has_credential = (self.scope.org_mode and self.mindshub_bearer) or ((turn_llm or {}).get("llm") or {}).get("api_key")
+        if not has_credential:
+            return None
+        try:
+            return await self.zdr_on(turn_llm)
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.warning("Could not read ZDR for the turn", exc_info=True)
+            return None
+
     async def zdr_on(self, turn_llm: dict | None = None, settings: UserSettings | None = None) -> bool:
         """Whether ZDR is on for this turn's organization (unknown counts as on).
         Asks as the caller on the web, else on the MindsHub key the turn uses."""
@@ -3253,6 +3267,8 @@ class ResponsesHandler:
                 conversation_id=str(conv_id),
                 org_id=self.scope.org_id,
                 user_id=self.scope.user_id,
+                # Asked as the caller, so the gate's cached answer is reused.
+                zdr_on=await self._zdr_on_quietly(turn_llm),
                 input_text=input_text,
                 model=model,
                 reasoning_effort=reasoning_effort,

@@ -190,7 +190,7 @@ _OVERLAID_SETTINGS: tuple[str, ...] = (
 )
 
 
-def _overlay_user_settings(anton_settings, user) -> list[str]:
+def _overlay_user_settings(anton_settings, user, *, zdr_on: bool = False) -> list[str]:
     """Copy the Cowork DB's settings onto anton's settings object.
 
     Extracted from ``_build_chat_session`` so it can be tested against a REAL
@@ -237,8 +237,9 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     # The Jev opt-out covers anton's completion check too, so an organization
     # that turns Jev off sends it nothing. Only ever turns it off: on leaves
     # anton's own setting alone. An organization MindsHub refuses Jev to needs
-    # no switch: anton stops asking after the first refusal.
-    if getattr(user, "jev_decisions_enabled", True) is False and hasattr(anton_settings, "verifier_jev"):
+    # no switch: anton stops asking after the first refusal. Under ZDR it is never asked at all.
+    jev_off = zdr_on or getattr(user, "jev_decisions_enabled", True) is False
+    if jev_off and hasattr(anton_settings, "verifier_jev"):
         anton_settings.verifier_jev = "off"
         applied.append("verifier_jev")
     return applied
@@ -853,6 +854,18 @@ def _live_apps_rule(apps: TurnLiveApps | None) -> str:
             f"message: {app.stop_text}. Tell them once, and offer to relaunch it. "
         )
     return rule
+
+
+async def _turn_zdr_on(user) -> bool:
+    """Whether ZDR is on for this in-process turn's org, asked with the stored MindsHub key."""
+    from cowork.services.mindshub_zdr import zdr_on_for
+
+    try:
+        return await zdr_on_for(scope=_units_scope(), settings=user)
+    except Exception:
+        # Unknown counts as on: it only turns off Jev's completion check.
+        logger.warning("Could not read ZDR for the turn", exc_info=True)
+        return True
 
 
 def _units_scope() -> TenantScope:
@@ -1674,7 +1687,7 @@ class AntonHarness:
         anton_settings.skills_extra_roots = [HOST_SKILLS_DIR]
 
         user = await run_on_unit_threads(get_user_settings)
-        _overlay_user_settings(anton_settings, user)
+        _overlay_user_settings(anton_settings, user, zdr_on=await _turn_zdr_on(user))
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
         elicitor = build_elicitor(str(conversation.id))
