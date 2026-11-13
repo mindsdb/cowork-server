@@ -234,7 +234,7 @@ async def register_custom_api_grants(
     connection_ids: list[int],
     settings,
 ) -> dict:
-    """Bind fetch grants for these custom API connections to the existing turn key.
+    """Bind grants for these custom API connections to the existing turn key, for the gateway to resolve.
 
     Auth fixes the audience and purpose itself (``custom-api``, ``fetch``) and
     issues each grant at the connection's current credential version. Raises

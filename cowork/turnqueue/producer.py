@@ -33,7 +33,7 @@ from cowork.services.providers import cached_org_model_catalog, minds_chat_base_
 from cowork.db.scoped import TenantScope, scope_for_identity
 from cowork.db.units import run_db
 from cowork.services import product_permissions
-from cowork.services.connectors.custom_connectors import member_turn_usage_notes
+from cowork.services.connectors.custom_connectors import MemberTurnTemplate, member_turn_templates
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
@@ -351,21 +351,52 @@ def _connectors_block(oauth_connections: dict | None) -> dict | None:
     return {engine: {"usage_notes": text} for engine, text in notes.items()} or None
 
 
+def custom_usage_prefix(connector_id: str, connection_ids: list[int], field_names: tuple[str, ...]) -> str:
+    """The fixed paragraph the producer puts before a custom connector's notes.
+
+    Input: the connector id, its connections' ids in this turn, and its
+    template's field names (empty when unknown). Output: how to call it with
+    ``call_minds_api``, that no credential value reaches the turn, and the
+    path rules. Built from ids and names only, never a value. No side effects.
+    """
+    ids = ", ".join(str(connection_id) for connection_id in connection_ids)
+    noun = "connection" if len(connection_ids) == 1 else "connections"
+    call_id = str(connection_ids[0]) if len(connection_ids) == 1 else "connection_id"
+    fields = f" Fields: {', '.join(field_names)}." if field_names else ""
+    return (
+        f"Custom {noun} {ids} ({connector_id}).{fields} No credential value reaches this turn: "
+        f"call it with call_minds_api({call_id}, path, query=None, headers=None) and the gateway "
+        "adds the credentials. Every path starts at the API's host and includes any version, "
+        "such as /v2/eod; a ?name=value part goes in query. The user typed only the host."
+    )
+
+
 async def _with_custom_usage_notes(connectors_block: dict | None, scope: TenantScope,
                                    custom_api_block: dict) -> dict | None:
-    """The connectors block plus the notes of the member's own templates for this turn's custom connections.
+    """The connectors block plus, per custom connector of this turn, the producer's prefix and the template's notes.
 
-    Read from the member's own rows only (member_turn_usage_notes). A
-    database that cannot answer leaves the notes out, never the turn.
+    Field names and notes come from the member's own rows only
+    (member_turn_templates). Every custom connector gets the prefix; a
+    template gone, one that no longer parses, or a database that cannot
+    answer leaves out its field names and notes, never the prefix or the turn.
+    Built-in notes win a key clash, as before.
     """
-    connector_ids = [c["connector_id"] for c in custom_api_block["connections"]]
+    ids_by_connector: dict[str, list[int]] = {}
+    for connection in custom_api_block["connections"]:
+        ids_by_connector.setdefault(connection["connector_id"], []).append(connection["connection_id"])
+    templates: dict[str, MemberTurnTemplate] = {}
     try:
-        notes = await run_db(partial(member_turn_usage_notes, connector_ids=connector_ids), scope=scope)
+        templates = await run_db(partial(member_turn_templates, connector_ids=list(ids_by_connector)), scope=scope)
     except Exception:
-        logger.warning("[producer] custom connector usage notes left out: the database did not answer",
+        logger.warning("[producer] custom connector field names and notes left out: the database did not answer",
                        exc_info=True)
-        return connectors_block
-    merged = {connector_id: {"usage_notes": text} for connector_id, text in notes.items()}
+    merged: dict[str, dict] = {}
+    for connector_id, connection_ids in ids_by_connector.items():
+        template = templates.get(connector_id)
+        text = custom_usage_prefix(connector_id, connection_ids, template.field_names if template else ())
+        if template is not None and template.notes:
+            text += "\n\n" + template.notes
+        merged[connector_id] = {"usage_notes": text}
     merged.update(connectors_block or {})
     return merged or None
 
@@ -558,7 +589,7 @@ def _refuse_custom_api(reason: str) -> product_permissions.ProductPermissionUnav
 
 async def _mint_custom_api_block(*, scope: TenantScope, correlation_id: str, turn_key_id: str | None,
                                  disabled: list[dict] | None, settings: TurnQueueSettings) -> dict | None:
-    """The member's custom API connections for this turn, with fetch grants bound to its turn key.
+    """The member's custom API connections for this turn, with grants bound to its turn key.
 
     None, logged, when the turn cannot carry them: outside org mode, the
     setting off, no turn key prefix (a channel turn), no producer key, a
@@ -1126,7 +1157,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               **({"connectors": connectors_block} if connectors_block else {}),
               **({"datasource": datasource_block} if datasource_block else {}),
               # The member's own verified custom API connections, by id, with
-              # fetch grants bound to this turn's key; never a field value.
+              # grants bound to this turn's key; never a field value.
               **({"custom_api": custom_api_block} if custom_api_block else {}),
               # Conversation creation time, ISO 8601. The pod is fresh every
               # turn and would otherwise stamp today's date into the system
