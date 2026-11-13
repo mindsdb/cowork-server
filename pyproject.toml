@@ -247,7 +247,7 @@ markers = [
 ]
 
 [tool.uv.sources]
-# Temporary, for this PR's environment only: anton with `call_minds_api` and the
-# custom API prompt sections (mindsdb/anton#777), which no release carries yet.
-# Replaced by a floor on the anton release that carries it before this merges.
-anton-agent = { git = "https://github.com/mindsdb/anton", rev = "6e7942288665f7bc128954eeb2f3aec90f1c2745" }
+# Integration branch only, never merged: anton from the anton integration branch
+# (connector templates, custom API sections), which no release carries yet.
+# Not for merging.
+anton-agent = { git = "https://github.com/mindsdb/anton", rev = "49a763476a4966eda1f457736f0d2233c728ac26" }
