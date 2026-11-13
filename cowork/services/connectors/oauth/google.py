@@ -635,6 +635,11 @@ class OAuthService:
             fields = _vault_for(connector_settings, scope).load(engine, name) or {}
         except Exception:
             return
+        from cowork.services.connectors import app_held
+        from cowork.services.connectors.persist import own_vault_root
+
+        # An MCP connection's token may be held in memory only, not in the file.
+        fields = app_held.overlay(own_vault_root(scope), engine, name, fields, keys=("access_token",))
         if fields.get("auth_type") != "oauth":
             return
         if engine == "notion" and fields.get("_method") != "mcp":

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import uvicorn
 
+from cowork import app_secret
 from cowork.common.settings.app_settings import (
     EXPORT_PDF_ENGINE_VAR,
     EXPORT_RENDER_URL_VAR,
@@ -24,6 +25,9 @@ def main() -> None:
     # On the desktop that file can be <COWORK_HOME>/.env, which
     # POST /settings/raw writes.
     get_export_pdf_settings()
+    # Taken from the spawn environment only, before the .env file below joins
+    # it: that file is writable by agent code.
+    secret_on_stdin = os.environ.get(app_secret.STDIN_FLAG) == "1"
     started_with = {name: os.environ.get(name) for name in (EXPORT_PDF_ENGINE_VAR, EXPORT_RENDER_URL_VAR)}
     try:
         from dotenv import load_dotenv
@@ -38,6 +42,8 @@ def main() -> None:
         else:
             os.environ[name] = value
     settings = get_app_settings()
+    if secret_on_stdin and settings.tenancy_mode != "org":
+        app_secret.read_from_stdin()
     port = settings.port
     host = settings.host
     # A SIGTERM from the desktop, a logout or a system shutdown must end the
