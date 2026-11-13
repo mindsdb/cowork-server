@@ -126,6 +126,25 @@ def keep_seeded_general_path():
 
 
 @pytest.fixture(autouse=True)
+def app_settings_rebuilt_after_a_test_replaced_them():
+    """Clear the cached app settings when a test left a different object there.
+
+    A fixture that sets an env var and clears ``get_app_settings`` leaves the
+    env to monkeypatch, which restores it last; a teardown in between that
+    reads settings caches the test's env for the next test. Autouse fixtures
+    set up before ``monkeypatch``, so this tears down after it, and the next
+    read uses the restored env. A test that never replaced the cached object
+    costs no rebuild.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    before = get_app_settings()
+    yield
+    if get_app_settings.cache_info().currsize and get_app_settings() is not before:
+        get_app_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
 def close_coding_services():
     yield
     from coding_service_fakes import close_services
