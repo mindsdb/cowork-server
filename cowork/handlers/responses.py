@@ -5,6 +5,7 @@ import base64
 import json
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import aclosing
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import cache, partial
@@ -152,7 +153,7 @@ from cowork.services.comparisons import (
 )
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
-from cowork.services.files import FileService
+from cowork.services.files import FileService, attachment_purpose, project_holds_files
 from cowork.services.live_apps import use_live_app_launcher
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
@@ -414,6 +415,10 @@ class _TurnStart:
     # threads, and the gate's history after that
     # (ResponsesHandler._settle_always_on). gate_rows is unread until then.
     always_on_unread: bool = False
+    # Set when the gate could run: whether a file was attached on any turn,
+    # and the project's folder, which handle() checks for files after this unit.
+    attached_files: bool = False
+    project_path: str | None = None
     # Set when the conversation is a contained model-comparison side: what it
     # was set up with, read here because the side row stays in the unit.
     comparison_pin: "_ComparisonPin | None" = None
@@ -886,6 +891,9 @@ class ResponsesHandler:
         )
         if start.always_on_unread:
             start = await self._settle_always_on(start)
+        has_files = start.attached_files
+        if not has_files and start.project_path and start.gate_rows is not None and not start.always_on_skills:
+            has_files = await self._project_has_files(start.project_path)
         self.harness_name = start.harness_name
         self.last_conversation_id = str(start.conversation_id)
 
@@ -939,7 +947,9 @@ class ResponsesHandler:
                     has_attachments=bool(request.attachment_ids),
                     has_disabled_connections=bool(disabled),
                     has_always_on_skills=start.always_on_skills,
+                    has_files=has_files,
                     is_comparison_side=start.comparison_pin is not None,
+                    is_pinned_schedule=self.schedule_id is not None and request.model is not None,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
                 )
@@ -1000,8 +1010,10 @@ class ResponsesHandler:
             answer_binding: RouterBinding | None = None
             answer_history: list[dict] = []
             if route.route == DIRECT_CONTEXT:
+                # With files, the answer never comes from the web: the files may hold it.
                 answer_binding = self._answer_binding(
                     model=request.model, reasoning_effort=request.reasoning_effort, turn_llm=turn_llm,
+                    web=not has_files,
                 )
                 answer_history = self.routing_history or _routing_history(
                     start.gate_rows or [], start.harness_input,
@@ -1061,10 +1073,13 @@ class ResponsesHandler:
                 # the only channel by which a turn delete can tell this producer
                 # that the history it is writing into no longer exists (the handle
                 # it will be registered under does not exist yet).
-                lifecycle = TurnLifecycle(identity=RunIdentity(
-                    correlation_id=(turn_llm or {}).get("correlation_id") or str(uuid4()),
-                    remote=TurnQueueSettings().is_remote,
-                ))
+                lifecycle = TurnLifecycle(
+                    identity=RunIdentity(
+                        correlation_id=(turn_llm or {}).get("correlation_id") or str(uuid4()),
+                        remote=TurnQueueSettings().is_remote,
+                    ),
+                    interactive=self.interactive,
+                )
 
                 def delegated(buffer: StreamBuffer, metadata: dict[str, str]):
                     return self._select_producer(
@@ -1123,7 +1138,9 @@ class ResponsesHandler:
                     await asyncio.shield(_drop_gate_key(turn_llm))
                     raise
                 self.last_run_handle = handle
-                return sse_from_buffer(handle.buffer, 0)
+                return sse_from_buffer(
+                    handle.buffer, 0, watching=(str(start.conversation_id), start.turn_id),
+                )
 
             if first_take is not None:
                 first_take.cancel()
@@ -1262,6 +1279,12 @@ class ResponsesHandler:
         conversation_id = conversation.id
         side = ComparisonService(session).contained_side(conversation)
         comparison_pin = _ComparisonPin(side.model, side.reasoning_effort) if side is not None else None
+        if comparison_pin is None:
+            # A side runs on its own pin, so the request's picks never ran there.
+            conversation_service.record_turn_picks(
+                conversation=conversation, model=request.model, reasoning_effort=request.reasoning_effort,
+                reset=request.reset_picks,
+            )
         # turn_id: prior message count. The current user message is NOT
         # persisted yet (deferred to the producer for the streaming path), so
         # this is a stable per-conversation index for the buffer file.
@@ -1272,12 +1295,18 @@ class ResponsesHandler:
         has_non_text_input = any(block.get("type") != "text" for block in harness_input)
         gate_rows: list[Message] | None = []
         always_on_unread = False
-        if ineligible_reason(
+        gate_eligible = ineligible_reason(
             has_non_text_input=has_non_text_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=comparison_pin is not None,
-        ) is None:
+            is_pinned_schedule=self.schedule_id is not None and request.model is not None,
+        ) is None
+        attached_files = False
+        project_path = None
+        if gate_eligible:
+            attached_files = self._reads_attached_files(session, conversation_id=conversation_id)
+            project_path = conversation.project.path
             rows = self._reads_always_on_rows(session, conversation_id=conversation_id)
             if rows is None:
                 # The read failed: the turn goes to the agent as when the
@@ -1298,6 +1327,8 @@ class ResponsesHandler:
             turn_id=turn_id,
             gate_rows=gate_rows,
             always_on_unread=always_on_unread,
+            attached_files=attached_files,
+            project_path=project_path,
             comparison_pin=comparison_pin,
         )
 
@@ -1367,6 +1398,32 @@ class ResponsesHandler:
             return None
 
     @staticmethod
+    def _reads_attached_files(session: ScopedSession, *, conversation_id: UUID) -> bool:
+        """Whether a file was attached to the conversation on any turn. True
+        when the read fails: the direct answer then only loses web search."""
+        try:
+            return bool(FileService(session).list_file_rows(attachment_purpose(str(conversation_id))))
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.warning(
+                "[responses] could not read the conversation's attachments", exc_info=True,
+                extra=log_context(conversation_id=conversation_id),
+            )
+            # Rolling back loses nothing: creating or relinking above committed already.
+            session.rollback()
+            return True
+
+    async def _project_has_files(self, project_path: str) -> bool:
+        """project_holds_files on the file store's threads, with no database
+        session held. True when the read fails, as _reads_attached_files."""
+        try:
+            return await run_efs(partial(project_holds_files, project_path), scope=self.scope)
+        except Exception:
+            logger.warning("[responses] could not check the project's files", exc_info=True)
+            return True
+
+    @staticmethod
     def _read_gate_rows(session: ScopedSession, *, conversation_id: UUID) -> list[Message] | None:
         """The rows decide_route and the direct answer can use: user and
         assistant messages, at most the direct answer's window (the gate reads
@@ -1396,7 +1453,9 @@ class ResponsesHandler:
         has_attachments: bool,
         has_disabled_connections: bool,
         has_always_on_skills: bool = False,
+        has_files: bool = False,
         is_comparison_side: bool = False,
+        is_pinned_schedule: bool = False,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
@@ -1409,7 +1468,7 @@ class ResponsesHandler:
         `gate_rows` is the history handle()'s first unit read for the gate
         (see _TurnStart). `has_always_on_skills` delegates the turn without a
         gate call: an always-on skill applies to every answer, and only the
-        agent's prompt carries it.
+        agent's prompt carries it. `has_files` goes to decide_route.
 
         The composer's per-conversation model pick (`request.model`) is
         deliberately not passed down: it drives Anton's turn, not the gate
@@ -1424,6 +1483,7 @@ class ResponsesHandler:
             has_attachments=has_attachments,
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=is_comparison_side,
+            is_pinned_schedule=is_pinned_schedule,
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
@@ -1511,6 +1571,7 @@ class ResponsesHandler:
                             has_attachments=has_attachments,
                             has_disabled_connections=has_disabled_connections,
                             after_router_answer=_last_answer_harness(gate_rows) == DIRECT_HARNESS,
+                            has_files=has_files,
                             binding=binding,
                             binding_factory=binding_for_turn,
                             jev=jev,
@@ -1617,13 +1678,15 @@ class ResponsesHandler:
 
     def _answer_binding(
         self, *, model: str | None, reasoning_effort: str | None = None, turn_llm: dict | None,
+        web: bool = True,
     ) -> RouterBinding | None:
         """The model that writes a direct answer the gate routed: the
         composer's pick, else the planning model, on the planning provider,
         which is the user's own keys when they brought them, at the reasoning
         effort the composer picked. A MindsHub turn uses the key the gate
         minted for it when there is one. None when no model resolves, which
-        delegates."""
+        delegates. Without `web`, it has no web tools and delegates what
+        needs them."""
         settings = get_user_settings(self.scope)
         answer_model = model or settings.resolved_planning_model
         if not answer_model:
@@ -1646,7 +1709,7 @@ class ResponsesHandler:
             return None
         return RouterBinding(
             provider=provider, model=answer_model, label=provider_kind.value,
-            reasoning_effort=reasoning_effort, web_tools=_allowed_web_tools(provider_kind),
+            reasoning_effort=reasoning_effort, web_tools=_allowed_web_tools(provider_kind) if web else frozenset(),
         )
 
     async def _router_binding(self) -> tuple[RouterBinding | None, dict | None]:
@@ -1773,7 +1836,7 @@ class ResponsesHandler:
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
-        lifecycle = TurnLifecycle(identity=RunIdentity(correlation_id=corr))
+        lifecycle = TurnLifecycle(identity=RunIdentity(correlation_id=corr), interactive=self.interactive)
         handle = await registry.start(
             conversation_id=str(conversation_id),
             turn_id=turn_id,
@@ -1792,7 +1855,7 @@ class ResponsesHandler:
             lifecycle=lifecycle,
         )
         self.last_run_handle = handle
-        return sse_from_buffer(handle.buffer, 0)
+        return sse_from_buffer(handle.buffer, 0, watching=(str(conversation_id), turn_id))
 
     async def _direct_figure_sources(
         self, *, conversation_id: UUID, answer: str, question: str,
@@ -2612,7 +2675,7 @@ class ResponsesHandler:
         Unlike in-process, messages are not timestamp-stamped here; that
         divergence is tracked separately.
         """
-        from cowork.harnesses.anton_harness.harness import AntonHarness
+        from cowork.harnesses.anton_harness.harness import AntonHarness, _without_repeated_narration
 
         service = ConversationService(session)
         replayable = [
@@ -2621,7 +2684,7 @@ class ResponsesHandler:
         ]
         fmt = partial(scrubbed_openai_dump, mode="json")
         if not get_user_settings(session.scope).history_compaction_enabled:
-            return [fmt(m) for m in replayable], None
+            return _without_repeated_narration([fmt(m) for m in replayable]), None
 
         conversation = service.get_conversation(conv_id)
         history, seed_info = AntonHarness._seed_history(
@@ -4392,7 +4455,39 @@ async def save_turn_compaction(
 SSE_KEEPALIVE_SECONDS = 20.0
 
 
-async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None]:
+def sse_from_buffer(
+    buffer, from_seq: int = 0, *, watching: tuple[str, int] | None = None,
+) -> AsyncGenerator[str, None]:
+    """``_sse_from_buffer``. With ``watching`` (conversation id, turn id) the
+    reader also counts as watching that turn while it streams, which holds
+    back the turn's "task finished" push (cowork.streaming.watchers). Where
+    push is off nothing reads that signal, so the stream skips recording it."""
+    if watching is None or not _push_reads_watchers():
+        return _sse_from_buffer(buffer, from_seq)
+    return _watched_sse_from_buffer(buffer, from_seq, watching)
+
+
+def _push_reads_watchers() -> bool:
+    from cowork.services.push.dispatch import push_enabled
+
+    return push_enabled()
+
+
+async def _watched_sse_from_buffer(
+    buffer, from_seq: int, watching: tuple[str, int],
+) -> AsyncGenerator[str, None]:
+    from cowork.streaming import watchers
+
+    async with watchers.watch(*watching) as held:
+        # aclosing: closing this generator closes the inner one at once, so
+        # its own finally (which settles the prefetch) runs before the watch
+        # is released.
+        async with aclosing(_sse_from_buffer(buffer, from_seq, held)) as frames:
+            async for frame in frames:
+                yield frame
+
+
+async def _sse_from_buffer(buffer, from_seq: int = 0, held=None) -> AsyncGenerator[str, None]:
     """Serialize a turn buffer to the SSE wire, replaying from ``from_seq``
     then live-tailing. Used by both the initial POST /responses stream
     (from_seq=0) and reconnects via GET /responses/tail. The terminal record
@@ -4428,6 +4523,8 @@ async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None
             # Checked BEFORE prefetching: the terminal record ends the stream,
             # so scheduling another __anext__() here would only be cancelled.
             if rec.is_terminal:
+                if held is not None:
+                    held.saw_end = True
                 if rec.data.get("reason") == "cancelled":
                     yield sse_frame("response.cancelled", {"type": "response.cancelled"})
                 return

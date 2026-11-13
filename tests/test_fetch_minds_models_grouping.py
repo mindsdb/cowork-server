@@ -59,7 +59,7 @@ def _serve(monkeypatch, body, status_code=200):
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
-    # The listing is cached per base URL for 5 minutes; each test needs a fetch.
+    # The listing is cached per base URL; each test needs a fetch.
     providers._minds_models_cache.clear()
     yield
     providers._minds_models_cache.clear()

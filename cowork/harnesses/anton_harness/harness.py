@@ -456,6 +456,64 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     return split_turn_into_rows(history_slice)
 
 
+def _narration(message: dict) -> list[str]:
+    content = message.get("content")
+    if message.get("role") != "assistant" or not isinstance(content, list):
+        return []
+    return [b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)]
+
+
+def _joined_rounds(texts: list[str]) -> str:
+    """The rounds' text as the stream formatter joins it into the answer."""
+    joined = ""
+    for text in texts:
+        if joined and not joined.endswith("\n\n"):
+            joined += "\n\n"
+        joined += text
+    return joined
+
+
+def _without_repeated_narration(history: list[dict]) -> list[dict]:
+    """Replay each turn as the model saw it live.
+
+    A turn's tool rows keep the text written beside each tool call, and its
+    answer row repeats all of that text before the final reply. When the answer
+    starts with exactly those rounds, only the final reply is replayed, which
+    makes the history byte-identical to the live one and keeps the prompt cache
+    valid across turns. Otherwise the text is dropped from the tool rows, so
+    they replay like rows saved before this change.
+    """
+    out: list[dict] = []
+    narrated_at: list[int] = []
+    for message in history:
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result") for b in content
+        ):
+            if _narration(message):
+                narrated_at.append(len(out))
+            out.append(message)
+            continue
+        if message.get("role") == "assistant" and isinstance(content, str) and narrated_at:
+            lead = _joined_rounds([t for i in narrated_at for t in _narration(out[i])])
+            rest = content[len(lead):] if content.startswith(lead) else None
+            if rest is not None and lead and not lead.endswith("\n\n") and rest:
+                rest = rest[2:] if rest.startswith("\n\n") else None
+            # Live anton appends no empty reply, so an empty one cannot match.
+            if not rest:
+                for i in narrated_at:
+                    out[i] = {**out[i], "content": [
+                        b for b in out[i]["content"] if not (isinstance(b, dict) and b.get("type") == "text")
+                    ]}
+            else:
+                message = {**message, "content": rest}
+            narrated_at = []
+        elif message.get("role") == "user":
+            narrated_at = []
+        out.append(message)
+    return out
+
+
 def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, compacted: bool) -> TurnHistory | None:
     """The tool block-rows of a turn that completed cleanly, or None when it
     has none.
@@ -1361,7 +1419,7 @@ class AntonHarness:
             else:
                 history_summary = None  # cutoff message is gone — stale
 
-        tail = [stamp(m) for m in ordered_messages[tail_start:]]
+        tail = _without_repeated_narration([stamp(m) for m in ordered_messages[tail_start:]])
         if history_summary:
             summary_msg = {"role": "user", "content": scrub_credentials(history_summary)}
             if tail and tail[0].get("role") == "user":
@@ -1879,7 +1937,7 @@ class AntonHarness:
                     self._stamp_message,
                 )
             else:
-                initial_history = [self._stamp_message(m) for m in replayable]
+                initial_history = _without_repeated_narration([self._stamp_message(m) for m in replayable])
                 seed_info = None
 
             # The memory of the person who asked: their own tiers, or the

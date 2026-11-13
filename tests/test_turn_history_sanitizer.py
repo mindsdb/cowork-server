@@ -79,9 +79,20 @@ def test_a_malformed_row_drops_the_whole_set(bad_row):
     assert sanitize_turn_history_rows(_pair() + [bad_row]) == []
 
 
-def test_a_text_block_in_a_tool_row_drops_the_set():
+def test_text_beside_a_tool_call_is_kept_in_order():
     rows = _pair()
-    rows[0]["content"].append({"type": "text", "text": "narration"})
+    rows[0]["content"].insert(0, {"type": "text", "text": "narration"})
+    assert sanitize_turn_history_rows(rows) == rows
+
+
+def test_an_assistant_row_with_only_text_drops_the_set():
+    rows = _pair() + [{"role": "assistant", "content": [{"type": "text", "text": "narration"}]}]
+    assert sanitize_turn_history_rows(rows) == []
+
+
+def test_a_text_block_in_a_tool_result_row_drops_the_set():
+    rows = _pair()
+    rows[1]["content"].append({"type": "text", "text": "narration"})
     assert sanitize_turn_history_rows(rows) == []
 
 

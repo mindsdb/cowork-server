@@ -656,7 +656,7 @@ async def test_route_request_hands_the_gates_binding_over(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_routing_error_cancels_the_take(monkeypatch):
+async def test_a_routing_error_cancels_the_take(monkeypatch, tmp_path):
     from types import SimpleNamespace
     from uuid import uuid4
 
@@ -670,8 +670,9 @@ async def test_a_routing_error_cancels_the_take(monkeypatch):
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(
-            get_conversation=lambda _cid: SimpleNamespace(id=conv_id),
+            get_conversation=lambda _cid: SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path))),
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
