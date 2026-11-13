@@ -8,10 +8,23 @@ from unittest.mock import AsyncMock
 
 import pytest
 from anton.cloud_turn.contract import TurnRequestV1
-from anton.core.llm.identity import render_custom_api_notes
+from anton.config.settings import AntonSettings
+from anton.core.llm.identity import build_runtime_context, render_custom_api_notes
+from anton.core.tools.connector_draft import parse_connector_draft
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine, select
 
 import test_producer as base
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings import user_settings
+from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
+from cowork.models.custom_connector import CustomConnector
+from cowork.services.connectors.custom_connectors import (
+    USAGE_NOTES_MAX,
+    CustomConnectorService,
+    member_turn_templates,
+)
 from cowork.services.product_permissions import ProductPermissionUnavailable
 from cowork.turnqueue import producer as prod
 
@@ -44,8 +57,6 @@ def _granted(versions, **overrides):
 @pytest.fixture()
 def turn(monkeypatch):
     """Org tenancy, the custom connector setting on, a producer key; auth faked."""
-    from cowork.common.settings import user_settings
-
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     monkeypatch.setenv("COWORK_TURN_CONNECTOR_DRAFTS_ENABLED", "true")
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID", "producer")
@@ -232,9 +243,6 @@ async def test_each_member_gets_only_what_auth_lists_for_their_own_key(turn, org
 
 async def test_a_grant_at_no_version_is_refused_by_the_producer_itself(turn):
     """The job model refuses it too; the producer must not rely on that."""
-    from cowork.common.settings.app_settings import TurnQueueSettings
-    from cowork.db.scoped import TenantScope
-
     turn["grant"].return_value = _granted({3: 1, 5: 0})
 
     with pytest.raises(ProductPermissionUnavailable):
@@ -250,13 +258,6 @@ async def test_a_grant_at_no_version_is_refused_by_the_producer_itself(turn):
 @pytest.fixture()
 def templates(monkeypatch):
     """A database holding acme_crm templates for two members of o1 and one of o2, saved the real way."""
-    from anton.core.tools.connector_draft import parse_connector_draft
-    from sqlalchemy.pool import StaticPool
-    from sqlmodel import Session, SQLModel, create_engine
-
-    from cowork.db.scoped import ScopedSession, TenantScope
-    from cowork.services.connectors.custom_connectors import CustomConnectorService
-
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     for org, user, notes in (("o1", "u1", "Call /v1/me first."), ("o1", "u2", "Other member's notes."),
@@ -292,10 +293,6 @@ _BETA_PREFIX = (
 
 def _template_row(engine, connector_id="acme_crm", org_id="o1", user_id="u1"):
     """The stored row of one member's template, to change it as an older or damaged save would have."""
-    from sqlmodel import Session, select
-
-    from cowork.models.custom_connector import CustomConnector
-
     session = Session(engine)
     row = session.exec(select(CustomConnector).where(
         CustomConnector.connector_id == connector_id, CustomConnector.created_by == user_id,
@@ -326,13 +323,16 @@ async def test_two_connections_of_one_connector_share_one_prefix(turn, templates
 
 async def test_the_address_field_is_never_listed(turn, templates):
     session, row = _template_row(templates)
-    row.spec = {**row.spec, "fields": [*row.spec["fields"], {"name": "base_url", "label": "Address"}]}
+    row.spec = {**row.spec, "fields": [{"name": "base_url", "label": "Address"}]}
     session.add(row)
     session.commit()
 
     params, _ = await _run(turn)
 
-    assert "base_url" not in params["connectors"]["acme_crm"]["usage_notes"]
+    notes = params["connectors"]["acme_crm"]["usage_notes"]
+    assert notes.startswith("Custom connection 5 (acme_crm). No credential value reaches this turn: ")
+    assert "Fields:" not in notes
+    assert "base_url" not in notes
 
 
 async def test_a_template_that_no_longer_parses_keeps_its_notes_but_names_no_field(turn, templates):
@@ -350,12 +350,6 @@ async def test_a_template_that_no_longer_parses_keeps_its_notes_but_names_no_fie
 
 
 async def test_a_malformed_stored_field_costs_only_its_own_connectors_names(turn, templates):
-    from anton.core.tools.connector_draft import parse_connector_draft
-    from sqlmodel import Session
-
-    from cowork.db.scoped import ScopedSession, TenantScope
-    from cowork.services.connectors.custom_connectors import CustomConnectorService
-
     beta = {"connector_id": "beta_api", "label": "Beta", "usage_notes": "GET /v1/tickets.",
             "fields": [{"name": "token", "label": "Token"}],
             "auth": {"type": "header", "headers": {"Authorization": "Bearer {token}"}},
@@ -410,11 +404,6 @@ async def test_a_connection_whose_template_is_gone_gets_the_prefix_alone(turn, t
 
 
 async def test_notes_are_scrubbed_and_cut(turn, templates):
-    from sqlmodel import Session, select
-
-    from cowork.models.custom_connector import CustomConnector
-    from cowork.services.connectors.custom_connectors import USAGE_NOTES_MAX
-
     # A shape scrub_output knows; the template parser refuses long token runs at save anyway.
     planted = "sk-proj-" + "abcdefghijklmnopqrstuvwxyz0123456789ABCD"
     with Session(templates) as session:
@@ -473,14 +462,6 @@ async def test_a_database_that_cannot_answer_costs_the_names_and_notes_not_the_p
 
 
 def test_the_notes_read_nothing_outside_a_members_org_scope(templates):
-    from sqlmodel import Session
-
-    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
-    from cowork.services.connectors.custom_connectors import member_turn_templates
-
-    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
-    from cowork.models.custom_connector import CustomConnector
-
     assert member_turn_templates(ScopedSession(Session(templates), LOCAL_SCOPE), ["acme_crm"]) == {}
     no_user = TenantScope(org_mode=True, org_id="o1", user_id=None)
     assert member_turn_templates(ScopedSession(Session(templates), no_user), ["acme_crm"]) == {}
@@ -527,3 +508,6 @@ async def test_the_pod_parses_and_renders_the_job_this_producer_queues(turn, tem
     lines = render_custom_api_notes(request.custom_api, request.connectors).splitlines()
     assert f"- beta_api: {json.dumps(_BETA_PREFIX)}" in lines
     assert f"- acme_crm: {json.dumps(_ACME_PREFIX + chr(10) * 2 + 'Call /v1/me first.')}" in lines
+    context = build_runtime_context(AntonSettings(), cloud_custom_api=request.custom_api).splitlines()
+    assert "  - 3: \"Ops\" (beta_api)" in context
+    assert "  - 5: \"Prod\" (acme_crm)" in context
