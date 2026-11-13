@@ -113,6 +113,10 @@ class MindsHubPermissions(BaseModel):
     signed_out: bool = False
     #: The organization's ZDR mode (``off``, ``standard``, ``strict``); None when unknown.
     zdr_mode: str | None = None
+    #: The organization the answer is for, from the browser block: the active
+    #: organization for a Keycloak token, the key's own organization for an API
+    #: key. None when the answer carried none.
+    organization_id: str | None = None
 
     def is_outage_answer(self) -> bool:
         """Auth's own answer when it couldn't read membership: no permissions
@@ -175,11 +179,14 @@ def _parse_permissions(payload: Any) -> MindsHubPermissions:
     except ValidationError:
         browser = None
     zdr_mode = payload.get("zdr_mode", ZDR_OFF)
+    block = payload.get(BROWSER_ENTITLEMENT_KEY)
+    organization_id = block.get("organization_id") if isinstance(block, dict) else None
     return MindsHubPermissions(
         permissions=frozenset(str(p) for p in payload["permissions"] if isinstance(p, str)),
         reachable=True,
         browser=browser,
         zdr_mode=zdr_mode if isinstance(zdr_mode, str) else None,
+        organization_id=organization_id if isinstance(organization_id, str) and organization_id else None,
     )
 
 

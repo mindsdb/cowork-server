@@ -83,7 +83,7 @@ from cowork.schemas.sharepoint import (
     SharePointImportResponse,
     SharePointSkippedItem,
 )
-from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
+from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME, SERVER_PROJECT_FOLDERS
 from cowork.services.artifacts import _is_the_projects_secrets
 from cowork.services.connectors.sharepoint import (
     DownloadBudget,
@@ -1946,7 +1946,6 @@ def _write_uploads(scoped: ScopedSession, *, project_name: str, uploads: list[Up
 
 
 _SHAREPOINT_IMPORT_FIELDS = frozenset({"connection", "site", "drive_id", "folder", "item_ids"})
-_RESERVED_IMPORT_FOLDERS = frozenset({CONVERSATIONS_DIRNAME, "skills"})
 _IMPORTS_RUNNING: set[UUID] = set()
 _IMPORTS_LOCK = threading.Lock()
 _SHAREPOINT_IMPORT_STATUS = {
@@ -2006,7 +2005,7 @@ def _sharepoint_import_request(body: Any) -> _SharePointImportRequest:
 
 def _reserved_import_folder(name: str) -> bool:
     """Whether a top-level project folder is Cowork's own and closed to imports."""
-    return name.casefold() in _RESERVED_IMPORT_FOLDERS
+    return name.casefold() in SERVER_PROJECT_FOLDERS
 
 
 def _import_folder_parts(folder: str, scoped: ScopedSession) -> tuple[str, ...]:

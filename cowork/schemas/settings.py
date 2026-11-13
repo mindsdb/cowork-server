@@ -57,6 +57,7 @@ ProbeDenialCode = Literal[
     "wallet_empty",
     "included_allowance_exhausted",
     "free_air_daily_spend_fuse_exceeded",
+    "budget_exceeded",
     "rate_limited",
     "policy_unavailable",
 ]

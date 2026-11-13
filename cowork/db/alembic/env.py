@@ -18,6 +18,7 @@ import cowork.models.message  # noqa: F401
 import cowork.models.message_event  # noqa: F401
 import cowork.models.pin  # noqa: F401
 import cowork.models.published_page  # noqa: F401
+import cowork.models.push_device  # noqa: F401
 import cowork.models.project  # noqa: F401
 import cowork.models.schedule  # noqa: F401
 import cowork.models.setting  # noqa: F401

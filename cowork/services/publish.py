@@ -23,6 +23,7 @@ from pydantic import SecretStr
 
 from cowork.code_sandbox import refuse_planted_links
 from cowork.common.logger import log_context
+from cowork.common.minds_tls import minds_ssl_verify
 from cowork.common.paths import cowork_home, pod_local_only
 # Imported for its side effect on the module namespace as well as its use:
 # tests monkeypatch `publish.get_app_settings`, so removing it because a
@@ -43,6 +44,7 @@ from cowork.services.artifact_audience import (
     ORG_AUDIENCE_FIELDS,
     PUBLISHER_OWNER_ONLY_FIELD,
     AudienceChanges,
+    ShareNotice,
     ShareNotify,
     for_publisher,
     notify_within,
@@ -1137,6 +1139,7 @@ def publish_artifact(
     notify: ShareNotify | None = None,
     stored: ArtifactRule | None = None,
     owner_save: bool = False,
+    notices: list[ShareNotice] | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -1176,6 +1179,10 @@ def publish_artifact(
     without teams or people by id, so people added by address alone are
     emailed too. Every other publish (live sync, autopublish, a retry) leaves
     it None.
+
+    `notices` collects the share notice MindsHub was asked to email, once
+    that request is made, so the access route can push the same people
+    (cowork.services.push.hooks.artifact_shared).
 
     `stored` is the artifact's rule the access route already read under the
     publish lock to check this save, so the save reads the rule once and is
@@ -1372,7 +1379,7 @@ def publish_artifact(
                 md_tmp_dir.cleanup()
             raise
 
-        ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+        ssl_verify = minds_ssl_verify()
         try:
             result = publish(
                 publish_source,
@@ -1532,6 +1539,8 @@ def publish_artifact(
                         "Could not ask MindsHub to notify the people an artifact was shared with",
                         exc_info=True,
                     )
+            if notice is not None and notices is not None:
+                notices.append(notice)
             state = _load_state(scope=scope)
             state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
             _save_state(state, scope=scope)
@@ -1662,7 +1671,7 @@ def unpublish_artifact(
         except Exception as exc:
             raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
-        ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+        ssl_verify = minds_ssl_verify()
         try:
             unpublish(
                 identifier,
@@ -1798,7 +1807,7 @@ def list_versions(raw_path: str, *, scope: TenantScope | None) -> dict:
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
-    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+    ssl_verify = minds_ssl_verify()
     from urllib.error import HTTPError
     try:
         data = _list_versions(report_id, api_key=api_key, publish_url=publish_url, ssl_verify=ssl_verify)
@@ -1855,7 +1864,7 @@ def activate_version(raw_path: str, md5: str, *, scope: TenantScope | None) -> d
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
-    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+    ssl_verify = minds_ssl_verify()
     from urllib.error import HTTPError
     try:
         result = _activate_version(report_id, md5, api_key=api_key, publish_url=publish_url, ssl_verify=ssl_verify)

@@ -7,7 +7,7 @@ import uuid
 
 from cowork.coding.commands import CommandIntent
 from cowork.coding.connector_capabilities import ConnectorCapability
-from cowork.coding.context import require_attachments_exist, validate_references
+from cowork.coding.context import message_attachments, require_attachments_exist, validate_references
 from cowork.coding.contracts import (
     CodingEvent,
     CodingSession,
@@ -286,7 +286,13 @@ class CodingTurnOperations:
                     phase="started",
                 )
                 if announced
-                else CodingEvent(type=EventType.user_message, title="You", text=prompt, phase="completed"),
+                else CodingEvent(
+                    type=EventType.user_message,
+                    title="You",
+                    text=prompt,
+                    phase="completed",
+                    data=message_attachments(attachments),
+                ),
                 mark_running,
             )
             thread = threading.Thread(
@@ -400,7 +406,13 @@ class CodingTurnOperations:
                 raise RuntimeError("Coding agent state is inconsistent")
             self._emit(
                 session.id,
-                CodingEvent(type=EventType.user_message, title="You", text=prompt, phase="completed"),
+                CodingEvent(
+                    type=EventType.user_message,
+                    title="You",
+                    text=prompt,
+                    phase="completed",
+                    data=message_attachments(attachments),
+                ),
             )
             if intent.name == "status":
                 self.commands.emit_status(session, engine)
@@ -416,7 +428,13 @@ class CodingTurnOperations:
         if outcome is None:
             self._emit(
                 session.id,
-                CodingEvent(type=EventType.user_message, title="Follow-up", text=prompt, phase="completed"),
+                CodingEvent(
+                    type=EventType.user_message,
+                    title="Follow-up",
+                    text=prompt,
+                    phase="completed",
+                    data=message_attachments(attachments),
+                ),
             )
             return self.get_session(session_id)
         # Codex has not answered within its deadline. The instruction is in
@@ -430,7 +448,7 @@ class CodingTurnOperations:
                 title="Follow-up (unconfirmed)",
                 text=prompt,
                 phase="pending",
-                data={"delivery": "unconfirmed"},
+                data={"delivery": "unconfirmed", **message_attachments(attachments)},
             ),
         )
         outcome.on_settled(lambda ok, detail: self._record_late_steer(session_id, prompt, ok, detail))
@@ -497,7 +515,7 @@ class CodingTurnOperations:
                     title="Queued next",
                     text=prompt,
                     phase="pending",
-                    data={"queueId": instruction.id},
+                    data={"queueId": instruction.id, **message_attachments(attachments)},
                 ),
                 lambda current: current.queued_instructions.append(instruction),
             )

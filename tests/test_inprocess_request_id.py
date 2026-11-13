@@ -52,6 +52,7 @@ class _RecBuffer:
 def _failing_handler(monkeypatch, saved: dict, exc: Exception):
     """A handler whose harness raises, so _run_turn takes its failure branch."""
     handler = object.__new__(ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = object()
 
     class FakeConversationService:

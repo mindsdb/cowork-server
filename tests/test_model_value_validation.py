@@ -46,12 +46,25 @@ def catalog(monkeypatch):
     """Install a fake /v1/models catalog; returns a list of fetch call counts."""
     calls = []
 
-    async def _fake(minds_url, api_key, *, force_refresh=False, tenant_key=None):
+    async def _fake(minds_url, api_key, *, force_refresh=False, tenant_key=None, **_kw):
         calls.append((minds_url, api_key))
         return _listing(list(CATALOG))
 
     monkeypatch.setattr(providers, "fetch_minds_models", _fake)
     return calls
+
+
+def test_validation_fetches_as_mindshub(monkeypatch):
+    flags = []
+
+    async def _fake(minds_url, api_key, **kw):
+        flags.append(kw.get("mindshub"))
+        return _listing(list(CATALOG))
+
+    monkeypatch.setattr(providers, "fetch_minds_models", _fake)
+    _reject(_minds_settings(), "planning_model", "deepseek-v4-flash")
+
+    assert flags == [True]
 
 
 def _reject(settings, key, value):
@@ -317,7 +330,7 @@ async def test_switching_byok_to_minds_in_one_put_is_gated(monkeypatch):
 
     fetched = []
 
-    async def _fake(minds_url, api_key, *, force_refresh=False, tenant_key=None):
+    async def _fake(minds_url, api_key, *, force_refresh=False, tenant_key=None, **_kw):
         fetched.append(minds_url)
         return _listing(list(CATALOG))
 

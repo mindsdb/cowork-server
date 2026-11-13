@@ -88,7 +88,7 @@ def turns(monkeypatch):
     release = asyncio.Event()
 
     class CountingHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -316,7 +316,7 @@ async def test_a_paused_schedule_whose_run_failed_runs_the_slot_it_left_due_once
     started: list[str] = []
 
     class PausedThenFailingHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -800,12 +800,13 @@ def test_postgres_reaper_cannot_split_settlement_from_finalization(postgres, mon
                 scheduler._record_turn_outcome(
                     scoped, schedule_id=postgres.schedule_id, run_id=claim.run_id,
                     end=scheduler._AttemptEnd(AttemptOutcome.failed_during_execution, "task failed"),
-                    is_manual=False, conversation_id=claim.conversation_id,
+                    is_manual=False, conversation_id=claim.conversation_id, unavailable_model="retired-model",
                 )
             else:
                 scheduler._record_schedule_error(
                     scoped, schedule_id=postgres.schedule_id, run_id=claim.run_id,
                     error="task failed", consume_slot=True, outcome=AttemptOutcome.failed_during_execution,
+                    unavailable_model="retired-model",
                 )
                 session.commit()
 
@@ -821,5 +822,6 @@ def test_postgres_reaper_cannot_split_settlement_from_finalization(postgres, mon
     assert _reap(postgres) == []
     assert _run_row(postgres, claim.run_id).error == "task failed"
     assert _run_row(postgres, claim.run_id).status == RunStatus.failed
+    assert _run_row(postgres, claim.run_id).unavailable_model == "retired-model"
     with Session(postgres.engine) as session:
         assert session.get(Schedule, postgres.schedule_id).consecutive_failures == 1

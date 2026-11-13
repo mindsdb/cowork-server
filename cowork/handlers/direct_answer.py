@@ -27,6 +27,7 @@ from functools import cache
 from pathlib import Path
 
 from cowork.build_info import surface
+from cowork.common.ui_locale import reply_language_line
 from cowork.deployment_identity import identity_for_turn
 from cowork.handlers.response_routing import (
     ANSWER_HISTORY_MESSAGES,
@@ -107,7 +108,7 @@ _WEB_OFF = (
 )
 
 
-def system_prompt(*, model: str, web_search: bool = True) -> str:
+def system_prompt(*, model: str, web_search: bool = True, ui_locale: str | None = None) -> str:
     """The direct answer's system prompt: role, runtime identity, product facts."""
     from anton.core.llm.identity import DEPLOYMENT_PRODUCT_SKILL_PREFACE, product_lines, serving_model_lines
 
@@ -130,6 +131,10 @@ def system_prompt(*, model: str, web_search: bool = True) -> str:
             "PRODUCT FACTS (answer questions about the product from these, never from "
             "general knowledge or a web search):\n" + facts
         )
+    # The app's language (ENG-4149), last so the sections above stay one prefix.
+    line = reply_language_line(ui_locale)
+    if line:
+        sections.append(line)
     return "\n\n".join(sections)
 
 
@@ -240,6 +245,7 @@ def _log_late(event: str, why: str | None) -> None:
 
 async def start_answer(
     binding: RouterBinding, *, history: list[dict], needs_search: bool = True,
+    ui_locale: str | None = None,
 ) -> DirectAnswer | None:
     """Start the direct answer: a `DirectAnswer` once it begins with text, or
     None to delegate. Never raises, except the caller's cancel, which closes
@@ -264,7 +270,9 @@ async def start_answer(
     try:
         events = provider.stream(
             model=binding.model,
-            system=system_prompt(model=binding.model, web_search="web_search" in web_tools),
+            system=system_prompt(
+                model=binding.model, web_search="web_search" in web_tools, ui_locale=ui_locale,
+            ),
             messages=messages,
             tools=[_DELEGATE_TOOL],
             max_tokens=_MAX_TOKENS,

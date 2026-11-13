@@ -7,8 +7,8 @@
 # What actually ships this repo is the PyPI wheel, not a container image: the
 # desktop app installs `cowork-server` from PyPI (or git, per channel), so
 # `publish.yml` and `publish-staging.yml` are the real deploy path. The image
-# build exists for the per-PR environments and for the staging/prod Helm deploy
-# below.
+# build exists for the per-PR environments, for the shared `dev` namespace, and
+# for the staging/prod Helm deploy below.
 #
 # ON PERMISSIONS. A called workflow can never exceed its caller's grant, and that
 # cap is checked when the workflow FILE IS LOADED, not when a job runs. A job here
@@ -153,13 +153,51 @@ jobs:
       runner: ${{ inputs.build-runner }}
     secrets: inherit
 
+  deploy-dev:
+    # The shared `dev` namespace (cowork.dev.mindshub.ai). Nothing else rolls it
+    # out: `deploy` below takes only staging and production builds, and
+    # `deploy-pr-env` gives each PR a namespace of its own. A PR labeled
+    # `deploy-to-dev` rolls its `development` image into `dev`, again on every
+    # push while the label stays; removing the label leaves the last rollout in
+    # place. Two labeled PRs take turns, so the last push wins.
+    #
+    # Only a branch of this repository reaches `dev`. The PR caller's `gate`
+    # already keeps fork PRs off this pipeline; the head-repository check here
+    # holds even for a caller that skips it, since `dev` is shared.
+    runs-on: ${{ inputs.build-runner }}
+    needs: [build, scan]
+    if: >-
+      inputs.pr-environment
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && contains(github.event.pull_request.labels.*.name, 'deploy-to-dev')
+    # One rollout into `dev` at a time across every PR. A queued rollout waits
+    # for the running one instead of cancelling it mid-upgrade.
+    concurrency:
+      group: cowork-server-deploy-dev
+      cancel-in-progress: false
+    environment:
+      name: dev
+      url: https://cowork.dev.mindshub.ai
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: mindsdb/github-actions/setup-env@main
+      - uses: DevOps-Nirvana/aws-helm-multi-deploy-nodocker@v8
+        with:
+          environment-slug: dev
+          k8s-namespace: dev
+          # The tag build-push-ecr gave this run's image, as in `deploy` below.
+          image-tag: ${{ inputs.build-environment }}-${{ env.SLUG }}
+          timeout: 600s
+
   deploy:
     runs-on: ${{ inputs.build-runner }}
     # `scan` too: it is blocking on a deploy branch (see `allow-vulns` above), and
     # needing only `build` meant a failing scan and a rollout ran side by side.
     needs: [build, scan]
-    # Only the two long-lived environments have a cluster to deploy to. A
-    # `development` build is either a PR (handled by `deploy-pr-env`) or nothing.
+    # Only staging and production builds roll out here. A `development` build is
+    # a PR, which `deploy-pr-env` and `deploy-dev` handle, or nothing.
     # `deploy-enabled` gates it further: having a cluster is not the same as
     # having something deployed in it, and a rollout into an environment that
     # was never stood up fails every run without saying anything useful.

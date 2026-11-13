@@ -114,6 +114,10 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     "skill_user_setting": PersonalResource.SKILLS,
     "schedules": PersonalResource.SCHEDULES,
     "pins": PersonalResource.PINS,
+    # The phones a person registered for push. Org mode only (cowork.services.push),
+    # where every resource is partitioned, so this entry decides nothing in a
+    # personal scope.
+    "push_devices": PersonalResource.SETTINGS,
     # SettingService routes its own rows; ScopedSession leaves this table alone.
     "settings": PersonalResource.SETTINGS,
 }
