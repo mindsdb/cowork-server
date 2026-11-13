@@ -205,6 +205,14 @@ def _parse_credit_spend(summary: Any, wallet: Any) -> Optional[MindsHubCreditSpe
     return None
 
 
+def _wallet_can_consume(entitlements: Any) -> Optional[bool]:
+    """``wallet.can_consume`` from entitlements/me, or None when it has no wallet block."""
+    wallet = entitlements.get("wallet") if isinstance(entitlements, dict) else None
+    if not isinstance(wallet, dict) or not isinstance(wallet.get("can_consume"), bool):
+        return None
+    return wallet["can_consume"]
+
+
 def parse_usage(entitlements: Any, wallet: Any, summary: Any = None) -> MindsHubUsageView:
     """Turn the auth bodies into one view. Any body may be None."""
     if entitlements is None and wallet is None and summary is None:
@@ -216,6 +224,7 @@ def parse_usage(entitlements: Any, wallet: Any, summary: Any = None) -> MindsHub
         balance=_parse_balance(wallet),
         auto_top_up=_parse_auto_top_up(wallet),
         credit_spend=_parse_credit_spend(summary, wallet),
+        wallet_can_consume=_wallet_can_consume(entitlements),
     )
 
 

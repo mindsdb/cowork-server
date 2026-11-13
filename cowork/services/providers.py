@@ -255,20 +255,23 @@ def provider_base_url(
 # so this live list is the only source of minds-cloud model names. The
 # deprecated MindsHub sentinel aliases are hidden from this route by design.
 #
-# Cached so a rapid sequence of Settings opens doesn't re-hit the
-# network. Failures are cached too — with a shorter TTL — so a route
-# that isn't deployed yet doesn't add a round-trip to every load.
-_MINDS_MODELS_TTL = 300.0       # successful fetch
+# Short-lived so a top-up (or running out) reaches the picker within seconds.
+# Failures are cached too, so an undeployed route doesn't cost every load a fetch.
+_MINDS_MODELS_TTL = 15.0        # successful MindsHub fetch (``mindshub=True``)
+_CUSTOM_MODELS_TTL = 300.0      # successful fetch from a BYO custom endpoint
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
-# Expired entries are dropped on every write, and past this many the least
-# recently used goes too. Org mode holds one listing per org member, so without
-# a bound the cache grows with every member a pod has ever served. Meant to sit
-# well above the members one pod serves within one TTL, since only their entries
-# are still fresh, so eviction normally takes an entry nobody is about to read.
+# For MindsHub, force_refresh retries a cached failure once it is this old, so a
+# picker open during an outage can wait up to the fetch budget (_MINDS_MODELS_TIMEOUT_S).
+_MINDS_MODELS_FORCED_RETRY_S = 5.0
+# How long an expired success stays readable through `cached_minds_models`.
+_MINDS_MODELS_RETAIN_S = 300.0
+# Past this many entries the least recently used goes (org mode holds one per
+# member). Sized well above the members one pod serves in the retain window.
 _MINDS_MODELS_CACHE_MAX = 512
-# Derived from the TTLs rather than restated, so raising one cannot start
-# dropping entries that are still fresh.
-_MINDS_MODELS_MAX_TTL_S = max(_MINDS_MODELS_TTL, _MINDS_MODELS_FAIL_TTL)
+# Derived rather than restated, so raising a TTL cannot start dropping fresh entries.
+_MINDS_MODELS_MAX_TTL_S = max(
+    _MINDS_MODELS_TTL, _CUSTOM_MODELS_TTL, _MINDS_MODELS_FAIL_TTL, _MINDS_MODELS_RETAIN_S
+)
 # Hard TOTAL budget for one /v1/models fetch. httpx.Timeout is per-operation, so
 # `follow_redirects` chains and trickled responses (each chunk under the per-op
 # read timeout) can otherwise run far past it — minutes, unbounded. This fetch
@@ -380,8 +383,16 @@ def _listing_cache_key(
     return _ListingCacheKey(base_url, tenant_key, user_id, credential)
 
 
-# Least recently used first, so the cap in `_store_listing` evicts from the front.
-_minds_models_cache: OrderedDict[_ListingCacheKey, tuple[float, MindsModelListing]] = OrderedDict()
+# LRU order; entries are (stored_at, listing), (failed_at, empty), or after a failure
+# that kept the last success, (stored_at, last_success, failed_at).
+_minds_models_cache: OrderedDict[_ListingCacheKey, tuple] = OrderedDict()
+
+
+def _failed_at(entry: tuple) -> float | None:
+    """When this entry's latest fetch failed, or None if it succeeded."""
+    if len(entry) > 2:
+        return entry[2]
+    return None if entry[1].ids else entry[0]
 
 
 def _store_listing(key: _ListingCacheKey, listing: MindsModelListing) -> None:
@@ -391,8 +402,27 @@ def _store_listing(key: _ListingCacheKey, listing: MindsModelListing) -> None:
     ``sweep_cache``. A departed caller's entry is never read or
     overwritten again, so nothing else would drop it.
     """
-    sweep_cache(_minds_models_cache, max_ttl_s=_MINDS_MODELS_MAX_TTL_S)
-    _minds_models_cache[key] = (time.monotonic(), listing)
+    _store_entry(key, (time.monotonic(), listing))
+
+
+def _latest_stamp(entry: tuple) -> float:
+    """An entry's most recent write, so a late failure isn't swept with its old success."""
+    return max(entry[0], entry[2]) if len(entry) > 2 else entry[0]
+
+
+def _store_failure(key: _ListingCacheKey) -> None:
+    """Record a failed fetch, keeping a retained success readable by ``cached_minds_models``."""
+    now = time.monotonic()
+    prior = _minds_models_cache.get(key)
+    if prior and prior[1].ids and now - prior[0] < _MINDS_MODELS_RETAIN_S:
+        _store_entry(key, (prior[0], prior[1], now))
+    else:
+        _store_entry(key, (now, _empty_listing()))
+
+
+def _store_entry(key: _ListingCacheKey, entry: tuple) -> None:
+    sweep_cache(_minds_models_cache, max_ttl_s=_MINDS_MODELS_MAX_TTL_S, stamp=_latest_stamp)
+    _minds_models_cache[key] = entry
     _minds_models_cache.move_to_end(key)
     while len(_minds_models_cache) > _MINDS_MODELS_CACHE_MAX:
         _minds_models_cache.popitem(last=False)
@@ -433,9 +463,9 @@ def cached_minds_models(
     A synchronous read for callers that cannot await the fetch (the coding
     endpoints run in a threadpool) and need only what the gateway advertises per
     model, which changes on the gateway's release cadence rather than the cache
-    TTL's. None until something has fetched the listing since the process
-    started, and None for a negatively cached failure. An expired entry is read
-    until the next write drops it (``_store_listing``). ``tenant_key``,
+    TTL's. None until a fetch has succeeded; a later failure keeps the last success
+    readable (``_store_failure``). An expired entry is read
+    until a sweep drops it, so it may be older than the retain window. ``tenant_key``,
     ``user_id`` and ``api_key`` pick the entry the same way they do in
     ``fetch_minds_models``: with no ``tenant_key``, the entry is the one fetched
     with this ``api_key``.
@@ -463,6 +493,7 @@ async def fetch_minds_models(
     api_key: str,
     *,
     force_refresh: bool = False,
+    mindshub: bool = False,
     tenant_key: str | None = None,
     user_id: str | None = None,
 ) -> MindsModelListing:
@@ -487,15 +518,8 @@ async def fetch_minds_models(
     id-derived label. Embedding and decision models are dropped entirely — they
     share this listing but cannot serve planning/coding roles.
 
-    ``force_refresh`` skips the cache *read* for a cached success (a fresh
-    result is still cached for subsequent calls) — used when the caller knows
-    the cached answer may be stale, e.g. the Settings picker re-checking on
-    dropdown open after the user tops up credits in an external tab.
-
-    A cached *failure* is still honored under ``force_refresh``: the negative
-    TTL exists so an unreachable MindsHub isn't re-probed on every call, and
-    the picker opens on demand, so bypassing it would make every open pay the
-    fetch budget for as long as the outage lasts.
+    ``force_refresh`` skips a cached success. ``mindshub`` (MindsHub callers only) uses the
+    short success TTL and lets force_refresh retry a failure older than 5s.
 
     ``tenant_key`` and ``user_id`` scope the cache entry (see
     ``_ListingCacheKey``): pass the org id for an org-scoped catalog, and the
@@ -516,16 +540,24 @@ async def fetch_minds_models(
     now = time.monotonic()
     cached = _minds_models_cache.get(cache_key)
     if cached:
-        ts, val = cached
-        ttl = _MINDS_MODELS_TTL if val.ids else _MINDS_MODELS_FAIL_TTL
-        # force_refresh only overrides the success TTL — see the negative-cache
-        # note above.
-        if (now - ts) < ttl and not (force_refresh and val.ids):
+        failed_at = _failed_at(cached)
+        if failed_at is not None:
+            retry = force_refresh and mindshub
+            window = _MINDS_MODELS_FORCED_RETRY_S if retry else _MINDS_MODELS_FAIL_TTL
+            if now - failed_at < window:
+                _minds_models_cache.move_to_end(cache_key)
+                return _empty_listing()
+        elif not force_refresh and now - cached[0] < (
+            _MINDS_MODELS_TTL if mindshub else _CUSTOM_MODELS_TTL
+        ):
             _minds_models_cache.move_to_end(cache_key)
-            return val
+            return cached[1]
 
     def _remember(val: MindsModelListing) -> MindsModelListing:
-        _store_listing(cache_key, val)
+        if val.ids:
+            _store_listing(cache_key, val)
+        else:
+            _store_failure(cache_key)
         return val
 
     async def _fetch() -> httpx.Response:
@@ -695,7 +727,8 @@ async def fetch_org_model_catalog(
     if not user_id:
         raise ValueError("org catalog requires the caller's user id")
     return await fetch_minds_models(
-        _org_catalog_url(), bearer_token, force_refresh=refresh, tenant_key=org_id, user_id=user_id
+        _org_catalog_url(), bearer_token, force_refresh=refresh, mindshub=True,
+        tenant_key=org_id, user_id=user_id,
     )
 
 
@@ -843,7 +876,7 @@ async def model_value_rejection(
                 org_id=org_id, user_id=user_id, bearer_token=bearer_token
             )
         elif api_key and settings.minds_url:
-            listing = await fetch_minds_models(settings.minds_url, api_key)
+            listing = await fetch_minds_models(settings.minds_url, api_key, mindshub=True)
         else:
             return None
     except Exception:
@@ -1086,7 +1119,9 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
     s = SettingService(session, scope).load()
     if s.minds_api_key is None or not s.minds_url:
         return False
-    listing = await fetch_minds_models(s.minds_url, s.minds_api_key.get_secret_value())
+    listing = await fetch_minds_models(
+        s.minds_url, s.minds_api_key.get_secret_value(), mindshub=True
+    )
     return persist_enabled_model_map(
         session, scope, s.minds_model_enabled, listing.enabled, listing.ids
     )
