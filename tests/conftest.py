@@ -219,6 +219,16 @@ def org_deployment(monkeypatch):
     get_app_settings.cache_clear()
 
 
+@pytest.fixture
+def allow_channel_senders(monkeypatch):
+    """Every channel sender reads as allowed, for tests whose subject is the turn
+    after the sender gate rather than the gate itself."""
+    from cowork.models.channel import SENDER_ALLOWED
+    from cowork.services.channel_senders import ChannelSenderService
+
+    monkeypatch.setattr(ChannelSenderService, "status_of", lambda self, *args: SENDER_ALLOWED)
+
+
 def stub_landlock_kernel(monkeypatch, *, abi: int = 6) -> None:
     """Answer the code sandbox's kernel checks without a kernel: the ABI probe
     reports ``abi`` and the launcher's self-test passes. The one seam

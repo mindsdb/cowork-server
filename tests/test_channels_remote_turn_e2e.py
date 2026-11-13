@@ -25,6 +25,8 @@ from cowork.services.channels import ChannelConfigService
 
 from _fakes import QueuedPipeline
 
+pytestmark = pytest.mark.usefixtures("allow_channel_senders")
+
 ORG_A = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
 SIGNING_SECRET = "test-signing-secret-remote-turn"
 

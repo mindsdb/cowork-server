@@ -37,7 +37,7 @@ from cowork.db.scoped import (
 from cowork.db.units import FilesystemBusy, conversation_writes, run_db, run_efs, run_efs_unit
 from cowork.handlers.responses import stage_remote_workspace
 from cowork.harnesses.base import ChannelContext, HarnessProvider, get_harness
-from cowork.models.channel import ChannelBinding, ChannelSession
+from cowork.models.channel import SENDER_ALLOWED, SENDER_BLOCKED, ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message as DBMessage
 from cowork.models.project import Project
@@ -45,6 +45,7 @@ from cowork.common.settings.app_settings import TurnQueueSettings, get_app_setti
 from cowork.common.settings.user_settings import UserSettings, use_settings_scope, use_turn_settings
 from cowork.services.artifact_roots import project_artifacts_base
 from cowork.services.channel_bindings import ChannelBindingService
+from cowork.services.channel_senders import ChannelSenderService
 from cowork.services.channels import ChannelConfigService, resolve_installation_by_external_account
 from cowork.services.conversations import ConversationService
 from cowork.services.files import store_file, upload_basename
@@ -436,6 +437,16 @@ class AntonChannelRuntime:
         # its acknowledgement and never sends the message again. The saves
         # after the answer retry and never raise a busy refusal (_save_turn_row).
         scope = scope_for_org(org_id) if org_id else scope_for_background_context()
+        # The sender comes first: nothing below, not even a busy notice, may
+        # answer someone the owner has not allowed.
+        try:
+            admitted = await run_db(partial(self._admit_sender, channel_type=channel_type, event=event), scope=scope)
+        except PoolTimeoutError:
+            log.warning("channel %s: no database connection to check the sender; the message was dropped", channel_type)
+            raise
+        if not admitted:
+            log.info("channel %s: held a message from a sender the owner has not allowed", channel_type)
+            return
         try:
             # A known thread's binding is a row. Only a new one may start in
             # the general project, whose folder is checked, which is file
@@ -542,6 +553,36 @@ class AntonChannelRuntime:
         ChannelBindingService(scoped).detach_conversation(binding)
         project = scoped.get(Project, binding.anton_project_id or self._resolve_default_project_id(scoped))
         return project.name if project else "general"
+
+    @staticmethod
+    def _admit_sender(scoped: ScopedSession, *, channel_type: str, event: Any) -> bool:
+        """Whether the event's sender may run a turn in its chat, as a unit.
+
+        A message with no sender id is refused. A DM, or a group message that
+        mentions the bot, from a sender neither allowed nor blocked records a
+        pending request for the owner; other group chatter records nothing.
+        """
+        message = event.message
+        sender_id = message.sender_id
+        if not sender_id:
+            return False
+        service = ChannelSenderService(scoped)
+        group_id = event.address.platform_id
+        status = service.status_of(channel_type, group_id, sender_id)
+        if status == SENDER_ALLOWED:
+            return True
+        if status == SENDER_BLOCKED:
+            return False
+        if message.is_group and not message.is_mention:
+            return False
+        service.record_request(
+            channel_type=channel_type,
+            group_id=group_id,
+            sender_id=sender_id,
+            sender_name=message.sender_name,
+            is_group=bool(message.is_group),
+        )
+        return False
 
     @staticmethod
     def _find_binding(scoped: ScopedSession, *, channel_type: str, event: Any) -> ChannelBinding | None:

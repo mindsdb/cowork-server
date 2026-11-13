@@ -109,6 +109,7 @@ def org_mode(monkeypatch):
     get_app_settings.cache_clear()
 
 
+@pytest.mark.usefixtures("allow_channel_senders")
 def test_discord_gateway_message_in_org_mode_gets_a_reply(monkeypatch, org_mode):
     fake_harness = FakeHarness()
     monkeypatch.setattr(runtime_mod, "get_harness", lambda _id: fake_harness)

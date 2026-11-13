@@ -14,6 +14,8 @@ from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_open_session
 from _fakes import inline_run_db
 
+pytestmark = pytest.mark.usefixtures("allow_channel_senders")
+
 
 class _FakeHarnessLocal:
     def stream_response(self, **kwargs):

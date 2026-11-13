@@ -28,6 +28,8 @@ from cowork.server import create_app
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.services.conversations import ConversationService, _is_tool_row
 
+pytestmark = pytest.mark.usefixtures("allow_channel_senders")
+
 REPLY = "hello from anton"
 LINK_PREFIX = "https://app.example.com/c/"
 

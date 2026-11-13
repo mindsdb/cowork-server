@@ -31,6 +31,8 @@ from cowork.models.channel import ChannelBinding, ChannelEvent, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.services.channels import ChannelConfigService
 
+pytestmark = pytest.mark.usefixtures("allow_channel_senders")
+
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 SIGNING_SECRET = "test-signing-secret-org-chat"
 
