@@ -51,6 +51,7 @@ from cowork.services.artifact_permissions import (
 )
 from cowork.services import artifact_files
 from cowork.services.preview_html import prepare_preview_html
+from cowork.services.quick_edit import direct_edit_available, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.schemas.artifact_access import (
@@ -621,16 +622,29 @@ async def _acquire_live_publish_lock(
 
 
 async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
+    """*capabilities* narrowed by the caller's current product permissions.
+
+    ``canQuickEdit`` (ENG-4227): the viewer's chat bar is offered. It needs
+    what an agent repair needs, plus the server setting and an anton with the
+    quick editor (``quick_edit_available``), so it is false on a server whose
+    anton predates it. ``quickEditDirect``: the bar can also edit directly,
+    because a decisions model serves the caller's provider; without one the
+    bar still shows and hands every message to the chat.
+    """
     if not capabilities["canEdit"]:
-        return capabilities
+        return {**capabilities, "canQuickEdit": False, "quickEditDirect": False}
     can_edit = await has_product_permission(scope, "artifact.manage")
     can_execute = await has_product_permission(scope, "product.execute")
+    can_address = capabilities["canAddressWithAgent"] and can_edit and can_execute
     current = {
         **capabilities,
         "canEdit": can_edit,
-        "canAddressWithAgent": capabilities["canAddressWithAgent"] and can_edit and can_execute,
+        "canAddressWithAgent": can_address,
         "canResolveComments": capabilities["canResolveComments"] and can_edit,
     }
+    can_quick_edit = bool(can_address and quick_edit_available())
+    current["canQuickEdit"] = can_quick_edit
+    current["quickEditDirect"] = can_quick_edit and await direct_edit_available(scope)
     # The export route needs `artifact.manage` too, so it offers nothing here.
     if not can_edit and "exportFormats" in capabilities:
         current["exportFormats"] = []

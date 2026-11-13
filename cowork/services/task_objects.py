@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -19,6 +20,9 @@ from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
 from cowork.services.artifact_identity import ArtifactListing, ListedIds
 from cowork.turnqueue.models import TurnCompleted
+
+if TYPE_CHECKING:
+    from cowork.services.revision_summaries import TurnRevisionSummaries
 
 logger = logging.getLogger(__name__)
 
@@ -540,6 +544,7 @@ def turn_artifact_changes(
     repair_slugs: set[str] | None = None,
     schedule_id: str | None = None,
     scope: TenantScope | None = None,
+    summaries: "TurnRevisionSummaries | None" = None,
 ) -> ArtifactChanges:
     """What the turn created and touched, from the directory as it stands now
     against ``before``, with an agent revision captured for every touched
@@ -605,6 +610,9 @@ def turn_artifact_changes(
 
     `schedule_id` marks a turn the scheduler started, so its edits refresh
     the schedule's previous revision (capture_agent_revision).
+
+    `summaries` labels each touched artifact's revision with what changed
+    (revision_summaries: the editor's summary, the reply, the request).
     """
     from cowork.services.artifacts import content_mtime_ns
     from cowork.services.artifact_identity import (
@@ -682,7 +690,8 @@ def turn_artifact_changes(
             continue
     for slug in touched:
         capture_agent_revision(
-            base / slug, conversation_id=conversation_key, schedule_id=schedule_id, scope=scope
+            base / slug, conversation_id=conversation_key, schedule_id=schedule_id, scope=scope,
+            summary=summaries.summary_for(slug) if summaries is not None else None,
         )
     # A repair turn that makes no source change must still leave the
     # polling state. Check only artifacts with a handoff explicitly bound
@@ -695,7 +704,10 @@ def turn_artifact_changes(
             # folder's capture; the check below keeps its row.
             continue
         if queued:
-            capture_agent_revision(base / slug, conversation_id=conversation_key, scope=scope)
+            capture_agent_revision(
+                base / slug, conversation_id=conversation_key, scope=scope,
+                summary=summaries.summary_for(slug) if summaries is not None else None,
+            )
     # A capture can leave a repair queued (the artifact's lock stayed held,
     # or a read failed), so a repair folder the diff read counts as ruled on
     # only once a read finds nothing in it still queued to this
