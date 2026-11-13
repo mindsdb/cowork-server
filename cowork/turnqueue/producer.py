@@ -53,6 +53,8 @@ from cowork.turnqueue.models import (
     TurnJobHeader,
     TurnReply,
     TurnReplyHeader,
+    is_connection_engine,
+    is_connection_label,
 )
 from cowork.streaming.cancellation import stop_controller_turn
 from cowork.streaming.liveness import WORKER_ALIVE_PHASE
@@ -376,7 +378,9 @@ def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermiss
     return product_permissions.ProductPermissionUnavailable()
 
 
-def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | None) -> list[dict]:
+def _datasource_connection_refs(
+    connections: list[dict], disabled: list[dict] | None, *, with_labels: bool = False
+) -> list[dict]:
     """The grant set: every verified connection auth listed, minus the
     conversation's disabled ones. A disabled entry carries ``engine`` and
     ``name``; auth's ``connector_id`` is the same value, so the join is exact."""
@@ -411,7 +415,10 @@ def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | 
         ):
             raise _refuse_datasource_grants("listing carries a malformed or repeated connection reference")
         seen.add(connection_id)
-        refs.append({"connection_id": connection_id, "credential_version": credential_version})
+        ref = {"connection_id": connection_id, "credential_version": credential_version}
+        if with_labels:
+            ref.update(_connection_labels(connection))
+        refs.append(ref)
     # Auth caps what is registered, so the cap applies after the disabled ones are gone.
     if len(refs) > MAX_DATASOURCE_CONNECTIONS:
         raise _refuse_datasource_grants("more enabled connections than a grant set may hold")
@@ -426,6 +433,16 @@ def _same_identifier(echoed: object, ours: str) -> bool:
         return uuid.UUID(echoed) == uuid.UUID(ours)
     except ValueError:
         return echoed == ours
+
+
+def _connection_labels(connection: dict) -> dict[str, str]:
+    """The connection's ``label`` and ``engine``, each only when the queue check accepts it; anton cleans them for the prompt."""
+    labels: dict[str, str] = {}
+    if is_connection_label(connection["name"]):
+        labels["label"] = connection["name"]
+    if is_connection_engine(connection["connector_id"]):
+        labels["engine"] = connection["connector_id"]
+    return labels
 
 
 async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
@@ -454,7 +471,7 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
             org_id, exc_info=True,
         )
         return None
-    refs = _datasource_connection_refs(connections, disabled)
+    refs = _datasource_connection_refs(connections, disabled, with_labels=settings.datasource_labels_enabled)
     if not refs:
         return None
     response = await register_datasource_grants(

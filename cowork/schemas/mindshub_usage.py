@@ -73,3 +73,6 @@ class MindsHubUsageView(CamelResponse):
     balance: Optional[MindsHubBalance] = None
     auto_top_up: Optional[MindsHubAutoTopUp] = None
     credit_spend: Optional[MindsHubCreditSpend] = None
+    # entitlements/me's ``wallet.can_consume``, which every member gets. Only the
+    # client's availability re-check reads it; it never drives UI.
+    wallet_can_consume: Optional[bool] = None

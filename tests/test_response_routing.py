@@ -439,6 +439,7 @@ async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -538,6 +539,7 @@ async def test_handle_logs_every_router_fallback_at_default_level(
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: SimpleNamespace(id=conv_id),
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=history,
         ),
     )
@@ -2799,6 +2801,7 @@ async def test_a_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -2960,6 +2963,7 @@ async def test_a_jev_direct_answer_revokes_the_key_the_gate_minted(monkeypatch):
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -3016,6 +3020,7 @@ async def test_a_refused_or_cancelled_start_revokes_the_gate_key(monkeypatch, re
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -3044,3 +3049,55 @@ async def test_a_refused_or_cancelled_start_revokes_the_gate_key(monkeypatch, re
     with pytest.raises(type(refusal)):
         await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id), stream=True))
     assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scheduled", "model", "expected"),
+    [(True, "pinned-model", DELEGATED_AGENTIC), (True, None, DIRECT_CONTEXT),
+     (False, "composer-model", DIRECT_CONTEXT)],
+)
+async def test_pinned_scheduled_turn_bypasses_direct_answers(monkeypatch, scheduled, model, expected):
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    handler.schedule_id = str(uuid4()) if scheduled else None
+    handler.interactive = not scheduled
+    gate_calls = []
+
+    async def binding():
+        return RouterBinding(provider=object(), model="router-model", label="openai_compatible"), None
+
+    async def direct(**kwargs):
+        gate_calls.append(kwargs)
+        return RouteDecision(route=DIRECT_CONTEXT, text="Hi!", reason="test")
+
+    monkeypatch.setattr(handler, "_router_binding", binding)
+    monkeypatch.setattr(responses, "_settings_binding", lambda: None)
+    monkeypatch.setattr(responses, "decide_route", direct)
+    # Keep this focused on request-shape routing, independent of installed skills.
+    monkeypatch.setattr(handler, "_reads_always_on_rows", lambda *a, **kw: [])
+    if scheduled and model:
+        def no_history(*a, **kw):
+            raise AssertionError("a pinned scheduled turn must skip router history")
+        monkeypatch.setattr(handler, "_read_gate_rows", no_history)
+
+    class Routed(Exception):
+        pass
+
+    route = handler._route_request
+
+    async def inspect_route(**kwargs):
+        decision, _ = await route(**kwargs)
+        assert decision.route == expected
+        if expected == DELEGATED_AGENTIC:
+            assert decision.reason == "pinned_schedule"
+        raise Routed
+
+    monkeypatch.setattr(handler, "_route_request", inspect_route)
+    with pytest.raises(Routed):
+        await handler.handle(ResponsesRequest(input="Say hi.", model=model, stream=True))
+    assert bool(gate_calls) == (expected == DIRECT_CONTEXT)
