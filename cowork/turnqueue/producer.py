@@ -815,6 +815,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
                                 tool_messages: bool = False,
+                                preview_checks: bool = False,
                                 ui_locale: str | None = None,
                                 reasoning_effort: str | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
@@ -828,6 +829,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
     user (the cowork UI does; channel turns never).
+    `preview_checks` lets the pod's artifact editor ask the app's open
+    preview whether an edit runs (ENG-4227, turnqueue/preview_checks.py).
+    Only with `interactive`: the answer reaches the pod on the stdin an
+    interactive turn keeps open. Channel turns never.
     `ui_locale` is the app's language (cowork.common.ui_locale), which the
     pod's anton replies in when the user's message does not say; None for a
     turn with no request behind it.
@@ -968,6 +973,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # The cowork UI renders a tool's message to the user as an
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
+              # The pod asks the app's preview to check its edits only when
+              # this is a real true, and only an interactive turn keeps the
+              # stdin its answer comes back on (scratchpad-controller#134
+              # relays it; an older controller drops it and the pod never asks).
+              **({"preview_checks": True} if preview_checks and interactive else {}),
               # False when the organization opted out of Jev: the pod's
               # completion check then never asks it. A controller that
               # predates the field drops it, and the pod keeps Jev on.

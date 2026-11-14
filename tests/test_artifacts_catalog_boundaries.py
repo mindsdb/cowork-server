@@ -58,7 +58,8 @@ async def test_project_route_basename_sanitizes_before_artifact_root_discovery(
 
     plan = RootsPlan(projects=(ProjectRow(id=server_id, name="project", path="/nowhere", external=False),))
 
-    def plan_for(_scope, project_ref):
+    def plan_for(_scope, project_ref, *, listed):
+        assert listed
         events.append("roots")
         seen["project_ref"] = project_ref
         return plan

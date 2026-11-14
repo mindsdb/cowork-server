@@ -52,7 +52,6 @@ from cowork.common.paths import (
     read_bounded,
 )
 from cowork.schemas.artifact_export import OmittedReason
-from cowork.services.artifact_identity import opened_artifact_folder
 
 if TYPE_CHECKING:
     from cowork.services.artifacts import ProjectArtifacts
@@ -88,6 +87,11 @@ MAX_PATH_PARTS = 64
 # every reference read all of them. The drafts route reads every entry, so a
 # folder of map tiles still serves.
 _MAX_SCANNED_ENTRIES = 20_000
+# The most directory entries all the reads of one export scan together. The
+# server serves every read a conversion asks for, and 256 references to the
+# last names of a 20,000-entry folder would keep it scanning for seconds; this
+# many takes about half a second.
+EXPORT_SCANNED_ENTRIES = 200_000
 
 _PATH_SEPARATORS = re.compile(r"[/\\]")
 
@@ -134,7 +138,7 @@ class CheckedName(NamedTuple):
 
 
 @dataclass
-class _ScanBudget:
+class ScanBudget:
     """The directory entries one walk may still read."""
 
     remaining: int
@@ -225,7 +229,7 @@ def existing_draft_entry_name(
     requested: str,
     *,
     native_case: bool = False,
-    budget: _ScanBudget | None = None,
+    budget: ScanBudget | None = None,
 ) -> str:
     """Return the pinned directory's own name for a request selector.
 
@@ -318,7 +322,7 @@ def refuse_housekeeping(*, parts: tuple[str, ...]) -> None:
         raise ArtifactFileRefused(OmittedReason.HOUSEKEEPING, "housekeeping name")
 
 
-def _disk_name(*, directory: PinnedDir, requested: str, budget: _ScanBudget | None) -> str:
+def _disk_name(*, directory: PinnedDir, requested: str, budget: ScanBudget | None) -> str:
     """The directory's own spelling of *requested*, or a refusal.
 
     Without a directory descriptor the name is joined onto a path, so a name
@@ -421,7 +425,7 @@ def _open_regular_file(
     folder: PinnedDir,
     parts: tuple[str, ...],
     resources: ExitStack,
-    budget: _ScanBudget | None,
+    budget: ScanBudget | None,
 ) -> _OpenedFile:
     """Walk *parts* down from *folder* and open the regular file at the end.
 
@@ -489,6 +493,10 @@ def open_pinned_draft_file(
     Raises ``ArtifactFileRefused`` for every refusal, with every descriptor
     already closed.
     """
+    # Imported here: artifact_identity loads the settings and database
+    # modules, which the export's conversion process never needs.
+    from cowork.services.artifact_identity import opened_artifact_folder
+
     resources = ExitStack()
     try:
         folder_name = artifact_folder_name(source=source, folder=folder)
@@ -506,7 +514,11 @@ def open_pinned_draft_file(
 
 
 def read_artifact_file_entry(
-    *, folder: PinnedDir, parts: tuple[str, ...], max_bytes: int
+    *,
+    folder: PinnedDir,
+    parts: tuple[str, ...],
+    max_bytes: int,
+    scan_budget: ScanBudget | None = None,
 ) -> ArtifactFileContent:
     """Read the regular file at *parts* below *folder*, at most *max_bytes* long.
 
@@ -522,17 +534,25 @@ def read_artifact_file_entry(
     stops one byte past *max_bytes*, so a file that grows after the size
     check is still refused. Every descriptor is closed before it returns or
     raises.
+
+    *scan_budget* is shared by every read of one export: each read spends
+    from it too, and an export that has spent it gets ``BUDGET`` for the rest.
     """
     refuse_unsafe_parts(parts=parts)
     if len(parts) > MAX_PATH_PARTS:
         raise ArtifactFileRefused(OmittedReason.BUDGET, "path nests too deep")
+    allowed = _MAX_SCANNED_ENTRIES
+    if scan_budget is not None:
+        allowed = min(allowed, scan_budget.remaining)
+    budget = ScanBudget(remaining=allowed)
     with ExitStack() as resources:
-        opened = _open_regular_file(
-            folder=folder,
-            parts=parts,
-            resources=resources,
-            budget=_ScanBudget(remaining=_MAX_SCANNED_ENTRIES),
-        )
+        try:
+            opened = _open_regular_file(
+                folder=folder, parts=parts, resources=resources, budget=budget
+            )
+        finally:
+            if scan_budget is not None:
+                scan_budget.remaining -= allowed - budget.remaining
         if opened.file_stat.st_size > max_bytes:
             raise ArtifactFileRefused(OmittedReason.TOO_LARGE, "over the size cap")
         try:

@@ -4,10 +4,11 @@ import hashlib
 import json
 import logging
 import shutil
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -19,6 +20,9 @@ from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
 from cowork.services.artifact_identity import ArtifactListing, ListedIds
 from cowork.turnqueue.models import TurnCompleted
+
+if TYPE_CHECKING:
+    from cowork.services.revision_summaries import TurnRevisionSummaries
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +186,15 @@ class TaskObjectService:
         Org mode (ENG-2961, D8): only folders owned by the task's creator move,
         and their owner rows follow them. A row whose folder is already gone is
         retargeted without an ownership check or a "not moved" log line — there
-        is nothing on disk to move or to protect.
+        is nothing on disk to move or to protect. Once a folder moved, each
+        moved folder's sort-time row follows it
+        (artifact_sort_times.move_sort_times), and the destination's shared
+        root is held (held_artifact_roots.hold_root). A failed hold is logged,
+        and asks for the destination's location check
+        (artifact_autopublish.request_project_location_check), whose listing
+        holds the root. A failed move of the sort times is logged, and asks
+        for the location checks of both projects, whose listings write the
+        destination's rows and drop the source's.
         """
         rows = self.reconcile_conversation(conversation, source)
         if not rows:
@@ -273,6 +285,45 @@ class TaskObjectService:
                     "Could not move the locations of artifacts to project %s", dest_id, exc_info=True,
                     extra=log_context(project_id=dest_id, conversation_id=conversation_id),
                 )
+            # Each moved folder keeps its sort time in the destination
+            # (artifact_sort_times), and the destination's shared root holds
+            # the moved folders now, so the artifacts list opens it
+            # (held_artifact_roots). Each write on its own, so a failed one
+            # never skips the other.
+            #
+            # The move writes no message, and the heal sweep lists only
+            # projects with a recent one, so it may never reach either
+            # project. A failed write asks for the location check of each
+            # project whose rows it left behind, built as a turn end builds
+            # its project's: the destination's listing holds its root and
+            # writes the moved folders' sort times, and the source's drops
+            # the rows of the folders gone from it
+            # (artifact_autopublish._record_listing). A request is an entry
+            # in an in-memory set, no file store call.
+            from cowork.services.artifact_autopublish import request_project_location_check
+            from cowork.services.artifact_sort_times import move_sort_times
+            from cowork.services.held_artifact_roots import hold_root
+
+            scope = self.session.scope
+            try:
+                move_sort_times(self.session, project_id=source_id, moved=dict(rekeys), to_project_id=dest_id)
+            except Exception:
+                self.session.rollback()
+                logger.warning(
+                    "Could not move the sort times of artifacts to project %s", dest_id, exc_info=True,
+                    extra=log_context(project_id=dest_id, conversation_id=conversation_id),
+                )
+                request_project_location_check(artifacts_base=dest_base, scope=scope, project_id=str(dest_id))
+                request_project_location_check(artifacts_base=src_base, scope=scope, project_id=str(source_id))
+            try:
+                hold_root(self.session, project_id=dest_id)
+            except Exception:
+                self.session.rollback()
+                logger.warning(
+                    "Could not record that project %s's artifacts folder holds an artifact", dest_id, exc_info=True,
+                    extra=log_context(project_id=dest_id, conversation_id=conversation_id),
+                )
+                request_project_location_check(artifacts_base=dest_base, scope=scope, project_id=str(dest_id))
         # A published page keeps its link: .published.json moved with the
         # folder, and its owner record follows. A failed rekey is logged; the
         # owner's next publish then gets a new link, as a copy would.
@@ -370,9 +421,13 @@ def snapshot_artifact_state(artifacts_base) -> tuple[set[str], dict[str, int]]:
 
 
 class ListedLocationsUnchecked(Exception):
-    """record_new_artifacts could not check the locations of the folders a
-    full listing found (record_listed_folders). The index, owner and
-    location writes it made before that check have committed."""
+    """record_new_artifacts could not write what the project's self-heal
+    writes again (artifact_autopublish._record_listed_locations): the check
+    of the locations of the folders a full listing found
+    (record_listed_folders), the row that holds the project's shared root
+    (held_artifact_roots.hold_root), or the sort times of the folders the
+    turn made or changed (artifact_sort_times.record_sort_times). The index,
+    owner and location writes it made besides have committed."""
 
 
 def record_new_artifacts(
@@ -384,6 +439,8 @@ def record_new_artifacts(
     creator: str | None,
     artifact_ids: Mapping[str, str] | None = None,
     listed_ids: ListedIds | None = None,
+    sort_times: Mapping[str, float] | None = None,
+    untimed: Collection[str] = (),
 ) -> None:
     """Attribute freshly appeared artifacts to this conversation, in the
     caller's session. Best-effort.
@@ -396,7 +453,24 @@ def record_new_artifacts(
     and the id's next lookup moves it (record_listed_folders). That check
     runs last, and when it fails it raises ListedLocationsUnchecked, once
     the writes before it have committed, so the caller can ask for the
-    project's self-heal to check the folders again.
+    project's self-heal to check the folders again. In org mode the
+    project's shared root is held first when the turn created, listed or
+    timed a folder there (held_artifact_roots.hold_root), when a listing
+    that read no id found folders it could not read, and when the turn end
+    could not read the time of the folders in `untimed`
+    (ArtifactChanges.untimed): those folders may hold an artifact the list
+    should show. `sort_times` is the time of each folder the turn created,
+    touched or its tools named as edited, or of every folder the listing
+    found when the pod sent no list (ArtifactChanges.sort_times), which the
+    artifacts list sorts it by; each is written after the hold, newest wins
+    (artifact_sort_times.record_sort_times). A failed hold or a failed write
+    of the sort times is logged, and once every other write has run it
+    raises ListedLocationsUnchecked too, since the self-heal's listing holds
+    the root and writes every folder's time again. The turn ends
+    (remote_turn._record_turn_artifacts and the responses handler's) call
+    this when the turn created a folder, its listing read an id or found a
+    folder it could not read, or it timed a folder or could not
+    (ArtifactChanges.needs_record).
 
     Two records: the `task_objects` row, and in org mode (ENG-2961) the owner
     row naming ``creator``, the conversation's creator, since a project-level
@@ -418,6 +492,41 @@ def record_new_artifacts(
         logger.warning(
             "artifact owner not recorded: conversation %s has no creator", conversation_id
         )
+    # Set when the hold or the sort times below fail, writes the project's
+    # self-heal makes again, which the end of this function raises for.
+    heal_write_failed = False
+    listed = listed_ids is not None and bool(listed_ids.ids or listed_ids.unreadable)
+    if org_mode and project_id and (slugs or listed or sort_times or untimed):
+        from cowork.services.held_artifact_roots import hold_root
+
+        # The diff found folders in the project's shared root, so the
+        # artifacts list opens it (held_artifact_roots). First, so a failure
+        # below cannot skip it.
+        try:
+            hold_root(session, project_id=project_id)
+        except Exception:
+            heal_write_failed = True
+            session.rollback()
+            logger.error(
+                "Could not record that a project's artifacts folder holds an artifact",
+                exc_info=True,
+                extra=log_context(project_id=project_id, conversation_id=conversation_id),
+            )
+    if org_mode and project_id and sort_times:
+        from cowork.services.artifact_sort_times import record_sort_times
+
+        # The time each folder the turn created or may have changed sorts by
+        # in the artifacts list (artifact_sort_times).
+        try:
+            record_sort_times(session, project_id=project_id, times=sort_times)
+        except Exception:
+            heal_write_failed = True
+            session.rollback()
+            logger.error(
+                "Could not record the sort times of a turn's artifacts",
+                exc_info=True,
+                extra=log_context(project_id=project_id, conversation_id=conversation_id),
+            )
     svc = TaskObjectService(session)
     # Independent of the owner writes below: a failed index row must not
     # leave the artifact ownerless as well.
@@ -476,6 +585,15 @@ def record_new_artifacts(
         except Exception as exc:
             session.rollback()
             raise ListedLocationsUnchecked from exc
+    if heal_write_failed:
+        # Without the held row the artifacts list never opens the root, and
+        # without a folder's sort time the list never shows the folder, or
+        # shows it below where a walk puts it; only the project's next turn
+        # end would write them. Raised last, once every other write has run,
+        # so the caller can ask for the project's self-heal, whose listing
+        # holds the root and writes every folder's time
+        # (artifact_autopublish._record_listing).
+        raise ListedLocationsUnchecked
 
 
 @dataclass(frozen=True)
@@ -508,6 +626,29 @@ class ArtifactChanges:
     # project's location check (request_self_heal_for_unread_folders). Empty
     # when the diff opened only named folders.
     listed_ids: ListedIds = field(default_factory=lambda: ListedIds(ids={}, unreadable=frozenset()))
+    # The time of the metadata.json of each folder the turn touched, and of
+    # each one its tools named as edited, or of every folder the listing
+    # found when the pod sent no list, read once the captures ran, which the
+    # artifacts list sorts the folder by (artifact_sort_times). A folder
+    # whose metadata.json isn't a plain file has none. Read only where
+    # artifacts have rows (artifact_locations.keeps_locations), and empty
+    # elsewhere.
+    sort_times: dict[str, float] = field(default_factory=dict)
+    # The folders among those whose time could not be read, such as with
+    # EIO (artifact_sort_times.SortTimesRead.unreadable). Their rows keep
+    # the time they had until the project's location check reads them again
+    # (request_self_heal_for_untimed_folders).
+    untimed: frozenset[str] = frozenset()
+
+    @property
+    def needs_record(self) -> bool:
+        """Whether a remote turn end has rows to write for this diff
+        (record_new_artifacts): a folder the turn created, an id its listing
+        read, a folder's sort time, or a folder the listing or the time read
+        could not read, whose root it holds."""
+        return bool(
+            self.created or self.listed_ids.ids or self.listed_ids.unreadable or self.sort_times or self.untimed
+        )
 
 
 def tracked_artifacts_from_reply(data: Mapping) -> set[str] | None:
@@ -540,6 +681,7 @@ def turn_artifact_changes(
     repair_slugs: set[str] | None = None,
     schedule_id: str | None = None,
     scope: TenantScope | None = None,
+    summaries: "TurnRevisionSummaries | None" = None,
 ) -> ArtifactChanges:
     """What the turn created and touched, from the directory as it stands now
     against ``before``, with an agent revision captured for every touched
@@ -605,6 +747,9 @@ def turn_artifact_changes(
 
     `schedule_id` marks a turn the scheduler started, so its edits refresh
     the schedule's previous revision (capture_agent_revision).
+
+    `summaries` labels each touched artifact's revision with what changed
+    (revision_summaries: the editor's summary, the reply, the request).
     """
     from cowork.services.artifacts import content_mtime_ns
     from cowork.services.artifact_identity import (
@@ -682,7 +827,8 @@ def turn_artifact_changes(
             continue
     for slug in touched:
         capture_agent_revision(
-            base / slug, conversation_id=conversation_key, schedule_id=schedule_id, scope=scope
+            base / slug, conversation_id=conversation_key, schedule_id=schedule_id, scope=scope,
+            summary=summaries.summary_for(slug) if summaries is not None else None,
         )
     # A repair turn that makes no source change must still leave the
     # polling state. Check only artifacts with a handoff explicitly bound
@@ -695,7 +841,10 @@ def turn_artifact_changes(
             # folder's capture; the check below keeps its row.
             continue
         if queued:
-            capture_agent_revision(base / slug, conversation_id=conversation_key, scope=scope)
+            capture_agent_revision(
+                base / slug, conversation_id=conversation_key, scope=scope,
+                summary=summaries.summary_for(slug) if summaries is not None else None,
+            )
     # A capture can leave a repair queued (the artifact's lock stayed held,
     # or a read failed), so a repair folder the diff read counts as ruled on
     # only once a read finds nothing in it still queued to this
@@ -710,14 +859,42 @@ def turn_artifact_changes(
     # Read once the captures ran, which can write a folder's id. The listing
     # covers the created folders too, so a row naming one of them is never
     # taken for a row whose folder is gone (record_listed_folders).
+    from cowork.services.artifact_locations import keeps_locations
+    from cowork.services.artifact_sort_times import SortTimesRead, id_holder_times
+
+    created = artifact_ids_below(base=base, slugs=new)
+    listed_ids = (
+        listed_folder_ids(base=base, listing=whole_listing)
+        if whole_listing is not None
+        else ListedIds(ids={}, unreadable=frozenset())
+    )
+    # Every folder the turn may have edited is timed, not only the touched
+    # ones: content_mtime_ns skips metadata.json, so a turn whose only
+    # change is a metadata.json rewrite, as anton's update_artifact_metadata
+    # makes, touches nothing, yet a walk moves its card up. Without the
+    # pod's list that is every folder, whose metadata.json the listing above
+    # already stat'ed, and record_sort_times writes only the times that moved.
+    # Only the folders holding an id are timed, as the self-heal times them
+    # (id_holder_times): the ids the whole listing read, or else those of
+    # the created folders and one read of the other named ones.
+    # Only where artifacts have rows: elsewhere no time is written, so none
+    # is read, and an edit alone opens no record unit (needs_record).
+    if scope is not None and keeps_locations(scope):
+        timed_slugs = touched | editable
+        if whole_listing is not None:
+            ids = listed_ids
+        else:
+            others = artifact_ids_below(base=base, slugs=sorted(timed_slugs.difference(new)))
+            ids = ListedIds(ids={**created.ids, **others.ids}, unreadable=created.unreadable | others.unreadable)
+        timed = id_holder_times(base=base, slugs=timed_slugs, ids=ids)
+    else:
+        timed = SortTimesRead(times={}, unreadable=frozenset())
     return ArtifactChanges(
-        created=new, touched=touched, created_ids=artifact_ids_below(base=base, slugs=new).ids,
+        created=new, touched=touched, created_ids=created.ids,
         checked_repairs=checked_repairs,
-        listed_ids=(
-            listed_folder_ids(base=base, listing=whole_listing)
-            if whole_listing is not None
-            else ListedIds(ids={}, unreadable=frozenset())
-        ),
+        sort_times=timed.times,
+        untimed=timed.unreadable,
+        listed_ids=listed_ids,
     )
 
 

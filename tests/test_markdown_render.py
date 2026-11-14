@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import re
-import time
 
 import markdown
 import pytest
-from markdown.extensions.toc import TocExtension, strip_tags
+from markdown.extensions.toc import TocExtension
 
-from cowork.services import markdown_render
 from cowork.services.markdown_render import MAX_FENCE_LENGTH, MarkdownRefused, render_markdown
 from tests._no_fetch import no_fetch, recording_server
 
@@ -71,62 +69,21 @@ def test_heading_ids_match_what_toc_extension_gives(headings):
     assert _heading_ids(html=render_markdown(text=text)) == _heading_ids(html=oracle.convert(text))
 
 
-# toc.strip_tags searches from the start again after each comment it drops,
-# so a "<", "<!" or "<!-" kept before one can open another with what follows.
-@pytest.mark.parametrize(
-    "text",
-    [
-        "<!<!-- x -->-- a > b -->",
-        "<<!-- -->!-- --> x",
-        "<!-<!-- -->-> y",
-        "<<<!-- -->!-- -->!-- --> z",
-        "a <!--> b",
-        "a <!---> b",
-        "a <!-- b",
-        "a <b c",
-        "a <b> <!-- c > d --> e",
-        "a\u2028\x85\u1680 b",
-    ],
-)
-def test_tags_strip_as_toc_strip_tags_strips_them(text):
-    assert markdown_render._strip_tags(text=text) == strip_tags(text)
+def test_a_toc_marker_stays_text():
+    """There is no table of contents, as before TocExtension came back."""
+    html = render_markdown(text="[TOC]\n\n# A\n")
+
+    assert "<p>[TOC]</p>" in html
+    assert 'class="toc"' not in html
 
 
-# Each shape is linear for the port; toc.strip_tags copies the whole string
-# after each tag or comment it drops, and a cascade gives back one kept
-# character per comment.
-@pytest.mark.parametrize(
-    "text",
-    [
-        "<b>" * 200_000,
-        "<!---->" * 200_000,
-        "<" * 200_000,
-        "<!-- x" * 200_000,
-        "<" * 200_000 + "<!-- -->" + "!-- -->" * 200_000,
-    ],
-    ids=["tags", "comments", "unclosed-tags", "unclosed-comments", "cascade"],
-)
-def test_tags_strip_in_linear_time(text):
-    started = time.perf_counter()
-    markdown_render._strip_tags(text=text)
+def test_a_repeated_heading_whose_number_runs_past_4300_digits_is_refused():
+    """TocExtension reads the number to count past it, and Python refuses an
+    integer that long; the export answers that as a source it can't convert."""
+    heading = "## a_" + "9" * 5_000 + "\n\n"
 
-    assert time.perf_counter() - started < 1.0
-
-
-def _render_seconds(*, text: str) -> float:
-    started = time.perf_counter()
-    render_markdown(text=text)
-    return time.perf_counter() - started
-
-
-@pytest.mark.parametrize("heading", ["a", "a_100"])
-def test_repeated_headings_take_no_longer_than_distinct_ones(heading):
-    """TocExtension counted past every id a repeat took, so 20,000 repeats took minutes."""
-    count = 20_000
-    distinct = _render_seconds(text="".join(f"# h{index}\n\n" for index in range(count)))
-    repeated = _render_seconds(text=f"# {heading}\n\n" * count)
-
-    assert repeated < 3 * distinct + 0.5
+    with pytest.raises(MarkdownRefused):
+        render_markdown(text=heading * 2)
 
 
 def test_raw_html_and_image_references_pass_through_unsanitized():
