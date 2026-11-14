@@ -36,7 +36,7 @@ import threading
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from uuid import UUID
 from weakref import WeakValueDictionary
 
@@ -69,11 +69,26 @@ class DatabaseBusy(PoolTimeoutError):
 class FilesystemBusy(Exception):
     """No shared-file-store slot freed within POOL_TIMEOUT.
 
-    The app answers it with 503 and Retry-After (cowork.server), as it does
-    DatabaseBusy.
+    ``limiter`` names what the caller was waiting for when the time ran out:
+    ``efs_share``, its share of the slots (EFS_SHARE), or ``run_efs``, the
+    event loop's slots (EFS_SLOTS). ``share`` is that share's key
+    (_efs_share_key), None where nobody's share applies. The app answers it
+    with 503 and Retry-After (cowork.server), as it does DatabaseBusy, and
+    logs both.
     """
 
     status_code = 503
+
+    def __init__(
+        self,
+        message: str = "no shared file store slot freed within POOL_TIMEOUT",
+        *,
+        limiter: Literal["efs_share", "run_efs"] | None = None,
+        share: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.limiter = limiter
+        self.share = share
 
 
 def busy_retry_seconds() -> int:
@@ -448,6 +463,15 @@ def _efs_slots() -> anyio.CapacityLimiter:
     return limiter
 
 
+def _efs_share_key(scope: TenantScope) -> str | None:
+    """The key of the caller's share of the EFS slots (_efs_share): its
+    person's user id, ``org:<org_id>`` for an organization's work with no
+    person, or None where one person owns the deployment."""
+    if not scope.partitioned:
+        return None
+    return scope.user_id or f"org:{scope.org_id}"
+
+
 def _efs_share(scope: TenantScope) -> anyio.CapacityLimiter | None:
     """The caller's share of the EFS slots, or None where one person owns the
     deployment (the desktop, the operator view) and there is nobody to keep
@@ -460,9 +484,9 @@ def _efs_share(scope: TenantScope) -> anyio.CapacityLimiter | None:
     (cowork/principal.py) parses X-User-Id as a UUID, so no person's key
     starts with ``org:``.
     """
-    if not scope.partitioned:
+    key = _efs_share_key(scope)
+    if key is None:
         return None
-    key = scope.user_id or f"org:{scope.org_id}"
     try:
         shares = _EFS_SHARES.get()
     except LookupError:
@@ -500,6 +524,7 @@ async def _efs_task(
     fn: Callable[[], T],
     *,
     share: anyio.CapacityLimiter | None,
+    share_key: str | None,
     unit_slots: tuple[anyio.CapacityLimiter, ...],
     deadline: float,
     start: _EfsStart,
@@ -512,14 +537,16 @@ async def _efs_task(
     then holds no unit slot, so database work elsewhere keeps its slots.
     """
     held: list[anyio.CapacityLimiter] = []
+    waiting_for: Literal["efs_share", "run_efs"] | None = None
     try:
         with anyio.CancelScope(deadline=deadline) as slot_wait:
-            for limiter in (share, _efs_slots()):
+            for name, limiter in (("efs_share", share), ("run_efs", _efs_slots())):
                 if limiter is not None:
+                    waiting_for = name
                     await limiter.acquire()
                     held.append(limiter)
         if slot_wait.cancelled_caught:
-            raise FilesystemBusy("no shared file store slot freed within POOL_TIMEOUT")
+            raise FilesystemBusy(limiter=waiting_for, share=share_key)
         if unit_slots:
             with anyio.CancelScope(deadline=deadline) as unit_wait:
                 for limiter in unit_slots:
@@ -544,7 +571,10 @@ async def _run_on_efs(
     until = loop.time() + db_session.settings.database.pool_timeout if deadline else math.inf
     start = _EfsStart()
     work = asyncio.ensure_future(
-        _efs_task(fn, share=_efs_share(scope), unit_slots=unit_slots, deadline=until, start=start)
+        _efs_task(
+            fn, share=_efs_share(scope), share_key=_efs_share_key(scope), unit_slots=unit_slots, deadline=until,
+            start=start,
+        )
     )
     work.add_done_callback(_retrieve_outcome)
     try:

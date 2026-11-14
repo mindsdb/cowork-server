@@ -2529,3 +2529,23 @@ async def test_a_channel_turn_leaves_the_index_entry_of_a_claimed_turn_alone(mon
 
     entry = await turn_index.get_turn("conv-1")
     assert (entry.run_id, entry.correlation_id) == ("run-web", "corr-web")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "interactive,preview_checks,expected",
+    [(True, True, True), (False, True, None), (True, False, None), (False, False, None)],
+)
+async def test_preview_checks_reaches_the_job_only_for_an_interactive_turn(
+    monkeypatch, interactive, preview_checks, expected,
+):
+    """ENG-4227: the pod asks the app's preview only with a real true, and its
+    answer comes back on the stdin only an interactive turn keeps open."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", interactive=interactive,
+                                            preview_checks=preview_checks))
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params.get("preview_checks") is expected

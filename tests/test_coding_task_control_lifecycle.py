@@ -2,7 +2,7 @@ import hashlib
 
 import pytest
 
-from coding_service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
+from coding_service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_run_to_follow, wait_for_status
 from cowork.coding.contracts import InputReference, ModeTurnRequest, PermissionMode, SessionCreateRequest, SessionStatus
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.engines.base import EngineSessionConfig
@@ -37,7 +37,7 @@ def task(tmp_path):
     service = service_with(tmp_path, engine)
     created = service.create_session(SessionCreateRequest(path=str(repository(tmp_path)), prompt='Plan a timer', task_mode='plan', permission_mode='full_access'), CREDS, 'fake', 'fake-model')
     wait_for_status(service, created.id, SessionStatus.completed)
-    return service, engine, service.get_session(created.id)
+    return service, engine, wait_for_run_to_follow(service, created.id)
 
 
 def test_question_persists_until_answer_then_continues_without_permission_grant(tmp_path):
@@ -154,7 +154,7 @@ def test_rejected_mode_attachment_does_not_allocate_a_run_and_can_retry(tmp_path
         expected_event_count=restored.event_count, attachments=[reference],
     ), CREDS)
     wait_for_status(service, created.id, SessionStatus.completed)
-    built = service.get_session(created.id)
+    built = wait_for_run_to_follow(service, created.id)
     assert built.task_mode == 'build'
     assert built.run_id != created.run_id
     assert built.runtime_epoch == created.runtime_epoch + 1
@@ -204,7 +204,7 @@ def test_mode_turn_validates_the_target_mode_before_changing_state(tmp_path):
         prompt='Build', task_mode='build', expected_event_count=created.event_count,
     ), CREDS)
     wait_for_status(service, created.id, SessionStatus.completed)
-    built = service.get_session(created.id)
+    built = wait_for_run_to_follow(service, created.id)
     with pytest.raises(ValueError, match='Finish planning'):
         service.submit_mode_turn(created.id, ModeTurnRequest(
             prompt='/review', task_mode='plan', expected_event_count=built.event_count,

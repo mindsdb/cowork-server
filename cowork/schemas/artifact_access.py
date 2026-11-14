@@ -195,13 +195,16 @@ class ArtifactAccessView(CamelResponse):
     # The key the renderer addresses comment requests by; "" when
     # unpublished or published before the key was kept.
     artifact_key: str = ""
+    # The live page's id, for the client's sharing analytics; "" without one.
+    report_id: str = ""
 
     @classmethod
-    def audience_unknown(cls, *, artifact_key: str) -> ArtifactAccessView:
+    def audience_unknown(cls, *, artifact_key: str, report_id: str = "") -> ArtifactAccessView:
         """A restricted artifact whose audience this server doesn't know."""
         return cls(
             access_mode=AccessMode.RESTRICTED,
             artifact_key=artifact_key,
+            report_id=report_id,
             access_emails=None,
             org_allowed=None,
             owner_only=None,
@@ -215,6 +218,7 @@ class ArtifactAccessView(CamelResponse):
         return ArtifactAccessView(
             access_mode=AccessMode.RESTRICTED,
             artifact_key=self.artifact_key,
+            report_id=self.report_id,
             **ArtifactAudienceView.of(rule).model_dump(),
         )
 
@@ -242,6 +246,8 @@ class ArtifactStatusView(CamelResponse):
     # The key the renderer addresses comment requests by; "" when
     # unpublished or published before the key was kept.
     artifact_key: str = ""
+    # The live page's id, as on the card; "" without one.
+    report_id: str = ""
     # False when no owner record ties the live page to this artifact, so
     # Update shares a new link and Stop sharing leaves this one live. None
     # with no live link, or when that can't be read. Not on the card.
@@ -261,6 +267,7 @@ class ArtifactStatusView(CamelResponse):
             org_allowed=card.get("orgAllowed", False),
             owner_only=card.get("ownerOnly", False),
             artifact_key=card.get("artifactKey") or "",
+            report_id=card.get("reportId") or "",
         )
 
 

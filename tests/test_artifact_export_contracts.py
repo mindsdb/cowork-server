@@ -24,9 +24,12 @@ from cowork.schemas.artifact_export import (
     RenderPdfRequest,
     RenderPdfResult,
 )
+from cowork.schemas.export_child import ChildLimits, ConversionRequest, ConvertRequest
 from cowork.services.artifact_export import export_formats
 from cowork.services.artifact_files import read_artifact_file
-from cowork.services.artifact_inline import inline_artifact_html
+from cowork.services.artifact_inline import AssetReader, inline_artifact_html
+from cowork.services.export_child import Conversion, convert
+from cowork.services.export_runner import convert_in_child
 from cowork.services.docx_writer import write_docx
 from cowork.services.markdown_render import render_markdown
 
@@ -97,6 +100,8 @@ def test_render_pdf_response_fixture_validates_and_holds_a_pdf():
         (inline_artifact_html, ["html", "folder", "base_parts", "mode", "limits"]),
         (write_docx, ["document", "title"]),
         (export_formats, ["source_name", "is_backend", "can_edit", "pdf"]),
+        (convert_in_child, ["request", "source", "read_asset", "limits"]),
+        (convert, ["request", "source", "read_asset"]),
     ],
 )
 def test_export_helpers_take_keyword_arguments_only(helper, names):
@@ -133,6 +138,25 @@ def test_export_helpers_take_keyword_arguments_only(helper, names):
                 "can_edit": bool,
                 "pdf": ExportPdfSettings,
                 "return": list[ExportFormat],
+            },
+        ),
+        (
+            convert_in_child,
+            {
+                "request": ConversionRequest,
+                "source": bytes,
+                "read_asset": AssetReader | None,
+                "limits": ChildLimits,
+                "return": Conversion,
+            },
+        ),
+        (
+            convert,
+            {
+                "request": ConvertRequest,
+                "source": bytes,
+                "read_asset": AssetReader,
+                "return": Conversion,
             },
         ),
     ],

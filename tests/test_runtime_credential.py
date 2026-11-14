@@ -279,3 +279,81 @@ def test_the_browser_holder_refuses_wherever_people_share_the_process(no_browser
             finally:
                 get_app_settings.cache_clear()
         runtime_credential.clear_browser_host()
+
+
+# ── which organization the held credential acts in ─────────────────────────
+
+
+@pytest.fixture
+def entitlements(monkeypatch):
+    """MindsHub's entitlements answer, per credential."""
+    from types import SimpleNamespace
+
+    from cowork.services import mindshub_teams
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    state = SimpleNamespace(asked=[], replies={})
+
+    async def reply(path, bearer):
+        state.asked.append((path, bearer))
+        return state.replies.get(bearer, MindsHubReply(MindsHubAnswer.UNREACHABLE))
+
+    mindshub_teams.reset_caches_for_tests()
+    monkeypatch.setattr(mindshub_teams, "get_mindshub_reply", reply)
+    yield state
+    mindshub_teams.reset_caches_for_tests()
+
+
+def _answer_for(organization_id):
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    browser = {"enabled": True, "daily_bytes": 1, "disabled_reason": None}
+    if organization_id is not None:
+        browser["organization_id"] = organization_id
+    return MindsHubReply(MindsHubAnswer.OK, payload={"permissions": ["browser.use"], "browser": browser})
+
+
+def _organization(client) -> tuple[int, dict]:
+    response = client.get("/api/v1/runtime-credential/minds/organization")
+    return response.status_code, response.json()
+
+
+def test_the_organization_is_the_held_keys_own(entitlements):
+    # A key the person pasted can belong to another organization than the one
+    # they are signed in to. The answer is MindsHub's for the credential the
+    # app handed over, which is the key when there is one.
+    runtime_credential.set_minds_credential("mdb_key_of_org_b")
+    entitlements.replies["mdb_key_of_org_b"] = _answer_for("org-b")
+
+    assert _organization(_loopback_client()) == (200, {"organizationId": "org-b"})
+    assert entitlements.asked == [("/entitlements/me/", "mdb_key_of_org_b")]
+
+
+def test_no_held_credential_has_no_organization_and_asks_nothing(entitlements):
+    assert _organization(_loopback_client()) == (200, {"organizationId": None})
+    assert entitlements.asked == []
+
+
+@pytest.mark.parametrize("reply", ["unreachable", "refused", "no_block", "no_id"])
+def test_an_answer_that_names_no_organization_is_none(entitlements, reply):
+    from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
+
+    runtime_credential.set_minds_credential("mdb_key")
+    entitlements.replies["mdb_key"] = {
+        "unreachable": MindsHubReply(MindsHubAnswer.UNREACHABLE),
+        "refused": MindsHubReply(MindsHubAnswer.REFUSED, status_code=401),
+        "no_block": MindsHubReply(MindsHubAnswer.OK, payload={"permissions": []}),
+        "no_id": _answer_for(None),
+    }[reply]
+
+    assert _organization(_loopback_client()) == (200, {"organizationId": None})
+
+
+def test_the_organization_read_refuses_a_caller_that_is_not_loopback(entitlements):
+    from cowork.server import create_app
+
+    runtime_credential.set_minds_credential("mdb_key")
+    client = TestClient(create_app(), client=("10.1.2.3", 40000))
+
+    assert client.get("/api/v1/runtime-credential/minds/organization").status_code == 403
+    assert entitlements.asked == []

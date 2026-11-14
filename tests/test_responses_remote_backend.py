@@ -3202,8 +3202,9 @@ async def test_a_record_of_a_remote_turn_that_lost_only_the_listed_check_says_so
     the diff listed. Either the turn created nothing, so the unit's failure
     lost only that check, or it created a folder and record_new_artifacts
     raised at the check, once that folder's rows were written
-    (ListedLocationsUnchecked). The line says the check failed, not that
-    created folders went unrecorded."""
+    (ListedLocationsUnchecked), which a failed hold of the root or a failed
+    write of the sort times raises too. The line names the check, the hold
+    and the sort times, not created folders gone unrecorded."""
     from cowork.services import task_objects
 
     handler = _remote_handler(monkeypatch, {})
@@ -3253,7 +3254,8 @@ async def test_a_record_of_a_remote_turn_that_lost_only_the_listed_check_says_so
         if r.name == responses_mod.logger.name and r.levelno == logging.ERROR
     ]
     assert [r.getMessage() for r in errors] == [
-        "[responses] could not check the locations of the artifacts a remote turn listed",
+        "[responses] could not check the locations of the artifacts a remote turn found,"
+        " or record the folder that holds them or their sort times",
     ]
     assert errors[0].exc_info[1] is error
 
@@ -3336,7 +3338,8 @@ async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(m
     indexed = {"new": set()}
 
     def spy_index_new(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
+        untimed=(),
     ):
         indexed["new"] = set(slugs)
 
@@ -3382,7 +3385,8 @@ async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(mon
     indexed = {"new": set()}
 
     def spy_index_new(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
+        untimed=(),
     ):
         indexed["new"] = set(slugs)
 
@@ -4471,3 +4475,27 @@ async def test_a_stop_while_the_diff_holds_an_artifacts_revision_lock_waits_for_
     assert let_go and closed and let_go[0] <= closed[0], "the stream ended while the diff held the lock"
     assert not (folder / ".revisions" / ".lock").exists()
     assert turn.recorded == [["mine"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interactive,schedule_id,expected", [(True, None, True), (False, None, False), (True, "s1", False)])
+async def test_produce_remote_asks_for_preview_checks_only_where_a_viewer_can_answer(
+    monkeypatch, interactive, schedule_id, expected,
+):
+    """ENG-4227: a person's web turn may have the artifact's viewer open; a
+    scheduled run or a non-interactive caller has none."""
+    saved, captured = {}, {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler.interactive = interactive
+    handler.schedule_id = schedule_id
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_RecBuffer(),
+    )
+    assert captured["preview_checks"] is expected

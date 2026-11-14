@@ -131,6 +131,19 @@ class TurnHistory:
 
 
 @dataclass
+class PreviewCheckRequest:
+    """Synthetic event: a remote turn's anton asks the open preview whether an
+    artifact runs (turnqueue/preview_checks.py). Written to the stream as the
+    same ``response.artifact_check`` frame an in-process turn writes
+    (preview_checker.artifact_check_sse), and like that one never saved:
+    it means something only while the pod waits on it."""
+
+    check_id: str
+    artifact_slug: str
+    timeout_s: int
+
+
+@dataclass
 class TurnContext:
     """Synthetic pre-turn event: what the formatter needs to know about the
     turn that its other events don't carry. Never emitted as SSE. Every
@@ -1283,6 +1296,14 @@ async def format_responses_stream(
 
         elif isinstance(event, TurnContext):
             turn_context = event
+
+        elif isinstance(event, PreviewCheckRequest):
+            from cowork.harnesses.anton_harness.preview_checker import artifact_check_sse
+
+            # Not through _event: never recorded with the turn's events.
+            yield artifact_check_sse(
+                check_id=event.check_id, artifact_slug=event.artifact_slug, timeout_s=event.timeout_s,
+            )
 
         elif isinstance(event, TurnAddon):
             # A message the person added mid-turn: accepted, read by the
