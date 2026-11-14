@@ -1,0 +1,55 @@
+{
+  "id": "replicate",
+  "label": "Replicate",
+  "aliases": [
+    "image generation",
+    "image generator",
+    "picture generator"
+  ],
+  "keywords": [
+    "image",
+    "images",
+    "picture",
+    "pictures",
+    "illustration",
+    "photo",
+    "drawing",
+    "artwork",
+    "generation",
+    "generator",
+    "flux",
+    "stable diffusion"
+  ],
+  "description": "Generate images from text prompts with models hosted on Replicate, such as FLUX.",
+  "category": "ai",
+  "logo": "image",
+  "logo_color": "#EA2804",
+  "notice": "Paid service: each generated image is billed to your Replicate account.",
+  "form": {
+    "form_id": "replicate-connector",
+    "title": "Connect Replicate",
+    "subtitle": "Paste your Replicate API token to generate images.",
+    "logo_color": "#EA2804",
+    "methods": [
+      {
+        "id": "api-token",
+        "label": "API Token",
+        "description": "The token is checked by reading your Replicate account (GET https://api.replicate.com/v1/account), not by running a model.",
+        "recommended": true,
+        "how_to": "## Get your Replicate API token\n\n1. Go to [replicate.com](https://replicate.com) and sign in (or create an account).\n2. Open **Account → API tokens**.\n3. Click **Create token**, name it (e.g. `Cowork`), and copy it. Tokens start with `r8_`.\n4. Paste the token into the **API Token** field below.\n\n## Cost\n\n- Replicate is a paid service. Each generated image is billed to your account; small image models cost a fraction of a cent per image.\n- Bound what it can spend under **Account → Billing**: accounts on prepaid credit stop when the balance reaches zero, so buy only a small amount (a few dollars). If your account is billed to a card instead, check the limits and alerts offered on that page before you connect.\n- Turn on billing email alerts in the same page to see when spend grows.\n\n## Notes\n\n- Keep the token private; anyone with it can spend your credit. Delete it under **Account → API tokens** if it is exposed.\n",
+        "help_url": "https://replicate.com/account/api-tokens",
+        "fields": [
+          {
+            "name": "api_token",
+            "label": "API Token",
+            "type": "password",
+            "required": true,
+            "secret": true,
+            "placeholder": "r8_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "description": "Token from replicate.com → Account → API tokens."
+          }
+        ]
+      }
+    ]
+  }
+}
