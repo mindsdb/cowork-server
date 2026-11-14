@@ -7,11 +7,13 @@ import os
 import shutil
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
 from scripts.pytest_inventory import source_identity
+from scripts.test_inventory import Report, compare, preserve, read_report, summary, validate, validate_junit
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -220,6 +222,147 @@ def test_output():
     assert "private-captured-payload" not in path.read_text()
 
 
+def test_serial_parallel_reports_reconcile_without_timing_equality(inventory_suite):
+    """The same cases and outcomes compare across workers while timings stay independent."""
+    _, run = inventory_suite
+    result, _, serial_path = run("-n", "0", source="def test_one():\n    pass\ndef test_two():\n    pass\n")
+    assert result.returncode == 0
+    result, _, parallel_path = run("-n", "2")
+    assert result.returncode == 0
+    serial, parallel = read_report(serial_path), read_report(parallel_path)
+    compare(serial, parallel)
+    assert "2 collected" in summary(parallel)
+    assert "Cumulative phase work" in summary(parallel)
+
+
+@pytest.mark.parametrize("fault", ["missing_case", "extra_case", "duplicate_case", "missing_phase", "duplicate_phase",
+                                  "missing_worker", "marker", "source", "lock", "coverage", "skip", "exit"])
+def test_report_comparison_refuses_corrupt_or_incompatible_evidence(inventory_suite, fault):
+    """Independent case, phase, source and selection discrepancies cannot compare green."""
+    _, run = inventory_suite
+    result, raw, path = run("-n", "2", source="def test_one():\n    pass\ndef test_two():\n    pass\n")
+    assert result.returncode == 0
+    changed = deepcopy(raw)
+    if fault == "missing_case":
+        changed["collection"]["items"].pop()
+    elif fault == "extra_case":
+        changed["collection"]["items"].append({"nodeid": "test_sample.py::test_missing", "module": "test_sample.py", "markers": []})
+    elif fault == "duplicate_case":
+        changed["collection"]["items"].append(changed["collection"]["items"][0])
+    elif fault == "missing_phase":
+        changed["phases"].pop()
+    elif fault == "duplicate_phase":
+        changed["phases"].append(changed["phases"][0])
+    elif fault == "missing_worker":
+        changed["workers"].pop()
+    elif fault == "marker":
+        changed["collection"]["items"][0]["markers"] = ["feature"]
+    elif fault == "source":
+        changed["revision"]["tree_digest"] = changed["revision_end"]["tree_digest"] = "f" * 64
+    elif fault == "lock":
+        changed["revision"]["config"]["uv.lock"] = "f" * 64
+        changed["revision_end"]["config"]["uv.lock"] = "f" * 64
+    elif fault == "coverage":
+        changed["invocation"]["coverage"]["branch"] = True
+    elif fault == "skip":
+        call = next(phase for phase in changed["phases"] if phase["phase"] == "call")
+        call.update(outcome="skipped", reason="new skip")
+    elif fault == "exit":
+        changed["completion"]["exitstatus"] = 1
+    with pytest.raises(ValueError):
+        compare(read_report(path), Report.model_validate(changed))
+
+
+def test_body_only_edits_fail_execution_comparison(inventory_suite):
+    """Matching node IDs and commit IDs do not permit different uncommitted source bodies."""
+    _, run = inventory_suite
+    result, _, before_path = run(source="def test_same_id():\n    assert 1\n")
+    assert result.returncode == 0
+    result, _, after_path = run(source="def test_same_id():\n    assert 2\n")
+    assert result.returncode == 0
+    before, after = read_report(before_path), read_report(after_path)
+    assert before.collection == after.collection
+    with pytest.raises(ValueError, match="revision"):
+        compare(before, after)
+
+
+@pytest.mark.parametrize("fault", [None, "removed", "marker", "unapproved", "collector"])
+def test_preservation_allows_only_declared_additions(inventory_suite, fault):
+    """The separate collection audit permits new source but preserves old case ownership."""
+    _, run = inventory_suite
+    result, _, base_path = run("--collect-only", source="def test_old():\n    pass\n")
+    assert result.returncode == 0
+    source = "def test_old():\n    pass\ndef test_added():\n    pass\n"
+    if fault == "removed":
+        source = "def test_added():\n    pass\n"
+    elif fault == "marker":
+        source = "import pytest\n@pytest.mark.feature\n" + source
+    result, raw, candidate_path = run("--collect-only", source=source)
+    assert result.returncode == 0
+    base, candidate = read_report(base_path), read_report(candidate_path)
+    # Synthetic repositories have no commit; exercise declared revision matching explicitly.
+    base.revision.sha = base.revision_end.sha = "a" * 40
+    candidate.revision.sha = candidate.revision_end.sha = "b" * 40
+    additions = ["test_sample.py::test_added"] if fault != "unapproved" else []
+    if fault == "collector":
+        candidate.reporter_digest = "c" * 64
+    if fault is None:
+        preserve(base, candidate, "a" * 40, "b" * 40, additions)
+    else:
+        with pytest.raises(ValueError):
+            preserve(base, candidate, "a" * 40, "b" * 40, additions)
+
+
+def test_junit_reconciles_call_and_teardown_failure_and_module_skip(inventory_suite):
+    """Pytest's extra XML row for a double failure is not mistaken for another case."""
+    root, run = inventory_suite
+    (root / "test_skip.py").write_text('import pytest\npytest.skip("module prerequisite", allow_module_level=True)\n')
+    xml = root.parent / "result.xml"
+    result, _, path = run(f"--junitxml={xml}", source='''
+import pytest
+@pytest.fixture
+def resource():
+    yield
+    assert False
+def test_double_failure(resource):
+    assert False
+''')
+    assert result.returncode == 1
+    validate_junit(read_report(path), xml)
+    xml.write_text("<testsuite/>")
+    with pytest.raises(ValueError, match="count"):
+        validate_junit(read_report(path), xml)
+
+
+def test_invalid_report_values_are_rejected_without_echoing_payload(tmp_path):
+    """Malformed artifact content is diagnosed without copying it to CLI output."""
+    path = tmp_path / "invalid.json"
+    path.write_text('{"schema_version": 1, "private": "hidden-payload"}')
+    result = subprocess.run([sys.executable, str(_ROOT / "scripts/test_inventory.py"), "check", str(path)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 1
+    assert "hidden-payload" not in result.stderr
+
+
+def test_validator_accepts_setup_skips_and_expected_failures(inventory_suite):
+    """Valid missing call phases and xfail classifications remain valid evidence."""
+    _, run = inventory_suite
+    result, _, path = run(source='''
+import pytest
+@pytest.mark.skip(reason="platform prerequisite")
+def test_skip():
+    pass
+@pytest.mark.xfail(reason="expected fault")
+def test_xfail():
+    assert False
+''')
+    assert result.returncode == 0
+    report = read_report(path)
+    assert len(validate(report)) == 2
+    assert "'skipped': 1" in summary(report)
+    assert "'xfailed': 1" in summary(report)
+
+
 @pytest.mark.parametrize("failure", ["pytest.exit('finish failure', returncode=1)", "raise RuntimeError('finish failure')"],
                          ids=["pytest-exit", "exception"])
 def test_finish_hook_exceptions_never_publish_successful_evidence(inventory_suite, failure):
@@ -272,3 +415,43 @@ def pytest_sessionfinish(session):
     assert result.returncode == 3
     assert report == {}
     assert path.read_text() == "{}"
+
+
+@pytest.mark.parametrize("change", ["disabled", "append", "external-config"])
+def test_coverage_comparison_checks_effective_measurement(inventory_suite, change):
+    """Different instrumentation/configuration cannot be accepted as a matched timing run."""
+    root, run = inventory_suite
+    coverage_config = root.parent / "coverage.ini"
+    coverage_config.write_text("[run]\nbranch = false\n")
+    args = ["-p", "pytest_cov.plugin", "--cov=.", "--cov-report=", f"--cov-config={coverage_config}"]
+    result, _, before_path = run(*args, source="def test_passes():\n    assert True\n")
+    assert result.returncode == 0, result.stdout + result.stderr
+    if change == "disabled":
+        args.append("--no-cov")
+    elif change == "append":
+        args.append("--cov-append")
+    else:
+        coverage_config.write_text("[run]\nbranch = true\n")
+    result, _, after_path = run(*args)
+    assert result.returncode == 0, result.stdout + result.stderr
+    before, after = read_report(before_path), read_report(after_path)
+    assert before.revision == after.revision
+    assert before.invocation.coverage.enabled
+    if change == "disabled":
+        assert not after.invocation.coverage.enabled
+    with pytest.raises(ValueError, match="coverage settings"):
+        compare(before, after)
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_complete_evidence_requires_collection_timings(inventory_suite, workers):
+    """Required serial and worker timing fields cannot silently disappear from a report."""
+    _, run = inventory_suite
+    result, raw, _ = run("-n", str(workers), source="def test_passes():\n    pass\n")
+    assert result.returncode == 0
+    if workers:
+        raw["workers"][0].pop("collection_seconds")
+    else:
+        raw["collection_seconds"] = None
+    with pytest.raises(ValueError, match="collection"):
+        validate(Report.model_validate(raw))

@@ -62,6 +62,8 @@ Initializes the database and validates configuration.
 
 ### Testing
 
+The existing CI jobs retain case inventories, phase timings and JUnit results. See [test evidence and execution cohorts](docs/testing.md) for collection, comparison and preservation checks.
+
 ```sh
 make test/unit
 ```
