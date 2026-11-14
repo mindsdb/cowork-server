@@ -164,6 +164,17 @@ def _sized(*, unit: str, target_bytes: int) -> str:
     return unit * (target_bytes // len(unit))
 
 
+def _attribute_css_heavy_html() -> str:
+    """SVG transforms, each just under the per-attribute CSS bound, up to the page's read bound.
+
+    Attributes have no CSS total, so this is the most CSS a page can send through tinycss2.
+    """
+    transform = _sized(unit="translate(1 1) ", target_bytes=MIB - 64)
+    count = HTML_BYTES // (len(transform) + 32)
+    groups = "".join(f'<g transform="{transform}"></g>' for _ in range(count))
+    return f"<html><body><svg>{groups}</svg></body></html>"
+
+
 def _markdown_case(text: Callable[[], str], note: str) -> Case:
     return Case(primary="report.md", build=lambda folder: _write(folder, "report.md", text()), note=note)
 
@@ -229,6 +240,11 @@ CASES: dict[str, Case] = {
             + "</style></head><body><p>x</p></body></html>",
         ),
         note="a style element just under the 1 MiB CSS cap",
+    ),
+    "html-attribute-css-heavy": Case(
+        primary="report.html",
+        build=lambda folder: _write(folder, "report.html", _attribute_css_heavy_html()),
+        note="1 MiB SVG transforms up to the 10 MiB page bound",
     ),
     "html-node-heavy": Case(
         primary="report.html",
