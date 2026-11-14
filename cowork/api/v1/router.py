@@ -35,6 +35,7 @@ from cowork.api.v1.endpoints import (
     project_files,
     projects,
     publish,
+    notices,
     push,
     responses,
     runtime_credential,
@@ -92,6 +93,7 @@ api_router.include_router(responses.router, prefix="/responses", tags=["response
 api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(schedules.router, prefix="/schedules", tags=["schedules"])
 api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
+api_router.include_router(notices.router, prefix="/notices", tags=["notices"])
 api_router.include_router(push.router, prefix="/push", tags=["push"])
 # The sharing routes first: GET /skills/sharing-capabilities must match before
 # the skills router's GET /skills/{skill_id} reads it as a skill's id.

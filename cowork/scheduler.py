@@ -276,6 +276,10 @@ class _ScheduledTurn:
     prompt: str
     model: str | None
     project_id: UUID | None
+    # The schedule's owner as its row has it (NULL on the desktop), for the
+    # run's notice: unlike ``principal``, set wherever the run is.
+    org_id: str | None = None
+    owner_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -544,6 +548,8 @@ def _read_schedule(session: ScopedSession, *, schedule_id: UUID) -> _ScheduledTu
         prompt=schedule.prompt,
         model=schedule.model,
         project_id=schedule.project_id,
+        org_id=schedule.org_id,
+        owner_id=schedule.created_by,
     )
 
 
@@ -1154,6 +1160,12 @@ async def _execute_schedule(
                 _active_run_ids.discard(run_id)
             if push_succeeded is not None and not lease_lost.is_set() and trigger != RunTrigger.trial:
                 _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
+                if push_succeeded is False and scheduled is not None:
+                    _announce_run_ending(
+                        org_id=scheduled.org_id, user_id=scheduled.owner_id, schedule_id=schedule_id,
+                        run_id=run_id, conversation_id=conversation_id, schedule_name=scheduled.title,
+                        outcome=outcome,
+                    )
 
 
 def _push_run_ending(
@@ -1183,6 +1195,27 @@ def _push_run_ending(
         logger.warning("Could not push a scheduled run's ending", exc_info=True, extra={"event": "push_schedule_failed"})
 
 
+def _announce_run_ending(
+    *, org_id: str | None, user_id: str | None, schedule_id: UUID, run_id: UUID | None,
+    conversation_id: UUID | str | None, schedule_name: str, outcome: AttemptOutcome | str | None,
+) -> None:
+    """Post a notice to the schedule's owner's inbox that its run didn't
+    finish. Unlike the phone push, every deployment gets one, the desktop
+    included. Detached, like the push: a notice never holds up or fails a run.
+    The same runs as the push count, for the same reasons (_push_run_ending)."""
+    try:
+        from cowork.services.notices import announce_scheduled_run
+        from cowork.services.push.dispatch import spawn
+
+        spawn(announce_scheduled_run(
+            org_id=org_id, user_id=user_id, schedule_id=schedule_id, run_id=run_id,
+            conversation_id=conversation_id, schedule_name=schedule_name,
+            outcome=getattr(outcome, "value", outcome),
+        ))
+    except Exception:
+        logger.warning("Could not post a scheduled run's notice", exc_info=True, extra={"event": "notice_post_failed"})
+
+
 def _push_reaped_run(push: ReapedRunPush) -> None:
     """Tell a reaped run's owner it didn't finish. Fire and forget."""
     try:
@@ -1194,6 +1227,11 @@ def _push_reaped_run(push: ReapedRunPush) -> None:
         )
     except Exception:
         logger.warning("Could not push a reaped run's ending", exc_info=True, extra={"event": "push_schedule_failed"})
+    if push.schedule_id is not None:
+        _announce_run_ending(
+            org_id=push.org_id, user_id=push.user_id, schedule_id=push.schedule_id, run_id=push.run_id,
+            conversation_id=push.conversation_id, schedule_name=push.schedule_name, outcome=push.outcome,
+        )
 
 
 class _LeaseLost(Exception):
@@ -1580,6 +1618,9 @@ class ReapedRunPush:
     user_id: str | None
     schedule_name: str
     conversation_id: str | None
+    schedule_id: UUID | None = None
+    run_id: UUID | None = None
+    outcome: str | None = None
 
 
 def _reap_lapsed_runs(
@@ -1628,6 +1669,7 @@ def _reap_lapsed_runs(
             committed_pushes.append(ReapedRunPush(
                 org_id=schedule.org_id, user_id=schedule.created_by, schedule_name=schedule.title,
                 conversation_id=str(run.conversation_id) if run.conversation_id else None,
+                schedule_id=schedule.id, run_id=run.id, outcome=run.outcome,
             ))
     session.commit()
     if abandoned is not None:
