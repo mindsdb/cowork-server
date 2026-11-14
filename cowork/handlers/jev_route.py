@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -194,6 +195,17 @@ def own_decision_target(settings) -> "JevTarget | None":
     return JevTarget(url=url, api_key=key) if key and url else None
 
 
+def is_web_address(*, url: str) -> bool:
+    """An http(s) URL with a host and no user: what a decision model's
+    endpoint must be, as anton's ``DecisionsTarget`` takes it. Settings checks
+    a saved or tested URL with it, and `decisions_model` a stored one."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # an unclosed IPv6 bracket, say
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname) and "@" not in parts.netloc
+
+
 def gate_mode(settings) -> GateMode:
     """Which gate decides a turn, from settings alone. One source for the turn
     handler and for the settings response, so the UI shows what turns do.
@@ -208,10 +220,15 @@ def gate_mode(settings) -> GateMode:
     A decision MindsHub refuses (an organization it does not serve Jev to)
     needs no mode of its own: the turn falls back to the LLM gate.
     """
-    from cowork.common.settings.user_settings import Provider
-
     if own_decision_target(settings) is not None:
         return "own"
+    return _mode_without_own_model(settings=settings)
+
+
+def _mode_without_own_model(*, settings) -> Literal["jev", "off", "llm"]:
+    """`gate_mode` for settings with no decision model of the organization's own."""
+    from cowork.common.settings.user_settings import Provider
+
     if settings.resolved_planning_provider is not Provider.MINDS_CLOUD:
         return "llm"
     return "jev" if settings.jev_decisions_enabled else "off"
@@ -221,16 +238,22 @@ DecisionsModel = Literal["mindshub", "own"]
 
 
 def decisions_model(settings) -> "DecisionsModel | None":
-    """What picks the shared browser's steps, from settings alone: the
-    organization's own decision model ("own"), Jev on MindsHub for an LLM on
-    MindsHub that the organization didn't turn Jev off for ("mindshub"), or
-    None. The same precedence as `gate_mode`. Without one every browser step
-    goes back to the LLM, which is too slow to offer, so the browser is off
-    (`decisions_available`)."""
-    mode = gate_mode(settings)
-    if mode == "own":
+    """What picks the shared browser's steps: the organization's own decision
+    model ("own"), Jev on MindsHub for an LLM on MindsHub that the
+    organization didn't turn Jev off for ("mindshub"), or None. The same
+    precedence as `gate_mode`, except that "own" needs a URL the browser
+    takes (`is_web_address`: one stored before Settings checked it may not
+    be) and this deployment's browser to reach that model
+    (`browser.own_model_reaches_browser`): where it can't, the browser never
+    asks it, so this answers what the browser asks instead. Without one every
+    browser step goes back to the LLM, which is too slow to offer, so the
+    browser is off (`decisions_available`)."""
+    from cowork.services.browser import own_model_reaches_browser
+
+    target = own_decision_target(settings)
+    if target is not None and is_web_address(url=target.url) and own_model_reaches_browser():
         return "own"
-    return "mindshub" if mode == "jev" else None
+    return "mindshub" if _mode_without_own_model(settings=settings) == "jev" else None
 
 
 def decisions_available(settings) -> bool:

@@ -143,9 +143,18 @@ class BrowseStatus(BaseModel):
     person who turned it off can turn it back on.
 
     ``decisions_model`` is what picks the browser's steps
-    (``jev_route.decisions_model``): None means the browser can't run until
+    (``jev_route.decisions_model``), ``own`` only where the organization's
+    own model reaches this deployment's browser
+    (``own_model_reaches_browser``) at a URL anton takes. None means the browser can't run until
     someone who may (``can_set_decisions_model``: an organization admin, or
     anyone on a desktop) sets up a decision model of the organization's own.
+
+    ``own_decisions_unused``: the organization set up its own decision model,
+    but this deployment's browser can't ask it (the function
+    ``own_decisions_unused``). Setting one up again changes nothing then, and
+    a save that turns the browser on answers 400 saying the organization's
+    own model can't be used here yet
+    (``endpoints.settings._reject_browser_that_cant_run``).
     """
 
     enabled: bool
@@ -153,6 +162,7 @@ class BrowseStatus(BaseModel):
     status: BrowseState
     decisions_model: Literal["mindshub", "own"] | None = None
     can_set_decisions_model: bool = False
+    own_decisions_unused: bool = False
 
 
 class RouterStatus(BaseModel):
@@ -265,6 +275,39 @@ def _require_router() -> str:
     if not router:
         raise BrowserServiceError(409, "unavailable", _NO_BROWSER)
     return router
+
+
+def own_model_reaches_browser() -> bool:
+    """Whether an organization's own decision model can pick this
+    deployment's browser steps. On the web a turn's browser asks it through
+    this server's decisions proxy, which needs the proxy's URL
+    (``decisions_proxy.proxy_url``) and an anton whose browser config takes
+    one (``_decisions_proxy_block``). On the desktop the in-process anton
+    takes the model itself, as ``DecisionsTarget`` (``_decisions_block``).
+    Without either, the browser asks Jev on MindsHub or the LLM, so status
+    and Settings don't name the organization's model
+    (``jev_route.decisions_model``)."""
+    if on_web():
+        from cowork.services.decisions_proxy import proxy_url
+
+        return bool(proxy_url()) and "decisions_proxy" in BrowserConfig.model_fields
+    try:
+        from anton.core.browser.config import DecisionsTarget  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def own_decisions_unused(user_settings: UserSettings) -> bool:
+    """Whether the organization set up its own decision model (its URL and
+    key) that this deployment's browser can't ask
+    (``own_model_reaches_browser``). Status reports it
+    (``BrowseStatus.own_decisions_unused``), and Settings' refusal to turn
+    the browser on says the same
+    (``endpoints.settings._reject_browser_that_cant_run``)."""
+    from cowork.handlers.jev_route import own_decision_target
+
+    return own_decision_target(user_settings) is not None and not own_model_reaches_browser()
 
 
 def _digest(value: str) -> str:
@@ -695,7 +738,7 @@ async def browse_status(
 
     status = partial(
         BrowseStatus, enabled=browser_runs(user_settings), decisions_model=decisions_model(user_settings),
-        can_set_decisions_model=can_set_decisions_model,
+        can_set_decisions_model=can_set_decisions_model, own_decisions_unused=own_decisions_unused(user_settings),
     )
     if not on_web():
         if get_browser_host() is None:
@@ -752,20 +795,24 @@ def _decisions_proxy_block(user_settings: UserSettings) -> dict:
     from cowork.handlers.jev_route import decisions_model
     from cowork.services.decisions_proxy import proxy_url
 
-    url = proxy_url()
-    if not url or decisions_model(user_settings) != "own" or "decisions_proxy" not in BrowserConfig.model_fields:
+    if decisions_model(user_settings) != "own" or not own_model_reaches_browser():
         return {}
     from anton.core.browser.config import DecisionsProxy
     from cowork.common.settings.app_settings import TurnQueueSettings
 
     model = (getattr(user_settings, "decision_model", "") or "").strip() or TurnQueueSettings().jev_route_model
-    return {"decisions_proxy": DecisionsProxy(url=url, model=model)}
+    return {"decisions_proxy": DecisionsProxy(url=proxy_url(), model=model)}
 
 
 def _decisions_block(decisions: Any) -> dict:
     """The organization's own decision model as anton's browser takes it,
     or nothing for none, or for an anton that predates it (its browser then
-    asks Jev on MindsHub, or the model, as before)."""
+    asks Jev on MindsHub, or the model, as before).
+
+    Also nothing for a target anton refuses, such as a stored URL with no
+    scheme from before Settings checked it: the browser still runs, and its
+    steps go where they would without the organization's model. Logged
+    without the URL or the key."""
     if decisions is None:
         return {}
     try:
@@ -773,7 +820,14 @@ def _decisions_block(decisions: Any) -> dict:
     except ImportError:
         return {}
     target, model = decisions
-    return {"decisions": DecisionsTarget(url=target.url, api_key=target.api_key, model=model)}
+    try:
+        return {"decisions": DecisionsTarget(url=target.url, api_key=target.api_key, model=model)}
+    except ValidationError:
+        logger.warning(
+            "the agent's browser config refused the organization's decision model; the browser runs without it",
+            extra={"event": "desktop_browser_decisions_refused"},
+        )
+        return {}
 
 
 def desktop_browser_config(
@@ -786,7 +840,9 @@ def desktop_browser_config(
 
     ``decisions`` is the organization's own decision model, a
     ``jev_route.JevTarget`` and its model name, which then picks the
-    browser's steps. It stays in this process, as the launch key does."""
+    browser's steps. It stays in this process, as the launch key does. One
+    anton refuses is left out, and the browser still runs
+    (``_decisions_block``)."""
     host = get_browser_host()
     if host is None:
         return None

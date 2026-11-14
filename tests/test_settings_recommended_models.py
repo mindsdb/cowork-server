@@ -859,3 +859,42 @@ def test_an_unknown_refresh_scope_refreshes_everything(monkeypatch):
     # A newer client's scope must not fail the refresh.
     forced = _forced_by_url(monkeypatch, "everything")
     assert forced == {"https://api.mindshub.ai": (True, True), "https://llm.local/v1": (True, False)}
+
+
+def test_settings_say_the_organizations_model_picks_browser_steps_only_where_it_reaches_them(monkeypatch):
+    """`routing.decisions` follows what the browser asks: Jev on MindsHub on a
+    desktop whose anton predates the host's own decision model, and the
+    organization's model once anton takes it. `routing.mode`, the turn
+    gate's, is the organization's model either way."""
+    from anton.core.browser import config as anton_config
+
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
+        return _listing(["mindshub_air"], enabled={"mindshub_air": True})
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(
+            session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai",
+            decision_model_url="https://decide.example.test/v1/systemone", decision_model_api_key="own-key",
+        )
+        _delete_settings(session, "providers_json", "jev_decisions_enabled")
+
+        monkeypatch.delattr(anton_config, "DecisionsTarget", raising=False)
+        routing = asyncio.run(recommended_models(FakeRequest(), LOCAL_SCOPE))["routing"]
+        assert (routing["mode"], routing["decisions"]) == ("own", "mindshub")
+
+        # Only whether anton has it matters to this check.
+        monkeypatch.setattr(anton_config, "DecisionsTarget", object, raising=False)
+        routing = asyncio.run(recommended_models(FakeRequest(), LOCAL_SCOPE))["routing"]
+        assert (routing["mode"], routing["decisions"]) == ("own", "own")
+    finally:
+        _delete_settings(
+            session, "minds_api_key", "minds_url", "minds_model_enabled", "decision_model_url", "decision_model_api_key",
+        )
+        session.close()

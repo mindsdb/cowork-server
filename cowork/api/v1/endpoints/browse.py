@@ -135,7 +135,7 @@ async def browse_provision(
     # The router started it for the caller, so it is theirs to use.
     return browser_service.BrowseStatus(
         enabled=browser_service.browser_runs(user), available=True, status=warmed.status,
-        decisions_model=decisions_model(user),
+        decisions_model=decisions_model(user), own_decisions_unused=browser_service.own_decisions_unused(user),
     )
 
 

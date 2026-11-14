@@ -233,7 +233,11 @@ async def test_turning_the_browser_on_without_a_decisions_model_400s_and_writes_
         session.close()
 
 
-async def test_the_organizations_own_decision_model_and_the_browser_save_together():
+async def test_the_organizations_own_decision_model_and_the_browser_save_together(monkeypatch):
+    from cowork.services import browser
+
+    # Where the organization's model reaches the browser (an anton that takes it).
+    monkeypatch.setattr(browser, "own_model_reaches_browser", lambda: True)
     session = get_open_session()
     try:
         _cleanup(session, *_DECISION_KEYS)
@@ -254,6 +258,127 @@ async def test_the_organizations_own_decision_model_and_the_browser_save_togethe
         from cowork.services.browser import browser_runs
 
         assert browser_runs(SettingService(session).load()) is False
+    finally:
+        _cleanup(session, *_DECISION_KEYS)
+        session.close()
+
+
+async def test_an_own_decision_model_the_browser_cant_reach_doesnt_turn_it_on(monkeypatch):
+    """No proxy URL on the web, or an anton that predates it on the desktop:
+    the browser would never ask the organization's model, so it can't be
+    what lets the browser on, and the refusal says why."""
+    from cowork.services import browser
+
+    monkeypatch.setattr(browser, "own_model_reaches_browser", lambda: False)
+    session = get_open_session()
+    try:
+        _cleanup(session, *_DECISION_KEYS)
+        with pytest.raises(HTTPException) as exc:
+            await bulk_upsert_settings(
+                SettingsBulkUpsertRequest(values={
+                    "jev_decisions_enabled": "false", "browser_enabled": "true",
+                    "decision_model_url": "https://decide.example.test/v1/systemone", "decision_model_api_key": "own",
+                }),
+                LOCAL_SCOPE,
+                None,
+            )
+        assert exc.value.status_code == 400 and "can't use the organization's own decision model" in exc.value.detail
+        assert SettingService(session)._fetch_row("browser_enabled") is None
+    finally:
+        _cleanup(session, *_DECISION_KEYS)
+        session.close()
+
+
+@pytest.mark.parametrize("url", [
+    "decisions.example.test/v1", "ftp://decisions.example.test/v1", "https://", "https:///v1", "http://[::1",
+    "https://u:p@decide.example.test/v1",
+])
+async def test_a_decision_model_url_without_a_scheme_and_host_is_refused_on_save(url):
+    """Both writers refuse it, as Settings' test does, and nothing is
+    written: the gate can't send to it, and anton's browser refuses it."""
+    from cowork.api.v1.endpoints.settings import upsert_setting
+    from cowork.schemas.settings import SettingUpsertRequest
+
+    session = get_open_session()
+    try:
+        _cleanup(session, *_DECISION_KEYS)
+        with pytest.raises(HTTPException) as exc:
+            await bulk_upsert_settings(
+                SettingsBulkUpsertRequest(values={"decision_model_url": url, "decision_model_api_key": "own"}),
+                LOCAL_SCOPE,
+                None,
+            )
+        assert exc.value.status_code == 400 and "full web address" in exc.value.detail
+        with pytest.raises(HTTPException) as exc:
+            await upsert_setting("decision_model_url", SettingUpsertRequest(value=url), LOCAL_SCOPE, None)
+        assert exc.value.status_code == 400
+        service = SettingService(session)
+        assert service._fetch_row("decision_model_url") is None and service._fetch_row("decision_model_api_key") is None
+    finally:
+        _cleanup(session, *_DECISION_KEYS)
+        session.close()
+
+
+async def test_a_decision_model_url_saves_with_a_scheme_and_host_and_clears_blank():
+    from cowork.api.v1.endpoints.settings import upsert_setting
+    from cowork.schemas.settings import SettingUpsertRequest
+
+    session = get_open_session()
+    try:
+        _cleanup(session, *_DECISION_KEYS)
+        for url in ("https://decide.example.test/v1/systemone", " http://10.0.0.5:8080/decide ", ""):
+            await upsert_setting("decision_model_url", SettingUpsertRequest(value=url), LOCAL_SCOPE, None)
+            assert SettingService(session).load().decision_model_url == url
+    finally:
+        _cleanup(session, *_DECISION_KEYS)
+        session.close()
+
+
+async def test_a_stored_url_the_browser_refuses_asks_for_a_decision_model_again(monkeypatch):
+    """A URL stored before Settings checked it, where the organization's model
+    would reach the browser: the refusal asks for a decision model, not for
+    Jev, since a corrected URL is what turns the browser on, as status says
+    (`browser.own_decisions_unused` is false)."""
+    from cowork.services import browser
+
+    monkeypatch.setattr(browser, "own_model_reaches_browser", lambda: True)
+    session = get_open_session()
+    try:
+        _cleanup(session, *_DECISION_KEYS)
+        SettingService(session).save_all({
+            "jev_decisions_enabled": "false",
+            "decision_model_url": "decisions.example.test/v1", "decision_model_api_key": "own",
+        })
+        assert browser.own_decisions_unused(SettingService(session).load()) is False
+        with pytest.raises(HTTPException) as exc:
+            await bulk_upsert_settings(
+                SettingsBulkUpsertRequest(values={"browser_enabled": "true"}), LOCAL_SCOPE, None,
+            )
+        assert exc.value.status_code == 400 and "needs a decisions model" in exc.value.detail
+        await bulk_upsert_settings(
+            SettingsBulkUpsertRequest(values={
+                "browser_enabled": "true", "decision_model_url": "https://decide.example.test/v1",
+            }),
+            LOCAL_SCOPE,
+            None,
+        )
+        assert SettingService(session).load().browser_enabled is True
+    finally:
+        _cleanup(session, *_DECISION_KEYS)
+        session.close()
+
+
+def test_a_bad_decision_model_url_stored_before_the_check_still_loads():
+    """The check is on the write, not the field: a value stored earlier
+    can't break reading settings."""
+    session = get_open_session()
+    try:
+        _cleanup(session, *_DECISION_KEYS)
+        service = SettingService(session)
+        service.save_all({"decision_model_url": "decisions.example.test/v1"})
+        assert service.load().decision_model_url == "decisions.example.test/v1"
+        listed = {row.key: row.value for row in service.list_settings()}
+        assert listed["decision_model_url"] == "decisions.example.test/v1"
     finally:
         _cleanup(session, *_DECISION_KEYS)
         session.close()

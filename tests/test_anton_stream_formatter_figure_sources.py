@@ -30,6 +30,7 @@ from anton.core.tools.registry import ToolOutcome
 from anton.core.utils.scratchpad import format_cell_result
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from cowork.common import event_clock
 from cowork.harnesses.anton_harness import figure_sources as figure_sources_mod
 from cowork.harnesses.anton_harness import stream_formatter as stream_formatter_mod
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
@@ -1482,7 +1483,9 @@ class TestTheFigureSourcesEventIsUnchanged:
         formatter reads its steps can't move a figure, a source or a step."""
         from uuid import UUID
 
-        monkeypatch.setattr(stream_formatter_mod, "time", SimpleNamespace(time=lambda: 1_760_000_000.0))
+        clock = SimpleNamespace(time=lambda: 1_760_000_000.0)
+        monkeypatch.setattr(stream_formatter_mod, "time", clock)
+        monkeypatch.setattr(event_clock, "time", clock)
         monkeypatch.setattr(stream_formatter_mod, "uuid", SimpleNamespace(uuid4=lambda: UUID(int=0xABCDEF)))
 
         frames = await _every_input_shape(compacted=True) + await _every_input_shape(compacted=False)
