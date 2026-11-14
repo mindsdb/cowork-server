@@ -205,6 +205,9 @@ class ConnectorMetadataResponse(BaseModel):
     # Built in Cowork and stored per org (or per local install), not shipped
     # in the static registry.
     custom: bool = False
+    # Connects with a typed key or token, the kind a custom connector can
+    # stand in for: not a database, and not only a sign-in redirect.
+    api_key: bool = False
 
 
 class CustomConnectorUpdate(BaseModel):

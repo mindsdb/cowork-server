@@ -1,7 +1,10 @@
 """Stored custom connector definitions: built from a handcrafted form, kept per scope."""
 from __future__ import annotations
 
+import logging
 import re
+from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -20,8 +23,11 @@ from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope, tenant_scope_required
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorForm, CustomConnectorUpdate
+from cowork.services.connectors.custom_connect import parse_stored
 from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
 from cowork.services.connectors.specs._registry import registry
+
+logger = logging.getLogger(__name__)
 
 # Top-level keys a handcrafted form may carry that ConnectorForm doesn't model
 # but the connect form still renders.
@@ -29,6 +35,7 @@ _KEPT_FORM_KEYS = ("how_to", "help_url")
 _COLOR_PATTERN = re.compile(r"#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?")
 # Matches the cap agent-facing usage notes have on built-in specs.
 USAGE_NOTES_MAX = 1600
+NO_CHECK_REASON = "has no connection check, so it cannot be connected."
 
 
 class UnstorableFormError(ValueError):
@@ -95,7 +102,8 @@ def check_handcrafted_form(form_spec: dict[str, Any]) -> None:
     if len(notes) > USAGE_NOTES_MAX:
         raise UnstorableFormError(f"connector.usage_notes must be at most {USAGE_NOTES_MAX} characters.")
     # Hygiene for the builder's own prompt: anton's output scrubber knows the key
-    # and token shapes. No one else reads a definition (scope_is_one_persons).
+    # and token shapes. No one else reads a definition (scope_is_one_persons;
+    # in org mode, only the builder's own turns, member_turn_templates).
     if scrub_output(notes) != notes:
         raise UnstorableFormError(
             "connector.usage_notes looks like it holds a credential value. "
@@ -115,12 +123,73 @@ def scope_is_one_persons(scope: TenantScope) -> bool:
     usage notes) is model-written and may hold what its builder typed, in
     any encoding. A handcrafted form is therefore kept only where this is
     True. In org mode a member keeps only checked drafts
-    (save_member_draft), seen by that member alone (scope_definitions).
-    Sharing definitions across people is not built yet.
+    (save_member_draft), seen by that member alone (scope_definitions), and
+    their notes reach only that member's own cloud turns
+    (member_turn_templates). Sharing definitions across people is not
+    built yet.
     """
     if scope.personal:
         return scope.partitioned_for(PersonalResource.CONNECTIONS)
     return not scope.org_mode and not tenant_scope_required()
+
+
+@dataclass(frozen=True)
+class MemberTurnTemplate:
+    """What a member's own template gives their cloud turn: its field names and its notes.
+
+    ``field_names`` is empty when the template no longer parses. ``notes``
+    passed anton's output scrubber and is cut to USAGE_NOTES_MAX; it may be "".
+    """
+
+    field_names: tuple[str, ...]
+    notes: str
+
+
+def _turn_field_names(row: CustomConnector) -> tuple[str, ...]:
+    """The template's field names, never a value, or () when it no longer parses.
+
+    A template that parses names no address field: anton's parser reserves ``base_url``.
+    """
+    try:
+        parsed = parse_stored(row)
+    except (KeyError, TypeError):
+        # A stored field without a name: parse_stored indexes it. This row alone loses its names.
+        logger.warning("custom connector %s: stored fields are malformed; its field names are left out",
+                       row.connector_id)
+        return ()
+    if parsed is None:
+        return ()
+    return tuple(field["name"] for field in row.spec.get("fields", []))
+
+
+def member_turn_templates(session: ScopedSession, connector_ids: Iterable[str]) -> dict[str, MemberTurnTemplate]:
+    """Field names and usage notes of an org-mode member's own templates, for that member's own cloud turn.
+
+    Args:
+        session: The turn's scoped session; only its user's rows are read
+            (scope_definitions).
+        connector_ids: The connector ids of the custom connections the turn
+            carries.
+
+    Returns:
+        connector id -> MemberTurnTemplate, for every template of the member
+        among ``connector_ids``, empty notes included. Empty outside org mode
+        or without a user; a connection whose template the member no longer
+        keeps has no entry.
+    """
+    scope = session.scope
+    wanted = set(connector_ids)
+    if not scope.org_mode or not scope.user_id or not wanted:
+        return {}
+    stmt = scope_definitions(session).where(CustomConnector.connector_id.in_(wanted))
+    templates: dict[str, MemberTurnTemplate] = {}
+    for row in session.exec(stmt).all():
+        text = (row.usage_notes or "")[:USAGE_NOTES_MAX]
+        templates[row.connector_id] = MemberTurnTemplate(
+            field_names=_turn_field_names(row),
+            notes=scrub_output(text) if text.strip() else "",
+        )
+    return templates
 
 
 def _text(value: Any, limit: int | None = None) -> str | None:
@@ -164,6 +233,11 @@ def is_builtin_connector_id(connector_id: str) -> bool:
     )
 
 
+def custom_id_for(builtin_id: str) -> str:
+    """The id a member's template takes when Anton named it after a built-in connector."""
+    return f"{builtin_id}_custom"
+
+
 def turn_connector_cards(entries: Any) -> tuple[list[dict[str, Any]], list[str]]:
     """Check one ``turn_connector`` reply's drafts again before they are shown.
 
@@ -177,15 +251,27 @@ def turn_connector_cards(entries: Any) -> tuple[list[dict[str, Any]], list[str]]
     items = entries if isinstance(entries, list) else []
     cards: list[dict[str, Any]] = []
     notices: list[str] = []
+    shown: set[str] = set()
     for entry in items[:MAX_DRAFTS_PER_TURN]:
         try:
             draft = parse_connector_draft(entry)
+            asked_id = draft.connector_id
+            if is_builtin_connector_id(draft.connector_id):
+                # Its own id, so every place where a built-in id wins stays right.
+                draft = parse_connector_draft({**entry, "connector_id": custom_id_for(draft.connector_id)})
         except ConnectorDraftError as e:
             notices.append(f"A connector template was not shown: {e}")
             continue
         if is_builtin_connector_id(draft.connector_id):
             notices.append(f"A connector template was not shown: {draft.connector_id!r} is a built-in connector.")
             continue
+        if draft.check is None:
+            notices.append(f"A connector template was not shown: {asked_id!r} {NO_CHECK_REASON}")
+            continue
+        if draft.connector_id in shown:
+            notices.append(f"A second connector template for {draft.connector_id!r} was not shown.")
+            continue
+        shown.add(draft.connector_id)
         cards.append(draft.to_dict())
     if len(items) > MAX_DRAFTS_PER_TURN:
         notices.append(f"{len(items) - MAX_DRAFTS_PER_TURN} more connector template(s) from this turn were not shown.")

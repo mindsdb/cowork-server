@@ -52,6 +52,7 @@ BASE_URL_FIELD = "base_url"
 
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _TOP_LABEL = re.compile(r"[a-z]{2,63}")
+_NO_CHECK_NEXT = "If the API takes a key, ask Anton to build it again; if it takes none, Anton can use it without a connector."
 _ADDRESS_HINT = "type only the address, like api.example.com"
 _REFUSED_WITHOUT_KEY = frozenset({401, 403})
 # A query-key API often refuses a missing key as a bad request. That proves the key only
@@ -130,7 +131,7 @@ def stored_template(row: CustomConnector) -> StoredTemplate:
     """
     template = parse_stored(row)
     if template is None:
-        raise ConnectRefused("no_check", 409, "This connector cannot be connected as saved; ask Anton to build it again.")
+        raise ConnectRefused("no_check", 409, "This connector cannot be connected as saved. " + _NO_CHECK_NEXT)
     return template
 
 

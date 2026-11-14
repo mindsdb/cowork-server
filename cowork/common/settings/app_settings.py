@@ -750,6 +750,11 @@ class TurnQueueSettings(Settings):
     def is_remote(self) -> bool:
         return self.backend == "remote"
 
+    @property
+    def needs_turn_key_id(self) -> bool:
+        """Whether a turn key's public prefix is minted, which auth binds turn grants to."""
+        return self.datasource_enabled or self.connector_drafts_enabled
+
     redis_url: str = Field(
         default="redis://localhost:6379/0",
         description="Redis connection URL used when backend is 'remote'.",
@@ -921,8 +926,8 @@ class TurnQueueSettings(Settings):
         default=False,
         description=(
             "Let cloud turns build custom connector templates a member saves "
-            "from a card and connects. Keep false until hosted turns can use "
-            "what members connect."
+            "from a card, connects and uses on their turns. The code default is false; "
+            "the Helm chart turns it on in every environment (connectorDraftsEnabled)."
         ),
     )  # COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
     custom_connect_refused_domains: list[str] = Field(

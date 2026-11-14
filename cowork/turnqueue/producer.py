@@ -30,19 +30,24 @@ from cowork.handlers.turn_errors import (
 from cowork.coding.reasoning import advertised_levels
 from cowork.schemas.turn_skills import TurnSkillEntry, TurnSkills, turn_skills_wire
 from cowork.services.providers import cached_org_model_catalog, minds_chat_base_url
-from cowork.db.scoped import scope_for_identity
+from cowork.db.scoped import TenantScope, scope_for_identity
+from cowork.db.units import run_db
 from cowork.services import product_permissions
+from cowork.services.connectors.custom_connectors import MemberTurnTemplate, member_turn_templates
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
     list_active_connections,
+    list_custom_api_connections,
     list_verified_datasource_connections,
     mint_turn_key,
     mint_turn_key_details,
+    register_custom_api_grants,
     register_datasource_grants,
     revoke_turn_key,
 )
 from cowork.turnqueue.models import (
+    MAX_CUSTOM_API_CONNECTIONS,
     MAX_DATASOURCE_CONNECTIONS,
     TurnJob,
     TurnJobHeader,
@@ -346,6 +351,56 @@ def _connectors_block(oauth_connections: dict | None) -> dict | None:
     return {engine: {"usage_notes": text} for engine, text in notes.items()} or None
 
 
+def custom_usage_prefix(connector_id: str, connection_ids: list[int], field_names: tuple[str, ...]) -> str:
+    """The fixed paragraph the producer puts before a custom connector's notes.
+
+    Input: the connector id, its connections' ids in this turn, and its
+    template's field names (empty when unknown). Output: how to call it with
+    ``call_minds_api``, that no credential value reaches the turn, and the
+    path rules. Built from ids and names only, never a value. No side effects.
+    """
+    ids = ", ".join(str(connection_id) for connection_id in connection_ids)
+    noun = "connection" if len(connection_ids) == 1 else "connections"
+    call_id = str(connection_ids[0]) if len(connection_ids) == 1 else "connection_id"
+    fields = f" Fields: {', '.join(field_names)}." if field_names else ""
+    return (
+        f"Custom {noun} {ids} ({connector_id}).{fields} No credential value reaches this turn: "
+        f"call it with call_minds_api({call_id}, path, query=None, headers=None) and the gateway "
+        "adds the credentials. Every path starts at the API's host and includes any version, "
+        "such as /v2/eod; a ?name=value part goes in query. The user typed only the host."
+    )
+
+
+async def _with_custom_usage_notes(connectors_block: dict | None, scope: TenantScope,
+                                   custom_api_block: dict) -> dict | None:
+    """The connectors block plus, per custom connector of this turn, the producer's prefix and the template's notes.
+
+    Field names and notes come from the member's own rows only
+    (member_turn_templates). Every custom connector gets the prefix; a
+    template gone, one that no longer parses, or a database that cannot
+    answer leaves out its field names and notes, never the prefix or the turn.
+    Built-in notes win a key clash, as before.
+    """
+    ids_by_connector: dict[str, list[int]] = {}
+    for connection in custom_api_block["connections"]:
+        ids_by_connector.setdefault(connection["connector_id"], []).append(connection["connection_id"])
+    templates: dict[str, MemberTurnTemplate] = {}
+    try:
+        templates = await run_db(partial(member_turn_templates, connector_ids=list(ids_by_connector)), scope=scope)
+    except Exception:
+        logger.warning("[producer] custom connector field names and notes left out: the database did not answer",
+                       exc_info=True)
+    merged: dict[str, dict] = {}
+    for connector_id, connection_ids in ids_by_connector.items():
+        template = templates.get(connector_id)
+        text = custom_usage_prefix(connector_id, connection_ids, template.field_names if template else ())
+        if template is not None and template.notes:
+            text += "\n\n" + template.notes
+        merged[connector_id] = {"usage_notes": text}
+    merged.update(connectors_block or {})
+    return merged or None
+
+
 def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermissionUnavailable:
     """Name the failed check for the operator, who otherwise sees the same
     permission_unavailable for an outage, a malformed row and a bad binding.
@@ -480,6 +535,131 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
         raise _refuse_datasource_grants("grants differ from the requested connection references")
     return {"protocol_version": 1, "connections": refs}
 
+
+
+def _custom_api_connection_refs(connections: list[dict], disabled: list[dict] | None) -> list[dict]:
+    """The custom API connections auth listed, minus the conversation's disabled ones.
+
+    A listing that contradicts itself (not verified, malformed, repeated)
+    fails the turn, as the datasource listing does. Past
+    MAX_CUSTOM_API_CONNECTIONS, the lowest ids are kept.
+
+    Raises:
+        ProductPermissionUnavailable: the listing is malformed.
+    """
+    disabled_keys = {
+        (entry.get("engine"), entry.get("name")) for entry in (disabled or []) if isinstance(entry, dict)
+    }
+    refs: list[dict] = []
+    seen: set[int] = set()
+    for connection in connections:
+        if not isinstance(connection, dict):
+            raise _refuse_custom_api("listing carries a connection that is not an object")
+        connection_id = connection.get("id")
+        if (
+            not isinstance(connection.get("connector_id"), str)
+            or not connection["connector_id"]
+            or not isinstance(connection.get("name"), str)
+            or not connection["name"]
+            or connection.get("status") != "verified"
+            or isinstance(connection_id, bool)
+            or not isinstance(connection_id, int)
+            or connection_id < 1
+            or connection_id in seen
+        ):
+            raise _refuse_custom_api("listing carries a malformed or repeated connection")
+        seen.add(connection_id)
+        if (connection["connector_id"], connection["name"]) in disabled_keys:
+            continue
+        refs.append({"connection_id": connection_id, "connector_id": connection["connector_id"],
+                     "name": connection["name"]})
+    refs.sort(key=lambda ref: ref["connection_id"])
+    if len(refs) > MAX_CUSTOM_API_CONNECTIONS:
+        logger.warning("[producer] %d custom API connections listed; the first %d by id are kept",
+                       len(refs), MAX_CUSTOM_API_CONNECTIONS)
+        refs = refs[:MAX_CUSTOM_API_CONNECTIONS]
+    return refs
+
+
+def _refuse_custom_api(reason: str) -> product_permissions.ProductPermissionUnavailable:
+    """Name the failed check for the operator; a fixed phrase, never a key or a row."""
+    logger.warning("[producer] custom API connections refused: %s", reason)
+    return product_permissions.ProductPermissionUnavailable()
+
+
+async def _mint_custom_api_block(*, scope: TenantScope, correlation_id: str, turn_key_id: str | None,
+                                 disabled: list[dict] | None, settings: TurnQueueSettings) -> dict | None:
+    """The member's custom API connections for this turn, with grants bound to its turn key.
+
+    None, logged, when the turn cannot carry them: outside org mode, the
+    setting off, no turn key prefix (a channel turn), no producer key, a
+    listing that failed, or a grant call auth refused. The turn then runs
+    without custom connections. Only an answer that contradicts this turn
+    fails it.
+
+    Returns:
+        ``{"connections": [{connection_id, connector_id, name, credential_version}]}``;
+        the caller adds the turn key. Versions are the grants', not the listing's.
+
+    Raises:
+        ProductPermissionUnavailable: the listing is malformed, or the grant
+            answer names another member, organization, key, correlation,
+            scope or connection set.
+    """
+    org_id, user_id = scope.org_id, scope.user_id
+    if not settings.connector_drafts_enabled or not scope.org_mode or not org_id or not user_id:
+        return None
+    if not isinstance(turn_key_id, str) or not turn_key_id.strip():
+        logger.info("[producer] custom API connections left out: the turn has no turn key prefix")
+        return None
+    if not settings.datasource_producer_key_id or not settings.datasource_producer_key:
+        logger.warning("[producer] custom API connections left out: the producer key is not configured")
+        return None
+    try:
+        connections = await list_custom_api_connections(
+            org_id=org_id, user_id=user_id, turn_key_id=turn_key_id, settings=settings
+        )
+    except product_permissions.ProductPermissionUnavailable:
+        logger.warning("[producer] custom API connections left out: auth could not list them", exc_info=True)
+        return None
+    refs = _custom_api_connection_refs(connections, disabled)
+    if not refs:
+        return None
+    requested = [ref["connection_id"] for ref in refs]
+    try:
+        response = await register_custom_api_grants(
+            user_id=user_id, org_id=org_id, correlation_id=correlation_id, turn_key_id=turn_key_id,
+            connection_ids=requested, settings=settings,
+        )
+    except product_permissions.ProductPermissionUnavailable:
+        logger.warning("[producer] custom API connections left out: auth refused their grants", exc_info=True)
+        return None
+    if (
+        not _same_identifier(response.get("user_id"), user_id)
+        or not _same_identifier(response.get("organization_id"), org_id)
+        or response.get("turn_key_id") != turn_key_id
+        or not _same_identifier(response.get("correlation_id"), correlation_id)
+        or response.get("audience") != "custom-api"
+        or response.get("purpose") != "fetch"
+    ):
+        raise _refuse_custom_api("grant response binding does not match this turn")
+    grants = response.get("grants")
+    if not isinstance(grants, list):
+        raise _refuse_custom_api("grant response carries no grant list")
+    versions: dict[int, int] = {}
+    for grant in grants:
+        connection_id = grant.get("connection_id") if isinstance(grant, dict) else None
+        version = grant.get("credential_version") if isinstance(grant, dict) else None
+        if (
+            isinstance(connection_id, bool) or not isinstance(connection_id, int)
+            or isinstance(version, bool) or not isinstance(version, int) or version < 1
+            or connection_id in versions
+        ):
+            raise _refuse_custom_api("grant response carries a malformed grant")
+        versions[connection_id] = version
+    if set(versions) != set(requested):
+        raise _refuse_custom_api("grants differ from the requested connections")
+    return {"connections": [{**ref, "credential_version": versions[ref["connection_id"]]} for ref in refs]}
 
 # What the reply loop reports when the worker stops answering. Shaped like the
 # pod's own scrubbed "ExceptionType: message" errors so remote_turn_error can
@@ -873,7 +1053,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
 
             user_settings = await run_on_unit_threads(partial(get_user_settings, scope))
             workspace_id = getattr(user_settings, "hub_workspace_id", "") or None
-            if settings.datasource_enabled:
+            if settings.needs_turn_key_id:
                 (llm_block, turn_key_id), oauth_connections = await asyncio.gather(
                     _mint_llm_block_with_turn_key_id(
                         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
@@ -897,6 +1077,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
             disabled=disabled,
             settings=settings,
         )
+        custom_api_connections = await _mint_custom_api_block(
+            scope=scope, correlation_id=corr, turn_key_id=turn_key_id, disabled=disabled, settings=settings,
+        )
     except product_permissions.ProductPermissionUnavailable:
         logger.warning(
             "[producer] turn setup unavailable conversation=%s correlation_id=%s", conversation_id, corr,
@@ -910,6 +1093,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # and never reach this function at all.
     oauth_block = {**oauth_connections, "turn_key": llm_block.get("api_key", "")} if oauth_connections else None
     connectors_block = _connectors_block(oauth_connections)
+    custom_api_block = (
+        {"turn_key": llm_block.get("api_key", ""), **custom_api_connections} if custom_api_connections else None
+    )
+    if custom_api_block:
+        connectors_block = await _with_custom_usage_notes(connectors_block, scope, custom_api_block)
     browser_block = await _scoped_browser_block(
         scope=scope, conversation_id=conversation_id, turn_key=llm_block.get("api_key", ""),
         project_id=workspace.project_id if workspace is not None else None,
@@ -978,6 +1166,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # entirely when none has notes.
               **({"connectors": connectors_block} if connectors_block else {}),
               **({"datasource": datasource_block} if datasource_block else {}),
+              # The member's own verified custom API connections, by id, with
+              # grants bound to this turn's key; never a field value.
+              **({"custom_api": custom_api_block} if custom_api_block else {}),
               # Conversation creation time, ISO 8601. The pod is fresh every
               # turn and would otherwise stamp today's date into the system
               # prompt, changing the cached prefix at midnight.
