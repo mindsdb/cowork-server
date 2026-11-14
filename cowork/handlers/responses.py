@@ -2965,14 +2965,17 @@ class ResponsesHandler:
                     # record_new_artifacts logs each slug whose index or
                     # owner write fails itself; this covers the unit's own
                     # refusal (a busy pool), a failed commit, or a failed
-                    # check of the folders the diff listed, which it raises
-                    # once its other writes have committed. In org mode
+                    # check of the folders the diff listed or hold of their
+                    # root (ListedLocationsUnchecked), which it raises once
+                    # its other writes have committed, a failed hold having
+                    # logged its own line. In org mode
                     # nothing records these folders later:
                     # reconcile_conversation skips org roots and the owner
                     # backfill runs once, at startup, so they keep no
                     # index row and their owner stays unknown. A turn that
                     # created nothing, or whose record failed only at that
-                    # check, lost only the check, so its line says that.
+                    # check or hold, lost only what the project's self-heal
+                    # writes again, so its line names those two writes.
                     # Without the pod's list nothing else checks the listed
                     # folders, so the project's self-heal does.
                     if touched is None:
@@ -2982,7 +2985,10 @@ class ResponsesHandler:
                     logger.error(
                         "[responses] could not record the artifacts a remote turn created"
                         if changes.created and not isinstance(exc, ListedLocationsUnchecked)
-                        else "[responses] could not check the locations of the artifacts a remote turn listed",
+                        else (
+                            "[responses] could not check the locations of the artifacts a remote turn found,"
+                            " or record the folder that holds them"
+                        ),
                         exc_info=True,
                         extra=log_context(
                             request_id=corr,

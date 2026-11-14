@@ -64,6 +64,7 @@ from cowork.services.artifact_roots import (
     plan_scope_roots,
     readable_sources,
     recorded_location,
+    with_held_roots,
 )
 from cowork.services.artifacts import (
     BackendPreviewRefused,
@@ -326,20 +327,28 @@ def _mark_received_live_apps(
 def _plan_scoped_project(session, *, project_ref: str) -> RootsPlan:
     """The database half of root discovery for one project, run as a unit:
     the server's own id for the selector, then the plan of that project's
-    roots.
+    roots, with the roots its held rows name (with_held_roots). So the list
+    of one project opens only those, and a delete by an old folder name
+    finds only what that list shows.
 
     ``scoped_project_id_for_request`` first enumerates the tenant-scoped
     project catalog and uses the client UUID only as an in-memory equality
     key, so root discovery receives the matching database value."""
     server_project_id = scoped_project_id_for_request(session, project_ref)
     try:
-        return plan_project_roots(session, server_project_id)
+        return with_held_roots(session, plan_project_roots(session, server_project_id))
     except ValueError as exc:
         # The project can disappear between catalog recovery and root discovery.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Unknown project",
         ) from exc
+
+
+def _listed_scope_plan(session) -> RootsPlan:
+    """The unfiltered list's plan: every project of the caller's scope, with
+    the roots the held rows name (with_held_roots), in one database unit."""
+    return with_held_roots(session, plan_scope_roots(session))
 
 
 async def _scoped_project_plan(scope: TenantScope, project_id: UUID | str) -> RootsPlan:
@@ -727,7 +736,7 @@ async def list_artifacts(
             )
         plan = await _scoped_project_plan(scope, project_ref)
         return await _cards_for(scope, partial(readable_sources, plan))
-    plan = await run_db(plan_scope_roots, scope=scope)
+    plan = await run_db(_listed_scope_plan, scope=scope)
     return await _cards_for(scope, partial(_browsable_sources, plan=plan))
 
 

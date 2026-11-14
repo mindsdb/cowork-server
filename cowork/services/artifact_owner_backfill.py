@@ -20,11 +20,15 @@ from the path. The result is only logged. To run the pass again, delete the
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Collection
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import UUID
 
 import sqlalchemy as sa
+from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from cowork.common.logger import log_context
@@ -98,13 +102,89 @@ def sentinel_present(engine, key: str = SENTINEL_KEY) -> bool:
         return SettingService(raw)._fetch_row(key) is not None
 
 
-def write_sentinel(engine, key: str = SENTINEL_KEY) -> None:
+def _global_row(raw: Session, key: str) -> Setting | None:
+    """The global (NULL-scope) settings row `key`, where a backfill keeps its
+    sentinel and its progress."""
+    return raw.exec(select(Setting).where(Setting.key == key, Setting.scope.is_(None))).first()
+
+
+def _write_global_value(engine, key: str, value: str) -> None:
+    """Write `value` into the global settings row `key`, adding the row when
+    there is none. A row another replica added meanwhile is left as it is."""
     with Session(engine) as raw:
-        raw.add(Setting(key=key, value="1"))
+        row = _global_row(raw, key) or Setting(key=key, value=value)
+        row.value = value
+        raw.add(row)
         try:
             raw.commit()
         except sa.exc.IntegrityError:
             raw.rollback()  # another replica finished first
+
+
+def write_sentinel(engine, key: str = SENTINEL_KEY, *, value: str = "1") -> None:
+    """Write the sentinel `key` holding `value`, or set the value of the one
+    already there: a sentinel that lists what its pass left
+    (held_artifact_roots) is rewritten by a later pass."""
+    _write_global_value(engine, key, value)
+
+
+class BackfillProgress(BaseModel):
+    """What earlier passes of a backfill finished, kept across starts in one
+    global setting row per backfill (read_progress, save_progress). One row,
+    not one per project: the settings service reads every global row on each
+    load."""
+
+    #: The last project, in id order, a pass finished.
+    after: UUID | None = None
+    #: Projects a pass could not read; each start walks them again.
+    unread: list[UUID] = []
+
+    def finished(self, *, project_id: UUID, read: bool) -> BackfillProgress:
+        """This progress once the walk is past `project_id`, which it read
+        or could not read."""
+        unread = [project for project in self.unread if project != project_id]
+        if not read:
+            unread.append(project_id)
+        after = project_id if self.after is None else max(self.after, project_id)
+        return BackfillProgress(after=after, unread=unread)
+
+    def within(self, project_ids: Collection[UUID]) -> BackfillProgress:
+        """This progress less the unread projects `project_ids` leaves out. A
+        pass's query returns every unread project that still exists, so one
+        deleted since leaves the progress here, or the walk would never
+        finish it."""
+        return BackfillProgress(after=self.after, unread=[p for p in self.unread if p in project_ids])
+
+
+def read_progress(engine, key: str) -> BackfillProgress:
+    """The progress a backfill kept in the global setting row `key`, or a
+    fresh one."""
+    with Session(engine) as raw:
+        row = _global_row(raw, key)
+        return BackfillProgress.model_validate_json(row.value) if row is not None else BackfillProgress()
+
+
+def save_progress(engine, key: str, *, progress: BackfillProgress) -> None:
+    _write_global_value(engine, key, progress.model_dump_json())
+
+
+def delete_progress(engine, key: str) -> None:
+    with Session(engine) as raw:
+        row = _global_row(raw, key)
+        if row is not None:
+            raw.delete(row)
+            raw.commit()
+
+
+class BackfillStopped(Exception):
+    """A backfill's ``stop`` was set during its walk."""
+
+
+def check_stop(stop: threading.Event | None) -> None:
+    """Raise BackfillStopped once ``stop`` is set, so a walk ends at its next
+    project, root or id."""
+    if stop is not None and stop.is_set():
+        raise BackfillStopped
 
 
 def _is_candidate(folder: Path) -> bool:

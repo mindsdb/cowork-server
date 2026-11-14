@@ -14,6 +14,7 @@ silently leak across builds and defeat the isolation.
 
 import os
 import shutil
+import stat
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -42,6 +43,11 @@ O_BINARY = getattr(os, "O_BINARY", 0)
 # ``O_NONBLOCK`` is POSIX-only too. An open with it never waits on a FIFO at
 # the path; Windows has no FIFOs a path can name, so 0 there loses nothing.
 O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+# Linux only: a descriptor that names a directory without opening it for
+# reading, so the open checks no permission. On NFS that is one ACCESS call
+# fewer per folder. 0 where the platform has none, and dir_child_stat then
+# opens the folder as open_pinned_child does.
+O_PATH = getattr(os, "O_PATH", 0)
 
 
 def cowork_home() -> Path:
@@ -169,6 +175,28 @@ def dir_stat(
     if d.fd is not None:
         return os.stat(name, dir_fd=d.fd, follow_symlinks=follow_symlinks)
     return os.stat(d.path / name, follow_symlinks=follow_symlinks)
+
+
+def dir_child_stat(d: PinnedDir, name: str, child: str) -> os.stat_result:
+    """``os.stat`` of *child* inside *name*, a direct child folder of *d*,
+    refusing a link in place of *name* as open_pinned_child does: with
+    ``O_PATH | O_NOFOLLOW | O_DIRECTORY`` where the platform has ``O_PATH``,
+    which a link fails with ENOTDIR, else by opening the folder ``O_NOFOLLOW``
+    after a no-follow stat says it is one. *child* is followed, as dir_stat
+    does by default."""
+    if d.fd is not None and O_PATH:
+        fd = os.open(name, O_PATH | O_NOFOLLOW | O_DIRECTORY | os.O_CLOEXEC, dir_fd=d.fd)
+        try:
+            return os.stat(child, dir_fd=fd)
+        finally:
+            os.close(fd)
+    if not stat.S_ISDIR(dir_stat(d, name, follow_symlinks=False).st_mode):
+        raise NotADirectoryError(name)
+    folder = open_pinned_child(d, name)
+    try:
+        return dir_stat(folder, child)
+    finally:
+        folder.close()
 
 
 def is_child_name(name: str) -> bool:

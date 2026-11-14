@@ -595,6 +595,58 @@ def test_a_skill_sharing_downgrade_takes_the_backfill_marker_with_the_rows(tmp_p
     assert marker == 0
 
 
+def test_held_artifact_roots_keep_one_row_per_root_and_take_their_sentinel_on_downgrade(tmp_path, monkeypatch):
+    """One row per root: a project's shared root (no conversation) and each
+    legacy root once. The settings row that says the backfill filled them
+    goes with the table on a downgrade: left behind, a re-upgrade's list
+    would trust an empty table and show no card. So does the backfill's
+    progress, which would let a re-upgrade's backfill skip projects."""
+    from cowork.services.held_artifact_roots import PROGRESS_KEY, SENTINEL_KEY
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "held-roots.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    project, conversation = uuid.uuid4().hex, uuid.uuid4().hex
+    insert = text(
+        "INSERT INTO held_artifact_roots (id, org_id, project_id, conversation_id) "
+        "VALUES (:id, :org, :project, :conversation)"
+    )
+
+    def add(conversation_id) -> None:
+        with engine.begin() as connection:
+            connection.execute(
+                insert, {"id": uuid.uuid4().hex, "org": _ORG, "project": project, "conversation": conversation_id}
+            )
+
+    add(None)
+    add(conversation)
+    for again in (None, conversation):
+        with pytest.raises(IntegrityError):
+            add(again)
+    with engine.begin() as connection:
+        _insert_setting(connection, key=SENTINEL_KEY, value='{"unread": []}')
+        _insert_setting(connection, key=PROGRESS_KEY, value='{"after": null, "unread": []}')
+        _insert_setting(connection, key="tone", value="balanced", scope="org", org_id=_ORG)
+
+    _downgrade_to(engine, uri, "f93151b5bad1")
+    with engine.connect() as connection:
+        keys = {row[0] for row in connection.execute(text("SELECT key FROM settings"))}
+    assert "held_artifact_roots" not in inspect(engine).get_table_names()
+    assert SENTINEL_KEY not in keys and PROGRESS_KEY not in keys
+    assert "tone" in keys
+
+    _upgrade_to(engine, uri, "head")
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT count(*) FROM held_artifact_roots")).scalar_one()
+        sentinel = connection.execute(
+            text("SELECT count(*) FROM settings WHERE key = :key"), {"key": SENTINEL_KEY}
+        ).scalar_one()
+    assert (rows, sentinel) == (0, 0)
+
+
 def test_artifact_owner_choices_upgrade_and_downgrade(tmp_path, monkeypatch):
     """One row per artifact per organization, keyed by its authorization key;
     the downgrade drops the table, so a re-upgrade never judges a re-publish

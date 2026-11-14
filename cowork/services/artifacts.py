@@ -36,6 +36,7 @@ from cowork.common.minds_tls import minds_ssl_verify
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
+    dir_child_stat,
     dir_open,
     dir_rmtree,
     dir_scandir,
@@ -1878,15 +1879,16 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                         except OSError:
                             continue
                 for child_name in sorted(child_names):
+                    # One no-follow open of the folder and one stat of its
+                    # metadata.json (dir_child_stat), the least a sort by that
+                    # time can cost on the file store. A folder that would not
+                    # open, or holds no metadata.json, sorts last at 0; the
+                    # build pass below opens it no-follow again and skips it.
                     try:
-                        with _opened_child_directory(root, child_name) as pinned_folder:
-                            try:
-                                mtime = dir_stat(pinned_folder, "metadata.json").st_mtime
-                            except OSError:
-                                mtime = 0.0
-                            candidates.append((mtime, source_idx, child_name, source))
-                    except (OSError, ValueError):
-                        continue
+                        mtime = dir_child_stat(root, child_name, "metadata.json").st_mtime
+                    except OSError:
+                        mtime = 0.0
+                    candidates.append((mtime, source_idx, child_name, source))
         except (OSError, ValueError):
             continue
 

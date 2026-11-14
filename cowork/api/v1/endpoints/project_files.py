@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NamedTuple
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
@@ -38,6 +38,7 @@ from cowork.api.v1.endpoints.connectors.sharepoint import (
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, require
 from cowork.api.v1.pinned_response import PinnedStreamingResponse
 
+from cowork.common.logger import log_context
 from cowork.common.paths import (
     O_NOFOLLOW,
     O_NONBLOCK,
@@ -83,7 +84,12 @@ from cowork.schemas.sharepoint import (
     SharePointImportResponse,
     SharePointSkippedItem,
 )
-from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME, SERVER_PROJECT_FOLDERS
+from cowork.services.artifact_roots import (
+    _ARTIFACTS_SUBPATH,
+    CONVERSATIONS_DIRNAME,
+    SERVER_PROJECT_FOLDERS,
+    workspace_conversation_id,
+)
 from cowork.services.artifacts import _is_the_projects_secrets
 from cowork.services.connectors.sharepoint import (
     DownloadBudget,
@@ -807,6 +813,34 @@ def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) 
     conversation id is the only workspace the operation can reach.
     """
     if not _conversation_workspace_ok(path.value, scoped):
+        raise HTTPException(status_code=404, detail="File not found")
+
+
+def _require_canonical_workspace(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:
+    """404, the answer a co-member's workspace gets, before a PUT writes into
+    a conversation workspace named by another spelling of its id.
+
+    In org mode the artifacts list and the held rows' backfill read a
+    workspace only under its canonical name, str(conversation_id)
+    (artifact_roots.workspace_conversation_id), so an artifact folder written
+    below another spelling would never be listed. An uppercase spelling is
+    another folder on a case-sensitive store and the same folder on a
+    case-insensitive one. A spelling without hyphens or with braces is another
+    folder on both. Only the PUT calls this, since it is the one route that
+    writes below a workspace: the owner still lists, reads, previews and
+    deletes what such a folder already holds (_conversation_workspace_ok).
+    Elsewhere no artifacts list reads a workspace, so nothing is refused.
+    """
+    if not scoped.scope.org_mode:
+        return
+    parts = path.parts
+    if len(parts) < 2 or parts[0] != CONVERSATIONS_DIRNAME:
+        return
+    try:
+        UUID(parts[1])
+    except ValueError:
+        return  # not a conversation workspace: a shared project folder
+    if workspace_conversation_id(parts[1]) is None:
         raise HTTPException(status_code=404, detail="File not found")
 
 
@@ -1701,6 +1735,72 @@ def _read_project_file(
     return response
 
 
+class _ArtifactFolderWrite(NamedTuple):
+    """The artifact folder a project files PUT wrote into: the conversation
+    whose legacy root holds it, None for the project's shared root, and the
+    folder's name."""
+
+    conversation_id: UUID | None
+    slug: str
+
+
+def _artifact_folder_written(path: _ValidatedProjectPath) -> _ArtifactFolderWrite | None:
+    """The artifact folder `path` lies in, when it lies in one: below a
+    project's shared root (`.anton/artifacts/<slug>/...`), or below a
+    conversation's legacy root (`conversations/<id>/.anton/artifacts/<slug>/
+    ...`), whose workspace name only counts in its canonical spelling
+    (artifact_roots.workspace_conversation_id). A file directly in a root is
+    no folder, and a folder whose name starts with a dot is none the list
+    opens (held_artifact_roots.holds_a_folder). Compared by parts,
+    case-sensitive, as the organization's file store is; the write refuses a
+    link in every component, so these parts are where it wrote."""
+    parts = path.parts
+    conversation_id = None
+    if parts[0] == CONVERSATIONS_DIRNAME and len(parts) > 2:
+        conversation_id = workspace_conversation_id(parts[1])
+        if conversation_id is None:
+            return None
+        parts = parts[2:]
+    if len(parts) < 4 or parts[:2] != _ARTIFACTS_SUBPATH or parts[2].startswith("."):
+        return None
+    return _ArtifactFolderWrite(conversation_id=conversation_id, slug=parts[2])
+
+
+def _record_artifact_folder_write(scoped: ScopedSession, *, project_name: str, path: _ValidatedProjectPath) -> None:
+    """After a PUT wrote into an artifact folder (_artifact_folder_written),
+    record that the folder's root holds one, in the PUT's own unit, so the
+    artifacts list opens that root (held_artifact_roots.hold_root): the
+    project's shared root, or the caller's own conversation's legacy root,
+    which after the backfill only this PUT and a comparison side's carry
+    (ComparisonService._hold_carried_workspace) record. Only org tenancy keeps
+    these rows. Reads the project's row, and makes no file store call.
+
+    Best-effort: the file is written already, so a failure is logged at
+    ERROR and the PUT still succeeds. A shared root is then held at the
+    project's next turn end or self-heal that finds the folder, and a legacy
+    root at the next write into it."""
+    from cowork.services.artifact_locations import keeps_locations
+    from cowork.services.held_artifact_roots import hold_root
+
+    folder = _artifact_folder_written(path)
+    if folder is None or not keeps_locations(scoped.scope):
+        return
+    project_id = None
+    try:
+        project_id = _project_for_name(project_name, scoped).id
+        hold_root(scoped, project_id=project_id, conversation_id=folder.conversation_id)
+    except Exception:
+        scoped.rollback()
+        logger.error(
+            "Could not record that a project files write put an artifact folder in its root",
+            exc_info=True,
+            extra={
+                "event": "held_artifact_root_not_recorded",
+                **log_context(project_id=project_id, conversation_id=folder.conversation_id, artifact_slug=folder.slug),
+            },
+        )
+
+
 @router.put(
     "/{project_name}/files/{path:path}",
     response_model=ProjectFileWriteResponse,
@@ -1728,6 +1828,7 @@ def _write_project_file(
     principal: Principal | None,
 ):
     _require_workspace_path(path, scoped)
+    _require_canonical_workspace(path, scoped)
     classification_base = (
         _project_dir(project_name, scoped) if scoped.scope.org_mode else None
     )
@@ -1838,6 +1939,7 @@ def _write_project_file(
             )
         raise
     response = {"path": path.value, "size": st.st_size, "modified": st.st_mtime}
+    _record_artifact_folder_write(scoped, project_name=project_name, path=path)
     if instructions_context is not None:
         project = instructions_context.project
         access = instructions_context.access
