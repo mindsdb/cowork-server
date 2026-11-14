@@ -61,7 +61,7 @@
             "required": true,
             "secret": true,
             "placeholder": "Paste your Rippling OAuth client secret",
-            "description": "Shown once when you create the app in Rippling. Store it securely — Anton encrypts it locally."
+            "description": "Shown once when you create the app in Rippling. Store it securely."
           }
         ]
       }

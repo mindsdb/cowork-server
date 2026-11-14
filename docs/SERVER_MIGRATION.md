@@ -41,7 +41,7 @@ Key structural API changes from the design doc:
 - Artifacts service — still entirely filesystem-based (`<project>/.anton/artifacts/<slug>/`), reading `metadata.json` from disk. No DB table.
 - Publish service — same flow, same `state.json` on disk.
 - Scratchpad — only the cancel stub exists; the full scratchpad is still managed by the harness (Anton core).
-- Connectors/data vault — `LocalDataVault` from Anton core, filesystem-based encrypted credentials.
+- Connectors/data vault — `LocalDataVault` from Anton core, one JSON file per connection on the filesystem.
 
 **Rethought:**
 - **Conversations and messages** — previously stored as episodes on the filesystem by Anton's `HistoryStore`. Now first-class DB entities. Messages are persisted during streaming with a companion `message_events` table that stores the SSE event log for replay, with each run of adjacent text deltas stored as one merged delta.
