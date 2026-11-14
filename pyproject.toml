@@ -233,6 +233,7 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.25.0",
     "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.pytest.ini_options]
@@ -250,4 +251,4 @@ markers = [
 # Integration branch only, never merged: anton from the anton integration branch
 # (connector templates, custom API sections), which no release carries yet.
 # Not for merging.
-anton-agent = { git = "https://github.com/mindsdb/anton", rev = "aa0267203cf9d04f5341fba2869df1fc89e6d7de" }
+anton-agent = { git = "https://github.com/mindsdb/anton", rev = "0283ed1d8b1d77716e7d42c92ebcdffbc8e9f097" }
