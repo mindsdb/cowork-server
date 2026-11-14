@@ -151,6 +151,8 @@ def test_route_cases(client, local_artifact, case):
     after = _snapshot(folder)
     if case["status"] != 200:
         assert after == before
+        if "detail" in case:
+            assert response.json()["detail"] == case["detail"]
         return
     written = case["written"]
     assert response.json() == {

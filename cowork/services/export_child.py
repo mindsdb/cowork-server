@@ -30,7 +30,7 @@ import struct
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import BinaryIO, NamedTuple
+from typing import BinaryIO, NamedTuple, NoReturn
 
 from pydantic import BaseModel, TypeAdapter
 
@@ -341,6 +341,15 @@ def _deny_network_and_processes() -> Callable[[], int]:
     return lambda: denied
 
 
+def _exit_refused(*, why: str) -> NoReturn:
+    """End as refused, which the server answers 413, leaving *why* on the error output it logs."""
+    try:
+        sys.stderr.write(f"{why}\n")
+        sys.stderr.flush()
+    finally:
+        os._exit(EXIT_REFUSED)
+
+
 def main() -> None:
     """Run one conversion: ``argv`` gives the memory and CPU-time limits, in bytes and seconds.
 
@@ -362,7 +371,7 @@ def main() -> None:
         )
         if len(conversion.data) > MAX_PAYLOAD_BYTES:
             # More than the server reads in one frame: refused as too large.
-            os._exit(EXIT_REFUSED)
+            _exit_refused(why="the output is past the frame bound")
         write_frame(
             stream=frames_out,
             message=Converted(
@@ -373,7 +382,13 @@ def main() -> None:
             payload=conversion.data,
         )
     except (MarkdownRefused, MemoryError):
-        os._exit(EXIT_REFUSED)
+        why = ""
+        try:
+            # Types and locations only, so a real bug behind a refusal shows
+            # in the server's log without the document's values.
+            why = safe_exception_traceback(sys.exc_info()) or ""
+        finally:
+            _exit_refused(why=why)
     except BaseException:
         try:
             # Types and locations only: an exception's values can repeat the document.

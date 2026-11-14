@@ -62,6 +62,10 @@ _ERROR_TAIL_BYTES = 2048
 # One conversion process per server process: a hosted replica has 1 GiB for
 # the server and its conversion together.
 _child_slot = threading.BoundedSemaphore(1)
+# The folder the process starts in: the filesystem root (on Windows, the
+# current drive's), so it inherits no folder of the server's, and the server's
+# user can't write there.
+CHILD_CWD = os.path.abspath(os.sep)
 
 if sys.platform == "win32":
     _CREATION_FLAGS = subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
@@ -175,6 +179,7 @@ def _run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         close_fds=True,
+        cwd=CHILD_CWD,
         env=command.environment,
         creationflags=_CREATION_FLAGS,
     )
@@ -322,7 +327,8 @@ def _outcome(
     A complete result counts whatever ended the process afterwards. The log
     lines use the fields the server's log formatter keeps (``reason``,
     ``error_type``, ``stack``); a process that failed before it could report
-    leaves the end of its error output in ``stack``.
+    leaves the end of its error output in ``stack``, and so does one that
+    refused its source, which writes there why.
     """
     message = exchange.message
     if isinstance(message, Converted):
@@ -340,10 +346,11 @@ def _outcome(
             # A signal: SIGXCPU or SIGKILL at the CPU-time limit, or a crash.
             cause = f"signal {-returncode}"
     if cause is not None:
-        logger.warning(
-            "Export conversion stopped",
-            extra={"event": "export_conversion_stopped", "reason": cause},
-        )
+        extra = {"event": "export_conversion_stopped", "reason": cause}
+        if cause == "refused":
+            # The refusal's types and locations, never its values.
+            extra["stack"] = error_tail
+        logger.warning("Export conversion stopped", extra=extra)
         raise ConversionOverrun(cause)
     if isinstance(message, ConversionFailed):
         logger.warning(
@@ -404,7 +411,9 @@ class _Watch:
     The wall clock counts from the start, imports included. Memory is what
     ``_held_bytes`` reads, checked every ``_WATCH_SECONDS``, so a fast
     allocation can pass the limit by what it takes in one check. On Linux the
-    process's own address-space limit is the hard bound.
+    process's own address-space limit is the hard bound. On macOS and Windows
+    this watch is the only memory limit, so a running process whose memory
+    can't be read is killed, not left to run unwatched.
     """
 
     def __init__(self, *, process: subprocess.Popen, limits: ChildLimits) -> None:
@@ -423,10 +432,7 @@ class _Watch:
         self._thread.join()
 
     def _run(self) -> None:
-        try:
-            watched = psutil.Process(self._process.pid)
-        except psutil.Error:
-            return
+        watched: psutil.Process | None = None
         while not self._stopped.wait(_WATCH_SECONDS):
             if self._process.poll() is not None:
                 return
@@ -434,8 +440,14 @@ class _Watch:
                 self._stop(cause="wall clock")
                 return
             try:
+                if watched is None:
+                    watched = psutil.Process(self._process.pid)
                 held = _held_bytes(watched=watched)
             except psutil.Error:
+                # A process that exited under the read is reaped here; one
+                # still running is never left without its limits.
+                if self._process.poll() is None:
+                    self._stop(cause="memory unreadable")
                 return
             if held > self._limits.memory_bytes:
                 self._stop(cause="memory")

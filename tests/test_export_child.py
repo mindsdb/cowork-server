@@ -553,6 +553,44 @@ def test_the_watch_kills_a_process_that_holds_more_than_its_memory_limit(monkeyp
     assert _descendants() == children
 
 
+def test_the_watch_kills_a_process_whose_memory_it_cant_read(monkeypatch, tmp_path):
+    """On macOS and Windows the watch is the only memory limit, so a process it
+    can't read doesn't run on unwatched, and the wall clock never goes with it."""
+
+    def unreadable(*, watched):
+        raise psutil.AccessDenied(watched.pid)
+
+    monkeypatch.setattr(export_runner, "_held_bytes", unreadable)
+    _fake_child(monkeypatch, "import time; time.sleep(20)")
+    children = _descendants()
+    started = time.monotonic()
+
+    with pytest.raises(export_runner.ConversionOverrun) as overrun:
+        _convert(tmp_path=tmp_path, wall_seconds=30.0)
+
+    assert overrun.value.cause == "memory unreadable"
+    assert time.monotonic() - started < 5
+    assert _descendants() == children
+
+
+def test_an_error_while_talking_to_the_process_kills_it_at_once(monkeypatch, tmp_path):
+    """Waited for instead, a busy process would hold the export until its wall clock."""
+
+    def broken(**_kwargs):
+        raise RuntimeError("the server failed mid-conversion")
+
+    monkeypatch.setattr(export_runner, "_talk", broken)
+    _fake_child(monkeypatch, "import time; time.sleep(20)")
+    children = _descendants()
+    started = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="the server failed mid-conversion"):
+        _convert(tmp_path=tmp_path, wall_seconds=15.0)
+
+    assert time.monotonic() - started < 5
+    assert _descendants() == children
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows has no signals")
 def test_a_process_killed_by_a_signal_is_an_overrun(monkeypatch, tmp_path):
     _fake_child(monkeypatch, "import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
@@ -685,6 +723,31 @@ def test_the_process_refuses_a_connection_and_a_process_start():
     assert finished.returncode == 0, finished.stderr
     assert finished.stdout.strip() == "2"
     assert hits == []
+
+
+_OPENS_A_SOCKET = """
+import socket, sys
+from cowork.services import export_child
+
+def convert(**_kwargs):
+    try:
+        socket.socket()
+    except RuntimeError:
+        pass
+    return export_child.Conversion(data=b"out", omitted_count=0, scripts_dropped=False)
+
+export_child.convert = convert
+sys.argv = ["export_child", str(2048 * 1024 * 1024), "31"]
+export_child.main()
+"""
+
+
+def test_a_conversion_that_opens_a_socket_fails_the_export(monkeypatch, tmp_path):
+    """Through ``main``, so the export fails only if ``main`` installs the refusal."""
+    _fake_child(monkeypatch, _OPENS_A_SOCKET)
+
+    with pytest.raises(export_runner.ConversionError, match="tried to connect"):
+        _convert(tmp_path=tmp_path)
 
 
 _CLOSURE_PROBE = """
@@ -924,6 +987,57 @@ def test_a_failed_conversion_logs_where_it_failed_but_not_the_documents_values(
     assert (line["event"], line["error_type"]) == ("export_conversion_failed", "ValueError")
     assert "in convert" in line["stack"]
     assert "text from the document" not in json.dumps(line)
+
+
+_REFUSES_WITH_A_VALUE = """
+import sys
+from cowork.services import export_child
+from cowork.services.markdown_render import MarkdownRefused
+
+def convert(**_kwargs):
+    try:
+        raise ValueError("text from the document")
+    except ValueError as exc:
+        raise MarkdownRefused("Python-Markdown can't convert this document") from exc
+
+export_child.convert = convert
+sys.argv = ["export_child", str(2048 * 1024 * 1024), "31"]
+export_child.main()
+"""
+
+
+def test_a_refused_conversion_logs_what_refused_it_but_not_the_documents_values(
+    monkeypatch, tmp_path, caplog
+):
+    """A real bug behind a refusal, such as an extension's ``ValueError``, shows
+    in the log instead of passing as a silent 413."""
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    _fake_child(monkeypatch, _REFUSES_WITH_A_VALUE)
+
+    with caplog.at_level(logging.WARNING, logger=RUNNER_LOGGER):
+        with pytest.raises(export_runner.ConversionOverrun):
+            _convert(tmp_path=tmp_path)
+
+    [record] = _runner_records(caplog)
+    line = _formatted(record)
+    assert (line["event"], line["reason"]) == ("export_conversion_stopped", "refused")
+    assert "MarkdownRefused: [error details omitted]" in line["stack"]
+    assert "ValueError: [error details omitted]" in line["stack"]
+    assert "in convert" in line["stack"]
+    assert "text from the document" not in json.dumps(line)
+
+
+def test_the_process_starts_in_the_filesystem_root(monkeypatch, tmp_path, caplog):
+    """No folder of the server's, which ``-I`` keeps off the import path but not out of reach."""
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    _fake_child(monkeypatch, "import os, sys; sys.stderr.write(os.getcwd()); sys.exit(1)")
+
+    with caplog.at_level(logging.WARNING, logger=RUNNER_LOGGER):
+        with pytest.raises(export_runner.ConversionError):
+            _convert(tmp_path=tmp_path)
+
+    [record] = _runner_records(caplog)
+    assert _formatted(record)["stack"] == os.path.abspath(os.sep)
 
 
 def test_a_process_that_fails_before_it_reports_leaves_its_last_error_in_the_log(
