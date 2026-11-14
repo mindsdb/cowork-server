@@ -489,18 +489,32 @@ def _apply_project_engram(
 # The ``<!-- key:value ... -->`` comment that ends a saved entry line, as
 # anton's Hippocampus finds it (_extract_metadata).
 _METADATA_TAIL = re.compile(r"\s*<!--[^>]*-->\s*$")
+# The sentence punctuation a line's end may carry or drop without naming a
+# different entry. anton strips the same characters (_SENTENCE_END in
+# anton/core/memory/hippocampus.py).
+_SENTENCE_END = ".!?;:"
 
 
 def normalize_memory_line(text: str) -> str:
     """The form a forget request and a saved memory entry are compared in.
 
     It drops the metadata tail and the surrounding whitespace, turns each run
-    of whitespace inside into one space, and folds case. A request removes an
-    entry only when the two normalize to the same text: never on a substring
-    and never on a near match. anton's forget tool compares in the same form,
-    so a change here changes which entries a cloud turn's request removes.
+    of whitespace inside into one space, folds case, and drops the sentence
+    punctuation (``. ! ? ; :``) that ends the text. A text that is only such
+    punctuation keeps it, and so does one where the punctuation follows a
+    ``-->``: without it, the pod's form, normalized here once more, would
+    lose that note as metadata. A request removes an entry only when the two
+    normalize to the same text: never on a substring and never on a near
+    match, so two entries that differ only in their ending punctuation are
+    removed together. anton's forget tool compares in the same form
+    (normalize_entry_text in anton/core/memory/hippocampus.py), so a change
+    here changes which entries a cloud turn's request removes.
     """
-    return " ".join(_METADATA_TAIL.sub("", text).split()).casefold()
+    folded = " ".join(_METADATA_TAIL.sub("", text).split()).casefold()
+    stripped = folded.rstrip(_SENTENCE_END + " ")
+    if not stripped or stripped.endswith("-->"):
+        return folded
+    return stripped
 
 
 class _WireForget(BaseModel):

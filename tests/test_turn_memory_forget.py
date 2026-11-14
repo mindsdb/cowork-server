@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from contextlib import contextmanager
 from types import SimpleNamespace
 from uuid import uuid4
@@ -116,20 +117,60 @@ def _refusals(caplog) -> list[logging.LogRecord]:
 # The matching rule anton's forget tool shares
 
 
-def test_normalize_memory_line_pins_the_shared_matching_rule():
-    """anton's forget tool compares in this same form, so each part is pinned:
-    the metadata tail and surrounding whitespace go, inner whitespace collapses
-    to one space, and case folds. Nothing else changes."""
-    assert normalize_memory_line(
-        "  Reply   in\tSpanish <!-- confidence:high source:user ts:2026-11-12 -->  "
-    ) == "reply in spanish"
-    assert normalize_memory_line("Reply in Spanish\n") == "reply in spanish"
-    assert normalize_memory_line("Straße") == "strasse"
-    # Only a tail is metadata; a comment inside the line is the line's text.
-    assert normalize_memory_line("a <!-- b --> c") == "a <!-- b --> c"
-    # A bullet is the line's text too, as the rule states.
-    assert normalize_memory_line("- Reply in Spanish") == "- reply in spanish"
-    assert normalize_memory_line("<!-- ts:2026-11-12 -->") == ""
+# The form a saved entry is compared in, case by case. anton's
+# tests/test_forget_memory.py holds this same table (_SHARED_FORM) for its
+# normalize_entry_text; change both together.
+_SHARED_FORM = [
+    ("  Reply   in\tSpanish <!-- confidence:high source:user ts:2026-11-12 -->  ", "reply in spanish"),
+    ("Reply in Spanish\n", "reply in spanish"),
+    ("Straße", "strasse"),
+    ("a <!-- b --> c", "a <!-- b --> c"),                  # only a tail is metadata
+    ("- Reply in Spanish", "- reply in spanish"),          # an entry's own bullet stays
+    ("<!-- ts:2026-11-12 -->", ""),
+    ("Preferred chart color: teal (#008080).", "preferred chart color: teal (#008080)"),
+    ("Preferred chart color: teal (#008080). <!-- confidence:high source:user ts:2026-11-14 -->",
+     "preferred chart color: teal (#008080)"),
+    ("Preferred chart color: teal (#008080)", "preferred chart color: teal (#008080)"),
+    ("Reply in Spanish!", "reply in spanish"),
+    ("Reply in Spanish?", "reply in spanish"),
+    ("Reply in Spanish;", "reply in spanish"),
+    ("Reply in Spanish:", "reply in spanish"),
+    ("Reply in Spanish ?!.. ", "reply in spanish"),        # a run of it, spaces between
+    ("Use v1.2 of the API: always.", "use v1.2 of the api: always"),
+    ("Reply in Spanish,", "reply in spanish,"),            # a comma stays
+    ("(see the docs.)", "(see the docs.)"),                # punctuation before a bracket stays
+    ("Reply in Spanish…", "reply in spanish…"),            # so does an ellipsis character
+    # Stripped, a note would end the form and a second pass would drop it.
+    ("Reply in Spanish <!-- x --> .", "reply in spanish <!-- x --> ."),
+    ("...", "..."),                                       # only punctuation keeps it
+    ("Name: Ada", "name: ada"),
+]
+
+
+@pytest.mark.parametrize("text, form", _SHARED_FORM)
+def test_normalize_memory_line_pins_the_shared_matching_rule(text, form):
+    assert normalize_memory_line(text) == form
+    # The pod sends an entry in this form, and it is normalized here once more.
+    assert normalize_memory_line(form) == form
+
+
+# anton's rule for a saved entry (normalize_entry_text in
+# anton/core/memory/hippocampus.py, with _extract_metadata), restated here to
+# pin cowork's to it.
+_ANTON_TAIL = re.compile(r"\s*<!--([^>]*)-->\s*$")
+
+
+def _anton_form(text: str) -> str:
+    tail = _ANTON_TAIL.search(text)
+    clean = text[: tail.start()].strip() if tail else text.strip()
+    folded = " ".join(clean.split()).casefold()
+    stripped = folded.rstrip(".!?;: ")
+    return folded if not stripped or stripped.endswith("-->") else stripped
+
+
+@pytest.mark.parametrize("text, form", _SHARED_FORM)
+def test_anton_normalizes_an_entry_to_the_same_form(text, form):
+    assert _anton_form(text) == form
 
 
 # The caller's own tier
@@ -178,6 +219,45 @@ def test_a_profile_fact_is_removed(org_engine):
     profile = _global(alice)["profile"]
     assert "Name: Zoran" not in profile
     assert "Role: analyst" in profile
+
+
+@pytest.mark.parametrize("saved, kind, sent", [
+    # The pod's form of the line the model sent without the saved period.
+    ("Preferred chart color: teal (#008080).", "profile", "preferred chart color: teal (#008080)"),
+    ("Label chart axes in English.", "always", "label chart axes in english"),
+    ("Label chart axes in English", "always", "label chart axes in english."),
+])
+def test_an_entry_is_removed_whether_or_not_either_side_ends_in_a_period(org_engine, saved, kind, sent):
+    alice = _scope(ALICE)
+    apply_turn_memory(alice, None, [
+        {"text": saved, "kind": kind, "scope": "global"},
+        {"text": "Role: analyst", "kind": "profile", "scope": "global"},
+    ])
+
+    assert apply_turn_forget(alice, None, [{"text": sent, "scope": "global"}]) == 1
+
+    memory = _global(alice)
+    assert saved.rstrip(".") not in memory.get("profile", "") + memory.get("rules", "")
+    assert "Role: analyst" in memory["profile"]
+
+
+def test_two_entries_that_differ_only_in_a_final_period_are_both_removed(org_engine):
+    """They say the same thing, so a person who asks to forget it wants neither
+    kept. One request removes both, as it does two entries that differ only in
+    case or spacing."""
+    alice = _scope(ALICE)
+    apply_turn_memory(alice, None, [
+        {"text": "Use teal for bars.", "kind": "always", "scope": "global"},
+        {"text": "Use teal for bars", "kind": "always", "scope": "global"},
+        {"text": "Use metric units", "kind": "always", "scope": "global"},
+    ])
+    assert _global(alice)["rules"].count("Use teal for bars") == 2
+
+    assert apply_turn_forget(alice, None, [{"text": "use teal for bars", "scope": "global"}]) == 2
+
+    rules = _global(alice)["rules"]
+    assert "teal" not in rules
+    assert "Use metric units" in rules
 
 
 def test_an_entry_that_matches_nothing_removes_nothing(org_engine, caplog):

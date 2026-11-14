@@ -495,6 +495,22 @@ def test_system_prompt_carries_the_product_facts_without_recall_skill():
     assert "Serving model: opus-5-5" in prompt
 
 
+def test_system_prompt_keeps_greetings_off_the_delegate_tool():
+    """ENG-3902: with the line telling it never to deny a capability and to
+    call the delegate tool instead, mindshub_air called the tool on about half
+    of plain greetings ("Hi", "Hello!"), each a 12 to 16 s agent turn. One line
+    telling it to answer a greeting itself brought that back to staging's
+    rate, and requests to save something or read a file still delegate, a
+    greeting in front included. Both lines stay."""
+    prompt = " ".join(direct_answer.system_prompt(model="mindshub_air").split())
+
+    assert "Reply to a greeting or small talk yourself, briefly." in prompt
+    assert (
+        "Never say you can't save, remember, search, look up or access something, "
+        "or open or read the user's files: call the delegate tool instead."
+    ) in prompt
+
+
 # ── ResponsesHandler._answer_binding ───────────────────────────────────────
 
 
