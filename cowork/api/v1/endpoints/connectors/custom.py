@@ -226,6 +226,8 @@ async def connect_custom_connector(
         stored = await create_custom_connection(
             credential=credential, organization_id=str(scope.org_id), payload=payload, dry_run=False, settings=settings,
         )
+    except custom_connect.ConnectRefused as refused:
+        return _refusal(refused.code, refused.status_code, refused.message)
     except CustomConnectionRefused as refused:
         message = _AUTH_REFUSALS.get(refused.code, "The connection could not be stored.")
         return _refusal(refused.code, refused.status_code, message)

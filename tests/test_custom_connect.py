@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import json
 import socket
 from urllib.parse import quote, quote_plus
@@ -791,3 +792,16 @@ def test_a_skipped_basic_password_beside_a_required_secret_login_is_a_keyed_conn
     assert world["provider"][1].headers["authorization"] == f"Basic {token}"
     reduced = {"type": "basic", "username": "{login}", "password": ""}
     assert _auth_payloads(world) == [reduced] * 2
+
+
+def test_a_keyless_connect_without_a_public_path_is_a_409_not_an_error(engine, world, monkeypatch):
+    real = custom_connect.parse_stored
+    monkeypatch.setattr(
+        custom_connect, "parse_stored", lambda row: dataclasses.replace(real(row), public_path=None)
+    )
+
+    res = _connect(_client(engine, monkeypatch), "optional_key_api", values={"account": "a1"})
+
+    assert res.status_code == 409
+    assert res.json()["detail"]["code"] == "no_check"
+    assert not world["provider"] and len(world["auth"]) == 1
