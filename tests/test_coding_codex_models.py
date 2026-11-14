@@ -48,7 +48,11 @@ def test_catalog_uses_scoped_proxy_and_preserves_metadata(monkeypatch, catalog):
     requests = mock_catalog(monkeypatch, catalog)
     with codex_models.model_catalog("https://gateway/inference/", "scoped-token", "0.147.0", "fable") as path:
         loaded = json.loads(path.read_text())
-        expected = {**catalog["models"][0], "supports_parallel_tool_calls": False}
+        expected = {
+            **catalog["models"][0],
+            "supports_parallel_tool_calls": False,
+            "auto_review_model_override": "fable",
+        }
         assert loaded == {"models": [expected]}
         assert path.parent.stat().st_mode & 0o077 == 0
         request = requests[0]
@@ -62,7 +66,25 @@ def test_catalog_preserves_explicit_parallel_tool_support(monkeypatch, catalog):
     catalog["models"][0]["supports_parallel_tool_calls"] = True
     mock_catalog(monkeypatch, catalog)
     with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable") as path:
-        assert json.loads(path.read_text()) == catalog
+        assert json.loads(path.read_text())["models"][0]["supports_parallel_tool_calls"] is True
+
+
+def test_catalog_reviews_approvals_with_a_served_model(monkeypatch, catalog):
+    # Codex's default reviewer model rides along as a hidden row MindsHub does
+    # not serve, so a review that used it would fail and deny every request.
+    catalog["models"].append({"slug": "codex-auto-review", "visibility": "hide"})
+    mock_catalog(monkeypatch, catalog)
+    with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable") as path:
+        served, unserved = json.loads(path.read_text())["models"]
+    assert served["auto_review_model_override"] == "fable"
+    assert "auto_review_model_override" not in unserved
+
+
+def test_catalog_keeps_the_reviewer_model_the_gateway_names(monkeypatch, catalog):
+    catalog["models"][0]["auto_review_model_override"] = "fable-small"
+    mock_catalog(monkeypatch, catalog)
+    with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable") as path:
+        assert json.loads(path.read_text())["models"][0]["auto_review_model_override"] == "fable-small"
 
 
 @pytest.mark.parametrize("payload", [
@@ -176,6 +198,7 @@ def test_session_loads_catalog_before_start_and_cleans_up(
                 raise RuntimeError("startup failed")
 
         def thread_start(self, params):
+            assert params["approvalsReviewer"] == "auto_review"
             calls.append("thread_start")
             if failure == "thread":
                 raise RuntimeError("startup failed")
@@ -183,6 +206,7 @@ def test_session_loads_catalog_before_start_and_cleans_up(
 
         def thread_resume(self, session_id, params):
             assert session_id == existing_session_id
+            assert params["approvalsReviewer"] == "auto_review"
             calls.append("thread_resume")
             if failure == "thread":
                 raise RuntimeError("startup failed")
@@ -233,6 +257,7 @@ def test_session_starts_on_fallback_metadata_for_unlisted_model(monkeypatch, tmp
     catalog["models"][0]["slug"] = "fable-alias"
     mock_catalog(monkeypatch, catalog)
     started = []
+    thread_params = []
 
     @dataclass
     class FakeConfig:
@@ -254,6 +279,7 @@ def test_session_starts_on_fallback_metadata_for_unlisted_model(monkeypatch, tmp
             pass
 
         def thread_start(self, params):
+            thread_params.append(params)
             return SimpleNamespace(thread=SimpleNamespace(id="thread"))
 
         def close(self):
@@ -274,4 +300,8 @@ def test_session_starts_on_fallback_metadata_for_unlisted_model(monkeypatch, tmp
         existing_session_id=None, approval_handler=lambda *args: {},
     )
     assert "model_catalog_json" not in started[0]
+    # Only the catalog points the reviewer at a served model, so without it an
+    # Approve for me task asks the person rather than failing every review.
+    assert thread_params[0]["approvalsReviewer"] == "user"
+    assert session._approvals_reviewer == "user"
     session.close()
