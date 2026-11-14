@@ -104,6 +104,10 @@ Never refer back to the chat ("as discussed", "the report above", "same as befor
 - next_run_at is the first run, in the future, ISO 8601 with a UTC offset; recurring tasks repeat \
 at that time. timezone is an IANA name. This device's timezone is {device_tz}: use it unless the user \
 names another.
+- Unless the user specifies a later start, choose the next occurrence of the requested cadence \
+in their timezone. For example, hourly at 11:48 starts at 12:00 that day. Convert the UTC message \
+time to that timezone first; never reuse a UTC clock reading with a local offset. For a daily \
+or weekly request without a time of day, ask for the missing time. Preserve explicit delayed starts.
 - Tasks created here belong to this chat's project and run on the account's default model."""
 
 
