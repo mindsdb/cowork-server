@@ -13,7 +13,6 @@ import logging
 import os
 import re
 import stat
-import sys
 import tempfile
 import threading
 import urllib.error
@@ -188,9 +187,9 @@ MARKDOWN_NOT_PUBLISHABLE_CODE = "markdown_not_publishable"
 MARKDOWN_TOO_LARGE_MESSAGE = (
     "This Markdown file is too large to publish. Publish a file under 2 MiB."
 )
-MARKDOWN_TOO_SLOW_MESSAGE = (
+MARKDOWN_NOT_CONVERTED_MESSAGE = (
     "This Markdown file can't be published. "
-    "Converting it took too long or used too much memory."
+    "Converting it took too long, used too much memory, or failed on something in the file."
 )
 CONVERSION_BUSY_CODE = "conversion_busy"
 CONVERSION_BUSY_MESSAGE = "Another document is converting on this server. Try again in a moment."
@@ -200,8 +199,9 @@ MARKDOWN_CONVERSION_FAILED_MESSAGE = "This Markdown file couldn't be converted f
 
 class MarkdownNotPublishable(_CodedRefusal):
     """The file is past publish's Markdown bound, or rendering it passed the
-    conversion's time or memory limit. Nothing was published, and the same
-    file is refused again, so callers report it instead of retrying."""
+    conversion's time or memory limit or failed on the file's content.
+    Nothing was published, and the same file is refused again, so callers
+    report it instead of retrying."""
 
     def __init__(self, message: str) -> None:
         super().__init__(413, MARKDOWN_NOT_PUBLISHABLE_CODE, message)
@@ -804,12 +804,16 @@ def _markdown_title(md_path: Path, md_text: str) -> str:
 # The most of a Markdown file publish reads. Python-Markdown renders an
 # ordinary 2 MiB report in about 3 s on one fast core, leaving room for a
 # replica's slower one inside the conversion's 30 s; real agent-written
-# reports stay far below it.
+# reports stay far below it. Measured with scripts/measure_export_capacity.py
+# in the server's image at docker --cpus=1 --memory=1g: a 2 MiB report's page
+# renders in 4.0 s and peaks at 123 MiB in the conversion process, under its
+# 640 MiB org limit, while the server adds 18 MiB; 32 KB of "[a][" is refused
+# at the 30 s wall clock.
 PUBLISH_MARKDOWN_MAX_BYTES = 2 * 1024 * 1024
 
 
 class _KeptPage(NamedTuple):
-    page: str
+    page: bytes
     size: int
 
 
@@ -819,8 +823,8 @@ class _RenderedPages:
     The "changed since publish" check renders a page each time it lists an
     edited artifact, so one render per edit serves every listing until the
     next, and one stopped render isn't run again by the next listing. Pages
-    are bounded by the memory they hold (a str with one emoji takes four
-    bytes a character), least recently used out first.
+    are kept as UTF-8, so each counts the bytes it holds (as a str, one emoji
+    would make every character four bytes), least recently used out first.
     Listings run in several threads, so every read and write takes the lock.
     """
 
@@ -832,7 +836,7 @@ class _RenderedPages:
         self._refused: OrderedDict[str, None] = OrderedDict()
         self._lock = threading.Lock()
 
-    def page(self, key: str) -> str | None:
+    def page(self, key: str) -> bytes | None:
         with self._lock:
             kept = self._pages.get(key)
             if kept is None:
@@ -840,8 +844,8 @@ class _RenderedPages:
             self._pages.move_to_end(key)
             return kept.page
 
-    def keep(self, key: str, page: str) -> None:
-        size = sys.getsizeof(page)
+    def keep(self, key: str, page: bytes) -> None:
+        size = len(page)
         if size > self._max_bytes:
             return
         with self._lock:
@@ -903,16 +907,17 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path, *, background: bool =
     page = _RENDERED_PAGES.page(key)
     if page is None:
         if background and _RENDERED_PAGES.was_refused(key):
-            raise MarkdownNotPublishable(MARKDOWN_TOO_SLOW_MESSAGE)
+            raise MarkdownNotPublishable(MARKDOWN_NOT_CONVERTED_MESSAGE)
         try:
             body = _publish_markdown_body(md_text)
         except MarkdownNotPublishable:
             _RENDERED_PAGES.refuse(key)
             raise
-        page = _MD_HTML_TEMPLATE.format(title=_html.escape(title), body=body)
+        page = _MD_HTML_TEMPLATE.format(title=_html.escape(title), body=body).encode("utf-8")
         _RENDERED_PAGES.keep(key, page)
     out_path = out_dir / "index.html"
-    out_path.write_text(page, encoding="utf-8")
+    # As text, so the file's line endings stay the platform's, as before.
+    out_path.write_text(page.decode("utf-8"), encoding="utf-8")
     return out_path
 
 
@@ -935,7 +940,7 @@ def _publish_markdown_body(md_text: str) -> str:
     except ConversionBusy as exc:
         raise MarkdownRenderBusy() from exc
     except ConversionOverrun as exc:
-        raise MarkdownNotPublishable(MARKDOWN_TOO_SLOW_MESSAGE) from exc
+        raise MarkdownNotPublishable(MARKDOWN_NOT_CONVERTED_MESSAGE) from exc
     except ConversionError as exc:
         raise MarkdownConversionFailed() from exc
     return conversion.data.decode("utf-8")
@@ -2033,40 +2038,54 @@ def activate_version(raw_path: str, md5: str, *, scope: TenantScope | None) -> d
     if not api_key:
         raise ValueError("Configure your provider API key in Settings before rolling back")
 
-    report = _resolve_report_id(raw_path, scope=scope)
-    published_json, published_key, report_id = report.published_json, report.published_key, report.report_id
-
     try:
         from anton.publisher import activate_version as _activate_version
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
-    ssl_verify = minds_ssl_verify()
-    from urllib.error import HTTPError
-    try:
-        result = _activate_version(report_id, md5, api_key=api_key, publish_url=publish_url, ssl_verify=ssl_verify)
-    except HTTPError as exc:
-        detail = _publisher_http_detail(exc)
-        # 404 (unknown/pruned version), 409 (fullstack not supported), 400 (bad
-        # request) are all caller-correctable → surface the message verbatim.
-        if exc.code in (400, 404, 409):
-            raise ValueError(detail or "Could not roll back to that version")
-        raise RuntimeError(detail or "Roll back failed")
-    except Exception as exc:
-        logger.exception("Activate version failed (report_id=%s md5=%s)", report_id, md5)
-        raise RuntimeError("Roll back failed") from exc
+    from cowork.services.published_page_ownership import publication_owner
 
-    # Reflect the rollback locally so the `modified` badge recomputes correctly.
-    try:
-        fresh_map = json.loads(published_json.read_text(encoding="utf-8"))
-        fresh_entry = fresh_map.get(published_key)
+    artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
+    publish_target, published_dir, _published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=_scan_artifact_dirs(scope=scope)
+    )
+    # A publish holds the folder's lock across its read, upload and save of
+    # .published.json; holding it across the rollback too keeps the two from
+    # interleaving, so neither one's save loses the other's.
+    with publication_owner(
+        publish_target, published_dir=published_dir, publish_url=publish_url, scope=scope,
+    ):
+        report = _resolve_report_id(raw_path, scope=scope)
+        published_json, published_key, report_id = (
+            report.published_json, report.published_key, report.report_id
+        )
+
+        ssl_verify = minds_ssl_verify()
+        from urllib.error import HTTPError
+        try:
+            result = _activate_version(report_id, md5, api_key=api_key, publish_url=publish_url, ssl_verify=ssl_verify)
+        except HTTPError as exc:
+            detail = _publisher_http_detail(exc)
+            # 404 (unknown/pruned version), 409 (fullstack not supported), 400 (bad
+            # request) are all caller-correctable → surface the message verbatim.
+            if exc.code in (400, 404, 409):
+                raise ValueError(detail or "Could not roll back to that version")
+            raise RuntimeError(detail or "Roll back failed")
+        except Exception as exc:
+            logger.exception("Activate version failed (report_id=%s md5=%s)", report_id, md5)
+            raise RuntimeError("Roll back failed") from exc
+
+        # Reflect the rollback locally so the `modified` badge recomputes correctly.
+        try:
+            fresh_map = json.loads(published_json.read_text(encoding="utf-8"))
+        except Exception:
+            fresh_map = None
+        fresh_entry = fresh_map.get(published_key) if isinstance(fresh_map, dict) else None
         if isinstance(fresh_entry, dict):
             fresh_entry["last_md5"] = md5
             fresh_entry["published_mtime"] = 0  # force exact md5 check
             fresh_map[published_key] = fresh_entry
-            published_json.write_text(json.dumps(fresh_map, indent=2) + "\n", encoding="utf-8")
-    except Exception:
-        pass
+            _write_published_map(published_json, fresh_map)
 
     return {
         "status": "ok",

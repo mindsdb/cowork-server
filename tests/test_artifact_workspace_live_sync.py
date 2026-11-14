@@ -474,7 +474,7 @@ async def test_a_markdown_page_the_conversion_refuses_stops_live_sync_without_a_
     import logging
 
     from cowork.services.publish import (
-        MARKDOWN_TOO_SLOW_MESSAGE,
+        MARKDOWN_NOT_CONVERTED_MESSAGE,
         MarkdownNotPublishable,
         MarkdownRenderBusy,
     )
@@ -486,7 +486,7 @@ async def test_a_markdown_page_the_conversion_refuses_stops_live_sync_without_a_
         lambda: ("desktop-key", "https://api.desktop.example"),
     )
     raised = {
-        "not_publishable": MarkdownNotPublishable(MARKDOWN_TOO_SLOW_MESSAGE),
+        "not_publishable": MarkdownNotPublishable(MARKDOWN_NOT_CONVERTED_MESSAGE),
         "busy": MarkdownRenderBusy(),
     }[refusal]
 

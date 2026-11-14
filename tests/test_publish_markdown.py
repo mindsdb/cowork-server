@@ -11,7 +11,6 @@ import asyncio
 import inspect
 import json
 import os
-import sys
 import threading
 import time
 from pathlib import Path
@@ -199,6 +198,73 @@ def test_a_persons_publish_renders_again_a_file_whose_check_was_stopped(
     assert len(calls) == 1
 
 
+REPEATED_LONG_NUMBER = ("## a_" + "9" * 5_000 + "\n\n") * 2
+
+
+def test_a_file_python_markdown_cant_convert_is_refused_and_not_checked_again(
+    tmp_path: Path, monkeypatch
+):
+    """toc's digit limit fails the same way every time: refused (413), as export
+    refuses it, and remembered, so the next listing starts no process for it."""
+    root = _notes_artifact(tmp_path, REPEATED_LONG_NUMBER)
+    calls = _counted_conversions(monkeypatch)
+
+    with pytest.raises(publish.MarkdownNotPublishable) as refused:
+        publish._render_markdown_to_html(root / "report.md", tmp_path)
+    assert publish.compute_publish_md5(root, artifacts_base=tmp_path) is None
+
+    assert refused.value.status_code == 413
+    assert len(calls) == 1
+
+
+def test_a_list_nested_past_the_recursion_limit_publishes_its_text(tmp_path: Path):
+    """As export does: the page holds every word, in a ``pre`` block."""
+    text = "".join("    " * depth + "* x\n" for depth in range(400))
+    md = tmp_path / "report.md"
+    md.write_text(text)
+
+    page = publish._render_markdown_to_html(md, tmp_path).read_text()
+
+    assert "<pre>* x\n    * x\n" in page
+
+
+def test_a_conversion_that_fails_answers_500_and_is_not_remembered(tmp_path: Path, monkeypatch):
+    """A fault on this server, not the file's: a person's next publish tries again."""
+    calls = []
+
+    def failed(**kwargs):
+        calls.append(kwargs)
+        raise export_runner.ConversionError("the conversion process exited 4 without a result")
+
+    monkeypatch.setattr(export_runner, "convert_in_child", failed)
+    root = _notes_artifact(tmp_path, "# R\n")
+
+    for _ in range(2):
+        with pytest.raises(publish.MarkdownConversionFailed) as refused:
+            publish._render_markdown_to_html(root / "report.md", tmp_path)
+
+    assert (refused.value.status_code, refused.value.detail["code"]) == (
+        500,
+        "markdown_conversion_failed",
+    )
+    assert len(calls) == 2
+
+
+def test_files_with_the_same_text_and_different_titles_get_their_own_pages(tmp_path: Path):
+    """With no heading the title is the file's name, so the cached page is keyed on it too."""
+    for name in ("alpha", "beta"):
+        (tmp_path / name).mkdir()
+        (tmp_path / f"{name}.md").write_text("no heading, the same text\n")
+
+    pages = [
+        publish._render_markdown_to_html(tmp_path / f"{name}.md", tmp_path / name).read_text()
+        for name in ("alpha", "beta")
+    ]
+
+    assert "<title>alpha</title>" in pages[0]
+    assert "<title>beta</title>" in pages[1]
+
+
 def test_the_changed_since_publish_check_reports_a_busy_slot(tmp_path: Path):
     """So autopublish can come back for it, rather than reading it as unchanged."""
     root = _notes_artifact(tmp_path, "# R\n")
@@ -332,7 +398,7 @@ def test_the_routes_that_render_a_markdown_page_run_in_the_threadpool(endpoint):
 @pytest.mark.parametrize(
     ("refusal", "status", "code"),
     [
-        (publish.MarkdownNotPublishable(publish.MARKDOWN_TOO_SLOW_MESSAGE), 413, "markdown_not_publishable"),
+        (publish.MarkdownNotPublishable(publish.MARKDOWN_NOT_CONVERTED_MESSAGE), 413, "markdown_not_publishable"),
         (publish.MarkdownRenderBusy(), 429, "conversion_busy"),
         (publish.MarkdownConversionFailed(), 500, "markdown_conversion_failed"),
     ],
@@ -521,27 +587,33 @@ def test_html_still_published_verbatim(tmp_path, monkeypatch):
 
 
 def test_the_page_cache_holds_its_memory_budget_least_recently_used_out_first():
-    """A page counts the memory it holds: one emoji makes every character four bytes."""
-    ascii_page, wide_page = "a" * 100, "\U0001F4CA" * 25
-    assert sys.getsizeof(wide_page) > sys.getsizeof(ascii_page) > len(wide_page.encode("utf-8"))
-    pages = publish._RenderedPages(
-        max_bytes=sys.getsizeof(ascii_page) + sys.getsizeof(wide_page), max_refused=2
-    )
-    pages.keep("a", ascii_page)
-    pages.keep("wide", wide_page)
-    assert pages.page("a") == ascii_page  # now the most recently used
-    pages.keep("b", "b" * 100)  # the budget holds two such pages: the wide one goes
-    pages.keep("huge", "x" * 10_000)  # past the whole budget: never kept
+    """A page counts the UTF-8 bytes it holds."""
+    pages = publish._RenderedPages(max_bytes=200, max_refused=2)
+    pages.keep("a", b"a" * 100)
+    pages.keep("wide", "\U0001F4CA".encode() * 25)  # 100 bytes
+    assert pages.page("a") == b"a" * 100  # now the most recently used
+    pages.keep("b", b"b" * 100)  # the budget holds two such pages: the wide one goes
+    pages.keep("huge", b"x" * 10_000)  # past the whole budget: never kept
 
     assert [pages.page(key) for key in ("a", "wide", "b", "huge")] == [
-        ascii_page,
+        b"a" * 100,
         None,
-        "b" * 100,
+        b"b" * 100,
         None,
     ]
     for key in ("r1", "r2", "r3"):
         pages.refuse(key)
     assert [pages.was_refused(key) for key in ("r1", "r2", "r3")] == [False, True, True]
+
+
+def test_a_page_at_publishs_bound_with_one_emoji_is_kept():
+    """As a str it would count four bytes a character, 8 MiB, past the whole budget."""
+    page = ("a" * (2 * 1024 * 1024) + "\U0001F4CA").encode()
+    pages = publish._RenderedPages(max_bytes=8 * 1024 * 1024, max_refused=2)
+
+    pages.keep("report", page)
+
+    assert pages.page("report") == page
 
 
 def test_an_autopublish_doesnt_render_again_a_page_the_conversion_stopped(tmp_path, monkeypatch):

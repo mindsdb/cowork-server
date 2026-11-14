@@ -173,8 +173,10 @@ async def list_versions_endpoint(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+# A plain `def`: the rollback waits for its folder's publish lock and calls
+# the publishing service, both off the event loop.
 @router.post("/activate")
-async def activate_version_endpoint(req: _ActivateBody, scope: ScopeDep):
+def activate_version_endpoint(req: _ActivateBody, scope: ScopeDep):
     try:
         return _activate_version(req.path, req.md5, scope=scope)
     except FileNotFoundError as e:

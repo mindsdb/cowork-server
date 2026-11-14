@@ -416,17 +416,17 @@ async def test_harness_tells_the_model_not_to_publish_wider_when_sharing_with_ev
 @pytest.mark.asyncio
 async def test_harness_tells_the_model_not_to_retry_a_markdown_page_the_server_stopped(tmp_path):
     """Each try of the same file can hold the server's one conversion for 30 s."""
-    from cowork.services.publish import MARKDOWN_TOO_SLOW_MESSAGE, MarkdownNotPublishable
+    from cowork.services.publish import MARKDOWN_NOT_CONVERTED_MESSAGE, MarkdownNotPublishable
 
     f = _artifact(tmp_path)
-    refused = mock.Mock(side_effect=MarkdownNotPublishable(MARKDOWN_TOO_SLOW_MESSAGE))
+    refused = mock.Mock(side_effect=MarkdownNotPublishable(MARKDOWN_NOT_CONVERTED_MESSAGE))
     with mock.patch.object(htools, "_publish_artifact", refused):
         out = await htools._cowork_publish_or_preview(
             _session(tmp_path), {"file_path": str(f), "action": "publish"},
         )
 
     text = getattr(out, "content", out)
-    assert MARKDOWN_TOO_SLOW_MESSAGE in text
+    assert MARKDOWN_NOT_CONVERTED_MESSAGE in text
     assert "Do not retry with the same file" in text
 
 

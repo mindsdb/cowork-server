@@ -151,10 +151,23 @@ def convert(*, request: ConvertRequest, source: bytes, read_asset: AssetReader) 
 
 
 def publish_markdown_body(*, text: str) -> str:
-    """A published Markdown page's body: Python-Markdown with the extensions publish has always used."""
-    return markdown.markdown(
-        text, extensions=["fenced_code", "tables", "toc", "sane_lists"], output_format="html5"
-    )
+    """A published Markdown page's body: Python-Markdown with the extensions publish has always used.
+
+    It answers what ``render_markdown`` answers for export. Nested lists past
+    Python's recursion limit come back as the text in a ``pre`` block, so the
+    page still holds every word. A ``ValueError`` from the content, such as
+    ``toc``'s for a repeated heading whose number runs past 4300 digits, raises
+    ``MarkdownRefused``: it fails the same way every time, so publish refuses
+    the file and remembers it.
+    """
+    try:
+        return markdown.markdown(
+            text, extensions=["fenced_code", "tables", "toc", "sane_lists"], output_format="html5"
+        )
+    except RecursionError:
+        return f"<pre>{html.escape(text, quote=False)}</pre>"
+    except ValueError as exc:
+        raise MarkdownRefused("Python-Markdown can't convert this document") from exc
 
 
 def source_html(*, data: bytes, suffix: str, title: str) -> bytes:
