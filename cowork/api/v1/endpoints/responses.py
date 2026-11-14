@@ -530,6 +530,13 @@ async def _extend_turn_key_window(correlation_id: str) -> bool:
         if await extend_turn_key(
             instance_id=correlation_id, ttl_seconds=settings.turn_key_lifetime_seconds, settings=settings,
         ):
+            # The decisions proxy knows the key as long as auth does.
+            from cowork.services import decisions_proxy
+            from cowork.turnqueue.redis_client import get_redis
+
+            await decisions_proxy.extend(
+                get_redis(), correlation_id=correlation_id, ttl_seconds=settings.turn_key_lifetime_seconds,
+            )
             return True
     logger.error(
         "turn key extension failed twice; answering Stop here instead of Keep going: correlation_id=%s",

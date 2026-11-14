@@ -1794,6 +1794,13 @@ class AntonHarness:
             backends_rule = _SANDBOXED_BACKENDS_RULE
         else:
             backends_rule = "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
+        # The desktop app's own browser, when it registered one and the
+        # person turned the browser on: anton registers its `browser` tool
+        # only then. Never for a channel turn.
+        turn_browser = await _browser_config(
+            user, channel_context=channel_context,
+            conversation_id=str(conversation.id), project_id=conversation.project_id,
+        )
         project_context = (
             # Conversational only. The next line hands the agent the real path,
             # so the name here never has to resolve to anything (ENG-1676).
@@ -1812,6 +1819,15 @@ class AntonHarness:
             " Processes and threads a scratchpad cell starts are stopped when your reply ends: "
             "variables carry over to the next turn, running servers do not. "
             + backends_rule
+            # Only a turn with a browser hears about it. Where no listed
+            # element fits, a step by position is the way in; whether a step
+            # waits for the person is the browser tool's own prompt's to say.
+            + (
+                " In the browser, when no listed element fits (a slider, a map, a date grid, a canvas, a drag "
+                "handle), click or drag by position (x, y) right away instead of reading the page again."
+                if turn_browser is not None
+                else ""
+            )
             + attachment_context
         )
         output_context = (
@@ -2164,14 +2180,9 @@ class AntonHarness:
                 # check (ENG-4207). Dropped by an anton without the field,
                 # whose editor then has no preview check at all.
                 **preview_checker_kwargs(ChatSessionConfig, preview_checker),
-                # The desktop app's own browser, when it registered one and the
-                # person turned the browser on: anton registers its `browser`
-                # tool only then. Never for a channel turn. Passed directly:
+                # Read above, with the prompt line it brings. Passed directly:
                 # every anton the floor admits has the field.
-                browser=await _browser_config(
-                    user, channel_context=channel_context,
-                    conversation_id=str(conversation.id), project_id=conversation.project_id,
-                ),
+                browser=turn_browser,
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
@@ -2255,19 +2266,30 @@ async def _browser_config(
 
     None for a channel turn: it comes from a chat where people other than the
     desktop's owner can write, and the browser holds the owner's sign-ins.
-    None when the person turned the browser off, when the app registered no
-    browser, which is always the case where more than one person shares this
-    process (cowork.common.settings.runtime_credential.get_browser_host), and
-    when a signed-in desktop's organization turned the browser off, read
-    before each turn (cowork.services.browser.desktop_organization_off).
+    None when the person turned the browser off or there is no decisions
+    model to pick its steps (cowork.services.browser.browser_runs), when the
+    app registered no browser, which is always the case where more than one
+    person shares this process
+    (cowork.common.settings.runtime_credential.get_browser_host), and when a
+    signed-in desktop's organization turned the browser off, read before each
+    turn (cowork.services.browser.desktop_organization_off).
     The web's browser never reaches an in-process turn: web turns run
     remotely, and the producer gives them the router.
-    """
-    if channel_context is not None or not getattr(user, "browser_enabled", False):
-        return None
-    from cowork.services.browser import desktop_browser_config, desktop_organization_off
 
-    config = desktop_browser_config(conversation_id=conversation_id, project_id=project_id)
+    The organization's own decision model, when it set one up, goes with the
+    config: anton then asks it for the browser's steps rather than Jev on
+    MindsHub, as the route gate does (jev_route.gate_mode).
+    """
+    from cowork.services.browser import browser_runs, desktop_browser_config, desktop_organization_off
+
+    if channel_context is not None or not browser_runs(user):
+        return None
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.handlers.jev_route import own_decision_target
+
+    target = own_decision_target(user)
+    decisions = (target, user.decision_model or TurnQueueSettings().jev_route_model) if target else None
+    config = desktop_browser_config(conversation_id=conversation_id, project_id=project_id, decisions=decisions)
     if config is None or await desktop_organization_off():
         return None
     return config

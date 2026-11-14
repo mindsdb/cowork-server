@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -194,6 +195,17 @@ def own_decision_target(settings) -> "JevTarget | None":
     return JevTarget(url=url, api_key=key) if key and url else None
 
 
+def is_web_address(*, url: str) -> bool:
+    """An http(s) URL with a host and no user: what a decision model's
+    endpoint must be, as anton's ``DecisionsTarget`` takes it. Settings checks
+    a saved or tested URL with it, and `decisions_model` a stored one."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # an unclosed IPv6 bracket, say
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname) and "@" not in parts.netloc
+
+
 def gate_mode(settings) -> GateMode:
     """Which gate decides a turn, from settings alone. One source for the turn
     handler and for the settings response, so the UI shows what turns do.
@@ -208,13 +220,55 @@ def gate_mode(settings) -> GateMode:
     A decision MindsHub refuses (an organization it does not serve Jev to)
     needs no mode of its own: the turn falls back to the LLM gate.
     """
-    from cowork.common.settings.user_settings import Provider
-
     if own_decision_target(settings) is not None:
         return "own"
+    return _mode_without_own_model(settings=settings)
+
+
+def _mode_without_own_model(*, settings) -> Literal["jev", "off", "llm"]:
+    """`gate_mode` for settings with no decision model of the organization's own."""
+    from cowork.common.settings.user_settings import Provider
+
     if settings.resolved_planning_provider is not Provider.MINDS_CLOUD:
         return "llm"
     return "jev" if settings.jev_decisions_enabled else "off"
+
+
+DecisionsModel = Literal["mindshub", "own"]
+
+
+def decisions_model(settings) -> "DecisionsModel | None":
+    """What picks the shared browser's steps: the organization's own decision
+    model ("own"), Jev on MindsHub for an LLM on MindsHub that the
+    organization didn't turn Jev off for ("mindshub"), or None. The same
+    precedence as `gate_mode`, except that "own" needs a URL the browser
+    takes (`is_web_address`: one stored before Settings checked it may not
+    be) and this deployment's browser to reach that model
+    (`browser.own_model_reaches_browser`): where it can't, the browser never
+    asks it, so this answers what the browser asks instead. Without one every
+    browser step goes back to the LLM, which is too slow to offer, so the
+    browser is off (`decisions_available`)."""
+    from cowork.services.browser import own_model_reaches_browser
+
+    target = own_decision_target(settings)
+    if target is not None and is_web_address(url=target.url) and own_model_reaches_browser():
+        return "own"
+    return "mindshub" if _mode_without_own_model(settings=settings) == "jev" else None
+
+
+def decisions_available(settings) -> bool:
+    """Whether the shared browser may run: it needs a decisions model."""
+    return decisions_model(settings) is not None
+
+
+async def probe(target: JevTarget, *, model: str, timeout_seconds: float) -> JevRoute:
+    """One minimal route decision, to check a decision endpoint answers
+    before the organization relies on it (Settings' test). Never raises; the
+    result's `error` is empty when the endpoint answered a usable decision."""
+    return await decide(
+        target=target, messages=[{"role": "user", "content": "Hello"}], model=model,
+        timeout_seconds=timeout_seconds, min_p_direct=0.5,
+    )
 
 
 def _elapsed_ms(started: float) -> int:
@@ -430,6 +484,28 @@ async def _post_decision(target: JevTarget, payload: dict, *, timeout_seconds: f
     if not isinstance(body, dict):
         raise _Failed("malformed_response")
     return body
+
+
+class DecisionFailed(Exception):
+    """A forwarded decision that got no usable answer, with its error class
+    (``http_401``, ``timeout``, ``endpoint_refused``, ...)."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__(error)
+        self.error = error
+
+
+async def forward_decision(target: JevTarget, payload: dict, *, timeout_seconds: float) -> dict:
+    """POST a decision body as given (model, state, questions) to ``target``
+    and return the answer's JSON object, out through the gate's own egress:
+    on the hosted server an organization's endpoint is dialed only at a
+    vetted public address over https (`_post_pinned`), within
+    ``timeout_seconds`` overall. For the browser's decisions proxy
+    (cowork.services.decisions_proxy). Raises `DecisionFailed`."""
+    try:
+        return await _post_decision(target, payload, timeout_seconds=timeout_seconds)
+    except _Failed as exc:
+        raise DecisionFailed(exc.error) from None
 
 
 async def decide(

@@ -72,15 +72,19 @@ def test_fetch_minds_models_drops_embedding_rows(monkeypatch):
     assert labels == {"sonnet": "Claude Sonnet 4.6"}
 
 
-@pytest.mark.parametrize("model_id", ["jev", "jev-1.13.0", "other-decision-model"])
+@pytest.mark.parametrize(("model_id", "kind"), [
+    ("jev", "decision"), ("jev-1.13.0", "decision"), ("other-decision-model", "decision"),
+    # Live voice models (auth's voice kind) aren't chat models either.
+    ("gpt-live-1", "voice"),
+])
 @pytest.mark.parametrize("embedding_fields", [{}, {"embedding": False}])
-def test_decision_models_are_excluded_from_picker_and_cached_catalog(monkeypatch, model_id, embedding_fields):
+def test_decision_models_are_excluded_from_picker_and_cached_catalog(monkeypatch, model_id, kind, embedding_fields):
     rows = [
         {"id": "mindshub_air"},  # Older catalogs do not declare a kind.
         {"id": "sonnet", "kind": "chat"},
         {
             "id": model_id,
-            "kind": "decision",
+            "kind": kind,
             "enabled": True,
             "label": "Decision model",
             "provider": "typesafe",
