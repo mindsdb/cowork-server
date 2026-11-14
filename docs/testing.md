@@ -14,7 +14,7 @@ The broad Linux, desktop export and disposable-service jobs save `inventory.json
 
 Windows and macOS each run `test_artifact_files.py`, `test_markdown_render.py`, `test_artifact_inline.py`, `test_docx_writer.py`, `test_export_hostile.py`, `test_no_fetch.py`, `test_artifact_export_contracts.py`, `test_artifact_export_service.py`, `test_export_child.py` and `test_publish_markdown.py`, all under `tests/`. Keep separate platform inventories: skips and filesystem/process behavior differ between operating systems.
 
-`test/unit` is the broad suite, including API and stateful tests. It does not mean every case is a pure unit test. The first organization pilot, `tests/test_coding_personal_skills.py`, belongs to API/coding and still inherits root resource fixtures. Shared coding fakes live in `tests/coding_service_fakes.py`; their callers and root cleanup use the same module. Other layer assignments remain unclassified until inspected. Test function definitions, parameterized cases and semantic behaviors are different counts.
+`test/unit` is the broad suite, including API and stateful tests. It does not mean every case is a pure unit test. The first organization pilot, `tests/api/coding/test_personal_skills.py`, belongs to API/coding and still inherits root resource fixtures. Shared coding fakes live in `tests/support/coding/service_fakes.py`; their callers and root cleanup use the same module. Other layer assignments remain unclassified until inspected. Test function definitions, parameterized cases and semantic behaviors are different counts.
 
 ## Record a run
 

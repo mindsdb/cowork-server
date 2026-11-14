@@ -8,7 +8,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from coding_service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
+from tests.support.coding.service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
 from cowork.api.v1.endpoints import coding
 from cowork.api.v1.endpoints.coding_personal_skills import MAX_SKILL_BYTES
 from cowork.api.v1.router import api_router

@@ -7,7 +7,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from coding_service_fakes import CREDS, FakeEngine, service_with, wait_for_workspace
+from tests.support.coding.service_fakes import CREDS, FakeEngine, service_with, wait_for_workspace
 from cowork.api.v1.endpoints import coding
 from cowork.coding.contracts import SessionCreateRequest, SourceContext
 from cowork.coding.integrations import DeveloperIntegrationService

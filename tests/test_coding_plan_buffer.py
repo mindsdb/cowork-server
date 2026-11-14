@@ -1,6 +1,6 @@
 """Plan text uses the bounded stream buffer without swallowing plan state."""
 
-from coding_service_fakes import CREDS, FakeEngine, FakeSession, repository, service_with, wait_for_status
+from tests.support.coding.service_fakes import CREDS, FakeEngine, FakeSession, repository, service_with, wait_for_status
 from cowork.coding.contracts import CodingEvent, EventType, SessionCreateRequest, SessionStatus
 from cowork.coding.engines.codex_events import map_codex_notification
 from cowork.coding.turns import EventBuffer

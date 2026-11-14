@@ -152,7 +152,7 @@ def app_settings_rebuilt_after_a_test_replaced_them():
 @pytest.fixture(autouse=True)
 def close_coding_services():
     yield
-    from coding_service_fakes import close_services
+    from tests.support.coding.service_fakes import close_services
 
     close_services()
 
