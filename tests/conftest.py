@@ -27,6 +27,10 @@ os.environ["DATABASE_URI"] = f"sqlite:///{TMP / 'test.db'}"
 # whichever test decrypts first after get_fernet's cache clears. Hosted pods
 # take the key from COWORK_MASTER_KEY and read no file.
 os.environ["MASTER_KEY_PATH"] = str(Path(tempfile.mkdtemp(prefix="cowork-test-key-")) / "master.key")
+# Org mode's pod-local stores (publish state.json, probe env files, the
+# harness's temporary vault) default to <system temp>/cowork, which every test
+# process shares; per process, and outside COWORK_HOME for the same reason as the key.
+os.environ["COWORK_POD_SCRATCH_DIR"] = str(Path(tempfile.mkdtemp(prefix="cowork-test-pod-scratch-")).resolve())
 os.environ["COWORK_PUBLIC_BASE_URL"] = "https://hooks.example.com"
 os.environ["COWORK_CONVERSATION_LINK_TEMPLATE"] = "https://app.example.com/c/{conversation_id}"
 # Org mode roots every filesystem store at cowork_home() (see
@@ -124,6 +128,25 @@ def keep_seeded_general_path():
             row.path = original
             write.add(row)
             write.commit()
+
+
+@pytest.fixture(autouse=True)
+def app_settings_rebuilt_after_a_test_replaced_them():
+    """Clear the cached app settings when a test left a different object there.
+
+    A fixture that sets an env var and clears ``get_app_settings`` leaves the
+    env to monkeypatch, which restores it last; a teardown in between that
+    reads settings caches the test's env for the next test. Autouse fixtures
+    set up before ``monkeypatch``, so this tears down after it, and the next
+    read uses the restored env. A test that never replaced the cached object
+    costs no rebuild.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    before = get_app_settings()
+    yield
+    if get_app_settings.cache_info().currsize and get_app_settings() is not before:
+        get_app_settings.cache_clear()
 
 
 @pytest.fixture(autouse=True)

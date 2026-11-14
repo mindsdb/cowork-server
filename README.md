@@ -63,8 +63,10 @@ Initializes the database and validates configuration.
 ### Testing
 
 ```sh
-uv run --locked pytest
+make test/unit
 ```
+
+`make test/unit`, `make test/unit/coverage` and `make coverage/html` run the unit tests in parallel, one pytest-xdist worker per logical CPU, and CI runs the same target. Each worker is its own process with its own temporary database and `COWORK_HOME`. Set `PYTEST_WORKERS` to choose the number of workers, or `0` to run serially, for example `make test/unit PYTEST_WORKERS=0`. A plain `uv run --locked pytest` runs serially. A test that passes alone but fails in a parallel run usually depends on state an earlier test left in the process; rerun it serially with the tests that ran before it on the same worker (`-v` names the worker).
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
 

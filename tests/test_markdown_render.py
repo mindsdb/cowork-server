@@ -107,10 +107,12 @@ def test_tags_strip_as_toc_strip_tags_strips_them(text):
     ids=["tags", "comments", "unclosed-tags", "unclosed-comments", "cascade"],
 )
 def test_tags_strip_in_linear_time(text):
-    started = time.perf_counter()
+    """CPU time, not wall time: a busy machine delays the call without adding
+    work, while a quadratic strip of these inputs costs far more than 1 s."""
+    started = time.process_time()
     markdown_render._strip_tags(text=text)
 
-    assert time.perf_counter() - started < 1.0
+    assert time.process_time() - started < 1.0
 
 
 def _render_seconds(*, text: str) -> float:
