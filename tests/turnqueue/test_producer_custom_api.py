@@ -308,6 +308,29 @@ async def test_the_turn_carries_the_prefix_and_the_notes_of_the_members_own_temp
     assert params["connectors"]["beta_api"] == {"usage_notes": _BETA_PREFIX}
 
 
+async def test_an_optional_field_is_listed_as_one_a_member_may_leave_unset(turn, templates):
+    session, row = _template_row(templates)
+    row.spec = {**row.spec, "fields": [{**row.spec["fields"][0], "required": False}]}
+    row.connection_check = {"path": "/v1/me", "public_path": "/v1/public"}
+    session.add(row)
+    session.commit()
+
+    params, _ = await _run(turn)
+
+    expected = _ACME_PREFIX.replace("Fields: api_key.", "Fields: api_key (optional, may not be set).")
+    assert params["connectors"]["acme_crm"] == {"usage_notes": f"{expected}\n\nCall /v1/me first."}
+
+
+def test_a_template_with_no_optional_field_gets_the_same_prefix_text_as_before():
+    text = prod.custom_usage_prefix("acme_crm", [5], ("api_key", "workspace"))
+
+    assert text == (
+        "Custom connection 5 (acme_crm). Fields: api_key, workspace. No credential value reaches this turn: "
+        f"call it with call_minds_api(5, path, query=None, headers=None) {_TAIL}"
+    )
+    assert prod.custom_usage_prefix("acme_crm", [5], ("api_key", "workspace"), frozenset()) == text
+
+
 async def test_two_connections_of_one_connector_share_one_prefix(turn, templates):
     turn["list"].return_value = [_listed(5), _listed(7, name="Prod 2")]
     turn["grant"].return_value = _granted({5: 2, 7: 1})

@@ -439,18 +439,25 @@ def _connectors_block(oauth_connections: dict | None, project_name: str | None =
     return {engine: {"usage_notes": text} for engine, text in notes.items()} or None
 
 
-def custom_usage_prefix(connector_id: str, connection_ids: list[int], field_names: tuple[str, ...]) -> str:
+def custom_usage_prefix(
+    connector_id: str,
+    connection_ids: list[int],
+    field_names: tuple[str, ...],
+    optional_names: frozenset[str] = frozenset(),
+) -> str:
     """The fixed paragraph the producer puts before a custom connector's notes.
 
     Input: the connector id, its connections' ids in this turn, and its
-    template's field names (empty when unknown). Output: how to call it with
+    template's field names (empty when unknown) and which of them a member
+    may leave unset, listed as "<name> (optional, may not be set)". Output: how to call it with
     ``call_minds_api``, that no credential value reaches the turn, and the
     path rules. Built from ids and names only, never a value. No side effects.
     """
     ids = ", ".join(str(connection_id) for connection_id in connection_ids)
     noun = "connection" if len(connection_ids) == 1 else "connections"
     call_id = str(connection_ids[0]) if len(connection_ids) == 1 else "connection_id"
-    fields = f" Fields: {', '.join(field_names)}." if field_names else ""
+    listed = [f"{name} (optional, may not be set)" if name in optional_names else name for name in field_names]
+    fields = f" Fields: {', '.join(listed)}." if listed else ""
     return (
         f"Custom {noun} {ids} ({connector_id}).{fields} No credential value reaches this turn: "
         f"call it with call_minds_api({call_id}, path, query=None, headers=None) and the gateway "
@@ -481,7 +488,10 @@ async def _with_custom_usage_notes(connectors_block: dict | None, scope: TenantS
     merged: dict[str, dict] = {}
     for connector_id, connection_ids in ids_by_connector.items():
         template = templates.get(connector_id)
-        text = custom_usage_prefix(connector_id, connection_ids, template.field_names if template else ())
+        text = custom_usage_prefix(
+            connector_id, connection_ids,
+            template.field_names if template else (), template.optional_names if template else frozenset(),
+        )
         if template is not None and template.notes:
             text += "\n\n" + template.notes
         merged[connector_id] = {"usage_notes": text}
