@@ -787,6 +787,9 @@ async def lifespan(app: FastAPI):
         # event loop stops.
         await drain_scratchpad_closes()
         await app.state.channel_adapters.shutdown()
+        teams_bot = getattr(app.state, "teams_bot", None)
+        if teams_bot is not None:
+            await teams_bot.aclose()
         get_coding_service().close_all()
         shutdown_launched_backends()
         await close_scratchpads()
@@ -1392,6 +1395,10 @@ def _install_channels(app: FastAPI, webhook_paths: set[str]) -> None:
     app.state.channel_runtime = runtime
     app.state.channel_ingress = IngressManager(sink=runtime.handle)
     app.state.channel_webhook_paths = webhook_paths
+
+    from cowork.channels.teams import install_teams_routes
+
+    install_teams_routes(app, webhook_paths)
 
 
 # Create the application instance
