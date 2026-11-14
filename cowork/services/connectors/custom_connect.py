@@ -6,9 +6,10 @@ only that origin is dialed, through the pinned public-only helper. The
 values are filled in by anton's shared rules, as the gateway fills them.
 The check must first be refused without the placed credentials, then pass
 with them. A member who skips every optional key is checked once, on the
-template's public path, which must answer 2xx. Nothing here logs or raises a submitted value: errors name a
-field or a code, and a failure's excerpt has every submitted value, and
-every form of it that went on the request, replaced before it leaves.
+template's public path, which must answer 2xx. Nothing here logs or raises
+a submitted value: errors name a field or a code, and a failure's excerpt
+has every submitted value, and every form of it that went on the request,
+replaced before it leaves.
 """
 
 from __future__ import annotations
@@ -450,13 +451,13 @@ async def run_check(
         auth: The connection's section from ``reduced_auth``.
 
     Raises:
-        ConnectRefused: 422 ``invalid_values`` when a value cannot be placed;
-            409 ``no_check`` when a keyless connection has no public path.
+        ConnectRefused: 422 ``invalid_values`` when a value cannot be placed.
     """
     placed = place_values(auth, values)
     if is_keyless(template, values):
-        if template.public_path is None:
-            raise ConnectRefused("no_check", 409, "This connector cannot be connected as saved. " + _NO_CHECK_NEXT)
+        # The parser requires a public path whenever every secret field is optional,
+        # so a keyless connection always has one.
+        assert template.public_path is not None
         answer = await _send(origin, template.public_path, placed.headers, placed.params)
         if isinstance(answer, CheckFailure):
             return answer
