@@ -760,6 +760,36 @@ def test_jev_opt_out_turns_off_antons_completion_check(enabled, verifier_jev):
     assert ("verifier_jev" in applied) is (not enabled)
 
 
+@pytest.mark.parametrize(("enabled", "classify_jev"), [(False, "off"), (True, "on")])
+def test_jev_classify_opt_out_reaches_anton(enabled, classify_jev):
+    """A settings object with the field stands in for an anton that has it;
+    the pinned anton may predate it."""
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = SimpleNamespace(classify_jev="on", verifier_jev="on")
+    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_classify_enabled": enabled}))
+
+    assert anton.classify_jev == classify_jev
+    assert ("classify_jev" in applied) is (not enabled)
+    assert anton.verifier_jev == "on"
+
+
+def test_an_anton_without_classify_is_left_alone():
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = SimpleNamespace(verifier_jev="on")
+    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_classify_enabled": False}))
+
+    assert not hasattr(anton, "classify_jev")
+    assert "classify_jev" not in applied
+
+
 def test_route_state_puts_the_latest_message_apart():
     messages = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}]
 

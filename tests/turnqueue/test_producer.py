@@ -2286,6 +2286,26 @@ async def test_the_job_carries_the_organizations_jev_opt_out(monkeypatch, enable
     assert json.loads(fake.added[0][1]["payload"])["params"]["jev_decisions"] is enabled
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_the_job_carries_the_organizations_classify_switch(monkeypatch, enabled):
+    from cowork.common.settings import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id="",
+                                      jev_decisions_enabled=True, jev_classify_enabled=enabled),
+    )
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["jev_classify"] is enabled
+    assert params["jev_decisions"] is True
+
+
 @pytest.fixture
 def revokes(monkeypatch):
     """Internal auth configured, as in every hosted deployment; records each

@@ -848,6 +848,19 @@ class UserSettings(Settings):
             "every message run the full agent, unless you configure a decision model of your own."
         ),
     )
+    # Lets the agent's scratchpad label many texts at once with Jev through
+    # classify() and classify_yes_no(), instead of the chat model. Separate from
+    # jev_decisions_enabled. anton offers them only when its coding model runs on
+    # MindsHub, so on another provider this setting changes nothing.
+    jev_classify_enabled: Annotated[bool, ORG] = Field(
+        default=True,
+        title="Use Jev for classification",
+        description=(
+            "Let the agent sort many texts into categories, or answer a yes/no question about "
+            "each, with Jev, MindsHub's decision model, instead of your chosen model. Faster and "
+            "cheaper for large batches. Only available when the coding model runs on MindsHub."
+        ),
+    )
     # A decision model of the organization's own, for teams that bring their
     # own inference keys or cannot use Jev on MindsHub. Any endpoint taking
     # TypeSafe's decision body works: TypeSafe's own (/v1/systemone), a
