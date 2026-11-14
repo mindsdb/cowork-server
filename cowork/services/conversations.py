@@ -576,10 +576,18 @@ class ConversationService:
         neither the directories it will find nor their project: a task moved
         to another project keeps its workspace directory under the old one.
         """
+        return set(self.session.exec(self.owned_ids_query()).all())
+
+    def owned_ids_query(self) -> ScopedSelect:
+        """The query `owned_ids` runs, for a query that filters by the
+        caller's conversations in the database
+        (held_artifact_roots.held_root_rows). Same rule as `_owned`: in org mode
+        the conversations the scope's user created, and for a scope with no
+        user the ones no member created."""
         stmt = self.session.select(Conversation).with_only_columns(Conversation.id)
         if self.session.scope.org_mode:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
-        return set(self.session.exec(stmt).all())
+        return stmt
 
     def get_conversation(self, conversation_id: UUID) -> Conversation:
         conversation = self._owned(conversation_id)

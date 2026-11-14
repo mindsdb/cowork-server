@@ -92,3 +92,31 @@ async def test_full_copy_slots_leave_the_file_store_to_everyone_else_and_refuse_
     assert len(ran) == slots
     assert units._project_files_copy_slots().borrowed_tokens == 0
     assert units._efs_slots().borrowed_tokens == 0
+
+
+async def test_a_copy_refused_for_a_copy_slot_names_the_copy_slots_and_whose_copy_it_was(monkeypatch):
+    """A copy that gets no copy slot within POOL_TIMEOUT says so in its
+    refusal, as a refusal at the file store slots names its limit and share
+    (FilesystemBusy.limiter, FilesystemBusy.share)."""
+    monkeypatch.setenv("COWORK_TURN_PROJECT_FILES_COPY_SLOTS", "1")
+    release = threading.Event()
+    started = threading.Semaphore(0)
+
+    def copying() -> str:
+        started.release()
+        release.wait(timeout=30)
+        return "copied"
+
+    held = asyncio.create_task(run_efs_copy(copying, scope=member(0)))
+    try:
+        await asyncio.to_thread(started.acquire)
+        with pytest.raises(FilesystemBusy) as refused:
+            await run_efs_copy(lambda: "a second copy", scope=member(1))
+        with pytest.raises(FilesystemBusy) as channel_refused:
+            await run_efs_copy(lambda: "a channel copy", scope=TenantScope(org_mode=True, org_id="org-1"))
+    finally:
+        release.set()
+        await held
+
+    assert (refused.value.limiter, refused.value.share) == ("run_efs_copy", "member-1")
+    assert (channel_refused.value.limiter, channel_refused.value.share) == ("run_efs_copy", "org:org-1:copy")

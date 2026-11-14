@@ -66,6 +66,9 @@ LIVE = "/api/v1/health/live"
 WORKSPACE = f"/api/v1/artifacts/workspace/local/{ARTIFACT_ID}"
 REVIEW = f"{WORKSPACE}/review"
 
+# These tests time the event loop; see without_gc_pauses.
+pytestmark = pytest.mark.usefixtures("without_gc_pauses")
+
 # Every route that resolves an artifact folder: the review and source routes,
 # the owner-gated workspace routes and the private draft. Each body passes
 # validation, so the request reaches the lookup.
@@ -383,17 +386,36 @@ def stuck_lookup(monkeypatch, seeded_artifact):
     released.set()
 
 
-async def test_a_stuck_file_store_refuses_artifact_reviews_and_nothing_else(stuck_lookup, monkeypatch):
+async def _until_blocked(state: dict[str, int], count: int) -> None:
+    """Wait until ``count`` lookups are stuck on the file store."""
+    for _ in range(500):
+        if state["blocked"] >= count:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"review {count} never reached its lookup: {state['blocked']} stuck")
+
+
+async def test_a_stuck_file_store_refuses_artifact_reviews_and_nothing_else(stuck_lookup, monkeypatch, caplog):
     state, released = stuck_lookup
     await _plan_once(monkeypatch, "local", LOCAL_SCOPE)
     loop = asyncio.get_running_loop()
+    slots = db_session.settings.storage.efs_slots
     extra = 4
     transport = httpx.ASGITransport(app=_marked(create_app()), raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        started = loop.time()
-        reviews = [asyncio.create_task(client.get(REVIEW)) for _ in range(db_session.settings.storage.efs_slots + extra)]
+        reviews: list[asyncio.Task[httpx.Response]] = []
         refused: list[tuple[httpx.Response, float]] = []
         try:
+            # Fill the slots one review at a time. Each review's lookup runs a
+            # database unit first, and SQLite gives the app one unit slot, so
+            # a burst of every review at once queues those units, and a loaded
+            # runner refuses the last ones at POOL_TIMEOUT before they reach
+            # the file store.
+            for _ in range(slots):
+                reviews.append(asyncio.create_task(client.get(REVIEW)))
+                await _until_blocked(state, len(reviews))
+            started = loop.time()
+            reviews += [asyncio.create_task(client.get(REVIEW)) for _ in range(extra)]
             while len(refused) < extra and loop.time() - started < 5:
                 for task in [t for t in reviews if t.done()]:
                     reviews.remove(task)
@@ -417,10 +439,15 @@ async def test_a_stuck_file_store_refuses_artifact_reviews_and_nothing_else(stuc
         assert response.json()["code"] == "server_busy"
         assert response.headers["retry-after"] == "1"
         assert seconds <= 1 + 1
+    # The file store's slots refused them, not the database: both answer the
+    # same 503, and only the log tells them apart.
+    file_store_refusals = [r for r in caplog.records if getattr(r, "event", None) == "filesystem_busy"]
+    assert len(file_store_refusals) == extra
+    assert not [r for r in caplog.records if "no database connection freed" in r.getMessage()]
     assert live.status_code == 200 and live_seconds < LIVE_BUDGET_SECONDS
     assert projects.status_code == 200 and projects_seconds < LIVE_BUDGET_SECONDS
-    assert blocked_now == db_session.settings.storage.efs_slots
-    assert state["most"] == db_session.settings.storage.efs_slots
+    assert blocked_now == slots
+    assert state["most"] == slots
 
 
 async def test_a_lookup_waiting_on_the_file_store_holds_no_pooled_connection(stuck_lookup):

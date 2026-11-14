@@ -31,7 +31,8 @@ from __future__ import annotations
 
 import logging
 import stat
-from dataclasses import dataclass
+from collections.abc import Collection
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -47,6 +48,8 @@ from cowork.services.artifacts import (
 
 if TYPE_CHECKING:
     from cowork.services.artifact_locations import Location
+    from cowork.services.artifact_sort_times import NewestFolders
+    from cowork.services.held_artifact_roots import HeldRoot
 
 logger = logging.getLogger(__name__)
 
@@ -161,15 +164,27 @@ def conversation_artifacts_base(project_path: str, conversation_id) -> Path:
     ).joinpath(*_ARTIFACTS_SUBPATH)
 
 
-def _conversation_id(child: Path) -> UUID | None:
-    """The conversation a workspace directory belongs to, or None when the name
-    is not one. Every directory this module writes is `str(conversation_id)`
-    (see `conversation_artifacts_base`), so a name that will not parse names no
-    conversation and therefore has no owner to check against."""
+def workspace_conversation_id(name: str) -> UUID | None:
+    """The conversation a workspace directory named `name` belongs to, or None
+    when the name is not one. Every directory this module writes is
+    `str(conversation_id)` (see `conversation_artifacts_base`), so only that
+    canonical spelling names a conversation. A name that will not parse names
+    none, and neither does another spelling of an id: an uppercase spelling
+    is another folder on a case-sensitive store, and one without hyphens or
+    with braces is another folder on every store, which the held rows would
+    never reach, since a row's root is rebuilt from `str(conversation_id)`
+    (recorded_source). Neither has an owner to check against."""
     try:
-        return UUID(child.name)
+        conversation_id = UUID(name)
     except ValueError:
         return None
+    return conversation_id if str(conversation_id) == name else None
+
+
+def _conversation_id(child: Path) -> UUID | None:
+    """The conversation the workspace directory `child` belongs to
+    (workspace_conversation_id)."""
+    return workspace_conversation_id(child.name)
 
 
 @dataclass(frozen=True)
@@ -200,6 +215,19 @@ class RootsPlan:
     of the shared root (`projects.partition_of`): a project whose folder sits
     in another one is left out of `projects` when the plan is built, so no
     reader of the plan reaches it, and again when the plan is expanded.
+    `held`, which only the artifacts routes' plans set (`with_held_roots`),
+    names the roots of `projects` known to hold an artifact folder, so
+    expanding the plan opens nothing on the file store; None finds the roots
+    there. `newest`, which only the list's plans set, holds the newest
+    sort-time rows of the roots `held` names for the projects outside `walk`
+    (artifact_sort_times.NewestFolders), and names the projects of `walk`
+    among `newest.unread`. The list then opens only the folders of the
+    rows, and reads every folder of the projects in `newest.unread`, which
+    have no rows to trust. When the rows were cut at the query's limit and
+    the folders at least as new as the last row kept build fewer cards than
+    the list shows, it reads every folder of the plan's roots instead; only
+    the folders newer than that row count when the run of rows at its time
+    was too long to read (NewestFolders.ties_read).
     """
 
     projects: tuple[ProjectRow, ...] = ()
@@ -209,6 +237,27 @@ class RootsPlan:
     adopted: tuple[ProjectRow, ...] = ()
     owner_filter: bool = False
     owned: frozenset[UUID] = frozenset()
+    # Set beside `held` (with_held_roots): the projects of `projects` whose
+    # roots the held-root backfill could not read, or that moved or went
+    # away during its walk (the unread list of its sentinel,
+    # held_artifact_roots.HeldRootSentinel). That backfill wrote none of
+    # their rows. A turn end, the project files PUT or the self-heal may
+    # have written some since, and `held` holds those, but they may not
+    # name every root, so `discover_roots` finds these projects' roots on
+    # the file store, as for a plan without `held`.
+    walk: frozenset[UUID] = frozenset()
+    held: frozenset[HeldRoot] | None = None
+    # Set by the artifacts list's plans, beside `held`, once the sort times'
+    # backfill has written its sentinel (artifact_sort_times.newest_folders):
+    # `rows`, the newest rows of the held roots of the projects outside
+    # `walk`, newest first; `complete`, false when the query's limit cut
+    # them; `tied`, the rest of a run of tied times that cut landed in, and
+    # `ties_read`, whether that run was read whole; `unread`, the projects
+    # whose every folder the list reads: those the sort-time sentinel lists
+    # (SortTimeSentinel.unread), which may have no rows and have none in
+    # `rows`, and those of `walk`. None reads every folder of the roots the
+    # plan expands to.
+    newest: NewestFolders | None = None
 
 
 @dataclass(frozen=True)
@@ -364,6 +413,32 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
     )
 
 
+def with_held_roots(session: ScopedSession, plan: RootsPlan) -> RootsPlan:
+    """`plan` with the roots of its projects the held_artifact_roots rows
+    name (held_artifact_roots.held_root_rows), for the artifacts list, and
+    the projects whose roots their backfill could not read (the unread list
+    of its sentinel, held_artifact_roots.read_sentinel), which it still
+    walks. Unchanged for a desktop scan, a scope that keeps no rows, or
+    before their backfill has written its sentinel. A database step: run it
+    in a database unit."""
+    from cowork.services.artifact_locations import keeps_locations
+    from cowork.services.held_artifact_roots import held_root_rows, read_sentinel
+
+    if plan.scan or not keeps_locations(session.scope):
+        return plan
+    # The one read of the sentinel, before the rows: `walk` comes from it.
+    # Another replica's pass over the unread projects commits a project's
+    # rows, then the sentinel without it: whenever it lands after this read,
+    # the project is still in `walk` and found on the file store, never left
+    # both unheld and unwalked.
+    sentinel = read_sentinel(session)
+    if sentinel is None:
+        return plan
+    project_ids = [project.id for project in plan.projects]
+    held = held_root_rows(session, project_ids=project_ids)
+    return replace(plan, held=held, walk=frozenset(sentinel.unread).intersection(project_ids))
+
+
 def _parts_below(path: Path, anchor: Path) -> tuple[str, ...]:
     """``path.relative_to(anchor).parts``, compared by parts, case-sensitive:
     on POSIX paths the same answer, and the same ValueError for a path outside
@@ -400,25 +475,33 @@ def recorded_source(project: ProjectRow, conversation_id: UUID | None) -> Projec
     return _project_source(project, base)
 
 
-def recorded_location(source: ProjectArtifacts, folder: Path) -> Location | None:
-    """The location row for `folder`, found below `source`, or None for a root
-    no row describes (a desktop root, which has no project id). A folder name
-    that is not valid UTF-8 still gets its location, so it counts toward a
-    conflict; record_checked_folders never stores it in a row."""
-    from cowork.services.artifact_locations import Location
+def held_root_of(source: ProjectArtifacts) -> HeldRoot | None:
+    """The root `source` is, as the rows name it: its project, and its
+    conversation for a legacy root. None for a root no row describes: a
+    desktop root, which has no project id, or a legacy root whose folder
+    name is no conversation id."""
+    from cowork.services.held_artifact_roots import HeldRoot
 
     if source.project_id is None:
         return None
     parts = tuple(source.root_parts)
     if parts == _ARTIFACTS_SUBPATH:
-        conversation_id = None
-    elif len(parts) == 4 and parts[0] == CONVERSATIONS_DIRNAME and parts[2:] == _ARTIFACTS_SUBPATH:
+        return HeldRoot(UUID(source.project_id), None)
+    if len(parts) == 4 and parts[0] == CONVERSATIONS_DIRNAME and parts[2:] == _ARTIFACTS_SUBPATH:
         conversation_id = _conversation_id(Path(parts[1]))
-        if conversation_id is None:
-            return None
-    else:
-        return None
-    return Location(UUID(source.project_id), conversation_id, folder.name)
+        return HeldRoot(UUID(source.project_id), conversation_id) if conversation_id is not None else None
+    return None
+
+
+def recorded_location(source: ProjectArtifacts, folder: Path) -> Location | None:
+    """The location row for `folder`, found below `source`, or None for a root
+    no row describes (held_root_of). A folder name that is not valid UTF-8
+    still gets its location, so it counts toward a conflict;
+    record_checked_folders never stores it in a row."""
+    from cowork.services.artifact_locations import Location
+
+    root = held_root_of(source)
+    return Location(root.project_id, root.conversation_id, folder.name) if root is not None else None
 
 
 def project_roots(
@@ -480,6 +563,26 @@ def project_roots(
         for child in children
         if _is_real_directory(child, strict=strict)
         and _storage_components_are_safe(child, may_be_absent=False, strict=strict)
+    ]
+
+
+def _held_project_roots(
+    project: ProjectRow, *, held: Collection[UUID | None], owned: frozenset[UUID] | None
+) -> list[_FoundRoot]:
+    """The roots of `project` that its held rows name, `held` being their
+    conversations (None for the shared root), in `project_roots`' order: the
+    shared root, then the legacy roots by conversation id. Opens nothing on
+    the file store. `owned`, when given, keeps only the legacy roots of those
+    conversations, as `project_roots` does by name."""
+    roots = [_FoundRoot(source=recorded_source(project, None))] if None in held else []
+    legacy = sorted(
+        (conversation_id for conversation_id in held
+         if conversation_id is not None and (owned is None or conversation_id in owned)),
+        key=str,
+    )
+    return roots + [
+        _FoundRoot(source=recorded_source(project, conversation_id), legacy=True, conversation_id=conversation_id)
+        for conversation_id in legacy
     ]
 
 
@@ -546,20 +649,29 @@ def discover_roots(plan: RootsPlan, *, own_only: bool = False, strict: bool = Fa
     lookup's scan, which reads `unfiltered()`.
 
     With `strict`, a project root that fails to list or stat raises
-    (project_roots) instead of being left out."""
+    (project_roots) instead of being left out. A plan with `held` lists and
+    stats nothing for a project outside `walk`: its roots are the ones
+    `held` names (_held_project_roots). A project in `walk` has its roots
+    found on the file store, as without `held`."""
     from cowork.services.projects import resolved_shared_root
 
     owned = plan.owned if own_only and plan.owner_filter else None
     # Read once for every project the plan names, not once per project.
     shared_root = resolved_shared_root() if plan.partition is not None and plan.projects else None
     roots: list[_FoundRoot] = []
+    held_by_project: dict[UUID, set[UUID | None]] = {}
+    for project_id, conversation_id in plan.held or ():
+        held_by_project.setdefault(project_id, set()).add(conversation_id)
     if plan.scan:
         roots += [_FoundRoot(source=source) for source in artifacts_sources_for_scan(scope=plan.scan_scope)]
         roots += [found for project in plan.adopted if (found := _adopted_root(project)) is not None]
     for project in plan.projects:
         if left_out_for_another_partition(project, partition=plan.partition, shared_root=shared_root):
             continue
-        roots += project_roots(project, owned=owned, strict=strict)
+        if plan.held is not None and project.id not in plan.walk:
+            roots += _held_project_roots(project, held=held_by_project.get(project.id, set()), owned=owned)
+        else:
+            roots += project_roots(project, owned=owned, strict=strict)
     return DiscoveredRoots(roots=tuple(roots), owner_filter=plan.owner_filter, owned=plan.owned)
 
 

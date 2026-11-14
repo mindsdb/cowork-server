@@ -74,3 +74,13 @@ async def test_an_organizations_copies_still_hold_no_more_than_one_share():
 async def test_the_copy_share_is_keyed_apart_for_an_organization_and_shared_for_a_person():
     assert units._efs_share(ORG_1_CHANNELS, for_copy=True) is not units._efs_share(ORG_1_CHANNELS)
     assert units._efs_share(ALICE, for_copy=True) is units._efs_share(ALICE)
+
+
+async def test_a_channel_copy_refused_at_its_full_share_names_the_copy_share():
+    """A refusal names the share the copy waited for (FilesystemBusy.share):
+    the organization's copy share, not the share its other work takes."""
+    async with holding(db_session.settings.storage.efs_share, run_efs_copy, ORG_1_CHANNELS):
+        with pytest.raises(FilesystemBusy) as refused:
+            await run_efs_copy(lambda: "a third copy", scope=ORG_1_CHANNELS)
+
+    assert (refused.value.limiter, refused.value.share) == ("efs_share", "org:org-1:copy")

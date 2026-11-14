@@ -39,7 +39,7 @@ import threading
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from uuid import UUID
 from weakref import WeakValueDictionary
 
@@ -73,11 +73,27 @@ class DatabaseBusy(PoolTimeoutError):
 class FilesystemBusy(Exception):
     """No shared-file-store slot freed within POOL_TIMEOUT.
 
-    The app answers it with 503 and Retry-After (cowork.server), as it does
-    DatabaseBusy.
+    ``limiter`` names what the caller was waiting for when the time ran out:
+    ``efs_share``, its share of the slots (EFS_SHARE), ``run_efs``, the
+    event loop's slots (EFS_SLOTS), or ``run_efs_copy``, the event loop's
+    copy slots (TurnQueueSettings.project_files_copy_slots). ``share`` is that share's key
+    (_efs_share_key), None where nobody's share applies. The app answers it
+    with 503 and Retry-After (cowork.server), as it does DatabaseBusy, and
+    logs both.
     """
 
     status_code = 503
+
+    def __init__(
+        self,
+        message: str = "no shared file store slot freed within POOL_TIMEOUT",
+        *,
+        limiter: Literal["efs_share", "run_efs", "run_efs_copy"] | None = None,
+        share: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.limiter = limiter
+        self.share = share
 
 
 def busy_retry_seconds() -> int:
@@ -453,6 +469,20 @@ def _efs_slots() -> anyio.CapacityLimiter:
     return limiter
 
 
+def _efs_share_key(scope: TenantScope, *, for_copy: bool = False) -> str | None:
+    """The key of the caller's share of the EFS slots (_efs_share): its
+    person's user id, ``org:<org_id>`` for an organization's work with no
+    person, ``org:<org_id>:copy`` for that work's copies of a project's files
+    (``for_copy``), or None where one person owns the deployment."""
+    if not scope.partitioned:
+        return None
+    if scope.user_id:
+        return scope.user_id
+    if for_copy:
+        return f"org:{scope.org_id}:copy"
+    return f"org:{scope.org_id}"
+
+
 def _efs_share(scope: TenantScope, *, for_copy: bool = False) -> anyio.CapacityLimiter | None:
     """The caller's share of the EFS slots, or None where one person owns the
     deployment (the desktop, the operator view) and there is nobody to keep
@@ -471,14 +501,9 @@ def _efs_share(scope: TenantScope, *, for_copy: bool = False) -> anyio.CapacityL
     new bindings, staging and artifact sends wait for. A person's copy takes
     the person's own share.
     """
-    if not scope.partitioned:
+    key = _efs_share_key(scope, for_copy=for_copy)
+    if key is None:
         return None
-    if scope.user_id:
-        key = scope.user_id
-    elif for_copy:
-        key = f"org:{scope.org_id}:copy"
-    else:
-        key = f"org:{scope.org_id}"
     try:
         shares = _EFS_SHARES.get()
     except LookupError:
@@ -516,6 +541,7 @@ async def _efs_task(
     fn: Callable[[], T],
     *,
     share: anyio.CapacityLimiter | None,
+    share_key: str | None,
     unit_slots: tuple[anyio.CapacityLimiter, ...],
     deadline: float,
     start: _EfsStart,
@@ -528,14 +554,16 @@ async def _efs_task(
     then holds no unit slot, so database work elsewhere keeps its slots.
     """
     held: list[anyio.CapacityLimiter] = []
+    waiting_for: Literal["efs_share", "run_efs"] | None = None
     try:
         with anyio.CancelScope(deadline=deadline) as slot_wait:
-            for limiter in (share, _efs_slots()):
+            for name, limiter in (("efs_share", share), ("run_efs", _efs_slots())):
                 if limiter is not None:
+                    waiting_for = name
                     await limiter.acquire()
                     held.append(limiter)
         if slot_wait.cancelled_caught:
-            raise FilesystemBusy("no shared file store slot freed within POOL_TIMEOUT")
+            raise FilesystemBusy(limiter=waiting_for, share=share_key)
         if unit_slots:
             with anyio.CancelScope(deadline=deadline) as unit_wait:
                 for limiter in unit_slots:
@@ -562,7 +590,10 @@ async def _run_on_efs(
     until = loop.time() + db_session.settings.database.pool_timeout if deadline else math.inf
     start = _EfsStart()
     work = asyncio.ensure_future(
-        _efs_task(fn, share=_efs_share(scope, for_copy=for_copy), unit_slots=unit_slots, deadline=until, start=start)
+        _efs_task(
+            fn, share=_efs_share(scope, for_copy=for_copy), share_key=_efs_share_key(scope, for_copy=for_copy),
+            unit_slots=unit_slots, deadline=until, start=start,
+        )
     )
     work.add_done_callback(_retrieve_outcome)
     try:
@@ -640,7 +671,10 @@ async def run_efs_copy(fn: Callable[[], T], *, scope: TenantScope) -> T:
     with anyio.CancelScope(deadline=deadline) as slot_wait:
         await slots.acquire()
     if slot_wait.cancelled_caught:
-        raise FilesystemBusy("no project files copy slot freed within POOL_TIMEOUT")
+        raise FilesystemBusy(
+            "no project files copy slot freed within POOL_TIMEOUT",
+            limiter="run_efs_copy", share=_efs_share_key(scope, for_copy=True),
+        )
     try:
         return await _run_on_efs(fn, scope=scope, deadline=True, unit_slots=(), for_copy=True)
     finally:

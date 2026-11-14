@@ -3235,8 +3235,9 @@ async def test_a_record_of_a_remote_turn_that_lost_only_the_listed_check_says_so
     the diff listed. Either the turn created nothing, so the unit's failure
     lost only that check, or it created a folder and record_new_artifacts
     raised at the check, once that folder's rows were written
-    (ListedLocationsUnchecked). The line says the check failed, not that
-    created folders went unrecorded."""
+    (ListedLocationsUnchecked), which a failed hold of the root or a failed
+    write of the sort times raises too. The line names the check, the hold
+    and the sort times, not created folders gone unrecorded."""
     from cowork.services import task_objects
 
     handler = _remote_handler(monkeypatch, {})
@@ -3286,7 +3287,8 @@ async def test_a_record_of_a_remote_turn_that_lost_only_the_listed_check_says_so
         if r.name == responses_mod.logger.name and r.levelno == logging.ERROR
     ]
     assert [r.getMessage() for r in errors] == [
-        "[responses] could not check the locations of the artifacts a remote turn listed",
+        "[responses] could not check the locations of the artifacts a remote turn found,"
+        " or record the folder that holds them or their sort times",
     ]
     assert errors[0].exc_info[1] is error
 
@@ -3369,7 +3371,8 @@ async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(m
     indexed = {"new": set()}
 
     def spy_index_new(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
+        untimed=(),
     ):
         indexed["new"] = set(slugs)
 
@@ -3415,7 +3418,8 @@ async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(mon
     indexed = {"new": set()}
 
     def spy_index_new(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
+        untimed=(),
     ):
         indexed["new"] = set(slugs)
 
@@ -4571,14 +4575,18 @@ async def test_a_busy_turns_warning_names_its_conversation_and_correlation_as_fi
     """The deployments' JSON log keeps a line's static message and drops its
     template values, so the WARNING of a turn that found no free database
     connection or file store slot carries its conversation and correlation
-    as fields, with no template values."""
+    as fields, with no template values. A file store refusal also names the
+    limit that ran out and whose share it was."""
     from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
     from cowork.common.structured_logging import make_formatter
     from cowork.db.units import FilesystemBusy
 
     error = (
-        FilesystemBusy("no project files copy slot freed within POOL_TIMEOUT") if busy == "file_store"
+        FilesystemBusy(
+            "no project files copy slot freed within POOL_TIMEOUT", limiter="run_efs_copy", share="org:org-1:copy",
+        )
+        if busy == "file_store"
         else PoolTimeoutError("QueuePool limit reached")
     )
     conv_id = uuid4()
@@ -4593,6 +4601,8 @@ async def test_a_busy_turns_warning_names_its_conversation_and_correlation_as_fi
     line = json.loads(make_formatter().format(record))
     assert (line["conversation_id"], line["request_id"]) == (str(conv_id), failed["request_id"])
     assert line["message"] == "[responses] remote turn found no free database connection or file store slot"
+    expected = ("run_efs_copy", "org:org-1:copy") if busy == "file_store" else (None, None)
+    assert (line.get("limiter"), line.get("share")) == expected
 
 
 def test_a_busy_file_store_maps_to_server_busy():

@@ -12,6 +12,7 @@ the lease is stubbed down to the staging call and the remote turn.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from types import SimpleNamespace
 from uuid import uuid4
@@ -174,6 +175,25 @@ async def test_a_refused_turn_releases_the_lease_for_the_next_one(redis, turns):
     turns.first_may_end.set()
     await asyncio.wait_for(replica().handle("slack", message("again"), ORG), timeout=5)
     assert turns.steps == ["stage", "stage", "turn starts", "turn ends"]
+
+
+async def test_a_refused_turns_warning_names_the_limit_and_the_share(redis, turns, caplog):
+    """A channel turn whose copy of the project's files found no copy slot
+    logs which limit ran out and whose share it was, as fields the JSON log
+    keeps."""
+    from cowork.common.structured_logging import make_formatter
+
+    turns.stage_error = FilesystemBusy(
+        "no project files copy slot freed within POOL_TIMEOUT", limiter="run_efs_copy", share=f"org:{ORG}:copy",
+    )
+    with caplog.at_level(logging.WARNING, logger=runtime_mod.log.name), pytest.raises(FilesystemBusy):
+        await replica(RecordingAdapter()).handle("slack", message(), ORG)
+
+    [record] = [r for r in caplog.records if getattr(r, "event", None) == "channel_turn_busy"]
+    line = json.loads(make_formatter().format(record))
+    assert (line["limiter"], line["share"], line["conversation_id"]) == (
+        "run_efs_copy", f"org:{ORG}:copy", str(CONVERSATION_ID),
+    )
 
 
 async def test_a_redis_that_cannot_hand_out_the_lease_refuses_the_turn_with_the_busy_notice(turns, monkeypatch):

@@ -635,10 +635,13 @@ class AntonChannelRuntime:
         typing = None
         if adapter is not None and callable(getattr(adapter, "set_typing", None)):
             typing = asyncio.create_task(typing_loop(adapter, event.address))
+        # The conversation a refusal below names, once it is open.
+        conversation_id: UUID | None = None
         try:
             conversation = await run_db(
                 partial(self._open_conversation, binding=binding, event=event), scope=scope
             )
+            conversation_id = conversation.id
             channel_context = ChannelContext(
                 channel_type=channel_type,
                 is_group=bool(event.message.is_group),
@@ -654,7 +657,18 @@ class AntonChannelRuntime:
                     outcome = await self._run_anton(
                         scope, conversation, event, adapter, channel_context=channel_context
                     )
-        except (PoolTimeoutError, FilesystemBusy, TurnClaimUnavailable):
+        except (PoolTimeoutError, FilesystemBusy, TurnClaimUnavailable) as refused:
+            log.warning(
+                "channel turn refused: no free database connection, file store slot or turn lease",
+                extra={
+                    "event": "channel_turn_busy",
+                    # A file store refusal names the limit and the share
+                    # (FilesystemBusy), such as a copy of the project's files.
+                    "limiter": getattr(refused, "limiter", None),
+                    "share": getattr(refused, "share", None),
+                    **log_context(conversation_id=conversation_id),
+                },
+            )
             await self._send_busy_notice(channel_type=channel_type, event=event, org_id=org_id)
             raise
         finally:

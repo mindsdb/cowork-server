@@ -2,7 +2,8 @@
 # tenancy. `files` are written into the artifact folder and `primary` into its
 # metadata.json. `written` is the new file's path inside the folder for a 200,
 # and `scripts_dropped` (default false) what the answer reports; every other
-# answer leaves the folder byte for byte as it was.
+# answer leaves the folder byte for byte as it was, and `detail`, when given,
+# is what it says.
 cases:
   - id: markdown-to-word
     files:
@@ -127,3 +128,10 @@ cases:
     primary: .revisions/report.md
     format: html
     status: 422
+  - id: markdown-the-conversion-process-refuses
+    files:
+      report.md: "# Report\n\n`````````````````````````````````\ncode\n"
+    primary: report.md
+    format: docx
+    status: 413
+    detail: "This file can't be exported."
