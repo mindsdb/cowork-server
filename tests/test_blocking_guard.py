@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -754,6 +755,26 @@ def test_sites_reached_on_different_workers_count_together(tmp_path):
     assert "stale-entry check skipped" not in result.stdout, result.stdout
     assert "ALLOWLIST names sites no test reached" not in result.stdout, result.stdout
     assert result.returncode == pytest.ExitCode.OK, result.stdout
+
+
+@pytest.mark.parametrize("workers,reach", [(0, False), (2, False), (2, True)])
+def test_inventory_keeps_the_stale_check_and_its_final_status(tmp_path, workers, reach):
+    """Inventory handoff preserves stale-entry failure and merged-worker success."""
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
+    (source / ".gitignore").write_text("__pycache__/\nhome/\ntest.db*\nmaster.key\n.pytest_cache/\n")
+    report_path = tmp_path / "inventory.json"
+    result = _run_the_stale_check(
+        source, "-n", str(workers), "-p", "scripts.pytest_inventory", "--test-cohort=guard",
+        f"--test-inventory={report_path}", "tests",
+        env={"REACH_THE_ALLOWLIST_SPLIT_BY_WORKER": "1"} if reach else {},
+    )
+    assert result.returncode == (0 if reach else 1), result.stdout + result.stderr
+    report = json.loads(report_path.read_text())
+    assert report["completion"]["exitstatus"] == result.returncode
+    assert report["completion"]["complete"]
+    assert "stale-entry check skipped" not in result.stdout
 
 
 def test_a_worker_that_dies_skips_the_stale_check_instead_of_blaming_its_sites(tmp_path):
