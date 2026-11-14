@@ -95,24 +95,48 @@ def test_tags_strip_as_toc_strip_tags_strips_them(text):
 # Each shape is linear for the port; toc.strip_tags copies the whole string
 # after each tag or comment it drops, and a cascade gives back one kept
 # character per comment.
-@pytest.mark.parametrize(
-    "text",
-    [
-        "<b>" * 200_000,
-        "<!---->" * 200_000,
-        "<" * 200_000,
-        "<!-- x" * 200_000,
-        "<" * 200_000 + "<!-- -->" + "!-- -->" * 200_000,
-    ],
-    ids=["tags", "comments", "unclosed-tags", "unclosed-comments", "cascade"],
-)
-def test_tags_strip_in_linear_time(text):
-    """CPU time, not wall time: a busy machine delays the call without adding
-    work, while a quadratic strip of these inputs costs far more than 1 s."""
-    started = time.process_time()
-    markdown_render._strip_tags(text=text)
+_STRIP_SHAPES = {
+    "tags": lambda n: "<b>" * n,
+    "comments": lambda n: "<!---->" * n,
+    "unclosed-tags": lambda n: "<" * n,
+    "unclosed-comments": lambda n: "<!-- x" * n,
+    "cascade": lambda n: "<" * n + "<!-- -->" + "!-- -->" * n,
+}
+_SMALL, _LARGE = 10_000, 100_000
+# From the small input to the large one, a linear strip costs about 10x more
+# and a quadratic one about 100x, so the bound leaves 3x either way.
+_MAX_GROWTH = 30
 
-    assert time.process_time() - started < 1.0
+
+def _cpu_seconds_per_call(*, strip, text: str) -> float:
+    """Thread CPU time per call, repeating until the calls add up to 10 ms so
+    a fast call still measures. CPU, not wall time: a busy machine delays the
+    calls without adding work, and coverage slows both sizes alike."""
+    calls, started = 0, time.thread_time()
+    while True:
+        strip(text=text)
+        calls += 1
+        if (elapsed := time.thread_time() - started) >= 0.01:
+            return elapsed / calls
+
+
+def _strip_growth(*, strip, shape) -> float:
+    """How many times more one call costs on the large input than the small."""
+    small = min(_cpu_seconds_per_call(strip=strip, text=shape(_SMALL)) for _ in range(3))
+    return _cpu_seconds_per_call(strip=strip, text=shape(_LARGE)) / small
+
+
+@pytest.mark.parametrize("shape", _STRIP_SHAPES.values(), ids=_STRIP_SHAPES.keys())
+def test_tags_strip_in_linear_time(shape):
+    assert _strip_growth(strip=markdown_render._strip_tags, shape=shape) < _MAX_GROWTH
+
+
+def test_the_growth_check_catches_the_quadratic_strip():
+    """toc.strip_tags is the quadratic original; tags is its cheapest shape."""
+    def quadratic(*, text: str) -> str:
+        return strip_tags(text)
+
+    assert _strip_growth(strip=quadratic, shape=_STRIP_SHAPES["tags"]) >= _MAX_GROWTH
 
 
 def _render_seconds(*, text: str) -> float:
