@@ -21,8 +21,9 @@ single stall past the grace period keeps it from doing that; the parent then
 kills it and reports the grace as a lower bound.
 
 The cases cover ordinary reports at the org caps (10 MiB inline budget, 10 MiB
-HTML and 512 KiB Markdown read bounds), the heaviest HTML the caps allow, and
-Markdown shapes that slow Python-Markdown down much faster than their size.
+HTML and 512 KiB Markdown read bounds), the heaviest HTML the caps allow,
+Markdown shapes that slow Python-Markdown down much faster than their size,
+and publish's own render of a Markdown page at its 2 MiB bound.
 
 Run it in the server's own image with 1 CPU and 1 GiB of memory, so the
 conversion process starts and imports as it does in production:
@@ -60,6 +61,8 @@ MIB = 1024 * 1024
 # Just under the export's read bounds, so every case is one the route accepts.
 HTML_BYTES = 10 * MIB - 4096
 MARKDOWN_BYTES = 512 * 1024 - 4096
+# Just under publish's Markdown bound.
+PUBLISH_MARKDOWN_BYTES = 2 * MIB - 4096
 # Just under the inliner's 2 MiB per-asset cap.
 IMAGE_BYTES = 2 * MIB - 4096
 WATCH_INTERVAL_SECONDS = 0.01
@@ -84,11 +87,16 @@ class Row(BaseModel):
 
 @dataclass(frozen=True)
 class Case:
-    """An artifact to export: its primary file's name and a builder for its folder."""
+    """An artifact to export: its primary file's name and a builder for its folder.
+
+    A ``publish`` case renders its Markdown page as publish does, in the same
+    conversion process, instead of exporting it.
+    """
 
     primary: str
     build: Callable[[Path], None]
     note: str
+    publish: bool = False
 
 
 def _png(*, filler_bytes: int) -> bytes:
@@ -281,6 +289,20 @@ CASES: dict[str, Case] = {
         lambda: "\n".join("`" * (3 + n) for n in range(1_000)), "1,000 fence lines of growing length"
     ),
     "md-tag-runs": _markdown_case(lambda: "<a b" * 8_000, "32 KB of '<a b'"),
+    "publish-md-report": Case(
+        primary="report.md",
+        build=lambda folder: _write(
+            folder, "report.md", _report_markdown(target_bytes=PUBLISH_MARKDOWN_BYTES, images=0)
+        ),
+        note="publish: a 2 MiB report's page",
+        publish=True,
+    ),
+    "publish-md-reference-brackets": Case(
+        primary="report.md",
+        build=lambda folder: _write(folder, "report.md", "[a][" * 8_000),
+        note="publish: 32 KB of '[a]['",
+        publish=True,
+    ),
     "md-emphasis": _markdown_case(lambda: "***" + "a*" * 8_000, "16 KB of emphasis markers"),
     "md-deep-list": _markdown_case(
         lambda: "".join("    " * depth + "* x\n" for depth in range(400)), "a list nested 400 levels"
@@ -356,12 +378,15 @@ def _measure_case(*, case_id: str, budget_seconds: float) -> Row:
     # Read before the case is built: building holds the source and its images
     # in memory once, as the export's read does.
     baseline = _replica_baseline_mib()
-    from cowork.services import artifact_export
+    from fastapi import HTTPException
+
+    from cowork.services import artifact_export, publish
     from cowork.services.artifacts import ProjectArtifacts
 
     # The org inline budget, without an org deployment's database and identity,
     # with org export on: this measures what turning it on would cost.
     artifact_export._org_mode = lambda: True
+    publish._org_mode = lambda: True
     artifact_export.ORG_EXPORT_ENABLED = True
     case = CASES[case_id]
     with tempfile.TemporaryDirectory() as tmp:
@@ -406,6 +431,13 @@ def _measure_case(*, case_id: str, budget_seconds: float) -> Row:
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(lambda: _watch_loop(watch=watch, stop=stop, on_overrun=on_overrun))
                 try:
+                    if case.publish:
+                        await anyio.to_thread.run_sync(
+                            lambda: publish._render_markdown_to_html(
+                                folder / case.primary, Path(tmp)
+                            )
+                        )
+                        return "ok, rendered"
                     result = await anyio.to_thread.run_sync(
                         lambda: artifact_export.export_primary_file(
                             source=source,
@@ -427,6 +459,8 @@ def _measure_case(*, case_id: str, budget_seconds: float) -> Row:
                 exc = exc.exceptions[0]
             if isinstance(exc, artifact_export.ExportRefused):
                 outcome = f"refused ({exc.refusal}): {exc}"
+            elif isinstance(exc, HTTPException):
+                outcome = f"refused ({exc.status_code}): {exc.detail['message']}"
             else:
                 outcome = f"error: {type(exc).__name__}"
         return row(outcome=outcome)

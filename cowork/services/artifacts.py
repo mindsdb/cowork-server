@@ -579,14 +579,17 @@ def _modified_state(
 
     # Local import: publish imports this module, so import lazily to avoid a
     # circular import (mirrors _unpublish_folder below).
-    from cowork.services.publish import compute_publish_md5
+    from cowork.services.publish import MarkdownRenderBusy, compute_publish_md5
 
     # `folder.parent` IS the artifacts root: artifacts always live at
     # `<base>/<slug>/`. Passing it explicitly is what makes the badge work in org
     # mode, where the module-level FS scan finds no roots at all.
-    current_md5 = compute_publish_md5(
-        folder, artifacts_base=artifacts_base or folder.parent
-    )
+    try:
+        current_md5 = compute_publish_md5(
+            folder, artifacts_base=artifacts_base or folder.parent
+        )
+    except MarkdownRenderBusy:
+        return False, False  # another conversion runs: can't tell yet
     if current_md5 is None:
         return False, False  # can't tell — don't raise a false "modified"
     if current_md5 != entry.get("last_md5"):

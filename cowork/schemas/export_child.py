@@ -37,6 +37,12 @@ class ConvertRequest(_Message):
     limits: InlineLimits
 
 
+class PublishMarkdownRequest(_Message):
+    """Render one Markdown file as the body of a published page. The payload is its text, UTF-8."""
+
+    type: Literal["publish_markdown"] = "publish_markdown"
+
+
 class AssetRequest(_Message):
     """The conversion asks for one file of the artifact, by its path inside the folder."""
 
@@ -62,8 +68,9 @@ class Converted(_Message):
     """The finished conversion. The payload is the output.
 
     The output is the Word or HTML file, or, for a PDF, the inlined HTML the
-    render service gets. ``denied_events`` counts the network and process
-    starts the conversion process refused; any is a failure.
+    render service gets, or a published page's body. ``denied_events`` counts
+    the network and process starts the conversion process refused; any is a
+    failure.
     """
 
     type: Literal["converted"] = "converted"
@@ -83,7 +90,11 @@ class ConversionFailed(_Message):
     detail: str
 
 
-ServerMessage = Annotated[ConvertRequest | AssetReply, Field(discriminator="type")]
+ServerMessage = Annotated[
+    ConvertRequest | PublishMarkdownRequest | AssetReply, Field(discriminator="type")
+]
+# What the server asks a conversion process to do.
+ConversionRequest = ConvertRequest | PublishMarkdownRequest
 ChildMessage = Annotated[AssetRequest | Converted | ConversionFailed, Field(discriminator="type")]
 
 

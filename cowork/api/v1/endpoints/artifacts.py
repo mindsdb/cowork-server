@@ -1191,11 +1191,13 @@ def _forget_deleted_folder(session, *, artifact_id: str, location: Location) -> 
     response_model=ArtifactStatusView,
     dependencies=[Depends(require(DesktopOnly))],
 )
-async def artifact_status(
+def artifact_status(
     scope: ScopeDep, path: str = Query(..., min_length=1, max_length=4096)
 ) -> ArtifactStatusView:
     # Cheap published/modified/access read for the preview viewer's in-place
     # refresh. Never raises for an unknown path — returns the blank default.
+    # Plain `def`: an edited Markdown artifact's modified check renders its
+    # page in the conversion process, so it runs in FastAPI's threadpool.
     status = _desktop_artifact_status_for_path(path, scope=scope)
     if status.published_url:
         from cowork.services.publish import published_link_owner_recorded

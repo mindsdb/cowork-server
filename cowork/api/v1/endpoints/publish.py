@@ -81,8 +81,12 @@ async def list_publishable_endpoint(scope: ScopeDep):
     return list_publishable(scope=scope)
 
 
+# Plain `def`: publishing renders a Markdown page in the conversion process
+# and uploads the bundle, both blocking, so FastAPI runs it in its threadpool,
+# off the event loop. A typed refusal (an HTTPException) answers with its own
+# status: 413, 429 or 500 for a Markdown page, 413 for a bundle too large.
 @router.post("/")
-async def publish_artifact(req: _PublishBody, scope: ScopeDep):
+def publish_artifact(req: _PublishBody, scope: ScopeDep):
     try:
         artifact, artifacts_base, api_key, publish_url = _desktop_context(req.path, scope=scope)
         # The publisher resolves datasource secrets from the connector vault,
@@ -113,7 +117,7 @@ async def publish_artifact(req: _PublishBody, scope: ScopeDep):
 
 
 @router.post("/update")
-async def update_artifact(req: _UpdateBody, scope: ScopeDep):
+def update_artifact(req: _UpdateBody, scope: ScopeDep):
     try:
         return _update(req.path, scope=scope)
     except FileNotFoundError as e:
@@ -129,8 +133,10 @@ async def update_artifact(req: _UpdateBody, scope: ScopeDep):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+# Plain `def`: it waits for the folder's publish lock, which a publish
+# running in the threadpool may hold.
 @router.delete("/")
-async def unpublish_artifact(
+def unpublish_artifact(
     scope: ScopeDep,
     path: str = Query(..., description="Absolute path to the published HTML artifact"),
 ):
@@ -167,8 +173,10 @@ async def list_versions_endpoint(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+# A plain `def`: the rollback waits for its folder's publish lock and calls
+# the publishing service, both off the event loop.
 @router.post("/activate")
-async def activate_version_endpoint(req: _ActivateBody, scope: ScopeDep):
+def activate_version_endpoint(req: _ActivateBody, scope: ScopeDep):
     try:
         return _activate_version(req.path, req.md5, scope=scope)
     except FileNotFoundError as e:

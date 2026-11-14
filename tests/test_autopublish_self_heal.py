@@ -541,3 +541,24 @@ async def test_a_shutdown_cancels_the_running_self_heals_and_waits_for_them(base
 
     assert running.cancelled()
     assert unwound == [True]
+
+
+async def test_a_pass_whose_check_found_the_slot_busy_asks_for_the_next_self_heal(
+    base, enabled, key, published, monkeypatch  # noqa: F811
+):
+    """A Markdown page the busy conversion slot left unknown is planned again
+    by the project's self-heal, not left for the next turn to touch it."""
+    asked = []
+    _make(base, "notes", files={"report.md": "# R\n"}, meta={"slug": "notes", "type": "document"})
+    monkeypatch.setattr(
+        ap, "_plan", lambda _base, _slugs: ap.PlannedPhase(planned=[], conversion_busy=1)
+    )
+    monkeypatch.setattr(ap, "_ask_again_later", lambda **kwargs: asked.append(kwargs))
+
+    out = await ap.autopublish_project_artifacts(
+        base, ORG_SCOPE, touched={"notes"}, project_id=PROJECT_ID, only_touched=True,
+    )
+
+    assert out == set()
+    assert published == []
+    assert asked == [{"artifacts_base": base, "scope": ORG_SCOPE, "project_id": PROJECT_ID}]
