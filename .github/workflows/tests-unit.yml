@@ -36,13 +36,22 @@ jobs:
       - name: Run unit tests
         run: make test/unit/coverage
 
-  export-tests-windows:
-    # The desktop app runs on Windows, where a pinned folder has no directory
-    # descriptor and the export's path-segment checks are the only guard on
-    # which file it reads. The Windows lxml wheel also bundles a libxml2 that
-    # speaks HTTP and FTP. These tests prove, on Windows itself, that export
-    # reads only the artifact's own files and fetches nothing.
-    runs-on: windows-latest
+  export-tests-desktop:
+    # The desktop app runs on Windows and macOS. On Windows a pinned folder has
+    # no directory descriptor and the export's path-segment checks are the
+    # only guard on which file it reads, and the Windows lxml wheel bundles a
+    # libxml2 that speaks HTTP and FTP. On both, the export's conversion
+    # process limits itself less than on Linux: macOS refuses an address-space
+    # limit, and Windows has no resource limits at all, so the server's memory
+    # watch and wall clock are the limits there. These tests prove, on each
+    # desktop OS, that export reads only the artifact's own files, fetches
+    # nothing, and that a conversion past its limits is killed and leaves no
+    # process behind.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - name: Keep line endings as committed
@@ -74,3 +83,4 @@ jobs:
           tests/test_no_fetch.py
           tests/test_artifact_export_contracts.py
           tests/test_artifact_export_service.py
+          tests/test_export_child.py

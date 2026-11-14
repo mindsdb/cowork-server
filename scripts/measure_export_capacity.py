@@ -2,32 +2,37 @@
 
 Each case builds an artifact in a temporary folder and exports it to Word at
 org caps through ``export_primary_file``, in a worker thread, the way the
-export route runs it. Meanwhile a task on the event loop sleeps 10 ms at a time
-and records how late it wakes. Pure Python in the worker thread gives the GIL
-back every few milliseconds, but one long C call such as a regex match holds
-it, and that shows up as one long wake-up.
+export route runs it. The conversion runs in its own process, which the
+export kills past its limits. Meanwhile a task on the event loop sleeps 10 ms
+at a time and records how late it wakes, so a conversion that still held the
+server's GIL would show up as one long wake-up.
 
 Every case runs in its own process, so each case's peak RSS is its own. A
 replica imports the whole server and warms its agent runtime before it
 reports ready, so each case does both before it reads its baseline, and
 reads it before it builds the artifact. Peak RSS is then what a replica peaks
 at before its database and caches, which only add more. RSS added counts
-building the case as well as the export, so it errs high. A case still
-running at its time budget stops itself and reports the longest stall it saw.
-Only a single stall past the grace period keeps it from doing that; the
-parent then kills it and reports the grace as a lower bound.
+building the case as well as the export, so it errs high. The conversion
+process's peak RSS and the most address space it mapped, which its
+address-space limit counts, are columns of their own, read on Linux every
+~100 ms. A case still running
+at its time budget stops itself and reports the longest stall it saw. Only a
+single stall past the grace period keeps it from doing that; the parent then
+kills it and reports the grace as a lower bound.
 
 The cases cover ordinary reports at the org caps (10 MiB inline budget, 10 MiB
 HTML and 512 KiB Markdown read bounds), the heaviest HTML the caps allow, and
 Markdown shapes that slow Python-Markdown down much faster than their size.
 
-Run it with 1 CPU and 1 GiB of memory, with the repository mounted read-only:
+Run it in the server's own image with 1 CPU and 1 GiB of memory, so the
+conversion process starts and imports as it does in production:
 
-    docker run --rm --cpus=1 --memory=1g -v "$PWD":/src:ro -w /src \\
-      -e UV_PROJECT_ENVIRONMENT=/opt/venv -e PYTHONPATH=/src \\
-      ghcr.io/astral-sh/uv:0.6.14-python3.12-bookworm-slim \\
-      sh -c 'uv sync --frozen --group dev --no-install-project \\
-        && uv run --no-sync python scripts/measure_export_capacity.py'
+    docker build -t cowork-server:capacity .
+    docker run --rm --cpus=1 --memory=1g --memory-swap=1g cowork-server:capacity \\
+      python scripts/measure_export_capacity.py
+
+``--memory-swap`` equal to ``--memory`` gives the container no swap, as a
+replica has none, so passing 1 GiB ends in the OOM killer, not in swapping.
 
 It prints one Markdown table row per case.
 """
@@ -37,7 +42,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import resource
 import struct
 import subprocess
 import sys
@@ -72,6 +76,9 @@ class Row(BaseModel):
     baseline_rss_mib: float
     peak_rss_mib: float
     rss_added_mib: float
+    # The conversion process's peak RSS, and on Linux the most address space it mapped.
+    child_peak_rss_mib: float
+    child_peak_vm_mib: float
     result: str
 
 
@@ -142,11 +149,9 @@ def _report_html(*, target_bytes: int, images: int) -> str:
 
 
 def _write(folder: Path, name: str, data: str | bytes) -> None:
+    """Write *data* as given: text as UTF-8 with its line ends kept, so a case is its size on Windows too."""
     path = folder / name
-    if isinstance(data, str):
-        path.write_text(data, encoding="utf-8")
-    else:
-        path.write_bytes(data)
+    path.write_bytes(data.encode("utf-8") if isinstance(data, str) else data)
 
 
 def _with_images(folder: Path, *, count: int) -> None:
@@ -247,9 +252,14 @@ CASES: dict[str, Case] = {
         lambda: _sized(unit="# a\n\n", target_bytes=256 * 1024),
         "256 KiB of one repeated heading",
     ),
+    "md-unclosed-fences": _markdown_case(
+        lambda: _sized(unit="```x\n", target_bytes=MARKDOWN_BYTES),
+        "512 KiB of short unclosed code fences",
+    ),
     "md-backtick-run": _markdown_case(lambda: "`" * 2_000, "2 KB of backticks"),
     "md-code-spans": _markdown_case(lambda: "`a` " * 20_000, "80 KB of inline code spans"),
     "md-reference-brackets": _markdown_case(lambda: "[a][" * 8_000, "32 KB of '[a]['"),
+    "md-open-brackets": _markdown_case(lambda: "[" * 20_000, "20 KB of '['"),
     "md-image-brackets": _markdown_case(lambda: "![" * 8_000, "16 KB of '!['"),
     "md-fence-ladder": _markdown_case(
         lambda: "\n".join("`" * (3 + n) for n in range(1_000)), "1,000 fence lines of growing length"
@@ -263,9 +273,31 @@ CASES: dict[str, Case] = {
 
 
 def _peak_rss_mib() -> float:
+    """This process's peak RSS."""
+    import resource
+
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     # Linux reports KiB; macOS reports bytes.
     return peak / (MIB if sys.platform == "darwin" else 1024)
+
+
+def _child_peaks_mib(*, pid: int) -> tuple[float, float]:
+    """Process *pid*'s peak RSS and peak address space so far, on Linux; zeros elsewhere.
+
+    Read from /proc, which counts from the process's own start. A finished
+    child's rusage doesn't: on Linux it begins at the size of the server it
+    was started from.
+    """
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return 0.0, 0.0
+    peaks = {}
+    for line in status.splitlines():
+        name, _, value = line.partition(":")
+        if name in ("VmHWM", "VmPeak"):
+            peaks[name] = int(value.split()[0]) / 1024
+    return peaks.get("VmHWM", 0.0), peaks.get("VmPeak", 0.0)
 
 
 def _replica_baseline_mib() -> float:
@@ -280,13 +312,27 @@ def _replica_baseline_mib() -> float:
 @dataclass
 class _Watch:
     longest: float = 0.0
+    child_peak_rss_mib: float = 0.0
+    child_peak_vm_mib: float = 0.0
 
 
 async def _watch_loop(*, watch: _Watch, stop: anyio.Event, on_overrun: Callable[[], None]) -> None:
+    import psutil
+
+    me = psutil.Process()
+    ticks = 0
     while not stop.is_set():
         start = time.perf_counter()
         await anyio.sleep(WATCH_INTERVAL_SECONDS)
         watch.longest = max(watch.longest, time.perf_counter() - start - WATCH_INTERVAL_SECONDS)
+        ticks += 1
+        # Both peaks only grow, so a reading every ~100 ms finds them but the
+        # last moments, and keeps the process-table scan off most ticks.
+        if ticks % 10 == 0:
+            for child in me.children():
+                rss, vm = _child_peaks_mib(pid=child.pid)
+                watch.child_peak_rss_mib = max(watch.child_peak_rss_mib, rss)
+                watch.child_peak_vm_mib = max(watch.child_peak_vm_mib, vm)
         on_overrun()
 
 
@@ -328,6 +374,8 @@ def _measure_case(*, case_id: str, budget_seconds: float) -> Row:
                 baseline_rss_mib=round(baseline, 1),
                 peak_rss_mib=round(peak, 1),
                 rss_added_mib=round(peak - baseline, 1),
+                child_peak_rss_mib=round(watch.child_peak_rss_mib, 1),
+                child_peak_vm_mib=round(watch.child_peak_vm_mib, 1),
                 result=outcome,
             )
 
@@ -359,7 +407,12 @@ def _measure_case(*, case_id: str, budget_seconds: float) -> Row:
         try:
             outcome = anyio.run(run)
         except Exception as exc:  # the row records any failure; the next case still runs
-            outcome = f"error: {type(exc).__name__}"
+            while isinstance(exc, ExceptionGroup) and exc.exceptions:
+                exc = exc.exceptions[0]
+            if isinstance(exc, artifact_export.ExportRefused):
+                outcome = f"refused ({exc.refusal}): {exc}"
+            else:
+                outcome = f"error: {type(exc).__name__}"
         return row(outcome=outcome)
 
 
@@ -380,6 +433,8 @@ def _run_isolated(*, case_id: str, budget_seconds: float) -> Row:
             baseline_rss_mib=0.0,
             peak_rss_mib=0.0,
             rss_added_mib=0.0,
+            child_peak_rss_mib=0.0,
+            child_peak_vm_mib=0.0,
             result=f"killed: one stall outlasted the {GRACE_SECONDS:.0f} s grace",
         )
     lines = finished.stdout.strip().splitlines()
@@ -392,6 +447,8 @@ def _run_isolated(*, case_id: str, budget_seconds: float) -> Row:
             baseline_rss_mib=0.0,
             peak_rss_mib=0.0,
             rss_added_mib=0.0,
+            child_peak_rss_mib=0.0,
+            child_peak_vm_mib=0.0,
             result=f"exit {finished.returncode}: {tail[:120]}",
         )
     return Row.model_validate_json(lines[-1])
@@ -420,14 +477,15 @@ def main() -> None:
     print()
     print(
         "| Case | What it holds | Wall s | Longest stall ms | Baseline RSS MiB | Peak RSS MiB "
-        "| RSS added MiB | Result |"
+        "| RSS added MiB | Conversion peak RSS MiB | Conversion peak VM MiB | Result |"
     )
-    print("| -- | -- | -- | -- | -- | -- | -- | -- |")
+    print("| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |")
     for case_id in args.only or list(CASES):
         row = _run_isolated(case_id=case_id, budget_seconds=args.budget)
         print(
             f"| {row.case} | {CASES[case_id].note} | {row.wall_seconds} | {row.longest_stall_ms} "
-            f"| {row.baseline_rss_mib} | {row.peak_rss_mib} | {row.rss_added_mib} | {row.result} |",
+            f"| {row.baseline_rss_mib} | {row.peak_rss_mib} | {row.rss_added_mib} "
+            f"| {row.child_peak_rss_mib} | {row.child_peak_vm_mib} | {row.result} |",
             flush=True,
         )
 
