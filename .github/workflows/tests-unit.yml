@@ -16,6 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Choose test evidence directory
+        run: echo "TEST_REPORT_DIR=$RUNNER_TEMP/test-inventory/broad" >> "$GITHUB_ENV"
+
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
         with:
@@ -34,7 +37,28 @@ jobs:
         run: python scripts/release_contract.py --check
 
       - name: Run unit tests
-        run: make test/unit/coverage
+        run: >-
+          make test/unit/coverage MAKEOVERRIDES=
+          PYTEST="uv run --locked python -m pytest -p scripts.pytest_inventory
+          --test-cohort=broad --test-inventory='$TEST_REPORT_DIR/inventory.json'
+          --junitxml='$TEST_REPORT_DIR/junit.xml'"
+
+      - name: Check and summarize test evidence
+        if: always()
+        run: >-
+          uv run --locked python scripts/test_inventory.py check
+          "$TEST_REPORT_DIR/inventory.json" --junit "$TEST_REPORT_DIR/junit.xml"
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: test-inventory-broad-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.TEST_REPORT_DIR }}/inventory.json
+            ${{ env.TEST_REPORT_DIR }}/junit.xml
+          if-no-files-found: error
+          retention-days: 14
 
   export-tests-desktop:
     # The desktop app runs on Windows and macOS. On Windows a pinned folder has
@@ -61,6 +85,9 @@ jobs:
 
       - uses: actions/checkout@v5
 
+      - name: Choose test evidence directory
+        run: echo "TEST_REPORT_DIR=$RUNNER_TEMP/test-inventory/desktop-export" >> "$GITHUB_ENV"
+
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
         with:
@@ -85,3 +112,23 @@ jobs:
           tests/test_artifact_export_service.py
           tests/test_export_child.py
           tests/test_publish_markdown.py
+          -p scripts.pytest_inventory --test-cohort=desktop-export
+          --test-inventory="$TEST_REPORT_DIR/inventory.json"
+          --junitxml="$TEST_REPORT_DIR/junit.xml"
+
+      - name: Check and summarize test evidence
+        if: always()
+        run: >-
+          uv run python scripts/test_inventory.py check
+          "$TEST_REPORT_DIR/inventory.json" --junit "$TEST_REPORT_DIR/junit.xml"
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: test-inventory-desktop-export-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.TEST_REPORT_DIR }}/inventory.json
+            ${{ env.TEST_REPORT_DIR }}/junit.xml
+          if-no-files-found: error
+          retention-days: 14
