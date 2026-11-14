@@ -10,30 +10,51 @@ from fastapi import HTTPException, Request, status
 _TRUSTED_LOOPBACK_HOSTS = frozenset({"localhost"})
 
 
-def _trusted_loopback_host(value: str) -> bool:
-    parsed = urlparse(f"//{value}")
-    hostname = (parsed.hostname or "").casefold()
-    if hostname in _TRUSTED_LOOPBACK_HOSTS:
+def _is_loopback_address(value: str | None) -> bool:
+    """Whether an address literal, or a host name trusted as local, is loopback.
+
+    Unwraps an IPv4-mapped IPv6 address first. A dual-stack socket reports an
+    IPv4 loopback connection as ``::ffff:127.0.0.1``, and ``is_loopback`` does
+    not answer True for that form on every Python this server runs on.
+    """
+    name = (value or "").strip().strip("[]").casefold()
+    if name in _TRUSTED_LOOPBACK_HOSTS:
         return True
     try:
-        return ipaddress.ip_address(hostname).is_loopback
+        address = ipaddress.ip_address(name)
     except ValueError:
         return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback
+
+
+def _trusted_loopback_host(value: str) -> bool:
+    return _is_loopback_address(urlparse(f"//{value}").hostname)
 
 
 def require_local(request: Request) -> None:
-    """Reject the request unless it originates from loopback.
+    """Reject the request unless it comes from this machine.
 
-    Endpoints that return unmasked secrets (settings reveal-key and /raw,
-    OAuth client credentials) are restricted to loopback so a network-exposed
-    deployment (e.g. the self-host compose that binds 0.0.0.0) can't hand
-    secrets to a remote peer (ENG-457, ENG-868). The desktop sidecar, UI, and
-    Electron main process all talk over 127.0.0.1, so the legitimate flows are
-    unaffected; hosted-web builds call `/settings/raw` on boot and treat the 403
-    as expected (ENG-817).
+    For routes only the desktop sidecar, its renderer and the Electron main
+    process call, all over 127.0.0.1: the ones that return unmasked secrets
+    (settings reveal-key and /raw, OAuth client credentials) or write
+    credentials. A network-exposed deployment, such as a self-host compose
+    that binds 0.0.0.0, must not answer them to a remote peer. Hosted-web
+    builds call ``/settings/raw`` on boot and treat the 403 as expected.
     """
     client = request.client.host if request.client else ""
     if client not in {"127.0.0.1", "::1"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="local requests only")
+
+    # The peer address alone is forgeable wherever uvicorn trusts a proxy: the
+    # image passes --forwarded-allow-ips '*', so an X-Forwarded-For from any
+    # peer rewrites request.client. scope["server"] is the local address of
+    # the accepted socket. The proxy middleware never rewrites it and no caller
+    # chooses it, so a request that landed on a loopback socket really came
+    # from this machine.
+    server = request.scope.get("server") or ()
+    if not _is_loopback_address(server[0] if server else None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="local requests only")
 
     # A loopback TCP peer is not sufficient in a browser: DNS rebinding can

@@ -180,3 +180,124 @@ def test_enforce_mode_boots_quietly(monkeypatch, caplog):
         create_app()
 
     assert [r.message for r in caplog.records if "identity_enforce" in r.message] == []
+
+
+# ── the routes only the desktop app calls that hand out or write secrets ──
+
+#: What a forged request carries. Inside the pod uvicorn reads only
+#: X-Forwarded-For. CF-Connecting-IP and X-Forwarded-Host are what an
+#: ingress turns into the client address and the upstream Host; they are sent
+#: here as an attacker sends them.
+FORGED_LOOPBACK_HEADERS = {
+    "X-Forwarded-For": "127.0.0.1",
+    "CF-Connecting-IP": "127.0.0.1",
+    "X-Forwarded-Host": "localhost",
+}
+
+#: The detail each guard on the way in answers with. A desktop answer that
+#: carries none of them came from the route's own handler.
+GUARD_DETAILS = {
+    "local requests only",
+    "local host required",
+    "trusted local origin required",
+    "not available in org deployments",
+}
+
+_SAVE_BODY = {"connector_id": "no-such-connector", "method": "x", "name": "", "values": {}}
+
+#: (method, path, body, the handler's own status for a desktop caller).
+SECRET_ROUTES = [
+    pytest.param("GET", "/api/v1/settings/reveal-key/anthropic", None, 200, id="reveal-key"),
+    pytest.param("POST", "/api/v1/connectors/connections/save", _SAVE_BODY, 404, id="save"),
+    pytest.param(
+        "POST", "/api/v1/connectors/connections/validate-and-save", _SAVE_BODY, 422, id="validate-and-save"
+    ),
+    pytest.param(
+        "PATCH",
+        "/api/v1/connectors/connections/no-such-engine/no-such-name/token",
+        {"status": "needs_reconnect"},
+        404,
+        id="token",
+    ),
+    pytest.param("GET", "/api/v1/connectors/oauth/no-such-engine/credentials", None, 404, id="credentials"),
+    pytest.param(
+        "POST", "/api/v1/connectors/oauth/no-such-engine/mcp/identity", {"access_token": "t"}, 404, id="mcp-identity"
+    ),
+]
+
+
+def _forwarding_client(*, socket_address: str) -> TestClient:
+    """The image's own path: uvicorn trusts X-Forwarded-For from every peer
+    (``--forwarded-allow-ips '*'``) and rewrites the client address from it.
+    ``socket_address`` sets ``scope["server"]``, the local address the
+    request landed on."""
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    return TestClient(
+        ProxyHeadersMiddleware(create_app(), trusted_hosts="*"),
+        base_url=f"http://{socket_address}",
+        client=("10.105.65.111", 40000),
+    )
+
+
+@pytest.mark.parametrize("method,path,body,desktop_status", SECRET_ROUTES)
+def test_org_mode_refuses_the_secret_routes_to_a_forwarded_loopback_caller(
+    org_deployment, method, path, body, desktop_status
+):
+    """A signed-in member makes the request look like it came from 127.0.0.1.
+    The socket is loopback here on purpose, so ``require_local`` passes and
+    the detail proves the org-mode refusal itself turned the member away."""
+    resp = _forwarding_client(socket_address="localhost").request(
+        method, path, json=body, headers={**MEMBER_HEADERS, **FORGED_LOOPBACK_HEADERS}
+    )
+
+    assert (resp.status_code, resp.json()["detail"]) == (403, "not available in org deployments")
+
+
+@pytest.mark.parametrize("tenancy", ["local", "org"])
+@pytest.mark.parametrize("method,path,body,desktop_status", SECRET_ROUTES)
+def test_a_forwarded_loopback_address_on_a_pod_socket_is_not_local(
+    monkeypatch, tenancy, method, path, body, desktop_status
+):
+    """What an ingress hands the pod: the request lands on the pod's own
+    address whatever X-Forwarded-For claims, with the Host the ingress copied
+    from X-Forwarded-Host. ``require_local`` reads that socket, so the forged
+    address is refused before tenancy is asked, in either mode."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", tenancy)
+    get_app_settings.cache_clear()
+
+    resp = _forwarding_client(socket_address="10.105.98.84:9010").request(
+        method,
+        path,
+        json=body,
+        headers={**MEMBER_HEADERS, **FORGED_LOOPBACK_HEADERS, "Host": "localhost"},
+    )
+
+    assert (resp.status_code, resp.json()["detail"]) == (403, "local requests only")
+
+
+@pytest.mark.parametrize("method,path,body,desktop_status", SECRET_ROUTES)
+def test_the_desktop_still_reaches_the_secret_routes(method, path, body, desktop_status):
+    """The other direction: the desktop sidecar runs local tenancy on
+    127.0.0.1, and every route still answers it from its own handler."""
+    client = TestClient(create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321))
+
+    resp = client.request(method, path, json=body)
+
+    assert resp.status_code == desktop_status, resp.text
+    assert resp.json().get("detail") not in GUARD_DETAILS
+
+
+def test_the_desktop_renderer_still_reveals_a_key():
+    """The renderer calls reveal-key with its own Origin, which the default
+    allowed origins list."""
+    client = TestClient(create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321))
+
+    resp = client.get(
+        "/api/v1/settings/reveal-key/anthropic", headers={"Origin": "http://localhost:5173"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert "value" in resp.json()

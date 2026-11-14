@@ -14,10 +14,13 @@ import pytest
 from fastapi import HTTPException
 
 
-def _request(host, *, headers=None):
-    """Minimal stand-in for the request boundary used by the guard."""
+def _request(host, *, headers=None, server=("127.0.0.1", 26866)):
+    """Minimal stand-in for the request boundary used by the guard.
+
+    ``server`` is ``scope["server"]``, the local address of the socket the
+    request landed on; the desktop sidecar's is loopback."""
     client = SimpleNamespace(host=host) if host is not None else None
-    return SimpleNamespace(client=client, headers=headers or {})
+    return SimpleNamespace(client=client, headers=headers or {}, scope={"server": server})
 
 
 def test_require_local_allows_loopback():
@@ -75,6 +78,36 @@ def test_require_local_rejects_non_loopback(host):
     with pytest.raises(HTTPException) as exc:
         require_local(_request(host))
     assert exc.value.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "server",
+    [("127.0.0.1", 26866), ("::1", 26866), ("::ffff:127.0.0.1", 26866), ["localhost", 80]],
+)
+def test_require_local_allows_a_loopback_socket(server):
+    """The desktop sidecar binds 127.0.0.1. A dual-stack bind reports the same
+    connection as ``::ffff:127.0.0.1``, and Starlette's TestClient hands the
+    server over as a list."""
+    from cowork.api.v1.endpoints.guards import require_local
+
+    require_local(_request("127.0.0.1", headers={"host": "localhost:26866"}, server=server))
+
+
+@pytest.mark.parametrize(
+    "server",
+    [("10.105.98.84", 9010), ("172.17.0.2", 9010), ("::ffff:10.0.0.5", 9010), ("/run/cowork.sock", None), None],
+)
+def test_require_local_refuses_a_loopback_peer_on_a_socket_that_is_not_loopback(server):
+    """Behind uvicorn's proxy middleware an X-Forwarded-For sets the peer to
+    127.0.0.1, but the request still landed on the pod's own address. A unix
+    socket reports its path instead of an address, and a proxy in front of
+    one would make every request look local, so it gets the same refusal, as
+    does a transport that reports nothing."""
+    from cowork.api.v1.endpoints.guards import require_local
+
+    with pytest.raises(HTTPException) as exc:
+        require_local(_request("127.0.0.1", headers={"host": "localhost"}, server=server))
+    assert (exc.value.status_code, exc.value.detail) == (403, "local requests only")
 
 
 def test_reveal_key_blocks_non_local():

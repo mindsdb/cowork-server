@@ -519,3 +519,32 @@ def test_the_scope_key_file_is_the_routers_secret_mounted_where_the_server_reads
     assert mount.get("readOnly") is True
     [item] = [i for i in volume["secret"]["items"] if i["key"] == "scope_key"]
     assert path == Path(mount["mountPath"]) / item["path"]
+
+
+def _network_policy(path: Path) -> dict:
+    """The ``networkPolicy:`` values an environment renders with."""
+
+    def block(values_file: Path) -> dict:
+        return (yaml.safe_load(values_file.read_text()) or {}).get("networkPolicy") or {}
+
+    return block(BASE) if path == BASE else _merged(block(BASE), block(path))
+
+
+def test_every_named_environment_admits_only_the_ingress_controllers():
+    """dev, staging and prod run org mode, where the pod trusts the identity
+    headers of whoever reaches it, so each renders the policy. A PR
+    environment renders the base, which keeps it off, and its deploy turns it
+    on with a parameter of its own. Every rendering admits the same peer, the
+    labeled controller pods in ``infrastructure``, and nothing wider."""
+    assert _network_policy(BASE)["enabled"] is False
+    assert {path.stem.removeprefix("values-") for path in ENVIRONMENTS} == {"dev", "staging", "prod"}
+    for path in RENDERED:
+        policy = _network_policy(path)
+        assert policy["enabled"] is (path != BASE), path.name
+        assert policy["ingressController"] == {
+            "enabled": True,
+            "namespaceSelector": {"kubernetes.io/metadata.name": "infrastructure"},
+            "podSelector": {"nginx-ingress-controller": "true"},
+        }, path.name
+        assert policy["nodeCidrs"] == [], path.name
+        assert policy["extraIngress"] == [], path.name

@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackDesktopOnly, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_db, run_efs, unit_session
@@ -128,13 +128,14 @@ async def get_connection(engine: str, name: str, scope: ScopeDep, request: Reque
     return record
 
 
-# LoopbackOnly: the callers are Electron's main process and a renderer path
-# gated behind !host.isWeb, both over 127.0.0.1, and the route writes vault
-# credentials with no principal to attribute them to.
+# LoopbackDesktopOnly: the callers are Electron's main process and a renderer
+# path gated behind !host.isWeb, both over 127.0.0.1, and the route writes
+# vault credentials with no principal to attribute them to. No hosted caller
+# uses it, so an org deployment refuses it outright.
 @router.post(
     "/save",
     response_model=DirectSaveResponse,
-    dependencies=[Depends(require(LoopbackOnly))],
+    dependencies=[Depends(require(LoopbackDesktopOnly))],
 )
 def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
     """Persist credentials to the vault without running a probe.
@@ -146,7 +147,7 @@ def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
     return _persist_direct_connection(body, scope, dict(body.values))
 
 
-# LoopbackOnly: the caller is Code's connector setup panel
+# LoopbackDesktopOnly: the caller is Code's connector setup panel
 # (cowork src/renderer/cowork/code/CodeConnectorsView.tsx, through
 # api.js validateAndSaveConnector), and Code mode only exists on desktop
 # (host.ts: codeModeAvailable = isElectron && bridge.codeModeAvailable), so
@@ -154,7 +155,7 @@ def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
 @router.post(
     "/validate-and-save",
     response_model=DirectSaveResponse,
-    dependencies=[Depends(require(LoopbackOnly))],
+    dependencies=[Depends(require(LoopbackDesktopOnly))],
 )
 def validate_and_save_developer_connection(body: DirectSaveRequest, scope: ScopeDep):
     """Validate a Code developer-tool credential before storing it.
@@ -273,10 +274,10 @@ class PatchTokenBody(BaseModel):
     status: str | None = None
 
 
-# LoopbackOnly: the only caller is Electron main's token-refresh.ts, always
-# over 127.0.0.1 (the in-body 501 for org mode, below, is a second,
-# independent belt-and-suspenders check).
-@router.patch("/{engine}/{name}/token", dependencies=[Depends(require(LoopbackOnly))])
+# LoopbackDesktopOnly: the only caller is Electron main's token-refresh.ts,
+# always over 127.0.0.1, and an org deployment refuses the route before the
+# handler runs. The in-body org-mode refusal below stays as a second check.
+@router.patch("/{engine}/{name}/token", dependencies=[Depends(require(LoopbackDesktopOnly))])
 def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: ScopeDep):
     """Partially update token fields on a vault entry.
 
@@ -392,7 +393,7 @@ class PatchAccessModeBody(BaseModel):
 # deliberately rather than just its dual-branch shape — this is the only
 # thing standing between an arbitrary caller and rewriting another user's
 # tool-access mode (see the HubSpot blueprint tab, "found during a later
-# review pass"). Not LoopbackOnly like /save: the "edit access" affordance
+# review pass"). Not LoopbackDesktopOnly like /save: the "edit access" affordance
 # this backs must work identically from Electron and from the web SPA
 # (CustomizeView.jsx), same as patch_picked_files above.
 @router.patch(

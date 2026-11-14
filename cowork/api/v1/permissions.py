@@ -10,9 +10,9 @@ than "open" and "closed":
 ===========================  =====================================================
 ``OpenByDesign``             no credential at all. Pinned route by route in
                              tests/test_open_by_design_pin.py.
-``LoopbackOnly``             the caller's network position (``require_local``)
 ``DesktopOnly``              refused in org mode (``require_local_tenancy``)
-``LoopbackDesktopOnly``      both of the above
+``LoopbackDesktopOnly``      the caller's network position (``require_local``),
+                             and refused in org mode
 ``PlatformSignature``        the calling platform's HMAC over the body
 ``Authenticated``            a verified ``Principal``
 ``AuthenticatedInOrgMode``   a verified ``Principal``, in org mode only
@@ -78,8 +78,8 @@ class OpenByDesign:
     because some other layer in front of the route happens to check it.
 
     The odd name in this file, on purpose. Every other class here is named
-    after the credential the route takes: ``LoopbackOnly`` is a network
-    position, ``PlatformSignature`` is an HMAC, ``Authenticated`` is a
+    after the credential the route takes: ``LoopbackDesktopOnly`` is a
+    network position, ``PlatformSignature`` is an HMAC, ``Authenticated`` is a
     ``Principal``. The absence of a credential has no name, so this one is
     named after the assertion instead — that the route is open because
     someone decided it, not because a line went missing. That is also the
@@ -112,7 +112,7 @@ class OpenByDesign:
     runtime without it.
 
     If the answer is "loopback", "desktop-only" or "the platform signed it",
-    the class for that is ``LoopbackOnly`` / ``DesktopOnly`` /
+    the class for that is ``LoopbackDesktopOnly`` / ``DesktopOnly`` /
     ``PlatformSignature``, not this. This one means no credential at all, and
     every route that carries it is pinned with its reason in
     tests/test_open_by_design_pin.py — declare it here and the build stays red
@@ -125,33 +125,6 @@ class OpenByDesign:
     """
 
     async def check(self, request: Request) -> None:
-        return None
-
-
-class LoopbackOnly:
-    """The credential is the caller's network position, not an identity.
-
-    ``require_local`` (endpoints/guards.py) is the check: a loopback peer, a
-    loopback ``Host`` (DNS rebinding), and an ``Origin`` in
-    ``allowed_origins`` (CSRF). For a route only the desktop sidecar, its
-    renderer, or the Electron main process ever calls.
-
-    Takes it as a declared ``Depends(require_local)`` rather than calling it,
-    for the same reason ``Authenticated`` declares ``get_principal``: a bare
-    call inside ``check`` is invisible to FastAPI, so a test's
-    ``app.dependency_overrides[require_local]`` would stop reaching it.
-
-    Named rather than folded into ``OpenByDesign``: "no principal" and "a
-    credential that is not a principal" are different declarations, and every
-    system that does this for real keeps them apart — Istio splits
-    ``ipBlocks`` from ``requestPrincipals``, Envoy splits an empty ``requires``
-    from ``allow_missing``, and mindshub_inference's own front door (ENG-1564)
-    has ``HeaderIdentity`` and ``SignedTokenIdentity`` beside its open marker.
-    Collapsing them loses the one fact a reader needs: what would have to go
-    wrong for this route to be reachable.
-    """
-
-    async def check(self, request: Request, _local: None = Depends(require_local)) -> None:
         return None
 
 
@@ -169,17 +142,30 @@ class DesktopOnly:
 
 
 class LoopbackDesktopOnly:
-    """``LoopbackOnly`` and ``DesktopOnly`` together, in that order.
+    """The credential is the caller's network position, and only on desktop.
 
-    Loopback first, matching the order these two guards were declared in
-    before they became one declaration: a non-loopback caller is told "local
-    requests only" whatever the tenancy mode, and only a loopback caller
-    reaches the org-mode refusal.
+    ``require_local`` (endpoints/guards.py) is the first check: a loopback
+    peer that landed on a loopback socket, a loopback ``Host`` (DNS
+    rebinding), and an ``Origin`` in ``allowed_origins`` (CSRF). For a route
+    only the desktop sidecar, its renderer, or the Electron main process ever
+    calls. ``require_local_tenancy`` then refuses the route in org mode,
+    because loopback inside a hosted pod says nothing about which member is
+    calling: a ``kubectl port-forward`` or any process in the pod lands there.
+    There is deliberately no loopback-only class without the org refusal.
 
-    Not a subclass of either — ``require()`` copies one class's ``check``
-    signature, so composing by inheritance would mean re-declaring both
-    sub-dependencies here anyway, and a flat signature is what a reader can
-    check the order against.
+    Loopback first: a non-loopback caller is told "local requests only"
+    whatever the tenancy mode, and only a loopback caller reaches the
+    org-mode refusal.
+
+    Takes both guards as declared ``Depends(...)`` rather than calling them,
+    for the same reason ``Authenticated`` declares ``get_principal``: a bare
+    call inside ``check`` is invisible to FastAPI, so a test's
+    ``app.dependency_overrides[require_local]`` would stop reaching it.
+
+    Not a subclass of ``DesktopOnly``: ``require()`` copies one class's
+    ``check`` signature, so composing by inheritance would mean re-declaring
+    both sub-dependencies here anyway, and a flat signature is what a reader
+    can check the order against.
 
     Safe to declare on a router, which is the point. A route added to a router
     carrying this inherits a check that REFUSES; a route added to one carrying
