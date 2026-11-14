@@ -60,6 +60,12 @@ def _alembic_versions(path) -> set[str]:
 # staging revision after 2a366c1f4b9f leaves it stamped.
 MAINS_OWNER_INDEX = "599bf4bf0370"
 
+# The org_appearance branch head (it drops the table), on its own
+# branch off c69488788ac7 until e2a7c4f9b613 merges it with staging's
+# f93151b5bad1. A downgrade to a revision on staging's side of that merge
+# leaves it stamped.
+ORG_APPEARANCE_DROP = "d16c08651013"
+
 
 def _set_alembic_version(path, revision: str) -> None:
     with sqlite3.connect(path) as connection:
@@ -178,6 +184,33 @@ def test_schema_migrations_create_new_database(tmp_path, monkeypatch):
 
     assert "harness" in _message_columns(db_path)
     assert _alembic_version(db_path) == expected_head()
+
+
+def test_push_devices_upgrade_from_staging_head(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "push-upgrade.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+
+    _upgrade_to(engine, uri, "c1d7e2a94f60")
+    assert not _has_table(db_path, "push_devices")
+    _upgrade_to(engine, uri, "head")
+
+    schema = inspect(engine)
+    assert {"org_id", "user_id", "token", "platform"} <= {
+        column["name"] for column in schema.get_columns("push_devices")
+    }
+    assert any(
+        constraint["column_names"] == ["token"]
+        for constraint in schema.get_unique_constraints("push_devices")
+    )
+    assert any(
+        index["column_names"] == ["org_id", "user_id"]
+        for index in schema.get_indexes("push_devices")
+    )
+    _upgrade_to(engine, uri, "head")
+    assert _alembic_versions(db_path) == {expected_head()}
 
 
 def test_schema_migrations_rerun_on_up_to_date_database_is_noop(tmp_path, monkeypatch):
@@ -344,7 +377,7 @@ def test_the_conversations_owner_index_is_added_by_its_migration_and_dropped_on_
 
     assert "ix_conversations_org_id_created_by" not in _conversation_indexes(path=db_path)
     assert "ix_conversations_org_id" in _conversation_indexes(path=db_path)
-    assert _alembic_versions(db_path) == {"6f1b8d3a5c27", MAINS_OWNER_INDEX}
+    assert _alembic_versions(db_path) == {"6f1b8d3a5c27", MAINS_OWNER_INDEX, ORG_APPEARANCE_DROP}
 
 
 def test_task_objects_downgrade_drops_table(tmp_path, monkeypatch):
@@ -560,6 +593,129 @@ def test_a_skill_sharing_downgrade_takes_the_backfill_marker_with_the_rows(tmp_p
             text("SELECT count(*) FROM settings WHERE key = :key"), {"key": BACKFILL_SETTING_KEY}
         ).scalar_one()
     assert marker == 0
+
+
+def test_held_artifact_roots_keep_one_row_per_root_and_take_their_sentinel_on_downgrade(tmp_path, monkeypatch):
+    """One row per root: a project's shared root (no conversation) and each
+    legacy root once. The settings row that says the backfill filled them
+    goes with the table on a downgrade: left behind, a re-upgrade's list
+    would trust an empty table and show no card. So does the backfill's
+    progress, which would let a re-upgrade's backfill skip projects."""
+    from cowork.services.held_artifact_roots import PROGRESS_KEY, SENTINEL_KEY
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "held-roots.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    project, conversation = uuid.uuid4().hex, uuid.uuid4().hex
+    insert = text(
+        "INSERT INTO held_artifact_roots (id, org_id, project_id, conversation_id) "
+        "VALUES (:id, :org, :project, :conversation)"
+    )
+
+    def add(conversation_id) -> None:
+        with engine.begin() as connection:
+            connection.execute(
+                insert, {"id": uuid.uuid4().hex, "org": _ORG, "project": project, "conversation": conversation_id}
+            )
+
+    add(None)
+    add(conversation)
+    for again in (None, conversation):
+        with pytest.raises(IntegrityError):
+            add(again)
+    with engine.begin() as connection:
+        _insert_setting(connection, key=SENTINEL_KEY, value='{"unread": []}')
+        _insert_setting(connection, key=PROGRESS_KEY, value='{"after": null, "unread": []}')
+        _insert_setting(connection, key="tone", value="balanced", scope="org", org_id=_ORG)
+
+    _downgrade_to(engine, uri, "f93151b5bad1")
+    with engine.connect() as connection:
+        keys = {row[0] for row in connection.execute(text("SELECT key FROM settings"))}
+    assert "held_artifact_roots" not in inspect(engine).get_table_names()
+    assert SENTINEL_KEY not in keys and PROGRESS_KEY not in keys
+    assert "tone" in keys
+
+    _upgrade_to(engine, uri, "head")
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT count(*) FROM held_artifact_roots")).scalar_one()
+        sentinel = connection.execute(
+            text("SELECT count(*) FROM settings WHERE key = :key"), {"key": SENTINEL_KEY}
+        ).scalar_one()
+    assert (rows, sentinel) == (0, 0)
+
+
+def test_artifact_sort_times_keep_one_row_per_folder_and_take_their_sentinel_on_downgrade(tmp_path, monkeypatch):
+    """One row per folder: a shared root's folder (no conversation) and a
+    legacy root's folder each once. The sentinel that says the backfill read
+    every held root goes with the table on a downgrade, and so does the
+    backfill's progress, which would let a re-upgrade's backfill skip
+    projects; the held roots stay with theirs. The revision sits on the
+    merge of the held-root and the org appearance heads. The list's newest
+    rows come through an index per form of the list: a project's
+    (project_id, sort_time) and an organization's (org_id, sort_time), the
+    same in the revision as in the model."""
+    from cowork.models.artifact_sort_time import ArtifactSortTime
+    from cowork.services.artifact_sort_times import PROGRESS_KEY, SENTINEL_KEY
+    from cowork.services.held_artifact_roots import PROGRESS_KEY as HELD_PROGRESS_KEY
+    from cowork.services.held_artifact_roots import SENTINEL_KEY as HELD_KEY
+
+    script = ScriptDirectory.from_config(_alembic_config("sqlite://"))
+    assert script.get_revision("33c9ba9927ad").down_revision == "7a18a01d56a0"
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "sort-times.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    migrated = {index["name"]: index["column_names"] for index in inspect(engine).get_indexes("artifact_sort_times")}
+    modeled = {index.name: [column.name for column in index.columns] for index in ArtifactSortTime.__table__.indexes}
+    assert migrated["ix_artifact_sort_times_org_time"] == ["org_id", "sort_time"]
+    assert migrated["ix_artifact_sort_times_project_time"] == ["project_id", "sort_time"]
+    for name in ("ix_artifact_sort_times_org_time", "ix_artifact_sort_times_project_time"):
+        assert modeled[name] == migrated[name], name
+    project, conversation = uuid.uuid4().hex, uuid.uuid4().hex
+    insert = text(
+        "INSERT INTO artifact_sort_times (id, org_id, project_id, conversation_id, slug, sort_time) "
+        "VALUES (:id, :org, :project, :conversation, :slug, 1.0)"
+    )
+
+    def add(conversation_id, slug="report") -> None:
+        with engine.begin() as connection:
+            connection.execute(
+                insert,
+                {"id": uuid.uuid4().hex, "org": _ORG, "project": project, "conversation": conversation_id, "slug": slug},
+            )
+
+    add(None)
+    add(conversation)
+    add(None, slug="chart")
+    for again in (None, conversation):
+        with pytest.raises(IntegrityError):
+            add(again)
+    with engine.begin() as connection:
+        _insert_setting(connection, key=SENTINEL_KEY, value='{"unread": []}')
+        _insert_setting(connection, key=PROGRESS_KEY, value='{"after": null, "unread": []}')
+        _insert_setting(connection, key=HELD_KEY, value='{"unread": []}')
+        _insert_setting(connection, key=HELD_PROGRESS_KEY, value='{"after": null, "unread": []}')
+
+    _downgrade_to(engine, uri, "7a18a01d56a0")
+    with engine.connect() as connection:
+        keys = {row[0] for row in connection.execute(text("SELECT key FROM settings"))}
+    tables = inspect(engine).get_table_names()
+    assert "artifact_sort_times" not in tables and "held_artifact_roots" in tables
+    assert SENTINEL_KEY not in keys and PROGRESS_KEY not in keys
+    assert HELD_KEY in keys and HELD_PROGRESS_KEY in keys
+
+    _upgrade_to(engine, uri, "head")
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT count(*) FROM artifact_sort_times")).scalar_one()
+        sentinel = connection.execute(
+            text("SELECT count(*) FROM settings WHERE key = :key"), {"key": SENTINEL_KEY}
+        ).scalar_one()
+    assert (rows, sentinel) == (0, 0)
 
 
 def test_artifact_owner_choices_upgrade_and_downgrade(tmp_path, monkeypatch):
@@ -1245,6 +1401,220 @@ def test_live_app_preview_migration_round_trip_preserves_launches(tmp_path, monk
     engine.dispose()
 
 
+# The last revision with org_appearance: d16c08651013 drops it (auth owns the
+# org look). The revisions that built it are tested up to here.
+LAST_ORG_APPEARANCE_REVISION = "71332e7a1839"
+
+
+def _org_appearance_columns(path) -> list[str]:
+    with sqlite3.connect(path) as connection:
+        return [row[1] for row in connection.execute("pragma table_info(org_appearance)")]
+
+
+def test_sidebar_title_is_added_where_the_first_org_appearance_revision_lacked_it(tmp_path, monkeypatch):
+    # A deployed environment ran d4b7e2a9c1f3 before it gained sidebar_title,
+    # so its org_appearance has no such column; 3e78d31dc845 adds it there.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "sidebar-title-missing.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "d4b7e2a9c1f3")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("alter table org_appearance drop column sidebar_title")
+        connection.commit()
+    assert "sidebar_title" not in _org_appearance_columns(db_path)
+
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
+
+    assert _org_appearance_columns(db_path).count("sidebar_title") == 1
+    assert _alembic_version(db_path) == LAST_ORG_APPEARANCE_REVISION
+
+
+def test_sidebar_title_revision_is_a_no_op_where_the_column_already_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "sidebar-title-present.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "d4b7e2a9c1f3")
+    assert "sidebar_title" in _org_appearance_columns(db_path)
+
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
+    assert _org_appearance_columns(db_path).count("sidebar_title") == 1
+
+    # Downgrade leaves the column to d4b7e2a9c1f3, whose downgrade drops the table.
+    _downgrade_to(engine, uri, "d4b7e2a9c1f3")
+    assert "sidebar_title" in _org_appearance_columns(db_path)
+    _downgrade_to(engine, uri, "c69488788ac7")
+    assert not _has_table(db_path, "org_appearance")
+
+
+def test_sidebar_title_mode_is_added_and_an_existing_title_becomes_custom(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "sidebar-title-mode.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "5b9e1c7d3a20")
+    assert "sidebar_title_mode" not in _org_appearance_columns(db_path)
+    with sqlite3.connect(db_path) as connection:
+        for org_id, title in (("a" * 32, "Acme AI"), ("b" * 32, None), ("c" * 32, "")):
+            connection.execute(
+                "insert into org_appearance (id, org_id, sidebar_title, members_can_choose) "
+                "values (?, ?, ?, 1)",
+                (uuid.uuid4().hex, org_id, title),
+            )
+        connection.commit()
+
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
+
+    with sqlite3.connect(db_path) as connection:
+        modes = dict(connection.execute("select org_id, sidebar_title_mode from org_appearance"))
+    assert modes == {"a" * 32: "custom", "b" * 32: "company", "c" * 32: "company"}
+
+    # Run again on an up-to-date database: nothing to add.
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
+    assert _org_appearance_columns(db_path).count("sidebar_title_mode") == 1
+
+    _downgrade_to(engine, uri, "5b9e1c7d3a20")
+    assert "sidebar_title_mode" not in _org_appearance_columns(db_path)
+    assert "sidebar_title" in _org_appearance_columns(db_path)
+
+
+def test_sidebar_title_mode_revision_is_a_no_op_where_the_column_already_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "sidebar-title-mode-present.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "5b9e1c7d3a20")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "alter table org_appearance add column sidebar_title_mode varchar(16) not null default 'none'"
+        )
+        connection.execute(
+            "insert into org_appearance (id, org_id, sidebar_title, members_can_choose) values (?, ?, ?, 1)",
+            (uuid.uuid4().hex, "d" * 32, "Acme AI"),
+        )
+        connection.commit()
+
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
+
+    assert _org_appearance_columns(db_path).count("sidebar_title_mode") == 1
+    with sqlite3.connect(db_path) as connection:
+        # Left as it was: the revision neither re-adds the column nor rewrites rows.
+        assert connection.execute("select sidebar_title_mode from org_appearance").fetchone()[0] == "none"
+
+
+def test_the_backgrounds_are_added_and_the_single_background_copied_into_both(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "backgrounds.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "c3d548ba2bdb")
+    assert "background_light" not in _org_appearance_columns(db_path)
+    with sqlite3.connect(db_path) as connection:
+        for org_id, background in (("a" * 32, "#fafafa"), ("b" * 32, None)):
+            connection.execute(
+                "insert into org_appearance (id, org_id, background, members_can_choose) values (?, ?, ?, 1)",
+                (uuid.uuid4().hex, org_id, background),
+            )
+        connection.commit()
+
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
+
+    with sqlite3.connect(db_path) as connection:
+        rows = {
+            org_id: (light, dark)
+            for org_id, light, dark in connection.execute(
+                "select org_id, background_light, background_dark from org_appearance"
+            )
+        }
+    assert rows == {"a" * 32: ("#fafafa", "#fafafa"), "b" * 32: (None, None)}
+
+    _downgrade_to(engine, uri, "c3d548ba2bdb")
+    columns = _org_appearance_columns(db_path)
+    assert "background_light" not in columns and "background_dark" not in columns
+    assert "background" in columns
+
+
+def test_the_backgrounds_revision_keeps_columns_and_values_already_there(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "backgrounds-present.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "c3d548ba2bdb")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("alter table org_appearance add column background_light varchar(7)")
+        connection.execute(
+            "insert into org_appearance (id, org_id, background, background_light, members_can_choose) "
+            "values (?, ?, ?, ?, 1)",
+            (uuid.uuid4().hex, "c" * 32, "#fafafa", "#eeeeee"),
+        )
+        connection.commit()
+
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
+
+    columns = _org_appearance_columns(db_path)
+    assert columns.count("background_light") == 1 and columns.count("background_dark") == 1
+    with sqlite3.connect(db_path) as connection:
+        light, dark = connection.execute("select background_light, background_dark from org_appearance").fetchone()
+    # A value already there is kept; only the empty side takes the legacy one.
+    assert (light, dark) == ("#eeeeee", "#fafafa")
+
+
+def test_org_appearance_is_dropped_now_that_auth_owns_the_look(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "drop-org-appearance.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    # A deployed database that ran every org_appearance revision, with a row.
+    _upgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "insert into org_appearance (id, org_id, accent, members_can_choose) values (?, ?, ?, 1)",
+            (uuid.uuid4().hex, "e" * 32, "#0055ff"),
+        )
+        connection.commit()
+
+    run_schema_migrations(engine, uri)
+    assert not _has_table(db_path, "org_appearance")
+    assert _alembic_version(db_path) == expected_head()
+
+    # Downgrade brings the table back, empty and as 71332e7a1839 left it.
+    _downgrade_to(engine, uri, LAST_ORG_APPEARANCE_REVISION)
+    columns = _org_appearance_columns(db_path)
+    for column in ("sidebar_title", "sidebar_title_mode", "background_light", "background_dark"):
+        assert columns.count(column) == 1, column
+    _downgrade_to(engine, uri, "c69488788ac7")
+    assert not _has_table(db_path, "org_appearance")
+
+
+def test_a_fresh_database_never_keeps_org_appearance(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "fresh-no-org-appearance.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert not _has_table(db_path, "org_appearance")
+    # Rerunning on an up-to-date database is a no-op.
+    run_schema_migrations(engine, uri)
+    assert _alembic_version(db_path) == expected_head()
+
+
 def test_artifact_locations_upgrade_and_downgrade(tmp_path, monkeypatch):
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     get_app_settings.cache_clear()
@@ -1280,4 +1650,4 @@ def test_artifact_locations_downgrade_guards_missing_table(tmp_path, monkeypatch
 
     _downgrade_to(engine, uri, "dce94d4bafc0")  # must not raise
 
-    assert _alembic_versions(db_path) == {"dce94d4bafc0", MAINS_OWNER_INDEX}
+    assert _alembic_versions(db_path) == {"dce94d4bafc0", MAINS_OWNER_INDEX, ORG_APPEARANCE_DROP}

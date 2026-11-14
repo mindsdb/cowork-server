@@ -37,6 +37,14 @@ helm upgrade --namespace $K8S_NAMESPACE --install $CURRENT_HELM_CHART $HELM_CHAR
 
 Swap `CI_ENVIRONMENT_SLUG` / `K8S_NAMESPACE` for `staging` or `prod` to target those environments.
 
+## Who rolls out each environment
+
+- **staging and prod:** CI, on a push to `staging` or `main` (the `deploy` job in `.github/workflows/build-deploy.yml`).
+- **A PR's own environment:** CI, when the PR carries the `deploy` label. It gets a namespace of its own, `pr-cowork-server-<N>`.
+- **dev** (`cowork.dev.mindshub.ai`): CI, when a PR carries the `deploy-to-dev` label (the `deploy-dev` job). That PR's `development` image rolls into `dev` on every push while the label stays. Removing the label leaves the last rollout in place. Two labeled PRs take turns, so the last push wins.
+
+Each rollout runs `alembic upgrade head` on that environment's database first. A PR that adds a migration leaves `dev`'s database at its revision, so a later rollout from a branch without that revision fails its `db-migrate` init container until a branch that has it rolls out again. The running pods keep serving meanwhile.
+
 ## Required cluster secrets
 
 The chart references these Secrets in the target namespace:
@@ -98,6 +106,14 @@ environments are on.
 - `deployment.datasourceTurnsEnabled`, rendered as
   `COWORK_TURN_DATASOURCE_ENABLED`: `"true"` registers grants and queues the
   datasource block for hosted turns.
+- `deployment.datasourceLabelsEnabled`, rendered as
+  `COWORK_TURN_DATASOURCE_LABELS_ENABLED`: `"true"` in `values.yaml`, so every
+  environment sends each connection's name and connector id once its grants
+  are on; it does nothing where `datasourceTurnsEnabled` is off. An anton older
+  than the change refuses a block carrying them, so before an environment turns
+  grants on, its scratchpad image must have that anton and no live pod may
+  predate the image. Rollback for one environment sets the scalar to `"false"`
+  in its values file, the only value the chart test lets it set.
 - `deployment.datasourceCapabilities`, rendered as
   `COWORK_DATASOURCE_CAPABILITIES`: the methods this deployment may run, as a
   versioned manifest such as
@@ -163,7 +179,7 @@ times below count from the pod's deletion.
 | 0 to 15 s | The preStop hook sleeps. ingress-nginx drops the pod's endpoint and sends new requests, reconnects included, to the other pods. Answers already streaming from this pod keep streaming, and one that finishes now ends normally. |
 | About 15 s | The kubelet sends SIGTERM. Before uvicorn sees it, the server refuses new turns (503, code `server_busy`, `Retry-After: 1`) and stops its scheduler. A scheduled run whose turn it refuses is recorded as not started, and its slot stays due for the next poll on a pod still serving. Then it ends each answer still running: it writes the sandbox controller's cancel flag so the sandbox turn stops, saves the answer as it stands, and sends "The response was interrupted before it finished. Please try again." on the answer's open stream, which then ends cleanly. This takes at most 5 s (`TURN_SHUTDOWN_GRACE_SECONDS`). If an answer's save is still running a second after that, the message goes to its stream without waiting for the save, which goes on in the background. The pod logs `Cancelled in-flight turns for shutdown` at WARNING, with `event` `shutdown_turns_cancelled` and the number of answers it ended in `count`. |
 | Up to about 22 s | uvicorn closes its listener and waits at most 2 s (`--timeout-graceful-shutdown` in the Dockerfile's `CMD`) for responses still open, such as a `/tail` of an answer another pod runs, then cuts them. |
-| Up to about 44 s | The lifespan teardown's bounded waits, about 22 s: the draft listener's own drain when `COWORK_DRAFT_PORT` is set (2 s), another pass over turns and scheduled runs (5 s), the artifact location backfill's stop (2 s, `LOCATION_BACKFILL_SHUTDOWN_SECONDS`), channel tasks (3 s, then up to 5 s more) and scratchpad closes (5 s). The backfill's walk ends at its next root or id once the teardown sets its stop. When it is still running after 2 s, as during a file store stall, the pod logs `artifact location backfill still running at shutdown; going on` at WARNING, with `event` `shutdown_location_backfill_unfinished`, and the teardown goes on without it. The channel drain waits up to 3 s for the channel answers in flight, then cancels each one still running. The pod logs `Cancelled channel inbound tasks still running at the shutdown drain's timeout` at WARNING, with `event` `shutdown_channel_tasks_cancelled` and the number it cancelled in `count`. The drain then waits up to 5 s more while each cancelled answer writes its sandbox turn's cancel flag and records its artifacts. If an answer is still running after those 5 s, the pod logs `Cancelled channel inbound tasks still unwinding; shutdown goes on without them` at WARNING, with `event` `shutdown_channel_tasks_unfinished` and the number still running in `count`, and the teardown goes on without it. |
+| Up to about 44 s | The lifespan teardown's bounded waits, about 22 s: the draft listener's own drain when `COWORK_DRAFT_PORT` is set (2 s), another pass over turns and scheduled runs (5 s), the artifact backfills' stop (2 s, `LOCATION_BACKFILL_SHUTDOWN_SECONDS`), channel tasks (3 s, then up to 5 s more) and scratchpad closes (5 s). The three artifact backfills (location, then held-root, then sort-time) run in one task, and the walk running ends at its next project, root or id once the teardown sets their stop. When the task is still running after 2 s, as during a file store stall, the pod logs `artifact backfills (location, held-root, sort-time) still running at shutdown; going on` at WARNING, with `event` `shutdown_location_backfill_unfinished`, and the teardown goes on without it. The channel drain waits up to 3 s for the channel answers in flight, then cancels each one still running. The pod logs `Cancelled channel inbound tasks still running at the shutdown drain's timeout` at WARNING, with `event` `shutdown_channel_tasks_cancelled` and the number it cancelled in `count`. The drain then waits up to 5 s more while each cancelled answer writes its sandbox turn's cancel flag and records its artifacts. If an answer is still running after those 5 s, the pod logs `Cancelled channel inbound tasks still unwinding; shutdown goes on without them` at WARNING, with `event` `shutdown_channel_tasks_unfinished` and the number still running in `count`, and the teardown goes on without it. |
 | Up to about 52 s | Last, only while an answer's artifact diff or record is still running, as it is during a file store stall: the teardown waits up to 8 s more for those (`TURN_END_RECORD_DRAIN_SECONDS` in `cowork/db/units.py`). A stall that clears within that wait keeps the answer's artifact rows. For each one still running after it, the pod logs `A turn's artifact record was still running at shutdown; its rows are lost` at ERROR, with `event` `shutdown_turn_record_lost`, `conversation_id`, `project_id`, `touched` and `count`. `touched` holds the new artifacts' slugs its diff found, or, when the diff had not returned, the artifacts the pod named as its tools' (`artifacts_touched`; empty for a pod that sends no usable list), the first of them in sorted order, none longer than 255 characters, at most 50 (`TURN_END_RECORD_NAMES_LOGGED`) and only as many as fit in 12 KiB as the line encodes them (`TURN_END_RECORD_TOUCHED_BYTES`), so the line stays under the 16 KiB a container runtime splits a line at; `count` says how many the record held. |
 | 62 s | `terminationGracePeriodSeconds`. Outside a file store stall, the bounded waits above end by about 44 s, which leaves about 18 s before the kubelet's SIGKILL for the closes at the end of the teardown, which have no bound. During a stall they end by about 52 s, which leaves about 10 s. When the teardown ends, the event loop's close cancels every task still running. It cuts an artifact diff that has not returned and a record still waiting for its database slot, so that answer's artifact rows are lost. A web answer still streaming at SIGTERM is saved anyway, marked `turn_lost`, before the loop closes; its stream already ended with the turn-lost message. An answer that had finished streaming and was recording its artifacts at SIGTERM starts its save only once that record ends, and if that is in the last wait, the save starts as the loop closes and may not finish. A file store call already running on the stuck mount keeps its worker thread, which is not a daemon thread, so the process stays alive until the SIGKILL ends it. |
 
@@ -220,6 +236,26 @@ Desktop and other non-hosted deployments are unchanged. They run turns in the
 server's own process, keep uvicorn's SIGTERM handling, and end their turns in
 the lifespan teardown, as before. A single-replica PR environment renders these
 values too, and they change only how its pod stops.
+
+## The agent's browser
+
+`COWORK_BROWSER_ROUTER_URL` turns on the agent's browser for the web app: it
+names the browser router, served on the same host under `/browser`.
+`values-dev.yaml`, `values-staging.yaml` and `values-prod.yaml` set it to
+their own host. The router must answer on that host's `/browser` path before
+the entry ships, since without it the path reaches the web frontend. PR
+environments get theirs from where they are deployed.
+`tests/test_chart_values.py` pins each value to its environment's host. What
+the router does with it is in the top-level README ("The agent's browser").
+
+The router's scope key is the `browser-scope-key` volume: the router's own
+Secret, `browser-proxy`, key `scope_key`, in the same namespace, mounted at
+`/etc/cowork/browser-scope/scope_key` (`COWORK_BROWSER_SCOPE_KEY_FILE`,
+`values.yaml`). The router takes a turn key's scope only with that key beside
+it, so the two must match, and reading one Secret keeps them so. cowork-server
+reads the file on every scope, and the kubelet fills it when the Secret first
+appears and rewrites it on rotation, so no restart is needed. The volume is
+optional: a namespace with no router has no such Secret and scopes no turn.
 
 ## Browser organization boundary
 

@@ -461,6 +461,8 @@ async def test_handle_refuses_non_streaming_turn_in_org_mode(org_mode, granted_p
     class _FakeConversation:
         def __init__(self, conv_id):
             self.id = conv_id
+            # No folder there, so the project holds no files.
+            self.project = SimpleNamespace(path="/nonexistent/project")
 
     class _FakeConversationService:
         def __init__(self, scoped):
@@ -472,6 +474,9 @@ async def test_handle_refuses_non_streaming_turn_in_org_mode(org_mode, granted_p
         def message_count(self, conversation):
             return 0
 
+        def record_turn_picks(self, *, conversation, model, reasoning_effort, reset=()):
+            pass
+
         def get_recent_messages(self, conversation_id, *, roles, limit):
             return []
 
@@ -480,6 +485,7 @@ async def test_handle_refuses_non_streaming_turn_in_org_mode(org_mode, granted_p
     responses_mod.ConversationService = _FakeConversationService
     try:
         handler = object.__new__(ResponsesHandler)
+        handler.schedule_id = None
         from cowork.db.scoped import TenantScope
         handler.scope = TenantScope(org_mode=True, org_id="org-fixture", user_id="user-fixture")
         handler.principal = None

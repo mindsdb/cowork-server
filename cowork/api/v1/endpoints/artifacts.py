@@ -56,26 +56,32 @@ from cowork.schemas.live_apps import (
     SharedLiveAppResponse,
 )
 from cowork.services.artifact_identity import canonical_artifact_id
-from cowork.services.artifact_locations import forget_location
+from cowork.services.artifact_locations import Location, forget_location
 from cowork.services.artifact_roots import (
     RootsPlan,
     artifacts_sources_for_scan,
+    held_root_of,
     plan_project_roots,
     plan_scope_roots,
     readable_sources,
     recorded_location,
+    with_held_roots,
 )
 from cowork.services.artifacts import (
+    LIST_CARDS,
     BackendPreviewRefused,
     ExecutionRefused,
+    ListCandidate,
     ProjectArtifacts,
     _is_single_named_file,
     _org_mode,
     _project_artifacts_base,
     artifact_id_for_folder as _artifact_id_for_folder,
+    cards_for_candidates,
     delete_artifact as _delete_artifact,
     delete_artifact_from_source as _delete_artifact_from_source,
     list_artifacts as _list_artifacts,
+    list_candidates,
     mount_preview,
     preview_artifact as _preview_artifact,
     preview_mount_for,
@@ -86,6 +92,7 @@ from cowork.services.projects import ProjectService, is_comparison_sandbox
 
 if TYPE_CHECKING:
     from cowork.services.artifact_export import ExportSource
+    from cowork.services.artifact_sort_times import NewestFolders
     from cowork.services.live_apps import CopyOfShare
 
 logger = logging.getLogger(__name__)
@@ -207,22 +214,124 @@ class _FoundCard(NamedTuple):
 
 
 class _SourcesAndCards(NamedTuple):
-    """The file store half of a card list: the roots, and the cards of the
-    artifacts in them before the owner reads."""
+    """The file store half of a card list: the roots, the cards of the
+    artifacts in them before the owner reads, and, when the list fell back
+    to reading every folder, the shared roots whose sort-time rows named a
+    folder that is gone or that opened and built no card (_newest_cards)."""
 
     sources: list[ProjectArtifacts]
     cards: list[_FoundCard]
+    stale: tuple[ProjectArtifacts, ...]
 
 
-def _sources_and_cards(*, find_sources: Callable[[], list[ProjectArtifacts]]) -> _SourcesAndCards:
+def _sources_and_cards(
+    *,
+    find_sources: Callable[[], list[ProjectArtifacts]],
+    newest: NewestFolders | None = None,
+) -> _SourcesAndCards:
     """The roots ``find_sources`` finds and their cards, each with its export
-    source, on the calling thread."""
+    source, on the calling thread. With ``newest``, the plan's newest folders
+    (RootsPlan.newest), only those folders are opened, beside every folder
+    of the projects in newest.unread (_newest_cards)."""
     from cowork.services.artifact_export import card_export_source
 
     sources = find_sources()
+    stale: tuple[ProjectArtifacts, ...] = ()
+    if newest is None:
+        cards = _list_artifacts(sources)
+    else:
+        cards, stale = _newest_cards(sources, newest)
     return _SourcesAndCards(
         sources=sources,
-        cards=[_FoundCard(card, card_export_source(card)) for card in _list_artifacts(sources)],
+        cards=[_FoundCard(card, card_export_source(card)) for card in cards],
+        stale=stale,
+    )
+
+
+class _NewestCards(NamedTuple):
+    """What _newest_cards built: the cards, and the shared roots whose rows
+    named a folder its read of every folder did not find, or one that
+    opened and built no card (ListedCards.no_card)."""
+
+    cards: list[dict]
+    stale: tuple[ProjectArtifacts, ...]
+
+
+def _newest_cards(sources: list[ProjectArtifacts], newest: NewestFolders) -> _NewestCards:
+    """The cards of the folders ``newest`` names among ``sources``, and of
+    every folder in the roots of the projects in newest.unread, whose rows
+    the list cannot trust (NewestFolders.unread). Those roots are read here
+    in full (list_candidates), and their folders sort with the rows'
+    folders, newest first, then by root and name, as a walk of every folder
+    orders them (cards_for_candidates). A row whose name a walk skips
+    (artifact_identity.is_listable_folder_name) names no folder to open.
+
+    When the rows were cut at the query's limit, a folder past the cut is no
+    newer than the last row kept. The query cuts a run of equal times by
+    name, while a walk sorts it by root first, so a folder at that row's
+    time may sort above the rows kept at it. When newest_folders read the
+    whole run (NewestFolders.tied, ties_read), the candidates at least as
+    new as that row are sure to sort as a walk sorts them; otherwise only
+    those newer are. When those build fewer than LIST_CARDS cards, every
+    folder of ``sources`` is read instead, so neither a run too long to
+    read nor rows of folders that are gone or build no card leave the list
+    short or out of order. Then each shared root comes back in ``stale``
+    when one of its rows names a folder that read did not find, or a
+    folder that opened but built no card (ListedCards.no_card says when).
+    The location check of the project then drops the rows of the folders
+    it finds gone or holding no id, and keeps the rows of the folders it
+    could not read, as on EIO. So a folder whose id read keeps failing
+    that way, or that builds no card on a host without procfs, keeps its
+    row, and each list that falls back asks for the check again, which
+    the poll starts at most once per SELF_HEAL_INTERVAL_S. A legacy root's
+    rows come back in none: the location check lists only the project's
+    shared root, so it could not drop them."""
+    from cowork.services.artifact_identity import is_listable_folder_name
+    from cowork.services.held_artifact_roots import HeldRoot
+
+    index: dict[HeldRoot, int] = {}
+    for position, source in enumerate(sources):
+        root = held_root_of(source)
+        if root is not None:
+            index.setdefault(root, position)
+    recorded = [
+        ListCandidate(row.sort_time, position, row.slug, sources[position])
+        for row in newest.rows + newest.tied
+        if is_listable_folder_name(row.slug)
+        and (position := index.get(HeldRoot(row.project_id, row.conversation_id))) is not None
+    ]
+    walked_at = {
+        position
+        for position, source in enumerate(sources)
+        if source.project_id is not None and UUID(source.project_id) in newest.unread
+    }
+    walked = list_candidates(sources, indexes=sorted(walked_at))
+    candidates = recorded + walked
+    if not newest.complete:
+        oldest_kept = newest.rows[-1].sort_time
+        if newest.ties_read:
+            candidates = [candidate for candidate in candidates if candidate.sort_time >= oldest_kept]
+        else:
+            candidates = [candidate for candidate in candidates if candidate.sort_time > oldest_kept]
+    listed = cards_for_candidates(candidates)
+    if newest.complete or len(listed.cards) >= LIST_CARDS:
+        return _NewestCards(cards=listed.cards, stale=())
+    every = walked + list_candidates(
+        sources, indexes=[position for position in range(len(sources)) if position not in walked_at]
+    )
+    # The folders the read of every folder found, less those that opened
+    # and built no card above.
+    usable = {(candidate.source_index, candidate.name) for candidate in every}.difference(
+        (candidate.source_index, candidate.name) for candidate in listed.no_card
+    )
+    shared_at = {position for root, position in index.items() if root.conversation_id is None}
+    stale_at = {
+        candidate.source_index
+        for candidate in recorded
+        if candidate.source_index in shared_at and (candidate.source_index, candidate.name) not in usable
+    }
+    return _NewestCards(
+        cards=cards_for_candidates(every).cards, stale=tuple(sources[position] for position in sorted(stale_at))
     )
 
 
@@ -237,16 +346,53 @@ def _browsable_sources(*, plan: RootsPlan) -> list[ProjectArtifacts]:
 
 
 async def _cards_for(
-    scope: TenantScope, find_sources: Callable[[], list[ProjectArtifacts]]
+    scope: TenantScope,
+    find_sources: Callable[[], list[ProjectArtifacts]],
+    *,
+    newest: NewestFolders | None = None,
 ) -> list[dict]:
     """``_artifact_cards`` with the roots found and their folders walked in one
     file store call, then the owner reads in a database unit, so no pooled
     connection waits on the file server. ``find_sources`` runs in that file
-    store call."""
-    found = await run_efs(partial(_sources_and_cards, find_sources=find_sources), scope=scope)
+    store call. ``newest``, a plan's newest folders (RootsPlan.newest),
+    limits the walk to those folders and every folder of the projects in
+    newest.unread (_newest_cards).
+
+    When the list falls back to reading every folder (_newest_cards), a
+    shared root whose rows named a folder that is gone, or one that opened
+    and built no card, asks for its project's location check
+    (_ask_for_location_checks). That check drops the rows of the folders
+    it finds gone or holding no id, so the project's later lists open only
+    its newest folders again, and keeps the rows of the folders it could
+    not read."""
+    found = await run_efs(partial(_sources_and_cards, find_sources=find_sources, newest=newest), scope=scope)
+    _ask_for_location_checks(scope, roots=found.stale)
     return await run_db(
         partial(_card_capabilities, sources=found.sources, cards=found.cards), scope=scope
     )
+
+
+def _ask_for_location_checks(scope: TenantScope, *, roots: tuple[ProjectArtifacts, ...]) -> None:
+    """Ask for the location check of each shared root in ``roots``: the
+    self-heal's listing of that root, which drops the sort time of each
+    folder it finds gone or holding no id, and keeps that of each folder
+    it could not read (artifact_sort_times.reconcile_sort_times). A root
+    lands in ``roots`` when the list fell back to reading every folder and
+    one of its rows named a folder that is gone or that opened and built
+    no card (_newest_cards). Asked for in the scope of
+    ``scope``'s organization with no user (scope_for_org), as the heal
+    sweep asks (artifact_heal_sweep), so every member's list of the
+    project asks for the one check. An entry in an in-memory set that the
+    poll starts (artifact_autopublish.request_project_location_check): no
+    write, and no file store call."""
+    if not roots:
+        return
+    from cowork.db.scoped import scope_for_org
+    from cowork.services.artifact_autopublish import request_project_location_check
+
+    project_scope = scope_for_org(scope.org_id)
+    for root in roots:
+        request_project_location_check(artifacts_base=Path(root.base), scope=project_scope, project_id=root.project_id)
 
 
 def _card_capabilities(session, *, sources, cards: list[_FoundCard]) -> list[dict]:
@@ -326,14 +472,18 @@ def _mark_received_live_apps(
 def _plan_scoped_project(session, *, project_ref: str) -> RootsPlan:
     """The database half of root discovery for one project, run as a unit:
     the server's own id for the selector, then the plan of that project's
-    roots.
+    roots, with the roots its held rows name (with_held_roots). So the list
+    of one project opens only those, and a delete by an old folder name
+    finds only what that list shows. It reads no sort-time row: the list
+    reads those in its own unit (_listed_project_plan), and the delete and
+    the live-app duplicate have no use for them.
 
     ``scoped_project_id_for_request`` first enumerates the tenant-scoped
     project catalog and uses the client UUID only as an in-memory equality
     key, so root discovery receives the matching database value."""
     server_project_id = scoped_project_id_for_request(session, project_ref)
     try:
-        return plan_project_roots(session, server_project_id)
+        return with_held_roots(session, plan_project_roots(session, server_project_id))
     except ValueError as exc:
         # The project can disappear between catalog recovery and root discovery.
         raise HTTPException(
@@ -342,9 +492,60 @@ def _plan_scoped_project(session, *, project_ref: str) -> RootsPlan:
         ) from exc
 
 
-async def _scoped_project_plan(scope: TenantScope, project_id: UUID | str) -> RootsPlan:
+def _listed_project_plan(session, *, project_ref: str) -> RootsPlan:
+    """The list of one project's plan: _plan_scoped_project's, with the
+    newest folders of its roots (_with_newest), in one database unit."""
+    plan = _plan_scoped_project(session, project_ref=project_ref)
+    return _with_newest(session, plan, sources_of=readable_sources)
+
+
+# Twice the cards a list shows: a folder deleted since its row was written
+# costs the list one of these, and a list left short reads every folder.
+_NEWEST_CANDIDATES = 2 * LIST_CARDS
+
+
+def _with_newest(
+    session, plan: RootsPlan, *, sources_of: Callable[[RootsPlan], list[ProjectArtifacts]]
+) -> RootsPlan:
+    """``plan`` with the newest folders of the roots its held rows name
+    (artifact_sort_times.newest_folders): the roots ``sources_of`` expands
+    the plan to, without the projects in its ``walk``. Those have no held
+    rows from the held-root backfill, so their rows may not name every
+    root, and finding the roots would list the file store inside this
+    database unit, so the list reads every folder of them instead: they
+    join newest.unread (_newest_cards). Unchanged before the plan trusts the
+    held rows (no ``held``), in a scope that keeps no rows, and before the
+    sort times' backfill has written its sentinel."""
+    from dataclasses import replace
+
+    from cowork.services.artifact_sort_times import newest_folders
+
+    if plan.held is None:
+        return plan
+    held_only = replace(plan, projects=tuple(project for project in plan.projects if project.id not in plan.walk))
+    roots = [root for source in sources_of(held_only) if (root := held_root_of(source)) is not None]
+    newest = newest_folders(session, roots=roots, limit=_NEWEST_CANDIDATES)
+    if newest is None:
+        return plan
+    return replace(plan, newest=newest._replace(unread=newest.unread | plan.walk))
+
+
+def _listed_scope_plan(session) -> RootsPlan:
+    """The unfiltered list's plan: every project of the caller's scope, with
+    the roots the held rows name (with_held_roots) and the newest folders of
+    those it browses (_with_newest), in one database unit."""
+    plan = with_held_roots(session, plan_scope_roots(session))
+    return _with_newest(session, plan, sources_of=lambda listed: _browsable_sources(plan=listed))
+
+
+async def _scoped_project_plan(
+    scope: TenantScope, project_id: UUID | str, *, listed: bool = False
+) -> RootsPlan:
     """The plan of one request-selected project's roots, read in a database
-    unit.
+    unit: with ``listed``, the list's, with the newest folders of its roots
+    (_listed_project_plan), and otherwise without them
+    (_plan_scoped_project), for the delete by an old folder name and the
+    live-app duplicate.
 
     ``basename`` is intentionally applied even though FastAPI already typed the
     route value as a UUID. Snyk recognizes this standard path-leaf operation as
@@ -359,7 +560,8 @@ async def _scoped_project_plan(scope: TenantScope, project_id: UUID | str) -> Ro
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid project",
         )
-    return await run_db(partial(_plan_scoped_project, project_ref=project_ref), scope=scope)
+    unit = _listed_project_plan if listed else _plan_scoped_project
+    return await run_db(partial(unit, project_ref=project_ref), scope=scope)
 
 
 def _desktop_source_path_keys(source) -> set[str]:
@@ -725,10 +927,10 @@ async def list_artifacts(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid project",
             )
-        plan = await _scoped_project_plan(scope, project_ref)
-        return await _cards_for(scope, partial(readable_sources, plan))
-    plan = await run_db(plan_scope_roots, scope=scope)
-    return await _cards_for(scope, partial(_browsable_sources, plan=plan))
+        plan = await _scoped_project_plan(scope, project_ref, listed=True)
+        return await _cards_for(scope, partial(readable_sources, plan), newest=plan.newest)
+    plan = await run_db(_listed_scope_plan, scope=scope)
+    return await _cards_for(scope, partial(_browsable_sources, plan=plan), newest=plan.newest)
 
 
 
@@ -930,14 +1132,21 @@ async def delete_artifact_for_request(
             extra=log_context(project_id=source.project_id, artifact_slug=folder_name),
         )
 
-    # The location row goes with the folder (org mode; a no-op elsewhere).
-    # Best-effort: a row left behind names a folder that no longer holds the
-    # id, and the next lookup drops it.
+    # The location row and the sort time go with the folder (org mode; a
+    # no-op elsewhere). Best-effort: a location row left behind names a
+    # folder that no longer holds the id, and the next lookup drops it. A
+    # sort time left behind costs a list one failed open. The project's next
+    # self-heal drops a shared root's (reconcile_sort_times). A legacy
+    # root's stays, since no self-heal lists a legacy root.
     location = recorded_location(source, Path(source.base) / folder_name)
     if expected_artifact_id is not None and location is not None:
         try:
             await run_db(
-                partial(forget_location, artifact_id=canonical_artifact_id(expected_artifact_id), location=location),
+                partial(
+                    _forget_deleted_folder,
+                    artifact_id=canonical_artifact_id(expected_artifact_id),
+                    location=location,
+                ),
                 scope=scope,
             )
         except Exception:
@@ -946,6 +1155,25 @@ async def delete_artifact_for_request(
                 exc_info=True,
                 extra=log_context(project_id=source.project_id, artifact_slug=folder_name),
             )
+
+
+def _forget_deleted_folder(session, *, artifact_id: str, location: Location) -> None:
+    """Drop the rows of a folder just deleted: its location row
+    (forget_location) and its sort time (forget_sort_time). Each has its own
+    try, so a failed drop of one still drops the other."""
+    from cowork.services.artifact_sort_times import forget_sort_time
+
+    context = log_context(project_id=location.project_id, artifact_slug=location.slug)
+    try:
+        forget_location(session, artifact_id=artifact_id, location=location)
+    except Exception:
+        session.rollback()
+        logger.warning("Could not drop the location of a deleted artifact", exc_info=True, extra=context)
+    try:
+        forget_sort_time(session, location=location)
+    except Exception:
+        session.rollback()
+        logger.warning("Could not drop the sort time of a deleted artifact", exc_info=True, extra=context)
 
 
 # The routes below (through delete_artifact_endpoint) are DesktopOnly, which
@@ -963,11 +1191,13 @@ async def delete_artifact_for_request(
     response_model=ArtifactStatusView,
     dependencies=[Depends(require(DesktopOnly))],
 )
-async def artifact_status(
+def artifact_status(
     scope: ScopeDep, path: str = Query(..., min_length=1, max_length=4096)
 ) -> ArtifactStatusView:
     # Cheap published/modified/access read for the preview viewer's in-place
     # refresh. Never raises for an unknown path — returns the blank default.
+    # Plain `def`: an edited Markdown artifact's modified check renders its
+    # page in the conversion process, so it runs in FastAPI's threadpool.
     status = _desktop_artifact_status_for_path(path, scope=scope)
     if status.published_url:
         from cowork.services.publish import published_link_owner_recorded

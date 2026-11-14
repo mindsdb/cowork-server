@@ -9,18 +9,19 @@ import stat
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple
 from urllib.parse import quote
 from uuid import UUID
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
-from functools import partial
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
@@ -50,6 +51,7 @@ from cowork.services.artifact_permissions import (
 )
 from cowork.services import artifact_files
 from cowork.services.preview_html import prepare_preview_html
+from cowork.services.quick_edit import direct_edit_available, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.schemas.artifact_access import (
@@ -107,6 +109,9 @@ _DRAFT_RESPONSE_HEADERS = {
 }
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
 _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
+# The stats tracking toggle waits only briefly for an in-flight publish:
+# the full publish wait would freeze the switch for a minute.
+_STATS_TRACKING_LOCK_TIMEOUT_S = 5.0
 # Matched against the first path component of a draft request. The file
 # walk refuses them there casefolded too, and the store-owned ones at any
 # depth (`artifact_files.refuse_housekeeping`).
@@ -495,6 +500,8 @@ async def _sync_live_artifact(
     """
     from cowork.services.publish import (
         AccessModeChanged,
+        MarkdownNotPublishable,
+        MarkdownRenderBusy,
         PublishOwnedByOtherUser,
         PublishTooLarge,
         ShareOrgRequired,
@@ -574,6 +581,16 @@ async def _sync_live_artifact(
         # Repeats on every save until the artifact shrinks, so no traceback.
         logger.warning("Could not synchronize live artifact %s: it is too large to publish", folder)
         return False
+    except MarkdownNotPublishable:
+        # Repeats on every save until the Markdown changes, so no traceback.
+        logger.warning(
+            "Could not synchronize live artifact %s: its Markdown page can't be rendered", folder
+        )
+        return False
+    except MarkdownRenderBusy:
+        # Another conversion held the server's one slot; the next save tries again.
+        logger.warning("Could not synchronize live artifact %s: another conversion runs", folder)
+        return False
     except (AccessModeChanged, ShareOrgRequired):
         # publish_artifact logged the refusal: a mode changed after the
         # owner's last save, or MindsHub refusing a share with everyone that
@@ -593,11 +610,15 @@ async def _sync_live_artifact(
             await key.revoke()
 
 
-async def _acquire_live_publish_lock(folder: Path, scope: TenantScope) -> bool:
+async def _acquire_live_publish_lock(
+    folder: Path, scope: TenantScope, *, timeout_s: float | None = None
+) -> bool:
     from cowork.services.artifact_locks import acquire
 
+    if timeout_s is None:
+        timeout_s = _LIVE_PUBLISH_TIMEOUT_S
     loop = asyncio.get_running_loop()
-    lock_deadline = loop.time() + _LIVE_PUBLISH_TIMEOUT_S
+    lock_deadline = loop.time() + timeout_s
     while True:
         try:
             if await run_efs(
@@ -613,16 +634,29 @@ async def _acquire_live_publish_lock(folder: Path, scope: TenantScope) -> bool:
 
 
 async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
+    """*capabilities* narrowed by the caller's current product permissions.
+
+    ``canQuickEdit`` (ENG-4227): the viewer's chat bar is offered. It needs
+    what an agent repair needs, plus the server setting and an anton with the
+    quick editor (``quick_edit_available``), so it is false on a server whose
+    anton predates it. ``quickEditDirect``: the bar can also edit directly,
+    because a decisions model serves the caller's provider; without one the
+    bar still shows and hands every message to the chat.
+    """
     if not capabilities["canEdit"]:
-        return capabilities
+        return {**capabilities, "canQuickEdit": False, "quickEditDirect": False}
     can_edit = await has_product_permission(scope, "artifact.manage")
     can_execute = await has_product_permission(scope, "product.execute")
+    can_address = capabilities["canAddressWithAgent"] and can_edit and can_execute
     current = {
         **capabilities,
         "canEdit": can_edit,
-        "canAddressWithAgent": capabilities["canAddressWithAgent"] and can_edit and can_execute,
+        "canAddressWithAgent": can_address,
         "canResolveComments": capabilities["canResolveComments"] and can_edit,
     }
+    can_quick_edit = bool(can_address and quick_edit_available())
+    current["canQuickEdit"] = can_quick_edit
+    current["quickEditDirect"] = can_quick_edit and await direct_edit_available(scope)
     # The export route needs `artifact.manage` too, so it offers nothing here.
     if not can_edit and "exportFormats" in capabilities:
         current["exportFormats"] = []
@@ -1267,6 +1301,27 @@ async def artifact_access(
     return state if rule is None else state.restricted_to(rule)
 
 
+def _push_share(scope, principal: Principal | None, notices: list) -> None:
+    """Push the people the save asked to notify, the ones MindsHub emails:
+    individuals by id only. People named by address alone, and the members
+    of a team or the whole organization a share opens to, get no push, as
+    they get no email. Never raises."""
+    try:
+        from cowork.services.push.hooks import artifact_shared
+
+        for notice in notices:
+            artifact_shared(
+                org_id=scope.org_id if scope.org_mode else None,
+                sharer_id=principal.user_id if principal else None,
+                sharer_name=principal.email if principal else None,
+                recipient_ids=notice.recipients.user_ids,
+                artifact_title=notice.artifact_title,
+                url=notice.artifact_url,
+            )
+    except Exception:
+        logger.warning("Could not push an artifact share", exc_info=True, extra={"event": "push_share_failed"})
+
+
 async def set_artifact_access(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -1342,8 +1397,9 @@ async def set_artifact_access(
                 detail="Publishing is unavailable right now. Try again in a moment.",
             )
         publish_started = True
+        notices: list = []
         try:
-            return await asyncio.wait_for(
+            published = await asyncio.wait_for(
                 asyncio.to_thread(
                     _publish_bundle,
                     folder,
@@ -1356,9 +1412,12 @@ async def set_artifact_access(
                     notify=notify or None,
                     stored=checked.stored,
                     owner_save=True,
+                    notices=notices,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
+            _push_share(scope, principal, notices)
+            return published
         except asyncio.TimeoutError as exc:
             publish_abandoned = True
             raise HTTPException(
@@ -1421,6 +1480,103 @@ class CommentsAccessResponse(CamelResponse):
     scope: Literal["organization", "owner"]
     capabilities: dict[str, Any]
     current_revision: dict[str, Any] | None
+
+
+async def _call_stats_service(scope: TenantScope, folder: Path, call: Callable[..., Any]) -> Any:
+    """Run one stats request with a publish key minted for it, then revoke the key."""
+    from cowork.services import artifact_stats as stats
+
+    key = None
+    try:
+        report_id = await run_efs(partial(stats.report_id_for_folder, folder), scope=scope)
+        _artifacts_base, publish_url, key = await run_on_unit_threads(
+            partial(_owner_publish_context, scope, folder)
+        )
+        api_key = await key.get()
+        if not api_key:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Publishing is unavailable right now. Try again in a moment.",
+            )
+        return await run_in_threadpool(
+            call, publish_url=publish_url, key=api_key, report_id=report_id,
+        )
+    except stats.STATS_ROUTE_ERRORS as exc:
+        if isinstance(exc, stats.PublishCredentialRejected):
+            logger.warning("artifact_stats_upstream_unauthorized artifact=%s", folder.name)
+        raise stats.stats_http_exception(exc, desktop=False) from exc
+    finally:
+        if key is not None:
+            # Under a cancelled anyio scope this await would be cancelled too,
+            # leaving the key live until its TTL.
+            with anyio.CancelScope(shield=True):
+                await key.revoke()
+
+
+class _StatsTrackingBody(BaseModel):
+    enabled: StrictBool
+
+
+@router.get("/workspace/{project_ref}/{artifact_id}/stats")
+async def read_artifact_stats(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    scope: ScopeDep,
+):
+    """View statistics of this published artifact, as the publishing service returns them.
+
+    Owner-only. artifact.manage is checked here too: auth mints the publish
+    key only with it, and a refusal at the mint would read as a key failure.
+    """
+    await require_product_permission(scope, "artifact.manage")
+    from cowork.services import artifact_stats as stats
+
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    return await _call_stats_service(scope, folder, stats.fetch_stats)
+
+
+@router.put("/workspace/{project_ref}/{artifact_id}/stats/tracking")
+async def set_artifact_stats_tracking(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    body: _StatsTrackingBody,
+    scope: ScopeDep,
+):
+    """Turn view recording on or off for this published artifact. Owner-only.
+
+    The publishing service rewrites the artifact's metadata file to store the
+    flag, so the request holds the publish lock: a live sync or autopublish
+    rewriting the same file in between would drop the change.
+    """
+    await require_product_permission(scope, "artifact.manage")
+
+    from cowork.services import artifact_stats as stats
+    from cowork.services.artifact_locks import release
+
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    if not await _acquire_live_publish_lock(
+        folder, scope, timeout_s=_STATS_TRACKING_LOCK_TIMEOUT_S
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Publishing is busy right now. Try again in a moment.",
+        )
+    try:
+        tracking = await _call_stats_service(
+            scope, folder, partial(stats.set_tracking, enabled=body.enabled),
+        )
+    finally:
+        # Shielded for the same reason: an unreleased lock blocks publishing
+        # of this artifact until its TTL. Waits for a file store slot.
+        with anyio.CancelScope(shield=True):
+            await run_efs(
+                partial(release, folder.parent, folder.name), scope=scope, deadline=False
+            )
+    return {"tracking": tracking}
 
 
 def _open_comments(

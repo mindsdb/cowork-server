@@ -7,6 +7,7 @@ Emits typed events:
     response.output_text.delta  (assistant text deltas)
     response.answer_reset       (drop the answer so far; the next delta replaces it)
     response.answer_restore     (a hand-back gives back the answer a reset dropped)
+    response.browser_session_opened (the agent opened the person's browser session; carries its id only)
     response.memory_read        (whether the turn read learned memory, and how many entries)
     response.figure_sources     (each figure in the answer and the steps it came from)
     response.completed          (final response object)
@@ -51,9 +52,21 @@ from cowork.schemas.responses import (
     ResponseStatus,
     Role,
 )
+from cowork.streaming.addons import TurnAddon
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
 
 logger = logging.getLogger(__name__)
+
+
+class BrowserSessionOpened(BaseModel):
+    """The ``response.browser_session_opened`` event's body: the session id
+    only, never a viewer link (a stored event opens nothing)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["response.browser_session_opened"] = "response.browser_session_opened"
+    sequence_number: int
+    session_id: str
 
 
 @dataclass
@@ -114,6 +127,19 @@ class TurnHistory:
     # instead; None means `rows` are what the agent read. The pod's rows
     # arrive unchecked, so an entry may not be a row at all.
     read: list[object] | None = None
+
+
+@dataclass
+class PreviewCheckRequest:
+    """Synthetic event: a remote turn's anton asks the open preview whether an
+    artifact runs (turnqueue/preview_checks.py). Written to the stream as the
+    same ``response.artifact_check`` frame an in-process turn writes
+    (preview_checker.artifact_check_sse), and like that one never saved:
+    it means something only while the pod waits on it."""
+
+    check_id: str
+    artifact_slug: str
+    timeout_s: int
 
 
 @dataclass
@@ -358,7 +384,8 @@ _APPENDED_CONTEXT = re.compile(r"^\[[^\n]*Anton-only context[^\n]*\]$", re.MULTI
 _CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error|artifact lint|live app)\]\n", re.MULTILINE)
 # The note format_cell_result puts after printed output it cut short, with
 # the line breaks before the next part.
-_TRUNCATION_NOTE = re.compile(r"\n\n\.\.\. \(truncated, \d+ chars total\)\n*\Z")
+# Newer anton follows it with a sentence on how to read files whole.
+_TRUNCATION_NOTE = re.compile(r"\n\n\.\.\. \(truncated, \d+ chars total\)[^\n]*\n*\Z")
 
 
 class _HistoryRow(BaseModel):
@@ -731,6 +758,7 @@ async def format_responses_stream(
     from anton.core.llm.provider import (
         StreamAskUser,
         StreamAskUserAnswered,
+        StreamBrowserSession,
         StreamComplete,
         StreamContextCompacted,
         StreamTaskProgress,
@@ -782,6 +810,11 @@ async def format_responses_stream(
     # What the last spent boundary set aside, returned if the turn hands back
     # instead of delivering the replacement it promised.
     superseded_stash = ""
+    # Where in `collected_text` the current answer starts: just past the last
+    # tool call. Text before a tool call is narration, which the app files as
+    # a step (ENG-3554), so a boundary sets aside only the text after it and a
+    # hand-back gives back the answer alone (ENG-4194).
+    answer_from = 0
     # Why a turn that handed back stopped (anton's `ended_by`); None if it finished.
     ended_by: str | None = None
 
@@ -857,8 +890,13 @@ async def format_responses_stream(
                 # answer it promised; if it hands back instead, the answer that
                 # was already read has to come back rather than be lost from the
                 # transcript and from the history the next turn is rebuilt from.
-                superseded_stash = "".join(collected_text)
+                # The answer the user read: the text after the last tool
+                # call, or all of it when nothing followed that call.
+                superseded_stash = "".join(collected_text[answer_from:]).lstrip("\n")
+                if not superseded_stash.strip():
+                    superseded_stash = "".join(collected_text)
                 collected_text.clear()
+                answer_from = 0
                 # The armed paragraph break belongs between two rounds of the
                 # answer being discarded, not in front of its replacement.
                 round_break = False
@@ -888,6 +926,7 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, StreamToolUseStart):
+            answer_from = len(collected_text)
             tool_names[event.id] = event.name
             tool_json_parts[event.id] = []
             if is_evidence_tool(name=event.name):
@@ -1049,6 +1088,7 @@ async def format_responses_stream(
                 superseded_pending = False
                 if superseded_stash:
                     collected_text.insert(0, superseded_stash)
+                    answer_from = 0
                     seq += 1
                     yield _event("response.answer_restore", {
                         "type": "response.answer_restore",
@@ -1184,6 +1224,17 @@ async def format_responses_stream(
                 "content": event.message,
             })
 
+        elif isinstance(event, StreamBrowserSession):
+            # The agent opened the person's browser session: the app shows the
+            # browser beside the chat. Persisted like every event, so a reload
+            # reopens the pane. The session id only, never a viewer link: on the
+            # web, whoever opens the pane mints their own link with their own
+            # credential (POST /browse/embed), so a stored event opens nothing.
+            seq += 1
+            yield _event("response.browser_session_opened", BrowserSessionOpened(
+                sequence_number=seq, session_id=event.session_id,
+            ).model_dump())
+
         elif isinstance(event, ArtifactCreated):
             seq += 1
             yield _event("response.artifact_created", {
@@ -1242,6 +1293,20 @@ async def format_responses_stream(
 
         elif isinstance(event, TurnContext):
             turn_context = event
+
+        elif isinstance(event, PreviewCheckRequest):
+            from cowork.harnesses.anton_harness.preview_checker import artifact_check_sse
+
+            # Not through _event: never recorded with the turn's events.
+            yield artifact_check_sse(
+                check_id=event.check_id, artifact_slug=event.artifact_slug, timeout_s=event.timeout_s,
+            )
+
+        elif isinstance(event, TurnAddon):
+            # A message the person added mid-turn: accepted, read by the
+            # model, or returned to run next (cowork.streaming.addons).
+            seq += 1
+            yield _event("response.addon", {**event.payload(), "sequence_number": seq})
 
         elif isinstance(event, SkillCreated):
             seq += 1

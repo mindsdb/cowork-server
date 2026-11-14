@@ -77,6 +77,7 @@ CAPABILITIES = "COWORK_DATASOURCE_CAPABILITIES"
 # gate's own change adds the environment here and sets both deployment scalars
 # in its values file.
 ENABLED_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
+LABELS_FLAG = "COWORK_TURN_DATASOURCE_LABELS_ENABLED"
 # The exact methods each enabled environment offers.
 OFFERED_METHODS: dict[str, frozenset[str]] = {"staging": frozenset({"mysql:host-password", "postgres:host-port"})}
 # The draft host of each environment. cowork's web build frames exactly these
@@ -87,6 +88,13 @@ DRAFT_HOSTS = {
     "prod": "draft.mindshub.co",
 }
 DRAFT_HOST = "{{ $.Values.draftHost }}"
+# The browser router each environment's web app calls: its own host under
+# /browser, where the router is served.
+BROWSER_ROUTER_URLS = {
+    "dev": "https://cowork.dev.mindshub.ai/browser",
+    "staging": "https://cowork.staging.mindshub.ai/browser",
+    "prod": "https://cowork.mindshub.ai/browser",
+}
 # The Ingress refuses to render without a host, which would make it a catch-all.
 REQUIRED_DRAFT_HOST = '{{ required "set deployment.draftHost to enable ingress_secondary" $.Values.draftHost }}'
 
@@ -137,6 +145,24 @@ def base() -> list[_Env]:
     return _env(BASE)
 
 
+@pytest.mark.parametrize("name", [
+    "COWORK_PUSH_ENABLED",
+    "COWORK_PUSH_APNS_TOPIC",
+    "COWORK_PUSH_APNS_KEY_P8",
+    "COWORK_PUSH_APNS_KEY_ID",
+    "COWORK_PUSH_APNS_TEAM_ID",
+    "COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON",
+])
+def test_push_settings_use_optional_secret_keys(base, name):
+    assert _entry(base, name) == _Env(
+        name=name, secret="cowork-push", key=name, optional=True,
+    )
+    for env_values in ENVIRONMENTS:
+        assert not [entry for entry in _env(env_values) if entry.name == name], (
+            f"{env_values.name} overrides the shared push secret reference"
+        )
+
+
 def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed(base):
     assert _deployment(BASE)["datasourceTurnsEnabled"] == "false"
     assert _entry(base, FLAG).value == "{{ $.Values.datasourceTurnsEnabled }}"
@@ -146,6 +172,20 @@ def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed
         assert _deployment(env_values).get("datasourceTurnsEnabled") == expected, f"{env_values.name} flips the grants"
         assert not [e for e in _env(env_values) if e.name == FLAG], (
             f"{env_values.name} declares {FLAG}; set deployment.datasourceTurnsEnabled instead"
+        )
+
+
+def test_connection_labels_are_on_in_the_base_and_an_environment_may_only_opt_out(base):
+    """Labels act only where grants are on, so the base turns them on everywhere;
+    an environment's values file may set "false" as its rollback, nothing else."""
+    assert _deployment(BASE)["datasourceLabelsEnabled"] == "true"
+    assert _entry(base, LABELS_FLAG).value == "{{ $.Values.datasourceLabelsEnabled }}"
+    for env_values in ENVIRONMENTS:
+        assert _deployment(env_values).get("datasourceLabelsEnabled") in (None, "false"), (
+            f"{env_values.name} sets datasourceLabelsEnabled to something other than the \"false\" rollback"
+        )
+        assert not [e for e in _env(env_values) if e.name == LABELS_FLAG], (
+            f"{env_values.name} declares {LABELS_FLAG}; set deployment.datasourceLabelsEnabled instead"
         )
 
 
@@ -342,7 +382,7 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     """Counted from the pod's deletion: the preStop sleep, the pre-drain that
     ends remote turns before uvicorn sees SIGTERM, uvicorn's drain bound, then
     the lifespan teardown's bounded waits (the draft listener's own drain,
-    another pass over turns, the location backfill's stop, channel tasks,
+    another pass over turns, the artifact backfills' stop, channel tasks,
     scratchpad closes, and last the turn-end artifact records a file store
     stall left waiting), and a margin for its unbounded closes.
 
@@ -440,3 +480,42 @@ def test_hosted_logs_slow_statements_and_leaves_both_session_timeouts_off(base):
         names = {entry.name for entry in _env(path)}
         assert "STATEMENT_TIMEOUT_MS" not in names, path.name
         assert "IDLE_IN_TRANSACTION_TIMEOUT_MS" not in names, path.name
+
+
+@pytest.mark.parametrize("env_values", ENVIRONMENTS, ids=lambda p: p.name)
+def test_an_environment_names_its_own_browser_router(base, env_values, monkeypatch):
+    """The router is served on the web app's own host under /browser, so the
+    URL is that host's: a typo would send every browser call, with the
+    caller's credential, somewhere else. The base sets none, so a PR
+    environment takes its own from where it is deployed, and an environment
+    without a router offers no browser. The value passes the app setting's
+    own check."""
+    from cowork.common.settings.app_settings import AppSettings
+
+    environment = env_values.stem.removeprefix("values-")
+    assert [entry for entry in base if entry.name == "COWORK_BROWSER_ROUTER_URL"] == []
+    entries = [entry for entry in _env(env_values) if entry.name == "COWORK_BROWSER_ROUTER_URL"]
+    expected = BROWSER_ROUTER_URLS.get(environment)
+    if expected is None:
+        assert entries == [], f"{env_values.name} sets a browser router this test does not list"
+        return
+    [entry] = entries
+    primary = [host["host"] for host in (_deployment(env_values).get("ingress") or {}).get("hosts") or []]
+    assert entry.value == expected == f"https://{primary[0]}/browser", env_values.name
+    monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", entry.value)
+    assert AppSettings().browser_router_url == expected
+
+
+def test_the_scope_key_file_is_the_routers_secret_mounted_where_the_server_reads_it(base):
+    """The producer reads COWORK_BROWSER_SCOPE_KEY_FILE on every scope. If the
+    path, the mount and the Secret's item drift apart the file is missing,
+    every _scope gets 403 scope_key_invalid, and only a log line shows it. The
+    volume is optional, so a namespace with no router starts as usual."""
+    deployment = _deployment(BASE)
+    path = Path(_entry(base, "COWORK_BROWSER_SCOPE_KEY_FILE").value)
+    [volume] = [v for v in deployment.get("volumes") or [] if (v.get("secret") or {}).get("secretName") == "browser-proxy"]
+    assert volume["secret"]["optional"] is True
+    [mount] = [m for m in deployment.get("volumeMounts") or [] if m["name"] == volume["name"]]
+    assert mount.get("readOnly") is True
+    [item] = [i for i in volume["secret"]["items"] if i["key"] == "scope_key"]
+    assert path == Path(mount["mountPath"]) / item["path"]

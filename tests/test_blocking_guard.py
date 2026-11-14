@@ -665,26 +665,43 @@ from pathlib import Path
 import _blocking_guard
 
 
-def pytest_configure(config):
-    if os.environ.get("FAKE_XDIST_WORKER"):
-        config.workerinput = {"workerid": "gw0"}
+def _this_workers_share_of_the_allowlist():
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    if not os.environ.get("REACH_THE_ALLOWLIST_SPLIT_BY_WORKER") or worker is None:
+        return set()
+    share = _blocking_guard.ALLOWLIST[int(worker.removeprefix("gw"))::2]
+    return {
+        _blocking_guard.Site(entry.path, entry.function, entry.kind, leaf)
+        for entry in share
+        for leaf in entry.leaves
+    }
 
 
 def pytest_sessionstart(session):
     session.config.pluginmanager.register(
-        _blocking_guard.StaleEntryCheck(tests_dir=Path(__file__).parent, reached=set()), "stale-entries"
+        _blocking_guard.StaleEntryCheck(
+            tests_dir=Path(__file__).parent, reached=_this_workers_share_of_the_allowlist()
+        ),
+        "stale-entries",
     )
 """
 
 
-def _run_the_stale_check(tmp_path: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+def _run_the_stale_check(
+    tmp_path: Path, *args: str, env: dict[str, str] | None = None, crash_a_worker: bool = False
+) -> subprocess.CompletedProcess:
     """A run over two test files, one of which skips itself at import, with a
     check that reached no site, so every ALLOWLIST entry is stale when the
-    check runs."""
+    check runs. Under ``-n 2`` with REACH_THE_ALLOWLIST_SPLIT_BY_WORKER set,
+    each worker reaches half the entries and neither reaches them all. With
+    ``crash_a_worker``, one test ends its process mid-run."""
     tests = tmp_path / "tests"
     tests.mkdir(exist_ok=True)
     (tests / "conftest.py").write_text(_STALE_CONFTEST)
-    (tests / "test_runs.py").write_text("def test_runs():\n    pass\n\n\ndef test_runs_too():\n    pass\n")
+    runs = "def test_runs():\n    pass\n\n\ndef test_runs_too():\n    pass\n"
+    if crash_a_worker:
+        runs += "\n\ndef test_ends_its_process():\n    import os\n\n    os._exit(1)\n"
+    (tests / "test_runs.py").write_text(runs)
     (tests / "test_skips_itself.py").write_text(
         "import pytest\n\npytest.skip('needs what this machine lacks', allow_module_level=True)\n"
     )
@@ -716,29 +733,63 @@ def test_a_run_that_only_lists_says_nothing_of_the_stale_check(tmp_path, listing
     assert result.returncode == pytest.ExitCode.OK, result.stdout
 
 
-def test_a_test_file_that_skips_itself_leaves_the_stale_check_on(tmp_path):
+@pytest.mark.parametrize(
+    "mode",
+    [[], ["-p", "no:xdist"], ["-n", "0"], ["-n", "2"]],
+    ids=["serial", "without xdist", "xdist off", "two workers"],
+)
+def test_a_test_file_that_skips_itself_leaves_the_stale_check_on(tmp_path, mode):
     assert guard.ALLOWLIST, "the check needs an entry to report"
-    result = _run_the_stale_check(tmp_path, "tests")
+    result = _run_the_stale_check(tmp_path, *mode, "tests")
 
+    assert "stale-entry check skipped" not in result.stdout, result.stdout
     assert "ALLOWLIST names sites no test reached" in result.stdout, result.stdout
     assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout
 
 
+def test_sites_reached_on_different_workers_count_together(tmp_path):
+    assert len(guard.ALLOWLIST) >= 2, "each worker needs an entry the other lacks"
+    result = _run_the_stale_check(tmp_path, "-n", "2", "tests", env={"REACH_THE_ALLOWLIST_SPLIT_BY_WORKER": "1"})
+
+    assert "stale-entry check skipped" not in result.stdout, result.stdout
+    assert "ALLOWLIST names sites no test reached" not in result.stdout, result.stdout
+    assert result.returncode == pytest.ExitCode.OK, result.stdout
+
+
+def test_a_worker_that_dies_skips_the_stale_check_instead_of_blaming_its_sites(tmp_path):
+    result = _run_the_stale_check(tmp_path, "-n", "2", "tests", crash_a_worker=True)
+
+    assert "The blocking guard's stale-entry check skipped: pytest-xdist worker gw" in result.stdout, result.stdout
+    assert "ended without handing over its sites (tests/_blocking_guard.py)." in result.stdout, result.stdout
+    assert "ALLOWLIST names sites no test reached" not in result.stdout, result.stdout
+    assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout
+
+
 @pytest.mark.parametrize(
-    ("args", "env", "reason"),
+    ("args", "reason"),
     [
-        (["tests/test_runs.py"], {}, "it collected 1 of 2 test files"),
-        (["--setup-only", "tests"], {}, "--setup-only runs no test bodies"),
-        (["--setup-plan", "tests"], {}, "--setup-only runs no test bodies"),
-        (["tests"], {"FAKE_XDIST_WORKER": "1"}, "pytest-xdist splits the tests between workers"),
-        (["-k", "runs", "tests"], {}, "tests were deselected"),
-        (["-m", "not slow", "tests"], {}, "tests were deselected"),
-        (["--deselect", "tests/test_runs.py::test_runs_too", "tests"], {}, "tests were deselected"),
+        (["tests/test_runs.py"], "it collected 1 of 2 test files"),
+        (["-n", "2", "tests/test_runs.py"], "it collected 1 of 2 test files"),
+        (["--setup-only", "tests"], "--setup-only runs no test bodies"),
+        (["--setup-plan", "tests"], "--setup-only runs no test bodies"),
+        (["-k", "runs", "tests"], "tests were deselected"),
+        (["-m", "not slow", "tests"], "tests were deselected"),
+        (["--deselect", "tests/test_runs.py::test_runs_too", "tests"], "tests were deselected"),
+        (["-n", "2", "--deselect", "tests/test_runs.py::test_runs_too", "tests"], "tests were deselected"),
     ],
-    ids=["one file", "setup only", "setup plan", "xdist worker", "keyword", "marker", "deselect"],
+    ids=[
+        "one file",
+        "one file on two workers",
+        "setup only",
+        "setup plan",
+        "keyword",
+        "marker",
+        "deselect",
+        "deselect on two workers",
+    ],
 )
-def test_a_run_that_is_not_full_skips_the_stale_check_in_one_line(tmp_path, args, env, reason):
-    result = _run_the_stale_check(tmp_path, *args, env=env)
+def test_a_run_that_is_not_full_skips_the_stale_check_in_one_line(tmp_path, args, reason):
+    result = _run_the_stale_check(tmp_path, *args)
 
     assert f"The blocking guard's stale-entry check skipped: {reason} (tests/_blocking_guard.py)." in result.stdout
     assert "ALLOWLIST names sites no test reached" not in result.stdout, result.stdout

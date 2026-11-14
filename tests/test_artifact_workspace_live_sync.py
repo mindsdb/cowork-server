@@ -456,3 +456,49 @@ async def test_a_refused_share_with_everyone_stops_live_sync_with_one_warning(ar
     ]
     assert ShareOrgRequired.code == caplog.records[0].reason
     assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("refusal", "said"),
+    [
+        ("not_publishable", "its Markdown page can't be rendered"),
+        ("busy", "another conversion runs"),
+    ],
+)
+async def test_a_markdown_page_the_conversion_refuses_stops_live_sync_without_a_traceback(
+    artifact, monkeypatch, caplog, refusal, said
+):
+    """A stopped render repeats on every save until the Markdown changes, and a
+    busy slot clears on the next save: neither needs a stack."""
+    import logging
+
+    from cowork.services.publish import (
+        MARKDOWN_NOT_CONVERTED_MESSAGE,
+        MarkdownNotPublishable,
+        MarkdownRenderBusy,
+    )
+
+    folder, _metadata = artifact
+    _publish(folder, {"mode": "public"})
+    monkeypatch.setattr(
+        "cowork.services.publish.desktop_publish_credential",
+        lambda: ("desktop-key", "https://api.desktop.example"),
+    )
+    raised = {
+        "not_publishable": MarkdownNotPublishable(MARKDOWN_NOT_CONVERTED_MESSAGE),
+        "busy": MarkdownRenderBusy(),
+    }[refusal]
+
+    def refuse(*_args, **_kwargs):
+        raise raised
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", refuse)
+
+    with caplog.at_level(logging.WARNING, logger=workspace.logger.name):
+        assert await workspace._sync_live_artifact(LOCAL_SCOPE, folder) is False
+
+    record = next(r for r in caplog.records if "Could not synchronize live artifact" in r.getMessage())
+    assert said in record.getMessage()
+    assert record.exc_info is None
+    assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is True
