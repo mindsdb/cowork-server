@@ -1061,6 +1061,32 @@ def test_a_refused_conversion_logs_what_refused_it_but_not_the_documents_values(
     assert "text from the document" not in json.dumps(line)
 
 
+def test_tocextensions_digit_limit_is_refused_and_logged_where_it_was_raised(
+    monkeypatch, tmp_path, caplog
+):
+    """``render_markdown`` answers any ``ValueError`` as a refusal, so the log
+    line has to tell the digit limit apart from an extension's own bug."""
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    heading = "## a_" + "9" * 5_000 + "\n\n"
+
+    with caplog.at_level(logging.WARNING, logger=RUNNER_LOGGER):
+        with pytest.raises(export_runner.ConversionOverrun):
+            with pinned_dir(tmp_path) as folder:
+                export_runner.convert_in_child(
+                    request=_request(suffix=".md"),
+                    source=(heading * 2).encode(),
+                    read_asset=folder_reader(folder=folder, max_bytes=1024),
+                    limits=ChildLimits(wall_seconds=WALL_SECONDS, memory_bytes=2048 * MIB),
+                )
+
+    [record] = _runner_records(caplog)
+    line = _formatted(record)
+    assert (line["event"], line["reason"]) == ("export_conversion_stopped", "refused")
+    assert 'File "toc.py"' in line["stack"]
+    assert "ValueError: [error details omitted]" in line["stack"]
+    assert "9" * 50 not in json.dumps(line)
+
+
 def test_the_process_starts_in_the_filesystem_root(monkeypatch, tmp_path, caplog):
     """No folder of the server's, which ``-I`` keeps off the import path but not out of reach."""
     monkeypatch.setenv("LOG_FORMAT", "json")

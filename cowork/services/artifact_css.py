@@ -69,6 +69,11 @@ _MAX_CSS_BYTES = 1024 * 1024
 # parses at most this much, and a longer one is dropped and listed as
 # TOO_LARGE. Attributes have no total, so a chart's thousandth transform keeps
 # working: the inliner's deadline, checked before each one, bounds them all.
+# The most a page can send through tinycss2 this way, nine 1 MiB transforms in
+# a 10 MiB page (scripts/measure_export_capacity.py, html-attribute-css-heavy,
+# in the server's image at docker --cpus=1 --memory=1g), converts in 6.6 s and
+# peaks at 136 MiB in the conversion process, under its 640 MiB org limit:
+# tinycss2 holds one attribute's tokens at a time.
 _MAX_ATTRIBUTE_CSS_BYTES = _MAX_CSS_BYTES
 
 
