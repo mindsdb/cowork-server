@@ -20,6 +20,8 @@ from cowork.handlers.probe import ProbeHandler
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.submissions import store
 
+pytestmark = pytest.mark.usefixtures("self_hosted_probe")
+
 _STEP_ONE = {"form_id": "fm_aaaaaaaaaa", "engine": "linkedin", "title": "LinkedIn", "fields": []}
 
 

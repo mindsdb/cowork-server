@@ -38,9 +38,11 @@ from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_i
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.custom_connectors import (
+    NEEDS_REBUILD_FOR_AGENT,
     UnstorableFormError,
     check_handcrafted_form,
     handcrafted_form_allowed,
+    has_test_requests,
     scope_is_one_persons,
 )
 from cowork.services.connectors.persist import vault_for_scope
@@ -754,6 +756,16 @@ _DATA_REQUEST_NOTE = (
     "say how to fetch a small sample of data (method, path, body shape, token "
     "flow), because the connection test passes only once data comes back."
 )
+_TEST_REQUEST_NOTE = (
+    "Every handcrafted form needs a `test_request`: the request Cowork sends to "
+    "check that the API returns data, written as data with `{{field}}` "
+    "placeholders. Give it an optional `token` step (method, url, form or "
+    "json_body, basic_auth, token_field) and a `data` step that sends `{{token}}` "
+    "or a secret field and fetches a few rows. Placeholders go only in the path, "
+    "query, header values and bodies, never in the host, so when each customer "
+    "has their own host, ask the user for it first and write it into the url. "
+    "APIs that need signed requests or client certificates can't be tested this way."
+)
 _BUILD_CUSTOM_CONNECTOR = (
     "No built-in or saved connector matches. Build a custom connector: ask the "
     "user how the system is reached (a REST or GraphQL API, a database, or file "
@@ -761,14 +773,14 @@ _BUILD_CUSTOM_CONNECTOR = (
     "handcraft the form with `engine` set to the new connector's id and a "
     "`connector` block (label, description, category, usage_notes), and pass it "
     "to `request_credentials`. Credentials go only through that form, never chat. "
-    f"{_DATA_REQUEST_NOTE} Once its connection test passes it is saved for reuse."
+    f"{_TEST_REQUEST_NOTE} {_DATA_REQUEST_NOTE} Once its connection test passes it is saved for reuse."
 )
 _NO_CUSTOM_CONNECTOR = (
     "No built-in or saved connector matches, and custom connectors can't be "
     "saved for reuse on this deployment. Tell the user so. A handcrafted form "
     "passed to `request_credentials` still saves this connection once its test "
     "passes, but it won't be listed with the connectors. Still give the form a "
-    f"`connector` block with usage_notes. {_DATA_REQUEST_NOTE}"
+    f"`connector` block with usage_notes. {_TEST_REQUEST_NOTE} {_DATA_REQUEST_NOTE}"
 )
 
 
@@ -917,9 +929,14 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         return f"request_credentials: {_sharepoint_instruction()}"
     known = (await _scope_connectors()).get(connector_id)
     extends_name = spec.get("extends_connection")
+    custom = bool(known and known.get("custom"))
+    stored_test_request = has_test_requests(known.get("form") or {}) if custom else None
     handcrafted = handcrafted_form_allowed(
-        known=known is not None, custom=bool(known and known.get("custom")), extends=extends_name is not None,
+        known=known is not None, custom=custom, extends=extends_name is not None,
+        stored_test_request=stored_test_request,
     )
+    if spec.get("_connector_id") and stored_test_request is False and not tenant_scope_required():
+        return f"request_credentials: {NEEDS_REBUILD_FOR_AGENT.format(connector_id=connector_id)}"
     if not spec.get("_connector_id") and not handcrafted:
         return (
             f"request_credentials: {connector_id!r} is already a connector. Call "
@@ -967,13 +984,34 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         "fence and AFTER the closing fence. Do not concatenate the fence "
         "onto the end of a sentence — markdown parsers won't recognise it "
         "as a code block if it isn't at the start of a line.\n\n"
-        "After the user submits, the server tests the connection and saves "
-        "the credentials automatically — your job is done. Do not call any "
+        "After the user submits, the server tests the connection, and the "
+        "credentials are saved once it passes (on a custom connector, once the "
+        "user confirms its result) — your job is done. Do not call any "
         "tool to retrieve the submitted values, and do not re-emit the form "
         "unless the user asks for a new one.\n\n"
         f"{block}"
     )
 
+
+_TEST_STEP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "method": {"type": "string", "enum": ["GET", "POST"]},
+        "url": {"type": "string", "description": "https URL; {{field}} placeholders only in the path and query."},
+        "headers": {"type": "object", "description": "Header values may use {{field}} or {{token}}."},
+        "basic_auth": {"type": "array", "items": {"type": "string"}, "description": "Two placeholders: user, then password."},
+        "form": {"type": "object", "description": "Form-encoded body."},
+        "json_body": {"description": "JSON body; placeholders in its string values."},
+        "token_field": {"type": "string", "description": "Token step only: the JSON key that holds the token."},
+    },
+    "required": ["method", "url"],
+}
+_TEST_REQUEST_SCHEMA = {
+    "type": "object",
+    "description": "REQUIRED on a handcrafted form (on each method of a multi-method form). " + _TEST_REQUEST_NOTE,
+    "properties": {"token": _TEST_STEP_SCHEMA, "data": _TEST_STEP_SCHEMA},
+    "required": ["data"],
+}
 
 _REQUEST_CREDENTIALS_SCHEMA = {
     "type": "object",
@@ -1000,6 +1038,7 @@ _REQUEST_CREDENTIALS_SCHEMA = {
                 "usage_notes": {"type": "string", "description": f"Short notes for using it later: base URL, auth header, key endpoints, quirks. {_DATA_REQUEST_NOTE} Never credential values."},
             },
         },
+        "test_request": _TEST_REQUEST_SCHEMA,
         "_connector_id": {
             "type": "string",
             "description": "Slug of the canonical spec returned by `lookup_connector`. ALWAYS copy it over when the spec came from lookup (routes submissions to the registry-aware save endpoint); omit for handcrafted specs.",
@@ -1094,6 +1133,7 @@ _REQUEST_CREDENTIALS_SCHEMA = {
                         "items": {"type": "object"},
                     },
                     "actions": {"type": "array", "items": {"type": "object"}},
+                    "test_request": _TEST_REQUEST_SCHEMA,
                 },
                 "required": ["id", "label", "fields"],
             },

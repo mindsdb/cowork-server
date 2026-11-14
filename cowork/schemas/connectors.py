@@ -144,6 +144,41 @@ class CloudMethod(BaseModel):
     engine: str | None = None
 
 
+class ConnectorTestStep(BaseModel):
+    """One HTTP request of a custom connector's connection test, as data.
+
+    ``{{name}}`` placeholders stand for the member's values; the server fills
+    them in when it runs the step (cowork/services/connectors/connector_test_run.py).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["GET", "POST"]
+    url: str
+    headers: dict[str, str] = {}
+    #: Two placeholders, user then password, sent as HTTP Basic auth.
+    basic_auth: list[str] | None = Field(default=None, min_length=2, max_length=2)
+    #: A form-encoded body. At most one of ``form`` and ``json_body``.
+    form: dict[str, str] | None = None
+    json_body: Any = None
+
+
+class ConnectorTokenStep(ConnectorTestStep):
+    """The step that fetches a token; ``token_field`` names it in the JSON answer."""
+
+    token_field: str = Field(min_length=1, max_length=64)
+
+
+class ConnectorTestRequest(BaseModel):
+    """How the server tests a custom connector: an optional token step, then
+    the data step whose answer the member is shown before anything is saved."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: ConnectorTokenStep | None = None
+    data: ConnectorTestStep
+
+
 class ConnectorMethod(BaseModel):
     id: str
     label: str
@@ -159,6 +194,7 @@ class ConnectorMethod(BaseModel):
     # Field(s) a saved connection is named after; read from the raw spec by
     # cowork/services/connectors/identity.py.
     name_from: str | list[str] | None = None
+    test_request: ConnectorTestRequest | None = None
 
     @field_validator("id")
     @classmethod
@@ -178,6 +214,8 @@ class ConnectorForm(BaseModel):
     logo_color: str | None = None
     methods: list[ConnectorMethod] | None = None
     fields: list[ConnectorField] | None = None
+    #: A single-method form's test request; a multi-method form puts one on each method.
+    test_request: ConnectorTestRequest | None = None
 
 
 class ConnectorMetadataResponse(BaseModel):
@@ -202,6 +240,9 @@ class ConnectorMetadataResponse(BaseModel):
     # Built in Cowork and stored per org (or per local install), not shipped
     # in the static registry.
     custom: bool = False
+    # A custom connector saved before connection tests existed, which cannot
+    # be connected until the agent builds it again.
+    needs_rebuild: bool = False
 
 
 class CustomConnectorUpdate(BaseModel):
@@ -517,3 +558,13 @@ class DatasourceConnectionResponse(BaseModel):
     validation_code: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class ConnectorTestAnswer(BaseModel):
+    """The member's answer to a waiting custom connector test: the id of the
+    approval or confirmation it answers, exactly one of the two."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: str | None = Field(default=None, min_length=1, max_length=64)
+    confirm_id: str | None = Field(default=None, min_length=1, max_length=64)

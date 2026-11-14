@@ -661,6 +661,13 @@ def pytest_sessionstart(session):
     )
 
 
+@pytest.fixture()
+def self_hosted_probe(monkeypatch):
+    """The probe handler as self-hosted runs it: a custom connector still goes
+    to the model probe there, until self-hosted gets its own test requests."""
+    monkeypatch.setattr("cowork.handlers.probe.tenant_scope_required", lambda: True)
+
+
 @pytest.fixture
 def without_gc_pauses():
     """Collect now, then hold the cyclic garbage collector off for the test.

@@ -4,7 +4,7 @@ call it here (ENG-2094).
 Ported from mindshub_inference's front door (ENG-1564, minds/api/v1/permissions.py).
 
 **Each class names the credential the route actually takes.** That is the one
-rule the vocabulary is built on, and it is why there are seven classes rather
+rule the vocabulary is built on, and it is why there are eight classes rather
 than "open" and "closed":
 
 ===========================  =====================================================
@@ -13,6 +13,8 @@ than "open" and "closed":
 ``LoopbackOnly``             the caller's network position (``require_local``)
 ``DesktopOnly``              refused in org mode (``require_local_tenancy``)
 ``LoopbackDesktopOnly``      both of the above
+``SingleUserOnly``           refused wherever a scope can be one of many people
+                             (``require_single_user``)
 ``PlatformSignature``        the calling platform's HMAC over the body
 ``Authenticated``            a verified ``Principal``
 ``AuthenticatedInOrgMode``   a verified ``Principal``, in org mode only
@@ -59,7 +61,7 @@ from typing import Protocol
 
 from fastapi import Depends, HTTPException, Request, status
 
-from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
+from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy, require_single_user
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.principal import Principal, can_manage_org, get_principal
 
@@ -165,6 +167,18 @@ class DesktopOnly:
     """
 
     async def check(self, request: Request, _desktop: None = Depends(require_local_tenancy)) -> None:
+        return None
+
+
+class SingleUserOnly:
+    """Refused in org mode and on a deployment that trusts identity headers.
+
+    ``require_single_user`` 403s the route wherever ``tenant_scope_required()``
+    holds, so it runs only on one person's own install, where the caller is
+    that person.
+    """
+
+    async def check(self, request: Request, _single: None = Depends(require_single_user)) -> None:
         return None
 
 
