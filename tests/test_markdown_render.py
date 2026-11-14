@@ -106,17 +106,20 @@ _SMALL, _LARGE = 10_000, 100_000
 # From the small input to the large one, a linear strip costs about 10x more
 # and a quadratic one about 100x, so the bound leaves 3x either way.
 _MAX_GROWTH = 30
+# Windows' thread clock ticks every 15.6 ms; 20 ticks keep its rounding near 5%.
+_MIN_TIMED_SECONDS = max(0.01, 20 * time.get_clock_info("thread_time").resolution)
 
 
 def _cpu_seconds_per_call(*, strip, text: str) -> float:
-    """Thread CPU time per call, repeating until the calls add up to 10 ms so
-    a fast call still measures. CPU, not wall time: a busy machine delays the
-    calls without adding work, and coverage slows both sizes alike."""
+    """Thread CPU time per call, repeating until the calls add up to
+    _MIN_TIMED_SECONDS so a fast call still measures. CPU, not wall time: a
+    busy machine delays the calls without adding work, and coverage slows
+    both sizes alike."""
     calls, started = 0, time.thread_time()
     while True:
         strip(text=text)
         calls += 1
-        if (elapsed := time.thread_time() - started) >= 0.01:
+        if (elapsed := time.thread_time() - started) >= _MIN_TIMED_SECONDS:
             return elapsed / calls
 
 
