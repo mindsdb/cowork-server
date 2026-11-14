@@ -500,6 +500,8 @@ async def _sync_live_artifact(
     """
     from cowork.services.publish import (
         AccessModeChanged,
+        MarkdownNotPublishable,
+        MarkdownRenderBusy,
         PublishOwnedByOtherUser,
         PublishTooLarge,
         ShareOrgRequired,
@@ -578,6 +580,16 @@ async def _sync_live_artifact(
     except PublishTooLarge:
         # Repeats on every save until the artifact shrinks, so no traceback.
         logger.warning("Could not synchronize live artifact %s: it is too large to publish", folder)
+        return False
+    except MarkdownNotPublishable:
+        # Repeats on every save until the Markdown changes, so no traceback.
+        logger.warning(
+            "Could not synchronize live artifact %s: its Markdown page can't be rendered", folder
+        )
+        return False
+    except MarkdownRenderBusy:
+        # Another conversion held the server's one slot; the next save tries again.
+        logger.warning("Could not synchronize live artifact %s: another conversion runs", folder)
         return False
     except (AccessModeChanged, ShareOrgRequired):
         # publish_artifact logged the refusal: a mode changed after the

@@ -197,3 +197,41 @@ def test_activate_500_maps_to_runtime_error(tmp_path: Path):
         stack.enter_context(patch("anton.publisher.activate_version", _activate))
         with pytest.raises(RuntimeError):
             publish_mod.activate_version(str(root), "m_old", scope=LOCAL_SCOPE)
+
+
+def test_a_rollback_waits_for_a_publish_of_its_folder_and_neither_save_is_lost(tmp_path: Path):
+    """A publish reads .published.json, uploads and saves it under the folder's
+    lock. A rollback that wrote between that read and save would be lost."""
+    import threading
+    import time
+
+    from cowork.services.published_page_ownership import publication_owner
+
+    root = _make_fullstack(tmp_path)
+    _write_map(root, {"report_id": "r1", "url": "https://x/a/r1", "published": True, "last_md5": "m1"})
+    holding, finished = threading.Event(), []
+
+    def a_publish():
+        with publication_owner(
+            root / "static" / "index.html", published_dir=root, publish_url="https://x", scope=LOCAL_SCOPE,
+        ):
+            entry = _read_map(root)
+            holding.set()
+            time.sleep(0.5)  # the upload
+            _write_map(root, {**entry, "last_md5": "m_published"})
+        finished.append(time.monotonic())
+
+    def _activate(report_id, md5, *, api_key, publish_url, ssl_verify):
+        return {"report_id": report_id, "current_md5": md5, "view_url": "https://x/a/r1"}
+
+    publisher = threading.Thread(target=a_publish)
+    with _base_patches(tmp_path) as stack:
+        stack.enter_context(patch("anton.publisher.activate_version", _activate))
+        publisher.start()
+        assert holding.wait(timeout=10)
+        publish_mod.activate_version(str(root), "m_old", scope=LOCAL_SCOPE)
+        rolled_back = time.monotonic()
+    publisher.join(timeout=10)
+
+    assert finished and rolled_back >= finished[0]
+    assert _read_map(root)["last_md5"] == "m_old"

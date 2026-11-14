@@ -35,7 +35,7 @@ from docx.shared import Emu, Pt, RGBColor
 from docx.table import _Cell
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run
-from lxml.etree import ParserError
+from lxml.etree import ParserError, XMLSyntaxError
 from lxml.html import HtmlElement
 
 from cowork.schemas.artifact_export import InlinedDocument
@@ -302,6 +302,10 @@ def write_docx(*, document: InlinedDocument, title: str) -> bytes:
     except ParserError:
         # lxml.html raises this for input with no element at all.
         root = None
+    except XMLSyntaxError as failed:
+        # Out of memory, libxml2 fails the parse rather than stopping it.
+        parse_stopped(error_log=failed.error_log)
+        raise
     if root is not None:
         uris.put_back(root=root)
     word = docx.Document()
