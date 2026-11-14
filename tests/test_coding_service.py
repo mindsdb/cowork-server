@@ -22,6 +22,7 @@ from coding_service_fakes import (
     git,
     repository,
     service_with,
+    wait_for_run_to_follow,
     wait_for_status,
     wait_for_turn_thread,
     wait_for_workspace,
@@ -1131,7 +1132,7 @@ def test_interrupted_local_task_resumes_on_a_follow_up_run(tmp_path: Path) -> No
     wait_for_status(restarted, created.id, SessionStatus.completed)
 
     assert resumed.run_id != interrupted_run.id
-    finished = restarted.get_session(created.id)
+    finished = wait_for_run_to_follow(restarted, created.id)
     assert finished.run_status == "completed"
     assert finished.runtime_epoch == interrupted_run.epoch + 1
     assert restarted.control.store.get_run(interrupted_run.id).status == RunStatus.interrupted
@@ -1223,7 +1224,7 @@ def test_local_context_exhaustion_recovers_ready_with_a_fresh_agent_session(tmp_
         "fake-model",
     )
     wait_for_status(service, created.id, SessionStatus.failed)
-    failed = service.get_session(created.id)
+    failed = wait_for_run_to_follow(service, created.id)
     original_workspace = failed.workspace_path
     assert failed.engine_session_id == "engine-session-1"
     context_error = (
@@ -1947,7 +1948,7 @@ def test_queued_instruction_runs_as_the_next_turn_and_is_persisted(tmp_path: Pat
         time.sleep(0.01)
     assert engine.prompts == ["First turn", "Long second turn", "Run this after the current work"]
     wait_for_status(service, created.id, SessionStatus.completed)
-    finished = service.get_session(created.id)
+    finished = wait_for_run_to_follow(service, created.id)
     assert finished.queued_instructions == []
     assert finished.run_id != queued.run_id
     assert finished.run_status == "completed"

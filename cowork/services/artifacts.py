@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import partial
@@ -36,6 +37,7 @@ from cowork.common.minds_tls import minds_ssl_verify
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
+    dir_child_stat,
     dir_open,
     dir_rmtree,
     dir_scandir,
@@ -577,14 +579,17 @@ def _modified_state(
 
     # Local import: publish imports this module, so import lazily to avoid a
     # circular import (mirrors _unpublish_folder below).
-    from cowork.services.publish import compute_publish_md5
+    from cowork.services.publish import MarkdownRenderBusy, compute_publish_md5
 
     # `folder.parent` IS the artifacts root: artifacts always live at
     # `<base>/<slug>/`. Passing it explicitly is what makes the badge work in org
     # mode, where the module-level FS scan finds no roots at all.
-    current_md5 = compute_publish_md5(
-        folder, artifacts_base=artifacts_base or folder.parent
-    )
+    try:
+        current_md5 = compute_publish_md5(
+            folder, artifacts_base=artifacts_base or folder.parent
+        )
+    except MarkdownRenderBusy:
+        return False, False  # another conversion runs: can't tell yet
     if current_md5 is None:
         return False, False  # can't tell — don't raise a false "modified"
     if current_md5 != entry.get("last_md5"):
@@ -1835,26 +1840,68 @@ def artifact_status(raw_path: str, *, scope: TenantScope | None) -> ArtifactStat
     return artifact_status_for_resolved(artifact, scope=scope)
 
 
+#: The cards a list shows, newest first.
+LIST_CARDS = 80
+
+
+class ListCandidate(NamedTuple):
+    """One folder a list may show: the time it sorts by, its root's place in
+    the list's roots (which breaks a tie), its name, and its root."""
+
+    sort_time: float
+    source_index: int
+    name: str
+    source: ProjectArtifacts
+
+
+class ListedCards(NamedTuple):
+    """What cards_for_candidates built: the cards, newest first, and the
+    candidates whose folder opened and built no card. A folder lands in
+    `no_card` when the read of its id raises any OSError or ValueError
+    (artifact_identity.read_full_id): it holds no metadata.json, one that
+    is a link or not a regular file, one with no valid id, or one whose
+    read fails, as on EIO or ESTALE. It lands there too when the card
+    builder finds no procfs path for the open folder or its root
+    (_pinned_directory_path), on a Linux host without procfs. A folder
+    that fails to open, or whose card build raises, is skipped and is in
+    neither field."""
+
+    cards: list[dict]
+    no_card: tuple[ListCandidate, ...]
+
+
 def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
-    """Every artifact under the given roots, newest first, capped at 80.
+    """Every artifact under the given roots, newest first, capped at
+    LIST_CARDS.
 
     Roots come from the caller (see services.artifact_roots) — this function
     never discovers them, because a filesystem scan cannot tell which tenant is
-    asking. The 80-item cap is pre-existing but matters more in org mode, where
+    asking. The cap is pre-existing but matters more in org mode, where
     `sources` spans every project of the organization instead of one tree.
 
     Two passes so the cap is applied before card work, not after: a collect
-    pass opens each artifact once and reads only its `metadata.json` mtime (no
-    card built), then a build pass walks the sorted candidates and stops once
-    80 cards have been produced.
+    pass (list_candidates) opens each artifact once and reads only its
+    `metadata.json` mtime (no card built), then a build pass
+    (cards_for_candidates) walks the sorted candidates and stops once
+    LIST_CARDS cards have been produced. In org mode, once the sort times are
+    recorded, the list runs the collect pass only over the roots of the
+    projects whose rows it cannot trust, and passes the newest rows as the
+    other candidates (cowork.services.artifact_sort_times).
     """
-    from cowork.services.artifact_identity import (
-        _opened_child_directory,
-        opened_artifact_root,
-    )
+    return cards_for_candidates(list_candidates(sources, indexes=range(len(sources)))).cards
 
-    candidates: list[tuple[float, int, str, ProjectArtifacts]] = []
-    for source_idx, source in enumerate(sources):
+
+def list_candidates(sources: list[ProjectArtifacts], *, indexes: Iterable[int]) -> list[ListCandidate]:
+    """The collect pass of list_artifacts over the roots of `sources` at
+    `indexes`: one candidate for each folder of those roots, with its root's
+    index in `sources`, so candidates from separate calls over the same
+    `sources` sort together as one walk's (cards_for_candidates). A root that
+    fails to open or list gives none."""
+    from cowork.services.artifact_identity import opened_artifact_root
+
+    candidates: list[ListCandidate] = []
+    for source_idx in indexes:
+        source = sources[source_idx]
         try:
             with opened_artifact_root(source) as root:
                 with dir_scandir(root) as entries:
@@ -1878,21 +1925,35 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                         except OSError:
                             continue
                 for child_name in sorted(child_names):
+                    # One no-follow open of the folder and one stat of its
+                    # metadata.json (dir_child_stat), the least a sort by that
+                    # time can cost on the file store. A folder that would not
+                    # open, or holds no metadata.json, sorts last at 0; the
+                    # build pass opens it no-follow again and skips it.
                     try:
-                        with _opened_child_directory(root, child_name) as pinned_folder:
-                            try:
-                                mtime = dir_stat(pinned_folder, "metadata.json").st_mtime
-                            except OSError:
-                                mtime = 0.0
-                            candidates.append((mtime, source_idx, child_name, source))
-                    except (OSError, ValueError):
-                        continue
+                        mtime = dir_child_stat(root, child_name, "metadata.json").st_mtime
+                    except OSError:
+                        mtime = 0.0
+                    candidates.append(ListCandidate(mtime, source_idx, child_name, source))
         except (OSError, ValueError):
             continue
+    return candidates
 
-    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
 
+def cards_for_candidates(candidates: Iterable[ListCandidate]) -> ListedCards:
+    """The cards of `candidates`, newest first, then by root and name, capped
+    at LIST_CARDS: each folder opened without following a link, and one
+    that fails to open or builds no card skipped. Each candidate whose
+    folder opened and built no card comes back in ListedCards.no_card,
+    which says when that happens."""
+    from cowork.services.artifact_identity import (
+        _opened_child_directory,
+        opened_artifact_root,
+    )
+
+    ordered = sorted(candidates, key=lambda item: (-item.sort_time, item.source_index, item.name))
     cards: list[dict] = []
+    no_card: list[ListCandidate] = []
     # One root open per source, not per surviving candidate: opening a root
     # costs an openat+stat per path component, so re-opening it per card
     # would undo what capping the candidates before this pass just saved.
@@ -1909,9 +1970,10 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                     opened_roots[source_idx] = None
             return opened_roots[source_idx]
 
-        for _mtime, source_idx, child_name, source in candidates:
-            if len(cards) >= 80:
+        for candidate in ordered:
+            if len(cards) >= LIST_CARDS:
                 break
+            _mtime, source_idx, child_name, source = candidate
             root = _root_for(source_idx, source)
             if root is None:
                 continue
@@ -1927,13 +1989,14 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                         pinned_root=root,
                         artifacts_base=source.base,
                     )
-                    if card is None:
-                        continue
-                    cards.append(card)
             except (OSError, ValueError):
                 continue
+            if card is None:
+                no_card.append(candidate)
+                continue
+            cards.append(card)
 
-    return cards
+    return ListedCards(cards=cards, no_card=tuple(no_card))
 
 
 def _line_breaks(text: str, start: int, end: int, has_cr: bool) -> int:

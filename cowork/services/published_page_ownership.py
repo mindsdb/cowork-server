@@ -50,6 +50,10 @@ def publisher_key(publish_url: str) -> str:
     return hashlib.sha256(normalized.rstrip("/").encode()).hexdigest()
 
 
+# The process-lock namespace for publishers Cowork doesn't protect.
+_UNPROTECTED = "unprotected"
+
+
 def publish_record_lock_key(published_dir: Path) -> str:
     """The lock that guards one folder's .published.json and the owner rows its pages have."""
     return hashlib.sha256(str(published_dir.resolve()).encode()).hexdigest()
@@ -152,7 +156,15 @@ def publication_owner(
     artifact: Path, *, published_dir: Path, publish_url: str, scope: TenantScope | None,
 ) -> Iterator[PublicationOwner | None]:
     if not protects_publisher(publish_url):
-        yield None
+        # Publishes run in worker threads (the routes, the agent's tool,
+        # autopublish, live sync), so two of one folder can overlap. Holding
+        # the folder's process lock keeps each one's read, upload and save of
+        # its .published.json whole, so neither starts a second page.
+        lock_key = publish_record_lock_key(published_dir)
+        with _process_lock(
+            _UNPROTECTED, "published_page", lock_key, timeout=RESOURCE_LOCK_TIMEOUT_SECONDS
+        ):
+            yield None
         return
     try:
         if scope is None or not scope.personal or not scope.org_id or not scope.user_id:

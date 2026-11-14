@@ -16,10 +16,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Collection, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -32,6 +35,8 @@ from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.services.publish import (
+    MarkdownNotPublishable,
+    MarkdownRenderBusy,
     PublishOwnedByOtherUser,
     PublishRejected,
     PublishTooLarge,
@@ -43,6 +48,7 @@ if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
     from cowork.services.artifact_identity import ListedIds
     from cowork.services.artifact_ownership import OwnerResolution
+    from cowork.services.artifact_sort_times import SortTimeRow, SortTimesRead
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +77,9 @@ REASON_NO_CONTENT = "no_content"
 REASON_NOT_PUBLISHABLE = "not_publishable"
 REASON_UNPUBLISHED = "unpublished"
 REASON_UNCHANGED = "unchanged"
+# Another conversion held the server's one slot, so whether a Markdown page
+# changed is unknown: the project's self-heal asks again later.
+REASON_CONVERSION_BUSY = "conversion_busy"
 
 
 @dataclass(frozen=True)
@@ -155,7 +164,10 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
     if isinstance(published_mtime, (int, float)) and current_mtime <= published_mtime:
         return PublishDecision(None, REASON_UNCHANGED, is_fullstack, current_mtime)
 
-    digest = compute_publish_md5(folder, artifacts_base=artifacts_base)
+    try:
+        digest = compute_publish_md5(folder, artifacts_base=artifacts_base)
+    except MarkdownRenderBusy:
+        return PublishDecision(None, REASON_CONVERSION_BUSY, is_fullstack, current_mtime)
     if digest is None or digest == entry.get("last_md5"):
         # None means "can't tell" — never republish on a guess.
         return PublishDecision(None, REASON_UNCHANGED, is_fullstack, current_mtime)
@@ -298,7 +310,14 @@ def _candidate_slugs(*, artifacts_base: Path) -> list[str]:
     return sorted(artifact_folders_below(base=Path(artifacts_base)).found)
 
 
-def _plan(artifacts_base: Path, slugs: list[str]) -> list[tuple[str, PublishDecision]]:
+class PlannedPhase(NamedTuple):
+    """One phase's work, and how many candidates a busy conversion slot left undecided."""
+
+    planned: list[tuple[str, PublishDecision]]
+    conversion_busy: int
+
+
+def _plan(artifacts_base: Path, slugs: list[str]) -> PlannedPhase:
     """Decide and order one phase's work: static before fullstack, newest first.
 
     Static goes first because publishing a fullstack artifact triggers a dependency
@@ -322,7 +341,16 @@ def _plan(artifacts_base: Path, slugs: list[str]) -> list[tuple[str, PublishDeci
     if skipped:
         _record("skipped", **skipped)
     planned.sort(key=lambda item: (item[1].is_fullstack, -item[1].content_mtime))
-    return planned
+    return PlannedPhase(planned=planned, conversion_busy=skipped.get(REASON_CONVERSION_BUSY, 0))
+
+
+def _ask_again_later(*, artifacts_base: Path, scope, project_id: str | None) -> None:
+    """Ask for the project's self-heal, which plans its artifacts again once
+    SELF_HEAL_INTERVAL_S has passed: for a page a busy conversion slot left
+    unknown, which would otherwise wait for the next turn to touch it."""
+    heal = _project_self_heal(artifacts_base=artifacts_base, scope=scope, project_id=project_id)
+    if heal is not None:
+        request_self_heal(heal)
 
 
 async def _release(artifacts_base: Path, slug: str, *, scope) -> None:
@@ -388,6 +416,9 @@ async def _publish_one(
                 # get here with an org scope in hand (see the caller's guard).
                 scope=scope,
                 project_id=project_id,
+                # No person asked for this publish: a Markdown page the
+                # conversion stopped before is refused without a new render.
+                background=True,
             ),
             timeout=timeout_s,
         )
@@ -414,6 +445,18 @@ async def _publish_one(
         # already logged by the classifier: a skip, not a failure.
         await _release(artifacts_base, slug, scope=scope)
         _record("skipped", slug=slug, reason="too_large")
+        return False
+    except MarkdownNotPublishable:
+        # The same Markdown is refused again until it changes: a skip.
+        await _release(artifacts_base, slug, scope=scope)
+        _record("skipped", slug=slug, reason="markdown_not_publishable")
+        return False
+    except MarkdownRenderBusy:
+        # Another conversion held the server's one slot: nothing was tried,
+        # so the project's self-heal tries again.
+        await _release(artifacts_base, slug, scope=scope)
+        _record("deferred", slug=slug, reason=REASON_CONVERSION_BUSY)
+        _ask_again_later(artifacts_base=Path(artifacts_base), scope=scope, project_id=project_id)
         return False
     except Exception as exc:
         # A synchronous failure (a 502 a second in, ValueError from the target
@@ -542,8 +585,10 @@ async def autopublish_project_artifacts(
             if (started + budget_s) - time.monotonic() < _MIN_START_BUDGET_S:
                 _record("deferred", reason="budget", slugs=len(phase_slugs))
                 continue
-            plans = await run_efs(partial(_plan, base, phase_slugs), scope=scope, deadline=False)
-            for slug, decision in plans:
+            phase = await run_efs(partial(_plan, base, phase_slugs), scope=scope, deadline=False)
+            if phase.conversion_busy:
+                _ask_again_later(artifacts_base=base, scope=scope, project_id=project_id)
+            for slug, decision in phase.planned:
                 if len(published) >= limit:
                     _record("deferred", slug=slug, reason="limit")
                     continue
@@ -640,6 +685,11 @@ _self_heals_started_at: dict[SelfHeal, float] = {}
 # The task of each one started, so a second never runs beside it and a
 # shutdown can cancel it (cancel_self_heals).
 _self_heal_tasks: dict[SelfHeal, asyncio.Task] = {}
+# The location checks a check run inside keep_location_checks asks for, kept
+# apart from _self_heals_requested, or None outside one. A ContextVar, so
+# only the requests of the task that entered the block, and of any task it
+# starts there, land in it.
+_location_checks_kept: ContextVar[set[SelfHeal] | None] = ContextVar("_location_checks_kept", default=None)
 
 
 def request_self_heal(heal: SelfHeal) -> None:
@@ -658,8 +708,32 @@ def request_location_check(heal: SelfHeal) -> None:
     (_record_listed_locations), for a project whose locations a listing has
     to check again. The poll starts it as it starts a self-heal
     (start_due_self_heals), and it publishes nothing unless the publish is
-    asked for too (request_self_heal) before it starts."""
+    asked for too (request_self_heal) before it starts. Inside
+    keep_location_checks the request goes to that block's own set instead,
+    and the poll never sees it."""
+    kept = _location_checks_kept.get()
+    if kept is not None:
+        kept.add(heal)
+        return
     _self_heals_requested.add(heal)
+
+
+@contextmanager
+def keep_location_checks() -> Iterator[set[SelfHeal]]:
+    """Collect the location checks this task asks for inside the block
+    (request_location_check) in the set it yields, instead of asking this
+    replica's poll for them (start_due_self_heals). The heal sweep
+    (artifact_heal_sweep) runs each project's check inside it: a check that
+    asks for another has fallen short, and the sweep, not the poll, lists
+    that project again, one project at a time. The set lives in a
+    ContextVar, so a turn end or a self-heal in another task that asks for
+    the same project's self-heal during the block still reaches the poll."""
+    kept: set[SelfHeal] = set()
+    token = _location_checks_kept.set(kept)
+    try:
+        yield kept
+    finally:
+        _location_checks_kept.reset(token)
 
 
 def request_turn_end_self_heal(*, artifacts_base: Path, scope: TenantScope | None, project_id: str | None) -> None:
@@ -685,6 +759,23 @@ def request_turn_end_self_heal(*, artifacts_base: Path, scope: TenantScope | Non
         request_self_heal(heal)
 
 
+def request_project_location_check(*, artifacts_base: Path, scope: TenantScope | None, project_id: str | None) -> None:
+    """Ask for the location check alone (request_location_check) of the
+    project whose shared root is `artifacts_base`, built as a turn end
+    builds its project's self-heal: for a writer that could not record a
+    row of that root, such as a project files PUT or a task move, and for a
+    list whose rows named folders that are gone or build no card. The
+    check's listing holds the root, writes the time of every folder it
+    reads, drops the rows of folders gone from it or holding no id, and
+    keeps the rows of folders it could not read (_record_listing).
+    Nothing is asked where artifacts have no location rows or no project is
+    named (_project_self_heal). Adds an entry to an in-memory set, and makes
+    no file store call."""
+    heal = _project_self_heal(artifacts_base=artifacts_base, scope=scope, project_id=project_id)
+    if heal is not None:
+        request_location_check(heal)
+
+
 def request_self_heal_for_unread_folders(
     *, listing: ListedIds, artifacts_base: Path, scope: TenantScope | None, project_id: str | None,
 ) -> None:
@@ -693,7 +784,8 @@ def request_self_heal_for_unread_folders(
     root itself: log one WARNING, and ask for the project's location check
     alone (request_location_check), so the poll lists the project again
     once SELF_HEAL_INTERVAL_S has passed since its last self-heal
-    (start_due_self_heals), and publishes nothing for it. A copy no turn end
+    (start_due_self_heals), or the heal sweep does for its own check
+    (keep_location_checks), and publishes nothing for it. A copy no turn end
     claims, in a folder the listing could not read, is then marked at the
     first listing that reads it. Asked for even when the listing found no
     id, and wherever artifacts have location rows, as
@@ -713,8 +805,31 @@ def request_self_heal_for_unread_folders(
         else {"reason": "folders_unreadable", "count": len(listing.unreadable)}
     )
     logger.warning(
-        "a full listing of a project's artifacts could not read every folder, so the project's self-heal lists it again",
+        "a full listing of a project's artifacts could not read every folder, so the project is listed again",
         extra={"event": "artifact_location_listing_unreadable", **log_context(project_id=project_id), **unread},
+    )
+    request_location_check(heal)
+
+
+def request_self_heal_for_untimed_folders(
+    *, folders: Collection[str], artifacts_base: Path, scope: TenantScope | None, project_id: str | None,
+) -> None:
+    """After a read of the sort times of folders in a project's shared root,
+    a turn end's or the self-heal's (artifact_sort_times.sort_times_below),
+    that could not read some of them, such as with EIO: log one WARNING, with
+    the `count` of those folders, and ask for the project's location check
+    alone (request_location_check). Its listing reads their times again and
+    writes them (_record_listing), and until then their rows keep the time
+    they had. Asked for wherever artifacts have location rows, as
+    request_self_heal_for_unread_folders is. Makes no file store call."""
+    if not folders:
+        return
+    heal = _project_self_heal(artifacts_base=artifacts_base, scope=scope, project_id=project_id)
+    if heal is None:
+        return
+    logger.warning(
+        "a read of artifact folders' sort times could not read every folder, so the project is listed again",
+        extra={"event": "artifact_sort_times_unreadable", **log_context(project_id=project_id), "count": len(folders)},
     )
     request_location_check(heal)
 
@@ -740,6 +855,145 @@ def _listed_artifact_ids(*, artifacts_base: Path) -> ListedIds:
     return listed_folder_ids(base=base, listing=artifact_folders_below(base=base))
 
 
+class ListedIdsAndTimes(NamedTuple):
+    """What the self-heal's full listing of a project's shared root read
+    (_listed_ids_and_times)."""
+
+    #: The id each folder holds, and the folders it could not read
+    #: (_listed_artifact_ids).
+    listing: ListedIds
+    #: The time each folder holding an id sorts by in the artifacts list,
+    #: and the folders whose time it could not read
+    #: (artifact_sort_times.sort_times_below).
+    times: SortTimesRead
+
+
+def _listed_ids_and_times(*, artifacts_base: Path) -> ListedIdsAndTimes:
+    """The listing _listed_artifact_ids makes, and the time each folder
+    holding an id sorts by in the artifacts list (artifact_sort_times)."""
+    from cowork.services.artifact_sort_times import sort_times_below
+
+    listing = _listed_artifact_ids(artifacts_base=artifacts_base)
+    return ListedIdsAndTimes(listing=listing, times=sort_times_below(base=Path(artifacts_base), slugs=listing.ids))
+
+
+def _still_the_project_root(session, *, project_id: UUID, artifacts_base: Path) -> bool:
+    """Whether `artifacts_base` is still `project_id`'s shared root, read
+    from the project's row. A self-heal names the root its project had when
+    it was asked for, and the project's path follows its name: a rename
+    moves the project's folder (projects.ProjectService._stage_project_rename),
+    so the old path is gone, or holds another project's folders once a
+    project takes the old name. False too for a project the scope no longer
+    sees, such as one deleted since. Makes no file store call."""
+    from cowork.models.project import Project
+    from cowork.services.artifact_roots import project_artifacts_base
+
+    project = session.get(Project, project_id)
+    return project is not None and project_artifacts_base(project.path) == Path(artifacts_base)
+
+
+def _rows_before_the_listing(
+    session, *, project_id: UUID, artifacts_base: Path
+) -> dict[str, SortTimeRow] | None:
+    """The sort-time rows of `project_id`'s shared root
+    (artifact_sort_times.sort_time_rows), which the self-heal reads before it
+    lists the root, or None when `artifacts_base` is no longer that root
+    (_still_the_project_root), so the self-heal lists nothing."""
+    from cowork.services.artifact_sort_times import sort_time_rows
+
+    if not _still_the_project_root(session, project_id=project_id, artifacts_base=artifacts_base):
+        return None
+    return sort_time_rows(session, project_id=project_id)
+
+
+class ListingNotRecorded(Exception):
+    """One or more of _record_listing's writes failed. Each logged its own
+    WARNING and was rolled back, and the others ran."""
+
+
+def _record_listing(
+    session,
+    *,
+    project_id: UUID,
+    artifacts_base: Path,
+    listing: ListedIds,
+    times: SortTimesRead,
+    droppable: Mapping[str, SortTimeRow],
+) -> None:
+    """Record what a full listing of `project_id`'s shared root at
+    `artifacts_base` found: that the root holds a folder, when it does, so
+    the artifacts list opens it (held_artifact_roots); each listed folder's
+    sort time from `times`: a newer one always, and an older one when the
+    row is still the one `droppable` holds, the rows read before the
+    listing began (_rows_before_the_listing); the end of each row in
+    `droppable` whose folder the listing found gone or holding no id
+    (reconcile_sort_times); and each listed id's location
+    (artifact_locations.record_listed_folders).
+
+    It records nothing when `artifacts_base` is no longer the project's
+    shared root (_still_the_project_root): a rename that committed while the
+    listing ran moved the project's folders away from the path it listed,
+    which may hold another project's folders by now. A folder whose id or
+    time the listing could not read keeps its row, and so does every row
+    when the listing could not read the root or found it gone, as it does
+    when a rename moves the folder before that rename commits.
+
+    Each of the three writes runs on its own, and one that fails is rolled
+    back and logged at WARNING, so it never skips the others. Once all have
+    run, a failure raises ListingNotRecorded, so the caller asks for the
+    next location check (_record_listed_locations)."""
+    from cowork.services.artifact_locations import record_listed_folders
+    from cowork.services.artifact_sort_times import reconcile_sort_times
+    from cowork.services.held_artifact_roots import hold_root
+
+    if not _still_the_project_root(session, project_id=project_id, artifacts_base=artifacts_base):
+        return
+    failed = False
+    if listing.ids or listing.unreadable:
+        try:
+            hold_root(session, project_id=project_id)
+        except Exception:
+            failed = True
+            session.rollback()
+            logger.warning(
+                "artifact self-heal could not record that the project's artifacts folder holds an artifact",
+                exc_info=True,
+                extra=log_context(project_id=project_id),
+            )
+    try:
+        reconcile_sort_times(
+            session,
+            project_id=project_id,
+            listed=times.times,
+            # Every folder found holding an id keeps its row, those whose
+            # time could not be read among them: the listing timed only
+            # those folders (_listed_ids_and_times).
+            kept=set(listing.ids) | listing.unreadable,
+            droppable=droppable,
+            complete=not (listing.base_unreadable or listing.base_missing),
+        )
+    except Exception:
+        failed = True
+        session.rollback()
+        logger.warning(
+            "artifact self-heal could not record the sort times of the project's artifacts",
+            exc_info=True,
+            extra=log_context(project_id=project_id),
+        )
+    try:
+        record_listed_folders(session, project_id=project_id, listing=listing)
+    except Exception:
+        failed = True
+        session.rollback()
+        logger.warning(
+            "artifact self-heal could not check the locations of the project's listed artifacts",
+            exc_info=True,
+            extra=log_context(project_id=project_id),
+        )
+    if failed:
+        raise ListingNotRecorded
+
+
 async def _record_listed_locations(heal: SelfHeal) -> None:
     """Read the id of every artifact folder in `heal`'s project, and mark an
     id conflicted when its location row names another folder of the project,
@@ -749,26 +1003,55 @@ async def _record_listed_locations(heal: SelfHeal) -> None:
     list opens only the turn's own folders, so a copy no turn end claims,
     such as one a shell `cp -r` makes, is found here, at the first
     self-heal after the turn that asked for one whose listing reads its
-    folder. A listing that could not read a folder, or the root, asks for
-    the next location check (request_self_heal_for_unread_folders), and so
-    does a check that fails outright (request_location_check). Never raises:
-    the publish after it runs either way."""
+    folder. The same listing holds the root and writes each folder's sort
+    time, drops the sort-time rows of folders gone from it or holding no
+    id, and keeps those of folders it could not read (_record_listing).
+    It reads those rows in a database unit of its own before it lists, so
+    a row a turn end or a task move writes while the listing runs is never
+    dropped. A heal whose path is no longer the
+    project's shared root, as after a rename, lists and records nothing and
+    asks for no further check: that unit reads the project's path first,
+    and the record reads it again (_still_the_project_root). A listing that
+    could not read a folder, the root, or a folder's time asks for the next
+    location check (request_self_heal_for_unread_folders,
+    request_self_heal_for_untimed_folders), and so does a check that fails
+    outright or a write of it that fails (request_location_check). Never
+    raises: the publish after it runs either way."""
     from cowork.db.units import run_db
-    from cowork.services.artifact_locations import keeps_locations, record_listed_folders
+    from cowork.services.artifact_locations import keeps_locations
 
     if not keeps_locations(heal.scope):
         return
     try:
-        listing = await run_efs(
-            partial(_listed_artifact_ids, artifacts_base=heal.artifacts_base), scope=heal.scope, deadline=False,
+        project_id = UUID(heal.project_id)
+        droppable = await run_db(
+            partial(_rows_before_the_listing, project_id=project_id, artifacts_base=heal.artifacts_base),
+            scope=heal.scope,
         )
-        # Asked for before the record, so a failed record cannot drop it.
+        if droppable is None:
+            return
+        listed = await run_efs(
+            partial(_listed_ids_and_times, artifacts_base=heal.artifacts_base), scope=heal.scope, deadline=False,
+        )
+        # Asked for before the record, so a failed record cannot drop them.
         request_self_heal_for_unread_folders(
-            listing=listing, artifacts_base=heal.artifacts_base, scope=heal.scope, project_id=heal.project_id,
+            listing=listed.listing, artifacts_base=heal.artifacts_base, scope=heal.scope, project_id=heal.project_id,
+        )
+        request_self_heal_for_untimed_folders(
+            folders=listed.times.unreadable, artifacts_base=heal.artifacts_base, scope=heal.scope,
+            project_id=heal.project_id,
         )
         await run_db(
-            partial(record_listed_folders, project_id=UUID(heal.project_id), listing=listing), scope=heal.scope,
+            partial(
+                _record_listing, project_id=project_id, artifacts_base=heal.artifacts_base, listing=listed.listing,
+                times=listed.times, droppable=droppable,
+            ),
+            scope=heal.scope,
         )
+    except ListingNotRecorded:
+        # Each write that failed logged its own line, and the next location
+        # check writes it again.
+        request_location_check(heal)
     except Exception:
         logger.warning(
             "artifact self-heal could not check the locations of the project's artifacts", exc_info=True,

@@ -1664,6 +1664,7 @@ def _poll(
 
 async def _scheduler_loop() -> None:
     from cowork.services.artifact_autopublish import start_due_self_heals
+    from cowork.services.artifact_heal_sweep import start_heal_sweep
 
     logger.info("Scheduler loop started")
     # Replicas a rollout starts together would otherwise poll in step, and two
@@ -1704,6 +1705,10 @@ async def _scheduler_loop() -> None:
         # The artifact self-heals remote turn ends asked for, each project at
         # its own slower cadence.
         start_due_self_heals()
+        # The heal sweep of every project with a recent message, which needs
+        # no request: one replica of the cluster claims it once per
+        # self-heal interval, in a task of its own.
+        start_heal_sweep()
 
 
 def start_scheduler() -> None:

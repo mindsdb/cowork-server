@@ -233,6 +233,7 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.25.0",
     "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.pytest.ini_options]
@@ -250,4 +251,4 @@ markers = [
 # Temporary, for this PR's environment only: anton with `call_minds_api` and the
 # custom API prompt sections (mindsdb/anton#777), which no release carries yet.
 # Replaced by a floor on the anton release that carries it before this merges.
-anton-agent = { git = "https://github.com/mindsdb/anton", rev = "a61bb1eba965a629e81d53327dd5527948ed8067" }
+anton-agent = { git = "https://github.com/mindsdb/anton", rev = "ef276f5c71e298b43584a8bd6e4d1abda79653f1" }
