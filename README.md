@@ -519,7 +519,7 @@ Agents (via their harness) have read/write access to their project's working dir
 
 On a hosted deployment `COWORK_HOME` is a shared NFS mount (EFS), mounted `hard`. A `stat` that the file server doesn't answer blocks its thread with no time limit. On the event loop such a call stops every request on the pod, liveness included. On anyio's default threads it holds threads that sync routes and every request's sync dependencies share.
 
-The artifact routes' lookups and reads, and a turn's artifact bookkeeping, run their file store work through `run_efs` in `cowork/db/units.py`, beside `run_db`. Other file store work still runs on other threads, and a stuck mount can hold those too. On anyio's default threads: the live-app share and copy routes through `run_in_threadpool`, and the sync handlers and `FileResponse` bodies of desktop-only and loopback-only routes. In org tenancy no response body reads the file store there, and neither does any sync route but the loopback-only ones, which `require_local` refuses to any peer but loopback. On asyncio's default executor through `asyncio.to_thread`, for example: the publish uploads, an artifact delete's take-down of its live pages, the live-app reads and the startup owner backfills. `run_efs` works like this:
+The artifact routes' lookups and reads, and a turn's artifact bookkeeping, run their file store work through `run_efs` in `cowork/db/units.py`, beside `run_db`. Other file store work still runs on other threads, and a stuck mount can hold those too. On anyio's default threads: the live-app share and copy routes through `run_in_threadpool`, and the sync handlers and `FileResponse` bodies of desktop-only and loopback-only routes. In org tenancy no response body reads the file store there, and no sync route does either: the desktop-only and loopback routes refuse org tenancy outright. On asyncio's default executor through `asyncio.to_thread`, for example: the publish uploads, an artifact delete's take-down of its live pages, the live-app reads and the startup owner backfills. `run_efs` works like this:
 
 - `run_efs` has its own 100 threads per process by default (`EFS_SLOTS`). A started call keeps its thread until it returns, so a stuck mount holds that many threads at most.
 - One person holds at most 10 of them at once by default (`EFS_SHARE`). A heavy client is then refused before anyone else waits. One organization's work that runs for no person, such as a channel turn, shares 10 the same way. Nothing caps an organization: ten busy people fill the slots, and anyone else, in any organization, then waits for one.
@@ -613,9 +613,8 @@ Every route declares its permission at its own definition, and `create_app()` re
 | Declaration | The credential is |
 |-------------|-------------------|
 | `OpenByDesign` | nothing at all. Pinned route by route, with a written reason, in `tests/test_open_by_design_pin.py` |
-| `LoopbackOnly` | the caller being on this machine (`require_local`) |
 | `DesktopOnly` | not MindsHub mode (`require_local_tenancy` 403s the route there) |
-| `LoopbackDesktopOnly` | both of the above |
+| `LoopbackDesktopOnly` | the caller being on this machine (`require_local`: a loopback peer on a loopback socket), and not MindsHub mode |
 | `PlatformSignature` | the calling platform's HMAC over the body (channel webhooks) |
 | `Authenticated` | a verified `Principal` |
 | `AuthenticatedInOrgMode` | a verified `Principal`, in MindsHub mode only; a no-op on desktop |
@@ -633,6 +632,8 @@ FastAPI *adds* a route-level `dependencies=[...]` to its router's rather than
 replacing it, so a router carrying the open marker hands it to every route
 added later, and the walker cannot tell that apart from a deliberate choice.
 Every other class refuses, so inheriting one is safe.
+
+There is no loopback-only declaration. Loopback inside a hosted pod says nothing about which member is calling, so a route only the desktop app calls declares `LoopbackDesktopOnly`. [Who can reach the pod](deployment/cowork-server/README.md#who-can-reach-the-pod) names the routes that hand out or write secrets and what MindsHub mode answers them.
 
 `COWORK_TENANCY_MODE=org python -m scripts.dump_routes` prints the current
 surface with each route's declaration.
@@ -701,7 +702,7 @@ The pick is stored as an untagged `UserSettings` field, so it lands per `(org, u
 
 Single-user mode has one person, so none of this applies: every check below is inert on the desktop.
 
-In MindsHub mode a request acts as a pair, an organization and a user, and it never carries less. The gateway authenticates the credential, asks MindsHub whether that user is still a member of that organization, and injects `X-User-Id` and `X-Organization-Id`. cowork-server validates the shape of those headers and then trusts them, so **the gateway being the only route to the pod is what makes them trustworthy**, and that is a NetworkPolicy rather than anything in this codebase. `deployment/cowork-server/templates/network-policy.yaml` is that policy, on in staging and prod, and it admits only the nginx ingress controller pods in the `infrastructure` namespace on port 9010. It is off in PR environments, which take base values, so a PR environment does not enforce this boundary and a forged-header caller inside one is served. A request with no valid pair is answered 401 before any route runs, except on `/api/v1/health/`, `/api/v1/health/live` and `/api/v1/health/ready`, which clients and the kubelet probe with no headers, and the channel webhook paths, which third parties call.
+In MindsHub mode a request acts as a pair, an organization and a user, and it never carries less. The gateway authenticates the credential, asks MindsHub whether that user is still a member of that organization, and injects `X-User-Id` and `X-Organization-Id`. cowork-server validates the shape of those headers and then trusts them, so **the gateway being the only route to the pod is what makes them trustworthy**, and that is a NetworkPolicy rather than anything in this codebase. `deployment/cowork-server/templates/network-policy.yaml` is that policy, on in dev, staging, prod and every PR environment, and it admits only the nginx ingress controller pods in the `infrastructure` namespace on ports 9010 and 9011 ([Who can reach the pod](deployment/cowork-server/README.md#who-can-reach-the-pod)). A request with no valid pair is answered 401 before any route runs, except on `/api/v1/health/`, `/api/v1/health/live` and `/api/v1/health/ready`, which clients and the kubelet probe with no headers, and the channel webhook paths, which third parties call.
 
 ### What the lists read in MindsHub mode
 

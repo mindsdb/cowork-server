@@ -1,3 +1,12 @@
+# dev runs org mode like staging, so it gets the same ingress restriction (see
+# networkPolicy in values.yaml). Merging this does not roll dev: only a push to
+# a PR labeled deploy-to-dev does, and the last such push wins, so a branch cut
+# before this line rolls the policy away again. Watch both replicas stay Ready
+# through the rollout, then run the forged-header curl from a pod in another
+# namespace.
+networkPolicy:
+  enabled: true
+
 deployment:
   ingress:
     enabled: true

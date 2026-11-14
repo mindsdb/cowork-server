@@ -1,4 +1,3 @@
-import ipaddress
 from collections.abc import Mapping
 from contextlib import ExitStack
 from functools import partial
@@ -305,17 +304,6 @@ def _list_projects(
     return [*owned, *SharedProjectFiles(session).list_projects()]
 
 
-def _is_loopback_address(host: str | None) -> bool:
-    """Whether an address literal names the loopback interface."""
-    value = (host or "").strip().strip("[]").casefold()
-    if value == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(value).is_loopback
-    except ValueError:
-        return False
-
-
 async def require_local_for_chosen_folder(
     body: ProjectCreateRequest, request: Request
 ) -> None:
@@ -325,29 +313,16 @@ async def require_local_for_chosen_folder(
     the server user can reach, so this has to hold on a deployment that is
     local-mode but not local-only.
 
-    Neither of the obvious signals can carry it. The peer address is forgeable:
-    the image runs uvicorn with ``--forwarded-allow-ips "*"``, so
-    ``X-Forwarded-For`` rewrites ``request.client``. The configured host is
-    blind: that same CMD passes ``--host 0.0.0.0`` on argv and sets no
-    ``COWORK_SERVER_HOST``, so ``AppSettings.host`` still reads its loopback
-    default inside the container.
-
-    ``scope["server"]`` is the local address of the accepted socket. The proxy
-    middleware rewrites only ``client`` and ``scheme``, and a caller cannot
-    choose which interface their connection lands on, so a request that
-    arrived over loopback really did. The desktop sidecar binds 127.0.0.1, so
-    nothing legitimate is refused. ``require_local`` stays as a second layer
-    and the service refuses org deployments outright as a third.
+    ``require_local`` carries it, because it reads the socket the request
+    landed on, not only the peer address an ``X-Forwarded-For`` rewrites. The
+    configured host can't: the image's CMD passes ``--host 0.0.0.0`` on argv
+    and sets no ``COWORK_SERVER_HOST``, so ``AppSettings.host`` still reads its
+    loopback default inside the container. The service refuses org
+    deployments outright as a second layer.
     """
     if body.path is None:
         return
     require_local(request)
-    server = request.scope.get("server") or ()
-    if not _is_loopback_address(server[0] if server else None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="a chosen project folder needs a request over loopback",
-        )
 
 
 @router.post(

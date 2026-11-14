@@ -1,12 +1,7 @@
-# Staging enables the ingress restriction first, and it is the only place it can
-# be rehearsed: cowork-server has no deployment in the dev namespace and PR
-# environments take base values only.
-#
-# The prerequisite outside this repo is now in place. `newdev-gha-runner` gets
-# `create networkpolicies` in this namespace from the `<env>-gha-runner-deploy`
-# role in Kubernetes-Foundational-Services. Without it the release fails and
-# --atomic rolls the whole deploy back, so confirm the runner chart was rolled
-# before merging a change here:
+# Staging runs the ingress restriction, as dev, prod and every PR environment
+# do. `newdev-gha-runner` gets `create networkpolicies` in this namespace from
+# its `<env>-gha-runner-deploy` role. Without it the release fails and --atomic
+# rolls the whole deploy back, so confirm it before merging a change here:
 #   kubectl --context newdev -n staging auth can-i create networkpolicies \
 #     --as=system:serviceaccount:infrastructure:newdev-gha-runner
 #

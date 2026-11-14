@@ -143,15 +143,39 @@ unaffected.
 
 ## Required cluster permissions
 
-In `staging` and `prod` this chart renders a NetworkPolicy (`networkPolicy.enabled`
+In `dev`, `staging` and `prod` this chart renders a NetworkPolicy (`networkPolicy.enabled`
 is true in those values files), so whoever runs the upgrade needs
 `create networkpolicies` in the target namespace. Without it the release fails and
 `--atomic` rolls the whole deploy back. CI runs as
 `system:serviceaccount:infrastructure:<env>-gha-runner`, which holds the verb only
-in the namespaces listed under `runner_deploy_namespaces` in
-Kubernetes-Foundational-Services. See the `networkPolicy` block in `values.yaml`
+in the namespaces its deploy role lists. A PR environment renders the base values,
+where the policy is off; its deploy turns the policy on with a parameter of its
+own, and Argo CD creates it there. See the `networkPolicy` block in `values.yaml`
 for the two selector checks to run alongside it, since getting either one wrong
 drops every real request without failing the release.
+
+## Who can reach the pod
+
+In MindsHub mode the pod trusts the identity headers of whoever reaches it, so who can open a connection to it is the boundary. `templates/network-policy.yaml` draws it in `dev`, `staging`, `prod` and every PR environment.
+
+The policy admits connections on ports 9010 and 9011 from pods in the `infrastructure` namespace labeled `nginx-ingress-controller: "true"`. Two controllers carry that label: the public one, which routes to cowork-server, and the internal (VPN) one, which routes nothing here today. Two more paths reach the pod whatever the policy says. The pod's own node can connect, which is how the kubelet's probes get through. Anything inside the pod's network namespace can connect over loopback, and `kubectl port-forward` lands there too.
+
+uvicorn runs with `--forwarded-allow-ips '*'` (the `Dockerfile` CMD), so it takes `X-Forwarded-For` and `X-Forwarded-Proto` from every peer above and rewrites the client address from them. A controller fills `X-Forwarded-For` from what its own caller sent when that caller sits inside the network it trusts, so the client address the app sees is not a credential. `require_local` (`cowork/api/v1/endpoints/guards.py`) decides on the local address of the socket the request landed on, which no header changes. A request through the ingress lands on the pod's own address, so it is refused there.
+
+These six routes hand out or write secrets, and only the desktop app calls them. Each declares `LoopbackDesktopOnly`, so MindsHub mode refuses it whatever the request carries:
+
+| Route | What it does on the desktop |
+|-------|-----------------------------|
+| `GET /api/v1/settings/reveal-key/{name}` | returns a stored provider key |
+| `POST /api/v1/connectors/connections/save` | stores a connector's credentials |
+| `POST /api/v1/connectors/connections/validate-and-save` | checks and stores a Code connector's credentials |
+| `PATCH /api/v1/connectors/connections/{engine}/{name}/token` | stores a refreshed token |
+| `GET /api/v1/connectors/oauth/{engine}/credentials` | returns a built-in OAuth client ID and secret |
+| `POST /api/v1/connectors/oauth/{engine}/mcp/identity` | resolves the account behind an MCP access token |
+
+Other desktop-only routes that hand out or write secrets declare it too, such as `GET` and `POST /api/v1/settings/raw` and the `/api/v1/runtime-credential` routes. A caller that is not on loopback gets 403 `local requests only`. A caller that is, from inside the pod or through a port-forward, gets 403 `not available in org deployments`.
+
+To prove the policy after a rollout, run the forged-header curl from a pod in another namespace and expect a timeout. A port-forward can't observe the policy, for the reason in the `networkPolicy` block of `values.yaml`.
 
 ## Probes
 
