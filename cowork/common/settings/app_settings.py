@@ -750,6 +750,11 @@ class TurnQueueSettings(Settings):
     def is_remote(self) -> bool:
         return self.backend == "remote"
 
+    @property
+    def needs_turn_key_id(self) -> bool:
+        """Whether a turn key's public prefix is minted, which auth binds turn grants to."""
+        return self.datasource_enabled or self.connector_drafts_enabled
+
     redis_url: str = Field(
         default="redis://localhost:6379/0",
         description="Redis connection URL used when backend is 'remote'.",
@@ -917,6 +922,24 @@ class TurnQueueSettings(Settings):
             "until the controller and pod support the datasource block."
         ),
     )  # COWORK_TURN_DATASOURCE_ENABLED
+    connector_drafts_enabled: bool = Field(
+        default=False,
+        description=(
+            "Let cloud turns build custom connector templates a member saves "
+            "from a card, connects and uses on their turns. The code default is false; "
+            "the Helm chart turns it on in every environment (connectorDraftsEnabled)."
+        ),
+    )  # COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
+    custom_connect_refused_domains: list[str] = Field(
+        default=[
+            "mindshub.ai", "mindshub.co", "mindsdb.com", "mindsdb.cloud", "mindscloud.ai",
+            "minds-db.com", "mdb.ai", "4nton.ai", "cluster.local",
+        ],
+        description=(
+            "Domains a custom connector's address may not be, or be under: our own, "
+            "so a member cannot point the check at our services."
+        ),
+    )  # COWORK_TURN_CUSTOM_CONNECT_REFUSED_DOMAINS
     datasource_labels_enabled: bool = Field(
         default=False,
         description=(

@@ -20,6 +20,8 @@ from pydantic import BaseModel, Field, StrictStr, field_validator, model_validat
 MAX_DEADLINE_MS = 24 * 60 * 60 * 1000
 DATASOURCE_PROTOCOL_VERSION = 1
 MAX_DATASOURCE_CONNECTIONS = 100
+#: The most custom API connections one turn carries (anton holds the same).
+MAX_CUSTOM_API_CONNECTIONS = 25
 _REQUIRED_REF_KEYS = frozenset({"connection_id", "credential_version"})
 #: Names for the prompt only. anton's `anton/cloud_turn/contract.py` allows the
 #: same two, cleans each value for the prompt and drops what it cannot use, so
@@ -90,6 +92,38 @@ def _validate_datasource_block(value: object) -> None:
         seen.add(connection_id)
 
 
+def _is_positive_int(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 1
+
+
+def _validate_custom_api_block(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != {"turn_key", "connections"}:
+        raise ValueError("custom_api must carry exactly turn_key and connections")
+    if not isinstance(value["turn_key"], str) or not value["turn_key"]:
+        raise ValueError("custom_api turn key is missing")
+    connections = value["connections"]
+    if not isinstance(connections, list) or not connections or len(connections) > MAX_CUSTOM_API_CONNECTIONS:
+        raise ValueError("custom_api connections are invalid")
+    seen: set[int] = set()
+    for connection in connections:
+        if not isinstance(connection, dict) or set(connection) != {
+            "connection_id", "connector_id", "name", "credential_version",
+        }:
+            raise ValueError("custom_api connection reference is invalid")
+        connection_id = connection["connection_id"]
+        if (
+            not _is_positive_int(connection_id)
+            or not _is_positive_int(connection["credential_version"])
+            or not isinstance(connection["connector_id"], str)
+            or not connection["connector_id"]
+            or not isinstance(connection["name"], str)
+            or not connection["name"]
+            or connection_id in seen
+        ):
+            raise ValueError("custom_api connection reference is invalid")
+        seen.add(connection_id)
+
+
 def is_connection_label(value: object) -> bool:
     """Whether ``value`` has the shape of a connection name the producer sends: a non-empty string within auth's cap."""
     return isinstance(value, str) and 0 < len(value) <= _MAX_CONNECTION_LABEL_CHARS
@@ -136,6 +170,8 @@ class TurnJob(BaseModel):
             raise ValueError("anton_turn_v2 requires a persistent or ephemeral workspace_mode")
         if "datasource" in self.params:
             _validate_datasource_block(self.params["datasource"])
+        if "custom_api" in self.params:
+            _validate_custom_api_block(self.params["custom_api"])
         return self
 
     @field_validator("deadline_ms")
@@ -168,7 +204,7 @@ class TurnReply(BaseModel):
     # rather than being ignored. Kinds this build does nothing with are dropped
     # further down.
     kind: Literal["progress", "cell", "error", "turn_delta", "turn_step",
-                  "turn_memory", "turn_skill", "turn_history", "turn_compaction",
+                  "turn_memory", "turn_skill", "turn_connector", "turn_history", "turn_compaction",
                   "turn_completed", "turn_failed"]
     data: dict[str, Any] = Field(default_factory=dict)
     # The reply's number within its turn, counting up by one. The controller

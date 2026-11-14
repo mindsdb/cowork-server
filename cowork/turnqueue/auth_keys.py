@@ -194,6 +194,74 @@ async def register_datasource_grants(
     return result
 
 
+def _producer_headers(settings) -> dict[str, str]:
+    """The datasource producer role's credential, which auth's custom API routes also take."""
+    return {
+        "X-Datasource-Service-Key-Id": settings.datasource_producer_key_id,
+        "X-Datasource-Service-Key": settings.datasource_producer_key,
+    }
+
+
+async def list_custom_api_connections(*, org_id: str, user_id: str, turn_key_id: str, settings) -> list[dict]:
+    """List the turn key owner's verified custom API connections, metadata only.
+
+    Auth derives the member from the live turn key named by ``turn_key_id``;
+    the ids are cross-checks. Raises ``ProductPermissionUnavailable`` on any
+    failure, an unconfigured producer key included.
+    """
+    if not settings.datasource_producer_key_id or not settings.datasource_producer_key:
+        raise ProductPermissionUnavailable()
+    url = f"{settings.auth_internal_base_url.rstrip('/')}/internal/custom-connections/"
+    params = {"organization_id": org_id, "user_id": user_id, "turn_key_id": turn_key_id}
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            resp = await client.get(url, params=params, headers=_producer_headers(settings))
+            resp.raise_for_status()
+            result = resp.json()
+    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+        raise ProductPermissionUnavailable() from exc
+    if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+        raise ProductPermissionUnavailable()
+    return result["items"]
+
+
+async def register_custom_api_grants(
+    *,
+    user_id: str,
+    org_id: str,
+    correlation_id: str,
+    turn_key_id: str,
+    connection_ids: list[int],
+    settings,
+) -> dict:
+    """Bind grants for these custom API connections to the existing turn key, for the gateway to resolve.
+
+    Auth fixes the audience and purpose itself (``custom-api``, ``fetch``) and
+    issues each grant at the connection's current credential version. Raises
+    ``ProductPermissionUnavailable`` on any refusal or failure.
+    """
+    if not settings.datasource_producer_key_id or not settings.datasource_producer_key:
+        raise ProductPermissionUnavailable()
+    url = f"{settings.auth_internal_base_url.rstrip('/')}/internal/custom-connections/turn-grants/"
+    body = {
+        "user_id": user_id,
+        "organization_id": org_id,
+        "correlation_id": correlation_id,
+        "turn_key_id": turn_key_id,
+        "connection_ids": connection_ids,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            resp = await client.post(url, json=body, headers=_producer_headers(settings))
+            resp.raise_for_status()
+            result = resp.json()
+    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+        raise ProductPermissionUnavailable() from exc
+    if not isinstance(result, dict):
+        raise ProductPermissionUnavailable()
+    return result
+
+
 async def revoke_turn_key(*, instance_id: str, settings) -> None:
     """Revoke every active turn key for `instance_id`.
 

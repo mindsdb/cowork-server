@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import uuid
 from types import SimpleNamespace
@@ -1118,14 +1119,17 @@ def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monk
     assert "reports" in names and "untitled-project" in names
 
 
-def _insert_custom_connector(connection, *, connector_id, org_id=None):
+def _insert_custom_connector(connection, *, connector_id, org_id=None, created_by=None):
     connection.execute(
         text(
             "insert into custom_connectors "
-            "(id, connector_id, label, description, spec, featured, org_id) "
-            "values (:id, :connector_id, :label, '', '{}', 1, :org_id)"
+            "(id, connector_id, label, description, spec, featured, org_id, created_by) "
+            "values (:id, :connector_id, :label, '', '{}', 1, :org_id, :created_by)"
         ),
-        {"id": uuid.uuid4().hex, "connector_id": connector_id, "label": connector_id, "org_id": org_id},
+        {
+            "id": uuid.uuid4().hex, "connector_id": connector_id, "label": connector_id,
+            "org_id": org_id, "created_by": created_by,
+        },
     )
 
 
@@ -1156,17 +1160,63 @@ def test_custom_connector_id_is_unique_per_scope(tmp_path, monkeypatch):
 
     with engine.begin() as connection:
         _insert_custom_connector(connection, connector_id="httpbin")
-        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
-        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-b")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a", created_by="user-1")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-b", created_by="user-1")
 
     with pytest.raises(IntegrityError):
         with engine.begin() as connection:
             _insert_custom_connector(connection, connector_id="httpbin")
     with pytest.raises(IntegrityError):
         with engine.begin() as connection:
-            _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
+            _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a", created_by="user-1")
 
 
+#: The revision before org custom connectors became one per builder.
+PRIOR_TO_PER_BUILDER = "1d5fe417cc0a"
+
+
+def test_custom_connector_id_is_unique_per_builder_in_an_org(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    uri = _sqlite_uri(tmp_path / "custom_connectors_builder.db")
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-2")
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+
+
+def test_custom_connectors_per_builder_upgrade_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db = tmp_path / "custom_connectors_per_builder.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, PRIOR_TO_PER_BUILDER)
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+    _upgrade_to(engine, uri, "head")
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-2")
+
+    # Two members share the id, which the one-per-org index cannot hold.
+    with pytest.raises(Exception, match="cannot downgrade custom connectors per builder"):
+        _downgrade_to(engine, uri, PRIOR_TO_PER_BUILDER)
+    assert _alembic_version(db) == expected_head()
+
+    with engine.begin() as connection:
+        connection.execute(text("delete from custom_connectors where created_by = 'user-2'"))
+    _downgrade_to(engine, uri, PRIOR_TO_PER_BUILDER)
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-2")
 def _insert_queued_repair(connection, *, conversation_id: str, org_id=None):
     connection.execute(
         text(
@@ -1651,3 +1701,61 @@ def test_artifact_locations_downgrade_guards_missing_table(tmp_path, monkeypatch
     _downgrade_to(engine, uri, "dce94d4bafc0")  # must not raise
 
     assert _alembic_versions(db_path) == {"dce94d4bafc0", MAINS_OWNER_INDEX, ORG_APPEARANCE_DROP}
+
+
+def test_the_custom_connector_check_column_upgrades_and_downgrades(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db = tmp_path / "custom_connector_check.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "d4b8e2f6a9c1")
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+    _upgrade_to(engine, uri, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            text("update custom_connectors set connection_check = :check where connector_id = 'acme'"),
+            {"check": '{"path": "/v1/me", "headers": {"X-Key": "{api_key}"}}'},
+        )
+
+    _downgrade_to(engine, uri, "d4b8e2f6a9c1")
+
+    with engine.begin() as connection:
+        columns = {row[1] for row in connection.execute(text("pragma table_info(custom_connectors)"))}
+        kept = connection.execute(text("select count(*) from custom_connectors")).scalar()
+    assert "connection_check" not in columns
+    assert kept == 1
+
+
+def test_the_custom_connector_auth_column_upgrades_and_downgrades(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db = tmp_path / "custom_connector_auth.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "e5f1a3c7b9d2")
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+        connection.execute(
+            text("update custom_connectors set connection_check = :check where connector_id = 'acme'"),
+            {"check": '{"path": "/v1/me"}'},
+        )
+    _upgrade_to(engine, uri, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            text("update custom_connectors set connection_auth = :auth where connector_id = 'acme'"),
+            {"auth": '{"type": "header", "headers": {"X-Key": "{api_key}"}}'},
+        )
+        stored = connection.execute(text("select connection_auth from custom_connectors")).scalar()
+    assert json.loads(stored) == {"type": "header", "headers": {"X-Key": "{api_key}"}}
+
+    _downgrade_to(engine, uri, "e5f1a3c7b9d2")
+
+    with engine.begin() as connection:
+        columns = {row[1] for row in connection.execute(text("pragma table_info(custom_connectors)"))}
+        check = connection.execute(text("select connection_check from custom_connectors")).scalar()
+    assert "connection_auth" not in columns
+    assert json.loads(check) == {"path": "/v1/me"}

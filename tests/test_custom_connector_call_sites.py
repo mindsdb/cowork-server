@@ -151,6 +151,57 @@ class TestConnectorIdStamp:
         assert block["engine"] == "acme"
 
 
+ORG_BUILDER = TenantScope(org_mode=True, org_id="org-a", user_id="builder-a")
+ORG_OTHER_MEMBER = TenantScope(org_mode=True, org_id="org-a", user_id="member-a2")
+
+
+@pytest.fixture()
+def org_row(engine):
+    """The builder's own org definition of a connector the static registry lacks."""
+    with Session(engine) as session:
+        session.add(CustomConnector(
+            connector_id="acme_crm", label="Acme CRM", description="", spec=HTTPBIN_FORM,
+            org_id=ORG_BUILDER.org_id, created_by=ORG_BUILDER.user_id,
+        ))
+        session.commit()
+    return engine
+
+
+class TestOrgDefinitionsAreTheBuilders:
+    @pytest.mark.asyncio
+    async def test_the_builders_id_is_known_so_a_handcrafted_form_is_refused(self, org_row, staged):
+        req = SubmitFormRequest(form_spec={"form_id": "fm_aaaaaaaaaa", "engine": "acme_crm", "fields": []})
+
+        with pytest.raises(HTTPException) as exc:
+            await submissions_endpoints.submit_form(req, ORG_BUILDER)
+        assert exc.value.status_code == 422
+        assert staged == []
+
+    @pytest.mark.asyncio
+    async def test_the_builders_stamped_form_is_checked_against_their_row(self, org_row, staged):
+        req = SubmitFormRequest(form_spec={"_connector_id": "acme_crm", "form_id": "acme_crm-connector"}, values={})
+
+        with pytest.raises(HTTPException) as exc:
+            await submissions_endpoints.submit_form(req, ORG_BUILDER)
+        assert exc.value.status_code == 400
+        assert "token" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_another_member_submits_the_same_id_as_an_unknown_one(self, org_row, staged):
+        req = SubmitFormRequest(
+            form_spec={"form_id": "fm_aaaaaaaaaa", "engine": "acme_crm", "title": "Connect Acme", "fields": [
+                {"name": "key", "label": "Key", "type": "password", "secret": True},
+            ]},
+            values={"key": "any-key"},
+        )
+
+        await submissions_endpoints.submit_form(req, ORG_OTHER_MEMBER)
+
+        [call] = staged
+        assert call["connector_id"] == "acme_crm"
+        assert call.get("custom_spec") is None
+
+
 class TestSubmitForm:
     @pytest.mark.asyncio
     async def test_a_handcrafted_form_reusing_a_custom_id_is_a_422(self, engine, staged):
