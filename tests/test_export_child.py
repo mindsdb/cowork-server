@@ -573,6 +573,34 @@ def test_the_watch_kills_a_process_whose_memory_it_cant_read(monkeypatch, tmp_pa
     assert _descendants() == children
 
 
+_FAILS_AFTER_A_MOMENT = """
+import sys, time
+from cowork.services import export_child
+
+def convert(**_kwargs):
+    time.sleep(0.5)
+    raise ValueError("text from the document")
+
+export_child.convert = convert
+sys.argv = ["export_child", str(2048 * 1024 * 1024), "31"]
+export_child.main()
+"""
+
+
+def test_a_process_that_exits_under_the_memory_read_answers_for_itself(monkeypatch, tmp_path):
+    """On macOS an exited process the server hasn't reaped raises ZombieProcess.
+    Read as unreadable, a failed conversion would answer as an overrun."""
+
+    def exited(*, watched):
+        raise psutil.ZombieProcess(watched.pid)
+
+    monkeypatch.setattr(export_runner, "_held_bytes", exited)
+    _fake_child(monkeypatch, _FAILS_AFTER_A_MOMENT)
+
+    with pytest.raises(export_runner.ConversionError):
+        _convert(tmp_path=tmp_path)
+
+
 def test_an_error_while_talking_to_the_process_kills_it_at_once(monkeypatch, tmp_path):
     """Waited for instead, a busy process would hold the export until its wall clock."""
 

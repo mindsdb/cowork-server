@@ -443,11 +443,15 @@ class _Watch:
                 if watched is None:
                     watched = psutil.Process(self._process.pid)
                 held = _held_bytes(watched=watched)
+            except psutil.NoSuchProcess:
+                # It exited under the read (on macOS an unreaped one raises
+                # ZombieProcess), so its own exit decides the outcome. poll()
+                # can't tell here: while _run waits on the process, it holds
+                # the lock poll() needs and poll() answers None.
+                return
             except psutil.Error:
-                # A process that exited under the read is reaped here; one
-                # still running is never left without its limits.
-                if self._process.poll() is None:
-                    self._stop(cause="memory unreadable")
+                # A running process is never left without its limits.
+                self._stop(cause="memory unreadable")
                 return
             if held > self._limits.memory_bytes:
                 self._stop(cause="memory")
