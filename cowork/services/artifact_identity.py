@@ -44,6 +44,7 @@ from cowork.common.paths import (
     dir_open,
     dir_scandir,
     dir_stat,
+    is_child_name,
     open_pinned_child,
     pinned_dir,
 )
@@ -444,6 +445,25 @@ def _strictly_holds_no_id(*, exc: OSError) -> bool:
     return _holds_no_id(exc) or may_not_read(exc=exc)
 
 
+def storable_name(name: str) -> bool:
+    """Whether a database row can store the folder name `name`. Linux hands
+    Python a name that is not valid UTF-8 with a lone surrogate, which a
+    row's model refuses and the database driver cannot encode."""
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def is_listable_folder_name(name: str) -> bool:
+    """Whether the artifacts list would open a folder named `name` from a
+    row: one direct child name (is_child_name), not dot-named, since the
+    walk skips those (artifacts.list_artifacts), the locks folder
+    (LOCKS_DIRNAME) among them, and a name a row can store (storable_name)."""
+    return is_child_name(name) and not name.startswith(".") and storable_name(name)
+
+
 def _build_identity_index(
     base: PinnedDir, *, widen: bool = True, strict: bool = False
 ) -> dict[str, tuple[str, ...]]:
@@ -749,26 +769,39 @@ class ArtifactListing(NamedTuple):
     # The error listing the folder itself failed with, when it was such an
     # error. No entry below it was seen, so both sets are empty.
     base_error: OSError | None = None
+    # Whether the folder itself is gone (ENOENT), when the listing lists it
+    # or once a stat finds an entry missing, as it is for a caller that still
+    # names a project's old path after a rename moved its folder. Both sets
+    # are empty, as for a folder that holds no artifact folder, so a caller
+    # that drops what a listing did not find checks this first.
+    base_missing: bool = False
 
 
 def artifact_folders_below(*, base: Path) -> ArtifactListing:
     """List the artifact folders directly below ``base``, a project's
     artifacts folder, following links as a full listing always has: each
-    entry is stat'ed, then its ``metadata.json``. A missing ``base``, or one
-    that is not a folder, holds none. The project's lock folder
-    (``LOCKS_DIRNAME``) is never an artifact, even when agent code put a
-    ``metadata.json`` there, so it is in neither set. The listing's errors
-    are sorted by errno rather than left to ``Path.is_dir``, whose answer to
-    an EIO differs between Python versions (it raises on 3.12 and 3.13, and
-    answers False from 3.14). ENOENT, ENOTDIR and ELOOP mean the entry holds
-    no artifact folder; any other error leaves it in ``unreadable``, or, for
-    ``base`` itself, in ``base_error``, so a caller never takes an entry it
-    could not read for one that is gone."""
+    entry is stat'ed, then its ``metadata.json``. A missing ``base`` holds
+    none and sets ``base_missing``, and one that is not a folder holds none.
+    So does a ``base`` found gone once a stat finds an entry missing, as
+    when a project's rename moves its folder while the listing runs: the
+    listing cannot tell its entries gone from moved, so it names none of
+    them, even when ``base`` is back by the time a caller reads it. The
+    project's lock folder (``LOCKS_DIRNAME``) is never an artifact, even
+    when agent code put a ``metadata.json`` there, so it is in neither set.
+    The listing's errors are sorted by errno rather than left to
+    ``Path.is_dir``, whose answer to an EIO differs between Python versions
+    (it raises on 3.12 and 3.13, and answers False from 3.14). ENOENT,
+    ENOTDIR and ELOOP mean the entry holds no artifact folder; any other
+    error leaves it in ``unreadable``, or, for ``base`` itself, in
+    ``base_error``, so a caller never takes an entry it could not read for
+    one that is gone."""
     base = Path(base)
     try:
         with os.scandir(base) as entries:
             names = sorted(entry.name for entry in entries if entry.name != LOCKS_DIRNAME)
     except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return ArtifactListing(found=frozenset(), unreadable=frozenset(), base_missing=True)
         return ArtifactListing(found=frozenset(), unreadable=frozenset(), base_error=None if _holds_no_id(exc) else exc)
     found: set[str] = set()
     unreadable: set[str] = set()
@@ -780,6 +813,8 @@ def artifact_folders_below(*, base: Path) -> ArtifactListing:
             if not stat.S_ISREG(os.stat(folder / "metadata.json").st_mode):
                 continue
         except OSError as exc:
+            if exc.errno == errno.ENOENT and not os.path.lexists(base):
+                return ArtifactListing(found=frozenset(), unreadable=frozenset(), base_missing=True)
             if not _holds_no_id(exc):
                 unreadable.add(name)
             continue
@@ -805,6 +840,12 @@ class ListedIds(NamedTuple):
     # Never set for a ``base`` the id reader refuses, such as a link
     # (listed_folder_ids).
     base_unreadable: bool = False
+    # Whether a full listing found ``base`` itself gone, while it listed and
+    # stat'ed ``base``'s entries (ArtifactListing.base_missing) or when the
+    # id reader opened it (listed_folder_ids), so it read no folder: the
+    # folders may live on under another path, such as a renamed project's,
+    # whose rename can move them while the listing runs.
+    base_missing: bool = False
 
 
 def artifact_ids_below(*, base: Path, slugs) -> ListedIds:
@@ -847,8 +888,13 @@ def _ids_below_pinned_base(*, base: Path, slugs) -> ListedIds | None:
 def listed_folder_ids(*, base: Path, listing: ArtifactListing) -> ListedIds:
     """The id each folder a full listing of ``base`` found holds, read
     without writing (artifact_ids_below), with the entries the listing could
-    not stat among the unreadable folders, and ``base_unreadable`` when it
-    could not list a plain ``base`` at all.
+    not stat among the unreadable folders, ``base_unreadable`` when it
+    could not list a plain ``base`` at all, and ``base_missing`` when
+    ``base`` was gone while the listing listed and stat'ed its entries, or
+    is gone once the id reader found nothing to open there. A rename that
+    moves the project's folder once the listing's stats are done leaves the
+    listing whole, and the id reader then finds ``base`` gone, so it read no
+    id: that is not complete either.
 
     The listing follows links and the id reader never does, so an entry the
     reader refuses as holding no id is left out of the unreadable folders,
@@ -861,11 +907,15 @@ def listed_folder_ids(*, base: Path, listing: ArtifactListing) -> ListedIds:
     error counts, so only a plain ``base`` sets ``base_unreadable``."""
     read = _ids_below_pinned_base(base=base, slugs=listing.found)
     if read is None:
-        return ListedIds(ids={}, unreadable=frozenset())
+        # The id reader refuses a missing ``base`` and a link on the way to
+        # it alike; only the first means the listing may have missed folders.
+        return ListedIds(
+            ids={}, unreadable=frozenset(), base_missing=listing.base_missing or not os.path.lexists(base),
+        )
     if listing.base_error is not None:
         return ListedIds(ids={}, unreadable=frozenset(), base_unreadable=True)
     unstatted = frozenset(name for name in listing.unreadable if not _refused_as_a_link(base=Path(base), name=name))
-    return read._replace(unreadable=read.unreadable | unstatted)
+    return read._replace(unreadable=read.unreadable | unstatted, base_missing=listing.base_missing)
 
 
 def _refused_as_a_link(*, base: Path, name: str) -> bool:

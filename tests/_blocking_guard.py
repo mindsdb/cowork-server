@@ -194,12 +194,9 @@ class Allowed(NamedTuple):
 ALLOWLIST: tuple[Allowed, ...] = (
     Allowed('cowork/handlers/responses.py', 'ResponsesHandler._route_request', LOOP_POOL_CHECKOUT, ('cowork/services/settings.py:SettingService._fetch_all_rows',), "loads the caller's settings with get_user_settings, which checks out a connection on the loop"),
     Allowed('cowork/server.py', 'lifespan', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'startup work before uvicorn binds the port, when no request waits on the loop'),
-    Allowed('cowork/api/v1/endpoints/artifacts.py', 'artifact_status', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only (DesktopOnly on GET /api/v1/artifacts/status)'),
     Allowed('cowork/api/v1/endpoints/coding.py', 'inference_proxy', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only (LoopbackDesktopOnly on the router)'),
-    Allowed('cowork/api/v1/endpoints/publish.py', 'activate_version_endpoint', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only (DesktopOnly on the publish router)'),
     Allowed('cowork/api/v1/endpoints/publish.py', 'list_publishable_endpoint', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only (DesktopOnly on the publish router)'),
     Allowed('cowork/api/v1/endpoints/publish.py', 'list_versions_endpoint', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only (DesktopOnly on the publish router)'),
-    Allowed('cowork/api/v1/endpoints/publish.py', 'unpublish_artifact', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only (DesktopOnly on the publish router)'),
     Allowed('cowork/api/v1/endpoints/settings.py', 'write_raw_settings', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only (LoopbackDesktopOnly)'),
     Allowed('cowork/services/providers.py', 'warm_enabled_model_map', LOOP_POOL_CHECKOUT, (ANY_LEAF,), 'desktop only: the boot warm and POST /api/v1/settings/raw, which org tenancy skips and refuses'),
     Allowed('cowork/services/artifacts.py', 'mount_preview', LOOP_FILE_STORE, (ANY_LEAF,), 'desktop only (DesktopOnly on POST /api/v1/artifacts/preview-mount)'),
@@ -620,13 +617,21 @@ class StaleEntryCheck:
     counts as collected. A run that is not full says so in one line and why,
     except a run that only lists, --collect-only, --fixtures or
     --fixtures-per-test, whose output tools read as a list.
+
+    Under pytest-xdist each worker reaches only its share of the sites, so a
+    worker hands what it saw to the controller (``WORKER_OUTPUT_KEY``) and the
+    controller decides on the merged run. A worker that ended without handing
+    anything over makes the run not full.
     """
+
+    WORKER_OUTPUT_KEY = "blocking_guard_stale_check"
 
     def __init__(self, *, tests_dir: Path, reached: set[Site]) -> None:
         self.tests_dir = tests_dir
         self.reached = reached
         self.collected: set[Path] = set()
         self.deselected = False
+        self.workers_lost: list[str] = []
         self.skipped_because: str | None = None
         self.stale: list[Allowed] = []
 
@@ -636,6 +641,29 @@ class StaleEntryCheck:
 
     def pytest_deselected(self) -> None:
         self.deselected = True
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_testnodedown(self, node, error) -> None:
+        """On the xdist controller: merge one worker's sites, collected files
+        and run state into this check. A worker that went down with an error
+        or sent nothing is recorded as lost, since its sites are missing."""
+        output = getattr(node, "workeroutput", {}).get(self.WORKER_OUTPUT_KEY)
+        if error or output is None:
+            self.workers_lost.append(node.gateway.id)
+            return
+        # execnet carries only builtin types, so Site and Path cross as tuple and str.
+        self.reached.update(Site(*site) for site in output["reached"])
+        self.collected.update(Path(path) for path in output["collected"])
+        self.deselected = self.deselected or output["deselected"]
+
+    def hand_over_to_controller(self, session: pytest.Session) -> None:
+        """On an xdist worker: put what this worker saw where the controller's
+        ``pytest_testnodedown`` reads it."""
+        session.config.workeroutput[self.WORKER_OUTPUT_KEY] = {
+            "reached": [tuple(site) for site in self.reached],
+            "collected": [str(path) for path in self.collected],
+            "deselected": self.deselected,
+        }
 
     def not_a_full_run(self, session: pytest.Session, *, exitstatus: int) -> str | None:
         """Why this run can't tell a stale entry from an unreached one, or
@@ -647,8 +675,8 @@ class StaleEntryCheck:
         # pytest sets setuponly for --setup-plan too.
         if option.setuponly:
             return "--setup-only runs no test bodies"
-        if hasattr(config, "workerinput") or config.pluginmanager.hasplugin("dsession"):
-            return "pytest-xdist splits the tests between workers"
+        if self.workers_lost:
+            return f"pytest-xdist worker {', '.join(self.workers_lost)} ended without handing over its sites"
         if self.deselected or option.keyword or option.markexpr:
             return "tests were deselected"
         if session.shouldstop or session.shouldfail:
@@ -666,6 +694,9 @@ class StaleEntryCheck:
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         option = session.config.option
         if option.collectonly or option.showfixtures or option.show_fixtures_per_test:
+            return
+        if hasattr(session.config, "workerinput"):
+            self.hand_over_to_controller(session)
             return
         self.skipped_because = self.not_a_full_run(session, exitstatus=exitstatus)
         if self.skipped_because is None:

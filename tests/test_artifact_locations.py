@@ -1861,7 +1861,7 @@ async def test_a_full_listing_that_could_not_read_the_copy_asks_for_the_self_hea
     assert not _conflicted(brief.org_id, brief.artifact_id)
     [warning] = _unread_listing_warnings(caplog)
     assert warning.getMessage() == (
-        "a full listing of a project's artifacts could not read every folder, so the project's self-heal lists it again"
+        "a full listing of a project's artifacts could not read every folder, so the project is listed again"
     )
     if failure == "root_listing":
         # It read no folder below the root, so it counts none.
@@ -2608,19 +2608,19 @@ def test_a_stopped_backfill_resumes_after_the_last_project_it_finished(
     ids = sorted(project.id for _org_id, project, _ids in projects)
     stop = threading.Event()
     walked: list[UUID] = []
-    real_found, real_save = artifact_location_backfill._found_locations, artifact_location_backfill._save_progress
+    real_found, real_save = artifact_location_backfill._found_locations, artifact_location_backfill.save_progress
 
     def found_locations(project, *, stop):
         walked.append(project.id)
         return real_found(project, stop=stop)
 
-    def save_progress(engine, *, progress):
+    def save_progress(engine, key, *, progress):
         # Shutdown lands once the first project is finished.
-        real_save(engine, progress=progress)
+        real_save(engine, key, progress=progress)
         stop.set()
 
     monkeypatch.setattr(artifact_location_backfill, "_found_locations", found_locations)
-    monkeypatch.setattr(artifact_location_backfill, "_save_progress", save_progress)
+    monkeypatch.setattr(artifact_location_backfill, "save_progress", save_progress)
     with caplog.at_level(logging.WARNING, logger=artifact_location_backfill.logger.name):
         assert artifact_location_backfill.run_artifact_location_backfill(
             try_lock=_no_lock, project_ids=ids, stop=stop
@@ -2635,7 +2635,7 @@ def test_a_stopped_backfill_resumes_after_the_last_project_it_finished(
     ]
     assert "resumes" in stopped.getMessage()
 
-    monkeypatch.setattr(artifact_location_backfill, "_save_progress", real_save)
+    monkeypatch.setattr(artifact_location_backfill, "save_progress", real_save)
     walked.clear()
     summary = artifact_location_backfill.run_artifact_location_backfill(try_lock=_no_lock, project_ids=ids)
 
@@ -2707,7 +2707,8 @@ def test_a_backfill_counts_a_folder_name_that_is_not_utf8_toward_a_conflict(
 
 def _progress_present() -> bool:
     with Session(get_engine(get_app_settings().database.uri)) as raw:
-        return artifact_location_backfill._progress_row(raw) is not None
+        query = select(Setting).where(Setting.key == artifact_location_backfill.PROGRESS_KEY, Setting.scope.is_(None))
+        return raw.exec(query).first() is not None
 
 
 def test_a_backfill_drops_an_unread_project_deleted_since_and_finishes(
@@ -2974,10 +2975,10 @@ async def test_shutdown_goes_on_while_the_location_backfill_is_stuck(boot, monke
         assert len(drained) == 1
         assert drained[0] - stopping_at <= server.LOCATION_BACKFILL_SHUTDOWN_SECONDS + 1
         assert [
-            record for record in caplog.records
+            record.getMessage() for record in caplog.records
             if record.name == server.logger.name
             and getattr(record, "event", None) == "shutdown_location_backfill_unfinished"
-        ]
+        ] == ["artifact backfills (location, held-root, sort-time) still running at shutdown; going on"]
     finally:
         release.set()
         backfill = app.state.artifact_location_backfill

@@ -411,3 +411,40 @@ async def test_harness_tells_the_model_not_to_publish_wider_when_sharing_with_ev
         "user that an organization admin can share it with everyone, or offer to share it with specific "
         "people by email."
     )
+
+
+@pytest.mark.asyncio
+async def test_harness_tells_the_model_not_to_retry_a_markdown_page_the_server_stopped(tmp_path):
+    """Each try of the same file can hold the server's one conversion for 30 s."""
+    from cowork.services.publish import MARKDOWN_NOT_CONVERTED_MESSAGE, MarkdownNotPublishable
+
+    f = _artifact(tmp_path)
+    refused = mock.Mock(side_effect=MarkdownNotPublishable(MARKDOWN_NOT_CONVERTED_MESSAGE))
+    with mock.patch.object(htools, "_publish_artifact", refused):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": "publish"},
+        )
+
+    text = getattr(out, "content", out)
+    assert MARKDOWN_NOT_CONVERTED_MESSAGE in text
+    assert "Do not retry with the same file" in text
+
+
+@pytest.mark.asyncio
+async def test_harness_publishes_in_a_thread_off_the_event_loop(tmp_path):
+    """A Markdown page renders for up to 30 s, and the tool runs on the server's loop."""
+    import threading
+
+    f = _artifact(tmp_path)
+    threads = []
+
+    def publish(*_args, **_kwargs):
+        threads.append(threading.get_ident())
+        return {"url": "https://v/r/1"}
+
+    with mock.patch.object(htools, "_publish_artifact", publish):
+        await htools._cowork_publish_or_preview(
+            _session(tmp_path), {"file_path": str(f), "action": "publish"},
+        )
+
+    assert threads and threads[0] != threading.get_ident()
