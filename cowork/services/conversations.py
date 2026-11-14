@@ -585,6 +585,47 @@ class ConversationService:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
         return stmt
 
+    def _channel_conversations(self) -> ScopedSelect:
+        """Channel conversations in the caller's org: marked by the runtime,
+        owned by nobody. The scoped session adds the org filter; admin access
+        is the route's to check, so nothing here is reachable from `_owned`."""
+        return self.session.select(Conversation).where(
+            Conversation.channel_type.is_not(None),
+            Conversation.created_by.is_(None),
+        )
+
+    def list_channel_conversations(self, limit: int = 50) -> list[tuple[Conversation, datetime]]:
+        """Channel conversations, most recently active first, each with its last-activity time."""
+        last_activity = func.coalesce(
+            sa_select(func.max(Message.created_at))
+            .where(Message.conversation_id == Conversation.id)
+            .correlate(Conversation)
+            .scalar_subquery(),
+            Conversation.created_at,
+        )
+        stmt = self._channel_conversations().order_by(
+            last_activity.desc(), Conversation.created_at.desc(), Conversation.id
+        ).limit(limit)
+        return [
+            (conv, self.last_message_at(conv.id) or conv.created_at)
+            for conv in self.session.exec(stmt).all()
+        ]
+
+    def channel_conversation(self, conversation_id: UUID) -> Conversation | None:
+        """One channel conversation by id, or None if it is not one in this org."""
+        return self.session.exec(
+            self._channel_conversations().where(Conversation.id == conversation_id)
+        ).first()
+
+    def delete_channel_conversation(self, conversation_id: UUID) -> bool:
+        """Delete a channel conversation the way an owner deletes their own:
+        its messages go, its route is kept and unpinned. False if it is not
+        a channel conversation in this org."""
+        conversation = self.channel_conversation(conversation_id)
+        if conversation is None:
+            return False
+        return self._delete_conversation(conversation)
+
     def get_conversation(self, conversation_id: UUID) -> Conversation:
         conversation = self._owned(conversation_id)
         if conversation is None:
@@ -1341,6 +1382,16 @@ class ConversationService:
 
     def get_messages(self, conversation_id: UUID) -> list[dict]:
         self.get_conversation(conversation_id)  # raises if not found
+        return self._message_items(conversation_id)
+
+    def channel_messages(self, conversation_id: UUID) -> list[dict]:
+        """`get_messages` for a channel conversation, gated by `channel_conversation`."""
+        if self.channel_conversation(conversation_id) is None:
+            raise ValueError("Conversation not found")
+        return self._message_items(conversation_id)
+
+    def _message_items(self, conversation_id: UUID) -> list[dict]:
+        """The whole UI-facing history; the caller has already checked access."""
         messages = self.session.exec(
             self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
@@ -1368,6 +1419,24 @@ class ConversationService:
         back as an empty page while still claiming more is available.
         """
         self.get_conversation(conversation_id)  # raises if not found
+        return self._message_items_page(conversation_id, limit=limit, before=before)
+
+    def channel_messages_page(
+        self,
+        conversation_id: UUID,
+        *,
+        limit: int = _DEFAULT_PAGE_LIMIT,
+        before: str | None = None,
+    ) -> ConversationItemsPage:
+        """`get_messages_page` for a channel conversation, gated by `channel_conversation`."""
+        if self.channel_conversation(conversation_id) is None:
+            raise ValueError("Conversation not found")
+        return self._message_items_page(conversation_id, limit=limit, before=before)
+
+    def _message_items_page(
+        self, conversation_id: UUID, *, limit: int, before: str | None
+    ) -> ConversationItemsPage:
+        """One page of the UI-facing history; the caller has already checked access."""
         if not (1 <= limit <= _MAX_PAGE_LIMIT):
             raise InvalidPaginationParams(f"limit must be between 1 and {_MAX_PAGE_LIMIT}")
         cursor = _decode_message_cursor(before) if before else None

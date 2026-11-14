@@ -14,6 +14,7 @@ from cowork.api.v1.endpoints import (
     artifact_workspace,
     browse,
     capabilities,
+    channel_conversations,
     channels,
     comments,
     comparisons,
@@ -100,6 +101,9 @@ api_router.include_router(comparisons.router, prefix="/comparisons", tags=["comp
 api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])
+api_router.include_router(
+    channel_conversations.router, prefix="/channel-conversations", tags=["channels"]
+)
 api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
 api_router.include_router(artifacts.live_app_router, prefix="/artifacts", tags=["artifacts", "live-apps"])
 api_router.include_router(artifact_workspace.router, prefix="/artifacts", tags=["artifact-workspace"])
