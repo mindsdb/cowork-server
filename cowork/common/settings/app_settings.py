@@ -854,6 +854,55 @@ class TurnQueueSettings(Settings):
             "<root>/<project path in the organization>/conversations/<conversation id>."
         ),
     )  # COWORK_TURN_POD_SHARED_MOUNT_ROOT
+    project_files_max_file_bytes: int = Field(
+        default=50 * 1024 * 1024,
+        gt=0,
+        description=(
+            "Before each cloud turn the server copies the project's files into the "
+            "conversation's project-files folder. A file larger than this many bytes is "
+            "left out and named in the folder's list of files not copied."
+        ),
+    )  # COWORK_TURN_PROJECT_FILES_MAX_FILE_BYTES
+    # At most 2,000: anton's scan of the copy (anton/cloud_turn/session.py)
+    # stops at 2,000 entries, so a copy holding more reads to the agent as cut short.
+    # 0 turns the copy off: each copy empties on its conversation's next turn.
+    project_files_max_files: int = Field(
+        default=200,
+        ge=0,
+        le=2000,
+        description=(
+            "The most project files one conversation's copy holds; the rest are named as not copied. "
+            "0 copies nothing, and each conversation's copy empties on its next cloud turn."
+        ),
+    )  # COWORK_TURN_PROJECT_FILES_MAX_FILES
+    project_files_max_total_bytes: int = Field(
+        default=128 * 1024 * 1024,
+        gt=0,
+        description="The most bytes one conversation's copy of the project's files holds; the rest are named as not copied.",
+    )  # COWORK_TURN_PROJECT_FILES_MAX_TOTAL_BYTES
+    project_files_copy_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        le=60,
+        allow_inf_nan=False,
+        description=(
+            "How long one turn may spend walking the project and copying its files. Once it "
+            "passes, the walk stops, a file being copied is left out, and the folder's list says "
+            "the walk stopped early; a later turn copies what was not reached. Removing stale "
+            "copies and saving the copy's record run after it."
+        ),
+    )  # COWORK_TURN_PROJECT_FILES_COPY_SECONDS
+    project_files_copy_slots: int = Field(
+        default=8,
+        gt=0,
+        description=(
+            "Copies of a project's files one event loop runs at once (cowork.db.units.run_efs_copy). "
+            "A copy holds a file store slot for up to the copy's time, so without a cap of their own, "
+            "copies could hold every file store slot and refuse every other organization's file work. "
+            "Sized to a replica's one CPU, not to EFS_SLOTS. A copy that finds no free slot within "
+            "POOL_TIMEOUT refuses its own turn."
+        ),
+    )  # COWORK_TURN_PROJECT_FILES_COPY_SLOTS
     minds_base_url: str = Field(
         default="",
         description=(

@@ -13,9 +13,10 @@ from pathlib import Path
 from datetime import datetime, timezone
 from functools import partial
 from typing import Any, NamedTuple
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import re2
+from redis.exceptions import WatchError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from anton.core.dispatch import OutboundMessage
@@ -50,7 +51,11 @@ from cowork.services.conversations import ConversationService
 from cowork.services.files import store_file, upload_basename
 from cowork.services.settings import unit_setting_service
 from cowork.services.skills import SkillService
+from cowork.streaming import turn_claim
 from cowork.streaming.answer_text import accumulate_answer_text
+from cowork.streaming.backend import get_backend
+from cowork.streaming.turn_claim import TurnClaimUnavailable
+from cowork.turnqueue.redis_client import get_redis
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
 log = logging.getLogger(__name__)
@@ -276,6 +281,164 @@ class _KeyedLocks:
                     self._locks.pop(key, None)
 
 
+# How often a channel turn asks again for its conversation's lease while
+# another replica's turn holds it (conversation_turn_lease).
+LEASE_POLL_SECONDS = 0.5
+# Tries of one compare-and-set on the lease after another client changed it.
+_LEASE_WATCH_ATTEMPTS = 3
+
+
+def lease_key(conversation_id: UUID) -> str:
+    """The Redis key of a conversation's channel turn lease."""
+    return f"cowork:channel_turn_lease:{conversation_id}"
+
+
+@asynccontextmanager
+async def conversation_turn_lease(conversation_id: UUID) -> AsyncIterator[None]:
+    """Hold the conversation's channel turn lease for the block, so channel
+    turns of one conversation run one at a time on every replica.
+
+    _KeyedLocks orders a thread's turns inside one process only, and every
+    replica takes the platforms' webhooks. Without the lease, a message that
+    reaches another replica stages the conversation's workspace
+    (stage_remote_workspace), and so rewrites the project files' copy and
+    anton.md, while the turn before it still reads them.
+
+    Web turns take the conversation's turn claim (cowork.streaming.turn_claim).
+    The lease is a key of its own: every reader of the claim takes its holder
+    for a web run with a stream at its turn number, and a channel turn writes
+    its turn index entry only while no claim is held
+    (turn_index.record_channel_turn). It keeps the claim's timings. Its TTL
+    is CLAIM_TTL_SECONDS, renewed every RENEW_INTERVAL_SECONDS while the block
+    runs, so the lease of a replica that died lapses on its own. The owner
+    token is new for each turn.
+
+    A turn waits for another replica's turn to release the lease, as it waits
+    for its own thread's lock, asking again every LEASE_POLL_SECONDS. Only
+    the Redis stream backend, which several replicas share, takes the lease;
+    the file backend serves one process.
+
+    Raises TurnClaimUnavailable when Redis does not answer while the lease
+    is taken, after removing the lease that call may have taken. A renewal
+    or a release that fails is logged, and the lease lapses with its TTL.
+    """
+    if get_backend() != "redis":
+        yield
+        return
+    key = lease_key(conversation_id)
+    owner = uuid4().hex
+    await _take_lease(key, owner, conversation_id=conversation_id)
+    keeper = asyncio.create_task(_keep_lease(key, owner, conversation_id=conversation_id))
+    try:
+        yield
+    finally:
+        keeper.cancel()
+        try:
+            await asyncio.gather(keeper, return_exceptions=True)
+        finally:
+            await _release_lease(key, owner, conversation_id=conversation_id)
+
+
+async def _take_lease(key: str, owner: str, *, conversation_id: UUID) -> None:
+    """Take the lease for ``owner``, waiting while another turn holds it."""
+    waited = False
+    while True:
+        try:
+            async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
+                taken = await get_redis().set(key, owner, nx=True, px=turn_claim.CLAIM_TTL_SECONDS * 1000)
+        except BaseException as exc:
+            # Redis may have applied the SET before the call failed.
+            await _release_lease(key, owner, conversation_id=conversation_id)
+            if isinstance(exc, Exception):
+                raise TurnClaimUnavailable(conversation_id=str(conversation_id)) from exc
+            raise
+        if taken:
+            return
+        if not waited:
+            waited = True
+            log.info(
+                "channel turn waits for another replica's turn in its conversation",
+                extra={"event": "channel_turn_lease_wait", **log_context(conversation_id=conversation_id)},
+            )
+        await asyncio.sleep(LEASE_POLL_SECONDS)
+
+
+async def _renew_lease(key: str, owner: str) -> bool:
+    """Start the lease's TTL again while ``owner`` holds it, and take it back
+    when it lapsed (an event loop stall, or Redis lost it). False when
+    another turn holds it. Raises on a Redis error. Unbounded; the caller
+    bounds it."""
+    r = get_redis()
+    for _attempt in range(_LEASE_WATCH_ATTEMPTS):
+        try:
+            async with r.pipeline(transaction=True) as pipe:
+                await pipe.watch(key)
+                if await pipe.get(key) not in (None, owner):
+                    return False
+                pipe.multi()
+                pipe.set(key, owner, px=turn_claim.CLAIM_TTL_SECONDS * 1000)
+                await pipe.execute()
+                return True
+        except WatchError:
+            continue
+    raise WatchError(f"the channel turn lease {key} kept changing while it was renewed")
+
+
+async def _keep_lease(key: str, owner: str, *, conversation_id: UUID) -> None:
+    """Renew the lease every RENEW_INTERVAL_SECONDS until cancelled. A
+    renewal that finds another turn holding it logs channel_turn_lease_lost,
+    once until a renewal holds it again; a Redis error is tried again at the
+    next interval."""
+    lost = False
+    while True:
+        await asyncio.sleep(turn_claim.RENEW_INTERVAL_SECONDS)
+        try:
+            async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
+                held = await _renew_lease(key, owner)
+        except Exception:
+            log.warning(
+                "Could not renew a channel turn's lease; the next renewal tries again.",
+                exc_info=True,
+                extra={"event": "channel_turn_lease_renew_failed", **log_context(conversation_id=conversation_id)},
+            )
+            continue
+        if held:
+            lost = False
+        elif not lost:
+            lost = True
+            log.warning(
+                "A running channel turn lost its conversation's lease to another turn.",
+                extra={"event": "channel_turn_lease_lost", **log_context(conversation_id=conversation_id)},
+            )
+
+
+async def _release_lease(key: str, owner: str, *, conversation_id: UUID) -> None:
+    """Delete the lease while ``owner`` holds it. Never raises: a failure is
+    logged, and the lease lapses with its TTL."""
+    try:
+        async with asyncio.timeout(turn_claim.REDIS_CALL_SECONDS):
+            r = get_redis()
+            for _attempt in range(_LEASE_WATCH_ATTEMPTS):
+                try:
+                    async with r.pipeline(transaction=True) as pipe:
+                        await pipe.watch(key)
+                        if await pipe.get(key) != owner:
+                            return
+                        pipe.multi()
+                        pipe.delete(key)
+                        await pipe.execute()
+                        return
+                except WatchError:
+                    continue
+            raise WatchError(f"the channel turn lease {key} kept changing while it was released")
+    except Exception:
+        log.warning(
+            "Could not release a channel turn's lease; it lapses with its TTL.",
+            exc_info=True,
+            extra={"event": "channel_turn_lease_release_failed", **log_context(conversation_id=conversation_id)},
+        )
+
+
 @dataclass(frozen=True)
 class _Claim:
     """The installation that claims a platform account: its org, or None for
@@ -435,6 +598,8 @@ class AntonChannelRuntime:
         # the sender hears BUSY_NOTICE rather than nothing: the platform got
         # its acknowledgement and never sends the message again. The saves
         # after the answer retry and never raise a busy refusal (_save_turn_row).
+        # A Redis that cannot hand out the conversation's lease refuses the
+        # turn the same way.
         scope = scope_for_org(org_id) if org_id else scope_for_background_context()
         try:
             # A known thread's binding is a row. Only a new one may start in
@@ -470,10 +635,13 @@ class AntonChannelRuntime:
         typing = None
         if adapter is not None and callable(getattr(adapter, "set_typing", None)):
             typing = asyncio.create_task(typing_loop(adapter, event.address))
+        # The conversation a refusal below names, once it is open.
+        conversation_id: UUID | None = None
         try:
             conversation = await run_db(
                 partial(self._open_conversation, binding=binding, event=event), scope=scope
             )
+            conversation_id = conversation.id
             channel_context = ChannelContext(
                 channel_type=channel_type,
                 is_group=bool(event.message.is_group),
@@ -481,12 +649,26 @@ class AntonChannelRuntime:
                 instructions=binding.instructions,
             )
             # Nested get_user_settings() reads (model/provider) must resolve
-            # against this org, not fall back to local/global.
+            # against this org, not fall back to local/global. The lease
+            # keeps a turn of this conversation on another replica from
+            # staging its workspace until this turn's run returns.
             with use_settings_scope(scope):
-                outcome = await self._run_anton(
-                    scope, conversation, event, adapter, channel_context=channel_context
-                )
-        except (PoolTimeoutError, FilesystemBusy):
+                async with conversation_turn_lease(conversation.id):
+                    outcome = await self._run_anton(
+                        scope, conversation, event, adapter, channel_context=channel_context
+                    )
+        except (PoolTimeoutError, FilesystemBusy, TurnClaimUnavailable) as refused:
+            log.warning(
+                "channel turn refused: no free database connection, file store slot or turn lease",
+                extra={
+                    "event": "channel_turn_busy",
+                    # A file store refusal names the limit and the share
+                    # (FilesystemBusy), such as a copy of the project's files.
+                    "limiter": getattr(refused, "limiter", None),
+                    "share": getattr(refused, "share", None),
+                    **log_context(conversation_id=conversation_id),
+                },
+            )
             await self._send_busy_notice(channel_type=channel_type, event=event, org_id=org_id)
             raise
         finally:

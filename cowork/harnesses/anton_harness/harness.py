@@ -2093,19 +2093,25 @@ class AntonHarness:
                 None if comparison_side else live_app_host_for_turn(project_id=conversation.project.id)
             )
 
+            # The identity only where the operator set COWORK_DEPLOYMENT_KIND.
             deployment = identity_for_turn()
-            deployment_kwargs = {} if deployment is None else {
-                "deployment_identity": deployment,
-                "learned_memory_scope": learned_memory_scope(
-                    off=memory_state.off,
-                    learns=memory_layout.learns,
-                    shared=memory_state.shared,
-                ),
-            }
+            deployment_kwargs = {} if deployment is None else {"deployment_identity": deployment}
 
             config = ChatSessionConfig(
                 llm_client=llm_client,
                 **deployment_kwargs,
+                # Every turn, with or without an identity: anton's forget
+                # tool refuses where it is "shared", so one person's "forget"
+                # never removes a line everyone reads, as the memory API
+                # refuses them that delete (SHARED_DELETE_REFUSED). anton's
+                # prompt reads it only with an identity. Passed directly:
+                # every anton the floor admits has the field, and a dropped
+                # one would let that removal through.
+                learned_memory_scope=learned_memory_scope(
+                    off=memory_state.off,
+                    learns=memory_layout.learns,
+                    shared=memory_state.shared,
+                ),
                 settings=anton_settings,
                 self_awareness=self_awareness,
                 cortex=cortex,

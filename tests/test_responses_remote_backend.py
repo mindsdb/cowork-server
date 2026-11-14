@@ -251,13 +251,15 @@ def _remote_handler(monkeypatch, saved):
     handler = _handler()
     handler.principal = object()
     monkeypatch.setattr(ResponsesHandler, "_remote_seed_history", staticmethod(lambda session, conv_id: ([], None)))
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory_writable", staticmethod(lambda session, conv_id: True))
 
     class FakeConversationService:
         def __init__(self, session):
             pass
 
         def get_conversation(self, conv_id):
-            return object()
+            # In no project, so staging copies no project files.
+            return SimpleNamespace(project=None)
 
         def save_user_message(self, conv_id, content, created_at=None, *, pending=False):
             saved["user"] = content
@@ -786,6 +788,35 @@ def test_memory_on_still_writes(monkeypatch, memory_write_fakes, mode):
     assert memory_write_fakes.written == [entries]
 
 
+def test_a_memory_write_logs_its_count_and_conversation_as_fields(monkeypatch, memory_write_fakes, caplog):
+    """The deployments' JSON log keeps a line's static message and drops its
+    template values, so the write's INFO line carries how many entries it
+    applied and the conversation as fields, with no template values."""
+    from cowork.common.structured_logging import make_formatter
+
+    monkeypatch.setattr(
+        responses_mod, "get_user_settings",
+        lambda scope=None: SimpleNamespace(memory_enabled=True, memory_mode="autopilot"),
+    )
+    conv_id = uuid4()
+    entries = [
+        {"text": "remember", "kind": "always", "scope": "project"},
+        {"text": "and this", "kind": "lesson", "scope": "global"},
+    ]
+
+    with caplog.at_level(logging.INFO, logger=responses_mod.logger.name):
+        ResponsesHandler._persist_turn_memory(memory_write_fakes.session, conv_id, entries, object())
+
+    [record] = [
+        r for r in caplog.records if r.name == responses_mod.logger.name and r.levelno == logging.INFO
+    ]
+    assert record.args == ()
+    line = json.loads(make_formatter().format(record))
+    assert (line["message"], line["count"], line["conversation_id"]) == (
+        "[responses] applied the memory entries a remote turn sent", 2, str(conv_id),
+    )
+
+
 def test_a_failed_settings_read_writes_nothing(monkeypatch, memory_write_fakes):
     """Fail closed: with the settings unknown, a user who turned memory off must
     not get a write, and the turn itself must not fail over it."""
@@ -814,10 +845,12 @@ def _units_on_the_test_database(monkeypatch, *, scope=None):
 
 
 @pytest.mark.asyncio
-async def test_a_cancel_during_staging_waits_for_it_and_saves_nothing(monkeypatch):
+async def test_a_cancel_during_staging_waits_for_it_and_keeps_the_question(monkeypatch):
     """Staging runs as a unit in a worker thread. A Stop that lands while it
     runs waits for it: the producer never unwinds while the unit still holds
-    its session. The question was not saved yet, so nothing is."""
+    its session. The question is saved before staging, which copies the
+    project's files and can take seconds, so the Stop keeps it, answered as
+    it stands."""
     import asyncio
     from threading import Event
 
@@ -849,7 +882,8 @@ async def test_a_cancel_during_staging_waits_for_it_and_saves_nothing(monkeypatc
     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
 
     assert buffer.frames == ["CLOSE:cancelled"]
-    assert saved == {}
+    assert saved["user"] == "hi"
+    assert saved["finalized_id"] == saved["user_id"]
 
 
 @pytest.mark.asyncio
@@ -2837,6 +2871,7 @@ def test_a_remote_turns_inputs_look_up_the_workspace_once(monkeypatch):
     monkeypatch.setattr(ResponsesHandler, "_remote_artifacts_context", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_started_at", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory_writable", staticmethod(lambda session, conv_id: True))
     monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(remote_workspace))
     monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(remote_agent_files))
 
@@ -3594,13 +3629,15 @@ def _remote_handler_with_message_id(monkeypatch, saved, *, assistant_message_id)
     handler = _handler()
     handler.principal = object()
     monkeypatch.setattr(ResponsesHandler, "_remote_seed_history", staticmethod(lambda session, conv_id: ([], None)))
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory_writable", staticmethod(lambda session, conv_id: True))
 
     class FakeConversationService:
         def __init__(self, session):
             pass
 
         def get_conversation(self, conv_id):
-            return object()
+            # In no project, so staging copies no project files.
+            return SimpleNamespace(project=None)
 
         def save_user_message(self, conv_id, content, created_at=None, *, pending=False):
             saved["user"] = content
@@ -4438,6 +4475,145 @@ async def test_a_stop_while_the_diff_holds_an_artifacts_revision_lock_waits_for_
     assert let_go and closed and let_go[0] <= closed[0], "the stream ended while the diff held the lock"
     assert not (folder / ".revisions" / ".lock").exists()
     assert turn.recorded == [["mine"]]
+
+
+async def _a_turn_whose_staging_raises(
+    monkeypatch, error: Exception, *, conv_id: UUID | None = None,
+) -> tuple[dict, dict]:
+    """Run one remote turn whose staging (the copy of the project's files
+    included) raises ``error``. Returns the streamed response.failed payload
+    and what the turn saved."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def refused(*, conv_id, scope):
+        raise error
+
+    async def pod_replies(**kwargs):
+        raise AssertionError("the pod must not be asked when staging failed")
+        yield  # an async generator, like the real one
+
+    monkeypatch.setattr(responses_mod, "stage_remote_workspace", refused)
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", pod_replies)
+    buffer = _RecBuffer()
+    await handler._produce_remote(
+        conv_id=conv_id or uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+    failed = [f for f in buffer.frames if "response.failed" in f]
+    assert len(failed) == 1 and buffer.frames[-1] == "CLOSE:error", buffer.frames
+    return json.loads(failed[0].split("data: ", 1)[1].strip()), saved
+
+
+@pytest.mark.asyncio
+async def test_a_busy_file_store_at_staging_ends_the_turn_as_server_busy(monkeypatch):
+    """A file store with no free slot for the copy is the same wait as a full
+    pool: the frame says server_busy with the wait, so the client offers a
+    retry once it passes. The question was saved first, so it stays."""
+    from cowork.db.units import FilesystemBusy
+    from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
+
+    monkeypatch.setattr(responses_mod, "busy_retry_seconds", lambda: 5)
+    monkeypatch.setattr("cowork.handlers.turn_errors.busy_retry_seconds", lambda: 5)
+    failed, saved = await _a_turn_whose_staging_raises(
+        monkeypatch, FilesystemBusy("no project files copy slot freed within POOL_TIMEOUT"),
+    )
+
+    assert (failed["code"], failed["error"], failed["retry_after"]) == (
+        SERVER_BUSY_CODE, server_busy_message(5), 5,
+    )
+    assert failed["retry_at"]
+    assert saved["user"] == "hi" and saved["finalized_id"] == saved["user_id"]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_project_files_copy_says_so_and_keeps_the_question(monkeypatch):
+    """A copy that could not finish or be emptied refuses the turn with its
+    own sentence, not the generic one, on the generic code the client draws
+    as the sentence alone. The question was saved first, so it stays."""
+    from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, PROJECT_FILES_REFUSED_MESSAGE
+    from cowork.services.project_file_copy import ProjectFilesRefusal, ProjectFilesRefused
+
+    failed, saved = await _a_turn_whose_staging_raises(
+        monkeypatch, ProjectFilesRefused(uuid4(), ProjectFilesRefusal.NOT_EMPTIED),
+    )
+
+    assert (failed["code"], failed["error"]) == (GENERIC_TURN_ERROR_CODE, PROJECT_FILES_REFUSED_MESSAGE)
+    assert "retry_after" not in failed
+    assert saved["user"] == "hi" and saved["finalized_id"] == saved["user_id"]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_turns_warning_names_its_conversation_and_refusal_as_fields(monkeypatch, caplog):
+    """The deployments' JSON log keeps a line's static message and drops its
+    template values, and a line with an exception among them keeps only its
+    type. So the refused turn's WARNING carries the conversation, the
+    correlation and the refusal as fields, with no template values."""
+    from cowork.common.structured_logging import make_formatter
+    from cowork.services.project_file_copy import ProjectFilesRefusal, ProjectFilesRefused
+
+    conv_id = uuid4()
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        await _a_turn_whose_staging_raises(
+            monkeypatch, ProjectFilesRefused(conv_id, ProjectFilesRefusal.NOT_A_PROJECT), conv_id=conv_id,
+        )
+
+    [record] = [
+        r for r in caplog.records
+        if r.name == responses_mod.logger.name and getattr(r, "event", None) == "remote_turn_refused"
+    ]
+    assert (record.levelname, record.args) == ("WARNING", ())
+    line = json.loads(make_formatter().format(record))
+    assert (line["conversation_id"], line["refusal"]) == (str(conv_id), "not_a_project")
+    assert line["request_id"]
+    assert line["message"] == "[responses] remote turn refused: its copy of the project's files was refused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy", ["file_store", "pool"])
+async def test_a_busy_turns_warning_names_its_conversation_and_correlation_as_fields(monkeypatch, caplog, busy):
+    """The deployments' JSON log keeps a line's static message and drops its
+    template values, so the WARNING of a turn that found no free database
+    connection or file store slot carries its conversation and correlation
+    as fields, with no template values. A file store refusal also names the
+    limit that ran out and whose share it was."""
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    from cowork.common.structured_logging import make_formatter
+    from cowork.db.units import FilesystemBusy
+
+    error = (
+        FilesystemBusy(
+            "no project files copy slot freed within POOL_TIMEOUT", limiter="run_efs_copy", share="org:org-1:copy",
+        )
+        if busy == "file_store"
+        else PoolTimeoutError("QueuePool limit reached")
+    )
+    conv_id = uuid4()
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        failed, _saved = await _a_turn_whose_staging_raises(monkeypatch, error, conv_id=conv_id)
+
+    [record] = [
+        r for r in caplog.records
+        if r.name == responses_mod.logger.name and getattr(r, "event", None) == "remote_turn_busy"
+    ]
+    assert (record.levelname, record.args) == ("WARNING", ())
+    line = json.loads(make_formatter().format(record))
+    assert (line["conversation_id"], line["request_id"]) == (str(conv_id), failed["request_id"])
+    assert line["message"] == "[responses] remote turn found no free database connection or file store slot"
+    expected = ("run_efs_copy", "org:org-1:copy") if busy == "file_store" else (None, None)
+    assert (line.get("limiter"), line.get("share")) == expected
+
+
+def test_a_busy_file_store_maps_to_server_busy():
+    """friendly_turn_error answers a file store with no free slot as it
+    answers a full pool."""
+    from cowork.db.units import FilesystemBusy
+    from cowork.handlers.turn_errors import SERVER_BUSY_CODE, friendly_turn_error
+
+    code, message = friendly_turn_error(FilesystemBusy("no file store slot freed within POOL_TIMEOUT"))
+
+    assert code == SERVER_BUSY_CODE and message.startswith("Cowork is busy.")
 
 
 @pytest.mark.asyncio

@@ -773,6 +773,7 @@ async def revoke_turn_key_quietly(correlation_id: str) -> None:
 async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 user_id: str | None, input_text: str,
                                 model: str | None,
+                                memory_writable: bool,
                                 turn_id: int = 0,
                                 history: list | None = None,
                                 memory: dict | None = None,
@@ -800,6 +801,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
     user (the cowork UI does; channel turns never).
+    `memory_writable` tells the pod whether this server applies the memory
+    saves and removals it sends (cowork.handlers.responses.turn_memory_writable);
+    with False its memory tools answer that memory is read-only. Required, so
+    every caller decides it: a wrong False makes the pod refuse a save this
+    server would apply, and a wrong True makes it report one that is dropped.
     `preview_checks` lets the pod's artifact editor ask the app's open
     preview whether an edit runs (ENG-4227, turnqueue/preview_checks.py).
     Only with `interactive`: the answer reaches the pod on the stdin an
@@ -954,6 +960,12 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # (mindsdb/scratchpad-controller#124, which merges first).
               **({"ui_locale": ui_locale} if ui_locale else {}),
               **({"memory": memory_block} if memory_block else {}),
+              # False when this server drops every memory save and removal
+              # the turn sends: memory off, its mode "off", a comparison side
+              # or an organization's channel turn. The pod's memory tools then
+              # answer read-only. A controller or pod that predates the field
+              # keeps memory writable, as before.
+              "memory_writable": memory_writable,
               # Only the skills the caller sees, and the pod's whole
               # recallable set, so always present, even empty.
               "skills": turn_skills_wire(skills or {}),
@@ -1144,8 +1156,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         yield "progress", {"phase": WORKER_ALIVE_PHASE}
                         continue
                     if kind == "error" or (
-                        kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_history",
-                                 "turn_compaction", "turn_completed")
+                        kind in ("turn_delta", "turn_step", "turn_memory", "turn_memory_forget", "turn_skill",
+                                 "turn_history", "turn_compaction", "turn_completed")
                         and authorized_workspace_mode is None
                     ):
                         # Unsupported v2 operations and missing mount-policy
@@ -1173,7 +1185,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         )
                     if kind in ("turn_completed", "turn_failed"):
                         ended = True
-                    if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill",
+                    if kind in ("turn_delta", "turn_step", "turn_memory", "turn_memory_forget", "turn_skill",
                                 "turn_history", "turn_compaction", "turn_completed", "turn_failed"):
                         yield kind, data
                     if kind in ("turn_completed", "turn_failed"):

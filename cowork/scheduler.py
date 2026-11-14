@@ -24,7 +24,7 @@ from cowork.db.scoped import (
     scope_from_principal,
     unsafe_unscoped_session,
 )
-from cowork.db.units import FilesystemBusy, run_db
+from cowork.db.units import FilesystemBusy, run_db, run_efs_unit
 from cowork.handlers.turn_errors import MODEL_UNAVAILABLE_CODES
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.schedule_timing import missed_slots, next_future_occurrence
@@ -586,31 +586,48 @@ def _link_conversation(
 
 def _delete_unstarted_conversation(
     session: ScopedSession, *, scheduled: _ScheduledTurn, conversation_id: UUID,
+    cleanup_project_files: bool = False,
 ) -> None:
     """Delete the conversation _link_conversation made for a run whose turn
     never started, so it is not left empty in its owner's list. Under the
     schedule's own scope, as it was created.
 
-    Rows only: create_conversation makes no folder for it and the run attached
-    nothing, and this runs in a database unit, where a call to a stalled file
-    store would hold its connection and unit slot with no time limit."""
+    Rows only by default: create_conversation makes no folder for it and the
+    run attached nothing, and this runs in a database unit, where a call to a
+    stalled file store would hold its connection and unit slot with no time
+    limit. ``cleanup_project_files`` removes the conversation's folders too,
+    for a conversation whose turn ran and was deleted
+    (_discard_unstarted_conversation's ``turn_ran``)."""
     from cowork.services.conversations import ConversationService
 
     conv_session = ScopedSession(
         unsafe_unscoped_session(session), scope_from_principal(scheduled.principal)
     )
-    ConversationService(conv_session).delete_conversation(conversation_id, cleanup_project_files=False)
+    ConversationService(conv_session).delete_conversation(
+        conversation_id, cleanup_project_files=cleanup_project_files,
+    )
 
 
 async def _discard_unstarted_conversation(
-    *, scheduled: _ScheduledTurn, conversation_id: UUID, schedule_id: UUID,
+    *, scheduled: _ScheduledTurn, conversation_id: UUID, schedule_id: UUID, turn_ran: bool = False,
 ) -> bool:
     """Delete the conversation a run made for a turn that never started
     (_delete_unstarted_conversation) in a unit of its own. True when it went;
-    a failed delete is logged, and the run keeps its link to the conversation."""
+    a failed delete is logged, and the run keeps its link to the conversation.
+
+    ``turn_ran`` is for a refused fallback whose pinned turn ran and was then
+    deleted. That turn may have staged files into the conversation's folder
+    in its project, a cloud turn's copy of the project's files among them
+    (stage_remote_workspace in cowork.handlers.responses), so the delete
+    removes the folders and the copy's record too, in a unit on the file
+    store's threads (run_efs_unit)."""
+    unit = run_efs_unit if turn_ran else run_db
     try:
-        await run_db(
-            partial(_delete_unstarted_conversation, scheduled=scheduled, conversation_id=conversation_id),
+        await unit(
+            partial(
+                _delete_unstarted_conversation, scheduled=scheduled, conversation_id=conversation_id,
+                cleanup_project_files=turn_ran,
+            ),
             scope=SYSTEM_SCOPE,
         )
     except Exception:
@@ -1009,6 +1026,7 @@ async def _execute_schedule(
                 lease_lost_first = False
                 if created_conversation and failed_turn_deleted and await _discard_unstarted_conversation(
                     scheduled=scheduled, conversation_id=conversation_id, schedule_id=schedule_id,
+                    turn_ran=True,
                 ):
                     conversation_id = None
             if lease_lost_first:

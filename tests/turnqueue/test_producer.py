@@ -84,7 +84,7 @@ async def test_default_model_uses_the_verified_hosted_scope(monkeypatch, org_dep
     monkeypatch.setattr(user_settings, "get_user_settings", current_settings)
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="org-verified", user_id="user-verified",
-        input_text="hi", model=None,
+        input_text="hi", model=None, memory_writable=True,
     ))
     job = json.loads(fake.added[0][1]["payload"])
     assert job["params"]["model"] == "minds-default"
@@ -106,7 +106,7 @@ async def _scope_reaching_settings(monkeypatch, *, org_id, user_id):
 
     monkeypatch.setattr(user_settings, "get_user_settings", current_settings)
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=org_id, user_id=user_id, input_text="hi", model=None,
+        conversation_id="conv-1", org_id=org_id, user_id=user_id, input_text="hi", model=None, memory_writable=True,
     ))
     return seen[0]
 
@@ -151,7 +151,7 @@ async def test_job_goes_to_the_conversations_own_stream(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
-                                            user_id=None, input_text="hi", model="m"))
+                                            user_id=None, input_text="hi", model="m", memory_writable=True))
     assert fake.added[0][0] == "scratchpad:requests:conv-1"
     # Registered in the controller's queue registry, and in cowork's own turn
     # index so another replica can find this turn.
@@ -169,7 +169,7 @@ async def test_stream_remote_replies_yields_deltas_in_order(monkeypatch):
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     items = await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
-        model="m", history=[{"role": "user", "content": "prev"}]))
+        model="m", memory_writable=True, history=[{"role": "user", "content": "prev"}]))
     job = json.loads(fake.added[0][1]["payload"])
     assert job["op"] == "anton_turn_v2"
     assert job["params"]["workspace_mode"] == "persistent"
@@ -189,7 +189,7 @@ async def test_turn_failed_yields_classified_code_and_message(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True))
     kind, data = items[-1]
     assert kind == "turn_failed"
     assert data["code"] == "provider_overloaded"
@@ -225,7 +225,7 @@ async def test_a_stale_cancel_cause_is_cleared_with_the_stale_flag(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True))
     assert "cowork:cancel:r" in fake.deleted
     assert "cowork:cancel_cause:r" in fake.deleted
 
@@ -242,7 +242,7 @@ async def test_an_admitted_runs_early_cancel_survives_dispatch(monkeypatch):
     monkeypatch.setattr(fake, "delete", delete)
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True,
         correlation_id="r", run_id="b4bef70a-5ea4-47ae-be86-5d49ca45e154",
     ))
     assert "cowork:cancel:r" not in deleted
@@ -265,7 +265,7 @@ async def _failed_turn(monkeypatch, data):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True))
     kind, failed = items[-1]
     assert kind == "turn_failed"
     return failed
@@ -347,7 +347,7 @@ async def test_unmapped_turn_failure_is_redacted(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True))
     kind, data = items[-1]
     assert kind == "turn_failed"
     assert data["code"] == "anton_error"
@@ -361,7 +361,7 @@ async def test_stream_remote_replies_history_defaults_empty(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
-                                            user_id=None, input_text="hi", model="m"))
+                                            user_id=None, input_text="hi", model="m", memory_writable=True))
     assert json.loads(fake.added[0][1]["payload"])["params"]["history"] == []
 
 
@@ -384,7 +384,7 @@ async def test_oversized_required_request_warns_without_shedding_history(monkeyp
 
     huge_history = [{"role": "user", "content": "x" * 5000}]
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
-                                            user_id=None, input_text="hi", model="m",
+                                            user_id=None, input_text="hi", model="m", memory_writable=True,
                                             history=huge_history))
 
     assert any("over the 4096-byte cap" in w for w in warnings), warnings
@@ -414,6 +414,7 @@ async def test_oversized_request_sheds_whole_project_memory_first(monkeypatch):
             user_id="user-1",
             input_text="hi",
             model="m",
+            memory_writable=True,
             history=history,
             memory={
                 "project": {
@@ -454,11 +455,11 @@ async def test_stream_remote_replies_forwards_started_at_only_when_known(monkeyp
     monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
 
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m", memory_writable=True,
         started_at="2026-09-01T08:15:00",
     ))
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m", memory_writable=True,
     ))
 
     with_it = json.loads(fake.added[0][1]["payload"])["params"]
@@ -479,7 +480,8 @@ async def _enqueued_params(monkeypatch, org_id, **kwargs):
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=org_id, user_id="u1", input_text="hi", model="m", **kwargs,
+        conversation_id="conv-1", org_id=org_id, user_id="u1", input_text="hi", model="m",
+        memory_writable=True, **kwargs,
     ))
     return json.loads(fake.added[0][1]["payload"])["params"]
 
@@ -591,10 +593,11 @@ async def test_stream_remote_replies_forwards_reasoning_effort_only_when_selecte
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        reasoning_effort="some-future-level",
+        memory_writable=True, reasoning_effort="some-future-level",
     ))
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        memory_writable=True,
     ))
 
     with_it = json.loads(fake.added[0][1]["payload"])["params"]
@@ -655,7 +658,7 @@ async def test_an_effort_the_model_does_not_offer_is_left_out_of_the_job(
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model=model,
-        reasoning_effort=selected,
+        memory_writable=True, reasoning_effort=selected,
     ))
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
@@ -701,7 +704,7 @@ async def test_concurrent_turns_keep_their_own_reasoning_effort(monkeypatch):
     await asyncio.gather(*(
         _drain(prod.stream_remote_replies(
             conversation_id=f"conv-{c}", org_id=f"org-{c}", user_id=f"u-{c}", input_text=c,
-            model="m", correlation_id=f"r-{c}", reasoning_effort=effort,
+            model="m", memory_writable=True, correlation_id=f"r-{c}", reasoning_effort=effort,
         ))
         for c, effort in (("a", "low"), ("b", "high"))
     ))
@@ -731,6 +734,7 @@ async def test_stream_remote_replies_attaches_oauth_block_with_the_llm_turn_key(
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+        memory_writable=True,
     ))
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
@@ -761,6 +765,7 @@ async def test_stream_remote_replies_omits_oauth_block_when_no_connections(monke
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+        memory_writable=True,
     ))
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
@@ -787,6 +792,7 @@ async def test_stream_remote_replies_attaches_connector_usage_notes(monkeypatch)
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+        memory_writable=True,
     ))
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
@@ -856,7 +862,7 @@ async def test_datasource_grants_are_registered_before_refs_are_enqueued(monkeyp
     monkeypatch.setattr(fake, "xadd", tracking_xadd)
 
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m", memory_writable=True,
     ))
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
@@ -906,7 +912,7 @@ async def test_datasource_grant_mismatch_fails_before_enqueue(monkeypatch):
     )
 
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m", memory_writable=True,
     ))
     assert [(kind, data["code"]) for kind, data in items] == [("turn_failed", "permission_unavailable")]
     assert not fake.added
@@ -957,7 +963,7 @@ async def test_datasource_grant_binding_mismatch_fails_before_enqueue(monkeypatc
     )
 
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m", memory_writable=True,
     ))
     assert [(kind, data["code"]) for kind, data in items] == [("turn_failed", "permission_unavailable")]
     assert not fake.added
@@ -988,7 +994,7 @@ async def test_an_auth_outage_during_turn_setup_ends_the_turn_as_permission_unav
         monkeypatch.setattr(prod, name, mock)
 
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m", memory_writable=True,
     ))
 
     assert items == [("turn_failed", {
@@ -1024,7 +1030,7 @@ async def test_llm_mint_and_oauth_connections_fetch_run_concurrently(monkeypatch
 
     try:
         await asyncio.wait_for(_drain(prod.stream_remote_replies(
-            conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+            conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m", memory_writable=True,
         )), timeout=2.0)
     except asyncio.TimeoutError:
         pytest.fail("deadlocked: the oauth connections fetch never started before the llm mint awaited it")
@@ -1051,6 +1057,7 @@ async def test_stream_remote_replies_mints_and_attaches_llm_block(monkeypatch):
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
         model="mindshub_air",
+        memory_writable=True,
     ))
 
     payload = json.loads(fake.added[0][1]["payload"])
@@ -1094,6 +1101,7 @@ async def test_stream_remote_replies_forwards_the_active_hub_workspace(monkeypat
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
         model="mindshub_air",
+        memory_writable=True,
     ))
 
     assert captured["workspace_id"] == "ws-1"
@@ -1127,6 +1135,7 @@ async def test_the_active_hub_workspace_binds_the_key_with_datasources_on_too(mo
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
         model="mindshub_air",
+        memory_writable=True,
     ))
 
     assert captured["workspace_id"] == "ws-1"
@@ -1156,6 +1165,7 @@ async def test_stream_remote_replies_omits_workspace_id_when_none_picked(monkeyp
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
         model="mindshub_air",
+        memory_writable=True,
     ))
 
     assert captured["workspace_id"] is None
@@ -1258,6 +1268,7 @@ async def test_unresponsive_worker_fails_the_turn_instead_of_spinning(monkeypatc
     items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
         model="m",
+        memory_writable=True,
     )), timeout=5)
 
     # Terminal yielded, so the generator (and the SSE response with it) ends,
@@ -1312,6 +1323,7 @@ async def test_replies_refresh_the_idle_deadline(monkeypatch):
     items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
         model="m",
+        memory_writable=True,
     )), timeout=5)
 
     assert items[-1] == ("turn_completed", {})
@@ -1360,7 +1372,7 @@ async def test_the_controllers_liveness_replies_keep_a_quiet_turn_alive_and_reac
 
     items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
-        model="m",
+        model="m", memory_writable=True,
     ), include_policy=True), timeout=5)
 
     assert items == [
@@ -1383,7 +1395,7 @@ async def test_idle_bound_can_be_disabled(monkeypatch):
     async def consume():
         async for item in prod.stream_remote_replies(
                 conversation_id="conv-1", org_id=None, user_id=None,
-                input_text="hi", model="m"):
+                input_text="hi", model="m", memory_writable=True):
             items.append(item)
 
     with pytest.raises(asyncio.TimeoutError):
@@ -1498,7 +1510,7 @@ async def test_turn_skill_reaches_the_caller(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True))
     assert items == [("turn_skill", {"entries": [draft]}), ("turn_completed", {})]
 
 
@@ -1521,7 +1533,7 @@ async def test_turn_history_reaches_the_caller(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True))
     assert items == [("turn_history", {"rows": rows}), ("turn_completed", {})]
 
 
@@ -1539,8 +1551,41 @@ async def test_turn_compaction_reaches_the_caller(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True))
     assert items == [("turn_compaction", payload), ("turn_completed", {})]
+
+
+@pytest.mark.asyncio
+async def test_turn_memory_forget_reaches_the_caller(monkeypatch):
+    """Dropped by the same whitelist, the pod's forget request never reaches
+    the handler that removes the entries, while the pod already told the
+    person the line goes when the turn ends."""
+    payload = {"entries": [{"text": "Reply in Spanish", "scope": "global"}]}
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply("turn_memory_forget", payload)),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True))
+    assert items == [("turn_memory_forget", payload), ("turn_completed", {})]
+
+
+@pytest.mark.asyncio
+async def test_a_connector_draft_is_dropped_and_the_turn_goes_on(monkeypatch):
+    """The controller relays a pod's connector line as turn_connector, which
+    this build does nothing with. The reply parses and is dropped, so the
+    turn still completes rather than failing on a kind it can't read."""
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply("turn_connector", {"entries": [{"name": "crm"}]})),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True))
+    assert items == [("turn_completed", {})]
 
 
 pytestmark = pytest.mark.usefixtures("granted_product_permissions")
@@ -1559,7 +1604,7 @@ async def test_workspace_authority_is_sent_and_acknowledged_before_turn_events(m
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True
     ), include_policy=True)
     job = json.loads(fake.added[0][1]["payload"])
     assert job["op"] == "anton_turn_v2"
@@ -1582,7 +1627,7 @@ async def test_worker_without_verified_storage_policy_fails_terminally(monkeypat
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True
     ), include_policy=True)
     assert len(items) == 1
     assert items[0][0] == "turn_failed"
@@ -1602,7 +1647,7 @@ async def test_worker_cannot_upgrade_or_malform_execution_only_policy(monkeypatc
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True
     ), include_policy=True)
     assert len(items) == 1
     assert items[0][0] == "turn_failed"
@@ -1616,7 +1661,7 @@ async def test_worker_cannot_change_an_acknowledged_mount_policy(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     items = await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True
     ), include_policy=True)
     assert items[0] == ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"})
     assert items[1][0] == "turn_failed"
@@ -1640,7 +1685,7 @@ async def test_artifact_authority_outage_stops_before_queue_side_effects(monkeyp
     with pytest.raises(prod.product_permissions.ProductPermissionUnavailable):
         await _drain(prod.stream_remote_replies(
             conversation_id="conv-1", org_id="org", user_id="user", input_text="run",
-            model="m", llm={"api_key": "already-minted-key"},
+            model="m", memory_writable=True, llm={"api_key": "already-minted-key"},
         ))
     assert permissions == ["product.execute", "artifact.manage"]
     redis.assert_not_called()
@@ -1680,7 +1725,7 @@ async def test_a_hosted_turn_registers_grants_against_the_gate_minted_key(monkey
     block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "https://minds.internal/v1"}
 
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m", memory_writable=True,
         correlation_id="r", llm=block, turn_key_id="mdb_gate",
     ))
 
@@ -1713,7 +1758,7 @@ async def test_a_listing_auth_cannot_answer_costs_the_turn_its_databases_not_the
     block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "https://minds.internal/v1"}
 
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m", memory_writable=True,
         correlation_id="r", llm=block, turn_key_id="mdb_gate",
     ))
 
@@ -1736,7 +1781,7 @@ async def test_with_the_flag_off_nothing_datasource_related_runs_or_is_queued(mo
     monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(side_effect=AssertionError("registered")))
 
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m", memory_writable=True,
     ))
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
@@ -1757,7 +1802,7 @@ async def _queued_datasource(monkeypatch, listing, *, labels: bool) -> dict | No
     block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "https://minds.internal/v1"}
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block, turn_key_id="mdb_gate",
+        memory_writable=True, correlation_id="r", llm=block, turn_key_id="mdb_gate",
     ))
     return json.loads(fake.added[0][1]["payload"])["params"].get("datasource")
 
@@ -1922,7 +1967,7 @@ async def test_interactive_reaches_the_job_params(monkeypatch, interactive):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
-                                            input_text="hi", model="m", interactive=interactive))
+                                            input_text="hi", model="m", memory_writable=True, interactive=interactive))
     job = json.loads(fake.added[0][1]["payload"])
     assert job["params"]["interactive"] is interactive
 
@@ -1933,7 +1978,7 @@ async def test_interactive_defaults_to_false(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
-                                            input_text="hi", model="m"))
+                                            input_text="hi", model="m", memory_writable=True))
     assert json.loads(fake.added[0][1]["payload"])["params"]["interactive"] is False
 
 
@@ -1944,7 +1989,8 @@ async def test_tool_messages_reaches_the_job_params(monkeypatch, tool_messages):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
-                                            input_text="hi", model="m", tool_messages=tool_messages))
+                                            input_text="hi", model="m", memory_writable=True,
+                                            tool_messages=tool_messages))
     job = json.loads(fake.added[0][1]["payload"])
     assert job["params"]["tool_messages"] is tool_messages
 
@@ -1957,8 +2003,31 @@ async def test_tool_messages_defaults_to_false(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
-                                            input_text="hi", model="m"))
+                                            input_text="hi", model="m", memory_writable=True))
     assert json.loads(fake.added[0][1]["payload"])["params"]["tool_messages"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("memory_writable", [True, False])
+async def test_memory_writable_reaches_the_job_params(monkeypatch, memory_writable):
+    """Every remote turn's job says whether this server applies the memory
+    changes its pod sends (tests/test_turn_memory_writable.py pins what each
+    caller passes), so the pod's memory tools answer read-only when not."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", memory_writable=memory_writable))
+    assert json.loads(fake.added[0][1]["payload"])["params"]["memory_writable"] is memory_writable
+
+
+def test_memory_writable_is_required():
+    """No default for a caller to fall into: a wrong False makes the pod
+    refuse a save this server would apply, and a wrong True makes it report
+    one that is dropped, so every caller says which."""
+    with pytest.raises(TypeError, match="memory_writable"):
+        prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                   input_text="hi", model="m")
 
 
 @pytest.mark.asyncio
@@ -1968,7 +2037,8 @@ async def test_ui_locale_reaches_the_job_params(monkeypatch, ui_locale):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
-                                            input_text="hi", model="m", ui_locale=ui_locale))
+                                            input_text="hi", model="m", memory_writable=True,
+                                            ui_locale=ui_locale))
     assert json.loads(fake.added[0][1]["payload"])["params"]["ui_locale"] == ui_locale
 
 
@@ -1979,7 +2049,7 @@ async def test_no_ui_locale_leaves_the_job_params_without_the_key(monkeypatch):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
-                                            input_text="hi", model="m"))
+                                            input_text="hi", model="m", memory_writable=True))
     assert "ui_locale" not in json.loads(fake.added[0][1]["payload"])["params"]
 
 
@@ -2038,7 +2108,7 @@ async def test_a_turn_reads_only_the_replies_written_after_its_job(monkeypatch):
     (newest_earlier_id, _fields), = await client.xrevrange(_REPLY_STREAM, count=1)
 
     items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True,
     ), include_policy=True), timeout=5)
 
     assert items == [_AUTHORIZED, ("turn_delta", {"text": "hi"}), ("turn_completed", {})]
@@ -2052,7 +2122,7 @@ async def test_a_conversations_first_turn_reads_its_reply_stream_from_the_start(
     )
 
     items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True,
     )), timeout=5)
 
     assert items == [("turn_completed", {})]
@@ -2081,7 +2151,7 @@ async def test_an_earlier_turns_late_replies_are_skipped_and_keep_no_turn_alive(
     )
 
     items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True,
     )), timeout=5)
 
     (kind, data), = items
@@ -2111,7 +2181,7 @@ async def test_an_earlier_turns_reply_of_an_unknown_kind_after_the_start_id_is_s
     )
 
     items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True,
     )), timeout=5)
 
     assert items == [("turn_completed", {})]
@@ -2128,7 +2198,7 @@ async def test_this_turns_own_reply_of_an_unknown_kind_still_fails_it(monkeypatc
 
     with pytest.raises(ValidationError, match="kind"):
         await asyncio.wait_for(_drain(prod.stream_remote_replies(
-            conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+            conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True,
         )), timeout=5)
 
 
@@ -2169,6 +2239,7 @@ async def _web_turn(*, user_id="u1", project_id="proj-1"):
     workspace = prod.RemoteWorkspace(project_id=project_id, workspace_rel_path="projects/p") if project_id else None
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id=user_id, input_text="hi", model="mindshub_air",
+        memory_writable=True,
         workspace=workspace,
     ))
 
@@ -2281,7 +2352,7 @@ async def test_the_job_carries_the_organizations_jev_opt_out(monkeypatch, enable
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True))
 
     assert json.loads(fake.added[0][1]["payload"])["params"]["jev_decisions"] is enabled
 
@@ -2306,7 +2377,7 @@ def _turn_with_key(monkeypatch, replies):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     return prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True,
         llm={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
     )
 
@@ -2357,7 +2428,7 @@ async def _cancel_mid_turn(monkeypatch, *, stopped: bool) -> None:
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     task = asyncio.create_task(_drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True,
         llm={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
     )))
     await fake.waiting.wait()
@@ -2435,7 +2506,7 @@ async def test_a_channel_turn_leaves_the_index_entry_of_a_claimed_turn_alone(mon
     await r.set(claim_key("conv-1"), "held")
 
     replies = asyncio.create_task(_drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True,
         correlation_id="r",
     )))
     for _ in range(500):
@@ -2467,7 +2538,7 @@ async def test_preview_checks_reaches_the_job_only_for_an_interactive_turn(
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
-                                            input_text="hi", model="m", interactive=interactive,
-                                            preview_checks=preview_checks))
+                                            input_text="hi", model="m", memory_writable=True,
+                                            interactive=interactive, preview_checks=preview_checks))
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params.get("preview_checks") is expected

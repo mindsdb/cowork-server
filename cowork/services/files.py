@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
+import re
 import shutil
 import stat
+from contextlib import closing
 from functools import partial
 from pathlib import Path
+from typing import NamedTuple
 from uuid import UUID
 
 from fastapi import UploadFile
 
+from cowork.common.logger import log_context
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
+    dir_chmod_folder,
     dir_lstat,
     dir_mkdir,
     dir_open,
@@ -21,6 +27,7 @@ from cowork.common.paths import (
     dir_scandir,
     dir_stat,
     dir_unlink,
+    is_child_name,
     open_fd,
     open_pinned_child,
     pinned_dir,
@@ -31,6 +38,8 @@ from cowork.db.scoped import ScopedSession, TenantScope, scoped_storage_root
 from cowork.db.units import run_db, run_efs
 from cowork.models.file import File
 from cowork.schemas.files import FileResponse, StoredFileContent
+from cowork.services.artifact_roots import SERVER_PROJECT_FOLDERS
+from cowork.services.project_file_view import OS_FILES, WalkState, walk_ordinary_files
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +110,14 @@ def remove_conversation_workspace_dir(
             try:
                 conversations = open_pinned_child(project_dir, "conversations")
                 try:
-                    dir_rmtree(conversations, conv_seg)
+                    try:
+                        dir_rmtree(conversations, conv_seg)
+                    except PermissionError:
+                        # The pod took a folder's access away; give each
+                        # folder left its owner's access back and remove
+                        # the rest.
+                        _restore_tree_access(conversations, conv_seg)
+                        dir_rmtree(conversations, conv_seg)
                 finally:
                     conversations.close()
             finally:
@@ -109,11 +125,33 @@ def remove_conversation_workspace_dir(
     except FileNotFoundError:
         return
     except OSError:
+        # Fields, not template values: the log formatter drops those.
         logger.warning(
-            "could not remove conversation workspace dir %s",
-            Path(project_path) / "conversations" / conv_seg,
+            "Could not remove a deleted conversation's folder",
             exc_info=True,
+            extra={"event": "conversation_folder_not_removed", **log_context(conversation_id=conv_seg)},
         )
+
+
+def _restore_tree_access(parent: PinnedDir, name: str) -> None:
+    """Give the folder ``name`` in ``parent``, and every folder below it,
+    its owner's access back when the pod took it away (_restore_folder_mode),
+    so a removal can open and empty each one. The pod runs as the server's
+    user, so it can make any folder in its conversation's folder ``0o000``.
+
+    ``os.fwalk`` opens each folder through its parent's descriptor and, with
+    ``follow_symlinks=False``, never descends through a link; each mode is
+    set before the walk opens that folder. A folder that goes away meanwhile
+    is skipped, and one the walk can't open is left to the removal that
+    follows, which raises. POSIX only, as org mode is."""
+    _restore_folder_mode(parent, name)
+    for path, folders, _files, folder_fd in os.fwalk(name, dir_fd=parent.fd, follow_symlinks=False):
+        here = PinnedDir(folder_fd, parent.path / path)
+        for folder in folders:
+            try:
+                _restore_folder_mode(here, folder)
+            except FileNotFoundError:
+                continue
 
 
 def stage_project_instructions(
@@ -145,7 +183,7 @@ def stage_project_instructions(
             conversation_id,
         )
         return False
-    src = Path(project_path) / ".anton" / "anton.md"
+    src = _instructions_path(project_path)
     if not src.is_file():
         # Instructions removed at the project → clear the stale staged copy so
         # the agent stops seeing them. Cleared by truncating IN PLACE, never by
@@ -184,22 +222,36 @@ def stage_project_instructions(
         return False
 
 
-# Files the OS leaves in a folder, which are not the user's.
-_OS_FILES = frozenset({"desktop.ini", "thumbs.db", "icon\r"})
+def project_holds_ordinary_files(project_path: str | Path) -> bool:
+    """Whether a project folder holds a file a cloud turn's agent gets, by
+    the rule of the copy a cloud turn reads (stage_project_files in
+    cowork.services.project_file_copy): an ordinary file
+    (``cowork.services.project_file_view``). A project routes as holding
+    files exactly when its turn gets one, copied, or named or counted as not
+    copied (a file whose path is not valid UTF-8 is counted). Stops at the
+    first. A missing folder holds none; any other read error raises, and the
+    caller decides."""
+    try:
+        with pinned_dir(project_path) as project, closing(
+            walk_ordinary_files(project, state=WalkState())
+        ) as walk:
+            return next(walk, None) is not None
+    except (FileNotFoundError, NotADirectoryError):
+        return False
 
 
-def project_holds_files(project_path: str | Path) -> bool:
-    """Whether a project folder holds anything the user or the agent put
-    there: a file, or a folder with something in it, other than hidden ones
-    (``.anton``), the server's own folders and OS files. Stops at the first.
-    A missing folder holds none."""
-    from cowork.services.artifact_roots import SERVER_PROJECT_FOLDERS
-
+def project_holds_files_in_place(project_path: str | Path) -> bool:
+    """Whether a project folder holds files a turn that runs in this process
+    can read. Its agent works in the project folder itself, so anything
+    there the user or the agent put counts: a file, or a folder with
+    something in it, other than hidden ones (``.anton``), the server's own
+    folders and OS files. Stops at the first. A missing folder holds none;
+    any other read error raises, and the caller decides."""
     try:
         with os.scandir(project_path) as entries:
             for entry in entries:
                 name = entry.name.casefold()
-                if name.startswith(".") or name in SERVER_PROJECT_FOLDERS or name in _OS_FILES:
+                if name.startswith(".") or name in SERVER_PROJECT_FOLDERS or name in OS_FILES:
                     continue
                 if not entry.is_dir(follow_symlinks=False):
                     return True
@@ -207,11 +259,88 @@ def project_holds_files(project_path: str | Path) -> bool:
                     with os.scandir(entry.path) as inner:
                         if next(inner, None) is not None:
                             return True
-                except FileNotFoundError:
+                except (FileNotFoundError, NotADirectoryError):
                     continue
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
     return False
+
+
+def _instructions_path(project_path: str | Path) -> Path:
+    """Where a project keeps its instructions for the agent."""
+    return Path(project_path) / ".anton" / "anton.md"
+
+
+# The boilerplate of the template anton writes into ``.anton/anton.md`` when it
+# sets up a workspace (``anton.workspace.ANTON_MD_TEMPLATE``), matched as
+# loosely as anton matches it: any date, CRLF, a BOM, a reflowed comment, and
+# the heading or the date line deleted. Mirrors ``anton.workspace.
+# anton_md_user_text``, which the locked anton-agent does not ship yet (it
+# first ships in 2.26.11.9.2rc2): delete this copy and import that function
+# once the lock reaches a final anton release at or after 2.26.11.9.2.
+# tests/test_response_routing.py pins it to the installed anton's template.
+_TEMPLATE_HEADER_RE = re.compile(
+    r"\A\ufeff?\s*(?:# Anton Workspace[ \t\r]*$)?"
+    r"(?:\s*Created:[ \t]*\d{4}-\d{2}-\d{2}[ \t\r]*$)?",
+    re.MULTILINE,
+)
+_TEMPLATE_COMMENT_RE = re.compile(
+    r"<!--\s*Add project context, conventions, and notes below\.\s*"
+    r"Anton reads this file at the start of every conversation\.\s*-->"
+)
+
+
+def instructions_user_text(content: str) -> str:
+    """What the user wrote in an ``anton.md``, without anton's template
+    boilerplate: "" for a blank file or the untouched template."""
+    text = _TEMPLATE_HEADER_RE.sub("", content)
+    return _TEMPLATE_COMMENT_RE.sub("", text).strip()
+
+
+def project_has_instructions(project_path: str | Path) -> bool:
+    """Whether the project has instructions: a regular ``.anton/anton.md``
+    holding text the user wrote (``stage_project_instructions`` gives the
+    agent that file, and only when it is a regular file). The template anton
+    writes when it sets up a workspace is not instructions, so a project the
+    agent has worked in once still routes like one with none. A missing path
+    or a non-file there means none; any other read error raises. ``is_file``
+    comes first so a pipe or a device at that path is never opened."""
+    path = _instructions_path(project_path)
+    try:
+        if not path.is_file():
+            return False
+        content = path.read_bytes().decode("utf-8", errors="replace")
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return bool(instructions_user_text(content))
+
+
+class ProjectContext(NamedTuple):
+    """What a project's folder says about routing a turn."""
+
+    #: Files the user or the agent put there, or an attachment on any turn.
+    has_files: bool
+    #: Project instructions, which only the agent's prompt carries.
+    has_instructions: bool
+    #: The folder could not be read, so neither fact is known. The turn
+    #: counts as having files, and routing sends it to the agent as a router
+    #: fallback (ResponsesHandler._route_request).
+    unread: bool = False
+
+
+def read_project_context(project_path: str | Path, *, files_known: bool, cloud: bool) -> ProjectContext:
+    """Both routing facts about a project's folder in one pass on the file
+    store. ``files_known`` says an attachment already counts as files, so
+    the folder is not listed; ``cloud`` says the turn runs in a pod, which
+    counts files by its copy's rule (project_holds_ordinary_files), and
+    otherwise by what the agent reads in place
+    (project_holds_files_in_place). A missing folder holds neither; any read
+    error other than a missing path raises, and the caller decides."""
+    holds_files = project_holds_ordinary_files if cloud else project_holds_files_in_place
+    return ProjectContext(
+        has_files=files_known or holds_files(project_path),
+        has_instructions=project_has_instructions(project_path),
+    )
 
 
 def attachment_purpose(session_id: str) -> str:
@@ -254,18 +383,103 @@ def _secure_attachments_dir(conv_dir: Path) -> PinnedDir | None:
         # state (the pod mounts INTO <conv>, it does not create it), so creating
         # them is trusted. Only the `attachments` child below is agent-reachable.
         with pinned_dir(conv_dir, create=True, nofollow_base=True) as conv:
-            try:
-                st = dir_lstat(conv, "attachments")
-                if not stat.S_ISDIR(st.st_mode):
-                    # A symlink (S_ISLNK, never S_ISDIR under lstat) or a plain
-                    # file squatting the name: remove it and recreate a real dir.
-                    dir_unlink(conv, "attachments")
-                    dir_mkdir(conv, "attachments")
-            except FileNotFoundError:
-                dir_mkdir(conv, "attachments")
-            return open_pinned_child(conv, "attachments")
+            return _secure_workspace_child(conv, "attachments")
     except OSError:
         return None
+
+
+def _secure_workspace_child(parent: PinnedDir, name: str) -> PinnedDir:
+    """Open the folder ``name`` in ``parent``, a folder the pod can write, as
+    a pinned handle the caller must ``close()``. A link or anything else that
+    is not a folder squatting the name is removed (the link only, never its
+    target) and a real folder made in its place. The folder is opened by
+    _open_workspace_folder, so one the pod made unreadable still opens, and a
+    link planted between the check and the open raises ``OSError``."""
+    try:
+        st = dir_lstat(parent, name)
+        if not stat.S_ISDIR(st.st_mode):
+            # A symlink (S_ISLNK, never S_ISDIR under lstat) or a plain
+            # file squatting the name: remove it and recreate a real dir.
+            if parent.fd is not None and "\\" in name:
+                # A project folder's name may hold a "\" (the copy opens its
+                # folders here), an ordinary character through a descriptor.
+                # dir_unlink refuses one for its path fallback, which has no
+                # descriptor (is_child_name); the rest of that check holds.
+                if not is_child_name(name.replace("\\", "_")):
+                    raise ValueError("Unlink path must be a direct-child name")
+                os.unlink(name, dir_fd=parent.fd)
+            else:
+                dir_unlink(parent, name)
+            _make_dir(parent, name)
+    except FileNotFoundError:
+        _make_dir(parent, name)
+    return _open_workspace_folder(parent, name)
+
+
+#: The mode a folder the pod can write gets back when the pod took away any of
+#: its owner's read, write or search access. The pod runs as the server's own
+#: user, so it can chmod any folder in its conversation's folder, and a folder
+#: it made unreadable (``0o000``) or unwritable would refuse every later turn's
+#: open, copy or removal there.
+_WORKSPACE_FOLDER_MODE = 0o700
+
+
+def _lacks_owner_access(info: os.stat_result) -> bool:
+    return info.st_mode & stat.S_IRWXU != stat.S_IRWXU
+
+
+def _restore_folder_mode(parent: PinnedDir, name: str) -> os.stat_result:
+    """Give the folder ``name`` in ``parent`` _WORKSPACE_FOLDER_MODE when the
+    pod took its owner's access away, without opening it for reading and
+    never through a link (dir_chmod_folder), and return its stat. The folder
+    a later open finds may not be this one, so the caller compares their
+    ``st_dev`` and ``st_ino`` (_open_workspace_folder). Anything but a folder
+    is left alone, for the caller's open to refuse."""
+    info = dir_lstat(parent, name)
+    if parent.fd is not None and stat.S_ISDIR(info.st_mode) and _lacks_owner_access(info):
+        # Windows (no descriptor) runs local mode only, with no pod.
+        return dir_chmod_folder(parent, name, mode=_WORKSPACE_FOLDER_MODE)
+    return info
+
+
+def _open_workspace_folder(parent: PinnedDir, name: str) -> PinnedDir:
+    """Open the folder ``name`` in ``parent``, a folder the pod can write, as
+    a pinned handle the caller must ``close()``, giving its owner's access
+    back first (_restore_folder_mode) so a folder the pod made unreadable or
+    unwritable still opens and can be written. The open never follows a link,
+    and must find the folder whose mode was set: one the pod swapped in
+    between raises ``OSError``."""
+    if parent.fd is None:
+        # Windows runs local mode only, with no pod (cowork.common.paths).
+        return open_pinned_child(parent, name)
+    restored = _restore_folder_mode(parent, name)
+    folder = open_pinned_child(parent, name)
+    try:
+        info = os.fstat(folder.fd)
+        if (info.st_dev, info.st_ino) != (restored.st_dev, restored.st_ino):
+            raise OSError(errno.EAGAIN, "the folder was replaced while its mode was restored", name)
+        _own_folder(folder)
+    except BaseException:
+        folder.close()
+        raise
+    return folder
+
+
+def _own_folder(folder: PinnedDir) -> None:
+    """Give an open folder _WORKSPACE_FOLDER_MODE back when the pod took its
+    owner's access away after it was opened."""
+    if folder.fd is not None and _lacks_owner_access(os.fstat(folder.fd)):
+        os.fchmod(folder.fd, _WORKSPACE_FOLDER_MODE)
+
+
+def _make_dir(parent: PinnedDir, name: str) -> None:
+    """Make the folder ``name``. One that appears between the check and the
+    make (another staging of the same conversation, or the pod) is left to
+    the open that follows, which refuses anything but a real folder."""
+    try:
+        dir_mkdir(parent, name)
+    except FileExistsError:
+        pass
 
 
 def _stage_attachment(
@@ -277,14 +491,7 @@ def _stage_attachment(
     the file name (``O_NOFOLLOW`` on every component the agent can reach). Skips
     a copy already present at the right size so the caller stays idempotent.
     """
-    try:
-        st = dir_lstat(attach, file_id)
-        if not stat.S_ISDIR(st.st_mode):
-            dir_unlink(attach, file_id)
-            dir_mkdir(attach, file_id)
-    except FileNotFoundError:
-        dir_mkdir(attach, file_id)
-    id_dir = open_pinned_child(attach, file_id)
+    id_dir = _secure_workspace_child(attach, file_id)
     try:
         try:
             dst_st = dir_stat(id_dir, name, follow_symlinks=False)

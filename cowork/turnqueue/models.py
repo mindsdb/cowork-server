@@ -166,10 +166,11 @@ class TurnReply(BaseModel):
     # Must accept every kind the controller can publish: the reply loop validates
     # each of its own turn's entries unguarded, so a missing kind fails the turn
     # rather than being ignored. Kinds this build does nothing with are dropped
-    # further down.
+    # further down. A new kind lands here, and deploys, before the controller
+    # publishes it.
     kind: Literal["progress", "cell", "error", "turn_delta", "turn_step",
-                  "turn_memory", "turn_skill", "turn_history", "turn_compaction",
-                  "turn_completed", "turn_failed"]
+                  "turn_memory", "turn_memory_forget", "turn_skill", "turn_connector",
+                  "turn_history", "turn_compaction", "turn_completed", "turn_failed"]
     data: dict[str, Any] = Field(default_factory=dict)
     # The reply's number within its turn, counting up by one. The controller
     # resends a reply whose XADD reply it lost, and the relay drops a reply

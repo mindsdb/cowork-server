@@ -6,7 +6,7 @@ import logging
 import os
 import stat
 from collections.abc import Collection, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -164,6 +164,10 @@ class ConversationDeleteStage:
     conversation_id: UUID
     attachment_dirs: tuple[Path, ...]
     project_path: str | None
+    #: Org mode: the record of the conversation's copy of its project's files
+    #: (cowork.services.project_file_copy.stage_project_files), kept outside
+    #: the project.
+    copy_record: Path | None = None
 
 
 def _is_tool_row(content) -> bool:
@@ -646,14 +650,30 @@ class ConversationService:
             raise ValueError("Conversation not found")
         if topic is not None:
             conversation.topic = topic
+        # Org mode: the folder of the project the conversation leaves, which
+        # holds its cloud turns' copy of that project's files.
+        left_path: str | None = None
         if project_id is not None:
             # Anchor the move target: the project must be visible in scope.
             if self.session.get(Project, project_id) is None:
                 raise ValueError("Project not found")
+            if (
+                self.session.scope.org_mode
+                and conversation.project_id != project_id
+                and conversation.project is not None
+            ):
+                left_path = conversation.project.path
             conversation.project_id = project_id
         self.session.add(conversation)
         self.session.commit()
         self.session.refresh(conversation)
+        if left_path is not None:
+            from cowork.services.project_file_copy import remove_project_files_copy
+
+            # After the commit, so a move that fails keeps its copy. Its
+            # turns now copy the new project's files into the new project's
+            # folder, and nothing else would remove the old copy.
+            remove_project_files_copy(left_path, conversation_id)
         return conversation
 
     def record_turn_picks(
@@ -737,9 +757,10 @@ class ConversationService:
         their own conversation.
 
         ``cleanup_project_files=False`` deletes the rows and the attachments'
-        files but leaves the conversation's folders in its project alone, for
-        a caller that knows none were made and runs off the file store's
-        threads, such as the scheduler's discard of a run that never started."""
+        files but leaves the conversation's folders in its project, and the
+        record of its project files copy, alone, for a caller that knows none
+        were made and runs off the file store's threads, such as the
+        scheduler's discard of a run that never started."""
         conversation = self._owned(conversation_id)
         if conversation is None:
             return False
@@ -785,10 +806,8 @@ class ConversationService:
         # THIS transaction (single commit below, so a crash can't leave a
         # half-deleted "ghost" conversation), then unlink the bytes only after
         # the commit succeeds.
-        from cowork.services.files import (
-            FileService,
-            attachment_purpose,
-        )
+        from cowork.services.files import FileService, attachment_purpose
+        from cowork.services.project_file_copy import copy_record_path
 
         file_service = FileService(self.session)
         purpose = attachment_purpose(str(conversation_id))
@@ -822,6 +841,10 @@ class ConversationService:
             conversation_id=conversation_id,
             attachment_dirs=tuple(attachment_dirs),
             project_path=session_project_path,
+            copy_record=(
+                copy_record_path(self.session.scope, conversation_id)
+                if self.session.scope.org_mode else None
+            ),
         )
 
     @staticmethod
@@ -831,16 +854,18 @@ class ConversationService:
         cleanup_project_files: bool = True,
     ) -> None:
         """Remove external state only after the staged DB transaction commits."""
-        from cowork.services.files import (
-            remove_conversation_workspace_dir,
-            unlink_file_dirs,
-        )
+        from cowork.services.files import remove_conversation_workspace_dir, unlink_file_dirs
+        from cowork.services.project_file_copy import remove_copy_record
 
         # Its buffers and turn-index entry outlive the rows otherwise: on the
         # Redis backend /in-flight keeps naming a turn whose conversation is
         # gone, and a reused turn_id would replay a deleted turn's answer.
         _discard_conversation_streams(stage.conversation_id)
         unlink_file_dirs(list(stage.attachment_dirs))
+        # Outside the project, so a project delete, which skips the
+        # per-conversation cleanup below, removes it too.
+        if stage.copy_record is not None:
+            remove_copy_record(stage.copy_record)
         if cleanup_project_files:
             remove_conversation_sessions(stage.project_path, stage.conversation_id)
             # Also drop the per-conversation workspace (staged attachments +
@@ -858,6 +883,9 @@ class ConversationService:
                 conversation,
                 include_org_attachments=False,
             )
+            if not cleanup_project_files:
+                # Rows only: no turn ran, so no copy and no record were made.
+                stage = replace(stage, copy_record=None)
             self.session.commit()
         except Exception:
             self.session.rollback()

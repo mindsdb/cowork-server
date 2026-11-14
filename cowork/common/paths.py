@@ -12,6 +12,7 @@ the settings classes or directly) — a path that hardcodes ``~/.cowork`` would
 silently leak across builds and defeat the isolation.
 """
 
+import errno
 import os
 import shutil
 import stat
@@ -45,8 +46,9 @@ O_BINARY = getattr(os, "O_BINARY", 0)
 O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 # Linux only: a descriptor that names a directory without opening it for
 # reading, so the open checks no permission. On NFS that is one ACCESS call
-# fewer per folder. 0 where the platform has none, and dir_child_stat then
-# opens the folder as open_pinned_child does.
+# fewer per folder, and dir_chmod_folder reaches a folder whose mode refuses
+# its owner. 0 where the platform has none: dir_child_stat then opens the
+# folder as open_pinned_child does, and dir_chmod_folder sets the mode by name.
 O_PATH = getattr(os, "O_PATH", 0)
 
 
@@ -154,6 +156,16 @@ def read_bounded(fd: int, size: int, chunk_size: int = 1 << 16) -> Iterator[byte
     while remaining > 0 and (chunk := os.read(fd, min(remaining, chunk_size))):
         remaining -= len(chunk)
         yield chunk
+
+
+def write_all(fd: int, data: bytes) -> None:
+    """Write every byte of *data* to *fd*; a write that makes no progress is an error."""
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written == 0:
+            raise OSError(errno.EIO, "write made no progress")
+        remaining = remaining[written:]
 
 
 def dir_open(d: PinnedDir, name: str, flags: int, mode: int = 0o777) -> int:
@@ -302,6 +314,36 @@ def dir_link(d: PinnedDir, source_name: str, destination_name: str) -> None:
         os.link(source_name, destination_name, src_dir_fd=d.fd, dst_dir_fd=d.fd, **follow)
     else:
         os.link(d.path / source_name, d.path / destination_name)
+
+
+def dir_chmod_folder(d: PinnedDir, name: str, *, mode: int) -> os.stat_result:
+    """Set the mode of the folder *name* in *d* without opening it for
+    reading, and never through a link, and return the stat of the folder
+    whose mode was set, from before the change.
+
+    A folder whose mode refuses its owner (``0o000``) refuses a read open, so
+    ``fchmod`` can't reach it. Linux opens the name with ``O_PATH |
+    O_NOFOLLOW | O_DIRECTORY``, which needs no read access and refuses a
+    link, and sets the mode through ``/proc/self/fd``. Elsewhere the mode is
+    set by name with ``follow_symlinks=False``, which changes a link swapped
+    in after the check, never its target. Either way a caller that opens the
+    folder afterwards compares ``st_dev`` and ``st_ino`` with the result to
+    know it opened the same one. POSIX only: Windows has no ``dir_fd``."""
+    if d.fd is None:
+        raise NotImplementedError("folder modes are set relative to a pinned descriptor")
+    if O_PATH:
+        fd = os.open(name, O_PATH | O_NOFOLLOW | O_DIRECTORY, dir_fd=d.fd)
+        try:
+            info = os.fstat(fd)
+            os.chmod(f"/proc/self/fd/{fd}", mode)
+        finally:
+            os.close(fd)
+        return info
+    info = os.lstat(name, dir_fd=d.fd)
+    if not stat.S_ISDIR(info.st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), name)
+    os.chmod(name, mode, dir_fd=d.fd, follow_symlinks=False)
+    return info
 
 
 def dir_scandir(d: PinnedDir) -> "Iterator[os.DirEntry[str]]":

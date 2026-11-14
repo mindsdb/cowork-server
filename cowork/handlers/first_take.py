@@ -38,6 +38,7 @@ from cowork.handlers.response_routing import (
     RouterBinding,
     _close,
     _condense_content,
+    denies_agent_capability,
     denies_our_product,
     names_foreign_product,
     names_gate_tool,
@@ -111,8 +112,14 @@ def take_history(history: list[dict]) -> list[dict]:
 
 
 def _shippable(text: str) -> bool:
-    """Whether the take so far may stay on screen, by the gate's own guards."""
-    return not (names_foreign_product(text) or denies_our_product(text) or names_gate_tool(text))
+    """Whether the take so far may stay on screen, by the gate's own guards.
+
+    A take saying it can't save or read something stays on screen until the
+    agent answers, so the capability denial withdraws it too."""
+    return not (
+        names_foreign_product(text) or denies_our_product(text) or names_gate_tool(text)
+        or denies_agent_capability(text)
+    )
 
 
 _SENTENCE_END = re.compile(r"[.!?…]+[\"'»”’)\]]*")

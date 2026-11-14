@@ -51,7 +51,7 @@ except ImportError:  # TODO(ENG-1585): import it above once uv.lock pins an anto
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.settings.app_settings import default_minds_url
-from cowork.db.units import busy_retry_seconds
+from cowork.db.units import FilesystemBusy, busy_retry_seconds
 
 # Curated copy for the unsupported-image case. Surfaced verbatim.
 IMAGE_FORMAT_USER_MESSAGE = (
@@ -541,18 +541,29 @@ WORKER_UNRESPONSIVE_MESSAGE = (
     "side rather than a problem with your request. Try again in a moment."
 )
 
-# Wire code for a request refused because no database connection freed within
-# POOL_TIMEOUT. Before a stream exists the sentence is a 503's `detail`
-# (cowork.server). Inside one it is a response.failed frame that carries
-# `retry_after` and `retry_at`, as rate_limited does. The web UI waits for
-# Retry-After, or the frame's `retry_at`, before it offers a retry, and the
-# sentence names the wait for clients that read neither.
+# Wire code for a request refused because no database connection, or no file
+# store slot, freed within POOL_TIMEOUT. Before a stream exists the sentence
+# is a 503's `detail` (cowork.server). Inside one it is a response.failed
+# frame that carries `retry_after` and `retry_at`, as rate_limited does. The
+# web UI waits for Retry-After, or the frame's `retry_at`, before it offers a
+# retry, and the sentence names the wait for clients that read neither.
 SERVER_BUSY_CODE = "server_busy"
 
 
 def server_busy_message(retry_after: int) -> str:
     unit = "second" if retry_after == 1 else "seconds"
     return f"Cowork is busy. Try again in about {retry_after} {unit}."
+
+
+# Message for a cloud turn refused because the copy of its project's files
+# was refused (ProjectFilesRefused in cowork.services.project_file_copy, whose
+# ProjectFilesRefusal says why), so the turn does not run on files the project
+# may no longer back. Only NOT_EMPTIED, a copy that could not finish and could
+# not empty its folder, reaches a stored conversation, and a later turn tries
+# that copy again; no route stores a conversation or project whose name gets
+# the other refusals. It rides GENERIC_TURN_ERROR_CODE, which the renderer
+# draws as the message alone, so no renderer change goes with it.
+PROJECT_FILES_REFUSED_MESSAGE = "Cowork couldn't prepare this project's files; try again."
 
 
 def is_image_format_error(exc: Exception) -> bool:
@@ -1372,9 +1383,10 @@ def friendly_turn_error(
     (the streaming handler needs the rejected model for the card) pass it in so
     it isn't computed twice; omit it and it's resolved on demand.
     """
-    # The database had no connection to give within POOL_TIMEOUT. Matched
-    # first: it is not a provider failure, so nothing below applies to it.
-    if isinstance(exc, PoolTimeoutError):
+    # The database had no connection, or the file store no slot, to give
+    # within POOL_TIMEOUT. Matched first: it is not a provider failure, so
+    # nothing below applies to it.
+    if isinstance(exc, (PoolTimeoutError, FilesystemBusy)):
         return SERVER_BUSY_CODE, server_busy_message(busy_retry_seconds())
 
     # anton's model-call deadline. Its message is curated copy that names the

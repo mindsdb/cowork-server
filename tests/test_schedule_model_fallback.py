@@ -342,3 +342,39 @@ async def test_refused_fallback_discards_only_its_new_empty_conversation(
             assert session.get(Conversation, original_id) is not None
     finally:
         session.close()
+
+
+@pytest.mark.parametrize("refused", ["first_turn", "fallback"])
+async def test_a_discarded_conversation_loses_its_folders_only_once_a_turn_ran(
+    schedule_id, turns, monkeypatch, refused,
+):
+    """A refused fallback discards a conversation whose pinned turn ran first.
+    That turn may have staged files into the conversation's folder, a cloud
+    turn's copy of the project's files among them, so the delete removes the
+    folders too. A first turn refused before it started made none, so its
+    delete stays rows only."""
+    import cowork.handlers.responses as responses_mod
+    from cowork.services.conversations import ConversationService
+
+    turns.endings.append(_failed("model_not_found", message_id=str(uuid4())))
+    original = responses_mod.ResponsesHandler.handle
+
+    async def handle(self, request):
+        if refused == "first_turn" or request.model is None:
+            raise scheduler.ServerShuttingDown()
+        return await original(self, request)
+
+    monkeypatch.setattr(responses_mod.ResponsesHandler, "handle", handle)
+    cleanups: list[bool] = []
+    delete = ConversationService.delete_conversation
+
+    def recording_delete(self, conversation_id, *, cleanup_project_files=True):
+        cleanups.append(cleanup_project_files)
+        return delete(self, conversation_id, cleanup_project_files=cleanup_project_files)
+
+    monkeypatch.setattr(ConversationService, "delete_conversation", recording_delete)
+    await scheduler.execute_schedule(schedule_id, is_manual=True)
+
+    assert cleanups == [refused == "fallback"]
+    (run,) = _runs(schedule_id)
+    assert run.conversation_id is None

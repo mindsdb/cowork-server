@@ -38,6 +38,7 @@ from cowork.db.units import (
     note_turn_end_slugs,
     run_db,
     run_efs,
+    run_efs_copy,
     run_efs_unit,
     run_on_unit_threads,
     run_to_completion,
@@ -115,6 +116,7 @@ from cowork.handlers.turn_errors import (
     GENERIC_TURN_ERROR_MESSAGE,
     INTERRUPTED_TURN_MESSAGE,
     MODEL_UNAVAILABLE_CODES,
+    PROJECT_FILES_REFUSED_MESSAGE,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
     REMOTE_CANCEL_LITERAL,
@@ -153,12 +155,12 @@ from cowork.services.comparisons import (
 )
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
-from cowork.services.files import FileService, attachment_purpose, project_holds_files
+from cowork.services.files import FileService, ProjectContext, attachment_purpose, read_project_context
 from cowork.services.live_apps import use_live_app_launcher
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
-from cowork.services.memory import apply_turn_memory, build_turn_memory
+from cowork.services.memory import apply_turn_forget, apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectNotFoundError, ProjectService, is_comparison_sandbox
 from cowork.services.queued_repairs import QueuedRepairs
 from cowork.services.settings import SettingService
@@ -181,13 +183,17 @@ class _RemoteTurnFailed(Exception):
 ASK_USER_EVENT = "response.ask_user"
 ASK_USER_ANSWERED_EVENT = "response.ask_user_answered"
 
-#: Trace metadata for a turn Jev routed direct that went to the agent after
-#: all: the user's model delegated, or could not be reached. Counting these
-#: is how a wrong direct route shows up in traces.
-_DIRECT_DELEGATED_METADATA = {
-    "response_route": DELEGATED_AGENTIC,
-    "response_route_reason": "direct_answer_delegated",
-}
+def _direct_delegated_metadata(why: str) -> dict[str, str]:
+    """Trace metadata for a turn Jev routed direct that went to the agent after
+    all: the user's model delegated, or could not be reached. Counting these
+    is how a wrong direct route shows up in traces, and `why`
+    (`direct_answer.Delegated.why`, or "no_answer_model") tells a denial or
+    a foreign-product drop from a timeout or a tool call."""
+    return {
+        "response_route": DELEGATED_AGENTIC,
+        "response_route_reason": "direct_answer_delegated",
+        "direct_answer_why": why,
+    }
 
 #: A direct answer from the routing gate runs no agent, so it reads no learned
 #: memory. It sends and saves the record an agent turn does, in the same shape
@@ -416,7 +422,8 @@ class _TurnStart:
     # (ResponsesHandler._settle_always_on). gate_rows is unread until then.
     always_on_unread: bool = False
     # Set when the gate could run: whether a file was attached on any turn,
-    # and the project's folder, which handle() checks for files after this unit.
+    # and the project's folder, which handle() reads for files and
+    # instructions after this unit (read_project_context).
     attached_files: bool = False
     project_path: str | None = None
     # Set when the conversation is a contained model-comparison side: what it
@@ -592,6 +599,24 @@ class _RemoteTurnInputs:
     # Where the pod's scratchpad works, as this server finds it in the
     # project, or None when it could not be resolved (_remote_agent_files).
     files: AgentFiles | None
+    # Whether this server applies what the pod asks to save or remove in
+    # memory (_remote_memory_writable). The job carries it as
+    # memory_writable, so the pod's memory tools answer read-only when not.
+    memory_writable: bool
+
+
+def turn_memory_writable(settings: UserSettings, *, project_name: str | None) -> bool:
+    """Whether a remote turn's memory saves and removals are applied: memory
+    is enabled, its mode is not "off", and the project is not a
+    model-comparison side, which reads memory but never writes it, as the
+    in-process harness's Cortex runs in mode "off" there.
+
+    The one check both ends use: ResponsesHandler._change_turn_memory drops
+    every change the pod sends when this is False, and the producer sends it
+    to the pod as the job's memory_writable (_remote_memory_writable)."""
+    if not settings.memory_enabled or settings.memory_mode == "off":
+        return False
+    return not is_comparison_sandbox(project_name)
 
 
 def remote_turn_skills(
@@ -891,9 +916,9 @@ class ResponsesHandler:
         )
         if start.always_on_unread:
             start = await self._settle_always_on(start)
-        has_files = start.attached_files
-        if not has_files and start.project_path and start.gate_rows is not None and not start.always_on_skills:
-            has_files = await self._project_has_files(start.project_path)
+        project = ProjectContext(has_files=start.attached_files, has_instructions=False)
+        if start.project_path and start.gate_rows is not None and not start.always_on_skills:
+            project = await self._read_project_context(start.project_path, files_known=start.attached_files)
         self.harness_name = start.harness_name
         self.last_conversation_id = str(start.conversation_id)
 
@@ -947,7 +972,9 @@ class ResponsesHandler:
                     has_attachments=bool(request.attachment_ids),
                     has_disabled_connections=bool(disabled),
                     has_always_on_skills=start.always_on_skills,
-                    has_files=has_files,
+                    has_files=project.has_files,
+                    has_instructions=project.has_instructions,
+                    project_unread=project.unread,
                     is_comparison_side=start.comparison_pin is not None,
                     is_pinned_schedule=self.schedule_id is not None and request.model is not None,
                     trace_metadata=trace_metadata,
@@ -1013,7 +1040,7 @@ class ResponsesHandler:
                 # With files, the answer never comes from the web: the files may hold it.
                 answer_binding = self._answer_binding(
                     model=request.model, reasoning_effort=request.reasoning_effort, turn_llm=turn_llm,
-                    web=not has_files,
+                    web=not project.has_files,
                 )
                 answer_history = self.routing_history or _routing_history(
                     start.gate_rows or [], start.harness_input,
@@ -1034,7 +1061,7 @@ class ResponsesHandler:
                         )
                     finally:
                         reset_trace_context(token)
-                    if text is not None:
+                    if isinstance(text, str):
                         try:
                             return await self._handle_direct_response(
                                 request=request,
@@ -1048,8 +1075,9 @@ class ResponsesHandler:
                             # Answered without the agent: no turn runs on the gate's key.
                             await _drop_gate_key(turn_llm)
                     answer_binding = None
-                if answer_binding is None:
-                    trace_metadata = {**trace_metadata, **_DIRECT_DELEGATED_METADATA}
+                    trace_metadata = {**trace_metadata, **_direct_delegated_metadata(text.why)}
+                elif answer_binding is None:
+                    trace_metadata = {**trace_metadata, **_direct_delegated_metadata("no_answer_model")}
 
             # Built lazily on a direct answer: it may never need the agent.
             harness = None if answer_binding is not None else self._get_harness()
@@ -1113,7 +1141,7 @@ class ResponsesHandler:
                         history=answer_history,
                         trace_metadata=trace_metadata,
                         buffer=buffer,
-                        delegate=lambda: delegated(buffer, {**trace_metadata, **_DIRECT_DELEGATED_METADATA}),
+                        delegate=lambda why: delegated(buffer, {**trace_metadata, **_direct_delegated_metadata(why)}),
                         first_take=first_take,
                         gate_key=turn_llm,
                     )
@@ -1414,14 +1442,23 @@ class ResponsesHandler:
             session.rollback()
             return True
 
-    async def _project_has_files(self, project_path: str) -> bool:
-        """project_holds_files on the file store's threads, with no database
-        session held. True when the read fails, as _reads_attached_files."""
+    async def _read_project_context(self, project_path: str, *, files_known: bool) -> ProjectContext:
+        """read_project_context on the file store's threads, with no database
+        session held. When the read fails, the project is ``unread``: it
+        counts as having files, and _route_request sends the turn to the
+        agent as a router fallback, since routing failures fail open to the
+        agent."""
         try:
-            return await run_efs(partial(project_holds_files, project_path), scope=self.scope)
+            return await run_efs(
+                partial(
+                    read_project_context, project_path, files_known=files_known,
+                    cloud=TurnQueueSettings().is_remote,
+                ),
+                scope=self.scope,
+            )
         except Exception:
-            logger.warning("[responses] could not check the project's files", exc_info=True)
-            return True
+            logger.warning("[responses] could not read the project's files and instructions", exc_info=True)
+            return ProjectContext(has_files=True, has_instructions=False, unread=True)
 
     @staticmethod
     def _read_gate_rows(session: ScopedSession, *, conversation_id: UUID) -> list[Message] | None:
@@ -1454,6 +1491,8 @@ class ResponsesHandler:
         has_disabled_connections: bool,
         has_always_on_skills: bool = False,
         has_files: bool = False,
+        has_instructions: bool = False,
+        project_unread: bool = False,
         is_comparison_side: bool = False,
         is_pinned_schedule: bool = False,
         trace_metadata: dict[str, str] | None = None,
@@ -1468,7 +1507,11 @@ class ResponsesHandler:
         `gate_rows` is the history handle()'s first unit read for the gate
         (see _TurnStart). `has_always_on_skills` delegates the turn without a
         gate call: an always-on skill applies to every answer, and only the
-        agent's prompt carries it. `has_files` goes to decide_route.
+        agent's prompt carries it, and `has_instructions` does the same for
+        the project's instructions. `project_unread` (ProjectContext.unread)
+        does the same as a router fallback, since the project may hold
+        instructions nobody could read. `has_files` (read_project_context)
+        goes to decide_route.
 
         The composer's per-conversation model pick (`request.model`) is
         deliberately not passed down: it drives Anton's turn, not the gate
@@ -1489,6 +1532,17 @@ class ResponsesHandler:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
         if has_always_on_skills:
             return RouteDecision(route=DELEGATED_AGENTIC, reason="always_on_skills"), None
+        if project_unread:
+            # The project's files and instructions could not be read. As with
+            # instructions, no gate key is minted and no first take written,
+            # and the turn counts as a router fallback, as a failed history
+            # read does.
+            return RouteDecision(route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True), None
+        if has_instructions:
+            # Like an always-on skill: the instructions apply to every answer
+            # and only the agent's prompt carries them, so no gate key is
+            # minted and no first take is written without them.
+            return RouteDecision(route=DELEGATED_AGENTIC, reason="project_instructions"), None
         if gate_rows is None:
             # The history read failed. Like any other gate failure, the turn
             # goes to the agent rather than failing.
@@ -2026,12 +2080,13 @@ class ResponsesHandler:
         history: list[dict],
         trace_metadata: dict[str, str],
         buffer,
-        delegate: Callable[[], Awaitable[None]],
+        delegate: Callable[[str], Awaitable[None]],
         first_take: FirstTake | None = None,
         gate_key: dict | None = None,
     ) -> None:
         """Stream the direct answer Jev routed, on the user's own model, or
-        hand the turn to the agent on this same buffer.
+        hand the turn to the agent on this same buffer, passing `delegate`
+        the reason (`direct_answer.Delegated.why`).
 
         `gate_key` is the turn key the gate minted. A delegated turn runs on
         it; otherwise it is revoked when this answer ends, however it ends.
@@ -2164,27 +2219,28 @@ class ResponsesHandler:
                 metadata={**trace_metadata, "correlation_id": corr},
             ))
             try:
-                answer = await direct_answer.start_answer(
+                opening = await direct_answer.start_answer(
                     binding, history=history, needs_search=route.needs_search, ui_locale=self.ui_locale,
                 )
             finally:
                 reset_trace_context(token)
-            if answer is None:
+            if isinstance(opening, direct_answer.Delegated):
                 # Fields, not template values: the log formatter drops those. A
                 # delegation here is Jev's wrong direct route, or a failure before
-                # the answer started.
+                # the answer started; `why` tells them apart.
                 logger.warning(
                     "Direct answer handed the turn to the agent",
                     extra={
                         "event": "direct_answer_delegated",
-                        "model": binding.model,
+                        "why": opening.why,
                         **log_context(request_id=corr, conversation_id=conv_id),
                     },
                 )
                 # The agent's producer ends this turn, a Stop during it included.
                 delegated = True
-                await delegate()
+                await delegate(opening.why)
                 return
+            answer = opening
 
             if first_take is not None:
                 first_take.cancel()
@@ -2395,7 +2451,7 @@ class ResponsesHandler:
             self._skill_viewer = None
 
     @staticmethod
-    def _stage_remote_workspace_files(session: ScopedSession, conv_id: UUID) -> None:
+    def _stage_remote_workspace_files(session: ScopedSession, conv_id: UUID) -> str | None:
         """Stage the project-level files the pod can't otherwise see (the
         conversation's attachments and the project's anton.md instructions)
         into the conversation workspace on the shared mount, and seed this
@@ -2404,14 +2460,22 @@ class ResponsesHandler:
         The seeding call belongs here, not just behind ``GET /skills``: this
         runs before every remote turn, web or channel, and catches an org that
         chats before it ever opens the skills menu, as the turn's skills block
-        (remote_turn_skills) seeds again. Never fails the turn: a
-        staging error degrades to a turn without the missing piece."""
-        try:
-            from cowork.services.artifact_roots import project_artifacts_base
-            from cowork.services.files import stage_project_instructions
+        (remote_turn_skills) seeds again. A staging error degrades to a turn
+        without the missing piece.
 
-            conversation = ConversationService(session).get_conversation(conv_id)
-            project_path = conversation.project.path
+        Returns the project's folder, whose files stage_remote_workspace
+        copies next with no database session held (stage_project_files), or
+        None for a conversation in no project. A conversation that can't be
+        read raises: without its project, the copy an earlier turn left can't
+        be checked or emptied."""
+        from cowork.services.artifact_roots import project_artifacts_base
+        from cowork.services.files import stage_project_instructions
+
+        conversation = ConversationService(session).get_conversation(conv_id)
+        if conversation.project is None:
+            return None
+        project_path: str = conversation.project.path
+        try:
             # ENG-2056: the pod mounts the PROJECT-level artifacts base (subPath
             # `.anton/artifacts`) at /project-artifacts, and a subPath mount needs
             # the directory to exist before the pod starts. Project creation does
@@ -2424,6 +2488,7 @@ class ResponsesHandler:
             SkillService(session.scope).ensure_builtin_skills()
         except Exception:
             logger.exception("[responses] failed to stage workspace files", extra=log_context(conversation_id=conv_id))
+        return project_path
 
     @staticmethod
     def _remote_started_at(session: ScopedSession, conv_id: UUID) -> str | None:
@@ -2577,14 +2642,54 @@ class ResponsesHandler:
 
         Never fails the turn — a lost memory is recoverable, a lost reply isn't.
         """
+        applied = ResponsesHandler._change_turn_memory(
+            session, conv_id, entries, principal, apply=apply_turn_memory,
+        )
+        if applied is not None:
+            logger.info(
+                "[responses] applied the memory entries a remote turn sent",
+                extra={"count": applied, **log_context(conversation_id=conv_id)},
+            )
+
+    @staticmethod
+    def _persist_turn_memory_forget(
+        session: ScopedSession,
+        conv_id: UUID,
+        entries: list,
+        principal: Principal | None,
+    ) -> None:
+        """Remove the saved memory entries the pod asked to forget
+        (apply_turn_forget). A removal is a memory write, so it passes every
+        check _persist_turn_memory's write passes: the re-anchored
+        conversation, the memory settings, and the comparison side that never
+        writes. It never fails the turn either."""
+        removed = ResponsesHandler._change_turn_memory(
+            session, conv_id, entries, principal, apply=apply_turn_forget,
+        )
+        if removed is not None:
+            logger.info(
+                "[responses] removed the memory entries a remote turn asked to forget",
+                extra={"count": removed, **log_context(conversation_id=conv_id)},
+            )
+
+    @staticmethod
+    def _change_turn_memory(
+        session: ScopedSession,
+        conv_id: UUID,
+        entries: list,
+        principal: Principal | None,
+        *,
+        apply: Callable[..., int],
+    ) -> int | None:
+        """The body _persist_turn_memory and _persist_turn_memory_forget share:
+        ``apply`` changes memory for the conversation's current project.
+        Returns how many entries it changed, or None when nothing was applied:
+        no entries, memory off or a comparison side (turn_memory_writable), or
+        a failure, which this logs."""
         if not entries:
-            return
+            return None
         try:
             settings = get_user_settings(session.scope)
-            if not settings.memory_enabled or settings.memory_mode == "off":
-                logger.info("[responses] memory is off; dropped %d memory entr(ies) for conversation %s",
-                            len(entries), conv_id, extra=log_context(conversation_id=conv_id))
-                return
             conversation = ConversationService(session).get_conversation(conv_id)
             from cowork.models.project import Project
             from cowork.services.shared_resources import (
@@ -2610,25 +2715,24 @@ class ResponsesHandler:
                 if project is None:
                     raise ValueError("Project not found")
                 session.refresh(project)
-                if is_comparison_sandbox(getattr(project, "name", None)):
-                    # A comparison side reads memory but never writes it,
-                    # same as the in-process harness's Cortex in "off" mode.
+                if not turn_memory_writable(settings, project_name=getattr(project, "name", None)):
+                    # Fields, not template values: the log formatter drops those.
                     logger.info(
-                        "[responses] dropped %d memory entr(ies) from comparison side %s",
-                        len(entries), conv_id,
+                        "[responses] memory is read-only in this conversation; "
+                        "dropped what a remote turn asked to save or remove",
+                        extra={"count": len(entries), **log_context(conversation_id=conv_id)},
                     )
-                    return
-                applied = apply_turn_memory(
+                    return None
+                return apply(
                     session.scope,
                     project.path,
                     entries,
                     access=access,
                     project_id=project.id,
                 )
-            logger.info("[responses] applied %d memory entr(ies) for conversation %s",
-                        applied, conv_id)
         except Exception:
             logger.exception("[responses] failed to apply memory", extra=log_context(conversation_id=conv_id))
+            return None
 
     @staticmethod
     def _read_remote_turn_inputs(
@@ -2637,7 +2741,8 @@ class ResponsesHandler:
         """What a remote turn's pod is seeded with, read as one unit once the
         question is saved: the scrubbed history, where the project's artifacts
         live and who created the conversation, the project's memory when
-        ``with_memory``, its workspace, and when the conversation started. A
+        ``with_memory``, its workspace, when the conversation started, and
+        whether this server applies the memory changes the pod sends. A
         browser turn reads memory, which lives on the file store, so it reads
         this on the file store's threads (run_efs_unit); a channel turn never
         sends memory, and reads only rows here. Its skills block reads skill
@@ -2653,7 +2758,28 @@ class ResponsesHandler:
             workspace=workspace,
             started_at=ResponsesHandler._remote_started_at(session, conv_id),
             files=ResponsesHandler._remote_agent_files(session, conv_id, workspace=workspace),
+            memory_writable=ResponsesHandler._remote_memory_writable(session, conv_id),
         )
+
+    @staticmethod
+    def _remote_memory_writable(session: ScopedSession, conv_id: UUID) -> bool:
+        """turn_memory_writable for the turn's settings and the conversation's
+        project, the check _change_turn_memory applies to each memory change
+        the pod sends. True on a read error: the value only tells the pod's
+        memory tools how to answer, and _change_turn_memory checks each change
+        again when it arrives. A pod told read-only would refuse a save that
+        check applies, and the user would lose it."""
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            return turn_memory_writable(
+                get_user_settings(session.scope), project_name=conversation.project.name,
+            )
+        except Exception:
+            logger.exception(
+                "[responses] failed to read whether memory is writable; the pod gets it writable",
+                extra=log_context(conversation_id=conv_id),
+            )
+            return True
 
     @staticmethod
     def _remote_seed_history(session, conv_id) -> tuple[list[dict], dict | None]:
@@ -2794,9 +2920,10 @@ class ResponsesHandler:
 
         Its database work runs as units (cowork.db.units), so it holds no
         pooled connection while the pod answers, and a wait for one never
-        stalls the event loop. Staging the workspace is the first unit. The
-        next saves the question (pending) under the conversation's
-        write lock. What the pod is seeded with is read in one unit when the
+        stalls the event loop. The first unit saves the question (pending)
+        under the conversation's write lock, so a turn that ends while its
+        workspace is staged, the next unit, still keeps its question. What
+        the pod is seeded with is read in one unit when the
         reply stream starts (get_ordered_messages leaves the pending row out,
         so the current input isn't replayed). Memory and compaction the pod
         reports are saved as they arrive, the artifacts it created are
@@ -3244,6 +3371,9 @@ class ResponsesHandler:
                 # a bounded, sheddable wire block. Skills travel as the
                 # caller's whole recallable set (remote_turn_skills).
                 memory=seed.memory,
+                # False when the save below drops every memory change the pod
+                # sends (turn_memory_writable), so its memory tools say so.
+                memory_writable=seed.memory_writable,
                 skills=skills,
                 workspace=seed.workspace,
                 started_at=seed.started_at,
@@ -3325,13 +3455,14 @@ class ResponsesHandler:
                         continue
                     for event in step_stream_events(data):
                         yield event
-                elif kind == "turn_memory":
+                elif kind in ("turn_memory", "turn_memory_forget"):
                     await save_turn_memory(
                         conv_id=conv_id,
                         entries=data.get("entries") or [],
                         principal=self.principal,
                         scope=scope,
                         request_id=corr,
+                        forget=kind == "turn_memory_forget",
                     )
                 elif kind == "turn_history":
                     # Sanitized at the boundary (remote_turn_history): the pod
@@ -3424,13 +3555,16 @@ class ResponsesHandler:
                 )
 
         try:
-            # Stage attachments + project instructions before the pod runs.
-            await stage_remote_workspace(conv_id=conv_id, scope=scope)
             # Save the question (pending) as this producer's first write
             # (ENG-1231); see the note in handle(). Committed before
             # streaming, so a refresh/reconnect mid-turn shows the question
-            # via /items.
+            # via /items. Before staging too: the first copy of a project's
+            # files can take seconds, and a Stop or a refusal during it then
+            # ends a turn whose question is saved.
             await run_to_completion(start())
+            # Stage attachments, project instructions and the project's files
+            # before the pod runs.
+            await stage_remote_workspace(conv_id=conv_id, scope=scope)
             first = True
             completed_frame: str | None = None
             async for sse in format_responses_stream(
@@ -3546,17 +3680,38 @@ class ResponsesHandler:
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
             await run_to_completion(end_turn("cancelled"))
         except Exception as exc:
-            if isinstance(exc, PoolTimeoutError):
-                # No database connection freed in time. The frame says so with
-                # the wait, as a refused request's 503 does. friendly_turn_error
-                # answers a pool timeout at its first check, from the cached
-                # POOL_TIMEOUT alone, so it runs inline.
+            from cowork.services.project_file_copy import ProjectFilesRefused
+
+            if isinstance(exc, (PoolTimeoutError, FilesystemBusy)):
+                # No database connection or file store slot freed in time.
+                # The frame says so with the wait, as a refused request's 503
+                # does. friendly_turn_error answers either at its first
+                # check, from the cached POOL_TIMEOUT alone, so it runs
+                # inline.
                 code, message = friendly_turn_error(exc)
                 retry_after = busy_retry_seconds()
                 extra: dict = {"retry_after": retry_after, "retry_at": retry_at_instant(retry_after)}
                 logger.warning(
-                    "[responses] remote turn for conversation %s correlation_id=%s found no free "
-                    "database connection", conv_id, corr, extra={"request_id": corr},
+                    "[responses] remote turn found no free database connection or file store slot",
+                    extra={
+                        "event": "remote_turn_busy",
+                        # A file store refusal names the limit and the share
+                        # (FilesystemBusy); a pool timeout has neither.
+                        "limiter": getattr(exc, "limiter", None),
+                        "share": getattr(exc, "share", None),
+                        **log_context(request_id=corr, conversation_id=conv_id),
+                    },
+                )
+            elif isinstance(exc, ProjectFilesRefused):
+                # The copy logged why at ERROR or WARNING already.
+                code, message, extra = GENERIC_TURN_ERROR_CODE, PROJECT_FILES_REFUSED_MESSAGE, {}
+                logger.warning(
+                    "[responses] remote turn refused: its copy of the project's files was refused",
+                    extra={
+                        "event": "remote_turn_refused",
+                        "refusal": exc.refusal.value,
+                        **log_context(request_id=corr, conversation_id=conv_id),
+                    },
                 )
             else:
                 code, message, extra = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE, {}
@@ -4377,22 +4532,159 @@ async def stage_remote_workspace(*, conv_id: UUID, scope: TenantScope) -> None:
     hold at most EFS_UNIT_SLOTS of the database unit slots, so database units
     keep the rest.
 
+    Then it copies the project's files into the conversation's project-files
+    folder (stage_project_files) on the file store's threads with no database
+    session held, since a first copy can take seconds. The copy first takes
+    one of the event loop's copy slots (run_efs_copy), so copies never hold
+    every file store slot. The walk and the copying stop at the time budget
+    (TurnQueueSettings.project_files_copy_seconds); removing stale copies and
+    saving the copy's record run after it. It logs one
+    ``project_files_staged`` line per turn, worded by the copy's outcome. A
+    project whose folder is outside the organization's projects store copies
+    nothing, and its turn runs (ProjectFilesOutcome.SKIPPED).
+
+    Once the copy ends, cancelled or not, it reads the conversation's row
+    again, and that check and its removal run to their end even when the turn
+    is cancelled meanwhile. A conversation deleted since the staging unit
+    read it gets its folder and the copy's record removed, and one moved to
+    another project gets its copy removed from the project it left
+    (_remove_copy_if_conversation_gone); the line then says
+    CONVERSATION_GONE.
+
     A full pool or a busy file store is not a missing file: PoolTimeoutError
     and FilesystemBusy propagate, so the turn is refused rather than run
     without what the user sent. Staging itself degrades on its own, so any
-    other failure is the unit's own connect or commit; it is logged, and the
-    turn runs without the staged files.
+    other failure is the unit's own connect or commit, or a conversation
+    that can't be read. Once the project's folder is known, that is logged
+    and the copy still runs. When it is not known, the copy an earlier turn
+    left can't be checked or emptied, so the error propagates and the turn is
+    refused, as it is when the copy is refused (ProjectFilesRefused).
     """
+    from cowork.services.project_file_copy import (
+        OUTCOME_LOG_MESSAGES,
+        ProjectFilesOutcome,
+        ProjectFilesRefused,
+        stage_project_files,
+    )
+
+    resolved: list[str | None] = []
+
+    def staging(session: ScopedSession) -> None:
+        # Kept outside the unit, so a commit that fails after staging ran
+        # still leaves the copy its project's folder.
+        resolved.append(ResponsesHandler._stage_remote_workspace_files(session, conv_id))
+
     try:
-        await run_efs_unit(
-            partial(ResponsesHandler._stage_remote_workspace_files, conv_id=conv_id), scope=scope,
-        )
+        await run_efs_unit(staging, scope=scope)
     except (PoolTimeoutError, FilesystemBusy):
         raise
     except Exception:
         logger.exception(
             "[responses] failed to stage workspace files", extra=log_context(conversation_id=conv_id),
         )
+        if not resolved:
+            raise
+    project_path = resolved[0]
+    if project_path is None:
+        return
+    try:
+        staged = await run_efs_copy(partial(stage_project_files, project_path, conv_id, scope=scope), scope=scope)
+    except asyncio.CancelledError:
+        # A conversation delete cancels its turn (registry.discard), and a
+        # copy that started runs to its end first (run_efs_copy), so it may
+        # have made the deleted conversation's folder again.
+        await run_to_completion(_remove_copy_if_conversation_gone(project_path, conv_id, scope=scope))
+        raise
+    if (
+        # A cancel while the removal waits for its file store slot would
+        # otherwise leave the copy for good (run_efs).
+        await run_to_completion(_remove_copy_if_conversation_gone(project_path, conv_id, scope=scope))
+        # A refused copy still refuses the turn, below.
+        and staged.outcome is not ProjectFilesOutcome.REFUSED
+    ):
+        # What this turn wrote stays its cost; none of it is kept.
+        staged = staged._replace(outcome=ProjectFilesOutcome.CONVERSATION_GONE, files=0, bytes=0)
+    # WARNING, not INFO: the hosted LOG_LEVEL is WARNING, and this line is
+    # the per-turn cost of the copy. Fields, not template values: the log
+    # formatter drops those.
+    logger.warning(
+        OUTCOME_LOG_MESSAGES[staged.outcome],
+        extra={
+            "event": "project_files_staged",
+            "outcome": staged.outcome.value,
+            "files": staged.files,
+            "bytes": staged.bytes,
+            "copied": staged.copied,
+            "copied_bytes": staged.copied_bytes,
+            "not_copied": staged.not_copied,
+            "duration_ms": staged.elapsed_ms,
+            **({"refusal": staged.refusal.value} if staged.refusal is not None else {}),
+            **log_context(conversation_id=conv_id),
+        },
+    )
+    if staged.outcome is ProjectFilesOutcome.REFUSED:
+        raise ProjectFilesRefused(conv_id, staged.refusal)
+
+
+@dataclass(frozen=True)
+class _ConversationAfterCopy:
+    """A conversation's row as its staging reads it again once the copy of
+    its project's files ends."""
+
+    exists: bool
+    #: The folder of the project it is in now; None when it is in none.
+    project_path: str | None
+
+
+async def _remove_copy_if_conversation_gone(project_path: str, conv_id: UUID, *, scope: TenantScope) -> bool:
+    """Remove the copy a turn just made of the project's files at
+    ``project_path`` when its conversation is no longer in that project once
+    the copy ends, and say whether it did.
+
+    A delete or a move that lands after the staging unit read the
+    conversation and before the copy opened its folder removes what is there
+    then, and the copy makes the folder, its copies and its record again. A
+    conversation deleted since then gets its folder and the copy's record
+    removed (remove_deleted_conversations_copy). One moved to another project
+    gets its copy removed from the project it left (remove_project_files_copy),
+    since the turn's pod mounts the new project's folder, which the turn's
+    inputs read after staging (ResponsesHandler._read_remote_turn_inputs). A
+    project renamed since then took the copy with its folder, so nothing is
+    found to remove.
+
+    The removal waits for its file store slot as long as it takes
+    (``run_efs`` with no deadline): nothing else removes them. A read or a
+    removal that fails, a busy pool's included, is logged and answers False,
+    and the turn goes on, as it does when staging's own unit fails."""
+    from cowork.services.project_file_copy import remove_deleted_conversations_copy, remove_project_files_copy
+
+    def read_row(session: ScopedSession) -> _ConversationAfterCopy:
+        conversation = ConversationService(session)._owned(conv_id)
+        if conversation is None:
+            return _ConversationAfterCopy(exists=False, project_path=None)
+        project = conversation.project
+        return _ConversationAfterCopy(exists=True, project_path=None if project is None else project.path)
+
+    try:
+        row = await run_db(read_row, scope=scope)
+        if row.exists:
+            if row.project_path == project_path:
+                return False
+            return await run_efs(
+                partial(remove_project_files_copy, project_path, conv_id), scope=scope, deadline=False,
+            )
+        await run_efs(
+            partial(remove_deleted_conversations_copy, project_path, conv_id, scope=scope),
+            scope=scope, deadline=False,
+        )
+    except Exception:
+        logger.warning(
+            "[responses] could not check a conversation is still there after its project files copy",
+            exc_info=True,
+            extra={"event": "project_files_gone_check_failed", **log_context(conversation_id=conv_id)},
+        )
+        return False
+    return True
 
 
 async def save_turn_memory(
@@ -4402,11 +4694,17 @@ async def save_turn_memory(
     principal: Principal | None,
     scope: TenantScope,
     request_id: str | None,
+    forget: bool = False,
 ) -> None:
     """Apply what a remote turn's pod asked to remember, in a unit on the
     file store's threads (run_efs_unit), as it arrives: the memory store
     lives on the file store. The browser and the channel producers both save
-    memory here.
+    memory here. With ``forget`` the entries are the saved entries the pod
+    asked to remove (_persist_turn_memory_forget). Both producers await this
+    before they read the next reply, so a removal and a write apply in the
+    order the pod sent them: anton sends memory_forget before memory
+    (anton/cloud_turn/contract.py), so a removal never takes a line the turn
+    saves again.
 
     Never fails the turn: a lost memory is recoverable, a lost reply isn't.
     A pool that frees no connection, or a file store that frees no slot,
@@ -4415,10 +4713,11 @@ async def save_turn_memory(
     """
     if not entries:
         return
+    persist = ResponsesHandler._persist_turn_memory_forget if forget else ResponsesHandler._persist_turn_memory
     try:
         await run_efs_unit(
             partial(
-                ResponsesHandler._persist_turn_memory,
+                persist,
                 conv_id=conv_id, entries=entries, principal=principal,
             ),
             scope=scope,

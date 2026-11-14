@@ -138,6 +138,13 @@ async def remote_turn_events(
     # compacted step comes for both, its compaction reply for a summary. Both
     # arrive before the history frame.
     compacted = False
+    # A channel turn runs for its organization, with no member, and in org
+    # tenancy neither memory tier takes an entry without one, to save or to
+    # remove: apply_turn_memory and apply_turn_forget refuse project entries
+    # that carry no trusted member, and the person's tier (GlobalMemoryStore)
+    # needs a user. Outside org tenancy the turn changes memory with no
+    # principal.
+    saves_memory = not scope.org_mode
 
     try:
         async for kind, data in stream_remote_replies(
@@ -151,6 +158,9 @@ async def remote_turn_events(
             workspace=inputs.workspace,
             started_at=inputs.started_at,
             skills=skills,
+            # False when the save below drops every memory change the pod
+            # sends, so its memory tools say so.
+            memory_writable=inputs.memory_writable and saves_memory,
             correlation_id=correlation_id,
             llm=llm,
         ):
@@ -173,27 +183,21 @@ async def remote_turn_events(
                     continue
                 for event in step_stream_events(data):
                     yield event
-            elif kind == "turn_memory":
+            elif kind in ("turn_memory", "turn_memory_forget"):
                 entries = data.get("entries") or []
-                if entries and scope.org_mode:
-                    # A channel turn runs for its organization, with no member,
-                    # and in org tenancy neither memory tier takes an entry
-                    # without one: apply_turn_memory drops project entries that
-                    # carry no trusted member, and the person's tier
-                    # (GlobalMemoryStore) needs a user.
+                if entries and not saves_memory:
                     logger.info(
                         "channel turn memory not saved: an organization's channel turn has no member",
                         extra=log_context(request_id=correlation_id, conversation_id=conv_id),
                     )
                 else:
-                    # Outside org tenancy the turn writes memory with no
-                    # principal.
                     await save_turn_memory(
                         conv_id=conv_id,
                         entries=entries,
                         principal=None,
                         scope=scope,
                         request_id=correlation_id,
+                        forget=kind == "turn_memory_forget",
                     )
             elif kind == "turn_history":
                 history = remote_turn_history(pod_rows=data.get("rows"), compacted=compacted)

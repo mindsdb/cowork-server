@@ -1917,7 +1917,7 @@ def test_the_producer_sends_the_skills_block(monkeypatch):
         monkeypatch.setattr(producer, "_mint_oauth_block", oauth)
         monkeypatch.setattr(producer, "_mint_datasource_block", datasource)
         gen = producer.stream_remote_replies(
-            conversation_id="c", org_id=ORG_ID, user_id=BOB, input_text="hi", model="m",
+            conversation_id="c", org_id=ORG_ID, user_id=BOB, input_text="hi", model="m", memory_writable=True,
             llm={"api_key": "k"}, skills=skills,
         )
         with pytest.raises(RuntimeError):

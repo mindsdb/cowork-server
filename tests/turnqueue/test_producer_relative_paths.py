@@ -49,7 +49,7 @@ def captured(monkeypatch):
 async def _enqueue(**kwargs):
     base = dict(
         conversation_id="conv-1", org_id="org-1", user_id="user-1",
-        input_text="hi", model="m",
+        input_text="hi", model="m", memory_writable=True,
     )
     base.update(kwargs)
     gen = prod.stream_remote_replies(**base)

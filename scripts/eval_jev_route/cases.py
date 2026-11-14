@@ -12,6 +12,13 @@ back to Anton. "direct" is anything that call can answer well; "agent" is
 anything needing the user's data, files, code or multi-step work; "either"
 cases are defensible both ways, reported but never counted as errors. Since
 the direct model can still delegate, the labels lean direct.
+
+Each kind of case that must reach the agent has cases of the same shape beside
+it that must stay direct: the same words in other senses, the same request in
+Spanish, inside a long conversation, and as a follow-up. A rule that sends more
+turns to the agent then shows what it costs as well as what it catches. The
+set is built to hold these words, so its rates describe behavior, not
+production shares.
 """
 from __future__ import annotations
 
@@ -89,6 +96,63 @@ _CHURN_ANALYSIS = [
         "from customers hit by the March 1 price increase, whose churn was 12.1%. "
         "Customers on annual plans (22% of the base) were unaffected.",
     ),
+]
+
+# A plain conversation of nine exchanges, no tools. It is longer than the LLM
+# gate's 16-message window, so the gate never sees its opening.
+LONG_CHAT = [
+    user("I'm putting together a pricing page for a small analytics tool. What makes a good one?"),
+    assistant("Keep it to three tiers, name each for who it serves, put the recommended "
+              "tier in the middle, and show the annual savings clearly."),
+    user("Should the cheapest tier be free?"),
+    assistant("A free tier helps when the product spreads by word of mouth. Otherwise a "
+              "low-cost starter tier with a trial usually converts better."),
+    user("How long should the trial be?"),
+    assistant("14 days is the common default. Use 30 when setup takes real effort, such "
+              "as connecting data sources."),
+    user("What's a reasonable annual discount?"),
+    assistant("15 to 20 percent, often framed as two months free."),
+    user("Is it OK to hide enterprise pricing behind 'contact us'?"),
+    assistant("Yes, for custom contracts it's standard. Show a starting price if you "
+              "can: it turns away poor fits early."),
+    user("How do I explain usage-based pricing simply?"),
+    assistant("Say what one unit is, what it costs, and give one worked example of a "
+              "typical monthly bill."),
+    user("What's a good way to show a feature comparison?"),
+    assistant("A table with tiers as columns, grouped feature rows, and checkmarks "
+              "rather than long text."),
+    user("Any common mistakes to avoid?"),
+    assistant("Too many tiers, jargon in feature names, and hiding the price of the "
+              "plan most people need."),
+    user("Should I show prices in more than one currency?"),
+    assistant("If a large share of visitors are abroad, yes: detect the region and "
+              "let people switch."),
+]
+
+# The agent saved a preference with its memory tool and said so.
+MEMORY_SAVED = [
+    user("Please remember that I prefer teal for my charts."),
+    *tool_work(
+        [("memorize", "saved rule: use teal (#008080) for charts")],
+        "Saved. Your charts will use teal from now on, in this and future conversations.",
+    ),
+]
+
+_EBITDA_ANSWERED = [
+    user("What does EBITDA stand for?"),
+    assistant("Earnings before interest, taxes, depreciation and amortization."),
+]
+
+_PLANETS_ANSWERED = [
+    user("What's a good trick to remember the order of the planets?"),
+    assistant('Try "My Very Educated Mother Just Served Us Nachos": Mercury, Venus, '
+              "Earth, Mars, Jupiter, Saturn, Uranus, Neptune."),
+]
+
+_ISO_ANSWERED = [
+    user("What date format is clearest for international teams?"),
+    assistant("ISO 8601, written YYYY-MM-DD. No one misreads it, and it sorts "
+              "correctly as text."),
 ]
 
 
@@ -179,4 +243,188 @@ CASES: list[dict] = [
     # ── names a file: agent (a code check catches these before any model) ──
     {"id": "file_mention", "category": "file", "expect": "agent",
      "history": [user("what's in q3_forecast.xlsx?")]},
+
+    # ── remember for later: agent (only the agent keeps anything past this
+    #    conversation; a direct answer can only promise it, or say it can't) ──
+    # With a listed memory word (a code check catches these before any model).
+    {"id": "remember_chart_color", "category": "memory", "expect": "agent",
+     "history": [user("Please remember this for my later chats: my preferred chart color is teal (#008080).")]},
+    {"id": "keep_this_in_mind", "category": "memory", "expect": "agent",
+     "history": [user("Keep this in mind: I prefer teal for charts.")]},
+    {"id": "from_now_on_bullets", "category": "memory", "expect": "agent",
+     "history": [user("From now on, answer me in bullet points.")]},
+    # With no listed word: only the router's prompt sends these to the agent.
+    {"id": "note_for_next_time", "category": "memory", "expect": "agent",
+     "history": [user("Note for next time: I prefer concise replies.")]},
+    {"id": "always_call_me", "category": "memory", "expect": "agent",
+     "history": [user("Please always call me Sam.")]},
+    {"id": "never_pie_charts", "category": "memory", "expect": "agent",
+     "history": [user("I want you to know I never use pie charts.")]},
+    # Spanish, with and without a listed word.
+    {"id": "recuerda_color", "category": "memory", "expect": "agent",
+     "history": [user("Recuerda que prefiero los gráficos en verde azulado.")]},
+    {"id": "a_partir_de_ahora", "category": "memory", "expect": "agent",
+     "history": [user("A partir de ahora respóndeme siempre en español.")]},
+    {"id": "guarda_en_tu_memoria", "category": "memory", "expect": "agent",
+     "history": [user("Guarda en tu memoria que mi jefa se llama Marta.")]},
+
+    # ── the same shapes with nothing to keep past this reply: direct (the
+    #    code check takes the ones with a listed word to the agent, at one
+    #    hop each) ──
+    {"id": "keep_in_mind_beginner", "category": "memory_word_general", "expect": "direct",
+     "history": [user("Keep in mind I'm a beginner: what's compound interest, in two sentences?")]},
+    {"id": "from_now_on_team", "category": "memory_word_general", "expect": "direct",
+     "history": [user("How do I tell my team politely that from now on standups start at 9:30?")]},
+    {"id": "this_answer_bullets", "category": "memory_word_general", "expect": "direct",
+     "history": [user("Just for this answer, use bullet points: what are the pros and cons of index funds?")]},
+    {"id": "next_time_overheats", "category": "memory_word_general", "expect": "direct",
+     "history": [user("What should I do next time my laptop overheats?")]},
+    {"id": "always_called_big_apple", "category": "memory_word_general", "expect": "direct",
+     "history": [user("Why is New York always called the Big Apple?")]},
+    {"id": "never_pie_charts_why", "category": "memory_word_general", "expect": "direct",
+     "history": [user("Why do some analysts say you should never use pie charts?")]},
+    # Says who they are and asks nothing to be kept.
+    {"id": "nice_to_meet_sam", "category": "small_talk", "expect": "direct",
+     "history": [user("Hi, I'm Sam, nice to meet you!")]},
+    {"id": "eso_me_recuerda", "category": "memory_word_general", "expect": "direct",
+     "history": [user("¿Qué es una muestra aleatoria?"),
+                 assistant("Un subconjunto de la población elegido al azar, de modo que cada "
+                           "elemento tiene la misma probabilidad de salir."),
+                 user("Eso me recuerda: ¿qué es un intervalo de confianza?")]},
+    {"id": "a_partir_de_ahora_equipo", "category": "memory_word_general", "expect": "direct",
+     "history": [user("¿Cómo le digo a mi equipo que a partir de ahora las reuniones empiezan a las 9?")]},
+    {"id": "memoria_ram", "category": "memory_word_general", "expect": "direct",
+     "history": [user("¿Cuánta memoria RAM necesito para trabajar con hojas de cálculo grandes?")]},
+    {"id": "memorizar_planetas", "category": "memory_word_general", "expect": "direct",
+     "history": [user("¿Algún truco para memorizar el orden de los planetas?")]},
+
+    # ── forget something saved: agent ──
+    {"id": "forget_address", "category": "forget", "expect": "agent",
+     "history": [user("Please forget my home address.")]},
+    {"id": "wipe_employer", "category": "forget", "expect": "agent",
+     "history": [user("Wipe what you know about my previous employer.")]},
+    {"id": "olvida_presupuesto", "category": "forget", "expect": "agent",
+     "history": [user("Olvida lo que te dije sobre el presupuesto.")]},
+
+    # ── forget and wipe in other senses: direct ──
+    {"id": "elephants_never_forget", "category": "memory_word_general", "expect": "direct",
+     "history": [user("Is it true that elephants never forget?")]},
+    {"id": "wipe_laptop", "category": "memory_word_general", "expect": "direct",
+     "history": [user("How do I wipe my old laptop before selling it?")]},
+    {"id": "elefante_nunca_olvida", "category": "memory_word_general", "expect": "direct",
+     "history": [user("¿Es verdad que un elefante nunca olvida?")]},
+    {"id": "olvide_kpi", "category": "memory_word_general", "expect": "direct",
+     "history": [user("Se me olvidó qué significa KPI, ¿me lo recuerdas?")]},
+
+    # ── what the assistant can keep: agent (a direct answer, with no product
+    #    fact about memory, tends to say it can't) ──
+    {"id": "long_term_memory", "category": "capability", "expect": "agent",
+     "history": [user("Do you have long-term memory?")]},
+    {"id": "store_preferences", "category": "capability", "expect": "agent",
+     "history": [user("Can you store my preferences?")]},
+
+    # ── memory as a topic, and what the direct call can answer about itself:
+    #    direct ──
+    {"id": "memory_psychology", "category": "capability", "expect": "direct",
+     "history": [user("What's the difference between short-term and long-term memory?")]},
+    {"id": "ai_memory_general", "category": "capability", "expect": "direct",
+     "history": [user("How do AI assistants usually keep long-term memory between sessions?")]},
+    {"id": "store_preferences_webapp", "category": "capability", "expect": "direct",
+     "history": [user("What's a good way to store user preferences in a web app?")]},
+    {"id": "speak_spanish", "category": "capability", "expect": "direct",
+     "history": [user("Do you speak Spanish?")]},
+    # The honest answer says "can't" about something the agent can't do either.
+    {"id": "hug_rough_day", "category": "capability", "expect": "direct",
+     "history": [user("Can you give me a hug? Rough day.")]},
+    {"id": "read_my_mind", "category": "capability", "expect": "direct",
+     "history": [user("Can you read my mind?")]},
+    {"id": "divide_by_zero", "category": "general", "expect": "direct",
+     "history": [user("Can you divide by zero?")]},
+
+    # ── the user's own preferences: agent when said in another conversation
+    #    (only the agent recalls them), direct when said in this one ──
+    {"id": "my_saved_color", "category": "preference", "expect": "agent",
+     "history": [user("What chart color did I tell you I prefer?")]},
+    {"id": "my_color_this_chat", "category": "preference", "expect": "direct",
+     "history": [user("My favorite color for charts is teal. What accent color goes well with it?"),
+                 assistant("Coral or a warm orange pairs well with teal: both stand out without clashing."),
+                 user("What did I say my favorite chart color was?")]},
+    {"id": "colorblind_palette", "category": "general", "expect": "direct",
+     "history": [user("Which chart colors work best for colorblind readers?")]},
+
+    # ── the memory words in other senses: direct (general knowledge; the
+    #    code check takes some of these to the agent, at one hop each) ──
+    {"id": "remember_world_cup", "category": "memory_word_general", "expect": "direct",
+     "history": [user("Do you remember who won the 1998 World Cup?")]},
+    {"id": "remember_planets", "category": "memory_word_general", "expect": "direct",
+     "history": [user("What's a good trick to remember the order of the planets?")]},
+    {"id": "forgotten_gdpr", "category": "memory_word_general", "expect": "direct",
+     "history": [user("What is the right to be forgotten under GDPR?")]},
+    {"id": "forgot_ebitda", "category": "memory_word_general", "expect": "direct",
+     "history": [user("I forgot, what does EBITDA stand for?")]},
+    {"id": "keep_in_mind_salary", "category": "memory_word_general", "expect": "direct",
+     "history": [user("What should I keep in mind when negotiating a salary?")]},
+    {"id": "going_forward_rates", "category": "memory_word_general", "expect": "direct",
+     "history": [user("What's the outlook for interest rates going forward?")]},
+    {"id": "memorize_periodic_table", "category": "memory_word_general", "expect": "direct",
+     "history": [user("How do I memorize the periodic table quickly?")]},
+    {"id": "store_my_passwords", "category": "memory_word_general", "expect": "direct",
+     "history": [user("Where's the safest place to store my passwords?")]},
+    {"id": "flask_across_sessions", "category": "memory_word_general", "expect": "direct",
+     "history": [user("How do I keep a user logged in across sessions in Flask?")]},
+
+    # ── greetings and general questions: direct ──
+    {"id": "good_morning", "category": "small_talk", "expect": "direct",
+     "history": [user("Good morning!")]},
+    {"id": "hola", "category": "small_talk", "expect": "direct",
+     "history": [user("Hola, ¿qué tal?")]},
+    {"id": "mean_vs_median", "category": "general", "expect": "direct",
+     "history": [user("What's the difference between the mean and the median?")]},
+    {"id": "explain_cte", "category": "general", "expect": "direct",
+     "history": [user("Explain what a CTE is in SQL in two sentences.")]},
+    {"id": "que_es_ebitda", "category": "general", "expect": "direct",
+     "history": [user("¿Qué significa EBITDA?")]},
+    {"id": "gracias_tras_trabajo", "category": "small_talk", "expect": "direct",
+     "history": [*DASHBOARD_VISIBLE, user("¡Perfecto, muchas gracias!")]},
+    {"id": "buenos_dias", "category": "small_talk", "expect": "direct",
+     "history": [user("Buenos días, ¿cómo va todo?")]},
+    {"id": "pvalor_es", "category": "general", "expect": "direct",
+     "history": [user("Explícame qué es un p-valor en dos frases.")]},
+    # Sounds like the user's own documents, but asks what is typical.
+    {"id": "saas_refund_policy", "category": "general", "expect": "direct",
+     "history": [user("What does a typical SaaS refund policy say?")]},
+
+    # ── long conversations: the latest message decides, and memory work
+    #    earlier on does not make a general question agent work ──
+    {"id": "long_chat_general", "category": "long_history", "expect": "direct",
+     "history": [*LONG_CHAT, user("One more: what's the difference between ARR and MRR?")]},
+    {"id": "long_chat_thanks", "category": "long_history", "expect": "direct",
+     "history": [*LONG_CHAT, user("This was really helpful, thanks!")]},
+    {"id": "long_chat_currency", "category": "long_history", "expect": "direct",
+     "history": [*LONG_CHAT, user("Which currency should I show first if most visitors are in Germany?")]},
+    # With no listed word: only the router's prompt sends this to the agent.
+    {"id": "long_chat_eur_always", "category": "long_history", "expect": "agent",
+     "history": [*LONG_CHAT, user("By the way, I always work in EUR. Use EUR with me in every chat, please.")]},
+    # The memory turn is outside the LLM gate's window; Jev and the direct answer see it.
+    {"id": "long_chat_after_saved", "category": "long_history", "expect": "direct",
+     "history": [*MEMORY_SAVED, *LONG_CHAT, user("One more: what's the difference between ARR and MRR?")]},
+
+    # ── follow-ups: direct unless the follow-up itself asks to keep something ──
+    {"id": "follow_up_ebit", "category": "follow_up", "expect": "direct",
+     "history": [*_EBITDA_ANSWERED, user("And how is that different from EBIT?")]},
+    {"id": "follow_up_mnemonic", "category": "follow_up", "expect": "direct",
+     "history": [*_PLANETS_ANSWERED, user("Nice. Is there one for the order of operations too?")]},
+    {"id": "follow_up_iso_why", "category": "follow_up", "expect": "direct",
+     "history": [*_ISO_ANSWERED, user("Why does it sort correctly as text?")]},
+    {"id": "follow_up_use_iso", "category": "follow_up", "expect": "agent",
+     "history": [*_ISO_ANSWERED, user("Great, use that format with me from now on.")]},
+    # Right after the agent saved a preference. The LLM gate sends all three
+    # to the agent on `prior_turn_ran_tools`, so only Jev's path tells them apart.
+    {"id": "after_saved_thanks", "category": "follow_up", "expect": "direct",
+     "history": [*MEMORY_SAVED, user("great, thanks!")]},
+    {"id": "after_saved_darker_teal", "category": "follow_up", "expect": "direct",
+     "history": [*MEMORY_SAVED, user("What's the hex code for a slightly darker teal?")]},
+    # With no listed word: only a model sends this to the agent.
+    {"id": "after_saved_fiscal_year", "category": "follow_up", "expect": "agent",
+     "history": [*MEMORY_SAVED, user("Also, my fiscal year starts in April.")]},
 ]
