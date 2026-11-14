@@ -29,6 +29,7 @@ from typing import Annotated, Any, AsyncIterator, Callable, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
+from cowork.common.event_clock import event_at_ms
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.figure_sources import (
     CellResult,
@@ -813,9 +814,11 @@ async def format_responses_stream(
         # reducer would otherwise see every `now()` collapse to the
         # same JS-tick value, producing 0ms across the board.
         # Persisted into the turns sidecar via `event_sink`, so the
-        # field is also there for future replays.
+        # field is also there for future replays. A held step's card
+        # compares it with the approvals-off stamp, which event_clock
+        # keeps at or after it.
         if "at_ms" not in data:
-            data["at_ms"] = int(time.time() * 1000)
+            data["at_ms"] = event_at_ms()
         if event_sink is not None:
             try:
                 event_sink(event_type, data)

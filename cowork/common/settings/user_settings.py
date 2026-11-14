@@ -764,11 +764,25 @@ class UserSettings(Settings):
     )
     # Untagged like browser_enabled: the person's own choice. The app reads it
     # (as browserApproveSteps) to decide whether a browser step waits for the
-    # person's approval; this server only stores it.
+    # person's approval. This server stores it, and a write of it as false
+    # stamps browser_approve_steps_off_at below.
     browser_approve_steps: bool = Field(
         default=True,
         title="Approve Browser Steps",
         description="Ask before the agent's browser steps run.",
+    )
+    # Untagged (user scope) like browser_approve_steps. SettingService
+    # (_stamp_approvals_off) stamps it, by this server's clock, on every write
+    # of browser_approve_steps as false, and the settings routes refuse a
+    # client's write of it. The app reads it as browserApproveStepsOffAt and
+    # approves for the person only a step held after it, by the `at_ms` this
+    # server puts on the step's event. "" until approvals first go off, and a
+    # string, not 0, so an unset stamp approves nothing.
+    browser_approve_steps_off_at: str = Field(
+        default="",
+        max_length=20,
+        title="Browser Approvals Off Since",
+        description="When the person last turned browser step approvals off, epoch milliseconds.",
     )
     # Untagged like browser_enabled. The app reads it (as
     # browserOnlyWhenNeeded): on, the browser pane opens by itself only when

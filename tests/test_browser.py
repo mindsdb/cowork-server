@@ -10,6 +10,7 @@ import inspect
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, NamedTuple
@@ -19,11 +20,12 @@ import pytest
 from anton.core.browser.config import BrowserConfig
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
+from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator
 
 from cowork.api.v1.router import api_router
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.runtime_credential import LocalBrowserHost
+from cowork.handlers.jev_route import decisions_model as real_decisions_model
 from cowork.principal import Principal, get_principal
 from cowork.services import browser as svc
 from cowork.services.browser_contract import SESSION_ID
@@ -286,7 +288,9 @@ def test_removed_browser_settings_are_gone(client):
     from cowork.common.settings.user_settings import UserSettings
 
     browser_keys = {k for k in UserSettings.model_fields if k.startswith("browser_")}
-    assert browser_keys == {"browser_enabled", "browser_approve_steps", "browser_only_when_needed"}
+    assert browser_keys == {
+        "browser_enabled", "browser_approve_steps", "browser_approve_steps_off_at", "browser_only_when_needed",
+    }
     gone_keys = ("browser_mode", "browser_service_url", "browser_service_api_key", "browser_url", "browser_proxy", "browser_city")
     for gone in gone_keys:
         assert client.put(f"/api/v1/settings/{gone}", json={"value": "x"}).status_code == 400, gone
@@ -312,6 +316,109 @@ def test_browser_steps_wait_for_approval_by_default_and_the_person_can_say_other
     from cowork.db.scoped import LOCAL_SCOPE
 
     assert get_user_settings(LOCAL_SCOPE).browser_approve_steps is False
+
+
+def _settings_as_stored(client, headers: dict[str, str] | None = None) -> dict[str, str]:
+    return {row["key"]: row["value"] for row in client.get("/api/v1/settings/", headers=headers or {}).json()}
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def test_when_approvals_went_off_is_unset_by_default_and_the_persons_own():
+    """A string, so an unset stamp reads as no time at all, which approves
+    nothing, rather than 0, before which every step was held."""
+    from cowork.common.settings.user_settings import UserSettings, setting_is_org_scoped
+
+    assert UserSettings().browser_approve_steps_off_at == ""
+    assert setting_is_org_scoped("browser_approve_steps_off_at") is setting_is_org_scoped("browser_approve_steps") is False
+
+
+@pytest.mark.parametrize("route", ["single", "bulk"])
+def test_turning_approvals_off_stamps_when_by_the_servers_clock(client, route):
+    """The app approves for the person only a step held after this stamp, by
+    the `at_ms` this server puts on the step's event, so the stamp is this
+    server's clock too. Each write of off moves it, one that finds approvals
+    already off included (a held step's Skip approvals); a write of on leaves
+    it."""
+    def write_approve_steps(value: str) -> None:
+        if route == "bulk":
+            saved = client.put("/api/v1/settings/", json={"values": {"browser_approve_steps": value}})
+        else:
+            saved = client.put("/api/v1/settings/browser_approve_steps", json={"value": value})
+        assert saved.status_code == 200, saved.text
+
+    before = _now_ms()
+    write_approve_steps("false")
+    first = int(_settings_as_stored(client)["browser_approve_steps_off_at"])
+    assert before <= first <= _now_ms()
+
+    while _now_ms() <= first:
+        time.sleep(0.001)
+    before = _now_ms()
+    write_approve_steps("false")
+    second = int(_settings_as_stored(client)["browser_approve_steps_off_at"])
+    assert first < before <= second <= _now_ms()
+
+    write_approve_steps("true")
+    stored = _settings_as_stored(client)
+    assert (stored["browser_approve_steps"].lower(), stored["browser_approve_steps_off_at"]) == ("true", str(second))
+
+
+def test_a_clock_stepped_back_cant_stamp_approvals_off_before_a_held_step(client, monkeypatch):
+    """A step is held at 2,000 s, then the clock steps back to 1,000 s and
+    the person turns approvals off. The stamp stays at or after the step's
+    `at_ms`, so the app, which approves only a step held after the stamp,
+    leaves this one to the person."""
+    from anton.core.interaction.elicit import AskRequest
+    from anton.core.llm.provider import StreamAskUser
+
+    from cowork.common import event_clock
+    from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
+
+    async def held_step() -> dict:
+        async def events():
+            yield StreamAskUser(id="browser:approve:t-a:pa-1", request=AskRequest(prompt="Place the order?"))
+
+        sunk: list[tuple[str, dict]] = []
+        async for _ in format_responses_stream(events(), model="m", event_sink=lambda t, d: sunk.append((t, d))):
+            pass
+        return next(data for name, data in sunk if name == "response.ask_user")
+
+    monkeypatch.setattr(event_clock, "_latest_ms", 0)
+    with monkeypatch.context() as clock:
+        clock.setattr(time, "time", lambda: 2_000.0)
+        held = asyncio.run(held_step())
+        clock.setattr(time, "time", lambda: 1_000.0)
+        saved = client.put("/api/v1/settings/browser_approve_steps", json={"value": "false"})
+    assert saved.status_code == 200, saved.text
+    assert held["at_ms"] == 2_000_000
+    assert int(_settings_as_stored(client)["browser_approve_steps_off_at"]) >= held["at_ms"]
+
+
+def test_a_client_cant_say_when_approvals_went_off(client):
+    """Only the server stamps it: a client's 0 would have the app approve
+    steps held before the person turned approvals off. The bulk save writes
+    nothing, the switch beside it included."""
+    single = client.put("/api/v1/settings/browser_approve_steps_off_at", json={"value": "0"})
+    bulk = client.put("/api/v1/settings/", json={"values": {
+        "browser_approve_steps": "false", "browser_approve_steps_off_at": "0",
+    }})
+    assert (single.status_code, bulk.status_code) == (400, 400)
+    stored = _settings_as_stored(client)
+    assert (stored["browser_approve_steps"].lower(), stored["browser_approve_steps_off_at"]) == ("true", "")
+
+
+def test_on_the_web_each_person_has_their_own_stamp(web_client):
+    """Per person, as browser_approve_steps is: one member turning approvals
+    off stamps nobody else's."""
+    saved = web_client.put(
+        "/api/v1/settings/browser_approve_steps", json={"value": "false"}, headers=_as("alice"),
+    )
+    assert saved.status_code == 200, saved.text
+    assert _settings_as_stored(web_client, _as("alice"))["browser_approve_steps_off_at"] != ""
+    assert _settings_as_stored(web_client, _as("bob"))["browser_approve_steps_off_at"] == ""
 
 
 def test_the_browser_shows_only_when_needed_by_default_and_the_person_can_say_otherwise(client):
@@ -549,16 +656,180 @@ def test_the_harness_hands_anton_the_organizations_own_decision_model(app_browse
     assert config.decisions is None
 
 
+# ── where the organization's own decision model reaches the browser ───────
+
+
+class _StandInDecisionsTarget(BaseModel):
+    """anton's ``anton.core.browser.config.DecisionsTarget``, for an installed
+    anton that predates it, with the same check on the URL. The tests use
+    anton's own wherever it has one."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    url: str
+    api_key: SecretStr
+    model: str = "jev"
+
+    @field_validator("url")
+    @classmethod
+    def _url_is_http(cls, value: str) -> str:
+        from urllib.parse import urlsplit
+
+        url = urlsplit(value)
+        if url.scheme not in ("http", "https") or not url.hostname or "@" in url.netloc:
+            raise ValueError("the decision endpoint must be an http(s) URL with a host and no user")
+        return value
+
+
+def _anton_takes_own_model(monkeypatch, takes: bool) -> None:
+    """The in-process anton takes the host's own decision model, or predates it."""
+    from anton.core.browser import config as anton_config
+
+    if not takes:
+        monkeypatch.delattr(anton_config, "DecisionsTarget", raising=False)
+    elif not hasattr(anton_config, "DecisionsTarget"):
+        monkeypatch.setattr(anton_config, "DecisionsTarget", _StandInDecisionsTarget, raising=False)
+
+
+def _anton_takes_proxy(monkeypatch, takes: bool) -> None:
+    """The pod's anton's browser config takes the decisions proxy, or predates it."""
+    fields = {k: v for k, v in BrowserConfig.model_fields.items() if k != "decisions_proxy"}
+    if takes:
+        fields["decisions_proxy"] = None
+    monkeypatch.setattr(svc, "BrowserConfig", SimpleNamespace(model_fields=fields))
+
+
+@pytest.fixture
+def proxy_url():
+    """Sets this server's decisions proxy URL, or none. Its own patch, undone
+    before the cached app settings are dropped, so no later test reads them."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    with pytest.MonkeyPatch.context() as patch:
+        def set_url(url: str) -> None:
+            if url:
+                patch.setenv("COWORK_BROWSER_DECISIONS_URL", url)
+            else:
+                patch.delenv("COWORK_BROWSER_DECISIONS_URL", raising=False)
+            patch.setenv("COWORK_PUBLIC_BASE_URL", "")
+            get_app_settings.cache_clear()
+
+        yield set_url
+    get_app_settings.cache_clear()
+
+
+PROXY = "https://cowork.example.test/api/v1/browse/decisions"
+
+
+def test_on_the_web_the_organizations_model_reaches_the_browser_only_through_the_proxy(web, proxy_url, monkeypatch):
+    _anton_takes_own_model(monkeypatch, True)
+    for url, takes, reaches in (("", True, False), (PROXY, False, False), (PROXY, True, True)):
+        proxy_url(url)
+        _anton_takes_proxy(monkeypatch, takes)
+        assert svc.own_model_reaches_browser() is reaches, (url, takes)
+
+
+def test_on_the_desktop_the_organizations_model_reaches_the_browser_only_through_anton(proxy_url, monkeypatch):
+    # The proxy is the web's: its URL changes nothing here.
+    proxy_url(PROXY)
+    _anton_takes_proxy(monkeypatch, True)
+    _anton_takes_own_model(monkeypatch, False)
+    assert svc.own_model_reaches_browser() is False
+    _anton_takes_own_model(monkeypatch, True)
+    assert svc.own_model_reaches_browser() is True
+
+
+@pytest.fixture
+def own_model(decisions, monkeypatch):
+    """The organization set up its own decision model, and status reads
+    jev_route.decisions_model itself, over it."""
+    from cowork.handlers import jev_route
+
+    monkeypatch.setattr(jev_route, "decisions_model", real_decisions_model)
+    decisions.own = jev_route.JevTarget(url="https://decide.example.test/v1/systemone", api_key="own-key")
+    return decisions
+
+
+def _on_mindshub(*, jev: bool = True):
+    from cowork.common.settings.user_settings import UserSettings
+
+    return UserSettings.model_validate({
+        "planning_provider": "minds_cloud", "minds_api_key": "k", "jev_decisions_enabled": jev, "browser_enabled": True,
+    })
+
+
+def _status(settings):
+    return asyncio.run(svc.browse_status(settings, bearer="jwt-alice", org_id=ORG, user_id="alice"))
+
+
+def test_web_status_says_own_only_where_the_proxy_reaches_the_browser(router, mindshub, own_model, proxy_url, monkeypatch):
+    """Without a proxy URL, or with an anton that predates the proxy, the
+    browser asks Jev on MindsHub: status says so, and with Jev off there is
+    nothing to pick the steps, so the browser is off. Either way status says
+    the organization's model is set up but unused, so Settings doesn't ask
+    for one."""
+    _anton_takes_proxy(monkeypatch, True)
+    proxy_url("")
+    answer = _status(_on_mindshub())
+    assert (answer.decisions_model, answer.enabled, answer.own_decisions_unused) == ("mindshub", True, True)
+    answer = _status(_on_mindshub(jev=False))
+    assert (answer.decisions_model, answer.enabled, answer.available, answer.own_decisions_unused) == (
+        None, False, True, True,
+    )
+    proxy_url(PROXY)
+    _anton_takes_proxy(monkeypatch, False)
+    answer = _status(_on_mindshub())
+    assert (answer.decisions_model, answer.own_decisions_unused) == ("mindshub", True)
+    _anton_takes_proxy(monkeypatch, True)
+    answer = _status(_on_mindshub(jev=False))
+    assert (answer.decisions_model, answer.enabled, answer.own_decisions_unused) == ("own", True, False)
+
+
+def test_desktop_status_says_own_only_where_anton_takes_the_organizations_model(app_browser, own_model, monkeypatch):
+    _anton_takes_own_model(monkeypatch, False)
+    answer = _status(_on_mindshub())
+    assert (answer.decisions_model, answer.own_decisions_unused) == ("mindshub", True)
+    answer = _status(_on_mindshub(jev=False))
+    assert (answer.decisions_model, answer.enabled, answer.available, answer.own_decisions_unused) == (
+        None, False, True, True,
+    )
+    _anton_takes_own_model(monkeypatch, True)
+    answer = _status(_on_mindshub(jev=False))
+    assert (answer.decisions_model, answer.enabled, answer.own_decisions_unused) == ("own", True, False)
+
+
+def test_a_decisions_target_anton_refuses_leaves_the_desktop_browser_running(app_browser, monkeypatch, caplog):
+    """A URL stored without its scheme, from before Settings checked it: the
+    turn keeps its browser, without the organization's model, and the log
+    names neither the URL nor the key."""
+    from cowork.handlers.jev_route import JevTarget
+
+    _anton_takes_own_model(monkeypatch, True)
+    stored = JevTarget(url="decisions.example.test/v1", api_key="own-key-secret")
+    with caplog.at_level(logging.WARNING, logger="cowork.services.browser"):
+        config = svc.desktop_browser_config(conversation_id="c", project_id=None, decisions=(stored, "jev-own"))
+
+    assert config is not None and config.in_app
+    assert getattr(config, "decisions", None) is None
+    [record] = [r for r in caplog.records if r.name == "cowork.services.browser" and r.levelno == logging.WARNING]
+    assert record.event == "desktop_browser_decisions_refused"
+    logged = json.dumps(record.__dict__, default=str)
+    assert "decisions.example.test" not in logged and "own-key-secret" not in logged
+
+
 def test_desktop_status_says_what_picks_the_steps(client, decisions):
     runtime_credential.set_browser_host(APP_BROWSER)
     # Anyone on a desktop may set it up.
     assert client.put("/api/v1/settings/browser_enabled", json={"value": "true"}).status_code == 200
     answer = client.get("/api/v1/browse/status").json()
     assert (answer["enabled"], answer["decisions_model"], answer["can_set_decisions_model"]) == (True, "mindshub", True)
-    # Cleared later: the switch stays on, and the browser reads as off.
+    # Cleared later: the switch stays on, and the browser reads as off. No
+    # model of the organization's own either, so nothing set up goes unused.
     decisions.model = None
     answer = client.get("/api/v1/browse/status").json()
-    assert (answer["enabled"], answer["available"], answer["decisions_model"]) == (False, True, None)
+    assert (answer["enabled"], answer["available"], answer["decisions_model"], answer["own_decisions_unused"]) == (
+        False, True, None, False,
+    )
 
 
 def test_on_the_web_only_an_organization_admin_may_set_up_a_decisions_model(web_client, router, mindshub):
@@ -752,7 +1023,9 @@ def test_web_status_fails_closed_when_mindshub_cant_say(web_client, router, mind
 
 def test_web_status_answers_match_the_model(web_client, router, mindshub):
     answer = web_client.get("/api/v1/browse/status", headers=_as("alice")).json()
-    assert set(answer) == {"enabled", "available", "status", "decisions_model", "can_set_decisions_model"}
+    assert set(answer) == {
+        "enabled", "available", "status", "decisions_model", "can_set_decisions_model", "own_decisions_unused",
+    }
     svc.BrowseStatus.model_validate(answer)
 
 

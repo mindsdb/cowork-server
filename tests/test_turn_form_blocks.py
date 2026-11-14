@@ -103,6 +103,7 @@ def _ui_handler(monkeypatch, saved: dict, events: list):
 
         def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
             saved["assistant"] = text
+            saved["events"] = events
             return SimpleNamespace(id=uuid4())
 
     class FakeSession:
