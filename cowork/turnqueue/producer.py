@@ -499,6 +499,12 @@ SECOND_RUN_ERROR = "TurnRunRepeated: a second run of this turn's job sent replie
 #: one at a time, so a job that landed is among the last few.
 _JOB_READBACK_COUNT = 5
 
+# Replies a turn streams to the client before it ends; each needs the
+# workspace authorized first. `TurnReply.kind` lists the kinds it accepts.
+_STREAMED_REPLY_KINDS = (
+    "turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_connector", "turn_history", "turn_compaction",
+)
+
 
 async def _job_queued(*, r, job_stream: str, correlation_id: str) -> bool:
     """Whether the job for ``correlation_id`` is among the newest entries of
@@ -786,6 +792,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
                                 tool_messages: bool = False,
+                                connector_drafts: bool = False,
                                 preview_checks: bool = False,
                                 ui_locale: str | None = None,
                                 reasoning_effort: str | None = None):
@@ -800,6 +807,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
     user (the cowork UI does; channel turns never).
+    `connector_drafts` asks for the pod's connector template tool. It reaches
+    the job only with the deployment setting on, in org mode, for a turn with
+    a user; the caller passes it only where a member sees and saves the card.
     `preview_checks` lets the pod's artifact editor ask the app's open
     preview whether an edit runs (ENG-4227, turnqueue/preview_checks.py).
     Only with `interactive`: the answer reaches the pod on the stdin an
@@ -931,6 +941,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     turn_settings = await run_on_unit_threads(partial(get_user_settings, scope))
     jev_decisions = getattr(turn_settings, "jev_decisions_enabled", True) is not False
     time_limit = settings.time_limit_seconds
+    offer_connector_drafts = bool(
+        connector_drafts and settings.connector_drafts_enabled and scope.org_mode and user_id
+    )
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
@@ -940,6 +953,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # The cowork UI renders a tool's message to the user as an
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
+              **({"connector_drafts": True} if offer_connector_drafts else {}),
               # The pod asks the app's preview to check its edits only when
               # this is a real true, and only an interactive turn keeps the
               # stdin its answer comes back on (scratchpad-controller#134
@@ -1144,8 +1158,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         yield "progress", {"phase": WORKER_ALIVE_PHASE}
                         continue
                     if kind == "error" or (
-                        kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_history",
-                                 "turn_compaction", "turn_completed")
+                        (kind in _STREAMED_REPLY_KINDS or kind == "turn_completed")
                         and authorized_workspace_mode is None
                     ):
                         # Unsupported v2 operations and missing mount-policy
@@ -1173,8 +1186,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         )
                     if kind in ("turn_completed", "turn_failed"):
                         ended = True
-                    if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill",
-                                "turn_history", "turn_compaction", "turn_completed", "turn_failed"):
+                    if kind in _STREAMED_REPLY_KINDS or kind in ("turn_completed", "turn_failed"):
                         yield kind, data
                     if kind in ("turn_completed", "turn_failed"):
                         return

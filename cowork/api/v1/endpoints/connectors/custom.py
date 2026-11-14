@@ -1,18 +1,83 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from typing import Annotated, Any
 
-from cowork.api.v1.permissions import AuthenticatedOrgAdmin, require
+from anton.core.tools.connector_draft import ConnectorDraftError, check_draft_text, parse_connector_draft
+from fastapi import APIRouter, Body, Depends, HTTPException, Response, status
+
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.connectors import ConnectorMetadataResponse, CustomConnectorUpdate
 from cowork.services.connectors.catalog import custom_connector_spec
-from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError
+from cowork.services.connectors.custom_connectors import (
+    CustomConnectorService,
+    UnstorableFormError,
+    is_builtin_connector_id,
+)
 from cowork.services.connectors.specs._registry import connector_metadata
 
-# AuthenticatedOrgAdmin: a custom connector is listed for everyone in the
-# organization, so changing or removing one is an admin decision. A no-op on a
+# In org mode a custom connector is visible to its builder only (see
+# scope_definitions), so the member who built it manages it. A no-op on a
 # local install, where the one user owns every definition.
-router = APIRouter(dependencies=[Depends(require(AuthenticatedOrgAdmin))])
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+#: What a member may change on their own connector in org mode. Its form came
+#: from a checked draft and stays as saved; featured is a directory setting.
+_ORG_MODE_CHANGES = frozenset({"label", "description", "category"})
+
+
+def _unprocessable(detail: str) -> HTTPException:
+    """A 422 with ``detail``, which never quotes a submitted value."""
+    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail)
+
+
+def _check_member_edit(body: CustomConnectorUpdate) -> None:
+    """Check an org-mode edit's texts with the draft rules they were saved under.
+
+    Raises:
+        HTTPException: 422 naming the field, without its value.
+    """
+    for key in sorted(body.model_fields_set & _ORG_MODE_CHANGES):
+        value = getattr(body, key)
+        if value is None:
+            continue
+        try:
+            checked = check_draft_text(key, value)
+        except ConnectorDraftError as e:
+            raise _unprocessable(str(e)) from e
+        if key == "label" and checked is None:
+            raise _unprocessable("label is required.")
+
+
+@router.post("", response_model=ConnectorMetadataResponse)
+def save_connector_draft(
+    draft: Annotated[dict[str, Any], Body()], session: ScopedSessionDep,
+) -> ConnectorMetadataResponse:
+    """Save a connector draft from a chat card as the member's own connector.
+
+    Org mode only, for an authenticated member, and only while the setting
+    that lets cloud turns build drafts is on. The draft is untrusted client
+    data and is checked again here with the parser the pod used.
+
+    Raises:
+        HTTPException: 404 outside org mode or with the setting off, 422 for
+            a draft outside the allowlist or a built-in id.
+    """
+    if not session.scope.org_mode or not TurnQueueSettings().connector_drafts_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
+    try:
+        parsed = parse_connector_draft(draft)
+    except ConnectorDraftError as e:
+        raise _unprocessable(str(e)) from e
+    connector_id = parsed.connector_id
+    if is_builtin_connector_id(connector_id):
+        raise _unprocessable(f"{connector_id!r} is already a built-in connector.")
+    try:
+        row = CustomConnectorService(session).save_member_draft(parsed)
+    except UnstorableFormError as e:
+        raise _unprocessable(str(e)) from e
+    return connector_metadata(custom_connector_spec(row))
 
 
 @router.patch("/{connector_id}", response_model=ConnectorMetadataResponse)
@@ -23,8 +88,18 @@ def update_custom_connector(
 
     Raises:
         HTTPException: 404 when the scope has no such custom connector, 422
-            when ``spec`` is invalid or unsafe to keep.
+            when ``spec`` is invalid or unsafe to keep, or in org mode when
+            anything but label, description or category is sent.
     """
+    if session.scope.org_mode:
+        if not body.model_fields_set <= _ORG_MODE_CHANGES:
+            raise _unprocessable("Only label, description and category can be changed here.")
+        if CustomConnectorService(session).get(connector_id) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom connector not found.")
+        _check_member_edit(body)
+        for key in _ORG_MODE_CHANGES:
+            if isinstance(getattr(body, key), str):
+                setattr(body, key, getattr(body, key).strip())
     try:
         row = CustomConnectorService(session).update(connector_id, body)
     except UnstorableFormError as e:

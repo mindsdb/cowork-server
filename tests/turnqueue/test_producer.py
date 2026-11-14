@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections import OrderedDict
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -1574,6 +1575,7 @@ async def test_workspace_authority_is_sent_and_acknowledged_before_turn_events(m
 @pytest.mark.parametrize("reply", [
     ("error", {"error": "unsupported op 'anton_turn_v2'"}),
     ("turn_delta", {"text": "must not be shown"}),
+    ("turn_connector", {"entries": [{"connector_id": "acme", "label": "Acme", "fields": []}]}),
     ("turn_completed", {}),
     ("turn_failed", {"code": "permission_unavailable", "error": "private authority detail"}),
 ])
@@ -2132,6 +2134,64 @@ async def test_this_turns_own_reply_of_an_unknown_kind_still_fails_it(monkeypatc
         )), timeout=5)
 
 
+async def _connector_drafts_param(monkeypatch, *, enabled, org_id="org-1", user_id="user-1",
+                                  tenancy="org", **kwargs):
+    """The job's `connector_drafts` param, or None when the job leaves it out."""
+    from cowork.common.settings import user_settings
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", tenancy)
+    monkeypatch.setenv("COWORK_TURN_CONNECTOR_DRAFTS_ENABLED", "true" if enabled else "false")
+    get_app_settings.cache_clear()
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
+    monkeypatch.setattr(user_settings, "get_user_settings",
+                        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id=""))
+    try:
+        await _drain(prod.stream_remote_replies(
+            conversation_id="conv-1", org_id=org_id, user_id=user_id, input_text="hi", model="m", **kwargs,
+        ))
+    finally:
+        get_app_settings.cache_clear()
+    return json.loads(fake.added[0][1]["payload"])["params"].get("connector_drafts")
+
+
+async def test_connector_drafts_reach_a_members_org_turn_with_the_setting_on(monkeypatch):
+    assert await _connector_drafts_param(monkeypatch, enabled=True, connector_drafts=True) is True
+
+
+@pytest.mark.parametrize("case", ["setting off", "no user", "local tenancy", "caller did not ask"])
+async def test_connector_drafts_stay_off_otherwise(monkeypatch, case):
+    kwargs = {"enabled": True, "connector_drafts": True}
+    if case == "setting off":
+        kwargs["enabled"] = False
+    elif case == "no user":
+        kwargs["user_id"] = None
+    elif case == "local tenancy":
+        # A user and an org id, but local tenancy without trusted identity
+        # headers is not org mode.
+        kwargs["tenancy"] = "local"
+        monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
+    else:
+        kwargs.pop("connector_drafts")
+    assert await _connector_drafts_param(monkeypatch, **kwargs) is None
+
+
+async def test_a_turn_connector_reply_is_passed_on(monkeypatch):
+    """The reply kind is accepted and relayed, so a draft does not fail the turn."""
+    reply = json.loads((Path(__file__).parents[1] / "fixtures" / "turn_connector_reply.json").read_text())
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply(reply["kind"], reply["data"])),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    out = await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                                  input_text="hi", model="m"))
+    assert ("turn_connector", reply["data"]) in out
+    assert out[-1][0] == "turn_completed"
 ROUTER = "https://app.example.test/browser"
 
 

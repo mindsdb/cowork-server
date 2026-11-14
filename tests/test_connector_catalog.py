@@ -22,6 +22,8 @@ from tests._fakes import FakeRequest
 
 ORG_A = TenantScope(org_mode=True, org_id="org-a", user_id="user-a")
 ORG_B = TenantScope(org_mode=True, org_id="org-b", user_id="user-b")
+ORG_A_OTHER_MEMBER = TenantScope(org_mode=True, org_id="org-a", user_id="user-a2")
+ORG_A_NO_USER = TenantScope(org_mode=True, org_id="org-a")
 PERSON_A = TenantScope(
     org_id="partition-a", user_id="person-a", personal=True, personal_resources=ALL_PERSONAL_RESOURCES,
 )
@@ -47,19 +49,19 @@ def engine():
     return eng
 
 
-def _add(engine, *, connector_id="httpbin", org_id=None, featured=True, label="httpbin"):
+def _add(engine, *, connector_id="httpbin", org_id=None, featured=True, label="httpbin", created_by=None):
     with Session(engine) as session:
         session.add(CustomConnector(
             connector_id=connector_id, label=label, description="Bearer test API",
             category="developer", logo_color="#3a7", spec=HTTPBIN_FORM,
-            featured=featured, org_id=org_id,
+            featured=featured, org_id=org_id, created_by=created_by,
         ))
         session.commit()
 
 
-def _add_with_notes(engine, notes, *, org_id=None):
+def _add_with_notes(engine, notes, *, org_id=None, created_by=None):
     """Store the httpbin definition with ``notes`` as its usage notes."""
-    _add(engine, org_id=org_id)
+    _add(engine, org_id=org_id, created_by=created_by)
     with Session(engine) as session:
         row = session.exec(select(CustomConnector)).one()
         row.usage_notes = notes
@@ -94,10 +96,24 @@ class TestCatalog:
         assert [c.id for c in result.candidates] == ["httpbin"]
 
     def test_one_org_never_sees_another_orgs_connector(self, engine):
-        _add(engine, org_id="org-a")
+        _add(engine, org_id="org-a", created_by=ORG_A.user_id)
 
         assert _catalog(engine, ORG_A).get_connector("httpbin") is not None
         assert _catalog(engine, ORG_B).get_connector("httpbin") is None
+
+    def test_another_member_of_the_org_never_sees_a_members_connector(self, engine):
+        _add(engine, org_id="org-a", created_by=ORG_A.user_id)
+
+        assert _catalog(engine, ORG_A_OTHER_MEMBER).get_connector("httpbin") is None
+        assert _catalog(engine, ORG_A_NO_USER).get_connector("httpbin") is None
+        assert _catalog(engine, ORG_A_OTHER_MEMBER).match_connector("httpbin", 5).candidates == []
+
+    def test_an_org_row_with_no_builder_is_seen_by_no_member(self, engine):
+        _add(engine, org_id="org-a")
+
+        assert _catalog(engine, ORG_A).get_connector("httpbin") is None
+        # A scope with no user must not match the row's missing builder.
+        assert _catalog(engine, ORG_A_NO_USER).get_connector("httpbin") is None
 
     def test_a_local_install_never_sees_an_orgs_connector(self, engine):
         _add(engine, org_id="org-a")
@@ -141,7 +157,7 @@ class TestCatalog:
         (ORG_A, "org-a", False),
     ], ids=["single-user install", "personal connections", "org mode"])
     def test_custom_usage_notes_reach_an_agent_only_in_ones_own_scope(self, engine, scope, row_org, own):
-        _add_with_notes(engine, "Call /bearer.", org_id=row_org)
+        _add_with_notes(engine, "Call /bearer.", org_id=row_org, created_by=scope.user_id)
 
         catalog = _catalog(engine, scope)
 
@@ -205,6 +221,18 @@ class TestSpecsEndpoints:
         with pytest.raises(HTTPException) as exc:
             await specs_endpoints.get_connector_spec("httpbin", ORG_B)
         assert exc.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_only_the_builder_looks_up_or_matches_an_org_connector(self, endpoint_db):
+        _add(endpoint_db, org_id="org-a", created_by=ORG_A.user_id)
+
+        assert (await specs_endpoints.get_connector_spec("httpbin", ORG_A)).custom is True
+        assert (await specs_endpoints.match_connector_spec(MatchRequest(query="httpbin"), ORG_A)).candidates
+        with pytest.raises(HTTPException) as exc:
+            await specs_endpoints.get_connector_spec("httpbin", ORG_A_OTHER_MEMBER)
+        assert exc.value.status_code == 404
+        matched = await specs_endpoints.match_connector_spec(MatchRequest(query="httpbin"), ORG_A_OTHER_MEMBER)
+        assert matched.candidates == []
 
     @pytest.mark.asyncio
     async def test_match_includes_custom_connectors(self, endpoint_db):

@@ -1,12 +1,20 @@
-"""Admins can rename, unfeature, re-form and delete a custom connector, in their own scope only."""
+"""A custom connector's owner can change and delete it, in their own scope only.
+
+Locally the one user owns every definition. In org mode only the member who
+built a definition sees it, and may change only its label, description and
+category."""
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from anton.cloud_turn.session import drain_pending_connectors
 from anton.core.datasources.data_vault import LocalDataVault
+from anton.core.tools.connector_draft import ConnectorDraftBox, connector_draft_tool, parse_connector_draft
 from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -14,7 +22,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from cowork.api.v1.endpoints.connectors import connections as connections_endpoints
 from cowork.api.v1.endpoints.connectors.custom import delete_custom_connector, update_custom_connector
 from cowork.api.v1.endpoints.connectors.custom import router as custom_router
-from cowork.api.v1.permissions import AuthenticatedOrgAdmin
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin
 from cowork.api.v1.route_walker import declared_permissions
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, get_scoped_session
@@ -23,10 +31,15 @@ from cowork.principal import ORG_MANAGE_ROLE, Principal, get_principal
 from cowork.schemas.connectors import CustomConnectorUpdate
 from cowork.server import create_app
 from cowork.services.connectors.catalog import ConnectorCatalog
+from cowork.services.connectors.custom_connectors import (
+    CustomConnectorService,
+    UnstorableFormError,
+)
 from tests._fakes import FakeRequest
 
-ORG_A = TenantScope(org_mode=True, org_id="org-a", user_id="admin-a")
-ORG_B = TenantScope(org_mode=True, org_id="org-b", user_id="admin-b")
+ORG_A = TenantScope(org_mode=True, org_id="org-a", user_id="builder-a")
+ORG_A_OTHER = TenantScope(org_mode=True, org_id="org-a", user_id="member-a2")
+ORG_B = TenantScope(org_mode=True, org_id="org-b", user_id="member-b")
 
 FORM = {
     "form_id": "httpbin-connector",
@@ -41,7 +54,10 @@ def engine():
     SQLModel.metadata.create_all(eng)
     with Session(eng) as session:
         session.add(CustomConnector(connector_id="httpbin", label="httpbin", description="", spec=FORM))
-        session.add(CustomConnector(connector_id="httpbin", label="httpbin", description="", spec=FORM, org_id="org-a"))
+        session.add(CustomConnector(
+            connector_id="httpbin", label="httpbin", description="", spec=FORM,
+            org_id="org-a", created_by=ORG_A.user_id,
+        ))
         session.commit()
     return eng
 
@@ -169,61 +185,244 @@ async def test_delete_removes_the_definition_but_keeps_connections(engine, tmp_p
     assert after.custom is False
 
 
-def test_another_orgs_connector_is_a_404(engine):
+@pytest.mark.parametrize("scope", [ORG_B, ORG_A_OTHER], ids=["another org", "another member"])
+def test_someone_elses_connector_is_a_404(engine, scope):
     with pytest.raises(HTTPException) as exc:
-        update_custom_connector("httpbin", CustomConnectorUpdate(featured=False), _scoped(engine, ORG_B))
+        update_custom_connector("httpbin", CustomConnectorUpdate(label="Mine now"), _scoped(engine, scope))
     assert exc.value.status_code == 404
     with pytest.raises(HTTPException) as exc:
-        delete_custom_connector("httpbin", _scoped(engine, ORG_B))
+        delete_custom_connector("httpbin", _scoped(engine, scope))
     assert exc.value.status_code == 404
+    assert ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("httpbin").label == "httpbin"
 
 
-def test_an_org_admin_changes_only_their_own_orgs_row(engine):
+def test_the_builder_renames_only_their_own_row(engine):
     update_custom_connector("httpbin", CustomConnectorUpdate(label="Org copy"), _scoped(engine, ORG_A))
 
     assert ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("httpbin").label == "Org copy"
     assert ConnectorCatalog(_scoped(engine)).get_connector("httpbin").label == "httpbin"
 
 
-def test_org_mode_keeps_no_usage_notes_from_a_new_form(engine):
-    new_form = {**FORM, "connector": {"usage_notes": "Send the team token in X-Team-Key."}}
-
-    update_custom_connector("httpbin", CustomConnectorUpdate(spec=new_form), _scoped(engine, ORG_A))
+@pytest.mark.parametrize("body", [
+    {"spec": {**FORM, "connector": {"usage_notes": "Send the team token in X-Team-Key."}}},
+    {"featured": False},
+    {"featured": None},
+    {"label": "Renamed", "spec": FORM},
+], ids=["form", "featured", "featured null", "label with form"])
+def test_org_mode_changes_nothing_but_label_description_and_category(engine, body):
+    with pytest.raises(HTTPException) as exc:
+        update_custom_connector("httpbin", CustomConnectorUpdate.model_validate(body), _scoped(engine, ORG_A))
+    assert exc.value.status_code == 422
 
     with Session(engine) as session:
-        rows = session.exec(select(CustomConnector).where(CustomConnector.org_id == "org-a")).all()
-    assert [r.usage_notes for r in rows] == [None]
+        [row] = session.exec(select(CustomConnector).where(CustomConnector.org_id == "org-a")).all()
+    assert (row.label, row.featured, row.spec, row.usage_notes) == ("httpbin", True, FORM, None)
 
 
-def _org_client(engine, principal) -> TestClient:
+def _org_client(engine, principal, scope) -> TestClient:
     app = FastAPI()
     app.include_router(custom_router, prefix="/custom")
     app.dependency_overrides[get_principal] = lambda: principal
-    app.dependency_overrides[get_scoped_session] = lambda: _scoped(engine, ORG_A)
+    app.dependency_overrides[get_scoped_session] = lambda: _scoped(engine, scope)
     return TestClient(app)
 
 
-def test_a_member_who_is_not_an_admin_gets_a_403_in_org_mode(engine, monkeypatch):
+def test_in_org_mode_the_builder_manages_their_connector_and_no_one_else(engine, monkeypatch):
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
     try:
-        member = Principal(user_id="member-a", org_id="org-a")
-        admin = Principal(user_id="admin-a", org_id="org-a", roles=frozenset({ORG_MANAGE_ROLE}))
+        builder = Principal(user_id=ORG_A.user_id, org_id="org-a")
+        admin = Principal(user_id=ORG_A_OTHER.user_id, org_id="org-a", roles=frozenset({ORG_MANAGE_ROLE}))
 
-        assert _org_client(engine, member).patch("/custom/httpbin", json={"featured": False}).status_code == 403
-        assert _org_client(engine, member).delete("/custom/httpbin").status_code == 403
-        assert _org_client(engine, admin).patch("/custom/httpbin", json={"featured": False}).status_code == 200
+        assert _org_client(engine, admin, ORG_A_OTHER).patch("/custom/httpbin", json={"label": "x"}).status_code == 404
+        assert _org_client(engine, admin, ORG_A_OTHER).delete("/custom/httpbin").status_code == 404
+        renamed = _org_client(engine, builder, ORG_A).patch("/custom/httpbin", json={"label": "Acme"})
+        assert renamed.status_code == 200 and renamed.json()["label"] == "Acme"
+        assert _org_client(engine, builder, ORG_A).delete("/custom/httpbin").status_code == 204
     finally:
         get_app_settings.cache_clear()
 
 
-def test_both_routes_require_an_org_admin():
-    # AuthenticatedOrgAdmin's own 403 for a non-admin is covered in test_permissions.py.
+def test_both_routes_require_an_authenticated_member_not_an_admin():
     routes = [
         r for r in create_app().routes
-        if getattr(r, "path", "").startswith("/api/v1/connectors/custom/")
+        if getattr(r, "path", "").startswith("/api/v1/connectors/custom")
     ]
 
-    assert {tuple(sorted(r.methods)) for r in routes} == {("PATCH",), ("DELETE",)}
+    assert {tuple(sorted(r.methods)) for r in routes} == {("POST",), ("PATCH",), ("DELETE",)}
     for route in routes:
-        assert AuthenticatedOrgAdmin in declared_permissions(route)
+        assert AuthenticatedInOrgMode in declared_permissions(route)
+        assert AuthenticatedOrgAdmin not in declared_permissions(route)
+
+
+def _anton_draft(**overrides) -> dict:
+    """A connector draft exactly as the pod's tool and drain produce it."""
+    box = ConnectorDraftBox()
+    data = {
+        "connector_id": "acme_crm", "label": "Acme CRM", "description": "Contacts and deals.",
+        "category": "CRM", "help_url": "https://docs.acme.example/api-keys",
+        "usage_notes": "Base URL https://api.acme.example/v2. Send Authorization: Bearer <api_key>.",
+        "fields": [
+            {"name": "api_key", "label": "API key", "help": "Settings, then API."},
+            {"name": "region", "label": "Region", "secret": False, "placeholder": "eu"},
+        ],
+        "auth": {"type": "header", "headers": {"Authorization": "Bearer {api_key}", "X-Region": "{region}"}},
+        **overrides,
+    }
+    outcome = asyncio.run(connector_draft_tool(box).handler(None, data))
+    assert outcome.ok, outcome.content
+    [draft] = drain_pending_connectors(SimpleNamespace(_connector_drafts=box))
+    return draft
+
+
+@pytest.fixture()
+def org_tenancy(monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.setenv("COWORK_TURN_CONNECTOR_DRAFTS_ENABLED", "true")
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+def _member(scope) -> Principal:
+    return Principal(user_id=scope.user_id, org_id=scope.org_id)
+
+
+def _org_rows(engine, connector_id="acme_crm") -> list[CustomConnector]:
+    with Session(engine) as session:
+        return session.exec(
+            select(CustomConnector).where(
+                CustomConnector.connector_id == connector_id, CustomConnector.org_id == "org-a",
+            )
+        ).all()
+
+
+class TestSaveConnectorDraft:
+    def test_a_member_saves_a_draft_as_their_own_connector(self, engine, org_tenancy):
+        resp = _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=_anton_draft())
+
+        assert resp.status_code == 200 and resp.json()["id"] == "acme_crm" and resp.json()["custom"] is True
+        [row] = _org_rows(engine)
+        assert row.created_by == ORG_A.user_id
+        assert row.usage_notes.startswith("Base URL")
+        spec = ConnectorCatalog(_scoped(engine, ORG_A)).get_connector("acme_crm")
+        assert [(f.name, f.type, f.secret, f.required) for f in spec.form.fields] == [
+            ("api_key", "password", True, True), ("region", "text", False, True),
+        ]
+        assert spec.form.methods is None
+        assert ConnectorCatalog(_scoped(engine, ORG_A_OTHER)).get_connector("acme_crm") is None
+
+    def test_two_members_keep_the_same_id_and_a_resave_updates_in_place(self, engine, org_tenancy):
+        assert _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=_anton_draft()).status_code == 200
+        other = _org_client(engine, _member(ORG_A_OTHER), ORG_A_OTHER)
+        assert other.post("/custom", json=_anton_draft(label="Acme for me")).status_code == 200
+        again = _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=_anton_draft(label="Acme v2"))
+
+        assert again.status_code == 200
+        assert sorted((r.created_by, r.label) for r in _org_rows(engine)) == [
+            (ORG_A.user_id, "Acme v2"), (ORG_A_OTHER.user_id, "Acme for me"),
+        ]
+
+    @pytest.mark.parametrize("change", [
+        {"label": "sk_live_" + "4eC39HqLyjWDarjtT1zdp7dc"},
+        {"methods": [{"id": "oauth", "oauth": {"auth_url": "https://acme.example/auth"}}]},
+        {"connector_id": "acme_crm\n"},
+        {"fields": []},
+        {"auth": None},
+        {"check": {"path": "/v2/me", "headers": {"Authorization": "Bearer {api_key}"}}},
+    ], ids=["token label", "oauth method", "trailing newline id", "no fields", "no auth", "check headers"])
+    def test_a_draft_outside_the_allowlist_is_a_422_without_the_value(self, engine, org_tenancy, change):
+        resp = _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json={**_anton_draft(), **change})
+
+        assert resp.status_code == 422
+        assert "4eC39HqLyjWDarjtT1zdp7dc" not in resp.text
+        assert _org_rows(engine) == []
+
+    @pytest.mark.parametrize("connector_id", ["postgres", "google_drive"])
+    def test_a_built_in_id_is_a_422(self, engine, org_tenancy, connector_id):
+        draft = {**_anton_draft(), "connector_id": connector_id}
+        resp = _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=draft)
+
+        assert resp.status_code == 422 and "built-in" in resp.text
+        assert _org_rows(engine, connector_id) == []
+
+    def test_with_the_setting_off_there_is_no_save(self, engine, org_tenancy, monkeypatch):
+        monkeypatch.setenv("COWORK_TURN_CONNECTOR_DRAFTS_ENABLED", "false")
+
+        resp = _org_client(engine, _member(ORG_A), ORG_A).post("/custom", json=_anton_draft())
+
+        assert resp.status_code == 404
+        assert _org_rows(engine) == []
+
+    def test_with_the_setting_off_a_member_can_still_change_or_delete_theirs(self, engine, org_tenancy, monkeypatch):
+        """Turning the setting off stops new saves; a member can still remove what they saved."""
+        monkeypatch.setenv("COWORK_TURN_CONNECTOR_DRAFTS_ENABLED", "false")
+        client = _org_client(engine, _member(ORG_A), ORG_A)
+
+        assert client.patch("/custom/httpbin", json={"label": "Acme"}).status_code == 200
+        assert client.delete("/custom/httpbin").status_code == 204
+        assert _org_rows(engine, "httpbin") == []
+
+    def test_outside_org_mode_there_is_no_save(self, engine):
+        app = FastAPI()
+        app.include_router(custom_router, prefix="/custom")
+        app.dependency_overrides[get_scoped_session] = lambda: _scoped(engine)
+
+        assert TestClient(app).post("/custom", json=_anton_draft()).status_code == 404
+
+    def test_a_save_racing_the_same_members_save_updates_their_row(self, engine, monkeypatch):
+        """The insert loses to the other save's row, so it updates that row instead."""
+        service = CustomConnectorService(_scoped(engine, ORG_A))
+        service.save_member_draft(parse_connector_draft(_anton_draft()))
+        real_get = CustomConnectorService.get
+        calls = []
+
+        def get_missing_once(self, connector_id):
+            calls.append(connector_id)
+            return None if len(calls) == 1 else real_get(self, connector_id)
+
+        monkeypatch.setattr(CustomConnectorService, "get", get_missing_once)
+        racing = CustomConnectorService(_scoped(engine, ORG_A))
+        row = racing.save_member_draft(parse_connector_draft(_anton_draft(label="Raced")))
+
+        assert row.label == "Raced" and len(calls) == 2
+        assert [r.label for r in _org_rows(engine)] == ["Raced"]
+
+
+    @pytest.mark.parametrize("scope", [LOCAL_SCOPE, TenantScope(org_mode=True, org_id="org-a")],
+                             ids=["local", "org scope with no user"])
+    def test_the_service_saves_drafts_only_for_an_org_member(self, engine, scope):
+        with pytest.raises(UnstorableFormError):
+            CustomConnectorService(_scoped(engine, scope)).save_member_draft(parse_connector_draft(_anton_draft()))
+        assert _org_rows(engine) == []
+
+
+class TestOrgModeEditUsesTheDraftRules:
+    @pytest.mark.parametrize("body", [
+        {"label": "ghp_" + "16C7e42F292c6912E7710c838347Ae178B4a"},
+        {"description": "d" * 301},
+        {"category": "AKIA" + "IOSFODNN7EXAMPLE"},
+        {"label": "Acme\nCRM"},
+    ], ids=["token label", "long description", "token category", "newline label"])
+    def test_a_text_outside_the_draft_rules_is_a_422(self, engine, org_tenancy, body):
+        resp = _org_client(engine, _member(ORG_A), ORG_A).patch("/custom/httpbin", json=body)
+
+        assert resp.status_code == 422
+        for value in body.values():
+            assert value not in resp.text
+        assert [r.label for r in _org_rows(engine, "httpbin")] == ["httpbin"]
+
+    def test_an_empty_label_is_a_422(self, engine, org_tenancy):
+        resp = _org_client(engine, _member(ORG_A), ORG_A).patch("/custom/httpbin", json={"label": "  "})
+
+        assert resp.status_code == 422 and "label is required" in resp.text
+        assert [r.label for r in _org_rows(engine, "httpbin")] == ["httpbin"]
+
+    def test_a_plain_rename_and_recategorize_pass(self, engine, org_tenancy):
+        resp = _org_client(engine, _member(ORG_A), ORG_A).patch(
+            "/custom/httpbin", json={"label": "  Acme  ", "description": " Contacts. ", "category": None},
+        )
+
+        assert resp.status_code == 200 and resp.json()["label"] == "Acme"
+        [row] = _org_rows(engine, "httpbin")
+        assert (row.label, row.description, row.category) == ("Acme", "Contacts.", None)

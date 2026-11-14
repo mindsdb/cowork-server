@@ -1118,14 +1118,17 @@ def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monk
     assert "reports" in names and "untitled-project" in names
 
 
-def _insert_custom_connector(connection, *, connector_id, org_id=None):
+def _insert_custom_connector(connection, *, connector_id, org_id=None, created_by=None):
     connection.execute(
         text(
             "insert into custom_connectors "
-            "(id, connector_id, label, description, spec, featured, org_id) "
-            "values (:id, :connector_id, :label, '', '{}', 1, :org_id)"
+            "(id, connector_id, label, description, spec, featured, org_id, created_by) "
+            "values (:id, :connector_id, :label, '', '{}', 1, :org_id, :created_by)"
         ),
-        {"id": uuid.uuid4().hex, "connector_id": connector_id, "label": connector_id, "org_id": org_id},
+        {
+            "id": uuid.uuid4().hex, "connector_id": connector_id, "label": connector_id,
+            "org_id": org_id, "created_by": created_by,
+        },
     )
 
 
@@ -1156,17 +1159,63 @@ def test_custom_connector_id_is_unique_per_scope(tmp_path, monkeypatch):
 
     with engine.begin() as connection:
         _insert_custom_connector(connection, connector_id="httpbin")
-        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
-        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-b")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a", created_by="user-1")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-b", created_by="user-1")
 
     with pytest.raises(IntegrityError):
         with engine.begin() as connection:
             _insert_custom_connector(connection, connector_id="httpbin")
     with pytest.raises(IntegrityError):
         with engine.begin() as connection:
-            _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
+            _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a", created_by="user-1")
 
 
+#: The revision before org custom connectors became one per builder.
+PRIOR_TO_PER_BUILDER = "1d5fe417cc0a"
+
+
+def test_custom_connector_id_is_unique_per_builder_in_an_org(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    uri = _sqlite_uri(tmp_path / "custom_connectors_builder.db")
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-2")
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+
+
+def test_custom_connectors_per_builder_upgrade_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db = tmp_path / "custom_connectors_per_builder.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, PRIOR_TO_PER_BUILDER)
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+    _upgrade_to(engine, uri, "head")
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-2")
+
+    # Two members share the id, which the one-per-org index cannot hold.
+    with pytest.raises(Exception, match="cannot downgrade custom connectors per builder"):
+        _downgrade_to(engine, uri, PRIOR_TO_PER_BUILDER)
+    assert _alembic_version(db) == expected_head()
+
+    with engine.begin() as connection:
+        connection.execute(text("delete from custom_connectors where created_by = 'user-2'"))
+    _downgrade_to(engine, uri, PRIOR_TO_PER_BUILDER)
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-2")
 def _insert_queued_repair(connection, *, conversation_id: str, org_id=None):
     connection.execute(
         text(

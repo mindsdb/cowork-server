@@ -66,8 +66,8 @@ async def list_connector_specs(
     exist. The default stays filtered so existing callers are unaffected.
 
     Desktop also lists the install's custom connectors. Org mode does not
-    yet: no org definitions are written, and auth's catalogue would file
-    them as desktop-only.
+    yet: a member's own definitions are listed once they can be connected
+    there, and auth's catalogue would file them as desktop-only.
     """
     if not scope.org_mode:
         return await run_db(lambda session: ConnectorCatalog(session).list_connectors(), scope=scope)
