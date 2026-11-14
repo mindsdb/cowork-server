@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import dataclasses
 import json
 import socket
 from urllib.parse import quote, quote_plus
@@ -17,7 +16,7 @@ from anton.core.tools.connector_draft import parse_connector_draft
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from cowork.api.v1.endpoints.connectors import custom as custom_endpoints
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, get_scoped_session, get_tenant_scope
@@ -764,7 +763,7 @@ def test_an_empty_or_blank_optional_value_counts_as_skipped(engine, world, monke
     assert "api_key" not in json.loads(world["auth"][1].content)["fields"]
 
 
-@pytest.mark.parametrize("status", [401, 403, 404, 500])
+@pytest.mark.parametrize("status", [302, 304, 401, 403, 404, 500])
 def test_a_failed_public_check_has_its_own_code_and_no_excerpt(engine, world, monkeypatch, status):
     world["unprotected"] = (status, b'{"error":"planted answer text"}')
 
@@ -794,14 +793,26 @@ def test_a_skipped_basic_password_beside_a_required_secret_login_is_a_keyed_conn
     assert _auth_payloads(world) == [reduced] * 2
 
 
-def test_a_keyless_connect_without_a_public_path_is_a_409_not_an_error(engine, world, monkeypatch):
-    real = custom_connect.parse_stored
-    monkeypatch.setattr(
-        custom_connect, "parse_stored", lambda row: dataclasses.replace(real(row), public_path=None)
-    )
+def test_a_bad_request_without_the_key_proves_it_when_a_skipped_password_leaves_the_login_the_one_value(
+    engine, world, monkeypatch
+):
+    world["unprotected"] = (400, b'{"error":"no sign-in"}')
+
+    res = _connect(_client(engine, monkeypatch), "optional_password_api", values={"login": SECRET})
+
+    assert res.status_code == 201, res.text
+    assert [request.url.raw_path for request in world["provider"]] == [b"/v1/me", b"/v1/me"]
+
+
+def test_a_template_with_an_optional_key_and_no_public_path_cannot_connect(engine, world, monkeypatch):
+    session = Session(engine)
+    row = session.exec(select(CustomConnector).where(CustomConnector.connector_id == "optional_key_api")).one()
+    row.connection_check = {"path": "/v1/me"}
+    session.add(row)
+    session.commit()
 
     res = _connect(_client(engine, monkeypatch), "optional_key_api", values={"account": "a1"})
 
     assert res.status_code == 409
     assert res.json()["detail"]["code"] == "no_check"
-    assert not world["provider"] and len(world["auth"]) == 1
+    assert not world["provider"] and not world["auth"]

@@ -361,14 +361,14 @@ def custom_usage_prefix(
 
     Input: the connector id, its connections' ids in this turn, and its
     template's field names (empty when unknown) and which of them a member
-    may leave unset, listed as "<name> (optional, may not be set)". Output: how to call it with
+    may leave unset, listed as "<name> (optional; this connection may not hold it)". Output: how to call it with
     ``call_minds_api``, that no credential value reaches the turn, and the
     path rules. Built from ids and names only, never a value. No side effects.
     """
     ids = ", ".join(str(connection_id) for connection_id in connection_ids)
     noun = "connection" if len(connection_ids) == 1 else "connections"
     call_id = str(connection_ids[0]) if len(connection_ids) == 1 else "connection_id"
-    listed = [f"{name} (optional, may not be set)" if name in optional_names else name for name in field_names]
+    listed = [f"{name} (optional; this connection may not hold it)" if name in optional_names else name for name in field_names]
     fields = f" Fields: {', '.join(listed)}." if listed else ""
     return (
         f"Custom {noun} {ids} ({connector_id}).{fields} No credential value reaches this turn: "

@@ -317,7 +317,7 @@ async def test_an_optional_field_is_listed_as_one_a_member_may_leave_unset(turn,
 
     params, _ = await _run(turn)
 
-    expected = _ACME_PREFIX.replace("Fields: api_key.", "Fields: api_key (optional, may not be set).")
+    expected = _ACME_PREFIX.replace("Fields: api_key.", "Fields: api_key (optional; this connection may not hold it).")
     assert params["connectors"]["acme_crm"] == {"usage_notes": f"{expected}\n\nCall /v1/me first."}
 
 
