@@ -176,9 +176,11 @@ async def guarded_origin(tmp_path, monkeypatch):
 async def test_a_query_check_through_the_real_transport_leaves_the_key_in_no_record(guarded_origin, records):
     template = custom_connect.StoredTemplate(
         path="/v1/status", auth={"type": "query", "params": {"access_key": "{access_key}"}},
+        secrets=frozenset({"access_key"}),
     )
 
-    failure = await custom_connect.run_check(guarded_origin, template, {"access_key": ENCODED_SECRET})
+    values = {"access_key": ENCODED_SECRET}
+    failure = await custom_connect.run_check(guarded_origin, template, values, template.auth)
     logging.getLogger("httpcore.http11").debug("library records pass again after the check")
 
     assert (failure.code, failure.provider_status) == ("provider_error", 301)
