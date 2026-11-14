@@ -33,11 +33,35 @@ def test_migration_env_map_is_derived_from_the_canonical_alias_map():
     assert _ENV_TO_SETTING is ENV_ALIAS_TO_SETTING
 
 
-def test_show_dots_default_is_true():
-    # The client (App.jsx) had seeded show_dots False while the model default
-    # is True — the exact drift ENG-1125 removes. Pin the canonical value so a
-    # future flip has to be deliberate.
-    assert UserSettings.model_fields["show_dots"].get_default() is True
+def test_show_dots_default_is_false():
+    # The animated background is off unless a person turns it on; the app
+    # reads a missing value as off too. Pin the canonical value so a future
+    # flip has to be deliberate.
+    assert UserSettings.model_fields["show_dots"].get_default() is False
+
+
+def test_the_show_dots_default_fills_in_only_a_missing_value():
+    """A stored explicit choice is kept either way; only a person who never
+    set it gets the default, off."""
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, SQLModel, create_engine
+
+    from cowork.services.settings import SettingService
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        service = SettingService(session)
+        assert service.load().show_dots is False
+        assert service.get_setting("show_dots").is_set is False
+
+        service.upsert_setting("show_dots", "true")
+        assert service.load().show_dots is True
+        assert service.get_setting("show_dots").is_set is True
+
+        service.upsert_setting("show_dots", "false")
+        assert service.load().show_dots is False
+        assert service.get_setting("show_dots").is_set is True
 
 
 def test_show_figure_sources_defaults_to_true():
