@@ -182,7 +182,7 @@ def test_enforce_mode_boots_quietly(monkeypatch, caplog):
     assert [r.message for r in caplog.records if "identity_enforce" in r.message] == []
 
 
-# ── the routes only the desktop app calls that hand out or write secrets ──
+# ── the six desktop-only routes that answered a loopback caller in org mode ──
 
 #: What a forged request carries. Inside the pod uvicorn reads only
 #: X-Forwarded-For. CF-Connecting-IP and X-Forwarded-Host are what an
@@ -278,6 +278,23 @@ def test_a_forwarded_loopback_address_on_a_pod_socket_is_not_local(
     assert (resp.status_code, resp.json()["detail"]) == (403, "local requests only")
 
 
+@pytest.fixture()
+def stored_anthropic_key():
+    """A provider key stored the way Settings stores it, removed afterwards."""
+    from cowork.db.session import get_open_session
+    from cowork.services.settings import SettingService
+
+    value = "sk-ant-desktop-reveal-not-real"
+    session = get_open_session()
+    try:
+        service = SettingService(session)
+        service.upsert_setting("anthropic_api_key", value)
+        yield value
+        service.delete_setting("anthropic_api_key")
+    finally:
+        session.close()
+
+
 @pytest.mark.parametrize("method,path,body,desktop_status", SECRET_ROUTES)
 def test_the_desktop_still_reaches_the_secret_routes(method, path, body, desktop_status):
     """The other direction: the desktop sidecar runs local tenancy on
@@ -290,9 +307,9 @@ def test_the_desktop_still_reaches_the_secret_routes(method, path, body, desktop
     assert resp.json().get("detail") not in GUARD_DETAILS
 
 
-def test_the_desktop_renderer_still_reveals_a_key():
-    """The renderer calls reveal-key with its own Origin, which the default
-    allowed origins list."""
+def test_the_desktop_renderer_still_reveals_a_stored_key(stored_anthropic_key):
+    """Settings' reveal button: the renderer calls reveal-key with its own
+    Origin, which the default allowed origins list, and gets the stored key."""
     client = TestClient(create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321))
 
     resp = client.get(
@@ -300,4 +317,4 @@ def test_the_desktop_renderer_still_reveals_a_key():
     )
 
     assert resp.status_code == 200, resp.text
-    assert "value" in resp.json()
+    assert resp.json() == {"value": stored_anthropic_key}

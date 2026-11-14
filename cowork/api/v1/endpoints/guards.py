@@ -43,8 +43,9 @@ def require_local(request: Request) -> None:
     that binds 0.0.0.0, must not answer them to a remote peer. Hosted-web
     builds call ``/settings/raw`` on boot and treat the 403 as expected.
     """
+    # A dual-stack socket reports an IPv4 loopback peer in its mapped form.
     client = request.client.host if request.client else ""
-    if client not in {"127.0.0.1", "::1"}:
+    if client not in {"127.0.0.1", "::1", "::ffff:127.0.0.1"}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="local requests only")
 
     # The peer address alone is forgeable wherever uvicorn trusts a proxy: the

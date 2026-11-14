@@ -162,7 +162,7 @@ The policy admits connections on ports 9010 and 9011 from pods in the `infrastru
 
 uvicorn runs with `--forwarded-allow-ips '*'` (the `Dockerfile` CMD), so it takes `X-Forwarded-For` and `X-Forwarded-Proto` from every peer above and rewrites the client address from them. A controller fills `X-Forwarded-For` from what its own caller sent when that caller sits inside the network it trusts, so the client address the app sees is not a credential. `require_local` (`cowork/api/v1/endpoints/guards.py`) decides on the local address of the socket the request landed on, which no header changes. A request through the ingress lands on the pod's own address, so it is refused there.
 
-These routes are only for the desktop app and hand out or write secrets. Each declares `LoopbackDesktopOnly`, so MindsHub mode refuses it whatever the request carries:
+These six routes hand out or write secrets, and only the desktop app calls them. Each declares `LoopbackDesktopOnly`, so MindsHub mode refuses it whatever the request carries:
 
 | Route | What it does on the desktop |
 |-------|-----------------------------|
@@ -173,7 +173,7 @@ These routes are only for the desktop app and hand out or write secrets. Each de
 | `GET /api/v1/connectors/oauth/{engine}/credentials` | returns a built-in OAuth client ID and secret |
 | `POST /api/v1/connectors/oauth/{engine}/mcp/identity` | resolves the account behind an MCP access token |
 
-A caller that is not on loopback gets 403 `local requests only`. A caller that is, from inside the pod or through a port-forward, gets 403 `not available in org deployments`.
+Other desktop-only routes that hand out or write secrets declare it too, such as `GET` and `POST /api/v1/settings/raw` and the `/api/v1/runtime-credential` routes. A caller that is not on loopback gets 403 `local requests only`. A caller that is, from inside the pod or through a port-forward, gets 403 `not available in org deployments`.
 
 To prove the policy after a rollout, run the forged-header curl from a pod in another namespace and expect a timeout. A port-forward can't observe the policy, for the reason in the `networkPolicy` block of `values.yaml`.
 

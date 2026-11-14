@@ -81,16 +81,21 @@ def test_require_local_rejects_non_loopback(host):
 
 
 @pytest.mark.parametrize(
-    "server",
-    [("127.0.0.1", 26866), ("::1", 26866), ("::ffff:127.0.0.1", 26866), ["localhost", 80]],
+    "peer,server",
+    [
+        ("127.0.0.1", ("127.0.0.1", 26866)),
+        ("::1", ("::1", 26866)),
+        ("::ffff:127.0.0.1", ("::ffff:127.0.0.1", 26866)),
+        ("127.0.0.1", ["localhost", 80]),
+    ],
 )
-def test_require_local_allows_a_loopback_socket(server):
-    """The desktop sidecar binds 127.0.0.1. A dual-stack bind reports the same
-    connection as ``::ffff:127.0.0.1``, and Starlette's TestClient hands the
-    server over as a list."""
+def test_require_local_allows_a_loopback_socket(peer, server):
+    """The desktop sidecar binds 127.0.0.1. A dual-stack bind reports both ends
+    of the same connection as ``::ffff:127.0.0.1``, and Starlette's TestClient
+    hands the server over as a list."""
     from cowork.api.v1.endpoints.guards import require_local
 
-    require_local(_request("127.0.0.1", headers={"host": "localhost:26866"}, server=server))
+    require_local(_request(peer, headers={"host": "localhost:26866"}, server=server))
 
 
 @pytest.mark.parametrize(
