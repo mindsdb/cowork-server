@@ -29,6 +29,8 @@ from cowork.turnqueue import producer
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 
 
+from cowork.turnqueue.preview_checks import ARTIFACT_CHECK_STEP, CHECK_ID, queue_check_result  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 
@@ -136,6 +138,13 @@ async def remote_turn_events(
     # compacted step comes for both, its compaction reply for a summary. Both
     # arrive before the history frame.
     compacted = False
+    # A channel turn runs for its organization, with no member, and in org
+    # tenancy neither memory tier takes an entry without one, to save or to
+    # remove: apply_turn_memory and apply_turn_forget refuse project entries
+    # that carry no trusted member, and the person's tier (GlobalMemoryStore)
+    # needs a user. Outside org tenancy the turn changes memory with no
+    # principal.
+    saves_memory = not scope.org_mode
 
     try:
         async for kind, data in stream_remote_replies(
@@ -149,6 +158,9 @@ async def remote_turn_events(
             workspace=inputs.workspace,
             started_at=inputs.started_at,
             skills=skills,
+            # False when the save below drops every memory change the pod
+            # sends, so its memory tools say so.
+            memory_writable=inputs.memory_writable and saves_memory,
             correlation_id=correlation_id,
             llm=llm,
         ):
@@ -159,29 +171,33 @@ async def remote_turn_events(
             elif kind == "turn_step":
                 if data.get("step") == "compacted":
                     compacted = True
+                if data.get("step") == ARTIFACT_CHECK_STEP:
+                    # No app watches a channel turn, so no preview can answer:
+                    # say so at once rather than leave the pod to time out.
+                    check_id = data.get("check_id")
+                    if isinstance(check_id, str) and CHECK_ID.fullmatch(check_id) and correlation_id:
+                        try:
+                            await queue_check_result(correlation_id=correlation_id, check_id=check_id, body=None)
+                        except Exception:
+                            logger.warning("Could not answer a channel turn's preview check", exc_info=True)
+                    continue
                 for event in step_stream_events(data):
                     yield event
-            elif kind == "turn_memory":
+            elif kind in ("turn_memory", "turn_memory_forget"):
                 entries = data.get("entries") or []
-                if entries and scope.org_mode:
-                    # A channel turn runs for its organization, with no member,
-                    # and in org tenancy neither memory tier takes an entry
-                    # without one: apply_turn_memory drops project entries that
-                    # carry no trusted member, and the person's tier
-                    # (GlobalMemoryStore) needs a user.
+                if entries and not saves_memory:
                     logger.info(
                         "channel turn memory not saved: an organization's channel turn has no member",
                         extra=log_context(request_id=correlation_id, conversation_id=conv_id),
                     )
                 else:
-                    # Outside org tenancy the turn writes memory with no
-                    # principal.
                     await save_turn_memory(
                         conv_id=conv_id,
                         entries=entries,
                         principal=None,
                         scope=scope,
                         request_id=correlation_id,
+                        forget=kind == "turn_memory_forget",
                     )
             elif kind == "turn_history":
                 history = remote_turn_history(pod_rows=data.get("rows"), compacted=compacted)
@@ -243,6 +259,7 @@ async def remote_turn_events(
                     completed_cleanly=completed_cleanly,
                     touched=pod_touched,
                     repairs=repairs,
+                    summaries=_summaries(turn_rows, input_text),
                 ),
                 record=TurnEndRecord(
                     conversation_id=conv_id, project_id=artifacts.project_id, touched=tuple(sorted(pod_touched or ())),
@@ -269,6 +286,19 @@ async def remote_turn_events(
         )
 
 
+def _summaries(turn_rows: list, input_text: str):
+    """The revision labels' sources a channel turn has: the editor's
+    summaries in the pod's tool rows and the request. Its reply is not kept
+    here, so a turn without the editor is labelled by its request."""
+    from cowork.services.revision_summaries import summaries_from_messages
+
+    try:
+        return summaries_from_messages(turn_rows, reply="", request=input_text)
+    except Exception:
+        logger.warning("Could not read the turn's edits for the revision labels", exc_info=True)
+        return None
+
+
 async def _record_turn_artifacts(
     artifacts: _RemoteArtifactsDir,
     *,
@@ -279,6 +309,7 @@ async def _record_turn_artifacts(
     completed_cleanly: bool,
     touched: set[str] | None = None,
     repairs: QueuedRepairs | None = None,
+    summaries=None,
 ) -> ArtifactChanges:
     """What the turn did to the project's artifacts. The folders it created
     are indexed as this conversation's (and, in org mode, its creator's), in
@@ -326,6 +357,8 @@ async def _record_turn_artifacts(
                 tracked_edits=touched,
                 completed_cleanly=completed_cleanly,
                 repair_slugs=repairs.slugs if repairs is not None else None,
+                scope=scope,
+                summaries=summaries,
             ),
             scope=scope,
             deadline=False,

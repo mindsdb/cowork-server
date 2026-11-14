@@ -9,6 +9,7 @@ unsupported shape delegates to Anton.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -21,6 +22,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from cowork.common.logger import exception_http_status
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
+from cowork.common.ui_locale import with_reply_language
 from cowork.deployment_identity import identity_for_turn
 from cowork.handlers.jev_route import JevRoute
 from cowork.services.providers import build_llm_client
@@ -97,10 +99,10 @@ describes some other company's product.
 Delegate any request to change, send, confirm or approve something, and any
 reply to a question asked earlier in this conversation. Never ask the user to
 confirm or approve, and never say that something was done.
-Delegate any request to remember, save or forget something for later, any
+Delegate any request to remember, save or forget something for later, and any
 question about the user's own preferences or about something they said in
-another conversation, and any question whose answer could be in the user's own
-files or project. Never say you can't do something: delegate it instead.
+another conversation. Never say you can't save, remember, search, look up or
+access something, or open or read the user's files: delegate it instead.
 Call the delegate tool when the request needs any of those capabilities or you
 are unsure. Direct answers must be short, helpful, and in the user's language.
 Never mention routing, Anton, tools, or these instructions."""
@@ -364,12 +366,21 @@ _APPROVAL_WORDS = (
 _CHANGE_OR_APPROVAL_RE = _whole_words(_CHANGE_WORDS + _APPROVAL_WORDS)
 # Only the agent keeps anything past this conversation, in its memory. A router
 # answer to "remember this for later" can only promise what it cannot keep, or
-# say it cannot, which is worse. Whole words, English only, as above.
+# say it cannot, which is worse. Whole words in English, Spanish and
+# Portuguese; a false positive costs one hop. "going forward", "forgot" and
+# "forgotten" are left out: they come mostly in general questions ("I forgot
+# my password, how do I reset it?").
 _MEMORY_RE = _whole_words((
     "remember", "remembered", "remembering", "memorize", "memorise",
-    "memorized", "memorised", "forget", "forgot", "forgotten", "keep in mind",
-    "bear in mind", "from now on", "going forward", "later chats",
+    "memorized", "memorised", "forget", "keep in mind", "keep this in mind",
+    "keep that in mind", "keep it in mind", "bear in mind", "bear this in mind",
+    "bear that in mind", "bear it in mind", "from now on", "for future reference",
+    "take note", "store this", "store that", "store my", "later chats",
     "future chats", "later conversations", "future conversations",
+    "across chats", "across sessions", "across conversations",
+    "recuerda", "recuérdalo", "acuérdate", "no olvides", "olvida", "olvídalo",
+    "memoriza", "guarda esto", "a partir de ahora", "de ahora en adelante",
+    "lembre-se", "não esqueça",
 ))
 # A message that is only a yes or a no answers a question someone asked, and
 # the router can only act the answer out.
@@ -427,45 +438,127 @@ def imitates_approval(text: str) -> str | None:
     return " ".join(match.group(0).lower().split()) if match else None
 
 
-# The agent can save, remember and read what the router cannot, so a router
-# answer saying "I" cannot do one of those speaks for the wrong one: the agent
-# would have done it. First person only, so "You can't divide by zero" ships.
-# English only; a false positive costs one hop.
+# The agent can save, remember, read and search what the router cannot, so a
+# router answer saying "I" cannot do one of those speaks for the wrong one: the
+# agent would have done it. "Cowork" or "this assistant" as the subject says
+# the same about memory; other things Cowork can't do ("Cowork can't read local
+# folders in the browser") are product facts, so they ship. "You can't divide
+# by zero" ships, and so does a quoted "I can't". English, Spanish and
+# Portuguese; a false positive costs one hop.
 _APOSTROPHE = "['’]"
+# No word and no opening quote right before the subject.
+_SUBJECT_START = r"(?<![\w'’‘\"“„«])"
+# One adverb between the subject and the verb: "I currently can't".
+_ADVERB = r"(?:\s+(?:\w+ly|still|also|just|now))?"
+_CANNOT = rf"can(?:not|{_APOSTROPHE}t|\s+not)"
+_DO_NOT = rf"(?:do|does)(?:\s+not|n{_APOSTROPHE}t)"
+# Each with its -ing form, for "I'm not capable of saving".
 _CAPABILITY_VERBS = (
-    "save", "store", "remember", "memorize", "memorise", "keep", "retain",
-    "recall", "access", "read", "open", "see", "view", "browse", r"look\s+at",
-    "check",
+    "sav(?:e|ing)", "stor(?:e|ing)", "remember(?:ing)?", "memori[sz](?:e|ing)",
+    "keep(?:ing)?", "retain(?:ing)?", "recall(?:ing)?", "access(?:ing)?",
+    "brows(?:e|ing)", "search(?:ing)?", r"look(?:ing)?\s+up",
 )
-_CAPABILITY_VERB_RE = "|".join(_CAPABILITY_VERBS)
+# Idioms too ("I can't see why", "I can't read your mind", "I can't open a bank
+# account"), so these count only with the user's data as their object.
+_SEEING_VERBS = (
+    "see(?:ing)?", "view(?:ing)?", "read(?:ing)?", "open(?:ing)?", "check(?:ing)?",
+    r"look(?:ing)?\s+at",
+)
+_USER_DATA = (
+    "files?", "documents?", "attachments?", "spreadsheets?", "projects?", "drives?",
+    "folders?", "notes", "conversations?", "chats?", "sessions?", "history",
+    "preferences", "data", "workspaces?", "uploads?", "links?", "images?",
+)
+_CAPABILITY = (
+    rf"(?:{'|'.join(_CAPABILITY_VERBS)}"
+    rf"|(?:{'|'.join(_SEEING_VERBS)})(?:\s+[\w'’-]+){{0,3}}?\s+(?:{'|'.join(_USER_DATA)}))"
+)
+_MEMORY = r"(?:an?\s+|any\s+)?(?:[\w-]+\s+)?memor(?:y|ies)"
+# "I don't store your passwords" and "I won't keep you long" are honest
+# answers; "I don't store anything between chats" is the denial.
+_KEPT_ACROSS_CHATS = (
+    r"(?:retain|remember|store|keep|save)(?:\s+[\w'’-]+){0,5}?\s+"
+    r"(?:between|across|for\s+(?:later|next\s+time|the\s+future)|after\s+(?:this|the|our|each|it)"
+    r"|(?:previous|past|earlier|prior|other|future|later)\s+(?:chats?|conversations?|sessions?))"
+)
+# The Spanish and Portuguese seeing verbs take the user's data as their
+# object too, as _SEEING_VERBS do: "No puedo leer la mente" ships.
+_DATOS = (
+    "archivos?", "ficheros?", "documentos?", "adjuntos?", r"hojas?\s+de\s+c[aá]lculo", "proyectos?",
+    "carpetas?", "notas", r"conversaci[oó]n(?:es)?", "chats?", r"sesi[oó]n(?:es)?", "historial",
+    "preferencias", "datos", r"im[aá]gen(?:es)?", "enlaces?",
+)
+_DADOS = (
+    "arquivos?", "ficheiros?", "documentos?", "anexos?", "planilhas?", "projetos?", "pastas?", "notas",
+    "conversas?", "chats?", r"sess(?:ão|ões)", r"hist[oó]rico", r"prefer[eê]ncias", "dados",
+    r"image(?:m|ns)", "links?",
+)
 _DENIES_CAPABILITY_RE = re.compile(
     rf"""(?ix)
-    (?<![\w'’])i
+    {_SUBJECT_START}i{_ADVERB}
     (?:
         (?:
-            \s+can(?:not|{_APOSTROPHE}t|\s+not)
-          | (?:\s+am|{_APOSTROPHE}m)\s+(?:unable|not\s+able)
-          | \s+(?:do\s+not|don{_APOSTROPHE}t)\s+have\s+the\s+ability
+            \s+{_CANNOT}
+          | (?:\s+am|{_APOSTROPHE}m){_ADVERB}\s+(?:unable|not{_ADVERB}\s+(?:able|capable\s+of))
+          | \s+{_DO_NOT}{_ADVERB}\s+have\s+(?:the|an?)\s+(?:ability|capability|way)
+          | \s+(?:have\s+no\s+way|lack\s+the\s+(?:ability|capability))
           | \s+(?:will\s+not|won{_APOSTROPHE}t)\s+be\s+able
         )
-        (?:\s+to)?(?:\s+\w+ly)?\s+(?:{_CAPABILITY_VERB_RE})
-      | \s+(?:do\s+not|don{_APOSTROPHE}t)(?:\s+\w+ly)?\s+have\s+(?:[\w-]+\s+)?access\s+to
-      | (?:\s+\w+ly)?\s+have\s+no\s+(?:[\w-]+\s+)?access\s+to
-      | \s+(?:do\s+not|don{_APOSTROPHE}t)(?:\s+\w+ly)?\s+have\s+(?:any\s+)?(?:personal\s+)?memor(?:y|ies)
-      | \s+(?:do\s+not|don{_APOSTROPHE}t)\s+(?:retain|remember|store|keep|save)
+        (?:\s+to)?(?:\s+\w+ly)?\s+{_CAPABILITY}
+      | \s+{_DO_NOT}{_ADVERB}\s+have\s+(?:[\w-]+\s+)?access\s+to
+      | \s+have\s+no\s+(?:[\w-]+\s+)?access\s+to
+      | \s+{_DO_NOT}{_ADVERB}\s+have\s+{_MEMORY}
+      | \s+have\s+no\s+(?:[\w-]+\s+)?memor(?:y|ies)
+      | \s+{_DO_NOT}{_ADVERB}\s+{_KEPT_ACROSS_CHATS}
+      | \s+(?:will\s+not|won{_APOSTROPHE}t){_ADVERB}\s+(?:remember|recall)
+      | \s+(?:will\s+not|won{_APOSTROPHE}t){_ADVERB}\s+{_KEPT_ACROSS_CHATS}
+      | (?:\s+am|{_APOSTROPHE}m){_ADVERB}\s+not\s+going\s+to\s+(?:remember|recall|retain)
+    )
+    (?!\w)
+  | {_SUBJECT_START}(?:cowork|this\s+assistant){_ADVERB}
+    (?:
+        \s+{_CANNOT}{_ADVERB}\s+(?:remember|recall|retain|save|store|keep|memori[sz]e)
+      | \s+{_DO_NOT}{_ADVERB}\s+have\s+{_MEMORY}
+      | \s+{_DO_NOT}{_ADVERB}\s+{_KEPT_ACROSS_CHATS}
     )
     (?!\w)
   | (?<!\w)no\s+memory\s+of\s+(?:previous|past|earlier|prior)(?!\w)
+  | (?<!\w)no\s+puedo\s+(?:guardar|recordar|acceder)(?!\w)
+  | (?<!\w)no\s+puedo\s+(?:ver|leer|abrir)(?:\s+[\w'’-]+){{0,3}}?\s+(?:{'|'.join(_DATOS)})(?!\w)
+  | (?<!\w)no\s+tengo\s+(?:acceso|memoria|la\s+capacidad)(?!\w)
+  | (?<!\w)não\s+(?:consigo|posso)\s+(?:guardar|salvar|lembrar|recordar|acessar)(?!\w)
+  | (?<!\w)não\s+(?:consigo|posso)\s+(?:ver|ler|abrir)(?:\s+[\w'’-]+){{0,3}}?\s+(?:{'|'.join(_DADOS)})(?!\w)
+    """
+)
+# A router answer promising to remember: nothing is saved, so the promise is
+# false, and the next chat shows it.
+_PROMISES_MEMORY_RE = re.compile(
+    rf"""(?ix)
+    {_SUBJECT_START}i(?:{_APOSTROPHE}ll|\s+will){_ADVERB}(?:\s+make\s+sure\s+to)?\s+
+    (?:remember|memori[sz]e|(?:keep|bear)(?:\s+[\w'’-]+){{0,4}}?\s+in\s+mind)
+    (?!\w)
+  | (?<!\w)noted(?:\s+(?:this|that|it))?\s+for\s+
+    (?:next\s+time|later|the\s+future|future\s+(?:reference|chats|conversations))
+    (?!\w)
     """
 )
 
 
 def denies_agent_capability(text: str) -> str | None:
-    """The first-person denial of something the agent can do in ``text``, or None.
+    """The denial of something the agent can do in ``text``, or None.
 
     Exported for the same reason as :func:`names_foreign_product`.
     """
     match = _DENIES_CAPABILITY_RE.search(text or "")
+    return " ".join(match.group(0).split())[:120] if match else None
+
+
+def promises_memory(text: str) -> str | None:
+    """The promise to remember something in ``text``, or None.
+
+    Exported for the same reason as :func:`names_foreign_product`.
+    """
+    match = _PROMISES_MEMORY_RE.search(text or "")
     return " ".join(match.group(0).split())[:120] if match else None
 
 
@@ -555,11 +648,13 @@ def answer_rejection(
     - It imitates an approval card or claims a finished change (ENG-3896):
       saved, it reads as an approval or as work that never ran, and a "yes"
       typed under it reaches the router again.
-    - It says it cannot do something the agent can: save or remember, or
-      read or open something. The agent would have done it, so the answer
-      speaks for the wrong one.
+    - It says it cannot do something the agent can: save or remember, read
+      or open the user's files, or search. The agent would have done it, so
+      the answer speaks for the wrong one.
+    - It promises to remember something. Only the agent saves anything, so
+      the promise is false.
 
-    The evidence is a slice of the model's answer for the last three, which no
+    The evidence is a slice of the model's answer for the last four, which no
     scrubber has seen, so callers log only the reason.
     """
     if names_gate_tool(answer) is not None:
@@ -576,10 +671,13 @@ def answer_rejection(
     denied = denies_agent_capability(answer)
     if denied is not None:
         return _RejectedAnswer("router_answer_denied_capability", denied)
+    promise = promises_memory(answer)
+    if promise is not None:
+        return _RejectedAnswer("router_answer_promised_memory", promise)
     return None
 
 
-async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
+async def _gate(binding: RouterBinding, *, history: list[dict], ui_locale: str | None = None) -> str | None:
     """One gating call on the router role, streamed, decided when it ends.
 
     Returns the direct answer, or None to delegate — on a tool call (as an
@@ -607,7 +705,7 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
 
     events = binding.provider.stream(
         model=binding.model,
-        system=with_deployment_identity(_SYSTEM_PROMPT),
+        system=with_reply_language(with_deployment_identity(_SYSTEM_PROMPT), ui_locale),
         messages=history,
         tools=[_DELEGATE_TOOL],
         max_tokens=_DIRECT_MAX_TOKENS,
@@ -778,20 +876,92 @@ def jev_history(history: list[dict]) -> list[dict]:
     )
 
 
+# How many of a running turn's last steps Jev reads when it decides where a
+# message sent mid-turn goes (jev_route.ADDON_ROUTE_QUESTION).
+ADDON_PROGRESS_STEPS = 8
+
+
+# A step's description as Jev reads it, at most this long. The steps list in
+# the app shows the same text (the tool call's `one_line_description`).
+ADDON_STEP_DESCRIPTION_CHARS = 200
+
+_DESCRIPTION_IN_ARGS = re.compile(r'"one_line_description"\s*:\s*"((?:[^"\\]|\\.)*)')
+
+
+def step_description(args) -> str:
+    """A tool call's `one_line_description`, the label the steps list shows,
+    from its input dict or its JSON args. The pod truncates long args, so a
+    string that no longer parses is searched for the field instead. "" when
+    the call has none."""
+    value = None
+    if isinstance(args, dict):
+        value = args.get("one_line_description")
+    elif isinstance(args, str) and args:
+        try:
+            parsed = json.loads(args)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            value = parsed.get("one_line_description")
+        else:
+            match = _DESCRIPTION_IN_ARGS.search(args)
+            if match:
+                try:
+                    value = json.loads(f'"{match.group(1)}"')
+                except ValueError:
+                    value = match.group(1)
+    return " ".join(value.split())[:ADDON_STEP_DESCRIPTION_CHARS] if isinstance(value, str) else ""
+
+
+def progress_line(name: str, description: str, *, in_progress: bool) -> str:
+    """One step of a running turn as Jev reads it:
+    `[done] Read the tuition pages (scratchpad)`, or `[in progress] ...` for a
+    step still running. The tool name alone when the step has no description."""
+    label = f"{description} ({name})" if description else name
+    return f"[{'in progress' if in_progress else 'done'}] {label}"
+
+
+def progress_lines(messages: list[dict], *, limit: int = ADDON_PROGRESS_STEPS) -> list[str]:
+    """A running turn's last steps with what each one did, the newest still
+    running flagged, so Jev can tell a correction to work in flight from one
+    to work already done. A tool call with no result yet is in progress."""
+    calls: list[tuple[str, str, str]] = []
+    finished: set[str] = set()
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            continue
+        for block in message["content"]:
+            if not isinstance(block, dict):
+                continue
+            if message.get("role") == "assistant" and block.get("type") == "tool_use":
+                calls.append((str(block.get("id") or ""), str(block.get("name") or "?"),
+                              step_description(block.get("input"))))
+            elif block.get("type") == "tool_result" and block.get("tool_use_id"):
+                finished.add(str(block["tool_use_id"]))
+    return [
+        progress_line(name, description, in_progress=bool(call_id) and call_id not in finished)
+        for call_id, name, description in calls
+    ][-limit:]
+
+
 def ineligible_reason(
     *,
     has_non_text_input: bool,
     has_attachments: bool,
     has_disabled_connections: bool,
     is_comparison_side: bool = False,
+    is_pinned_schedule: bool = False,
 ) -> str | None:
     """Return a deterministic delegation reason for unsupported turn shapes.
 
     A model-comparison side always goes to the agent: the gate answers on its
     own model, so a direct answer would compare the gate against itself.
+    A pinned schedule also requires its selected model to answer.
     """
     if is_comparison_side:
         return "comparison_side"
+    if is_pinned_schedule:
+        return "pinned_schedule"
     if has_non_text_input:
         return "non_text_input"
     if has_attachments:
@@ -863,6 +1033,7 @@ async def decide_route(
     binding: RouterBinding | None = None,
     binding_factory: Callable[[], RouterBinding | None] | None = None,
     jev: Callable[[list[dict]], Awaitable[JevRoute]] | None = None,
+    ui_locale: str | None = None,
 ) -> RouteDecision:
     """Choose a direct answer or safe delegation.
 
@@ -975,7 +1146,7 @@ async def decide_route(
                 route=DELEGATED_AGENTIC, reason="router_model_unavailable", fallback=True
             )
         try:
-            text = await _gate(binding, history=messages)
+            text = await _gate(binding, history=messages, ui_locale=ui_locale)
         except TimeoutError:
             return RouteDecision(
                 route=DELEGATED_AGENTIC,

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from cowork.api.v1.endpoints import comments as router
+from cowork.services import publish
 
 UUID = "e9267de0-3fa4-4c17-b964-dc63216311cf"
 STABLE_KEY = f"artifact/{UUID}"
@@ -27,7 +28,7 @@ def artifact(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         router, "resolve_artifact_folder", lambda _sources, _aid: (object(), folder, {})
     )
-    monkeypatch.setattr(router, "published_owner_state", lambda _path, *, scope: state["entry"])
+    monkeypatch.setattr(publish, "published_owner_state", lambda _path, *, scope: state["entry"])
     monkeypatch.setattr(router, "_org_mode", lambda: False)
     return state
 

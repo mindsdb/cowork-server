@@ -1,10 +1,12 @@
 """Runtime hand-overs from the desktop app: the MindsHub credential, and the
 address and launch key of the app's own browser.
 
-Write-only on purpose. The desktop app is the only caller and it already holds
-the values it is sending, so there is nothing to read back and no route offers
-them. ``GET /settings/reveal-key/minds`` stays the one place a local caller can
-read the resolved credential, under the same loopback guard it always had.
+Write-only for the values themselves. The desktop app is the only caller and it
+already holds what it is sending, so no route reads them back. ``GET
+/settings/reveal-key/minds`` stays the one place a local caller can read the
+resolved credential, under the same loopback guard it always had. The one read
+here, ``GET /minds/organization``, answers which organization the held
+credential acts in, never the credential.
 """
 
 import re
@@ -18,9 +20,11 @@ from cowork.common.settings.runtime_credential import (
     LocalBrowserHost,
     clear_browser_host,
     clear_minds_credential,
+    get_minds_credential,
     set_browser_host,
     set_minds_credential,
 )
+from cowork.schemas.base import CamelResponse
 
 # Both guards sit on the router rather than on the route, so a second route
 # added here inherits them instead of having to remember them. Loopback because
@@ -48,6 +52,28 @@ def put_minds_credential(body: MindsCredentialBody) -> dict[str, bool]:
     else:
         clear_minds_credential()
     return {"ok": True}
+
+
+class MindsCredentialOrganization(CamelResponse):
+    """The organization the held credential acts in, or None when there is no
+    credential or MindsHub could not say."""
+
+    organization_id: str | None = None
+
+
+@router.get("/minds/organization", response_model=MindsCredentialOrganization)
+async def get_minds_credential_organization() -> MindsCredentialOrganization:
+    """Which organization the desktop's work runs under. A key the person
+    supplied wins over their sign-in (the app hands over one or the other), and
+    that key can belong to another organization than the one they are signed in
+    to, so the sign-in's organization is not always the one that acted."""
+    from cowork.services.mindshub_teams import fetch_mindshub_permissions
+
+    credential = get_minds_credential()
+    if not credential:
+        return MindsCredentialOrganization()
+    permissions = await fetch_mindshub_permissions(bearer_token=credential, org_id="", user_id="")
+    return MindsCredentialOrganization(organization_id=permissions.organization_id)
 
 
 #: Where the app's browser listens: loopback, by address rather than by name,

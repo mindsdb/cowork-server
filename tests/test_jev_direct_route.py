@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from cowork.common.settings.user_settings import Provider
+from cowork.common.structured_logging import make_formatter
 from cowork.handlers import direct_answer, jev_route
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
@@ -110,7 +111,7 @@ async def test_a_refused_or_failed_jev_falls_back_to_the_llm_gate(monkeypatch, e
 
     asked = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, **_kwargs):
         asked.append((binding.model, history))
         return "Hello! How can I help?"
 
@@ -383,30 +384,46 @@ async def test_start_answer_runs_at_the_composers_reasoning_effort():
 
 
 @pytest.mark.asyncio
+async def test_start_answer_in_the_apps_language_still_delegates_saying_why():
+    """The app's language (ENG-4149) reaches the answer's system prompt, and
+    an answer that hands the turn over still says why (Delegated)."""
+    from anton.core.llm.provider import StreamToolUseStart
+
+    from cowork.common.ui_locale import reply_language_line
+
+    provider = _Provider([StreamToolUseStart(id="t", name="delegate"), _complete()])
+
+    answer = await direct_answer.start_answer(_binding(provider), history=_RECALL, ui_locale="es")
+
+    assert answer == direct_answer.Delegated("tool_call")
+    assert provider.calls[0]["system"].endswith(reply_language_line("es"))
+
+
+@pytest.mark.asyncio
 async def test_start_answer_delegates_on_a_tool_call():
     from anton.core.llm.provider import StreamToolUseStart
 
     provider = _Provider([StreamToolUseStart(id="t", name="delegate"), _complete()])
 
-    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) is None
+    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) == direct_answer.Delegated("tool_call")
     assert provider.closed
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("events", [
-    [_complete(tool_calls=[SimpleNamespace(name="delegate")])],
-    [_text("   "), _complete()],
-    [],
+@pytest.mark.parametrize(("events", "why"), [
+    ([_complete(tool_calls=[SimpleNamespace(name="delegate")])], "tool_call"),
+    ([_text("   "), _complete()], "empty"),
+    ([], "empty"),
 ])
-async def test_start_answer_delegates_when_no_text_comes(events):
-    assert await direct_answer.start_answer(_binding(_Provider(events)), history=_RECALL) is None
+async def test_start_answer_delegates_when_no_text_comes(events, why):
+    assert await direct_answer.start_answer(_binding(_Provider(events)), history=_RECALL) == direct_answer.Delegated(why)
 
 
 @pytest.mark.asyncio
 async def test_start_answer_delegates_on_a_failure_before_text():
     provider = _Provider([_text("never")], raise_after=0)
 
-    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) is None
+    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) == direct_answer.Delegated("failed")
 
 
 @pytest.mark.asyncio
@@ -414,7 +431,7 @@ async def test_start_answer_delegates_when_the_first_event_is_late(monkeypatch):
     monkeypatch.setattr(direct_answer, "_FIRST_EVENT_SECONDS", 0.01)
     provider = _Provider([_text("late")], delay=0.5)
 
-    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) is None
+    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) == direct_answer.Delegated("timeout")
     assert provider.closed
 
 
@@ -426,7 +443,9 @@ async def test_start_answer_waits_less_when_jev_expects_no_web_search(monkeypatc
     monkeypatch.setattr(direct_answer, "_FIRST_EVENT_NO_SEARCH_SECONDS", 0.01)
     late = _Provider([_text("late")], delay=0.5)
 
-    assert await direct_answer.start_answer(_binding(late), history=_RECALL, needs_search=False) is None
+    assert await direct_answer.start_answer(
+        _binding(late), history=_RECALL, needs_search=False,
+    ) == direct_answer.Delegated("timeout")
     assert late.calls[0]["native_web_tools"] == {"web_search", "web_fetch"}
 
     searching = _Provider([_text("Sunny, 21C."), _complete()], delay=0.05)
@@ -463,7 +482,7 @@ async def test_complete_answer_joins_the_text_or_delegates():
     # A failure part way, with nothing saved yet, still delegates.
     assert await direct_answer.complete_answer(
         _binding(_Provider([_text("Hi "), _text("there.")], raise_after=1)), history=_RECALL,
-    ) is None
+    ) == direct_answer.Delegated("failed")
 
 
 def test_system_prompt_carries_the_product_facts_without_recall_skill():
@@ -580,12 +599,13 @@ async def _answer(chunks, *, raise_after=None, delay=0.0):
 
 async def _produce(
     monkeypatch, conversation_id, answer, *, delegate=None, lifecycle=None, started=None, first_take=None,
+    gate_key=None,
 ):
     from cowork.streaming.registry import TurnLifecycle
 
     lifecycle = lifecycle or TurnLifecycle()
 
-    async def fake_start(_binding, *, history, needs_search=True):
+    async def fake_start(_binding, *, history, needs_search=True, ui_locale=None):
         if started is not None:
             # An answer that has not started yet: wait to be stopped.
             started.set()
@@ -606,8 +626,9 @@ async def _produce(
         history=_RECALL,
         trace_metadata={},
         buffer=buffer,
-        delegate=delegate or (lambda: pytest.fail("must not delegate")),
+        delegate=delegate or (lambda _why: pytest.fail("must not delegate")),
         first_take=first_take,
+        gate_key=gate_key,
     )
     return handler, buffer, coro
 
@@ -646,23 +667,81 @@ async def test_produce_answer_streams_then_saves_the_turn(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("delegates", [False, True, "fails"])
+async def test_produce_answer_revokes_the_gate_key_unless_the_agent_takes_the_turn(monkeypatch, delegates):
+    """An answered turn runs no agent turn to revoke the gate's key; a
+    delegated one runs on that key, and the agent's producer revokes it. A
+    hand-off that fails before the agent's turn ends runs nothing on it."""
+    import cowork.handlers.responses as responses
+
+    conversation_id = await _conversation()
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
+    buffers = []
+
+    async def delegate(_why):
+        if delegates == "fails":
+            raise RuntimeError("harness no longer resolves")
+        await buffers[0].close("completed")
+
+    answer = direct_answer.Delegated("tool_call") if delegates else await _answer(["Revenue was ", "$4.81M."])
+    _handler, buffer, coro = await _produce(
+        monkeypatch, conversation_id, answer, delegate=delegate if delegates else None,
+        gate_key={"correlation_id": "corr-gate"},
+    )
+    buffers.append(buffer)
+
+    await coro
+
+    assert revoked == ([] if delegates is True else ["corr-gate"])
+
+
+@pytest.mark.asyncio
+async def test_produce_answer_writes_in_the_apps_language(monkeypatch):
+    """The streamed direct answer gets the app's language (ENG-4149), as the
+    gate and the first take do."""
+    conversation_id = await _conversation()
+    answer = await _answer(["Hola."])
+    handler, _buffer, coro = await _produce(monkeypatch, conversation_id, answer)
+    handler.ui_locale = "es"
+    fake_start = direct_answer.start_answer
+    seen = []
+
+    async def recording_start(binding, **kwargs):
+        seen.append(kwargs.get("ui_locale"))
+        return await fake_start(binding, **kwargs)
+
+    monkeypatch.setattr(direct_answer, "start_answer", recording_start)
+
+    await coro
+
+    assert seen == ["es"]
+
+
+@pytest.mark.asyncio
 async def test_produce_answer_hands_a_delegated_turn_to_the_agent(monkeypatch):
     conversation_id = await _conversation()
     delegated = []
     buffers = []
 
-    async def delegate():
+    async def delegate(why):
         # The agent's producer ends the turn and closes the buffer.
-        delegated.append(True)
+        delegated.append(why)
         await buffers[0].close("completed")
 
     lifecycle = TurnLifecycle()
-    _handler, buffer, coro = await _produce(monkeypatch, conversation_id, None, delegate=delegate, lifecycle=lifecycle)
+    _handler, buffer, coro = await _produce(
+        monkeypatch, conversation_id, direct_answer.Delegated("tool_call"), delegate=delegate, lifecycle=lifecycle,
+    )
     buffers.append(buffer)
 
     await coro
 
-    assert delegated == [True]
+    assert delegated == ["tool_call"]
     # Nothing shown by the direct answer; the question was saved pending
     # before the answer started, and the agent's producer is handed that row.
     assert buffer.frames == []
@@ -670,6 +749,102 @@ async def test_produce_answer_hands_a_delegated_turn_to_the_agent(monkeypatch):
     assert rows == [("user", "what were those headline numbers again?", True, None)]
     assert lifecycle.saved_question is True
     assert lifecycle.question_id is not None
+
+
+@pytest.mark.asyncio
+async def test_a_delegated_direct_answer_says_why_at_warning(monkeypatch, caplog):
+    """Hosted logs drop INFO, so the WARNING line carries the reason: a denial
+    drop counts apart from a timeout or a tool call."""
+    import logging
+
+    from cowork.handlers import responses
+
+    conversation_id = await _conversation()
+    buffers = []
+    handed = []
+
+    async def delegate(why):
+        handed.append(why)
+        await buffers[0].close("completed")
+
+    caplog.set_level(logging.WARNING, logger=responses.__name__)
+    _handler, buffer, coro = await _produce(
+        monkeypatch, conversation_id, direct_answer.Delegated("router_answer_denied_capability"), delegate=delegate,
+    )
+    buffers.append(buffer)
+
+    await coro
+
+    (record,) = [
+        row for row in caplog.records
+        if row.name == responses.logger.name and getattr(row, "event", None) == "direct_answer_delegated"
+    ]
+    assert record.levelno == logging.WARNING
+    # As the hosted JSON log prints it: the formatter keeps only its
+    # allowlisted fields.
+    line = json.loads(make_formatter().format(record))
+    assert (line["event"], line["why"]) == ("direct_answer_delegated", "router_answer_denied_capability")
+    assert handed == ["router_answer_denied_capability"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("delegation", "why"), [
+    (direct_answer.Delegated("router_answer_denied_capability"), "router_answer_denied_capability"),
+    (None, "no_answer_model"),
+])
+async def test_a_delegated_direct_answer_carries_why_in_the_agents_trace_metadata(
+    monkeypatch, tmp_path, delegation, why,
+):
+    """A turn that does not stream: the agent's run is traced with the reason."""
+    from uuid import uuid4
+
+    from cowork.handlers import responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    conv_id = uuid4()
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path))),
+            message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
+            get_recent_messages=lambda *_a, **_k: [],
+        ),
+    )
+    monkeypatch.setattr(responses, "_conversation_for_harness", lambda _session, *, conversation_id: None)
+
+    async def ask(_messages):
+        return jev_route.JevRoute(direct=True, p_direct=0.9, needs_search=False)
+
+    async def no_router_binding():
+        return None, None
+
+    async def complete_answer(_binding, *, history, needs_search=True):
+        return delegation
+
+    class StopBeforeAgent(Exception):
+        pass
+
+    traced = {}
+
+    def stream_response(**kwargs):
+        traced.update(kwargs["trace_metadata"])
+        raise StopBeforeAgent
+
+    handler = ResponsesHandler()
+    handler.harness_name = "anton"
+    handler._jev_gate = lambda _turn_llm: ask
+    handler._answer_binding = lambda **_kwargs: None if delegation is None else _binding(_Provider())
+    monkeypatch.setattr(handler, "_router_binding", no_router_binding)
+    monkeypatch.setattr(handler, "_get_harness", lambda: SimpleNamespace(stream_response=stream_response))
+    monkeypatch.setattr(direct_answer, "complete_answer", complete_answer)
+
+    with pytest.raises(StopBeforeAgent):
+        await handler.handle(ResponsesRequest(input="hello there", conversation=str(conv_id), stream=False))
+
+    assert traced["response_route_reason"] == "direct_answer_delegated"
+    assert traced["direct_answer_why"] == why
 
 
 @pytest.mark.asyncio
@@ -887,14 +1062,16 @@ async def test_produce_answer_leaves_a_stop_after_delegation_to_the_agent(monkey
     running = asyncio.Event()
     buffers = []
 
-    async def delegate():
+    async def delegate(_why):
         running.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             await buffers[0].close("cancelled")
 
-    _handler, buffer, coro = await _produce(monkeypatch, conversation_id, None, delegate=delegate)
+    _handler, buffer, coro = await _produce(
+        monkeypatch, conversation_id, direct_answer.Delegated("tool_call"), delegate=delegate,
+    )
     buffers.append(buffer)
     task = asyncio.create_task(coro)
     await running.wait()
@@ -994,21 +1171,22 @@ async def test_a_preamble_then_delegate_never_reaches_the_user(ending):
     the held opening, so nothing was shown and the agent runs."""
     provider = _Provider([_text("Let me pull that from your data."), *ending])
 
-    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) is None
+    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) == direct_answer.Delegated("tool_call")
     assert provider.closed
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text", [
-    "Done! I've created both records for you.",
-    "Shall I proceed? Please answer yes or no.",
-    "You can install the ChatGPT desktop app from openai.com.",
+@pytest.mark.parametrize(("text", "why"), [
+    ("Done! I've created both records for you.", "router_answer_imitated_approval"),
+    ("Shall I proceed? Please answer yes or no.", "router_answer_imitated_approval"),
+    ("You can install the ChatGPT desktop app from openai.com.", "router_answer_named_foreign_product"),
+    ("Got it! I'll keep teal in mind for your charts.", "router_answer_promised_memory"),
 ])
-async def test_an_opening_the_gate_would_reject_delegates(text):
+async def test_an_opening_the_gate_would_reject_delegates(text, why):
     """The LLM gate's own checks (`answer_rejection`) hold on the direct answer."""
     provider = _Provider([_text(text), _complete()])
 
-    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) is None
+    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) == direct_answer.Delegated(why)
 
 
 @pytest.mark.asyncio
@@ -1024,7 +1202,9 @@ async def test_an_opening_that_denies_what_the_agent_can_do_delegates(caplog, te
     provider = _Provider([_text(text), _complete()])
     caplog.set_level(logging.INFO, logger=direct_answer.__name__)
 
-    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) is None
+    assert await direct_answer.start_answer(
+        _binding(provider), history=_RECALL,
+    ) == direct_answer.Delegated("router_answer_denied_capability")
     assert [row.why for row in caplog.records if hasattr(row, "why")] == ["router_answer_denied_capability"]
     assert provider.closed
 
@@ -1033,7 +1213,7 @@ async def test_an_opening_that_denies_what_the_agent_can_do_delegates(caplog, te
 async def test_a_cut_off_answer_delegates():
     provider = _Provider([_text("Revenue was"), _complete(stop_reason="max_tokens")])
 
-    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) is None
+    assert await direct_answer.start_answer(_binding(provider), history=_RECALL) == direct_answer.Delegated("cut_off")
 
 
 @pytest.mark.asyncio
@@ -1154,10 +1334,12 @@ async def test_a_failed_hand_off_still_ends_the_turn(monkeypatch):
     conversation_id = await _conversation()
     take = _Take()
 
-    async def delegate():
+    async def delegate(_why):
         raise RuntimeError("no such harness")
 
-    _handler, buffer, coro = await _produce(monkeypatch, conversation_id, None, delegate=delegate, first_take=take)
+    _handler, buffer, coro = await _produce(
+        monkeypatch, conversation_id, direct_answer.Delegated("tool_call"), delegate=delegate, first_take=take,
+    )
 
     await coro
 
@@ -1173,10 +1355,12 @@ async def test_the_first_take_goes_to_the_agent_on_delegation(monkeypatch):
     take = _Take()
     buffers = []
 
-    async def delegate():
+    async def delegate(_why):
         await buffers[0].close("completed")
 
-    _handler, buffer, coro = await _produce(monkeypatch, conversation_id, None, delegate=delegate, first_take=take)
+    _handler, buffer, coro = await _produce(
+        monkeypatch, conversation_id, direct_answer.Delegated("tool_call"), delegate=delegate, first_take=take,
+    )
     buffers.append(buffer)
     await coro
 
@@ -1221,7 +1405,7 @@ async def test_the_direct_answer_may_name_its_own_model_and_products_the_user_na
         _binding(provider), history=[{"role": "user", "content": question}],
     )
 
-    assert answer is not None and answer.first_text == reply
+    assert isinstance(answer, direct_answer.DirectAnswer) and answer.first_text == reply
 
 
 @pytest.mark.parametrize(("model", "allowed"), [
@@ -1255,7 +1439,7 @@ async def test_the_held_opening_ends_at_a_word_boundary(monkeypatch):
 
     answer = await direct_answer.start_answer(_binding(provider, model="muse-spark"), history=_RECALL)
 
-    assert answer is None
+    assert answer == direct_answer.Delegated("router_answer_named_foreign_product")
 
 
 @pytest.mark.asyncio
@@ -1270,15 +1454,15 @@ async def test_the_shown_opening_never_ends_inside_a_word(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ending", [
-    [_text("More."), _tool_start()],
-    [_text("More."), _complete(stop_reason="max_tokens")],
-    [_text(" Install the ChatGPT app."), _complete()],
+@pytest.mark.parametrize(("ending", "why"), [
+    ([_text("More."), _tool_start()], "tool_call"),
+    ([_text("More."), _complete(stop_reason="max_tokens")], "cut_off"),
+    ([_text(" Install the ChatGPT app."), _complete()], "router_answer_named_foreign_product"),
 ])
-async def test_complete_answer_delegates_what_a_streamed_answer_could_only_log(monkeypatch, ending):
+async def test_complete_answer_delegates_what_a_streamed_answer_could_only_log(monkeypatch, ending, why):
     """Nothing is shown before the whole answer is in hand, so a late tool
     call, a cut-off or a rejected later passage still reaches the agent."""
     monkeypatch.setattr(direct_answer, "_HOLD_CHARS", 10)
     provider = _Provider([_text("Revenue was $4.81M. "), *ending])
 
-    assert await direct_answer.complete_answer(_binding(provider), history=_RECALL) is None
+    assert await direct_answer.complete_answer(_binding(provider), history=_RECALL) == direct_answer.Delegated(why)

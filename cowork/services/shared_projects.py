@@ -22,6 +22,7 @@ from cowork.models.project import Project
 from cowork.schemas.project_files import ProjectFileListResponse, ProjectFileMetadata
 from cowork.schemas.projects import ProjectResponse
 from cowork.schemas.shared_resources import ProjectCapabilities, ResourceAttribution
+from cowork.services.artifact_roots import SERVER_PROJECT_FOLDERS
 from cowork.services.project_file_view import (
     MAX_LIST_ENTRIES, WalkState, ordinary_path, safe_component, utf8_path, walk_ordinary_files,
 )
@@ -32,19 +33,36 @@ DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024
 # What a recipient sees as "not there": the walk skips such an entry, and the
 # routes answer 404.
 UNREADABLE_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM})
+#: Folder and file names a recipient's view hides at any depth, compared
+#: case-folded. The ordinary-file rule hides the server's folders at the
+#: project root only and memory nowhere (cowork.services.project_file_view);
+#: a recipient's view keeps hiding them everywhere.
+_RECIPIENT_HIDDEN_NAMES = SERVER_PROJECT_FOLDERS | {"memory"}
 
 
 def _recipient_component(name: str) -> bool:
-    """A name a recipient's view of a shared project shows: an ordinary one
+    """A name a recipient's view of a shared project shows: a safe one
     (cowork.services.project_file_view) with no ``:`` or ``\\`` either."""
     return safe_component(name) and not any(c in name for c in ("\\", ":"))
 
 
+def _recipient_file_component(name: str) -> bool:
+    """A name a recipient's view shows on the way to a file, at any depth,
+    on top of the ordinary-file rule: a recipient's name
+    (_recipient_component) that is none of _RECIPIENT_HIDDEN_NAMES and is
+    valid UTF-8. A name that is not can't be sent in the listing's JSON, so
+    it is left out, as the copy leaves it out of a cloud turn's files
+    (utf8_path)."""
+    return (
+        _recipient_component(name)
+        and name.casefold() not in _RECIPIENT_HIDDEN_NAMES
+        and utf8_path((name,))
+    )
+
+
 def _recipient_path(parts: tuple[str, ...]) -> bool:
-    """A path a recipient's view shows. A name that is not valid UTF-8 can't
-    be sent in the listing's JSON, so it is left out, as the copy leaves it
-    out of a cloud turn's files (utf8_path)."""
-    return ordinary_path(parts) and utf8_path(parts) and all(_recipient_component(part) for part in parts)
+    """A path a recipient's view shows."""
+    return ordinary_path(parts) and all(_recipient_file_component(part) for part in parts)
 
 
 def _file_parts(path: str) -> tuple[str, ...]:
@@ -123,8 +141,11 @@ class SharedProjectFiles:
             files = [
                 ProjectFileMetadata(path="/".join(found.parts), name=found.name,
                     size=found.info.st_size, modified=found.info.st_mtime, is_dir=False)
+                # The walk never enters a folder a recipient can't see, so its
+                # entry budget goes to the files they can.
                 for found in walk_ordinary_files(
                     directory, state=state, max_entries=MAX_LIST_ENTRIES, unreadable=UNREADABLE_ERRNOS,
+                    component=_recipient_file_component,
                 )
                 if _recipient_path(found.parts)
             ]

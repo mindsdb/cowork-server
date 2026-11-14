@@ -1,3 +1,4 @@
+import asyncio
 import os
 from types import SimpleNamespace
 
@@ -80,7 +81,7 @@ async def test_text_context_routes_direct_with_resolved_router(monkeypatch):
 
     client = _Client(_response(content="The result was 42."))
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, **_kwargs):
         assert binding.provider is client
         return "The result was 42."
 
@@ -148,7 +149,7 @@ async def test_gate_runs_on_resolved_gate_model_not_the_router_pick(monkeypatch)
     client.router_model = "opus"  # the user's router pick, as the client sees it
     seen_models = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, **_kwargs):
         seen_models.append(binding.model)
         return "The result was 42."
 
@@ -438,6 +439,7 @@ async def test_handle_registers_vault_secrets_before_routing(monkeypatch, tmp_pa
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -538,6 +540,7 @@ async def test_handle_logs_every_router_fallback_at_default_level(
             # A project with no files, so the gate still runs.
             get_conversation=lambda _cid: SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path))),
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=history,
         ),
     )
@@ -548,7 +551,7 @@ async def test_handle_logs_every_router_fallback_at_default_level(
             raise RuntimeError(private)
         return (None if failure == "no_model" else binding), None
 
-    async def gate(_binding, *, history):
+    async def gate(_binding, *, history, ui_locale=None):
         if failure == "provider":
             raise RuntimeError(private)
         if failure == "timeout":
@@ -638,6 +641,7 @@ async def test_handle_keeps_answers_about_a_projects_files_off_the_web(
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path))),
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_a, **_k: [],
         ),
     )
@@ -772,12 +776,12 @@ async def test_files_send_a_direct_route_that_would_search_to_the_agent(has_file
         ([".anton/", "conversations/", "notes.md"], True),
         # An in-process agent reads the project folder itself, so a folder a
         # cloud turn's copy skips still holds files it can read.
-        (["memory/notes.md"], True),
+        (["node_modules/x.js"], True),
     ],
 )
 def test_project_holds_files_counts_only_files_there_are_to_read(tmp_path, entries, holds):
     """An in-process turn's rule: its agent works in the project folder."""
-    from cowork.services.files import project_holds_files
+    from cowork.services.files import project_holds_files_in_place
 
     for entry in entries:
         path = tmp_path / entry
@@ -787,7 +791,7 @@ def test_project_holds_files_counts_only_files_there_are_to_read(tmp_path, entri
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("x")
 
-    assert project_holds_files(tmp_path, cloud=False) is holds
+    assert project_holds_files_in_place(tmp_path) is holds
 
 
 _ORDINARY_FILE_LAYOUTS = [
@@ -797,9 +801,14 @@ _ORDINARY_FILE_LAYOUTS = [
     ["research/notes.md"],
     [".anton/anton.md", ".hidden.md"],
     ["conversations/c/notes.md", "skills/s/SKILL.md"],
+    # The server's folder names below the root are the user's folders.
+    ["docs/skills/guide.md"],
+    ["Research/Memory/porter.md"],
+    ["archive/conversations/2024.md"],
     ["memory/notes.md"],
     ["data/memory/notes.md"],
     ["node_modules/x.js", "__pycache__/m.pyc"],
+    ["src/node_modules/x.js"],
     ["desktop.ini", "Thumbs.db"],
     ["Q3: results.csv"],
     ["data/back\\slash.csv"],
@@ -837,25 +846,26 @@ def test_routing_counts_exactly_the_files_a_cloud_turn_gets(tmp_path, org_deploy
     """A turn in a project with files skips the web gate and goes to the
     agent, so the agent must get those files: a project routes as holding
     files exactly when the cloud copy copies, or names as not copied, at
-    least one file. The memory folder, caches and hard links counted for
-    routing and copied nothing before both used one rule."""
+    least one file. Caches and hard links counted for routing and copied
+    nothing before both used one rule."""
     from uuid import uuid4
 
     from cowork.db.scoped import TenantScope
-    from cowork.services.files import ProjectFileCopyLimits, project_holds_files, stage_project_files
+    from cowork.services.files import project_holds_ordinary_files
+    from cowork.services.project_file_copy import ProjectFileCopyLimits, ProjectFilesOutcome, stage_project_files
     from cowork.services.projects import projects_root
 
     scope = TenantScope(org_mode=True, org_id=str(uuid4()), user_id=str(uuid4()))
     project = projects_root(scope=scope) / "p"
     _lay_out(project, tmp_path / "outside", entries)
-    holds = project_holds_files(project, cloud=True)
+    holds = project_holds_ordinary_files(project)
 
     staged = stage_project_files(
         project, uuid4(), scope=scope,
         limits=ProjectFileCopyLimits(max_file_bytes=1000, max_files=10, max_total_bytes=10_000, seconds=30.0),
     )
 
-    assert not staged.failed
+    assert staged.outcome is ProjectFilesOutcome.STAGED
     assert holds is (staged.files + staged.not_copied > 0)
 
 
@@ -863,31 +873,34 @@ def test_routing_counts_exactly_the_files_a_cloud_turn_gets(tmp_path, org_deploy
 @pytest.mark.parametrize(
     ("entries", "in_process", "cloud"),
     [
-        (["memory/notes.md"], True, False),
         (["research/node_modules/x.js"], True, False),
         (["<hard link>"], True, False),
         (["notes.md"], True, True),
+        # A memory folder, and the server's folder names below the root,
+        # count on both.
+        (["memory/notes.md"], True, True),
+        (["docs/skills/guide.md"], True, True),
     ],
 )
 def test_an_in_process_turn_counts_what_its_agent_reads_in_place(tmp_path, entries, in_process, cloud):
     """A cloud turn counts by its copy's rule. An in-process turn's agent
-    reads the project folder itself, so a memory folder, a cache or a second
-    name for a file still holds something for it to read."""
-    from cowork.services.files import project_holds_files
+    reads the project folder itself, so a cache or a second name for a file
+    still holds something for it to read."""
+    from cowork.services.files import project_holds_files_in_place, project_holds_ordinary_files
 
     project = tmp_path / "project"
     _lay_out(project, tmp_path / "outside", entries)
 
-    assert (project_holds_files(project, cloud=False), project_holds_files(project, cloud=True)) == (
+    assert (project_holds_files_in_place(project), project_holds_ordinary_files(project)) == (
         in_process, cloud,
     )
 
 
-@pytest.mark.parametrize("cloud", [False, True])
-def test_a_missing_project_folder_holds_no_files(tmp_path, cloud):
-    from cowork.services.files import project_holds_files
+@pytest.mark.parametrize("rule", ["project_holds_files_in_place", "project_holds_ordinary_files"])
+def test_a_missing_project_folder_holds_no_files(tmp_path, rule):
+    from cowork.services import files
 
-    assert project_holds_files(tmp_path / "moved-away", cloud=cloud) is False
+    assert getattr(files, rule)(tmp_path / "moved-away") is False
 
 
 @pytest.mark.asyncio
@@ -970,7 +983,8 @@ def test_anton_template_alone_is_not_instructions(tmp_path, written, expected):
 def test_read_project_context_skips_the_listing_when_an_attachment_counts(monkeypatch, tmp_path):
     import cowork.services.files as files
 
-    monkeypatch.setattr(files, "project_holds_files", lambda _path, **_: pytest.fail("listed the folder"))
+    for rule in ("project_holds_files_in_place", "project_holds_ordinary_files"):
+        monkeypatch.setattr(files, rule, lambda _path: pytest.fail("listed the folder"))
 
     assert files.read_project_context(tmp_path, files_known=True, cloud=False) == files.ProjectContext(
         has_files=True, has_instructions=False,
@@ -1106,18 +1120,44 @@ async def test_failed_files_reads_count_as_files(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_failed_project_read_counts_as_files_and_instructions(monkeypatch):
-    """Routing failures fail open to the agent: the turn goes there."""
+    """Routing failures fail open to the agent: the turn goes there, as a
+    router fallback (router_unavailable), never labeled project_instructions,
+    and, as with instructions it may hold, with no gate key and no first take."""
     import cowork.handlers.responses as responses
     from cowork.services.files import ProjectContext
 
     async def efs_fails(*_args, **_kwargs):
         raise PermissionError("store gone")
 
-    monkeypatch.setattr(responses, "run_efs", efs_fails)
+    async def no_router(**_kwargs):
+        pytest.fail("decide_route must not run")
 
-    assert await ResponsesHandler()._read_project_context("/projects/p", files_known=False) == ProjectContext(
-        has_files=True, has_instructions=True,
+    async def no_mint():
+        pytest.fail("no gate key is minted")
+
+    monkeypatch.setattr(responses, "run_efs", efs_fails)
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(responses, "decide_route", no_router)
+    monkeypatch.setattr(handler, "_router_binding", no_mint)
+
+    project = await handler._read_project_context("/projects/p", files_known=False)
+    decision, turn_llm = await handler._route_request(
+        conversation_id=None,
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        has_files=project.has_files,
+        has_instructions=project.has_instructions,
+        project_unread=project.unread,
+        first_take=True,
     )
+
+    assert project == ProjectContext(has_files=True, has_instructions=False, unread=True)
+    assert (decision, turn_llm) == (
+        RouteDecision(route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True), None,
+    )
+    assert getattr(handler, "first_take", None) is None
 
 
 @pytest.mark.asyncio
@@ -1379,7 +1419,7 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
         minted["workspace_id"] = workspace_id
         return block
 
-    monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
+    monkeypatch.setattr(producer, "mint_llm_block", fake_mint)
 
     trace_token = set_trace_context(TraceContext(session_id="conv-router"))
     try:
@@ -1440,7 +1480,7 @@ async def test_router_binding_omits_workspace_id_when_none_picked(monkeypatch):
         minted["workspace_id"] = workspace_id
         return {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
 
-    monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
+    monkeypatch.setattr(producer, "mint_llm_block", fake_mint)
 
     await handler._router_binding()
 
@@ -1479,7 +1519,7 @@ async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_
         return block, "mdb_gate"
 
     monkeypatch.setattr(producer, "_mint_llm_block_with_turn_key_id", fake_mint)
-    monkeypatch.setattr(producer, "_mint_llm_block", AsyncMock(side_effect=AssertionError("minted without the prefix")))
+    monkeypatch.setattr(producer, "mint_llm_block", AsyncMock(side_effect=AssertionError("minted without the prefix")))
 
     _, turn_llm = await handler._router_binding()
 
@@ -3074,7 +3114,7 @@ def _tool_turn(prompt="pull the sales table", result="rows: 1204", answer="Pulle
 def _no_gate(monkeypatch):
     import cowork.handlers.response_routing as routing
 
-    async def gate_must_not_run(binding, *, history):
+    async def gate_must_not_run(binding, *, history, **_kwargs):
         raise AssertionError("the gate must not be called")
 
     monkeypatch.setattr(routing, "_gate", gate_must_not_run)
@@ -3108,7 +3148,7 @@ async def test_plain_previous_turn_still_reaches_the_gate(monkeypatch):
 
     seen = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, **_kwargs):
         seen.append(history)
         return "Hello!"
 
@@ -3184,7 +3224,7 @@ def _gate_spy(monkeypatch):
 
     seen = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, **_kwargs):
         seen.append(history)
         return "Hello!"
 
@@ -3232,6 +3272,8 @@ async def test_only_the_latest_prompt_is_checked_for_file_names(monkeypatch):
     assert decision.route == DIRECT_CONTEXT and seen
 
 
+
+
 # --- turns that need the agent, on both routers -------------------------------
 #
 # Jev decides on MindsHub and the LLM gate on other providers (and when Jev
@@ -3267,9 +3309,14 @@ async def _route_turn(prompt, **kwargs):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("on_jev", [False, True], ids=["llm_gate", "jev"])
-async def test_a_memory_request_goes_to_the_agent_without_a_router_call(monkeypatch, on_jev):
+@pytest.mark.parametrize("prompt", [
+    _MEMORY_PROMPT,
+    "Keep this in mind: I prefer teal for charts.",
+    "Recuerda que prefiero el color verde azulado para los gráficos.",
+])
+async def test_a_memory_request_goes_to_the_agent_without_a_router_call(monkeypatch, on_jev, prompt):
     _no_gate(monkeypatch)
-    decision = await _route_turn(_MEMORY_PROMPT, jev=_jev_must_not_run() if on_jev else None)
+    decision = await _route_turn(prompt, jev=_jev_must_not_run() if on_jev else None)
     assert decision == RouteDecision(route=DELEGATED_AGENTIC, reason="memory_request")
 
 
@@ -3279,6 +3326,25 @@ async def test_a_memory_request_goes_to_the_agent_without_a_router_call(monkeypa
     "Keep in mind that our fiscal year starts in April.",
     "Forget what I said about the budget.",
     "Use this in future conversations too.",
+    # The words of a request need not sit side by side.
+    "Keep this in mind: I prefer teal for charts.",
+    "Bear that in mind for next time.",
+    "For future reference, my preferred chart color is teal.",
+    "Take note: I'm allergic to peanuts.",
+    "Store my preferred date format as DD/MM/YYYY.",
+    "Can you retain my preference for dark-mode dashboards across sessions?",
+    # Spanish and Portuguese.
+    "Recuerda que mi color preferido para los gráficos es el verde.",
+    "Recuérdalo para mis próximos chats: prefiero barras.",
+    "Acuérdate de que trabajo en Bogotá.",
+    "No olvides que trabajo en Bogotá.",
+    "Olvida lo que te dije sobre el presupuesto.",
+    "Memoriza esto: mi equipo es Ana y Raj.",
+    "Guarda esto en tu memoria: mi jefa es Marta.",
+    "A partir de ahora responde siempre en español.",
+    "De ahora en adelante usa el color verde.",
+    "Lembre-se de que prefiro gráficos em azul.",
+    "Não esqueça que trabalho em Lisboa.",
 ])
 def test_memory_requests_are_named(prompt):
     from cowork.handlers.response_routing import names_memory_request
@@ -3288,6 +3354,11 @@ def test_memory_requests_are_named(prompt):
 
 @pytest.mark.parametrize("prompt", [
     "Hi", "thanks!", "explain a p-value", "What is the capital of France?", "Is Remembrance Day a holiday?",
+    # Words that come mostly in general questions are not on the list.
+    "I forgot my password, how do I reset it?",
+    "What's the economic outlook going forward?",
+    "Let's say the team had forgotten to renew the certificate: what breaks?",
+    "¿Recuerdas quién ganó el mundial de 1998?",
 ])
 def test_plain_questions_are_not_memory_requests(prompt):
     from cowork.handlers.response_routing import names_memory_request
@@ -3316,12 +3387,63 @@ _DENYING_ANSWERS = [
     "I don't currently have access to your files.",
     "I don't have real-time access to the web.",
     "As an AI, I don't have personal memories.",
+    # An adverb before the verb.
+    "I currently can't access your files.",
+    "I'm currently unable to access your files.",
+    "I'm not currently able to access your files.",
+    # A modifier before memory, and the other ways to say "can't".
+    "I don't have persistent memory between chats.",
+    "I don't have long-term memory.",
+    "I don't have a memory feature, so I can't hold on to your teal preference.",
+    "I have no persistent memory.",
+    "I don't have the capability to remember.",
+    "I lack the ability to remember past chats.",
+    "I'm not capable of saving preferences.",
+    "I have no way to save that.",
+    "I won't remember this in future chats.",
+    "I won't keep your preferences between chats.",
+    "I won't save that for next time.",
+    "I'm not going to remember this next time.",
+    # Cowork as the subject.
+    "Cowork can't save preferences between chats.",
+    "Cowork doesn't have memory.",
+    "This assistant can't remember previous chats.",
+    # Search, which the agent has.
+    "I can't look up live stock prices.",
+    "I can't search the web for current prices.",
+    # Spanish and Portuguese.
+    "No puedo guardar preferencias entre conversaciones.",
+    "Lo siento, no tengo acceso a tus archivos.",
+    "No tengo memoria entre chats.",
+    "No puedo ver tus archivos.",
+    "No puedo abrir los documentos que subiste.",
+    "Não consigo guardar as suas preferências entre conversas.",
+    "Não consigo ler os seus arquivos.",
 ]
 _PLAIN_ANSWERS = [
     "Hello! How can I help you today?",
     "Paris is the capital of France.",
     "You can't divide by zero.",
     "A p-value is the probability of seeing results at least as extreme as yours if the null hypothesis is true.",
+    # Honest "I can't" and "I don't": idioms, quotes and privacy answers.
+    "I can't see any reason why that formula would fail; the ranges match.",
+    "I can't see why that would fail.",
+    "I can't read your mind, so tell me which option you prefer!",
+    "I can't open a bank account on your behalf, but here are the usual steps.",
+    'If a client says "I can\'t read this chart", the usual fix is to simplify the axes.',
+    "In English that is: “I can’t open the file.”",
+    "Se dice: «I don’t have access to the folder.»",
+    "I don't store your passwords anywhere, and I never will.",
+    "No, I don't retain your data for training.",
+    "I don't remember the exact number, but it was around 4 million.",
+    "I won't keep you long: the answer is 42.",
+    "No puedo ver por qué falla tu fórmula sin más contexto.",
+    "No puedo leer la mente, pero aquí va una idea.",
+    "Não consigo ver por que a fórmula falha sem mais contexto.",
+    # What Cowork can't do on a surface is a product fact, not a denial.
+    "Cowork can't read local folders in the browser — that's desktop only.",
+    "No puedo predecir el mercado de valores.",
+    "Não posso prever o mercado de ações.",
 ]
 
 
@@ -3334,9 +3456,30 @@ def test_capability_denials_are_named(answer):
 
 @pytest.mark.parametrize("answer", _PLAIN_ANSWERS)
 def test_plain_answers_deny_nothing(answer):
-    from cowork.handlers.response_routing import denies_agent_capability
+    from cowork.handlers.response_routing import denies_agent_capability, promises_memory
 
     assert denies_agent_capability(answer) is None
+    assert promises_memory(answer) is None
+
+
+_PROMISING_ANSWERS = [
+    "Got it! I'll keep teal in mind for your charts.",
+    "Sure, I'll remember that you prefer teal.",
+    "I will remember your preference.",
+    "Of course, I'll bear that in mind.",
+    "Noted for next time: teal charts.",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", _PROMISING_ANSWERS)
+async def test_an_llm_gate_answer_promising_to_remember_is_not_shipped(answer):
+    """Only the agent saves anything, so the router's promise is false."""
+    provider = _StreamProvider([_text(answer), _complete()])
+    decision = await _route_turn("I prefer teal for charts.", binding=_binding(provider))
+    assert (decision.route, decision.reason, decision.text) == (
+        DELEGATED_AGENTIC, "router_answer_promised_memory", "",
+    )
 
 
 @pytest.mark.asyncio
@@ -3409,6 +3552,7 @@ async def test_handle_sends_a_turn_in_a_project_with_instructions_to_the_agent(
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path))),
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_a, **_k: [],
         ),
     )
@@ -3448,13 +3592,380 @@ async def test_handle_sends_a_turn_in_a_project_with_instructions_to_the_agent(
 
 def test_both_routers_are_told_to_hand_these_turns_over():
     from cowork.handlers import direct_answer
-    from cowork.handlers.response_routing import _SYSTEM_PROMPT
+    from cowork.handlers.response_routing import _SYSTEM_PROMPT, denies_agent_capability
 
     gate = " ".join(_SYSTEM_PROMPT.split())
     answer = " ".join(direct_answer._SYSTEM_PROMPT.split())
     assert "Delegate any request to remember, save or forget something for later" in gate
-    assert "could be in the user's own files or project" in gate
+    # The gate runs only on turns with no files (`files_present` returns
+    # first), so a files line could only take general questions from it.
+    assert "files or project" not in gate
     assert "about the user's own preferences or about something they said in another conversation" in gate
-    assert "Never say you can't do something: delegate it instead." in gate
     assert "any request to remember or forget something" in answer
-    assert "Never say you can't do something the user asked; call the delegate tool instead." in answer
+    # Both name what the agent can do and the answer check refuses a denial
+    # of (denies_agent_capability), in the same words. A line against every
+    # "can't" would send general questions whose honest answer is no, such
+    # as dividing by zero, to the agent.
+    never_deny = (
+        "Never say you can't save, remember, search, look up or access something, "
+        "or open or read the user's files:"
+    )
+    assert f"{never_deny} delegate it instead." in gate
+    assert f"{never_deny} call the delegate tool instead." in answer
+    assert "Never say you can't do something" not in gate + answer
+    for denial in (
+        "I can't save that", "I can't remember that", "I can't search for that",
+        "I can't look up that", "I can't access that", "I can't open your files", "I can't read your files",
+    ):
+        assert denies_agent_capability(denial), denial
+
+
+def test_progress_lines_describe_each_step_and_flag_the_running_one():
+    from cowork.handlers.response_routing import progress_lines
+
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Starting."},
+            {"type": "tool_use", "id": "t1", "name": "scratchpad",
+             "input": {"one_line_description": "Read the tuition pages", "code": "..."}},
+        ]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t2", "name": "web_search", "input": {"query": "dates"}},
+            {"type": "tool_use", "id": "t3", "name": "scratchpad",
+             "input": {"one_line_description": "  Fill   coverage gaps  "}},
+        ]},
+    ]
+    assert progress_lines(messages) == [
+        "[done] Read the tuition pages (scratchpad)",
+        "[in progress] web_search",
+        "[in progress] Fill coverage gaps (scratchpad)",
+    ]
+
+
+def test_step_description_caps_its_length():
+    from cowork.handlers.response_routing import ADDON_STEP_DESCRIPTION_CHARS, step_description
+
+    assert len(step_description({"one_line_description": "x" * 500})) == ADDON_STEP_DESCRIPTION_CHARS
+    assert step_description({"code": "1"}) == ""
+    assert step_description("not json") == ""
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_revokes_the_key_the_gate_minted(monkeypatch, tmp_path):
+    """The gate mints a turn key for a delegated turn to reuse. When the
+    router answers itself, no turn runs to revoke it, so the handler does."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path)))
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: conversation,
+            message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
+            get_recent_messages=lambda *_args, **_kwargs: [],
+        ),
+    )
+
+    async def no_secrets(_scope):
+        return None
+
+    monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+
+    async def direct(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi"), {"correlation_id": "corr-gate"}
+
+    handler._route_request = direct
+
+    async def answered(**_kwargs):
+        return "answered"
+
+    handler._handle_direct_response = answered
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
+
+    assert await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id))) == "answered"
+    assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_gate_revokes_the_key_it_minted(monkeypatch):
+    """The gate falls back to the agent, which mints its own key; the gate's
+    would otherwise live out its whole window."""
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+
+    async def broken_gate(**_kwargs):
+        raise RuntimeError("router down")
+
+    monkeypatch.setattr(responses, "decide_route", broken_gate)
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
+    decision, turn_llm = await handler._route_request(
+        conversation_id="conv-1",
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+    assert decision.fallback is True
+    assert turn_llm is None
+    assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_gate_cancels_the_first_take_before_revoking_its_key(monkeypatch):
+    """The first take runs on the gate's key, and handle() keeps it for the
+    agent when the gate falls back. Revoking the key under it would fail its
+    model call on every router outage, so the take is cancelled first."""
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+    events = []
+
+    class _Take:
+        def cancel(self):
+            events.append("take cancelled")
+
+    monkeypatch.setattr(responses, "_start_first_take", lambda *a, **k: _Take())
+
+    async def broken_gate(**_kwargs):
+        raise RuntimeError("router down")
+
+    monkeypatch.setattr(responses, "decide_route", broken_gate)
+
+    async def revoke(correlation_id):
+        events.append(f"revoked {correlation_id}")
+
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
+    decision, _turn_llm = await handler._route_request(
+        conversation_id="conv-1",
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        first_take=True,
+    )
+    assert decision.fallback is True
+    assert events == ["take cancelled", "revoked corr-gate"]
+    assert handler.first_take is None
+
+
+@pytest.mark.asyncio
+async def test_a_gate_cancelled_after_its_mint_revokes_the_key(monkeypatch):
+    """The client went away while the gate ran: no turn will run on its key."""
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+
+    async def cancelled_gate(**_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(responses, "decide_route", cancelled_gate)
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
+    with pytest.raises(asyncio.CancelledError):
+        await handler._route_request(
+            conversation_id="conv-1",
+            gate_rows=[],
+            harness_input=[{"type": "text", "text": "Hello"}],
+            has_attachments=False,
+            has_disabled_connections=False,
+        )
+    assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
+async def test_a_jev_direct_answer_revokes_the_key_the_gate_minted(monkeypatch, tmp_path):
+    """Jev routes the turn direct and the user's own model answers it, with
+    no agent turn to revoke the gate's key."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path)))
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: conversation,
+            message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
+            get_recent_messages=lambda *_args, **_kwargs: [],
+        ),
+    )
+
+    async def no_secrets(_scope):
+        return None
+
+    monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+
+    async def jev_direct(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="jev_direct", provider="jev"), {"correlation_id": "corr-gate"}
+
+    handler._route_request = jev_direct
+    handler.routing_history = [{"role": "user", "content": "hi"}]
+    handler._answer_binding = lambda **_kwargs: SimpleNamespace(model="opus-5-5")
+
+    async def complete(_binding, **_kwargs):
+        return "The answer."
+
+    monkeypatch.setattr(responses.direct_answer, "complete_answer", complete)
+
+    async def answered(**_kwargs):
+        return "answered"
+
+    handler._handle_direct_response = answered
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
+
+    assert await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id))) == "answered"
+    assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", [RuntimeError("already running"), asyncio.CancelledError()])
+async def test_a_refused_or_cancelled_start_revokes_the_gate_key(monkeypatch, tmp_path, refusal):
+    """A turn the registry refused never runs to revoke the key. Nor does one
+    whose request was cancelled during start(): it launches the producer after
+    its last await, so a cancellation there means no turn is running."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path)))
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: conversation,
+            message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
+            get_recent_messages=lambda *_args, **_kwargs: [],
+        ),
+    )
+
+    async def no_secrets(_scope):
+        return None
+
+    monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+
+    async def delegated(**_kwargs):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test"), {"correlation_id": "corr-gate"}
+
+    handler._route_request = delegated
+    handler._get_harness = lambda: SimpleNamespace(id="anton")
+
+    async def refuse(**_kwargs):
+        raise refusal
+
+    monkeypatch.setattr(responses.registry, "start", refuse)
+    revoked = []
+
+    async def revoke(correlation_id):
+        revoked.append(correlation_id)
+
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
+    with pytest.raises(type(refusal)):
+        await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id), stream=True))
+    assert revoked == ["corr-gate"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scheduled", "model", "expected"),
+    [(True, "pinned-model", DELEGATED_AGENTIC), (True, None, DIRECT_CONTEXT),
+     (False, "composer-model", DIRECT_CONTEXT)],
+)
+async def test_pinned_scheduled_turn_bypasses_direct_answers(monkeypatch, scheduled, model, expected):
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    handler.schedule_id = str(uuid4()) if scheduled else None
+    handler.interactive = not scheduled
+    gate_calls = []
+
+    async def binding():
+        return RouterBinding(provider=object(), model="router-model", label="openai_compatible"), None
+
+    async def direct(**kwargs):
+        gate_calls.append(kwargs)
+        return RouteDecision(route=DIRECT_CONTEXT, text="Hi!", reason="test")
+
+    monkeypatch.setattr(handler, "_router_binding", binding)
+    monkeypatch.setattr(responses, "_settings_binding", lambda: None)
+    monkeypatch.setattr(responses, "decide_route", direct)
+    # Keep this focused on request-shape routing, independent of installed skills.
+    monkeypatch.setattr(handler, "_reads_always_on_rows", lambda *a, **kw: [])
+    if scheduled and model:
+        def no_history(*a, **kw):
+            raise AssertionError("a pinned scheduled turn must skip router history")
+        monkeypatch.setattr(handler, "_read_gate_rows", no_history)
+
+    class Routed(Exception):
+        pass
+
+    route = handler._route_request
+
+    async def inspect_route(**kwargs):
+        decision, _ = await route(**kwargs)
+        assert decision.route == expected
+        if expected == DELEGATED_AGENTIC:
+            assert decision.reason == "pinned_schedule"
+        raise Routed
+
+    monkeypatch.setattr(handler, "_route_request", inspect_route)
+    with pytest.raises(Routed):
+        await handler.handle(ResponsesRequest(input="Say hi.", model=model, stream=True))
+    assert bool(gate_calls) == (expected == DIRECT_CONTEXT)

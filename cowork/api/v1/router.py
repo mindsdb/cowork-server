@@ -8,6 +8,8 @@ that can be included in the main FastAPI application.
 from fastapi import APIRouter
 
 from cowork.api.v1.endpoints import (
+    artifact_checks,
+    artifact_quick_edit,
     artifacts,
     artifact_workspace,
     browse,
@@ -21,16 +23,19 @@ from cowork.api.v1.endpoints import (
     conversations,
     files,
     health,
+    mindshub_org_icons,
     mindshub_people,
     mindshub_teams,
     mindshub_usage,
     mindshub_workspaces,
     live_apps,
     memory,
+    org_branding,
     pins,
     project_files,
     projects,
     publish,
+    push,
     responses,
     runtime_credential,
     schedules,
@@ -87,6 +92,7 @@ api_router.include_router(responses.router, prefix="/responses", tags=["response
 api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(schedules.router, prefix="/schedules", tags=["schedules"])
 api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
+api_router.include_router(push.router, prefix="/push", tags=["push"])
 # The sharing routes first: GET /skills/sharing-capabilities must match before
 # the skills router's GET /skills/{skill_id} reads it as a skill's id.
 api_router.include_router(skill_sharing.router, prefix="/skills", tags=["skills"])
@@ -97,6 +103,8 @@ api_router.include_router(channels.router, prefix="/channels", tags=["channels"]
 api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
 api_router.include_router(artifacts.live_app_router, prefix="/artifacts", tags=["artifacts", "live-apps"])
 api_router.include_router(artifact_workspace.router, prefix="/artifacts", tags=["artifact-workspace"])
+api_router.include_router(artifact_checks.router, prefix="/artifacts", tags=["artifact-checks"])
+api_router.include_router(artifact_quick_edit.router, prefix="/artifacts", tags=["artifact-workspace"])
 api_router.include_router(comments.router, prefix="/artifact-comments", tags=["artifact-comments"])
 api_router.include_router(live_apps.router, prefix="/live-apps", tags=["live-apps"])
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])
@@ -112,6 +120,8 @@ api_router.include_router(mindshub_workspaces.router, prefix="/hub/workspaces", 
 api_router.include_router(mindshub_usage.router, prefix="/hub/usage", tags=["mindshub-usage"])
 api_router.include_router(mindshub_teams.router, prefix="/hub/teams", tags=["mindshub-teams"])
 api_router.include_router(mindshub_people.router, prefix="/hub/people", tags=["mindshub-people"])
+api_router.include_router(mindshub_org_icons.router, prefix="/hub/org-icons", tags=["mindshub-org-icons"])
+api_router.include_router(org_branding.router, prefix="/org-branding", tags=["org-branding"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────
 api_router.include_router(integrations_router, prefix="/integrations", tags=["compat"])

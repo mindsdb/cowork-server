@@ -353,7 +353,7 @@ def test_a_remote_allowance_stop_posts_the_allowance_message_not_out_of_credits(
     ])
     monkeypatch.setattr(producer, "get_redis", lambda: fake_redis)
     monkeypatch.setattr(producer, "_new_correlation_id", lambda: "corr-billing")
-    monkeypatch.setattr(producer, "_mint_llm_block", fake_llm_block)
+    monkeypatch.setattr(producer, "mint_llm_block", fake_llm_block)
     monkeypatch.setattr(producer, "_mint_oauth_block", no_oauth_block)
 
     posted: list[tuple[str, dict]] = []

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import stat
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from pydantic import (
     field_validator,
 )
 
+from cowork.common.logger import log_context
 from cowork.common.paths import dir_lstat, dir_rmtree, dir_unlink, opened_subdir_nofollow, pinned_dir
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
@@ -260,6 +262,39 @@ def _drop_project_engram(reason: str, key: str) -> bool:
     return False
 
 
+def _existing_slot_refusal(
+    coordination: ExitStack,
+    access: SharedResourceAccess,
+    store: ProjectMemoryStore,
+    slot: MemorySlot,
+    key: str,
+) -> str | None:
+    """The authorship gate a remote turn passes to change a shared slot that
+    already holds content or an author: to write an entry into it
+    (_apply_project_engram) or to remove one (_forget_project_slot).
+
+    The caller must be allowed to change the author's slot, and no other write
+    may be establishing it. The authorship is checked again once the slot's
+    mutation lock is held, which this enters on ``coordination``. Returns why
+    the caller is refused, or None once the lock is held for a caller who may
+    change the slot.
+    """
+    if not access.can_change(access.creator_id(PROJECT_MEMORY, key)):
+        return "the turn's actor is not its author"
+    if access.claim_is_pending(PROJECT_MEMORY, key):
+        return "another write is establishing it"
+    attribution = coordination.enter_context(
+        access.mutation_lock(
+            PROJECT_MEMORY,
+            key,
+            resource_exists=lambda: _slot_holds_content(store.read_state(slot)),
+        )
+    )
+    if attribution is None or not access.can_change(attribution.created_by_id):
+        return "the turn's actor is not its author"
+    return None
+
+
 def apply_turn_memory(
     scope: TenantScope,
     project_path: str | None,
@@ -360,32 +395,9 @@ def _apply_project_engram(
             claimed = None
             claim_token = None
             if _slot_holds_content(before) or attribution_exists:
-                if not access.can_change(access.creator_id(PROJECT_MEMORY, key)):
-                    return _drop_project_engram(
-                        "the turn's actor is not its author",
-                        key,
-                    )
-                if access.claim_is_pending(PROJECT_MEMORY, key):
-                    return _drop_project_engram(
-                        "another write is establishing it",
-                        key,
-                    )
-                attribution = coordination.enter_context(
-                    access.mutation_lock(
-                        PROJECT_MEMORY,
-                        key,
-                        resource_exists=lambda: _slot_holds_content(
-                            store.read_state(slot)
-                        ),
-                    )
-                )
-                if attribution is None or not access.can_change(
-                    attribution.created_by_id
-                ):
-                    return _drop_project_engram(
-                        "the turn's actor is not its author",
-                        key,
-                    )
+                refusal = _existing_slot_refusal(coordination, access, store, slot, key)
+                if refusal is not None:
+                    return _drop_project_engram(refusal, key)
                 before = store.read_state(slot)
             else:
                 claimed, claim_token = access.reserve_claim(PROJECT_MEMORY, key)
@@ -472,6 +484,234 @@ def _apply_project_engram(
                     logger.exception("Could not release a failed project-memory claim")
             raise
     return True
+
+
+# The ``<!-- key:value ... -->`` comment that ends a saved entry line, as
+# anton's Hippocampus finds it (_extract_metadata).
+_METADATA_TAIL = re.compile(r"\s*<!--[^>]*-->\s*$")
+
+
+def normalize_memory_line(text: str) -> str:
+    """The form a forget request and a saved memory entry are compared in.
+
+    It drops the metadata tail and the surrounding whitespace, turns each run
+    of whitespace inside into one space, and folds case. A request removes an
+    entry only when the two normalize to the same text: never on a substring
+    and never on a near match. anton's forget tool compares in the same form,
+    so a change here changes which entries a cloud turn's request removes.
+    """
+    return " ".join(_METADATA_TAIL.sub("", text).split()).casefold()
+
+
+class _WireForget(BaseModel):
+    """One saved memory entry a pod asked to remove, from its memory_forget
+    event. Untrusted like _WireEngram: an entry that does not parse is skipped.
+
+    The fields mirror anton's MemoryForgetEntry (anton/cloud_turn/contract.py).
+    ``text`` is the saved entry's own text in the form anton's
+    normalize_entry_text gives it, the form normalize_memory_line gives too.
+    ``scope`` is the tier the pod found the entry in, the caller's own
+    ("global") or the project's ("project"), and the only tier it is removed
+    from. An entry with no scope or another one is skipped.
+
+    ``text`` has no length bound, unlike _WireEngram's: a removal writes nothing
+    to disk, and a saved entry can be longer than that bound in the form
+    anton sends. The Memories page (MemoryService.update_memory_sync) saves
+    an entry of any length, and casefold can make one character three
+    ("ﬃ" becomes "ffi"), so a bound here could only refuse a valid removal.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    text: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    scope: Literal["global", "project"]
+
+
+def _validated_forgets(entries: list) -> list[_WireForget]:
+    """The removal requests worth matching. Anything unparseable is skipped,
+    and so is a text that is only a metadata tail, since it names no entry;
+    one WARNING counts what was skipped."""
+    validated: list[_WireForget] = []
+    for raw in entries:
+        try:
+            entry = _WireForget.model_validate(raw)
+        except ValidationError:
+            continue
+        if normalize_memory_line(entry.text):
+            validated.append(entry)
+    if skipped := len(entries) - len(validated):
+        logger.warning(
+            "Dropped remote-turn memory removals that name no saved entry",
+            extra={"event": "turn_memory_forget_dropped", "count": skipped},
+        )
+    return validated
+
+
+def _matching_ids(
+    hippocampus: "Hippocampus", slot: MemorySlot, wanted: frozenset[str]
+) -> set[str]:
+    """The ids of the entries in ``slot`` whose text normalizes to one of
+    ``wanted``."""
+    if slot is MemorySlot.PROFILE:
+        entries = hippocampus.get_identities()
+    elif slot is MemorySlot.RULES:
+        entries = hippocampus.get_rules()
+    else:
+        entries = hippocampus.get_lessons()
+    return {
+        entry.id for entry in entries if normalize_memory_line(entry.text) in wanted
+    }
+
+
+def _forget_in_slot(
+    hippocampus: "Hippocampus", slot: MemorySlot, wanted: frozenset[str]
+) -> int:
+    """Remove the entries of ``slot`` that match ``wanted``, by id through
+    anton's own deleter for the slot; returns how many it removed."""
+    ids = _matching_ids(hippocampus, slot, wanted)
+    delete = {
+        MemorySlot.PROFILE: hippocampus.del_identity,
+        MemorySlot.RULES: hippocampus.del_rule,
+        MemorySlot.LESSONS: hippocampus.del_lesson,
+    }[slot]
+    for entry_id in sorted(ids):
+        delete(entry_id)
+    return len(ids)
+
+
+def apply_turn_forget(
+    scope: TenantScope,
+    project_path: str | None,
+    entries: list,
+    *,
+    access: SharedResourceAccess | None = None,
+    project_id: UUID | None = None,
+) -> int:
+    """Remove the saved memory entries a remote turn asked to forget; returns
+    how many entries it removed.
+
+    The pod holds a read-only copy of memory and only reports the request, so
+    a cloud turn's removal happens here. Like apply_turn_memory, it goes
+    through the caller's ``scope``, so a pod can't reach another org's memory.
+    Each request removes the entries of the tier it names whose text matches
+    it (normalize_memory_line), by id through anton's own Hippocampus.
+
+    The caller's own tier is changed first and on its own, as a write is. The
+    project tier changes only where apply_turn_memory would write to it:
+    outside org mode with no gate, and in org mode only for a trusted caller
+    who passes the slot's authorship gate (_forget_project_slot). A refused
+    request is logged at WARNING and removes nothing from that slot.
+    """
+    from anton.core.memory.hippocampus import Hippocampus
+
+    validated = _validated_forgets(entries)
+    removed = 0
+
+    global_wanted = frozenset(
+        normalize_memory_line(entry.text) for entry in validated if entry.scope == "global"
+    )
+    if global_wanted:
+        global_hc = Hippocampus(GlobalMemoryStore(scope=scope).root)
+        for slot in MemorySlot:
+            removed += _forget_in_slot(global_hc, slot, global_wanted)
+
+    project_wanted = frozenset(
+        normalize_memory_line(entry.text) for entry in validated if entry.scope == "project"
+    )
+    if not project_wanted:
+        return removed
+    if project_path is None:
+        logger.warning(
+            "Dropped remote-turn project memory removals: the turn has no project",
+            extra={"event": "turn_memory_forget_dropped", "count": len(project_wanted)},
+        )
+        return removed
+
+    if not scope.org_mode:
+        project_hc = Hippocampus(ProjectMemoryStore(Path(project_path)).root)
+        for slot in PROJECT_SLOTS:
+            removed += _forget_in_slot(project_hc, slot, project_wanted)
+        return removed
+
+    # The same trusted identity a project write needs (apply_turn_memory).
+    if access is None or project_id is None or not access.has_trusted_actor:
+        logger.warning(
+            "Dropped remote-turn project memory removals: "
+            "the turn carries no trusted organization identity",
+            extra={
+                "event": "turn_memory_forget_dropped",
+                "count": len(project_wanted),
+                **log_context(project_id=project_id),
+            },
+        )
+        return removed
+    for slot in PROJECT_SLOTS:
+        removed += _forget_project_slot(access, project_id, slot, project_wanted)
+    return removed
+
+
+def _forget_project_slot(
+    access: SharedResourceAccess,
+    project_id: UUID,
+    slot: MemorySlot,
+    wanted: frozenset[str],
+) -> int:
+    """Remove the entries of one shared slot that match ``wanted``, under the
+    authorship gate a write to the slot passes (_existing_slot_refusal).
+
+    Returns how many it removed. A slot with no matching entry is left alone,
+    with no gate and no log line. A slot the caller may not change removes
+    nothing and logs one WARNING naming it, so one refused slot costs only
+    itself.
+    """
+    from anton.core.memory.hippocampus import Hippocampus
+
+    with ExitStack() as coordination:
+        try:
+            _project, store, key = coordination.enter_context(
+                _project_slot_coordination(access.session, access, project_id, slot)
+            )
+            hippocampus = Hippocampus(store.root)
+            if not _matching_ids(hippocampus, slot, wanted):
+                return 0
+            access.recover_stale_claim(
+                PROJECT_MEMORY,
+                key,
+                resource_exists=lambda: _slot_holds_content(store.read_state(slot)),
+            )
+            refusal = _existing_slot_refusal(coordination, access, store, slot, key)
+            if refusal is not None:
+                logger.warning(
+                    "Refused a remote-turn project memory removal",
+                    extra={
+                        "event": "turn_memory_forget_refused",
+                        "reason": refusal,
+                        "slot": slot.value,
+                        **log_context(project_id=project_id),
+                    },
+                )
+                return 0
+            before = store.read_state(slot)
+        except Exception:
+            access.session.rollback()
+            raise
+
+        try:
+            # Matched again under the lock: the slot may have changed while
+            # this waited for it.
+            removed = _forget_in_slot(hippocampus, slot, wanted)
+            after = store.read_state(slot)
+            if after.content != before.content or after.exists != before.exists:
+                access.record_update(PROJECT_MEMORY, key, action="update")
+        except Exception:
+            try:
+                _restore_project_slot(store, slot, before)
+            except Exception:
+                logger.exception(
+                    "Could not restore project memory after a failed removal"
+                )
+            raise
+    return removed
 
 
 class PersonMemoryResetError(ValueError):

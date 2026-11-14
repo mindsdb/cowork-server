@@ -97,7 +97,7 @@ async def _no_connections(**kwargs):
     return None
 
 
-producer._mint_llm_block = _turn_key
+producer.mint_llm_block = _turn_key
 producer._mint_oauth_block = _no_connections
 
 # Held because the event loop keeps only a weak reference to a task.
@@ -143,6 +143,7 @@ async def start(request: Request, cancel_on_disconnect: bool = False):
     conversation_id = _new_conversation()
     lifecycle = TurnLifecycle()
     handler = object.__new__(responses.ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = None  # local, single-process deployment
     handle = await registry.start(
         conversation_id=str(conversation_id), turn_id=0,

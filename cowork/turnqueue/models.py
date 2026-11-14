@@ -8,6 +8,7 @@ package exists.
 """
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, StrictStr, field_validator, model_validator
@@ -19,6 +20,14 @@ from pydantic import BaseModel, Field, StrictStr, field_validator, model_validat
 MAX_DEADLINE_MS = 24 * 60 * 60 * 1000
 DATASOURCE_PROTOCOL_VERSION = 1
 MAX_DATASOURCE_CONNECTIONS = 100
+_REQUIRED_REF_KEYS = frozenset({"connection_id", "credential_version"})
+#: Names for the prompt only. anton's `anton/cloud_turn/contract.py` allows the
+#: same two, cleans each value for the prompt and drops what it cannot use, so
+#: this check enforces shape alone; the producer sends only values that pass it.
+_OPTIONAL_REF_KEYS = frozenset({"label", "engine"})
+#: Auth's cap on a connection's name.
+_MAX_CONNECTION_LABEL_CHARS = 128
+_CONNECTION_ENGINE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,31}")
 
 #: The ``turn_completed`` key that names the artifact folders the turn's tools
 #: touched. anton holds the same name as ``ARTIFACTS_TOUCHED_KEY`` in
@@ -57,7 +66,14 @@ def _validate_datasource_block(value: object) -> None:
         raise ValueError("datasource connections are invalid")
     seen: set[int] = set()
     for connection in connections:
-        if not isinstance(connection, dict) or set(connection) != {"connection_id", "credential_version"}:
+        if (
+            not isinstance(connection, dict)
+            or not _REQUIRED_REF_KEYS <= set(connection) <= _REQUIRED_REF_KEYS | _OPTIONAL_REF_KEYS
+        ):
+            raise ValueError("datasource connection reference is invalid")
+        if "label" in connection and not is_connection_label(connection["label"]):
+            raise ValueError("datasource connection reference is invalid")
+        if "engine" in connection and not is_connection_engine(connection["engine"]):
             raise ValueError("datasource connection reference is invalid")
         connection_id = connection.get("connection_id")
         version = connection.get("credential_version")
@@ -74,11 +90,21 @@ def _validate_datasource_block(value: object) -> None:
         seen.add(connection_id)
 
 
+def is_connection_label(value: object) -> bool:
+    """Whether ``value`` has the shape of a connection name the producer sends: a non-empty string within auth's cap."""
+    return isinstance(value, str) and 0 < len(value) <= _MAX_CONNECTION_LABEL_CHARS
+
+
+def is_connection_engine(value: object) -> bool:
+    """Whether ``value`` has the shape of auth's connector id; ``fullmatch``, so a trailing newline fails."""
+    return isinstance(value, str) and _CONNECTION_ENGINE_PATTERN.fullmatch(value) is not None
+
+
 class TurnJob(BaseModel):
     """Mirror of scratchpad-controller ScratchpadJobPayload (job the controller consumes).
 
     ``params`` carries an ``llm`` block minted per turn by
-    ``cowork.turnqueue.producer._mint_llm_block``:
+    ``cowork.turnqueue.producer.mint_llm_block``:
     ``{"provider": "minds-cloud", "api_key": <short-TTL mdb_ turn key>,
     "base_url": <MindsHub chat base URL>}``. MVP is MindsHub-inference-only, so
     this is the only provider/credential shape carried here. The key is scoped
@@ -140,10 +166,11 @@ class TurnReply(BaseModel):
     # Must accept every kind the controller can publish: the reply loop validates
     # each of its own turn's entries unguarded, so a missing kind fails the turn
     # rather than being ignored. Kinds this build does nothing with are dropped
-    # further down.
+    # further down. A new kind lands here, and deploys, before the controller
+    # publishes it.
     kind: Literal["progress", "cell", "error", "turn_delta", "turn_step",
-                  "turn_memory", "turn_skill", "turn_history", "turn_compaction",
-                  "turn_completed", "turn_failed"]
+                  "turn_memory", "turn_memory_forget", "turn_skill", "turn_connector",
+                  "turn_history", "turn_compaction", "turn_completed", "turn_failed"]
     data: dict[str, Any] = Field(default_factory=dict)
     # The reply's number within its turn, counting up by one. The controller
     # resends a reply whose XADD reply it lost, and the relay drops a reply

@@ -16,10 +16,10 @@ from cowork.server import create_app
 
 PRODUCT = "Acme & Co's $workbench"
 # Exact unbranded prompts: the gate's since it delegates write, approval,
-# reply-to-a-question, remember, recall and files turns and never says it
-# can't, the take's since staging 8b1ecf4. These compatibility assertions exercise
-# provider requests, not just the constants.
-DEFAULT_GATE_SHA256 = "4a90091f541d9412f6bd7548b7ebe623618ce3719521e3a60af6392302da4bcb"
+# reply-to-a-question, remember and recall turns and never says it can't do
+# what the agent can, the take's since staging 8b1ecf4. These compatibility
+# assertions exercise provider requests, not just the constants.
+DEFAULT_GATE_SHA256 = "5c4a893d8cbb8621c24498c20749a5f105bb1dd3ce7b68df079bb73fc693a208"
 DEFAULT_TAKE_SHA256 = "423cf10dd88589f84adadb158b7851a89cfd32da4bad967c473062f07a51427a"
 
 
@@ -179,6 +179,21 @@ async def test_configured_product_denials_delegate_and_withdraw_first_takes(monk
     assert not decision.text
     frame = take._queue.get_nowait()
     assert "response.first_take.cleared" in frame
+    assert take._queue.empty()
+
+
+@pytest.mark.parametrize("branded", [False, True])
+async def test_a_first_take_denying_what_the_agent_can_do_is_withdrawn(monkeypatch, tmp_path, branded):
+    """A remember request goes to the agent with the take on screen until the
+    agent answers, so a take saying it can't save is withdrawn."""
+    _initialize(monkeypatch, tmp_path, branded=branded)
+    take_text = "I can't save preferences between chats, but I'll use teal here."
+    history = [{"role": "user", "content": "Please remember this for my later chats: my chart color is teal."}]
+
+    assert not first_take._shippable(take_text)
+    take = first_take.FirstTake(_binding(_Provider(take_text)), history)
+    assert await take._write() == "withdrawn"
+    assert "response.first_take.cleared" in take._queue.get_nowait()
     assert take._queue.empty()
 
 

@@ -24,7 +24,10 @@ from the environment (StorageSettings in cowork.common.settings.app_settings).
 A unit that also works on the file store (``run_efs_unit``) holds a pooled
 connection while the store answers, so those units together hold at most
 EFS_UNIT_SLOTS of the database unit slots (DatabaseSettings), and units stuck
-on the store never hold every connection.
+on the store never hold every connection. A cloud turn's copy of its
+project's files (``run_efs_copy``) holds its slot for seconds, so copies take
+one of their own slots first (TurnQueueSettings.project_files_copy_slots) and
+never hold every EFS slot.
 """
 from __future__ import annotations
 
@@ -46,6 +49,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.exceptions import HTTPException
 
+from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.db import session as db_session
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.turnqueue.models import MAX_ARTIFACT_NAME_CHARS
@@ -430,8 +434,9 @@ async def _drain(task: asyncio.Future[Any]) -> None:
 # EFS_SLOTS, the threads EFS work may hold at once per event loop, and
 # EFS_SHARE, the slots one person, or one organization's work with no person,
 # may hold at once, are settings (StorageSettings.efs_slots and efs_share, 100
-# and 10 by default). Nothing caps an organization: ten busy people fill the
-# default EFS_SLOTS.
+# and 10 by default). An organization's copies of a project's files with no
+# person hold a share of their own (_efs_share). Nothing caps an organization:
+# ten busy people fill the default EFS_SLOTS.
 _EFS_SLOTS: RunVar[anyio.CapacityLimiter] = RunVar("cowork_efs_slots")
 _EFS_SHARES: RunVar[WeakValueDictionary[str, anyio.CapacityLimiter]] = RunVar("cowork_efs_shares")
 _efs_thread = threading.local()
@@ -448,7 +453,7 @@ def _efs_slots() -> anyio.CapacityLimiter:
     return limiter
 
 
-def _efs_share(scope: TenantScope) -> anyio.CapacityLimiter | None:
+def _efs_share(scope: TenantScope, *, for_copy: bool = False) -> anyio.CapacityLimiter | None:
     """The caller's share of the EFS slots, or None where one person owns the
     deployment (the desktop, the operator view) and there is nobody to keep
     apart. A share lives while someone waits for it or holds it.
@@ -459,10 +464,21 @@ def _efs_share(scope: TenantScope) -> anyio.CapacityLimiter | None:
     never matches a person's: ``TrustedHeaderMiddleware.dispatch``
     (cowork/principal.py) parses X-User-Id as a UUID, so no person's key
     starts with ``org:``.
+
+    ``for_copy`` is a copy of a project's files (run_efs_copy). With no
+    person, it shares under ``org:<org_id>:copy``: a copy holds its slot for
+    seconds, so an organization's channel copies never take the slots its
+    new bindings, staging and artifact sends wait for. A person's copy takes
+    the person's own share.
     """
     if not scope.partitioned:
         return None
-    key = scope.user_id or f"org:{scope.org_id}"
+    if scope.user_id:
+        key = scope.user_id
+    elif for_copy:
+        key = f"org:{scope.org_id}:copy"
+    else:
+        key = f"org:{scope.org_id}"
     try:
         shares = _EFS_SHARES.get()
     except LookupError:
@@ -536,15 +552,17 @@ async def _efs_task(
 
 async def _run_on_efs(
     fn: Callable[[], T], *, scope: TenantScope, deadline: bool, unit_slots: tuple[anyio.CapacityLimiter, ...],
+    for_copy: bool = False,
 ) -> T:
-    """``run_efs`` for both of its callers: ``unit_slots`` is what a database
+    """``run_efs`` for each of its callers: ``unit_slots`` is what a database
     unit (``run_efs_unit``) takes after its file store slot, in order, or
-    nothing."""
+    nothing. ``for_copy`` takes the share of a copy of a project's files
+    (``run_efs_copy``, _efs_share)."""
     loop = asyncio.get_running_loop()
     until = loop.time() + db_session.settings.database.pool_timeout if deadline else math.inf
     start = _EfsStart()
     work = asyncio.ensure_future(
-        _efs_task(fn, share=_efs_share(scope), unit_slots=unit_slots, deadline=until, start=start)
+        _efs_task(fn, share=_efs_share(scope, for_copy=for_copy), unit_slots=unit_slots, deadline=until, start=start)
     )
     work.add_done_callback(_retrieve_outcome)
     try:
@@ -582,6 +600,51 @@ async def run_efs_cleanup(fn: Callable[[], T], *, scope: TenantScope) -> T:
     ``Task.cancel()``, waits for it before it propagates (``run_to_completion``).
     """
     return await run_to_completion(run_efs(fn, scope=scope, deadline=False))
+
+
+_PROJECT_FILES_COPY_SLOTS: RunVar[anyio.CapacityLimiter] = RunVar("cowork_project_files_copy_slots")
+
+
+def _project_files_copy_slots() -> anyio.CapacityLimiter:
+    """This event loop's cap on the copies of a project's files that run at
+    once (TurnQueueSettings.project_files_copy_slots)."""
+    try:
+        return _PROJECT_FILES_COPY_SLOTS.get()
+    except LookupError:
+        pass
+    limiter = anyio.CapacityLimiter(TurnQueueSettings().project_files_copy_slots)
+    _PROJECT_FILES_COPY_SLOTS.set(limiter)
+    return limiter
+
+
+async def run_efs_copy(fn: Callable[[], T], *, scope: TenantScope) -> T:
+    """Run ``fn``, one cloud turn's copy of its project's files, on
+    ``run_efs`` once one of this event loop's copy slots is free
+    (_project_files_copy_slots).
+
+    A copy holds its file store slot for up to its time budget, longer than
+    POOL_TIMEOUT, so copies with no cap of their own could hold every
+    EFS_SLOTS and refuse every other organization's file store work. The copy
+    slot comes first, so a copy waiting for one holds no file store slot. The
+    wait gives up POOL_TIMEOUT after the call with ``FilesystemBusy``, which
+    refuses the copier's own turn only. The copy slot is held until
+    ``run_efs`` returns, which waits for a copy that started even when the
+    caller is cancelled.
+
+    A copy with no person behind it, a channel turn's, takes its
+    organization's copy share, not the share its other work takes
+    (_efs_share's ``for_copy``).
+    """
+    slots = _project_files_copy_slots()
+    deadline = asyncio.get_running_loop().time() + db_session.settings.database.pool_timeout
+    with anyio.CancelScope(deadline=deadline) as slot_wait:
+        await slots.acquire()
+    if slot_wait.cancelled_caught:
+        raise FilesystemBusy("no project files copy slot freed within POOL_TIMEOUT")
+    try:
+        return await _run_on_efs(fn, scope=scope, deadline=True, unit_slots=(), for_copy=True)
+    finally:
+        slots.release()
 
 
 _EFS_UNIT_SLOTS: RunVar[anyio.CapacityLimiter] = RunVar("cowork_efs_unit_slots")
@@ -651,6 +714,7 @@ def loop_limiters() -> dict[str, anyio.CapacityLimiter]:
         "run_db": _slots(_engine()),
         "run_efs": _efs_slots(),
         "run_efs_unit": _efs_unit_slots(),
+        "run_efs_copy": _project_files_copy_slots(),
     }
 
 

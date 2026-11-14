@@ -108,7 +108,7 @@ def test_a_remote_turns_project_file_copy_runs_on_the_file_store_threads_with_no
     from contextlib import contextmanager
 
     from cowork.db import units
-    from cowork.services import files
+    from cowork.services import project_file_copy
 
     (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
     open_sessions: list[int] = []
@@ -124,14 +124,14 @@ def test_a_remote_turns_project_file_copy_runs_on_the_file_store_threads_with_no
             open_sessions.pop()
 
     seen: list[tuple[bool, int]] = []
-    real_stage = files.stage_project_files
+    real_stage = project_file_copy.stage_project_files
 
     def watched_stage(*args, **kwargs):
         seen.append((units.on_efs_thread(), len(open_sessions)))
         return real_stage(*args, **kwargs)
 
     monkeypatch.setattr(units, "unit_session", counted_unit_session)
-    monkeypatch.setattr(files, "stage_project_files", watched_stage)
+    monkeypatch.setattr(project_file_copy, "stage_project_files", watched_stage)
 
     with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
         with blocking_guard.watching() as found:
@@ -142,7 +142,8 @@ def test_a_remote_turns_project_file_copy_runs_on_the_file_store_threads_with_no
     copy = org_conversation.project_path / "conversations" / str(org_conversation.id) / "project-files"
     assert (copy / "chapter-1.md").read_text() == "The porter kept the keys."
     [record] = [r for r in caplog.records if getattr(r, "event", None) == "project_files_staged"]
-    assert record.levelname == "WARNING"
+    assert (record.name, record.levelname) == (responses_mod.logger.name, "WARNING")
+    assert record.getMessage() == "Copied the project's files for a cloud turn"
     # The deployments' JSON log keeps every field of the line.
     from cowork.common.structured_logging import make_formatter
 
@@ -162,7 +163,7 @@ def test_a_project_file_copy_that_cant_finish_empties_the_copy_and_the_turn_goes
     """A failed copy never fails the turn. It leaves no file behind that the
     project may no longer hold, only the list that tells the agent the copy
     failed, so it says so rather than answering from the web."""
-    from cowork.services import files
+    from cowork.services import project_file_copy
 
     (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
     asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
@@ -172,22 +173,25 @@ def test_a_project_file_copy_that_cant_finish_empties_the_copy_and_the_turn_goes
     def broken(*args, **kwargs):
         raise OSError(5, "Input/output error")
 
-    monkeypatch.setattr(files, "_stage_project_files", broken)
+    monkeypatch.setattr(project_file_copy, "_stage_project_files", broken)
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
         asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
 
-    assert [path.name for path in copy.iterdir()] == [files.NOT_COPIED_FILENAME]
-    listed = files.NotCopiedFiles.model_validate_json((copy / files.NOT_COPIED_FILENAME).read_bytes())
-    assert listed == files.NotCopiedFiles(copy_failed=True)
+    assert [path.name for path in copy.iterdir()] == [project_file_copy.NOT_COPIED_FILENAME]
+    listed = (copy / project_file_copy.NOT_COPIED_FILENAME).read_bytes()
+    assert project_file_copy.NotCopiedFiles.model_validate_json(listed) == project_file_copy.NotCopiedFiles(
+        copy_failed=True,
+    )
     [record] = [r for r in caplog.records if getattr(r, "event", None) == "project_files_staged"]
     assert (record.outcome, record.files) == ("failed", 0)
+    assert record.getMessage() == "Could not copy the project's files for a cloud turn; its copy was emptied"
 
 
 def test_a_copy_that_cant_empty_its_folder_refuses_the_turn(org_conversation, monkeypatch):
     """A folder that may still hold a copy the project no longer backs is
     never handed to a turn."""
-    from cowork.services import files
+    from cowork.services import project_file_copy
 
     (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
     asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
@@ -195,11 +199,334 @@ def test_a_copy_that_cant_empty_its_folder_refuses_the_turn(org_conversation, mo
     def broken(*args, **kwargs):
         raise OSError(5, "Input/output error")
 
-    monkeypatch.setattr(files, "_prune_folder", broken)
-    monkeypatch.setattr(files._CopyFolders, "set_aside", broken)
+    monkeypatch.setattr(project_file_copy, "_prune_folder", broken)
+    monkeypatch.setattr(project_file_copy._CopyFolders, "set_aside", broken)
 
-    with pytest.raises(files.ProjectFilesRefused):
+    with pytest.raises(project_file_copy.ProjectFilesRefused) as refused:
         asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    assert refused.value.refusal is project_file_copy.ProjectFilesRefusal.NOT_EMPTIED
+    assert str(refused.value) == (
+        f"the project files copy of conversation {org_conversation.id} was refused: "
+        "the copy could not finish and its folder could not be emptied"
+    )
+
+
+def test_a_refused_copys_log_lines_carry_their_values_as_fields(org_conversation, monkeypatch, caplog):
+    """The deployments' JSON log keeps a line's static message and drops its
+    template values, and a line with an exception becomes "Operation
+    failed". So every line of a refused copy names its conversation, and
+    the staged line its refusal, as fields, never as template values."""
+    from cowork.common.structured_logging import make_formatter
+    from cowork.services import project_file_copy
+
+    (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
+    asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    def broken(*args, **kwargs):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(project_file_copy, "_prune_folder", broken)
+    monkeypatch.setattr(project_file_copy._CopyFolders, "set_aside", broken)
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(project_file_copy.ProjectFilesRefused):
+            asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    records = [
+        r for r in caplog.records
+        if r.name in {project_file_copy.logger.name, responses_mod.logger.name} and r.levelno >= logging.WARNING
+    ]
+    assert [(r.name, r.event) for r in records] == [
+        (project_file_copy.logger.name, "project_files_copy_failed"),
+        (project_file_copy.logger.name, "project_files_empty_set_aside"),
+        (project_file_copy.logger.name, "project_files_copy_not_emptied"),
+        (responses_mod.logger.name, "project_files_staged"),
+    ]
+    lines = [json.loads(make_formatter().format(r)) for r in records]
+    for record, line in zip(records, lines, strict=True):
+        assert record.args == ()
+        assert (line["event"], line["conversation_id"]) == (record.event, str(org_conversation.id))
+    assert (lines[-1]["outcome"], lines[-1]["refusal"]) == ("refused", "not_emptied")
+
+
+def _delete_conversation(conversation: OrgConversation) -> None:
+    """The member's own delete, through the app: it removes the row, then
+    the conversation's folder and the copy's record."""
+    deleted = TestClient(create_app()).delete(f"/api/v1/conversations/{conversation.id}", headers=MEMBER)
+    assert deleted.status_code == 200, deleted.text
+
+
+def test_a_conversation_deleted_before_its_copy_starts_keeps_no_folder_or_record(
+    org_conversation, monkeypatch, caplog,
+):
+    """The delete lands after the staging unit read the conversation and
+    before the copy opens its folder. The copy makes the folder, its copies
+    and its record again, and its own check passes on the folder it made,
+    so the staging reads the conversation's row again once the copy ends and
+    removes them, and the turn's line says the conversation went away."""
+    from cowork.services import project_file_copy
+
+    (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
+    asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+    conversation = org_conversation.project_path / "conversations" / str(org_conversation.id)
+    record = project_file_copy.copy_record_path(org_conversation.scope, org_conversation.id)
+    assert (conversation / "project-files" / "chapter-1.md").exists() and record.exists()
+    real_stage = project_file_copy.stage_project_files
+    made_again: list[bool] = []
+
+    def deleted_first(*args, **kwargs):
+        _delete_conversation(org_conversation)
+        assert not conversation.exists() and not record.exists()
+        staged = real_stage(*args, **kwargs)
+        made_again.append(conversation.exists() and record.exists())
+        return staged
+
+    monkeypatch.setattr(project_file_copy, "stage_project_files", deleted_first)
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    assert made_again == [True]
+    assert not conversation.exists()
+    assert not record.exists()
+    [line] = [r for r in caplog.records if getattr(r, "event", None) == "project_files_staged"]
+    assert (line.outcome, line.conversation_id) == ("conversation_gone", str(org_conversation.id))
+    # Nothing is kept, and what the turn wrote stays its cost.
+    assert (line.files, line.bytes, line.copied, line.copied_bytes) == (0, 0, 1, 25)
+
+
+@pytest.mark.parametrize("taken_from", ["project-files/docs", "."], ids=["a folder of its copy", "its own folder"])
+def test_a_deleted_conversation_whose_pod_took_a_folders_access_away_keeps_no_folder(org_conversation, taken_from):
+    """The pod runs as the server's user, so it can make any folder in its
+    conversation's folder 0o000, its mount included. The delete gives each
+    folder its owner's access back and removes the whole folder, with the
+    copy of the project's files in it."""
+    import os
+
+    (org_conversation.project_path / "docs").mkdir()
+    (org_conversation.project_path / "docs" / "plan.md").write_text("The porter kept the keys.")
+    asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+    conversation = org_conversation.project_path / "conversations" / str(org_conversation.id)
+    assert (copy_folder(org_conversation) / "docs" / "plan.md").exists()
+    taken = conversation / taken_from
+    os.chmod(taken, 0o000)
+    try:
+        _delete_conversation(org_conversation)
+    finally:
+        if taken.exists():
+            os.chmod(taken, 0o700)
+
+    assert not conversation.exists()
+
+
+def test_a_conversation_folder_the_delete_cant_remove_is_logged_with_its_id(org_conversation, monkeypatch, caplog):
+    """A fixed message with the conversation as a field: the log formatter
+    drops template values, so the hosted line names the conversation."""
+    import errno
+
+    from cowork.common.structured_logging import make_formatter
+    from cowork.services import files as files_mod
+
+    conversation = org_conversation.project_path / "conversations" / str(org_conversation.id)
+    conversation.mkdir(parents=True)
+
+    def refused(folder, name):
+        raise PermissionError(errno.EACCES, "refused")
+
+    monkeypatch.setattr(files_mod, "dir_rmtree", refused)
+
+    with caplog.at_level(logging.WARNING, logger=files_mod.logger.name):
+        files_mod.remove_conversation_workspace_dir(org_conversation.project_path, org_conversation.id)
+
+    [record] = [r for r in caplog.records if r.name == files_mod.logger.name and r.levelno == logging.WARNING]
+    assert (record.getMessage(), record.args) == ("Could not remove a deleted conversation's folder", ())
+    line = json.loads(make_formatter().format(record))
+    assert (line["event"], line["conversation_id"], line["error_type"]) == (
+        "conversation_folder_not_removed", str(org_conversation.id), "PermissionError",
+    )
+    assert conversation.exists()
+
+
+def _staged_line(caplog) -> logging.LogRecord:
+    [line] = [
+        r for r in caplog.records
+        if r.name == responses_mod.logger.name and getattr(r, "event", None) == "project_files_staged"
+    ]
+    return line
+
+
+def test_a_conversation_moved_before_its_copy_starts_leaves_no_copy_in_the_project_it_left(
+    org_conversation, monkeypatch, caplog,
+):
+    """The move lands after the staging unit read the conversation and
+    before the copy opens its folder. The move removes the old copy, and the
+    copy makes it again in the project the conversation left, where nothing
+    would remove it before that project's delete. So the staging finds the
+    conversation in another project once the copy ends, and removes it."""
+    from cowork.services import project_file_copy
+
+    (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
+    asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+    conversation = org_conversation.project_path / "conversations" / str(org_conversation.id)
+    left_copy = copy_folder(org_conversation)
+    assert (left_copy / "chapter-1.md").exists()
+    client = TestClient(create_app())
+    joined = client.post("/api/v1/projects/", json={"name": f"joined-{uuid4().hex[:8]}"}, headers=MEMBER)
+    assert joined.status_code == 201, joined.text
+    real_stage = project_file_copy.stage_project_files
+    made_again: list[bool] = []
+
+    def moved_first(*args, **kwargs):
+        moved = client.patch(
+            f"/api/v1/conversations/{org_conversation.id}", json={"projectId": joined.json()["id"]}, headers=MEMBER,
+        )
+        assert moved.status_code == 200, moved.text
+        assert not left_copy.exists()
+        staged = real_stage(*args, **kwargs)
+        made_again.append((left_copy / "chapter-1.md").exists())
+        return staged
+
+    monkeypatch.setattr(project_file_copy, "stage_project_files", moved_first)
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    assert made_again == [True]
+    assert not left_copy.exists()
+    assert not (conversation / project_file_copy.REMOVED_DIRNAME).exists()
+    line = _staged_line(caplog)
+    assert (line.outcome, line.files, line.bytes) == ("conversation_gone", 0, 0)
+
+
+def test_a_project_renamed_while_its_copy_runs_keeps_the_copy(org_conversation, monkeypatch, caplog):
+    """A rename moves the project's folder with the copy in it, and the
+    turn's pod mounts the renamed folder. The conversation's project path
+    changed, but nothing is left at the old one, so the copy stays and the
+    turn's line says it was staged."""
+    from cowork.services import project_file_copy
+
+    (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
+    client = TestClient(create_app())
+    project_id = client.get(f"/api/v1/conversations/{org_conversation.id}", headers=MEMBER).json()["projectId"]
+    real_stage = project_file_copy.stage_project_files
+    renamed: list[Path] = []
+
+    def renamed_after_the_copy(*args, **kwargs):
+        staged = real_stage(*args, **kwargs)
+        answer = client.patch(f"/api/v1/projects/{project_id}", json={"name": f"renamed-{uuid4().hex[:8]}"}, headers=MEMBER)
+        assert answer.status_code == 200, answer.text
+        renamed.append(Path(answer.json()["path"]))
+        return staged
+
+    monkeypatch.setattr(project_file_copy, "stage_project_files", renamed_after_the_copy)
+
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    [new_path] = renamed
+    assert not org_conversation.project_path.exists()
+    copied = new_path / "conversations" / str(org_conversation.id) / "project-files" / "chapter-1.md"
+    assert copied.read_text() == "The porter kept the keys."
+    line = _staged_line(caplog)
+    assert (line.outcome, line.files) == ("staged", 1)
+
+
+async def test_a_turn_cancelled_while_its_removal_waits_for_a_slot_still_removes_the_copy(
+    org_conversation, monkeypatch,
+):
+    """The delete lands before the copy opens the folder, and did not cancel
+    the turn (another replica served it, say). The copy ends normally and
+    makes the folder again; the staging finds the row gone, and its removal
+    waits for a file store slot. A cancel then, from the idle watchdog or a
+    shutdown, still lets the removal run once a slot frees, since nothing
+    else removes the folder and the record."""
+    from cowork.db import units
+    from cowork.services import project_file_copy
+
+    (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
+    conversation = org_conversation.project_path / "conversations" / str(org_conversation.id)
+    record = project_file_copy.copy_record_path(org_conversation.scope, org_conversation.id)
+    real_stage = project_file_copy.stage_project_files
+
+    def deleted_first(*args, **kwargs):
+        _delete_conversation(org_conversation)
+        return real_stage(*args, **kwargs)
+
+    monkeypatch.setattr(project_file_copy, "stage_project_files", deleted_first)
+    real_run_db = responses_mod.run_db
+    row_read, slots_held = asyncio.Event(), asyncio.Event()
+
+    async def row_read_then_wait(fn, **kwargs):
+        result = await real_run_db(fn, **kwargs)
+        row_read.set()
+        await slots_held.wait()
+        return result
+
+    monkeypatch.setattr(responses_mod, "run_db", row_read_then_wait)
+    turn = asyncio.create_task(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+    await asyncio.wait_for(row_read.wait(), timeout=30)
+    assert conversation.exists() and record.exists()
+
+    async with holding(db_session.settings.storage.efs_slots, LOCAL_SCOPE):
+        slots_held.set()
+        for _ in range(3000):
+            if units._efs_slots().statistics().tasks_waiting:
+                break
+            await asyncio.sleep(0.01)
+        assert units._efs_slots().statistics().tasks_waiting == 1
+        turn.cancel()
+        await asyncio.sleep(0.05)
+        assert conversation.exists()
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert not conversation.exists()
+    assert not record.exists()
+
+
+async def test_a_delete_that_cancels_the_turn_during_its_copy_keeps_no_folder_or_record(
+    org_conversation, monkeypatch,
+):
+    """A conversation delete cancels its turn, and a copy that started runs
+    to its end first. When the delete removed the folder before the copy
+    opened it, the copy makes it again, so the cancelled staging still reads
+    the row once the copy ends and removes what the copy made."""
+    import threading
+
+    from cowork.services import project_file_copy
+
+    (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
+    conversation = org_conversation.project_path / "conversations" / str(org_conversation.id)
+    record = project_file_copy.copy_record_path(org_conversation.scope, org_conversation.id)
+    real_stage = project_file_copy.stage_project_files
+    started, deleted = threading.Event(), threading.Event()
+    made_again: list[bool] = []
+
+    def copy_after_the_delete(*args, **kwargs):
+        started.set()
+        assert deleted.wait(timeout=30)
+        staged = real_stage(*args, **kwargs)
+        made_again.append(conversation.exists() and record.exists())
+        return staged
+
+    monkeypatch.setattr(project_file_copy, "stage_project_files", copy_after_the_delete)
+    turn = asyncio.create_task(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+    assert await asyncio.to_thread(started.wait, 30)
+    turn.cancel()
+    await asyncio.to_thread(_delete_conversation, org_conversation)
+    deleted.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert made_again == [True]
+    assert not conversation.exists()
+    assert not record.exists()
 
 
 def test_a_conversation_staging_cant_read_refuses_the_turn(org_conversation, monkeypatch):
@@ -218,7 +545,7 @@ def test_a_conversation_staging_cant_read_refuses_the_turn(org_conversation, mon
 
     monkeypatch.setattr(responses_mod, "ConversationService", Unreadable)
     staged: list = []
-    monkeypatch.setattr("cowork.services.files.stage_project_files", lambda *a, **k: staged.append(a))
+    monkeypatch.setattr("cowork.services.project_file_copy.stage_project_files", lambda *a, **k: staged.append(a))
 
     with pytest.raises(RuntimeError, match="conversation read failed"):
         asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
@@ -258,19 +585,91 @@ def test_a_staging_unit_whose_commit_fails_still_copies_the_projects_files(
 
 
 def test_a_busy_file_store_refuses_a_remote_turns_project_file_copy(org_conversation, monkeypatch):
-    """The copy waits for its own file store slot after the staging unit; a
-    busy store refuses the turn there too."""
-    from cowork.services import files
+    """The copy waits for its own copy slot and file store slot after the
+    staging unit (run_efs_copy); a busy store refuses the turn there too."""
+    from cowork.services import project_file_copy
 
     async def busy(call, **_kwargs):
-        if getattr(call, "func", None) is files.stage_project_files:
+        if getattr(call, "func", None) is project_file_copy.stage_project_files:
             raise FilesystemBusy()
         raise AssertionError(f"unexpected file store call {call!r}")
 
-    monkeypatch.setattr(responses_mod, "run_efs", busy)
+    monkeypatch.setattr(responses_mod, "run_efs_copy", busy)
 
     with pytest.raises(FilesystemBusy):
         asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+
+async def test_a_turns_copy_waits_for_a_copy_slot_and_full_slots_refuse_it(
+    org_conversation, monkeypatch, one_second_wait,
+):
+    """The copy takes one of the event loop's copy slots before its file
+    store slot (run_efs_copy). With every copy slot held by other turns'
+    copies, this turn's copy is refused after POOL_TIMEOUT with
+    FilesystemBusy and copies nothing, while the file store keeps its slots
+    for everyone else's work."""
+    import threading
+
+    from cowork.db.units import run_efs_copy
+
+    (org_conversation.project_path / "chapter-1.md").write_text("The porter kept the keys.")
+    monkeypatch.setenv("COWORK_TURN_PROJECT_FILES_COPY_SLOTS", "1")
+    release = threading.Event()
+    started = threading.Semaphore(0)
+
+    def another_turns_copy():
+        started.release()
+        release.wait(timeout=30)
+
+    other = TenantScope(org_mode=True, org_id=str(uuid4()), user_id=str(uuid4()))
+    held = asyncio.create_task(run_efs_copy(another_turns_copy, scope=other))
+    await asyncio.to_thread(started.acquire)
+    try:
+        with pytest.raises(FilesystemBusy):
+            await stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope)
+    finally:
+        release.set()
+        await held
+
+    assert not (copy_folder(org_conversation) / "chapter-1.md").exists()
+
+
+def test_a_project_outside_the_organizations_projects_copies_nothing_and_its_turn_runs(
+    org_conversation, tmp_path, caplog,
+):
+    """A project seeded before projects were kept per organization can keep
+    its old folder (ProjectService._repoint_if_stale). Its turn runs, as it
+    did before the copy existed: nothing is copied into the old folder and
+    nothing is refused, and the one WARNING line of the turn says the copy
+    was skipped."""
+    import sqlalchemy as sa
+
+    from cowork.db.session import get_open_session
+    from cowork.models.project import Project
+
+    legacy = tmp_path / "projects" / "general"
+    legacy.mkdir(parents=True)
+    (legacy / "chapter-1.md").write_text("The porter kept the keys.")
+    session = get_open_session()
+    try:
+        session.execute(
+            sa.update(Project).where(Project.path == str(org_conversation.project_path)).values(path=str(legacy))
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(stage_remote_workspace(conv_id=org_conversation.id, scope=org_conversation.scope))
+
+    assert not (legacy / "conversations" / str(org_conversation.id) / "project-files").exists()
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert [(r.name, r.getMessage(), getattr(r, "outcome", None)) for r in warnings] == [(
+        responses_mod.logger.name,
+        "Did not copy the project's files for a cloud turn: the project's folder is outside the "
+        "organization's projects",
+        "skipped",
+    )]
 
 
 def test_a_turn_gets_only_its_own_organizations_project_files(org_deployment):
@@ -279,7 +678,7 @@ def test_a_turn_gets_only_its_own_organizations_project_files(org_deployment):
     organization's tree, and its copy's record sits in that organization's
     store."""
     from cowork.common.settings.app_settings import get_app_settings
-    from cowork.services import files
+    from cowork.services import project_file_copy
 
     name = f"research-{uuid4().hex[:8]}"
     turns = {}
@@ -298,9 +697,9 @@ def test_a_turn_gets_only_its_own_organizations_project_files(org_deployment):
         assert own in copy.parents
         assert sorted(path.name for path in copy.iterdir()) == ["notes.md"]
         assert (copy / "notes.md").read_text() == f"organization {label}'s notes"
-        record = files.copy_record_path(conversation.scope, conversation.id)
+        record = project_file_copy.copy_record_path(conversation.scope, conversation.id)
         assert own in record.parents and record.is_file()
-        assert sorted(files.CopyRecord.model_validate_json(record.read_bytes()).files) == ["notes.md"]
+        assert sorted(project_file_copy.CopyRecord.model_validate_json(record.read_bytes()).files) == ["notes.md"]
 
 
 def test_a_remote_turns_memory_save_runs_on_the_file_store_threads(org_conversation):

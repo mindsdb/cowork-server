@@ -425,7 +425,7 @@ _ACCOUNT_LEVEL_COWORK_HOME_CALLS = Counter(
         # turn copies them, so the desktop never writes it, and an org
         # deployment keys it per organization through scoped_storage_root.
         (
-            "cowork/services/files.py",
+            "cowork/services/project_file_copy.py",
             "copy_records_root",
             "scoped_storage_root(cowork_home() / 'project-file-copies', scope, store='project-file-copies')",
         ),

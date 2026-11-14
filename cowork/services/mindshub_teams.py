@@ -107,6 +107,10 @@ class MindsHubPermissions(BaseModel):
     #: MindsHub refused the credential itself (401): the caller signs in again,
     #: which says nothing about their browser access.
     signed_out: bool = False
+    #: The organization the answer is for, from the browser block: the active
+    #: organization for a Keycloak token, the key's own organization for an API
+    #: key. None when the answer carried none.
+    organization_id: str | None = None
 
     def is_outage_answer(self) -> bool:
         """Auth's own answer when it couldn't read membership: no permissions
@@ -163,10 +167,13 @@ def _parse_permissions(payload: Any) -> MindsHubPermissions:
         browser = BrowserEntitlement.model_validate(payload.get(BROWSER_ENTITLEMENT_KEY))
     except ValidationError:
         browser = None
+    block = payload.get(BROWSER_ENTITLEMENT_KEY)
+    organization_id = block.get("organization_id") if isinstance(block, dict) else None
     return MindsHubPermissions(
         permissions=frozenset(str(p) for p in payload["permissions"] if isinstance(p, str)),
         reachable=True,
         browser=browser,
+        organization_id=organization_id if isinstance(organization_id, str) and organization_id else None,
     )
 
 

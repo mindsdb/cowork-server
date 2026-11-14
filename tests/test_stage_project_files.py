@@ -24,9 +24,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 import cowork.services.files as files
+import cowork.services.project_file_copy as project_file_copy
 import cowork.services.project_file_view as project_file_view
 from cowork.db.scoped import TenantScope
-from cowork.services.files import (
+from cowork.services.project_file_copy import (
     NOT_COPIED_FILENAME,
     NotCopiedFiles,
     NotCopiedReason,
@@ -108,20 +109,23 @@ def test_the_projects_files_are_copied_with_their_folders(project):
     result = stage(project, conv)
 
     assert copied(project, conv) == {"chapter-1.md": "The porter kept the keys.", "data/sales.csv": "a,b\n1,2\n"}
-    assert (result.files, result.bytes, result.copied, result.not_copied, result.failed) == (2, 33, 2, 0, False)
+    assert (result.files, result.bytes, result.copied, result.not_copied, result.outcome) == (
+        2, 33, 2, 0, ProjectFilesOutcome.STAGED,
+    )
     assert not_copied(project, conv) == {}
     assert oct((copy_of(project, conv) / "chapter-1.md").stat().st_mode & 0o777) == oct(0o600)
 
 
 @posix_only
 def test_only_ordinary_files_are_copied(project, tmp_path):
-    """Hidden entries, the server's folders, memory, caches, OS files and
-    anything that is not a regular file with one name stay out."""
+    """Hidden entries, the server's folders at the project root, caches at
+    any depth, OS files and anything that is not a regular file with one
+    name stay out."""
     write(project, "keep.txt", "keep")
     for rel in (
         ".hidden.txt", ".anton/anton.md", ".anton/memory/rules.md", f"conversations/{uuid4()}/notes.md",
-        "skills/house-style/SKILL.md", "memory/notes.md", "data/memory/notes.md", "__pycache__/m.pyc",
-        "node_modules/x.js", "desktop.ini", "Thumbs.db",
+        "skills/house-style/SKILL.md", "Skills/x.md", "__pycache__/m.pyc", "data/__pycache__/m.pyc",
+        "node_modules/x.js", "src/node_modules/x.js", "desktop.ini", "Thumbs.db",
     ):
         write(project, rel)
     outside = write(tmp_path, "outside/secret.txt", "secret")
@@ -134,7 +138,7 @@ def test_only_ordinary_files_are_copied(project, tmp_path):
     result = stage(project, conv)
 
     assert copied(project, conv) == {"keep.txt": "keep"}
-    assert result.files == 1 and not result.failed
+    assert (result.files, result.outcome) == (1, ProjectFilesOutcome.STAGED)
 
 
 @posix_only
@@ -142,17 +146,17 @@ def test_names_with_a_colon_or_a_backslash_route_and_are_copied(project):
     """The shared store and the upload route take such names, so a project
     whose only file has one still routes a cloud turn to the agent, and the
     agent gets the file."""
-    from cowork.services.files import project_holds_files
+    from cowork.services.files import project_holds_ordinary_files
 
     write(project, "Q3: results.csv", "q3")
     write(project, "back\\slash.csv", "b")
     conv = uuid4()
 
-    assert project_holds_files(project, cloud=True)
+    assert project_holds_ordinary_files(project)
     result = stage(project, conv)
 
     assert copied(project, conv) == {"Q3: results.csv": "q3", "back\\slash.csv": "b"}
-    assert (result.files, result.failed) == (2, False)
+    assert (result.files, result.outcome) == (2, ProjectFilesOutcome.STAGED)
 
 
 @posix_only
@@ -216,8 +220,8 @@ def test_a_copy_the_pod_wrote_into_while_it_was_copied_is_copied_again(project, 
     source = "abcdefghijklmnopqrstuvwxyz"
     write(project, "notes.md", source)
     conv = uuid4()
-    monkeypatch.setattr(files, "_COPY_CHUNK_BYTES", 10)
-    real_write_all = files.write_all
+    monkeypatch.setattr(project_file_copy, "_COPY_CHUNK_BYTES", 10)
+    real_write_all = project_file_copy.write_all
     writes: list[int] = []
 
     def pod_writes_between_chunks(fd, data):
@@ -230,9 +234,9 @@ def test_a_copy_the_pod_wrote_into_while_it_was_copied_is_copied_again(project, 
             finally:
                 os.close(pod)
 
-    monkeypatch.setattr(files, "write_all", pod_writes_between_chunks)
+    monkeypatch.setattr(project_file_copy, "write_all", pod_writes_between_chunks)
     stage(project, conv)
-    monkeypatch.setattr(files, "write_all", real_write_all)
+    monkeypatch.setattr(project_file_copy, "write_all", real_write_all)
     assert copied(project, conv)["notes.md"].startswith("EVIL")
 
     result = stage(project, conv)
@@ -247,7 +251,7 @@ def test_the_record_lives_outside_the_conversations_folder(project):
     conv = uuid4()
     stage(project, conv)
 
-    record = files.copy_record_path(SCOPE, conv)
+    record = project_file_copy.copy_record_path(SCOPE, conv)
     conversation = project / "conversations" / str(conv)
     assert record.is_file()
     assert conversation not in record.parents and project not in record.parents
@@ -304,7 +308,7 @@ def test_a_planted_link_is_removed_and_never_followed(project, tmp_path, level):
 
     result = stage(project, conv)
 
-    assert not result.failed
+    assert result.outcome is ProjectFilesOutcome.STAGED
     assert victim.read_text() == "victim text"
     assert not planted.is_symlink()
     assert copied(project, conv) == {"data/notes.md": "edited text"}
@@ -394,7 +398,7 @@ def test_past_the_time_budget_the_walk_stops_and_what_it_did_not_reach_goes(proj
 
     assert copied(project, conv) == {}
     assert listing(project, conv) == NotCopiedFiles(listing_truncated=True)
-    assert (result.files, result.copied, result.failed) == (0, 0, False)
+    assert (result.files, result.copied, result.outcome) == (0, 0, ProjectFilesOutcome.STAGED)
     stage(project, conv)
     assert copied(project, conv) == {"old.md": "old", "new.md": "new"}
     assert listing(project, conv) is None
@@ -418,7 +422,7 @@ def test_the_time_budget_bounds_the_walk(project, monkeypatch):
     result = stage(project, uuid4(), seconds=0.0)
 
     assert len(looked) < 20, len(looked)
-    assert result.files == 0 and not result.failed
+    assert (result.files, result.outcome) == (0, ProjectFilesOutcome.STAGED)
 
 
 @posix_only
@@ -429,21 +433,21 @@ def test_a_copy_the_budget_cuts_short_is_removed_and_named(project, monkeypatch)
     write(project, "long.md", "abcdefghijkl")
     conv = uuid4()
     now = [0.0]
-    monkeypatch.setattr(files.time, "monotonic", lambda: now[0])
-    monkeypatch.setattr(files, "_COPY_CHUNK_BYTES", 4)
-    real_write_all = files.write_all
+    monkeypatch.setattr(project_file_copy.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(project_file_copy, "_COPY_CHUNK_BYTES", 4)
+    real_write_all = project_file_copy.write_all
 
     def slow_write(fd, data):
         real_write_all(fd, data)
         now[0] += 10.0
 
-    monkeypatch.setattr(files, "write_all", slow_write)
+    monkeypatch.setattr(project_file_copy, "write_all", slow_write)
 
     result = stage(project, conv, seconds=5.0)
 
     assert copied(project, conv) == {}
     assert not_copied(project, conv) == {"long.md": NotCopiedReason.OUT_OF_TIME}
-    assert not result.failed
+    assert result.outcome is ProjectFilesOutcome.STAGED
 
 
 @posix_only
@@ -458,14 +462,14 @@ def test_a_copy_that_cant_finish_empties_the_folder(project, monkeypatch, failur
     folder_inode = copy_of(project, conv).stat().st_ino
     deleted.unlink()
     write(project, "a.md", "second")
-    real_dir_open = files.dir_open
+    real_dir_open = project_file_copy.dir_open
 
     def refuse_the_source(directory, name, flags, mode=0o777):
         if directory.path == project and name == "a.md":
             raise OSError(failure, os.strerror(failure))
         return real_dir_open(directory, name, flags, mode)
 
-    monkeypatch.setattr(files, "dir_open", refuse_the_source)
+    monkeypatch.setattr(project_file_copy, "dir_open", refuse_the_source)
 
     result = stage(project, conv)
 
@@ -494,6 +498,26 @@ def test_an_unreadable_record_fails_closed(project, monkeypatch):
 
 
 @posix_only
+def test_a_record_that_does_not_parse_is_discarded_and_the_warning_names_the_conversation(project, caplog):
+    """A record that does not parse trusts no copy, so every file is copied
+    again. Its WARNING names the conversation as a field, which the
+    deployments' JSON log keeps, not as a template value, which it drops."""
+    write(project, "a.md", "kept")
+    conv = uuid4()
+    stage(project, conv)
+    project_file_copy.copy_record_path(SCOPE, conv).write_text("not a record")
+
+    with caplog.at_level(logging.WARNING, logger=project_file_copy.logger.name):
+        result = stage(project, conv)
+
+    assert (result.outcome, result.copied) == (ProjectFilesOutcome.STAGED, 1)
+    assert copied(project, conv) == {"a.md": "kept"}
+    [record] = [r for r in caplog.records if r.name == project_file_copy.logger.name]
+    assert (record.levelname, record.args) == ("WARNING", ())
+    assert (record.event, record.conversation_id) == ("project_files_record_unreadable", str(conv))
+
+
+@posix_only
 def test_a_copy_that_cant_empty_its_folder_refuses_the_turn(project, monkeypatch):
     """When the folder can be neither emptied nor set aside, it may still
     hold a copy the project no longer backs, so the outcome tells the caller
@@ -505,8 +529,8 @@ def test_a_copy_that_cant_empty_its_folder_refuses_the_turn(project, monkeypatch
     def broken(*_args, **_kwargs):
         raise OSError(errno.EIO, os.strerror(errno.EIO))
 
-    monkeypatch.setattr(files, "_prune_folder", broken)
-    monkeypatch.setattr(files._CopyFolders, "set_aside", broken)
+    monkeypatch.setattr(project_file_copy, "_prune_folder", broken)
+    monkeypatch.setattr(project_file_copy._CopyFolders, "set_aside", broken)
 
     assert stage(project, conv).outcome is ProjectFilesOutcome.REFUSED
 
@@ -543,7 +567,7 @@ def test_a_folder_the_pod_locked_does_not_block_the_next_copy(project, folder, m
     assert result.outcome is ProjectFilesOutcome.STAGED
     assert copied(project, conv) == {"data/new.md": "new", "top.md": "top"}
     assert not (copy / "pod-made").exists()
-    assert not (copy.parent / files.REMOVED_DIRNAME).exists()
+    assert not (copy.parent / project_file_copy.REMOVED_DIRNAME).exists()
     if folder != "project-files/pod-made":
         assert stat.S_IMODE(wedged.stat().st_mode) == 0o700
 
@@ -626,8 +650,8 @@ def test_a_copy_the_pod_made_unreadable_while_it_was_copied_is_copied_again(proj
     source = "abcdefghijklmnopqrstuvwxyz"
     write(project, "notes.md", source)
     conv = uuid4()
-    monkeypatch.setattr(files, "_COPY_CHUNK_BYTES", 10)
-    real_write_all = files.write_all
+    monkeypatch.setattr(project_file_copy, "_COPY_CHUNK_BYTES", 10)
+    real_write_all = project_file_copy.write_all
     writes: list[int] = []
 
     def pod_locks_the_copy(fd, data):
@@ -636,9 +660,9 @@ def test_a_copy_the_pod_made_unreadable_while_it_was_copied_is_copied_again(proj
         if len(writes) == 1:
             (copy_of(project, conv) / "notes.md").chmod(0o000)
 
-    monkeypatch.setattr(files, "write_all", pod_locks_the_copy)
+    monkeypatch.setattr(project_file_copy, "write_all", pod_locks_the_copy)
     first = stage(project, conv)
-    monkeypatch.setattr(files, "write_all", real_write_all)
+    monkeypatch.setattr(project_file_copy, "write_all", real_write_all)
     assert (first.outcome, first.files) == (ProjectFilesOutcome.STAGED, 1)
     assert stat.S_IMODE((copy_of(project, conv) / "notes.md").stat().st_mode) == 0o000
 
@@ -679,16 +703,16 @@ def test_a_tree_deeper_than_the_recursion_limit_never_fails_the_turn(project, mo
     _nest(copy / "pod-made", sys.getrecursionlimit() + 100)
     # The entry budget, not the time, is under test: a loaded machine must
     # not run out of time on the deep tree.
-    monkeypatch.setattr(files, "_REMOVAL_SECONDS", 120.0)
+    monkeypatch.setattr(project_file_copy, "_REMOVAL_SECONDS", 120.0)
     if copy_fails:
-        real_dir_open = files.dir_open
+        real_dir_open = project_file_copy.dir_open
 
         def refuse_the_source(directory, name, flags, mode=0o777):
             if directory.path == project and name == "notes.md":
                 raise OSError(errno.EIO, os.strerror(errno.EIO))
             return real_dir_open(directory, name, flags, mode)
 
-        monkeypatch.setattr(files, "dir_open", refuse_the_source)
+        monkeypatch.setattr(project_file_copy, "dir_open", refuse_the_source)
         write(project, "notes.md", "edited")
 
     result = stage(project, conv)
@@ -700,16 +724,17 @@ def test_a_tree_deeper_than_the_recursion_limit_never_fails_the_turn(project, mo
         assert result.outcome is ProjectFilesOutcome.STAGED
         assert copied(project, conv) == {"notes.md": "kept"}
         # The turn deletes what it moved aside within its budget.
-        assert not (copy.parent / files.REMOVED_DIRNAME).exists()
+        assert not (copy.parent / project_file_copy.REMOVED_DIRNAME).exists()
     assert not (copy / "pod-made").exists()
 
 
 @posix_only
-def test_leftovers_past_the_budget_set_the_folder_aside_for_later_turns(project, monkeypatch):
+def test_leftovers_past_the_budget_set_the_folder_aside_for_later_turns(project, monkeypatch, caplog):
     """More leftovers than one turn may examine set the whole project-files
     folder aside, in the conversation's removed folder, and the copy goes on
     in a new one. Each later turn deletes some of what was set aside, within
-    its own budget, until it is gone."""
+    its own budget, until it is gone. The set-aside WARNING names the
+    conversation as a field, which the deployments' JSON log keeps."""
     write(project, "notes.md", "kept")
     conv = uuid4()
     stage(project, conv)
@@ -717,13 +742,17 @@ def test_leftovers_past_the_budget_set_the_folder_aside_for_later_turns(project,
     for index in range(40):
         write(copy, f"junk-{index}.txt", "the pod's")
     old_folder = copy.stat().st_ino
-    monkeypatch.setattr(files, "_REMOVAL_MAX_ENTRIES", 10)
+    monkeypatch.setattr(project_file_copy, "_REMOVAL_MAX_ENTRIES", 10)
 
-    result = stage(project, conv)
+    with caplog.at_level(logging.WARNING, logger=project_file_copy.logger.name):
+        result = stage(project, conv)
 
+    [record] = [r for r in caplog.records if r.name == project_file_copy.logger.name]
+    assert (record.levelname, record.args) == ("WARNING", ())
+    assert (record.event, record.conversation_id) == ("project_files_copy_set_aside", str(conv))
     assert result.outcome is ProjectFilesOutcome.STAGED
     assert copied(project, conv) == {"notes.md": "kept"}
-    removed = copy.parent / files.REMOVED_DIRNAME
+    removed = copy.parent / project_file_copy.REMOVED_DIRNAME
     [aside] = list(removed.iterdir())
     assert aside.stat().st_ino == old_folder
     left = len(list(aside.iterdir()))
@@ -732,7 +761,7 @@ def test_leftovers_past_the_budget_set_the_folder_aside_for_later_turns(project,
     stage(project, conv)
     assert 0 < len(list(aside.iterdir())) < left
 
-    monkeypatch.setattr(files, "_REMOVAL_MAX_ENTRIES", 10_000)
+    monkeypatch.setattr(project_file_copy, "_REMOVAL_MAX_ENTRIES", 10_000)
     stage(project, conv)
     assert not removed.exists()
     assert copied(project, conv) == {"notes.md": "kept"}
@@ -749,13 +778,13 @@ def test_the_agent_never_lists_the_removed_folder(project, monkeypatch):
     write(copy, "pod-made/notes.md", "the pod's")
     for index in range(20):
         write(copy, f"junk-{index}.txt", "the pod's")
-    monkeypatch.setattr(files, "_REMOVAL_MAX_ENTRIES", 5)
+    monkeypatch.setattr(project_file_copy, "_REMOVAL_MAX_ENTRIES", 5)
 
     stage(project, conv)
 
-    removed = copy.parent / files.REMOVED_DIRNAME
+    removed = copy.parent / project_file_copy.REMOVED_DIRNAME
     assert removed.exists() and removed.parent == copy.parent
-    assert files.REMOVED_DIRNAME.startswith(".")
+    assert project_file_copy.REMOVED_DIRNAME.startswith(".")
     assert sorted(p.name for p in copy.iterdir()) == ["notes.md"]
 
 
@@ -778,7 +807,7 @@ def test_a_kept_folder_the_pod_changes_before_the_prune_opens_it_leaks_no_descri
     conv = uuid4()
     stage(project, conv)
     copy = copy_of(project, conv)
-    real_open_copy_path = files._open_copy_path
+    real_open_copy_path = project_file_copy._open_copy_path
     changed: list[tuple[str, ...]] = []
 
     def pod_changes_the_folder(mirror, parts):
@@ -790,7 +819,7 @@ def test_a_kept_folder_the_pod_changes_before_the_prune_opens_it_leaks_no_descri
                 target.symlink_to(tmp_path, target_is_directory=True)
         return real_open_copy_path(mirror, parts)
 
-    monkeypatch.setattr(files, "_open_copy_path", pod_changes_the_folder)
+    monkeypatch.setattr(project_file_copy, "_open_copy_path", pod_changes_the_folder)
     before = _open_descriptors()
 
     for _turn in range(3):
@@ -816,8 +845,8 @@ def test_a_removed_folder_deleted_under_a_staging_is_made_again(project, monkeyp
     stage(project, conv)
     shutil.rmtree(project / "old")
     shutil.rmtree(project / "docs")
-    removed = copy_of(project, conv).parent / files.REMOVED_DIRNAME
-    real_rename = files.dir_rename
+    removed = copy_of(project, conv).parent / project_file_copy.REMOVED_DIRNAME
+    real_rename = project_file_copy._rename_listed
     moved: list[str] = []
 
     def another_staging_deletes_the_removed_folder(source, source_name, destination, destination_name):
@@ -826,7 +855,7 @@ def test_a_removed_folder_deleted_under_a_staging_is_made_again(project, monkeyp
         if len(moved) == 1:
             shutil.rmtree(removed)
 
-    monkeypatch.setattr(files, "dir_rename", another_staging_deletes_the_removed_folder)
+    monkeypatch.setattr(project_file_copy, "_rename_listed", another_staging_deletes_the_removed_folder)
 
     result = stage(project, conv)
 
@@ -873,14 +902,14 @@ def test_a_removed_folder_that_cant_be_checked_never_fails_a_finished_copy(proje
     and whatever the pod did there is logged and left for a later turn."""
     write(project, "notes.md", "kept")
     conv = uuid4()
-    real_lstat = files.dir_lstat
+    real_lstat = project_file_copy.dir_lstat
 
     def refused(directory, name):
-        if name == files.REMOVED_DIRNAME:
+        if name == project_file_copy.REMOVED_DIRNAME:
             raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), name)
         return real_lstat(directory, name)
 
-    monkeypatch.setattr(files, "dir_lstat", refused)
+    monkeypatch.setattr(project_file_copy, "dir_lstat", refused)
 
     result = stage(project, conv)
 
@@ -908,7 +937,8 @@ def test_each_project_copies_only_its_own_files(org_deployment):
     assert copied(q, in_q) == {"budget.csv": "a,b"}
     assert copied(q, in_p) == {"budget.csv": "a,b"} and moved.copied == 1
     assert not (q / "conversations" / str(in_q) / "project-files" / "chapter-1.md").exists()
-    record = files.CopyRecord.model_validate_json(files.copy_record_path(SCOPE, in_p).read_bytes())
+    record_path = project_file_copy.copy_record_path(SCOPE, in_p)
+    record = project_file_copy.CopyRecord.model_validate_json(record_path.read_bytes())
     assert sorted(record.files) == ["budget.csv"]
     back = stage(p, in_p)
     assert back.copied == 1, "a record written for Q must not let P skip a copy"
@@ -918,24 +948,56 @@ def test_each_project_copies_only_its_own_files(org_deployment):
 def test_a_missing_project_copies_nothing(org_deployment):
     result = stage(projects() / f"gone-{uuid4().hex[:8]}", uuid4())
 
-    assert (result.files, result.failed) == (0, False)
+    assert (result.files, result.outcome) == (0, ProjectFilesOutcome.STAGED)
 
 
 @posix_only
-def test_a_project_of_another_organization_is_refused_and_left_alone(org_deployment):
-    """The copy trusts the project folder it is given, so it refuses one that
-    is not in the turn's organization's projects store, even under the same
-    name, and touches nothing there."""
+@pytest.mark.parametrize("where", ["another organization", "before projects were kept per organization"])
+def test_a_project_outside_the_organizations_projects_is_skipped_and_left_alone(org_deployment, tmp_path, where):
+    """The copy trusts the project folder it is given, so it copies nothing
+    from one that is not in the turn's organization's projects store, even
+    under the same name, and touches nothing there. A project seeded before
+    projects were kept per organization keeps such a folder, and its turns
+    still run: the outcome is SKIPPED, not REFUSED, and no list is written."""
     name = f"research-{uuid4().hex[:8]}"
-    elsewhere = projects(str(uuid4())) / name
-    write(elsewhere, "chapter-1.md", "another organization's text")
+    elsewhere = projects(str(uuid4())) / name if where == "another organization" else tmp_path / "projects" / name
+    write(elsewhere, "chapter-1.md", "another folder's text")
     conv = uuid4()
 
     result = stage(elsewhere, conv)
 
-    assert result.outcome is ProjectFilesOutcome.REFUSED
+    assert result == project_file_copy.ProjectFilesStaged(0, 0, 0, 0, 0, ProjectFilesOutcome.SKIPPED, 0)
     assert not (elsewhere / "conversations").exists()
-    assert not files.copy_record_path(SCOPE, conv).exists()
+    assert not project_file_copy.copy_record_path(SCOPE, conv).exists()
+
+
+@posix_only
+@pytest.mark.parametrize("path", ["..", ""])
+def test_a_project_path_that_names_no_project_folder_is_refused(org_deployment, path):
+    """``<projects>/..`` has the projects store as its parent, and names the
+    organization's own folder, which holds every project and the copy
+    records. Such a path, and an empty one, is refused, and nothing is copied
+    from it."""
+    projects().mkdir(parents=True, exist_ok=True)
+    write(projects().parent, "secret-at-org-root.txt", "the organization's")
+    project = projects() / path if path else Path(path)
+    conv = uuid4()
+
+    result = stage(project, conv)
+
+    assert (result.outcome, result.refusal) == (
+        ProjectFilesOutcome.REFUSED, project_file_copy.ProjectFilesRefusal.NOT_A_PROJECT,
+    )
+    assert not (projects().parent / "conversations").exists()
+    assert not project_file_copy.copy_record_path(SCOPE, conv).exists()
+
+
+def test_a_conversation_id_that_is_not_a_uuid_is_refused(org_deployment):
+    result = stage_project_files(projects() / "p", "../other", scope=SCOPE, limits=LIMITS)
+
+    assert (result.outcome, result.refusal) == (
+        ProjectFilesOutcome.REFUSED, project_file_copy.ProjectFilesRefusal.NOT_A_CONVERSATION,
+    )
 
 
 @posix_only
@@ -960,9 +1022,53 @@ def test_deleting_a_project_file_removes_its_copies_from_every_conversation(org_
 
 
 @posix_only
-def test_a_delete_past_its_time_limit_leaves_the_rest_to_each_next_turn(org_deployment, monkeypatch, caplog):
-    """The delete bounds how long it spends on the project's conversations;
-    a copy it did not reach goes on that conversation's next turn."""
+def test_a_copy_a_file_delete_cant_remove_is_logged_with_its_conversation_as_a_field(
+    org_deployment, monkeypatch, caplog,
+):
+    """The deployments' JSON log drops a line's template values, so the
+    WARNING for a deleted file's copy that could not be removed names the
+    conversation as a field."""
+    from cowork.api.v1.endpoints import project_files
+
+    client = TestClient(_app())
+    created = client.post("/api/v1/projects/", json={"name": f"stuck-{uuid4().hex[:8]}"}, headers=MEMBER)
+    assert created.status_code == 201, created.text
+    name, project = created.json()["name"], Path(created.json()["path"])
+    write(project, "chapter-1.md", "The porter kept the keys.")
+    conv = uuid4()
+    stage(project, conv)
+    real_unlink = project_files.dir_unlink
+
+    def broken_in_the_copy(parent, name, *args, **kwargs):
+        # The copy's folder, by its names: the store's path may reach it
+        # through a link, as /var does on macOS.
+        if Path(parent.path).parts[-2:] == (str(conv), project_file_copy.PROJECT_FILES_DIRNAME):
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return real_unlink(parent, name, *args, **kwargs)
+
+    monkeypatch.setattr(project_files, "dir_unlink", broken_in_the_copy)
+    # The app's logging setup can replace the root handlers, caplog's among
+    # them, so the logger hands its records to caplog alone.
+    monkeypatch.setattr(project_files.logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(project_files.logger, "propagate", False)
+
+    with caplog.at_level(logging.WARNING, logger=project_files.logger.name):
+        deleted = client.delete(f"/api/v1/projects/{name}/files/chapter-1.md", headers=MEMBER)
+
+    assert deleted.status_code == 200, deleted.text
+    [record] = [
+        r for r in caplog.records
+        if r.name == project_files.logger.name and getattr(r, "event", None) == "project_file_copy_not_removed"
+    ]
+    assert (record.levelname, record.args, record.conversation_id) == ("WARNING", (), str(conv))
+
+
+@posix_only
+def test_a_delete_past_its_time_limit_removes_the_rest_after_its_response(org_deployment, monkeypatch):
+    """The delete's own removal of a file's copies stops at its time limit,
+    once it reached one conversation. The conversations it did not reach
+    lose their copy after the response, a time-limited call at a time,
+    whether or not they run another turn."""
     from cowork.api.v1.endpoints import project_files
 
     client = TestClient(_app())
@@ -970,18 +1076,28 @@ def test_a_delete_past_its_time_limit_leaves_the_rest_to_each_next_turn(org_depl
     assert created.status_code == 201, created.text
     name, project = created.json()["name"], Path(created.json()["path"])
     write(project, "chapter-1.md", "The porter kept the keys.")
-    conv = uuid4()
-    stage(project, conv)
+    conversations = [uuid4() for _ in range(3)]
+    for conv in conversations:
+        stage(project, conv)
     monkeypatch.setattr(project_files, "COPY_PURGE_SECONDS", 0.0)
+    calls = []
+    real_remove = project_files._remove_project_file_copies
 
-    with caplog.at_level(logging.WARNING, logger=project_files.logger.name):
-        deleted = client.delete(f"/api/v1/projects/{name}/files/chapter-1.md", headers=MEMBER)
+    def counted(*args, **kwargs):
+        calls.append(kwargs.get("only"))
+        return real_remove(*args, **kwargs)
+
+    monkeypatch.setattr(project_files, "_remove_project_file_copies", counted)
+
+    deleted = client.delete(f"/api/v1/projects/{name}/files/chapter-1.md", headers=MEMBER)
 
     assert deleted.status_code == 200, deleted.text
-    assert copied(project, conv) == {"chapter-1.md": "The porter kept the keys."}
-    assert any("time limit" in record.getMessage() for record in caplog.records)
-    stage(project, conv)
-    assert copied(project, conv) == {}
+    for conv in conversations:
+        assert copied(project, conv) == {}
+    # With no time, each call reaches one conversation: the request's, then
+    # one call after the response for each conversation it did not reach.
+    assert len(calls) == 3, calls
+    assert calls[0] is None and len(calls[1]) == 2 and len(calls[2]) == 1
 
 
 @posix_only
@@ -997,7 +1113,7 @@ def test_deleting_a_conversation_removes_its_copy_record(org_deployment):
     conv = UUID(conversation.json()["id"])
     write(project, "chapter-1.md")
     stage(project, conv)
-    record = files.copy_record_path(SCOPE, conv)
+    record = project_file_copy.copy_record_path(SCOPE, conv)
     assert record.is_file()
 
     deleted = client.delete(f"/api/v1/conversations/{conv}", headers=MEMBER)
@@ -1022,7 +1138,7 @@ def test_the_project_listing_skips_the_conversations_copies(org_deployment):
     stage(project, conv)
     write(project / "conversations" / str(conv), "result.csv")
     # What a copy set aside and a later turn has not deleted yet.
-    write(project / "conversations" / str(conv) / files.REMOVED_DIRNAME / uuid4().hex, "chapter-1.md")
+    write(project / "conversations" / str(conv) / project_file_copy.REMOVED_DIRNAME / uuid4().hex, "chapter-1.md")
 
     listed = client.get(f"/api/v1/projects/{name}/files", headers=MEMBER)
 
@@ -1050,12 +1166,12 @@ def _write_non_utf8(folder: Path, name: bytes, content: bytes = b"x") -> None:
 def test_a_file_whose_name_is_not_utf8_is_counted_not_copied(project):
     """The copy's list and record are JSON, which can't hold such a name, so
     the file is left out and counted, and the rest of the copy goes on."""
-    from cowork.services.files import project_holds_files
+    from cowork.services.files import project_holds_ordinary_files
 
     _write_non_utf8(project, b"report-\xff.txt")
     conv = uuid4()
 
-    assert project_holds_files(project, cloud=True)
+    assert project_holds_ordinary_files(project)
     write(project, "notes.md", "kept")
     (project / "data").mkdir()
     _write_non_utf8(project / "data", b"\xfe\xfd.csv")
@@ -1133,7 +1249,7 @@ async def test_an_in_process_turn_never_copies_the_projects_files(monkeypatch):
     async def decide(**_kwargs):
         return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
 
-    monkeypatch.setattr(files, "stage_project_files", never)
+    monkeypatch.setattr(project_file_copy, "stage_project_files", never)
     monkeypatch.setattr(responses_mod, "stage_remote_workspace", never_staged)
     monkeypatch.setattr(responses_mod, "decide_route", decide)
     harness = PausedHarness()
@@ -1218,7 +1334,7 @@ def test_each_folder_of_the_copy_is_opened_once_per_turn(project, monkeypatch):
 
 @posix_only
 def test_the_list_counts_the_files_it_does_not_name(project, monkeypatch):
-    monkeypatch.setattr(files, "MAX_NAMED_NOT_COPIED", 2)
+    monkeypatch.setattr(project_file_copy, "MAX_NAMED_NOT_COPIED", 2)
     for name in ("a.md", "b.md", "c.md", "d.md", "e.md"):
         write(project, name)
     conv = uuid4()
@@ -1272,12 +1388,14 @@ def test_the_copy_limits_default_to_the_decided_values(monkeypatch):
 
 
 def test_the_servers_project_folders_are_never_ordinary():
-    """The rule keeps its own list of private names; every folder the server
-    keeps in a project must be on it, or routing and the copy would treat a
-    new one as the user's."""
+    """Every folder the server keeps at a project's root is not ordinary
+    there, in any case, or routing and the copy would treat a new one as the
+    user's."""
     from cowork.services.artifact_roots import SERVER_PROJECT_FOLDERS
 
-    assert SERVER_PROJECT_FOLDERS <= project_file_view.PRIVATE_NAMES
+    for name in SERVER_PROJECT_FOLDERS:
+        assert not project_file_view.ordinary_component(name, at_root=True)
+        assert not project_file_view.ordinary_component(name.upper(), at_root=True)
 
 
 @posix_only
@@ -1287,19 +1405,255 @@ def test_a_file_that_shrinks_while_it_is_copied_is_left_for_the_next_turn(projec
     and the next turn copies it whole."""
     write(project, "notes.md", "abcdefghijkl")
     conv = uuid4()
-    real_read_bounded = files.read_bounded
+    real_read_bounded = project_file_copy.read_bounded
 
     def shrunk(fd, size, chunk_size=1 << 16):
         yield from real_read_bounded(fd, size - 4, chunk_size)
 
-    monkeypatch.setattr(files, "read_bounded", shrunk)
+    monkeypatch.setattr(project_file_copy, "read_bounded", shrunk)
     open_before = len(os.listdir("/dev/fd"))
 
     result = stage(project, conv)
 
     assert len(os.listdir("/dev/fd")) == open_before
-    assert (result.files, result.failed) == (0, False)
+    assert (result.files, result.outcome) == (0, ProjectFilesOutcome.STAGED)
     assert copied(project, conv) == {}
-    monkeypatch.setattr(files, "read_bounded", real_read_bounded)
+    monkeypatch.setattr(project_file_copy, "read_bounded", real_read_bounded)
     assert stage(project, conv).files == 1
     assert copied(project, conv) == {"notes.md": "abcdefghijkl"}
+
+
+@posix_only
+@pytest.mark.parametrize(
+    "planted",
+    [
+        "project-files/a\\b",
+        "project-files/a\\b/inside.md",
+        "project-files/data/a\\b",
+        "project-files/pod-made/a\\b",
+        f"{project_file_copy.REMOVED_DIRNAME}/a\\b",
+        f"{project_file_copy.REMOVED_DIRNAME}/x\\y/inside.md",
+    ],
+)
+def test_a_name_with_a_backslash_the_pod_writes_never_fails_a_later_turn(project, planted):
+    """A name holding a backslash is a valid name on the shared store, and
+    the pod can make one in its conversation's folder, at the top of its copy
+    or in a folder, for one by unzipping an archive made on Windows. The copy
+    removes it through the folder it listed it in, so every later turn copies
+    as before and nothing of it is left."""
+    write(project, "data/notes.md", "kept")
+    conv = uuid4()
+    stage(project, conv)
+    conversation = copy_of(project, conv).parent
+    write(conversation, planted, "the pod's")
+
+    results = [stage(project, conv), stage(project, conv)]
+
+    assert [result.outcome for result in results] == [ProjectFilesOutcome.STAGED] * 2
+    assert copied(project, conv) == {"data/notes.md": "kept"}
+    assert [path for path in conversation.rglob("*") if "\\" in path.name] == []
+    assert not (conversation / project_file_copy.REMOVED_DIRNAME).exists()
+
+
+@posix_only
+@pytest.mark.parametrize("squatter", ["file", "link"])
+def test_a_squatter_where_a_backslash_named_folders_copy_goes_is_replaced(project, tmp_path, squatter):
+    """A project folder's name may hold a backslash. When the pod puts a file
+    or a link where that folder's copy goes, the copy removes it through the
+    folder's descriptor, where the backslash is an ordinary character, and the
+    same turn copies the folder in its place."""
+    write(project, "a\\b/notes.md", "kept")
+    conv = uuid4()
+    stage(project, conv)
+    copy = copy_of(project, conv)
+    shutil.rmtree(copy / "a\\b")
+    outside = write(tmp_path, "outside/secret.txt", "secret")
+    if squatter == "file":
+        write(copy, "a\\b", "the pod's")
+    else:
+        (copy / "a\\b").symlink_to(outside.parent, target_is_directory=True)
+
+    result = stage(project, conv)
+
+    assert result.outcome == ProjectFilesOutcome.STAGED
+    assert copied(project, conv) == {"a\\b/notes.md": "kept"}
+    assert (copy / "a\\b").is_dir() and not (copy / "a\\b").is_symlink()
+    assert outside.read_text() == "secret" and sorted(p.name for p in outside.parent.iterdir()) == ["secret.txt"]
+
+
+@posix_only
+def test_a_backslash_name_keeps_the_rest_of_the_direct_child_check(tmp_path):
+    """Only the backslash rule is lifted, and only through a descriptor: a
+    name that also holds a separator is refused before anything is removed,
+    and the path fallback, which has no descriptor, refuses a backslash."""
+    from cowork.common.paths import PinnedDir, pinned_dir
+
+    (tmp_path / "x\\y").mkdir()
+    write(tmp_path, "z", "kept")
+    write(tmp_path, "a\\b", "kept")
+    with pinned_dir(tmp_path) as parent:
+        with pytest.raises(ValueError, match="direct-child"):
+            files._secure_workspace_child(parent, "x\\y/../z")
+    with pytest.raises(ValueError, match="direct-child"):
+        files._secure_workspace_child(PinnedDir(None, tmp_path), "a\\b")
+
+    assert (tmp_path / "z").read_text() == (tmp_path / "a\\b").read_text() == "kept"
+
+
+@posix_only
+def test_a_removed_folder_wider_than_the_budget_empties_over_the_next_turns(project, monkeypatch):
+    """Listing the removed folder spends nothing of the removal budget, so
+    however many names its top level holds, the budget empties some of them
+    on every turn until none are left. A listing that spent the budget left
+    nothing to empty the first folder with, and the folder never shrank."""
+    write(project, "notes.md", "kept")
+    conv = uuid4()
+    stage(project, conv)
+    removed = copy_of(project, conv).parent / project_file_copy.REMOVED_DIRNAME
+    for index in range(60):
+        write(removed, f"folder-{index}/junk.txt", "the pod's")
+    monkeypatch.setattr(project_file_copy, "_REMOVAL_MAX_ENTRIES", 50)
+
+    left = [120]
+    for _turn in range(10):
+        assert stage(project, conv).outcome is ProjectFilesOutcome.STAGED
+        left.append(len(list(removed.rglob("*"))) if removed.exists() else 0)
+        if left[-1] == 0:
+            break
+
+    assert left[-1] == 0, left
+    assert all(later < earlier for earlier, later in zip(left, left[1:])), left
+    assert copied(project, conv) == {"notes.md": "kept"}
+
+
+def _deep_file(root: Path, components: list[str], content: bytes) -> None:
+    """Write a file below ``root`` at ``components``, making each folder from
+    its parent's descriptor, so the path can run past what one system call
+    takes."""
+    root.mkdir(parents=True, exist_ok=True)
+    fd = os.open(root, os.O_RDONLY)
+    try:
+        for name in components[:-1]:
+            os.mkdir(name, dir_fd=fd)
+            child = os.open(name, os.O_RDONLY, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        out = os.open(components[-1], os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=fd)
+        try:
+            os.write(out, content)
+        finally:
+            os.close(out)
+    finally:
+        os.close(fd)
+
+
+@posix_only
+def test_the_list_names_files_only_while_it_fits_what_anton_reads(project):
+    """anton reads at most 1 MiB of the list and calls a longer one
+    unreadable, so 1,000 left-out files with long paths, which named by count
+    alone make a list past 256 KiB, are named while the list fits in 256 KiB
+    and counted after that."""
+    folder = "f" * 200
+    for index in range(1001):
+        write(project, f"{folder}/{index:04d}-{'n' * 70}.md")
+    conv = uuid4()
+
+    result = stage(project, conv, max_files=1)
+
+    path = copy_of(project, conv) / NOT_COPIED_FILENAME
+    listed = listing(project, conv)
+    assert result.not_copied == 1000
+    assert path.stat().st_size <= project_file_copy.MAX_NOT_COPIED_LIST_BYTES
+    assert 0 < len(listed.files) < 1000
+    assert len(listed.files) + listed.unnamed == 1000
+    assert {entry.reason for entry in listed.files} == {NotCopiedReason.TOO_MANY_FILES}
+
+
+@posix_only
+def test_a_path_longer_than_anton_reads_is_counted_not_named(project):
+    """anton refuses the whole list when one path in it is longer than 4,096
+    characters, so such a file is counted, and the rest are still named."""
+    components = ["d" * 200] * 21 + ["deep.csv"]
+    _deep_file(project, components, b"x" * 2000)
+    write(project, "big.csv", "x" * 2000)
+    conv = uuid4()
+
+    result = stage(project, conv)
+
+    assert len("/".join(components)) > project_file_copy.MAX_NOT_COPIED_PATH_CHARS
+    assert result.not_copied == 2
+    assert listing(project, conv) == NotCopiedFiles(
+        files=[project_file_copy.NotCopiedFile(path="big.csv", size=2000, reason=NotCopiedReason.TOO_LARGE)],
+        unnamed=1,
+    )
+
+
+@posix_only
+def test_a_set_aside_counts_what_both_passes_wrote(project, monkeypatch):
+    """When the pod left more in the copy than one turn removes, the first
+    pass's copies are set aside with the folder and the copy runs again. The
+    turn's log line counts what both passes wrote, so the cost the pod forces
+    shows."""
+    source = write(project, "notes.md", "first")
+    conv = uuid4()
+    stage(project, conv)
+    source.write_text("third")
+    for index in range(40):
+        write(copy_of(project, conv), f"junk-{index}.txt", "the pod's")
+    monkeypatch.setattr(project_file_copy, "_REMOVAL_MAX_ENTRIES", 10)
+
+    result = stage(project, conv)
+
+    assert result.outcome is ProjectFilesOutcome.STAGED
+    assert copied(project, conv) == {"notes.md": "third"}
+    assert (result.files, result.bytes, result.copied, result.copied_bytes) == (1, 5, 2, 10)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("COPY_SECONDS", "nan"),
+        ("COPY_SECONDS", "inf"),
+        ("COPY_SECONDS", "0"),
+        ("COPY_SECONDS", "-1"),
+        ("COPY_SECONDS", "61"),
+        ("MAX_FILES", "-1"),
+        ("MAX_FILES", "2001"),
+        ("MAX_FILE_BYTES", "-5"),
+        ("MAX_TOTAL_BYTES", "0"),
+        ("COPY_SLOTS", "0"),
+    ],
+)
+def test_a_copy_setting_out_of_its_bounds_is_refused(monkeypatch, name, value):
+    """NaN never passes a deadline, so it would turn the copy's time budget
+    off; a copy past 2,000 files is more than anton's scan of it reads."""
+    from pydantic import ValidationError
+
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    monkeypatch.setenv(f"COWORK_TURN_PROJECT_FILES_{name}", value)
+
+    with pytest.raises(ValidationError):
+        TurnQueueSettings()
+
+
+@posix_only
+def test_a_copy_limit_of_no_files_empties_each_copy_on_its_next_turn(project, monkeypatch):
+    """COWORK_TURN_PROJECT_FILES_MAX_FILES=0 turns the copy off without a
+    code change: the server starts, and a conversation's next turn names
+    every file as not copied and leaves none in its copy."""
+    write(project, "chapter-1.md", "The porter kept the keys.")
+    write(project, "data/sales.csv", "a,b\n1,2\n")
+    conv = uuid4()
+    stage(project, conv)
+    assert copied(project, conv) == {"chapter-1.md": "The porter kept the keys.", "data/sales.csv": "a,b\n1,2\n"}
+    monkeypatch.setenv("COWORK_TURN_PROJECT_FILES_MAX_FILES", "0")
+
+    result = stage_project_files(project, conv, scope=SCOPE, limits=ProjectFileCopyLimits.from_settings())
+
+    assert copied(project, conv) == {}
+    assert not_copied(project, conv) == {
+        "chapter-1.md": NotCopiedReason.TOO_MANY_FILES,
+        "data/sales.csv": NotCopiedReason.TOO_MANY_FILES,
+    }
+    assert (result.files, result.copied, result.outcome) == (0, 0, ProjectFilesOutcome.STAGED)

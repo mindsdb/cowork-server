@@ -74,14 +74,14 @@ SERVER_PROJECT_FOLDERS = frozenset({CONVERSATIONS_DIRNAME, "skills"})
 #: Org mode only. The folder in a conversation's workspace,
 #: `conversations/<conversation_id>/project-files/`, where the server copies the
 #: project's ordinary files before each cloud turn (`stage_project_files` in
-#: cowork.services.files), since the pod mounts its conversation folder and not
+#: cowork.services.project_file_copy), since the pod mounts its conversation folder and not
 #: the project. The hyphen keeps it from being imported as a package from the
 #: workspace root.
 PROJECT_FILES_DIRNAME = "project-files"
 #: Org mode only. The hidden folder beside it,
 #: `conversations/<conversation_id>/.project-files-removed/`, that holds what a
 #: copy removes until a turn has time to delete it (`_CopyFolders.remove` in
-#: cowork.services.files). The agent reads only the project-files folder, so it
+#: cowork.services.project_file_copy). The agent reads only the project-files folder, so it
 #: never lists this one, and the project's listing skips both.
 REMOVED_DIRNAME = ".project-files-removed"
 

@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import stat
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import partial
@@ -32,7 +32,7 @@ from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.conversations import ConversationItemsPage
 from cowork.schemas.figure_sources import EarlierAnswer
-from cowork.schemas.responses import Role
+from cowork.schemas.responses import Role, TurnPick
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
@@ -165,19 +165,21 @@ class ConversationDeleteStage:
     attachment_dirs: tuple[Path, ...]
     project_path: str | None
     #: Org mode: the record of the conversation's copy of its project's files
-    #: (cowork.services.files.stage_project_files), kept outside the project.
+    #: (cowork.services.project_file_copy.stage_project_files), kept outside
+    #: the project.
     copy_record: Path | None = None
 
 
 def _is_tool_row(content) -> bool:
-    """True for a history-only tool block-row (all blocks are tool_use /
-    tool_result). These carry prior tool calls for LLM-history replay and are
-    hidden from the UI, which renders tool activity from message events."""
+    """True for a history-only tool block-row: tool_use / tool_result blocks,
+    plus the text the assistant wrote beside its tool calls. These carry prior
+    tool calls for LLM-history replay and are hidden from the UI, which renders
+    tool activity from message events."""
     return (
         isinstance(content, list)
-        and len(content) > 0
+        and any(isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result") for block in content)
         and all(
-            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result")
+            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result", "text")
             for block in content
         )
     )
@@ -640,15 +642,61 @@ class ConversationService:
             raise ValueError("Conversation not found")
         if topic is not None:
             conversation.topic = topic
+        # Org mode: the folder of the project the conversation leaves, which
+        # holds its cloud turns' copy of that project's files.
+        left_path: str | None = None
         if project_id is not None:
             # Anchor the move target: the project must be visible in scope.
             if self.session.get(Project, project_id) is None:
                 raise ValueError("Project not found")
+            if (
+                self.session.scope.org_mode
+                and conversation.project_id != project_id
+                and conversation.project is not None
+            ):
+                left_path = conversation.project.path
             conversation.project_id = project_id
         self.session.add(conversation)
         self.session.commit()
         self.session.refresh(conversation)
+        if left_path is not None:
+            from cowork.services.project_file_copy import remove_project_files_copy
+
+            # After the commit, so a move that fails keeps its copy. Its
+            # turns now copy the new project's files into the new project's
+            # folder, and nothing else would remove the old copy.
+            remove_project_files_copy(left_path, conversation_id)
         return conversation
+
+    def record_turn_picks(
+        self,
+        *,
+        conversation: Conversation,
+        model: str | None,
+        reasoning_effort: str | None,
+        reset: Collection[TurnPick] = (),
+    ) -> None:
+        """Save a turn's model and reasoning-effort picks as the conversation's
+        own, so a reopened chat comes back on the latest ones.
+
+        A pick the turn leaves out keeps the saved value. Cowork's renderer
+        sends no model for a pinned model its picker no longer offers
+        (`offeredModelId`, e.g. one the wallet locks), and that turn must not
+        wipe the pin a top-up brings back. A pick named in `reset` that the
+        turn leaves out is cleared instead: the user went back to Model Router
+        or the default effort. A pick the turn sends wins over its reset.
+        Commits only on a change.
+        """
+        picks = (
+            model or (None if "model" in reset else conversation.model),
+            reasoning_effort or (None if "reasoning_effort" in reset else conversation.reasoning_effort),
+        )
+        if picks == (conversation.model, conversation.reasoning_effort):
+            return
+        conversation.model, conversation.reasoning_effort = picks
+        self.session.add(conversation)
+        self.session.commit()
+        self.session.refresh(conversation)
 
     def update_history_compaction(
         self,
@@ -750,11 +798,8 @@ class ConversationService:
         # THIS transaction (single commit below, so a crash can't leave a
         # half-deleted "ghost" conversation), then unlink the bytes only after
         # the commit succeeds.
-        from cowork.services.files import (
-            FileService,
-            attachment_purpose,
-            copy_record_path,
-        )
+        from cowork.services.files import FileService, attachment_purpose
+        from cowork.services.project_file_copy import copy_record_path
 
         file_service = FileService(self.session)
         purpose = attachment_purpose(str(conversation_id))
@@ -801,11 +846,8 @@ class ConversationService:
         cleanup_project_files: bool = True,
     ) -> None:
         """Remove external state only after the staged DB transaction commits."""
-        from cowork.services.files import (
-            remove_conversation_workspace_dir,
-            remove_copy_record,
-            unlink_file_dirs,
-        )
+        from cowork.services.files import remove_conversation_workspace_dir, unlink_file_dirs
+        from cowork.services.project_file_copy import remove_copy_record
 
         # Its buffers and turn-index entry outlive the rows otherwise: on the
         # Redis backend /in-flight keeps naming a turn whose conversation is

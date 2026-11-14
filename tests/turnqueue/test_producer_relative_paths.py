@@ -42,14 +42,14 @@ def captured(monkeypatch):
     async def _fake_llm(**_kw):
         return {"provider": "minds-cloud", "api_key": "k", "base_url": "u"}
 
-    monkeypatch.setattr(prod, "_mint_llm_block", _fake_llm)
+    monkeypatch.setattr(prod, "mint_llm_block", _fake_llm)
     return box
 
 
 async def _enqueue(**kwargs):
     base = dict(
         conversation_id="conv-1", org_id="org-1", user_id="user-1",
-        input_text="hi", model="m",
+        input_text="hi", model="m", memory_writable=True,
     )
     base.update(kwargs)
     gen = prod.stream_remote_replies(**base)

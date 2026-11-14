@@ -69,6 +69,13 @@ EVENT_FIELDS = frozenset(
         "copied",
         "copied_bytes",
         "not_copied",
+        # Why that copy was refused (cowork.services.project_file_copy
+        # .ProjectFilesRefusal), on its project_files_staged line and the
+        # refused turn's line.
+        "refusal",
+        # Why a direct answer handed its turn to the agent
+        # (cowork.handlers.direct_answer.Delegated.why).
+        "why",
         # A remote turn reply's number and the last one the relay applied
         # (cowork.turnqueue.producer.stream_remote_replies).
         "reply_n",

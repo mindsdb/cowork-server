@@ -33,10 +33,12 @@ import logging
 import re
 import time
 
+from cowork.common.ui_locale import with_reply_language
 from cowork.handlers.response_routing import (
     RouterBinding,
     _close,
     _condense_content,
+    denies_agent_capability,
     denies_our_product,
     names_foreign_product,
     names_gate_tool,
@@ -110,8 +112,14 @@ def take_history(history: list[dict]) -> list[dict]:
 
 
 def _shippable(text: str) -> bool:
-    """Whether the take so far may stay on screen, by the gate's own guards."""
-    return not (names_foreign_product(text) or denies_our_product(text) or names_gate_tool(text))
+    """Whether the take so far may stay on screen, by the gate's own guards.
+
+    A take saying it can't save or read something stays on screen until the
+    agent answers, so the capability denial withdraws it too."""
+    return not (
+        names_foreign_product(text) or denies_our_product(text) or names_gate_tool(text)
+        or denies_agent_capability(text)
+    )
 
 
 _SENTENCE_END = re.compile(r"[.!?…]+[\"'»”’)\]]*")
@@ -164,8 +172,10 @@ class FirstTake:
     then) on every way out of the turn.
     """
 
-    def __init__(self, binding: RouterBinding, history: list[dict]) -> None:
+    def __init__(self, binding: RouterBinding, history: list[dict], *, ui_locale: str | None = None) -> None:
         self._binding = binding
+        # The app's language: the take follows the same rule as the agent.
+        self._ui_locale = ui_locale
         self._messages = take_history(history)
         self._queue: asyncio.Queue = asyncio.Queue()
         self._writer: asyncio.Task | None = None
@@ -261,7 +271,7 @@ class FirstTake:
 
         events = self._binding.provider.stream(
             model=self._binding.model,
-            system=with_deployment_identity(_SYSTEM_PROMPT),
+            system=with_reply_language(with_deployment_identity(_SYSTEM_PROMPT), self._ui_locale),
             messages=self._messages,
             max_tokens=_MAX_TOKENS,
         )
