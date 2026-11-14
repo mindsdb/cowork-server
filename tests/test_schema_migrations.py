@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import uuid
 from types import SimpleNamespace
@@ -1700,3 +1701,61 @@ def test_artifact_locations_downgrade_guards_missing_table(tmp_path, monkeypatch
     _downgrade_to(engine, uri, "dce94d4bafc0")  # must not raise
 
     assert _alembic_versions(db_path) == {"dce94d4bafc0", MAINS_OWNER_INDEX, ORG_APPEARANCE_DROP}
+
+
+def test_the_custom_connector_check_column_upgrades_and_downgrades(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db = tmp_path / "custom_connector_check.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "d4b8e2f6a9c1")
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+    _upgrade_to(engine, uri, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            text("update custom_connectors set connection_check = :check where connector_id = 'acme'"),
+            {"check": '{"path": "/v1/me", "headers": {"X-Key": "{api_key}"}}'},
+        )
+
+    _downgrade_to(engine, uri, "d4b8e2f6a9c1")
+
+    with engine.begin() as connection:
+        columns = {row[1] for row in connection.execute(text("pragma table_info(custom_connectors)"))}
+        kept = connection.execute(text("select count(*) from custom_connectors")).scalar()
+    assert "connection_check" not in columns
+    assert kept == 1
+
+
+def test_the_custom_connector_auth_column_upgrades_and_downgrades(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db = tmp_path / "custom_connector_auth.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "e5f1a3c7b9d2")
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+        connection.execute(
+            text("update custom_connectors set connection_check = :check where connector_id = 'acme'"),
+            {"check": '{"path": "/v1/me"}'},
+        )
+    _upgrade_to(engine, uri, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            text("update custom_connectors set connection_auth = :auth where connector_id = 'acme'"),
+            {"auth": '{"type": "header", "headers": {"X-Key": "{api_key}"}}'},
+        )
+        stored = connection.execute(text("select connection_auth from custom_connectors")).scalar()
+    assert json.loads(stored) == {"type": "header", "headers": {"X-Key": "{api_key}"}}
+
+    _downgrade_to(engine, uri, "e5f1a3c7b9d2")
+
+    with engine.begin() as connection:
+        columns = {row[1] for row in connection.execute(text("pragma table_info(custom_connectors)"))}
+        check = connection.execute(text("select connection_check from custom_connectors")).scalar()
+    assert "connection_auth" not in columns
+    assert json.loads(check) == {"path": "/v1/me"}

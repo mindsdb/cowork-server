@@ -5,8 +5,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.common.settings.app_settings import OAuthSettings
-from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.common.settings.app_settings import OAuthSettings, TurnQueueSettings
+from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.units import run_db
 from cowork.schemas.connectors import (
     ConnectorMetadataResponse,
@@ -15,11 +15,15 @@ from cowork.schemas.connectors import (
     MatchRequest,
     MatchResponse,
 )
-from cowork.services.connectors.catalog import ConnectorCatalog
-from cowork.services.connectors.custom_connectors import scope_is_one_persons
+from cowork.services.connectors.catalog import ConnectorCatalog, custom_connector_spec
+from cowork.services.connectors.custom_connectors import (
+    is_builtin_connector_id,
+    scope_definitions,
+    scope_is_one_persons,
+)
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
-from cowork.services.connectors.specs._registry import registry
+from cowork.services.connectors.specs._registry import connector_metadata, registry
 
 router = APIRouter()
 
@@ -38,10 +42,23 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 async def custom_connector_availability(scope: ScopeDep) -> CustomConnectorAvailability:
     """Say whether the caller can build a custom connector kept for reuse.
 
-    True only in one person's scope (scope_is_one_persons); the picker shows
-    its build entries only then.
+    True in one person's scope (scope_is_one_persons), and in org mode while
+    the setting that lets cloud turns build templates is on: a member's
+    template is theirs alone there. The picker shows its build entries only
+    then.
     """
-    return CustomConnectorAvailability(can_build=scope_is_one_persons(scope))
+    org_drafts = scope.org_mode and TurnQueueSettings().connector_drafts_enabled
+    return CustomConnectorAvailability(can_build=scope_is_one_persons(scope) or org_drafts)
+
+
+def _own_custom_connectors(session: ScopedSession) -> list[ConnectorMetadataResponse]:
+    """The caller's own custom templates as directory entries, built-in ids left out."""
+    rows = session.exec(scope_definitions(session)).all()
+    return [
+        connector_metadata(custom_connector_spec(row))
+        for row in rows
+        if not is_builtin_connector_id(row.connector_id)
+    ]
 
 
 # AuthenticatedInOrgMode, not OpenByDesign: in org mode this forwards to
@@ -65,9 +82,9 @@ async def list_connector_specs(
     the caller can show them as desktop-only rather than pretend they don't
     exist. The default stays filtered so existing callers are unaffected.
 
-    Desktop also lists the install's custom connectors. Org mode does not
-    yet: a member's own definitions are listed once they can be connected
-    there, and auth's catalogue would file them as desktop-only.
+    Desktop also lists the install's custom connectors. Org mode lists the
+    member's own templates, available, while the setting that lets them be
+    connected is on; auth's catalogue does not know them.
     """
     if not scope.org_mode:
         return await run_db(lambda session: ConnectorCatalog(session).list_connectors(), scope=scope)
@@ -82,12 +99,16 @@ async def list_connector_specs(
     # Read, never written: OAuth's own allow-list is unchanged.
     allowed_ids = {item["id"] for item in catalogue.get("items", [])}
     allowed_ids |= load_datasource_capabilities().available_connector_ids()
+    own: list[ConnectorMetadataResponse] = []
+    if TurnQueueSettings().connector_drafts_enabled:
+        own = await run_db(_own_custom_connectors, scope=scope)
     if not include_unavailable:
-        return [c for c in connectors if c.id in allowed_ids]
-    return [
-        c.model_copy(update={"cloud_available": c.id in allowed_ids})
-        for c in connectors
-    ]
+        listed = [c for c in connectors if c.id in allowed_ids]
+    else:
+        listed = [c.model_copy(update={"cloud_available": c.id in allowed_ids}) for c in connectors]
+    if not own:
+        return listed
+    return sorted(listed + own, key=lambda c: (c.label or "").lower())
 
 
 # AuthenticatedInOrgMode: the answer includes the scope's custom connectors,

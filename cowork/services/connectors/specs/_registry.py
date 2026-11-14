@@ -93,6 +93,8 @@ class ConnectorSpecRegistry:
             custom=c.get("custom", False),
             keywords=c.get("keywords", []),
             form=c.get("form", {}),
+            check=c.get("check"),
+            auth_summary=c.get("auth_summary"),
         )
 
     def reload(self) -> None:

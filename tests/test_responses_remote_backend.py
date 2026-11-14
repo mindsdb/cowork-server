@@ -4023,6 +4023,7 @@ def _anton_connector_entries() -> list[dict]:
         "fields": [{"name": "api_key", "label": "API key", "help": "Settings, then API."},
                    {"name": "region", "label": "Region", "secret": False, "placeholder": "eu"}],
         "auth": {"type": "header", "headers": {"Authorization": "Bearer {api_key}", "X-Region": "{region}"}},
+        "check": {"path": "/v2/me"},
     }))
     return drain_pending_connectors(SimpleNamespace(_connector_drafts=box))
 

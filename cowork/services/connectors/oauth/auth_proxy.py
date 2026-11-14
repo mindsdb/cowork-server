@@ -218,3 +218,21 @@ async def proxy_datasource_retry(connection_id: int, request: Request, settings:
         "POST", f"/v1/datasources/{connection_id}/validation-retry",
         request=request, settings=settings, keep_code=True,
     )
+
+
+# Custom API connections. A member lists and deletes their own here, on the same
+# forwarded bearer; nobody creates one through this relay: cowork-server does,
+# on auth's internal route, only after the connection's check passed.
+
+
+async def proxy_custom_connection_list(request: Request, settings: OAuthSettings) -> list[dict]:
+    """auth answers with {"items": [...]}; callers here want the rows."""
+    result = await _relay("GET", "/v1/custom-connections", request=request, settings=settings, keep_code=True)
+    items = result.get("items", [])
+    return items if isinstance(items, list) else []
+
+
+async def proxy_custom_connection_delete(connection_id: int, request: Request, settings: OAuthSettings) -> None:
+    await _relay(
+        "DELETE", f"/v1/custom-connections/{connection_id}", request=request, settings=settings, keep_code=True,
+    )
