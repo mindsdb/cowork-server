@@ -90,6 +90,9 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     # Written and read only in org mode, where every resource is partitioned,
     # so this entry decides nothing in a personal scope.
     "artifact_locations": PersonalResource.PROJECTS,
+    # Written and read only in org mode, as artifact_locations are.
+    "held_artifact_roots": PersonalResource.PROJECTS,
+    "artifact_sort_times": PersonalResource.PROJECTS,
     # Authorship claims for skills, project memory and project instructions.
     # SharedResourceAccess reads and writes them only in org mode, where every
     # resource is partitioned, so this entry decides nothing in a personal scope.
