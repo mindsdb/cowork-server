@@ -42,6 +42,7 @@ from test_autopublish_reconcile import (  # noqa: F401  (fixtures)
     publish_url,
     published,
 )
+from tests._artifact_rows import no_self_heals_left  # noqa: F401  (a fixture)
 
 
 class TurnEndCase(BaseModel, frozen=True, extra="forbid"):
@@ -60,15 +61,6 @@ CASES = SelfHealCases.model_validate(
 )
 
 pytestmark = pytest.mark.usefixtures("publish_url")
-
-
-@pytest.fixture(autouse=True)
-def no_self_heals_left(monkeypatch):
-    """Self-heal state of this test's own, whatever an earlier test left."""
-    monkeypatch.setattr(ap, "_self_heals_requested", set())
-    monkeypatch.setattr(ap, "_self_heal_publishes_requested", set())
-    monkeypatch.setattr(ap, "_self_heals_started_at", {})
-    monkeypatch.setattr(ap, "_self_heal_tasks", {})
 
 
 @pytest.fixture(autouse=True)
@@ -354,6 +346,9 @@ async def test_a_location_check_that_fails_outright_asks_for_the_next_self_heal(
         raise RuntimeError("the step was refused")
 
     if failing_step == "listing":
+        # The project has no row here: its rows' read answers that the heal
+        # names its shared root, which holds no row yet.
+        monkeypatch.setattr(ap, "_rows_before_the_listing", lambda session, **kwargs: {})
         monkeypatch.setattr(ap, "_listed_artifact_ids", refused)
     else:
         monkeypatch.setattr(
@@ -397,7 +392,10 @@ async def test_a_location_check_asked_for_again_runs_no_publish_pass(base, enabl
         return set()
 
     async def recorded(fn, *, scope):
-        return None
+        # The project has no row here: the read before the listing answers
+        # that the heal names its shared root, which holds no row yet, and
+        # the record writes nothing.
+        return {} if getattr(fn, "func", None) is ap._rows_before_the_listing else None
 
     monkeypatch.setattr(ap, "_listed_artifact_ids", unread_copy)
     monkeypatch.setattr(ap, "autopublish_project_artifacts", reconciler)
@@ -440,6 +438,38 @@ async def test_a_self_heal_never_starts_beside_its_running_one(base, monkeypatch
     await asyncio.gather(*first)
     assert len(ap.start_due_self_heals()) == 1
     assert runs[0] == heal
+
+
+@pytest.mark.parametrize(
+    ("scope", "project_id"),
+    [
+        (ORG_SCOPE, PROJECT_ID),
+        (TenantScope(), PROJECT_ID),
+        (TenantScope(org_id="person-1", user_id="user-1", personal=True), PROJECT_ID),
+        (ORG_SCOPE, None),
+    ],
+    ids=["org", "desktop", "personal-partition", "no-project"],
+)
+def test_a_projects_location_check_is_asked_for_alone_where_artifacts_have_rows(
+    base, scope, project_id  # noqa: F811
+):
+    """A writer that could not record a row of a project's shared root asks
+    for the project's location check, and no publish. Only org tenancy
+    keeps the rows, so the desktop, a person's partition and a caller with
+    no project ask for nothing. Inside keep_location_checks the request
+    lands in that block's own set, as every location check does."""
+    asked = scope is ORG_SCOPE and project_id is not None
+
+    ap.request_project_location_check(artifacts_base=base, scope=scope, project_id=project_id)
+
+    heal = ap.SelfHeal(artifacts_base=base, scope=scope, project_id=PROJECT_ID)
+    assert ap._self_heals_requested == ({heal} if asked else set())
+    assert ap._self_heal_publishes_requested == set()
+    with ap.keep_location_checks() as kept:
+        ap._self_heals_requested.clear()
+        ap.request_project_location_check(artifacts_base=base, scope=scope, project_id=project_id)
+    assert kept == ({heal} if asked else set())
+    assert ap._self_heals_requested == set()
 
 
 async def test_each_member_gets_a_self_heal_of_their_own(base, monkeypatch):  # noqa: F811

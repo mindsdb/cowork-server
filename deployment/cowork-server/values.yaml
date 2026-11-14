@@ -175,7 +175,8 @@ deployment:
   #   about 22 s  the lifespan teardown's bounded waits: the draft listener's
   #           own drain when COWORK_DRAFT_PORT is set (2 s,
   #           cowork/draft_host/listener.py), another pass over turns (5 s),
-  #           the artifact backfills' stop (2 s,
+  #           the stop of the artifact backfills' one task (the location,
+  #           held-root and sort-time backfills; 2 s,
   #           LOCATION_BACKFILL_SHUTDOWN_SECONDS in cowork/server.py),
   #           channel tasks (3 s, then up to 5 s more while each one
   #           cancelled writes its sandbox turn's cancel flag and records its

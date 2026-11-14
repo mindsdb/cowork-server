@@ -48,6 +48,7 @@ from cowork.services.artifacts import (
 
 if TYPE_CHECKING:
     from cowork.services.artifact_locations import Location
+    from cowork.services.artifact_sort_times import NewestFolders
     from cowork.services.held_artifact_roots import HeldRoot
 
 logger = logging.getLogger(__name__)
@@ -204,7 +205,16 @@ class RootsPlan:
     `held`, which only the artifacts routes' plans set (`with_held_roots`),
     names the roots of `projects` known to hold an artifact folder, so
     expanding the plan opens nothing on the file store; None finds the roots
-    there.
+    there. `newest`, which only the list's plans set, holds the newest
+    sort-time rows of the roots `held` names for the projects outside `walk`
+    (artifact_sort_times.NewestFolders), and names the projects of `walk`
+    among `newest.unread`. The list then opens only the folders of the
+    rows, and reads every folder of the projects in `newest.unread`, which
+    have no rows to trust. When the rows were cut at the query's limit and
+    the folders at least as new as the last row kept build fewer cards than
+    the list shows, it reads every folder of the plan's roots instead; only
+    the folders newer than that row count when the run of rows at its time
+    was too long to read (NewestFolders.ties_read).
     """
 
     projects: tuple[ProjectRow, ...] = ()
@@ -215,12 +225,26 @@ class RootsPlan:
     owner_filter: bool = False
     owned: frozenset[UUID] = frozenset()
     # Set beside `held` (with_held_roots): the projects of `projects` whose
-    # roots the held-root backfill could not read (the unread list of its
-    # sentinel, held_artifact_roots.HeldRootSentinel). No row names their
-    # roots, so `discover_roots` finds them on the file store, as for a plan
-    # without `held`.
+    # roots the held-root backfill could not read, or that moved or went
+    # away during its walk (the unread list of its sentinel,
+    # held_artifact_roots.HeldRootSentinel). That backfill wrote none of
+    # their rows. A turn end, the project files PUT or the self-heal may
+    # have written some since, and `held` holds those, but they may not
+    # name every root, so `discover_roots` finds these projects' roots on
+    # the file store, as for a plan without `held`.
     walk: frozenset[UUID] = frozenset()
     held: frozenset[HeldRoot] | None = None
+    # Set by the artifacts list's plans, beside `held`, once the sort times'
+    # backfill has written its sentinel (artifact_sort_times.newest_folders):
+    # `rows`, the newest rows of the held roots of the projects outside
+    # `walk`, newest first; `complete`, false when the query's limit cut
+    # them; `tied`, the rest of a run of tied times that cut landed in, and
+    # `ties_read`, whether that run was read whole; `unread`, the projects
+    # whose every folder the list reads: those the sort-time sentinel lists
+    # (SortTimeSentinel.unread), which may have no rows and have none in
+    # `rows`, and those of `walk`. None reads every folder of the roots the
+    # plan expands to.
+    newest: NewestFolders | None = None
 
 
 @dataclass(frozen=True)
@@ -378,30 +402,27 @@ def plan_scope_roots(session: ScopedSession) -> RootsPlan:
 
 def with_held_roots(session: ScopedSession, plan: RootsPlan) -> RootsPlan:
     """`plan` with the roots of its projects the held_artifact_roots rows
-    name (held_artifact_roots.held_roots), for the artifacts list, and the
-    projects whose roots their backfill could not read (the unread list of
-    its sentinel, held_artifact_roots.read_sentinel), which it still walks.
-    Unchanged for a desktop scan, a scope that keeps no rows, or before
-    their backfill has finished. A database step: run it in a database
-    unit."""
+    name (held_artifact_roots.held_root_rows), for the artifacts list, and
+    the projects whose roots their backfill could not read (the unread list
+    of its sentinel, held_artifact_roots.read_sentinel), which it still
+    walks. Unchanged for a desktop scan, a scope that keeps no rows, or
+    before their backfill has written its sentinel. A database step: run it
+    in a database unit."""
     from cowork.services.artifact_locations import keeps_locations
-    from cowork.services.held_artifact_roots import held_roots, read_sentinel
+    from cowork.services.held_artifact_roots import held_root_rows, read_sentinel
 
     if plan.scan or not keeps_locations(session.scope):
         return plan
-    # `walk` comes from this read of the sentinel, which comes before the
-    # rows (held_roots reads the sentinel again only to check that it is
-    # there). Another replica's pass over the unread projects commits a
-    # project's rows, then the sentinel without it: whenever it lands after
-    # this read, the project is still in `walk` and found on the file store,
-    # never left both unheld and unwalked.
+    # The one read of the sentinel, before the rows: `walk` comes from it.
+    # Another replica's pass over the unread projects commits a project's
+    # rows, then the sentinel without it: whenever it lands after this read,
+    # the project is still in `walk` and found on the file store, never left
+    # both unheld and unwalked.
     sentinel = read_sentinel(session)
     if sentinel is None:
         return plan
     project_ids = [project.id for project in plan.projects]
-    held = held_roots(session, project_ids=project_ids)
-    if held is None:
-        return plan
+    held = held_root_rows(session, project_ids=project_ids)
     return replace(plan, held=held, walk=frozenset(sentinel.unread).intersection(project_ids))
 
 
@@ -441,25 +462,33 @@ def recorded_source(project: ProjectRow, conversation_id: UUID | None) -> Projec
     return _project_source(project, base)
 
 
-def recorded_location(source: ProjectArtifacts, folder: Path) -> Location | None:
-    """The location row for `folder`, found below `source`, or None for a root
-    no row describes (a desktop root, which has no project id). A folder name
-    that is not valid UTF-8 still gets its location, so it counts toward a
-    conflict; record_checked_folders never stores it in a row."""
-    from cowork.services.artifact_locations import Location
+def held_root_of(source: ProjectArtifacts) -> HeldRoot | None:
+    """The root `source` is, as the rows name it: its project, and its
+    conversation for a legacy root. None for a root no row describes: a
+    desktop root, which has no project id, or a legacy root whose folder
+    name is no conversation id."""
+    from cowork.services.held_artifact_roots import HeldRoot
 
     if source.project_id is None:
         return None
     parts = tuple(source.root_parts)
     if parts == _ARTIFACTS_SUBPATH:
-        conversation_id = None
-    elif len(parts) == 4 and parts[0] == CONVERSATIONS_DIRNAME and parts[2:] == _ARTIFACTS_SUBPATH:
+        return HeldRoot(UUID(source.project_id), None)
+    if len(parts) == 4 and parts[0] == CONVERSATIONS_DIRNAME and parts[2:] == _ARTIFACTS_SUBPATH:
         conversation_id = _conversation_id(Path(parts[1]))
-        if conversation_id is None:
-            return None
-    else:
-        return None
-    return Location(UUID(source.project_id), conversation_id, folder.name)
+        return HeldRoot(UUID(source.project_id), conversation_id) if conversation_id is not None else None
+    return None
+
+
+def recorded_location(source: ProjectArtifacts, folder: Path) -> Location | None:
+    """The location row for `folder`, found below `source`, or None for a root
+    no row describes (held_root_of). A folder name that is not valid UTF-8
+    still gets its location, so it counts toward a conflict;
+    record_checked_folders never stores it in a row."""
+    from cowork.services.artifact_locations import Location
+
+    root = held_root_of(source)
+    return Location(root.project_id, root.conversation_id, folder.name) if root is not None else None
 
 
 def project_roots(

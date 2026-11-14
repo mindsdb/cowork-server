@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import uuid
 from pathlib import Path
 
@@ -423,3 +424,9 @@ def test_the_lists_sort_read_never_follows_a_link_in_place_of_a_folder(tmp_path,
             paths.dir_child_stat(root, "link", "metadata.json")
         with pytest.raises(FileNotFoundError):
             paths.dir_child_stat(root, "empty", "metadata.json")
+        # A link in place of the child is followed by default, and stat'ed
+        # as the link itself without following.
+        (real / "metadata.json").unlink()
+        (real / "metadata.json").symlink_to(outside / "metadata.json")
+        assert stat.S_ISREG(paths.dir_child_stat(root, "real", "metadata.json").st_mode)
+        assert stat.S_ISLNK(paths.dir_child_stat(root, "real", "metadata.json", follow_symlinks=False).st_mode)

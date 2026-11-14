@@ -2978,7 +2978,7 @@ async def test_shutdown_goes_on_while_the_location_backfill_is_stuck(boot, monke
             record.getMessage() for record in caplog.records
             if record.name == server.logger.name
             and getattr(record, "event", None) == "shutdown_location_backfill_unfinished"
-        ] == ["artifact backfills still running at shutdown; going on"]
+        ] == ["artifact backfills (location, held-root, sort-time) still running at shutdown; going on"]
     finally:
         release.set()
         backfill = app.state.artifact_location_backfill

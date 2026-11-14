@@ -38,7 +38,7 @@ from cowork.auth_middleware import (
 from cowork.code_sandbox import check_startup as check_code_sandbox_startup
 from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.personal_resources import PersonalResource, check_personal_resource_dependencies
-from cowork.db.scoped import MissingTenantScopeError
+from cowork.db.scoped import MissingTenantScopeError, ScopedSession
 from cowork.db.units import (
     TURN_END_RECORD_DRAIN_SECONDS,
     DatabaseBusy,
@@ -421,17 +421,19 @@ async def _run_artifact_owner_backfill() -> None:
 
 
 # How long the lifespan teardown waits for the artifact backfills' task (the
-# location backfill, then the held-root backfill) once it sets the walks'
-# stop. A file store call already started is never abandoned
-# (cowork.db.units.run_efs), so during a stall a walk can outlast any wait;
-# the teardown goes on without it, and the walk's thread, which is not a
-# daemon thread, ends at its next project, root or id, or at the kubelet's
-# SIGKILL. Counted in the grace period (tests/test_chart_values.py).
+# location backfill, then the held-root backfill, then the sort-time
+# backfill) once it sets the walks' stop. A file store call already started
+# is never abandoned (cowork.db.units.run_efs), so during a stall a walk can
+# outlast any wait; the teardown goes on without it, and the walk's thread,
+# which is not a daemon thread, ends at its next project, root or id, or at
+# the kubelet's SIGKILL. Counted in the grace period
+# (tests/test_chart_values.py).
 LOCATION_BACKFILL_SHUTDOWN_SECONDS = 2
 
 
 async def _stop_location_backfill(*, task: asyncio.Task | None, stop: threading.Event | None) -> None:
-    """Set the artifact backfills' stop, cancel their task, and wait at most
+    """Set the stop of the artifact backfills (location, held-root and
+    sort-time), cancel their task, and wait at most
     LOCATION_BACKFILL_SHUTDOWN_SECONDS for it to end."""
     if stop is not None:
         stop.set()
@@ -441,26 +443,30 @@ async def _stop_location_backfill(*, task: asyncio.Task | None, stop: threading.
     done, _pending = await asyncio.wait({task}, timeout=LOCATION_BACKFILL_SHUTDOWN_SECONDS)
     if not done:
         logger.warning(
-            "artifact backfills still running at shutdown; going on",
+            "artifact backfills (location, held-root, sort-time) still running at shutdown; going on",
             extra={"event": "shutdown_location_backfill_unfinished"},
         )
 
 
 async def _run_artifact_location_backfill(stop: threading.Event) -> None:
     """Background, one-time location backfill, then the held-root backfill
-    (cowork.services.held_artifact_roots): each one file store call with no
-    deadline, so the task holds one file store slot at a time for its walks.
-    Never affects startup. Shutdown sets ``stop``, which both walks read,
+    (cowork.services.held_artifact_roots), then the sort-time backfill, which
+    reads the roots the held rows name (cowork.services.artifact_sort_times):
+    each one file store call with no deadline, so the task holds one file
+    store slot at a time for its walks.
+    Never affects startup. Shutdown sets ``stop``, which each walk reads,
     before it cancels the task, since a cancelled file store call waits for
     its work."""
     from cowork.db.scoped import SYSTEM_SCOPE
     from cowork.db.units import run_efs
     from cowork.services.artifact_location_backfill import run_artifact_location_backfill
+    from cowork.services.artifact_sort_times import run_sort_time_backfill
     from cowork.services.held_artifact_roots import run_held_root_backfill
 
     for operation, backfill in (
         ("artifact_location_backfill", run_artifact_location_backfill),
         ("held_artifact_roots_backfill", run_held_root_backfill),
+        ("artifact_sort_times_backfill", run_sort_time_backfill),
     ):
         try:
             await run_efs(partial(backfill, stop=stop), scope=SYSTEM_SCOPE, deadline=False)
@@ -474,38 +480,72 @@ async def _run_artifact_location_backfill(stop: threading.Event) -> None:
 
 
 # How long the startup task waits before it runs the artifact backfills again
-# while the held-root backfill's sentinel is missing: another replica held the
-# walk's lock when this one tried, and may have died since, or the walk here
-# ended in an error. Once the held-root sentinel exists the task stops trying.
-# A run after another replica finished skips the location pass and walks only
-# the projects the held-root sentinel lists as unread, as a later start does.
+# while the held-root or the sort-time backfill's sentinel is missing:
+# another replica held a walk's lock when this one tried, and may have died
+# since, or a walk here ended in an error. A run after another replica
+# finished skips the location pass and walks only the projects each
+# sentinel lists as unread, as a later start does.
 ARTIFACT_BACKFILL_RETRY_SECONDS = 300
+# How long it waits once both sentinels exist while either lists a project
+# its pass could not read, such as one whose root failed with EIO, or one
+# that moved or went away during its walk: every list in the organization
+# reads every folder of such a project. A run then walks only the listed
+# projects, one replica at a time, so the wait is longer. A project that
+# moved is read at its new path at the next run, and one deleted since
+# leaves the list there, since the run's query no longer finds it. A
+# project whose folder is missing for good, or one the server may not read
+# (artifact_owner_backfill.walked_folder_is_gone), is listed by the first
+# sort-time pass alone, and leaves that list at the next run, which counts
+# it as read with no rows (artifact_sort_times._time_project): only a root
+# that keeps failing, as on EIO, keeps the task going.
+ARTIFACT_BACKFILL_UNREAD_RETRY_SECONDS = 1800
+
+
+def _artifact_backfill_wait(session: ScopedSession) -> int | None:
+    """The seconds the startup task waits before it runs the artifact
+    backfills again: ARTIFACT_BACKFILL_RETRY_SECONDS while the held-root or
+    the sort-time backfill has written no sentinel it can read
+    (held_artifact_roots.read_sentinel,
+    artifact_sort_times.read_sort_sentinel), and
+    ARTIFACT_BACKFILL_UNREAD_RETRY_SECONDS while either sentinel lists an
+    unread project. None once both exist and list none: the task ends."""
+    from cowork.services.artifact_sort_times import read_sort_sentinel
+    from cowork.services.held_artifact_roots import read_sentinel
+
+    held, sort = read_sentinel(session), read_sort_sentinel(session)
+    if held is None or sort is None:
+        return ARTIFACT_BACKFILL_RETRY_SECONDS
+    if held.unread or sort.unread:
+        return ARTIFACT_BACKFILL_UNREAD_RETRY_SECONDS
+    return None
 
 
 async def _run_artifact_backfills(stop: threading.Event) -> None:
     """The startup task: the artifact backfills
-    (_run_artifact_location_backfill), then again every
-    ARTIFACT_BACKFILL_RETRY_SECONDS while the held-root backfill has written
-    no sentinel (held_artifact_roots.read_sentinel) and shutdown has not set
-    ``stop``. Shutdown cancels the task during its wait."""
+    (_run_artifact_location_backfill), then again after the wait
+    _artifact_backfill_wait gives, until both sentinels exist and list no
+    unread project, or shutdown sets ``stop``. A failed read of the
+    sentinels waits ARTIFACT_BACKFILL_RETRY_SECONDS. Shutdown cancels the
+    task during its wait."""
     from cowork.db.scoped import SYSTEM_SCOPE
     from cowork.db.units import run_db
-    from cowork.services.held_artifact_roots import read_sentinel
 
     while True:
         await _run_artifact_location_backfill(stop)
         if stop.is_set():
             return
         try:
-            if await run_db(read_sentinel, scope=SYSTEM_SCOPE) is not None:
-                return
+            wait = await run_db(_artifact_backfill_wait, scope=SYSTEM_SCOPE)
         except Exception:
             logger.warning(
-                "could not read the held-root backfill's sentinel; the artifact backfills run again later",
+                "could not read the artifact backfills' sentinels; the artifact backfills run again later",
                 exc_info=True,
-                extra={"event": "artifact_backfill_failed", "operation": "held_artifact_roots_sentinel"},
+                extra={"event": "artifact_backfill_failed", "operation": "artifact_backfill_sentinels"},
             )
-        await asyncio.sleep(ARTIFACT_BACKFILL_RETRY_SECONDS)
+            wait = ARTIFACT_BACKFILL_RETRY_SECONDS
+        if wait is None:
+            return
+        await asyncio.sleep(wait)
 
 
 # Imported lazily by the first agent turn otherwise, adding their import time to

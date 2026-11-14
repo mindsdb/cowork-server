@@ -498,40 +498,88 @@ class ComparisonService:
         return work_carried and not _artifacts_left(Path(sandbox.path))
 
     def _hold_carried_workspace(self, side: ComparisonSide, destination: Project) -> None:
-        """Record that the destination's legacy artifacts root of the side's
-        conversation holds a folder (held_artifact_roots.hold_root), when the
-        workspace the carry brought there holds one the artifacts list opens
-        (held_artifact_roots.holds_a_folder). The list trusts the rows once
-        their backfill has finished, so without the row it never opens that
-        root. A workspace with no artifacts folder gets no row. Org tenancy
-        only, where the rows are kept. Runs in the continue's file store unit,
-        after every carry, since one cut short may already have brought the
-        folder there; a retry's carry checks again. Best-effort, as the task
-        move's hold is: a failure is logged and rolled back, and the continue
-        goes on."""
+        """Record the destination's legacy artifacts root of the side's
+        conversation, when the workspace the carry brought there holds folders
+        the artifacts list opens (held_artifact_roots.listable_folder_names):
+        that the root holds one (held_artifact_roots.hold_root), so the list
+        opens it, and the sort time of each of those folders
+        (artifact_sort_times.record_sort_times, with the times
+        id_holder_times reads of those holding an id), so the list counts
+        them among the newest.
+        The list trusts both rows once their backfills have finished, so
+        without them it never shows those folders. A workspace with no
+        artifacts folder gets no row. Org tenancy only, where the rows are
+        kept. Runs in the continue's file store unit (run_efs_unit), so it
+        reads the root here, after every carry, since one cut short may
+        already have brought the folders there; a retry's carry reads it
+        again.
+
+        Best-effort, as the task move's and the project files PUT's writes
+        are, and each step has its own try, so the continue goes on. A
+        failed read of the folders is logged with the event
+        `held_artifact_root_not_recorded`, and records nothing. A failed hold
+        is rolled back and logged with that event, and the times are still
+        written. A failed read or write of the times is rolled back and
+        logged with the event `artifact_sort_time_not_recorded`. A folder
+        whose `metadata.json` the read could not reach, such as on EIO, is
+        logged at WARNING and its time is not updated. A legacy root has no
+        self-heal, so its rows then wait for a project files PUT into one of
+        its folders (project_files._record_artifact_folder_write), which
+        records that folder."""
         from cowork.services.artifact_locations import keeps_locations
         from cowork.services.artifact_roots import ProjectRow, recorded_source
-        from cowork.services.held_artifact_roots import hold_root, holds_a_folder
+        from cowork.services.artifact_sort_times import id_holder_times, record_sort_times
+        from cowork.services.held_artifact_roots import hold_root, listable_folder_names
 
         if not keeps_locations(self.session.scope):
             return
         # Plain values: a failed commit expires every loaded row.
         project_id, conversation_id = destination.id, side.conversation_id
+        context = log_context(project_id=project_id, conversation_id=conversation_id)
         # An org project's folder is never one the user chose
         # (ProjectService.directory_is_external).
-        row = ProjectRow(id=project_id, name=destination.name, path=destination.path, external=False)
+        source = recorded_source(
+            ProjectRow(id=project_id, name=destination.name, path=destination.path, external=False), conversation_id
+        )
         try:
-            if holds_a_folder(recorded_source(row, conversation_id)):
-                hold_root(self.session, project_id=project_id, conversation_id=conversation_id)
+            folders = listable_folder_names(source)
+        except Exception:
+            logger.warning(
+                "Could not read the artifact folders a continued side's workspace brought, so neither its root nor "
+                "their sort times were recorded",
+                exc_info=True,
+                extra={"event": "held_artifact_root_not_recorded", **context},
+            )
+            return
+        if not folders:
+            return
+        try:
+            hold_root(self.session, project_id=project_id, conversation_id=conversation_id)
         except Exception:
             self.session.rollback()
             logger.warning(
-                "Could not record that a continued side's workspace holds an artifact folder",
+                "Could not record the artifacts root a continued side's workspace brought",
                 exc_info=True,
-                extra={
-                    "event": "held_artifact_root_not_recorded",
-                    **log_context(project_id=project_id, conversation_id=conversation_id),
-                },
+                extra={"event": "held_artifact_root_not_recorded", **context},
+            )
+        try:
+            read = id_holder_times(base=source.base, slugs=folders)
+            record_sort_times(self.session, project_id=project_id, times=read.times, conversation_id=conversation_id)
+        except Exception:
+            self.session.rollback()
+            logger.warning(
+                "Could not record the sort times of the artifact folders a continued side's workspace brought",
+                exc_info=True,
+                extra={"event": "artifact_sort_time_not_recorded", **context},
+            )
+            return
+        if read.unreadable:
+            # The event and level a turn end's or the self-heal's read logs
+            # for folders whose time it could not read.
+            logger.warning(
+                "Could not read the metadata.json of artifact folders a continued side's workspace brought, so their "
+                "sort times were not updated",
+                extra={"event": "artifact_sort_times_unreadable", **context, "count": len(read.unreadable)},
             )
 
     def _remove_sandbox(self, sandbox: Project) -> None:

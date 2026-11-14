@@ -2,8 +2,9 @@
 comparison side's carry write, through the code that calls them rather than
 below it.
 
-A turn end that created or listed folders in its project's shared root holds
-the root (task_objects.record_new_artifacts). A failed hold raises
+A turn end that created, listed or timed folders in its project's shared
+root, or could not read a folder's time there, holds the root
+(task_objects.record_new_artifacts). A failed hold raises
 ListedLocationsUnchecked once the turn's other rows are written, so the turn
 end asks for the project's self-heal, and the self-heal's listing holds the
 root it finds folders in (artifact_autopublish._record_listed_locations),
@@ -12,7 +13,8 @@ shared root, and a failed hold asks for the destination's location check
 (TaskObjectService._relocate_artifacts). A comparison side continued into a
 project holds the legacy root its carried workspace brought, when that root
 holds a folder (ComparisonService._hold_carried_workspace), on the first
-continue and on the retry that finishes a carry cut short.
+continue and on the retry that finishes a carry cut short; a failed hold is
+logged and still lets the carry write its folders' sort times.
 """
 from __future__ import annotations
 
@@ -20,19 +22,19 @@ import asyncio
 import errno
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import pytest
-from sqlmodel import Session, select
+from sqlmodel import Session
 
 import cowork.turnqueue.remote_turn as remote_turn_mod
 from cowork.db import units
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.handlers.responses import ResponsesHandler
 from cowork.models.conversation import Conversation
-from cowork.models.held_artifact_root import HeldArtifactRoot
 from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
 from cowork.services import artifact_autopublish as ap
@@ -55,25 +57,11 @@ from test_org_list_scaling import (  # noqa: F401  (fixtures)
     held_roots,
     org,
 )
-from test_project_files_artifact_roots import _held_root_inserts_fail, _slugs
+from test_project_files_artifact_roots import _held_root_inserts_fail, _slugs, _sort_times
 from test_remote_turn import _drain, _fake_handler
+from tests._artifact_rows import held_roots_of, no_self_heals_left  # noqa: F401  (no_self_heals_left is a fixture)
 
 pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
-
-
-@pytest.fixture(autouse=True)
-def no_self_heals_left(monkeypatch):
-    """Self-heal state of this test's own, whatever an earlier test left."""
-    monkeypatch.setattr(ap, "_self_heals_requested", set())
-    monkeypatch.setattr(ap, "_self_heal_publishes_requested", set())
-    monkeypatch.setattr(ap, "_self_heals_started_at", {})
-    monkeypatch.setattr(ap, "_self_heal_tasks", {})
-
-
-def _held(org_id: str) -> set[HeldRoot]:
-    with Session(_engine()) as raw:
-        rows = raw.exec(select(HeldArtifactRoot).where(HeldArtifactRoot.org_id == org_id)).all()
-        return {HeldRoot(row.project_id, row.conversation_id) for row in rows}
 
 
 def _refuse_holds(monkeypatch) -> None:
@@ -145,7 +133,7 @@ def test_a_failed_hold_raises_once_the_turns_rows_are_written(tmp_path, monkeypa
         made_id: LocationRow(Location(project.id, None, "made-original"), conflicted=True),
         listed_id: LocationRow(Location(project.id, None, "listed-original"), conflicted=True),
     }
-    assert _held(org_id) == set()
+    assert held_roots_of(org_id) == set()
 
 
 async def test_a_turn_end_whose_hold_fails_asks_for_the_projects_self_heal(tmp_path, monkeypatch, caplog):
@@ -172,13 +160,14 @@ async def test_a_turn_end_whose_hold_fails_asks_for_the_projects_self_heal(tmp_p
     # The turn created a folder, but only the hold failed, which its line names.
     assert record.getMessage() == (
         "Could not check the locations of the artifacts a channel turn found, or record the folder that holds them"
+        " or their sort times"
     )
     # The turn's own rows are written all the same.
     with units.unit_session(scope=scope) as session:
         assert session.exec(
             session.select(TaskObject.ref).where(TaskObject.conversation_id == conversation_id)
         ).all() == ["report"]
-    assert _held(org_id) == set()
+    assert held_roots_of(org_id) == set()
 
 
 async def test_the_self_heals_location_check_holds_the_root_its_listing_finds_a_folder_in(tmp_path):
@@ -196,20 +185,20 @@ async def test_the_self_heals_location_check_holds_the_root_its_listing_finds_a_
 
     await asyncio.gather(*ap.start_due_self_heals())
 
-    assert _held(org_id) == {HeldRoot(project.id, None)}
+    assert held_roots_of(org_id) == {HeldRoot(project.id, None)}
     assert ap._self_heals_requested == set()
 
 
-async def test_a_turn_end_whose_listing_reads_no_folder_has_its_root_held_by_the_location_check(
+async def test_a_turn_end_whose_listing_reads_no_folder_holds_its_root_and_asks_for_the_location_check(
     tmp_path, monkeypatch
 ):
     """The file server stops answering for the project's one folder during
     the turn. The turn end's listing finds the folder and reads nothing in
-    it, so it records nothing (remote_turn._record_turn_artifacts records
-    only created or listed ids) and asks for the project's location check.
-    That check's listing still cannot read the folder, and holds the root:
-    an unreadable folder may hold an artifact the list should show once it
-    reads again."""
+    it, so its record holds the root (ArtifactChanges.needs_record): an
+    unreadable folder may hold an artifact the list should show once it
+    reads again. It asks for the project's location check, whose listing
+    still cannot read the folder, and the root stays held. That check holds
+    such a root on its own too (test_artifact_sort_time_writers)."""
     org_id, creator = str(uuid4()), str(uuid4())
     project = make_project(tmp_path, org_id)
     conversation_id = make_conversation(project, creator)
@@ -232,7 +221,7 @@ async def test_a_turn_end_whose_listing_reads_no_folder_has_its_root_held_by_the
     assert ap._self_heal_publishes_requested == set()
     await asyncio.gather(*ap.start_due_self_heals())
 
-    assert _held(org_id) == {HeldRoot(project.id, None)}
+    assert held_roots_of(org_id) == {HeldRoot(project.id, None)}
 
 
 async def test_a_task_move_whose_hold_fails_asks_for_the_destinations_location_check(tmp_path, monkeypatch):
@@ -257,19 +246,22 @@ async def test_a_task_move_whose_hold_fails_asks_for_the_destinations_location_c
     assert ap._self_heals_requested == {heal}
     # The location check alone: the move asks for no publish.
     assert ap._self_heal_publishes_requested == set()
-    assert _held(org_id) == set()
+    assert held_roots_of(org_id) == set()
     monkeypatch.setattr(held_artifact_roots, "hold_root", hold_root)
 
     await asyncio.gather(*ap.start_due_self_heals())
 
-    assert _held(org_id) == {HeldRoot(dest.id, None)}
+    assert held_roots_of(org_id) == {HeldRoot(dest.id, None)}
 
 
-def _continue_a_side(api, org_id: str, *, artifact: bool, retried: bool = False):
+def _continue_a_side(
+    api, org_id: str, *, artifact: bool, retried: bool = False, fill: Callable[[Path], None] | None = None
+):
     """Continue one of Alice's comparison sides into a project of `org_id`.
     The side's workspace holds its agent state and, when `artifact`, the
     legacy artifact folder `legacy-report`, as a PUT into the sandbox's
-    workspace or an agent's own write would leave it. When `retried`, the
+    workspace or an agent's own write would leave it; `fill`, when given,
+    writes more into the workspace's artifacts folder. When `retried`, the
     first continue's workspace carry fails, so the sandbox is kept and no
     row is written, and a second continue carries the workspace
     (ComparisonService._finish_carry). Returns the destination's id and the
@@ -288,11 +280,14 @@ def _continue_a_side(api, org_id: str, *, artifact: bool, retried: bool = False)
         (workspace / ".anton" / "anton.md").write_text("Always use EUR.")
         if artifact:
             _write_artifact(workspace / ".anton" / "artifacts", "legacy-report")
+        if fill is not None:
+            fill(workspace / ".anton" / "artifacts")
         if retried:
             with patch.object(comparisons, "_carry_hosted_workspace", return_value=False):
                 cut_short = service.continue_side(comparison.id, "a", destination_id)
             assert cut_short.carried_all is False
-            assert _held(org_id) == set()
+            assert held_roots_of(org_id) == set()
+            assert _sort_times(org_id) == set()
 
         continued = service.continue_side(comparison.id, "a", destination_id)
 
@@ -308,7 +303,7 @@ def test_a_continued_side_holds_the_legacy_root_its_workspace_brought(client, or
 
     destination_id, conversation_id = _continue_a_side(client, org, artifact=True)
 
-    assert _held(org) == {HeldRoot(destination_id, conversation_id)}
+    assert held_roots_of(org) == {HeldRoot(destination_id, conversation_id)}
     assert _slugs(client, org, ALICE, f"?project_id={destination_id}") == ["legacy-report"]
 
 
@@ -323,7 +318,7 @@ def test_a_side_continued_again_holds_the_legacy_root_its_finished_carry_brought
 
     destination_id, conversation_id = _continue_a_side(client, org, artifact=True, retried=True)
 
-    assert _held(org) == {HeldRoot(destination_id, conversation_id)}
+    assert held_roots_of(org) == {HeldRoot(destination_id, conversation_id)}
     assert _slugs(client, org, ALICE, f"?project_id={destination_id}") == ["legacy-report"]
 
 
@@ -353,7 +348,7 @@ def test_a_carry_cut_short_holds_the_legacy_root_it_already_brought(client, org,
             continued = service.continue_side(comparison.id, "a", destination_id)
 
     assert continued.carried_all is False
-    assert _held(org) == {HeldRoot(destination_id, conversation_id)}
+    assert held_roots_of(org) == {HeldRoot(destination_id, conversation_id)}
     assert _slugs(client, org, ALICE, f"?project_id={destination_id}") == ["legacy-report"]
 
 
@@ -364,7 +359,8 @@ def test_a_continued_side_with_no_artifacts_folder_holds_no_root(client, org, he
 
     destination_id, _ = _continue_a_side(client, org, artifact=False)
 
-    assert _held(org) == set()
+    assert held_roots_of(org) == set()
+    assert _sort_times(org) == set()
     assert _slugs(client, org, ALICE, f"?project_id={destination_id}") == []
 
 
@@ -373,7 +369,9 @@ def test_a_continued_sides_failed_hold_is_logged_and_the_continue_goes_on(
 ):
     """After the carry the continue moves the conversation and marks the
     side in the same session, so the carry rolls its failed hold back
-    first, or those writes fail too."""
+    first, or those writes fail too. The times have their own try, so each
+    carried folder's time is still written, as the project files PUT's is
+    after a failed hold."""
     held_roots()
 
     with _held_root_inserts_fail(), caplog.at_level(logging.WARNING, logger=comparisons.logger.name):
@@ -381,7 +379,10 @@ def test_a_continued_sides_failed_hold_is_logged_and_the_continue_goes_on(
 
     with Session(_engine()) as raw:
         assert raw.get(Conversation, conversation_id).project_id == destination_id
-    assert _held(org) == set()
+    assert held_roots_of(org) == set()
+    assert {(row.project_id, row.conversation_id, row.slug) for row in _sort_times(org)} == {
+        (destination_id, conversation_id, "legacy-report")
+    }
     [record] = [
         record for record in caplog.records
         if record.name == comparisons.logger.name
@@ -395,24 +396,25 @@ def test_a_continued_sides_failed_hold_is_logged_and_the_continue_goes_on(
 def test_a_continued_side_whose_workspace_the_server_cannot_read_still_continues(
     client, org, held_roots, caplog  # noqa: F811
 ):
-    """The check of the carried workspace reads the file store, after the
-    workspace is already in the destination. A file server error there is
-    logged like a failed hold, and the continue still moves the
-    conversation."""
+    """The read of the carried workspace's folders goes to the file store,
+    after the workspace is already in the destination. A file server error
+    there records neither row and is logged like a failed hold, and the
+    continue still moves the conversation."""
     held_roots()
 
-    def unreadable(_source):
+    def unreadable(_root):
         raise OSError(errno.EIO, "the file server did not answer")
 
     with (
-        patch.object(held_artifact_roots, "holds_a_folder", unreadable),
+        patch.object(held_artifact_roots, "listable_folders", unreadable),
         caplog.at_level(logging.WARNING, logger=comparisons.logger.name),
     ):
         destination_id, conversation_id = _continue_a_side(client, org, artifact=True)
 
     with Session(_engine()) as raw:
         assert raw.get(Conversation, conversation_id).project_id == destination_id
-    assert _held(org) == set()
+    assert held_roots_of(org) == set()
+    assert _sort_times(org) == set()
     [record] = [
         record for record in caplog.records
         if record.name == comparisons.logger.name

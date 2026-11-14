@@ -6,11 +6,15 @@ reads one row per project or per skill fails here at the second size.
 """
 from __future__ import annotations
 
+import asyncio
+import errno
+import json
 import os
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import uuid4
+from typing import NamedTuple
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -398,31 +402,38 @@ def test_the_callers_own_legacy_cards_stay_theirs_beside_a_co_members(client, or
 # backfill has run, the list opens only the roots they name.
 
 
-def _drop_held_sentinel() -> None:
+def _drop_sentinels() -> None:
+    from cowork.services.artifact_sort_times import SENTINEL_KEY as SORT_TIMES_KEY
     from cowork.services.held_artifact_roots import SENTINEL_KEY
 
     with Session(_engine()) as raw:
-        for row in raw.exec(select(Setting).where(Setting.key == SENTINEL_KEY, Setting.scope.is_(None))).all():
+        keys = (SENTINEL_KEY, SORT_TIMES_KEY)
+        for row in raw.exec(select(Setting).where(Setting.key.in_(keys), Setting.scope.is_(None))).all():
             raw.delete(row)
         raw.commit()
 
 
 @pytest.fixture()
 def held_roots(org):
-    """Fills ``org``'s held-root rows with the startup backfill, which writes
-    the sentinel the list trusts them by. The sentinel is global and the
-    database is shared across modules, so it goes again after the test."""
+    """Fills ``org``'s held-root rows, and then its sort times unless
+    ``times`` is false, with the startup backfills, which write the
+    sentinels the list trusts them by. The sentinels are global and the
+    database is shared across modules, so they go again after the test."""
+    from cowork.services.artifact_sort_times import run_sort_time_backfill
     from cowork.services.held_artifact_roots import run_held_root_backfill
 
-    def fill() -> None:
-        _drop_held_sentinel()
+    def fill(*, times: bool = True) -> None:
+        _drop_sentinels()
         with Session(_engine()) as raw:
             project_ids = raw.exec(select(Project.id).where(Project.org_id == org)).all()
         summary = run_held_root_backfill(project_ids=project_ids)
         assert summary is not None and summary.unread == 0
+        if times:
+            recorded = run_sort_time_backfill(project_ids=project_ids)
+            assert recorded is not None and recorded.unread == 0
 
     yield fill
-    _drop_held_sentinel()
+    _drop_sentinels()
 
 
 _FILE_STORE_CALLS = ("stat", "lstat", "fstat", "open", "scandir", "listdir", "access", "readlink")
@@ -529,9 +540,11 @@ def _seed_every_kind_of_root(client, org: str) -> list[Path]:
     return paths
 
 
-def test_the_list_shows_the_same_cards_through_the_held_rows(client, org, held_roots):
+@pytest.mark.parametrize("times", [False, True], ids=["held-roots", "and-sort-times"])
+def test_the_list_shows_the_same_cards_through_the_held_rows(client, org, held_roots, times):
     """Every form of the list, for every viewer, answers the same before the
-    held rows exist and after the backfill has filled them."""
+    rows exist and after the backfills have filled them: the held roots
+    alone, and with the sort times."""
     paths = _seed_every_kind_of_root(client, org)
     lists = ["/api/v1/artifacts/"] + [f"/api/v1/artifacts/?project_id={_project_id(org, path)}" for path in paths]
 
@@ -543,7 +556,7 @@ def test_the_list_shows_the_same_cards_through_the_held_rows(client, org, held_r
         }
 
     walked = answers()
-    held_roots()
+    held_roots(times=times)
     through_rows = answers()
 
     assert through_rows == walked
@@ -586,6 +599,716 @@ def test_a_held_row_never_shows_a_co_members_workspace_or_another_organizations_
     assert unfiltered.json() == []
     assert bobs_project.json() == []
     assert other_project.status_code == 404
+
+
+def _artifacts_at(org: str, project_path: Path, owner: str, times: dict[str, float]) -> None:
+    """One project-root artifact per name in ``times``, its metadata.json
+    modified at that time."""
+    for slug, at in times.items():
+        _project_root_artifact(org, project_path, owner, slug)
+        os.utime(project_path / ".anton" / "artifacts" / slug / "metadata.json", (at, at))
+
+
+@pytest.mark.parametrize("unfiltered", [False, True], ids=["one-project", "every-project"])
+def test_the_list_makes_no_more_file_store_calls_at_1000_artifacts_than_at_80(
+    client, org, held_roots, monkeypatch, unfiltered
+):
+    """One project's root with 1,000 artifacts against one with 80, through
+    the list of that project and the list of every project: with the sort
+    times recorded, the list opens only the folders it shows. A list that
+    read every folder's metadata.json fails here."""
+    [path] = _bulk_paths(client, org, 0, 1)
+    _artifacts_at(org, path, ALICE, {f"chart-{i:04d}": 1_000_000.0 + i for i in range(80)})
+    held_roots()
+    listed = "/api/v1/artifacts/" if unfiltered else f"/api/v1/artifacts/?project_id={_project_id(org, path)}"
+    small, small_calls = _file_store_get(client, monkeypatch, listed, _headers(org, ALICE))
+    _artifacts_at(org, path, ALICE, {f"chart-{i:04d}": 1_000_000.0 + i for i in range(80, 1000)})
+    held_roots()
+    large, large_calls = _file_store_get(client, monkeypatch, listed, _headers(org, ALICE))
+
+    assert (len(small), len(large)) == (80, 80)
+    assert [card["slug"] for card in large] == [f"chart-{i:04d}" for i in range(999, 919, -1)]
+    assert large_calls <= small_calls, f"{small_calls} file store calls at 80 artifacts, {large_calls} at 1,000"
+
+
+def _slugs_of(client, org: str, listed: str) -> list[str]:
+    """The slugs of the cards ``listed`` shows Alice, in its order."""
+    response = client.get(listed, headers=_headers(org, ALICE))
+    assert response.status_code == 200, response.text
+    return [card["slug"] for card in response.json()]
+
+
+def _walked_slugs(client, org: str, listed: str, monkeypatch) -> list[str]:
+    """``_slugs_of`` with every folder of the list's roots read, as before
+    the sort times' backfill: the order a walk of the folders gives."""
+    from cowork.services import artifact_sort_times
+
+    with monkeypatch.context() as walking:
+        walking.setattr(artifact_sort_times, "newest_folders", lambda *_args, **_kwargs: None)
+        return _slugs_of(client, org, listed)
+
+
+def _rewrite_metadata(folder: Path, *, at: float, description: str) -> None:
+    """Rewrite ``folder``'s metadata.json with a new description, as anton
+    rewrites it, modified at ``at``."""
+    metadata = folder / "metadata.json"
+    metadata.write_text(json.dumps({**json.loads(metadata.read_text()), "description": description}))
+    os.utime(metadata, (at, at))
+
+
+def _alices_conversation(org: str, project_path: Path):
+    with Session(_engine()) as raw:
+        conversation = Conversation(topic="turn", project_id=_project_id(org, project_path), org_id=org, created_by=ALICE)
+        raw.add(conversation)
+        raw.commit()
+        return conversation.id
+
+
+def _self_heal(org: str, project_path: Path):
+    """The location check of the shared root of the project at
+    ``project_path`` (artifact_autopublish.SelfHeal), in the organization's
+    scope with no user, as the heal sweep and a list ask for it."""
+    from cowork.db.scoped import TenantScope
+    from cowork.services.artifact_autopublish import SelfHeal
+
+    return SelfHeal(
+        artifacts_base=project_path / ".anton" / "artifacts",
+        scope=TenantScope(org_mode=True, org_id=org),
+        project_id=str(_project_id(org, project_path)),
+    )
+
+
+def test_a_turns_edit_moves_its_card_as_a_walk_does(client, org, held_roots, monkeypatch):
+    """The list gives the order a walk of every folder gives, also after a
+    turn edits an artifact: a rewrite of its metadata.json alone, as anton's
+    update_artifact_metadata makes, or of its content and its metadata.json.
+    The turn end records the time it read (task_objects.record_new_artifacts)."""
+    from cowork.services.artifact_sort_times import sort_times_below
+    from cowork.services.task_objects import record_new_artifacts
+    from test_artifact_ownership import scoped
+
+    [path] = _bulk_paths(client, org, 0, 1)
+    _artifacts_at(org, path, ALICE, {"first": 1_000_100.0, "second": 1_000_200.0, "third": 1_000_300.0})
+    held_roots()
+    listed = f"/api/v1/artifacts/?project_id={_project_id(org, path)}"
+    base = path / ".anton" / "artifacts"
+
+    def turn_end(slug: str) -> None:
+        with scoped(org, ALICE) as session:
+            record_new_artifacts(
+                session, conversation_id=_alices_conversation(org, path), project_id=_project_id(org, path),
+                slugs=[], creator=ALICE, sort_times=sort_times_below(base=base, slugs=[slug]).times,
+            )
+
+    assert _slugs_of(client, org, listed) == _walked_slugs(client, org, listed, monkeypatch) == [
+        "third", "second", "first",
+    ]
+
+    _rewrite_metadata(base / "first", at=1_000_400.0, description="renamed by the agent")
+    turn_end("first")
+    assert _slugs_of(client, org, listed) == _walked_slugs(client, org, listed, monkeypatch) == [
+        "first", "third", "second",
+    ]
+
+    (base / "second" / "index.html").write_text("<html>edited</html>")
+    _rewrite_metadata(base / "second", at=1_000_500.0, description="edited by the agent")
+    turn_end("second")
+    assert _slugs_of(client, org, listed) == _walked_slugs(client, org, listed, monkeypatch) == [
+        "second", "first", "third",
+    ]
+
+
+def test_a_metadata_rewrite_no_turn_names_moves_the_card_at_the_projects_next_self_heal(
+    client, org, held_roots, monkeypatch
+):
+    """A rewrite of metadata.json that no turn names, as anton's own file
+    bookkeeping makes, leaves the rows' order as it was until the project's
+    next self-heal, which reads the time of every folder of its shared root
+    (artifact_autopublish._record_listed_locations). The card then moves as
+    a walk moves it."""
+    from cowork.services.artifact_autopublish import _record_listed_locations
+
+    [path] = _bulk_paths(client, org, 0, 1)
+    _artifacts_at(org, path, ALICE, {"first": 1_000_100.0, "second": 1_000_200.0, "third": 1_000_300.0})
+    held_roots()
+    listed = f"/api/v1/artifacts/?project_id={_project_id(org, path)}"
+
+    _rewrite_metadata(path / ".anton" / "artifacts" / "first", at=1_000_400.0, description="files reconciled")
+
+    assert _slugs_of(client, org, listed) == ["third", "second", "first"]
+    assert _walked_slugs(client, org, listed, monkeypatch) == ["first", "third", "second"]
+
+    asyncio.run(_record_listed_locations(_self_heal(org, path)))
+
+    assert _slugs_of(client, org, listed) == _walked_slugs(client, org, listed, monkeypatch) == [
+        "first", "third", "second",
+    ]
+
+
+def test_the_servers_own_id_widening_leaves_the_order_as_it_was(client, org, held_roots, monkeypatch):
+    """A rewrite of metadata.json the server makes on its own, an id
+    widening (artifact_identity.ensure_full_id), puts the file's time back.
+    A walk of every folder and the rows both keep the order, and so does the
+    project's next self-heal, which reads every folder's time again."""
+    from cowork.services.artifact_autopublish import _record_listed_locations
+    from cowork.services.artifact_identity import ensure_full_id
+
+    [path] = _bulk_paths(client, org, 0, 1)
+    # metadata.json with no id, as a record from before full ids holds.
+    _artifacts_at(org, path, ALICE, {"first": 1_000_100.0, "second": 1_000_200.0, "third": 1_000_300.0})
+    held_roots()
+    listed = f"/api/v1/artifacts/?project_id={_project_id(org, path)}"
+    widened = path / ".anton" / "artifacts" / "first"
+    assert "id" not in json.loads((widened / "metadata.json").read_text())
+
+    full_id, _ = ensure_full_id(widened)
+
+    assert json.loads((widened / "metadata.json").read_text())["id"] == full_id
+    assert _slugs_of(client, org, listed) == _walked_slugs(client, org, listed, monkeypatch) == [
+        "third", "second", "first",
+    ]
+    asyncio.run(_record_listed_locations(_self_heal(org, path)))
+    assert _slugs_of(client, org, listed) == _walked_slugs(client, org, listed, monkeypatch) == [
+        "third", "second", "first",
+    ]
+
+
+def _gone_rows(org: str, project_path: Path, *, count: int, conversation_id: UUID | None = None) -> None:
+    """``count`` sort-time rows, newer than every folder the tests write, of
+    folders deleted behind the server's back: no folder holds their names.
+    In the project's shared root, or in ``conversation_id``'s legacy root."""
+    from cowork.models.artifact_sort_time import ArtifactSortTime
+
+    project_id = _project_id(org, project_path)
+    with Session(_engine()) as raw:
+        raw.add_all(
+            ArtifactSortTime(
+                org_id=org, project_id=project_id, conversation_id=conversation_id,
+                slug=f"gone-{i:03d}", sort_time=2_000_000.0 + i,
+            )
+            for i in range(count)
+        )
+        raw.commit()
+
+
+def _sort_time_slugs(org: str) -> set[str]:
+    from cowork.models.artifact_sort_time import ArtifactSortTime
+
+    with Session(_engine()) as raw:
+        return set(raw.exec(select(ArtifactSortTime.slug).where(ArtifactSortTime.org_id == org)).all())
+
+
+def _location_checks(monkeypatch) -> list:
+    """The location checks the lists ask for
+    (artifact_autopublish.request_location_check), collected here instead of
+    reaching the poll."""
+    from cowork.services import artifact_autopublish
+
+    asked: list = []
+    monkeypatch.setattr(artifact_autopublish, "request_location_check", asked.append)
+    return asked
+
+
+def test_a_list_whose_newest_rows_are_all_gone_reads_every_folder_and_asks_for_the_projects_check(
+    client, org, held_roots, monkeypatch
+):
+    """Rows for folders deleted behind the server's back fill the query's
+    limit: the list then reads every folder rather than come up short, and
+    asks for the project's location check, an in-memory request. That check
+    drops the rows, so the next list opens only the folders the rows name,
+    and asks for nothing."""
+    from cowork.services.artifact_autopublish import _record_listed_locations
+
+    [path] = _bulk_paths(client, org, 0, 1)
+    _artifacts_at(org, path, ALICE, {"kept-a": 1_000_100.0, "kept-b": 1_000_200.0})
+    held_roots()
+    _gone_rows(org, path, count=200)
+    listed = f"/api/v1/artifacts/?project_id={_project_id(org, path)}"
+    asked = _location_checks(monkeypatch)
+
+    assert _slugs_of(client, org, listed) == ["kept-b", "kept-a"]
+    [heal] = asked
+    assert heal == _self_heal(org, path)
+
+    asked.clear()
+    asyncio.run(_record_listed_locations(heal))
+
+    assert _sort_time_slugs(org) == {"kept-a", "kept-b"}
+    assert _slugs_of(client, org, listed) == ["kept-b", "kept-a"]
+    assert asked == []
+
+
+def test_gone_rows_of_a_legacy_root_ask_for_no_location_check(client, org, held_roots, monkeypatch):
+    """The self-heal lists a project's shared root alone, so rows of a
+    conversation's legacy root that name gone folders ask for no location
+    check, which would list the legacy root as the project's shared root.
+    The list still reads every folder, as a walk does."""
+    [path] = _bulk_paths(client, org, 0, 1)
+    _artifacts_at(org, path, ALICE, {"kept": 1_000_100.0})
+    workspace = _legacy_workspace(org, path, ALICE, slug="legacy-kept")
+    legacy_metadata = workspace / ".anton" / "artifacts" / "legacy-kept" / "metadata.json"
+    os.utime(legacy_metadata, (1_000_200.0, 1_000_200.0))
+    held_roots()
+    _gone_rows(org, path, count=200, conversation_id=UUID(workspace.name))
+    listed = f"/api/v1/artifacts/?project_id={_project_id(org, path)}"
+    asked = _location_checks(monkeypatch)
+
+    assert _slugs_of(client, org, listed) == _walked_slugs(client, org, listed, monkeypatch) == [
+        "legacy-kept", "kept",
+    ]
+    assert asked == []
+
+
+# The projects whose rows the list cannot trust: those the held-root
+# backfill could not read (RootsPlan.walk), and those the sort-time backfill
+# could not read. The list's plan names both in NewestFolders.unread, and
+# the list reads every folder of them.
+
+
+def _org_project_ids(org: str) -> list:
+    with Session(_engine()) as raw:
+        return list(raw.exec(select(Project.id).where(Project.org_id == org)).all())
+
+
+def _list_paths(org: str, *project_paths: Path) -> list[str]:
+    """The unfiltered list, and the list of each project at ``project_paths``."""
+    return ["/api/v1/artifacts/"] + [
+        f"/api/v1/artifacts/?project_id={_project_id(org, path)}" for path in project_paths
+    ]
+
+
+def _failing_listing(monkeypatch, *, unreadable: Path) -> None:
+    """The file server stops answering the backfills' listings of one root
+    (held_artifact_roots.listable_folders). The list's own listings still
+    read it."""
+    from cowork.services import held_artifact_roots
+
+    real = held_artifact_roots.dir_scandir
+
+    def scandir(root):
+        if Path(str(root.path)) == unreadable:
+            raise OSError(errno.EIO, "the file server did not answer")
+        return real(root)
+
+    monkeypatch.setattr(held_artifact_roots, "dir_scandir", scandir)
+
+
+class _Handed(NamedTuple):
+    """What one list handed its file store half (_newest_cards): the slugs
+    of the plan's newest rows, and the projects whose every folder it reads
+    (NewestFolders.unread)."""
+
+    rows: set[str]
+    unread: frozenset
+
+
+def _handed_to_the_file_store(monkeypatch) -> list[_Handed]:
+    from cowork.api.v1.endpoints import artifacts as artifacts_endpoint
+
+    handed: list[_Handed] = []
+    real = artifacts_endpoint._newest_cards
+
+    def newest_cards(sources, newest):
+        handed.append(_Handed(rows={row.slug for row in newest.rows}, unread=newest.unread))
+        return real(sources, newest)
+
+    monkeypatch.setattr(artifacts_endpoint, "_newest_cards", newest_cards)
+    return handed
+
+
+def _roots_found_on_efs_threads(monkeypatch) -> list[bool]:
+    """For each project whose roots a list finds on the file store
+    (artifact_roots.project_roots), whether that ran on a file store thread
+    (run_efs) rather than in a database unit."""
+    from cowork.db.units import on_efs_thread
+    from cowork.services import artifact_roots
+
+    found: list[bool] = []
+    real = artifact_roots.project_roots
+
+    def project_roots(project, **kwargs):
+        found.append(on_efs_thread())
+        return real(project, **kwargs)
+
+    monkeypatch.setattr(artifact_roots, "project_roots", project_roots)
+    return found
+
+
+def test_a_project_the_held_root_backfill_could_not_read_shows_its_folders_in_walk_order(
+    client, org, held_roots, monkeypatch
+):
+    """The held-root backfill could not read one project, so its roots have
+    no held rows and no sort times (RootsPlan.walk). Both list forms read
+    every folder of it, and show them among the other project's row-backed
+    folders in the order a walk of every folder gives. Its roots are found
+    on the file store threads, never in the database unit that reads the
+    newest rows."""
+    from cowork.services.artifact_sort_times import run_sort_time_backfill
+    from cowork.services.held_artifact_roots import run_held_root_backfill
+
+    _drop_sentinels()
+    timed, walked = _bulk_paths(client, org, 0, 2)
+    _artifacts_at(org, timed, ALICE, {"timed-old": 1_000_100.0, "timed-new": 1_000_300.0})
+    _artifacts_at(org, walked, ALICE, {"walked-old": 1_000_200.0, "walked-new": 1_000_400.0})
+    # A workspace of Alice's, so finding the walked project's roots stats
+    # its conversations folder (artifact_roots.project_roots).
+    _legacy_workspace(org, walked, ALICE, artifacts_folder=False)
+    lists = _list_paths(org, timed, walked)
+    walk = {listed: _slugs_of(client, org, listed) for listed in lists}
+    with monkeypatch.context() as failing:
+        _failing_listing(failing, unreadable=walked / ".anton" / "artifacts")
+        held = run_held_root_backfill(project_ids=_org_project_ids(org))
+    assert held is not None and held.unread == 1
+    assert run_sort_time_backfill(project_ids=_org_project_ids(org)) is not None
+    handed = _handed_to_the_file_store(monkeypatch)
+    found_on_efs = _roots_found_on_efs_threads(monkeypatch)
+
+    shown = {listed: _slugs_of(client, org, listed) for listed in lists}
+
+    assert shown == walk
+    assert shown["/api/v1/artifacts/"] == ["walked-new", "timed-new", "walked-old", "timed-old"]
+    walked_id = _project_id(org, walked)
+    assert handed == [
+        _Handed(rows={"timed-old", "timed-new"}, unread=frozenset({walked_id})),
+        _Handed(rows={"timed-old", "timed-new"}, unread=frozenset()),
+        _Handed(rows=set(), unread=frozenset({walked_id})),
+    ]
+    assert found_on_efs and all(found_on_efs)
+
+
+def test_a_project_the_sort_time_backfill_could_not_read_shows_its_folders_in_walk_order(
+    client, org, held_roots, monkeypatch
+):
+    """The sort-time backfill could not read one project's held root, so it
+    has no sort times, and the sentinel lists it (NewestFolders.unread).
+    Both list forms read every folder of it, and show them among the other
+    project's row-backed folders in the order a walk of every folder gives."""
+    from cowork.services.artifact_sort_times import run_sort_time_backfill
+
+    _drop_sentinels()
+    timed, unread = _bulk_paths(client, org, 0, 2)
+    _artifacts_at(org, timed, ALICE, {"timed-old": 1_000_100.0, "timed-new": 1_000_300.0})
+    _artifacts_at(org, unread, ALICE, {"unread-old": 1_000_200.0, "unread-new": 1_000_400.0})
+    lists = _list_paths(org, timed, unread)
+    walk = {listed: _slugs_of(client, org, listed) for listed in lists}
+    held_roots(times=False)
+    with monkeypatch.context() as failing:
+        _failing_listing(failing, unreadable=unread / ".anton" / "artifacts")
+        times = run_sort_time_backfill(project_ids=_org_project_ids(org))
+    assert times is not None and times.unread == 1
+    handed = _handed_to_the_file_store(monkeypatch)
+
+    shown = {listed: _slugs_of(client, org, listed) for listed in lists}
+
+    assert shown == walk
+    assert shown["/api/v1/artifacts/"] == ["unread-new", "timed-new", "unread-old", "timed-old"]
+    unread_id = _project_id(org, unread)
+    assert handed == [
+        _Handed(rows={"timed-old", "timed-new"}, unread=frozenset({unread_id})),
+        _Handed(rows={"timed-old", "timed-new"}, unread=frozenset()),
+        _Handed(rows=set(), unread=frozenset({unread_id})),
+    ]
+
+
+def test_rows_cut_at_the_limit_never_put_a_walked_projects_older_folders_first(
+    client, org, held_roots, monkeypatch
+):
+    """The rows were cut at the query's limit, and every folder they name is
+    gone, while a project the held-root backfill could not read holds
+    LIST_CARDS older folders. A folder past the cut may be newer than those,
+    so the list reads every folder, and shows the cards a walk shows: the
+    timed project's folders first. Only the timed project, whose rows named
+    gone folders, gets a location check."""
+    from cowork.services.artifact_sort_times import run_sort_time_backfill
+    from cowork.services.artifacts import LIST_CARDS
+    from cowork.services.held_artifact_roots import run_held_root_backfill
+
+    _drop_sentinels()
+    timed, walked = _bulk_paths(client, org, 0, 2)
+    _artifacts_at(org, timed, ALICE, {"timed-old": 1_000_100.0, "timed-new": 1_000_300.0})
+    _artifacts_at(org, walked, ALICE, {f"walked-{i:03d}": 500_000.0 + i for i in range(LIST_CARDS)})
+    walk = _slugs_of(client, org, "/api/v1/artifacts/")
+    with monkeypatch.context() as failing:
+        _failing_listing(failing, unreadable=walked / ".anton" / "artifacts")
+        assert run_held_root_backfill(project_ids=_org_project_ids(org)) is not None
+    assert run_sort_time_backfill(project_ids=_org_project_ids(org)) is not None
+    _gone_rows(org, timed, count=200)
+    asked = _location_checks(monkeypatch)
+
+    shown = _slugs_of(client, org, "/api/v1/artifacts/")
+
+    assert shown == walk
+    assert shown[:3] == ["timed-new", "timed-old", f"walked-{LIST_CARDS - 1:03d}"]
+    assert asked == [_self_heal(org, timed)]
+
+
+def _in_tie_order(client, org: str, first: Path, second: Path) -> tuple[Path, Path]:
+    """The projects at ``first`` and ``second`` in the order the unfiltered
+    list breaks a tie between their folders: by their roots' places in the
+    list (ListCandidate.source_index), which the projects' query leaves to
+    the database. Each gets one folder, at one time older than any the
+    tests write, named so that a tie broken by name alone would put
+    ``second``'s first."""
+    _artifacts_at(org, first, ALICE, {"order-b": 100.0})
+    _artifacts_at(org, second, ALICE, {"order-a": 100.0})
+    shown = _slugs_of(client, org, "/api/v1/artifacts/")
+    return (first, second) if shown.index("order-b") < shown.index("order-a") else (second, first)
+
+
+def _read_in_full(monkeypatch) -> list[set]:
+    """For each collect pass a list runs (artifacts.list_candidates), the
+    projects whose roots it reads every folder of."""
+    from cowork.api.v1.endpoints import artifacts as artifacts_endpoint
+
+    reads: list[set] = []
+    real = artifacts_endpoint.list_candidates
+
+    def list_candidates(sources, *, indexes):
+        indexes = list(indexes)
+        reads.append({UUID(sources[index].project_id) for index in indexes})
+        return real(sources, indexes=indexes)
+
+    monkeypatch.setattr(artifacts_endpoint, "list_candidates", list_candidates)
+    return reads
+
+
+@pytest.mark.parametrize("unread_by", ["held-roots", "sort-times"])
+def test_rows_cut_at_the_limit_still_show_a_walked_projects_newer_folders(
+    client, org, held_roots, monkeypatch, unread_by
+):
+    """The rows of one project were cut at the query's limit. One backfill
+    or the other could not read another project, which holds a folder newer
+    than most of the rows, one at the last row's time, and an older one.
+    The list reads every folder of that project alone, and both list forms
+    show the cards a walk shows, the newer folder among the rows' folders."""
+    from cowork.api.v1.endpoints.artifacts import _NEWEST_CANDIDATES
+    from cowork.services.artifact_sort_times import run_sort_time_backfill
+    from cowork.services.held_artifact_roots import run_held_root_backfill
+
+    _drop_sentinels()
+    timed, walked = _bulk_paths(client, org, 0, 2)
+    times = {f"timed-{i:03d}": 1_000_000.0 + i for i in range(_NEWEST_CANDIDATES + 10)}
+    last_kept = times["timed-010"]
+    _artifacts_at(org, timed, ALICE, times)
+    _artifacts_at(org, walked, ALICE, {"walked-new": last_kept + 155.5, "walked-tied": last_kept, "walked-old": 1.0})
+    lists = _list_paths(org, timed, walked)
+    walk = {listed: _slugs_of(client, org, listed) for listed in lists}
+    if unread_by == "held-roots":
+        with monkeypatch.context() as failing:
+            _failing_listing(failing, unreadable=walked / ".anton" / "artifacts")
+            held = run_held_root_backfill(project_ids=_org_project_ids(org))
+        assert held is not None and held.unread == 1
+        assert run_sort_time_backfill(project_ids=_org_project_ids(org)) is not None
+    else:
+        held_roots(times=False)
+        with monkeypatch.context() as failing:
+            _failing_listing(failing, unreadable=walked / ".anton" / "artifacts")
+            recorded = run_sort_time_backfill(project_ids=_org_project_ids(org))
+        assert recorded is not None and recorded.unread == 1
+    handed = _handed_to_the_file_store(monkeypatch)
+    reads = _read_in_full(monkeypatch)
+
+    shown = {listed: _slugs_of(client, org, listed) for listed in lists}
+
+    assert shown == walk
+    assert shown["/api/v1/artifacts/"][:6] == ["timed-169", "timed-168", "timed-167", "timed-166", "walked-new", "timed-165"]
+    # The timed project's rows were cut, and each list read every folder of
+    # the walked project only.
+    assert [len(found.rows) for found in handed] == [_NEWEST_CANDIDATES, _NEWEST_CANDIDATES, 0]
+    walked_id = _project_id(org, walked)
+    assert reads == [{walked_id}, set(), {walked_id}]
+
+
+@pytest.mark.parametrize("run", ["read-whole", "past-the-cap"])
+def test_rows_cut_inside_a_time_two_projects_share_list_the_tie_in_walk_order(
+    client, org, held_roots, monkeypatch, run
+):
+    """The rows were cut at the query's limit inside a run of folders that
+    share one time across two projects. The query cuts that run by name,
+    while a walk puts the folders of the earlier root first, so the rows
+    kept at that time may not be the ones a walk shows. newest_folders
+    reads the rest of the run (NewestFolders.tied), and the list sorts the
+    whole run by root, then name, opening only the folders it shows. A run
+    longer than artifact_sort_times._TIED_ROWS is not read: the list uses
+    only the rows newer than that time, and as those fill too few cards, it
+    reads every folder. Either way both list forms show the cards a walk
+    shows, and as every row names a folder that is there, no list asks for
+    a location check."""
+    from cowork.api.v1.endpoints.artifacts import _NEWEST_CANDIDATES
+    from cowork.services import artifact_sort_times
+    from cowork.services.artifacts import LIST_CARDS
+
+    _drop_sentinels()
+    first, second = _in_tie_order(client, org, *_bulk_paths(client, org, 0, 2))
+    tied_at = 1_000_000.0
+    _artifacts_at(org, first, ALICE, {"z-tied": tied_at})
+    newer = {f"newer-{i:03d}": tied_at + 1 + i for i in range(LIST_CARDS - 2)}
+    tied = {f"a-tied-{i:03d}": tied_at for i in range(_NEWEST_CANDIDATES)}
+    _artifacts_at(org, second, ALICE, newer | tied)
+    lists = _list_paths(org, first, second)
+    walk = {listed: _slugs_of(client, org, listed) for listed in lists}
+    held_roots()
+    if run == "past-the-cap":
+        monkeypatch.setattr(artifact_sort_times, "_TIED_ROWS", _NEWEST_CANDIDATES - 1)
+    asked = _location_checks(monkeypatch)
+    reads = _read_in_full(monkeypatch)
+
+    shown = {listed: _slugs_of(client, org, listed) for listed in lists}
+
+    assert shown == walk
+    assert shown["/api/v1/artifacts/"][LIST_CARDS - 2 :] == ["z-tied", "a-tied-000"]
+    assert asked == []
+    # One collect pass per list over the projects with no rows to trust
+    # (none here), and, past the cap, one more over every folder of the
+    # lists whose rows were cut: every project's, then the second's.
+    if run == "read-whole":
+        assert reads == [set(), set(), set()]
+    else:
+        first_id, second_id = _project_id(org, first), _project_id(org, second)
+        assert reads == [set(), {first_id, second_id}, set(), set(), {second_id}]
+
+
+@pytest.mark.parametrize("unfiltered", [False, True], ids=["one-project", "every-project"])
+def test_the_list_makes_no_more_file_store_calls_at_1000_folders_of_one_time_than_at_80(
+    client, org, held_roots, monkeypatch, unfiltered
+):
+    """One project's root with 1,000 artifacts that share one time, as an
+    archive's extraction or a bulk copy leaves them, against one with 80:
+    the query's limit cuts that run, newest_folders reads the rest of it
+    (NewestFolders.tied), and both list forms open only the folders they
+    show, the first 80 by name, as a walk shows them. A list that read
+    every folder to order the run fails here."""
+    [path] = _bulk_paths(client, org, 0, 1)
+    tied_at = 1_000_000.0
+    _artifacts_at(org, path, ALICE, {f"chart-{i:04d}": tied_at for i in range(80)})
+    held_roots()
+    listed = "/api/v1/artifacts/" if unfiltered else f"/api/v1/artifacts/?project_id={_project_id(org, path)}"
+    small, small_calls = _file_store_get(client, monkeypatch, listed, _headers(org, ALICE))
+    _artifacts_at(org, path, ALICE, {f"chart-{i:04d}": tied_at for i in range(80, 1000)})
+    held_roots()
+    large, large_calls = _file_store_get(client, monkeypatch, listed, _headers(org, ALICE))
+
+    assert (len(small), len(large)) == (80, 80)
+    assert [card["slug"] for card in large] == _walked_slugs(client, org, listed, monkeypatch)
+    assert [card["slug"] for card in large] == [f"chart-{i:04d}" for i in range(80)]
+    assert large_calls <= small_calls, f"{small_calls} file store calls at 80 tied artifacts, {large_calls} at 1,000"
+
+
+def _folders_with_no_card(project_path: Path, *, unparsable: dict[str, float], emptied: dict[str, float]) -> None:
+    """Folders of the project's shared root that build no card: one per name
+    in ``unparsable``, whose metadata.json does not parse, and one per name
+    in ``emptied``, whose metadata.json is a valid record until
+    ``_empty_folders`` removes it. Each metadata.json is modified at its
+    name's time."""
+    base = project_path / ".anton" / "artifacts"
+    for slug, at in unparsable.items():
+        (base / slug).mkdir(parents=True)
+        (base / slug / "metadata.json").write_text("not json")
+        os.utime(base / slug / "metadata.json", (at, at))
+    for slug, at in emptied.items():
+        _write_artifact(base, slug)
+        os.utime(base / slug / "metadata.json", (at, at))
+
+
+def _empty_folders(project_path: Path, slugs) -> None:
+    """Remove the metadata.json of each of ``slugs`` outside the server, as
+    an agent's rm does, which leaves the folder's sort-time row."""
+    for slug in slugs:
+        (project_path / ".anton" / "artifacts" / slug / "metadata.json").unlink()
+
+
+def test_rows_of_folders_that_build_no_card_ask_for_the_projects_check_that_drops_them(
+    client, org, held_roots, monkeypatch
+):
+    """170 rows newer than every artifact name folders that build no card:
+    their metadata.json does not parse, or is gone. They fill the query's
+    limit, so both list forms read every folder rather than come up short,
+    show the cards a walk shows, and ask for the project's location check.
+    That check keeps only the rows of folders that hold an id, so the next
+    lists open only the folders the rows name, and ask for nothing."""
+    from cowork.services.artifact_autopublish import _record_listed_locations
+
+    [path] = _bulk_paths(client, org, 0, 1)
+    kept = {f"chart-{i:03d}": 1_000_000.0 + i for i in range(80)}
+    _artifacts_at(org, path, ALICE, kept)
+    unparsable = {f"junk-{i:03d}": 2_000_000.0 + i for i in range(85)}
+    emptied = {f"emptied-{i:03d}": 2_000_100.0 + i for i in range(85)}
+    _folders_with_no_card(path, unparsable=unparsable, emptied=emptied)
+    held_roots()
+    _empty_folders(path, emptied)
+    assert _sort_time_slugs(org) == set(kept) | set(unparsable) | set(emptied)
+    lists = _list_paths(org, path)
+    walk = {listed: _walked_slugs(client, org, listed, monkeypatch) for listed in lists}
+    asked = _location_checks(monkeypatch)
+    reads = _read_in_full(monkeypatch)
+
+    shown = {listed: _slugs_of(client, org, listed) for listed in lists}
+
+    assert shown == walk
+    assert shown["/api/v1/artifacts/"] == sorted(kept, reverse=True)
+    project_id = _project_id(org, path)
+    assert reads == [set(), {project_id}, set(), {project_id}]
+    heal = _self_heal(org, path)
+    assert asked == [heal, heal]
+
+    asked.clear()
+    reads.clear()
+    asyncio.run(_record_listed_locations(heal))
+
+    assert _sort_time_slugs(org) == set(kept)
+    assert {listed: _slugs_of(client, org, listed) for listed in lists} == walk
+    assert reads == [set(), set()]
+    assert asked == []
+
+
+def test_a_row_whose_name_a_walk_skips_opens_no_folder(client, org, held_roots, monkeypatch):
+    """Rows are hints, and no writer stores a dot-named one
+    (record_sort_times). One written straight to the table, newer than
+    every artifact, beside a dot-named folder that would build a card,
+    opens nothing: both list forms show the cards a walk shows."""
+    from cowork.models.artifact_sort_time import ArtifactSortTime
+
+    [path] = _bulk_paths(client, org, 0, 1)
+    _artifacts_at(org, path, ALICE, {"visible": 1_000_100.0})
+    _write_artifact(path / ".anton" / "artifacts", ".shadow")
+    held_roots()
+    with Session(_engine()) as raw:
+        raw.add(
+            ArtifactSortTime(org_id=org, project_id=_project_id(org, path), slug=".shadow", sort_time=2_000_000.0)
+        )
+        raw.commit()
+    lists = _list_paths(org, path)
+
+    shown = {listed: _slugs_of(client, org, listed) for listed in lists}
+
+    assert shown == {listed: _walked_slugs(client, org, listed, monkeypatch) for listed in lists}
+    assert list(shown.values()) == [["visible"], ["visible"]]
+
+
+def test_a_folder_of_the_same_name_in_another_root_never_stands_for_a_gone_one(
+    client, org, held_roots, monkeypatch
+):
+    """The rows were cut at the query's limit, and most of them name folders
+    deleted behind the server's back from one project's root, while another
+    project holds folders of those names and a folder newer than every row.
+    The list reads every folder, as a walk does, and asks for the location
+    check of the first project alone: a folder of one root never answers
+    for a row of another, and the other project's rows name folders that
+    are there."""
+    emptied, other = _bulk_paths(client, org, 0, 2)
+    _artifacts_at(org, emptied, ALICE, {"still-here": 1_000_100.0})
+    namesakes = {f"gone-{i:03d}": 100.0 + i for i in range(200)}
+    _artifacts_at(org, other, ALICE, {"other-new": 3_000_000.0} | namesakes)
+    held_roots()
+    _gone_rows(org, emptied, count=200)
+    walk = _walked_slugs(client, org, "/api/v1/artifacts/", monkeypatch)
+    asked = _location_checks(monkeypatch)
+
+    shown = _slugs_of(client, org, "/api/v1/artifacts/")
+
+    assert shown == walk
+    assert shown[:3] == ["other-new", "still-here", "gone-199"]
+    assert asked == [_self_heal(org, emptied)]
 
 
 def _held_conversations(org: str) -> set:

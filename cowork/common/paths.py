@@ -177,24 +177,26 @@ def dir_stat(
     return os.stat(d.path / name, follow_symlinks=follow_symlinks)
 
 
-def dir_child_stat(d: PinnedDir, name: str, child: str) -> os.stat_result:
+def dir_child_stat(
+    d: PinnedDir, name: str, child: str, *, follow_symlinks: bool = True
+) -> os.stat_result:
     """``os.stat`` of *child* inside *name*, a direct child folder of *d*,
     refusing a link in place of *name* as open_pinned_child does: with
     ``O_PATH | O_NOFOLLOW | O_DIRECTORY`` where the platform has ``O_PATH``,
     which a link fails with ENOTDIR, else by opening the folder ``O_NOFOLLOW``
-    after a no-follow stat says it is one. *child* is followed, as dir_stat
-    does by default."""
+    after a no-follow stat says it is one. *child* is followed unless
+    *follow_symlinks* is false, as dir_stat does."""
     if d.fd is not None and O_PATH:
         fd = os.open(name, O_PATH | O_NOFOLLOW | O_DIRECTORY | os.O_CLOEXEC, dir_fd=d.fd)
         try:
-            return os.stat(child, dir_fd=fd)
+            return os.stat(child, dir_fd=fd, follow_symlinks=follow_symlinks)
         finally:
             os.close(fd)
     if not stat.S_ISDIR(dir_stat(d, name, follow_symlinks=False).st_mode):
         raise NotADirectoryError(name)
     folder = open_pinned_child(d, name)
     try:
-        return dir_stat(folder, child)
+        return dir_stat(folder, child, follow_symlinks=follow_symlinks)
     finally:
         folder.close()
 
