@@ -202,20 +202,20 @@ def test_invalid_attachments_are_rejected_before_the_task_is_created(tmp_path: P
 
 
 @pytest.mark.parametrize(
-    ("folder", "allow_direct_folder", "message"),
+    ("folder", "allow_folder_copy", "message"),
     [
         ("missing", True, "Choose an existing local folder"),
         ("plain", False, "Local folder isolation was not enabled"),
     ],
 )
 def test_a_folder_preparation_would_refuse_is_rejected_before_the_task_is_created(
-    folder: str, allow_direct_folder: bool, message: str, tmp_path: Path
+    folder: str, allow_folder_copy: bool, message: str, tmp_path: Path
 ) -> None:
     (tmp_path / "plain").mkdir()
     service = service_with(tmp_path, FakeEngine())
     with pytest.raises(WorkspaceError, match=message):
         service.create_session(
-            SessionCreateRequest(path=str(tmp_path / folder), prompt="Go", allow_direct_folder=allow_direct_folder),
+            SessionCreateRequest(path=str(tmp_path / folder), prompt="Go", allow_folder_copy=allow_folder_copy),
             CREDS,
             "fake",
             "fake-model",
