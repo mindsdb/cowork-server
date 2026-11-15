@@ -752,13 +752,15 @@ class UserSettings(Settings):
     )
     # The agent's browser. Untagged, so per-user in org mode and the single
     # global row on desktop, like `hub_workspace_id`: whether the agent may use
-    # a browser is the person's own choice. On by default: it only does something where a browser is
+    # a browser is the person's own choice. Off by default while the browser
+    # is in beta; once on, it only does something where a browser is
     # available, the browser router on the web or the desktop app's own
     # browser (cowork.services.browser).
     browser_enabled: bool = Field(
-        default=True,
+        # Beta: off until the person turns it on in Settings.
+        default=False,
         title="Browser Enabled",
-        description="Let the agent use a browser, shown beside the chat.",
+        description="Let the agent use a browser, shown beside the chat (beta).",
     )
     # `hub_workspace_id`, not `workspace_id`: in this repo `workspace` already
     # means a filesystem location (the per-conversation private directory, the
