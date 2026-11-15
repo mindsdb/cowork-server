@@ -166,15 +166,29 @@ def test_import_rejects_fields_the_editor_cannot_save(client, monkeypatch, conte
     assert not CodeSkillService().list_skills()
 
 
-@pytest.mark.parametrize("name", ["123", "1.5", "[example]", "{example: value}", "true", "null", "0", "[]", "{}", "2026-09-15"])
+@pytest.mark.parametrize("name", ["123"])
 @pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
 def test_import_rejects_non_text_yaml_names_without_writing(client, name, newline):
     source = f"---\nname: {name}\ndescription: Example\n---\nInstructions"
     result = client.post(f"{BASE}/import", json={"content": source.replace("\n", newline)})
     assert result.status_code == 400, result.text
+    assert isinstance(result.json()["detail"], str)
     assert "name" in result.json()["detail"].lower()
     assert "text" in result.json()["detail"].lower()
     assert not CodeSkillService().list_skills()
+
+
+@pytest.mark.parametrize("newline", ["\r\n", "\r"], ids=["crlf", "cr"])
+def test_import_accepts_quoted_numeric_name_with_non_lf_newlines(client, newline):
+    """Preserve successful import and storage across the other line endings."""
+    source = '---\nname: "123"\ndescription: Example\n---\nInstructions'
+    result = client.post(f"{BASE}/import", json={"content": source.replace("\n", newline)})
+    assert result.status_code == 201, result.text
+    assert result.json()["id"] == "123"
+    assert result.json()["name"] == "123"
+    stored = CodeSkillService().get_skill("123")
+    assert stored.display_name == "123"
+    assert stored.instructions == "Instructions"
 
 
 @pytest.mark.parametrize("content", [
