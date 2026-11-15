@@ -18,6 +18,8 @@ Windows and macOS each run `test_artifact_files.py`, `test_markdown_render.py`, 
 
 Artifact-export route tests retain all 117 cases. Twenty-eight mounting, validation, PDF-success and concurrent-request cases use the full server; 66 other local HTTP cases use the real artifact-workspace router on a fresh application. The 23 remaining cases keep their existing direct checks, including one self-mounted permission-denial application. Clients are closed without starting the server lifespan. Root resource fixtures and project cleanup remain active.
 
+Comparison tests retain all 147 cases. Eighteen wiring, validation, dispatch and cross-feature cases use the full server; 43 other local HTTP cases mount the real comparison and project routers. Four cases keep their existing full-server applications, and 82 direct or hosted-database cases remain unchanged. All 61 fixture clients get fresh applications and harnesses and close without starting the server lifespan. Root resource fixtures remain active.
+
 ## Record a run
 
 Use a new output path outside the checkout for each invocation. The plugin rejects an existing inventory file or a path inside the source tree. Reports fingerprint current tracked and non-ignored untracked source, so uncommitted code is distinguishable. An edit during the run makes the evidence incomplete.
