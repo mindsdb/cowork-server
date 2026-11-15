@@ -22,6 +22,8 @@ Comparison tests retain all 147 cases. Eighteen wiring, validation, dispatch and
 
 Org-list scaling tests keep their 1,000-item datasets and HTTP SQL/file-call assertions. Timed artifact batches write the same files, metadata timestamps and ORM ownership rows with one project lookup and one write commit per nonempty batch. Seeding finishes before request measurements; empty batches do no work. Single-artifact seeding and application/resource fixtures remain unchanged.
 
+Shared coding repository fixtures disable automatic maintenance and garbage collection in each disposable repository before its first commit. Background Git housekeeping can otherwise change the object store during strict before/after snapshot checks. Those checks still compare every source-object file; application Git behavior and global configuration remain unchanged.
+
 ## Record a run
 
 Use a new output path outside the checkout for each invocation. The plugin rejects an existing inventory file or a path inside the source tree. Reports fingerprint current tracked and non-ignored untracked source, so uncommitted code is distinguishable. An edit during the run makes the evidence incomplete.

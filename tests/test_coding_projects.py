@@ -44,9 +44,12 @@ def git(cwd: Path, *args: str) -> str:
 
 
 def repository(root: Path, name: str) -> Path:
+    """Create a disposable repository without background changes to its object store."""
     repo = root / name
     repo.mkdir()
     git(repo, "init")
+    git(repo, "config", "maintenance.auto", "false")
+    git(repo, "config", "gc.auto", "0")
     git(repo, "config", "user.email", "cowork@example.invalid")
     git(repo, "config", "user.name", "Cowork Test")
     (repo / "README.md").write_text(f"{name}\n", encoding="utf-8")
