@@ -20,6 +20,8 @@ Artifact-export route tests retain all 117 cases. Twenty-eight mounting, validat
 
 Comparison tests retain all 147 cases. Eighteen wiring, validation, dispatch and cross-feature cases use the full server; 43 other local HTTP cases mount the real comparison and project routers. Four cases keep their existing full-server applications, and 82 direct or hosted-database cases remain unchanged. All 61 fixture clients get fresh applications and harnesses and close without starting the server lifespan. Root resource fixtures remain active.
 
+Org-list scaling tests keep their 1,000-item datasets and HTTP SQL/file-call assertions. Timed artifact batches write the same files, metadata timestamps and ORM ownership rows with one project lookup and one write commit per nonempty batch. Seeding finishes before request measurements; empty batches do no work. Single-artifact seeding and application/resource fixtures remain unchanged.
+
 ## Record a run
 
 Use a new output path outside the checkout for each invocation. The plugin rejects an existing inventory file or a path inside the source tree. Reports fingerprint current tracked and non-ignored untracked source, so uncommitted code is distinguishable. An edit during the run makes the evidence incomplete.
