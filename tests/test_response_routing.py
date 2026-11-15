@@ -621,7 +621,7 @@ async def test_handle_logs_every_router_fallback_at_default_level(
     ],
 )
 async def test_handle_keeps_answers_about_a_projects_files_off_the_web(
-    monkeypatch, caplog, tmp_path, project_file, needs_search, reason, web,
+    monkeypatch, caplog, owned_logger, tmp_path, project_file, needs_search, reason, web,
 ):
     import logging
     from uuid import uuid4
@@ -673,7 +673,7 @@ async def test_handle_keeps_answers_about_a_projects_files_off_the_web(
         raise StopBeforeAgent
 
     monkeypatch.setattr(handler, "_get_harness", stop_before_agent)
-    caplog.set_level(logging.INFO, logger=responses.__name__)
+    logged = owned_logger(responses.__name__, level=logging.INFO)
     with pytest.raises(StopBeforeAgent):
         await handler.handle(
             ResponsesRequest(input="What's the porter's name?", conversation=str(conv_id), stream=False)
@@ -682,6 +682,10 @@ async def test_handle_keeps_answers_about_a_projects_files_off_the_web(
     (record,) = [row for row in caplog.records if getattr(row, "event", None) == "router_route"]
     assert record.reason == reason
     assert answer_kwargs.get("web") is web
+    # The serialized line, as the server writes it, carries Jev's probability.
+    assert_log_fields(
+        logged.output(), event="router_gate_decided", provider="jev", reason=reason, p_direct=0.9,
+    )
 
 
 @pytest.mark.asyncio

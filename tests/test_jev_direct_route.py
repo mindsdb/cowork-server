@@ -25,6 +25,7 @@ from cowork.handlers.response_routing import (
 )
 from cowork.handlers.responses import ResponsesHandler
 from cowork.streaming.registry import TurnLifecycle
+from tests._logging_assertions import assert_log_fields
 
 _TOOL_ROWS = [
     {"role": "user", "content": "Build me a dashboard of our 2025 sales."},
@@ -436,17 +437,24 @@ async def test_start_answer_delegates_when_the_first_event_is_late(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_start_answer_waits_less_when_jev_expects_no_web_search(monkeypatch):
+async def test_start_answer_waits_less_when_jev_expects_no_web_search(monkeypatch, owned_logger):
     """A wrong direct route reaches the agent sooner when no search runs
     before the first text; web search stays available either way."""
+    import logging
+
     monkeypatch.setattr(direct_answer, "_FIRST_EVENT_SECONDS", 5.0)
     monkeypatch.setattr(direct_answer, "_FIRST_EVENT_NO_SEARCH_SECONDS", 0.01)
     late = _Provider([_text("late")], delay=0.5)
+    logged = owned_logger(direct_answer.__name__, level=logging.WARNING)
 
     assert await direct_answer.start_answer(
         _binding(late), history=_RECALL, needs_search=False,
     ) == direct_answer.Delegated("timeout")
     assert late.calls[0]["native_web_tools"] == {"web_search", "web_fetch"}
+    # As the hosted JSON log prints it: the timeout line names its budget.
+    assert_log_fields(
+        logged.output(), event="direct_answer_timeout", timeout_seconds=0.01, needs_search=False,
+    )
 
     searching = _Provider([_text("Sunny, 21C."), _complete()], delay=0.05)
     answer = await direct_answer.start_answer(_binding(searching), history=_RECALL, needs_search=True)

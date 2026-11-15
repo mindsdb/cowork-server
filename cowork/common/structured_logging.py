@@ -81,6 +81,18 @@ EVENT_FIELDS = frozenset(
         # Why a direct answer handed its turn to the agent
         # (cowork.handlers.direct_answer.Delegated.why).
         "why",
+        # Jev's probability of a direct answer, 0 to 1, on the
+        # router_gate_decided line (cowork.handlers.response_routing
+        # .RouteDecision.p_direct).
+        "p_direct",
+        # A direct answer's first-event budget and whether Jev expected a web
+        # search, on its direct_answer_timeout line
+        # (cowork.handlers.direct_answer.start_answer).
+        "timeout_seconds",
+        "needs_search",
+        # A first take's time to its first word, on its first_take_finished
+        # line (cowork.handlers.first_take.FirstTake._write_safely).
+        "first_word_ms",
         # A remote turn reply's number and the last one the relay applied
         # (cowork.turnqueue.producer.stream_remote_replies).
         "reply_n",

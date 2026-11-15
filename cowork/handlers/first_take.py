@@ -257,13 +257,20 @@ class FirstTake:
                 self._queue.put_nowait(_sse(CLEARED, {}))
             self._queue.put_nowait(_FINISHED)
             # warning, not info: deployments log at WARNING, and this line is
-            # how the take's speed and cost are measured.
+            # how the take's speed and cost are measured. Fields, not template
+            # values: the log formatter drops those.
             logger.warning(
-                "[first-take] model=%s outcome=%s first_word_ms=%s total_ms=%d",
-                self._binding.model,
-                outcome,
-                None if self._first_word_at is None else round((self._first_word_at - started) * 1000),
-                round((time.monotonic() - started) * 1000),
+                "First take finished",
+                extra={
+                    "event": "first_take_finished",
+                    "model_alias": self._binding.model,
+                    "outcome": outcome,
+                    "first_word_ms": (
+                        None if self._first_word_at is None
+                        else round((self._first_word_at - started) * 1000)
+                    ),
+                    "duration_ms": round((time.monotonic() - started) * 1000),
+                },
             )
 
     async def _write(self) -> str:
