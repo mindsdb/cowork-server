@@ -26,6 +26,10 @@ ALICE = TenantScope(org_mode=True, org_id="org-1", user_id="alice")
 BOB = TenantScope(org_mode=True, org_id="org-1", user_id="bob")
 # A channel turn's scope (scope_for_org): the organization's, no person's.
 ORG_1_CHANNELS = TenantScope(org_mode=True, org_id="org-1")
+# Identities a request carries: the app reads X-User-Id as a UUID.
+ORG_UUID = "6f0d1c2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f"
+ALICE_UUID = "11111111-1111-4111-8111-111111111111"
+BOB_UUID = "22222222-2222-4222-8222-222222222222"
 
 
 @pytest.fixture(autouse=True)
@@ -80,6 +84,93 @@ async def test_one_person_holding_their_share_leaves_slots_for_everyone_else():
         with pytest.raises(FilesystemBusy):
             await run_efs(lambda: "alice again", scope=ALICE)
         assert await asyncio.wait_for(run_efs(lambda: "bob", scope=BOB), timeout=0.5) == "bob"
+
+
+async def test_a_refusal_names_the_full_share_and_whose_it_is():
+    async with holding(db_session.settings.storage.efs_share, ALICE):
+        with pytest.raises(FilesystemBusy) as refused:
+            await run_efs(lambda: "alice again", scope=ALICE)
+
+    assert (refused.value.limiter, refused.value.share) == ("efs_share", "alice")
+
+
+async def test_a_refusal_names_the_full_slots_and_the_waiting_callers_share(monkeypatch):
+    monkeypatch.setattr(db_session.settings.storage, "efs_slots", 2)
+    async with holding(2, BOB):
+        with pytest.raises(FilesystemBusy) as refused:
+            await run_efs(lambda: "alice", scope=ALICE)
+        with pytest.raises(FilesystemBusy) as channel_refused:
+            await run_efs(lambda: "channel", scope=ORG_1_CHANNELS)
+
+    assert (refused.value.limiter, refused.value.share) == ("run_efs", "alice")
+    assert (channel_refused.value.limiter, channel_refused.value.share) == ("run_efs", "org:org-1")
+
+
+async def test_a_refusal_on_the_desktop_names_the_slots_and_no_share():
+    async with holding(db_session.settings.storage.efs_slots, LOCAL_SCOPE):
+        with pytest.raises(FilesystemBusy) as refused:
+            await run_efs(lambda: "late", scope=LOCAL_SCOPE)
+
+    assert (refused.value.limiter, refused.value.share) == ("run_efs", None)
+
+
+@pytest.fixture()
+def org_app(monkeypatch):
+    """The app in MindsHub mode, served on the test's own event loop, so the
+    file store limiters a test fills are the ones its requests wait for."""
+    import httpx
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.server import create_app
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "enforce")
+    get_app_settings.cache_clear()
+    transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
+    yield httpx.AsyncClient(transport=transport, base_url="http://test")
+    get_app_settings.cache_clear()
+
+
+@pytest.mark.parametrize("full", ["share", "slots"])
+async def test_a_refused_request_logs_the_limit_that_ran_out_and_whose_share(
+    org_app, monkeypatch, caplog, owned_logger, full
+):
+    """Through the real route and the app's own 503 handler, so a refusal
+    raised without its limit, or a handler that drops it, fails here. The
+    server logs through the logger setup_logging returns, cowork.common.logger.
+    The line is read as the console handler prints it, which keeps only the
+    record attributes in structured_logging.EVENT_FIELDS, so a field left out
+    of them fails here too."""
+    import logging
+
+    from tests._logging_assertions import assert_log_fields
+
+    alice = TenantScope(org_mode=True, org_id=ORG_UUID, user_id=ALICE_UUID)
+    bob = TenantScope(org_mode=True, org_id=ORG_UUID, user_id=BOB_UUID)
+    if full == "slots":
+        monkeypatch.setattr(db_session.settings.storage, "efs_slots", 2)
+    holder, count = (alice, db_session.settings.storage.efs_share) if full == "share" else (bob, 2)
+    logged = owned_logger("cowork.common.logger", level=logging.WARNING)
+
+    async with holding(count, holder):
+        async with org_app as client:
+            response = await client.get(
+                "/api/v1/artifacts/", headers={"X-User-Id": ALICE_UUID, "X-Organization-Id": ORG_UUID}
+            )
+
+    assert response.status_code == 503, response.text
+    [record] = [
+        record for record in caplog.records
+        if record.name == "cowork.common.logger" and getattr(record, "event", None) == "filesystem_busy"
+    ]
+    limiter = "efs_share" if full == "share" else "run_efs"
+    assert record.levelno == logging.WARNING
+    assert record.route == "/api/v1/artifacts/"
+    assert (record.limiter, record.share) == (limiter, ALICE_UUID)
+    assert_log_fields(
+        logged.output(), log_level="WARNING", event="filesystem_busy", route="/api/v1/artifacts/",
+        limiter=limiter, share=ALICE_UUID,
+    )
 
 
 async def test_an_organizations_work_with_no_person_holds_one_share_and_leaves_slots_for_everyone():

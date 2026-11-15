@@ -61,7 +61,7 @@ def test_recommended_models_overlays_openai_compatible(monkeypatch):
 
     calls: list[tuple[str, str]] = []
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         calls.append((base_url, api_key))
         return _listing(
             ["model-a", "model-b"],
@@ -113,7 +113,7 @@ def test_custom_endpoint_cannot_override_a_minds_model(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         if "mindshub" in base_url:
             return _listing(
                 ["sonnet", "haiku"],
@@ -185,7 +185,7 @@ def test_custom_endpoint_cannot_describe_a_model_minds_listed_undescribed(monkey
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         if "mindshub" in base_url:
             # The pre-grouping gateway: ids and enabled flags, no metadata.
             return _listing(["sonnet", "haiku"], enabled={"sonnet": True, "haiku": True})
@@ -234,7 +234,7 @@ def test_custom_endpoint_cannot_supply_a_provider_minds_could_not_place(monkeypa
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         if "mindshub" in base_url:
             return _listing(["sonnet-4-5"], families={"sonnet-4-5": "sonnet"})
         return _listing(
@@ -283,7 +283,7 @@ def test_grouping_maps_stay_partial_across_two_listings(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         if "mindshub" in base_url:
             return _listing(
                 ["sonnet"],
@@ -328,7 +328,7 @@ def test_recommended_models_no_openai_compatible_card(monkeypatch):
 
     called = False
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         nonlocal called
         called = True
         return _listing(["x"])
@@ -354,7 +354,7 @@ def test_recommended_models_surfaces_minds_locked_upsells(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         # MindsHub lists the whole picker catalog; paid models come back
         # enabled:false for a free caller so the UI can show them as locked.
         return _listing(
@@ -388,7 +388,7 @@ def test_recommended_models_surfaces_the_grouping_metadata(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         return _listing(
             ["mindshub_air", "sonnet", "sonnet-4-5"],
             providers={"mindshub_air": "openai", "sonnet": "anthropic", "sonnet-4-5": "anthropic"},
@@ -425,7 +425,7 @@ def test_recommended_models_keeps_serving_the_pre_existing_keys(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         return _listing(["mindshub_air"], enabled={"mindshub_air": True})
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -456,7 +456,7 @@ def test_recommended_models_grouping_maps_empty_for_a_byok_endpoint(monkeypatch)
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         return _listing(["model-a", "model-b"])
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -492,7 +492,7 @@ def test_recommended_models_empty_enabled_does_not_wipe_map(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         return _listing(["mindshub_air", "opus"])  # ids present, enabled EMPTY
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -526,7 +526,7 @@ def test_recommended_models_writes_map_only_on_change(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         return _listing(["mindshub_air", "opus"], enabled={"mindshub_air": True, "opus": False})
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -566,7 +566,7 @@ def test_recommended_models_write_preserves_map_order(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         # Baseline listed FIRST by the gateway, but sorting alphabetically
         # would put 'air-mini' ahead of it.
         return _listing(
@@ -738,7 +738,7 @@ def test_recommended_models_relays_why_a_minds_model_is_locked(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         return _listing(
             ["mindshub_air", "opus", "gpt"],
             enabled={"mindshub_air": True, "opus": False, "gpt": False},
@@ -773,7 +773,7 @@ def test_a_custom_endpoint_cannot_label_a_model_admin_restricted(monkeypatch):
     from cowork.api.v1.endpoints.settings import recommended_models
     from cowork.db.session import get_open_session
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         if "mindshub" in base_url:
             return _listing(["sonnet"], enabled={"sonnet": True})
         return _listing(
@@ -806,3 +806,56 @@ def test_a_custom_endpoint_cannot_label_a_model_admin_restricted(monkeypatch):
             session, "minds_api_key", "minds_url", "providers_json", "openai_api_key", "minds_model_enabled"
         )
         session.close()
+
+
+def _forced_by_url(monkeypatch, refresh_scope):
+    """Per base URL, (force_refresh, mindshub) for a refresh with ``refresh_scope``."""
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    forced = {}
+
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
+        forced[base_url] = (force_refresh, _kw.get("mindshub", False))
+        return _listing(["sonnet"], enabled={"sonnet": True})
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+    session = get_open_session()
+    try:
+        _set_settings(
+            session,
+            minds_api_key="mdb_test",
+            minds_url="https://api.mindshub.ai",
+            providers_json=json.dumps(
+                [{"type": "openai-compatible", "baseUrl": "https://llm.local/v1", "apiKey": "***"}]
+            ),
+            openai_api_key="sk-test",
+        )
+        result = asyncio.run(recommended_models(
+            FakeRequest(), LOCAL_SCOPE, refresh=True, refresh_scope=refresh_scope
+        ))
+        assert result["refreshScopes"] == ["all", "minds"]
+    finally:
+        _delete_settings(
+            session, "minds_api_key", "minds_url", "providers_json", "openai_api_key", "minds_model_enabled"
+        )
+        session.close()
+    return forced
+
+
+def test_refresh_scope_all_forces_both_legs(monkeypatch):
+    forced = _forced_by_url(monkeypatch, "all")
+    assert forced == {"https://api.mindshub.ai": (True, True), "https://llm.local/v1": (True, False)}
+
+
+def test_refresh_scope_minds_leaves_the_custom_endpoint_cached(monkeypatch):
+    # Availability re-checks must not poll a third-party endpoint each time.
+    forced = _forced_by_url(monkeypatch, "minds")
+    assert forced == {"https://api.mindshub.ai": (True, True), "https://llm.local/v1": (False, False)}
+
+
+def test_an_unknown_refresh_scope_refreshes_everything(monkeypatch):
+    # A newer client's scope must not fail the refresh.
+    forced = _forced_by_url(monkeypatch, "everything")
+    assert forced == {"https://api.mindshub.ai": (True, True), "https://llm.local/v1": (True, False)}

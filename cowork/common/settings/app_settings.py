@@ -205,6 +205,26 @@ def _bare_origin(value: str) -> tuple[str, str] | None:
     return f"{match['scheme'].lower()}://{host}{match['port'] or ''}", host
 
 
+_ROUTER_URL = re.compile(
+    r"https://(?P<host>[a-z0-9][a-z0-9.-]*)(?P<port>:[0-9]{1,5})?"
+    r"(?P<path>(?:/[A-Za-z0-9._~-]+)*)/?",
+    re.IGNORECASE,
+)
+
+
+def _router_url(value: str) -> str | None:
+    """``value`` as a browser router base URL without its trailing slash, or
+    None when it isn't one: https to any host with an optional plain path, and
+    nothing else (no query, fragment or userinfo, which the pattern can't
+    match). Only https, because anton's browser tool takes no other router
+    address (anton.core.browser.config.BrowserConfig)."""
+    match = _ROUTER_URL.fullmatch(value.strip())
+    if match is None:
+        return None
+    host = match["host"].lower().rstrip(".")
+    return f"https://{host}{match['port'] or ''}{match['path']}"
+
+
 def _env_slug() -> str:
     """Return the env slug for URL construction, or '' for prod.
 
@@ -665,6 +685,59 @@ class StreamSettings(Settings):
     )
 
 
+class PushSettings(Settings):
+    """Mobile push credentials (cowork.services.push). Every field is optional:
+    a platform whose credentials are missing sends nothing, and push as a whole
+    runs only in org mode. The two secrets take their contents as they are or
+    base64-encoded, so a Kubernetes secret can hold either."""
+
+    enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_PUSH_ENABLED"),
+        description="Kill switch for mobile push. On by default; sends only where credentials are set.",
+    )
+    apns_key_p8: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_KEY_P8"),
+        description="APNs auth key (.p8 PEM from Apple Developer > Keys), as PEM or base64 of it.",
+    )
+    apns_key_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_KEY_ID"),
+        description="Key ID of the APNs auth key.",
+    )
+    apns_team_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_TEAM_ID"),
+        description="Apple Developer team ID that owns the APNs key.",
+    )
+    apns_topic: str = Field(
+        default="ai.mindshub.cowork",
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_TOPIC"),
+        description="APNs topic: the iOS app's bundle id.",
+    )
+    fcm_service_account_json: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON"),
+        description="Firebase service-account JSON for FCM HTTP v1, as JSON or base64 of it.",
+    )
+
+
+@lru_cache
+def get_push_settings() -> PushSettings:
+    """Cached push settings; tests clear the cache after changing the env."""
+    return PushSettings()
+
+
+#: auth's turn_key_max_ttl_seconds (API_KEYS__TURN_KEY_MAX_TTL_SECONDS in
+#: mindsdb/auth): the longest a turn key may live from now, at mint and at each
+#: extension. Mirrored here only to refuse a time limit whose key window auth
+#: would refuse; change both together.
+AUTH_TURN_KEY_MAX_TTL_SECONDS = 6600
+#: Kept free under that cap for clock skew between cowork-server and auth.
+AUTH_TURN_KEY_SKEW_SECONDS = 300
+
+
 class TurnQueueSettings(Settings):
     model_config = SettingsConfigDict(env_prefix="COWORK_TURN_")
 
@@ -695,12 +768,16 @@ class TurnQueueSettings(Settings):
         default=600.0,
         description=(
             "Fail a remote turn after this many seconds with no reply for it on the reply "
-            "stream (worker down, crashed, or wedged). Generous on purpose: the reply "
-            "protocol has no heartbeat, so a long tool run legitimately produces no reply "
-            "for minutes — tighten it once the pod sends one. <= 0 disables the bound, "
-            "which means an unresponsive worker leaves the turn spinning forever."
-            " An open ask_user question produces no reply either: keep this above the "
-            "pod's question timeout (ANTON_CLOUD_ASK_USER_TIMEOUT_SECONDS, 300 s)."
+            "stream (worker down, crashed, or wedged). A scratchpad-controller that relays "
+            "liveness sends a busy pod's heartbeat as a `worker_alive` progress reply once a "
+            "minute (its SCRATCHPAD_CONTROLLER__LIVENESS_RELAY_SECONDS), which counts as a "
+            "reply here, so a long tool run or an open ask_user question no longer goes "
+            "quiet; the UI also shows it as a model_wait frame after a quiet stretch, but "
+            "not over an open question. Keep this well above that interval. A controller too old to relay sends nothing during either, so until "
+            "every controller does, keep this above the longest quiet step and above the "
+            "pod's question timeout (ANTON_CLOUD_ASK_USER_TIMEOUT_SECONDS, 300 s). <= 0 "
+            "disables the bound, which means an unresponsive worker leaves the turn "
+            "spinning forever."
         ),
     )  # COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS
     auth_internal_base_url: str = Field(
@@ -714,12 +791,60 @@ class TurnQueueSettings(Settings):
     turn_key_ttl_seconds: int = Field(
         default=1200,
         description=(
-            "TTL, in seconds, of the minted per-turn MindsHub key (20 min; keep within "
-            "auth's turn_key_max_ttl_seconds). scratchpad-controller's "
-            "MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from it (TTL - 120); change "
-            "both together."
+            "TTL, in seconds, of the minted per-turn MindsHub key for a turn without a "
+            "time limit (20 min; keep within auth's turn_key_max_ttl_seconds). "
+            "scratchpad-controller's MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from "
+            "it (TTL - 120); change both together."
         ),
     )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
+    time_limit_seconds: int = Field(
+        default=0,
+        ge=0,
+        # Sized elsewhere for four 60-minute windows: scratchpad-controller's
+        # time_limited_turn_ceiling_seconds (16 800) and auth's
+        # turn_key_max_lifetime_seconds (17 100). A longer limit would end its
+        # last window on one of them, with no summary; raise those first.
+        le=3600,
+        description=(
+            "Per-turn time limit sent to the pod as params.limits.max_turn_seconds. "
+            "anton asks \"Keep going / Stop here\" at it and ends with a summary. 0 sends "
+            "none, and the turn keeps today's caps. Turn it on only where auth extends "
+            "turn keys and scratchpad-controller raises its backstop for time-limited "
+            "turns; a turn key then lives one time-limit window at a time "
+            "(turn_key_lifetime_seconds) and is extended on each \"Keep going\"."
+        ),
+    )  # COWORK_TURN_TIME_LIMIT_SECONDS
+    time_limit_key_margin_seconds: int = Field(
+        default=2400,
+        ge=0,
+        description=(
+            "How far past the time limit a turn key window reaches: the pod starts "
+            "after the key is minted, a cell that is already running finishes before "
+            "anton asks (the pod caps one cell at 15 minutes), then the summary is "
+            "written. The limit plus this must stay within auth's per-window cap "
+            "(AUTH_TURN_KEY_MAX_TTL_SECONDS) less clock-skew headroom."
+        ),
+    )  # COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS
+
+    @model_validator(mode="after")
+    def _time_limit_key_fits_auth(self) -> "TurnQueueSettings":
+        if self.time_limit_seconds > 0 and self.turn_key_lifetime_seconds > (
+            AUTH_TURN_KEY_MAX_TTL_SECONDS - AUTH_TURN_KEY_SKEW_SECONDS
+        ):
+            raise ValueError(
+                f"COWORK_TURN_TIME_LIMIT_SECONDS + COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS "
+                f"({self.turn_key_lifetime_seconds}s) must leave {AUTH_TURN_KEY_SKEW_SECONDS}s "
+                f"under auth's turn-key cap ({AUTH_TURN_KEY_MAX_TTL_SECONDS}s), or every web "
+                f"turn's key mint is refused"
+            )
+        return self
+
+    @property
+    def turn_key_lifetime_seconds(self) -> int:
+        """How long a turn key minted now, or extended now, must last."""
+        if self.time_limit_seconds > 0:
+            return self.time_limit_seconds + self.time_limit_key_margin_seconds
+        return self.turn_key_ttl_seconds
     pod_shared_mount_root: str = Field(
         default="/mnt/cowork-shared",
         description=(
@@ -760,6 +885,23 @@ class TurnQueueSettings(Settings):
             "direct model can still delegate. See scripts/eval_jev_route before raising it."
         ),
     )  # COWORK_TURN_JEV_ROUTE_MIN_P_DIRECT
+    addon_routing_enabled: bool = Field(
+        default=True,
+        description=(
+            "Let Jev add a message sent while a turn runs to that turn (POST /responses/addon) "
+            "instead of queueing it as the next one. A kill switch, on by default: with no Jev "
+            "to ask, or any doubt, the message is queued anyway. Off: every such message is queued."
+        ),
+    )  # COWORK_TURN_ADDON_ROUTING_ENABLED
+    addon_min_p_add: float = Field(
+        default=0.6,
+        ge=0,
+        le=1,
+        description=(
+            "Jev's probability of adding needed to add a mid-turn message to the running turn; "
+            "below it the message is queued, which is the behaviour without this feature."
+        ),
+    )  # COWORK_TURN_ADDON_MIN_P_ADD
     minds_coding_model: str = Field(
         default="",
         description=(
@@ -775,6 +917,14 @@ class TurnQueueSettings(Settings):
             "until the controller and pod support the datasource block."
         ),
     )  # COWORK_TURN_DATASOURCE_ENABLED
+    datasource_labels_enabled: bool = Field(
+        default=False,
+        description=(
+            "Send each datasource connection's name and connector id with its reference, "
+            "so the agent can tell the connections apart. Keep false until every pod runs "
+            "an anton that accepts them: an older one refuses the turn."
+        ),
+    )  # COWORK_TURN_DATASOURCE_LABELS_ENABLED
     datasource_producer_key_id: str = Field(
         default="",
         description="Key id for the dedicated datasource producer service role.",
@@ -966,6 +1116,19 @@ class AppSettings(Settings):
             "out. Set to false to degrade to plain-text questions (ENG-1984)."
         ),
     )
+    quick_edit_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_QUICK_EDIT_ENABLED"),
+        description=(
+            "Whether the artifact viewer's chat bar may edit an artifact "
+            "directly with anton's artifact editor, without a chat turn "
+            "(POST .../quick-edits, ENG-4227). Exposed to the app as the "
+            "artifact capability `canQuickEdit`, which is also false while "
+            "the installed anton has no quick editor. A kill switch: off, "
+            "the route answers 501 and the app sends every bar message to "
+            "the artifact's chat instead."
+        ),
+    )
     surface_override: str = Field(
         default="",
         validation_alias=AliasChoices("COWORK_SURFACE"),
@@ -1146,6 +1309,50 @@ class AppSettings(Settings):
         ),
     )
 
+    browser_router_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_ROUTER_URL"),
+        description=(
+            "The browser router, for example https://cowork.mindshub.ai/browser. "
+            "MindsHub mode only (COWORK_TENANCY_MODE=org): served on the cowork "
+            "host under /browser, it starts one browser per person and routes "
+            "each caller to their own by the credential they present. Status, "
+            "warm-up, viewer links and each web turn's browser go through it "
+            "(cowork.services.browser). https with an optional path; the "
+            "trailing slash is dropped. Blank (default): the web app has no "
+            "browser. Ignored outside MindsHub mode, where the desktop app "
+            "runs its own browser."
+        ),
+    )
+
+    @field_validator("browser_router_url", mode="before")
+    @classmethod
+    def _check_browser_router_url(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            return "" if value is None else value
+        normalized = _router_url(value)
+        if normalized is None:
+            raise ValueError(
+                "COWORK_BROWSER_ROUTER_URL must be an https URL with an optional "
+                "path (no query, fragment or credentials)"
+            )
+        return normalized
+
+    browser_scope_key_file: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_SCOPE_KEY_FILE"),
+        description=(
+            "A file holding the browser router's scope key, sent beside each web "
+            "turn's key on the router's _scope, so only this server can scope a "
+            "turn key (cowork.services.browser.scope_turn). MindsHub mode only. "
+            "The chart mounts the router's own Secret, browser-proxy, key "
+            "scope_key, here, so the two never differ. Read on every scope, so a "
+            "Secret that appears or rotates after start is picked up without a "
+            "restart. Blank, missing or empty: the router refuses every scope and "
+            "web turns run without a browser."
+        ),
+    )
+
     organization_switch_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("COWORK_ORGANIZATION_SWITCH_ENABLED"),
@@ -1275,6 +1482,17 @@ class AppSettings(Settings):
             "(ENG-439). Empty means the server advertises no owner and is not adoptable."
         ),
     )  # COWORK_SERVER_OWNER
+
+    health_proof_key: SecretStr = Field(
+        default=SecretStr(os.environ.get("COWORK_SERVER_HEALTH_PROOF_KEY", "")),
+        description=(
+            "Per-install secret the desktop app passes at spawn and keeps in a file only its OS "
+            "user can read. /health answers an HMAC of the app's nonce and the port it answered "
+            "on, keyed by this, so the app can tell its own server from a listener another OS "
+            "user put on its port, which can replay the owner token /health echoes but can't "
+            "compute this. Empty means /health proves nothing."
+        ),
+    )  # COWORK_SERVER_HEALTH_PROOF_KEY
 
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
     # The same switch that turns on anton's per-call usage log. Set by evals only.

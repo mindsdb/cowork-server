@@ -20,11 +20,17 @@ from the path. The result is only logged. To run the pass again, delete the
 from __future__ import annotations
 
 import logging
+import os
+import threading
+from collections.abc import Collection
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeVar
+from uuid import UUID
 
 import sqlalchemy as sa
+from pydantic import BaseModel, ValidationError
 from sqlmodel import Session, select
 
 from cowork.common.logger import log_context
@@ -35,6 +41,7 @@ from cowork.models.project import Project
 from cowork.models.setting import Setting
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.models.task_object import TaskObject
+from cowork.services.artifact_identity import _strictly_holds_no_id
 from cowork.services.artifact_ownership import (
     artifact_resource_key,
     conversation_creator,
@@ -42,6 +49,7 @@ from cowork.services.artifact_ownership import (
     record_artifact_owner,
 )
 from cowork.services.artifact_roots import (
+    ProjectRow,
     _is_real_directory,
     _storage_components_are_safe,
     project_artifacts_base,
@@ -58,6 +66,8 @@ logger = logging.getLogger(__name__)
 
 SENTINEL_KEY = "_artifact_owner_backfill_v1"
 _LOCK_KEY = advisory_lock_key(b"cowork\0artifact_owner_backfill_v1")
+
+SentinelValue = TypeVar("SentinelValue", bound=BaseModel)
 
 
 @dataclass
@@ -98,13 +108,175 @@ def sentinel_present(engine, key: str = SENTINEL_KEY) -> bool:
         return SettingService(raw)._fetch_row(key) is not None
 
 
-def write_sentinel(engine, key: str = SENTINEL_KEY) -> None:
+def _global_row(raw: Session, key: str) -> Setting | None:
+    """The global (NULL-scope) settings row `key`, where a backfill keeps its
+    sentinel and its progress."""
+    return raw.exec(select(Setting).where(Setting.key == key, Setting.scope.is_(None))).first()
+
+
+def _write_global_value(engine, key: str, value: str) -> None:
+    """Write `value` into the global settings row `key`, adding the row when
+    there is none. A row another replica added meanwhile is left as it is."""
     with Session(engine) as raw:
-        raw.add(Setting(key=key, value="1"))
+        row = _global_row(raw, key) or Setting(key=key, value=value)
+        row.value = value
+        raw.add(row)
         try:
             raw.commit()
         except sa.exc.IntegrityError:
             raw.rollback()  # another replica finished first
+
+
+def write_sentinel(engine, key: str = SENTINEL_KEY, *, value: str = "1") -> None:
+    """Write the sentinel `key` holding `value`, or set the value of the one
+    already there: a sentinel that lists what its pass left
+    (held_artifact_roots) is rewritten by a later pass."""
+    _write_global_value(engine, key, value)
+
+
+def read_sentinel_value(
+    session: ScopedSession,
+    *,
+    key: str,
+    model: type[SentinelValue],
+    logger: logging.Logger,
+    unreadable_event: str,
+    unreadable_message: str,
+) -> SentinelValue | None:
+    """The value of the sentinel `key` as a `model`, or None when no pass has
+    written it. A value that is not a `model`, as one written by hand, also
+    reads as None, so a reader falls back to its walk instead of failing, and
+    the next pass rewrites the value. That case logs `unreadable_message` on
+    the backfill's `logger` at WARNING, with `unreadable_event`."""
+    query = session.select(Setting).where(Setting.key == key, Setting.scope.is_(None))
+    row = session.exec(query).first()
+    if row is None:
+        return None
+    try:
+        return model.model_validate_json(row.value)
+    except ValidationError:
+        logger.warning(unreadable_message, extra={"event": unreadable_event})
+        return None
+
+
+def log_skipped(logger: logging.Logger, *, event_prefix: str, reason: str) -> None:
+    """Log on the backfill's `logger` why a pass walks nothing, as the event
+    `<event_prefix>_backfill_skipped`: `not_org`, `locked` (another replica
+    holds the walk), or a reason of the backfill's own, such as `finished`.
+    WARNING, as the start and summary lines: every hosted deployment runs at
+    LOG_LEVEL=WARNING, where an INFO line never shows, so an operator could
+    not tell a walk that never started from one that runs. One line per
+    pass. The message carries the backfill's name with no positional
+    argument: the console prints a message with arguments as its bare
+    template (structured_logging._event_schema), and `event_prefix` is a
+    fixed module name, never a value from a request or the file store."""
+    logger.warning(
+        f"{event_prefix} backfill skipped its walk",
+        extra={"event": f"{event_prefix}_backfill_skipped", "reason": reason},
+    )
+
+
+def walked_path_is_current(session: ScopedSession, *, project: ProjectRow) -> bool:
+    """Whether `project`'s row, read in `session`, still holds the path a
+    backfill read for it before its walk. A rename moves the project's folder
+    (projects.ProjectService._stage_project_rename), so a walk of the old
+    path finds it gone, or finds another project's folders once a project
+    takes the old name. False too for a project the scope no longer sees,
+    such as one deleted since. Makes no file store call, so a rename that
+    has moved the folder but not yet committed still shows the old path
+    here. walked_folder_is_gone catches such a move only when it lands
+    after the backfill's check before the walk and before its check after
+    it; a first sort-time pass, which makes no check before the walk, also
+    catches one that landed before the walk. When the move lands before a
+    held-root pass's check, or before the check of a sort-time pass over
+    its sentinel's list, and the rename commits only after this read, the
+    project looks like one whose folder is gone for good: it counts as
+    read, with no rows."""
+    row = session.get(Project, project.id)
+    return row is not None and row.path == project.path
+
+
+def walked_folder_is_gone(project: ProjectRow) -> bool:
+    """Whether `project`'s folder is missing at the path a backfill walked,
+    one stat that follows no link in its place. A rename moves the folder
+    before it commits the new path (projects.ProjectService.stage_project_update),
+    so a walk in between finds the old path gone while the project's row
+    still holds it (walked_path_is_current). A stat error that the walk
+    reads as a root holding no folder (artifact_identity._strictly_holds_no_id:
+    ENOENT, ENOTDIR, ELOOP, and EACCES or EPERM, which say the server may
+    not read the path) counts as missing too, so a folder the walk could
+    never read is treated as a missing one, never as a read failure that
+    lists its project on every pass. A backfill counts the project as
+    unread when it finds the folder there before its walk and missing after
+    it, and a first sort-time pass also when it finds it missing after the
+    walk alone; the next pass reads it at its committed path. Any other
+    stat error raises."""
+    try:
+        os.lstat(project.path)
+    except OSError as exc:
+        if _strictly_holds_no_id(exc=exc):
+            return True
+        raise
+    return False
+
+
+class BackfillProgress(BaseModel):
+    """What earlier passes of a backfill finished, kept across starts in one
+    global setting row per backfill (read_progress, save_progress). One row,
+    not one per project: the settings service reads every global row on each
+    load."""
+
+    #: The last project, in id order, a pass finished.
+    after: UUID | None = None
+    #: Projects a pass could not read; each start walks them again.
+    unread: list[UUID] = []
+
+    def finished(self, *, project_id: UUID, read: bool) -> BackfillProgress:
+        """This progress once the walk is past `project_id`, which it read
+        or could not read."""
+        unread = [project for project in self.unread if project != project_id]
+        if not read:
+            unread.append(project_id)
+        after = project_id if self.after is None else max(self.after, project_id)
+        return BackfillProgress(after=after, unread=unread)
+
+    def within(self, project_ids: Collection[UUID]) -> BackfillProgress:
+        """This progress less the unread projects `project_ids` leaves out. A
+        pass's query returns every unread project that still exists, so one
+        deleted since leaves the progress here, or the walk would never
+        finish it."""
+        return BackfillProgress(after=self.after, unread=[p for p in self.unread if p in project_ids])
+
+
+def read_progress(engine, key: str) -> BackfillProgress:
+    """The progress a backfill kept in the global setting row `key`, or a
+    fresh one."""
+    with Session(engine) as raw:
+        row = _global_row(raw, key)
+        return BackfillProgress.model_validate_json(row.value) if row is not None else BackfillProgress()
+
+
+def save_progress(engine, key: str, *, progress: BackfillProgress) -> None:
+    _write_global_value(engine, key, progress.model_dump_json())
+
+
+def delete_progress(engine, key: str) -> None:
+    with Session(engine) as raw:
+        row = _global_row(raw, key)
+        if row is not None:
+            raw.delete(row)
+            raw.commit()
+
+
+class BackfillStopped(Exception):
+    """A backfill's ``stop`` was set during its walk."""
+
+
+def check_stop(stop: threading.Event | None) -> None:
+    """Raise BackfillStopped once ``stop`` is set, so a walk ends at its next
+    project, root or id."""
+    if stop is not None and stop.is_set():
+        raise BackfillStopped
 
 
 def _is_candidate(folder: Path) -> bool:

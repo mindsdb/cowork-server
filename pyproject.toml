@@ -120,7 +120,9 @@ dependencies = [
     "cryptography>=48.0.0,<51",
     "cryptography<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "fastapi>=0.136.1",
-    "httpx>=0.27",
+    # The http2 extra (h2) is for APNs, which only speaks HTTP/2
+    # (cowork/services/push/apns.py).
+    "httpx[http2]>=0.27",
     # Structured app-server integration with a pinned, bundled Codex runtime;
     # users do not need to install a separate CLI.
     "openai-codex==0.147.0",
@@ -186,6 +188,11 @@ dependencies = [
     # it in transitively with lower bounds that still allow 2.13.
     "pyjwt>=2.15.0",
     "structlog==26.1.0",
+    # Teams channel (cowork/channels/teams_client.py). Linux only: Teams runs
+    # only on a server Cowork, so desktop installs don't need them. A main
+    # dependency rather than an extra because the server image installs none.
+    "microsoft-teams-api>=2.1.1; sys_platform == 'linux'",
+    "msal>=1.37.0; sys_platform == 'linux'",
 ]
 
 [project.urls]
@@ -223,6 +230,7 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.25.0",
     "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.pytest.ini_options]
