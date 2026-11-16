@@ -2,7 +2,7 @@
  * In-frame preview shim. Injected as the first script of every HTML artifact
  * preview (see preview_shim.py).
  *
- * Two independent halves:
+ * Three independent parts:
  *   1. An error reporter, installed ALWAYS. It is the only way a page's own
  *      failure reaches the user or the agent — the viewer never sees the
  *      frame's console. Report types: error (uncaught), resource (a file
@@ -16,6 +16,10 @@
  *      typically reads storage during top-level initialisation, so the throw
  *      aborts its script before any listener is bound and every control on
  *      the rendered page is dead.
+ *   3. PDF embeds, installed when the server passes the address of the
+ *      bundled pdf.js viewer (the draft host and the desktop draft route).
+ *      Browsers do not run their own PDF viewer in a sandboxed frame; the
+ *      shared code (pdf_viewer/embed.js) is spliced in by preview_shim.py.
  *
  * Verified by hand against a real browser. tests/test_preview_shim.py runs
  * the reporters in node against stand-in browser objects, which proves the
@@ -290,6 +294,32 @@
     }
   } catch (e) { /* XMLHttpRequest not patchable: no XHR reports */ }
 
+  /* Empty wherever the server serves no viewer files: nothing is replaced. */
+  var PDF_ASSETS = __PDF_ASSETS__;
+  if (PDF_ASSETS) {
+    try {
+      installPdfEmbeds(window, {
+        assets: function () { return window.location.origin + PDF_ASSETS; },
+        draft: true,
+        report: reportPdfFailure
+      });
+    } catch (e) {
+      reportPdfFailure(e);
+    }
+  }
+
+  function reportPdfFailure(err) {
+    var message = err && err.message ? err.message : String(err);
+    report('x|' + message, {
+      type: 'error',
+      message: 'PDF viewer: ' + local(message),
+      file: '',
+      line: 0,
+      col: 0,
+      stack: ''
+    });
+  }
+
   var nativeStorageWorks = true;
   try { void window.localStorage; } catch (e) { nativeStorageWorks = false; }
   /* One probe stands for the whole opaque-origin condition: where localStorage
@@ -408,4 +438,6 @@
       }
     });
   } catch (e) { /* cookie accessor is not redefinable here */ }
+
+  /* pdf-embeds */
 })();
