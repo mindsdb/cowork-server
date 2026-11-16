@@ -167,14 +167,15 @@ class ConversationDeleteStage:
 
 
 def _is_tool_row(content) -> bool:
-    """True for a history-only tool block-row (all blocks are tool_use /
-    tool_result). These carry prior tool calls for LLM-history replay and are
-    hidden from the UI, which renders tool activity from message events."""
+    """True for a history-only tool block-row: tool_use / tool_result blocks,
+    plus the text the assistant wrote beside its tool calls. These carry prior
+    tool calls for LLM-history replay and are hidden from the UI, which renders
+    tool activity from message events."""
     return (
         isinstance(content, list)
-        and len(content) > 0
+        and any(isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result") for block in content)
         and all(
-            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result")
+            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result", "text")
             for block in content
         )
     )
@@ -571,10 +572,18 @@ class ConversationService:
         neither the directories it will find nor their project: a task moved
         to another project keeps its workspace directory under the old one.
         """
+        return set(self.session.exec(self.owned_ids_query()).all())
+
+    def owned_ids_query(self) -> ScopedSelect:
+        """The query `owned_ids` runs, for a query that filters by the
+        caller's conversations in the database
+        (held_artifact_roots.held_root_rows). Same rule as `_owned`: in org mode
+        the conversations the scope's user created, and for a scope with no
+        user the ones no member created."""
         stmt = self.session.select(Conversation).with_only_columns(Conversation.id)
         if self.session.scope.org_mode:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
-        return set(self.session.exec(stmt).all())
+        return stmt
 
     def get_conversation(self, conversation_id: UUID) -> Conversation:
         conversation = self._owned(conversation_id)

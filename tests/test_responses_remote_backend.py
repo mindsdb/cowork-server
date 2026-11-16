@@ -12,6 +12,7 @@ from tests._event_loop import on_the_event_loop
 from tests._logging_assertions import assert_log_fields
 
 import asyncio
+import itertools
 import json
 from contextlib import contextmanager
 import logging
@@ -23,6 +24,7 @@ from uuid import UUID, uuid4
 import pytest
 
 import cowork.handlers.responses as responses_mod
+from cowork.common import event_clock
 from cowork.handlers.responses import ResponsesHandler, _RemoteArtifactsDir
 from cowork.services.artifact_identity import ListedIds
 from cowork.streaming.registry import TurnLifecycle
@@ -3200,8 +3202,9 @@ async def test_a_record_of_a_remote_turn_that_lost_only_the_listed_check_says_so
     the diff listed. Either the turn created nothing, so the unit's failure
     lost only that check, or it created a folder and record_new_artifacts
     raised at the check, once that folder's rows were written
-    (ListedLocationsUnchecked). The line says the check failed, not that
-    created folders went unrecorded."""
+    (ListedLocationsUnchecked), which a failed hold of the root or a failed
+    write of the sort times raises too. The line names the check, the hold
+    and the sort times, not created folders gone unrecorded."""
     from cowork.services import task_objects
 
     handler = _remote_handler(monkeypatch, {})
@@ -3251,7 +3254,8 @@ async def test_a_record_of_a_remote_turn_that_lost_only_the_listed_check_says_so
         if r.name == responses_mod.logger.name and r.levelno == logging.ERROR
     ]
     assert [r.getMessage() for r in errors] == [
-        "[responses] could not check the locations of the artifacts a remote turn listed",
+        "[responses] could not check the locations of the artifacts a remote turn found,"
+        " or record the folder that holds them or their sort times",
     ]
     assert errors[0].exc_info[1] is error
 
@@ -3334,7 +3338,8 @@ async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(m
     indexed = {"new": set()}
 
     def spy_index_new(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
+        untimed=(),
     ):
         indexed["new"] = set(slugs)
 
@@ -3380,7 +3385,8 @@ async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(mon
     indexed = {"new": set()}
 
     def spy_index_new(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
+        untimed=(),
     ):
         indexed["new"] = set(slugs)
 
@@ -3838,6 +3844,41 @@ async def test_produce_remote_retires_an_open_question(monkeypatch, ending):
         "type": "response.ask_user_answered", "question_id": "ask:1",
         "status": "cancelled", "values": [], "text": "",
     }]
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_saves_the_ask_user_time_its_live_frame_carried(monkeypatch):
+    """The app approves a held browser step for the person only when the
+    card's `at_ms` comes after the approvals-off stamp, live and after a
+    reload. A reload replays the record this turn's sink saved, so that record
+    keeps the live frame's time: a later one would approve, after a reload, a
+    card held before approvals went off. The clock ticks a second on every
+    read, so a second stamp can't land on the same value."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    _fake_redis(monkeypatch, flag_set=False)
+    seconds = itertools.count(1_000)
+    monkeypatch.setattr(event_clock, "time", SimpleNamespace(time=lambda: float(next(seconds))))
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", _ASK_STEP
+        yield "turn_step", {"step": "ask_user_answered", "id": "ask:1", "status": "answered",
+                            "values": ["pg"], "text": "", "answer_id": "a1"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    buffer = _RecBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    assert buffer.frames[-1] == "CLOSE:completed"
+    live = next(json.loads(f.split("data: ", 1)[1]) for f in buffer.frames
+                if f.startswith("event: response.ask_user\n"))
+    stored = next(e for e in saved["events"] if e.get("type") == "response.ask_user")
+    assert stored["at_ms"] == live["at_ms"]
 
 
 @pytest.mark.asyncio
@@ -4434,3 +4475,27 @@ async def test_a_stop_while_the_diff_holds_an_artifacts_revision_lock_waits_for_
     assert let_go and closed and let_go[0] <= closed[0], "the stream ended while the diff held the lock"
     assert not (folder / ".revisions" / ".lock").exists()
     assert turn.recorded == [["mine"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interactive,schedule_id,expected", [(True, None, True), (False, None, False), (True, "s1", False)])
+async def test_produce_remote_asks_for_preview_checks_only_where_a_viewer_can_answer(
+    monkeypatch, interactive, schedule_id, expected,
+):
+    """ENG-4227: a person's web turn may have the artifact's viewer open; a
+    scheduled run or a non-interactive caller has none."""
+    saved, captured = {}, {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler.interactive = interactive
+    handler.schedule_id = schedule_id
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_RecBuffer(),
+    )
+    assert captured["preview_checks"] is expected

@@ -29,6 +29,7 @@ from typing import Annotated, Any, AsyncIterator, Callable, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
+from cowork.common.event_clock import event_at_ms
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.figure_sources import (
     CellResult,
@@ -127,6 +128,19 @@ class TurnHistory:
     # instead; None means `rows` are what the agent read. The pod's rows
     # arrive unchecked, so an entry may not be a row at all.
     read: list[object] | None = None
+
+
+@dataclass
+class PreviewCheckRequest:
+    """Synthetic event: a remote turn's anton asks the open preview whether an
+    artifact runs (turnqueue/preview_checks.py). Written to the stream as the
+    same ``response.artifact_check`` frame an in-process turn writes
+    (preview_checker.artifact_check_sse), and like that one never saved:
+    it means something only while the pod waits on it."""
+
+    check_id: str
+    artifact_slug: str
+    timeout_s: int
 
 
 @dataclass
@@ -813,9 +827,11 @@ async def format_responses_stream(
         # reducer would otherwise see every `now()` collapse to the
         # same JS-tick value, producing 0ms across the board.
         # Persisted into the turns sidecar via `event_sink`, so the
-        # field is also there for future replays.
+        # field is also there for future replays. A held step's card
+        # compares it with the approvals-off stamp, which event_clock
+        # keeps at or after it.
         if "at_ms" not in data:
-            data["at_ms"] = int(time.time() * 1000)
+            data["at_ms"] = event_at_ms()
         if event_sink is not None:
             try:
                 event_sink(event_type, data)
@@ -1280,6 +1296,14 @@ async def format_responses_stream(
 
         elif isinstance(event, TurnContext):
             turn_context = event
+
+        elif isinstance(event, PreviewCheckRequest):
+            from cowork.harnesses.anton_harness.preview_checker import artifact_check_sse
+
+            # Not through _event: never recorded with the turn's events.
+            yield artifact_check_sse(
+                check_id=event.check_id, artifact_slug=event.artifact_slug, timeout_s=event.timeout_s,
+            )
 
         elif isinstance(event, TurnAddon):
             # A message the person added mid-turn: accepted, read by the

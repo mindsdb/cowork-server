@@ -382,7 +382,7 @@ def test_the_grace_period_covers_the_whole_shutdown(values):
     """Counted from the pod's deletion: the preStop sleep, the pre-drain that
     ends remote turns before uvicorn sees SIGTERM, uvicorn's drain bound, then
     the lifespan teardown's bounded waits (the draft listener's own drain,
-    another pass over turns, the location backfill's stop, channel tasks,
+    another pass over turns, the artifact backfills' stop, channel tasks,
     scratchpad closes, and last the turn-end artifact records a file store
     stall left waiting), and a margin for its unbounded closes.
 

@@ -151,3 +151,29 @@ def test_autopublish_skips_a_non_content_primary(tmp_path: Path):
     _write(art / "data.csv")
 
     assert needs_publish(art, tmp_path).reason == REASON_NOT_PUBLISHABLE
+
+
+def test_listing_names_the_live_pages_report_id(tmp_path: Path):
+    art = tmp_path / "report"
+    _meta(art, primary="index.html")
+    _write(art / "index.html", "<h1>hi</h1>")
+    _write(art / ".published.json", json.dumps({"index.html": {
+        "report_id": "rid-2", "url": "https://4nton.ai/view/u/rid-2", "published": True,
+    }}))
+    other = tmp_path / "draft"
+    _meta(other, primary="index.html")
+    _write(other / "index.html", "<h1>draft</h1>")
+
+    by_folder = {Path(e["path"]).parent.name: e["reportId"] for e in _entries(tmp_path)}
+    assert by_folder == {"report": "rid-2", "draft": ""}
+
+
+def test_listing_names_no_report_id_for_a_taken_down_page(tmp_path: Path):
+    art = tmp_path / "report"
+    _meta(art, primary="index.html")
+    _write(art / "index.html", "<h1>hi</h1>")
+    # Soft-deleted: the record keeps its report_id for a later re-publish.
+    _write(art / ".published.json", json.dumps({"index.html": {
+        "report_id": "rid-2", "url": "https://4nton.ai/view/u/rid-2", "published": False,
+    }}))
+    assert [e["reportId"] for e in _entries(tmp_path)] == [""]

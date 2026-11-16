@@ -461,6 +461,8 @@ async def test_handle_refuses_non_streaming_turn_in_org_mode(org_mode, granted_p
     class _FakeConversation:
         def __init__(self, conv_id):
             self.id = conv_id
+            # No folder there, so the project holds no files.
+            self.project = SimpleNamespace(path="/nonexistent/project")
 
     class _FakeConversationService:
         def __init__(self, scoped):
