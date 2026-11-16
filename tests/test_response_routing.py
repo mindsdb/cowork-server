@@ -1005,7 +1005,7 @@ async def test_pre_minted_binding_skips_settings_and_is_used(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch, router_wire_budget):
+async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch):
     import json
 
     import httpx2 as httpx
@@ -1016,7 +1016,16 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch,
     import cowork.turnqueue.producer as producer
     from cowork.common.settings.user_settings import Provider
 
+    import cowork.handlers.response_routing as routing
+
     handler = _routing_handler(monkeypatch)
+    # This test checks key minting and tracing, not the gate's latency
+    # budgets. The first streamed event goes through a real OpenAI client and
+    # can miss the 2s production budget on a loaded CI runner, which falls back
+    # to `delegated_agentic` and fails the route assertion below.
+    monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 30.0)
+    monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 30.0)
+    monkeypatch.setattr(routing, "_GATE_TOTAL_SECONDS", 60.0)
     monkeypatch.setattr(
         responses, "TurnQueueSettings",
         lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=False),
@@ -1078,7 +1087,7 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch,
     assert binding.label == "minds_cloud"
     assert binding.model == "mindshub_air"
     assert type(binding.provider).__name__ == "OpenAIProvider"
-    assert decision.route == DIRECT_CONTEXT, decision.reason
+    assert decision.route == DIRECT_CONTEXT, decision
     assert len(requests) == 1
     assert requests[0].headers["Langfuse-Session-Id"] == "conv-router"
     # Exercise the installed Anton: assigning the attribute alone also passes
