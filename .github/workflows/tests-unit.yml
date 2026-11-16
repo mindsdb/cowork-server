@@ -56,6 +56,7 @@ jobs:
 
   unit-test-shards:
     name: unit-test-shards-${{ matrix.number }}
+    timeout-minutes: 30
     needs: collect-tests
     strategy:
       fail-fast: false
