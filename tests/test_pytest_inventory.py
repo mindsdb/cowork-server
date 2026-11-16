@@ -15,6 +15,7 @@ import pytest
 from coverage import CoverageData
 from coverage.exceptions import CoverageException
 
+from scripts.blocking_guard_evidence import sidecar
 from scripts.pytest_inventory import source_identity
 from scripts.test_inventory import Report, compare, preserve, read_report, summary, validate, validate_junit
 from scripts.test_shards import aggregate, latest_artifact, partition
@@ -481,10 +482,15 @@ def test_nested_coverage_keeps_parent_data(inventory_suite, monkeypatch):
 @pytest.fixture
 def shard_evidence(inventory_suite, monkeypatch):
     """Produce a full collection and both real shard reports in an isolated checkout."""
+    return _shard_evidence(inventory_suite, monkeypatch)
+
+
+def _shard_evidence(inventory_suite, monkeypatch, *, prepare=None):
+    """Build the shared shard probe, optionally installing a real runtime guard before collection."""
     root, run = inventory_suite
     scripts = root / "scripts"
     scripts.mkdir()
-    for name in ("test_shards.py", "test_inventory.py", "pytest_inventory.py"):
+    for name in ("test_shards.py", "test_inventory.py", "pytest_inventory.py", "blocking_guard_evidence.py"):
         shutil.copyfile(_ROOT / "scripts" / name, scripts / name)
     package = root / "cowork"
     package.mkdir()
@@ -513,6 +519,8 @@ def test_runtime_skip():
     (tests / "test_skip.py").write_text('import pytest\npytest.skip("module prerequisite", allow_module_level=True)\n')
     (tests / "integration").mkdir()
     (tests / "integration/test_ignored.py").write_text('raise RuntimeError("integration must stay excluded")\n')
+    if prepare is not None:
+        prepare(root)
     monkeypatch.setenv("GITHUB_RUN_ID", "1234")
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
     monkeypatch.setenv("GITHUB_JOB", "collect-tests")
@@ -523,6 +531,8 @@ def test_runtime_skip():
     collected = inputs / "test-inventory-broad-collection-1234-1"
     collected.mkdir(parents=True)
     shutil.copyfile(path, collected / "inventory.json")
+    if (root / "tests/_blocking_guard.py").is_file():
+        shutil.copyfile(sidecar(path), sidecar(collected / "inventory.json"))
 
     def execute(index: int, attempt: int = 1, *, fail: bool = False):
         """Run the actual shard CLI with explicit producer context and optional test failure."""

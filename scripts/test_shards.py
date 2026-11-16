@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from collections.abc import Iterable
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import sys
 from coverage import Coverage, CoverageData
 from coverage.exceptions import CoverageException
 
+from scripts.blocking_guard_evidence import GuardEvidence, read_evidence, sidecar
 from scripts.pytest_inventory import source_identity
 from scripts.test_inventory import Report, read_report, validate, validate_junit
 
@@ -88,7 +90,7 @@ def _module_path(name: str) -> str:
     return name
 
 
-def partition(collection: Report) -> list[list[str]]:
+def partition(collection: Report, modules: Iterable[str] = ()) -> list[list[str]]:
     """Assign every collected module once using descending case counts and stable ties."""
     validate(collection)
     selection = collection.invocation.selection
@@ -104,6 +106,8 @@ def partition(collection: Report) -> list[list[str]]:
         counts[module] += 1
     for skipped in collection.collection.reports:
         counts.setdefault(_module_path(skipped.nodeid), 0)
+    for module in modules:
+        counts.setdefault(_module_path(module), 0)
     groups: list[list[str]] = [[], []]
     totals = [0, 0]
     for module in sorted(counts, key=lambda name: (-counts[name], name)):
@@ -118,8 +122,55 @@ def _collection(inputs: Path) -> tuple[Path, Report, int]:
     """Validate the full collection against the actual checked-out source."""
     path, report, attempt = latest_artifact(inputs, _COLLECTION)
     _require(report.revision.model_dump() == source_identity(Path.cwd()), "Collection source differs from checkout")
-    partition(report)
+    declaration = _guard_evidence(path, report)
+    if declaration is not None:
+        required_files = sorted(path.relative_to(Path.cwd()).as_posix() for path in (Path.cwd() / "tests").rglob("test_*.py")
+                                if "integration" not in path.relative_to(Path.cwd() / "tests").parts)
+        _require(declaration.required_files == required_files and
+                 set(required_files) <= set(declaration.collected_files), "Blocking guard full collection differs")
+        _require(declaration.ineligible_because == "collection only", "Expected blocking guard declaration")
+    partition(report, declaration.collected_files if declaration else ())
     return path, report, attempt
+
+
+def _guard_evidence(path: Path, report: Report) -> GuardEvidence | None:
+    """Require source-bound guard evidence when the checkout defines the runtime guard."""
+    if not (Path.cwd() / "tests/_blocking_guard.py").is_file():
+        return None
+    evidence = read_evidence(_artifact_file(path, sidecar(Path("inventory.json")).name))
+    _require(evidence.revision == evidence.revision_end == report.revision and
+             evidence.mode == report.mode and evidence.cohort == report.cohort,
+             "Blocking guard source/cohort differs")
+    _require(evidence.run_id == report.environment.ci.get("GITHUB_RUN_ID") == _context()[0] and
+             evidence.run_attempt == report.environment.ci.get("GITHUB_RUN_ATTEMPT"),
+             "Blocking guard producer identity differs")
+    for name in [*evidence.required_files, *evidence.collected_files]:
+        _module_path(name)
+    return evidence
+
+
+def _global_guard(declaration: GuardEvidence | None, paths: list[Path], reports: list[Report],
+                  groups: list[list[str]]) -> dict[str, object] | None:
+    """Compose complete real worker observations before making the original stale decision."""
+    if declaration is None:
+        return None
+    reached = set()
+    collected = set()
+    for path, report, modules in zip(paths, reports, groups):
+        evidence = _guard_evidence(path, report)
+        _require(evidence.required == declaration.required and evidence.required_files == declaration.required_files,
+                 "Blocking guard declarations differ")
+        _require(evidence.ineligible_because is None and not evidence.workers_lost and
+                 evidence.workers == sorted(worker.id for worker in report.workers) and
+                 len(evidence.workers) == 4, "Blocking guard execution is incomplete")
+        _require(evidence.collected_files == modules, "Blocking guard module membership differs")
+        reached.update(leaf.key() for leaf in evidence.reached)
+        collected.update(evidence.collected_files)
+    _require(collected == set(declaration.collected_files), "Blocking guard collected-file union differs")
+    required = {leaf.key() for leaf in declaration.required}
+    _require(reached == required, "Blocking guard ALLOWLIST names sites no test reached")
+    return {"complete": True, "required_leaves": len(required), "reached_leaves": len(reached),
+            "collected_files": len(collected)}
 
 
 def _output(path: Path) -> Path:
@@ -133,8 +184,9 @@ def _output(path: Path) -> Path:
 def run_shard(inputs: Path, output: Path, index: int) -> int:
     """Execute one complete module partition and propagate pytest's exit status."""
     _require(index in (0, 1), "Invalid shard index")
-    _, collection, _ = _collection(inputs)
-    modules = partition(collection)[index]
+    collection_path, collection, _ = _collection(inputs)
+    declaration = _guard_evidence(collection_path, collection)
+    modules = partition(collection, declaration.collected_files if declaration else ())[index]
     output = _output(output)
     environment = dict(os.environ, COVERAGE_FILE=str(output / "coverage.data"))
     command = [sys.executable, "-m", "pytest", "-vv", "-o", "faulthandler_timeout=120",
@@ -177,7 +229,8 @@ def _coverage_sets(data: CoverageData) -> dict[str, set[int | tuple[int, int]]]:
 def aggregate(inputs: Path, output: Path) -> dict[str, object]:
     """Audit both real executions, combine only their coverage and retain provenance."""
     collection_path, collection, collection_attempt = _collection(inputs)
-    groups = partition(collection)
+    declaration = _guard_evidence(collection_path, collection)
+    groups = partition(collection, declaration.collected_files if declaration else ())
     reports, paths, attempts = [], [], []
     for index in range(2):
         path, report, attempt = latest_artifact(inputs, _SHARD + str(index))
@@ -205,6 +258,7 @@ def aggregate(inputs: Path, output: Path) -> dict[str, object]:
     _require(reports[0].invocation.coverage == reports[1].invocation.coverage, "Coverage configurations differ")
     items = [case for report in reports for case in report.collection.items]
     _require(len(items) == len({case.nodeid for case in items}) == len(collection.collection.items), "Case union is not exact")
+    guard_result = _global_guard(declaration, paths, reports, groups)
     coverage_paths = [_artifact_file(path, "coverage.data") for path in paths]
     data = [_coverage_data(path) for path in coverage_paths]
     _require(data[0].has_arcs() == data[1].has_arcs(), "Coverage line/arc modes differ")
@@ -221,12 +275,16 @@ def aggregate(inputs: Path, output: Path) -> dict[str, object]:
     coverage.report()
     percent = coverage.json_report(outfile=str(output / "coverage.json"))
     shutil.copyfile(collection_path / "inventory.json", output / "collection.json")
+    if declaration is not None:
+        shutil.copyfile(sidecar(collection_path / "inventory.json"), sidecar(output / "collection.json"))
     producers = []
     for index, (path, report, attempt) in enumerate(zip(paths, reports, attempts)):
         target = output / f"shard-{index}"
         target.mkdir()
         for name in ("inventory.json", "junit.xml", "coverage.data"):
             shutil.copyfile(path / name, target / name)
+        if declaration is not None:
+            shutil.copyfile(sidecar(path / "inventory.json"), sidecar(target / "inventory.json"))
         producers.append({"index": index, "producer_attempt": attempt, "artifact": path.name,
                           "cases": len(report.collection.items),
                           "inventory_sha256": hashlib.sha256((path / "inventory.json").read_bytes()).hexdigest()})
@@ -235,6 +293,8 @@ def aggregate(inputs: Path, output: Path) -> dict[str, object]:
                "revision": collection.revision.model_dump(), "collected": len(items),
                "collector_skips": len(collection.collection.reports), "coverage_percent": percent,
                "shards": producers}
+    if guard_result is not None:
+        summary["blocking_guard"] = guard_result
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(f"Verified complete broad selection: {len(items)} cases across two shards.")
     return summary

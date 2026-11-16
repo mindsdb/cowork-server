@@ -18,6 +18,7 @@ import sys
 import sysconfig
 from asyncio import to_thread as to_thread_bound_at_import
 from collections.abc import Callable, Iterator
+from copy import deepcopy
 from pathlib import Path
 
 import anyio
@@ -28,6 +29,9 @@ from fastapi.responses import FileResponse
 from sqlalchemy import text
 
 import _blocking_guard as guard
+from scripts.blocking_guard_evidence import read_evidence, sidecar
+from scripts.test_shards import aggregate
+from tests.test_pytest_inventory import _shard_evidence, inventory_suite
 from cowork.common.paths import cowork_home, safe_join
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
@@ -815,3 +819,156 @@ def test_a_run_that_is_not_full_skips_the_stale_check_in_one_line(tmp_path, args
     assert f"The blocking guard's stale-entry check skipped: {reason} (tests/_blocking_guard.py)." in result.stdout
     assert "ALLOWLIST names sites no test reached" not in result.stdout, result.stdout
     assert result.returncode == pytest.ExitCode.OK, result.stdout
+
+
+@pytest.fixture
+def guarded_shards(inventory_suite, monkeypatch):
+    """Execute real watched operations through the existing isolated shard builder."""
+    def prepare(root):
+        """Copy actual runtime dependencies and define two separately exercised allowed sites."""
+        shutil.copytree(_ROOT / "cowork", root / "cowork", dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copyfile(_ROOT / "tests/_blocking_guard.py", root / "tests/_blocking_guard.py")
+        (root / "cowork/guard_probe.py").write_text('''
+import os
+async def left():
+    os.stat(os.environ["COWORK_HOME"])
+async def right():
+    os.stat(os.environ["COWORK_HOME"])
+''')
+        conftest = _STALE_CONFTEST.replace("reached=_this_workers_share_of_the_allowlist()", "reached=REACHED")
+        (root / "tests/conftest.py").write_text(conftest + '''
+import pytest
+REACHED = set()
+_blocking_guard.ALLOWLIST = (
+    _blocking_guard.Allowed("cowork/guard_probe.py", "left", _blocking_guard.LOOP_FILE_STORE,
+                           ("cowork/guard_probe.py:left",), "probe's explicit leaf"),
+    _blocking_guard.Allowed("cowork/guard_probe.py", "right", _blocking_guard.LOOP_FILE_STORE,
+                           ("*",), "probe's wildcard leaf"),
+)
+@pytest.fixture(autouse=True)
+def watch(monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    with _blocking_guard.watching() as found:
+        yield
+    REACHED.update(found)
+    assert not _blocking_guard.unlisted(found)
+''')
+        (root / "tests/test_left é.py").write_text('''
+import asyncio
+from cowork.guard_probe import left
+def test_left():
+    asyncio.run(left())
+''')
+        (root / "tests/test_right.py").write_text('''
+import asyncio
+from cowork.guard_probe import right
+def test_right():
+    asyncio.run(right())
+''')
+        (root / "tests/test_empty.py").write_text('"""Collected module with no test cases."""\n')
+
+    return _shard_evidence(inventory_suite, monkeypatch, prepare=prepare)
+
+
+def test_two_shards_keep_the_whole_suite_guard(guarded_shards, monkeypatch):
+    """Only the complete union reaches both real sites; stale leaves still fail aggregation."""
+    root, run, inputs, _, execute = guarded_shards
+    packets = [sidecar(inputs / f"test-inventory-broad-shard-{index}-1234-1/inventory.json") for index in range(2)]
+    evidence = [read_evidence(path) for path in packets]
+    assert all(len(packet.reached) == 1 and len(packet.workers) == 4 for packet in evidence)
+    assert {leaf.leaf for packet in evidence for leaf in packet.reached} == {"*", "cowork/guard_probe.py:left"}
+    output = root.parent / "combined-guard"
+    combined = aggregate(inputs, output)
+    assert combined["blocking_guard"] == {"complete": True, "required_leaves": 2, "reached_leaves": 2, "collected_files": 4}
+    assert any("tests/test_empty.py" in packet.collected_files for packet in evidence)
+    assert any("tests/test_skip.py" in packet.collected_files for packet in evidence)
+    for index, path in enumerate(packets):
+        assert sidecar(output / f"shard-{index}/inventory.json").read_bytes() == path.read_bytes()
+    for path in packets:
+        original = path.read_bytes()
+        altered = json.loads(original)
+        altered["reached"] = []
+        try:
+            path.write_text(json.dumps(altered))
+            with pytest.raises(ValueError, match="sites no test reached"):
+                aggregate(inputs, root.parent / "stale-guard")
+        finally:
+            path.write_bytes(original)
+    collection = inputs / "test-inventory-broad-collection-1234-1"
+    held = root.parent / "held-collection"
+    collection.rename(held)
+    try:
+        for name in ("inventory.json", "inventory.json.blocking-guard.json"):
+            shutil.copyfile(held / name, inputs / name)
+        flat = aggregate(inputs, root.parent / "flat-guard")
+        assert flat["blocking_guard"] == combined["blocking_guard"]
+    finally:
+        for name in ("inventory.json", "inventory.json.blocking-guard.json"):
+            (inputs / name).unlink(missing_ok=True)
+        held.rename(collection)
+    result, _ = execute(0, attempt=2)
+    assert result.returncode == 0, result.stdout + result.stderr
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    carried = aggregate(inputs, root.parent / "carried-guard")
+    assert [producer["producer_attempt"] for producer in carried["shards"]] == [2, 1]
+    for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB"):
+        monkeypatch.delenv(key, raising=False)
+    # Both local inventories share a directory, so a fixed sidecar name would collide.
+    result, _, collection_path = run("tests/", "--ignore=tests/integration", "--collect-only", "-n", "0", "--test-cohort=broad")
+    assert result.returncode == 0, result.stdout + result.stderr
+    result, _, execution_path = run("tests/", "--ignore=tests/integration", "-n", "2", "--test-cohort=broad")
+    assert result.returncode == 0, result.stdout + result.stderr
+    local = [read_evidence(sidecar(path)) for path in (collection_path, execution_path)]
+    assert all(packet.run_id is None and packet.run_attempt is None for packet in local)
+    assert not local[0].reached and len(local[1].reached) == 2
+    assert "stale-entry check skipped" not in result.stdout
+
+
+def test_shard_guard_refuses_incomplete_or_altered_evidence(guarded_shards, monkeypatch):
+    """Damage actual producer bytes and require every completeness/provenance rejection."""
+    root, _, inputs, _, _ = guarded_shards
+    path = sidecar(inputs / "test-inventory-broad-shard-0-1234-1/inventory.json")
+    original = path.read_bytes()
+    raw = json.loads(original)
+    mutations = []
+    for field, value in (
+        ("workers", raw["workers"][:-1]), ("workers_lost", ["gw0"]),
+        ("ineligible_because", "tests were deselected"), ("ineligible_because", "the run stopped early"),
+        ("run_id", "999"), ("run_attempt", "2"), ("schema_version", 2),
+        ("collected_files", []), ("required_files", []), ("workers", raw["workers"] * 2),
+    ):
+        changed = deepcopy(raw)
+        changed[field] = value
+        mutations.append(changed)
+    changed = deepcopy(raw)
+    changed["revision"]["tree_digest"] = "0" * 64
+    mutations.append(changed)
+    changed = deepcopy(raw)
+    changed["required"][0]["leaf"] = "altered"
+    mutations.append(changed)
+    changed = deepcopy(raw)
+    changed["reached"][0]["leaf"] = "unobserved-wildcard-leaf"
+    mutations.append(changed)
+    mutations.extend([{"schema_version": 1}, []])
+    try:
+        for index, changed in enumerate(mutations):
+            path.write_text(json.dumps(changed))
+            with pytest.raises(ValueError):
+                aggregate(inputs, root.parent / f"damaged-guard-{index}")
+        path.unlink()
+        with pytest.raises(ValueError):
+            aggregate(inputs, root.parent / "missing-guard")
+        path.write_bytes(original)
+        # A partial rerun must validate the newest packet, never reuse its older success.
+        newest = path.parent.with_name("test-inventory-broad-shard-0-1234-2")
+        shutil.copytree(path.parent, newest)
+        report_path = newest / "inventory.json"
+        report = json.loads(report_path.read_bytes())
+        report["environment"]["ci"]["GITHUB_RUN_ATTEMPT"] = "2"
+        report_path.write_text(json.dumps(report))
+        monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+        with pytest.raises(ValueError, match="producer identity"):
+            aggregate(inputs, root.parent / "invalid-newest-guard")
+    finally:
+        path.write_bytes(original)
