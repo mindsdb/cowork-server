@@ -51,6 +51,7 @@ from cowork.services.artifact_permissions import (
 )
 from cowork.services import artifact_files
 from cowork.services.preview_html import prepare_preview_html
+from cowork.services.quick_edit import direct_edit_available, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.schemas.artifact_access import (
@@ -499,6 +500,8 @@ async def _sync_live_artifact(
     """
     from cowork.services.publish import (
         AccessModeChanged,
+        MarkdownNotPublishable,
+        MarkdownRenderBusy,
         PublishOwnedByOtherUser,
         PublishTooLarge,
         ShareOrgRequired,
@@ -578,6 +581,16 @@ async def _sync_live_artifact(
         # Repeats on every save until the artifact shrinks, so no traceback.
         logger.warning("Could not synchronize live artifact %s: it is too large to publish", folder)
         return False
+    except MarkdownNotPublishable:
+        # Repeats on every save until the Markdown changes, so no traceback.
+        logger.warning(
+            "Could not synchronize live artifact %s: its Markdown page can't be rendered", folder
+        )
+        return False
+    except MarkdownRenderBusy:
+        # Another conversion held the server's one slot; the next save tries again.
+        logger.warning("Could not synchronize live artifact %s: another conversion runs", folder)
+        return False
     except (AccessModeChanged, ShareOrgRequired):
         # publish_artifact logged the refusal: a mode changed after the
         # owner's last save, or MindsHub refusing a share with everyone that
@@ -621,16 +634,29 @@ async def _acquire_live_publish_lock(
 
 
 async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
+    """*capabilities* narrowed by the caller's current product permissions.
+
+    ``canQuickEdit`` (ENG-4227): the viewer's chat bar is offered. It needs
+    what an agent repair needs, plus the server setting and an anton with the
+    quick editor (``quick_edit_available``), so it is false on a server whose
+    anton predates it. ``quickEditDirect``: the bar can also edit directly,
+    because a decisions model serves the caller's provider; without one the
+    bar still shows and hands every message to the chat.
+    """
     if not capabilities["canEdit"]:
-        return capabilities
+        return {**capabilities, "canQuickEdit": False, "quickEditDirect": False}
     can_edit = await has_product_permission(scope, "artifact.manage")
     can_execute = await has_product_permission(scope, "product.execute")
+    can_address = capabilities["canAddressWithAgent"] and can_edit and can_execute
     current = {
         **capabilities,
         "canEdit": can_edit,
-        "canAddressWithAgent": capabilities["canAddressWithAgent"] and can_edit and can_execute,
+        "canAddressWithAgent": can_address,
         "canResolveComments": capabilities["canResolveComments"] and can_edit,
     }
+    can_quick_edit = bool(can_address and quick_edit_available())
+    current["canQuickEdit"] = can_quick_edit
+    current["quickEditDirect"] = can_quick_edit and await direct_edit_available(scope)
     # The export route needs `artifact.manage` too, so it offers nothing here.
     if not can_edit and "exportFormats" in capabilities:
         current["exportFormats"] = []

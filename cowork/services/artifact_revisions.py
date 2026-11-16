@@ -946,9 +946,13 @@ def revision_with_content(folder: Path, revision_id: str) -> dict:
 
 def capture_agent_revision(
     folder: Path, *, conversation_id: str | None = None, schedule_id: str | None = None,
-    scope: TenantScope | None = None,
+    scope: TenantScope | None = None, summary: str | None = None,
 ) -> dict | None:
     """Record an agent edit and finish repair handoffs attributed to this turn.
+
+    `summary` is the revision's label for a chat turn's edit
+    (``revision_summaries``: "Agent: Added a pricing section"); without one
+    it reads "Agent updated artifact". A scheduled refresh keeps its own.
 
     `schedule_id` is set only for a turn the scheduler started. Its edit is
     recorded against that schedule, and replaces the schedule's own previous
@@ -1007,6 +1011,20 @@ def capture_agent_revision(
                         manifest.revisions.remove(previous)
                     _write_manifest(folder, manifest)
                     _prune_orphan_blobs(folder, manifest.revisions)
+                elif (
+                    summary
+                    and not schedule_id
+                    and latest.actor is not None
+                    and latest.actor.kind == "system"
+                    and latest.summary == "Captured current draft"
+                ):
+                    # A viewer read captured this turn's write before the turn
+                    # ended; it is the agent's change, so it says so. Keeps
+                    # its id: comments and editors may already hold it.
+                    latest.actor = RevisionActor(kind="agent", id=None)
+                    latest.conversation_id = conversation_id
+                    latest.summary = summary.strip()[:240]
+                    _write_manifest(folder, manifest)
                 _finish_queued_repairs(
                     folder,
                     queued,
@@ -1022,7 +1040,7 @@ def capture_agent_revision(
                 content=content,
                 actor_kind="agent",
                 actor_id=None,
-                summary="Scheduled task updated artifact" if schedule_id else "Agent updated artifact",
+                summary="Scheduled task updated artifact" if schedule_id else (summary or "Agent updated artifact"),
                 base_revision_id=latest_id,
                 conversation_id=conversation_id,
                 comment_thread_ids=[
@@ -1044,6 +1062,93 @@ def capture_agent_revision(
             return entry.to_json()
     except (OSError, UnicodeDecodeError, ValueError, RevisionValidationError, TimeoutError):
         return None
+
+
+def begin_quick_edit(
+    folder: Path, metadata: dict, artifact_id: str, *, expected_revision_id: str | None
+) -> dict:
+    """The source a quick edit (ENG-4227) starts from, or why it may not start.
+
+    Same gates, under the same lock, as ``create_agent_repair``: the head the
+    viewer saw must still be the head (``RevisionConflict``), and a repair
+    that still gates new agent work refuses the edit (``RepairAlreadyPending``),
+    since its turn may be writing the same file. A head moved by a write the
+    journal has not seen yet is captured first, as any read does. Returns
+    ``{"path", "revision"}``: the tracked source and the revision the edit's
+    own revision will follow (its ``previousRevisionId``).
+    """
+    with artifact_lock(folder):
+        source = _current_source_locked(folder, metadata, artifact_id)
+        if expected_revision_id is not None and source.revision.id != expected_revision_id:
+            raise RevisionConflict(source.revision.to_json())
+        partition = _partition_actionable_repairs(folder, _read_manifest(folder), source.path)
+        if partition.blocking:
+            raise RepairAlreadyPending(partition.blocking[0].to_json())
+        return {"path": source.path, "revision": source.revision.to_json()}
+
+
+QUICK_EDIT_SUMMARY_PREFIX = "Quick edit: "
+
+
+def record_quick_edit(
+    folder: Path,
+    metadata: dict,
+    artifact_id: str,
+    *,
+    rel_path: str,
+    base_revision_id: str,
+    summary: str,
+    conversation_id: str | None = None,
+) -> dict | None:
+    """Record the source a quick edit left on disk as ONE new draft revision.
+
+    anton's editor has already written the files (all-or-nothing, no-follow),
+    so unlike ``save_source`` this only journals what is there: the blob and a
+    manifest entry whose base is the revision the edit started from. Undo is
+    then the ordinary restore of that base.
+
+    None when the tracked source is unchanged (the edit touched only other
+    files). When a viewer's read captured the edit first (a "Captured current
+    draft" system revision on top of the base, with these exact bytes), that
+    revision is relabelled in place rather than duplicated: its id may already
+    be an editor's save token.
+    """
+    with artifact_lock(folder):
+        _recover_pending_source_write(folder)
+        target, relative = resolve_source(folder, metadata, rel_path)
+        content = _read_source(target)
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RevisionValidationError("Artifact source is not UTF-8 text") from exc
+        manifest = _read_manifest(folder)
+        head = manifest.head(relative)
+        label = (QUICK_EDIT_SUMMARY_PREFIX + " ".join((summary or "").split())).strip()
+        if head is not None and head.content_hash == _sha(content):
+            if head.id == base_revision_id:
+                return None
+            if (
+                head.actor is not None
+                and head.actor.kind == "system"
+                and head.base_revision_id == base_revision_id
+            ):
+                head.actor = RevisionActor(kind="agent", id=None)
+                head.summary = label[:240]
+                head.conversation_id = conversation_id
+                _write_manifest(folder, manifest)
+            return head.to_json()
+        return _append_revision(
+            folder,
+            manifest,
+            artifact_id=artifact_id,
+            rel_path=relative,
+            content=content,
+            actor_kind="agent",
+            actor_id=None,
+            summary=label,
+            base_revision_id=head.id if head is not None else None,
+            conversation_id=conversation_id,
+        ).to_json()
 
 
 _MAX_PREVIEW_ERRORS = 10

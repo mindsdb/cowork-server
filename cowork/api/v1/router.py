@@ -8,6 +8,8 @@ that can be included in the main FastAPI application.
 from fastapi import APIRouter
 
 from cowork.api.v1.endpoints import (
+    artifact_checks,
+    artifact_quick_edit,
     artifacts,
     artifact_workspace,
     browse,
@@ -42,6 +44,7 @@ from cowork.api.v1.endpoints import (
     settings,
     skill_sharing,
     skills,
+    voice,
 )
 from cowork.api.v1.endpoints.connectors import (
     connections,
@@ -68,6 +71,7 @@ api_router = APIRouter(prefix="/api/v1")
 # ── Canonical routes ─────────────────────────────────────────────────
 api_router.include_router(health.router, prefix="/health", tags=["health"])
 api_router.include_router(browse.router, prefix="/browse", tags=["browser"])
+api_router.include_router(voice.router, prefix="/voice", tags=["voice"])
 api_router.include_router(
     capabilities.router, prefix="/capabilities", tags=["capabilities"]
 )
@@ -103,6 +107,8 @@ api_router.include_router(channels.router, prefix="/channels", tags=["channels"]
 api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
 api_router.include_router(artifacts.live_app_router, prefix="/artifacts", tags=["artifacts", "live-apps"])
 api_router.include_router(artifact_workspace.router, prefix="/artifacts", tags=["artifact-workspace"])
+api_router.include_router(artifact_checks.router, prefix="/artifacts", tags=["artifact-checks"])
+api_router.include_router(artifact_quick_edit.router, prefix="/artifacts", tags=["artifact-workspace"])
 api_router.include_router(comments.router, prefix="/artifact-comments", tags=["artifact-comments"])
 api_router.include_router(live_apps.router, prefix="/live-apps", tags=["live-apps"])
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])

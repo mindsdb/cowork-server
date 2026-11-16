@@ -4,7 +4,7 @@ call it here (ENG-2094).
 Ported from mindshub_inference's front door (ENG-1564, minds/api/v1/permissions.py).
 
 **Each class names the credential the route actually takes.** That is the one
-rule the vocabulary is built on, and it is why there are seven classes rather
+rule the vocabulary is built on, and it is why there are this many classes rather
 than "open" and "closed":
 
 ===========================  =====================================================
@@ -17,6 +17,7 @@ than "open" and "closed":
 ``Authenticated``            a verified ``Principal``
 ``AuthenticatedInOrgMode``   a verified ``Principal``, in org mode only
 ``AuthenticatedOrgAdmin``    ... and org-admin standing
+``TurnKey``                  a live web turn's key this server recorded
 ===========================  =====================================================
 
 An earlier draft had one open marker covering all five non-identity cases, and
@@ -313,6 +314,46 @@ class AuthenticatedOrgAdmin(AuthenticatedInOrgMode):
         if get_app_settings().tenancy_mode == "org" and not can_manage_org(principal):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="requires an org admin")
         return principal
+
+
+class TurnKey:
+    """The credential is a web turn's key: one this server minted for a turn
+    it queued, and recorded because that turn's browser asks the
+    organization's own decision model through this server
+    (cowork.services.decisions_proxy). The check returns whom the key was
+    minted for (``TurnHolder``): the route acts for that organization and
+    person, never for anyone the request names.
+
+    401 for no bearer, or one that is not a recorded key that still lives (a
+    person's API key or sign-in, another turn's key, a key whose turn ended).
+    403 when the request also carries a verified identity (behind the MindsHub
+    gateway) that names another organization or person than the key. 404 off
+    the remote turn queue, where no turn runs in a pod and nothing is ever
+    recorded; 503 when the record can't be read.
+    """
+
+    async def check(
+        self, request: Request, principal: Principal | None = Depends(get_principal)
+    ) -> object:
+        from cowork.common.settings.app_settings import TurnQueueSettings
+        from cowork.principal import caller_bearer
+        from cowork.services import decisions_proxy
+        from cowork.turnqueue.redis_client import get_redis
+
+        if not TurnQueueSettings().is_remote:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        bearer = caller_bearer(request)
+        if not bearer:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+        try:
+            holder = await decisions_proxy.holder(get_redis(), bearer)
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Unavailable") from exc
+        if holder is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+        if principal is not None and (principal.org_id, principal.user_id) != (holder.org_id, holder.user_id):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+        return holder
 
 
 @cache
