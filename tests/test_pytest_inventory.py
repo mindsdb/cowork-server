@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -11,9 +12,12 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from coverage import CoverageData
+from coverage.exceptions import CoverageException
 
 from scripts.pytest_inventory import source_identity
 from scripts.test_inventory import Report, compare, preserve, read_report, summary, validate, validate_junit
+from scripts.test_shards import aggregate, latest_artifact, partition
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -41,7 +45,7 @@ def inventory_suite(tmp_path):
             (root / "conftest.py").write_text(conftest)
         report = tmp_path / f"result {sequence}.json"
         env = {key: value for key, value in os.environ.items() if key not in {
-            "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "COWORK_REQUIRE_SERVICES", "COWORK_REQUIRE_INTEGRATION", "GITHUB_STEP_SUMMARY",
+            "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "COVERAGE_FILE", "COWORK_REQUIRE_SERVICES", "COWORK_REQUIRE_INTEGRATION", "GITHUB_STEP_SUMMARY",
         }}
         env.update(PYTHONPATH=str(plugins), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
         result = subprocess.run(
@@ -455,3 +459,214 @@ def test_complete_evidence_requires_collection_timings(inventory_suite, workers)
         raw["collection_seconds"] = None
     with pytest.raises(ValueError, match="collection"):
         validate(Report.model_validate(raw))
+
+
+def test_nested_coverage_keeps_parent_data(inventory_suite, monkeypatch):
+    """A nested measured pytest run preserves the parent runner's coverage bytes."""
+    root, run = inventory_suite
+    source = root / "sentinel.py"
+    source.write_text("value = 1\n")
+    parent = root.parent / "parent-coverage.data"
+    data = CoverageData(basename=str(parent))
+    data.add_lines({str(source): {1}})
+    data.write()
+    before = parent.read_bytes()
+    monkeypatch.setenv("COVERAGE_FILE", str(parent))
+    result, _, _ = run("-p", "pytest_cov.plugin", "--cov=.", "--cov-report=",
+                       source="def test_child():\n    assert True\n")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert parent.read_bytes() == before
+
+
+@pytest.fixture
+def shard_evidence(inventory_suite, monkeypatch):
+    """Produce a full collection and both real shard reports in an isolated checkout."""
+    root, run = inventory_suite
+    scripts = root / "scripts"
+    scripts.mkdir()
+    for name in ("test_shards.py", "test_inventory.py", "pytest_inventory.py"):
+        shutil.copyfile(_ROOT / "scripts" / name, scripts / name)
+    package = root / "cowork"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "sample.py").write_text("def choose(value):\n    if value:\n        return 1\n    return 0\n")
+    tests = root / "tests"
+    tests.mkdir()
+    (tests / "test_left é.py").write_text('''
+import os
+import pytest
+from cowork.sample import choose
+pytestmark = pytest.mark.feature
+@pytest.mark.parametrize("value", [True, True], ids=['quoted["one"]', 'line\\nnext'])
+def test_left(value):
+    assert not os.environ.get("PROBE_FAIL")
+    assert choose(value) == 1
+''')
+    (tests / "test_right.py").write_text('''
+import pytest
+from cowork.sample import choose
+def test_right():
+    assert choose(False) == 0
+def test_runtime_skip():
+    pytest.skip("runtime prerequisite")
+''')
+    (tests / "test_skip.py").write_text('import pytest\npytest.skip("module prerequisite", allow_module_level=True)\n')
+    (tests / "integration").mkdir()
+    (tests / "integration/test_ignored.py").write_text('raise RuntimeError("integration must stay excluded")\n')
+    monkeypatch.setenv("GITHUB_RUN_ID", "1234")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+    monkeypatch.setenv("GITHUB_JOB", "collect-tests")
+    result, collection, path = run("tests/", "--ignore=tests/integration", "-n", "0", "--collect-only",
+                                   "--test-cohort=broad")
+    assert result.returncode == 0, result.stdout + result.stderr
+    inputs = root.parent / "inputs"
+    collected = inputs / "test-inventory-broad-collection-1234-1"
+    collected.mkdir(parents=True)
+    shutil.copyfile(path, collected / "inventory.json")
+
+    def execute(index: int, attempt: int = 1, *, fail: bool = False):
+        """Run the actual shard CLI with explicit producer context and optional test failure."""
+        environment = {k: v for k, v in os.environ.items() if k not in {
+            "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTHONPATH", "COVERAGE_FILE", "GITHUB_STEP_SUMMARY",
+        }}
+        environment.update(PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTEST_PLUGINS="xdist.plugin,pytest_cov.plugin",
+                           GITHUB_RUN_ATTEMPT=str(attempt), GITHUB_JOB="unit-test-shards")
+        if fail:
+            environment["PROBE_FAIL"] = "1"
+        output = inputs / f"test-inventory-broad-shard-{index}-1234-{attempt}"
+        completed = subprocess.run(
+            [sys.executable, "-m", "scripts.test_shards", "run", "--inputs", str(inputs),
+             "--output", str(output), "--index", str(index)],
+            cwd=root, env=environment, capture_output=True, text=True, timeout=120,
+        )
+        return completed, output
+
+    for index in range(2):
+        result, _ = execute(index)
+        assert result.returncode == 0, result.stdout + result.stderr
+    monkeypatch.setenv("GITHUB_JOB", "unit-tests")
+    monkeypatch.chdir(root)
+    return root, run, inputs, Report.model_validate(collection), execute
+
+
+def test_shards_preserve_cases_skips_and_covered_lines(shard_evidence):
+    """Both real executions preserve the full selection and equal unsharded line coverage."""
+    root, run, inputs, collection, _ = shard_evidence
+    result, control, _ = run("tests/", "--ignore=tests/integration", "-n", "0", "-p", "pytest_cov.plugin",
+                             "--cov=cowork", "--cov-report=")
+    assert result.returncode == 0, result.stdout + result.stderr
+    output = root.parent / "combined"
+    combined = aggregate(inputs, output)
+    assert combined["collected"] == len(collection.collection.items) == 4
+    assert combined["collector_skips"] == 1
+    actual = [read_report(output / f"shard-{i}/inventory.json") for i in range(2)]
+    assert sorted(case.nodeid for report in actual for case in report.collection.items) == sorted(
+        case["nodeid"] for case in control["collection"]["items"])
+    skips = [phase.reason for report in actual for phase in report.phases if phase.outcome == "skipped"]
+    assert skips == ["runtime prerequisite"]
+    data = [CoverageData(basename=str(path)) for path in (root / ".coverage", output / "coverage.data")]
+    for measurement in data:
+        measurement.read()
+    assert {name: set(data[0].lines(name) or []) for name in data[0].measured_files()} == {
+        name: set(data[1].lines(name) or []) for name in data[1].measured_files()}
+
+
+def test_shard_aggregate_rejects_damaged_evidence(shard_evidence):
+    """Missing inputs and altered source, runtime, coverage or membership cannot pass the join."""
+    root, _, inputs, _, _ = shard_evidence
+    shard = inputs / "test-inventory-broad-shard-0-1234-1"
+    report_path = shard / "inventory.json"
+    original = report_path.read_bytes()
+    changes = (
+        ("source", "Shard source"), ("runtime", "runtime"), ("marker", "cases/markers"),
+        ("selection", "selection"), ("coverage", "coverage"), ("worker", "worker"),
+        ("run", "producer identity"),
+    )
+    for fault, message in changes:
+        raw = json.loads(original)
+        if fault == "source":
+            raw["revision"]["tree_digest"] = raw["revision_end"]["tree_digest"] = "f" * 64
+        elif fault == "runtime":
+            raw["environment"]["python"] = "0.0.0"
+        elif fault == "marker":
+            raw["collection"]["items"][0]["markers"] = ["altered"]
+            digest = hashlib.sha256(json.dumps(raw["collection"], sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+            for worker in raw["workers"]:
+                worker["digest"] = digest
+        elif fault == "selection":
+            raw["invocation"]["selection"]["markers"] = "feature"
+        elif fault == "coverage":
+            raw["invocation"]["coverage"]["disabled"] = True
+        elif fault == "worker":
+            raw["workers"].pop()
+        else:
+            raw["environment"]["ci"]["GITHUB_RUN_ID"] = "9999"
+        try:
+            report_path.write_text(json.dumps(raw))
+            with pytest.raises(ValueError, match=message):
+                aggregate(inputs, root.parent / "must-not-pass")
+        finally:
+            report_path.write_bytes(original)
+    coverage = shard / "coverage.data"
+    original_data = coverage.read_bytes()
+    for damaged in (b"", b"not a coverage database"):
+        try:
+            coverage.write_bytes(damaged)
+            with pytest.raises((ValueError, CoverageException)):
+                aggregate(inputs, root.parent / "must-not-pass")
+        finally:
+            coverage.write_bytes(original_data)
+    hidden = shard.with_name("withheld-shard")
+    shard.rename(hidden)
+    try:
+        with pytest.raises(ValueError, match="Missing required artifact"):
+            aggregate(inputs, root.parent / "must-not-pass")
+    finally:
+        hidden.rename(shard)
+
+
+def test_shards_retain_partial_rerun_producers(shard_evidence, monkeypatch):
+    """Numerically latest successful retries combine with carried collection and sibling data."""
+    root, _, inputs, _, execute = shard_evidence
+    for attempt in (9, 10):
+        completed, _ = execute(0, attempt)
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "10")
+    combined = aggregate(inputs, root.parent / "partial-rerun")
+    assert combined["collection_attempt"] == 1
+    assert combined["consumer_attempt"] == 10
+    assert [shard["producer_attempt"] for shard in combined["shards"]] == [10, 1]
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "9")
+    with pytest.raises(ValueError, match="future producer"):
+        latest_artifact(inputs, "test-inventory-broad-shard-0")
+
+
+def test_shard_failure_never_falls_back_to_old_success(shard_evidence, monkeypatch):
+    """A real failed retry preserves its nonzero status and shadows the older passing input."""
+    root, _, inputs, _, execute = shard_evidence
+    completed, output = execute(0, 2, fail=True)
+    assert completed.returncode == 1
+    failed = read_report(output / "inventory.json")
+    assert failed.completion.exitstatus == 1
+    assert any(phase.outcome == "failed" for phase in failed.phases)
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    with pytest.raises(ValueError, match="Newest producer did not succeed"):
+        aggregate(inputs, root.parent / "must-not-pass")
+
+
+def test_shards_reject_unsafe_modules_and_indices(shard_evidence):
+    """Malformed collection paths or indices cannot expand what the runner executes."""
+    root, _, inputs, collection, execute = shard_evidence
+    outside = root.parent / "outside.py"
+    outside.write_text("raise RuntimeError('must not execute')\n")
+    (root / "tests/link.py").symlink_to(outside)
+    for name in ("../outside.py", str(outside), "tests/../outside.py", "--collect-only", "tests/link.py",
+                 "tests/missing.py", "tests/test_right.py::test_right", ""):
+        changed = collection.model_copy(deep=True)
+        changed.collection.items[0].module = name
+        changed.collection.items[0].nodeid = name + "::test_bad"
+        with pytest.raises(ValueError, match="module" if name else "metadata"):
+            partition(changed)
+    completed, output = execute(2)
+    assert completed.returncode != 0
+    assert not output.exists()
