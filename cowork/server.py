@@ -676,16 +676,19 @@ async def lifespan(app: FastAPI):
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
         from cowork.db.session import get_open_session
-        from cowork.scheduler import boot_reap_cutoff
+        from cowork.scheduler import boot_reap_cutoff, post_reaped_run_notices
         from cowork.services.schedules import ScheduleRunService
 
         recovery_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
+            executed: list = []
             reaped = ScheduleRunService(recovery_session).reap_orphaned_runs(
-                started_before=boot_reap_cutoff(),
+                started_before=boot_reap_cutoff(), executed=executed,
             )
             if reaped:
                 logger.warning("Reaped orphaned scheduled runs", extra={"event": "orphaned_runs_reaped", "count": reaped})
+            # Their owners hear the runs didn't finish, as the lease reaper's do.
+            post_reaped_run_notices(recovery_session, [run.id for run in executed])
         finally:
             recovery_session.close()
     except Exception:

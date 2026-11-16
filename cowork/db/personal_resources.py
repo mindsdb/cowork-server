@@ -116,6 +116,9 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     # the person alone) where skills are left shared.
     "skill_user_setting": PersonalResource.SKILLS,
     "schedules": PersonalResource.SCHEDULES,
+    # A person's inbox. Kept with schedules, its first source: a notice
+    # carries its schedule's org_id, so it lands in the same partition.
+    "notices": PersonalResource.SCHEDULES,
     "pins": PersonalResource.PINS,
     # The phones a person registered for push. Org mode only (cowork.services.push),
     # where every resource is partitioned, so this entry decides nothing in a
