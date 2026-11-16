@@ -307,7 +307,19 @@ class CodingSessionFactory:
                     self._selected_project(project, request.resource_ids)
                 )
                 if problem:
-                    raise WorkspaceError(problem)
+                    # Like the options endpoint, treat an unusable project
+                    # default as a preference. An explicit mode or branch
+                    # choice must never silently change where the task works.
+                    if request.workspace_mode is not None or request.repository_setup is not None:
+                        raise WorkspaceError(problem)
+                    try:
+                        workspace_mode = resolve_workspace_mode(
+                            WorkspaceMode.in_place, None,
+                            runs_locally=runs_locally, org_mode=_org_mode(),
+                        )
+                        self.in_place_roots(project, request.resource_ids, request.path)
+                    except (ValueError, WorkspaceError) as exc:
+                        raise WorkspaceError(problem) from exc
             validate_directories(request.additional_dirs)
         except Exception:
             with suppress(KeyError, ValueError):

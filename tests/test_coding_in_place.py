@@ -520,3 +520,40 @@ def test_deleting_an_in_place_project_task_leaves_every_repository_alone(tmp_pat
 
     assert (app / "README.md").read_text(encoding="utf-8") == "keep me\n"
     assert (api / ".git").is_dir()
+
+
+def test_an_unusable_worktree_project_default_falls_back_to_the_offered_local_mode(tmp_path: Path) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    plain = tmp_path / "notes"
+    plain.mkdir()
+    project = service.projects.create(ProjectCreateRequest(
+        name="Notes", folders=[ProjectFolder(id="notes", name="Notes", path=str(plain))],
+        default_engine_id="fake", default_model="fake-model",
+        default_workspace_mode=WorkspaceMode.worktree,
+    ))
+    options = service.workspace_mode_options(project.id, None)
+    assert options.supported == [WorkspaceMode.in_place]
+    assert options.default == WorkspaceMode.in_place
+    created = service.create_session(SessionCreateRequest(project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model")
+    assert wait_for_status(service, created.id, SessionStatus.completed).workspace_mode == options.default
+    for choice in [
+        {"workspace_mode": WorkspaceMode.worktree},
+        {"repository_setup": TaskRepositorySetup(branch="feature/x")},
+    ]:
+        with pytest.raises(WorkspaceError, match="isn't a Git repository|Include a repository"):
+            service.create_session(SessionCreateRequest(project_id=project.id, prompt="Go", **choice), CREDS, "fake", "fake-model")
+
+
+def test_an_unusable_worktree_default_does_not_enable_local_on_windows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset())
+    service = service_with(tmp_path, FakeEngine())
+    plain = tmp_path / "notes"
+    plain.mkdir()
+    project = service.projects.create(ProjectCreateRequest(
+        name="Notes", folders=[ProjectFolder(id="notes", name="Notes", path=str(plain))],
+        default_workspace_mode=WorkspaceMode.worktree,
+        default_engine_id="fake", default_model="fake-model",
+    ))
+    assert service.workspace_mode_options(project.id, None).supported == []
+    with pytest.raises(WorkspaceError, match="isn't a Git repository"):
+        service.create_session(SessionCreateRequest(project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model")
