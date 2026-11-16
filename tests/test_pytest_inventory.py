@@ -571,6 +571,41 @@ def test_shards_preserve_cases_skips_and_covered_lines(shard_evidence):
         name: set(data[1].lines(name) or []) for name in data[1].measured_files()}
 
 
+def test_shards_accept_flat_single_collection_download(shard_evidence, monkeypatch):
+    """A real singleton download runs and joins without losing producer identity checks."""
+    root, _, inputs, _, execute = shard_evidence
+    named = inputs / "test-inventory-broad-collection-1234-1"
+    flat = inputs / "inventory.json"
+    (named / "inventory.json").rename(flat)
+    named.rmdir()
+    original = flat.read_bytes()
+    completed, _ = execute(0, 2)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    combined = aggregate(inputs, root.parent / "flat-combined")
+    assert combined["collection_attempt"] == 1
+    assert [shard["producer_attempt"] for shard in combined["shards"]] == [2, 1]
+    assert flat.read_bytes() == original
+    for key, value, message in (
+        ("GITHUB_RUN_ID", "9999", "producer identity"),
+        ("GITHUB_RUN_ATTEMPT", "3", "producer attempt"),
+        ("GITHUB_RUN_ATTEMPT", "01", "producer attempt"),
+        ("GITHUB_RUN_ATTEMPT", "", "producer attempt"),
+    ):
+        changed = json.loads(original)
+        changed["environment"]["ci"][key] = value
+        try:
+            flat.write_text(json.dumps(changed))
+            with pytest.raises(ValueError, match=message):
+                latest_artifact(inputs, "test-inventory-broad-collection")
+        finally:
+            flat.write_bytes(original)
+    named.mkdir()
+    shutil.copyfile(flat, named / "inventory.json")
+    with pytest.raises(ValueError, match="Duplicate producer attempt"):
+        latest_artifact(inputs, "test-inventory-broad-collection")
+
+
 def test_shard_aggregate_rejects_damaged_evidence(shard_evidence):
     """Missing inputs and altered source, runtime, coverage or membership cannot pass the join."""
     root, _, inputs, _, _ = shard_evidence

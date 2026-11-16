@@ -130,17 +130,10 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --group dev
 
-      - name: Download collection evidence
+      - name: Download collection and shard evidence
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          pattern: test-inventory-broad-collection-${{ github.run_id }}-*
-          path: ${{ runner.temp }}/test-inventory/inputs
-          merge-multiple: false
-
-      - name: Download shard evidence
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          pattern: test-inventory-broad-shard-*-${{ github.run_id }}-*
+          pattern: test-inventory-broad-*-${{ github.run_id }}-*
           path: ${{ runner.temp }}/test-inventory/inputs
           merge-multiple: false
 

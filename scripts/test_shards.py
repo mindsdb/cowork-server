@@ -50,6 +50,15 @@ def latest_artifact(inputs: Path, cohort: str) -> tuple[Path, Report, int]:
     run, consumer = _context()
     prefix = f"{cohort}-{run}-"
     candidates = []
+    flat = inputs / "inventory.json"
+    if cohort == _COLLECTION and (flat.exists() or flat.is_symlink()):
+        report = read_report(_artifact_file(inputs, "inventory.json"))
+        validate(report)
+        _require(report.environment.ci.get("GITHUB_RUN_ID") == run, "Artifact producer identity differs")
+        producer = report.environment.ci.get("GITHUB_RUN_ATTEMPT", "")
+        _require(producer.isascii() and producer.isdecimal() and str(int(producer)) == producer and
+                 0 < int(producer) <= consumer, "Invalid or future producer attempt")
+        candidates.append((int(producer), inputs))
     for path in inputs.glob(prefix + "*"):
         suffix = path.name.removeprefix(prefix)
         _require(suffix.isdecimal() and str(int(suffix)) == suffix and 0 < int(suffix) <= consumer,
@@ -57,6 +66,7 @@ def latest_artifact(inputs: Path, cohort: str) -> tuple[Path, Report, int]:
         _require(path.is_dir() and not path.is_symlink(), "Invalid artifact directory")
         candidates.append((int(suffix), path))
     _require(bool(candidates), "Missing required artifact")
+    _require(len({attempt for attempt, _ in candidates}) == len(candidates), "Duplicate producer attempt")
     attempt, path = max(candidates)
     report = read_report(_artifact_file(path, "inventory.json"))
     validate(report)
