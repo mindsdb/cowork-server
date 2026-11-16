@@ -1093,14 +1093,30 @@ def persist_org_model_availability(
     return True
 
 
+def _parsed_map(stored: str | None) -> dict:
+    try:
+        parsed = json.loads(stored or "{}")
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def persist_image_model_map(
     session, scope, prior_json: str | None, listing: MindsModelListing, *, member_restricted: Collection[str] = (),
 ) -> bool:
     """``persist_enabled_model_map`` for the image models' own availability map.
 
-    A listing with no image models, which is what every gateway predating `kind`
-    returns, leaves the stored map alone, as a failed fetch leaves the chat one.
+    A failed fetch leaves the stored map alone. A good one that lists no image
+    models (including every gateway predating `kind`) empties it, so a retired
+    image model is never handed to Anton.
     """
+    if not listing.image_models:
+        if not (listing.ids or listing.enabled) or _parsed_map(prior_json) == {}:
+            return False
+        from cowork.services.settings import SettingService
+
+        SettingService(session, scope).upsert_setting("minds_image_model_enabled", "{}")
+        return True
     return persist_enabled_model_map(
         session, scope, prior_json, listing.image_models, list(listing.image_models),
         member_restricted=member_restricted, key="minds_image_model_enabled",

@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from types import SimpleNamespace
 
 import pytest
 from anton.core.llm.provider import StreamToolResult
@@ -347,13 +346,25 @@ def test_the_picker_caches_what_resolution_reads(session, monkeypatch):
     assert payload["imageModelDefault"] == stored.resolved_image_model == SUNBURST
 
 
-def test_a_catalog_without_image_models_keeps_the_stored_image_map(session, monkeypatch):
+def test_a_catalog_that_stops_listing_image_models_empties_the_stored_map(session, monkeypatch):
     from cowork.services.settings import SettingService
 
     _desktop_picker(session, monkeypatch, _listing(image_models={FLARE: True}))
     payload = _desktop_picker(session, monkeypatch, _listing(image_models={}))
 
     assert payload["imageModels"] == []
+    stored = SettingService(session, LOCAL_SCOPE).load()
+    assert json.loads(stored.minds_image_model_enabled) == {}
+    assert stored.image_model_for_agent is None
+
+
+def test_a_failed_catalog_fetch_keeps_the_stored_image_map(session, monkeypatch):
+    from cowork.services.providers import _empty_listing
+    from cowork.services.settings import SettingService
+
+    _desktop_picker(session, monkeypatch, _listing(image_models={FLARE: True}))
+    _desktop_picker(session, monkeypatch, _empty_listing())
+
     assert json.loads(SettingService(session, LOCAL_SCOPE).load().minds_image_model_enabled) == {FLARE: True}
 
 
