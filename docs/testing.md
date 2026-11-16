@@ -1,12 +1,12 @@
 # Test evidence and execution cohorts
 
-The broad Linux, desktop export and disposable-service jobs save `inventory.json` and pytest's `junit.xml` as artifacts for 14 days. Artifact names include the cohort, workflow run ID and attempt; desktop export names also include the runner OS so Windows and macOS upload distinct artifacts. The existing test command determines success; missing or inconsistent evidence also fails its reporting step. Reports are uploaded after failing tests when available. Each job still runs its selection once.
+Each broad Linux shard, desktop export job and disposable-service job saves `inventory.json` and pytest's `junit.xml` as artifacts for 14 days. Artifact names include the cohort, workflow run ID and producing attempt; desktop export names also include the runner OS. The broad aggregate retains both real execution reports and combined coverage. Test exit status and complete, consistent evidence determine success. Reports are uploaded after failing tests when available. Each execution job runs its selection once per producing attempt.
 
 ## Which tests run
 
 | Cohort | Existing command/selection | Execution |
 | --- | --- | --- |
-| Broad PR | `make test/unit/coverage`: `tests/ --ignore=tests/integration`, coverage of `cowork` | One local xdist worker per logical CPU; `PYTEST_WORKERS=0` is the serial control |
+| Broad PR | Full collection of `tests/ --ignore=tests/integration`, coverage of `cowork` | Two Linux shards, four xdist workers each; aggregate checks complete union and combined coverage |
 | Disposable services | `make test/services`: `tests/ -m "redis_service or postgres_service"` | Serial; real disposable Redis/PostgreSQL, required prerequisites, exclusive Redis failover operations |
 | Desktop export | The ten files below, with `-rs` | Serial on each Windows/macOS matrix runner; cohort `desktop-export` |
 | Deployed | `make test/integration`: `tests/integration -m "not production_read_only and not redis_service"` | Existing deployment job; documented here, not profiled by this tooling change |
@@ -23,6 +23,18 @@ Comparison tests retain all 147 cases. Eighteen wiring, validation, dispatch and
 Org-list scaling tests keep their 1,000-item datasets and HTTP SQL/file-call assertions. Timed artifact batches write the same files, metadata timestamps and ORM ownership rows with one project lookup and one write commit per nonempty batch. Seeding finishes before request measurements; empty batches do no work. Single-artifact seeding and application/resource fixtures remain unchanged.
 
 Shared coding repository fixtures disable automatic maintenance and garbage collection in each disposable repository before its first commit. Background Git housekeeping can otherwise change the object store during strict before/after snapshot checks. Those checks still compare every source-object file; application Git behavior and global configuration remain unchanged.
+
+## Broad CI shards
+
+The preparation job collects the full broad selection without executing it. Modules are sorted by descending collected-case count, with lexical ties, and assigned to the shard with fewer cases. Both groups include their whole modules; collection skips remain assigned and new cases enter automatically. There is no committed timing table. Each shard keeps its actual schema-1 inventory, JUnit and nonhidden `coverage.data` outside the checkout. Local `make test/unit/coverage` stays unsharded, using one worker per logical CPU by default and `PYTEST_WORKERS=0` for a serial control.
+
+The required `run-unit-tests / unit-tests` check now verifies preparation and both matrix jobs succeeded, then requires exact, disjoint coverage of the full collected IDs, module ownership, markers and collector skips. Missing evidence, unsuccessful execution, source/runtime/configuration differences or incomplete workers fail the check. Both coverage inputs must be readable, nonempty package measurements with matching settings; the combined measured lines/arcs must equal their union. Only combined coverage is reported. No numeric fail-under policy is added.
+
+Artifacts retain their producing attempts. Partial reruns may reuse an earlier successful collection or sibling shard from the same workflow run. The helper selects each cohort's newest producer at or before the consumer attempt, validates its identity and records the selected attempts. It never falls back from invalid newest evidence to an older passing result. Runtime/image changes require rerunning `collect-tests`, which reruns its broad-test dependents. No artifacts from another run are used.
+
+The canonical `test-inventory-broad-<run>-<attempt>` artifact contains `collection.json`, `summary.json`, combined `coverage.json`/`coverage.data`, and `shard-0/`/`shard-1/` directories with the original execution reports and coverage inputs. The summary composes genuine executions; it is not a synthetic schema-1 report. Use `scripts/test_inventory.py check` on each shard inventory/JUnit. Earlier single-run artifacts retain their original layout, and desktop/service artifacts are unchanged.
+
+Measure broad CI latency from preparation start through aggregate completion. The aggregate check's own short job duration is not the suite runtime. Compare original cases' outcomes and skips separately when validating a workflow change; a full collection alone does not prove execution equivalence. Inventory probes clear inherited `COVERAGE_FILE` before launching their own measured child pytest runs, so those children cannot replace the enclosing shard's coverage.
 
 ## Record a run
 

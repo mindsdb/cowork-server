@@ -11,13 +11,10 @@ defaults:
     shell: bash
 
 jobs:
-  unit-tests:
+  collect-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-
-      - name: Choose test evidence directory
-        run: echo "TEST_REPORT_DIR=$RUNNER_TEMP/test-inventory/broad" >> "$GITHUB_ENV"
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
@@ -36,27 +33,129 @@ jobs:
       - name: Check exported release dependencies
         run: python scripts/release_contract.py --check
 
-      - name: Run unit tests
+      - name: Collect the complete broad selection
         run: >-
-          make test/unit/coverage MAKEOVERRIDES=
-          PYTEST="uv run --locked python -m pytest -p scripts.pytest_inventory
-          --test-cohort=broad --test-inventory='$TEST_REPORT_DIR/inventory.json'
-          --junitxml='$TEST_REPORT_DIR/junit.xml'"
+          uv run --locked python -m pytest tests/ --ignore=tests/integration
+          --collect-only -qq -n 0 -p scripts.pytest_inventory --test-cohort=broad
+          --test-inventory="$RUNNER_TEMP/test-inventory/collection/inventory.json"
 
       - name: Check and summarize test evidence
         if: always()
         run: >-
           uv run --locked python scripts/test_inventory.py check
-          "$TEST_REPORT_DIR/inventory.json" --junit "$TEST_REPORT_DIR/junit.xml"
+          "$RUNNER_TEMP/test-inventory/collection/inventory.json"
 
       - name: Upload test evidence
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
+          name: test-inventory-broad-collection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/test-inventory/collection/inventory.json
+          if-no-files-found: error
+          retention-days: 14
+
+  unit-test-shards:
+    needs: collect-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.30"
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Download collection evidence
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: test-inventory-broad-collection-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/test-inventory/inputs
+          merge-multiple: false
+
+      - name: Run broad shard
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: >-
+          uv run --locked python -m scripts.test_shards run --index "$SHARD_INDEX"
+          --inputs "$RUNNER_TEMP/test-inventory/inputs"
+          --output "$RUNNER_TEMP/test-inventory/shard-$SHARD_INDEX"
+
+      - name: Check and summarize shard evidence
+        if: always()
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: >-
+          uv run --locked python scripts/test_inventory.py check
+          "$RUNNER_TEMP/test-inventory/shard-$SHARD_INDEX/inventory.json"
+          --junit "$RUNNER_TEMP/test-inventory/shard-$SHARD_INDEX/junit.xml"
+
+      - name: Upload shard evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: test-inventory-broad-shard-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/test-inventory/shard-${{ matrix.shard }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  unit-tests:
+    needs: [collect-tests, unit-test-shards]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the complete broad execution
+        env:
+          COLLECTION_RESULT: ${{ needs.collect-tests.result }}
+          SHARDS_RESULT: ${{ needs.unit-test-shards.result }}
+        run: |
+          test "$COLLECTION_RESULT" = success
+          test "$SHARDS_RESULT" = success
+
+      - uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.30"
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Download collection evidence
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: test-inventory-broad-collection-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/test-inventory/inputs
+          merge-multiple: false
+
+      - name: Download shard evidence
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: test-inventory-broad-shard-*-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/test-inventory/inputs
+          merge-multiple: false
+
+      - name: Verify broad union and report combined coverage
+        run: >-
+          uv run --locked python -m scripts.test_shards aggregate
+          --inputs "$RUNNER_TEMP/test-inventory/inputs"
+          --output "$RUNNER_TEMP/test-inventory/broad"
+
+      - name: Upload combined evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
           name: test-inventory-broad-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ env.TEST_REPORT_DIR }}/inventory.json
-            ${{ env.TEST_REPORT_DIR }}/junit.xml
+          path: ${{ runner.temp }}/test-inventory/broad/
           if-no-files-found: error
           retention-days: 14
 
