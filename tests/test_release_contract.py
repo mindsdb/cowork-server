@@ -98,3 +98,23 @@ def test_export_refuses_changed_project_metadata_without_rewriting_lock(tmp_path
     assert release.main() != 0
     assert lock.read_bytes() == original
     assert contract.read_text() == ""
+
+
+def test_final_pins_pass_the_production_check():
+    export = (
+        "anton-agent==2.26.11.15.1 \\\n"
+        "    --hash=sha256:abc\n"
+        "pywin32==311 ; sys_platform == 'win32' \\\n"
+        "    --hash=sha256:def\n"
+        "certifi==2026.10.5.post1\n"
+        "torch==2.9.0+cpu\n"
+    )
+    assert release.unreleased_pins(export) == []
+
+
+@pytest.mark.parametrize(
+    "version", ["2.26.11.13.1rc3", "2.26.10.29.1rc4", "1.0a1", "1.0b2", "1.0.dev3", "1.0rc1.post1", "not-a-version"]
+)
+def test_production_check_refuses_pre_release_dev_and_unparseable_pins(version):
+    export = f"aiohttp==3.14.0 \\\n    --hash=sha256:abc\nanton-agent=={version} \\\n    --hash=sha256:def\n"
+    assert release.unreleased_pins(export) == [f"anton-agent=={version}"]

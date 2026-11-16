@@ -110,6 +110,29 @@ jobs:
       default-permissions: read
     secrets: inherit
 
+  final-release-lock:
+    # Desktop installs exactly the anton-agent this lock names. Staging may lock
+    # a release candidate to test it; production may not (ENG-4101, ENG-4355).
+    # Runs on every PR into main, so the release PR goes red before it merges,
+    # not after the wheel is on PyPI. Ungated: GitHub-hosted and secret-free.
+    if: github.base_ref == 'main'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.30"
+          python-version: "3.12"
+
+      - name: Refuse a lock that pins a pre-release
+        run: python scripts/release_contract.py --check --require-final
+
   build-deploy:
     needs: [gate]
     if: needs.gate.outputs.run == 'true'
