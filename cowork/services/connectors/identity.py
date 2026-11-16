@@ -133,11 +133,15 @@ def spec_secret_fields(connector_id: str, method: str | None, form: dict | None 
 # `account_email` as a synthetic composite placeholder — `org:<slug>` (see
 # `_fetch_userinfo_supabase`) or `<email>:<workspace_id>`/
 # `<email>:<organization_id>` (see `_fetch_userinfo_linear`/
-# `_fetch_userinfo_posthog`) — rather than a real, displayable email. Shared
-# so any caller falling back from `account_name` to `account_email` can skip
-# that fallback for exactly these three instead of leaking the composite
-# string.
-SYNTHETIC_ACCOUNT_EMAIL_ENGINES = frozenset({"supabase", "linear", "posthog"})
+# `_fetch_userinfo_posthog`, and Notion's MCP identity bridge) — rather than a
+# real, displayable email. Shared so any caller falling back from
+# `account_name` to `account_email` can skip that fallback for exactly these
+# engines instead of leaking the composite string.
+SYNTHETIC_ACCOUNT_EMAIL_ENGINES = frozenset({"supabase", "linear", "posthog", "notion"})
+
+# Of those, the engines whose composite starts with the person's real email
+# (`<email>:<workspace_id>`) and whose subtitle shows that email.
+EMAIL_SUBTITLE_ENGINES = frozenset({"notion"})
 
 
 def connection_display_name(fields: dict, engine: str = "") -> str | None:
@@ -157,7 +161,7 @@ def connection_display_name(fields: dict, engine: str = "") -> str | None:
     engine id, so a stored ``_user_label`` can repeat the title.
 
     ``account_name`` is checked first only for ``SYNTHETIC_ACCOUNT_EMAIL_ENGINES``
-    (supabase/linear/posthog): their ``account_email`` is a synthetic
+    (supabase/linear/posthog/notion): their ``account_email`` is a synthetic
     placeholder, not a real email/display value, so the human org/workspace
     name is more useful there. Every other engine populates a real
     ``account_email`` already, and ``account_name`` there is just a
@@ -166,6 +170,12 @@ def connection_display_name(fields: dict, engine: str = "") -> str | None:
     emails.
     """
     f = fields or {}
+    if engine in EMAIL_SUBTITLE_ENGINES:
+        # Like HubSpot's: the workspace is already the title (the
+        # connection's label), so the subtitle names the person who connected.
+        email = str(f.get("account_email", "")).split(":", 1)[0].strip()
+        if "@" in email:
+            return email
     keys = (
         ("account_name", "email", "account_email")
         if engine in SYNTHETIC_ACCOUNT_EMAIL_ENGINES

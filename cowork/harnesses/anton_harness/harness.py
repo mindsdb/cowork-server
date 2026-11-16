@@ -53,6 +53,7 @@ from cowork.models.conversation import Conversation
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
+from cowork.services.connectors.notion_pages import describe_project_pages
 from cowork.services.conversations import read_earlier_answers
 from cowork.services.live_apps import (
     TurnLiveApps,
@@ -1872,8 +1873,9 @@ class AntonHarness:
         data_vault = None
         turn_scratch_dir: Path | None = None
         if LocalDataVault is not None:
+            from cowork.services.connectors import app_held
             from cowork.services.connectors.layered_vault import FilteredDataVault
-            from cowork.services.connectors.persist import turn_vault_for_scope
+            from cowork.services.connectors.persist import own_vault_root, turn_vault_for_scope
 
             # The asker's own connections, with the operator's managed ones
             # over them and the ones others share with the asker after them,
@@ -1890,6 +1892,10 @@ class AntonHarness:
                 )
             else:
                 data_vault = source_vault
+            if app_held.active():
+                data_vault = app_held.AppHeldVault(
+                    source=data_vault, root=own_vault_root(current_settings_scope())
+                )
             # Registers this turn's DS_* names and values for scrubbing, and
             # touches no process state, so a concurrent turn's are left alone.
             from anton.utils.datasources import restore_namespaced_env
@@ -1936,6 +1942,10 @@ class AntonHarness:
                 # `data_vault` is already filtered by `disabled_connections`.
                 connector_usage_notes = await scope_usage_notes(
                     c["engine"] for c in vault_connections
+                )
+
+                integration_guidance += describe_project_pages(
+                    service.picked_files_by_project(data_vault, conversation.project.name, engine="notion")
                 )
 
             cells = extract_scratchpad_cells(history.events)

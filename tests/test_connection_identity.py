@@ -267,6 +267,39 @@ class TestGetMaskingFallback:
         assert detail.fields["app_password"] == VAULT_KEEP_SENTINEL  # secret masked
 
 
+class TestNotionTileIdentity:
+    """A Notion connection's tile reads like HubSpot's: the workspace as the
+    title, the person's email as the subtitle."""
+
+    def _listed(self, tmp_path, monkeypatch, engine, fields):
+        vault = LocalDataVault(tmp_path)
+        vault.save(engine, "conn", {"_connector_id": engine, "_method": "mcp", **fields})
+        svc = ConnectionsService()
+        monkeypatch.setattr(svc, "_vault", lambda: vault)
+        [row] = [r for r in svc.list() if r.engine == engine]
+        return row
+
+    def test_notion_shows_the_workspace_and_the_email(self, tmp_path, monkeypatch):
+        row = self._listed(tmp_path, monkeypatch, "notion", {
+            "_user_label": "MindsDB", "account_name": "MindsDB",
+            "account_email": "user@example.com:4b08f533-211a-4df6-bc9e-13b4af1bf8a3",
+        })
+        assert row.user_label == "MindsDB"
+        assert row.display_name == "user@example.com"
+
+    def test_hubspot_reads_the_same_way(self, tmp_path, monkeypatch):
+        row = self._listed(tmp_path, monkeypatch, "hubspot", {
+            "_user_label": "MindsHub", "account_name": "MindsHub", "account_email": "user@example.com",
+        })
+        assert (row.user_label, row.display_name) == ("MindsHub", "user@example.com")
+
+    def test_notion_without_an_email_falls_back_to_the_workspace(self, tmp_path, monkeypatch):
+        row = self._listed(tmp_path, monkeypatch, "notion", {
+            "_user_label": "MindsDB", "account_name": "MindsDB", "account_email": "user-id-123:ws-1",
+        })
+        assert row.display_name == "MindsDB"
+
+
 class TestConnectionLabel:
     """A human label ("Support") names a connection without changing its
     identity/slug, settable at save time (form field) or after (agent tool)."""
@@ -470,6 +503,10 @@ class TestOAuthDefaultLabel:
 
     def test_returns_none_when_neither_present(self):
         assert oauth_default_label({}, "gmail") is None
+
+    def test_notion_label_stays_the_workspace(self):
+        fields = {"account_name": "MindsDB", "account_email": "user@example.com:ws-1"}
+        assert oauth_default_label(fields, "notion") == "MindsDB"
 
     def test_does_not_fall_back_to_synthetic_account_email_for_linear_supabase_posthog(self):
         # account_email is a synthetic composite placeholder for these three

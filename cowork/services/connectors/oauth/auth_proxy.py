@@ -20,6 +20,8 @@ endpoints.
 """
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import httpx
 from fastapi import HTTPException, Request, status
 
@@ -133,6 +135,18 @@ async def proxy_connection_detail(engine: str, name: str, request: Request, sett
     the picked-files grant, so it had persisted server-side but had no read
     path back to this panel)."""
     return await _relay("GET", f"/v1/oauth/{engine}/{name}", request=request, settings=settings)
+
+
+async def proxy_remove_picked_file(
+    engine: str, name: str, file_id: str, project: str, request: Request, settings: OAuthSettings,
+) -> list[dict]:
+    """Untag one picked file from `project` in auth's Data Vault, dropping
+    it once no project is left. auth supports this for Notion pages only."""
+    result = await _relay(
+        "DELETE", f"/v1/oauth/{engine}/{name}/picked-files/{quote(file_id, safe='')}",
+        request=request, settings=settings, params={"project": project},
+    )
+    return result.get("files", [])
 
 
 async def proxy_delete(engine: str, name: str, request: Request, settings: OAuthSettings) -> None:
