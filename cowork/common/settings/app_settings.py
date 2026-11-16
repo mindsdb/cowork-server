@@ -624,6 +624,10 @@ class OAuthSettings(Settings):
 
     posthog_client_id: str = Field(default="", validation_alias=AliasChoices("POSTHOG_CLIENT_ID"))
 
+    # Notion MCP is a public client like PostHog: the id is our hosted Client
+    # ID Metadata Document's URL, and there is no secret.
+    notion_client_id: str = Field(default="", validation_alias=AliasChoices("NOTION_CLIENT_ID"))
+
     # HubSpot's MCP Auth App — a fixed client_id/secret pair, same shape as
     # Google/Linear/GitHub/Supabase, but the resulting token can only call
     # HubSpot's remote MCP server, never its REST API.
@@ -1337,6 +1341,41 @@ class AppSettings(Settings):
                 "path (no query, fragment or credentials)"
             )
         return normalized
+
+    browser_decisions_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_DECISIONS_URL"),
+        description=(
+            "The full URL at which a cloud pod reaches this server's decisions proxy "
+            "(POST /api/v1/browse/decisions), for example "
+            "https://cowork.mindshub.ai/api/v1/browse/decisions. A web turn's browser "
+            "asks the organization's own decision model through it with the turn's "
+            "key, so the organization's key never reaches the pod "
+            "(cowork.services.decisions_proxy). https with an optional path; the "
+            "trailing slash is dropped. Blank (default): the route under "
+            "COWORK_PUBLIC_BASE_URL when that is https; without either, web turns "
+            "pick browser steps with Jev on MindsHub."
+        ),
+    )
+
+    @field_validator("browser_decisions_url", mode="before")
+    @classmethod
+    def _check_browser_decisions_url(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            return "" if value is None else value
+        normalized = _router_url(value)
+        if normalized is None:
+            raise ValueError(
+                "COWORK_BROWSER_DECISIONS_URL must be an https URL with an optional "
+                "path (no query, fragment or credentials)"
+            )
+        return normalized
+
+    voice_operator_model: str = Field(
+        default=MINDS_FREE_MODEL,
+        validation_alias=AliasChoices("COWORK_VOICE_OPERATOR_MODEL"),
+        description="The MindsHub model that turns a voice call's requests into app actions (cowork.services.voice_operator).",
+    )
 
     browser_scope_key_file: str = Field(
         default="",
