@@ -8,6 +8,7 @@ from pydantic import SecretStr, ValidationError
 from sqlmodel import Session, select
 
 from cowork.common.encryption import decrypt, encrypt
+from cowork.common.event_clock import approvals_off_ms
 from cowork.common.settings.runtime_credential import get_minds_credential
 from cowork.common.settings.user_settings import (
     BUDGET_SETTING_KEYS,
@@ -364,6 +365,19 @@ class SettingService:
         if self._own_row("limits_enabled") is None:
             self.session.add(self._new_row("limits_enabled", "True"))
 
+    def _stamp_approvals_off(self, *, writes: dict[str, str]) -> None:
+        """A write of ``browser_approve_steps`` as false stamps
+        ``browser_approve_steps_off_at`` with now, in epoch milliseconds by
+        this server's clock, the clock that stamps each event's ``at_ms``.
+        ``approvals_off_ms`` keeps it at or after every ``at_ms`` this process
+        handed out, so a clock stepped back can't approve a step held before
+        the write. Every such write moves it, one that finds approvals
+        already off included, so a held step's card the person turns
+        approvals off from stays theirs. The settings routes refuse a
+        client's own value for it."""
+        if writes.get("browser_approve_steps") == "False":
+            self._write_row("browser_approve_steps_off_at", str(approvals_off_ms()))
+
     def upsert_setting(self, key: str, value: str) -> SettingResponse:
         self._require_writable()
         store_val, validated = self._encode_for_store(key, value)
@@ -371,6 +385,7 @@ class SettingService:
         try:
             self._write_row(key, store_val)
             self._opt_in_with_budgets({key: store_val})
+            self._stamp_approvals_off(writes={key: store_val})
             self.session.commit()
         except Exception:
             self.session.rollback()
@@ -403,6 +418,7 @@ class SettingService:
             for key, store_val in encoded.items():
                 self._write_row(key, store_val)
             self._opt_in_with_budgets(encoded)
+            self._stamp_approvals_off(writes=encoded)
             if encoded:
                 self.session.commit()
         except Exception:
