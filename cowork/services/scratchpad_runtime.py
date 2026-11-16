@@ -203,6 +203,7 @@ def get_or_create(
     coding_api_key: str = "",
     coding_base_url: str = "",
     cell_sandbox: CellSandbox | None = None,
+    image_model: str | None = None,
 ):
     refuse_a_missing_policy(cell_sandbox, site="a backend pool's scratchpad")
     _touch_activity()
@@ -235,7 +236,7 @@ def get_or_create(
         coding_api_key=api_key,
         coding_base_url=base_url,
         cell_sandbox=cell_sandbox,
-        image_model=_resolve_image_model(),
+        image_model=_resolve_image_model() if image_model is None else image_model,
     )
     pads[name] = _CachedPad(pad, cell_sandbox)
     return pad
@@ -299,16 +300,22 @@ class WorkspaceScopedPool:
         self.cell_sandbox = cell_sandbox
 
     async def venv_python(self, name: str) -> Optional[str]:
-        pad = self._pad(name)
+        pad = await self._pad(name)
         # Off-thread because `_ensure_venv` may shell out to `uv venv` /
         # `python -m venv` on first call (cold-start cost is seconds).
         await asyncio.to_thread(pad._ensure_venv)
         return pad._venv_python
 
     async def get_or_create(self, name: str):
-        return self._pad(name)
+        return await self._pad(name)
 
-    def _pad(self, name: str):
+    async def _pad(self, name: str):
+        # The image model is a settings read, so it is resolved off the loop and only for a new pad.
+        cached = _pads.get(_resolve_workspace(self._workspace_path), {}).get(name)
+        image_model = None if cached is not None else await asyncio.to_thread(_resolve_image_model)
         return get_or_create(
-            name, workspace_path=self._workspace_path, cell_sandbox=self.cell_sandbox
+            name,
+            workspace_path=self._workspace_path,
+            cell_sandbox=self.cell_sandbox,
+            image_model=image_model,
         )
