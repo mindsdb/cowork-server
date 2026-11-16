@@ -84,7 +84,11 @@ async function read(url, limit = 0) {
 // Counts the bytes as they arrive: a draft streams its files without
 // Content-Length, and a file over the limit must not be read whole first.
 async function readCapped(response, limit) {
-  if (!response.body) return new Uint8Array(await response.arrayBuffer());
+  if (!response.body) {
+    const whole = new Uint8Array(await response.arrayBuffer());
+    if (whole.byteLength > limit) throw new ViewerError('too-large');
+    return whole;
+  }
   const reader = response.body.getReader();
   const chunks = [];
   let total = 0;

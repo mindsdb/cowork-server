@@ -465,7 +465,7 @@ def _run_pdf_shim(pdf_assets, *, observer, scenario=""):
 
 
 def test_the_shim_installs_pdf_embeds_only_with_an_address():
-    assert _run_pdf_shim("/_t/v1.x/_anton_pdf/", observer="record")["observed"] == [["src", "data", "type"]]
+    assert _run_pdf_shim("/_t/v1.x/_anton_pdf/", observer="record")["observed"] == [["src", "data", "type", "srcdoc"]]
     assert _run_pdf_shim(None, observer="record")["observed"] == []
 
 

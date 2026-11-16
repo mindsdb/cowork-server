@@ -158,7 +158,8 @@ function installPdfEmbeds(w, options) {
   // <iframe>: the same element with srcdoc, taken out and put back in place.
   function swapIframe(el) {
     var state = states.get(el);
-    // The browser shows the page's own srcdoc and ignores src.
+    // The browser shows the page's own srcdoc and ignores src; srcdoc is
+    // observed, so the element is replaced once the page drops it.
     if (!state && el.hasAttribute('srcdoc')) return;
     var raw = el.getAttribute('src');
     if (state && raw === state.src && el.hasAttribute('srcdoc')) return;
@@ -289,7 +290,7 @@ function installPdfEmbeds(w, options) {
         report(err);
       }
     }
-  }).observe(doc, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'data', 'type'] });
+  }).observe(doc, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'data', 'type', 'srcdoc'] });
 
   if (doc.documentElement) scan(doc.documentElement);
 
