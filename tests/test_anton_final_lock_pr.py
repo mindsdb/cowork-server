@@ -167,7 +167,8 @@ def test_reconcile_pushes_once_then_refreshes_from_new_staging(repo, tmp_path, m
     ([{"number": 7, "title": TITLE.replace("1.0rc1", "0.9rc1"), "mergedAt": None}], True),
     ([], True),
 ])
-def test_a_declined_proposal_is_not_reopened(repo, tmp_path, monkeypatch, closed, proposes):
+@pytest.mark.parametrize("closer, active", [("reviewer", False), ("test[bot]", False), ("reviewer", True)])
+def test_a_declined_proposal_is_not_reopened(repo, tmp_path, monkeypatch, closed, proposes, closer, active):
     remote = tmp_path / "remote.git"
     pr.run("git", "init", "--bare", "-q", str(remote))
     pr.run("git", "remote", "add", "origin", str(remote))
@@ -178,7 +179,9 @@ def test_a_declined_proposal_is_not_reopened(repo, tmp_path, monkeypatch, closed
             return real_run(*args)
         calls.append(args)
         if args[1:3] == ("pr", "list"):
-            return json.dumps(closed) if "closed" in args else "[]"
+            return json.dumps(closed) if "closed" in args else ('[{"number": 42}]' if active else "[]")
+        if args[1] == "api" and args[2].startswith("repos/"):
+            return closer
         return "123" if args[1] == "api" else ""
     monkeypatch.setattr(pr, "run", run)
     for key, value in {"REPO": "mindsdb/cowork-server", "BRANCH": "bot/anton-final-lock",
@@ -187,5 +190,9 @@ def test_a_declined_proposal_is_not_reopened(repo, tmp_path, monkeypatch, closed
         monkeypatch.setenv(key, value)
     write_lock("1.0", "1")
     pr.main()
-    assert any(c[1:3] == ("pr", "create") for c in calls) == proposes
-    assert bool(pr.remote_head("bot/anton-final-lock")) == proposes
+    expected = proposes or closer == "test[bot]" or active
+    action = "edit" if active else "create"
+    assert any(c[1:3] == ("pr", action) for c in calls) == expected
+    assert bool(pr.remote_head("bot/anton-final-lock")) == expected
+    if active:
+        assert not any(c[1:3] == ("pr", "list") and "closed" in c for c in calls)

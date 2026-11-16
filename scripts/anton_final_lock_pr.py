@@ -56,17 +56,25 @@ def main() -> None:
     # A person who closed this exact proposal without merging declined it, for
     # example because the final lacks the candidate's code. Don't reopen it.
     # A newer final or a newly locked candidate changes the title and is proposed.
-    closed = json.loads(run("gh", "pr", "list", "--repo", repo, "--base", "staging", "--head", branch,
-                            "--state", "closed", "--limit", "50", "--json", "number,title,mergedAt"))
-    declined = next((p for p in closed if p["title"] == title and not p["mergedAt"]), None)
-    if declined:
-        print(f"#{declined['number']} proposed this and was closed without merging; not reopening",
-              file=sys.stderr)
-        return
+    bot = os.environ["APP_SLUG"] + "[bot]"
+    if not number:
+        closed = json.loads(run("gh", "pr", "list", "--repo", repo, "--base", "staging", "--head", branch,
+                                "--state", "closed", "--limit", "50", "--json", "number,title,mergedAt"))
+        for proposal in closed:
+            if proposal["title"] != title or proposal["mergedAt"]:
+                continue
+            # The issue endpoint records the latest closing actor, including
+            # after a reopen. Bot cleanup is not a person's rejection. Reading
+            # the actor also handles proposals closed before this distinction.
+            closer = run("gh", "api", f"repos/{repo}/issues/{proposal['number']}",
+                         "--jq", '.closed_by.login // ""')
+            if closer != bot:
+                print(f"#{proposal['number']} was closed outside bot cleanup; not reopening",
+                      file=sys.stderr)
+                return
     previous = remote_head(branch)
     if previous:
         run("git", "fetch", "--depth=2", "origin", previous)
-    bot = os.environ["APP_SLUG"] + "[bot]"
     bot_id = run("gh", "api", f"/users/{bot}", "--jq", ".id")
     run("git", "config", "user.name", bot)
     run("git", "config", "user.email", f"{bot_id}+{bot}@users.noreply.github.com")
