@@ -75,3 +75,34 @@ def test_a_final_with_nothing_installable_is_skipped(files):
 def test_the_locked_version_is_read_from_the_export():
     export = "aiohttp==3.14.0 \\\n    --hash=sha256:a\nanton-agent==2.26.11.13.1rc3 \\\n    --hash=sha256:b\n"
     assert lock.locked_version(export) == "2.26.11.13.1rc3"
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("2.26.11.15.1", "2.26.11.15.1"), ("", None), ("2.26.11.16.1rc1", None), ("not-a-version", None),
+])
+def test_only_a_final_announcement_is_waited_for(value, expected):
+    assert lock.announced_final(value) == expected
+
+
+def test_waits_until_pypi_lists_the_announced_final():
+    listings = iter([{"2.26.11.9.1": FILE}, {"2.26.11.9.1": FILE}, {"2.26.11.9.1": FILE, "2.26.11.15.1": FILE}])
+    sleeps = []
+    releases = lock.releases_listing("2.26.11.15.1", fetch=lambda: next(listings), sleep=sleeps.append,
+                                     attempts=5, interval=1)
+    assert "2.26.11.15.1" in releases
+    assert sleeps == [1, 1]
+
+
+def test_no_announcement_reads_pypi_once():
+    calls = []
+    def fetch():
+        calls.append(1)
+        return {"2.26.11.9.1": FILE}
+    lock.releases_listing(None, fetch=fetch, sleep=lambda _: None)
+    assert len(calls) == 1
+
+
+def test_gives_up_when_pypi_never_lists_the_announced_final():
+    with pytest.raises(RuntimeError, match="periodic run will retry"):
+        lock.releases_listing("2.26.11.15.1", fetch=lambda: {"2.26.11.15.1": [{"yanked": True}]},
+                              sleep=lambda _: None, attempts=3, interval=0)
