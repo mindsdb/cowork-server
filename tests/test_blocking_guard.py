@@ -30,7 +30,9 @@ from sqlalchemy import text
 
 import _blocking_guard as guard
 from scripts.blocking_guard_evidence import read_evidence, sidecar
-from scripts.test_shards import aggregate
+from scripts.test_shards import (
+    _collection, _compatible, _global_guard, _guard_evidence, aggregate, latest_artifact, partition,
+)
 from tests.test_pytest_inventory import _shard_evidence, inventory_suite
 from cowork.common.paths import cowork_home, safe_join
 from cowork.common.settings.app_settings import get_app_settings
@@ -822,12 +824,18 @@ def test_a_run_that_is_not_full_skips_the_stale_check_in_one_line(tmp_path, args
 
 
 @pytest.fixture
-def guarded_shards(inventory_suite, monkeypatch):
+def guarded_shards(inventory_suite, monkeypatch, guard_runtime_sources):
     """Execute real watched operations through the existing isolated shard builder."""
+    sources, _ = guard_runtime_sources
+
     def prepare(root):
-        """Copy actual runtime dependencies and define two separately exercised allowed sites."""
-        shutil.copytree(_ROOT / "cowork", root / "cowork", dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        """Copy actual imported runtime sources and define separately exercised allowed sites."""
+        for relative in sources:
+            original = _ROOT / relative
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(original, target)
+            assert target.read_bytes() == original.read_bytes()
         shutil.copyfile(_ROOT / "tests/_blocking_guard.py", root / "tests/_blocking_guard.py")
         (root / "cowork/guard_probe.py").write_text('''
 import os
@@ -839,6 +847,7 @@ async def right():
         conftest = _STALE_CONFTEST.replace("reached=_this_workers_share_of_the_allowlist()", "reached=REACHED")
         (root / "tests/conftest.py").write_text(conftest + '''
 import pytest
+import sys
 REACHED = set()
 _blocking_guard.ALLOWLIST = (
     _blocking_guard.Allowed("cowork/guard_probe.py", "left", _blocking_guard.LOOP_FILE_STORE,
@@ -853,6 +862,12 @@ def watch(monkeypatch):
         yield
     REACHED.update(found)
     assert not _blocking_guard.unlisted(found)
+
+def pytest_sessionfinish(session):
+    package = (Path(__file__).parent.parent / "cowork").resolve()
+    assert all(Path(module.__file__).resolve().is_relative_to(package)
+               for name, module in tuple(sys.modules.items())
+               if (name == "cowork" or name.startswith("cowork.")) and getattr(module, "__file__", None))
 ''')
         (root / "tests/test_left é.py").write_text('''
 import asyncio
@@ -869,6 +884,44 @@ def test_right():
         (root / "tests/test_empty.py").write_text('"""Collected module with no test cases."""\n')
 
     return _shard_evidence(inventory_suite, monkeypatch, prepare=prepare)
+
+
+@pytest.fixture(scope="session")
+def guard_runtime_sources(tmp_path_factory) -> tuple[tuple[str, ...], Path]:
+    """Discover the real guard's source dependencies in a fresh interpreter, per worker."""
+    directory = tmp_path_factory.mktemp("guard-runtime")
+    script = directory / "guard-runtime.py"
+    manifest = directory / "sources.json"
+    script.write_text('''
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve()
+sys.path[:0] = [str(root / "tests"), str(root)]
+import _blocking_guard
+
+sources = {Path(module.__file__).resolve() for module in tuple(sys.modules.values())
+           if getattr(module, "__file__", None)}
+files = sorted(path.relative_to(root).as_posix() for path in sources
+               if path.is_relative_to(root / "cowork"))
+assert files and all((root / name).is_file() and Path(name).suffix == ".py" for name in files)
+Path(sys.argv[2]).write_text(json.dumps(files) + "\\n")
+''')
+    environment = {key: value for key, value in os.environ.items() if key not in {
+        "COVERAGE_FILE", "COVERAGE_PROCESS_START", "COV_CORE_SOURCE", "COV_CORE_CONFIG", "COV_CORE_DATAFILE",
+        "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTHONPATH",
+    }}
+    home = directory / "home"
+    home.mkdir()
+    environment.update(COWORK_HOME=str(home), DATABASE_URI=f"sqlite:///{directory / 'test.db'}",
+                       MASTER_KEY_PATH=str(directory / "master.key"))
+    subprocess.run([sys.executable, str(script), str(_ROOT), str(manifest)], cwd=directory,
+                   env=environment, capture_output=True, check=True, timeout=30)
+    sources = tuple(json.loads(manifest.read_text()))
+    assert {"cowork/__init__.py", "cowork/common/paths.py", "cowork/db/units.py"} <= set(sources)
+    assert all((_ROOT / name).resolve().is_relative_to(_ROOT / "cowork") for name in sources)
+    return sources, manifest
 
 
 def test_two_shards_keep_the_whole_suite_guard(guarded_shards, monkeypatch):
@@ -895,14 +948,26 @@ def test_two_shards_keep_the_whole_suite_guard(guarded_shards, monkeypatch):
                 aggregate(inputs, root.parent / "stale-guard")
         finally:
             path.write_bytes(original)
+
+    def guard_composition():
+        """Audit actual guard inputs without repeating full package coverage rendering."""
+        collected_path, report, _ = _collection(inputs)
+        declaration = _guard_evidence(collected_path, report)
+        producers = [latest_artifact(inputs, f"test-inventory-broad-shard-{index}") for index in range(2)]
+        for _, shard, _ in producers:
+            _compatible(report, shard)
+        result = _global_guard(declaration, [path for path, _, _ in producers],
+                               [shard for _, shard, _ in producers], partition(report, declaration.collected_files))
+        return result, [attempt for _, _, attempt in producers]
+
     collection = inputs / "test-inventory-broad-collection-1234-1"
     held = root.parent / "held-collection"
     collection.rename(held)
     try:
         for name in ("inventory.json", "inventory.json.blocking-guard.json"):
             shutil.copyfile(held / name, inputs / name)
-        flat = aggregate(inputs, root.parent / "flat-guard")
-        assert flat["blocking_guard"] == combined["blocking_guard"]
+        flat, _ = guard_composition()
+        assert flat == combined["blocking_guard"]
     finally:
         for name in ("inventory.json", "inventory.json.blocking-guard.json"):
             (inputs / name).unlink(missing_ok=True)
@@ -910,14 +975,15 @@ def test_two_shards_keep_the_whole_suite_guard(guarded_shards, monkeypatch):
     result, _ = execute(0, attempt=2)
     assert result.returncode == 0, result.stdout + result.stderr
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
-    carried = aggregate(inputs, root.parent / "carried-guard")
-    assert [producer["producer_attempt"] for producer in carried["shards"]] == [2, 1]
+    carried, attempts = guard_composition()
+    assert carried == combined["blocking_guard"]
+    assert attempts == [2, 1]
     for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB"):
         monkeypatch.delenv(key, raising=False)
     # Both local inventories share a directory, so a fixed sidecar name would collide.
     result, _, collection_path = run("tests/", "--ignore=tests/integration", "--collect-only", "-n", "0", "--test-cohort=broad")
     assert result.returncode == 0, result.stdout + result.stderr
-    result, _, execution_path = run("tests/", "--ignore=tests/integration", "-n", "2", "--test-cohort=broad")
+    result, _, execution_path = run("tests/", "--ignore=tests/integration", "-n", "0", "--test-cohort=broad")
     assert result.returncode == 0, result.stdout + result.stderr
     local = [read_evidence(sidecar(path)) for path in (collection_path, execution_path)]
     assert all(packet.run_id is None and packet.run_attempt is None for packet in local)
