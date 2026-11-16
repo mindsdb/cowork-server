@@ -13,12 +13,23 @@ from cowork.coding.project_models import ProjectCreateRequest, ProjectFolder, Pr
 from cowork.coding.workspace_mode import resolve_workspace_mode, supported_workspace_modes
 
 
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_a_task_here_works_in_the_folder_unless_it_asks_for_a_worktree(platform: str) -> None:
+    assert resolve_workspace_mode(
+        None, None, runs_locally=True, org_mode=False, platform=platform,
+    ) == WorkspaceMode.in_place
+
+
 @pytest.mark.parametrize(
-    ("runs_locally", "org_mode"),
-    [(True, False), (False, False), (True, True), (False, True)],
+    ("runs_locally", "org_mode", "platform"),
+    [(False, False, "darwin"), (True, True, "darwin"), (False, True, "darwin"), (True, False, "win32")],
 )
-def test_every_computer_defaults_to_a_worktree_until_in_place_tasks_exist(runs_locally: bool, org_mode: bool) -> None:
-    assert resolve_workspace_mode(None, None, runs_locally=runs_locally, org_mode=org_mode) == WorkspaceMode.worktree
+def test_where_in_place_is_unavailable_a_task_defaults_to_a_worktree(
+    runs_locally: bool, org_mode: bool, platform: str,
+) -> None:
+    assert resolve_workspace_mode(
+        None, None, runs_locally=runs_locally, org_mode=org_mode, platform=platform,
+    ) == WorkspaceMode.worktree
 
 
 def test_an_explicit_worktree_is_honoured_everywhere() -> None:
@@ -26,11 +37,6 @@ def test_an_explicit_worktree_is_honoured_everywhere() -> None:
         assert resolve_workspace_mode(
             WorkspaceMode.worktree, WorkspaceMode.in_place, runs_locally=runs_locally, org_mode=org_mode,
         ) == WorkspaceMode.worktree
-
-
-def test_an_in_place_request_is_refused_on_this_computer_until_it_is_supported() -> None:
-    with pytest.raises(ValueError, match="original folder is not available yet"):
-        resolve_workspace_mode(WorkspaceMode.in_place, None, runs_locally=True, org_mode=False)
 
 
 @pytest.mark.parametrize(("runs_locally", "org_mode"), [(False, False), (True, True)])
@@ -46,7 +52,7 @@ def test_a_project_default_the_computer_cannot_honour_falls_back_instead_of_fail
     ) == WorkspaceMode.worktree
 
 
-def test_older_clients_still_enable_folder_copies_with_the_previous_field_name() -> None:
+def test_older_clients_copy_flag_still_validates_under_either_name() -> None:
     legacy = SessionCreateRequest.model_validate({"path": "/tmp/x", "prompt": "Go", "allow_direct_folder": True})
     current = SessionCreateRequest.model_validate({"path": "/tmp/x", "prompt": "Go", "allow_folder_copy": True})
     assert legacy.allow_folder_copy is True
@@ -62,17 +68,20 @@ def test_a_new_folder_task_records_its_resolved_mode(tmp_path: Path) -> None:
         SessionCreateRequest(path=str(repo), prompt="Build it"), CREDS, "fake", "fake-model",
     )
 
-    assert created.workspace_mode == WorkspaceMode.worktree
+    assert created.workspace_mode == WorkspaceMode.in_place
     prepared = wait_for_workspace(service, created.id)
-    assert prepared.workspace_mode == WorkspaceMode.worktree
-    assert prepared.workspace_kind == WorkspaceKind.git_worktree
+    assert prepared.workspace_mode == WorkspaceMode.in_place
+    assert prepared.workspace_kind == WorkspaceKind.direct_folder
 
 
-def test_an_in_place_task_is_refused_before_anything_is_prepared(tmp_path: Path) -> None:
+def test_an_unsupported_in_place_task_is_refused_before_anything_is_prepared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset())
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())
 
-    with pytest.raises(ValueError, match="not available yet"):
+    with pytest.raises(ValueError, match="not available on this platform"):
         service.create_session(
             SessionCreateRequest(path=str(repo), prompt="Build it", workspace_mode=WorkspaceMode.in_place),
             CREDS,
@@ -108,7 +117,8 @@ def test_a_task_saved_before_modes_existed_still_loads(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())
     created = service.create_session(
-        SessionCreateRequest(path=str(repo), prompt="Build it"), CREDS, "fake", "fake-model",
+        SessionCreateRequest(path=str(repo), prompt="Build it", workspace_mode=WorkspaceMode.worktree),
+        CREDS, "fake", "fake-model",
     )
     wait_for_workspace(service, created.id)
     raw = json.loads(service.store._meta_path(created.id).read_text(encoding="utf-8"))

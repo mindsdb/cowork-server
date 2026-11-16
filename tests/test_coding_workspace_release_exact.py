@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from coding_service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
 
-from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind
+from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
 from cowork.coding.workspace_retention import RetentionPolicy
 from cowork.common.settings.app_settings import CodingSettings
@@ -25,7 +25,7 @@ def git(cwd: Path, *args: str) -> str:
 def released_worktree(tmp_path: Path, key: str = "task") -> tuple[WorkspaceManager, Path, Path]:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    worktree = manager.prepare(key, str(repo), allow_folder_copy=False).workspace_path
+    worktree = manager.prepare(key, str(repo)).workspace_path
     return manager, repo, worktree
 
 
@@ -175,7 +175,7 @@ def test_idle_tasks_are_released_after_two_weeks_beyond_the_ten_most_recent(tmp_
     service = service_with(tmp_path, FakeEngine())
 
     def task(idle: timedelta) -> str:
-        created = service.create_session(SessionCreateRequest(path=str(repo), prompt="Go"), CREDS, "fake", "fake-model")
+        created = service.create_session(SessionCreateRequest(path=str(repo), workspace_mode=WorkspaceMode.worktree, prompt="Go"), CREDS, "fake", "fake-model")
         wait_for_status(service, created.id, SessionStatus.completed)
         service.store.update_session(
             created.id,
@@ -198,7 +198,7 @@ def test_idle_tasks_are_released_after_two_weeks_beyond_the_ten_most_recent(tmp_
 def test_a_kept_workspace_says_why_and_a_failed_rebuild_is_reported(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())
-    created = service.create_session(SessionCreateRequest(path=str(repo), prompt="Go"), CREDS, "fake", "fake-model")
+    created = service.create_session(SessionCreateRequest(path=str(repo), workspace_mode=WorkspaceMode.worktree, prompt="Go"), CREDS, "fake", "fake-model")
     session = wait_for_status(service, created.id, SessionStatus.completed)
     workspace = Path(session.workspace_path)
     (workspace / ".gitignore").write_text("secret.txt\n", encoding="utf-8")
@@ -230,7 +230,7 @@ def test_a_kept_workspace_says_why_and_a_failed_rebuild_is_reported(tmp_path: Pa
 def test_concurrent_restores_after_a_failure_never_report_success(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())
-    created = service.create_session(SessionCreateRequest(path=str(repo), prompt="Go"), CREDS, "fake", "fake-model")
+    created = service.create_session(SessionCreateRequest(path=str(repo), workspace_mode=WorkspaceMode.worktree, prompt="Go"), CREDS, "fake", "fake-model")
     session = wait_for_status(service, created.id, SessionStatus.completed)
     assert service.retention.release(session.id) is True
     moved = repo.with_name("moved")
