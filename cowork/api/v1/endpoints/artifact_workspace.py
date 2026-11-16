@@ -16,7 +16,7 @@ from urllib.parse import quote
 from uuid import UUID
 
 import anyio
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -50,6 +50,7 @@ from cowork.services.artifact_permissions import (
     with_export_formats,
 )
 from cowork.services import artifact_files
+from cowork.services import pdf_viewer
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.quick_edit import direct_edit_available, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
@@ -107,6 +108,38 @@ _DRAFT_RESPONSE_HEADERS = {
     "Cache-Control": "private, no-store",
     "X-Content-Type-Options": "nosniff",
 }
+_PDF_TYPE = "application/pdf"
+# Sec-Fetch-Dest of a navigation to a PDF that gets the viewer page. Besides
+# frames: the draft host serves a top-level open itself, with the sandbox CSP,
+# and a popup of the draft frame inherits the sandbox.
+_PDF_PAGE_DESTS = pdf_viewer.FRAME_DESTS | {"document"}
+
+
+def _pdf_headers(cors: bool) -> dict[str, str]:
+    """For both answers of a PDF address: the bytes and the viewer page."""
+    headers = {"Vary": "Sec-Fetch-Dest"}
+    if cors:
+        headers["Access-Control-Allow-Origin"] = "*"
+    return headers
+
+
+def _pdf_asset_response(name: str, *, cors: bool) -> Response:
+    """A file of the bundled PDF viewer, never one of the artifact."""
+    found = pdf_viewer.asset(name)
+    if found is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
+    body, content_type = found
+    headers = dict(_DRAFT_RESPONSE_HEADERS)
+    if cors:
+        headers["Access-Control-Allow-Origin"] = "*"
+    return Response(body, media_type=content_type, headers=headers)
+
+
+def _pdf_viewer_page(rel_path: str, *, cors: bool) -> HTMLResponse:
+    page = prepare_preview_html(pdf_viewer.viewer_page(rel_path, draft=True), comments=False)
+    return HTMLResponse(page, headers={**_DRAFT_RESPONSE_HEADERS, **_pdf_headers(cors)})
+
+
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
 _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
 # The stats tracking toggle waits only briefly for an in-flight publish:
@@ -222,7 +255,7 @@ def _recorded_source_selector(source, folder: Path, metadata: dict) -> str | Non
         return None
 
 
-def _preview_html_from_fd(fd: int, *, comments: bool) -> HTMLResponse | None:
+def _preview_html_from_fd(fd: int, *, comments: bool, pdf_assets: str | None = None) -> HTMLResponse | None:
     """Build the preview HTML from the already-authorized file descriptor."""
     payload = bytearray()
     try:
@@ -240,7 +273,7 @@ def _preview_html_from_fd(fd: int, *, comments: bool) -> HTMLResponse | None:
         except OSError:
             pass
     return HTMLResponse(
-        prepare_preview_html(html, comments=comments), headers=_DRAFT_RESPONSE_HEADERS
+        prepare_preview_html(html, comments=comments, pdf_assets=pdf_assets), headers=_DRAFT_RESPONSE_HEADERS
     )
 
 
@@ -349,6 +382,9 @@ def _draft_file_response(
     scope: TenantScope,
     comments: bool,
     download: bool = False,
+    pdf_assets: str | None = None,
+    cors: bool = False,
+    dest: str = "",
 ):
     """Check ``rel_path`` against the artifact the lookup found
     (``_draft_file_parts``), then open the draft file there and answer with it.
@@ -360,7 +396,16 @@ def _draft_file_response(
     ``download`` asks for the bytes; every other file, and HTML that is not
     UTF-8, streams from the pinned descriptor, read on the file store's
     threads in ``scope``.
+
+    PDFs in sandboxed previews: ``_anton_pdf/<file>`` is the bundled pdf.js
+    viewer (pdf_viewer/); a navigation to a PDF (``dest``) gets the viewer page
+    instead of the bytes; ``pdf_assets`` is the viewer's address the shim gets
+    in an HTML document; ``cors`` lets the desktop frame (opaque origin) read
+    the viewer's files and the PDF.
     """
+    name = pdf_viewer.asset_name(rel_path)
+    if name is not None:
+        return _pdf_asset_response(name, cors=cors)
     parts = _draft_file_parts(rel_path, artifact.metadata)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
     try:
@@ -373,17 +418,22 @@ def _draft_file_response(
             detail="Artifact file not found",
         ) from exc
     try:
+        if media_type == _PDF_TYPE and not download and dest in _PDF_PAGE_DESTS:
+            resources.close()
+            return _pdf_viewer_page("/".join(parts), cors=cors)
         if not download and media_type == "text/html":
-            response = _preview_html_from_fd(fd, comments=comments)
+            response = _preview_html_from_fd(fd, comments=comments, pdf_assets=pdf_assets)
             if response is not None:
                 resources.close()
                 return response
         extra = (
             {"Content-Disposition": attachment_disposition(parts[-1])}
-            if download else None
+            if download else {}
         )
+        if media_type == _PDF_TYPE:
+            extra.update(_pdf_headers(cors))
         return _draft_stream(
-            resources, fd, file_stat.st_size, media_type, scope=scope, extra_headers=extra,
+            resources, fd, file_stat.st_size, media_type, scope=scope, extra_headers=extra or None,
         )
     except BaseException:
         resources.close()
@@ -2033,6 +2083,7 @@ async def serve_private_draft(
     # scope (and the artifact roots it discovers) as an HTTP parameter.
     scope: TenantScope = Depends(get_tenant_scope),
     download: Annotated[bool, Query()] = False,
+    sec_fetch_dest: Annotated[str, Header()] = "",
 ):
     """Authenticated draft preview with project/org containment and relative assets.
 
@@ -2053,8 +2104,27 @@ async def serve_private_draft(
     agree on what a raw query string like ``?download=0`` means; a direct
     call still controls the outcome through the keyword argument, since its
     bare ``request`` carries no query string of its own.
+
+    PDFs: ``sec_fetch_dest`` (the request's Sec-Fetch-Dest) picks the viewer
+    page for a frame navigating to a PDF. On desktop the preview frame has an
+    opaque origin and Electron adds the bearer to every request it makes, so
+    this route answers the viewer's files and PDFs with
+    ``Access-Control-Allow-Origin: *`` and gives the shim the viewer's
+    address; any desktop draft page can then read the PDFs of the user's other
+    drafts, which is accepted. In org mode this route serves only the legacy
+    srcdoc path, where nothing is replaced, so neither is set.
     """
     project_selector, artifact_selector = _draft_selectors(project_ref, artifact_id)
+    desktop = get_app_settings().tenancy_mode != "org"
+    pdf_assets = None
+    if desktop:
+        from cowork.services.artifacts import draft_url_for
+
+        pdf_assets = draft_url_for(
+            project_id=None if project_selector == "local" else project_selector,
+            artifact_id=artifact_selector,
+            rel_path=pdf_viewer.ASSET_PREFIX,
+        )
     # A reviewer may read every file of the draft, so the path checks and the
     # open run in the lookup's own file store call.
     _artifact, response = await review_artifact_and_read(
@@ -2067,6 +2137,9 @@ async def serve_private_draft(
             scope=scope,
             comments=wants_comment_layer(request),
             download=download or wants_download(request),
+            pdf_assets=pdf_assets,
+            cors=desktop,
+            dest=sec_fetch_dest.strip().lower(),
         ),
     )
     return response

@@ -38,6 +38,7 @@ from cowork.common.request_logging import RequestLoggingMiddleware
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import scope_for_identity
 from cowork.db.units import FilesystemBusy, busy_retry_seconds
+from cowork.services import pdf_viewer
 from cowork.draft_host.token import DraftTokenError, verify_draft_token
 
 logger = logging.getLogger(__name__)
@@ -219,6 +220,10 @@ async def _draft_response(request: Request, grant: _DraftGrant) -> Response:
             rel_path=request.path_params["rel_path"],
             scope=scope,
             comments=wants_comment_layer(request),
+            # Root-relative: the frame's origin is opaque, and the shim adds
+            # location.origin, which still names this host.
+            pdf_assets=f"/_t/{request.path_params['token']}/{pdf_viewer.ASSET_PREFIX}",
+            dest=request.headers.get("sec-fetch-dest", "").strip().lower(),
         ),
     )
     return response
