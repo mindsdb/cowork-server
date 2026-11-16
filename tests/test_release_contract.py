@@ -118,3 +118,24 @@ def test_final_pins_pass_the_production_check():
 def test_production_check_refuses_pre_release_dev_and_unparseable_pins(version):
     export = f"aiohttp==3.14.0 \\\n    --hash=sha256:abc\nanton-agent=={version} \\\n    --hash=sha256:def\n"
     assert release.unreleased_pins(export) == [f"anton-agent=={version}"]
+
+
+@pytest.mark.parametrize("version, refused", [
+    ("1!2.0+linux.1", False),
+    ("1!2.0rc1+linux.1", True),
+    ("2.0.post1.dev2", True),
+])
+def test_production_check_handles_epoch_and_local_versions(version, refused):
+    pin = f"dependency=={version}"
+    assert release.unreleased_pins(pin + ' ; python_version >= "3.12"') == ([pin] if refused else [])
+
+
+def test_require_final_rejects_current_rc_export_without_rewriting(tmp_path, monkeypatch):
+    contract = tmp_path / "requirements.txt"
+    export = "anton-agent==2.26.11.13.1rc3\n"
+    contract.write_text(export)
+    monkeypatch.setattr(release, "CONTRACT", contract)
+    monkeypatch.setattr(release.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=0, stdout=export))
+    monkeypatch.setattr(sys, "argv", ["release_contract.py", "--check", "--require-final"])
+    assert release.main() == 1
+    assert contract.read_text() == export
