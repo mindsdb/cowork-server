@@ -6,6 +6,13 @@ from pathlib import Path
 import subprocess
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import anton_final_lock as selection  # noqa: E402
+
+
+class StagingMoved(RuntimeError):
+    """The prepared lock no longer belongs to the current staging commit."""
+
 
 def run(*args: str) -> str:
     return subprocess.check_output(args, text=True).strip()
@@ -36,9 +43,9 @@ def main() -> None:
     locked, version = os.environ["LOCKED"], os.environ.get("VERSION", "")
     base = run("git", "rev-parse", "HEAD")
     # Never publish a resolution made from staging that has already moved.
-    # The next poll starts again from its new lock and requirements.
+    # The workflow retries this condition from fresh staging in the same run.
     if remote_head("staging") != base:
-        raise RuntimeError("Staging moved during relock; retry from its new head")
+        raise StagingMoved("Staging moved during relock; retry from its new head")
     prs = json.loads(run("gh", "pr", "list", "--repo", repo, "--base", "staging",
                          "--head", branch, "--state", "open", "--json", "number"))
     number = str(prs[0]["number"]) if prs else ""
@@ -80,7 +87,7 @@ def main() -> None:
     run("git", "config", "user.email", f"{bot_id}+{bot}@users.noreply.github.com")
     changed = prepare_commit(base, previous, title)
     if remote_head("staging") != base:
-        raise RuntimeError("Staging moved during relock; retry from its new head")
+        raise StagingMoved("Staging moved during relock; retry from its new head")
     if changed:
         # An explicit lease also handles an absent branch. Never overwrite a
         # concurrent human update or a branch recreated since it was inspected.
@@ -106,5 +113,41 @@ def main() -> None:
             "--title", title, "--body-file", str(body_path))
 
 
+def refresh_staging() -> None:
+    """Discard this run's generated lock/commit in its disposable CI checkout."""
+    run("git", "fetch", "--depth=1", "origin", "refs/heads/staging")
+    run("git", "reset", "--hard", "FETCH_HEAD")
+    locked = selection.locked_version(selection.CONTRACT.read_text())
+    final = selection.is_final(locked)
+    version = None
+    if not final:
+        announced = selection.announced_final(os.environ.get("ANNOUNCED_VERSION", ""))
+        version = selection.replacement(locked, selection.releases_listing(announced))
+    # Replace every old decision, including clearing a previously selected final.
+    os.environ.update(LOCKED=locked, VERSION=version or "", LOCKED_FINAL=str(final).lower())
+    if version:
+        run("uv", "lock", "--upgrade-package", f"anton-agent=={version}")
+        run(sys.executable, "scripts/release_contract.py")
+        run(sys.executable, "scripts/release_contract.py", "--check")
+
+
+def retry_staging(*, attempts: int = 3) -> None:
+    """Retry staging races only; API, resolution and push-lease errors still fail."""
+    for attempt in range(attempts):
+        try:
+            main()
+            return
+        except StagingMoved:
+            if attempt + 1 == attempts:
+                raise
+            print(f"Staging moved; refreshing for attempt {attempt + 2}/{attempts}", file=sys.stderr)
+            refresh_staging()
+
+
 if __name__ == "__main__":
-    main()
+    # This opt-in resets generated files. The workflow uses a disposable checkout;
+    # direct/manual calls retain the non-destructive, single-attempt behavior.
+    if sys.argv[1:] == ["--retry-staging"]:
+        retry_staging()
+    else:
+        main()

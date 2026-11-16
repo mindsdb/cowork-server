@@ -104,8 +104,11 @@ jobs:
           LOCKED: ${{ steps.final.outputs.locked }}
           VERSION: ${{ steps.final.outputs.version }}
           LOCKED_FINAL: ${{ steps.final.outputs.final }}
+          ANNOUNCED_VERSION: ${{ github.event.client_payload.version }}
         run: |
           # The helper reads GH_TOKEN from the environment. No token in a URL
           # or persisted checkout credential; the App action revokes it on exit.
           gh auth setup-git
-          python scripts/anton_final_lock_pr.py
+          # Up to three attempts. A staging race refreshes the disposable
+          # checkout and repeats selection/export before reconciling again.
+          uv run --no-project --with packaging==26.3 python scripts/anton_final_lock_pr.py --retry-staging

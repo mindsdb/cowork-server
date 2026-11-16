@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -196,3 +197,85 @@ def test_a_declined_proposal_is_not_reopened(repo, tmp_path, monkeypatch, closed
     assert bool(pr.remote_head("bot/anton-final-lock")) == expected
     if active:
         assert not any(c[1:3] == ("pr", "list") and "closed" in c for c in calls)
+
+
+@pytest.mark.parametrize("new_locked, expected", [("1.1rc1", "1.1"), ("1.1", ""), ("1.2rc1", "")])
+def test_retry_uses_fresh_staging_lock_and_replaces_old_decision(repo, tmp_path, monkeypatch, new_locked, expected):
+    remote = tmp_path / "remote.git"
+    pr.run("git", "init", "--bare", "-q", str(remote))
+    pr.run("git", "remote", "add", "origin", str(remote))
+    # A merge lands while the original attempt waits for PyPI.
+    write_lock(new_locked, "2")
+    pr.run("git", "commit", "-qam", "staging advances during wait")
+    fresh = pr.run("git", "rev-parse", "HEAD")
+    pr.run("git", "push", "origin", "HEAD:refs/heads/staging")
+    pr.run("git", "checkout", "--detach", repo)
+    write_lock("1.0", "1")
+    # Also cover a race detected after prepare_commit has created a local commit.
+    pr.prepare_commit(repo, "", "obsolete generated bump")
+    monkeypatch.setattr(pr.selection, "CONTRACT", tmp_path / "cowork/release-requirements.txt")
+    announcements = []
+    def releases(announced):
+        announcements.append(announced)
+        return {"1.0": [{"yanked": False}], "1.1": [{"yanked": False}]}
+    monkeypatch.setattr(pr.selection, "releases_listing", releases)
+    real_run, calls = pr.run, []
+    def run(*args):
+        calls.append(args)
+        if args[0] == "git":
+            return real_run(*args)
+        if args[0] == "uv":
+            assert args == ("uv", "lock", "--upgrade-package", "anton-agent==1.1")
+            assert pr.run("git", "rev-parse", "HEAD") == fresh
+            write_lock("1.1", "2")
+            return ""
+        if args[0] == sys.executable:
+            return ""
+        if args[:3] == ("gh", "pr", "list"):
+            return "[]" if expected or "closed" in args else '[{"number": 42}]'
+        return "123" if args[1] == "api" else ""
+    monkeypatch.setattr(pr, "run", run)
+    for key, value in {"REPO": "mindsdb/cowork-server", "BRANCH": "bot/anton-final-lock",
+                       "LOCKED": "1.0rc1", "VERSION": "1.0", "APP_SLUG": "test",
+                       "LOCKED_FINAL": "false", "ANNOUNCED_VERSION": "1.1",
+                       "RUNNER_TEMP": str(tmp_path)}.items():
+        monkeypatch.setenv(key, value)
+    pr.retry_staging()
+    assert pr.os.environ["LOCKED"] == new_locked
+    assert pr.os.environ["VERSION"] == expected
+    assert pr.os.environ["LOCKED_FINAL"] == str(new_locked == "1.1").lower()
+    assert announcements == ([] if new_locked == "1.1" else ["1.1"])
+    if expected:
+        assert pr.remote_head("bot/anton-final-lock") == pr.run("git", "rev-parse", "HEAD")
+        assert pr.run("git", "rev-parse", "HEAD^") == fresh
+        assert "other==2" in pr.run("git", "show", "HEAD:uv.lock")
+        assert (sys.executable, "scripts/release_contract.py") in calls
+        assert (sys.executable, "scripts/release_contract.py", "--check") in calls
+    else:
+        assert not pr.remote_head("bot/anton-final-lock")
+        assert any(c[:3] == ("gh", "pr", "close") for c in calls)
+        assert not any(c[0] == "uv" for c in calls)
+
+
+def test_repeated_staging_changes_stop_after_three_attempts(monkeypatch):
+    calls, refreshes = [], []
+    def reconcile():
+        calls.append(1)
+        raise pr.StagingMoved("Staging moved")
+    monkeypatch.setattr(pr, "main", reconcile)
+    monkeypatch.setattr(pr, "refresh_staging", lambda: refreshes.append(1))
+    with pytest.raises(pr.StagingMoved):
+        pr.retry_staging()
+    assert len(calls) == 3
+    assert len(refreshes) == 2
+
+
+def test_retry_does_not_reset_checkout_for_non_staging_failure(monkeypatch):
+    def reconcile():
+        raise subprocess.CalledProcessError(1, ["git", "push", "--force-with-lease"])
+    def refresh():
+        pytest.fail("A rejected push lease must not trigger a reset/retry")
+    monkeypatch.setattr(pr, "main", reconcile)
+    monkeypatch.setattr(pr, "refresh_staging", refresh)
+    with pytest.raises(subprocess.CalledProcessError):
+        pr.retry_staging()
