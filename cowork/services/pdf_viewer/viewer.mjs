@@ -34,7 +34,18 @@ class ViewerError extends Error {
 const root = document.documentElement;
 const draft = root.hasAttribute('data-anton-pdf-draft');
 const embedded = root.hasAttribute('data-anton-pdf');
-const pdfUrl = embedded ? root.getAttribute('data-anton-pdf') : location.href;
+// The PDF's address becomes a read and a link: only http(s), never a
+// javascript: or data: URL, whatever the attribute holds.
+function httpUrl(raw) {
+  let url;
+  try {
+    url = new URL(raw, location.href);
+  } catch {
+    return '';
+  }
+  return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
+}
+const pdfUrl = httpUrl(embedded ? root.getAttribute('data-anton-pdf') : location.href);
 
 function setState(value) {
   root.setAttribute('data-anton-pdf-state', value);
@@ -220,7 +231,7 @@ function showError(kind) {
   box.append(element('p', '', MESSAGES[kind] || MESSAGES.fetch));
   // A draft opens the PDF in a new tab, which gets the viewer page; on the
   // viewer page of a draft that tab would be this page again.
-  if (!draft || embedded) {
+  if (pdfUrl && (!draft || embedded)) {
     const link = element('a', '', draft ? 'Open the PDF in a new tab' : 'Download the PDF');
     link.href = pdfUrl;
     link.target = '_blank';
@@ -352,6 +363,7 @@ async function main() {
   setState('waiting');
   await whenShown(ui.container);
   setState('loading');
+  if (!pdfUrl) throw new ViewerError('fetch');
   const bytes = read(pdfUrl, LIMITS.maxBytes);
   bytes.catch(() => {});
   let library;
