@@ -262,19 +262,27 @@ async def test_in_band_responses_failure_discards_partial_gate_text(endpoint, ki
 
 
 async def test_cancelling_the_gate_closes_the_responses_stream(endpoint):
+    """Cancel an active transport without requiring SDK startup to finish in one second."""
     endpoint.stream = _Stream({
         "type": "response.created", "response": _response("in_progress", usage=None),
     }, hold_open=True)
-    task = asyncio.create_task(_route(endpoint.binding()))
+    task = asyncio.create_task(_route(endpoint.binding()), name="router-cancellation")
+    ready = asyncio.create_task(endpoint.stream.waiting.wait(), name="router-stream-ready")
     try:
-        await asyncio.wait_for(endpoint.stream.waiting.wait(), timeout=1)
+        done, _ = await asyncio.wait(
+            {task, ready}, timeout=routing._GATE_TOTAL_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert ready in done and ready.result(), "The stream did not become ready before the router ended or timed out"
+        assert not task.done(), "The router completed before cancellation"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
     finally:
-        if not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        for pending in (task, ready):
+            if not pending.done():
+                pending.cancel()
+        await asyncio.gather(task, ready, return_exceptions=True)
 
     endpoint.request_body()
     assert endpoint.stream.closed
