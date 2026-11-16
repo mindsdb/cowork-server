@@ -189,7 +189,7 @@ def run_shard(inputs: Path, output: Path, index: int) -> int:
     modules = partition(collection, declaration.collected_files if declaration else ())[index]
     output = _output(output)
     environment = dict(os.environ, COVERAGE_FILE=str(output / "coverage.data"))
-    command = [sys.executable, "-m", "pytest", "-vv", "-o", "faulthandler_timeout=120",
+    command = [sys.executable, "-m", "pytest", "-q", "-o", "faulthandler_timeout=120",
                "-n", "4", "--cov=cowork", "--cov-report=",
                "--ignore=tests/integration", "-p", "scripts.pytest_inventory",
                f"--test-cohort=broad-shard-{index}", f"--test-inventory={output / 'inventory.json'}",
