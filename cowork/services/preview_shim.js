@@ -309,10 +309,10 @@
   }
 
   function reportPdfFailure(err) {
-    var message = err && err.message ? err.message : String(err);
+    var message = clip('PDF viewer: ' + local(err && err.message ? err.message : String(err)), MAX_TEXT);
     report('x|' + message, {
       type: 'error',
-      message: 'PDF viewer: ' + local(message),
+      message: message,
       file: '',
       line: 0,
       col: 0,
@@ -439,5 +439,7 @@
     });
   } catch (e) { /* cookie accessor is not redefinable here */ }
 
+  // installPdfEmbeds is called earlier; it relies on function-declaration
+  // hoisting, so embed.js must keep a single top-level function declaration.
   /* pdf-embeds */
 })();

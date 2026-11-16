@@ -8,6 +8,9 @@
  * The page keeps the element it holds a reference to, so its scripts and
  * frameworks go on working with it:
  * - <embed> stays, with type text/html and a blob: URL of the viewer document;
+ *   like <iframe> it is put back in place with the new type and src, because
+ *   Chrome fetches the PDF again when type changes while it is in the page and
+ *   Firefox shows no document when src changes before type;
  * - <iframe> stays: it gets srcdoc and is taken out and put back in place,
  *   which drops a navigation to the PDF that is already under way;
  * - <object> stays but hidden, and a new <object> goes right after it: Chrome
@@ -88,11 +91,21 @@ function installPdfEmbeds(w, options) {
       '<link rel="stylesheet" href="' + escapeAttr(assets + 'viewer.css') + '">' +
       '<script type="module" src="' + escapeAttr(assets + 'viewer.mjs') + '"><\/script>' +
       '<div class="anton-pdf-fallback" id="anton-pdf-fallback">' +
-      '<p>The PDF viewer could not start.</p><p>' + link + '</p></div>';
+      '<p>The PDF viewer could not start. Reload the page to try again.</p><p>' + link + '</p></div>';
   }
 
   function viewerBlob(url) {
     return w.URL.createObjectURL(new w.Blob([viewerDocument(url)], { type: VIEWER_TYPE }));
+  }
+
+  // Takes the element out of the document, runs `write`, and puts it back at
+  // the same place.
+  function reinsert(el, write) {
+    var parent = el.parentNode;
+    var after = el.nextSibling;
+    parent.removeChild(el);
+    write();
+    parent.insertBefore(el, after);
   }
 
   // <embed>: the same element, pointed at the viewer document.
@@ -111,8 +124,10 @@ function installPdfEmbeds(w, options) {
     states.set(el, next);
     if (next.title) el.setAttribute('title', TITLE);
     el.setAttribute('data-anton-pdf', url);
-    el.setAttribute('type', VIEWER_TYPE);
-    el.setAttribute('src', next.blob);
+    reinsert(el, function () {
+      el.setAttribute('type', VIEWER_TYPE);
+      el.setAttribute('src', next.blob);
+    });
   }
 
   function restoreEmbed(el, state) {
@@ -144,11 +159,9 @@ function installPdfEmbeds(w, options) {
     states.set(el, next);
     if (next.title) el.setAttribute('title', TITLE);
     el.setAttribute('data-anton-pdf', url);
-    el.setAttribute('srcdoc', viewerDocument(url));
-    var parent = el.parentNode;
-    var after = el.nextSibling;
-    parent.removeChild(el);
-    parent.insertBefore(el, after);
+    reinsert(el, function () {
+      el.setAttribute('srcdoc', viewerDocument(url));
+    });
   }
 
   // <object>: the original stays, hidden; a new <object> right after it
@@ -165,9 +178,7 @@ function installPdfEmbeds(w, options) {
     if (state) restoreObject(el, state);
     var url = pdfUrl(raw, type);
     if (!url) return;
-    var copy = doc.createElement('object');
-    var attrs = el.attributes;
-    for (var i = 0; i < attrs.length; i += 1) copy.setAttribute(attrs[i].name, attrs[i].value);
+    var copy = el.cloneNode(false);
     if (!copy.hasAttribute('title')) copy.setAttribute('title', TITLE);
     copy.setAttribute('data-anton-pdf', url);
     // type and data before the copy enters the document: Chrome decides then.
@@ -221,10 +232,12 @@ function installPdfEmbeds(w, options) {
 
   function swap(el) {
     try {
+      var tag = el.tagName;
+      if (tag !== 'EMBED' && tag !== 'IFRAME' && tag !== 'OBJECT') return;
       if (!el.isConnected || insideHidden(el)) return;
-      if (el.tagName === 'EMBED') swapEmbed(el);
-      else if (el.tagName === 'IFRAME') swapIframe(el);
-      else if (el.tagName === 'OBJECT') swapObject(el);
+      if (tag === 'EMBED') swapEmbed(el);
+      else if (tag === 'IFRAME') swapIframe(el);
+      else if (tag === 'OBJECT') swapObject(el);
     } catch (err) {
       report(err);
     }
@@ -290,6 +303,8 @@ function installPdfEmbeds(w, options) {
       return response.blob();
     }).then(function (blob) {
       var save = doc.createElement('a');
+      // The blob URL is not revoked: revoking right after the click can cancel
+      // the download, and this file may not use timers.
       save.setAttribute('href', w.URL.createObjectURL(blob));
       save.setAttribute('download', name);
       var parent = doc.body || doc.documentElement;
@@ -299,7 +314,9 @@ function installPdfEmbeds(w, options) {
     }).catch(report);
   }
 
-  if (!options.draft && typeof w.fetch === 'function' && typeof doc.addEventListener === 'function') {
-    doc.addEventListener('click', onClick);
+  if (!options.draft && typeof w.fetch === 'function' && typeof w.addEventListener === 'function') {
+    // On the window, in the bubble phase: handlers the page adds to the
+    // document later still run first and can cancel the click.
+    w.addEventListener('click', onClick);
   }
 }

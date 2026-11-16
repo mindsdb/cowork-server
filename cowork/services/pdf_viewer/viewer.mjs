@@ -326,9 +326,10 @@ async function main() {
     library = await loadLibrary(assetsBase());
   } catch {
     // On a published artifact the PDF read goes through the frame runtime,
-    // which refreshes an expired token; the modules are then tried once more
-    // at the address the runtime gives now.
-    await bytes.catch(() => {});
+    // which refreshes an expired token; once that read has succeeded the
+    // modules are tried once more at the address the runtime gives now. A
+    // failed read ends here with its own error.
+    await bytes;
     try {
       library = await loadLibrary(assetsBase());
     } catch (error) {
