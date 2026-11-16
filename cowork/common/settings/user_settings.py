@@ -752,13 +752,45 @@ class UserSettings(Settings):
     )
     # The agent's browser. Untagged, so per-user in org mode and the single
     # global row on desktop, like `hub_workspace_id`: whether the agent may use
-    # a browser is the person's own choice. On by default: it only does something where a browser is
+    # a browser is the person's own choice. Off by default while the browser
+    # is in beta; once on, it only does something where a browser is
     # available, the browser router on the web or the desktop app's own
     # browser (cowork.services.browser).
     browser_enabled: bool = Field(
-        default=True,
+        # Beta: off until the person turns it on in Settings.
+        default=False,
         title="Browser Enabled",
-        description="Let the agent use a browser, shown beside the chat.",
+        description="Let the agent use a browser, shown beside the chat (beta).",
+    )
+    # Untagged like browser_enabled: the person's own choice. The app reads it
+    # (as browserApproveSteps) to decide whether a browser step waits for the
+    # person's approval. This server stores it, and a write of it as false
+    # stamps browser_approve_steps_off_at below.
+    browser_approve_steps: bool = Field(
+        default=True,
+        title="Approve Browser Steps",
+        description="Ask before the agent's browser steps run.",
+    )
+    # Untagged (user scope) like browser_approve_steps. SettingService
+    # (_stamp_approvals_off) stamps it, by this server's clock, on every write
+    # of browser_approve_steps as false, and the settings routes refuse a
+    # client's write of it. The app reads it as browserApproveStepsOffAt and
+    # approves for the person only a step held after it, by the `at_ms` this
+    # server puts on the step's event. "" until approvals first go off, and a
+    # string, not 0, so an unset stamp approves nothing.
+    browser_approve_steps_off_at: str = Field(
+        default="",
+        max_length=20,
+        title="Browser Approvals Off Since",
+        description="When the person last turned browser step approvals off, epoch milliseconds.",
+    )
+    # Untagged like browser_enabled. The app reads it (as
+    # browserOnlyWhenNeeded): on, the browser pane opens by itself only when
+    # it is the person's turn, and a turn's browser steps show as one row.
+    browser_only_when_needed: bool = Field(
+        default=True,
+        title="Show The Browser Only When Needed",
+        description="Show the agent's browser only when it needs the person.",
     )
     # `hub_workspace_id`, not `workspace_id`: in this repo `workspace` already
     # means a filesystem location (the per-conversation private directory, the

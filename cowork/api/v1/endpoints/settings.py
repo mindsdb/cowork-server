@@ -9,6 +9,7 @@
 - GET /reveal-key/{name} — return the unmasked API key for a provider
 - POST /test-providers — ping provider APIs to check connectivity
 - POST /validate-provider — validate credentials for a specific provider
+- POST /test-decision-model — send one decision to the organization's decision model
 """
 from __future__ import annotations
 
@@ -33,6 +34,7 @@ from cowork.common.paths import cowork_home
 from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope, unsafe_unscoped_session
 from cowork.db.session import get_session
 from cowork.db.units import run_db
+from cowork.handlers.jev_route import is_web_address
 from cowork.principal import Principal, caller_bearer, can_manage_org, get_principal
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import (
@@ -209,6 +211,81 @@ async def _reject_unservable_models(
             )
 
 
+def _reject_decision_model_url_without_host(*, updates: dict[str, Any]) -> None:
+    """400 on saving a ``decision_model_url`` that isn't an http(s) URL with a
+    host and no user, such as ``decisions.example.com/v1`` typed without its
+    scheme: the gate can't send to it and anton's browser config refuses it,
+    and a user part would keep a password in a setting that isn't secret.
+    Blank clears it. A check on the write, not on the field, so a value stored
+    before this check still loads, and reading settings never fails on it."""
+    raw = (updates or {}).get("decision_model_url")
+    if not isinstance(raw, str) or not raw.strip():
+        return
+    if not is_web_address(url=raw.strip()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The decision model's endpoint must be a full web address, starting with https://, with no user name in it.",
+        )
+
+
+def _reject_approvals_off_stamp(*, keys: list[str]) -> None:
+    """400 on a write that names ``browser_approve_steps_off_at``: only
+    SettingService stamps it (``_stamp_approvals_off``), when a write turns
+    browser step approvals off. A client's value, such as 0, would have the
+    app approve steps held before the person turned approvals off."""
+    if "browser_approve_steps_off_at" in keys:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="browser_approve_steps_off_at is set by the server when browser step approvals go off.",
+        )
+
+
+def _turns_on(updates: dict[str, Any], key: str) -> bool:
+    value = (updates or {}).get(key)
+    return isinstance(value, str) and value.strip().lower() in ("true", "1", "yes", "on")
+
+
+async def _reject_browser_that_cant_run(scope: TenantScope, updates: dict[str, Any]) -> None:
+    """400 on turning the browser on where it can't run: with no decisions
+    model to pick its steps (`jev_route.decisions_available`), or on the web
+    with an LLM other than MindsHub, whose browser router takes only a
+    MindsHub credential. Read from the state the write produces, so a request
+    that sets up the organization's decision model and turns the browser on
+    together passes. Only a write that turns it on: a decision model removed
+    later leaves the switch stored as on, and the browser reads as off
+    (`browser.browser_runs`)."""
+    if not _turns_on(updates, "browser_enabled"):
+        return
+    from cowork.handlers.jev_route import decisions_available
+    from cowork.services import browser
+
+    settings = await run_db(lambda session: unit_setting_service(session).load_pending(updates), scope=scope)
+    if browser.on_web() and not browser.llm_on_mindshub(settings):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The browser needs MindsHub as the model provider.",
+        )
+    if decisions_available(settings):
+        return
+    if browser.own_decisions_unused(settings):
+        # Set up, but this deployment's browser can't ask it, as status
+        # reports (`BrowseStatus.own_decisions_unused`).
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "The browser can't use the organization's own decision model here yet. "
+                "It needs Jev on MindsHub until it can."
+            ),
+        )
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            "The browser needs a decisions model: Jev on MindsHub, or a decision model of the "
+            "organization's own (its endpoint URL and API key)."
+        ),
+    )
+
+
 # AuthenticatedInOrgMode, declared explicitly: SettingService's write path
 # already fails closed on its own (_require_writable -> MissingTenantScopeError
 # -> 401, cowork/services/settings.py) whenever org mode has no org in scope.
@@ -234,8 +311,11 @@ async def bulk_upsert_settings(
     _require_org_admin_for(live_keys, scope, principal)
     # Before anything is staged, so a bad model id 400s with nothing written —
     # same all-or-nothing contract as the field validation below.
+    _reject_approvals_off_stamp(keys=live_keys)
     _reject_malformed_role_defaults(body.values or {})
+    _reject_decision_model_url_without_host(updates=body.values or {})
     await _reject_unservable_models(scope, body.values or {}, request)
+    await _reject_browser_that_cant_run(scope, body.values or {})
     try:
         updated = await run_db(
             lambda session: unit_setting_service(session).save_all(body.values), scope=scope
@@ -256,8 +336,11 @@ async def upsert_setting(
     request: Request = None,
 ) -> SettingResponse:
     _require_org_admin_for([key], scope, principal)
+    _reject_approvals_off_stamp(keys=[key])
     _reject_malformed_role_defaults({key: body.value})
+    _reject_decision_model_url_without_host(updates={key: body.value})
     await _reject_unservable_models(scope, {key: body.value}, request)
+    await _reject_browser_that_cant_run(scope, {key: body.value})
     try:
         return await run_db(
             lambda session: unit_setting_service(session).upsert_setting(key, body.value),
@@ -591,6 +674,62 @@ def _foreign_ping_url_field(settings: UserSettings, provider: ProviderProbeCard)
     return field
 
 
+class _TestDecisionModelBody(CamelRequest):
+    # Each one left out is the stored one's.
+    url: Optional[str] = None
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+
+
+#: How long Settings' test waits on a decision endpoint: longer than a turn's
+#: gate waits, since a person is watching and a cold endpoint is still a
+#: working one.
+_DECISION_TEST_TIMEOUT_S = 10.0
+
+
+# AuthenticatedInOrgMode, and admin-only in org mode like the settings it
+# tests: the decision model is the organization's, set by an admin, and the
+# route makes the server send a request to a URL in the body. The stored key
+# only ever goes to the stored URL (the `_foreign_ping_url_field` rule): a
+# body that names another URL brings its own key. On the hosted server the
+# request goes out as the gate's does, https only, to a vetted public address
+# (`jev_route._post_pinned`).
+@router.post("/test-decision-model", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def check_decision_model(body: _TestDecisionModelBody, scope: ScopeDep, principal: PrincipalDep):
+    """Send one minimal decision request to the organization's decision
+    model, the one in the body over the stored one, so Settings can tell
+    whether it answers before the browser relies on it. 200 either way:
+    ``{"ok", "error", "ms"}``, with ``error`` the gate's error class
+    (``http_401``, ``timeout``, ``malformed_response``, ...)."""
+    _require_org_admin_for(["decision_model_url"], scope, principal)
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.handlers import jev_route
+
+    stored = await run_db(lambda session: unit_setting_service(session).load(), scope=scope)
+    stored_url = (stored.decision_model_url or "").strip()
+    url = (body.url or "").strip() or stored_url
+    key = (body.api_key or "").strip()
+    if not key or key == "***":
+        if url != stored_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Enter the API key for this endpoint.",
+            )
+        key = stored.decision_model_api_key.get_secret_value() if stored.decision_model_api_key else ""
+    if not url or not key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Enter the decision model's endpoint URL and API key.",
+        )
+    if not is_web_address(url=url):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That isn't a web address.")
+    model = (body.model or "").strip() or stored.decision_model or TurnQueueSettings().jev_route_model
+    result = await jev_route.probe(
+        jev_route.JevTarget(url=url, api_key=key), model=model, timeout_seconds=_DECISION_TEST_TIMEOUT_S,
+    )
+    return {"ok": not result.error, "error": result.error or None, "ms": result.ms}
+
+
 class _ValidateProviderBody(CamelRequest):
     provider: str
     api_key: str
@@ -662,6 +801,7 @@ async def recommended_models(
     scope: ScopeDep,
     refresh: bool = False,
     refresh_scope: str = "all",
+    principal: PrincipalDep = None,
 ):
     """Per-provider model picker options for the Settings UI.
 
@@ -915,9 +1055,21 @@ async def recommended_models(
     # use), so Settings can show the decision-model section and say what it
     # does. `gate` above stays for UIs that predate this; they ship OTA apart
     # from this server.
-    from cowork.handlers.jev_route import gate_mode
+    from cowork.handlers.jev_route import decisions_model, gate_mode
 
-    routing = {"mode": gate_mode(gate_settings), "routerProvider": gate["provider"]}
+    # `decisions`: what picks the shared browser's steps ("mindshub", "own"),
+    # or None, and the browser doesn't run. "own" only where the organization's
+    # model reaches this deployment's browser at a URL it takes
+    # (`jev_route.decisions_model`), while `mode` stays the turn
+    # gate's, which asks that model wherever it is set. `canSetDecisionModel`: whether
+    # the caller may edit the organization's own decision model, as for the
+    # provider and its keys (`_require_org_admin_for`): an organization admin,
+    # or anyone on a local server, where the person is the admin.
+    routing = {
+        "mode": gate_mode(gate_settings), "routerProvider": gate["provider"],
+        "decisions": decisions_model(gate_settings),
+        "canSetDecisionModel": not scope.org_mode or can_manage_org(principal),
+    }
 
     return {
         "recommendedModels": recommended,
