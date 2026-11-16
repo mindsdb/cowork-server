@@ -406,6 +406,11 @@ class CodingService(
             return
         self.lifecycle.delete_session(session_id)
         self.retention.discard(session)
+        try:
+            self.workspaces.discard_recovery(session.id)
+        except (OSError, WorkspaceError) as exc:
+            # The task is already gone; leftover recovery files must not fail the delete.
+            logger.warning("Could not remove recovery data for deleted coding task %s: %s", session.id, exc)
         if session.run_id:
             self.control.delete_task(session.run_id)
 

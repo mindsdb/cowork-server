@@ -263,10 +263,12 @@ def test_the_service_reports_a_worktree_task_and_the_total(tmp_path: Path) -> No
     assert page.total_bytes >= sizes[session.id]
 
 
-def test_a_deleted_folder_copy_keeps_counting_its_recovery_copy(tmp_path: Path) -> None:
+def test_deleting_a_folder_copy_frees_its_storage(tmp_path: Path) -> None:
     folder = tmp_path / "notes"
     write(folder / "big.bin", 300_000)
     service = service_with(tmp_path, FakeEngine())
+    # Left by a task deleted before deletes cleared recovery data.
+    write(service.workspaces.snapshots_root / "deleted-earlier" / "local-copy" / "old.bin", 50_000)
     session = wait_for_status(
         service,
         service.create_session(
@@ -280,9 +282,9 @@ def test_a_deleted_folder_copy_keeps_counting_its_recovery_copy(tmp_path: Path) 
     service.delete_session(session.id)
     page = service.workspace_usage.measure()
 
-    # The task is gone, but the copy saved for recovery still takes space.
     assert session.id not in {item.session_id for item in page.items}
-    assert page.removed_task_bytes >= 300_000
+    # Only the earlier leftover still counts; the task just deleted kept nothing.
+    assert 50_000 <= page.removed_task_bytes < 300_000
 
 
 def test_a_project_task_is_measured_across_its_folders(tmp_path: Path) -> None:

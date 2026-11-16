@@ -747,11 +747,13 @@ class WorkspaceManager:
         workspace_path: str,
         kind: WorkspaceKind,
         base_revision: str | None,
+        *,
+        keep_recovery: bool = True,
     ) -> None:
         with self._mutation_lock:
             if kind == WorkspaceKind.local_copy:
                 try:
-                    self.local_copies.cleanup(session_id, Path(workspace_path))
+                    self.local_copies.cleanup(session_id, Path(workspace_path), keep_recovery=keep_recovery)
                 except LocalCopyError as exc:
                     raise WorkspaceError(str(exc)) from exc
                 return
@@ -767,7 +769,7 @@ class WorkspaceManager:
                 raise WorkspaceError("Refusing to remove an unmanaged worktree path")
             source = Path(source_path)
             if actual.exists():
-                if base_revision and source.is_dir():
+                if keep_recovery and base_revision and source.is_dir():
                     self._snapshot_changes(session_id, actual, base_revision, "cleanup.patch", truncate=True)
                 if source.is_dir():
                     self.git.run(source, "worktree", "remove", "--force", str(actual))
@@ -1026,6 +1028,22 @@ class WorkspaceManager:
     @staticmethod
     def _release_ref(key: str) -> str:
         return "refs/cowork/released/" + managed_key(key).as_posix()
+
+    def discard_recovery(self, session_id: str) -> None:
+        """Remove everything kept to recover a task, once the task is deleted.
+
+        Recovery data outlives a released workspace on purpose, but a deleted
+        task can never be reopened, so its folder would only fill the disk.
+        """
+        relative = managed_key(session_id)
+        if len(relative.parts) != 1:
+            raise WorkspaceError("Invalid task recovery key")
+        with self._mutation_lock:
+            task_dir = self.snapshots_root / relative
+            if task_dir.is_symlink():
+                task_dir.unlink()
+            elif task_dir.is_dir():
+                shutil.rmtree(task_dir)
 
     def prune_task_root(self, session_id: str) -> None:
         """Remove an empty project-task parent without discarding task files."""

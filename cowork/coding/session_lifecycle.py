@@ -63,7 +63,7 @@ class SessionLifecycleOperations:
         ) as session:
             self.runtimes.close_locked(session_id)
             if session.workspaces:
-                self.project_workspaces.cleanup(session.id, session.workspaces)
+                self.project_workspaces.cleanup(session.id, session.workspaces, keep_recovery=False)
             else:
                 self.workspaces.cleanup(
                     session.id,
@@ -71,6 +71,7 @@ class SessionLifecycleOperations:
                     session.workspace_path,
                     session.workspace_kind,
                     session.base_revision,
+                    keep_recovery=False,
                 )
             self.store.delete_session(session.id)
             self.skill_runtime.cleanup(session.id)

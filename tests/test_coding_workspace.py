@@ -372,6 +372,63 @@ def test_cleanup_only_removes_the_managed_task_worktree(tmp_path: Path) -> None:
     assert "uncommitted.txt" in snapshot.read_text(encoding="utf-8")
 
 
+def test_cleanup_without_recovery_writes_no_patch_for_a_worktree(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("session-6", str(repo), False)
+    (prepared.workspace_path / "uncommitted.txt").write_text("discarded\n", encoding="utf-8")
+
+    manager.cleanup(
+        "session-6", str(repo), str(prepared.workspace_path), prepared.kind, prepared.base_revision,
+        keep_recovery=False,
+    )
+
+    assert not prepared.workspace_path.exists()
+    assert not (tmp_path / "coding" / "snapshots" / "session-6").exists()
+
+
+def test_cleanup_without_recovery_removes_a_changed_copy_without_reading_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("copy-1", str(source), allow_direct_folder=True)
+    (prepared.workspace_path / "notes.txt").write_text("v2\n", encoding="utf-8")
+    baseline = manager.local_copies.baselines_root / managed_key("copy-1")
+    assert baseline.is_dir()
+
+    def no_diff(_workspace: Path) -> list[str]:
+        raise AssertionError("deleting a task must not walk its copy")
+
+    monkeypatch.setattr(manager.local_copies, "diff", no_diff)
+    manager.cleanup(
+        "copy-1", str(source), str(prepared.workspace_path), WorkspaceKind.local_copy, None,
+        keep_recovery=False,
+    )
+
+    assert not prepared.workspace_path.exists()
+    assert not baseline.exists()
+    assert not (manager.local_copies.recovery_root / managed_key("copy-1")).exists()
+    assert (source / "notes.txt").read_text(encoding="utf-8") == "v1\n"
+
+
+def test_discard_recovery_removes_only_that_tasks_folder(tmp_path: Path) -> None:
+    manager = WorkspaceManager(tmp_path / "coding")
+    for task in ("gone", "kept"):
+        (manager.snapshots_root / task / "app" / "local-copy").mkdir(parents=True)
+        (manager.snapshots_root / task / "cleanup.patch").write_text("patch\n", encoding="utf-8")
+
+    manager.discard_recovery("gone")
+    manager.discard_recovery("never-existed")
+
+    assert not (manager.snapshots_root / "gone").exists()
+    assert (manager.snapshots_root / "kept" / "cleanup.patch").is_file()
+    with pytest.raises(WorkspaceError):
+        manager.discard_recovery("gone/app")
+
+
 def test_cleanup_refuses_unmanaged_paths(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
