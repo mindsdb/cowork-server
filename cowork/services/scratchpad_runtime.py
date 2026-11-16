@@ -73,6 +73,7 @@ def _resolve_coding(
     coding_model: str,
     coding_api_key: str,
     coding_base_url: str,
+    settings=None,
 ) -> tuple[str, str, str, str]:
     """Fill in any blank coding fields from cowork's UserSettings.
 
@@ -90,7 +91,7 @@ def _resolve_coding(
     )
     from cowork.services.providers import provider_base_url
 
-    us = get_user_settings()
+    us = settings if settings is not None else get_user_settings()
     # Normalize to the dash form up front so every return value (and the lookups
     # below) is consistent — anton's scratchpad_boot only understands the dash
     # spellings; the snake form would silently fall through to AnthropicProvider.
@@ -132,14 +133,33 @@ def _resolve_coding(
     return provider, model, api_key, base_url
 
 
-def _resolve_image_model() -> str:
+def _resolve_image_model(settings=None) -> str:
     """The image model a pad's helper draws with: resolved, like the coding
     model above, so a pin MindsHub no longer serves or the wallet cannot pay for
     never reaches it. Empty where no image model can be served
     (UserSettings.image_model_for_agent), so the pad gets none."""
     from cowork.common.settings.user_settings import get_user_settings
 
-    return get_user_settings().image_model_for_agent or ""
+    us = settings if settings is not None else get_user_settings()
+    return us.image_model_for_agent or ""
+
+
+class _PadSettings(NamedTuple):
+    """What a new pad is built with from the user's settings."""
+
+    coding: tuple[str, str, str, str]  # provider, model, api key, base URL
+    image_model: str
+
+
+def _resolve_pad_settings() -> _PadSettings:
+    """A new pad's coding credentials and image model from one settings load."""
+    from cowork.common.settings.user_settings import get_user_settings
+
+    us = get_user_settings()
+    coding = _resolve_coding(
+        coding_provider="", coding_model="", coding_api_key="", coding_base_url="", settings=us,
+    )
+    return _PadSettings(coding, _resolve_image_model(us))
 
 
 def _image_model_kwargs(runtime_cls, image_model: str) -> dict:
@@ -203,8 +223,10 @@ def get_or_create(
     coding_api_key: str = "",
     coding_base_url: str = "",
     cell_sandbox: CellSandbox | None = None,
-    image_model: str | None = None,
+    pad_settings: _PadSettings | None = None,
 ):
+    """The named pad, built on first use. ``pad_settings`` (resolved off the
+    loop by the caller) replaces the settings reads for a new pad."""
     refuse_a_missing_policy(cell_sandbox, site="a backend pool's scratchpad")
     _touch_activity()
     workspace = _resolve_workspace(workspace_path)
@@ -222,12 +244,17 @@ def get_or_create(
             f"Maximum concurrent scratchpads ({MAX_PADS}) reached. "
             f"Close an existing pad first."
         )
-    provider, model, api_key, base_url = _resolve_coding(
-        coding_provider=coding_provider,
-        coding_model=coding_model,
-        coding_api_key=coding_api_key,
-        coding_base_url=coding_base_url,
-    )
+    if pad_settings is None:
+        pad_settings = _PadSettings(
+            _resolve_coding(
+                coding_provider=coding_provider,
+                coding_model=coding_model,
+                coding_api_key=coding_api_key,
+                coding_base_url=coding_base_url,
+            ),
+            _resolve_image_model(),
+        )
+    provider, model, api_key, base_url = pad_settings.coding
     pad = _make_runtime(
         name,
         workspace=workspace,
@@ -236,7 +263,7 @@ def get_or_create(
         coding_api_key=api_key,
         coding_base_url=base_url,
         cell_sandbox=cell_sandbox,
-        image_model=_resolve_image_model() if image_model is None else image_model,
+        image_model=pad_settings.image_model,
     )
     pads[name] = _CachedPad(pad, cell_sandbox)
     return pad
@@ -310,12 +337,14 @@ class WorkspaceScopedPool:
         return await self._pad(name)
 
     async def _pad(self, name: str):
-        # The image model is a settings read, so it is resolved off the loop and only for a new pad.
+        # A new pad's settings are a DB read, so they are resolved off the loop.
+        from cowork.db.units import run_on_unit_threads
+
         cached = _pads.get(_resolve_workspace(self._workspace_path), {}).get(name)
-        image_model = None if cached is not None else await asyncio.to_thread(_resolve_image_model)
+        pad_settings = None if cached is not None else await run_on_unit_threads(_resolve_pad_settings)
         return get_or_create(
             name,
             workspace_path=self._workspace_path,
             cell_sandbox=self.cell_sandbox,
-            image_model=image_model,
+            pad_settings=pad_settings,
         )

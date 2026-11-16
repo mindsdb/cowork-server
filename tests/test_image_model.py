@@ -513,6 +513,27 @@ def test_the_pool_hands_its_pads_the_resolved_image_model(sandbox_off, monkeypat
     assert call["workspace_env_overlay"]["ANTON_SCRATCHPAD_IMAGE_MODEL"] == FLARE
 
 
+async def test_the_pool_loads_settings_once_per_new_pad(sandbox_off, monkeypatch, tmp_path):
+    from cowork.services import scratchpad_runtime
+
+    settings = _minds(minds_image_model_enabled=IMAGE_CATALOG)
+    loads = []
+    monkeypatch.setattr(
+        "cowork.common.settings.user_settings.get_user_settings", lambda: loads.append(1) or settings,
+    )
+    monkeypatch.setattr(_RuntimeWithOverlay, "calls", [])
+    monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _RuntimeWithOverlay)
+    monkeypatch.setattr(scratchpad_runtime, "_pads", {})
+    pool = scratchpad_runtime.WorkspaceScopedPool(str(tmp_path))
+
+    await pool.get_or_create("app")
+    await pool.get_or_create("app")
+
+    assert len(loads) == 1
+    (call,) = _RuntimeWithOverlay.calls
+    assert call["workspace_env_overlay"]["ANTON_SCRATCHPAD_IMAGE_MODEL"] == FLARE
+
+
 # ── Only where an image model can be served ──────────────────────────
 
 
