@@ -75,7 +75,8 @@ jobs:
 
       - name: Mint release-train App token
         id: app-token
-        if: steps.final.outputs.version != '' || (steps.final.outputs.final == 'true' && steps.existing.outputs.number != '')
+        # A bump to propose, or an open bot PR that no longer has one to close.
+        if: steps.final.outputs.version != '' || steps.existing.outputs.number != ''
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}

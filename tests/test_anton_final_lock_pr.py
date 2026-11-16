@@ -1,6 +1,7 @@
 """Exercise refresh decisions against real Git trees, and the PR lifecycle."""
 
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 
@@ -11,6 +12,7 @@ SPEC = importlib.util.spec_from_file_location(
 )
 pr = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pr)
+TITLE = "fix(deps): lock anton-agent's final 1.0 instead of 1.0rc1 (ENG-4355)"
 
 
 @pytest.fixture
@@ -70,8 +72,10 @@ def test_empty_relock_is_refused(repo):
         pr.prepare_commit(repo, "", "empty")
 
 
-@pytest.mark.parametrize("final, closes", [("true", True), ("false", False)])
-def test_only_a_manual_final_closes_existing_pr(monkeypatch, final, closes):
+@pytest.mark.parametrize("final, reason", [
+    ("true", "already locks a final"), ("false", "newer than any final"),
+])
+def test_an_open_pr_with_nothing_to_propose_is_closed(monkeypatch, final, reason):
     calls = []
     def run(*args):
         calls.append(args)
@@ -86,7 +90,8 @@ def test_only_a_manual_final_closes_existing_pr(monkeypatch, final, closes):
                        "LOCKED": "1.0", "VERSION": "", "LOCKED_FINAL": final}.items():
         monkeypatch.setenv(key, value)
     pr.main()
-    assert any(c[:3] == ("gh", "pr", "close") for c in calls) == closes
+    closes = [c for c in calls if c[:3] == ("gh", "pr", "close")]
+    assert len(closes) == 1 and reason in closes[0][-1]
 
 
 def test_staging_race_stops_before_any_pr_mutation(monkeypatch):
@@ -123,6 +128,8 @@ def test_reconcile_pushes_once_then_refreshes_from_new_staging(repo, tmp_path, m
             return real_run(*args)
         calls.append(args)
         if args[1:3] == ("pr", "list"):
+            if "closed" in args:
+                return "[]"
             return '[{"number": 42}]' if any(c[1:3] == ("pr", "create") for c in calls) else '[]'
         if args[1] == "api":
             return "123"
@@ -150,3 +157,35 @@ def test_reconcile_pushes_once_then_refreshes_from_new_staging(repo, tmp_path, m
     assert pr.remote_head("bot/anton-final-lock") != first
     assert pr.run("git", "rev-parse", "HEAD^") == base
     assert "other==2" in pr.run("git", "show", "HEAD:uv.lock")
+
+
+@pytest.mark.parametrize("closed, proposes", [
+    # Closed unmerged with this exact title: declined, so not reopened.
+    ([{"number": 7, "title": TITLE, "mergedAt": None}], False),
+    # Merged earlier, or a different final or candidate: still proposed.
+    ([{"number": 7, "title": TITLE, "mergedAt": "2026-11-16T00:00:00Z"}], True),
+    ([{"number": 7, "title": TITLE.replace("1.0rc1", "0.9rc1"), "mergedAt": None}], True),
+    ([], True),
+])
+def test_a_declined_proposal_is_not_reopened(repo, tmp_path, monkeypatch, closed, proposes):
+    remote = tmp_path / "remote.git"
+    pr.run("git", "init", "--bare", "-q", str(remote))
+    pr.run("git", "remote", "add", "origin", str(remote))
+    pr.run("git", "push", "origin", "HEAD:refs/heads/staging")
+    real_run, calls = pr.run, []
+    def run(*args):
+        if args[0] != "gh":
+            return real_run(*args)
+        calls.append(args)
+        if args[1:3] == ("pr", "list"):
+            return json.dumps(closed) if "closed" in args else "[]"
+        return "123" if args[1] == "api" else ""
+    monkeypatch.setattr(pr, "run", run)
+    for key, value in {"REPO": "mindsdb/cowork-server", "BRANCH": "bot/anton-final-lock",
+                       "LOCKED": "1.0rc1", "VERSION": "1.0", "APP_SLUG": "test",
+                       "RUNNER_TEMP": str(tmp_path)}.items():
+        monkeypatch.setenv(key, value)
+    write_lock("1.0", "1")
+    pr.main()
+    assert any(c[1:3] == ("pr", "create") for c in calls) == proposes
+    assert bool(pr.remote_head("bot/anton-final-lock")) == proposes

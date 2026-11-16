@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 
 def run(*args: str) -> str:
@@ -42,11 +43,26 @@ def main() -> None:
                          "--head", branch, "--state", "open", "--json", "number"))
     number = str(prs[0]["number"]) if prs else ""
     if not version:
-        if number and os.environ.get("LOCKED_FINAL") == "true":
-            run("gh", "pr", "close", number, "--repo", repo)
+        # Nothing to propose: staging locks a final already, or it moved to a
+        # newer candidate than any final. Either way an open proposal is stale.
+        if number:
+            reason = ("staging already locks a final" if os.environ.get("LOCKED_FINAL") == "true"
+                      else f"staging now locks `{locked}`, newer than any final anton")
+            run("gh", "pr", "close", number, "--repo", repo, "--comment",
+                f"Closing: {reason}. The bot reopens a proposal when a newer final is published.")
         return
 
     title = f"fix(deps): lock anton-agent's final {version} instead of {locked} (ENG-4355)"
+    # A person who closed this exact proposal without merging declined it, for
+    # example because the final lacks the candidate's code. Don't reopen it.
+    # A newer final or a newly locked candidate changes the title and is proposed.
+    closed = json.loads(run("gh", "pr", "list", "--repo", repo, "--base", "staging", "--head", branch,
+                            "--state", "closed", "--limit", "50", "--json", "number,title,mergedAt"))
+    declined = next((p for p in closed if p["title"] == title and not p["mergedAt"]), None)
+    if declined:
+        print(f"#{declined['number']} proposed this and was closed without merging; not reopening",
+              file=sys.stderr)
+        return
     previous = remote_head(branch)
     if previous:
         run("git", "fetch", "--depth=2", "origin", previous)
@@ -64,10 +80,12 @@ def main() -> None:
             "origin", f"HEAD:refs/heads/{branch}")
     body = (
         f"Staging locks `{locked}`. This proposes final `{version}` for ENG-4355.\n\n"
-        "Before merging, check that the final contains the Anton changes staging needs, "
-        "and let CI finish. During the release freeze, a Devops reviewer must merge this PR.\n\n"
-        "The bot refreshes this branch when staging or the proposed lock changes. "
-        "It leaves identical proposals untouched and closes the PR if staging already locks a final."
+        "Before merging, check that the final contains the anton changes staging needs, "
+        "and let CI finish. Merge it before the staging → main release PR, which stays red "
+        "until staging locks a final. anton's final usually lands during the release freeze.\n\n"
+        "The bot refreshes this branch when staging or the proposed lock changes, and closes "
+        "it once there is nothing to propose. If this final is wrong for staging, close this PR "
+        "without merging: the bot won't propose this final again for the same candidate."
     )
     # A body file avoids shell interpolation and preserves literal Markdown.
     body_path = Path(os.environ["RUNNER_TEMP"]) / "anton-final-lock-pr.md"
