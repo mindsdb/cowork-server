@@ -23,6 +23,10 @@ FILE = [{"yanked": False}]
         ("1.0a2", "1.0b1"),
         ("1.0b1", "1.0rc1"),
         ("2.26.9.2.1", "2.26.10.1.1"),
+        ("1.0.0rc1", "1.0"),
+        ("1!1.0rc1", "1!1.0"),
+        ("1.0.dev1", "1.0"),
+        ("1.0", "1.0.post1"),
     ],
 )
 def test_versions_sort_in_pep440_order(lower, higher):
@@ -41,6 +45,17 @@ def test_a_newer_final_replaces_the_locked_candidate():
 
 def test_the_final_of_the_same_release_counts():
     assert lock.replacement("2.26.11.13.1rc3", {"2.26.11.13.1": FILE}) == "2.26.11.13.1"
+
+
+@pytest.mark.parametrize("candidate, final", [
+    ("1.0.0rc1", "1.0"), ("1!1.0rc1", "1!1.0"), ("1.0.dev1", "1.0"),
+])
+def test_pep440_final_replaces_candidate(candidate, final):
+    assert lock.replacement(candidate, {final: FILE}) == final
+
+
+def test_post_release_ordering_selects_newest_final():
+    assert lock.replacement("1.0rc1", {"1.0.post2": FILE, "1.0.post1": FILE}) == "1.0.post2"
 
 
 def test_no_replacement_while_only_older_finals_exist():
