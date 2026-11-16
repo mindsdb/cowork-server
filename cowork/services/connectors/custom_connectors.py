@@ -137,18 +137,16 @@ def scope_is_one_persons(scope: TenantScope) -> bool:
 class MemberTurnTemplate:
     """What a member's own template gives their cloud turn: its field names and its notes.
 
-    ``field_names`` is empty when the template no longer parses;
-    ``optional_names`` are the fields a member may leave unset. ``notes``
+    ``field_names`` is empty when the template no longer parses. ``notes``
     passed anton's output scrubber and is cut to USAGE_NOTES_MAX; it may be "".
     """
 
     field_names: tuple[str, ...]
     notes: str
-    optional_names: frozenset[str] = frozenset()
 
 
-def _turn_field_names(row: CustomConnector) -> tuple[tuple[str, ...], frozenset[str]]:
-    """The template's field names and its optional ones, never a value; empty when it no longer parses.
+def _turn_field_names(row: CustomConnector) -> tuple[str, ...]:
+    """The template's field names, never a value, or () when it no longer parses.
 
     A template that parses names no address field: anton's parser reserves ``base_url``.
     """
@@ -158,10 +156,10 @@ def _turn_field_names(row: CustomConnector) -> tuple[tuple[str, ...], frozenset[
         # A stored field without a name: parse_stored indexes it. This row alone loses its names.
         logger.warning("custom connector %s: stored fields are malformed; its field names are left out",
                        row.connector_id)
-        return (), frozenset()
+        return ()
     if parsed is None:
-        return (), frozenset()
-    return tuple(field["name"] for field in row.spec.get("fields", [])), parsed.optional
+        return ()
+    return tuple(field["name"] for field in row.spec.get("fields", []))
 
 
 def member_turn_templates(session: ScopedSession, connector_ids: Iterable[str]) -> dict[str, MemberTurnTemplate]:
@@ -187,11 +185,9 @@ def member_turn_templates(session: ScopedSession, connector_ids: Iterable[str]) 
     templates: dict[str, MemberTurnTemplate] = {}
     for row in session.exec(stmt).all():
         text = (row.usage_notes or "")[:USAGE_NOTES_MAX]
-        names, optional = _turn_field_names(row)
         templates[row.connector_id] = MemberTurnTemplate(
-            field_names=names,
+            field_names=_turn_field_names(row),
             notes=scrub_output(text) if text.strip() else "",
-            optional_names=optional,
         )
     return templates
 

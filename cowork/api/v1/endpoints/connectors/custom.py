@@ -181,10 +181,7 @@ async def connect_custom_connector(
     Org mode only, with the setting on and the turn queue on Redis, which
     counts each member's attempts. auth is asked first whether it would take
     the connection (dry run), then the check runs against the typed address
-    only, then auth stores it verified. A member may skip a field the
-    template marks optional; auth then gets the template's section with the
-    skipped field's placements taken out, and a member holding no secret
-    field is checked once on the template's public path.
+    only, then auth stores it verified.
 
     Returns:
         201 with the stored connection. A refusal answers its own status with
@@ -201,8 +198,7 @@ async def connect_custom_connector(
         fields, template = await run_db(lambda session: _connect_template(connector_id, session), scope=scope)
         origin = custom_connect.normalize_address(body.address, settings.custom_connect_refused_domains)
         values = custom_connect.check_values(fields, body.values)
-        auth = custom_connect.reduced_auth(template, values)
-        custom_connect.place_values(auth, values)
+        custom_connect.place_values(template.auth, values)
     except custom_connect.ConnectRefused as refused:
         return _refusal(refused.code, refused.status_code, refused.message)
     payload = {
@@ -210,14 +206,14 @@ async def connect_custom_connector(
         "name": body.name,
         "fields": {**values, custom_connect.BASE_URL_FIELD: origin},
         "secure_keys": sorted(values),
-        "auth": auth,
+        "auth": template.auth,
     }
     credential = request.headers.get("authorization", "")
     try:
         await create_custom_connection(
             credential=credential, organization_id=str(scope.org_id), payload=payload, dry_run=True, settings=settings,
         )
-        failure = await custom_connect.run_check(origin, template, values, auth)
+        failure = await custom_connect.run_check(origin, template, values)
         if failure is not None:
             return JSONResponse(
                 {"detail": {"code": failure.code, "provider_status": failure.provider_status, "excerpt": failure.excerpt}},
