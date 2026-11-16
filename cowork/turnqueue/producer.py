@@ -456,7 +456,10 @@ def custom_usage_prefix(
     ids = ", ".join(str(connection_id) for connection_id in connection_ids)
     noun = "connection" if len(connection_ids) == 1 else "connections"
     call_id = str(connection_ids[0]) if len(connection_ids) == 1 else "connection_id"
-    listed = [f"{name} (optional; this connection may not hold it)" if name in optional_names else name for name in field_names]
+    listed = [
+        f"{name} (optional; this connection may not hold it)" if name in optional_names else name
+        for name in field_names
+    ]
     fields = f" Fields: {', '.join(listed)}." if listed else ""
     return (
         f"Custom {noun} {ids} ({connector_id}).{fields} No credential value reaches this turn: "

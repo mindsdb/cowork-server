@@ -804,6 +804,18 @@ def test_a_bad_request_without_the_key_proves_it_when_a_skipped_password_leaves_
     assert [request.url.raw_path for request in world["provider"]] == [b"/v1/me", b"/v1/me"]
 
 
+def test_a_keyless_check_without_a_public_path_is_refused_not_sent():
+    template = custom_connect.StoredTemplate(
+        path="/v1/me", auth={"type": "none"}, public_path=None, optional=frozenset({"api_key"}),
+        secrets=frozenset({"api_key"}),
+    )
+
+    with pytest.raises(custom_connect.ConnectRefused) as refused:
+        asyncio.run(custom_connect.run_check("https://api.example.com", template, {}, {"type": "none"}))
+
+    assert (refused.value.code, refused.value.status_code) == ("no_check", 409)
+
+
 def test_a_template_with_an_optional_key_and_no_public_path_cannot_connect(engine, world, monkeypatch):
     session = Session(engine)
     row = session.exec(select(CustomConnector).where(CustomConnector.connector_id == "optional_key_api")).one()

@@ -455,9 +455,10 @@ async def run_check(
     """
     placed = place_values(auth, values)
     if is_keyless(template, values):
-        # The parser requires a public path whenever every secret field is optional,
-        # so a keyless connection always has one.
-        assert template.public_path is not None
+        # The parser requires a public path whenever every secret field is optional; refused, not asserted,
+        # so a stored template without one never sends to a missing path.
+        if template.public_path is None:
+            raise ConnectRefused("no_check", 409, "This connector cannot be connected as saved. " + _NO_CHECK_NEXT)
         answer = await _send(origin, template.public_path, placed.headers, placed.params)
         if isinstance(answer, CheckFailure):
             return answer
