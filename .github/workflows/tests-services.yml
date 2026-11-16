@@ -91,7 +91,7 @@ jobs:
           "$TEST_REPORT_DIR/inventory.json" --junit "$TEST_REPORT_DIR/junit.xml"
 
       - name: Upload test evidence
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v7.0.2
         with:
           name: test-inventory-services-${{ github.run_id }}-${{ github.run_attempt }}
