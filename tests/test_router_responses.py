@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -185,8 +186,36 @@ async def test_responses_startup_event_does_not_extend_router_deadline(endpoint,
         "type": "response.created", "response": _response("in_progress", usage=None),
     }, hold_open=True)
 
-    decision = await asyncio.wait_for(_route(endpoint.binding()), timeout=0.5)
+    budgets = []
 
+    async def wait_after_startup(awaitable, timeout):
+        """Wait for transport readiness, then enforce the gate's supplied timeout."""
+        budgets.append(timeout)
+        event = asyncio.create_task(awaitable, name="router-startup-next-event")
+        ready = asyncio.create_task(endpoint.stream.waiting.wait(), name="router-startup-ready")
+        try:
+            done, _ = await asyncio.wait(
+                {event, ready}, timeout=routing._GATE_TOTAL_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert ready in done and ready.result(), "The startup event was not consumed"
+            assert not event.done(), "Startup metadata reached the router as an event"
+            return await asyncio.wait_for(event, timeout=timeout)
+        finally:
+            for task in (event, ready):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(event, ready, return_exceptions=True)
+
+    # Observe the router's budget without charging SDK setup to this wire check.
+    monkeypatch.setattr(routing, "asyncio", SimpleNamespace(
+        get_running_loop=asyncio.get_running_loop, wait_for=wait_after_startup,
+    ))
+    decision = await asyncio.wait_for(
+        _route(endpoint.binding()), timeout=routing._GATE_TOTAL_SECONDS,
+    )
+
+    assert budgets == [0.05]
     endpoint.request_body()
     assert endpoint.stream.waiting.is_set()
     assert endpoint.stream.closed
