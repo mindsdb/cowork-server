@@ -98,6 +98,12 @@ function installPdfEmbeds(w, options) {
     return w.URL.createObjectURL(new w.Blob([viewerDocument(url)], { type: VIEWER_TYPE }));
   }
 
+  // Only a blob: URL no element points at any more: an element that is
+  // moved or shown again loads its current one anew.
+  function release(blob) {
+    w.URL.revokeObjectURL(blob);
+  }
+
   // Takes the element out of the document, runs `write`, and puts it back at
   // the same place.
   function reinsert(el, write) {
@@ -112,15 +118,21 @@ function installPdfEmbeds(w, options) {
   function swapEmbed(el) {
     var state = states.get(el);
     var raw = el.getAttribute('src');
-    if (state && raw === state.blob) return;
     var current = el.getAttribute('type');
-    var type = state && String(current).toLowerCase() === VIEWER_TYPE ? state.type : current;
+    var viewerType = String(current).toLowerCase() === VIEWER_TYPE;
+    if (state && raw === state.blob) {
+      // Our own write; otherwise the page set only the type, which is
+      // weighed against the address the page gave.
+      if (viewerType) return;
+      raw = state.src;
+    }
+    var type = state && viewerType ? state.type : current;
     var url = pdfUrl(raw, type);
     if (!url) {
       if (state) restoreEmbed(el, state);
       return;
     }
-    var next = { type: type, blob: viewerBlob(url), title: state ? state.title : !el.hasAttribute('title') };
+    var next = { src: raw, type: type, blob: viewerBlob(url), title: state ? state.title : !el.hasAttribute('title') };
     states.set(el, next);
     if (next.title) el.setAttribute('title', TITLE);
     el.setAttribute('data-anton-pdf', url);
@@ -128,6 +140,7 @@ function installPdfEmbeds(w, options) {
       el.setAttribute('type', VIEWER_TYPE);
       el.setAttribute('src', next.blob);
     });
+    if (state) release(state.blob);
   }
 
   function restoreEmbed(el, state) {
@@ -136,13 +149,17 @@ function installPdfEmbeds(w, options) {
       if (state.type === null) el.removeAttribute('type');
       else el.setAttribute('type', state.type);
     }
+    if (el.getAttribute('src') === state.blob) el.setAttribute('src', state.src);
     el.removeAttribute('data-anton-pdf');
     if (state.title) el.removeAttribute('title');
+    release(state.blob);
   }
 
   // <iframe>: the same element with srcdoc, taken out and put back in place.
   function swapIframe(el) {
     var state = states.get(el);
+    // The browser shows the page's own srcdoc and ignores src.
+    if (!state && el.hasAttribute('srcdoc')) return;
     var raw = el.getAttribute('src');
     if (state && raw === state.src && el.hasAttribute('srcdoc')) return;
     var url = pdfUrl(raw, el.getAttribute('type'));
@@ -182,12 +199,14 @@ function installPdfEmbeds(w, options) {
     if (!copy.hasAttribute('title')) copy.setAttribute('title', TITLE);
     copy.setAttribute('data-anton-pdf', url);
     // type and data before the copy enters the document: Chrome decides then.
+    var blob = viewerBlob(url);
     copy.setAttribute('type', VIEWER_TYPE);
-    copy.setAttribute('data', viewerBlob(url));
+    copy.setAttribute('data', blob);
     ours.add(copy);
     var next = {
       data: raw,
       type: type,
+      blob: blob,
       name: el.getAttribute('name'),
       display: el.style.getPropertyValue('display'),
       priority: el.style.getPropertyPriority('display'),
@@ -204,6 +223,7 @@ function installPdfEmbeds(w, options) {
     states.delete(el);
     hidden.delete(el);
     if (state.copy.parentNode) state.copy.parentNode.removeChild(state.copy);
+    release(state.blob);
     if (state.display) el.style.setProperty('display', state.display, state.priority);
     else el.style.removeProperty('display');
     if (state.name !== null) el.setAttribute('name', state.name);
@@ -319,4 +339,16 @@ function installPdfEmbeds(w, options) {
     // document later still run first and can cancel the click.
     w.addEventListener('click', onClick);
   }
+
+  // Whether a failed load of `node` is expected because the viewer shows its
+  // PDF: the hidden original <object> (Chrome fires error on it in the
+  // sandbox), or a PDF <embed>/<object> not replaced yet. The preview shim
+  // leaves these out of its error reports.
+  return function shownByViewer(node) {
+    if (!node || typeof node.getAttribute !== 'function') return false;
+    if (hidden.has(node)) return true;
+    var tag = node.tagName;
+    if ((tag !== 'EMBED' && tag !== 'OBJECT') || states.has(node) || ours.has(node)) return false;
+    return !!pdfUrl(node.getAttribute(tag === 'EMBED' ? 'src' : 'data'), node.getAttribute('type'));
+  };
 }

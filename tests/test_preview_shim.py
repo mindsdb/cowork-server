@@ -74,6 +74,25 @@ def test_reporter_is_installed_before_the_storage_guard():
     assert SHIM_JS.index("addEventListener('error'") < SHIM_JS.index("nativeStorageWorks")
 
 
+def test_a_pdf_element_the_viewer_shows_is_not_reported_as_a_failed_file():
+    # Chrome fires error on the hidden original <object> of a replaced PDF.
+    element = (
+        "const element = (tagName, attrs) => ({ tagName, src: attrs.src || '',"
+        " getAttribute: (name) => (name in attrs ? attrs[name] : null) });\n"
+    )
+    fire = "listeners.error.forEach((fn) => fn({ target: %s }));\n"
+    scenario = (
+        element
+        + fire % "element('OBJECT', { data: 'report.pdf' })"
+        + fire % "element('EMBED', { src: 'docs/report.PDF' })"
+        + fire % "element('IMG', { src: 'chart.png' })"
+        + fire % "element('OBJECT', { data: 'chart.svg' })"
+    )
+    result = _run_pdf_shim("/_t/v1.x/_anton_pdf/", observer="record", scenario=scenario)
+    resources = [(m["tagName"], m["url"]) for m in result["posted"] if m.get("type") == "resource"]
+    assert resources == [("IMG", "chart.png"), ("OBJECT", "")]
+
+
 # Each reported field that can hold an address, and the value that feeds it.
 # Whitespace and line breaks may change; a field that stops going through
 # local() may not.
@@ -417,23 +436,27 @@ def test_pdf_assets_cannot_close_the_script():
     assert chr(92) + "u003c/script>" in out
 
 
-def _run_pdf_shim(pdf_assets, *, observer):
+def _run_pdf_shim(pdf_assets, *, observer, scenario=""):
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
     markup = inject_shim("<html><head></head></html>", pdf_assets=pdf_assets)
     js = markup[markup.index("<script>") + len("<script>"): markup.rindex("</script>")]
     harness = (
-        "const posted = []; const observed = [];\n"
+        "const posted = []; const observed = []; const listeners = {};\n"
+        "globalThis.ErrorEvent = class ErrorEvent {};\n"
         "class MO { constructor() { if (" + json.dumps(observer) + " === 'throw') throw new Error('no observer'); }"
         " observe(target, options) { observed.push([...options.attributeFilter]); } }\n"
         "const window = { location: { href: 'https://draft-staging.mindshub.co/_t/v1.x/index.html',"
         " origin: 'https://draft-staging.mindshub.co' }, parent: { postMessage: (m) => posted.push(m) },"
-        " addEventListener() {}, MutationObserver: MO, URL, Blob, navigator: {},"
+        " addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },"
+        " MutationObserver: MO, URL, Blob, navigator: {},"
         " get localStorage() { throw new Error('SecurityError'); } };\n"
         "window.document = { baseURI: window.location.href, addEventListener() {}, documentElement: null };\n"
         "const document = window.document;\n"
         + js
+        + "\n"
+        + scenario
         + "\nprocess.stdout.write(JSON.stringify({ observed, posted,"
         " storage: typeof Object.getOwnPropertyDescriptor(window, 'localStorage').value }));\n"
     )

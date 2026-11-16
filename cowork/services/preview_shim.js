@@ -183,6 +183,9 @@
           return;
         }
         var node = ev.target || {};
+        /* A PDF element whose PDF the viewer shows fails on purpose
+           (pdfShownByViewer is set further down). */
+        if (pdfShownByViewer && pdfShownByViewer(node)) return;
         var tagName = node.tagName || '';
         var url = local(node.src || node.href || '');
         report('r|' + tagName + '|' + url, {
@@ -296,13 +299,14 @@
 
   /* Empty wherever the server serves no viewer files: nothing is replaced. */
   var PDF_ASSETS = __PDF_ASSETS__;
+  var pdfShownByViewer = null;
   if (PDF_ASSETS) {
     try {
-      installPdfEmbeds(window, {
+      pdfShownByViewer = installPdfEmbeds(window, {
         assets: function () { return window.location.origin + PDF_ASSETS; },
         draft: true,
         report: reportPdfFailure
-      });
+      }) || null;
     } catch (e) {
       reportPdfFailure(e);
     }

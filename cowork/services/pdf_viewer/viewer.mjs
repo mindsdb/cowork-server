@@ -72,10 +72,38 @@ async function read(url, limit = 0) {
     response.body?.cancel().catch(() => {});
     throw new ViewerError('too-large');
   }
-  // Wrapped in this realm's Uint8Array: the response may come from the
-  // parent's realm, and pdf.js checks the type with instanceof.
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (limit && bytes.byteLength > limit) throw new ViewerError('too-large');
+  // This realm's Uint8Array: the response may come from the parent's realm,
+  // and pdf.js checks the type with instanceof.
+  try {
+    return limit ? await readCapped(response, limit) : new Uint8Array(await response.arrayBuffer());
+  } catch (error) {
+    throw error instanceof ViewerError ? error : new ViewerError('fetch', error);
+  }
+}
+
+// Counts the bytes as they arrive: a draft streams its files without
+// Content-Length, and a file over the limit must not be read whole first.
+async function readCapped(response, limit) {
+  if (!response.body) return new Uint8Array(await response.arrayBuffer());
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      reader.cancel().catch(() => {});
+      throw new ViewerError('too-large');
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
   return bytes;
 }
 
@@ -201,10 +229,17 @@ function showError(kind) {
   document.body.replaceChildren(box);
 }
 
+// pdf.js rejects a file it cannot parse with InvalidPDFException, and passes
+// an error of its worker that has no type of its own as
+// UnknownErrorException. Anything else is a fault of the viewer, not of the
+// file.
 function failureKind(error) {
   if (error instanceof ViewerError) return error.kind;
-  if (error && error.name === 'PasswordException') return 'password';
-  return 'invalid';
+  const name = error && error.name;
+  if (name === 'PasswordException') return 'password';
+  if (name === 'InvalidPDFException' || name === 'UnknownErrorException') return 'invalid';
+  console.error(error);
+  return 'assets';
 }
 
 function requestedPage() {
