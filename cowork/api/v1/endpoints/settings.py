@@ -1084,6 +1084,10 @@ async def recommended_models(
         "canSetDecisionModel": not scope.org_mode or can_manage_org(principal),
     }
 
+    # No image picker where Anton's images won't go to MindsHub: a pick there does nothing.
+    if not gate_settings._images_go_to_mindshub():
+        image_models = []
+
     return {
         "recommendedModels": recommended,
         "recommendedPair": pair,

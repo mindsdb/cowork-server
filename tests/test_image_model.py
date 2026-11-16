@@ -331,6 +331,19 @@ def test_the_image_picker_lists_only_image_models_with_their_state(session, monk
     assert payload["modelLabels"][FLARE] == "GPT Image 2.6 Flare"
 
 
+def test_no_image_picker_where_images_will_not_go_to_mindshub(session, monkeypatch):
+    from cowork.services.settings import SettingService
+
+    service = SettingService(session, LOCAL_SCOPE)
+    for key, value in (("planning_provider", "anthropic"), ("coding_provider", "anthropic"),
+                       ("router_provider", "anthropic"), ("anthropic_api_key", "sk-ant-test")):
+        service.upsert_setting(key, value)
+    payload = _desktop_picker(session, monkeypatch, _listing(image_models={FLARE: True}))
+
+    assert payload["imageModels"] == []
+    assert "imageModelDefault" not in payload
+
+
 def test_the_picker_caches_what_resolution_reads(session, monkeypatch):
     from cowork.services.settings import SettingService
 
