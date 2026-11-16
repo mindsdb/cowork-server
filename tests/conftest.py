@@ -14,7 +14,9 @@ import pkgutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
+from unittest.mock import AsyncMock
 
 # Resolved: macOS links /var to /private/var, and a COWORK_HOME under that
 # link takes branches a Linux run doesn't, so the blocking guard
@@ -501,6 +503,17 @@ def managed_postgres_service():
     }
     yield "managed_pg", "direct"
     raw.pop("managed_pg", None)
+
+
+@pytest.fixture
+def empty_decisions_proxy_records(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Return an empty-record lookup and patch the Redis factory for one test."""
+    # Application imports must follow bootstrap's blocking-guard installation.
+    from cowork.turnqueue import redis_client
+
+    client = SimpleNamespace(get=AsyncMock(return_value=None))
+    monkeypatch.setattr(redis_client, "get_redis", lambda: client)
+    return client
 
 
 @pytest.fixture
