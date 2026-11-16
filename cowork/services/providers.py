@@ -875,6 +875,8 @@ async def model_value_rejection(
       they exist, and blocking that would deadlock a fresh install;
     - the catalog fetch failed, timed out, or came back empty.
 
+    The image model is stricter: a good catalog listing no image models refuses it.
+
     An offline or degraded MindsHub must never stop someone changing settings,
     so every failure mode above resolves to "allow". The fetch is the cached one
     the picker already uses (TTL + negative TTL), so the common case costs no
@@ -926,9 +928,14 @@ async def model_value_rejection(
         return None
 
     # ids is None on any failure and the list is empty for a gateway that serves
-    # no chat models; in both cases we hold no evidence, so we allow. Same for a
-    # gateway that lists no image models, which includes every one predating `kind`.
+    # no chat models; in both cases we hold no evidence, so we allow. An image
+    # model is refused by any good catalog that lacks it, even one listing none.
     served = list(listing.image_models) if image else listing.ids
+    if image and not served and (listing.ids or listing.enabled):
+        return (
+            f"'{value}' is not an image model this provider offers. "
+            "MindsHub lists no image models yet, so leave the image model unset."
+        )
     if not served:
         return None
     if value in served:

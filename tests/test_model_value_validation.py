@@ -208,12 +208,21 @@ def test_the_image_role_is_checked_whatever_the_chat_provider(catalog):
     assert _reject(s, "image_model", "gpt-image-2.6-sunburst") is None
 
 
-def test_a_catalog_listing_no_image_models_allows_any_image_model(monkeypatch):
-    """A MindsHub that predates `kind` lists none: no evidence, so allow."""
+def test_a_catalog_listing_no_image_models_refuses_every_image_model(monkeypatch):
+    """A good catalog with no image models (one predating `kind`) serves none."""
     async def _chat_only(*a, **k):
         return _listing(list(CATALOG))
 
     monkeypatch.setattr(providers, "fetch_minds_models", _chat_only)
+    assert _reject(_minds_settings(), "image_model", "gpt-image-2.6-flare") is not None
+    assert _reject(_minds_settings(), "image_model", "") is None
+
+
+def test_a_failed_catalog_fetch_still_allows_an_image_model(monkeypatch):
+    async def _failed(*a, **k):
+        return _listing(None)
+
+    monkeypatch.setattr(providers, "fetch_minds_models", _failed)
     assert _reject(_minds_settings(), "image_model", "gpt-image-2.6-flare") is None
 
 
