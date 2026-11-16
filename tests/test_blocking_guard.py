@@ -843,6 +843,10 @@ async def left():
     os.stat(os.environ["COWORK_HOME"])
 async def right():
     os.stat(os.environ["COWORK_HOME"])
+async def third():
+    os.stat(os.environ["COWORK_HOME"])
+async def fourth():
+    os.stat(os.environ["COWORK_HOME"])
 ''')
         conftest = _STALE_CONFTEST.replace("reached=_this_workers_share_of_the_allowlist()", "reached=REACHED")
         (root / "tests/conftest.py").write_text(conftest + '''
@@ -854,6 +858,10 @@ _blocking_guard.ALLOWLIST = (
                            ("cowork/guard_probe.py:left",), "probe's explicit leaf"),
     _blocking_guard.Allowed("cowork/guard_probe.py", "right", _blocking_guard.LOOP_FILE_STORE,
                            ("*",), "probe's wildcard leaf"),
+    _blocking_guard.Allowed("cowork/guard_probe.py", "third", _blocking_guard.LOOP_FILE_STORE,
+                           ("cowork/guard_probe.py:third",), "probe's explicit leaf"),
+    _blocking_guard.Allowed("cowork/guard_probe.py", "fourth", _blocking_guard.LOOP_FILE_STORE,
+                           ("cowork/guard_probe.py:fourth",), "probe's explicit leaf"),
 )
 @pytest.fixture(autouse=True)
 def watch(monkeypatch):
@@ -880,6 +888,13 @@ import asyncio
 from cowork.guard_probe import right
 def test_right():
     asyncio.run(right())
+''')
+        for name in ("third", "fourth"):
+            (root / f"tests/test_{name}.py").write_text(f'''
+import asyncio
+from cowork.guard_probe import {name}
+def test_{name}():
+    asyncio.run({name}())
 ''')
         (root / "tests/test_empty.py").write_text('"""Collected module with no test cases."""\n')
 
@@ -924,16 +939,18 @@ Path(sys.argv[2]).write_text(json.dumps(files) + "\\n")
     return sources, manifest
 
 
-def test_two_shards_keep_the_whole_suite_guard(guarded_shards, monkeypatch):
-    """Only the complete union reaches both real sites; stale leaves still fail aggregation."""
+def test_shards_keep_the_whole_suite_guard(guarded_shards, monkeypatch):
+    """Only the complete union reaches all real sites; stale leaves still fail aggregation."""
     root, run, inputs, _, execute = guarded_shards
-    packets = [sidecar(inputs / f"test-inventory-broad-shard-{index}-1234-1/inventory.json") for index in range(2)]
+    packets = [sidecar(inputs / f"test-inventory-broad-shard-{index}-1234-1/inventory.json") for index in range(4)]
     evidence = [read_evidence(path) for path in packets]
     assert all(len(packet.reached) == 1 and len(packet.workers) == 4 for packet in evidence)
-    assert {leaf.leaf for packet in evidence for leaf in packet.reached} == {"*", "cowork/guard_probe.py:left"}
+    assert {leaf.leaf for packet in evidence for leaf in packet.reached} == {
+        "*", "cowork/guard_probe.py:left", "cowork/guard_probe.py:third", "cowork/guard_probe.py:fourth"
+    }
     output = root.parent / "combined-guard"
     combined = aggregate(inputs, output)
-    assert combined["blocking_guard"] == {"complete": True, "required_leaves": 2, "reached_leaves": 2, "collected_files": 4}
+    assert combined["blocking_guard"] == {"complete": True, "required_leaves": 4, "reached_leaves": 4, "collected_files": 6}
     assert any("tests/test_empty.py" in packet.collected_files for packet in evidence)
     assert any("tests/test_skip.py" in packet.collected_files for packet in evidence)
     for index, path in enumerate(packets):
@@ -953,7 +970,7 @@ def test_two_shards_keep_the_whole_suite_guard(guarded_shards, monkeypatch):
         """Audit actual guard inputs without repeating full package coverage rendering."""
         collected_path, report, _ = _collection(inputs)
         declaration = _guard_evidence(collected_path, report)
-        producers = [latest_artifact(inputs, f"test-inventory-broad-shard-{index}") for index in range(2)]
+        producers = [latest_artifact(inputs, f"test-inventory-broad-shard-{index}") for index in range(4)]
         for _, shard, _ in producers:
             _compatible(report, shard)
         result = _global_guard(declaration, [path for path, _, _ in producers],
@@ -977,7 +994,7 @@ def test_two_shards_keep_the_whole_suite_guard(guarded_shards, monkeypatch):
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
     carried, attempts = guard_composition()
     assert carried == combined["blocking_guard"]
-    assert attempts == [2, 1]
+    assert attempts == [2, 1, 1, 1]
     for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB"):
         monkeypatch.delenv(key, raising=False)
     # Both local inventories share a directory, so a fixed sidecar name would collide.
@@ -987,13 +1004,24 @@ def test_two_shards_keep_the_whole_suite_guard(guarded_shards, monkeypatch):
     assert result.returncode == 0, result.stdout + result.stderr
     local = [read_evidence(sidecar(path)) for path in (collection_path, execution_path)]
     assert all(packet.run_id is None and packet.run_attempt is None for packet in local)
-    assert not local[0].reached and len(local[1].reached) == 2
+    assert not local[0].reached and len(local[1].reached) == 4
     assert "stale-entry check skipped" not in result.stdout
 
 
 def test_shard_guard_refuses_incomplete_or_altered_evidence(guarded_shards, monkeypatch):
     """Damage actual producer bytes and require every completeness/provenance rejection."""
     root, _, inputs, _, _ = guarded_shards
+    fourth = sidecar(inputs / "test-inventory-broad-shard-3-1234-1/inventory.json")
+    original_fourth = fourth.read_bytes()
+    try:
+        fourth.unlink()
+        with pytest.raises(ValueError, match="Missing or invalid artifact input"):
+            aggregate(inputs, root.parent / "missing-fourth-guard")
+        fourth.write_text('{"schema_version": 1}')
+        with pytest.raises(ValueError, match="Invalid blocking guard structure"):
+            aggregate(inputs, root.parent / "invalid-fourth-guard")
+    finally:
+        fourth.write_bytes(original_fourth)
     path = sidecar(inputs / "test-inventory-broad-shard-0-1234-1/inventory.json")
     original = path.read_bytes()
     raw = json.loads(original)

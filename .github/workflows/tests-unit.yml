@@ -66,6 +66,10 @@ jobs:
             number: 1
           - shard: 1
             number: 2
+          - shard: 2
+            number: 3
+          - shard: 3
+            number: 4
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

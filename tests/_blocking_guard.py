@@ -716,7 +716,9 @@ class StaleEntryCheck:
     def export(self, session: pytest.Session, *, exitstatus: int) -> None:
         """Publish an opted-in broad controller's declaration and normalized observations."""
         inventory = session.config.pluginmanager.getplugin("cowork-test-inventory")
-        if inventory is None or session.config.option.test_cohort not in ("broad", "broad-shard-0", "broad-shard-1"):
+        if inventory is None or session.config.option.test_cohort not in (
+            "broad", "broad-shard-0", "broad-shard-1", "broad-shard-2", "broad-shard-3"
+        ):
             return
         path = sidecar(inventory.path)
         if path.resolve().is_relative_to(inventory.root) or path.exists() or path.is_symlink():

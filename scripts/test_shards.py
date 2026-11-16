@@ -1,4 +1,4 @@
-"""Run two complete broad-suite partitions and verify their combined evidence."""
+"""Run four complete broad-suite partitions and verify their combined evidence."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from scripts.test_inventory import Report, read_report, validate, validate_junit
 
 _COLLECTION = "test-inventory-broad-collection"
 _SHARD = "test-inventory-broad-shard-"
+_SHARD_COUNT = 4
 _VARIABLE_CI_FIELDS = {"GITHUB_JOB", "GITHUB_RUN_ATTEMPT"}
 
 
@@ -108,13 +109,13 @@ def partition(collection: Report, modules: Iterable[str] = ()) -> list[list[str]
         counts.setdefault(_module_path(skipped.nodeid), 0)
     for module in modules:
         counts.setdefault(_module_path(module), 0)
-    groups: list[list[str]] = [[], []]
-    totals = [0, 0]
+    groups: list[list[str]] = [[] for _ in range(_SHARD_COUNT)]
+    totals = [0] * _SHARD_COUNT
     for module in sorted(counts, key=lambda name: (-counts[name], name)):
-        index = min(range(2), key=lambda candidate: (totals[candidate], candidate))
+        index = min(range(_SHARD_COUNT), key=lambda candidate: (totals[candidate], candidate))
         groups[index].append(module)
         totals[index] += counts[module]
-    _require(all(totals), "Both shards require executable cases")
+    _require(all(totals), "Every shard requires executable cases")
     return [sorted(group) for group in groups]
 
 
@@ -183,11 +184,11 @@ def _output(path: Path) -> Path:
 
 def run_shard(inputs: Path, output: Path, index: int) -> int:
     """Execute one complete module partition and propagate pytest's exit status."""
-    _require(index in (0, 1), "Invalid shard index")
+    _require(index in range(_SHARD_COUNT), "Invalid shard index")
     collection_path, collection, _ = _collection(inputs)
     declaration = _guard_evidence(collection_path, collection)
     groups = partition(collection, declaration.collected_files if declaration else ())
-    ignored = ["tests/integration", *groups[1 - index]]
+    ignored = ["tests/integration", *sorted(name for i, group in enumerate(groups) if i != index for name in group)]
     output = _output(output)
     environment = dict(os.environ, COVERAGE_FILE=str(output / "coverage.data"))
     command = [sys.executable, "-m", "pytest", "-q", "-o", "faulthandler_timeout=120",
@@ -228,18 +229,19 @@ def _coverage_sets(data: CoverageData) -> dict[str, set[int | tuple[int, int]]]:
 
 
 def aggregate(inputs: Path, output: Path) -> dict[str, object]:
-    """Audit both real executions, combine only their coverage and retain provenance."""
+    """Audit every real shard execution, combine their coverage and retain provenance."""
     collection_path, collection, collection_attempt = _collection(inputs)
     declaration = _guard_evidence(collection_path, collection)
     groups = partition(collection, declaration.collected_files if declaration else ())
     reports, paths, attempts = [], [], []
-    for index in range(2):
+    for index in range(_SHARD_COUNT):
         path, report, attempt = latest_artifact(inputs, _SHARD + str(index))
         _require(report.mode == "execution" and report.cohort == f"broad-shard-{index}", "Wrong shard cohort/mode")
         _compatible(collection, report)
         validate_junit(report, _artifact_file(path, "junit.xml"))
         selection = report.invocation.selection
-        _require(selection.paths == ["tests/"] and selection.ignore == ["tests/integration", *groups[1 - index]] and
+        ignored = ["tests/integration", *sorted(name for i, group in enumerate(groups) if i != index for name in group)]
+        _require(selection.paths == ["tests/"] and selection.ignore == ignored and
                  not selection.keyword and not selection.markers and not selection.deselect and
                  not report.collection.deselected, "Shard selection differs")
         _require(report.invocation.workers == 4, "Shard worker count differs")
@@ -256,13 +258,14 @@ def aggregate(inputs: Path, output: Path) -> dict[str, object]:
         reports.append(report)
         paths.append(path)
         attempts.append(attempt)
-    _require(reports[0].invocation.coverage == reports[1].invocation.coverage, "Coverage configurations differ")
+    _require(all(report.invocation.coverage == reports[0].invocation.coverage for report in reports),
+             "Coverage configurations differ")
     items = [case for report in reports for case in report.collection.items]
     _require(len(items) == len({case.nodeid for case in items}) == len(collection.collection.items), "Case union is not exact")
     guard_result = _global_guard(declaration, paths, reports, groups)
     coverage_paths = [_artifact_file(path, "coverage.data") for path in paths]
     data = [_coverage_data(path) for path in coverage_paths]
-    _require(data[0].has_arcs() == data[1].has_arcs(), "Coverage line/arc modes differ")
+    _require(all(measurement.has_arcs() == data[0].has_arcs() for measurement in data), "Coverage line/arc modes differ")
     _require(data[0].has_arcs() == bool(reports[0].invocation.coverage.effective.get("branch")), "Coverage mode differs from report")
     expected = {}
     for measurement in data:
@@ -297,7 +300,7 @@ def aggregate(inputs: Path, output: Path) -> dict[str, object]:
     if guard_result is not None:
         summary["blocking_guard"] = guard_result
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(f"Verified complete broad selection: {len(items)} cases across two shards.")
+    print(f"Verified complete broad selection: {len(items)} cases across {_SHARD_COUNT} shards.")
     return summary
 
 
@@ -310,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--inputs", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)
         if name == "run":
-            command.add_argument("--index", type=int, choices=(0, 1), required=True)
+            command.add_argument("--index", type=int, choices=range(_SHARD_COUNT), required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "run":

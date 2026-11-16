@@ -481,7 +481,7 @@ def test_nested_coverage_keeps_parent_data(inventory_suite, monkeypatch):
 
 @pytest.fixture
 def shard_evidence(inventory_suite, monkeypatch):
-    """Produce a full collection and both real shard reports in an isolated checkout."""
+    """Produce a full collection and four real shard reports in an isolated checkout."""
     return _shard_evidence(inventory_suite, monkeypatch)
 
 
@@ -495,7 +495,10 @@ def _shard_evidence(inventory_suite, monkeypatch, *, prepare=None):
     package = root / "cowork"
     package.mkdir()
     (package / "__init__.py").write_text("")
-    (package / "sample.py").write_text("def choose(value):\n    if value:\n        return 1\n    return 0\n")
+    (package / "sample.py").write_text(
+        "def choose(value):\n    if value == 2:\n        return 2\n    if value == 3:\n        return 3\n"
+        "    if value:\n        return 1\n    return 0\n"
+    )
     tests = root / "tests"
     tests.mkdir()
     (tests / "test_left é.py").write_text('''
@@ -517,6 +520,14 @@ def test_runtime_skip():
     pytest.skip("runtime prerequisite")
 ''')
     (tests / "test_skip.py").write_text('import pytest\npytest.skip("module prerequisite", allow_module_level=True)\n')
+    for name, value in (("third", 2), ("fourth", 3)):
+        (tests / f"test_{name}.py").write_text(f'''
+import os
+from cowork.sample import choose
+def test_{name}():
+    assert not os.environ.get("PROBE_FAIL")
+    assert choose({value}) == {value}
+''')
     (tests / "integration").mkdir()
     (tests / "integration/test_ignored.py").write_text('raise RuntimeError("integration must stay excluded")\n')
     if prepare is not None:
@@ -551,7 +562,7 @@ def test_runtime_skip():
         )
         return completed, output
 
-    for index in range(2):
+    for index in range(4):
         result, _ = execute(index)
         assert result.returncode == 0, result.stdout + result.stderr
     monkeypatch.setenv("GITHUB_JOB", "unit-tests")
@@ -560,7 +571,7 @@ def test_runtime_skip():
 
 
 def test_shards_preserve_cases_skips_and_covered_lines(inventory_suite, monkeypatch):
-    """Both real executions preserve the full selection and equal unsharded line coverage."""
+    """Four real executions preserve the full selection and equal unsharded line coverage."""
     def observe_directories(root):
         """Record real collector visits outside the temporary source, separately per worker."""
         (root / "tests/conftest.py").write_text('''
@@ -589,9 +600,10 @@ def pytest_sessionfinish(session):
     assert result.returncode == 0, result.stdout + result.stderr
     output = root.parent / "combined"
     combined = aggregate(inputs, output)
-    assert combined["collected"] == len(collection.collection.items) == 4
+    assert combined["collected"] == len(collection.collection.items) == 6
     assert combined["collector_skips"] == 1
-    actual = [read_report(output / f"shard-{i}/inventory.json") for i in range(2)]
+    actual = [read_report(output / f"shard-{i}/inventory.json") for i in range(4)]
+    assert [shard["index"] for shard in combined["shards"]] == [0, 1, 2, 3]
     assert sorted(case.nodeid for report in actual for case in report.collection.items) == sorted(
         case["nodeid"] for case in control["collection"]["items"])
     skips = [phase.reason for report in actual for phase in report.phases if phase.outcome == "skipped"]
@@ -601,7 +613,7 @@ def pytest_sessionfinish(session):
         measurement.read()
     assert {name: set(data[0].lines(name) or []) for name in data[0].measured_files()} == {
         name: set(data[1].lines(name) or []) for name in data[1].measured_files()}
-    for index in range(2):
+    for index in range(4):
         for worker in range(4):
             counts = json.loads((root.parent / f"directories-broad-shard-{index}-gw{worker}.json").read_text())
             assert counts["tests"] == 1
@@ -621,7 +633,7 @@ def test_shards_accept_flat_single_collection_download(shard_evidence, monkeypat
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
     combined = aggregate(inputs, root.parent / "flat-combined")
     assert combined["collection_attempt"] == 1
-    assert [shard["producer_attempt"] for shard in combined["shards"]] == [2, 1]
+    assert [shard["producer_attempt"] for shard in combined["shards"]] == [2, 1, 1, 1]
     assert flat.read_bytes() == original
     for key, value, message in (
         ("GITHUB_RUN_ID", "9999", "producer identity"),
@@ -708,13 +720,37 @@ def test_shard_aggregate_rejects_damaged_evidence(shard_evidence):
                 aggregate(inputs, root.parent / "must-not-pass")
         finally:
             coverage.write_bytes(original_data)
-    hidden = shard.with_name("withheld-shard")
-    shard.rename(hidden)
+    for index in range(4):
+        producer = inputs / f"test-inventory-broad-shard-{index}-1234-1"
+        hidden = producer.with_name("withheld-shard")
+        producer.rename(hidden)
+        try:
+            with pytest.raises(ValueError, match="Missing required artifact"):
+                aggregate(inputs, root.parent / "must-not-pass")
+        finally:
+            hidden.rename(producer)
+    for index in (2, 3):
+        path = inputs / f"test-inventory-broad-shard-{index}-1234-1/inventory.json"
+        original_report = path.read_bytes()
+        altered = json.loads(original_report)
+        altered["invocation"]["coverage"]["context"] = "different-context"
+        try:
+            path.write_text(json.dumps(altered))
+            with pytest.raises(ValueError, match="Coverage configurations differ"):
+                aggregate(inputs, root.parent / "must-not-pass")
+        finally:
+            path.write_bytes(original_report)
+    fourth_coverage = inputs / "test-inventory-broad-shard-3-1234-1/coverage.data"
+    original_fourth = fourth_coverage.read_bytes()
     try:
-        with pytest.raises(ValueError, match="Missing required artifact"):
+        fourth_coverage.unlink()
+        arcs = CoverageData(basename=str(fourth_coverage))
+        arcs.add_arcs({str(root / "cowork/sample.py"): {(1, 2)}})
+        arcs.write()
+        with pytest.raises(ValueError, match="Coverage line/arc modes differ"):
             aggregate(inputs, root.parent / "must-not-pass")
     finally:
-        hidden.rename(shard)
+        fourth_coverage.write_bytes(original_fourth)
 
 
 def test_shards_retain_partial_rerun_producers(shard_evidence, monkeypatch):
@@ -727,7 +763,7 @@ def test_shards_retain_partial_rerun_producers(shard_evidence, monkeypatch):
     combined = aggregate(inputs, root.parent / "partial-rerun")
     assert combined["collection_attempt"] == 1
     assert combined["consumer_attempt"] == 10
-    assert [shard["producer_attempt"] for shard in combined["shards"]] == [10, 1]
+    assert [shard["producer_attempt"] for shard in combined["shards"]] == [10, 1, 1, 1]
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "9")
     with pytest.raises(ValueError, match="future producer"):
         latest_artifact(inputs, "test-inventory-broad-shard-0")
@@ -736,14 +772,18 @@ def test_shards_retain_partial_rerun_producers(shard_evidence, monkeypatch):
 def test_shard_failure_never_falls_back_to_old_success(shard_evidence, monkeypatch):
     """A real failed retry preserves its nonzero status and shadows the older passing input."""
     root, _, inputs, _, execute = shard_evidence
-    completed, output = execute(0, 2, fail=True)
-    assert completed.returncode == 1
-    failed = read_report(output / "inventory.json")
-    assert failed.completion.exitstatus == 1
-    assert any(phase.outcome == "failed" for phase in failed.phases)
-    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
-    with pytest.raises(ValueError, match="Newest producer did not succeed"):
-        aggregate(inputs, root.parent / "must-not-pass")
+    for index in (0, 3):
+        completed, output = execute(index, 2, fail=True)
+        assert completed.returncode == 1
+        failed = read_report(output / "inventory.json")
+        assert failed.completion.exitstatus == 1
+        assert any(phase.outcome == "failed" for phase in failed.phases)
+        monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+        try:
+            with pytest.raises(ValueError, match="Newest producer did not succeed"):
+                aggregate(inputs, root.parent / "must-not-pass")
+        finally:
+            output.rename(output.with_name(f"withheld-failed-{index}"))
 
 
 def test_shards_reject_unsafe_modules_and_indices(shard_evidence):
@@ -759,6 +799,7 @@ def test_shards_reject_unsafe_modules_and_indices(shard_evidence):
         changed.collection.items[0].nodeid = name + "::test_bad"
         with pytest.raises(ValueError, match="module" if name else "metadata"):
             partition(changed)
-    completed, output = execute(2)
-    assert completed.returncode != 0
-    assert not output.exists()
+    for index in (-1, 4):
+        completed, output = execute(index)
+        assert completed.returncode != 0
+        assert not output.exists()

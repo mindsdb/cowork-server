@@ -29,7 +29,7 @@ class GuardEvidence(BaseModel):
 
     schema_version: Literal[1]
     mode: Literal["collection", "execution"]
-    cohort: Literal["broad", "broad-shard-0", "broad-shard-1"]
+    cohort: Literal["broad", "broad-shard-0", "broad-shard-1", "broad-shard-2", "broad-shard-3"]
     revision: Revision
     revision_end: Revision
     run_id: str | None
