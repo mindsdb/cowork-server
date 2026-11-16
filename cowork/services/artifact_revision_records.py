@@ -141,6 +141,8 @@ class RevisionEntry(JournalRecord):
     # An older build saved a rejected or captured repair's commentThreadId as
     # is, even when it was null or not text.
     comment_thread_ids: list[str | int | float | bool | None] = []
+    #: The schedule whose run made an agent revision; absent otherwise.
+    schedule_id: str | None = None
 
 
 def _entry_or_none(raw: object) -> RevisionEntry | None:

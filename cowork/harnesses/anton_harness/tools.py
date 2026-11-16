@@ -20,6 +20,7 @@ here as needed; same pattern.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -367,7 +368,9 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
 
     from cowork.services.publish import (
         ARTIFACT_TOO_LARGE_MESSAGE,
+        MARKDOWN_NOT_PUBLISHABLE_CODE,
         OWNED_BY_OTHER_USER_MESSAGE,
+        MarkdownNotPublishable,
         PublishOwnedByOtherUser,
         PublishRejected,
         PublishTooLarge,
@@ -376,7 +379,10 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     from cowork.services.sharing_contract import SHARE_ORG_REQUIRED_INSTRUCTION
 
     try:
-        result = _publish_artifact(abs_path, access=access)
+        # A thread of its own: a Markdown page renders in the conversion
+        # process, for up to its 30 s, and the upload blocks too. This handler
+        # runs on the server's event loop.
+        result = await asyncio.to_thread(_publish_artifact, abs_path, access=access)
     except PublishOwnedByOtherUser:
         # The model can edit files, so spell out that it must not work around
         # the refusal (e.g. by dropping the stored report_id). Not a ban for the
@@ -398,6 +404,16 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             "Tell the user, or remove or shrink large files in the artifact "
             "(PDFs, images) and publish again.",
             reason="too_large",
+        )
+    except MarkdownNotPublishable as exc:
+        # The same file is refused on every try, and each try can hold the
+        # server's one conversion for 30 s; the model can shorten the file.
+        message = exc.detail["message"]
+        logger.info("Cowork publish refused: %s", message)
+        return _fail(
+            f"PUBLISH FAILED: {message} Do not retry with the same file. "
+            "Tell the user, or shorten or simplify the Markdown and publish again.",
+            reason=MARKDOWN_NOT_PUBLISHABLE_CODE,
         )
     except ShareOrgRequired as exc:
         # The reason is MindsHub's, and classify_upload_error already logged
@@ -733,6 +749,11 @@ def build_cowork_lookup_connector_tool():
     )
 
 
+_DATA_REQUEST_NOTE = (
+    "When the API has no plain GET route that returns data, usage_notes must "
+    "say how to fetch a small sample of data (method, path, body shape, token "
+    "flow), because the connection test passes only once data comes back."
+)
 _BUILD_CUSTOM_CONNECTOR = (
     "No built-in or saved connector matches. Build a custom connector: ask the "
     "user how the system is reached (a REST or GraphQL API, a database, or file "
@@ -740,13 +761,14 @@ _BUILD_CUSTOM_CONNECTOR = (
     "handcraft the form with `engine` set to the new connector's id and a "
     "`connector` block (label, description, category, usage_notes), and pass it "
     "to `request_credentials`. Credentials go only through that form, never chat. "
-    "Once its connection test passes it is saved for reuse."
+    f"{_DATA_REQUEST_NOTE} Once its connection test passes it is saved for reuse."
 )
 _NO_CUSTOM_CONNECTOR = (
     "No built-in or saved connector matches, and custom connectors can't be "
     "saved for reuse on this deployment. Tell the user so. A handcrafted form "
     "passed to `request_credentials` still saves this connection once its test "
-    "passes, but it won't be listed with the connectors."
+    "passes, but it won't be listed with the connectors. Still give the form a "
+    f"`connector` block with usage_notes. {_DATA_REQUEST_NOTE}"
 )
 
 
@@ -970,12 +992,12 @@ _REQUEST_CREDENTIALS_SCHEMA = {
         },
         "connector": {
             "type": "object",
-            "description": "Only when building a new custom connector: how it is listed for reuse, where lookup_connector says one can be saved, once its connection test passes.",
+            "description": "On every handcrafted form. Its usage_notes guide the connection test, and where lookup_connector says a custom connector can be saved, it is how the connector is listed for reuse once that test passes.",
             "properties": {
                 "label": {"type": "string", "description": "Display name (e.g. 'Acme Planner')."},
                 "description": {"type": "string", "description": "One line on what it connects to."},
                 "category": {"type": "string", "description": "Picker category (e.g. 'database', 'crm', 'developer')."},
-                "usage_notes": {"type": "string", "description": "Short notes for using it later: base URL, auth header, key endpoints, quirks. Never credential values."},
+                "usage_notes": {"type": "string", "description": f"Short notes for using it later: base URL, auth header, key endpoints, quirks. {_DATA_REQUEST_NOTE} Never credential values."},
             },
         },
         "_connector_id": {

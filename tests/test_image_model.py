@@ -31,7 +31,7 @@ from cowork.common.settings.user_settings import (
 )
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.services.providers import MindsModelListing
-from _fakes import FakeRequest
+from _fakes import FakeRequest, units_on_engine
 
 FLARE = IMAGE_MODEL_DEFAULT
 SUNBURST = "gpt-image-2.6-sunburst"
@@ -288,11 +288,12 @@ def _listing(*, image_models, enabled=None, role_defaults=None, disabled_reasons
 
 
 @pytest.fixture()
-def session():
+def session(monkeypatch):
     import cowork.models.setting  # noqa: F401
 
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
+    units_on_engine(monkeypatch, engine)
     with Session(engine) as s:
         yield s
 
@@ -301,12 +302,12 @@ def _desktop_picker(session, monkeypatch, listing) -> dict:
     from cowork.api.v1.endpoints import settings as ep
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         return listing
 
     monkeypatch.setattr(ep, "fetch_minds_models", fake_fetch)
     SettingService(session, LOCAL_SCOPE).upsert_setting("minds_api_key", "mdb_desktop")
-    return asyncio.run(ep.recommended_models(FakeRequest(), session, LOCAL_SCOPE))
+    return asyncio.run(ep.recommended_models(FakeRequest(), LOCAL_SCOPE))
 
 
 def test_the_chat_pickers_never_list_an_image_model(session, monkeypatch):
@@ -382,7 +383,7 @@ def test_an_org_members_restricted_image_model_is_theirs_alone(session, monkeypa
     def scope(user_id):
         return TenantScope(org_mode=True, org_id="org-image", user_id=user_id)
 
-    asyncio.run(ep.recommended_models(FakeRequest({"Authorization": "Bearer jwt-a"}), session, scope("u-a")))
+    asyncio.run(ep.recommended_models(FakeRequest({"Authorization": "Bearer jwt-a"}), scope("u-a")))
 
     member_a = SettingService(session, scope("u-a")).load()
     member_b = SettingService(session, scope("u-b")).load()

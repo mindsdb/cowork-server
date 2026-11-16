@@ -155,6 +155,18 @@ def test_expired_entries_are_dropped_on_the_next_write(monkeypatch) -> None:
     assert _key(_URL, api_key="newcomer") in providers._minds_models_cache
 
 
+def test_an_expired_success_survives_other_writes_for_the_retain_window(monkeypatch) -> None:
+    # The freshness TTL is short; the coding endpoints still read the last listing.
+    _serve(monkeypatch, [])
+    member = _key(_URL, api_key="member-a")
+    past_fresh = time.monotonic() - providers._MINDS_MODELS_TTL - 60
+    providers._minds_models_cache[member] = (past_fresh, _listing(["gpt"]))
+
+    _fetch("member-b")
+
+    assert providers.cached_minds_models(_URL, api_key="member-a").ids == ["gpt"]
+
+
 def test_the_cache_holds_at_most_the_cap_and_drops_the_least_recently_used(monkeypatch) -> None:
     calls: list[str] = []
     _serve(monkeypatch, calls)

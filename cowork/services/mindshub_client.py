@@ -17,7 +17,7 @@ import asyncio
 import hashlib
 import logging
 import time
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from enum import StrEnum
 from typing import Any, Generic, NamedTuple, Protocol, TypeVar
 from uuid import UUID
@@ -110,6 +110,43 @@ async def get_mindshub_reply(path: str, bearer_token: str) -> MindsHubReply:
     except ValueError:
         logger.debug("MindsHub GET %s returned a non-JSON body", path)
         return MindsHubReply(MindsHubAnswer.UNREACHABLE, status_code=code)
+
+
+async def send_mindshub(
+    method: str, path: str, bearer_token: str, *, json_body: Any = None
+) -> MindsHubReply:
+    """``method`` one MindsHub path with the caller's bearer and an optional
+    JSON body, and say how MindsHub answered, as get_mindshub_reply does.
+    Unlike it, a refusal (4xx) keeps its JSON body as ``payload``, so a route
+    that passes a write through can repeat MindsHub's own message. No
+    redirects: a write must not be replayed somewhere else."""
+
+    async def _send() -> httpx.Response:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_TIMEOUT_S)) as client:
+            return await client.request(
+                method,
+                f"{mindshub_v1()}{path}",
+                headers={"Authorization": f"Bearer {bearer_token}"},
+                json=json_body,
+            )
+
+    try:
+        response = await asyncio.wait_for(_send(), _TIMEOUT_S)
+    except Exception as exc:
+        logger.debug("MindsHub %s %s failed: %s", method, path, exc)
+        return MindsHubReply(MindsHubAnswer.UNREACHABLE)
+    code = response.status_code
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if code == status.HTTP_429_TOO_MANY_REQUESTS:
+        return MindsHubReply(MindsHubAnswer.THROTTLED, payload=payload, status_code=code)
+    if 400 <= code < 500:
+        return MindsHubReply(MindsHubAnswer.REFUSED, payload=payload, status_code=code)
+    if code >= 500 or payload is None:
+        return MindsHubReply(MindsHubAnswer.UNREACHABLE, status_code=code)
+    return MindsHubReply(MindsHubAnswer.OK, payload=payload, status_code=code)
 
 
 async def get_mindshub_json(path: str, bearer_token: str) -> Any | None:
@@ -341,10 +378,16 @@ class CallerTtlCache(Generic[_V]):
         self._entries.clear()
 
 
-def sweep_cache(cache: MutableMapping[Any, tuple[Any, ...]], *, max_ttl_s: float) -> None:
+def sweep_cache(
+    cache: MutableMapping[Any, tuple[Any, ...]],
+    *,
+    max_ttl_s: float,
+    stamp: Callable[[tuple[Any, ...]], float] = lambda entry: entry[0],
+) -> None:
     """Drop the entries of a cache of ``(stored_at, ...)`` tuples that no TTL
     up to ``max_ttl_s`` could still consider fresh, for a cache that keeps
-    its own entries (the model catalog, cowork.services.providers)."""
+    its own entries (the model catalog, cowork.services.providers). ``stamp``
+    reads an entry's age when it isn't ``entry[0]``."""
     cutoff = time.monotonic() - max_ttl_s
-    for key in [k for k, entry in cache.items() if entry[0] < cutoff]:
+    for key in [k for k, entry in cache.items() if stamp(entry) < cutoff]:
         del cache[key]

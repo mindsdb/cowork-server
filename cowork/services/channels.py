@@ -6,7 +6,8 @@ from cowork.channels.plugin import ChannelPlugin, VerifyResult
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.common.encryption import decrypt, encrypt
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import MissingTenantScopeError, ScopedSession
+from cowork.db.scoped import MissingTenantScopeError, ScopedSession, TenantScope
+from cowork.db.units import run_db
 from cowork.models.channel import ChannelInstallation
 from cowork.models.setting import Setting
 from cowork.schemas.channels import (
@@ -100,22 +101,6 @@ class ChannelConfigService:
     def get_config(self, channel_type: str) -> ChannelConfigResponse:
         plugin = self._require_plugin(channel_type)
         return self._config_dto(plugin)
-
-    async def test_connection(self, channel_type: str) -> VerifyResult:
-        """Calls the plugin's `verify` hook against the currently STORED
-        credentials — proof they actually authenticate, not just that
-        `_is_configured` found something typed into every required field."""
-        plugin = self._require_plugin(channel_type)
-        if plugin.verify is None:
-            return VerifyResult(ok=False, detail=f"{plugin.display_name} has no connection test yet")
-        result = await plugin.verify(self.load_credentials(channel_type))
-        # Stamp the discovered routing key onto the installation (in org mode, so
-        # webhooks can route to the right org; in local mode, for webhook deduping).
-        # If another org claimed this platform account, IntegrityError surfaces the
-        # conflict and the caller decides whether to proceed.
-        if result.ok and result.routing_key:
-            self.set_external_account_id(channel_type, result.routing_key)
-        return result
 
     def load_credentials(self, channel_type: str) -> dict[str, str]:
         """Decrypted credential values for internal runtime use only — building
@@ -285,3 +270,37 @@ class ChannelConfigService:
                     org_id=self._org_id(),
                 )
             )
+
+
+async def check_channel_connection(
+    channel_type: str, *, scope: TenantScope, registry: PluginRegistry | None = None
+) -> VerifyResult:
+    """Calls the plugin's `verify` hook against the currently STORED
+    credentials — proof they actually authenticate, not just that
+    `_is_configured` found something typed into every required field.
+
+    The credentials are read, and the routing key stamped, in units of their
+    own, so no pooled connection waits on the platform's answer."""
+    registry = registry if registry is not None else get_registry()
+    plugin = registry.get(channel_type)
+    if plugin is None:
+        raise UnknownChannelError(channel_type)
+    if plugin.verify is None:
+        return VerifyResult(ok=False, detail=f"{plugin.display_name} has no connection test yet")
+    credentials = await run_db(
+        lambda session: ChannelConfigService(session, registry=registry).load_credentials(channel_type),
+        scope=scope,
+    )
+    result = await plugin.verify(credentials)
+    # Stamp the discovered routing key onto the installation (in org mode, so
+    # webhooks can route to the right org; in local mode, for webhook deduping).
+    # If another org claimed this platform account, IntegrityError surfaces the
+    # conflict and the caller decides whether to proceed.
+    if result.ok and result.routing_key:
+        await run_db(
+            lambda session: ChannelConfigService(session, registry=registry).set_external_account_id(
+                channel_type, result.routing_key
+            ),
+            scope=scope,
+        )
+    return result

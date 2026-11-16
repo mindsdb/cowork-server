@@ -38,7 +38,8 @@ from cowork.common.settings.app_settings import get_app_settings, get_export_pdf
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.schemas.artifact_export import ExportPdfSettings, ExportRequest, ExportResult, RenderPdfRequest
-from cowork.services import artifact_export
+from cowork.schemas.export_child import ChildLimits
+from cowork.services import artifact_export, export_runner
 from cowork.services import artifact_ownership as ownership
 from cowork.services import artifacts as artifacts_service
 from cowork.services.artifact_export import ExportRefused, ExportSource, export_slot
@@ -46,6 +47,7 @@ from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.markdown_render import MAX_FENCE_LENGTH
 from cowork.services.render_pdf_client import RenderServicePdf
 from test_artifact_ownership import legacy_root, make_conversation, make_project, project_root
+from _async_stub import awaitable
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
 ROUTE_CASES = yaml.safe_load((FIXTURES / "route_cases.yaml").read_text(encoding="utf-8"))["cases"]
@@ -120,7 +122,7 @@ def local_artifact(tmp_path, monkeypatch):
         monkeypatch.setattr(
             workspace_ep,
             "review_artifact_for_request",
-            lambda *_args: (source, folder, _metadata(folder), True),
+            awaitable(lambda *_args: (source, folder, _metadata(folder), True)),
         )
         return folder
 
@@ -149,6 +151,8 @@ def test_route_cases(client, local_artifact, case):
     after = _snapshot(folder)
     if case["status"] != 200:
         assert after == before
+        if "detail" in case:
+            assert response.json()["detail"] == case["detail"]
         return
     written = case["written"]
     assert response.json() == {
@@ -493,9 +497,9 @@ def test_a_conversion_failure_answers_500_and_writes_nothing(client, local_artif
     before = _snapshot(folder)
 
     def broken(**_kwargs):
-        raise ValueError("the writer failed")
+        raise export_runner.ConversionError("ValueError")
 
-    monkeypatch.setattr(artifact_export, "write_docx", broken)
+    monkeypatch.setattr(artifact_export, "convert_in_child", broken)
 
     response = client.post(EXPORT_URL, json={"format": "docx"})
 
@@ -764,7 +768,7 @@ def test_a_unc_primary_is_passed_over_before_any_file_call(client, local_artifac
 
 
 def test_permission_is_checked_before_any_file_is_resolved(monkeypatch):
-    from cowork.db.scoped import get_scoped_session
+    from cowork.db.scoped import get_tenant_scope
     from cowork.services import product_permissions
 
     async def denied(_scope, _permission):
@@ -772,11 +776,11 @@ def test_permission_is_checked_before_any_file_is_resolved(monkeypatch):
 
     monkeypatch.setattr(product_permissions, "has_product_permission", denied)
     resolve = Mock(side_effect=AssertionError("resolved an artifact"))
-    monkeypatch.setattr(workspace_ep, "_owner_workspace", resolve)
+    monkeypatch.setattr(workspace_ep, "_owner_workspace", awaitable(resolve))
     app = FastAPI()
     app.include_router(workspace_ep.router)
     org = TenantScope(org_mode=True, org_id="org", user_id="user")
-    app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=org)
+    app.dependency_overrides[get_tenant_scope] = lambda: org
 
     with TestClient(app) as test_client:
         response = test_client.post(
@@ -923,7 +927,7 @@ async def _export(world, user_id: str, slug: str, export_format: str = "docx", *
             str(world.project.id),
             world.artifacts[slug].id,
             ExportRequest(format=export_format),
-            session,
+            session.scope,
         )
 
 
@@ -1013,21 +1017,29 @@ async def test_the_owner_asking_a_format_not_offered_gets_422(org_world, role, o
     assert _snapshot(folder) == before
 
 
-@pytest.mark.parametrize(("org_mode", "budget"), [(True, 10 * MIB), (False, 25 * MIB)])
-async def test_the_word_inline_budget_is_smaller_in_org_mode(
-    org_world, role, org_export_on, monkeypatch, org_mode, budget
+@pytest.mark.parametrize(
+    ("org_mode", "budget", "memory"),
+    [
+        (True, 10 * MIB, artifact_export.ORG_CONVERSION_MEMORY_BYTES),
+        (False, 25 * MIB, artifact_export.CONVERSION_MEMORY_BYTES),
+    ],
+)
+async def test_the_word_inline_budget_and_conversion_memory_are_smaller_in_org_mode(
+    org_world, role, org_export_on, monkeypatch, org_mode, budget, memory
 ):
     if not org_mode:
         monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
         get_app_settings.cache_clear()
     budgets: list[int] = []
-    inline = artifact_export.inline_artifact_html
+    limits: list[ChildLimits] = []
+    convert = artifact_export.convert_in_child
 
     def spy(**kwargs):
-        budgets.append(kwargs["limits"].max_total_bytes)
-        return inline(**kwargs)
+        budgets.append(kwargs["request"].limits.max_total_bytes)
+        limits.append(kwargs["limits"])
+        return convert(**kwargs)
 
-    monkeypatch.setattr(artifact_export, "inline_artifact_html", spy)
+    monkeypatch.setattr(artifact_export, "convert_in_child", spy)
     folder = org_world.artifacts["mine"].folder
     source = ProjectArtifacts(
         base=folder.parent,
@@ -1047,6 +1059,9 @@ async def test_the_word_inline_budget_is_smaller_in_org_mode(
     )
 
     assert budgets == [budget]
+    assert limits == [
+        ChildLimits(wall_seconds=artifact_export.CONVERSION_WALL_SECONDS, memory_bytes=memory)
+    ]
 
 
 def padded_png(size: int, *, filler: bytes = b"x") -> bytes:

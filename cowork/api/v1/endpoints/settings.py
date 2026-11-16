@@ -9,11 +9,13 @@
 - GET /reveal-key/{name} — return the unmasked API key for a provider
 - POST /test-providers — ping provider APIs to check connectivity
 - POST /validate-provider — validate credentials for a specific provider
+- POST /test-decision-model — send one decision to the organization's decision model
 """
 from __future__ import annotations
 
 import json
 import logging
+from functools import partial
 from typing import Annotated, Any, Optional
 from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -29,8 +31,10 @@ from cowork.api.v1.permissions import (
     require,
 )
 from cowork.common.paths import cowork_home
-from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope, unsafe_unscoped_session
 from cowork.db.session import get_session
+from cowork.db.units import run_db
+from cowork.handlers.jev_route import is_web_address
 from cowork.principal import Principal, caller_bearer, can_manage_org, get_principal
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import (
@@ -43,6 +47,7 @@ from cowork.schemas.settings import (
 )
 from cowork.services.providers import (
     MODEL_VALUE_SETTINGS,
+    MindsModelListing,
     check_config_status,
     fetch_minds_models,
     fetch_org_model_catalog,
@@ -56,7 +61,8 @@ from cowork.services.providers import (
     validate_provider as validate_provider_svc,
     warm_enabled_model_map,
 )
-from cowork.services.settings import SettingService
+from cowork.services.org_branding import remove_brand_skill
+from cowork.services.settings import SettingService, unit_setting_service
 
 logger = logging.getLogger(__name__)
 from cowork.common.settings.app_settings import (
@@ -152,7 +158,6 @@ def _reject_malformed_role_defaults(updates: dict[str, Any]) -> None:
 
 
 async def _reject_unservable_models(
-    session: Session,
     scope: TenantScope,
     updates: dict[str, Any],
     request: Request | None = None,
@@ -189,7 +194,9 @@ async def _reject_unservable_models(
     }
     if not candidates:
         return
-    settings = SettingService(session, scope).load_pending(updates)
+    settings = await run_db(
+        lambda session: unit_setting_service(session).load_pending(updates), scope=scope
+    )
     for key, value in candidates.items():
         rejection = await model_value_rejection(
             settings,
@@ -205,6 +212,81 @@ async def _reject_unservable_models(
             )
 
 
+def _reject_decision_model_url_without_host(*, updates: dict[str, Any]) -> None:
+    """400 on saving a ``decision_model_url`` that isn't an http(s) URL with a
+    host and no user, such as ``decisions.example.com/v1`` typed without its
+    scheme: the gate can't send to it and anton's browser config refuses it,
+    and a user part would keep a password in a setting that isn't secret.
+    Blank clears it. A check on the write, not on the field, so a value stored
+    before this check still loads, and reading settings never fails on it."""
+    raw = (updates or {}).get("decision_model_url")
+    if not isinstance(raw, str) or not raw.strip():
+        return
+    if not is_web_address(url=raw.strip()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The decision model's endpoint must be a full web address, starting with https://, with no user name in it.",
+        )
+
+
+def _reject_approvals_off_stamp(*, keys: list[str]) -> None:
+    """400 on a write that names ``browser_approve_steps_off_at``: only
+    SettingService stamps it (``_stamp_approvals_off``), when a write turns
+    browser step approvals off. A client's value, such as 0, would have the
+    app approve steps held before the person turned approvals off."""
+    if "browser_approve_steps_off_at" in keys:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="browser_approve_steps_off_at is set by the server when browser step approvals go off.",
+        )
+
+
+def _turns_on(updates: dict[str, Any], key: str) -> bool:
+    value = (updates or {}).get(key)
+    return isinstance(value, str) and value.strip().lower() in ("true", "1", "yes", "on")
+
+
+async def _reject_browser_that_cant_run(scope: TenantScope, updates: dict[str, Any]) -> None:
+    """400 on turning the browser on where it can't run: with no decisions
+    model to pick its steps (`jev_route.decisions_available`), or on the web
+    with an LLM other than MindsHub, whose browser router takes only a
+    MindsHub credential. Read from the state the write produces, so a request
+    that sets up the organization's decision model and turns the browser on
+    together passes. Only a write that turns it on: a decision model removed
+    later leaves the switch stored as on, and the browser reads as off
+    (`browser.browser_runs`)."""
+    if not _turns_on(updates, "browser_enabled"):
+        return
+    from cowork.handlers.jev_route import decisions_available
+    from cowork.services import browser
+
+    settings = await run_db(lambda session: unit_setting_service(session).load_pending(updates), scope=scope)
+    if browser.on_web() and not browser.llm_on_mindshub(settings):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The browser needs MindsHub as the model provider.",
+        )
+    if decisions_available(settings):
+        return
+    if browser.own_decisions_unused(settings):
+        # Set up, but this deployment's browser can't ask it, as status
+        # reports (`BrowseStatus.own_decisions_unused`).
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "The browser can't use the organization's own decision model here yet. "
+                "It needs Jev on MindsHub until it can."
+            ),
+        )
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            "The browser needs a decisions model: Jev on MindsHub, or a decision model of the "
+            "organization's own (its endpoint URL and API key)."
+        ),
+    )
+
+
 # AuthenticatedInOrgMode, declared explicitly: SettingService's write path
 # already fails closed on its own (_require_writable -> MissingTenantScopeError
 # -> 401, cowork/services/settings.py) whenever org mode has no org in scope.
@@ -215,7 +297,6 @@ async def _reject_unservable_models(
 @router.put("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def bulk_upsert_settings(
     body: SettingsBulkUpsertRequest,
-    session: SessionDep,
     scope: ScopeDep,
     principal: PrincipalDep,
     request: Request = None,
@@ -231,10 +312,15 @@ async def bulk_upsert_settings(
     _require_org_admin_for(live_keys, scope, principal)
     # Before anything is staged, so a bad model id 400s with nothing written —
     # same all-or-nothing contract as the field validation below.
+    _reject_approvals_off_stamp(keys=live_keys)
     _reject_malformed_role_defaults(body.values or {})
-    await _reject_unservable_models(session, scope, body.values or {}, request)
+    _reject_decision_model_url_without_host(updates=body.values or {})
+    await _reject_unservable_models(scope, body.values or {}, request)
+    await _reject_browser_that_cant_run(scope, body.values or {})
     try:
-        updated = SettingService(session, scope).save_all(body.values)
+        updated = await run_db(
+            lambda session: unit_setting_service(session).save_all(body.values), scope=scope
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return {"updated": updated}
@@ -246,16 +332,21 @@ async def bulk_upsert_settings(
 async def upsert_setting(
     key: str,
     body: SettingUpsertRequest,
-    session: SessionDep,
     scope: ScopeDep,
     principal: PrincipalDep,
     request: Request = None,
 ) -> SettingResponse:
     _require_org_admin_for([key], scope, principal)
+    _reject_approvals_off_stamp(keys=[key])
     _reject_malformed_role_defaults({key: body.value})
-    await _reject_unservable_models(session, scope, {key: body.value}, request)
+    _reject_decision_model_url_without_host(updates={key: body.value})
+    await _reject_unservable_models(scope, {key: body.value}, request)
+    await _reject_browser_that_cant_run(scope, {key: body.value})
     try:
-        return SettingService(session, scope).upsert_setting(key, body.value)
+        return await run_db(
+            lambda session: unit_setting_service(session).upsert_setting(key, body.value),
+            scope=scope,
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -339,6 +430,14 @@ def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     if scope.org_mode:
         return {"ok": True, "deleted": []}
     deleted = SettingService(session, scope).clear_credentials()
+    # The org's Brand guidelines skill was the signed-in org's.
+    try:
+        remove_brand_skill(scope)
+    except Exception:
+        logger.exception(
+            "Could not remove the Brand guidelines skill on sign-out",
+            extra={"event": "org_branding_skill_remove_failed"},
+        )
     return {"ok": True, "deleted": deleted}
 
 
@@ -475,7 +574,7 @@ def _stored_origins_for(settings: UserSettings, ptype: str) -> set[str]:
     dependencies=[Depends(require(AuthenticatedInOrgMode))],
 )
 async def test_providers(
-    session: SessionDep, scope: ScopeDep, body: _TestProvidersBody | None = None
+    scope: ScopeDep, body: _TestProvidersBody | None = None
 ) -> dict[str, Any]:
     """Ping the given (or all stored) providers and return connectivity results.
 
@@ -497,7 +596,7 @@ async def test_providers(
     Returns the dumped model rather than the model, so a direct caller can
     still subscript the result by its wire keys.
     """
-    s = SettingService(session, scope).load()
+    s = await run_db(lambda session: unit_setting_service(session).load(), scope=scope)
 
     if body and body.providers is not None:
         providers = list(body.providers)
@@ -576,6 +675,62 @@ def _foreign_ping_url_field(settings: UserSettings, provider: ProviderProbeCard)
     return field
 
 
+class _TestDecisionModelBody(CamelRequest):
+    # Each one left out is the stored one's.
+    url: Optional[str] = None
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+
+
+#: How long Settings' test waits on a decision endpoint: longer than a turn's
+#: gate waits, since a person is watching and a cold endpoint is still a
+#: working one.
+_DECISION_TEST_TIMEOUT_S = 10.0
+
+
+# AuthenticatedInOrgMode, and admin-only in org mode like the settings it
+# tests: the decision model is the organization's, set by an admin, and the
+# route makes the server send a request to a URL in the body. The stored key
+# only ever goes to the stored URL (the `_foreign_ping_url_field` rule): a
+# body that names another URL brings its own key. On the hosted server the
+# request goes out as the gate's does, https only, to a vetted public address
+# (`jev_route._post_pinned`).
+@router.post("/test-decision-model", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def check_decision_model(body: _TestDecisionModelBody, scope: ScopeDep, principal: PrincipalDep):
+    """Send one minimal decision request to the organization's decision
+    model, the one in the body over the stored one, so Settings can tell
+    whether it answers before the browser relies on it. 200 either way:
+    ``{"ok", "error", "ms"}``, with ``error`` the gate's error class
+    (``http_401``, ``timeout``, ``malformed_response``, ...)."""
+    _require_org_admin_for(["decision_model_url"], scope, principal)
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.handlers import jev_route
+
+    stored = await run_db(lambda session: unit_setting_service(session).load(), scope=scope)
+    stored_url = (stored.decision_model_url or "").strip()
+    url = (body.url or "").strip() or stored_url
+    key = (body.api_key or "").strip()
+    if not key or key == "***":
+        if url != stored_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Enter the API key for this endpoint.",
+            )
+        key = stored.decision_model_api_key.get_secret_value() if stored.decision_model_api_key else ""
+    if not url or not key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Enter the decision model's endpoint URL and API key.",
+        )
+    if not is_web_address(url=url):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That isn't a web address.")
+    model = (body.model or "").strip() or stored.decision_model or TurnQueueSettings().jev_route_model
+    result = await jev_route.probe(
+        jev_route.JevTarget(url=url, api_key=key), model=model, timeout_seconds=_DECISION_TEST_TIMEOUT_S,
+    )
+    return {"ok": not result.error, "error": result.error or None, "ms": result.ms}
+
+
 class _ValidateProviderBody(CamelRequest):
     provider: str
     api_key: str
@@ -607,15 +762,49 @@ def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None)
         target.setdefault(key, value)
 
 
+def _persist_catalog_maps(
+    session: ScopedSession, *, prior: UserSettings, listing: MindsModelListing, write_availability: bool
+) -> None:
+    """The catalog's writes from ``recommended_models``, as one unit: the
+    availability map when the listing named any model, then the role defaults.
+
+    Org mode splits the availability write. The listing is the caller's own
+    (auth applies the model rules for their org, workspace and team), and the
+    map is an org row every member's resolution reads, so the caller's
+    restricted models are stored for the caller alone. A desktop install has
+    one member and keeps them in the map.
+    """
+    raw = unsafe_unscoped_session(session)
+    scope = session.scope
+    if write_availability:
+        if scope.org_mode:
+            persist_org_model_availability(raw, scope, prior=prior, listing=listing)
+        else:
+            persist_enabled_model_map(
+                raw, scope, prior.minds_model_enabled, listing.enabled, listing.ids
+            )
+            persist_image_model_map(raw, scope, prior.minds_image_model_enabled, listing)
+    persist_role_defaults_map(raw, scope, prior.minds_role_defaults, listing.role_defaults)
+
+
+_REFRESH_SCOPES = ("all", "minds")
+
+
 # AuthenticatedInOrgMode, not OpenByDesign: the MindsHub overlay does need
 # the caller's own bearer, scope.org_id and scope.user_id
 # (fetch_org_model_catalog below),
 # but the openai-compatible overlay further down does not — it resolves the
 # stored key and fetches the stored baseUrl on any caller's behalf, and
-# `?refresh=true` bypasses its cache every time. So this is not a static
+# `?refresh=true` (unless `refresh_scope=minds`) bypasses its cache. So this is not a static
 # catalog read for an anonymous caller, and it should not read as one.
 @router.get("/recommended-models", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def recommended_models(request: Request, session: SessionDep, scope: ScopeDep, refresh: bool = False):
+async def recommended_models(
+    request: Request,
+    scope: ScopeDep,
+    refresh: bool = False,
+    refresh_scope: str = "all",
+    principal: PrincipalDep = None,
+):
     """Per-provider model picker options for the Settings UI, and the image
     picker's (`imageModels`, `imageModelDefault`).
 
@@ -625,12 +814,8 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     (the `latest:*` aliases) when the key is absent or the endpoint can't
     be reached.
 
-    `refresh=true` bypasses fetch_minds_models's cache (`force_refresh`) — the
-    Settings UI passes it when the model dropdown is opened, since the cached
-    `enabled` map can otherwise mask a wallet top-up for its 5-minute TTL. The
-    plain mount-time load omits it and stays cache-eligible. A cached *failure*
-    is honored either way, so an unreachable MindsHub doesn't cost every open
-    the full HTTP timeout."""
+    `refresh=true` bypasses the listing caches so a top-up shows at once;
+    `refresh_scope=minds` limits that to MindsHub, any other value means all."""
     recommended = {k: list(v) for k, v in RECOMMENDED_MODELS.items()}
     pair = {k: list(v) for k, v in RECOMMENDED_PAIR.items()}
 
@@ -650,8 +835,9 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
 
     # `modelDisabledReasons` maps a model id that `modelEnabled` marks false to
     # the gateway's reason for it: "model_restricted" (an admin in the org
-    # restricted it, so credits cannot unlock it), "wallet_empty" or
-    # "included_allowance_exhausted". Filled from the MindsHub listing only,
+    # restricted it, so credits cannot unlock it), "wallet_empty",
+    # "included_allowance_exhausted" or "budget_exceeded" (an org budget is
+    # spent, which credits cannot lift either). Filled from the MindsHub listing only,
     # never from a custom endpoint: a BYO base URL must not be able to label a
     # model "restricted by your admin". A model absent from this map keeps
     # today's locked, add-credits treatment.
@@ -695,7 +881,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     # key, or from a MindsHub that predates `kind`.
     image_models: list[str] = []
 
-    s = SettingService(session, scope).load()
+    s = await run_db(lambda session: unit_setting_service(session).load(), scope=scope)
     listing = None
     if scope.org_mode:
         # Org catalog: operator endpoint + the caller's own bearer, cached per
@@ -711,7 +897,8 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     elif s.minds_api_key is not None and s.minds_url:
         # Desktop / BYOK: the user's stored key against its configured URL.
         listing = await fetch_minds_models(
-            s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
+            s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh,
+            mindshub=True,
         )
     if listing is not None:
         live = listing.ids
@@ -738,18 +925,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             # Intentionally ungated by _require_org_admin_for: the value is
             # system-derived (MindsHub, via admin-set key/URL), so a member can
             # trigger this refresh but can't steer what's stored — and gating it
-            # would leave the map stale.
-            #
-            # Org mode splits the write. The listing is the caller's own (auth
-            # applies the model rules for their org, workspace and team), and the
-            # map is an org row every member's resolution reads, so the caller's
-            # restricted models are stored for the caller alone. A desktop
-            # install has one member and keeps them in the map.
-            if scope.org_mode:
-                persist_org_model_availability(session, scope, prior=s, listing=listing)
-            else:
-                persist_enabled_model_map(session, scope, s.minds_model_enabled, live_enabled, live)
-                persist_image_model_map(session, scope, s.minds_image_model_enabled, listing)
+            # would leave the map stale. _persist_catalog_maps writes it.
         # Cache the catalog's declared per-role defaults, so a default moved in
         # the config reaches this install on its next settings load with no client
         # release (UserSettings._minds_role_default_map).
@@ -763,7 +939,12 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         # list, and a gateway can publish role defaults while listing nothing we
         # recognise; nested, the defaults would be dropped for exactly that
         # gateway.
-        persist_role_defaults_map(session, scope, s.minds_role_defaults, live_role_defaults)
+        await run_db(
+            partial(
+                _persist_catalog_maps, prior=s, listing=listing, write_availability=bool(live)
+            ),
+            scope=scope,
+        )
         # The picker asks the server which model each role starts on, so it has to
         # be told the same answer resolution will give. Left on the compiled table,
         # the two disagree the moment a default moves in config and the user sees
@@ -818,7 +999,8 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         # shared openai_api_key), matching how the provider is actually built.
         oc_key = provider_api_key_str(s, Provider.OPENAI_COMPATIBLE)
         oc_listing = await fetch_minds_models(
-            oc_card["baseUrl"].strip(), oc_key, force_refresh=refresh,
+            oc_card["baseUrl"].strip(), oc_key,
+            force_refresh=refresh and refresh_scope != "minds",
             tenant_key=scope.org_id if scope.org_mode else None,
         )
         live = oc_listing.ids
@@ -874,13 +1056,32 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     # are what resolve, exactly as the next turn will see them. `model` is
     # None when the gate has nothing to run on (openai-compatible with no
     # model picked): that turn delegates without a gate call.
-    gate_settings = SettingService(session, scope).load()
+    gate_settings = await run_db(lambda session: unit_setting_service(session).load(), scope=scope)
     gate_provider = gate_settings.resolved_router_provider
     gate = {
         # The UI's provider type is the enum value hyphenated ("minds-cloud").
         "provider": gate_provider.value.replace("_", "-"),
         "model": gate_settings.resolved_gate_model,
         "followsRouterPick": gate_provider is Provider.OPENAI_COMPATIBLE,
+    }
+    # Which gate decides turns now (jev_route.gate_mode, the function turns
+    # use), so Settings can show the decision-model section and say what it
+    # does. `gate` above stays for UIs that predate this; they ship OTA apart
+    # from this server.
+    from cowork.handlers.jev_route import decisions_model, gate_mode
+
+    # `decisions`: what picks the shared browser's steps ("mindshub", "own"),
+    # or None, and the browser doesn't run. "own" only where the organization's
+    # model reaches this deployment's browser at a URL it takes
+    # (`jev_route.decisions_model`), while `mode` stays the turn
+    # gate's, which asks that model wherever it is set. `canSetDecisionModel`: whether
+    # the caller may edit the organization's own decision model, as for the
+    # provider and its keys (`_require_org_admin_for`): an organization admin,
+    # or anyone on a local server, where the person is the admin.
+    routing = {
+        "mode": gate_mode(gate_settings), "routerProvider": gate["provider"],
+        "decisions": decisions_model(gate_settings),
+        "canSetDecisionModel": not scope.org_mode or can_manage_org(principal),
     }
 
     return {
@@ -895,10 +1096,13 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
         "modelDisabledReasons": model_disabled_reasons,
+        # The refresh_scope values this server honours, for a newer UI on an older server.
+        "refreshScopes": list(_REFRESH_SCOPES),
         "modelLabels": model_labels,
         "modelProviders": model_providers,
         "modelFamilies": model_families,
         "gate": gate,
+        "routing": routing,
     }
 
 

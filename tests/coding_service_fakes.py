@@ -31,6 +31,9 @@ def repository(tmp_path: Path) -> Path:
     git(repo, "init")
     git(repo, "config", "user.email", "cowork@example.invalid")
     git(repo, "config", "user.name", "Cowork Test")
+    # A commit starts a detached `git maintenance`, which since git 2.55 holds
+    # .git/objects/maintenance.lock after the commit returns.
+    git(repo, "config", "maintenance.auto", "false")
     (repo / "README.md").write_text("base\n", encoding="utf-8")
     git(repo, "add", ".")
     git(repo, "commit", "-m", "base")
@@ -47,6 +50,21 @@ def wait_for_status(service: CodingService, session_id: str, status: SessionStat
         time.sleep(0.01)
     session = service.get_session(session_id)
     assert session.status == status
+    return session
+
+
+def wait_for_run_to_follow(service: CodingService, session_id: str) -> CodingSession:
+    """Wait for a local task's run status to match its session status, and
+    return the task as it is then.
+
+    The run follows the session in a separate save, so a read between the two
+    sees them disagree. A remote runtime owns its run's status; not for those.
+    """
+    deadline = time.monotonic() + 3
+    session = service.get_session(session_id)
+    while time.monotonic() < deadline and session.run_status != session.status.value:
+        time.sleep(0.01)
+        session = service.get_session(session_id)
     return session
 
 

@@ -8,8 +8,12 @@ from pydantic import SecretStr, ValidationError
 from sqlmodel import Session, select
 
 from cowork.common.encryption import decrypt, encrypt
+from cowork.common.event_clock import approvals_off_ms
 from cowork.common.settings.runtime_credential import get_minds_credential
 from cowork.common.settings.user_settings import (
+    BUDGET_SETTING_KEYS,
+    is_chosen_budget,
+    default_turn_limits,
     reject_unknown_harness,
     UserSettings,
     invalidate_user_settings_cache,
@@ -17,7 +21,7 @@ from cowork.common.settings.user_settings import (
     setting_is_org_scoped,
 )
 from cowork.db.personal_resources import PersonalResource
-from cowork.db.scoped import TenantScope
+from cowork.db.scoped import ScopedSession, TenantScope, unsafe_unscoped_session
 from cowork.models.setting import Setting
 from cowork.schemas.settings import SettingResponse
 
@@ -276,6 +280,7 @@ class SettingService:
             is_set=is_set,
             value=value,
             options=UserSettings.field_options(key),
+            default=str(getattr(default_turn_limits(), key)) if key in BUDGET_SETTING_KEYS else None,
         )
 
     def load(self) -> UserSettings:
@@ -344,12 +349,43 @@ class SettingService:
             return field_val.value, validated
         return (str(field_val) if field_val is not None else value), validated
 
+    def _opt_in_with_budgets(self, writes: dict[str, str]) -> None:
+        """Saving a chosen budget (``is_chosen_budget``) turns the limits
+        switch on at that scope, unless the switch is already stored there, or
+        staged by the same write (an explicit off stays off). Without this, a
+        budget saved by a renderer that predates the switch would be ignored
+        until the next boot's ``enable_limits_for_saved_budgets``. The write's
+        own switch is checked here, not looked up: the app's sessions don't
+        autoflush, so a switch staged by this write isn't visible to the
+        query, and adding another would break the unique key."""
+        if "limits_enabled" in writes:
+            return
+        if not any(k in BUDGET_SETTING_KEYS and is_chosen_budget(k, v) for k, v in writes.items()):
+            return
+        if self._own_row("limits_enabled") is None:
+            self.session.add(self._new_row("limits_enabled", "True"))
+
+    def _stamp_approvals_off(self, *, writes: dict[str, str]) -> None:
+        """A write of ``browser_approve_steps`` as false stamps
+        ``browser_approve_steps_off_at`` with now, in epoch milliseconds by
+        this server's clock, the clock that stamps each event's ``at_ms``.
+        ``approvals_off_ms`` keeps it at or after every ``at_ms`` this process
+        handed out, so a clock stepped back can't approve a step held before
+        the write. Every such write moves it, one that finds approvals
+        already off included, so a held step's card the person turns
+        approvals off from stays theirs. The settings routes refuse a
+        client's own value for it."""
+        if writes.get("browser_approve_steps") == "False":
+            self._write_row("browser_approve_steps_off_at", str(approvals_off_ms()))
+
     def upsert_setting(self, key: str, value: str) -> SettingResponse:
         self._require_writable()
         store_val, validated = self._encode_for_store(key, value)
         self._require_write_target(key)
         try:
             self._write_row(key, store_val)
+            self._opt_in_with_budgets({key: store_val})
+            self._stamp_approvals_off(writes={key: store_val})
             self.session.commit()
         except Exception:
             self.session.rollback()
@@ -381,6 +417,8 @@ class SettingService:
         try:
             for key, store_val in encoded.items():
                 self._write_row(key, store_val)
+            self._opt_in_with_budgets(encoded)
+            self._stamp_approvals_off(writes=encoded)
             if encoded:
                 self.session.commit()
         except Exception:
@@ -474,3 +512,13 @@ class SettingService:
         if deleted:
             invalidate_user_settings_cache()
         return deleted
+
+
+def unit_setting_service(session: ScopedSession) -> SettingService:
+    """A ``run_db`` unit's SettingService, for the unit's scope.
+
+    ``settings`` stays in ``_TENANCY_DEFERRED_TABLES`` (cowork/db/scoped.py),
+    so the service queries the raw session and routes by scope itself, as
+    SettingService's docstring says.
+    """
+    return SettingService(unsafe_unscoped_session(session), session.scope)

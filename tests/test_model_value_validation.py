@@ -47,12 +47,25 @@ def catalog(monkeypatch):
     """Install a fake /v1/models catalog; returns a list of fetch call counts."""
     calls = []
 
-    async def _fake(minds_url, api_key, *, force_refresh=False, tenant_key=None):
+    async def _fake(minds_url, api_key, *, force_refresh=False, tenant_key=None, **_kw):
         calls.append((minds_url, api_key))
         return _listing(list(CATALOG), IMAGE_CATALOG)
 
     monkeypatch.setattr(providers, "fetch_minds_models", _fake)
     return calls
+
+
+def test_validation_fetches_as_mindshub(monkeypatch):
+    flags = []
+
+    async def _fake(minds_url, api_key, **kw):
+        flags.append(kw.get("mindshub"))
+        return _listing(list(CATALOG))
+
+    monkeypatch.setattr(providers, "fetch_minds_models", _fake)
+    _reject(_minds_settings(), "planning_model", "deepseek-v4-flash")
+
+    assert flags == [True]
 
 
 def _reject(settings, key, value):
@@ -238,7 +251,6 @@ async def test_put_settings_key_400s_on_an_unservable_model(monkeypatch):
             await upsert_setting(
                 "planning_model",
                 SettingUpsertRequest(value="deepseek-v4-flash"),
-                session,
                 LOCAL_SCOPE,
                 None,
             )
@@ -251,7 +263,6 @@ async def test_put_settings_key_400s_on_an_unservable_model(monkeypatch):
         await upsert_setting(
             "planning_model",
             SettingUpsertRequest(value="mindshub_air"),
-            session,
             LOCAL_SCOPE,
             None,
         )
@@ -287,17 +298,17 @@ async def test_both_writers_refuse_a_chat_model_as_the_image_model(monkeypatch):
         _seed_minds(svc)
         with pytest.raises(HTTPException) as single:
             await upsert_setting(
-                "image_model", SettingUpsertRequest(value="mindshub_air"), session, LOCAL_SCOPE, None,
+                "image_model", SettingUpsertRequest(value="mindshub_air"), LOCAL_SCOPE, None,
             )
         with pytest.raises(HTTPException) as bulk:
             await bulk_upsert_settings(
-                SettingsBulkUpsertRequest(values={"image_model": "mindshub_air"}), session, LOCAL_SCOPE, None,
+                SettingsBulkUpsertRequest(values={"image_model": "mindshub_air"}), LOCAL_SCOPE, None,
             )
         assert single.value.status_code == bulk.value.status_code == 400
         assert svc._fetch_row("image_model") is None
 
         await bulk_upsert_settings(
-            SettingsBulkUpsertRequest(values={"image_model": "gpt-image-2.6-sunburst"}), session, LOCAL_SCOPE, None,
+            SettingsBulkUpsertRequest(values={"image_model": "gpt-image-2.6-sunburst"}), LOCAL_SCOPE, None,
         )
         assert svc.get_setting("image_model").value == "gpt-image-2.6-sunburst"
 
@@ -333,7 +344,6 @@ async def test_an_unreachable_catalog_never_blocks_a_settings_save(monkeypatch):
         await upsert_setting(
             "planning_model",
             SettingUpsertRequest(value="some-model-we-cannot-verify"),
-            session,
             LOCAL_SCOPE,
             None,
         )
@@ -385,7 +395,7 @@ async def test_switching_minds_to_byok_in_one_put_is_not_blocked(monkeypatch):
                 "planning_provider": "anthropic",
                 "anthropic_api_key": "sk-ant-xyz",
                 "planning_model": "claude-sonnet-4-6",
-            }), session, LOCAL_SCOPE, None,
+            }), LOCAL_SCOPE, None,
         )
         s = svc.load()
         assert s.planning_model == "claude-sonnet-4-6"
@@ -412,7 +422,7 @@ async def test_switching_byok_to_minds_in_one_put_is_gated(monkeypatch):
 
     fetched = []
 
-    async def _fake(minds_url, api_key, *, force_refresh=False, tenant_key=None):
+    async def _fake(minds_url, api_key, *, force_refresh=False, tenant_key=None, **_kw):
         fetched.append(minds_url)
         return _listing(list(CATALOG))
 
@@ -433,7 +443,7 @@ async def test_switching_byok_to_minds_in_one_put_is_gated(monkeypatch):
                 SettingsBulkUpsertRequest(values={
                     "planning_provider": "minds_cloud",
                     "planning_model": "deepseek-v4-flash",
-                }), session, LOCAL_SCOPE, None,
+                }), LOCAL_SCOPE, None,
             )
         assert exc.value.status_code == 400
         assert fetched, "the gate must consult the catalog for the PENDING provider"

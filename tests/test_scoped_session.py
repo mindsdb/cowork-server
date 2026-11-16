@@ -12,10 +12,11 @@ which must behave exactly like LOCAL_SCOPE.
 """
 from __future__ import annotations
 
+import httpx
 import pytest
+from fastapi import FastAPI
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from starlette.requests import Request
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, MODEL_RESOURCE, PersonalResource
@@ -25,6 +26,7 @@ from cowork.db.scoped import (
     ScopedSession,
     TenantMismatchError,
     TenantScope,
+    TenantScopeDep,
     get_tenant_scope,
     scope_for_identity,
     scope_for_org,
@@ -36,7 +38,7 @@ from cowork.db.scoped import (
     tenant_scope_required,
     unsafe_unscoped_session,
 )
-from cowork.principal import Principal
+from cowork.principal import Principal, get_principal
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
@@ -431,13 +433,6 @@ def test_wrapping_a_scoped_session_is_rejected(session, partition):
 
 # ── get_tenant_scope dependency ─────────────────────────────────────────────
 
-def _request(principal: Principal | None = None) -> Request:
-    req = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
-    if principal is not None:
-        req.state.principal = principal
-    return req
-
-
 @pytest.fixture()
 def _settings_env(monkeypatch):
     get_app_settings.cache_clear()
@@ -445,24 +440,43 @@ def _settings_env(monkeypatch):
     get_app_settings.cache_clear()
 
 
-def test_scope_is_local_in_local_mode(_settings_env):
+async def test_scope_is_local_in_local_mode(_settings_env):
     _settings_env.delenv("COWORK_TENANCY_MODE", raising=False)
     get_app_settings.cache_clear()
-    assert get_tenant_scope(_request()) == LOCAL_SCOPE
+    assert await get_tenant_scope(None) == LOCAL_SCOPE
 
 
-def test_scope_carries_principal_in_org_mode(_settings_env):
+async def test_scope_carries_principal_in_org_mode(_settings_env):
     _settings_env.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
     principal = Principal(user_id="u-1", org_id=ORG_A)
-    scope = get_tenant_scope(_request(principal))
+    scope = await get_tenant_scope(principal)
     assert scope == TenantScope(org_mode=True, org_id=ORG_A, user_id="u-1")
 
 
-def test_scope_without_principal_in_org_mode_has_no_org(_settings_env):
+async def test_the_scope_reads_the_principal_get_principal_gives(_settings_env):
+    """The scope and the authorization checks read one identity: an override
+    of get_principal, as a test or a change to how it reads the request
+    makes, reaches the scope too."""
     _settings_env.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
-    scope = get_tenant_scope(_request())
+    app = FastAPI()
+
+    @app.get("/scope")
+    async def read_scope(scope: TenantScopeDep):
+        return {"org_id": scope.org_id, "user_id": scope.user_id}
+
+    app.dependency_overrides[get_principal] = lambda: Principal(user_id="u-2", org_id=ORG_A)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/scope")
+
+    assert response.json() == {"org_id": ORG_A, "user_id": "u-2"}
+
+
+async def test_scope_without_principal_in_org_mode_has_no_org(_settings_env):
+    _settings_env.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    scope = await get_tenant_scope(None)
     assert scope.org_mode is True
     assert scope.org_id is None
 
@@ -642,9 +656,9 @@ def test_trusted_identity_scope_carries_the_configured_resources(_settings_env, 
     assert scope.personal_resources == {PersonalResource.MEMORY, PersonalResource.SKILLS}
 
 
-def test_trusted_identity_without_a_person_is_the_operator_view(_settings_env, personal_deployment):
+async def test_trusted_identity_without_a_person_is_the_operator_view(_settings_env, personal_deployment):
     assert scope_from_principal(None) == LOCAL_SCOPE
-    assert get_tenant_scope(_request()) == LOCAL_SCOPE
+    assert await get_tenant_scope(None) == LOCAL_SCOPE
 
 
 def test_trusted_identity_org_id_alone_is_a_personless_partition(_settings_env, personal_deployment):

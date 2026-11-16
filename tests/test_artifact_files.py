@@ -27,6 +27,8 @@ from cowork.services.artifact_files import (
     read_artifact_file_entry,
 )
 from cowork.services.artifacts import ProjectArtifacts
+from cowork.db.scoped import LOCAL_SCOPE
+from draft_host_support import reviewed_and_read
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_files"
 
@@ -277,6 +279,37 @@ def test_one_walk_stops_reading_entries_at_the_scan_cap(art, monkeypatch):
     monkeypatch.setattr(artifact_files, "_MAX_SCANNED_ENTRIES", 3)
     assert _refusal(folder=art, parts=("sub", "chart.png")) is OmittedReason.BUDGET
     assert read == ["other", "sub", "more", "extra"]
+
+
+def test_reads_sharing_an_export_scan_budget_stop_once_it_is_spent(art, monkeypatch):
+    """Every read of one export spends from one budget, so many references to
+    the last names of a large folder can't keep the server scanning."""
+    (art / "a.png").write_bytes(PNG)
+    (art / "b.png").write_bytes(PNG)
+    listings = {"art": ["other", "more", "a.png", "b.png"]}
+    read: list[str] = []
+    monkeypatch.setattr(
+        artifact_files, "dir_scandir", _scripted_scandir(listings=listings, read=read)
+    )
+    # The first read scans three entries; the second needs four of the three left.
+    budget = artifact_files.ScanBudget(remaining=6)
+
+    with pinned_dir(art) as pinned:
+        first = read_artifact_file_entry(
+            folder=pinned, parts=("a.png",), max_bytes=1024, scan_budget=budget
+        )
+        assert first.data == PNG
+        assert budget.remaining == 3
+        with pytest.raises(ArtifactFileRefused) as refused:
+            read_artifact_file_entry(folder=pinned, parts=("b.png",), max_bytes=1024, scan_budget=budget)
+
+    assert refused.value.reason is OmittedReason.BUDGET
+    assert budget.remaining == 0
+
+
+def test_the_shipped_export_scan_budget_is_ten_reads_at_the_per_read_cap():
+    """As shipped, so raising it fails a test."""
+    assert artifact_files.EXPORT_SCANNED_ENTRIES == 10 * artifact_files._MAX_SCANNED_ENTRIES
 
 
 def test_the_shipped_scan_cap_reads_20000_entries_and_refuses_the_next(art, monkeypatch):
@@ -709,15 +742,15 @@ def _draft_artifact(*, tmp_path) -> tuple[ProjectArtifacts, Path]:
 async def _serve_draft(*, monkeypatch, source, folder, rel_path):
     monkeypatch.setattr(
         workspace_ep,
-        "review_artifact_for_request",
-        lambda *_args: (source, folder, {"type": "html-app"}, True),
+        "review_artifact_and_read",
+        reviewed_and_read(lambda *_args: (source, folder, {"type": "html-app"}, True)),
     )
     return await workspace_ep.serve_private_draft(
         "local",
         "0123456789abcdef0123456789abcdef",
         rel_path,
         SimpleNamespace(query_params={}),
-        SimpleNamespace(),
+        LOCAL_SCOPE,
         download=False,
     )
 
