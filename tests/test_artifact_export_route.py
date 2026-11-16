@@ -38,7 +38,8 @@ from cowork.common.settings.app_settings import get_app_settings, get_export_pdf
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.schemas.artifact_export import ExportPdfSettings, ExportRequest, ExportResult, RenderPdfRequest
-from cowork.services import artifact_export
+from cowork.schemas.export_child import ChildLimits
+from cowork.services import artifact_export, export_runner
 from cowork.services import artifact_ownership as ownership
 from cowork.services import artifacts as artifacts_service
 from cowork.services.artifact_export import ExportRefused, ExportSource, export_slot
@@ -150,6 +151,8 @@ def test_route_cases(client, local_artifact, case):
     after = _snapshot(folder)
     if case["status"] != 200:
         assert after == before
+        if "detail" in case:
+            assert response.json()["detail"] == case["detail"]
         return
     written = case["written"]
     assert response.json() == {
@@ -494,9 +497,9 @@ def test_a_conversion_failure_answers_500_and_writes_nothing(client, local_artif
     before = _snapshot(folder)
 
     def broken(**_kwargs):
-        raise ValueError("the writer failed")
+        raise export_runner.ConversionError("ValueError")
 
-    monkeypatch.setattr(artifact_export, "write_docx", broken)
+    monkeypatch.setattr(artifact_export, "convert_in_child", broken)
 
     response = client.post(EXPORT_URL, json={"format": "docx"})
 
@@ -1014,21 +1017,29 @@ async def test_the_owner_asking_a_format_not_offered_gets_422(org_world, role, o
     assert _snapshot(folder) == before
 
 
-@pytest.mark.parametrize(("org_mode", "budget"), [(True, 10 * MIB), (False, 25 * MIB)])
-async def test_the_word_inline_budget_is_smaller_in_org_mode(
-    org_world, role, org_export_on, monkeypatch, org_mode, budget
+@pytest.mark.parametrize(
+    ("org_mode", "budget", "memory"),
+    [
+        (True, 10 * MIB, artifact_export.ORG_CONVERSION_MEMORY_BYTES),
+        (False, 25 * MIB, artifact_export.CONVERSION_MEMORY_BYTES),
+    ],
+)
+async def test_the_word_inline_budget_and_conversion_memory_are_smaller_in_org_mode(
+    org_world, role, org_export_on, monkeypatch, org_mode, budget, memory
 ):
     if not org_mode:
         monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
         get_app_settings.cache_clear()
     budgets: list[int] = []
-    inline = artifact_export.inline_artifact_html
+    limits: list[ChildLimits] = []
+    convert = artifact_export.convert_in_child
 
     def spy(**kwargs):
-        budgets.append(kwargs["limits"].max_total_bytes)
-        return inline(**kwargs)
+        budgets.append(kwargs["request"].limits.max_total_bytes)
+        limits.append(kwargs["limits"])
+        return convert(**kwargs)
 
-    monkeypatch.setattr(artifact_export, "inline_artifact_html", spy)
+    monkeypatch.setattr(artifact_export, "convert_in_child", spy)
     folder = org_world.artifacts["mine"].folder
     source = ProjectArtifacts(
         base=folder.parent,
@@ -1048,6 +1059,9 @@ async def test_the_word_inline_budget_is_smaller_in_org_mode(
     )
 
     assert budgets == [budget]
+    assert limits == [
+        ChildLimits(wall_seconds=artifact_export.CONVERSION_WALL_SECONDS, memory_bytes=memory)
+    ]
 
 
 def padded_png(size: int, *, filler: bytes = b"x") -> bytes:

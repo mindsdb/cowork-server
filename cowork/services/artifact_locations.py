@@ -44,7 +44,7 @@ from sqlalchemy.exc import IntegrityError
 from cowork.common.logger import log_context
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.models.artifact_location import ArtifactLocation
-from cowork.services.artifact_identity import ListedIds
+from cowork.services.artifact_identity import ListedIds, storable_name
 
 logger = logging.getLogger(__name__)
 
@@ -127,17 +127,6 @@ def _insert(
         if row is None:
             raise
         return row
-
-
-def _storable(location: Location) -> bool:
-    """Whether a row can store `location`'s folder name. Linux hands Python a
-    name that is not valid UTF-8 with a lone surrogate, which the row's model
-    refuses."""
-    try:
-        location.slug.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
 
 
 def _write(session: ScopedSession, row: ArtifactLocation, *, location: Location, conflicted: bool) -> None:
@@ -246,13 +235,13 @@ def record_checked_folders(
     folder past every cache (the lookup's _strictly_held, the backfill's
     walk): a folder whose read failed is never taken for one holding no id.
 
-    A folder whose name no row can store (_storable) counts toward a
-    conflict, and a row never names it. When every folder found is such a
-    one, nothing is written.
+    A folder whose name no row can store (artifact_identity.storable_name)
+    counts toward a conflict, and a row never names it. When every folder
+    found is such a one, nothing is written.
     """
     if not keeps_locations(session.scope):
         return RecordOutcome.NOTHING
-    storable = [folder for folder in folders if _storable(folder)]
+    storable = [folder for folder in folders if storable_name(folder.slug)]
     row = _row(session, artifact_id)
     if folders and not storable:
         return RecordOutcome.NOTHING if row is None else RecordOutcome.KEPT

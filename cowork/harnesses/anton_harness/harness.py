@@ -33,6 +33,7 @@ from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_sco
 from cowork.db.units import run_db, run_efs, run_on_unit_threads, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
+from cowork.harnesses.anton_harness.preview_checker import build_preview_checker, preview_checker_kwargs
 from cowork.harnesses.memory.policy import memory_policy
 from cowork.harnesses.memory.turn_layout import (
     TurnMemoryLayout,
@@ -68,6 +69,7 @@ from cowork.services.skill_links import links_apply_to, sync_turn_skill_links
 from cowork.services.skills import artifact_skill_dirs, link_turn_skills, reads_shared_skills
 from cowork.streaming.addons import AddonChannel, addons
 from cowork.streaming.liveness import ModelWaitTicker
+from cowork.streaming.preview_checks import preview_checks
 
 if TYPE_CHECKING:
     from anton.core.browser.config import BrowserConfig
@@ -241,6 +243,54 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
         anton_settings.verifier_jev = "off"
         applied.append("verifier_jev")
     return applied
+
+
+def _apply_user_credentials(anton_settings, user) -> None:
+    """Copy the caller's provider keys, URLs and router role onto anton's
+    settings, as every in-process turn does after ``_overlay_user_settings``.
+    Shared with the quick edit (``anton_settings_for_user``)."""
+    from pydantic import SecretStr
+
+    # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
+    for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
+        db_val = getattr(user, attr, None)
+        if db_val is not None:
+            setattr(anton_settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
+
+    # URLs (skip empty strings so AntonSettings.model_post_init derivations
+    # and AntonSettings' own publish_url default are preserved)
+    for attr in ("minds_url", "openai_base_url", "publish_url"):
+        db_val = getattr(user, attr, None)
+        if db_val:
+            setattr(anton_settings, attr, db_val)
+
+    # Routing & summarization role → anton's router_* fields. The LLM
+    # client is actually built by build_llm_client (which reads the
+    # resolved router model directly), so this only keeps AntonSettings
+    # consistent for any path that reads it. Guarded so an anton build
+    # predating ENG-648 (no router_* fields) doesn't raise.
+    router_provider = getattr(user, "router_provider", None)
+    if router_provider is not None and hasattr(anton_settings, "router_provider"):
+        anton_settings.router_provider = (
+            router_provider.value.replace("_", "-")
+            if hasattr(router_provider, "value") else router_provider
+        )
+    router_model = getattr(user, "router_model", None)
+    if router_model is not None and hasattr(anton_settings, "router_model"):
+        anton_settings.router_model = router_model
+
+
+def anton_settings_for_user(user):
+    """``AntonSettings`` for *user* (their ``UserSettings``) the way a turn of
+    theirs builds them, minus the workspace paths: the DB overlay, then the
+    keys and URLs. For callers outside a turn that need anton's view of the
+    person's providers, such as the quick edit's decisions-model check."""
+    from anton.config.settings import AntonSettings
+
+    anton_settings = AntonSettings()
+    _overlay_user_settings(anton_settings, user)
+    _apply_user_credentials(anton_settings, user)
+    return anton_settings
 
 
 def _apply_client_models(anton_settings, llm_client) -> list[str]:
@@ -502,6 +552,23 @@ def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, comp
     if not rows:
         return None
     return TurnHistory(rows=[], read=rows) if compacted else TurnHistory(rows=rows)
+
+
+def _turn_revision_summaries(session, seed_len: int | None, request: str):
+    """What this turn says about the artifacts it changed, for their revision
+    labels (revision_summaries): the editor's summaries and the final reply
+    from the turn's part of session.history, and the request. None when the
+    history can't be read; the revisions then keep the generic label."""
+    from cowork.services.revision_summaries import summaries_from_messages
+
+    try:
+        history = list(getattr(session, "history", None) or [])
+        # A compaction mid-turn replaces the list; its tail is then the turn.
+        turn = history[seed_len:] if seed_len is not None and seed_len <= len(history) else history[-40:]
+        return summaries_from_messages(turn, request=request)
+    except Exception:
+        logger.warning("Could not read this turn's edits for the revision labels", exc_info=True)
+        return None
 
 
 def _turn_progress(*, session: "ChatSession", seed_len: int | None) -> list[str]:
@@ -1078,6 +1145,9 @@ class AntonHarness:
         # go back unless the turn finishes, so the person's next turn tells them.
         built: BuiltChatSession | None = None
         turn_finished = False
+        # Where this turn's part of session.history starts, once known: the
+        # turn end reads its edits and reply there for the revision labels.
+        turn_seed_len: int | None = None
 
         async def record_turn_cleanup():
             nonlocal new_slugs, touched_slugs, turn_scope, skill_drafts
@@ -1108,6 +1178,7 @@ class AntonHarness:
                         extra=log_context(conversation_id=conv_id),
                     )
             try:
+                summaries = _turn_revision_summaries(session, turn_seed_len, prompt_text(input))
                 # It waits on each touched artifact's lock and parses its
                 # journal, so it runs off the event loop the server shares.
                 changes = await run_efs(
@@ -1121,6 +1192,7 @@ class AntonHarness:
                         tracked_edits=getattr(session, "artifacts_touched", None),
                         schedule_id=schedule_id,
                         scope=_units_scope(),
+                        summaries=summaries,
                     ),
                     scope=_units_scope(),
                     deadline=False,
@@ -1170,6 +1242,7 @@ class AntonHarness:
             # with neither `turn_messages` nor `.history` skips capture and
             # falls back to text-only replay.
             seed_len = len(session.history) if hasattr(session, "history") else None
+            turn_seed_len = seed_len
             compacted = False  # set if anton compacts or hard-truncates history mid-turn
             addon_channel = addons.open(
                 str(conv_id), session,
@@ -1254,6 +1327,9 @@ class AntonHarness:
         finally:
             if addon_channel is not None:
                 addons.close(str(conv_id), addon_channel)
+            # A preview check still open when the turn ends resolves to "no
+            # answer", and a late answer from the app is a 404.
+            preview_checks.close_conversation(str(conv_id))
             if model_wait is not None:
                 model_wait.detach()
             if turn_scratch_dir:
@@ -1603,6 +1679,14 @@ class AntonHarness:
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
         elicitor = build_elicitor(str(conversation.id))
+        # Asks the user's open preview whether an edited artifact runs. Only
+        # where the cowork app tails the turn: a scheduled run or a channel
+        # bot has no preview to answer, and would only wait out the timeout.
+        preview_checker = (
+            build_preview_checker(str(conversation.id))
+            if interactive and channel_context is None
+            else None
+        )
         # Every change to a scheduled task waits on a card the user confirms,
         # so the tools exist only where someone can: not in a scheduled run
         # (a task must not rewrite itself unattended), a channel bot, or a
@@ -1613,33 +1697,7 @@ class AntonHarness:
             else []
         )
 
-        # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
-        for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
-            db_val = getattr(user, attr, None)
-            if db_val is not None:
-                setattr(anton_settings, attr, db_val.get_secret_value() if isinstance(db_val, SecretStr) else db_val)
-
-        # URLs (skip empty strings so AntonSettings.model_post_init derivations
-        # and AntonSettings' own publish_url default are preserved)
-        for attr in ("minds_url", "openai_base_url", "publish_url"):
-            db_val = getattr(user, attr, None)
-            if db_val:
-                setattr(anton_settings, attr, db_val)
-
-        # Routing & summarization role → anton's router_* fields. The LLM
-        # client is actually built by build_llm_client (which reads the
-        # resolved router model directly), so this only keeps AntonSettings
-        # consistent for any path that reads it. Guarded so an anton build
-        # predating ENG-648 (no router_* fields) doesn't raise.
-        router_provider = getattr(user, "router_provider", None)
-        if router_provider is not None and hasattr(anton_settings, "router_provider"):
-            anton_settings.router_provider = (
-                router_provider.value.replace("_", "-")
-                if hasattr(router_provider, "value") else router_provider
-            )
-        router_model = getattr(user, "router_model", None)
-        if router_model is not None and hasattr(anton_settings, "router_model"):
-            anton_settings.router_model = router_model
+        _apply_user_credentials(anton_settings, user)
 
         workspace = Workspace(base)
         if sandboxed:
@@ -1737,6 +1795,13 @@ class AntonHarness:
             backends_rule = _SANDBOXED_BACKENDS_RULE
         else:
             backends_rule = "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
+        # The desktop app's own browser, when it registered one and the
+        # person turned the browser on: anton registers its `browser` tool
+        # only then. Never for a channel turn.
+        turn_browser = await _browser_config(
+            user, channel_context=channel_context,
+            conversation_id=str(conversation.id), project_id=conversation.project_id,
+        )
         project_context = (
             # Conversational only. The next line hands the agent the real path,
             # so the name here never has to resolve to anything (ENG-1676).
@@ -1755,6 +1820,15 @@ class AntonHarness:
             " Processes and threads a scratchpad cell starts are stopped when your reply ends: "
             "variables carry over to the next turn, running servers do not. "
             + backends_rule
+            # Only a turn with a browser hears about it. Where no listed
+            # element fits, a step by position is the way in; whether a step
+            # waits for the person is the browser tool's own prompt's to say.
+            + (
+                " In the browser, when no listed element fits (a slider, a map, a date grid, a canvas, a drag "
+                "handle), click or drag by position (x, y) right away instead of reading the page again."
+                if turn_browser is not None
+                else ""
+            )
             + attachment_context
         )
         output_context = (
@@ -2112,14 +2186,13 @@ class AntonHarness:
                 # Dropped by an anton without the field, which then answers
                 # in the user's language as it always has.
                 **supported_kwargs(ChatSessionConfig, ui_locale=ui_locale),
-                # The desktop app's own browser, when it registered one and the
-                # person turned the browser on: anton registers its `browser`
-                # tool only then. Never for a channel turn. Passed directly:
+                # The artifact editor's "does it run in the open preview?"
+                # check (ENG-4207). Dropped by an anton without the field,
+                # whose editor then has no preview check at all.
+                **preview_checker_kwargs(ChatSessionConfig, preview_checker),
+                # Read above, with the prompt line it brings. Passed directly:
                 # every anton the floor admits has the field.
-                browser=await _browser_config(
-                    user, channel_context=channel_context,
-                    conversation_id=str(conversation.id), project_id=conversation.project_id,
-                ),
+                browser=turn_browser,
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
@@ -2203,19 +2276,30 @@ async def _browser_config(
 
     None for a channel turn: it comes from a chat where people other than the
     desktop's owner can write, and the browser holds the owner's sign-ins.
-    None when the person turned the browser off, when the app registered no
-    browser, which is always the case where more than one person shares this
-    process (cowork.common.settings.runtime_credential.get_browser_host), and
-    when a signed-in desktop's organization turned the browser off, read
-    before each turn (cowork.services.browser.desktop_organization_off).
+    None when the person turned the browser off or there is no decisions
+    model to pick its steps (cowork.services.browser.browser_runs), when the
+    app registered no browser, which is always the case where more than one
+    person shares this process
+    (cowork.common.settings.runtime_credential.get_browser_host), and when a
+    signed-in desktop's organization turned the browser off, read before each
+    turn (cowork.services.browser.desktop_organization_off).
     The web's browser never reaches an in-process turn: web turns run
     remotely, and the producer gives them the router.
-    """
-    if channel_context is not None or not getattr(user, "browser_enabled", False):
-        return None
-    from cowork.services.browser import desktop_browser_config, desktop_organization_off
 
-    config = desktop_browser_config(conversation_id=conversation_id, project_id=project_id)
+    The organization's own decision model, when it set one up, goes with the
+    config: anton then asks it for the browser's steps rather than Jev on
+    MindsHub, as the route gate does (jev_route.gate_mode).
+    """
+    from cowork.services.browser import browser_runs, desktop_browser_config, desktop_organization_off
+
+    if channel_context is not None or not browser_runs(user):
+        return None
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.handlers.jev_route import own_decision_target
+
+    target = own_decision_target(user)
+    decisions = (target, user.decision_model or TurnQueueSettings().jev_route_model) if target else None
+    config = desktop_browser_config(conversation_id=conversation_id, project_id=project_id, decisions=decisions)
     if config is None or await desktop_organization_off():
         return None
     return config

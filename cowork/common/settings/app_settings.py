@@ -1120,6 +1120,19 @@ class AppSettings(Settings):
             "out. Set to false to degrade to plain-text questions (ENG-1984)."
         ),
     )
+    quick_edit_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_QUICK_EDIT_ENABLED"),
+        description=(
+            "Whether the artifact viewer's chat bar may edit an artifact "
+            "directly with anton's artifact editor, without a chat turn "
+            "(POST .../quick-edits, ENG-4227). Exposed to the app as the "
+            "artifact capability `canQuickEdit`, which is also false while "
+            "the installed anton has no quick editor. A kill switch: off, "
+            "the route answers 501 and the app sends every bar message to "
+            "the artifact's chat instead."
+        ),
+    )
     surface_override: str = Field(
         default="",
         validation_alias=AliasChoices("COWORK_SURFACE"),
@@ -1328,6 +1341,41 @@ class AppSettings(Settings):
                 "path (no query, fragment or credentials)"
             )
         return normalized
+
+    browser_decisions_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_DECISIONS_URL"),
+        description=(
+            "The full URL at which a cloud pod reaches this server's decisions proxy "
+            "(POST /api/v1/browse/decisions), for example "
+            "https://cowork.mindshub.ai/api/v1/browse/decisions. A web turn's browser "
+            "asks the organization's own decision model through it with the turn's "
+            "key, so the organization's key never reaches the pod "
+            "(cowork.services.decisions_proxy). https with an optional path; the "
+            "trailing slash is dropped. Blank (default): the route under "
+            "COWORK_PUBLIC_BASE_URL when that is https; without either, web turns "
+            "pick browser steps with Jev on MindsHub."
+        ),
+    )
+
+    @field_validator("browser_decisions_url", mode="before")
+    @classmethod
+    def _check_browser_decisions_url(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            return "" if value is None else value
+        normalized = _router_url(value)
+        if normalized is None:
+            raise ValueError(
+                "COWORK_BROWSER_DECISIONS_URL must be an https URL with an optional "
+                "path (no query, fragment or credentials)"
+            )
+        return normalized
+
+    voice_operator_model: str = Field(
+        default=MINDS_FREE_MODEL,
+        validation_alias=AliasChoices("COWORK_VOICE_OPERATOR_MODEL"),
+        description="The MindsHub model that turns a voice call's requests into app actions (cowork.services.voice_operator).",
+    )
 
     browser_scope_key_file: str = Field(
         default="",

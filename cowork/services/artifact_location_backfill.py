@@ -40,7 +40,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import UUID
 
-from pydantic import BaseModel
 from sqlalchemy import or_
 from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm.exc import StaleDataError
@@ -51,11 +50,15 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.models.project import Project
-from cowork.models.setting import Setting
 from cowork.services.artifact_identity import identities_below
 from cowork.services.artifact_locations import Location, RecordOutcome, record_checked_folders
 from cowork.services.artifact_owner_backfill import (
+    BackfillStopped,
     advisory_try_lock,
+    check_stop,
+    delete_progress,
+    read_progress,
+    save_progress,
     sentinel_present,
     write_sentinel,
 )
@@ -91,67 +94,12 @@ class LocationBackfillSummary:
     skipped: int = 0
 
 
-class _Progress(BaseModel):
-    """What earlier passes finished, kept across starts in one global
-    setting row (PROGRESS_KEY). One row, not one per project: the settings
-    service reads every global row on each load."""
-
-    #: The last project, in id order, a pass finished.
-    after: UUID | None = None
-    #: Projects a pass could not read; each start walks them again.
-    unread: list[UUID] = []
-
-    def finished(self, *, project_id: UUID, read: bool) -> _Progress:
-        """This progress once the walk is past `project_id`, which it read
-        or could not read."""
-        unread = [project for project in self.unread if project != project_id]
-        if not read:
-            unread.append(project_id)
-        after = project_id if self.after is None else max(self.after, project_id)
-        return _Progress(after=after, unread=unread)
-
-
-def _progress_row(raw: Session) -> Setting | None:
-    return raw.exec(select(Setting).where(Setting.key == PROGRESS_KEY, Setting.scope.is_(None))).first()
-
-
-def _read_progress(engine) -> _Progress:
-    with Session(engine) as raw:
-        row = _progress_row(raw)
-        return _Progress.model_validate_json(row.value) if row is not None else _Progress()
-
-
-def _save_progress(engine, *, progress: _Progress) -> None:
-    with Session(engine) as raw:
-        row = _progress_row(raw) or Setting(key=PROGRESS_KEY, value="")
-        row.value = progress.model_dump_json()
-        raw.add(row)
-        raw.commit()
-
-
-def _delete_progress(engine) -> None:
-    with Session(engine) as raw:
-        row = _progress_row(raw)
-        if row is not None:
-            raw.delete(row)
-            raw.commit()
-
-
-class _Stopped(Exception):
-    """``stop`` was set during the walk."""
-
-
-def _check_stop(stop: threading.Event | None) -> None:
-    if stop is not None and stop.is_set():
-        raise _Stopped
-
-
 def _found_locations(project: ProjectRow, *, stop: threading.Event | None) -> dict[str, list[Location]]:
     """Every id in `project`'s roots and the folders that hold it. Raises
     OSError when a root or a folder cannot be read."""
     found: dict[str, list[Location]] = {}
     for root in project_roots(project, strict=True):
-        _check_stop(stop)
+        check_stop(stop)
         for artifact_id, folder_names in identities_below(root.source).items():
             for folder_name in folder_names:
                 location = recorded_location(root.source, root.source.base / folder_name)
@@ -172,7 +120,7 @@ def _record_project(
     with Session(engine) as raw:
         session = ScopedSession(raw, TenantScope(org_mode=True, org_id=org_id))
         for artifact_id, locations in found.items():
-            _check_stop(stop)
+            check_stop(stop)
             try:
                 # The walk read every root of the project.
                 outcome = record_checked_folders(session, artifact_id=artifact_id, folders=locations)
@@ -269,7 +217,7 @@ def run_artifact_location_backfill(
             return None
         if sentinel_present(engine, SENTINEL_KEY):
             return None
-        progress = _read_progress(engine)
+        progress = read_progress(engine, PROGRESS_KEY)
         with Session(engine) as raw:
             query = select(Project.id, Project.name, Project.path, Project.org_id).order_by(Project.id)
             if progress.after is not None:
@@ -280,20 +228,20 @@ def run_artifact_location_backfill(
         # An unread project deleted since leaves the progress here: the query
         # never returns it again, so the walk would never finish it.
         returned = {UUID(str(row[0])) for row in projects}
-        progress = _Progress(after=progress.after, unread=[p for p in progress.unread if p in returned])
+        progress = progress.within(returned)
         summary = LocationBackfillSummary()
         # Read once for every project the pass walks, not once per project.
         shared_root = resolved_shared_root()
         try:
             for project_id, name, path, org_id in projects:
-                _check_stop(stop)
+                check_stop(stop)
                 project = ProjectRow(id=UUID(str(project_id)), name=name, path=path, external=False)
                 read = _walk_project(
                     engine, project=project, org_id=org_id, shared_root=shared_root, summary=summary, stop=stop
                 )
                 progress = progress.finished(project_id=project.id, read=read)
-                _save_progress(engine, progress=progress)
-        except _Stopped:
+                save_progress(engine, PROGRESS_KEY, progress=progress)
+        except BackfillStopped:
             logger.warning(
                 "artifact_location_backfill stopped before it finished; the next start resumes it",
                 extra={"event": "artifact_location_backfill_stopped"},
@@ -314,6 +262,6 @@ def run_artifact_location_backfill(
             # Progress first: a crash between the two leaves neither, and the
             # next start walks again, rather than a progress row that would
             # skip projects once the sentinel is deleted for a rerun.
-            _delete_progress(engine)
+            delete_progress(engine, PROGRESS_KEY)
             write_sentinel(engine, SENTINEL_KEY)
     return summary
