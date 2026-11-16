@@ -631,11 +631,13 @@ async def fetch_minds_models(
         model_id = str(row.get("id")).strip()
         if not model_id:
             continue
-        # Embedding and decision models share this listing but aren't chat/completion
-        # models — chosen for planning/coding roles they'd error every turn.
-        # Filtered here, the single place every row is parsed, so neither the
-        # picker nor default-resolution ever sees them.
-        if row.get("kind") == "decision" or _is_embedding_row(row, model_id):
+        # Embedding, decision and voice models share this listing but aren't
+        # chat/completion models — chosen for planning/coding roles they'd error
+        # every turn. Only chat rows are kept (a row with no kind, from an older
+        # gateway, counts as chat). Filtered here, the single place every row is
+        # parsed, so neither the picker nor default-resolution ever sees them.
+        kind = row.get("kind")
+        if (kind and kind != "chat") or _is_embedding_row(row, model_id):
             continue
         ids.append(model_id)
         # A model the org's wallet can't currently pay for (or whose free

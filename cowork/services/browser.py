@@ -53,10 +53,12 @@ import asyncio
 import hashlib
 import logging
 import re
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import httpx
+from urllib.parse import urlsplit
 from anton.core.browser.config import BrowserConfig
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -135,14 +137,32 @@ BrowseState = Literal["none", "starting", "running", "unavailable", "not_entitle
 
 
 class BrowseStatus(BaseModel):
-    """``GET /browse/status``. ``enabled`` is the person's own switch.
-    ``available`` is whether this deployment offers the browser to them,
-    whatever the switch says, so a person who turned it off can turn it back
-    on."""
+    """``GET /browse/status``. ``enabled`` is the person's own switch, read as
+    off while there is no decisions model. ``available`` is whether this
+    deployment offers the browser to them, whatever the switch says, so a
+    person who turned it off can turn it back on.
+
+    ``decisions_model`` is what picks the browser's steps
+    (``jev_route.decisions_model``), ``own`` only where the organization's
+    own model reaches this deployment's browser
+    (``own_model_reaches_browser``) at a URL anton takes. None means the browser can't run until
+    someone who may (``can_set_decisions_model``: an organization admin, or
+    anyone on a desktop) sets up a decision model of the organization's own.
+
+    ``own_decisions_unused``: the organization set up its own decision model,
+    but this deployment's browser can't ask it (the function
+    ``own_decisions_unused``). Setting one up again changes nothing then, and
+    a save that turns the browser on answers 400 saying the organization's
+    own model can't be used here yet
+    (``endpoints.settings._reject_browser_that_cant_run``).
+    """
 
     enabled: bool
     available: bool
     status: BrowseState
+    decisions_model: Literal["mindshub", "own"] | None = None
+    can_set_decisions_model: bool = False
+    own_decisions_unused: bool = False
 
 
 class RouterStatus(BaseModel):
@@ -257,6 +277,39 @@ def _require_router() -> str:
     return router
 
 
+def own_model_reaches_browser() -> bool:
+    """Whether an organization's own decision model can pick this
+    deployment's browser steps. On the web a turn's browser asks it through
+    this server's decisions proxy, which needs the proxy's URL
+    (``decisions_proxy.proxy_url``) and an anton whose browser config takes
+    one (``_decisions_proxy_block``). On the desktop the in-process anton
+    takes the model itself, as ``DecisionsTarget`` (``_decisions_block``).
+    Without either, the browser asks Jev on MindsHub or the LLM, so status
+    and Settings don't name the organization's model
+    (``jev_route.decisions_model``)."""
+    if on_web():
+        from cowork.services.decisions_proxy import proxy_url
+
+        return bool(proxy_url()) and "decisions_proxy" in BrowserConfig.model_fields
+    try:
+        from anton.core.browser.config import DecisionsTarget  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def own_decisions_unused(user_settings: UserSettings) -> bool:
+    """Whether the organization set up its own decision model (its URL and
+    key) that this deployment's browser can't ask
+    (``own_model_reaches_browser``). Status reports it
+    (``BrowseStatus.own_decisions_unused``), and Settings' refusal to turn
+    the browser on says the same
+    (``endpoints.settings._reject_browser_that_cant_run``)."""
+    from cowork.handlers.jev_route import own_decision_target
+
+    return own_decision_target(user_settings) is not None and not own_model_reaches_browser()
+
+
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -361,6 +414,156 @@ async def warm(bearer: str, prefs: RouterPrefs) -> RouterStatus:
     the preferences the router keeps for them. Safe to repeat."""
     body = {"prefs": prefs.model_dump(exclude_none=True)}
     return _parsed(RouterStatus, await _call("POST", f"{_require_router()}/_warm", bearer, json=body))
+
+
+class OpenedSession(BaseModel):
+    """``POST /browse/open``'s answer: the task's session, now at the address."""
+
+    session_id: str
+
+
+def person_url(raw: str) -> str | None:
+    """An address the person typed, as the browser takes it: http or https with
+    a host, ``https://`` added when they typed none. None for anything else."""
+    text = (raw or "").strip()
+    if not text or len(text) > 4096 or any(c.isspace() for c in text):
+        return None
+    if "://" not in text:
+        # "javascript:…" or "mailto:…" is a scheme, not a host; "localhost:3000" is a port.
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:(?!\d)", text):
+            return None
+        text = f"https://{text}"
+    parsed = urlsplit(text)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    return text
+
+
+async def person_open(bearer: str, *, user_id: str | None, conversation_id: str, url: str | None) -> OpenedSession:
+    """The person opens ``url`` in a task's browser themselves, from the pane:
+    the task's session (``task_session``) opens at it, or, open already, goes
+    there. No ``url`` opens it on a blank tab and leaves an open one as it is.
+    As the caller, so it is their browser and their allowance; no turn and no
+    agent are involved. Raises BrowserServiceError."""
+    router = _require_router()
+    session_id = task_session(user_id, conversation_id)
+    opened = await _call("POST", f"{router}/sessions", bearer, json={"session_id": session_id, **({"url": url} if url else {})})
+    # The router answers {session_id, resumed, url}: a resumed session stays where it was.
+    if url and isinstance(opened, dict) and opened.get("resumed") is True:
+        await _call("POST", f"{router}/sessions/{session_id}/action", bearer, json={"action": "navigate", "url": url})
+    return OpenedSession(session_id=session_id)
+
+
+class TaskTab(BaseModel):
+    id: str
+    url: str
+    title: str = ""
+    active: bool = False
+
+
+class ParkedTab(BaseModel):
+    url: str
+    title: str = ""
+
+
+class TaskBrowser(BaseModel):
+    """One task's open browser, for the project's browser list."""
+
+    conversation_id: str
+    session_id: str
+    url: str | None = None
+    viewers: int = 0
+    #: Who holds it: 'agent', or 'human' while the agent handed it to the person.
+    holder: str = "agent"
+    last_active_at: str | None = None
+    tabs: list[TaskTab] = Field(default_factory=list)
+    parked_tabs: list[ParkedTab] = Field(default_factory=list)
+
+
+class TaskBrowsers(BaseModel):
+    browsers: list[TaskBrowser]
+
+
+#: The most tasks one listing looks up: a project's recent ones.
+MAX_LISTED_TASKS = 100
+#: Tabs lookups one listing runs at once, and how long each may take: a slow
+#: browser is listed without its tabs rather than holding up the list.
+_TABS_CONCURRENCY = 6
+_TABS_TIMEOUT_S = 3.0
+
+
+async def _task_tabs(router: str, session_id: str, bearer: str, gate: asyncio.Semaphore) -> list[TaskTab]:
+    """A browser's tabs, or none when they can't be read now."""
+    async with gate:
+        try:
+            answer = await asyncio.wait_for(_call("GET", f"{router}/sessions/{session_id}/tabs", bearer), _TABS_TIMEOUT_S)
+            return [TaskTab.model_validate(t) for t in (answer or {}).get("tabs") or []]
+        except (BrowserServiceError, ValidationError, asyncio.TimeoutError, AttributeError, TypeError):
+            return []
+
+
+def _task_browser(row: dict, conversation_id: str, tabs: list[TaskTab]) -> TaskBrowser | None:
+    """One listed browser, or None for a row that doesn't parse."""
+    try:
+        control = row.get("control") if isinstance(row.get("control"), dict) else {}
+        parked = row.get("parked_tabs") or []
+        return TaskBrowser(
+            conversation_id=conversation_id,
+            session_id=row["session_id"],
+            url=row.get("url"),
+            viewers=int(row.get("viewers") or 0),
+            holder="human" if control.get("holder") == "human" else "agent",
+            last_active_at=row.get("last_active_at"),
+            tabs=tabs,
+            parked_tabs=[ParkedTab.model_validate(t) for t in parked if isinstance(t, dict)],
+        )
+    except (ValidationError, ValueError, TypeError):
+        logger.warning("browser router listed a malformed session", extra={"event": "browser_router_bad_session"})
+        return None
+
+
+async def task_browsers(bearer: str, *, user_id: str | None, conversation_ids: list[str]) -> TaskBrowsers:
+    """The open browsers among these tasks, each with its tabs, as the caller.
+    The router lists only the caller's own sessions, and each task's session
+    is named from the caller (``task_session``), so ids of anyone else's
+    tasks match nothing. A browser whose tabs can't be read now (the person
+    holds it, a dialog is up, it is slow) is listed without them, and a row
+    that doesn't parse is left out. Raises BrowserServiceError."""
+    router = _require_router()
+    by_session = {task_session(user_id, c): c for c in conversation_ids[:MAX_LISTED_TASKS]}
+    listed = await _call("GET", f"{router}/sessions", bearer)
+    rows = listed.get("sessions") if isinstance(listed, dict) else None
+    open_rows = [
+        row for row in (rows if isinstance(rows, list) else [])
+        if isinstance(row, dict) and row.get("session_id") in by_session and row.get("running") is not False
+    ]
+    gate = asyncio.Semaphore(_TABS_CONCURRENCY)
+    all_tabs = await asyncio.gather(*(_task_tabs(router, row["session_id"], bearer, gate) for row in open_rows))
+    browsers = [
+        browser for row, tabs in zip(open_rows, all_tabs)
+        if (browser := _task_browser(row, by_session[row["session_id"]], tabs)) is not None
+    ]
+    browsers.sort(key=lambda b: b.last_active_at or "", reverse=True)
+    return TaskBrowsers(browsers=browsers)
+
+
+async def switch_tab(bearer: str, *, user_id: str | None, conversation_id: str, tab_id: str) -> None:
+    """Brings one of a task's tabs to the front, where the pane shows it."""
+    session_id = task_session(user_id, conversation_id)
+    await _call("POST", f"{_require_router()}/sessions/{session_id}/tabs/{tab_id}/activate", bearer)
+
+
+async def close_tab(bearer: str, *, user_id: str | None, conversation_id: str, tab_id: str, park: bool) -> None:
+    """Closes one of a task's tabs; ``park`` keeps a note of it to reopen later."""
+    session_id = task_session(user_id, conversation_id)
+    suffix = "?park=true" if park else ""
+    await _call("DELETE", f"{_require_router()}/sessions/{session_id}/tabs/{tab_id}{suffix}", bearer)
+
+
+async def close_task_browser(bearer: str, *, user_id: str | None, conversation_id: str) -> None:
+    """Closes a task's browser. Its tabs are noted and reopen when the task needs them."""
+    session_id = task_session(user_id, conversation_id)
+    await _call("DELETE", f"{_require_router()}/sessions/{session_id}", bearer)
 
 
 async def embed(bearer: str, session_id: str) -> BrowserEmbed:
@@ -497,32 +700,60 @@ async def desktop_organization_off() -> bool:
     return _desktop_organization_off
 
 
-async def browse_status(user_settings: UserSettings, *, bearer: str, org_id: str, user_id: str) -> BrowseStatus:
+def llm_on_mindshub(user_settings: UserSettings) -> bool:
+    """Whether the person's LLM is MindsHub. The web's browser router takes
+    only a MindsHub credential, so the web offers the browser only then."""
+    from cowork.common.settings.user_settings import Provider
+
+    return user_settings.resolved_planning_provider is Provider.MINDS_CLOUD
+
+
+def browser_runs(user_settings: UserSettings) -> bool:
+    """Whether the person's switch is on and the browser can run with it: a
+    decisions model picks its steps (``jev_route.decisions_available``), and
+    on the web the LLM is MindsHub. Otherwise a turn gets no browser,
+    whatever the switch says."""
+    from cowork.handlers.jev_route import decisions_available
+
+    if not user_settings.browser_enabled or not decisions_available(user_settings):
+        return False
+    return llm_on_mindshub(user_settings) if on_web() else True
+
+
+async def browse_status(
+    user_settings: UserSettings, *, bearer: str, org_id: str, user_id: str, can_set_decisions_model: bool = False,
+) -> BrowseStatus:
     """``GET /browse/status`` for the caller.
 
     The desktop answers from the browser the app registered, and a signed-in
     desktop also from its organization's switch (``desktop_organization_off``).
-    On the web without a router there is no browser, and nothing is asked. An
-    account whose organization turned the browser off is ``organization_off``,
-    and one whose entitlement is otherwise off ``not_entitled``, both read from
-    MindsHub before the router is asked. Otherwise the router says how the
-    caller's browser is.
+    On the web without a router, or for a person whose LLM isn't MindsHub,
+    there is no browser, and nothing is asked. An account whose organization
+    turned the browser off is ``organization_off``, and one whose entitlement
+    is otherwise off ``not_entitled``, both read from MindsHub before the
+    router is asked. Otherwise the router says how the caller's browser is.
+    Every answer says what picks the browser's steps, if anything.
     """
-    enabled = user_settings.browser_enabled
+    from cowork.handlers.jev_route import decisions_model
+
+    status = partial(
+        BrowseStatus, enabled=browser_runs(user_settings), decisions_model=decisions_model(user_settings),
+        can_set_decisions_model=can_set_decisions_model, own_decisions_unused=own_decisions_unused(user_settings),
+    )
     if not on_web():
         if get_browser_host() is None:
-            return BrowseStatus(enabled=enabled, available=False, status="unavailable")
+            return status(available=False, status="unavailable")
         if await desktop_organization_off():
-            return BrowseStatus(enabled=enabled, available=False, status=ORGANIZATION_OFF)
-        return BrowseStatus(enabled=enabled, available=True, status="running")
-    if not router_url():
-        return BrowseStatus(enabled=enabled, available=False, status="unavailable")
+            return status(available=False, status=ORGANIZATION_OFF)
+        return status(available=True, status="running")
+    if not router_url() or not llm_on_mindshub(user_settings):
+        return status(available=False, status="unavailable")
     entitlement = await browser_entitlement(bearer=bearer, org_id=org_id, user_id=user_id)
     if entitlement.disabled_reason == BrowserDisabledReason.ORGANIZATION_OFF:
-        return BrowseStatus(enabled=enabled, available=False, status=ORGANIZATION_OFF)
+        return status(available=False, status=ORGANIZATION_OFF)
     if not entitlement.enabled:
-        return BrowseStatus(enabled=enabled, available=False, status=NOT_ENTITLED)
-    return BrowseStatus(enabled=enabled, available=True, status=(await router_status(bearer)).status)
+        return status(available=False, status=NOT_ENTITLED)
+    return status(available=True, status=(await router_status(bearer)).status)
 
 
 # ── A turn's browser ───────────────────────────────────────────────────────
@@ -537,25 +768,81 @@ def turn_block(
     ``to_dict()`` in the job, which anton reads back with ``from_dict``.
 
     None when this deployment has no router, when the person turned the
-    browser off, and for a turn with no person behind it: an organization's
-    channel turn, which comes from a chat anyone in it can write to, while the
-    browser holds one person's sign-ins.
+    browser off or it can't run (``browser_runs``), and for a turn with no
+    person behind it: an organization's channel turn, which comes from a chat
+    anyone in it can write to, while the browser holds one person's sign-ins.
+
+    When the organization set up a decision model of its own, the block also
+    names this server's decisions proxy (``decisions_proxy``: its URL and the
+    model name, never the key): the pod must not hold the organization's key,
+    so anton asks the model through the proxy with the turn's key
+    (cowork.services.decisions_proxy). Not for a deployment without a proxy
+    URL, nor for an anton that predates it; its browser then asks Jev on
+    MindsHub.
     """
     router = router_url()
-    if not router or not user_id or not user_settings.browser_enabled:
+    if not router or not user_id or not browser_runs(user_settings):
         return None
     return BrowserConfig(
         base_url=router,
         profile=task_session(user_id, conversation_id),
         project=project_key(user_id, project_id),
+        **_decisions_proxy_block(user_settings),
     )
 
 
-def desktop_browser_config(*, conversation_id: str, project_id: Any) -> BrowserConfig | None:
+def _decisions_proxy_block(user_settings: UserSettings) -> dict:
+    from cowork.handlers.jev_route import decisions_model
+    from cowork.services.decisions_proxy import proxy_url
+
+    if decisions_model(user_settings) != "own" or not own_model_reaches_browser():
+        return {}
+    from anton.core.browser.config import DecisionsProxy
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    model = (getattr(user_settings, "decision_model", "") or "").strip() or TurnQueueSettings().jev_route_model
+    return {"decisions_proxy": DecisionsProxy(url=proxy_url(), model=model)}
+
+
+def _decisions_block(decisions: Any) -> dict:
+    """The organization's own decision model as anton's browser takes it,
+    or nothing for none, or for an anton that predates it (its browser then
+    asks Jev on MindsHub, or the model, as before).
+
+    Also nothing for a target anton refuses, such as a stored URL with no
+    scheme from before Settings checked it: the browser still runs, and its
+    steps go where they would without the organization's model. Logged
+    without the URL or the key."""
+    if decisions is None:
+        return {}
+    try:
+        from anton.core.browser.config import DecisionsTarget
+    except ImportError:
+        return {}
+    target, model = decisions
+    try:
+        return {"decisions": DecisionsTarget(url=target.url, api_key=target.api_key, model=model)}
+    except ValidationError:
+        logger.warning(
+            "the agent's browser config refused the organization's decision model; the browser runs without it",
+            extra={"event": "desktop_browser_decisions_refused"},
+        )
+        return {}
+
+
+def desktop_browser_config(
+    *, conversation_id: str, project_id: Any, decisions: "tuple[Any, str] | None" = None,
+) -> BrowserConfig | None:
     """An in-process turn's browser: the one the desktop app registered, with
     the task's own session. None when the app registered none. anton's own
     check refuses a malformed address or key; that is logged without either
-    and the turn runs without a browser."""
+    and the turn runs without a browser.
+
+    ``decisions`` is the organization's own decision model, a
+    ``jev_route.JevTarget`` and its model name, which then picks the
+    browser's steps. It stays in this process, as the launch key does. One
+    anton refuses is left out, and the browser still runs
+    (``_decisions_block``)."""
     host = get_browser_host()
     if host is None:
         return None
@@ -565,6 +852,7 @@ def desktop_browser_config(*, conversation_id: str, project_id: Any) -> BrowserC
             profile=task_session(None, conversation_id),
             project=project_key(None, project_id),
             token=host.token,
+            **_decisions_block(decisions),
         )
     except ValidationError:
         logger.warning(
