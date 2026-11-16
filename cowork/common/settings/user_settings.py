@@ -1162,10 +1162,6 @@ class UserSettings(Settings):
     _image_enabled_map_cache: dict[str, bool] | None = PrivateAttr(default=None)
     # Same, for `minds_role_defaults` (see `_minds_role_default_map`).
     _role_default_cache: dict[str, str] | None = PrivateAttr(default=None)
-    # Whether `apply_model_defaults` filled `image_model`, i.e. nothing chose it.
-    # The fill makes the field read like a pick, and `image_model_for_agent`
-    # needs to tell the two apart.
-    _image_model_defaulted: bool = PrivateAttr(default=False)
 
     @field_validator("harness", "channels_harness")
     @classmethod
@@ -1354,7 +1350,6 @@ class UserSettings(Settings):
             )
         if self.image_model is None:
             self.image_model = self._image_model_default()
-            self._image_model_defaulted = True
         return self
 
     def _image_model_default(self) -> str:
@@ -1506,30 +1501,41 @@ class UserSettings(Settings):
     def image_model_for_agent(self) -> str | None:
         """The image model to hand Anton and its scratchpads, or None to hand none.
 
-        Anton offers its generate_image tool on a generic OpenAI-compatible
-        endpoint only when it is given an image model, and the default here is a
-        MindsHub/OpenAI id, so handing it to everyone would give a Gemini-key-only
-        or self-hosted-endpoint user a tool that fails every call. So the model
-        goes over only where it can be served: when the user picked it, when a
-        role runs on OpenAI's own API, which serves the default, or when MindsHub
-        is in play (a MindsHub key, org mode, or a role on minds-cloud) and its
-        cached catalog lists an image model. Without that last condition a
-        MindsHub that has not published its image models yet (this release can
-        ship first) would be handed the compiled default it cannot serve.
+        Every image model here is a MindsHub alias, so one goes over only when
+        Anton's images go to MindsHub (``_images_go_to_mindshub``) and the cached
+        catalog lists an image model this member is not restricted from. A pick
+        follows the same rule: on another provider it would fail every image
+        call. A wallet-locked model is still handed over, since a top-up lifts it.
         """
-        if not self._image_model_defaulted:
-            return self.resolved_image_model
-        roles = {
-            self.resolved_planning_provider,
-            self.resolved_coding_provider,
-            self.resolved_router_provider,
-        }
-        if Provider.OPENAI in roles:
-            return self.resolved_image_model
-        mindshub = self._has_key(Provider.MINDS_CLOUD) or Provider.MINDS_CLOUD in roles
-        if mindshub and self._minds_image_enabled_map():
-            return self.resolved_image_model
-        return None
+        if not self._images_go_to_mindshub():
+            return None
+        available = self._minds_image_enabled_map()
+        if not available:
+            return None
+        model = self.resolved_image_model
+        restricted = self._minds_restricted_ids()
+        if model in restricted:
+            # Only reached with nothing enabled: prefer a wallet-locked model, else none.
+            return next((m for m in available if m not in restricted), None)
+        return model
+
+    def _images_go_to_mindshub(self) -> bool:
+        """Whether Anton sends image calls to MindsHub.
+
+        Mirrors anton's ``LLMClient.image_provider``: a role on MindsHub wins,
+        else the first role on an OpenAI-API endpoint, so with no MindsHub role
+        the images go elsewhere. Org mode turns always run on MindsHub.
+        """
+        if get_app_settings().tenancy_mode == "org":
+            return True
+        from cowork.services.providers import is_minds_host
+
+        for p in (self.resolved_planning_provider, self.resolved_coding_provider, self.resolved_router_provider):
+            if p is Provider.MINDS_CLOUD:
+                return True
+            if p is Provider.OPENAI_COMPATIBLE and is_minds_host(self.openai_base_url):
+                return True
+        return False
 
     @property
     def resolved_gate_model(self) -> str | None:

@@ -521,18 +521,18 @@ def _settings(**kw) -> UserSettings:
 
 
 def _gemini_only(**kw) -> UserSettings:
-    return _settings(
-        planning_provider=Provider.GEMINI, coding_provider=Provider.GEMINI, router_provider=Provider.GEMINI,
-        gemini_api_key=SecretStr("gm-test"), **kw,
-    )
+    return _settings(**{
+        "planning_provider": Provider.GEMINI, "coding_provider": Provider.GEMINI,
+        "router_provider": Provider.GEMINI, "gemini_api_key": SecretStr("gm-test"), **kw,
+    })
 
 
 def _custom_endpoint_only(**kw) -> UserSettings:
-    return _settings(
-        planning_provider=Provider.OPENAI_COMPATIBLE, coding_provider=Provider.OPENAI_COMPATIBLE,
-        router_provider=Provider.OPENAI_COMPATIBLE, planning_model="llama3", coding_model="llama3",
-        router_model="llama3", openai_base_url="http://localhost:11434/v1", **kw,
-    )
+    return _settings(**{
+        "planning_provider": Provider.OPENAI_COMPATIBLE, "coding_provider": Provider.OPENAI_COMPATIBLE,
+        "router_provider": Provider.OPENAI_COMPATIBLE, "planning_model": "llama3", "coding_model": "llama3",
+        "router_model": "llama3", "openai_base_url": "http://localhost:11434/v1", **kw,
+    })
 
 
 @pytest.mark.parametrize(
@@ -547,10 +547,10 @@ def _custom_endpoint_only(**kw) -> UserSettings:
             ),
             None, id="anthropic-key-only",
         ),
-        pytest.param(lambda: _gemini_only(image_model=SUNBURST), SUNBURST, id="gemini-with-an-explicit-pick"),
+        pytest.param(lambda: _gemini_only(image_model=SUNBURST), None, id="gemini-with-an-explicit-pick"),
         pytest.param(
             lambda: _custom_endpoint_only(minds_api_key=SecretStr("mdb_test"), minds_image_model_enabled=IMAGE_CATALOG),
-            FLARE, id="custom-endpoint-with-a-mindshub-key",
+            None, id="custom-endpoint-with-a-mindshub-key",
         ),
         pytest.param(
             lambda: _custom_endpoint_only(minds_api_key=SecretStr("mdb_test")), None,
@@ -561,7 +561,7 @@ def _custom_endpoint_only(**kw) -> UserSettings:
                 planning_provider=Provider.OPENAI, coding_provider=Provider.OPENAI,
                 router_provider=Provider.OPENAI, openai_api_key=SecretStr("sk-test"),
             ),
-            FLARE, id="openai-key",
+            None, id="openai-key",
         ),
         pytest.param(
             lambda: _settings(
@@ -569,7 +569,7 @@ def _custom_endpoint_only(**kw) -> UserSettings:
                 router_provider=Provider.ANTHROPIC, anthropic_api_key=SecretStr("sk-ant-test"),
                 openai_api_key=SecretStr("sk-test"),
             ),
-            FLARE, id="one-role-on-openai",
+            None, id="one-role-on-openai",
         ),
         pytest.param(lambda: _minds(minds_image_model_enabled=IMAGE_CATALOG), FLARE, id="mindshub-key"),
         pytest.param(
@@ -577,14 +577,46 @@ def _custom_endpoint_only(**kw) -> UserSettings:
             SUNBURST, id="mindshub-declared-default",
         ),
         pytest.param(lambda: _minds(), None, id="mindshub-before-image-models-are-published"),
-        pytest.param(lambda: _minds(image_model=SUNBURST), SUNBURST, id="mindshub-pick-before-publishing"),
+        pytest.param(lambda: _minds(image_model=SUNBURST), None, id="mindshub-pick-before-publishing"),
         pytest.param(
             lambda: _settings(
                 planning_provider=Provider.OPENAI, coding_provider=Provider.OPENAI,
                 router_provider=Provider.OPENAI, openai_api_key=SecretStr("sk-test"),
                 minds_api_key=SecretStr("mdb_test"),
             ),
-            FLARE, id="openai-key-whatever-mindshub-lists",
+            None, id="openai-key-whatever-mindshub-lists",
+        ),
+        pytest.param(
+            lambda: _custom_endpoint_only(
+                openai_base_url="https://api.mindshub.ai/v1", minds_image_model_enabled=IMAGE_CATALOG,
+            ),
+            FLARE, id="custom-endpoint-on-mindshub",
+        ),
+        pytest.param(
+            lambda: _gemini_only(
+                coding_provider=Provider.MINDS_CLOUD, minds_api_key=SecretStr("mdb_test"),
+                minds_image_model_enabled=IMAGE_CATALOG, image_model=SUNBURST,
+            ),
+            SUNBURST, id="one-role-on-mindshub-wins",
+        ),
+        pytest.param(
+            lambda: _minds(
+                minds_image_model_enabled=json.dumps({FLARE: False, SUNBURST: False}),
+                minds_model_restricted=json.dumps([FLARE, SUNBURST]),
+            ),
+            None, id="every-image-model-restricted",
+        ),
+        pytest.param(
+            lambda: _minds(
+                image_model=FLARE,
+                minds_image_model_enabled=json.dumps({FLARE: False, SUNBURST: False}),
+                minds_model_restricted=json.dumps([FLARE]),
+            ),
+            SUNBURST, id="restricted-pick-moves-to-a-wallet-locked-model",
+        ),
+        pytest.param(
+            lambda: _minds(minds_image_model_enabled=json.dumps({FLARE: False, SUNBURST: False})),
+            FLARE, id="wallet-locked-keeps-its-top-up-path",
         ),
     ],
 )
@@ -601,16 +633,18 @@ def test_org_mode_hands_the_image_model_over_once_mindshub_lists_one(org_mode):
     assert UserSettings(minds_image_model_enabled=IMAGE_CATALOG).image_model_for_agent == FLARE
 
 
-def test_a_stored_pick_counts_as_a_pick(session):
+def test_a_stored_pick_is_handed_over_only_on_mindshub(session):
     from cowork.services.settings import SettingService
 
     service = SettingService(session, LOCAL_SCOPE)
     for key, value in (("planning_provider", "gemini"), ("coding_provider", "gemini"),
-                       ("router_provider", "gemini"), ("gemini_api_key", "gm-test")):
+                       ("router_provider", "gemini"), ("gemini_api_key", "gm-test"),
+                       ("minds_image_model_enabled", IMAGE_CATALOG), ("image_model", SUNBURST)):
         service.upsert_setting(key, value)
     assert service.load().image_model_for_agent is None
 
-    service.upsert_setting("image_model", SUNBURST)
+    service.upsert_setting("coding_provider", "minds_cloud")
+    service.upsert_setting("minds_api_key", "mdb_test")
 
     assert service.load().image_model_for_agent == SUNBURST
 
