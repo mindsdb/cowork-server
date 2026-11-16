@@ -730,6 +730,16 @@ class UserSettings(Settings):
             "or about to run."
         ),
     )
+    schedule_notify_failed: bool = Field(
+        default=True,
+        title="Notify On Failed Scheduled Runs",
+        description="Post a notice when one of your scheduled tasks fails or stops before finishing.",
+    )
+    schedule_notify_succeeded: bool = Field(
+        default=False,
+        title="Notify On Successful Scheduled Runs",
+        description="Post a notice when one of your scheduled tasks finishes successfully.",
+    )
     nav_title: str = Field(
         default="",
         title="Nav Title",
