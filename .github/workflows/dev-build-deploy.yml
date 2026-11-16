@@ -112,7 +112,7 @@ jobs:
 
   final-release-lock:
     # Desktop installs exactly the anton-agent this lock names. Staging may lock
-    # a release candidate to test it; production may not (ENG-4101, ENG-4355).
+    # a release candidate to test it; production may not.
     # Runs on every PR into main, so the release PR goes red before it merges,
     # not after the wheel is on PyPI. Ungated: GitHub-hosted and secret-free.
     if: github.base_ref == 'main'
