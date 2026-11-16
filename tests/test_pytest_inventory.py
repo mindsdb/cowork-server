@@ -559,9 +559,31 @@ def test_runtime_skip():
     return root, run, inputs, Report.model_validate(collection), execute
 
 
-def test_shards_preserve_cases_skips_and_covered_lines(shard_evidence):
+def test_shards_preserve_cases_skips_and_covered_lines(inventory_suite, monkeypatch):
     """Both real executions preserve the full selection and equal unsharded line coverage."""
-    root, run, inputs, collection, _ = shard_evidence
+    def observe_directories(root):
+        """Record real collector visits outside the temporary source, separately per worker."""
+        (root / "tests/conftest.py").write_text('''
+from collections import Counter
+import json
+import pytest
+
+VISITS = Counter()
+
+def pytest_collectstart(collector):
+    """Count visits to real directories without changing collection."""
+    if isinstance(collector, pytest.Dir):
+        VISITS[collector.path.relative_to(collector.config.rootpath).as_posix()] += 1
+
+def pytest_sessionfinish(session):
+    """Save this worker's counts outside the fingerprinted source tree."""
+    config = session.config
+    worker = getattr(config, "workerinput", {}).get("workerid", "serial")
+    path = config.rootpath.parent / f"directories-{config.option.test_cohort}-{worker}.json"
+    path.write_text(json.dumps(VISITS))
+''')
+
+    root, run, inputs, collection, _ = _shard_evidence(inventory_suite, monkeypatch, prepare=observe_directories)
     result, control, _ = run("tests/", "--ignore=tests/integration", "-n", "0", "-p", "pytest_cov.plugin",
                              "--cov=cowork", "--cov-report=")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -579,6 +601,11 @@ def test_shards_preserve_cases_skips_and_covered_lines(shard_evidence):
         measurement.read()
     assert {name: set(data[0].lines(name) or []) for name in data[0].measured_files()} == {
         name: set(data[1].lines(name) or []) for name in data[1].measured_files()}
+    for index in range(2):
+        for worker in range(4):
+            counts = json.loads((root.parent / f"directories-broad-shard-{index}-gw{worker}.json").read_text())
+            assert counts["tests"] == 1
+            assert all(visits == 1 for visits in counts.values())
 
 
 def test_shards_accept_flat_single_collection_download(shard_evidence, monkeypatch):
@@ -626,6 +653,10 @@ def test_shard_aggregate_rejects_damaged_evidence(shard_evidence):
         ("source", "Shard source"), ("runtime", "runtime"), ("marker", "cases/markers"),
         ("selection", "selection"), ("coverage", "coverage"), ("worker", "worker"),
         ("run", "producer identity"),
+        ("missing-integration", "selection"), ("missing-module", "selection"),
+        ("extra-module", "selection"), ("duplicate-ignore", "selection"),
+        ("reordered-ignore", "selection"), ("escaped-ignore", "selection"),
+        ("directory-ignore", "selection"), ("narrowed-paths", "selection"),
     )
     for fault, message in changes:
         raw = json.loads(original)
@@ -644,6 +675,22 @@ def test_shard_aggregate_rejects_damaged_evidence(shard_evidence):
             raw["invocation"]["coverage"]["disabled"] = True
         elif fault == "worker":
             raw["workers"].pop()
+        elif fault == "missing-integration":
+            raw["invocation"]["selection"]["ignore"].remove("tests/integration")
+        elif fault == "missing-module":
+            raw["invocation"]["selection"]["ignore"].pop()
+        elif fault == "extra-module":
+            raw["invocation"]["selection"]["ignore"].append("tests/test_left é.py")
+        elif fault == "duplicate-ignore":
+            raw["invocation"]["selection"]["ignore"].append("tests/integration")
+        elif fault == "reordered-ignore":
+            raw["invocation"]["selection"]["ignore"].reverse()
+        elif fault == "escaped-ignore":
+            raw["invocation"]["selection"]["ignore"][-1] = "../outside.py"
+        elif fault == "directory-ignore":
+            raw["invocation"]["selection"]["ignore"][-1] = "tests"
+        elif fault == "narrowed-paths":
+            raw["invocation"]["selection"]["paths"] = ["tests/test_left é.py"]
         else:
             raw["environment"]["ci"]["GITHUB_RUN_ID"] = "9999"
         try:

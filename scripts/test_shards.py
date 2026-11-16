@@ -186,14 +186,15 @@ def run_shard(inputs: Path, output: Path, index: int) -> int:
     _require(index in (0, 1), "Invalid shard index")
     collection_path, collection, _ = _collection(inputs)
     declaration = _guard_evidence(collection_path, collection)
-    modules = partition(collection, declaration.collected_files if declaration else ())[index]
+    groups = partition(collection, declaration.collected_files if declaration else ())
+    ignored = ["tests/integration", *groups[1 - index]]
     output = _output(output)
     environment = dict(os.environ, COVERAGE_FILE=str(output / "coverage.data"))
     command = [sys.executable, "-m", "pytest", "-q", "-o", "faulthandler_timeout=120",
                "-n", "4", "--cov=cowork", "--cov-report=",
-               "--ignore=tests/integration", "-p", "scripts.pytest_inventory",
+               *[f"--ignore={name}" for name in ignored], "-p", "scripts.pytest_inventory",
                f"--test-cohort=broad-shard-{index}", f"--test-inventory={output / 'inventory.json'}",
-               f"--junitxml={output / 'junit.xml'}", *modules]
+               f"--junitxml={output / 'junit.xml'}", "tests/"]
     return subprocess.run(command, env=environment, check=False).returncode
 
 
@@ -238,7 +239,7 @@ def aggregate(inputs: Path, output: Path) -> dict[str, object]:
         _compatible(collection, report)
         validate_junit(report, _artifact_file(path, "junit.xml"))
         selection = report.invocation.selection
-        _require(selection.paths == groups[index] and selection.ignore == ["tests/integration"] and
+        _require(selection.paths == ["tests/"] and selection.ignore == ["tests/integration", *groups[1 - index]] and
                  not selection.keyword and not selection.markers and not selection.deselect and
                  not report.collection.deselected, "Shard selection differs")
         _require(report.invocation.workers == 4, "Shard worker count differs")
