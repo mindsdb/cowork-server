@@ -3,7 +3,7 @@ name: Lock anton's final release on staging
 # Desktop installs exactly the anton-agent cowork/release-requirements.txt
 # names. Staging may lock an anton release candidate to test new agent code; a
 # production release may not, and `release_contract.py --require-final` keeps
-# the staging -> main release PR red until staging locks a final (ENG-4355).
+# the staging -> main release PR red until staging locks a final.
 #
 # Anton publishes its final in the same weekly release, so this polls PyPI.
 # When staging locks a candidate and a newer final exists, it relocks staging to

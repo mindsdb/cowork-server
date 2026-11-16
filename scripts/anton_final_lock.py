@@ -1,7 +1,7 @@
 """Name the final anton-agent that should replace a release candidate in the lock.
 
 Staging may lock an anton release candidate to test new agent code. A
-production release may not (ENG-4355): desktop installs exactly the anton the
+production release may not: desktop installs exactly the anton the
 lock names, and `release_contract.py --require-final` refuses a candidate on
 every PR into main. Once anton's weekly release publishes a final, staging
 should lock it before cowork-server's release is cut.
