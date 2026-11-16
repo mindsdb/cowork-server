@@ -141,7 +141,8 @@ def test_existing_changes_are_called_out_when_the_task_starts(tmp_path: Path) ->
     (repo / "README.md").write_text("mine\n", encoding="utf-8")
     service = service_with(tmp_path, FakeEngine())
 
-    session = wait_for_workspace(service, in_place(service, repo).id)
+    # The ready event is written after the workspace is recorded, so wait for the turn to finish.
+    session = wait_for_status(service, in_place(service, repo).id, SessionStatus.completed)
 
     assert session.source_dirty
     ready = [event for event in service.events(session.id).items if event.title == "Task workspace ready"]
