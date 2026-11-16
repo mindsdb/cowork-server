@@ -25,7 +25,7 @@ def git(cwd: Path, *args: str) -> str:
 def released_worktree(tmp_path: Path, key: str = "task") -> tuple[WorkspaceManager, Path, Path]:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    worktree = manager.prepare(key, str(repo), allow_direct_folder=False).workspace_path
+    worktree = manager.prepare(key, str(repo), allow_folder_copy=False).workspace_path
     return manager, repo, worktree
 
 
