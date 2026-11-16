@@ -26,9 +26,8 @@ def unreleased_pins(export: str) -> list[str]:
     """Return every pin in the export that names a pre-release or dev build.
 
     Desktop installs exactly what this export names, so a production release
-    must name only final releases. ENG-4101 and ENG-4355 shipped an
-    anton-agent release candidate to production because nothing checked. A
-    version this cannot parse is refused too, rather than waved through.
+    must name only final releases. A version this cannot parse is refused
+    too, rather than waved through.
     """
     refused = []
     for line in export.splitlines():
