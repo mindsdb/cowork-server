@@ -31,6 +31,9 @@ def repository(tmp_path: Path) -> Path:
     git(repo, "init")
     git(repo, "config", "user.email", "cowork@example.invalid")
     git(repo, "config", "user.name", "Cowork Test")
+    # A commit starts a detached `git maintenance`, which since git 2.55 holds
+    # .git/objects/maintenance.lock after the commit returns.
+    git(repo, "config", "maintenance.auto", "false")
     (repo / "README.md").write_text("base\n", encoding="utf-8")
     git(repo, "add", ".")
     git(repo, "commit", "-m", "base")
