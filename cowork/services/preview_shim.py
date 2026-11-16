@@ -11,12 +11,9 @@ import json
 import re
 from pathlib import Path
 
+from cowork.services import pdf_viewer
 from cowork.services.comments_layer import script_tag
-from cowork.services.pdf_viewer import EMBED_JS
 
-# preview_shim.js carries this marker once; embed.js (the PDF embed code
-# shared with mindshub_services's frame runtime) takes its place.
-_PDF_EMBEDS_MARKER = "/* pdf-embeds */"
 _PDF_ASSETS_TOKEN = "__PDF_ASSETS__"
 _LINE_OFFSET_TOKEN = "__LINE_OFFSET__"
 _HEAD_OPEN_RE = re.compile(r"<head(?:\s[^>]*)?>", re.IGNORECASE)
@@ -24,13 +21,9 @@ _HTML_OPEN_RE = re.compile(r"<html(?:\s[^>]*)?>", re.IGNORECASE)
 _DOCTYPE_RE = re.compile(r"<!doctype[^>]*>", re.IGNORECASE)
 
 
-def _with_pdf_embeds(shim_js: str) -> str:
-    if shim_js.count(_PDF_EMBEDS_MARKER) != 1:
-        raise ValueError("preview_shim.js must carry the pdf-embeds marker exactly once")
-    return shim_js.replace(_PDF_EMBEDS_MARKER, EMBED_JS)
-
-
-SHIM_JS = _with_pdf_embeds(Path(__file__).with_name("preview_shim.js").read_text(encoding="utf-8"))
+SHIM_JS = pdf_viewer.splice_embeds(
+    Path(__file__).with_name("preview_shim.js").read_text(encoding="utf-8"), "preview_shim.js"
+)
 
 
 def _script_tag(shim_js: str, line_offset: int) -> str:

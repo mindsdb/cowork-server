@@ -23,8 +23,12 @@ ASSET_DIR = "_anton_pdf"
 # First path segment, under an artifact's root, of the files served from here.
 ASSET_PREFIX = ASSET_DIR + "/"
 MANIFEST_NAME = "manifest.txt"
+PDF_TYPE = "application/pdf"
 # Sec-Fetch-Dest of a frame navigating to a PDF: it gets the viewer page.
 FRAME_DESTS = frozenset({"iframe", "frame"})
+# The frame runtime and the preview shim carry this comment once; embed.js
+# takes its place.
+EMBEDS_MARKER = "/* pdf-embeds */"
 
 # Only these types are served. With nosniff, a module served with another
 # type does not run.
@@ -59,6 +63,21 @@ def _read_manifest() -> tuple[str, dict[str, str]]:
 PDFJS_VERSION, FILES = _read_manifest()
 EMBED_JS = (DIR / "embed.js").read_text(encoding="utf-8")
 PAGE_HTML = (DIR / "page.html").read_text(encoding="utf-8")
+
+
+def splice_embeds(script: str, name: str) -> str:
+    """script (the file called name) with embed.js in place of its marker."""
+    if script.count(EMBEDS_MARKER) != 1:
+        raise ValueError(f"{name} must carry the pdf-embeds marker exactly once")
+    return script.replace(EMBEDS_MARKER, EMBED_JS)
+
+
+def wants_viewer_page(content_type: str, dest: str, *, document: bool = False) -> bool:
+    """Whether a request for a file of content_type made with Sec-Fetch-Dest
+    dest gets the viewer page instead of the PDF: a frame navigating to it,
+    and with ``document`` also a top-level load (the draft host serves top
+    documents itself, sandboxed, so a popup cannot show the PDF either)."""
+    return content_type == PDF_TYPE and (dest in FRAME_DESTS or (document and dest == "document"))
 
 
 def manifest_digest() -> str:

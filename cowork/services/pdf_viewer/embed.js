@@ -114,6 +114,20 @@ function installPdfEmbeds(w, options) {
     parent.insertBefore(el, after);
   }
 
+  // The element names the PDF it shows and, without a title of its own, gets
+  // one for screen readers. Returns whether that title is ours.
+  function mark(el, url, state) {
+    var ownTitle = state ? state.title : !el.hasAttribute('title');
+    if (ownTitle) el.setAttribute('title', TITLE);
+    el.setAttribute('data-anton-pdf', url);
+    return ownTitle;
+  }
+
+  function unmark(el, state) {
+    el.removeAttribute('data-anton-pdf');
+    if (state.title) el.removeAttribute('title');
+  }
+
   // <embed>: the same element, pointed at the viewer document.
   function swapEmbed(el) {
     var state = states.get(el);
@@ -132,10 +146,8 @@ function installPdfEmbeds(w, options) {
       if (state) restoreEmbed(el, state);
       return;
     }
-    var next = { src: raw, type: type, blob: viewerBlob(url), title: state ? state.title : !el.hasAttribute('title') };
+    var next = { src: raw, type: type, blob: viewerBlob(url), title: mark(el, url, state) };
     states.set(el, next);
-    if (next.title) el.setAttribute('title', TITLE);
-    el.setAttribute('data-anton-pdf', url);
     reinsert(el, function () {
       el.setAttribute('type', VIEWER_TYPE);
       el.setAttribute('src', next.blob);
@@ -150,8 +162,7 @@ function installPdfEmbeds(w, options) {
       else el.setAttribute('type', state.type);
     }
     if (el.getAttribute('src') === state.blob) el.setAttribute('src', state.src);
-    el.removeAttribute('data-anton-pdf');
-    if (state.title) el.removeAttribute('title');
+    unmark(el, state);
     release(state.blob);
   }
 
@@ -165,21 +176,19 @@ function installPdfEmbeds(w, options) {
     if (state && raw === state.src && el.hasAttribute('srcdoc')) return;
     var url = pdfUrl(raw, el.getAttribute('type'));
     if (!url) {
-      if (state) {
-        states.delete(el);
-        el.removeAttribute('srcdoc');
-        el.removeAttribute('data-anton-pdf');
-        if (state.title) el.removeAttribute('title');
-      }
+      if (state) restoreIframe(el, state);
       return;
     }
-    var next = { src: raw, title: state ? state.title : !el.hasAttribute('title') };
-    states.set(el, next);
-    if (next.title) el.setAttribute('title', TITLE);
-    el.setAttribute('data-anton-pdf', url);
+    states.set(el, { src: raw, title: mark(el, url, state) });
     reinsert(el, function () {
       el.setAttribute('srcdoc', viewerDocument(url));
     });
+  }
+
+  function restoreIframe(el, state) {
+    states.delete(el);
+    el.removeAttribute('srcdoc');
+    unmark(el, state);
   }
 
   // <object>: the original stays, hidden; a new <object> right after it

@@ -15,7 +15,7 @@ import subprocess
 import pytest
 
 from cowork.services import pdf_viewer
-from cowork.services.preview_shim import _PDF_EMBEDS_MARKER, SHIM_JS, _script_tag, _with_pdf_embeds, inject_shim
+from cowork.services.preview_shim import SHIM_JS, _script_tag, inject_shim
 
 
 def test_shim_goes_first_inside_head():
@@ -391,7 +391,7 @@ def test_new_reports_still_count_against_the_report_cap():
 
 def test_pdf_embeds_are_spliced_into_the_shim():
     assert pdf_viewer.EMBED_JS in SHIM_JS
-    assert _PDF_EMBEDS_MARKER not in SHIM_JS
+    assert pdf_viewer.EMBEDS_MARKER not in SHIM_JS
 
 
 def test_the_shim_carries_no_document_tags():
@@ -416,8 +416,8 @@ def test_pdf_embeds_are_installed_after_the_reporter_and_before_the_storage_guar
 
 
 def test_a_shim_template_without_the_marker_is_refused():
-    with pytest.raises(ValueError):
-        _with_pdf_embeds("(function () {})();")
+    with pytest.raises(ValueError, match="preview_shim.js"):
+        pdf_viewer.splice_embeds("(function () {})();", "preview_shim.js")
 
 
 def test_pdf_assets_are_filled_per_response():

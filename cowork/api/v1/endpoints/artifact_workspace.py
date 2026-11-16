@@ -108,19 +108,15 @@ _DRAFT_RESPONSE_HEADERS = {
     "Cache-Control": "private, no-store",
     "X-Content-Type-Options": "nosniff",
 }
-_PDF_TYPE = "application/pdf"
-# Sec-Fetch-Dest of a navigation to a PDF that gets the viewer page. Besides
-# frames: the draft host serves a top-level open itself, with the sandbox CSP,
-# and a popup of the draft frame inherits the sandbox.
-_PDF_PAGE_DESTS = pdf_viewer.FRAME_DESTS | {"document"}
+
+
+def _cors_headers(cors: bool) -> dict[str, str]:
+    return {"Access-Control-Allow-Origin": "*"} if cors else {}
 
 
 def _pdf_headers(cors: bool) -> dict[str, str]:
     """For both answers of a PDF address: the bytes and the viewer page."""
-    headers = {"Vary": "Sec-Fetch-Dest"}
-    if cors:
-        headers["Access-Control-Allow-Origin"] = "*"
-    return headers
+    return {"Vary": "Sec-Fetch-Dest", **_cors_headers(cors)}
 
 
 def _pdf_asset_response(name: str, *, cors: bool) -> Response:
@@ -129,10 +125,7 @@ def _pdf_asset_response(name: str, *, cors: bool) -> Response:
     if found is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
     body, content_type = found
-    headers = dict(_DRAFT_RESPONSE_HEADERS)
-    if cors:
-        headers["Access-Control-Allow-Origin"] = "*"
-    return Response(body, media_type=content_type, headers=headers)
+    return Response(body, media_type=content_type, headers={**_DRAFT_RESPONSE_HEADERS, **_cors_headers(cors)})
 
 
 def _pdf_viewer_page(rel_path: str, *, cors: bool) -> HTMLResponse:
@@ -418,7 +411,9 @@ def _draft_file_response(
             detail="Artifact file not found",
         ) from exc
     try:
-        if media_type == _PDF_TYPE and not download and dest in _PDF_PAGE_DESTS:
+        # The draft host serves top-level opens itself, sandboxed, and a popup
+        # of the draft frame inherits the sandbox: a document gets the viewer too.
+        if not download and pdf_viewer.wants_viewer_page(media_type, dest, document=True):
             resources.close()
             return _pdf_viewer_page("/".join(parts), cors=cors)
         if not download and media_type == "text/html":
@@ -430,11 +425,9 @@ def _draft_file_response(
             {"Content-Disposition": attachment_disposition(parts[-1])}
             if download else {}
         )
-        if media_type == _PDF_TYPE:
-            extra.update(_pdf_headers(cors))
-        return _draft_stream(
-            resources, fd, file_stat.st_size, media_type, scope=scope, extra_headers=extra or None,
-        )
+        if media_type == pdf_viewer.PDF_TYPE:
+            extra |= _pdf_headers(cors)
+        return _draft_stream(resources, fd, file_stat.st_size, media_type, scope=scope, extra_headers=extra)
     except BaseException:
         resources.close()
         raise

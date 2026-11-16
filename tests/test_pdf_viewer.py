@@ -14,7 +14,7 @@ from cowork.services import pdf_viewer
 
 ROOT = Path(__file__).resolve().parents[1]
 FOLDER = ROOT / "cowork" / "services" / "pdf_viewer"
-MANIFEST_SHA256 = "90954b4b1f34661ad3383cf25441e7ea7a2b30b0fc233dd333491b59aa3603cb"
+MANIFEST_SHA256 = "a2fba91dff4ddcfffdb9e3bbdeac5f39f5c832bf254f6ea3c1131c57b9d4ad45"
 
 
 def test_manifest_lists_every_file_with_its_sha256():

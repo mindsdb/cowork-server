@@ -259,13 +259,7 @@ function fileName() {
   }
 }
 
-async function render({ pdfjs, components, base }, data, ui) {
-  const worker = new pdfjs.PDFWorker();
-  try {
-    await worker.promise;
-  } catch (error) {
-    throw new ViewerError('assets', error);
-  }
+async function render({ pdfjs, components, base }, worker, data, ui) {
   const realWorker = typeof Worker === 'function' && worker.port instanceof Worker;
   root.setAttribute('data-anton-pdf-worker', realWorker ? 'worker' : 'main-thread');
   // Before getDocument: pdf.js takes over the bytes it is given.
@@ -375,7 +369,13 @@ async function main() {
       throw new ViewerError('assets', error);
     }
   }
-  await render(library, await bytes, ui);
+  // The worker loads while the PDF is still being read.
+  const worker = new library.pdfjs.PDFWorker();
+  const started = worker.promise.catch((error) => {
+    throw new ViewerError('assets', error);
+  });
+  const [data] = await Promise.all([bytes, started]);
+  await render(library, worker, data, ui);
 }
 
 main().catch((error) => showError(failureKind(error)));

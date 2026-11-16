@@ -105,15 +105,20 @@ async def _drain(response):
     return b"".join(chunks)
 
 
-async def _drafts(monkeypatch, tmp_path, rel, dest=""):
+def _serve_the_artifact(monkeypatch, tmp_path):
+    """The /drafts lookup finds the test artifact and lets the caller read it."""
     source, folder, metadata = make_artifact(tmp_path, files=FILES)
     monkeypatch.setattr(
         workspace_ep, "review_artifact_and_read",
         reviewed_and_read(lambda *_args: (source, folder, metadata, True)),
     )
+
+
+async def _drafts(monkeypatch, tmp_path, rel, dest="", *, download=False):
+    _serve_the_artifact(monkeypatch, tmp_path)
     request = SimpleNamespace(query_params={})
     return await workspace_ep.serve_private_draft(
-        "local", ARTIFACT_HEX, rel, request, LOCAL_SCOPE, sec_fetch_dest=dest,
+        "local", ARTIFACT_HEX, rel, request, LOCAL_SCOPE, download=download, sec_fetch_dest=dest,
     )
 
 
@@ -145,15 +150,7 @@ async def test_desktop_documents_give_the_shim_the_route_address(desktop, tmp_pa
 
 
 async def test_a_download_still_gets_the_bytes(desktop, tmp_path, monkeypatch):
-    source, folder, metadata = make_artifact(tmp_path, files=FILES)
-    monkeypatch.setattr(
-        workspace_ep, "review_artifact_and_read",
-        reviewed_and_read(lambda *_args: (source, folder, metadata, True)),
-    )
-    response = await workspace_ep.serve_private_draft(
-        "local", ARTIFACT_HEX, "docs/report.pdf", SimpleNamespace(query_params={}), LOCAL_SCOPE,
-        download=True, sec_fetch_dest="iframe",
-    )
+    response = await _drafts(monkeypatch, tmp_path, "docs/report.pdf", "iframe", download=True)
     assert response.headers["content-disposition"].startswith("attachment")
     assert await _drain(response) == PDF.encode()
 
@@ -170,11 +167,7 @@ async def test_a_download_still_gets_the_bytes(desktop, tmp_path, monkeypatch):
 def app_client(desktop, tmp_path, monkeypatch):
     from cowork.server import create_app
 
-    source, folder, metadata = make_artifact(tmp_path, files=FILES)
-    monkeypatch.setattr(
-        workspace_ep, "review_artifact_and_read",
-        reviewed_and_read(lambda *_args: (source, folder, metadata, True)),
-    )
+    _serve_the_artifact(monkeypatch, tmp_path)
     client = TestClient(create_app())
     client.app.dependency_overrides[get_tenant_scope] = lambda: LOCAL_SCOPE
     return client
