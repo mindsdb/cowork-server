@@ -504,6 +504,13 @@ def managed_postgres_service():
 
 
 @pytest.fixture
+def router_wire_budget(monkeypatch) -> None:
+    """Give real SDK wire checks setup headroom; deadline tests override their own bounds."""
+    monkeypatch.setattr("cowork.handlers.response_routing._GATE_FIRST_EVENT_SECONDS", 10.0)
+    monkeypatch.setattr("cowork.handlers.response_routing._GATE_TOTAL_SECONDS", 15.0)
+
+
+@pytest.fixture
 def openai_compatible_api(monkeypatch):
     """Set COWORK_OPENAI_COMPATIBLE_API for one test, or unset it with None.
 

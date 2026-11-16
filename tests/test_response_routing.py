@@ -1005,7 +1005,7 @@ async def test_pre_minted_binding_skips_settings_and_is_used(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch):
+async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch, router_wire_budget):
     import json
 
     import httpx2 as httpx
@@ -1078,7 +1078,7 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     assert binding.label == "minds_cloud"
     assert binding.model == "mindshub_air"
     assert type(binding.provider).__name__ == "OpenAIProvider"
-    assert decision.route == DIRECT_CONTEXT
+    assert decision.route == DIRECT_CONTEXT, decision.reason
     assert len(requests) == 1
     assert requests[0].headers["Langfuse-Session-Id"] == "conv-router"
     # Exercise the installed Anton: assigning the attribute alone also passes

@@ -131,12 +131,8 @@ class _Endpoint:
 
 
 @pytest.fixture
-async def endpoint(monkeypatch, openai_compatible_api):
+async def endpoint(monkeypatch, openai_compatible_api, router_wire_budget):
     openai_compatible_api("responses")
-    # Wire-contract tests must not measure cold SDK imports on a busy runner.
-    # The timeout test below supplies its own short deadline.
-    monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 10.0)
-    monkeypatch.setattr(routing, "_GATE_TOTAL_SECONDS", 15.0)
     endpoint = _Endpoint(monkeypatch)
     yield endpoint
     await asyncio.gather(*(client.aclose() for client in endpoint.clients))
