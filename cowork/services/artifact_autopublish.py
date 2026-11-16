@@ -25,14 +25,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple
 from uuid import UUID
 
-from anton.minds_client import DEFAULT_REQUEST_TIMEOUT_S
 from pydantic import ValidationError
 
 from cowork.common.logger import log_context
 from cowork.db.units import run_efs, run_efs_cleanup, run_on_unit_threads
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessRequest
-from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
+from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, refresh, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.services.publish import (
@@ -71,25 +70,22 @@ AUTOPUBLISH_ACCESS = ArtifactAccessRequest(mode=AccessMode.RESTRICTED, allowed_e
 # thread and a held lock.
 _MIN_START_BUDGET_S = 5.0
 
-# Time budgets. These numbers must agree:
-#   PUBLISH_POST_TIMEOUT_S      anton's urllib timeout on the POST /upload itself
-#                               (imported, so a change in anton moves the budget)
-#   PUBLISH_THREAD_SLACK_S      the thread's work outside the POST and the poll:
-#                               zipping and owner lookups before the upload,
-#                               writing .published.json after it, and the last
-#                               poll request running past the budget
-#   job_budget_for(ttl)         how long anton polls an accepted (202) job
-#   lock_ttl_for(t)             how long the slug lock is held
-# The publish runs in a thread that asyncio.wait_for(...) abandons but cannot
-# cancel, so it may still write .published.json after the wait_for window.
-# That window runs alongside the thread, which starts right after the lock is
-# taken, so counted from the lock's acquire the lock must outlive:
-#   PUBLISH_POST_TIMEOUT_S + job_budget + PUBLISH_THREAD_SLACK_S <= lock_ttl
-# Live sync holds its lock for the same factor of its own timeout and uses
-# these helpers too.
-# Enforced by tests/test_autopublish_budgets.py. Defaults: 30 + 135 + 15 = 180.
-PUBLISH_POST_TIMEOUT_S = float(DEFAULT_REQUEST_TIMEOUT_S)
+# Time budgets. The publish runs in a thread that asyncio.wait_for(...)
+# abandons but cannot cancel, so it may still write .published.json after the
+# wait_for window; the slug lock must outlive it. The thread restarts the lock's
+# TTL (artifact_locks.refresh) once the upload service accepts the job, which
+# splits its run in two, each within one lock_ttl:
+#   - from the acquire to the accepted job: the key, the owner and MindsHub
+#     reads, zipping and the POST /upload. Unbounded in theory (urllib's timeout
+#     is per socket operation), but far under a lock_ttl in practice;
+#   - from the refresh: job_budget + PUBLISH_THREAD_SLACK_S + LOCK_HEADROOM_S
+#     == lock_ttl.
+# PUBLISH_THREAD_SLACK_S covers writing .published.json and the last poll
+# request running past the budget. Live sync holds its lock for the same
+# factor of its own timeout and uses these helpers too.
+# Enforced by tests/test_autopublish_budgets.py. Defaults: 135 + 15 + 30 = 180.
 PUBLISH_THREAD_SLACK_S = 15.0
+LOCK_HEADROOM_S = 30.0
 DEFAULT_TIMEOUT_S = 60.0
 LOCK_TTL_FACTOR = 3
 
@@ -99,7 +95,7 @@ def lock_ttl_for(timeout_s: float) -> float:
 
 
 def job_budget_for(lock_ttl: float) -> float:
-    return lock_ttl - PUBLISH_POST_TIMEOUT_S - PUBLISH_THREAD_SLACK_S
+    return lock_ttl - PUBLISH_THREAD_SLACK_S - LOCK_HEADROOM_S
 
 
 # Reasons a candidate is skipped. Kept distinct because a single None would make
@@ -446,6 +442,11 @@ async def _publish_one(
     # Which phase the abandoned thread was in when wait_for gave up: "upload"
     # (POST in flight) or "polling" (server accepted the job).
     progress = {"phase": "upload"}
+
+    def accepted(_job: dict) -> None:
+        progress.update(phase="polling")
+        refresh(artifacts_base, slug)
+
     try:
         await asyncio.wait_for(
             asyncio.to_thread(
@@ -462,7 +463,7 @@ async def _publish_one(
                 # get here with an org scope in hand (see the caller's guard).
                 scope=scope,
                 job_budget_s=job_budget_s,
-                on_job_accepted=lambda _accepted: progress.update(phase="polling"),
+                on_job_accepted=accepted,
                 project_id=project_id,
                 # No person asked for this publish: a Markdown page the
                 # conversion stopped before is refused without a new render.

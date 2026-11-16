@@ -50,6 +50,7 @@ from cowork.services.artifact_permissions import (
     with_export_formats,
 )
 from cowork.services import artifact_files
+from cowork.services.artifact_autopublish import job_budget_for, lock_ttl_for
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.quick_edit import direct_edit_available, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
@@ -108,7 +109,7 @@ _DRAFT_RESPONSE_HEADERS = {
     "X-Content-Type-Options": "nosniff",
 }
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
-_LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
+_LIVE_PUBLISH_LOCK_TTL_S = lock_ttl_for(_LIVE_PUBLISH_TIMEOUT_S)
 # The stats tracking toggle waits only briefly for an in-flight publish:
 # the full publish wait would freeze the switch for a minute.
 _STATS_TRACKING_LOCK_TIMEOUT_S = 5.0
@@ -509,8 +510,7 @@ async def _sync_live_artifact(
         publish_artifact,
         published_artifact_access,
     )
-    from cowork.services.artifact_locks import release
-    from cowork.services.artifact_autopublish import job_budget_for
+    from cowork.services.artifact_locks import refresh, release
 
     artifacts_base = folder.parent
     if not await _acquire_live_publish_lock(folder, scope):
@@ -562,6 +562,7 @@ async def _sync_live_artifact(
                     scope=scope,
                     project_id=project_id,
                     job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S),
+                    on_job_accepted=lambda _job: refresh(folder.parent, folder.name),
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -1343,7 +1344,7 @@ async def set_artifact_access(
     from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
-    from cowork.services.artifact_autopublish import job_budget_for
+    from cowork.services.artifact_locks import refresh
 
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
@@ -1416,6 +1417,7 @@ async def set_artifact_access(
                     stored=checked.stored,
                     owner_save=True,
                     job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S),
+                    on_job_accepted=lambda _job: refresh(folder.parent, folder.name),
                     notices=notices,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
