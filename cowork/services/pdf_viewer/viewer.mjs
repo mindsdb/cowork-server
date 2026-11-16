@@ -369,13 +369,19 @@ async function main() {
       throw new ViewerError('assets', error);
     }
   }
-  // The worker loads while the PDF is still being read.
+  // The worker loads while the PDF is still being read. pdf.js does not stop
+  // a worker it was given, so a viewer that ends in an error stops it here.
   const worker = new library.pdfjs.PDFWorker();
-  const started = worker.promise.catch((error) => {
-    throw new ViewerError('assets', error);
-  });
-  const [data] = await Promise.all([bytes, started]);
-  await render(library, worker, data, ui);
+  try {
+    const started = worker.promise.catch((error) => {
+      throw new ViewerError('assets', error);
+    });
+    const [data] = await Promise.all([bytes, started]);
+    await render(library, worker, data, ui);
+  } catch (error) {
+    worker.destroy();
+    throw error;
+  }
 }
 
 main().catch((error) => showError(failureKind(error)));
