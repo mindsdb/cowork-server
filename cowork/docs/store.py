@@ -54,6 +54,7 @@ from cowork.common.paths import (
     dir_open,
     dir_rmtree,
     dir_unlink,
+    is_child_name,
     open_pinned_child,
     pinned_dir,
     read_bounded,
@@ -557,12 +558,14 @@ def _listed_names(base: Path) -> list[str]:
 def _doc_folders(base: Path, names: Iterable[str]) -> Iterator[tuple[Path, dict[str, Any]]]:
     """The doc folders among ``names`` in ``base``, in that order, each with its metadata.
 
-    ``names`` come from listing ``base``, never from a caller's ref, so no name
-    can reach outside it.
+    ``names`` should come from listing ``base``; a name that isn't one child's
+    is skipped, so none reaches outside it.
     """
     for name in names:
+        if name.startswith(".") or not is_child_name(name):
+            continue
         folder = base / name
-        if name.startswith(".") or not folder.is_dir():
+        if not folder.is_dir():
             continue
         meta = _doc_meta(folder)
         if meta is not None:
@@ -570,15 +573,17 @@ def _doc_folders(base: Path, names: Iterable[str]) -> Iterator[tuple[Path, dict[
 
 
 def _has_id(meta: dict[str, Any], hexref: str) -> bool:
-    return str(meta.get("id", "")).replace("-", "").lower() == hexref
+    # Empty only for a ref of dashes, which must not match a doc whose metadata is unreadable.
+    return bool(hexref) and str(meta.get("id", "")).replace("-", "").lower() == hexref
 
 
 def find_doc_folder(artifacts_dir: Path, ref: str) -> Path:
     """A doc folder by artifact id (dashed or not), slug, or exact title.
 
-    A slug is a folder's name, and a slug anton made ends in ``-<id[:8]>``, so
-    those lookups read only the folders they name. A title, or an id whose slug
-    doesn't carry it, reads every artifact's metadata.
+    A slug is a folder's name, so it reads only that folder's metadata. An id
+    reads only the folders whose name ends in ``-<id[:8]>``, as anton names
+    new artifacts. A title, or an id its folder's name doesn't carry, reads
+    every artifact's metadata.
     """
     ref = (ref or "").strip()
     if not ref:

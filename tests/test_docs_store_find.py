@@ -1,6 +1,7 @@
 """find_doc_folder: which doc a tool's ref names, and how much of the project it reads to find it."""
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 
@@ -59,6 +60,27 @@ def test_an_id_reads_only_the_folder_its_slug_names(project, base, reads, spell)
     _, budget = project
     assert find_doc_folder(base, spell(budget.artifact_id)) == budget.folder
     assert reads == [budget.slug]
+
+
+def test_folders_sharing_an_id_prefix_are_told_apart_by_the_whole_id(project, base, reads):
+    plan, budget = project
+    prefix = plan.artifact_id[:8]
+    twin_id = prefix + ("0" if plan.artifact_id[8] != "0" else "1") * 24
+    meta_path = budget.folder / "metadata.json"
+    meta_path.write_text(json.dumps({**json.loads(meta_path.read_text()), "id": twin_id}))
+    twin = budget.folder.rename(base / f"aaa-{prefix}")  # listed before the plan's folder
+
+    assert find_doc_folder(base, plan.artifact_id) == plan.folder
+    assert find_doc_folder(base, twin_id) == twin
+    assert reads == [twin.name, plan.slug, twin.name]
+
+
+@pytest.mark.parametrize("ref", ["-", "---"])
+def test_a_ref_of_dashes_is_no_id_even_for_a_doc_without_metadata(project, base, ref):
+    plan, _ = project
+    (plan.folder / "metadata.json").unlink()
+    assert find_doc_folder(base, plan.slug) == plan.folder
+    assert _refused(base, ref).code == "no_doc"
 
 
 @pytest.mark.parametrize("renamed", ["legacy-budget", "budget-{prefix}-2"])
