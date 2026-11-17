@@ -13,7 +13,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from coding_service_fakes import FakeEngine, FakeSession, repository
+from tests.support.coding.service_fakes import FakeEngine, FakeSession, repository
 
 from cowork.coding.contracts import PermissionMode
 from cowork.coding.control_models import (

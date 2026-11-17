@@ -309,22 +309,26 @@ async def test_model_selection_cannot_bypass_admission(monkeypatch, model):
         ("/agent-repairs/release", "post", {"commentThreadId": "thread"}),
         ("/agent-repairs/repair/cancel", "post", {}),
         ("/agent-repairs/repair/decision", "post", {"status": "accepted"}),
+        ("/quick-edits", "post", {"message": "Make the title blue"}),
+        ("/quick-edits/" + "0" * 32 + "/undo", "post", {}),
     ],
 )
 @pytest.mark.parametrize("allowed,status", [(False, 403), (None, 503)])
 def test_every_artifact_mutation_checks_authority_before_resolving_files(
     monkeypatch, suffix, method, body, allowed, status
 ):
-    from cowork.api.v1.endpoints import artifact_workspace
+    from cowork.api.v1.endpoints import artifact_quick_edit, artifact_workspace
     from cowork.db.scoped import get_scoped_session, get_tenant_scope
 
     authority(monkeypatch, body={"allowed": allowed})
     app = FastAPI()
     app.include_router(artifact_workspace.router)
+    app.include_router(artifact_quick_edit.router)
     app.dependency_overrides[get_scoped_session] = lambda: SimpleNamespace(scope=ORG)
     app.dependency_overrides[get_tenant_scope] = lambda: ORG
     resolve = Mock(side_effect=AssertionError("No artifact mutation"))
     monkeypatch.setattr(artifact_workspace, "_owner_workspace", awaitable(resolve))
+    monkeypatch.setattr(artifact_quick_edit, "_owner_workspace", awaitable(resolve))
     with TestClient(app) as client:
         response = client.request(
             method,
@@ -418,6 +422,8 @@ async def test_artifact_capabilities_reflect_current_role_and_execution(
         return can_edit if permission == "artifact.manage" else can_execute
 
     monkeypatch.setattr(artifact_workspace, "has_product_permission", allowed)
+    # Whichever anton is installed: quick edits are tested on their own.
+    monkeypatch.setattr(artifact_workspace, "quick_edit_available", lambda: False)
     original = {
         "canEdit": True,
         "canAddressWithAgent": True,
@@ -432,6 +438,10 @@ async def test_artifact_capabilities_reflect_current_role_and_execution(
         "canAddressWithAgent": can_edit and can_execute,
         "canResolveComments": can_edit,
         "canPreview": True,
+        # No quick editor here (patched above), so false whatever the
+        # permissions (ENG-4227; tests/test_artifact_quick_edit.py).
+        "canQuickEdit": False,
+        "quickEditDirect": False,
     }
     assert original["canEdit"] is True
 
@@ -450,7 +460,7 @@ async def test_artifact_role_permissions_never_elevate_a_reviewer(monkeypatch):
         await artifact_workspace._current_capabilities(
             ORG, original
         )
-        == original
+        == {**original, "canQuickEdit": False, "quickEditDirect": False}
     )
     assert call == []
 
@@ -581,7 +591,7 @@ async def test_a_role_grant_does_not_override_narrow_artifact_operation_flags(
         await artifact_workspace._current_capabilities(
             ORG, narrow
         )
-        == narrow
+        == {**narrow, "canQuickEdit": False, "quickEditDirect": False}
     )
 
 

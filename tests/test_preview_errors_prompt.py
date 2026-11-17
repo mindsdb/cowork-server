@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cowork.services.artifact_identity import ensure_full_id
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_revisions import (
     _MAX_PREVIEW_ENTRIES_SCANNED,
     _MAX_PREVIEW_FILE,
@@ -52,6 +53,28 @@ def test_a_file_with_no_usable_line_number_keeps_the_file_but_drops_the_line():
     # append after it.
     lines = _preview_error_lines([{"message": "boom", "file": "a.html", "line": 0}], "a.html")
     assert lines == ["  1. boom — a.html"]
+
+
+def test_the_shims_newer_report_types_render_like_any_other():
+    # rejection, console and http carry a message and no position, like a
+    # failed resource: the reader keys on message/file/line, never on type,
+    # so a type it has not heard of still reaches the agent.
+    body = "Traceback (most recent call last): " + "y" * 400
+    lines = _preview_error_lines(
+        [
+            {"type": "rejection", "message": "Unhandled promise rejection: boom", "file": "", "line": 0},
+            {"type": "console", "message": "TypeError: rows.map is not a function", "file": "", "line": 0},
+            {"type": "http", "message": f"GET /api/sales → 500: {body}", "file": "", "line": 0, "url": "/api/sales"},
+            {"type": "not-invented-yet", "message": "still shown", "file": "", "line": 0},
+        ],
+        "index.html",
+    )
+    assert lines[:3] == [
+        "  1. Unhandled promise rejection: boom",
+        "  2. TypeError: rows.map is not a function",
+        f"  3. {f'GET /api/sales → 500: {body}'[:_MAX_PREVIEW_MESSAGE]}",
+    ]
+    assert lines[3] == "  4. still shown"
 
 
 def test_at_most_ten_entries_survive():
@@ -126,7 +149,7 @@ def artifact(tmp_path):
     }
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     (folder / "brief.md").write_text("# First\n", encoding="utf-8")
-    artifact_id, metadata = ensure_full_id(folder, metadata)
+    artifact_id, metadata = ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
     return folder, metadata, artifact_id
 
 

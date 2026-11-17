@@ -733,6 +733,7 @@ async def test_a_channel_turn_drops_its_checked_repair_rows_once_its_cards_are_o
     drops the rows of the folders the diff ruled on, as read at turn start."""
     from unittest.mock import AsyncMock, Mock
 
+    from _artifact_cards import make_card
     from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
     from cowork.services import queued_repairs, task_objects
     from cowork.services.queued_repairs import QueuedRepairs
@@ -749,7 +750,7 @@ async def test_a_channel_turn_drops_its_checked_repair_rows_once_its_cards_are_o
     monkeypatch.setattr(task_objects, "turn_artifact_changes", Mock(return_value=task_objects.ArtifactChanges(
         created=[], touched={"made"}, checked_repairs={"fixme"},
     )))
-    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[{"slug": "made"}]))
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[make_card(slug="made")]))
     happened: list[tuple] = []
 
     async def drop_behind_a_full_pool(*, conversation_id, repairs, checked, scope):
@@ -767,7 +768,7 @@ async def test_a_channel_turn_drops_its_checked_repair_rows_once_its_cards_are_o
         input_text="run", model="m", turn_rows=[],
     ):
         if isinstance(event, ArtifactCreated):
-            happened.append(("card", event.artifact["slug"]))
+            happened.append(("card", event.artifact.slug))
 
     assert happened == [("card", "made"), ("drop", repairs, {"fixme"})]
 
@@ -910,6 +911,27 @@ async def test_a_cancelled_channel_turn_stays_cancelled_when_the_flag_cannot_be_
     assert_log_fields(logged.output(), **fields)
 
 
+@pytest.mark.asyncio
+async def test_a_channel_turn_drops_connector_drafts(monkeypatch):
+    """A channel member cannot save a card, so the kind is accepted and ignored."""
+    _fake_handler(monkeypatch)
+
+    async def fake_replies(**kwargs):
+        assert "connector_drafts" not in kwargs
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_connector", {"entries": [{"connector_id": "acme", "label": "Acme", "fields": []}]}
+        yield "turn_delta", {"text": "hi"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    events, failure = await _drain(remote_turn_events(
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
+
+    assert failure is None
+    assert [type(e).__name__ for e in events] == ["StreamTextDelta"]
 class _Recorded(NamedTuple):
     """One call of record_new_artifacts, as its spy saw it."""
 
@@ -965,7 +987,8 @@ def _turn_with_a_new_artifact(monkeypatch, *, diff=None, snapshot=None):
     recorded: list[_Recorded] = []
 
     def record_new_artifacts(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
+        untimed=(),
     ):
         recorded.append(_Recorded(slugs, project_id, creator, session.scope, on_efs_thread()))
 
@@ -1104,8 +1127,9 @@ async def test_a_record_that_lost_only_the_listed_check_says_so(monkeypatch, cap
     the diff listed. Either the turn created nothing, so the unit's failure
     lost only that check, or it created a folder and record_new_artifacts
     raised at the check, once that folder's rows were written
-    (ListedLocationsUnchecked). The line says the check failed, not that
-    created folders went unrecorded."""
+    (ListedLocationsUnchecked), which a failed hold of the root or a failed
+    write of the sort times raises too. The line names the check, the hold
+    and the sort times, not created folders gone unrecorded."""
     import logging
 
     from cowork.db.scoped import LOCAL_SCOPE
@@ -1137,7 +1161,9 @@ async def test_a_record_that_lost_only_the_listed_check_says_so(monkeypatch, cap
     assert failure is None
     record = _artifact_record_log(caplog)
     assert (record.levelname, record.getMessage()) == (
-        "ERROR", "Could not check the locations of the artifacts a channel turn listed",
+        "ERROR",
+        "Could not check the locations of the artifacts a channel turn found, or record the folder that holds them"
+        " or their sort times",
     )
     assert record.exc_info[1] is error
 

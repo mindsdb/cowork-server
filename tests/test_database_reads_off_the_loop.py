@@ -32,6 +32,9 @@ WAIT = 2
 # catches one and leaves a loaded CI runner room.
 LIVE_BUDGET = WAIT / 2
 
+# These tests time the event loop; see without_gc_pauses.
+pytestmark = pytest.mark.usefixtures("without_gc_pauses")
+
 
 @dataclass
 class _Measured:

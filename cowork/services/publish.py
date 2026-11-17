@@ -7,12 +7,17 @@ from __future__ import annotations
 
 import hashlib
 import html as _html
+import io
 import json
 import logging
 import os
+import re
 import stat
 import tempfile
+import threading
 import urllib.error
+from collections import OrderedDict
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -44,6 +49,7 @@ from cowork.services.artifact_audience import (
     ORG_AUDIENCE_FIELDS,
     PUBLISHER_OWNER_ONLY_FIELD,
     AudienceChanges,
+    ShareNotice,
     ShareNotify,
     for_publisher,
     notify_within,
@@ -68,12 +74,15 @@ from cowork.services.providers import (
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.core.artifacts.internal_files import REVISIONS_DIRNAME
 from anton.minds_client import describe_minds_connection_error
+from anton.publisher import PUBLISH_JOB_BUDGET_S, PublishJobFailed, PublishJobTimeout
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import resolve_access as _resolve_access
 from anton.publish_access import resolve_publish_target as _anton_resolve_publish_target
+from cowork.schemas.export_child import PublishMarkdownRequest
 from cowork.services.artifacts import (
     _content_mtime,
     _load_published_map,
+    _org_mode,
     PUBLISHABLE_STATIC_SUFFIXES,
     _scan_artifact_dirs,
     html_artifacts,
@@ -171,6 +180,47 @@ class PublishRejected(RuntimeError):
     a shared-storage path, so org routes show this type's text and hide the
     other's.
     """
+
+
+# A published Markdown page renders in the conversion process
+# (_publish_markdown_body). Its refusals are typed, like PublishTooLarge, so a
+# route answers with the status and the app reads the code.
+MARKDOWN_NOT_PUBLISHABLE_CODE = "markdown_not_publishable"
+MARKDOWN_TOO_LARGE_MESSAGE = (
+    "This Markdown file is too large to publish. Publish a file under 2 MiB."
+)
+MARKDOWN_NOT_CONVERTED_MESSAGE = (
+    "This Markdown file can't be published. "
+    "Converting it took too long, used too much memory, or failed on something in the file."
+)
+CONVERSION_BUSY_CODE = "conversion_busy"
+CONVERSION_BUSY_MESSAGE = "Another document is converting on this server. Try again in a moment."
+MARKDOWN_CONVERSION_FAILED_CODE = "markdown_conversion_failed"
+MARKDOWN_CONVERSION_FAILED_MESSAGE = "This Markdown file couldn't be converted for publishing."
+
+
+class MarkdownNotPublishable(_CodedRefusal):
+    """The file is past publish's Markdown bound, or rendering it passed the
+    conversion's time or memory limit or failed on the file's content.
+    Nothing was published, and the same file is refused again, so callers
+    report it instead of retrying."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(413, MARKDOWN_NOT_PUBLISHABLE_CODE, message)
+
+
+class MarkdownRenderBusy(_CodedRefusal):
+    """Another conversion holds this server process's one conversion slot."""
+
+    def __init__(self) -> None:
+        super().__init__(429, CONVERSION_BUSY_CODE, CONVERSION_BUSY_MESSAGE)
+
+
+class MarkdownConversionFailed(_CodedRefusal):
+    """The conversion process failed without passing a limit: a fault on this server."""
+
+    def __init__(self) -> None:
+        super().__init__(500, MARKDOWN_CONVERSION_FAILED_CODE, MARKDOWN_CONVERSION_FAILED_MESSAGE)
 
 
 # Sharing an artifact with everyone takes MindsHub's artifacts.share_org,
@@ -277,6 +327,12 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
     everyone with SHARE_ORG_REQUIRED_CODE (ShareOrgRequired, its reason,
     clipped, as the text). Every other HTTP answer comes back as an
     UploadError; a failure that got no HTTP answer returns None.
+
+    A failed asynchronous job (`PublishJobFailed`) carries the status /upload
+    would have answered. The server records the answer's code too, but anton
+    does not pass it on, so a job's refusal maps by status alone: its 503 is
+    the upload service itself, and a 403 share_org_required or permission_denied
+    comes back as an UploadError.
     """
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
@@ -291,6 +347,16 @@ def classify_upload_error(exc: Exception) -> UploadError | None:
         ),
     ):
         raise exc
+    if isinstance(exc, PublishJobFailed):
+        if exc.status_code == 503:
+            # Leaves publish_artifact before its failure log, like the typed
+            # refusals below; str(exc) names the job to find in the worker's log.
+            logger.warning(
+                "Publish service answered HTTP %s code=%s body=%r", 503, None, str(exc)[:200],
+                extra={"status_code": 503, "reason": "publish_job_failed"},
+            )
+            raise UploadServiceUnavailable() from exc
+        return UploadError(exc.status_code, None, exc.message)
     if not isinstance(exc, urllib.error.HTTPError):
         return None
     status = exc.code
@@ -497,6 +563,43 @@ def _write_published_map(published_json: Path, published_map: dict[str, Any]) ->
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _keep_timed_out_report(
+    report_id: str,
+    *,
+    ownership,
+    published_json: Path,
+    published_map: dict[str, Any],
+    published_key: str,
+    artifact_key: str | None,
+    owner_side: dict,
+) -> None:
+    """Record the report a first publish's job is still building.
+
+    The server named `report_id` when it accepted the job, and the build goes
+    on after the poll gave up. Without a record every retry, autopublish's
+    included, would publish the artifact as new and mint another report. The
+    entry has the report and no url, md5 or mtime: no card shows a link, and
+    the next publish sees a change and republishes that report. A failure to
+    record leaves the report orphaned, as the logged prefix says.
+    """
+    try:
+        if ownership is not None:
+            ownership.record(report_id)
+        published_map[published_key] = {
+            "report_id": report_id,
+            "url": "",
+            "artifact_key": artifact_key or "",
+            "lambda_artifact_key": "",
+            "published": True,
+            **owner_side,
+        }
+        _write_published_map(published_json, published_map)
+    except Exception:
+        logger.warning(
+            "orphaned_publish identifier=%s url= reason=job_timeout_unrecorded", report_id, exc_info=True,
+        )
 
 
 class DesktopArtifact(NamedTuple):
@@ -739,40 +842,163 @@ _MD_HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 
+# The line boundaries str.splitlines uses, so the title scan finds the same
+# first heading without building a list of every line.
+_LINE = re.compile(r"[^\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]*")
+
+
 def _markdown_title(md_path: Path, md_text: str) -> str:
     """Page <title>: the first ATX `# ` heading if present, else the filename."""
-    for line in md_text.splitlines():
-        stripped = line.strip()
+    for line in _LINE.finditer(md_text):
+        stripped = line.group().strip()
         if stripped.startswith("# "):
             return stripped[2:].strip() or md_path.stem
     return md_path.stem
 
 
-def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
+# The most of a Markdown file publish reads. Python-Markdown renders an
+# ordinary 2 MiB report in about 3 s on one fast core, leaving room for a
+# replica's slower one inside the conversion's 30 s; real agent-written
+# reports stay far below it. Measured with scripts/measure_export_capacity.py
+# in the server's image at docker --cpus=1 --memory=1g: a 2 MiB report's page
+# renders in 4.0 s and peaks at 123 MiB in the conversion process, under its
+# 640 MiB org limit, while the server adds 18 MiB; 32 KB of "[a][" is refused
+# at the 30 s wall clock.
+PUBLISH_MARKDOWN_MAX_BYTES = 2 * 1024 * 1024
+
+
+class _KeptPage(NamedTuple):
+    page: bytes
+    size: int
+
+
+class _RenderedPages:
+    """Pages publish rendered, and texts whose render the conversion stopped, by content digest.
+
+    The "changed since publish" check renders a page each time it lists an
+    edited artifact, so one render per edit serves every listing until the
+    next, and one stopped render isn't run again by the next listing. Pages
+    are kept as UTF-8, so each counts the bytes it holds (as a str, one emoji
+    would make every character four bytes), least recently used out first.
+    Listings run in several threads, so every read and write takes the lock.
+    """
+
+    def __init__(self, *, max_bytes: int, max_refused: int) -> None:
+        self._max_bytes = max_bytes
+        self._max_refused = max_refused
+        self._pages: OrderedDict[str, _KeptPage] = OrderedDict()
+        self._held_bytes = 0
+        self._refused: OrderedDict[str, None] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def page(self, key: str) -> bytes | None:
+        with self._lock:
+            kept = self._pages.get(key)
+            if kept is None:
+                return None
+            self._pages.move_to_end(key)
+            return kept.page
+
+    def keep(self, key: str, page: bytes) -> None:
+        size = len(page)
+        if size > self._max_bytes:
+            return
+        with self._lock:
+            if key in self._pages:
+                return
+            self._pages[key] = _KeptPage(page=page, size=size)
+            self._held_bytes += size
+            while self._held_bytes > self._max_bytes:
+                _key, dropped = self._pages.popitem(last=False)
+                self._held_bytes -= dropped.size
+
+    def was_refused(self, key: str) -> bool:
+        with self._lock:
+            return key in self._refused
+
+    def refuse(self, key: str) -> None:
+        with self._lock:
+            self._refused[key] = None
+            self._refused.move_to_end(key)
+            while len(self._refused) > self._max_refused:
+                self._refused.popitem(last=False)
+
+
+_RENDERED_PAGES = _RenderedPages(max_bytes=8 * 1024 * 1024, max_refused=256)
+
+
+def _read_markdown(md_path: Path) -> str:
+    """The file's text as ``Path.read_text`` reads it, refused past ``PUBLISH_MARKDOWN_MAX_BYTES``.
+
+    The bound is checked on the bytes, before any decoding or copy.
+    """
+    with md_path.open("rb") as source:
+        data = source.read(PUBLISH_MARKDOWN_MAX_BYTES + 1)
+    if len(data) > PUBLISH_MARKDOWN_MAX_BYTES:
+        raise MarkdownNotPublishable(MARKDOWN_TOO_LARGE_MESSAGE)
+    return io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace").read()
+
+
+def _render_markdown_to_html(md_path: Path, out_dir: Path, *, background: bool = False) -> Path:
     """Render a Markdown file to a standalone ``index.html`` in ``out_dir``.
 
     Returns the path to the generated file, which is what we hand to
     ``anton.publisher.publish`` (it zips it as index.html and serves it as a
     web page). The original ``.md`` is never modified — the registry and
     publish history still key off it, not this temp file.
-    """
-    # `markdown` is a direct dependency (pyproject.toml); the guard stays
-    # defensive so a broken install reports a clear error.
-    try:
-        import markdown
-    except Exception as exc:  # pragma: no cover - dependency guard
-        raise PublisherUnavailable("Markdown renderer is unavailable") from exc
 
-    md_text = md_path.read_text(encoding="utf-8", errors="replace")
-    body = markdown.markdown(
-        md_text,
-        extensions=["fenced_code", "tables", "toc", "sane_lists"],
-        output_format="html5",
-    )
-    page = _MD_HTML_TEMPLATE.format(title=_html.escape(_markdown_title(md_path, md_text)), body=body)
+    Python-Markdown runs in the export's conversion process
+    (``cowork.services.export_runner``), which the server kills past its time
+    or memory limit, so a hostile file can't hold the server. Raises
+    ``MarkdownNotPublishable`` for a file past the bound or one the process
+    stopped, ``MarkdownRenderBusy`` while another conversion runs, and
+    ``MarkdownConversionFailed`` for one that failed. A *background* render,
+    the "changed since publish" check, refuses at once a text whose render
+    was stopped before; a person's publish always tries again.
+    """
+    md_text = _read_markdown(md_path)
+    title = _markdown_title(md_path, md_text)
+    key = hashlib.sha256(f"{title}\0{md_text}".encode()).hexdigest()
+    page = _RENDERED_PAGES.page(key)
+    if page is None:
+        if background and _RENDERED_PAGES.was_refused(key):
+            raise MarkdownNotPublishable(MARKDOWN_NOT_CONVERTED_MESSAGE)
+        try:
+            body = _publish_markdown_body(md_text)
+        except MarkdownNotPublishable:
+            _RENDERED_PAGES.refuse(key)
+            raise
+        page = _MD_HTML_TEMPLATE.format(title=_html.escape(title), body=body).encode("utf-8")
+        _RENDERED_PAGES.keep(key, page)
     out_path = out_dir / "index.html"
-    out_path.write_text(page, encoding="utf-8")
+    # As text, so the file's line endings stay the platform's, as before.
+    out_path.write_text(page.decode("utf-8"), encoding="utf-8")
     return out_path
+
+
+def _publish_markdown_body(md_text: str) -> str:
+    """The page body Python-Markdown renders for *md_text*, in a conversion process."""
+    from cowork.services.artifact_export import conversion_limits
+    from cowork.services.export_runner import (
+        ConversionBusy,
+        ConversionError,
+        ConversionOverrun,
+        convert_in_child,
+    )
+
+    try:
+        conversion = convert_in_child(
+            request=PublishMarkdownRequest(),
+            source=md_text.encode("utf-8"),
+            limits=conversion_limits(org_mode=_org_mode()),
+        )
+    except ConversionBusy as exc:
+        raise MarkdownRenderBusy() from exc
+    except ConversionOverrun as exc:
+        raise MarkdownNotPublishable(MARKDOWN_NOT_CONVERTED_MESSAGE) from exc
+    except ConversionError as exc:
+        raise MarkdownConversionFailed() from exc
+    return conversion.data.decode("utf-8")
 
 
 def kept_access(entry: Any, *, org_mode: bool) -> ArtifactAccessRequest:
@@ -1135,11 +1361,18 @@ def publish_artifact(
     access: ArtifactAccessRequest | None = None,
     scope: TenantScope | None = None,
     project_id: str | None = None,
+    background: bool = False,
     notify: ShareNotify | None = None,
     stored: ArtifactRule | None = None,
     owner_save: bool = False,
+    notices: list[ShareNotice] | None = None,
+    job_budget_s: float = PUBLISH_JOB_BUDGET_S,
+    on_job_accepted: Callable[[dict], None] | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
+
+    A *background* publish, one no person asked for (autopublish), refuses at
+    once a Markdown page whose render the conversion process stopped before.
 
     `artifact` is the artifact folder or a single legacy loose file (loose-HTML /
     chat-bubble / the Utilities per-page list); `_resolve_publish_target`
@@ -1159,6 +1392,12 @@ def publish_artifact(
     deployment when it is missing - a caller that forgets it gets an error, not
     another org's secrets.
 
+    `job_budget_s` caps how long an asynchronously accepted publish (server
+    202) is polled; defaults to anton's. `on_job_accepted` is
+    anton's callback, invoked with the 202 body the moment the server accepts
+    the job, so a caller that abandons the thread on its own timeout can tell
+    "upload still in flight" from "job accepted, still polling".
+
     `project_id` is the artifact's project; required in organization mode,
     where the owner lookup is keyed by it.
 
@@ -1177,6 +1416,10 @@ def publish_artifact(
     without teams or people by id, so people added by address alone are
     emailed too. Every other publish (live sync, autopublish, a retry) leaves
     it None.
+
+    `notices` collects the share notice MindsHub was asked to email, once
+    that request is made, so the access route can push the same people
+    (cowork.services.push.hooks.artifact_shared).
 
     `stored` is the artifact's rule the access route already read under the
     publish lock to check this save, so the save reads the rule once and is
@@ -1356,7 +1599,9 @@ def publish_artifact(
         try:
             if not is_fullstack and publish_target.suffix.lower() == ".md":
                 md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-publish-")
-                publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
+                publish_source = _render_markdown_to_html(
+                    publish_target, Path(md_tmp_dir.name), background=background
+                )
 
             # Narrowed after the render, so a render that fails leaves the
             # record as it was.
@@ -1395,6 +1640,8 @@ def publish_artifact(
                 # While the password is unchanged anton re-sends the hash stored
                 # here, so a content-only re-publish keeps viewers' password grants.
                 previous_access=previous if isinstance(previous, dict) else None,
+                job_budget_s=job_budget_s,
+                on_job_accepted=on_job_accepted,
             )
         except ArtifactOwnedByOtherUserError as exc:
             # Not a failure to log or wrap: the upload service holds this
@@ -1410,6 +1657,16 @@ def publish_artifact(
                 narrowing=narrowing, exc=exc, publish_url=publish_url, scope=org_scope,
                 project_id=project_id, artifact_slug=published_dir.name,
             )
+            if isinstance(exc, PublishJobTimeout) and exc.report_id and report_id is None:
+                _keep_timed_out_report(
+                    exc.report_id,
+                    ownership=ownership,
+                    published_json=published_json,
+                    published_map=published_map,
+                    published_key=published_key,
+                    artifact_key=canonical_artifact_key,
+                    owner_side=owner_side,
+                )
             upload_error = classify_upload_error(exc)
             logger.exception("Publishing failed")
             # A 401's text ("Invalid token") says less than the credentials advice below.
@@ -1430,7 +1687,8 @@ def publish_artifact(
             if isinstance(exc, urllib.error.URLError):
                 headline, advice = describe_minds_connection_error(exc)
                 raise PublishRejected(f"Publishing failed. {headline} {advice}") from exc
-            if isinstance(exc, StatePublishBlocked):
+            # These texts come from the upload service or anton, never local paths.
+            if isinstance(exc, (StatePublishBlocked, PublishJobFailed, PublishJobTimeout)):
                 raise PublishRejected(f"Publishing failed: {exc}") from exc
             raise RuntimeError(f"Publishing failed: {exc}") from exc
         finally:
@@ -1533,6 +1791,8 @@ def publish_artifact(
                         "Could not ask MindsHub to notify the people an artifact was shared with",
                         exc_info=True,
                     )
+            if notice is not None and notices is not None:
+                notices.append(notice)
             state = _load_state(scope=scope)
             state["publish_history"] = [history_item, *state.get("publish_history", [])][:100]
             _save_state(state, scope=scope)
@@ -1572,6 +1832,8 @@ def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
 
     Returns None when the artifact can't be resolved or bundled — the caller
     treats None as "can't tell" and does not flag the artifact as modified.
+    Raises ``MarkdownRenderBusy`` while another conversion holds the slot, so
+    a caller that would act on the answer can come back for it.
     """
     try:
         publish_target, _published_dir, _key, is_fullstack = _resolve_publish_target(
@@ -1591,11 +1853,15 @@ def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
         publish_source = publish_target
         if not is_fullstack and publish_target.suffix.lower() == ".md":
             md_tmp_dir = tempfile.TemporaryDirectory(prefix="cowork-md-md5-")
-            publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
+            publish_source = _render_markdown_to_html(
+                publish_target, Path(md_tmp_dir.name), background=True
+            )
         if is_fullstack:
             zipped, _included = _zip_fullstack(publish_source)
         else:
             zipped = _zip_html(publish_source)
+    except MarkdownRenderBusy:
+        raise
     except Exception:
         return None
     finally:
@@ -1848,40 +2114,54 @@ def activate_version(raw_path: str, md5: str, *, scope: TenantScope | None) -> d
     if not api_key:
         raise ValueError("Configure your provider API key in Settings before rolling back")
 
-    report = _resolve_report_id(raw_path, scope=scope)
-    published_json, published_key, report_id = report.published_json, report.published_key, report.report_id
-
     try:
         from anton.publisher import activate_version as _activate_version
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
-    ssl_verify = minds_ssl_verify()
-    from urllib.error import HTTPError
-    try:
-        result = _activate_version(report_id, md5, api_key=api_key, publish_url=publish_url, ssl_verify=ssl_verify)
-    except HTTPError as exc:
-        detail = _publisher_http_detail(exc)
-        # 404 (unknown/pruned version), 409 (fullstack not supported), 400 (bad
-        # request) are all caller-correctable → surface the message verbatim.
-        if exc.code in (400, 404, 409):
-            raise ValueError(detail or "Could not roll back to that version")
-        raise RuntimeError(detail or "Roll back failed")
-    except Exception as exc:
-        logger.exception("Activate version failed (report_id=%s md5=%s)", report_id, md5)
-        raise RuntimeError("Roll back failed") from exc
+    from cowork.services.published_page_ownership import publication_owner
 
-    # Reflect the rollback locally so the `modified` badge recomputes correctly.
-    try:
-        fresh_map = json.loads(published_json.read_text(encoding="utf-8"))
-        fresh_entry = fresh_map.get(published_key)
+    artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
+    publish_target, published_dir, _published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=_scan_artifact_dirs(scope=scope)
+    )
+    # A publish holds the folder's lock across its read, upload and save of
+    # .published.json; holding it across the rollback too keeps the two from
+    # interleaving, so neither one's save loses the other's.
+    with publication_owner(
+        publish_target, published_dir=published_dir, publish_url=publish_url, scope=scope,
+    ):
+        report = _resolve_report_id(raw_path, scope=scope)
+        published_json, published_key, report_id = (
+            report.published_json, report.published_key, report.report_id
+        )
+
+        ssl_verify = minds_ssl_verify()
+        from urllib.error import HTTPError
+        try:
+            result = _activate_version(report_id, md5, api_key=api_key, publish_url=publish_url, ssl_verify=ssl_verify)
+        except HTTPError as exc:
+            detail = _publisher_http_detail(exc)
+            # 404 (unknown/pruned version), 409 (fullstack not supported), 400 (bad
+            # request) are all caller-correctable → surface the message verbatim.
+            if exc.code in (400, 404, 409):
+                raise ValueError(detail or "Could not roll back to that version")
+            raise RuntimeError(detail or "Roll back failed")
+        except Exception as exc:
+            logger.exception("Activate version failed (report_id=%s md5=%s)", report_id, md5)
+            raise RuntimeError("Roll back failed") from exc
+
+        # Reflect the rollback locally so the `modified` badge recomputes correctly.
+        try:
+            fresh_map = json.loads(published_json.read_text(encoding="utf-8"))
+        except Exception:
+            fresh_map = None
+        fresh_entry = fresh_map.get(published_key) if isinstance(fresh_map, dict) else None
         if isinstance(fresh_entry, dict):
             fresh_entry["last_md5"] = md5
             fresh_entry["published_mtime"] = 0  # force exact md5 check
             fresh_map[published_key] = fresh_entry
-            published_json.write_text(json.dumps(fresh_map, indent=2) + "\n", encoding="utf-8")
-    except Exception:
-        pass
+            _write_published_map(published_json, fresh_map)
 
     return {
         "status": "ok",

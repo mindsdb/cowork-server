@@ -31,6 +31,7 @@ from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.principal import ORG_MANAGE_ROLE, Principal
 from cowork.services import artifact_locks
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.publish import ARTIFACT_ORG_REFUSAL
 from _async_stub import awaitable
 from tests._org_sharing import (
@@ -53,10 +54,6 @@ ORG_SCOPE = TenantScope(
     org_mode=True, org_id="0a0a0a0a-0000-4000-8000-000000000001", user_id="0b0b0b0b-0000-4000-8000-000000000001"
 )
 ARTIFACT_ID = "11111111-1111-1111-1111-111111111111"
-
-
-class _Session:
-    scope = ORG_SCOPE
 
 
 def _answer(response) -> tuple[int, dict]:
@@ -85,7 +82,7 @@ def as_owner(monkeypatch, folder):
     monkeypatch.setattr(
         aw, "_owner_workspace",
         awaitable(lambda scope, project_ref, artifact_id: (
-            SimpleNamespace(project_id="proj-1"), folder, {"slug": "rep"}, {},
+            SimpleNamespace(project_id="proj-1"), folder, ArtifactMetadata.model_validate({"slug": "rep"}), {},
         )),
     )
     return folder
@@ -97,16 +94,28 @@ def publish_calls(monkeypatch):
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url,
                      password=None, access=None, scope=None, project_id=None,
-                     notify=None, stored=None, owner_save=False):
+                     notify=None, stored=None, owner_save=False, notices=None, job_budget_s=None,
+                     on_job_accepted=None):
         # publish_artifact takes the model; what it hands anton is its
         # publisher_access.
         assert isinstance(access, ArtifactAccessRequest)
+        # The thread outlives the route's wait, so its job poll must end
+        # before the live-publish lock does.
+        assert job_budget_s is not None and job_budget_s > 0
+        assert on_job_accepted is not None
         calls.append({
             "folder": artifact, "artifacts_base": artifacts_base, "api_key": api_key,
             "publish_url": publish_url, "access": access.publisher_access(), "scope": scope,
             "project_id": project_id, "notify": notify, "stored": stored,
             "owner_save": owner_save,
         })
+        if notify and notices is not None:
+            # What publish_artifact collects once it asked MindsHub to email them.
+            from cowork.services.artifact_audience import ShareNotice
+
+            notices.append(ShareNotice(
+                artifact_title="Q3 report", artifact_url="https://view.example/r/1", recipients=notify,
+            ))
         return {"status": "ok", "url": "https://view.example/r/1"}
 
     monkeypatch.setattr("cowork.services.publish.publish_artifact", fake_publish)
@@ -1127,3 +1136,55 @@ async def test_the_turn_key_is_kept_while_a_timed_out_publish_still_runs(
         finish.set()
     assert error.value.detail == "Publishing timed out. Try again in a moment."
     assert publish_context == []
+
+
+@pytest.fixture
+def share_pushes(monkeypatch):
+    """What the access route hands the push hook (cowork.services.push.hooks)."""
+    pushes: list[dict] = []
+    monkeypatch.setattr(
+        "cowork.services.push.hooks.artifact_shared", lambda **kwargs: pushes.append(kwargs),
+    )
+    return pushes
+
+
+async def test_a_save_that_notifies_people_pushes_exactly_those_people(
+    as_owner, publish_calls, publish_context, share_pushes,
+):
+    person = "aaaaaaaa-1111-1111-1111-111111111111"
+    sharer = Principal(user_id=ORG_SCOPE.user_id, org_id=ORG_SCOPE.org_id, email="owner@example.com")
+    request = SimpleNamespace(headers={}, state=SimpleNamespace(principal=sharer))
+    access = {
+        "mode": "restricted", "allowed_emails": ["a@example.com"], "org_allowed": False,
+        "notify": {"user_ids": [person], "emails": ["a@example.com"]},
+    }
+
+    await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), ORG_SCOPE, request, principal=sharer)
+
+    assert share_pushes == [{
+        "org_id": ORG_SCOPE.org_id,
+        "sharer_id": ORG_SCOPE.user_id,
+        "sharer_name": "owner@example.com",
+        "recipient_ids": (person,),
+        "artifact_title": "Q3 report",
+        "url": "https://view.example/r/1",
+    }]
+
+
+async def test_a_save_without_notify_pushes_no_one(as_owner, publish_calls, publish_context, share_pushes):
+    access = {"mode": "restricted", "allowed_emails": ["a@example.com"], "org_allowed": False}
+    await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), ORG_SCOPE, _REQUEST, principal=None)
+    assert share_pushes == []
+
+
+async def test_a_failing_push_never_fails_the_save(as_owner, publish_calls, publish_context, monkeypatch):
+    def broken(**_kwargs):
+        raise RuntimeError("push down")
+
+    monkeypatch.setattr("cowork.services.push.hooks.artifact_shared", broken)
+    access = {
+        "mode": "restricted", "allowed_emails": ["a@example.com"], "org_allowed": False,
+        "notify": {"user_ids": ["aaaaaaaa-1111-1111-1111-111111111111"]},
+    }
+    out = await aw.set_artifact_access("proj", ARTIFACT_ID, aw._AccessBody(access=access), ORG_SCOPE, _REQUEST, principal=None)
+    assert out["url"] == "https://view.example/r/1"

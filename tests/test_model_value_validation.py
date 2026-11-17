@@ -19,12 +19,13 @@ from cowork.common.settings.user_settings import Provider, UserSettings
 from cowork.services.providers import MODEL_VALUE_SETTINGS, model_value_rejection
 
 CATALOG = ["mindshub_air", "claude-sonnet-5", "deepseek-v4-pro"]
+IMAGE_CATALOG = ["gpt-image-2.6-flare", "gpt-image-2.6-sunburst"]
 
 
-def _listing(ids):
+def _listing(ids, image_models=()):
     return providers.MindsModelListing(
         ids=ids, efforts={}, enabled={}, labels={}, providers={}, families={}, role_defaults={},
-        disabled_reasons={},
+        disabled_reasons={}, image_models=dict.fromkeys(image_models, True),
     )
 
 
@@ -46,12 +47,25 @@ def catalog(monkeypatch):
     """Install a fake /v1/models catalog; returns a list of fetch call counts."""
     calls = []
 
-    async def _fake(minds_url, api_key, *, force_refresh=False, tenant_key=None):
+    async def _fake(minds_url, api_key, *, force_refresh=False, tenant_key=None, **_kw):
         calls.append((minds_url, api_key))
-        return _listing(list(CATALOG))
+        return _listing(list(CATALOG), IMAGE_CATALOG)
 
     monkeypatch.setattr(providers, "fetch_minds_models", _fake)
     return calls
+
+
+def test_validation_fetches_as_mindshub(monkeypatch):
+    flags = []
+
+    async def _fake(minds_url, api_key, **kw):
+        flags.append(kw.get("mindshub"))
+        return _listing(list(CATALOG))
+
+    monkeypatch.setattr(providers, "fetch_minds_models", _fake)
+    _reject(_minds_settings(), "planning_model", "deepseek-v4-flash")
+
+    assert flags == [True]
 
 
 def _reject(settings, key, value):
@@ -80,7 +94,7 @@ def test_rejection_names_real_models_and_leaks_no_credentials(catalog):
 
 @pytest.mark.parametrize("key", sorted(MODEL_VALUE_SETTINGS))
 def test_every_model_valued_setting_is_gated(catalog, key):
-    """planning/coding/router share the bare `str | None` shape and the failure."""
+    """planning/coding/router/image share the bare `str | None` shape and the failure."""
     assert _reject(_minds_settings(), key, "not-a-model") is not None
 
 
@@ -159,6 +173,59 @@ def test_non_model_settings_are_untouched(catalog):
     assert not catalog, "must not fetch a catalog for a non-model setting"
 
 
+# ── The image model: checked against the catalog's image models ──────
+
+
+def test_an_image_model_is_allowed_for_the_image_role(catalog):
+    for model in IMAGE_CATALOG:
+        assert _reject(_minds_settings(), "image_model", model) is None
+
+
+def test_a_chat_model_is_rejected_for_the_image_role(catalog):
+    """A chat id in image_model would fail every image call."""
+    reason = _reject(_minds_settings(), "image_model", "mindshub_air")
+    assert reason is not None
+    assert "image model" in reason
+    assert "gpt-image-2.6-flare" in reason  # points at something usable
+
+
+def test_an_image_model_is_rejected_for_a_chat_role(catalog):
+    """The image ids never join the chat ids the chat roles are checked against."""
+    for key in ("planning_model", "coding_model", "router_model"):
+        assert _reject(_minds_settings(), key, "gpt-image-2.6-flare") is not None, key
+
+
+def test_the_image_role_is_checked_whatever_the_chat_provider(catalog):
+    """Only MindsHub serves image models, so a BYOK chat setup with a MindsHub key
+    is still checked against MindsHub's image models."""
+    s = _minds_settings(
+        planning_provider=Provider.ANTHROPIC,
+        coding_provider=Provider.ANTHROPIC,
+        router_provider=Provider.ANTHROPIC,
+        anthropic_api_key="sk-ant-test-not-a-real-key",
+    )
+    assert _reject(s, "image_model", "not-a-model") is not None
+    assert _reject(s, "image_model", "gpt-image-2.6-sunburst") is None
+
+
+def test_a_catalog_listing_no_image_models_refuses_every_image_model(monkeypatch):
+    """A good catalog with no image models (one predating `kind`) serves none."""
+    async def _chat_only(*a, **k):
+        return _listing(list(CATALOG))
+
+    monkeypatch.setattr(providers, "fetch_minds_models", _chat_only)
+    assert _reject(_minds_settings(), "image_model", "gpt-image-2.6-flare") is not None
+    assert _reject(_minds_settings(), "image_model", "") is None
+
+
+def test_a_failed_catalog_fetch_still_allows_an_image_model(monkeypatch):
+    async def _failed(*a, **k):
+        return _listing(None)
+
+    monkeypatch.setattr(providers, "fetch_minds_models", _failed)
+    assert _reject(_minds_settings(), "image_model", "gpt-image-2.6-flare") is None
+
+
 # ── Endpoint level: the gate every real writer lands on ──────────────
 
 
@@ -211,6 +278,53 @@ async def test_put_settings_key_400s_on_an_unservable_model(monkeypatch):
         assert svc.load().planning_model == "mindshub_air"
     finally:
         for k in ("planning_model", "minds_api_key", "minds_url", "planning_provider"):
+            try:
+                svc.delete_setting(k)
+            except ValueError:
+                pass
+        session.close()
+
+
+async def test_both_writers_refuse_a_chat_model_as_the_image_model(monkeypatch):
+    """`PUT /settings/image_model` and the bulk `PUT /settings/` the picker saves
+    through: a chat id 400s with nothing written, an image id saves and reads
+    back, and deleting the row reads back the resolved default."""
+    from fastapi import HTTPException
+    from cowork.api.v1.endpoints.settings import bulk_upsert_settings, upsert_setting
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.session import get_open_session
+    from cowork.schemas.settings import SettingsBulkUpsertRequest, SettingUpsertRequest
+    from cowork.services.settings import SettingService
+
+    async def _fake(*a, **k):
+        return _listing(list(CATALOG), IMAGE_CATALOG)
+
+    monkeypatch.setattr(providers, "fetch_minds_models", _fake)
+
+    session = get_open_session()
+    svc = SettingService(session)
+    try:
+        _seed_minds(svc)
+        with pytest.raises(HTTPException) as single:
+            await upsert_setting(
+                "image_model", SettingUpsertRequest(value="mindshub_air"), LOCAL_SCOPE, None,
+            )
+        with pytest.raises(HTTPException) as bulk:
+            await bulk_upsert_settings(
+                SettingsBulkUpsertRequest(values={"image_model": "mindshub_air"}), LOCAL_SCOPE, None,
+            )
+        assert single.value.status_code == bulk.value.status_code == 400
+        assert svc._fetch_row("image_model") is None
+
+        await bulk_upsert_settings(
+            SettingsBulkUpsertRequest(values={"image_model": "gpt-image-2.6-sunburst"}), LOCAL_SCOPE, None,
+        )
+        assert svc.get_setting("image_model").value == "gpt-image-2.6-sunburst"
+
+        svc.delete_setting("image_model")
+        assert svc.get_setting("image_model").value == "gpt-image-2.6-flare"
+    finally:
+        for k in ("image_model", "minds_api_key", "minds_url", "planning_provider"):
             try:
                 svc.delete_setting(k)
             except ValueError:
@@ -317,7 +431,7 @@ async def test_switching_byok_to_minds_in_one_put_is_gated(monkeypatch):
 
     fetched = []
 
-    async def _fake(minds_url, api_key, *, force_refresh=False, tenant_key=None):
+    async def _fake(minds_url, api_key, *, force_refresh=False, tenant_key=None, **_kw):
         fetched.append(minds_url)
         return _listing(list(CATALOG))
 
