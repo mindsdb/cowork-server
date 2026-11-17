@@ -31,7 +31,6 @@ import errno
 import json
 import logging
 import os
-import re
 import stat
 import threading
 import time
@@ -54,7 +53,6 @@ from cowork.common.paths import (
     dir_open,
     dir_rmtree,
     dir_unlink,
-    is_child_name,
     open_pinned_child,
     pinned_dir,
     read_bounded,
@@ -92,8 +90,6 @@ SESSION_PAUSE_S = 5 * 60
 SESSION_MAX_S = 30 * 60
 MAX_DOC_BYTES = 8 * 1024 * 1024
 _MAX_DOC_MB = MAX_DOC_BYTES // (1024 * 1024)
-
-_HEX_ID = re.compile(r"[0-9a-f]{32}")
 
 _locks: dict[str, _DocLock] = {}
 _locks_guard = threading.Lock()
@@ -261,14 +257,22 @@ def remove_child(folder: Path, name: str) -> None:
         pass
 
 
+def _meta_in(d: PinnedDir) -> dict[str, Any]:
+    """The ``metadata.json`` in the artifact's opened folder; {} when it is missing or unreadable."""
+    try:
+        meta = json.loads(read_child(d, "metadata.json", max_bytes=1024 * 1024))
+    except (OSError, ValueError, DocError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
 def _read_meta(folder: Path) -> dict[str, Any]:
     """The artifact's ``metadata.json``; {} when it is missing or unreadable."""
     try:
         with doc_subfolder(folder) as d:
-            meta = json.loads(read_child(d, "metadata.json", max_bytes=1024 * 1024))
+            return _meta_in(d)
     except (OSError, ValueError, DocError):
         return {}
-    return meta if isinstance(meta, dict) else {}
 
 
 def _doc_file(folder: Path, meta: dict[str, Any]) -> Path:
@@ -286,9 +290,17 @@ def doc_file(folder: Path) -> Path:
 
 
 def _doc_meta(folder: Path) -> dict[str, Any] | None:
-    """The artifact's metadata ({} when unreadable) if ``folder`` holds a doc, else None."""
-    meta = _read_meta(folder)
-    return meta if child_exists(folder, _doc_file(folder, meta).name) else None
+    """The artifact's metadata ({} when unreadable) if ``folder`` holds a doc, else None.
+
+    One open of the folder serves both reads; a link at ``folder`` or anything
+    but a folder there fails it, so is not a doc.
+    """
+    try:
+        with doc_subfolder(folder) as d:
+            meta = _meta_in(d)
+            return meta if stat.S_ISREG(dir_lstat(d, _doc_file(folder, meta).name).st_mode) else None
+    except (DocError, OSError):
+        return None
 
 
 def is_doc_folder(folder: Path) -> bool:
@@ -552,22 +564,18 @@ def _remove_folder(artifacts_dir: Path, slug: str) -> None:
 
 
 def _listed_names(base: Path) -> list[str]:
-    return [child.name for child in sorted(base.iterdir())] if base.is_dir() else []
+    """``base``'s entries, in the order sorting their paths gives (case-blind on Windows)."""
+    try:
+        return sorted(os.listdir(base), key=os.path.normcase)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
 
 
 def _doc_folders(base: Path, names: Iterable[str]) -> Iterator[tuple[Path, dict[str, Any]]]:
-    """The doc folders among ``names`` in ``base``, in that order, each with its metadata.
-
-    ``names`` should come from listing ``base``; a name that isn't one child's
-    is skipped, so none reaches outside it.
-    """
+    """The doc folders among ``names``, listed from ``base``, in that order, each with its metadata."""
     for name in names:
-        if name.startswith(".") or not is_child_name(name):
-            continue
         folder = base / name
-        if not folder.is_dir():
-            continue
-        meta = _doc_meta(folder)
+        meta = None if name.startswith(".") else _doc_meta(folder)
         if meta is not None:
             yield folder, meta
 
@@ -580,10 +588,10 @@ def _has_id(meta: dict[str, Any], hexref: str) -> bool:
 def find_doc_folder(artifacts_dir: Path, ref: str) -> Path:
     """A doc folder by artifact id (dashed or not), slug, or exact title.
 
-    A slug is a folder's name, so it reads only that folder's metadata. An id
-    reads only the folders whose name ends in ``-<id[:8]>``, as anton names
-    new artifacts. A title, or an id its folder's name doesn't carry, reads
-    every artifact's metadata.
+    The folder named ``ref`` is read first, then those whose name ends in
+    ``-<id[:8]>`` as anton names new artifacts, so a slug or an id is found
+    without reading the rest. A title, or an id its folder's name doesn't
+    carry, reads every artifact's metadata.
     """
     ref = (ref or "").strip()
     if not ref:
@@ -591,19 +599,12 @@ def find_doc_folder(artifacts_dir: Path, ref: str) -> Path:
     base = Path(artifacts_dir)
     if not base.is_dir():
         raise DocError("no_doc", f"no doc {ref!r}: this project has no artifacts yet.")
-    names = _listed_names(base)
-    if ref in names:
-        for folder, _meta in _doc_folders(base, [ref]):
-            return folder
     hexref = ref.replace("-", "").lower()
-    if _HEX_ID.fullmatch(hexref):
-        suffix = f"-{hexref[:ARTIFACT_ID_SLUG_PREFIX_LEN]}"
-        for folder, meta in _doc_folders(base, [name for name in names if name.endswith(suffix)]):
-            if _has_id(meta, hexref):
-                return folder
+    suffix = f"-{hexref[:ARTIFACT_ID_SLUG_PREFIX_LEN]}"
+    names = sorted(_listed_names(base), key=lambda name: (name != ref, not name.endswith(suffix)))
     by_title = []
     for folder, meta in _doc_folders(base, names):
-        if _has_id(meta, hexref):
+        if folder.name == ref or _has_id(meta, hexref):
             return folder
         if str(meta.get("name", "")).strip().lower() == ref.lower():
             by_title.append(folder)

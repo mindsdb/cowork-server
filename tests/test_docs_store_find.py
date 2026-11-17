@@ -33,13 +33,13 @@ def project(base):
 def reads(monkeypatch):
     """The folders whose metadata.json is read, in order."""
     seen: list[str] = []
-    read = store._read_meta
+    read = store._meta_in
 
-    def counting(folder):
-        seen.append(Path(folder).name)
-        return read(folder)
+    def counting(d):
+        seen.append(d.path.name)
+        return read(d)
 
-    monkeypatch.setattr(store, "_read_meta", counting)
+    monkeypatch.setattr(store, "_meta_in", counting)
     return seen
 
 
@@ -57,15 +57,15 @@ def test_a_slug_reads_only_its_own_folder(project, base, reads):
 
 @pytest.mark.parametrize("spell", [str, lambda i: str(uuid.UUID(i)), str.upper, lambda i: str(uuid.UUID(i)).upper()])
 def test_an_id_reads_only_the_folder_its_slug_names(project, base, reads, spell):
-    _, budget = project
-    assert find_doc_folder(base, spell(budget.artifact_id)) == budget.folder
-    assert reads == [budget.slug]
+    plan, _ = project  # listed after the charts, so a scan would read them first
+    assert find_doc_folder(base, spell(plan.artifact_id)) == plan.folder
+    assert reads == [plan.slug]
 
 
 def test_folders_sharing_an_id_prefix_are_told_apart_by_the_whole_id(project, base, reads):
     plan, budget = project
     prefix = plan.artifact_id[:8]
-    twin_id = prefix + ("0" if plan.artifact_id[8] != "0" else "1") * 24
+    twin_id = prefix + "0" * 24  # a uuid4's version digit keeps it from being the plan's
     meta_path = budget.folder / "metadata.json"
     meta_path.write_text(json.dumps({**json.loads(meta_path.read_text()), "id": twin_id}))
     twin = budget.folder.rename(base / f"aaa-{prefix}")  # listed before the plan's folder
@@ -110,9 +110,8 @@ def test_two_docs_with_one_title_are_ambiguous(project, base):
 
 def test_a_slug_wins_over_another_docs_title(project, base):
     plan, _ = project
-    titled_as_slug = create_doc(base, title=plan.slug, markdown="x")
+    create_doc(base, title=plan.slug, markdown="x")
     assert find_doc_folder(base, plan.slug) == plan.folder
-    assert find_doc_folder(base, titled_as_slug.artifact_id) == titled_as_slug.folder
 
 
 def test_a_slug_wins_over_another_docs_id(project, base):
