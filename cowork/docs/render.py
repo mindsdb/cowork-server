@@ -140,6 +140,11 @@ def changed_lines(doc: dict[str, Any], touched: dict[str, list[str]]) -> str:
 # nest. Every look ahead is a cached "next match from here", which keeps all
 # of it linear in the length of the text.
 #
+# Looser than CommonMark: a run of * or ~~ opens unless white space follows it
+# and closes unless white space precedes it, so "**Note:**text" and
+# "价格**$5**起" are bold, as the editor writes them. "_" keeps CommonMark's
+# rule, so snake_case stays as typed.
+#
 # Narrower than CommonMark: a code span is one backtick each side, kept
 # verbatim; only these marks escape; a link is inline, has words, and its
 # address is http(s):// or mailto: plus at least one character, up to ")";
@@ -157,6 +162,8 @@ _HREF_ESCAPE = re.compile(r"\\([*`~\[\]{}_\\])")
 
 # A character beside a run of marks is white space (0), punctuation (1: CommonMark's
 # Unicode P and S categories) or anything else (2). The text's edges count as white space.
+# P and S come from Python's Unicode tables; the editor's may be newer and class a
+# character assigned since then apart.
 _ASCII_CLASS = {chr(c): 0 if chr(c) in _SPACE_CHARS else 1 if chr(c) in string.punctuation else 2 for c in range(128)}
 
 
@@ -170,11 +177,12 @@ def _char_class(ch: str) -> int:
 def _flanks(before: int, after: int, underscore: bool) -> tuple[bool, bool]:
     """Whether a run can open and close emphasis, by the classes of the characters around it."""
     space_before, punct_before, space_after, punct_after = before == 0, before == 1, after == 0, after == 1
+    if not underscore:
+        return not space_after, not space_before
     left = not space_after and (not punct_after or space_before or punct_before)
     right = not space_before and (not punct_before or space_after or punct_after)
-    if underscore:  # "_" never opens or closes inside a word
-        return left and (not right or punct_before), right and (not left or punct_after)
-    return left, right
+    # "_" never opens or closes inside a word.
+    return left and (not right or punct_before), right and (not left or punct_after)
 
 
 _FLANKS = {u: tuple(_flanks(b, a, u) for b in range(3) for a in range(3)) for u in (False, True)}
@@ -195,6 +203,11 @@ class _Next:
             m = self._pattern.search(self._s, pos)
             self._from, self._at = pos, m.start() if m else len(self._s)
         return self._at
+
+
+def _text_html(text: str) -> str:
+    """Plain text as HTML: escaped, a line feed as the line break the editor shows."""
+    return html.escape(text, quote=False).replace("\n", "<br>")
 
 
 def _attr(value: str) -> str:
@@ -240,7 +253,8 @@ class _Run:
         self.length = self.left = end - start
         self.can_open, self.can_close = can_open, can_close
         self.prev, self.next = prev, None
-        self.opens = self.closes = ""  # the tags it opens after its marks, and closes before them
+        self.opens: list[str] = []  # the tags it opens after its marks, innermost first
+        self.closes: list[str] = []  # the tags it closes before its marks, innermost first
 
     def pairs_with(self, closer: _Run) -> bool:
         # CommonMark's rule of 3: "*a**b*" is one emphasis, not two.
@@ -249,7 +263,7 @@ class _Run:
         )
 
     def html(self) -> str:
-        return self.closes + self.mark * self.left + self.opens
+        return "".join(self.closes) + self.mark * self.left + "".join(reversed(self.opens))
 
     def drop(self) -> None:
         self.prev.next = self.next
@@ -282,8 +296,8 @@ def _pair(bottom: _Run) -> None:
         tag = "s" if closer.mark == "~" else "strong" if used == 2 else "em"
         opener.left -= used
         closer.left -= used
-        opener.opens = f"<{tag}>{opener.opens}"
-        closer.closes += f"</{tag}>"
+        opener.opens.append(f"<{tag}>")
+        closer.closes.append(f"</{tag}>")
         opener.next, closer.prev = closer, opener  # the runs between pair with nothing now
         if not opener.left:
             opener.drop()
@@ -374,10 +388,10 @@ def inline_html(text: str) -> str:
     out, done = [], 0
     for item in items:
         if done < item.start:
-            out.append(html.escape(s[done:item.start], quote=False))
+            out.append(_text_html(s[done:item.start]))
         out.append(item.html())
         done = item.end
-    out.append(html.escape(s[done:], quote=False))
+    out.append(_text_html(s[done:]))
     return "".join(out)
 
 
@@ -663,7 +677,10 @@ _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
 
 
 def _date_label(value: str) -> str:
-    """``2026-10-21`` as ``Oct 21, 2026``; anything but a real day of a four-digit year unchanged (as formatDate)."""
+    """``2026-10-21`` as ``Oct 21, 2026``; anything but a real day of a four-digit year unchanged.
+
+    The editor's formatDate refuses the same values (it formats the rest in the app's language).
+    """
     m = re.match(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})$", (value or "").strip(_SPACE_CHARS))
     try:
         day = date(int(m[1]), int(m[2]), int(m[3])) if m and m[1] >= "1000" else None
