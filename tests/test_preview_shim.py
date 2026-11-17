@@ -366,3 +366,225 @@ def test_a_5xx_xhr_is_reported_with_its_text_body():
 def test_new_reports_still_count_against_the_report_cap():
     out = _run_shim("for (let i = 0; i < 40; i++) window.console.error(new Error('e' + i));")
     assert len(out["reports"]) == 20
+
+
+# The view reporter, run in node against a stand-in DOM and a fake clock: what
+# the shim tells the app about where the user is, so the app's inline editor
+# can open on the same slide (ENG-4384).
+_VIEW_HARNESS = r"""
+const posted = [];
+const listeners = {};
+let now = 0, nextId = 1;
+const timers = [];
+const fakeSetTimeout = (fn, ms) => { const id = nextId++; timers.push({ id, at: now + (ms || 0), fn }); return id; };
+const fakeClearTimeout = (id) => { const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); };
+const advance = (ms) => {
+  const end = now + ms;
+  for (;;) {
+    timers.sort((a, b) => a.at - b.at || a.id - b.id);
+    const t = timers[0];
+    if (!t || t.at > end) break;
+    timers.shift();
+    now = t.at;
+    t.fn();
+  }
+  now = end;
+};
+const observers = new Set();
+class FakeMutationObserver {
+  constructor(cb) { this.cb = cb; }
+  observe() { observers.add(this); }
+  disconnect() { observers.delete(this); }
+}
+const mutate = (target) => { for (const o of [...observers]) o.cb([{ target }]); };
+const R = (top, left = 20) => ({ top, left, right: left + 200, bottom: top + 40, width: 200, height: 40 });
+class El {
+  constructor(tag, opts = {}) {
+    this.localName = tag; this.nodeType = 1; this.id = opts.id || '';
+    this.sel = [tag].concat(opts.sel || []); if (this.id) this.sel.push('#' + this.id);
+    this.classes = opts.classes || []; this.classes.forEach((c) => this.sel.push('.' + c));
+    this.text = opts.text || ''; this.rect = opts.rect || null; this.visible = opts.visible !== false;
+    this.children = []; this.parentElement = null; this.isConnected = true;
+    this.scrollTop = 0; this.scrollLeft = 0;
+    this.classList = { contains: (c) => this.classes.includes(c) };
+  }
+  add(child) { child.parentElement = this; this.children.push(child); return child; }
+  get previousElementSibling() {
+    const p = this.parentElement; if (!p) return null;
+    const i = p.children.indexOf(this); return i > 0 ? p.children[i - 1] : null;
+  }
+  matches(sel) { return sel.split(',').map((s) => s.trim()).some((s) => this.sel.includes(s)); }
+  closest(sel) { for (let e = this; e && e.nodeType === 1; e = e.parentElement) if (e.matches(sel)) return e; return null; }
+  get textContent() { return this.text + this.children.map((c) => c.textContent).join(''); }
+  getBoundingClientRect() { return this.rect || { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
+  checkVisibility() { return this.visible; }
+}
+const all = (root) => [root].concat(...root.children.map(all));
+const html = new El('html');
+const body = html.add(new El('body'));
+const fakeDocument = {
+  body, documentElement: html,
+  addEventListener: (type, fn) => { (listeners['doc:' + type] = listeners['doc:' + type] || []).push(fn); },
+  getElementById: (id) => all(html).find((e) => e.id === id) || null,
+  querySelectorAll: (sel) => all(html).filter((e) => e.matches(sel)),
+};
+const fakeWindow = {
+  location: { href: 'about:srcdoc', hash: '' },
+  parent: { postMessage: (m) => posted.push(JSON.parse(JSON.stringify(m))) },
+  addEventListener: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },
+  innerWidth: 1000, innerHeight: 800, scrollX: 0, scrollY: 0,
+  localStorage: {},
+};
+const fire = (type, ev) => (listeners[type] || []).forEach((fn) => fn(ev));
+const key = (k, more = {}) => fire('keydown', Object.assign({ isTrusted: true, key: k, target: body }, more));
+const click = (target, more = {}) => fire('click', Object.assign({ isTrusted: true, button: 0, target }, more));
+const window = fakeWindow, document = fakeDocument;
+// A deck: two slides (the second off screen) and a nav with Prev / Next.
+const deck = body.add(new El('main', { id: 'deck' }));
+const h1 = deck.add(new El('section')).add(new El('h1', { text: 'One', rect: R(20) }));
+const h2 = deck.add(new El('section')).add(new El('h1', { text: 'Two' }));
+const nav = body.add(new El('nav'));
+const prev = nav.add(new El('button', { text: 'Prev' }));
+const next = nav.add(new El('button', { text: 'Next' }));
+const nextIcon = next.add(new El('span'));
+const show = (from, to) => { from.rect = null; to.rect = R(20); mutate(to); };
+(function (window, document, setTimeout, clearTimeout, MutationObserver) {
+__SHIM__
+})(fakeWindow, fakeDocument, fakeSetTimeout, fakeClearTimeout, FakeMutationObserver);
+__SCENARIO__
+advance(5000);
+process.stdout.write(JSON.stringify(posted.filter((m) => m.type === 'view')));
+"""
+
+
+def _views(scenario: str) -> list[dict]:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    script = _VIEW_HARNESS.replace(
+        "__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")
+    ).replace("__SCENARIO__", scenario)
+    done = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=30, check=True
+    )
+    views = json.loads(done.stdout)
+    for view in views:
+        assert view["source"] == "anton-preview"
+    return views
+
+
+def test_a_key_the_page_reacts_to_is_reported_with_the_heading_it_lands_on():
+    views = _views("key('ArrowRight'); show(h1, h2);")
+    assert views[-1] == {
+        "type": "view",
+        "source": "anton-preview",
+        "hash": "",
+        "scrollX": 0,
+        "scrollY": 0,
+        "container": None,
+        "inputs": [{"type": "key", "key": "ArrowRight", "shiftKey": False}],
+        "overflow": False,
+        "heading": "Two",
+    }
+
+
+def test_only_trusted_unmodified_nav_keys_the_page_reacted_to_are_kept():
+    views = _views(
+        "const field = body.add(new El('input'));\n"
+        "key('ArrowRight', { isTrusted: false }); mutate(h2); advance(300);\n"
+        "key('ArrowRight', { ctrlKey: true }); mutate(h2); advance(300);\n"
+        "key('a'); mutate(h2); advance(300);\n"
+        "key('ArrowRight', { target: field }); mutate(h2); advance(300);\n"
+        # Space on a focused button also clicks it; the click is recorded instead.
+        "key(' ', { target: nextIcon }); mutate(h2); advance(300);\n"
+        # Scrolling a long page with the arrow keys changes no DOM.
+        "key('ArrowDown'); advance(300);\n"
+    )
+    assert views == []
+
+
+def test_a_click_names_the_control_by_a_path_the_editor_can_resolve():
+    views = _views(
+        "const inDeck = deck.add(new El('button', { text: 'Start' }));\n"
+        "click(nextIcon); show(h1, h2); advance(300);\n"
+        "click(inDeck); mutate(h1); advance(300);\n"
+    )
+    assert views[-1]["inputs"] == [
+        {"type": "click", "path": "nav:0/button:1", "label": "Next"},
+        {"type": "click", "path": "#deck/button:0", "label": "Start"},
+    ]
+
+
+def test_a_click_the_page_ignored_or_an_untrusted_one_is_not_kept():
+    views = _views(
+        "click(h1); advance(300);\n"
+        "click(next, { isTrusted: false }); mutate(h2); advance(300);\n"
+        "click(next, { button: 2 }); mutate(h2); advance(300);\n"
+    )
+    assert views == []
+
+
+def test_the_comment_layer_is_left_out_of_paths_and_inputs():
+    views = _views(
+        # comments_layer.py appends its own elements to <body>.
+        "const hl = body.add(new El('div', { classes: ['act-hl'] }));\n"
+        "const mk = body.add(new El('div', { id: 'act-mk' }));\n"
+        "const panel = body.add(new El('div'));\n"
+        "const pin = mk.add(new El('div', { classes: ['act-marker'] }));\n"
+        "click(pin); mutate(h2); advance(300);\n"
+        "click(next); mutate(hl); advance(300);\n"
+        "body.classes.push('act-mode');\n"
+        "click(next); mutate(h2); advance(300);\n"
+        "body.classes.pop();\n"
+        "click(panel); mutate(panel); advance(300);\n"
+    )
+    assert views[-1]["inputs"] == [{"type": "click", "path": "div:0", "label": ""}]
+
+
+def test_too_many_inputs_report_an_overflow_and_none_of_them():
+    views = _views(
+        "for (let i = 0; i < 51; i++) { key('ArrowRight'); mutate(h2); advance(300); }"
+    )
+    assert views[-1]["overflow"] is True
+    assert views[-1]["inputs"] == []
+    assert all(len(view["inputs"]) <= 50 for view in views)
+
+
+def test_hash_window_and_container_scroll_are_reported():
+    views = _views(
+        "window.location.hash = '#pricing'; fire('hashchange', {}); advance(1000);\n"
+        "const pane = body.add(new El('div', { id: 'pane' }));\n"
+        "pane.scrollTop = 300; window.scrollY = 50;\n"
+        "fire('scroll', { target: pane }); advance(300);\n"
+    )
+    assert views[0]["hash"] == "#pricing"
+    assert views[-1]["scrollY"] == 50
+    assert views[-1]["container"] == {"path": "#pane", "top": 300, "left": 0}
+
+
+def test_an_unchanged_view_is_reported_once():
+    views = _views(
+        "window.location.hash = '#a'; fire('hashchange', {}); advance(1000);\n"
+        "fire('hashchange', {}); advance(1000);\n"
+        "fire('scroll', { target: fakeDocument }); advance(300);\n"
+    )
+    assert len(views) == 1
+
+
+def test_the_heading_is_the_topmost_one_actually_on_screen():
+    views = _views(
+        "const lower = body.add(new El('h2', { text: '  Lower\\n  heading ', rect: R(300) }));\n"
+        "const upper = body.add(new El('h3', { text: 'Upper', rect: R(100) }));\n"
+        "const faded = body.add(new El('h2', { text: 'Faded', rect: R(5), visible: false }));\n"
+        "const below = body.add(new El('h2', { text: 'Below', rect: R(900) }));\n"
+        "h1.rect = null;\n"
+        "fire('hashchange', {});\n"
+    )
+    assert views[-1]["heading"] == "Upper"
+    views = _views("h1.rect = null; fire('hashchange', {});")
+    assert views[-1]["heading"] == ""
+
+
+def test_the_view_reporter_cannot_stop_the_storage_half():
+    # A page in the opaque preview origin still gets its storage substitutes.
+    assert SHIM_JS.index("View reporter") < SHIM_JS.index("var nativeStorageWorks")
