@@ -390,14 +390,17 @@ class _ListingCacheKey(NamedTuple):
     # the key never shows it. Nothing is derived from it: the key is the same
     # value the settings object already holds in memory.
     credential: SecretStr | None
+    # A fetch that did not ask for `?kind=image` (not MindsHub): its listing has no
+    # image models, so a MindsHub read must never be served it.
+    chat_only: bool = False
 
 
 def _listing_cache_key(
-    *, base_url: str, api_key: str, tenant_key: str | None, user_id: str | None
+    *, base_url: str, api_key: str, tenant_key: str | None, user_id: str | None, chat_only: bool = False
 ) -> _ListingCacheKey:
     """The entry a fetch writes and a cached read looks up, built in one place."""
     credential = SecretStr(api_key) if tenant_key is None else None
-    return _ListingCacheKey(base_url, tenant_key, user_id, credential)
+    return _ListingCacheKey(base_url, tenant_key, user_id, credential, chat_only)
 
 
 # LRU order; entries are (stored_at, listing), (failed_at, empty), or after a failure
@@ -553,7 +556,7 @@ async def fetch_minds_models(
         return _empty_listing()
     base = minds_chat_base_url(minds_url)
     cache_key = _listing_cache_key(
-        base_url=base, api_key=api_key, tenant_key=tenant_key, user_id=user_id
+        base_url=base, api_key=api_key, tenant_key=tenant_key, user_id=user_id, chat_only=not mindshub
     )
 
     now = time.monotonic()
@@ -621,7 +624,11 @@ async def fetch_minds_models(
         # not bound a redirect chain or a trickled response. asyncio.wait_for
         # cancels the whole fetch at the ceiling and the TimeoutError falls
         # through to the negative-cache path below.
-        responses = await asyncio.wait_for(asyncio.gather(*fetches), _MINDS_MODELS_TIMEOUT_S)
+        # return_exceptions: one request failing must not leave the other's error unretrieved.
+        responses = await asyncio.wait_for(asyncio.gather(*fetches, return_exceptions=True), _MINDS_MODELS_TIMEOUT_S)
+        for response in responses:
+            if isinstance(response, BaseException):
+                raise response
         parsed = [_rows(r) for r in responses]
     except Exception as exc:
         logger.debug("minds /models fetch failed: %s", exc)

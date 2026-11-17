@@ -278,6 +278,32 @@ def test_a_failed_image_request_fails_the_listing(monkeypatch):
     assert listing.image_models == {}
 
 
+def test_a_chat_only_fetch_of_mindshub_is_never_served_to_a_mindshub_read(monkeypatch):
+    """An openai-compatible card pointed at MindsHub caches a listing with no image models."""
+    from cowork.services import providers
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            rows = [{"id": FLARE, "kind": "image"}] if "?kind=image" in url else [{"id": "sonnet", "kind": "chat"}]
+            return type("R", (), {"status_code": 200, "json": staticmethod(lambda: {"data": rows})})()
+
+    monkeypatch.setattr(providers.httpx, "AsyncClient", _Client)
+    providers._minds_models_cache.clear()
+    asyncio.run(providers.fetch_minds_models("https://api.mindshub.ai", "mdb_test", mindshub=True))
+    asyncio.run(providers.fetch_minds_models("https://api.mindshub.ai", "mdb_test", force_refresh=True))
+    listing = asyncio.run(providers.fetch_minds_models("https://api.mindshub.ai", "mdb_test", mindshub=True))
+    assert listing.image_models == {FLARE: True}
+
+
 def test_a_custom_endpoint_is_not_asked_for_image_models(monkeypatch):
     from cowork.services import providers
 

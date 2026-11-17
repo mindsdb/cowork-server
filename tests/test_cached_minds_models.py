@@ -83,7 +83,8 @@ def _serve(monkeypatch, calls: list[str]) -> None:
 
     async def fake_get(url, headers=None, **kw):
         bearer = headers["Authorization"]
-        calls.append(bearer)
+        if "?kind=" not in url:  # the image half of the same fetch
+            calls.append(bearer)
         restricted = "account-a" in bearer
 
         class R:
@@ -110,7 +111,7 @@ def _serve(monkeypatch, calls: list[str]) -> None:
 
 
 def _fetch(api_key: str):
-    return asyncio.run(providers.fetch_minds_models(_URL, api_key))
+    return asyncio.run(providers.fetch_minds_models(_URL, api_key, mindshub=True))
 
 
 def test_two_desktop_credentials_do_not_share_a_listing(monkeypatch) -> None:
