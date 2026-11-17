@@ -247,10 +247,10 @@ def test_a_loopback_permission_still_refuses_a_remote_caller():
 
 def test_the_skill_sharing_route_declares_authenticated_and_401s_with_no_principal():
     """A person shares their own skill, so the route declares Authenticated
-    beside the skills router's AuthenticatedInOrgMode: a caller with no
+    beside the sharing router's AuthenticatedInOrgMode: a caller with no
     principal, the desktop or the operator view, gets a 401 in either mode,
     before anything is read or written."""
-    from cowork.api.v1.endpoints import skills
+    from cowork.api.v1.endpoints import skill_sharing
     from cowork.api.v1.route_walker import declared_permissions, route_key
     from cowork.api.v1.router import api_router
 
@@ -262,6 +262,20 @@ def test_the_skill_sharing_route_declares_authenticated_and_401s_with_no_princip
     assert declared_permissions(route) == [AuthenticatedInOrgMode, Authenticated]
 
     app = FastAPI()
-    app.include_router(skills.router, prefix="/skills")
+    app.include_router(skill_sharing.router, prefix="/skills")
     response = TestClient(app).put("/skills/my-notes/sharing", json={"shared": True})
     assert (response.status_code, response.json()) == (401, {"detail": "Unauthorized"})
+
+
+def test_the_sharing_capabilities_route_is_never_read_as_a_skills_id():
+    """The sharing router is mounted ahead of the skills router, so GET
+    /skills/sharing-capabilities reaches the capabilities route, never GET
+    /skills/{skill_id} with "sharing-capabilities" as the id."""
+    from starlette.routing import Match
+
+    from cowork.api.v1.endpoints import skill_sharing
+    from cowork.api.v1.router import api_router
+
+    scope = {"type": "http", "path": "/api/v1/skills/sharing-capabilities", "method": "GET", "root_path": ""}
+    first = next(route for route in api_router.routes if route.matches(scope)[0] is Match.FULL)
+    assert first.endpoint is skill_sharing.skill_sharing_capabilities

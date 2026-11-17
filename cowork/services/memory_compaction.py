@@ -43,7 +43,7 @@ from cowork.harnesses.memory.registry import SLOT_REGISTRY, MemorySlot
 from cowork.harnesses.memory.store import GlobalMemoryStore
 from cowork.principal import Principal
 from cowork.services.memory import apply_project_compaction, project_slots_to_compact
-from cowork.turnqueue.producer import _mint_llm_block
+from cowork.turnqueue.producer import mint_llm_block
 from cowork.turnqueue.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
@@ -292,13 +292,15 @@ async def _plan_files(
     # The same key and model a cloud turn of this person gets: minted for their
     # user, org and workspace, so the call is billed where their turns are.
     # Its own id, led by the turn's: auth hands out one key per id, and a key
-    # under the turn's own id is revoked with the turn.
-    block = await _mint_llm_block(
+    # under the turn's own id is revoked with the turn. The plain turn TTL,
+    # not a time-limited turn's hours: the deadline below is cut from it.
+    block = await mint_llm_block(
         org_id=scope.org_id,
         user_id=scope.user_id,
         correlation_id=f"{turn_correlation_id}:compact-{uuid4().hex[:8]}",
         settings=turn_settings,
         workspace_id=settings.hub_workspace_id or None,
+        ttl_seconds=turn_settings.turn_key_ttl_seconds,
     )
     provider = OpenAIProvider(
         api_key=block["api_key"],

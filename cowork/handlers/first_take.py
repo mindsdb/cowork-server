@@ -4,9 +4,10 @@ A delegated turn shows nothing until Anton's first model call speaks, which is
 seconds on a quick turn and much longer when it goes straight to tools. The
 first take fills that gap: a short, tool-free reply on the gate's fast model,
 started alongside the gate, saying what the user asked for and that the work is
-under way. The renderer shows it muted above the thinking block until Anton
-writes its own text, asks the user something, or the turn ends: one sentence on
-screen at a time, never two.
+under way. The renderer shows it muted above the thinking block until the final
+answer starts, Anton asks the user something, or the turn ends: one sentence on
+screen at a time, never two. Anton's narration before a tool call ("let me check
+X") is a step, not the answer, so it does not end the take (ENG-3554).
 
 It is a placeholder, never an answer:
 
@@ -32,6 +33,7 @@ import logging
 import re
 import time
 
+from cowork.common.ui_locale import with_reply_language
 from cowork.handlers.response_routing import (
     RouterBinding,
     _close,
@@ -139,17 +141,16 @@ CLEARED = "response.first_take.cleared"
 
 
 def clears_take(event_type: str | None, sse: str) -> bool:
-    """Whether a turn frame takes the first take's place: Anton's own words, a
-    question, or the turn's end. A blank text delta is not Anton speaking."""
-    if event_type in {"response.ask_user", "response.completed", "response.failed"}:
-        return True
-    if event_type != "response.output_text.delta":
-        return False
-    try:
-        data = json.loads(sse.split("data: ", 1)[1])
-    except (IndexError, ValueError):
-        return True
-    return bool(str(data.get("delta") or "").strip())
+    """Whether a turn frame ends the first take here: a question for the user,
+    or the turn's end.
+
+    Anton's text does not: a line before a tool call is narration, shown as a
+    step, and only the renderer can tell when the text has become the answer
+    (it takes the take off screen then). Ending the take on Anton's first word
+    cut it off mid-sentence above narration that then moved away (ENG-3554).
+    ``sse`` is unused and kept for the caller's signature.
+    """
+    return event_type in {"response.ask_user", "response.completed", "response.failed"}
 
 
 class FirstTake:
@@ -164,8 +165,10 @@ class FirstTake:
     then) on every way out of the turn.
     """
 
-    def __init__(self, binding: RouterBinding, history: list[dict]) -> None:
+    def __init__(self, binding: RouterBinding, history: list[dict], *, ui_locale: str | None = None) -> None:
         self._binding = binding
+        # The app's language: the take follows the same rule as the agent.
+        self._ui_locale = ui_locale
         self._messages = take_history(history)
         self._queue: asyncio.Queue = asyncio.Queue()
         self._writer: asyncio.Task | None = None
@@ -261,7 +264,7 @@ class FirstTake:
 
         events = self._binding.provider.stream(
             model=self._binding.model,
-            system=with_deployment_identity(_SYSTEM_PROMPT),
+            system=with_reply_language(with_deployment_identity(_SYSTEM_PROMPT), self._ui_locale),
             messages=self._messages,
             max_tokens=_MAX_TOKENS,
         )

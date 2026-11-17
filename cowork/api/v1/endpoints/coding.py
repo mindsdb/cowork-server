@@ -45,6 +45,9 @@ from cowork.coding.contracts import (
     TurnRequest,
     GitIdentity,
     GitIdentityRequest,
+    InitializeGitRequest,
+    WorkspaceModeOptions,
+    WorkspaceUsagePage,
 )
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
 from cowork.coding.contracts import ModeTurnRequest
@@ -87,7 +90,7 @@ from cowork.coding.project_models import (
     WorkItemSearchRequest,
     canonical_model_id,
 )
-from cowork.coding.reasoning import check_reasoning_effort
+from cowork.coding.reasoning import advertised_levels, check_reasoning_effort
 from cowork.coding.repository_setup import RepositorySetupService
 from cowork.coding.redaction import redact_text
 from cowork.coding.runtime_protocol import (
@@ -233,6 +236,25 @@ def engines():
     return _service().capabilities()
 
 
+@router.get("/workspace-usage", response_model=WorkspaceUsagePage)
+def workspace_usage(session_id: str | None = Query(default=None, min_length=1, max_length=128)):
+    """Approximate storage Cowork manages for each task; measured in the background.
+
+    Passing the task being looked at measures again if the last measurement predates it.
+    """
+    return _service().workspace_usage_page(session_id)
+
+
+@router.get("/workspace-modes", response_model=WorkspaceModeOptions)
+def workspace_modes(
+    project_id: str | None = Query(default=None, min_length=1, max_length=128),
+    computer_id: str | None = Query(default=None, min_length=1, max_length=128),
+    path: str | None = Query(default=None, min_length=1, max_length=32_768),
+):
+    """Which workspace modes the composer may offer for a new task, optionally for one folder."""
+    return _call(_service().workspace_mode_options, project_id, computer_id, path)
+
+
 @router.get("/models")
 def models(session: SessionDep, scope: ScopeDep, engine_id: str = Query(default="codex", alias="engineId")):
     settings = _settings(session, scope)
@@ -291,6 +313,12 @@ async def inference_proxy(path: str, request: Request, session: SessionDep, scop
     _require_inference_client(request)
     credentials = _credentials(_settings(session, scope))
     return await proxy_inference(request, path, credentials)
+
+
+@router.post("/workspace/initialize-git", response_model=WorkspaceModeOptions)
+def initialize_git(body: InitializeGitRequest):
+    """Make a folder on this computer a Git repository so tasks on it can use a worktree."""
+    return _call(_service().initialize_git, body.path)
 
 
 @router.get("/workspace/inspect")
@@ -626,10 +654,16 @@ def setup_windows_sandbox(session_id: str, session: SessionDep, scope: ScopeDep)
 
 @router.patch("/sessions/{session_id}")
 def update_session(session_id: str, body: SessionUpdateRequest, session: SessionDep, scope: ScopeDep):
-    if body.reasoning_effort is not None:
+    if body.model or body.reasoning_effort is not None:
         current = _call(_service().get_session, session_id)
         model = canonical_model_id(body.model) if body.model else current.model
-        _call(check_reasoning_effort, model, body.reasoning_effort, _model_levels(_settings(session, scope)))
+        levels = _model_levels(_settings(session, scope))
+        _call(check_reasoning_effort, model, body.reasoning_effort, levels)
+        if body.reasoning_effort is None and current.reasoning_effort:
+            offered = advertised_levels(model, levels)
+            if offered is not None and current.reasoning_effort not in offered:
+                # The previous model's level would reach Codex on the next turn and fail it there.
+                body = body.model_copy(update={"reasoning_effort": None})
     return _call(_service().update_session_config, session_id, body)
 
 

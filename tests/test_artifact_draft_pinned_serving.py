@@ -11,8 +11,12 @@ from fastapi import HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+from cowork.services import artifact_files
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.comments_layer import ACTIVATION_PARAM
+from cowork.db.scoped import LOCAL_SCOPE
+from draft_host_support import reviewed_and_read
 
 
 def _artifact(tmp_path, *, metadata: dict | None = None):
@@ -27,7 +31,7 @@ def _artifact(tmp_path, *, metadata: dict | None = None):
         trusted_anchor=project,
         root_parts=(".anton", "artifacts"),
     )
-    return source, folder, metadata or {"type": "html-app"}
+    return source, folder, ArtifactMetadata.model_validate(metadata or {"type": "html-app"})
 
 
 async def _serve(
@@ -36,8 +40,8 @@ async def _serve(
 ):
     monkeypatch.setattr(
         workspace_ep,
-        "review_artifact_for_request",
-        lambda *_args: (source, folder, metadata, is_own),
+        "review_artifact_and_read",
+        reviewed_and_read(lambda *_args: (source, folder, metadata, is_own)),
     )
     request = SimpleNamespace(
         query_params={ACTIVATION_PARAM: "1"} if comments else {}
@@ -47,7 +51,7 @@ async def _serve(
         "0123456789abcdef0123456789abcdef",
         rel_path,
         request,
-        SimpleNamespace(),
+        LOCAL_SCOPE,
         download=download,
     )
 
@@ -80,7 +84,7 @@ async def test_traversal_never_reaches_a_filesystem_open(
     def unexpected_open(*_args):
         raise AssertionError("invalid path reached the pinned open")
 
-    monkeypatch.setattr(workspace_ep, "_open_pinned_draft_file", unexpected_open)
+    monkeypatch.setattr(artifact_files, "open_pinned_draft_file", unexpected_open)
 
     with pytest.raises(HTTPException) as error:
         await _serve(monkeypatch, source, folder, metadata, rel_path)
@@ -165,8 +169,8 @@ def test_request_components_are_replaced_with_names_read_from_disk(
     requested_file = ("app.js" + "x")[:-1]
     requested = (requested_dir, requested_file)
     opened_names = []
-    original_open_child = workspace_ep.open_pinned_child
-    original_dir_open = workspace_ep.dir_open
+    original_open_child = artifact_files.open_pinned_child
+    original_dir_open = artifact_files.dir_open
 
     def open_child(directory, name):
         opened_names.append(name)
@@ -176,10 +180,10 @@ def test_request_components_are_replaced_with_names_read_from_disk(
         opened_names.append(name)
         return original_dir_open(directory, name, flags, mode)
 
-    monkeypatch.setattr(workspace_ep, "open_pinned_child", open_child)
-    monkeypatch.setattr(workspace_ep, "dir_open", open_file)
+    monkeypatch.setattr(artifact_files, "open_pinned_child", open_child)
+    monkeypatch.setattr(artifact_files, "dir_open", open_file)
 
-    resources, fd, _file_stat = workspace_ep._open_pinned_draft_file(
+    resources, fd, _file_stat = artifact_files.open_pinned_draft_file(
         source, folder, requested
     )
     try:
@@ -198,7 +202,7 @@ async def test_send_failure_before_iteration_closes_the_pinned_file(tmp_path):
     fd = os.open(path, os.O_RDONLY)
     resources = ExitStack()
     resources.callback(os.close, fd)
-    response = workspace_ep._draft_stream(resources, fd, 5, "text/plain")
+    response = workspace_ep._draft_stream(resources, fd, 5, "text/plain", scope=LOCAL_SCOPE)
 
     async def receive():
         return {"type": "http.disconnect"}
@@ -215,6 +219,45 @@ async def test_send_failure_before_iteration_closes_the_pinned_file(tmp_path):
 
     with pytest.raises(OSError):
         os.fstat(fd)
+
+
+@pytest.mark.parametrize("case", ("preview", "preview_raises", "stream_raises"))
+async def test_the_route_closes_the_pinned_file_it_does_not_hand_to_a_stream(
+    tmp_path, monkeypatch, case
+):
+    """A preview reads the whole file and answers with the bytes, so nothing
+    is left to close the descriptor later; a read or a stream that fails
+    hands it to nothing either. Each one must be closed before the route
+    returns or raises."""
+    source, folder, metadata = _artifact(tmp_path)
+    (folder / "index.html").write_text("<html><body>draft</body></html>")
+    (folder / "notes.txt").write_text("draft notes")
+    opened: list[artifact_files.PinnedDraftFile] = []
+    open_pinned = artifact_files.open_pinned_draft_file
+
+    def open_and_keep(*args):
+        pinned = open_pinned(*args)
+        opened.append(pinned)
+        return pinned
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("draft read failed")
+
+    monkeypatch.setattr(artifact_files, "open_pinned_draft_file", open_and_keep)
+    if case == "preview":
+        response = await _serve(monkeypatch, source, folder, metadata, "index.html")
+        assert isinstance(response, HTMLResponse)
+        assert response.status_code == 200
+    else:
+        failing = "_preview_html_from_fd" if case == "preview_raises" else "_draft_stream"
+        monkeypatch.setattr(workspace_ep, failing, broken)
+        rel_path = "index.html" if case == "preview_raises" else "notes.txt"
+        with pytest.raises(RuntimeError, match="draft read failed"):
+            await _serve(monkeypatch, source, folder, metadata, rel_path)
+
+    [pinned] = opened
+    with pytest.raises(OSError):
+        os.fstat(pinned.fd)
 
 
 @pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="POSIX symlink defence")
@@ -269,7 +312,7 @@ async def test_a_symlinked_artifacts_root_cannot_reuse_the_sources_authority(
             monkeypatch,
             source,
             outside_folder,
-            {"type": "html-app"},
+            ArtifactMetadata.model_validate({"type": "html-app"}),
             "secret.txt",
         )
 
@@ -283,10 +326,10 @@ async def test_fullstack_preview_stays_inside_the_declared_public_subtree(
     (folder / "static").mkdir()
     (folder / "static" / "app.js").write_text("public")
     (folder / "backend.py").write_text("secret")
-    metadata = {
+    metadata = ArtifactMetadata.model_validate({
         "type": "fullstack-stateless-app",
         "primary": "static/index.html",
-    }
+    })
 
     response = await _serve(
         monkeypatch, source, folder, metadata, "static/app.js"
@@ -361,8 +404,8 @@ async def test_download_skips_the_comment_layer(tmp_path, monkeypatch):
         ('evil" bad.txt', 'evil\\" bad.txt', "evil%22%20bad.txt"),
         # CR/LF are dropped: the header can never gain a second line.
         ("a\r\nX-Injected: 1.txt", "aX-Injected: 1.txt", "aX-Injected%3A%201.txt"),
-        # Non-ASCII survives only in the RFC 5987 spelling; the ASCII one degrades.
-        ("rapport-\u00e9.xlsx", "rapport-.xlsx", "rapport-%C3%A9.xlsx"),
+        # Non-ASCII survives only in the RFC 5987 spelling; the ASCII one drops the accent.
+        ("rapport-\u00e9.xlsx", "rapport-e.xlsx", "rapport-%C3%A9.xlsx"),
         # A fully non-ASCII stem must not degrade to a hidden ".xlsx" dotfile
         # (review finding on #413: two such names also collide, so a second
         # `curl -OJ` fails outright).
@@ -376,7 +419,7 @@ async def test_download_skips_the_comment_layer(tmp_path, monkeypatch):
 async def test_download_filename_cannot_inject_headers(
     tmp_path, monkeypatch, name, ascii_part, encoded_part
 ):
-    """`_relative_file_parts` lets these names through — it only guards the
+    """`relative_file_parts` lets these names through — it only guards the
     filesystem walk. The header builder is the second gate."""
     source, folder, metadata = _artifact(tmp_path, metadata={"type": "file"})
     (folder / name).write_bytes(b"x")
@@ -409,12 +452,12 @@ async def test_download_does_not_bypass_authorization(tmp_path, monkeypatch):
     def deny(*_args):
         raise HTTPException(status_code=404, detail="Artifact not found")
 
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", deny)
+    monkeypatch.setattr(workspace_ep, "review_artifact_and_read", reviewed_and_read(deny))
 
     with pytest.raises(HTTPException) as excinfo:
         await workspace_ep.serve_private_draft(
             "local", "0123456789abcdef0123456789abcdef", "report.xlsx",
-            SimpleNamespace(query_params={}), SimpleNamespace(), download=True,
+            SimpleNamespace(query_params={}), LOCAL_SCOPE, download=True,
         )
     assert excinfo.value.status_code == 404
 

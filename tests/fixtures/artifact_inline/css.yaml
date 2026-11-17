@@ -1,0 +1,217 @@
+# Same shape as elements.yaml; `css` is the text of one <style> element.
+# `inlined` lists the folder files whose bytes `inlined_bytes` must sum to.
+
+- id: unquoted-url
+  css: '.a{background:url(chart.png)}'
+  present: ['.a{background:url(data:image/png;base64,{png_b64});}']
+  inlined: [chart.png]
+
+- id: quoted-url
+  css: '.a{background:url("chart.png") no-repeat}'
+  present: ['.a{background:url(data:image/png;base64,{png_b64}) no-repeat;}']
+
+- id: single-quoted-url-with-spaces
+  css: ".a{background: url( 'chart.png' ) no-repeat}"
+  present: ['url(data:image/png;base64,{png_b64})', 'no-repeat']
+
+- id: escaped-url-function
+  css: '.a{background:u\72 l(chart.png)}'
+  present: ['.a{background:url(data:image/png;base64,{png_b64});}']
+
+- id: escaped-url-to-outside
+  css: '.a{color:red;background:\55 RL({outside}/x.png)}'
+  present: ['.a{color:red;}']
+  omitted: [[scheme, '{outside}/x.png']]
+
+- id: src-function
+  css: '.a{background-image:src("chart.png")}'
+  present: ['.a{background-image:url(data:image/png;base64,{png_b64});}']
+
+- id: image-set-strings-and-urls
+  css: '.a{background-image:image-set("chart.png" 1x, url(photo.jpg) 2x)}'
+  present: ['image-set(url(data:image/png;base64,{png_b64}) 1x, url(data:image/jpeg;base64,{jpeg_b64}) 2x)']
+  inlined: [chart.png, photo.jpg]
+
+- id: webkit-image-set-keeps-type-string
+  css: '.a{background-image:-webkit-image-set("anim.gif" type("image/gif") 1x)}'
+  present: ['-webkit-image-set(url(data:image/gif;base64,{gif_b64}) type("image/gif") 1x)']
+
+- id: image-function-string
+  css: '.a{background-image:image("{outside}/x.png")}'
+  absent: ['image(']
+  omitted: [[scheme, '{outside}/x.png']]
+
+- id: image-set-through-var-is-dropped
+  css: '.a{color:red;background-image:image-set(var(--u) 1x)}'
+  present: ['.a{color:red;}']
+  absent: ['image-set']
+
+- id: src-through-attr-is-dropped
+  css: '.a{color:red;background-image:src(attr(data-u))}'
+  present: ['.a{color:red;}']
+  absent: ['src(']
+
+- id: outside-url-drops-only-its-declaration
+  css: '.a{color:red;background:url({outside}/x.png);width:1px}'
+  present: ['.a{color:red;width:1px;}']
+  omitted: [[scheme, '{outside}/x.png']]
+
+- id: one-failure-drops-the-whole-declaration-and-its-bytes
+  css: '.a{background:url(chart.png),url(absent.png)}'
+  absent: ['data:']
+  omitted: [[missing, absent.png]]
+  inlined: []
+
+- id: custom-property-with-outside-url
+  css: ':root{--bg:url({outside}/v.png);--ok:url(chart.png)}.a{background:var(--bg)}'
+  present: [':root{--ok:url(data:image/png;base64,{png_b64});}']
+  omitted: [[scheme, '{outside}/v.png']]
+
+- id: fragment-url-stays
+  css: '.a{filter:url(#blur);mask:url("#m")}'
+  present: ['.a{filter:url(#blur);mask:url("#m");}']
+
+- id: legacy-binding-properties
+  css: '.a{behavior:url(script.htc);-moz-binding:url({outside}/x.xml#b);color:red}'
+  present: ['.a{color:red;}']
+  omitted: [[missing, script.htc], [scheme, '{outside}/x.xml#b']]
+
+- id: data-image-in-css-is-re-encoded
+  css: '.a{background:url(data:image/png;base64,{png_b64})}'
+  present: ['.a{background:url(data:image/png;base64,{png_b64});}']
+  inlined: [chart.png]
+
+- id: data-svg-in-css-is-refused
+  css: '.a{background:url("data:image/svg+xml,<svg onload=alert(1)/>")}'
+  absent: ['svg', 'alert']
+  omitted: [[unsupported_type, 'data:image/svg+xml,<svg onload=alert(1)/>']]
+
+- id: comments-go
+  css: '/* {outside} */ p{color:red /* note */}'
+  present: ['p{color:red ;}']
+  absent: ['{outside}', 'note']
+
+- id: import-is-spliced-with-urls-resolved-from-its-folder
+  css: '@import url(css/more.css); p{color:red}'
+  present: ['.more{background:url(data:image/png;base64,', 'p{color:red;}']
+  absent: ['@import']
+  inlined: [css/more.css, css/inner.png]
+
+- id: import-with-media-query
+  css: '@import "css/more.css" print;'
+  present: ['@media print{.more{']
+  absent: ['@import']
+
+- id: import-with-layer-splices-unconditionally
+  css: '@import url(css/more.css) layer(base);'
+  present: ['.more{background:url(data:image/png;base64,']
+  absent: ['@media', 'layer', '@import']
+
+- id: import-depth-is-capped
+  css: '@import "css/d1.css";'
+  present: ['.d1{color:red;}', '.d2{color:red;}', '.d3{color:red;}']
+  absent: ['.d4', '@import']
+  omitted: [[budget, d4.css]]
+
+- id: import-cycle-is-cut
+  css: '@import "css/loop-a.css";'
+  present: ['.loop-a{color:red;}', '.loop-b{color:blue;}']
+  absent: ['@import']
+  omitted: [[budget, loop-a.css]]
+
+- id: import-of-a-data-stylesheet
+  css: '@import url("data:text/css,body{background:url({outside}/x)}"); p{color:red}'
+  present: ['p{color:red;}']
+  absent: ['{outside}', 'body{']
+  omitted: [[unsupported_type, 'data:text/css,body{background:url({outside}/x)}']]
+
+- id: import-from-outside
+  css: '@import url({outside}/x.css); @import "../other/secret.txt"; @import "metadata.json";'
+  absent: ['@import', 'SENTINEL']
+  omitted:
+    - [scheme, '{outside}/x.css']
+    - [traversal, ../other/secret.txt]
+    - [housekeeping, metadata.json]
+
+- id: import-not-at-top-level-goes
+  css: '@media print { @import "css/more.css"; p{color:red} }'
+  present: ['@media print {p{color:red;}}']
+  absent: ['.more', '@import']
+
+- id: font-face-inlines-fonts
+  css: '@font-face{font-family:F;src:url(font.woff2) format("woff2"),url(font.ttf) format("truetype")}'
+  present: ['@font-face{font-family:F;src:url(data:font/woff2;base64,{woff2_b64}) format("woff2"),url(data:font/ttf;base64,{ttf_b64}) format("truetype");}']
+
+- id: font-face-refuses-an-image
+  css: '@font-face{font-family:G;src:url(chart.png)}'
+  present: ['@font-face{font-family:G;}']
+  omitted: [[unsupported_type, chart.png]]
+
+- id: background-refuses-a-font
+  css: '.a{background:url(font.woff2)}'
+  absent: ['data:']
+  omitted: [[unsupported_type, font.woff2]]
+
+- id: page-background
+  css: '@page{size:A4;background:url({outside}/bg.png);margin:1in}@page :first{background:url(chart.png)}'
+  present: ['@page{size:A4;margin:1in;}', '@page :first{background:url(data:image/png;base64,{png_b64});}']
+  omitted: [[scheme, '{outside}/bg.png']]
+
+- id: at-rules-that-can-load-or-are-unknown-go
+  css: >-
+    @namespace svg url(http://www.w3.org/2000/svg); @charset "utf-8";
+    @counter-style x{symbols:"*"} @property --x{syntax:"*";inherits:false}
+    @color-profile --p{src:url({outside}/p.icc)} @font-feature-values F{@swash{a:1}}
+    @document url-prefix(https://example.com/){p{color:red}} p{color:green}
+  present: ['p{color:green;}']
+  absent: ['@namespace', '@charset', '@counter-style', '@property', '@color-profile', '@font-feature-values', '@document', '{outside}']
+
+- id: kept-at-rules
+  css: '@media print{p{color:red}} @supports (display:grid){p{display:grid}} @keyframes k{from{opacity:0}to{opacity:1}} @container (min-width: 1px){p{color:blue}} @layer base{p{margin:0}} @layer a, b;'
+  present:
+    - '@media print{p{color:red;}}'
+    - '@supports (display:grid){p{display:grid;}}'
+    - '@keyframes k{from{opacity:0;}to{opacity:1;}}'
+    - '@container (min-width: 1px){p{color:blue;}}'
+    - '@layer base{p{margin:0;}}'
+    - '@layer a, b;'
+
+- id: nested-rules
+  css: '.card{color:red; & > h2 {color:blue; background:url({outside}/n.png)}}'
+  present: ['.card{color:red;& > h2 {color:blue;}}']
+  omitted: [[scheme, '{outside}/n.png']]
+
+# css/angles.css holds a raw `</style>`, which an inline <style> can't.
+- id: angle-brackets-are-escaped
+  css: '@import "css/angles.css"; a[title="<b>"]{color:blue} .a\>b{color:red}'
+  present:
+    - 'p::after{content:"\3c /style\3e \3c script\3e alert(1)\3c /script\3e ";}'
+    - 'a[title="\3c b\3e "]{color:blue;}'
+    - '.a\3e b{color:red;}'
+  absent: ['</style><script>', '<script', '<b>']
+
+- id: child-combinator-and-media-range-greater-than-stay
+  css: 'ul > li{color:red} @media (width > 600px) and (width >= 1px){p{color:red}}'
+  present: ['ul > li{color:red;}', '@media (width > 600px) and (width >= 1px){p{color:red;}}']
+
+# Every `<` is escaped, so a media range written with one is turned round to
+# use `>`, which means the same and survives the escape.
+- id: media-range-with-less-than-is-turned-round
+  css: '@media (width > 600px) and (width < 900px){p{color:red}} @media (600px <= width < 900px){p{color:blue}} @container card (inline-size < 30em){p{color:green}}'
+  present:
+    - '@media (width > 600px) and (900px > width){p{color:red;}}'
+    - '@media (900px > width >= 600px){p{color:blue;}}'
+    - '@container card (30em > inline-size){p{color:green;}}'
+  absent: ['\3c ']
+
+- id: import-with-a-less-than-media-range
+  css: '@import "css/more.css" (width < 900px);'
+  present: ['@media (900px > width){.more{']
+  absent: ['\3c ', '@import']
+
+- id: less-than-outside-a-media-range-stays-escaped
+  css: '@supports (a < b){p{color:red}} @media (a < b > c){p{color:blue}} .x < .y{color:green}'
+  present:
+    - '@supports (a \3c  b){p{color:red;}}'
+    - '@media (a \3c  b > c){p{color:blue;}}'
+    - '.x \3c  .y{color:green;}'

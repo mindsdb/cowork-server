@@ -312,7 +312,9 @@ def test_what_takes_its_place():
     def frame(kind, **data):
         return f"event: {kind}\ndata: {json.dumps({'type': kind, **data})}\n\n"
 
-    assert ft.clears_take("response.output_text.delta", frame("response.output_text.delta", delta="Here"))
+    # Anton's text is narration until the renderer says otherwise: it no longer
+    # ends the take here, so the take finishes its sentence (ENG-3554).
+    assert not ft.clears_take("response.output_text.delta", frame("response.output_text.delta", delta="Let me check."))
     assert not ft.clears_take("response.output_text.delta", frame("response.output_text.delta", delta="\n\n"))
     for kind in ("response.ask_user", "response.completed", "response.failed"):
         assert ft.clears_take(kind, frame(kind))
@@ -409,7 +411,7 @@ async def test_first_take_and_gate_build_one_provider_per_request(monkeypatch):
         providers.append(provider)
         return SimpleNamespace(router_provider=provider)
 
-    async def gate(binding, *, history):
+    async def gate(binding, *, history, **_kwargs):
         gated.append(binding)
         await _settle()
         return None
@@ -462,18 +464,24 @@ async def test_no_gate_model_is_resolved_once_for_take_and_gate(monkeypatch):
 async def test_skipped_gate_and_disabled_take_do_not_resolve_a_provider(monkeypatch, requested, enabled):
     from unittest.mock import Mock
 
+    from uuid import uuid4
+
     import cowork.handlers.response_routing as routing
     import cowork.handlers.responses as responses
+    from cowork.models.message import Message
+    from cowork.models.message_event import MessageEvent  # noqa: F401 — resolves the ORM relationship
+    from cowork.schemas.responses import Role
 
     resolve = Mock(side_effect=AssertionError("no provider is needed"))
     monkeypatch.setattr(routing, "_settings_binding", resolve)
     monkeypatch.setattr(responses, "_settings_binding", resolve)
     monkeypatch.setattr(responses, "_first_take_enabled", lambda: enabled)
-    monkeypatch.setattr(responses, "scrubbed_openai_dump", lambda row: row)
     handler = _handler()
     decision, _ = await handler._route_request(
         conversation_id=None,
-        gate_rows=[{"role": "assistant", "content": [{"type": "tool_use", "name": "scratchpad"}]}],
+        gate_rows=[Message(conversation_id=uuid4(), role=Role.assistant, content=[
+            {"type": "tool_use", "id": "t1", "name": "scratchpad", "input": {}},
+        ])],
         harness_input=[{"type": "text", "text": "summarize that"}],
         has_attachments=False, has_disabled_connections=False, first_take=requested,
     )
@@ -648,7 +656,7 @@ async def test_route_request_hands_the_gates_binding_over(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_routing_error_cancels_the_take(monkeypatch):
+async def test_a_routing_error_cancels_the_take(monkeypatch, tmp_path):
     from types import SimpleNamespace
     from uuid import uuid4
 
@@ -662,8 +670,9 @@ async def test_a_routing_error_cancels_the_take(monkeypatch):
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(
-            get_conversation=lambda _cid: SimpleNamespace(id=conv_id),
+            get_conversation=lambda _cid: SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path))),
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
@@ -696,9 +705,11 @@ def test_the_setting_defaults_on():
 
 
 @pytest.mark.asyncio
-async def test_the_turn_clears_it_right_before_anton_speaks():
+async def test_anton_speaking_does_not_clear_it_the_turns_end_does():
     """In-process producer, end to end: created, then the take's words, then
-    its clear, then Anton's first words. Nothing of it reaches the saved turn."""
+    Anton's words (narration or answer: the renderer decides), then the take's
+    clear right before the turn ends (ENG-3554). Nothing of it reaches the
+    saved turn."""
     from unittest.mock import MagicMock, patch
     from types import SimpleNamespace
     from uuid import uuid4
@@ -707,7 +718,7 @@ async def test_the_turn_clears_it_right_before_anton_speaks():
 
     take = _take(_Provider(["Pulling your sales now."])).start()
 
-    async def formatter(stream, model, event_sink):
+    async def formatter(stream, model, event_sink, **_kwargs):
         yield "event: response.created\ndata: {}\n\n"
         await asyncio.sleep(0.05)  # Anton's first model call, still silent
         yield 'event: response.in_progress\ndata: {"thought_role": "thought.progress"}\n\n'
@@ -734,7 +745,8 @@ async def test_the_turn_clears_it_right_before_anton_speaks():
 
     kinds = [frame.split("\n", 1)[0].removeprefix("event: ") for frame in buffer.frames]
     assert kinds[0] == "response.created"
-    assert kinds.index(ft.DELTA) < kinds.index(ft.CLEARED) < kinds.index("response.output_text.delta")
+    assert kinds.index(ft.DELTA) < kinds.index("response.output_text.delta") < kinds.index(ft.CLEARED)
+    assert kinds.index(ft.CLEARED) < kinds.index("response.completed")
     assert kinds.count(ft.CLEARED) == 1
     assert all(k not in kinds[kinds.index(ft.CLEARED) + 1:] for k in (ft.DELTA, ft.DONE))
     saved_text = json.dumps([str(c) for c in conv_svc.return_value.save_assistant_turn.call_args_list])

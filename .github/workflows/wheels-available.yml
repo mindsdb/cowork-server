@@ -28,6 +28,11 @@ name: Wheels Available
 
 on:
   workflow_call:
+    inputs:
+      floating:
+        description: "Probe compatibility ranges instead of the reviewed release lock"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -56,10 +61,64 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
         with:
+          version: "0.11.30"
           python-version: "3.12"
+
+      # This required gate runs before publish, so wait here before its first
+      # constrained resolution. The independent floating probe never selects a lock.
+      - name: Select anton-agent from the reviewed lock
+        if: "!inputs.floating"
+        id: pin
+        run: |
+          python - <<'PYTHON'
+          import os
+          import tomllib
+          from pathlib import Path
+          packages = tomllib.loads(Path("uv.lock").read_text())["package"]
+          versions = {p["version"] for p in packages if p["name"] == "anton-agent"}
+          if len(versions) != 1:
+              raise SystemExit("Expected one reviewed anton-agent version")
+          version = versions.pop()
+          print(f"Selected anton-agent=={version}")
+          if "rc" in version:
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write(f"rc={version}\n")
+          PYTHON
+
+      # Keep the existing visibility wait for an explicitly selected rc.
+      # PyPI can accept its upload before the Simple index serves it.
+      - name: Wait until uv resolves the pinned anton-agent rc
+        if: steps.pin.outputs.rc != ''
+        env:
+          ANTON_RC: ${{ steps.pin.outputs.rc }}
+        run: |
+          set -uo pipefail
+          attempts=30
+          for attempt in $(seq 1 "$attempts"); do
+            if out=$(uv pip compile - --no-config --no-deps --quiet \
+                       --refresh-package anton-agent <<<"anton-agent==$ANTON_RC" 2>&1); then
+              echo "uv resolves anton-agent==$ANTON_RC"
+              exit 0
+            fi
+            echo "uv cannot resolve anton-agent==$ANTON_RC yet (attempt $attempt/$attempts)"
+            if [ "$attempt" -lt "$attempts" ]; then
+              sleep 30
+            fi
+          done
+          echo "$out" >&2
+          echo "PyPI's Simple index still does not serve anton-agent==$ANTON_RC after $attempts attempts, 30s apart" >&2
+          exit 1
 
       # Resolution only — no venv, no install. The script cross-resolves for
       # every platform via `--python-platform`, so one ubuntu runner covers
       # macOS and Windows too, and no Intel-Mac hardware is needed.
       - name: Check every shipped platform resolves to versions with wheels
-        run: bash scripts/check_wheels_available.sh
+        env:
+          FLOATING: ${{ inputs.floating }}
+        run: |
+          if [ "$FLOATING" = true ]; then
+            bash scripts/check_wheels_available.sh --floating
+          else
+            python scripts/release_contract.py --check
+            bash scripts/check_wheels_available.sh
+          fi

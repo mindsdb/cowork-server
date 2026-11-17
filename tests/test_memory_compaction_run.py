@@ -76,7 +76,7 @@ def world(monkeypatch, redis_client, tmp_path):
         return {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "http://minds", "coding_model": "m"}
 
     monkeypatch.setattr(memory_compaction, "get_user_settings", lambda scope: state.settings)
-    monkeypatch.setattr(memory_compaction, "_mint_llm_block", mint)
+    monkeypatch.setattr(memory_compaction, "mint_llm_block", mint)
     monkeypatch.setattr(memory_compaction, "LLMClient", lambda **kwargs: state.model)
     return state
 
@@ -104,6 +104,7 @@ async def test_a_due_tier_is_compacted_and_its_count_stored(world):
     assert world.mints[0]["org_id"] == "org-1"
     assert world.mints[0]["workspace_id"] == "ws-1"
     assert world.mints[0]["correlation_id"].startswith(f"{TURN}:compact-")
+    assert world.mints[0]["ttl_seconds"] == TurnQueueSettings().turn_key_ttl_seconds
     assert len(world.mints[0]["correlation_id"]) <= 59
     assert await world.redis.get(COUNT_KEY) == "1"
     assert await world.redis.get(LOCK_KEY) is None
@@ -152,7 +153,7 @@ async def test_a_failed_mint_keeps_the_file_and_counts_the_attempt(world, monkey
     async def refuse(**kwargs):
         raise ProductPermissionUnavailable()
 
-    monkeypatch.setattr(memory_compaction, "_mint_llm_block", refuse)
+    monkeypatch.setattr(memory_compaction, "mint_llm_block", refuse)
     with caplog.at_level(logging.WARNING, logger="cowork.services.memory_compaction"):
         await _compact(world)
 

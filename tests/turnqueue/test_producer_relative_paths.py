@@ -42,7 +42,7 @@ def captured(monkeypatch):
     async def _fake_llm(**_kw):
         return {"provider": "minds-cloud", "api_key": "k", "base_url": "u"}
 
-    monkeypatch.setattr(prod, "_mint_llm_block", _fake_llm)
+    monkeypatch.setattr(prod, "mint_llm_block", _fake_llm)
     return box
 
 
@@ -88,7 +88,9 @@ async def test_only_project_memory_is_shipped_in_anton_job_params(captured):
         },
     )
     params = captured["payload"]["params"]
-    assert "skills" not in params
+    # No skills were passed: the block is still there, empty, since the pod
+    # recalls only what it names.
+    assert params["skills"] == {}
     assert params["memory"] == {"project": project_memory}
 
 

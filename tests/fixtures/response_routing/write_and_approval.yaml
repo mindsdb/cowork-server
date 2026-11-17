@@ -1,0 +1,75 @@
+# Turns the router must hand to the agent, and turns it keeps. A prompt is the
+# user's latest message; an answer is the router's own text.
+
+# A change, a confirmation or an approval, or a bare yes or no: only the agent
+# can act on these, so no router call is made.
+delegates_without_router_call:
+  - Create two sandbox scenarios, and ask me to confirm with a question card before you create anything
+  - Add a row for the new plant to the capacity table
+  - Please update the forecast for March
+  - Delete the draft orders from last week
+  - Set up a weekly report every Monday
+  - Can you send the summary to the planning team?
+  - Rename the scenario to Q4 baseline
+  - Check with me before you change anything
+  - Do I have permission to edit this?
+  - Generate the Q4 forecast
+  - Email the summary to the planning team
+  - "yes"
+  - "Yes!"
+  - "Yes, please."
+  - ok
+  - go ahead
+  - "No."
+
+# Harmless questions that a change word still sends to the agent. Each costs
+# one hop, not a wrong answer; pinned so a wider word list is a visible choice.
+known_over_fires:
+  - What does run rate mean?
+  - Does this make sense?
+
+# Small talk and stable general knowledge still get the router's fast answer.
+reaches_router:
+  - Hi
+  - thanks!
+  - What is the capital of France?
+  - Explain the difference between a forecast and a plan.
+  - What does a 95% interval mean?
+
+# A router answer that reads as an approval card, a confirmation question or
+# finished work is never shipped.
+rejected_answers:
+  - "**Question card:** Proceed? Please answer yes or no"
+  - Shall I go ahead?
+  - Both scenarios are created.
+  - Please confirm before I continue.
+  - Reply yes to approve the change.
+  - "Proceed? (yes/no)"
+  - I'm creating the two scenarios now.
+  - Done!
+  - I've added both rows.
+  - Shall I continue?
+
+kept_answers:
+  - Paris is the capital of France.
+  - Hello! How can I help you today?
+  - You're welcome.
+  - A 95% interval is a range that holds the true value 95% of the time.
+
+# The router's previous answer and the user's reply. Every reply to a router
+# answer goes to the agent without a router call, in any language: the router
+# could only act out what its own answer asked. The last two are the cost, a
+# plain question that takes one hop.
+follow_ups:
+  - router_answer: "**Question card:** Proceed? Please answer yes or no"
+    reply: both of them please
+  - router_answer: Hello! How can I help you today?
+    reply: "yes"
+  - router_answer: Would you like me to generate the forecast now?
+    reply: "Yes, please."
+  - router_answer: "¿Procedo? Responde sí o no"
+    reply: sí
+  - router_answer: Hello! How can I help you today?
+    reply: What is the capital of Spain?
+  - router_answer: Paris is the capital of France.
+    reply: and of Spain?

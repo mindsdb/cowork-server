@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import sys
 import threading
-from contextlib import contextmanager
 
 import pytest
 from anton.core.memory.cortex import plan_compaction, read_compaction_input
@@ -14,6 +13,7 @@ from anton.core.memory.hippocampus import Hippocampus
 
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.api.v1.endpoints import memory as memory_endpoints
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.harnesses.memory import store as store_mod
 from cowork.harnesses.memory.store import GlobalMemoryStore, MemorySlotBusyError, ProjectMemoryStore
 from cowork.schemas.memory import MemoryDeleteRequest, MemoryUpdateRequest
@@ -121,27 +121,21 @@ def test_a_lock_held_too_long_fails_the_change(tmp_path, monkeypatch, change):
     assert store.read(MemorySlot.RULES) == "# Rules\n- Kept\n"
 
 
-class _BusyService:
-    def update_memory_sync(self, **kwargs):
-        raise MemorySlotBusyError("busy")
-
-    delete_memory_sync = update_memory_sync
+async def _busy(use, *, scope, principal):
+    raise MemorySlotBusyError("busy")
 
 
 @pytest.mark.parametrize("call", ["update", "delete"])
-def test_a_busy_slot_answers_503(monkeypatch, call):
-    monkeypatch.setattr(memory_endpoints, "_memory_service", lambda scope, principal: _busy())
+async def test_a_busy_slot_answers_503(monkeypatch, call):
+    monkeypatch.setattr(memory_endpoints, "_with_memory_service", _busy)
     with pytest.raises(HTTPException) as raised:
         if call == "update":
-            memory_endpoints.update_memory(
-                MemoryUpdateRequest(scope="global", category="rules", content="# Rules\n"), None, None
+            await memory_endpoints.update_memory(
+                MemoryUpdateRequest(scope="global", category="rules", content="# Rules\n"), LOCAL_SCOPE, None
             )
         else:
-            memory_endpoints.delete_memory(MemoryDeleteRequest(scope="global", category="rules"), None, None)
+            await memory_endpoints.delete_memory(
+                MemoryDeleteRequest(scope="global", category="rules"), LOCAL_SCOPE, None
+            )
 
     assert raised.value.status_code == 503
-
-
-@contextmanager
-def _busy():
-    yield _BusyService()

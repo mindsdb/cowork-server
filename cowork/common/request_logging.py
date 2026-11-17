@@ -1,0 +1,182 @@
+"""One final HTTP diagnostic, with context that lasts through streamed bodies."""
+
+import logging
+import re
+from dataclasses import dataclass
+from http import HTTPMethod, HTTPStatus
+from time import monotonic
+from uuid import uuid4
+
+from fastapi import FastAPI
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from structlog.contextvars import bind_contextvars, reset_contextvars
+
+logger = logging.getLogger(__name__)
+_REQUEST_ID = re.compile(
+    r"[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+)
+_REFUSAL_REASONS = frozenset(
+    {
+        "expected_organization_missing",
+        "expected_organization_invalid",
+        "organization_mismatch",
+        # The draft-preview host (cowork/draft_host/app.py): why a signed link
+        # was refused, never the link itself.
+        "draft_links_disabled",
+        "draft_host_unknown",
+        "draft_no_fetch_metadata",
+        "draft_token_malformed",
+        "draft_token_kid",
+        "draft_token_signature",
+        "draft_token_purpose",
+        "draft_token_env",
+        "draft_token_expired",
+        "draft_token_identity",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _InFlight:
+    """One request this process is serving."""
+
+    method: str
+    started: float
+    #: The request's ASGI scope. Routing adds the matched route to it, so the
+    #: summary names the request by the route's template, never by its path.
+    scope: Scope
+
+    @property
+    def route(self) -> str:
+        return getattr(self.scope.get("route"), "path", None) or "<unrouted>"
+
+
+#: Requests this process is serving, by an id of their own. Written on the
+#: event loop; cowork.common.loop_watchdog reads a copy from its own thread
+#: when the loop stalls.
+_in_flight: dict[int, _InFlight] = {}
+#: Requests listed from each end, the oldest and the newest.
+_IN_FLIGHT_LISTED_EACH = 10
+_PATH_CHARS = 200
+
+
+def in_flight_summary() -> str:
+    """The requests in flight, oldest first, as ``METHOD /route (age s)``.
+
+    A request is named by its route's template (``/drafts/{project_ref}/...``),
+    so the line carries no id, path or token a request's own path holds; one
+    that routing has not matched yet reads ``<unrouted>``.
+
+    Past twice _IN_FLIGHT_LISTED_EACH, the oldest and the newest of them,
+    with a count of the rest between. Open turn streams fill the oldest end,
+    so the request that arrived just before a stall is still named.
+    """
+    now = monotonic()
+    requests = sorted(_in_flight.copy().values(), key=lambda entry: entry.started)
+    unlisted = len(requests) - 2 * _IN_FLIGHT_LISTED_EACH
+    if unlisted > 0:
+        requests = requests[:_IN_FLIGHT_LISTED_EACH] + requests[-_IN_FLIGHT_LISTED_EACH:]
+    listed = [
+        f"{entry.method} {entry.route[:_PATH_CHARS]} ({now - entry.started:.1f}s)"
+        for entry in requests
+    ]
+    if unlisted > 0:
+        listed.insert(_IN_FLIGHT_LISTED_EACH, f"{unlisted} more")
+    return "; ".join(listed)
+
+
+class RequestLoggingApp(FastAPI):
+    def build_middleware_stack(self) -> ASGIApp:
+        # Include ServerErrorMiddleware so generated 500 responses carry the
+        # same correlation header and access-log context as handled responses.
+        return RequestLoggingMiddleware(super().build_middleware_stack())
+
+
+class RequestLoggingMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers", []))
+        supplied = headers.get(b"x-request-id", b"").decode("latin-1")
+        valid = _REQUEST_ID.fullmatch(supplied) is not None
+        request_id = supplied if valid else str(uuid4())
+        tokens = bind_contextvars(
+            request_id=request_id,
+            request_id_source="header" if valid else "generated",
+            method=scope["method"] if scope["method"] in HTTPMethod else "OTHER",
+        )
+        started = monotonic()
+        status = 0
+        escaped = False
+        in_flight_key = id(scope)
+        _in_flight[in_flight_key] = _InFlight(
+            method=scope["method"] if scope["method"] in HTTPMethod else "OTHER",
+            started=started,
+            scope=scope,
+        )
+
+        def fields():
+            route = getattr(scope.get("route"), "path", None)
+            return {
+                "status_code": status or 500,
+                "route": route,
+                "duration_ms": round((monotonic() - started) * 1000, 2),
+            }
+
+        async def send_logged(message: Message) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                response_headers = message.get("headers", [])
+                message = {
+                    **message,
+                    "headers": [
+                        (k, v)
+                        for k, v in response_headers
+                        if k.lower() != b"x-request-id"
+                    ]
+                    + [(b"x-request-id", request_id.encode("ascii"))],
+                }
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_logged)
+        except Exception as exc:
+            escaped = True
+            logger.exception(
+                "Request execution failed",
+                extra={
+                    **fields(),
+                    "event": "request_failed",
+                    "reason": "unhandled_exception",
+                    "error_type": type(exc).__name__,
+                },
+            )
+            exc._cowork_diagnostic_logged = True
+            raise
+        finally:
+            _in_flight.pop(in_flight_key, None)
+            if not escaped and status >= 400:
+                candidate = scope.get("state", {}).get("_request_log_reason")
+                reason = candidate if candidate in _REFUSAL_REASONS else None
+                fallback = (
+                    HTTPStatus(status).name.lower()
+                    if status in HTTPStatus
+                    else "http_error"
+                )
+                logger.log(
+                    logging.ERROR if status >= 500 else logging.WARNING,
+                    "Request refused" if status < 500 else "Request failed",
+                    extra={
+                        **fields(),
+                        "event": "request_refused"
+                        if status < 500
+                        else "request_failed",
+                        "reason": reason or fallback,
+                    },
+                )
+            reset_contextvars(**tokens)

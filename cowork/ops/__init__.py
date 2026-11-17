@@ -5,8 +5,9 @@ acts for one person on a local deployment that trusts identity headers
 (COWORK_TRUST_IDENTITY_HEADERS). Every action takes the pair that deployment's
 proxy sends for the person: ``--organization-id``, the deployment's own id
 (X-Organization-Id), and ``--user-id``, the person's ``sub`` (X-User-Id).
-The one exception is memory left shared, where the memory actions act on the
-deployment's one store and take neither (cowork.ops.memory). cowork-server
+Memory left shared acts on the deployment's one store and takes neither
+(cowork.ops.memory). Connections list also takes neither to enumerate all
+stored partitions (cowork.ops.connections). cowork-server
 works out the person's space from the pair, as it does for their requests, so
 a caller never repeats the storage layout.
 

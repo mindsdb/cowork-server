@@ -244,7 +244,13 @@ class LocalCopyManager:
                 shutil.copy2(desired_path, temp)
                 os.replace(temp, target)
 
-    def cleanup(self, key: str, workspace: Path) -> None:
+    def cleanup(self, key: str, workspace: Path, *, keep_recovery: bool = True) -> None:
+        """Remove a task copy and its baseline.
+
+        With ``keep_recovery`` a changed copy is saved under the recovery root
+        first. Deleting a task passes False: nothing could reopen the copy, and
+        the diff and copy are the slowest part of removing a large folder.
+        """
         relative = managed_key(key)
         actual = workspace.resolve()
         expected_roots = (self.copies_root, self.legacy_copies_root)
@@ -252,7 +258,7 @@ class LocalCopyManager:
             raise LocalCopyError("Refusing to remove an unmanaged task copy")
         baseline = self.baselines_root / relative
         recovery = self.recovery_root / relative / "local-copy"
-        if workspace.exists() and self.diff(workspace):
+        if keep_recovery and workspace.exists() and self.diff(workspace):
             recovery.parent.mkdir(parents=True, exist_ok=True)
             if recovery.exists():
                 shutil.rmtree(recovery)

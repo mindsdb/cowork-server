@@ -37,6 +37,7 @@ import cowork.handlers.responses as responses_mod
 import cowork.scheduler as scheduler
 import cowork.services.history_recall as history_recall
 from cowork.common.datetime_utils import ensure_utc
+from cowork.common.settings.user_settings import UserSettings
 from cowork.db import units
 from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE
 from cowork.db.units import DatabaseBusy, conversation_writes, unit_session
@@ -44,6 +45,7 @@ from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, 
 from cowork.handlers.turn_errors import (
     INTERRUPTED_TURN_MESSAGE,
     SERVER_BUSY_CODE,
+    TURN_LOST_MESSAGE,
     STALLED_CODE,
     STALLED_TURN_MESSAGE,
     server_busy_message,
@@ -61,7 +63,7 @@ from cowork.streaming import discard_conversation, registry
 from cowork.streaming.buffer import FileStreamBuffer, read_records
 from cowork.streaming.recovery import seal_orphan_turns_in_history
 
-from _fakes import PausedModel
+from _fakes import PausedModel, inline_run_db
 
 # Seconds; the one_connection_pool fixture's POOL_TIMEOUT.
 WAIT = 2
@@ -570,7 +572,7 @@ async def test_a_cancel_during_the_turn_start_unit_waits_for_it_and_finalizes_th
     rows = [(r.role, r.pending) for r in _rows(conversation_id)]
     if cancel == "shutdown":
         last_kind, last = frames[-1]
-        assert (last_kind, last["error"]) == ("response.failed", INTERRUPTED_TURN_MESSAGE)
+        assert (last_kind, last["error"]) == ("response.failed", TURN_LOST_MESSAGE)
         assert "assistant_message_id" in last, last
         assert _terminal(conversation_id) == "Interrupted"
         # The interrupted turn's failure is saved as its answer.
@@ -746,7 +748,7 @@ async def test_a_channel_turns_saves_wait_for_the_conversations_write_lock(monke
         def stream_response(self, **_kwargs):
             return None
 
-        async def formatter(self, stream, model, event_sink):
+        async def formatter(self, stream, model, event_sink, **_kwargs):
             delta = {"type": "response.output_text.delta", "delta": "ok"}
             event_sink(delta["type"], delta)
             yield "event: response.output_text.delta\ndata: {}\n\n"
@@ -764,10 +766,16 @@ async def test_a_channel_turns_saves_wait_for_the_conversations_write_lock(monke
     async def text_only(scoped, adapter, event, text):
         return [{"type": "text", "text": text}]
 
-    monkeypatch.setattr(runtime, "resolve_turn_harness", lambda scoped, conversation: "anton", raising=False)
+    monkeypatch.setattr(
+        runtime, "_read_turn_setup",
+        lambda scoped, conversation: channel_runtime._TurnSetup(harness_id="anton", settings=UserSettings()),
+        raising=False,
+    )
     monkeypatch.setattr(runtime, "build_input_blocks", text_only, raising=False)
     monkeypatch.setattr(channel_runtime, "get_harness", lambda harness_id: _Answers())
     monkeypatch.setattr(channel_runtime, "ConversationService", _RecordingService)
+    # Each unit runs inline here; the recording service ignores its session.
+    monkeypatch.setattr(channel_runtime, "run_db", inline_run_db(None))
 
     lock_held, release = asyncio.Event(), asyncio.Event()
 
@@ -782,12 +790,12 @@ async def test_a_channel_turns_saves_wait_for_the_conversations_write_lock(monke
     await asyncio.sleep(0.2)
     saved_while_the_ui_turn_saved = list(saved)
     release.set()
-    reply, _ = await asyncio.wait_for(channel_turn, timeout=5)
+    outcome = await asyncio.wait_for(channel_turn, timeout=5)
     await ui_turn
 
     assert saved_while_the_ui_turn_saved == []
     assert saved == ["question", "answer"]
-    assert reply == "ok"
+    assert outcome.reply == "ok"
 
 
 async def test_a_channel_turn_does_not_load_the_conversations_history(monkeypatch):
@@ -809,7 +817,7 @@ async def test_a_channel_turn_does_not_load_the_conversations_history(monkeypatc
         def stream_response(self, **_kwargs):
             return None
 
-        async def formatter(self, stream, model, event_sink):
+        async def formatter(self, stream, model, event_sink, **_kwargs):
             delta = {"type": "response.output_text.delta", "delta": "ok"}
             event_sink(delta["type"], delta)
             yield "event: response.output_text.delta\ndata: {}\n\n"
@@ -827,14 +835,71 @@ async def test_a_channel_turn_does_not_load_the_conversations_history(monkeypatc
     async def text_only(scoped, adapter, event, text):
         return [{"type": "text", "text": text}]
 
-    monkeypatch.setattr(runtime, "resolve_turn_harness", lambda scoped, conversation: "anton", raising=False)
+    monkeypatch.setattr(
+        runtime, "_read_turn_setup",
+        lambda scoped, conversation: channel_runtime._TurnSetup(harness_id="anton", settings=UserSettings()),
+        raising=False,
+    )
     monkeypatch.setattr(runtime, "build_input_blocks", text_only, raising=False)
     monkeypatch.setattr(channel_runtime, "get_harness", lambda harness_id: _Answers())
     monkeypatch.setattr(channel_runtime, "ConversationService", _Service)
+    monkeypatch.setattr(channel_runtime, "run_db", inline_run_db(None))
 
-    reply, _ = await asyncio.wait_for(runtime._run_anton(None, _Conversation(), event), timeout=5)
+    outcome = await asyncio.wait_for(runtime._run_anton(None, _Conversation(), event), timeout=5)
 
-    assert reply == "ok"
+    assert outcome.reply == "ok"
+
+
+async def test_a_remote_channel_turn_reads_its_seed_and_saves_its_memory_in_a_pool_of_one(
+    one_connection_pool, monkeypatch,
+):
+    """A remote channel turn outside org tenancy, in a pool of one connection.
+    Its seed read and the memory save the pod reports each ask for settings
+    inside a unit. The turn's first unit loads them, and the snapshot bound
+    around the rest of the turn answers both, so neither unit waits for a
+    second connection while it holds the only one: the seed is read, the
+    memory is applied and the reply comes back. Without the snapshot, the
+    seed read ends in the pool's timeout."""
+    import cowork.turnqueue.remote_turn as remote_turn_mod
+    from cowork.common.settings.user_settings import use_settings_scope
+    from cowork.handlers.responses import ResponsesHandler
+
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    monkeypatch.setattr(
+        ResponsesHandler, "_stage_remote_workspace_files", staticmethod(lambda session, conv_id: None),
+    )
+
+    async def no_vault(_scope):
+        return None
+
+    monkeypatch.setattr(remote_turn_mod, "register_vault_secrets", no_vault)
+    applied: list[list[dict]] = []
+
+    def recording_apply(scope, project_path, entries, *, access, project_id):
+        applied.append(entries)
+        return len(entries)
+
+    monkeypatch.setattr(responses_mod, "apply_turn_memory", recording_apply)
+    entries = [{"tier": "project", "text": "The team reads charts, not tables."}]
+
+    async def replies(**_kwargs):
+        yield "turn_memory", {"entries": entries}
+        yield "turn_delta", {"text": "ok"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+    conversation_id = _conversation()
+    runtime = channel_runtime.AntonChannelRuntime(channel_runtime.LiveAdapterRegistry())
+    event = SimpleNamespace(message=SimpleNamespace(content="hi", is_group=False, sender_name=None, attachments=[]))
+
+    with use_settings_scope(LOCAL_SCOPE):
+        outcome = await asyncio.wait_for(
+            runtime._run_anton(LOCAL_SCOPE, SimpleNamespace(id=conversation_id), event), timeout=WAIT * 5,
+        )
+
+    assert outcome.reply == "ok"
+    assert applied == [entries]
+    assert [r.role for r in _rows(conversation_id)] == ["user", "assistant"]
 
 
 async def test_a_turn_deleted_while_its_save_waits_saves_nothing(one_connection_pool, monkeypatch):
@@ -962,7 +1027,7 @@ async def test_an_interrupted_turn_whose_save_fails_is_left_for_boot_recovery(mo
     if how == "ui_stall":
         assert (last["code"], last["error"]) == (STALLED_CODE, STALLED_TURN_MESSAGE), last
     else:
-        assert last["error"] == INTERRUPTED_TURN_MESSAGE, last
+        assert last["error"] == (TURN_LOST_MESSAGE if how == "shutdown" else INTERRUPTED_TURN_MESSAGE), last
     assert _terminal(conversation_id) == "Interrupted"
     assert _rows(conversation_id) == [_Row(role="user", pending=True, seq=0)]
     # Boot recovery over this turn's buffer alone.

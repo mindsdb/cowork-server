@@ -44,6 +44,8 @@ class ChannelContext:
 class HarnessProvider(Protocol):
     id: str
     label: str
+    # Called as formatter(stream, model, event_sink, form_blocks=...); the
+    # in-process UI turn passes form_blocks=True (format_responses_stream).
     formatter: AsyncIterator[str]
     # Whether this harness is offered in org (multi-tenant) deployments.
     # Defaults True for implementers that don't set it (see _harness_options).
@@ -82,6 +84,17 @@ class HarnessProvider(Protocol):
         # the turn alive while a model call is quiet; other harnesses accept
         # and ignore it.
         model_wait: "ModelWaitTicker | None" = None,
+        # False when nobody is there to answer, as in a scheduled run. A
+        # harness withholds tools that need the user's confirmation then.
+        interactive: bool = True,
+        # The app's language (a UI_LOCALE_NAMES tag; cowork.common.ui_locale),
+        # or None when the turn has no request behind it. A harness tells its
+        # agent to reply in it when the user's message does not say.
+        ui_locale: str | None = None,
+        # Set only on a turn the scheduler started, never from the request,
+        # since people keep chatting in a scheduled run's conversation. A
+        # harness that records artifact revisions attributes them to it.
+        schedule_id: str | None = None,
     ) -> AsyncIterator[str]:
         ...
 

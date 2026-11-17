@@ -30,6 +30,7 @@ from anton.core.tools.registry import ToolOutcome
 from anton.core.utils.scratchpad import format_cell_result
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from cowork.common import event_clock
 from cowork.harnesses.anton_harness import figure_sources as figure_sources_mod
 from cowork.harnesses.anton_harness import stream_formatter as stream_formatter_mod
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
@@ -483,6 +484,25 @@ class TestStepsFromTheTurnsToolRows:
         figures = _by_text(_figures(events))
         assert figures["250"]["sources"] == [{"tool_use_id": "toolu_rows", "page": None}]
         assert figures["42"]["origin"] == "none"
+
+    async def test_a_replayed_cells_live_app_lines_are_not_what_it_printed(self):
+        """With live apps on, anton appends [live app] to the result of a cell
+        that relaunched a running app."""
+        code = "print(open('/workspace/stock.csv').read())"
+        result = (
+            format_cell_result(Cell(code=code, stdout="P100,S1,250\n", stderr="", error=None))
+            + "\n\n[live app]\nsales-dash relaunched in slot 7"
+        )
+
+        events = await _run_turn(
+            TurnContext(question="What is at S1?"),
+            StreamTextDelta(text="S1 holds 250 units; the app runs in slot 7."),
+            TurnHistory(_tool_rows("toolu_rows", "scratchpad", {"action": "exec", "name": "main", "code": code}, result)),
+        )
+
+        figures = _by_text(_figures(events))
+        assert figures["250"]["sources"] == [{"tool_use_id": "toolu_rows", "page": None}]
+        assert figures["7"]["origin"] == "none"
 
     @pytest.mark.parametrize(("logs", "lint"), [
         ("", ""),
@@ -1276,6 +1296,7 @@ class TestTheInProcessHandlerSavesTheSources:
             id="anton", formatter=staticmethod(format_responses_stream), stream_response=stream_response,
         )
         handler = object.__new__(ResponsesHandler)
+        handler.schedule_id = None
         handler.principal = None
         handler.harness = harness
         frames: list[str] = []
@@ -1462,7 +1483,9 @@ class TestTheFigureSourcesEventIsUnchanged:
         formatter reads its steps can't move a figure, a source or a step."""
         from uuid import UUID
 
-        monkeypatch.setattr(stream_formatter_mod, "time", SimpleNamespace(time=lambda: 1_760_000_000.0))
+        clock = SimpleNamespace(time=lambda: 1_760_000_000.0)
+        monkeypatch.setattr(stream_formatter_mod, "time", clock)
+        monkeypatch.setattr(event_clock, "time", clock)
         monkeypatch.setattr(stream_formatter_mod, "uuid", SimpleNamespace(uuid4=lambda: UUID(int=0xABCDEF)))
 
         frames = await _every_input_shape(compacted=True) + await _every_input_shape(compacted=False)

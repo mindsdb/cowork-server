@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, select
@@ -24,8 +25,10 @@ from cowork.models.channel import ChannelBinding
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
+from cowork.models.task_object import TaskObject
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
 from cowork.services.schedules import ScheduleRunService
+from tests.test_channel_binding_delete import postgres_engine  # noqa: F401  (fixture)
 
 
 def _fk_enforced_session() -> Session:
@@ -98,7 +101,8 @@ def test_delete_project_removes_schedule_runs_too(tmp_path, monkeypatch):
     schedule = _schedule(session, project.id)
     run_service = ScheduleRunService(scoped)
     for _ in range(3):
-        run_service.create_run(schedule.id, is_manual=False)
+        # One running run per schedule: finish each before the next.
+        run_service.finish_run(run_service.create_run(schedule.id, is_manual=False).id, error="ended")
 
     assert ProjectService(scoped).delete_project(project.id) is True
 
@@ -198,3 +202,75 @@ def test_delete_project_releases_a_channel_binding_without_deleting_it(
     session.refresh(survivor)
     assert survivor.anton_project_id is None
     assert survivor.external_group_id == "C123"
+
+
+def _assert_delete_drops_objects_a_moved_task_left_behind(session: Session, tmp_path) -> None:
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    project = _project(session, tmp_path, name="source")
+    destination = _project(session, tmp_path, name="destination")
+
+    moved = Conversation(project_id=destination.id, topic="moved task")
+    session.add(moved)
+    session.commit()
+    session.refresh(moved)
+    left_behind = TaskObject(
+        conversation_id=moved.id, project_id=project.id, kind="artifact", ref="report"
+    )
+    session.add(left_behind)
+    session.commit()
+    session.refresh(left_behind)
+
+    assert ProjectService(scoped).delete_project(project.id) is True
+
+    assert session.get(Project, project.id) is None
+    assert session.get(TaskObject, left_behind.id) is None
+    assert session.get(Conversation, moved.id) is not None, "the moved task stays"
+
+
+def test_delete_project_drops_objects_a_moved_task_left_behind(tmp_path, monkeypatch):
+    """A task moved to another project without its objects keeps its
+    `task_objects` rows pointing at the old project. Those rows belong to a
+    conversation the project delete does not touch, and `task_objects.project_id`
+    has no `ondelete`, so the final `DELETE FROM projects` failed on Postgres."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
+    _assert_delete_drops_objects_a_moved_task_left_behind(_fk_enforced_session(), tmp_path)
+
+
+@pytest.mark.postgres_service
+def test_delete_project_drops_objects_a_moved_task_left_behind_on_postgres(
+    postgres_engine, tmp_path, monkeypatch  # noqa: F811
+):
+    """The same case against the migrated schema, where the bug was reported."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
+    with Session(postgres_engine) as session:
+        _assert_delete_drops_objects_a_moved_task_left_behind(session, tmp_path)
+
+
+def test_delete_project_cleans_every_conversations_streams_under_one_redis_deadline(
+    tmp_path, monkeypatch
+):
+    """On the Redis stream backend each conversation's stream cleanup makes
+    blocking Redis calls (`streaming.discard_conversation`), which retry until
+    their deadline while Redis does not answer. With a deadline per
+    conversation, a project delete holds its request for one budget per
+    conversation."""
+    import cowork.streaming as streaming
+    from cowork.turnqueue import redis_client
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
+    session = _fk_enforced_session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    project = _project(session, tmp_path, name="chatty")
+    for topic in ("one", "two", "three"):
+        session.add(Conversation(project_id=project.id, topic=topic))
+    session.commit()
+    deadlines: list[float | None] = []
+    monkeypatch.setattr(
+        streaming, "discard_conversation", lambda _cid: deadlines.append(redis_client._deadline.get()),
+    )
+
+    assert ProjectService(scoped).delete_project(project.id) is True
+
+    assert len(deadlines) == 3
+    assert deadlines[0] is not None
+    assert len(set(deadlines)) == 1

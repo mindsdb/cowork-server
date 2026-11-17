@@ -31,6 +31,7 @@ from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.session_factory import project_instructions, task_title
 from cowork.coding.workspace import GitIdentityMissingError, GitRunner, WorkspaceError, WorkspaceManager
+from tests.support.coding.service_fakes import copy_folders_without_git
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -44,11 +45,17 @@ def git(cwd: Path, *args: str) -> str:
 
 
 def repository(root: Path, name: str) -> Path:
+    """Create a disposable repository without background changes to its object store."""
     repo = root / name
     repo.mkdir()
     git(repo, "init")
+    git(repo, "config", "maintenance.auto", "false")
+    git(repo, "config", "gc.auto", "0")
     git(repo, "config", "user.email", "cowork@example.invalid")
     git(repo, "config", "user.name", "Cowork Test")
+    # A commit starts a detached `git maintenance`, which since git 2.55 holds
+    # .git/objects/maintenance.lock after the commit returns.
+    git(repo, "config", "maintenance.auto", "false")
     (repo / "README.md").write_text(f"{name}\n", encoding="utf-8")
     git(repo, "add", ".")
     git(repo, "commit", "-m", "base")
@@ -306,6 +313,8 @@ def test_project_workspace_isolates_git_and_non_git_folders_and_hands_off_togeth
         environment=ProjectEnvironment(port_names=["PORT", "API_PORT"]),
     )
     manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    # Folder copies are no longer made; tasks that have one keep working.
+    copy_folders_without_git(manager.workspaces)
 
     first = manager.prepare("session-one", project)
     second = manager.prepare("session-two", project)
@@ -451,6 +460,8 @@ def test_multi_folder_handoff_restores_every_source_after_an_apply_failure(
         ],
     )
     manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    # Folder copies are no longer made; tasks that have one keep working.
+    copy_folders_without_git(manager.workspaces)
     prepared = manager.prepare("session-rollback", project)
     (Path(prepared.workspaces[0].workspace_path) / "README.md").write_text("task\n", encoding="utf-8")
     (Path(prepared.workspaces[1].workspace_path) / "plan.txt").write_text("task\n", encoding="utf-8")
@@ -659,6 +670,8 @@ def test_project_commands_are_shell_free_and_receive_unique_ports(tmp_path: Path
         ],
     )
     manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    # Folder copies are no longer made; tasks that have one keep working.
+    copy_folders_without_git(manager.workspaces)
     prepared = manager.prepare("command-session", project)
     results = manager.run_commands(project, list(prepared.workspaces), "setup", prepared.ports)
 

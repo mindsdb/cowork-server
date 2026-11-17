@@ -80,6 +80,9 @@ def downgrade() -> None:
     the dashed string form, so the join strips dashes) and prepends the
     owning project's name. Unresolvable rows are left as-is (see module
     docstring).
+
+    Postgres stores the id as a native uuid, which has no comparison with
+    text, so the join casts it to text, its dashed form there.
     """
     op.drop_index("ix_files_purpose", table_name="files")
     bind = op.get_bind()
@@ -90,8 +93,8 @@ def downgrade() -> None:
         sa.text(
             "SELECT f.id, substr(f.purpose, 12) AS sid, p.name AS project_name "
             "FROM files f "
-            "JOIN conversations c ON c.id = replace(substr(f.purpose, 12), '-', '') "
-            "     OR c.id = substr(f.purpose, 12) "
+            "JOIN conversations c ON CAST(c.id AS TEXT) = replace(substr(f.purpose, 12), '-', '') "
+            "     OR CAST(c.id AS TEXT) = substr(f.purpose, 12) "
             "JOIN projects p ON p.id = c.project_id "
             "WHERE f.purpose LIKE 'attachment:%' "
             "  AND substr(f.purpose, 12) NOT LIKE '%:%'"

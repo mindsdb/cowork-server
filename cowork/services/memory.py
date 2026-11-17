@@ -35,6 +35,7 @@ from cowork.harnesses.memory.store import (
     PROJECT_TIERS_DIRNAME,
     GlobalMemoryStore,
     PROJECT_SLOTS,
+    MemoryStore,
     ProjectMemoryStore,
     SlotRead,
     deployment_memory_root,
@@ -43,6 +44,7 @@ from cowork.harnesses.memory.store import (
     project_memory_store,
     project_tier_ids,
 )
+from cowork.managed import managed_folder
 from cowork.models.project import Project
 from cowork.principal import Principal
 from cowork.schemas.memory import MemoryResponse, MemoryScope
@@ -745,6 +747,38 @@ def clear_deployment_memory() -> DeploymentMemoryClear:
     return DeploymentMemoryClear(root=root, removed=removed)
 
 
+# Why the memory API refuses a person's change on a deployment that trusts
+# identity headers (cowork.api.v1.endpoints.memory).
+PERSON_EDIT_REFUSED = "Memory saves on its own as you work, so it can't be edited here."
+SHARED_DELETE_REFUSED = (
+    "Memory is one store everyone shares on this deployment (COWORK_PERSONAL_RESOURCES "
+    "leaves it out), so no one can delete it here."
+)
+OWN_RESET_REFUSED = "Resetting memory needs a person whose memory is kept per person."
+MANAGED_REFUSED = "The deployment's memory rules are read-only: the operator sets them."
+
+
+def is_person(scope: TenantScope) -> bool:
+    """Whether ``scope`` is a signed-in person on a deployment that trusts
+    identity headers (cowork.db.scoped.scope_for_identity), rather than the
+    operator view, the desktop or hosted org mode."""
+    return scope.personal and bool(scope.user_id)
+
+
+def person_owns_memory(scope: TenantScope) -> bool:
+    """Whether ``scope`` is a person whose memory is their own: memory is kept
+    per person (COWORK_PERSONAL_RESOURCES lists it), so their tiers are their
+    own folders (GlobalMemoryStore, project_memory_store), never the
+    deployment's one store."""
+    return is_person(scope) and scope.partitioned_for(PersonalResource.MEMORY)
+
+
+def person_may_reset_memory(scope: TenantScope) -> bool:
+    """Whether DELETE /api/v1/memory/all removes ``scope``'s memory: a person
+    whose memory is their own, while memory is on."""
+    return person_owns_memory(scope) and not resolve_memory_policy(scope=scope).off
+
+
 class MemoryService:
     def __init__(
         self,
@@ -755,14 +789,6 @@ class MemoryService:
         self.access = SharedResourceAccess(session, principal)
         # Org mode → per-(org, user); the store keys itself (see GlobalMemoryStore).
         self._global_store = GlobalMemoryStore(scope=session.scope)
-
-    async def get_memory(
-        self,
-        scope: MemoryScope,
-        category: MemorySlot,
-        project_id: UUID | None = None,
-    ) -> MemoryResponse:
-        return self.get_memory_sync(scope, category, project_id)
 
     def get_memory_sync(
         self,
@@ -782,15 +808,6 @@ class MemoryService:
             read_verified=state.readable,
         )
 
-    async def update_memory(
-        self,
-        scope: MemoryScope,
-        category: MemorySlot,
-        content: str,
-        project_id: UUID | None = None,
-    ) -> MemoryResponse:
-        return self.update_memory_sync(scope, category, content, project_id)
-
     def update_memory_sync(
         self,
         scope: MemoryScope,
@@ -804,14 +821,6 @@ class MemoryService:
         self._write(scope, category, content, project_id)
         return self._response(scope, category, content, project_id)
 
-    async def delete_memory(
-        self,
-        scope: MemoryScope,
-        category: MemorySlot,
-        project_id: UUID | None = None,
-    ) -> None:
-        self.delete_memory_sync(scope, category, project_id)
-
     def delete_memory_sync(
         self,
         scope: MemoryScope,
@@ -823,8 +832,20 @@ class MemoryService:
         self._refuse_while_memory_off(refused="Deleting it is refused.")
         self._delete(scope, category, project_id)
 
-    async def list_memory(self, project_id: UUID | None = None) -> list[MemoryResponse]:
-        return self.list_memory_sync(project_id)
+    def reset_own_memory_sync(self) -> PersonMemoryReset:
+        """Remove all of the caller's learned memory with reset_person_memory,
+        the reset the operator's clear runs (cowork.ops.memory).
+
+        Only a person whose memory is their own may (person_owns_memory):
+        anyone else gets 403, so the desktop and hosted org mode keep no
+        reset of their own and no person ever reaches the deployment's shared
+        store. While memory is off it answers 409, as the operator's clear
+        refuses then, so the kept memory stays as it is.
+        """
+        if not person_owns_memory(self.session.scope):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=OWN_RESET_REFUSED)
+        self._refuse_while_memory_off(refused="Resetting it is refused.")
+        return reset_person_memory(self.session.scope)
 
     def list_memory_sync(
         self,
@@ -840,6 +861,7 @@ class MemoryService:
             self._global_response(category=category, content=self._global_store.read(category))
             for category in MemorySlot
         ]
+        items.extend(_managed_responses())
 
         projects = list(self.session.exec(self.session.select(Project)).all())
         visible = {project.id for project in projects}
@@ -869,6 +891,13 @@ class MemoryService:
             }
         if project_id is not None:
             stores = {tier_id: store for tier_id, store in stores.items() if tier_id == project_id}
+        else:
+            # The unfiltered list is the Memories screen. A comparison side
+            # never writes memory, so its project has nothing to show there.
+            from cowork.services.projects import is_comparison_sandbox
+
+            sandboxes = {p.id for p in projects if is_comparison_sandbox(p.name)}
+            stores = {tier_id: store for tier_id, store in stores.items() if tier_id not in sandboxes}
 
         for tier_id, store in stores.items():
             for category in PROJECT_SLOTS:
@@ -915,6 +944,7 @@ class MemoryService:
         content: str,
         project_id: UUID | None,
     ) -> None:
+        _refuse_managed(scope)
         if scope == MemoryScope.global_:
             self._global_store.write(category, content)
             return
@@ -1032,6 +1062,7 @@ class MemoryService:
         category: MemorySlot,
         project_id: UUID | None,
     ) -> None:
+        _refuse_managed(scope)
         if scope == MemoryScope.global_:
             self._global_store.delete(category)
             return
@@ -1136,9 +1167,8 @@ class MemoryService:
     def _global_response(self, *, category: MemorySlot, content: str) -> MemoryResponse:
         # The global tier records no per-slot authorship. Where memory is
         # shared (reads_deployment_tiers) it is the deployment's one store that
-        # every person reads, and nothing here refuses a person's write to it,
-        # so the fronting proxy must. Everywhere else it is the caller's own.
-        # Either way any caller may edit or delete its slots.
+        # every person reads, and the memory API refuses a person's change to
+        # it. Everywhere else it is the caller's own.
         return MemoryResponse(
             scope=MemoryScope.global_,
             category=category,
@@ -1149,10 +1179,25 @@ class MemoryService:
                 last_modified_by=None,
                 last_modified_at=None,
             ),
-            capabilities=MutableResourceCapabilities(
-                can_edit=True,
-                can_delete=True,
-            ),
+            capabilities=self._capabilities(can_change=True),
+        )
+
+    def _capabilities(self, *, can_change: bool) -> MutableResourceCapabilities:
+        """What the caller may do to one learned slot it may otherwise change.
+
+        A person on a deployment that trusts identity headers never edits: their
+        agent saves memory on its own, and a hand-written rule would shape every
+        later answer. They delete a slot only while memory is their own
+        (person_owns_memory). The memory API refuses the rest
+        (cowork.api.v1.endpoints.memory). Everyone else edits and deletes what
+        ``can_change`` allows.
+        """
+        scope = self.session.scope
+        if not is_person(scope):
+            return MutableResourceCapabilities(can_edit=can_change, can_delete=can_change)
+        return MutableResourceCapabilities(
+            can_edit=False,
+            can_delete=can_change and person_owns_memory(scope),
         )
 
     def _project_response(
@@ -1216,8 +1261,42 @@ class MemoryService:
                 key,
                 fallback_modified_at=store.modified_at(category),
             ),
-            capabilities=MutableResourceCapabilities(
-                can_edit=can_change,
-                can_delete=can_change,
-            ),
+            capabilities=self._capabilities(can_change=can_change),
         )
+
+
+def _refuse_managed(scope: MemoryScope) -> None:
+    """Answer 403 to a change of the managed folder's slots, which nothing in
+    Cowork writes (cowork.managed)."""
+    if scope == MemoryScope.managed:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=MANAGED_REFUSED)
+
+
+def _managed_responses() -> list[MemoryResponse]:
+    """The managed folder's memory slots that hold anything, for the listing,
+    read-only for every caller.
+
+    Every turn reads them ahead of the learned tiers (managed_hc, passed by the
+    anton harness), so the listing shows the caller the rules their answers
+    follow. None without a managed folder.
+    """
+    folder = managed_folder()
+    if folder is None:
+        return []
+    store = MemoryStore(folder.memory_dir)
+    return [
+        MemoryResponse(
+            scope=MemoryScope.managed,
+            category=category,
+            content=content,
+            project_id=None,
+            attribution=ResourceAttribution(
+                created_by=None,
+                last_modified_by=None,
+                last_modified_at=None,
+            ),
+            capabilities=MutableResourceCapabilities(can_edit=False, can_delete=False),
+        )
+        for category in MemorySlot
+        if (content := store.read(category)).strip()
+    ]

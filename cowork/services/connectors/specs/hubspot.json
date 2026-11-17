@@ -66,6 +66,5 @@
     "logo_url": "logos/hubspot.svg"
   },
   "logo_url": "logos/hubspot.svg",
-  "featured": true,
-  "notice": "HubSpot shows an \"unverified app\" warning when you connect — expected while our Marketplace listing is under review."
+  "featured": true
 }

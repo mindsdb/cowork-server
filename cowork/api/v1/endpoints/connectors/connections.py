@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import partial
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
+from cowork import app_secret
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.units import run_db, run_efs, unit_session
 from cowork.schemas.connectors import (
     ConnectionDetailResponse,
     ConnectionSummaryResponse,
@@ -18,6 +21,8 @@ from cowork.schemas.connectors import (
     DirectSaveResponse,
     PatchPickedFilesBody,
 )
+from cowork.services.connectors import app_held
+from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
@@ -28,8 +33,8 @@ from cowork.services.connectors.identity import oauth_default_label
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, SharedConnectionError
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
-from cowork.services.connectors.persist import persist_connection, vault_for_scope
-from cowork.services.connectors.specs._registry import registry
+from cowork.services.connectors.persist import own_vault_root, persist_connection, vault_for_scope
+from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 
 _log = logging.getLogger("cowork.connectors.connections")
 router = APIRouter()
@@ -38,6 +43,17 @@ router = APIRouter()
 # SkillService/skills.py, and must never be read/written through the unscoped
 # module-level `service` singleton on an org request.
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+
+
+def require_app_secret(request: Request) -> None:
+    """While the server holds the desktop app's secret, refuse a caller that
+    doesn't send it: these routes change what an MCP connection may do, and
+    COWORK_AUTH_TOKEN alone is readable by agent code on the same machine.
+    A no-op otherwise."""
+    if app_secret.get_app_secret() is None:
+        return
+    if not app_secret.matches(request.headers.get(app_secret.HEADER)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="app_secret_required")
 
 
 def _refuse_unchangeable(scope: TenantScope, engine: str, name: str) -> None:
@@ -66,12 +82,21 @@ async def list_connections(scope: ScopeDep, request: Request):
         # data ConnectWorkflowView's org-mode connector list reads), so no
         # separate "list connections" endpoint is needed on auth's side.
         catalogue = await auth_proxy.proxy_catalogue(request, OAuthSettings())
+        # The card reads a missing status as healthy, like the local vault's
+        # list, so only the one actionable state is passed on; auth's
+        # "active" would otherwise render as an unknown status.
         return [
-            ConnectionSummaryResponse(engine=c["engine"], name=c["name"], user_label=c.get("user_label"))
+            ConnectionSummaryResponse(
+                engine=c["engine"],
+                name=c["name"],
+                user_label=c.get("user_label"),
+                status="needs_reconnect" if c.get("status") == "needs_reconnect" else None,
+            )
             for item in catalogue.get("items", [])
             for c in item.get("connections", [])
         ]
-    return ConnectionsService(scope).list()
+    specs = await run_db(lambda session: ConnectorCatalog(session).get_connectors(), scope=scope)
+    return ConnectionsService(scope).list(specs)
 
 
 # Non-secret fields surfaced from auth's connection-detail response —
@@ -109,7 +134,11 @@ async def get_connection(engine: str, name: str, scope: ScopeDep, request: Reque
         # CustomizeView.jsx's JSON.parse(fields._picked_files) expects that
         # same shape, not the native list auth's Data Vault holds it as.
         fields["_picked_files"] = json.dumps(detail.get("picked_files") or [])
-        return ConnectionDetailResponse(engine=engine, name=name, fields=fields)
+        # Same shape as desktop: `method` at the top, `_access_mode` among the
+        # fields, which the panel's Tool access control reads.
+        if detail.get("_access_mode"):
+            fields["_access_mode"] = detail["_access_mode"]
+        return ConnectionDetailResponse(engine=engine, name=name, method=detail.get("_method"), fields=fields)
     record = ConnectionsService(scope).get(engine, name)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
@@ -151,6 +180,7 @@ def validate_and_save_developer_connection(body: DirectSaveRequest, scope: Scope
     using ``/save``.  This route is for the personal-token fallback shown when
     a desktop build has no hosted OAuth client configured.
     """
+    _refuse_sharepoint(body.connector_id, scope)
     try:
         identity = validate_developer_connection(body.connector_id, body.method, body.values)
     except DeveloperCredentialError as exc:
@@ -162,18 +192,29 @@ def validate_and_save_developer_connection(body: DirectSaveRequest, scope: Scope
     return _persist_direct_connection(body, scope, values)
 
 
+def _refuse_sharepoint(connector_id: str, scope: TenantScope) -> None:
+    """Refuse SharePoint here: only its own routes save it, after checking the key with Microsoft."""
+    if connector_id == SHAREPOINT:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=generic_setup_refusal(scope.org_mode))
+
+
 def _persist_direct_connection(
     body: DirectSaveRequest,
     scope: TenantScope,
     values: dict,
 ) -> dict[str, object]:
-    if registry.get_connector(body.connector_id) is None:
+    _refuse_sharepoint(body.connector_id, scope)
+    with unit_session(scope=scope) as session:
+        known = ConnectorCatalog(session).get_connector(body.connector_id)
+    if known is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
     if body.name.strip():
         _refuse_unchangeable(scope, body.connector_id, body.name.strip())
     if body.method in {"browser_oauth_builtin", "oauth"} or values.get("refresh_token"):
         values["auth_type"] = "oauth"
     vault = vault_for_scope(scope)
+    if body.method == "mcp" and app_held.active():
+        vault = app_held.AppHeldVault(source=vault, root=own_vault_root(scope))
     try:
         # default_label gives a brand-new OAuth connection's tile a
         # meaningful title (the account/org/workspace name the provider
@@ -190,6 +231,7 @@ def _persist_direct_connection(
             body.name,
             values,
             replace_existing=body.replace_existing,
+            spec_form=known.form.model_dump() if known.custom else None,
             default_label=oauth_default_label(values, body.connector_id),
             # HubSpot's MCP connector has no connect-time read/write/none
             # picker (see the HubSpot blueprint tab, Stage 0) — every new
@@ -197,7 +239,8 @@ def _persist_direct_connection(
             # connection; a reconnect (HubSpot session expiring, user
             # re-authorizing) must not silently reset an "edit access"
             # upgrade to "write" back to "read".
-            default_fields={"_access_mode": "read"} if body.method == "mcp" else None,
+            # While app-held, only the secret-guarded routes set the mode (AppHeldVault).
+            default_fields={"_access_mode": "read"} if body.method == "mcp" and not app_held.active() else None,
             vault=vault,
             scope=scope,
         )
@@ -253,7 +296,7 @@ class PatchTokenBody(BaseModel):
 # LoopbackOnly: the only caller is Electron main's token-refresh.ts, always
 # over 127.0.0.1 (the in-body 501 for org mode, below, is a second,
 # independent belt-and-suspenders check).
-@router.patch("/{engine}/{name}/token", dependencies=[Depends(require(LoopbackOnly))])
+@router.patch("/{engine}/{name}/token", dependencies=[Depends(require(LoopbackOnly)), Depends(require_app_secret)])
 def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: ScopeDep):
     """Partially update token fields on a vault entry.
 
@@ -287,9 +330,23 @@ def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: 
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="At least one of access_token, expires_at, or status is required.",
         )
-    if not ConnectionsService(scope).patch_token(engine, name, updates):
+    service = ConnectionsService(scope)
+    if "access_token" in updates and app_held.active() and _method_of(service, engine, name) == "mcp":
+        service.hold_app_held(
+            engine, name, {"access_token": updates.pop("access_token"), "expires_at": updates.get("expires_at")}
+        )
+        if not updates:
+            return {"ok": True}
+    if not service.patch_token(engine, name, updates):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
     return {"ok": True}
+
+
+def _method_of(service: ConnectionsService, engine: str, name: str) -> str | None:
+    try:
+        return service.method(engine, name)
+    except LookupError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.") from None
 
 
 # AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_picked_files,
@@ -319,32 +376,54 @@ async def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody,
     return {"ok": True, "files": merged}
 
 
-# AuthenticatedInOrgMode, defensive classification: an antontron caller audit
-# confirmed this is reachable from both desktop and hosted web (no isElectron/
-# isWeb guard, see useGoogleDrivePicker.js). This declares the identity floor
-# only — it does NOT fix the actual gap: unlike patch_picked_files above, this
-# route has no org-mode branch and unconditionally hits the local vault via
-# ConnectionsService, and auth_proxy has no "remove one picked file" call to
-# forward to (only proxy_picked_files's merge/union semantics and proxy_delete
-# for the whole connection). TODO: an org-mode caller here likely gets a 404
-# against the wrong (local, non-durable) vault instead of actually un-picking
-# the file — needs a real auth-service endpoint before it can work correctly
-# in org mode, same class of gap as test_providers's stored-key issue.
+# Engines whose picked files auth can untag in org mode.
+_ORG_PICKED_FILE_REMOVAL_ENGINES = frozenset({"notion"})
+
+
+# AuthenticatedInOrgMode: reachable from both desktop and hosted web. In org
+# mode a Notion page is untagged in auth's Data Vault, which checks the
+# forwarded credential itself. Other engines still hit the local vault there,
+# which in org mode is not the connection's real store, so Remove does not
+# stick for them yet (auth has no route for them).
 @router.delete(
     "/{engine}/{name}/picked-files/{file_id}",
     dependencies=[Depends(require(AuthenticatedInOrgMode))],
 )
-def delete_picked_file(engine: str, name: str, file_id: str, project: str, scope: ScopeDep):
+async def delete_picked_file(
+    engine: str, name: str, file_id: str, project: str, scope: ScopeDep, request: Request = None,
+):
     """Untag one file from `project` — the "un-pick" counterpart to
     patch_picked_files, used by the Project files rail's delete action on
-    a Drive reference row. Only removes the file from `project`'s rail;
+    a reference row. Only removes the file from `project`'s rail;
     if the file is tagged to other projects too, it stays visible there
     (see remove_picked_file's docstring)."""
-    _refuse_unchangeable(scope, engine, name)
-    remaining = ConnectionsService(scope).remove_picked_file(engine, name, file_id, project)
+    if scope.org_mode and engine in _ORG_PICKED_FILE_REMOVAL_ENGINES:
+        try:
+            remaining = await auth_proxy.proxy_remove_picked_file(engine, name, file_id, project, request, OAuthSettings())
+        except HTTPException as exc:
+            # Already removed, say from another tab: the Remove is done. The
+            # remaining list isn't known without another call, and the
+            # renderer doesn't read it.
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
+            return {"ok": True}
+        return {"ok": True, "files": remaining}
+    # The caller's vault is files on disk, on the shared file store where
+    # hosted, so its read and write run on the file store's threads.
+    remaining = await run_efs(
+        partial(_remove_picked_file, scope=scope, engine=engine, name=name, file_id=file_id, project=project),
+        scope=scope,
+    )
     if remaining is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
     return {"ok": True, "files": remaining}
+
+
+def _remove_picked_file(
+    *, scope: TenantScope, engine: str, name: str, file_id: str, project: str
+) -> list[dict] | None:
+    _refuse_unchangeable(scope, engine, name)
+    return ConnectionsService(scope).remove_picked_file(engine, name, file_id, project)
 
 
 _ACCESS_MODES = {"read", "write", "none"}
@@ -363,7 +442,7 @@ class PatchAccessModeBody(BaseModel):
 # (CustomizeView.jsx), same as patch_picked_files above.
 @router.patch(
     "/{engine}/{name}/access-mode",
-    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+    dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require_app_secret)],
 )
 async def patch_access_mode(engine: str, name: str, body: PatchAccessModeBody, scope: ScopeDep, request: Request):
     """Change a connection's read/write/none MCP tool-access mode after it's
@@ -381,6 +460,42 @@ async def patch_access_mode(engine: str, name: str, body: PatchAccessModeBody, s
     if scope.org_mode:
         return await auth_proxy.proxy_access_mode(engine, name, body.access_mode, request, OAuthSettings())
     _refuse_unchangeable(scope, engine, name)
-    if not ConnectionsService(scope).patch_token(engine, name, {"_access_mode": body.access_mode}):
+    service = ConnectionsService(scope)
+    if app_held.active() and _method_of(service, engine, name) == "mcp":
+        service.hold_app_held(engine, name, {"access_mode": body.access_mode})
+        return {"ok": True, "access_mode": body.access_mode}
+    if not service.patch_token(engine, name, {"_access_mode": body.access_mode}):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
     return {"ok": True, "access_mode": body.access_mode}
+
+
+class AppHeldBody(BaseModel):
+    access_token: str | None = None
+    expires_at: str | None = None
+    access_mode: str | None = None
+
+
+# LoopbackOnly: the only caller is Electron main, over 127.0.0.1, after every
+# server start and every connect of an MCP connection.
+@router.put(
+    "/{engine}/{name}/app-held",
+    dependencies=[Depends(require(LoopbackOnly)), Depends(require_app_secret)],
+)
+def put_app_held(engine: str, name: str, body: AppHeldBody, scope: ScopeDep):
+    """Hold an MCP connection's access token and access mode in server memory
+    (app_held). Once both are held, they are removed from the vault file; the
+    app keeps the mode in the OS keychain and can push both again after a
+    restart."""
+    if scope.org_mode or not app_held.active():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="app_secret_protocol_off")
+    _refuse_unchangeable(scope, engine, name)
+    service = ConnectionsService(scope)
+    if _method_of(service, engine, name) != "mcp":
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Not an MCP connection.")
+    if body.access_mode is not None and body.access_mode not in _ACCESS_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"access_mode must be one of {sorted(_ACCESS_MODES)}.",
+        )
+    service.hold_app_held(engine, name, body.model_dump())
+    return {"ok": True, "stripped": service.strip_app_held(engine, name)}

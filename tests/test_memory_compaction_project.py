@@ -58,7 +58,7 @@ async def project(org_engine):
     """A project whose lessons Alice wrote, so Alice is their author."""
     alice = _scoped(org_engine, ALICE)
     created = ProjectService(alice).create_project("compaction")
-    await MemoryService(alice, _principal(ALICE)).update_memory(
+    MemoryService(alice, _principal(ALICE)).update_memory_sync(
         scope="project", category=MemorySlot.LESSONS, content=LESSONS, project_id=created.id
     )
     return created
@@ -140,7 +140,7 @@ async def test_a_lesson_saved_during_the_model_call_survives(org_engine, project
     alice = _scoped(org_engine, ALICE)
     root, _ = project_slots_to_compact(alice, principal=_principal(ALICE), project_id=project.id)
     plans = await _plan(root)
-    await MemoryService(alice, _principal(ALICE)).update_memory(
+    MemoryService(alice, _principal(ALICE)).update_memory_sync(
         scope="project", category=MemorySlot.LESSONS, content=LESSONS + "\n- Late fact", project_id=project.id
     )
 
