@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from coding_service_fakes import CREDS, FakeEngine, copy_folders_without_git, repository, service_with, wait_for_status
+from tests.support.coding.service_fakes import CREDS, FakeEngine, copy_folders_without_git, repository, service_with, wait_for_status
 
 from cowork.coding import pending_removals as pending_module
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode
