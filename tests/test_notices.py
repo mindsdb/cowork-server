@@ -25,6 +25,7 @@ from cowork.services.conversations import ConversationService
 from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.services.schedules import ScheduleRunService
 from cowork.services.settings import SettingService
+from tests.test_notice_dedup_migration import notice_postgres  # noqa: F401
 from tests.test_schedule_run_outcomes import SLOT, _delete_schedule, _make_schedule, _poll, _run, _schedule
 
 ORG = "11111111-1111-1111-1111-111111111111"
@@ -351,3 +352,57 @@ async def test_a_run_the_boot_reaper_fails_posts_a_notice(schedule_id):
     assert run_id in {run.id for run in executed}
     (notice,) = _notices_for(schedule_id)
     assert notice.source_id == str(run_id)
+
+
+def _race_notice_writers(session_factory, schedule_id, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    with session_factory() as session:
+        run = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE)).create_run(schedule_id, slot_at=SLOT)
+        run.status, run.outcome = "failed", "interrupted"
+        session.add(run)
+        session.commit()
+        run_id = run.id
+    barrier = Barrier(2)
+
+    def wants(*args):
+        barrier.wait(timeout=10)
+        return True
+
+    monkeypatch.setattr(notices, "_wants", wants)
+
+    def post(_):
+        with session_factory() as session:
+            result = notices.post_scheduled_run_notice(ScopedSession(session, SYSTEM_SCOPE), run_id=run_id)
+            # The losing session must still be usable after the conflict.
+            session.exec(select(Notice.id)).all()
+            return result
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(post, range(2)))
+    assert sum(result is not None for result in results) == 1
+    with session_factory() as session:
+        assert len(session.exec(select(Notice).where(Notice.source_id == str(run_id))).all()) == 1
+
+
+def test_concurrent_reapers_post_only_once(schedule_id, monkeypatch):
+    _race_notice_writers(get_open_session, schedule_id, monkeypatch)
+
+
+@pytest.mark.postgres_service
+def test_concurrent_reapers_post_only_once_postgres(notice_postgres, monkeypatch):  # noqa: F811
+    from sqlmodel import Session
+    from cowork.models.project import Project
+    from cowork.services.schedules import ScheduleService
+
+    with Session(notice_postgres) as session:
+        project = Project(name="notice-race", path="/notice-race")
+        session.add(project)
+        session.commit()
+        schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
+            title="notice race", prompt="p", cadence="daily", next_run_at=SLOT,
+            model="default", timezone="UTC", project_id=project.id, enabled=True,
+        )
+        schedule_id = schedule.id
+    _race_notice_writers(lambda: Session(notice_postgres), schedule_id, monkeypatch)
