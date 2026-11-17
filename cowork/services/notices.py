@@ -144,16 +144,28 @@ def post_scheduled_run_notice(scoped: ScopedSession, *, run_id: UUID) -> Notice 
     ).first()
     if already is not None or not _wants(session, schedule, kind):
         return None
-    return post_notice(
-        session, org_id=schedule.org_id, user_id=schedule.created_by, kind=kind,
-        subject=schedule.title or "",
-        target={
-            "scheduleId": str(schedule.id),
-            "runId": str(run.id),
-            "conversationId": str(run.conversation_id) if run.conversation_id else None,
-        },
-        source_id=str(run.id),
-    )
+    try:
+        return post_notice(
+            session, org_id=schedule.org_id, user_id=schedule.created_by, kind=kind,
+            subject=schedule.title or "",
+            target={
+                "scheduleId": str(schedule.id),
+                "runId": str(run.id),
+                "conversationId": str(run.conversation_id) if run.conversation_id else None,
+            },
+            source_id=str(run.id),
+        )
+    except sa.exc.IntegrityError:
+        # Another executor/reaper may have posted after our fast-path read.
+        # Roll back the failed insert before checking the winning row; do not
+        # swallow unrelated integrity failures.
+        session.rollback()
+        if session.exec(select(Notice.id).where(
+            Notice.source_id == str(run_id),
+            Notice.kind.in_(_SCHEDULED_RUN_KINDS),  # type: ignore[attr-defined]
+        )).first() is not None:
+            return None
+        raise
 
 
 class NoticeService:

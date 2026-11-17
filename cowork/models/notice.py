@@ -48,4 +48,10 @@ class Notice(BaseSQLModel, table=True):
     __table_args__ = (
         Index("ix_notices_org_id_user_id_created_at", "org_id", "user_id", "created_at"),
         Index("ix_notices_kind_source_id", "kind", "source_id"),
+        # One ending per run, even when two reapers post concurrently.
+        Index(
+            "uq_notices_scheduled_run_source", "source_id", unique=True,
+            sqlite_where=sa.text("kind IN ('scheduled_run.failed', 'scheduled_run.stopped', 'scheduled_run.succeeded')"),
+            postgresql_where=sa.text("kind IN ('scheduled_run.failed', 'scheduled_run.stopped', 'scheduled_run.succeeded')"),
+        ),
     )
