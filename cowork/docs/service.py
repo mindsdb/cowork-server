@@ -79,6 +79,7 @@ def announce(
     doc: Doc,
     result: dict[str, Any] | None,
     *,
+    folder: Path,
     by: str,
     client_id: str | None = None,
     conversation_id: str | None = None,
@@ -87,7 +88,7 @@ def announce(
 ) -> None:
     """Tell watching editors (and the conversation the change came from)."""
     try:
-        hub.publish(doc_topic(artifact_id), {
+        hub.publish(doc_topic(folder), {
             "type": "doc.updated",
             "artifactId": artifact_id,
             "rev": doc["rev"],

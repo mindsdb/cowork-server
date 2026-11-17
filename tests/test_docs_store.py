@@ -324,3 +324,52 @@ def test_a_doc_that_cannot_be_written_leaves_no_folder_behind(tmp_path, monkeypa
     with pytest.raises(OSError):
         create_doc(artifacts, title="Plan", markdown="Lead.", by="agent")
     assert [p for p in artifacts.iterdir() if not p.name.startswith(".")] == []
+
+
+def test_a_write_to_a_doc_whose_file_is_a_link_makes_nothing_where_it_points(made, tmp_path):
+    """The lock is the doc folder's: a planted link must not have the write make
+    `.revisions` (or its lock file) in the folder the link points into."""
+    from cowork.docs.ops import apply_ops
+    from cowork.docs.store import mutate_doc
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / DOC_FILENAME).write_text("{}")
+    (made.folder / DOC_FILENAME).unlink()
+    (made.folder / DOC_FILENAME).symlink_to(elsewhere / DOC_FILENAME)
+    with pytest.raises(DocError):
+        mutate_doc(made.folder, lambda d: apply_ops(d, [{"op": "rename_doc", "title": "x"}]), by="user")
+    assert sorted(p.name for p in elsewhere.iterdir()) == [DOC_FILENAME]
+
+
+def test_a_doc_folder_that_is_a_link_is_not_locked_through(made, tmp_path):
+    from cowork.docs.ops import apply_ops
+    from cowork.docs.store import mutate_doc
+
+    target = tmp_path / "target"
+    target.mkdir()
+    link = made.folder.parent / "linked-doc"
+    link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(DocError):
+        mutate_doc(link, lambda d: apply_ops(d, [{"op": "rename_doc", "title": "x"}]), by="user")
+    assert list(target.iterdir()) == []
+
+
+def test_a_doc_nested_too_deeply_is_a_bad_doc_and_the_list_skips_it(made):
+    (made.folder / DOC_FILENAME).write_text("[" * 100_000 + "]" * 100_000)
+    with pytest.raises(DocError) as refused:
+        load_doc(made.folder)
+    assert refused.value.code == "bad_doc"
+    assert list_doc_folders(made.folder.parent) == []
+
+
+def test_a_docs_topic_is_its_folder_never_an_id_its_files_claim(tmp_path):
+    """Two docs whose files claim one id (the agent's code can write them) never
+    share a topic, so one's editor can't read or be fed the other's writes."""
+    from cowork.docs.hub import doc_topic
+
+    a = create_doc(tmp_path / "a", title="A", markdown="Mine.", by="user")
+    b = create_doc(tmp_path / "b", title="B", markdown="Theirs.", by="user")
+    assert doc_topic(a.folder) != doc_topic(b.folder)
+    # One folder, however it is spelled, is one topic.
+    assert doc_topic(a.folder) == doc_topic(a.folder.parent / "." / a.folder.name)
