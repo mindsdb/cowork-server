@@ -111,12 +111,14 @@ _FILE_CALLS = (
 def _refusal_without_file_calls(
     *, folder: Path, parts: tuple[str, ...], monkeypatch
 ) -> OmittedReason:
-    with pinned_dir(folder) as pinned:
+    # pytest.raises is entered before the file calls are replaced: a coverage
+    # run looks up each source file the first time it runs, with os.stat,
+    # and pytest's own code must not be first seen while that is a trap.
+    with pinned_dir(folder) as pinned, pytest.raises(ArtifactFileRefused) as refused:
         with monkeypatch.context() as patch:
             for module, name in _FILE_CALLS:
                 patch.setattr(module, name, _unexpected_file_call)
-            with pytest.raises(ArtifactFileRefused) as refused:
-                read_artifact_file_entry(folder=pinned, parts=parts, max_bytes=1024)
+            read_artifact_file_entry(folder=pinned, parts=parts, max_bytes=1024)
     return refused.value.reason
 
 
