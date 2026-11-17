@@ -1849,7 +1849,9 @@ def _gate_warnings(caplog):
 
 
 @pytest.mark.asyncio
-async def test_router_unavailable_logs_the_refusal_without_its_message(monkeypatch, caplog, owned_logger):
+async def test_router_unavailable_logs_the_refusal_without_its_message(
+    monkeypatch, caplog, owned_logger, router_wire_budget,
+):
     """OpenAI refuses the gate's function tool on chat completions when the
     router model reasons. The failure line names that refusal by class and
     status. Provider text can quote the request or echo a credential."""
@@ -1992,7 +1994,9 @@ async def test_router_unavailable_drops_arbitrary_status_and_provider_body_field
 
 
 @pytest.mark.asyncio
-async def test_router_unavailable_logs_the_status_under_antons_own_error(monkeypatch, caplog):
+async def test_router_unavailable_logs_the_status_under_antons_own_error(
+    monkeypatch, caplog, router_wire_budget,
+):
     """anton raises its own error from the SDK's for the statuses it names, so
     the line reads only the status from that cause. Here,
     an Azure deployment that doesn't exist."""

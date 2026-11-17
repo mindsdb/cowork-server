@@ -8,7 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from coding_service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
+from tests.support.coding.service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
 
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
