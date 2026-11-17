@@ -733,6 +733,7 @@ async def test_a_channel_turn_drops_its_checked_repair_rows_once_its_cards_are_o
     drops the rows of the folders the diff ruled on, as read at turn start."""
     from unittest.mock import AsyncMock, Mock
 
+    from _artifact_cards import make_card
     from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
     from cowork.services import queued_repairs, task_objects
     from cowork.services.queued_repairs import QueuedRepairs
@@ -749,7 +750,7 @@ async def test_a_channel_turn_drops_its_checked_repair_rows_once_its_cards_are_o
     monkeypatch.setattr(task_objects, "turn_artifact_changes", Mock(return_value=task_objects.ArtifactChanges(
         created=[], touched={"made"}, checked_repairs={"fixme"},
     )))
-    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[{"slug": "made"}]))
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[make_card(slug="made")]))
     happened: list[tuple] = []
 
     async def drop_behind_a_full_pool(*, conversation_id, repairs, checked, scope):
@@ -767,7 +768,7 @@ async def test_a_channel_turn_drops_its_checked_repair_rows_once_its_cards_are_o
         input_text="run", model="m", turn_rows=[],
     ):
         if isinstance(event, ArtifactCreated):
-            happened.append(("card", event.artifact["slug"]))
+            happened.append(("card", event.artifact.slug))
 
     assert happened == [("card", "made"), ("drop", repairs, {"fixme"})]
 

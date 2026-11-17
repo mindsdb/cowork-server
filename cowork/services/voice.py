@@ -133,8 +133,12 @@ def _client() -> httpx.AsyncClient:
 # Whether this deployment's inference serves live voice, per process. Inference
 # has no capability route: an empty request answers 404 ``live_not_enabled``
 # where it is off and 400 (no transport) where it is on, without starting
-# anything. Cached, so the + menu doesn't ask on every page load.
+# anything. Cached, so the + menu doesn't ask on every page load. An "off" is
+# asked again sooner: each process caches its own answer, so one that asked
+# before inference turned voice on would otherwise hide the call button for
+# the whole TTL while the others show it.
 _STATUS_TTL_S = 600.0
+_STATUS_OFF_TTL_S = 60.0
 _status_cache: dict[str, tuple[float, bool]] = {}
 
 
@@ -143,7 +147,7 @@ async def available(bearer: str) -> bool:
         return False
     url = live_sessions_url()
     cached = _status_cache.get(url)
-    if cached and time.monotonic() - cached[0] < _STATUS_TTL_S:
+    if cached and time.monotonic() - cached[0] < (_STATUS_TTL_S if cached[1] else _STATUS_OFF_TTL_S):
         return cached[1]
     try:
         async with _client() as client:
