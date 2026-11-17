@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from uuid import UUID
 
-from pydantic import computed_field, field_validator
+from typing import Literal
+
+from pydantic import Field, computed_field, field_validator, model_validator
 
 from cowork.schemas.base import CamelRequest, CamelResponse
 
@@ -45,6 +47,66 @@ class Cadence(str, Enum):
     daily = "daily"
     weekdays = "weekdays"
     weekly = "weekly"
+    monthly = "monthly"
+
+
+Weekday = Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+_WEEK_ORDER = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+class Recurrence(CamelRequest):
+    """Which days a weekly or monthly task runs on. The time of day is the
+    task's next run's, in its zone.
+
+    - Weekly: ``days``, such as ``["mon", "wed", "fri"]``.
+    - Monthly: ``month_day`` (1-31; a shorter month runs on its last day), or
+      ``week`` (1-4, or -1 for the last) with ``weekday``, such as the first
+      Monday.
+    """
+
+    days: list[Weekday] | None = Field(default=None, min_length=1)
+    month_day: int | None = Field(default=None, ge=1, le=31)
+    week: Literal[1, 2, 3, 4, -1] | None = None
+    weekday: Weekday | None = None
+
+    @field_validator("days")
+    @classmethod
+    def _unique_in_week_order(cls, days: list[str] | None) -> list[str] | None:
+        if days is None:
+            return None
+        return sorted(set(days), key=_WEEK_ORDER.index)
+
+    @model_validator(mode="after")
+    def _one_rule(self) -> "Recurrence":
+        if (self.week is None) != (self.weekday is None):
+            raise ValueError("`week` and `weekday` go together, as in the first Monday")
+        rules = [self.days is not None, self.month_day is not None, self.week is not None]
+        if sum(rules) != 1:
+            raise ValueError("Give one rule: `days`, `monthDay`, or `week` with `weekday`")
+        return self
+
+    def stored(self) -> dict:
+        """As the schedule's `recurrence` column holds it."""
+        return self.model_dump(exclude_none=True)
+
+
+class RecurrenceResponse(CamelResponse):
+    days: list[str] | None = None
+    month_day: int | None = None
+    week: int | None = None
+    weekday: str | None = None
+
+
+def check_recurrence(cadence: str, recurrence: "Recurrence | None") -> None:
+    """A rule fits its cadence: `days` for weekly, a day of the month for
+    monthly, and none for any other cadence."""
+    if recurrence is None:
+        return
+    if cadence == Cadence.weekly and recurrence.days is not None:
+        return
+    if cadence == Cadence.monthly and recurrence.days is None:
+        return
+    raise ValueError(f"A {cadence} task can't take that `recurrence`")
 
 
 class RunStatus(str, Enum):
@@ -121,6 +183,8 @@ class ScheduleCreateRequest(CamelRequest):
     prompt: str
     cadence: Cadence
     next_run_at: datetime
+    # Weekly and monthly only; see Recurrence.
+    recurrence: Recurrence | None = None
     model: str | None = None
     timezone: str = "UTC"
     project_id: UUID | None = None
@@ -128,12 +192,19 @@ class ScheduleCreateRequest(CamelRequest):
 
     _next_run_utc = field_validator("next_run_at")(_utc_next_run)
 
+    @model_validator(mode="after")
+    def _recurrence_fits(self) -> "ScheduleCreateRequest":
+        check_recurrence(self.cadence, self.recurrence)
+        return self
+
 
 class ScheduleUpdateRequest(CamelRequest):
     title: str | None = None
     prompt: str | None = None
     cadence: Cadence | None = None
     next_run_at: datetime | None = None
+    # Checked against the cadence it ends up with, by ScheduleService.
+    recurrence: Recurrence | None = None
     model: str | None = None
     timezone: str | None = None
     project_id: UUID | None = None
@@ -147,6 +218,10 @@ class ScheduleResponse(CamelResponse):
     title: str
     prompt: str
     cadence: str
+    # Which days a weekly or monthly task runs on; see Recurrence. Absent on
+    # other cadences, and on a weekly task saved before rules existed, which
+    # runs on its next run's weekday.
+    recurrence: RecurrenceResponse | None = None
     timezone: str
     next_run_at: datetime
     enabled: bool
