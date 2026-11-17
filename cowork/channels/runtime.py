@@ -169,8 +169,8 @@ class TurnOutcome:
     used_tools: bool
     # The "path" of each artifact card the turn emitted
     # (response.artifact_created): the artifact's primary file, or its folder
-    # when it has none. The card itself has no typed model; only its path is
-    # read here.
+    # when it has none, read from the serialized card (ArtifactCard.to_json)
+    # the event carries.
     artifact_paths: tuple[str, ...]
 
 
