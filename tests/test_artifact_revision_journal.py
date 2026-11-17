@@ -33,6 +33,7 @@ from cowork.api.v1.endpoints.artifact_workspace import _not_found_detail
 from cowork.services import artifact_journal, artifact_revisions, local_artifact_comments
 from cowork.services.artifact_draft_review import draft_review_grant, enable_draft_review
 from cowork.services.artifact_identity import ensure_full_id
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_journal import (
     MAX_JOURNAL_FILE_BYTES,
     MAX_JOURNAL_RECORD_BYTES,
@@ -112,7 +113,7 @@ class Layout:
     """One artifact in its project, beside the files a planted name could reach."""
 
     folder: Path
-    metadata: dict
+    metadata: ArtifactMetadata
     artifact_id: str
     secret: Path
     other_secret: Path
@@ -137,7 +138,7 @@ def layout(tmp_path) -> Layout:
     }
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     (folder / "brief.md").write_text(FIRST, encoding="utf-8")
-    artifact_id, metadata = ensure_full_id(folder, metadata)
+    artifact_id, metadata = ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
     return Layout(
         folder=folder,
         metadata=metadata,
@@ -262,7 +263,7 @@ def _victim(tmp_path: Path) -> Path:
     metadata = {"id": "e5f6a7b8", "slug": "plan", "name": "Plan", "type": "document", "primary": "plan.md"}
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     (folder / "plan.md").write_text("# Bob's plan\n", encoding="utf-8")
-    artifact_id, metadata = ensure_full_id(folder, metadata)
+    artifact_id, metadata = ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
     head = current_source(folder, metadata, artifact_id)["revision"]
     _plant_ready_repair(folder, base_revision_id=head["id"], revision_id=head["id"], path=head["path"])
     write_journal_file(folder, "comments.json", content=b'[{"id": "t1", "status": "open"}]')
@@ -1304,7 +1305,7 @@ def _partition_layout(dash: Path, tmp_path: Path) -> Layout:
     server's home folder."""
     return Layout(
         folder=dash,
-        metadata={},
+        metadata=ArtifactMetadata.empty(),
         artifact_id=_artifact_id(dash),
         secret=_write_secret(_general(ALICE) / ".anton" / ".env", SECRET),
         other_secret=_write_secret(_general(BOB) / ".anton" / ".env", OTHER_SECRET),

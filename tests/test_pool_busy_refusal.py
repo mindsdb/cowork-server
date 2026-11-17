@@ -103,7 +103,7 @@ def _assert_refused_as_busy(measured: _Measured) -> None:
 
 
 async def test_a_question_that_finds_the_pool_held_is_refused_while_the_loop_keeps_serving(
-    one_connection_pool,
+    one_connection_pool, without_gc_pauses,
 ):
     """The pool's only connection is out with another caller, so the request's
     unit waits for it in a worker thread and gives up at POOL_TIMEOUT."""
@@ -145,7 +145,7 @@ async def test_a_connection_that_frees_within_pool_timeout_is_used(one_connectio
 
 
 async def test_a_question_that_finds_every_unit_slot_taken_is_refused_while_the_loop_keeps_serving(
-    monkeypatch,
+    monkeypatch, without_gc_pauses,
 ):
     """Units queue for a slot, one per connection the pool can lend (one on
     SQLite), before they ask the pool. That wait is bounded by POOL_TIMEOUT
