@@ -104,22 +104,6 @@ async def test_the_members_connections_travel_by_id_with_the_grants_versions_and
     assert (granted["turn_key_id"], granted["correlation_id"]) == ("turnkey", "r")
 
 
-async def test_the_block_the_producer_sends_is_one_anton_parses_with_the_same_connections(turn):
-    params, _ = await _run(turn)
-
-    request = TurnRequestV1.from_json(json.dumps({
-        "protocol_version": 1, "conversation_id": "conv-1", "input": "hi", "llm": params["llm"],
-        "custom_api": params["custom_api"],
-    }))
-
-    assert request.custom_api is not None
-    assert [
-        {"connection_id": ref.connection_id, "connector_id": ref.connector_id,
-         "name": ref.name, "credential_version": ref.credential_version}
-        for ref in request.custom_api.connections
-    ] == params["custom_api"]["connections"]
-
-
 async def test_a_routed_turn_binds_to_the_key_the_gate_minted(turn, monkeypatch):
     for name in ("mint_turn_key", "mint_turn_key_details"):
         monkeypatch.setattr(prod, name, AsyncMock(side_effect=AssertionError(f"{name} minted a second key")))
@@ -234,7 +218,10 @@ async def test_a_grant_set_that_differs_from_the_request_fails_the_turn(turn, gr
 
 @pytest.mark.parametrize("listing", [
     [_listed(3, status="pending")], [_listed(3), _listed(3)], [_listed(0)], ["not an object"], [_listed(3, name="")],
-], ids=["not verified", "repeated", "zero id", "not an object", "no name"])
+    [_listed(3, connector_id="Bad-One")], [_listed(3, connector_id="a" * 42)], [_listed(3, connector_id="acme-crm")],
+    [_listed(3, name="n" * 129)],
+], ids=["not verified", "repeated", "zero id", "not an object", "no name", "uppercase and dash id",
+        "id too long", "dashed id", "name too long"])
 async def test_a_listing_that_contradicts_itself_fails_the_turn(turn, listing):
     turn["list"].return_value = listing
 
@@ -543,8 +530,8 @@ async def test_the_pod_parses_and_renders_the_job_this_producer_queues(turn, tem
         "custom_api": params["custom_api"], "connectors": params["connectors"],
     }))
 
-    assert [(ref.connection_id, ref.connector_id, ref.credential_version)
-            for ref in request.custom_api.connections] == [(3, "beta_api", 1), (5, "acme_crm", 2)]
+    assert [(ref.connection_id, ref.connector_id, ref.name, ref.credential_version)
+            for ref in request.custom_api.connections] == [(3, "beta_api", "Ops", 1), (5, "acme_crm", "Prod", 2)]
     lines = render_custom_api_notes(request.custom_api, request.connectors).splitlines()
     assert f"- beta_api: {json.dumps(_BETA_PREFIX)}" in lines
     assert f"- acme_crm: {json.dumps(_ACME_PREFIX + chr(10) * 2 + 'Call /v1/me first.')}" in lines
