@@ -283,6 +283,8 @@ _EXPORT_REFUSAL_STATUS = {
     ExportRefusal.NOT_FOUND: status.HTTP_404_NOT_FOUND,
     ExportRefusal.BUSY: status.HTTP_429_TOO_MANY_REQUESTS,
 }
+# The artifact export words this refusal for a file.
+_EXPORT_REFUSAL_DETAIL = {ExportRefusal.TOO_LARGE: "This doc is too large to export."}
 _PDF_FAILURE_DETAIL = {
     413: "This doc can't be exported as a PDF.",
     422: "This doc can't be exported as a PDF.",
@@ -306,8 +308,8 @@ async def export_doc(
     format: Literal["md", "html", "pdf", "docx"] = Query(default="md"),
 ):
     """The doc as a file to download. Markdown and HTML always; Word and PDF as
-    the deployment offers them (``offered_formats``): one conversion at a time,
-    a busy server answering 429 at once, as the artifact export does."""
+    the deployment offers them (``offered_formats``), converted, admitted and
+    refused as the artifact export does them."""
     org_mode = bool(scope.org_mode)
     if format not in offered_formats(org_mode=org_mode):
         if org_export_refused(org_mode=org_mode):
@@ -330,11 +332,16 @@ async def export_doc(
     except DocError as err:
         raise _doc_error(err) from err
     except ExportRefused as exc:
-        raise HTTPException(status_code=_EXPORT_REFUSAL_STATUS[exc.refusal], detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=_EXPORT_REFUSAL_STATUS[exc.refusal],
+            detail=_EXPORT_REFUSAL_DETAIL.get(exc.refusal, str(exc)),
+        ) from exc
     except RenderPdfFailed as exc:
         # The reason never quotes the render service, so it is safe to log.
         logger.info("PDF export of a doc failed: %s", exc)
         raise HTTPException(status_code=exc.status, detail=_PDF_FAILURE_DETAIL[exc.status]) from exc
+    except FilesystemBusy:
+        raise  # 503 with Retry-After (cowork.server), not a failed export
     except Exception as exc:
         logger.warning("doc export to %s failed", format, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Could not export the doc as {format.upper()}") from exc
