@@ -1,12 +1,14 @@
 """A doc as a file to download: Markdown, its page as HTML, Word or PDF.
 
-Word and PDF are made as an artifact's export makes them
-(cowork.services.artifact_export): the doc's page is first made self-contained
-by the fetch-free inliner, so an image comes from the doc itself or its folder
-and a web image is left out, never fetched. Word is written by the Word writer;
-a PDF comes from the render service, which only a deployment that configures
-one offers. While org export is off, an organization deployment offers
-neither. Markdown and HTML need no conversion and are always offered.
+Word and PDF are made the way an artifact's export makes them
+(cowork.services.artifact_export): the doc's page goes to the export's
+conversion process, which the server kills past its time or memory limit.
+There the fetch-free inliner makes the page self-contained, so an image comes
+from the doc itself or its folder and a web image is left out, never fetched.
+Word is written by the Word writer in that process; a PDF comes from the render
+service, which only a deployment that configures one offers. While org export
+is off, an organization deployment offers neither. Markdown and HTML need no
+conversion and are always offered.
 """
 
 from __future__ import annotations
@@ -14,10 +16,8 @@ from __future__ import annotations
 import html
 
 from cowork.common.paths import PinnedDir
-from cowork.schemas.artifact_export import InlineLimits, InlineMode
 from cowork.services import artifact_export
-from cowork.services.artifact_inline import inline_artifact_html
-from cowork.services.docx_writer import write_docx
+from cowork.services.artifact_export import ExportRefusal, ExportRefused
 
 from .markdown import doc_to_markdown
 from .model import Doc
@@ -29,10 +29,14 @@ MEDIA_TYPES = {
     "pdf": "application/pdf",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
-# The formats that convert, in a worker thread and one at a time (export_slot).
+# The formats that convert, in the conversion process and one at a time (export_slot).
 CONVERTED_FORMATS = ("docx", "pdf")
 # The order the doc's Export menu lists them in.
 _MENU_ORDER = ("docx", "pdf", "md", "html")
+# The most of the title a conversion request carries: its header is bounded,
+# and a doc title can run to 20,000 characters. Nothing is lost, since Word
+# takes its title from the page's own <title>.
+_REQUEST_TITLE_CHARS = 255
 
 
 def offered_formats(*, org_mode: bool) -> list[str]:
@@ -56,7 +60,8 @@ def _document(doc: Doc) -> bytes:
 def export_bytes(doc: Doc, fmt: str, *, folder: PinnedDir | None = None, org_mode: bool = False) -> bytes:
     """``doc`` as ``fmt``. Word and PDF need the doc's pinned ``folder``, which
     an image beside the doc is read from, and run in an anyio worker thread: a
-    PDF reaches the event loop from there for the render service."""
+    PDF reaches the event loop from there for the render service. They raise
+    ``ExportRefused`` and ``RenderPdfFailed`` as an artifact's export does."""
     if fmt == "md":
         body = doc_to_markdown(doc)
         if not body.lstrip().startswith("# "):
@@ -66,21 +71,20 @@ def export_bytes(doc: Doc, fmt: str, *, folder: PinnedDir | None = None, org_mod
         return doc_html(doc).encode("utf-8")
     if folder is None:
         raise ValueError(f"a {fmt} export reads the doc's folder")
-    if fmt == "pdf":
-        budget = artifact_export.PDF_INLINE_BUDGET_BYTES
-    else:
-        budget = artifact_export.ORG_INLINE_BUDGET_BYTES if org_mode else artifact_export.INLINE_BUDGET_BYTES
-    inlined = inline_artifact_html(
-        html=_document(doc),
-        folder=folder,
+    page = _document(doc)
+    # The bound an artifact's HTML source is read with.
+    if len(page) > artifact_export.HTML_SOURCE_MAX_BYTES:
+        raise ExportRefused(ExportRefusal.TOO_LARGE, "This doc is too large to export.")
+    return artifact_export.convert_document(
+        source=page,
+        suffix=".html",
+        title=doc["title"][:_REQUEST_TITLE_CHARS],
         base_parts=(),
-        mode=InlineMode.WORD if fmt == "docx" else InlineMode.PDF,
-        limits=InlineLimits(max_total_bytes=budget),
-    )
-    if fmt == "docx":
-        return write_docx(document=inlined, title=doc["title"])
-    # The one way the server gets a PDF: the render service, as an artifact's export does.
-    return artifact_export._render_pdf(source_name="doc.html", html=inlined.html)
+        source_name="doc.html",
+        folder=folder,
+        export_format=fmt,
+        org_mode=org_mode,
+    ).data
 
 
 def export_filename(doc: Doc, fmt: str) -> str:

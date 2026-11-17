@@ -305,8 +305,9 @@ async def export_doc(
     format: Literal["md", "html", "pdf", "docx"] = Query(default="md"),
 ):
     """The doc as a file to download. Markdown and HTML always; Word and PDF as
-    the deployment offers them (``offered_formats``): one conversion at a time,
-    a busy server answering 429 at once, as the artifact export does."""
+    the deployment offers them (``offered_formats``), converted in the export's
+    conversion process: one at a time, a busy server answering 429 at once and
+    a doc past a limit 413, as the artifact export does."""
     org_mode = bool(scope.org_mode)
     if format not in offered_formats(org_mode=org_mode):
         if org_export_refused(org_mode=org_mode):
@@ -334,6 +335,8 @@ async def export_doc(
         # The reason never quotes the render service, so it is safe to log.
         logger.info("PDF export of a doc failed: %s", exc)
         raise HTTPException(status_code=exc.status, detail=_PDF_FAILURE_DETAIL[exc.status]) from exc
+    except FilesystemBusy:
+        raise  # 503 with Retry-After (cowork.server), not a failed export
     except Exception as exc:
         logger.warning("doc export to %s failed", format, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Could not export the doc as {format.upper()}") from exc

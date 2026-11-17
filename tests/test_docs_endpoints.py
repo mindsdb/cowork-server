@@ -583,3 +583,177 @@ def test_an_edit_answers_its_undo_and_posting_it_puts_the_doc_back(client, doc):
     assert back["doc"]["tabs"][0]["blocks"][0]["id"] == lead["id"]
     assert back["doc"]["tabs"][0]["blocks"][0]["text"] == lead["text"]
     assert back["undo"][0] == {"op": "delete", "tab": first["tabs"][0]["id"], "target": [lead["id"]]}
+
+
+# ---------------------------------------------------------------- Word and PDF in the conversion process
+
+
+@pytest.fixture
+def conversions(monkeypatch):
+    """Each conversion an export runs, as (the call's arguments, its result); it still runs."""
+    from cowork.services import artifact_export
+
+    calls = []
+    convert = artifact_export.convert_in_child
+
+    def spy(**kwargs):
+        result = convert(**kwargs)
+        calls.append((kwargs, result))
+        return result
+
+    monkeypatch.setattr(artifact_export, "convert_in_child", spy)
+    return calls
+
+
+@pytest.mark.parametrize("fmt", ["docx", "pdf"])
+def test_word_and_pdf_convert_the_docs_page_in_the_conversion_process(client, doc, render_service, conversions, fmt):
+    from cowork.services.artifact_export import INLINE_BUDGET_BYTES, PDF_INLINE_BUDGET_BYTES, conversion_limits
+
+    res = client.get(_url(doc, f"/export?format={fmt}"))
+
+    assert res.status_code == 200, res.text
+    [(call, result)] = conversions
+    request = call["request"]
+    assert (request.export_format, request.suffix, request.base_parts, request.title) == (fmt, ".html", (), "Hiring plan")
+    assert request.limits.max_total_bytes == (PDF_INLINE_BUDGET_BYTES if fmt == "pdf" else INLINE_BUDGET_BYTES)
+    assert call["limits"] == conversion_limits(org_mode=False)
+    assert b"<h1>Hiring plan</h1>" in call["source"]
+    if fmt == "docx":
+        assert res.content == result.data
+    else:
+        # The render service gets the page the conversion process inlined, and only that.
+        assert [r.html for r in render_service.requests] == [result.data.decode("utf-8")]
+        assert res.content == FAKE_PDF
+
+
+def test_in_org_mode_a_doc_converts_with_the_org_budget_and_memory(conversions, tmp_path):
+    from cowork.common.paths import pinned_dir
+    from cowork.docs.export import export_bytes
+    from cowork.docs.model import new_doc, new_tab
+    from cowork.services.artifact_export import ORG_INLINE_BUDGET_BYTES, conversion_limits
+
+    doc = {**new_doc("Plan"), "tabs": [new_tab("Plan")]}
+    with pinned_dir(tmp_path) as pinned:
+        assert export_bytes(doc, "docx", folder=pinned, org_mode=True)[:2] == b"PK"
+
+    [(call, _result)] = conversions
+    assert call["request"].limits.max_total_bytes == ORG_INLINE_BUDGET_BYTES
+    assert call["limits"] == conversion_limits(org_mode=True)
+
+
+def test_a_title_past_the_requests_header_bound_still_exports_to_word(client, doc):
+    title = "計" * 20_000
+    renamed = client.post(_url(doc, "/ops"), json={"ops": [{"op": "rename_doc", "title": title}]})
+    assert renamed.status_code == 200, renamed.text
+
+    exported = client.get(_url(doc, "/export?format=docx"))
+
+    assert exported.status_code == 200, exported.text
+    assert _docx_paragraphs(exported.content)[0][1] == title
+
+
+@pytest.mark.parametrize("second_fmt", ["docx", "pdf"])
+def test_a_second_export_while_one_converts_answers_429_at_once(client, doc, render_service, monkeypatch, second_fmt):
+    import threading
+    import time
+
+    from cowork.services import artifact_export
+
+    entered, release = threading.Event(), threading.Event()
+    convert = artifact_export.convert_in_child
+
+    def held(**kwargs):
+        entered.set()
+        assert release.wait(timeout=10)
+        return convert(**kwargs)
+
+    monkeypatch.setattr(artifact_export, "convert_in_child", held)
+    answers = []
+    first = threading.Thread(target=lambda: answers.append(client.get(_url(doc, "/export?format=docx")).status_code))
+    first.start()
+    try:
+        assert entered.wait(timeout=10)
+        started = time.monotonic()
+        second = client.get(_url(doc, f"/export?format={second_fmt}"))
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        first.join(timeout=60)
+
+    assert second.status_code == 429, second.text
+    assert second.json()["detail"] == "An export is already running; try again in a moment."
+    assert elapsed < 1.0
+    assert answers == [200]
+    assert client.get(_url(doc, f"/export?format={second_fmt}")).status_code == 200
+
+
+def test_a_word_export_while_another_conversion_holds_the_process_answers_429(client, doc):
+    """Publishing a Markdown page converts in the same one-at-a-time process."""
+    from cowork.services import export_runner
+
+    assert export_runner._child_slot.acquire(blocking=False)
+    try:
+        res = client.get(_url(doc, "/export?format=docx"))
+    finally:
+        export_runner._child_slot.release()
+
+    assert res.status_code == 429, res.text
+    assert res.json()["detail"] == "An export is already running; try again in a moment."
+
+
+def test_a_page_past_the_source_bound_answers_413_and_is_never_converted(client, doc, conversions, monkeypatch):
+    from cowork.services import artifact_export
+
+    monkeypatch.setattr(artifact_export, "HTML_SOURCE_MAX_BYTES", 100)
+
+    res = client.get(_url(doc, "/export?format=docx"))
+
+    assert res.status_code == 413, res.text
+    assert res.json()["detail"] == "This doc is too large to export."
+    assert conversions == []
+
+
+@pytest.mark.parametrize("fmt", ["docx", "pdf"])
+def test_a_conversion_past_its_limits_answers_413_and_renders_nothing(client, doc, render_service, monkeypatch, fmt):
+    from cowork.schemas.export_child import ChildLimits
+    from cowork.services import artifact_export
+
+    monkeypatch.setattr(
+        artifact_export, "conversion_limits",
+        lambda *, org_mode: ChildLimits(wall_seconds=0.0, memory_bytes=artifact_export.CONVERSION_MEMORY_BYTES),
+    )
+
+    res = client.get(_url(doc, f"/export?format={fmt}"))
+
+    assert res.status_code == 413, res.text
+    assert res.json()["detail"] == "This file can't be exported."
+    assert render_service.requests == []
+
+
+def test_a_failed_conversion_answers_500(client, doc, monkeypatch):
+    from cowork.services import artifact_export, export_runner
+
+    def broken(**_kwargs):
+        raise export_runner.ConversionError("ValueError")
+
+    monkeypatch.setattr(artifact_export, "convert_in_child", broken)
+
+    res = client.get(_url(doc, "/export?format=docx"))
+
+    assert res.status_code == 500, res.text
+    assert res.json()["detail"] == "Could not export the doc as DOCX"
+
+
+def test_a_busy_file_store_answers_503_not_a_failed_export(client, doc, monkeypatch):
+    from cowork.api.v1.endpoints import docs as docs_ep
+    from cowork.db.units import FilesystemBusy
+
+    def busy(*_args, **_kwargs):
+        raise FilesystemBusy(limiter="run_efs")
+
+    monkeypatch.setattr(docs_ep, "_converted", busy)
+
+    res = client.get(_url(doc, "/export?format=docx"))
+
+    assert res.status_code == 503, res.text
+    assert "Retry-After" in res.headers

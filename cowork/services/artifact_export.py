@@ -18,7 +18,7 @@ import os
 import secrets
 from collections.abc import AsyncIterator, Callable
 from contextlib import ExitStack, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
@@ -392,6 +392,47 @@ def _convert(
         raise ExportRefused(ExportRefusal.TOO_LARGE, _CANT_EXPORT) from exc
 
 
+def convert_document(
+    *,
+    source: bytes,
+    suffix: str,
+    title: str,
+    base_parts: tuple[str, ...],
+    source_name: str,
+    folder: PinnedDir,
+    export_format: ExportFormat,
+    org_mode: bool,
+) -> Conversion:
+    """Convert *source* to *export_format* as an export does, writing nothing.
+
+    The conversion runs in a conversion process that reads the files it names
+    through *folder*, below *base_parts*; a PDF is then the render service's
+    PDF of the inlined *source_name*. Blocking, like ``_render_pdf``. Raises
+    ``ExportRefused`` as ``_convert`` does, and ``RenderPdfFailed`` when no
+    usable PDF came back.
+    """
+    if export_format == "pdf":
+        budget = PDF_INLINE_BUDGET_BYTES
+    else:
+        budget = ORG_INLINE_BUDGET_BYTES if org_mode else INLINE_BUDGET_BYTES
+    conversion = _convert(
+        request=ConvertRequest(
+            export_format=export_format,
+            suffix=suffix,
+            title=title,
+            base_parts=base_parts,
+            limits=InlineLimits(max_total_bytes=budget),
+        ),
+        source=source,
+        folder=folder,
+        org_mode=org_mode,
+    )
+    if export_format != "pdf":
+        return conversion
+    pdf = _render_pdf(source_name=source_name, html=conversion.data.decode("utf-8"))
+    return replace(conversion, data=pdf)
+
+
 def _primary_names_a_file(*, folder: PinnedDir, primary: object) -> bool:
     """Whether metadata's *primary* names a file the card shows.
 
@@ -650,32 +691,21 @@ def export_primary_file(
         if parts is None or export_format not in offered or extension is None:
             raise ExportRefused(ExportRefusal.NOT_OFFERED, _NOT_OFFERED)
         suffix = PurePosixPath(parts[-1]).suffix.lower()
-        title = PurePosixPath(parts[-1]).stem
-        data = _read_source(folder=folder, parts=parts, suffix=suffix)
-        if export_format == "pdf":
-            budget = PDF_INLINE_BUDGET_BYTES
-        else:
-            budget = ORG_INLINE_BUDGET_BYTES if org_mode else INLINE_BUDGET_BYTES
-        conversion = _convert(
-            request=ConvertRequest(
-                export_format=export_format,
-                suffix=suffix,
-                title=title,
-                base_parts=parts[:-1],
-                limits=InlineLimits(max_total_bytes=budget),
-            ),
-            source=data,
+        conversion = convert_document(
+            source=_read_source(folder=folder, parts=parts, suffix=suffix),
+            suffix=suffix,
+            title=PurePosixPath(parts[-1]).stem,
+            base_parts=parts[:-1],
+            source_name=parts[-1],
             folder=folder,
+            export_format=export_format,
             org_mode=org_mode,
         )
-        output = conversion.data
-        if export_format == "pdf":
-            output = _render_pdf(source_name=parts[-1], html=output.decode("utf-8"))
         name = _write_beside(
             folder=folder,
             parts=parts,
             extension=extension,
-            data=output,
+            data=conversion.data,
             before_placing=lambda: _record_primary(folder=folder, primary="/".join(parts)),
         )
     rel_path = "/".join((*parts[:-1], name))
