@@ -229,6 +229,80 @@ def _parse(monkeypatch, rows):
     return asyncio.run(providers.fetch_minds_models("https://api.mindshub.ai", "mdb_test"))
 
 
+def _fetch_mindshub(monkeypatch, by_query):
+    """A MindsHub fetch whose answer depends on the query: ``by_query`` maps it to (status, rows)."""
+    from cowork.services import providers
+
+    asked = []
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            query = url.partition("/models/")[2]
+            asked.append(query)
+            status, rows = by_query[query]
+            return type("R", (), {"status_code": status, "json": staticmethod(lambda: {"data": rows})})()
+
+    monkeypatch.setattr(providers.httpx, "AsyncClient", _Client)
+    providers._minds_models_cache.clear()
+    listing = asyncio.run(providers.fetch_minds_models("https://api.mindshub.ai", "mdb_test", mindshub=True))
+    return listing, asked
+
+
+def test_mindshub_image_models_are_asked_for_by_kind(monkeypatch):
+    """MindsHub lists image models only under ``?kind=image``; a stray chat row there is not one."""
+    listing, asked = _fetch_mindshub(monkeypatch, {
+        "": (200, [{"id": "sonnet", "kind": "chat"}]),
+        "?kind=image": (200, [{"id": FLARE, "kind": "image", "enabled": True}, {"id": "stray", "kind": "chat"}]),
+    })
+    assert sorted(asked) == ["", "?kind=image"]
+    assert listing.ids == ["sonnet"]
+    assert listing.image_models == {FLARE: True}
+
+
+def test_a_failed_image_request_fails_the_listing(monkeypatch):
+    """Read as a good listing with no image models, it would empty the stored image map."""
+    listing, _ = _fetch_mindshub(monkeypatch, {
+        "": (200, [{"id": "sonnet", "kind": "chat"}]),
+        "?kind=image": (503, []),
+    })
+    assert listing.ids is None
+    assert listing.image_models == {}
+
+
+def test_a_custom_endpoint_is_not_asked_for_image_models(monkeypatch):
+    from cowork.services import providers
+
+    asked = []
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            asked.append(url)
+            return type("R", (), {"status_code": 200, "json": staticmethod(lambda: {"data": [{"id": "gpt"}]})})()
+
+    monkeypatch.setattr(providers.httpx, "AsyncClient", _Client)
+    providers._minds_models_cache.clear()
+    asyncio.run(providers.fetch_minds_models("https://llm.example.com", "sk-test"))
+    assert asked == ["https://llm.example.com/v1/models/"]
+
+
 def test_image_rows_are_listed_apart_from_the_chat_models(monkeypatch):
     listing = _parse(monkeypatch, [
         {"id": MINDS_FREE_MODEL, "kind": "chat", "enabled": True,

@@ -579,7 +579,7 @@ async def fetch_minds_models(
             _store_failure(cache_key)
         return val
 
-    async def _fetch() -> httpx.Response:
+    async def _fetch(query: str = "") -> httpx.Response:
         # `max_redirects` low (not the httpx default of 20) so a same-origin
         # redirect loop can't multiply the per-op timeout into a long stall;
         # the endpoint is hit directly at `/models/` so no real redirect is
@@ -596,32 +596,46 @@ async def fetch_minds_models(
             # `/models/` directly is what the other frameworks' shared
             # model-catalog helper already does.
             return await client.get(
-                f"{base}/models/",
+                f"{base}/models/{query}",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
 
+    def _rows(r: httpx.Response) -> Optional[list]:
+        # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
+        # Accept a bare list too, defensively. Each row may carry the non-standard
+        # extension fields `reasoning_efforts` (list), `default_reasoning_effort`
+        # (str), `enabled` (bool), and `label` / `provider` / `family` (str) —
+        # OpenAI clients ignore unknown keys; we surface them for the picker.
+        if r.status_code >= 400:
+            logger.debug("minds /models fetch returned HTTP %s", r.status_code)
+            return None
+        data = r.json()
+        rows = data.get("data") if isinstance(data, dict) else data
+        return rows if isinstance(rows, list) else None
+
+    # MindsHub lists image models only when asked for with `?kind=image`, so a
+    # chat picker that predates `kind` never offers one. One listing: either half failing fails it.
+    fetches = [_fetch()] + ([_fetch(f"?kind={_IMAGE_KIND}")] if mindshub else [])
     try:
         # Hard TOTAL budget: httpx.Timeout is per-operation, so it alone does
         # not bound a redirect chain or a trickled response. asyncio.wait_for
         # cancels the whole fetch at the ceiling and the TimeoutError falls
         # through to the negative-cache path below.
-        r = await asyncio.wait_for(_fetch(), _MINDS_MODELS_TIMEOUT_S)
-        if r.status_code >= 400:
-            logger.debug("minds /models fetch returned HTTP %s", r.status_code)
-            return _remember(_empty_listing())
-        data = r.json()
+        responses = await asyncio.wait_for(asyncio.gather(*fetches), _MINDS_MODELS_TIMEOUT_S)
+        parsed = [_rows(r) for r in responses]
     except Exception as exc:
         logger.debug("minds /models fetch failed: %s", exc)
         return _remember(_empty_listing())
-
-    # OpenAI shape: {"object": "list", "data": [{"id": "...", ...}]}.
-    # Accept a bare list too, defensively. Each row may carry the non-standard
-    # extension fields `reasoning_efforts` (list), `default_reasoning_effort`
-    # (str), `enabled` (bool), and `label` / `provider` / `family` (str) —
-    # OpenAI clients ignore unknown keys; we surface them for the picker.
-    rows = data.get("data") if isinstance(data, dict) else data
-    if not isinstance(rows, list):
+    if any(part is None for part in parsed):
         return _remember(_empty_listing())
+    rows = parsed[0]
+    if mindshub:
+        # Only the image rows: a gateway that ignores `kind` answers with its whole listing.
+        listed = {str(row.get("id")).strip() for row in rows if isinstance(row, dict)}
+        rows = rows + [
+            row for row in parsed[1]
+            if isinstance(row, dict) and row.get("kind") == _IMAGE_KIND and str(row.get("id")).strip() not in listed
+        ]
     ids: list[str] = []
     efforts: dict[str, dict] = {}
     enabled: dict[str, bool] = {}

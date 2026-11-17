@@ -683,7 +683,8 @@ def test_org_catalog_cache_is_scoped_by_caller_within_one_org(monkeypatch):
     calls = []
 
     async def fake_get(url, headers=None, **kw):
-        calls.append(headers.get("Authorization"))
+        if "?kind=" not in url:  # the image half of the same fetch
+            calls.append(headers.get("Authorization"))
         restricted = headers["Authorization"].startswith("Bearer tok-member")
 
         class R:
