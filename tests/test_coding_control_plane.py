@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
@@ -182,6 +183,21 @@ def project(local_computer_id: str) -> CodeProject:
             ),
         ],
     )
+
+
+def test_concurrent_first_starts_mint_one_local_computer(tmp_path: Path) -> None:
+    barrier = threading.Barrier(8)
+
+    def first_start(_: int) -> str:
+        barrier.wait()
+        return ControlPlaneService(tmp_path, capabilities()).local_computer.id
+
+    with ThreadPoolExecutor(8) as pool:
+        identifiers = set(pool.map(first_start, range(8)))
+
+    restarted = ControlPlaneService(tmp_path, capabilities())
+    assert identifiers == {restarted.local_computer.id}
+    assert [item.id for item in restarted.store.list_computers() if item.is_local] == [restarted.local_computer.id]
 
 
 def test_registration_is_one_use_and_computers_survive_restart(tmp_path: Path) -> None:
