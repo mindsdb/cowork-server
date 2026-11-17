@@ -6,6 +6,7 @@ from anton.core.datasources.data_vault import is_secret_key
 
 from cowork.db.scoped import TenantScope
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse
+from cowork.services.connectors import app_held
 from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL as _SENTINEL,
     connection_display_name,
@@ -125,6 +126,7 @@ class ConnectionsService:
         fields = (record or {}).get("fields") or {}
         if fields.get("_method") != "mcp":
             return None
+        fields = app_held.overlay(own_vault_root(self.scope), engine, name, fields, keys=("access_token",))
         return fields.get("access_token") or None
 
     def get(self, engine: str, name: str) -> ConnectionDetailResponse | None:
@@ -133,7 +135,9 @@ class ConnectionsService:
         if record is None:
             return None
 
-        fields: dict = dict(record.get("fields") or {})
+        fields: dict = app_held.overlay(
+            own_vault_root(self.scope), engine, name, dict(record.get("fields") or {}), keys=("access_mode",)
+        )
         # Mask secrets. Prefer the record's explicit secure_keys; fall back to the
         # name heuristic so records saved before secure_keys was persisted don't
         # leak their secret values through this endpoint.
@@ -352,7 +356,38 @@ class ConnectionsService:
     def delete(self, engine: str, name: str) -> bool:
         deleted = self._vault().delete(engine, name)
         discard_lock(vault_root=own_vault_root(self.scope), engine=engine, name=name)
+        app_held.release(own_vault_root(self.scope), engine, name)
         return deleted
+
+    def method(self, engine: str, name: str) -> str | None:
+        """The connection's ``_method``; raises LookupError when it doesn't exist."""
+        record = self._read_record(self._vault(), engine, name)
+        if record is None:
+            raise LookupError(f"{engine}/{name}")
+        return (record.get("fields") or {}).get("_method")
+
+    def hold_app_held(self, engine: str, name: str, values: dict) -> dict[str, str]:
+        """Merge app-held values (app_held.VAULT_FIELD keys) into server memory."""
+        return app_held.hold(own_vault_root(self.scope), engine, name, values)
+
+    def strip_app_held(self, engine: str, name: str) -> bool:
+        """Once memory holds both the token and the access mode, remove them
+        from the vault file. Returns whether the file is now without them."""
+        entry = app_held.held(own_vault_root(self.scope), engine, name)
+        if not (entry.get("access_token") and entry.get("access_mode")):
+            return False
+        vault = self._vault()
+        stripped_fields = ("access_token", "_access_mode")
+        with self._lock(engine, name):
+            record = self._read_record(vault, engine, name)
+            if record is None:
+                return False
+            fields = dict(record.get("fields") or {})
+            if any(key in fields for key in stripped_fields):
+                for key in stripped_fields:
+                    fields.pop(key, None)
+                vault.save(engine, name, fields, secure_keys=record.get("secure_keys"))
+            return True
 
 
 # LOCAL-MODE-ONLY convenience singleton (unscoped, so scoped_storage_root

@@ -31,6 +31,9 @@ def repository(tmp_path: Path) -> Path:
     git(repo, "init")
     git(repo, "config", "user.email", "cowork@example.invalid")
     git(repo, "config", "user.name", "Cowork Test")
+    # A commit starts a detached `git maintenance`, which since git 2.55 holds
+    # .git/objects/maintenance.lock after the commit returns.
+    git(repo, "config", "maintenance.auto", "false")
     (repo / "README.md").write_text("base\n", encoding="utf-8")
     git(repo, "add", ".")
     git(repo, "commit", "-m", "base")
@@ -335,3 +338,28 @@ def close_services() -> None:
     """Stop every service a test built through ``service_with``; the conftest fixture calls this per test."""
     while _open_services:
         _open_services.pop().close_all()
+
+
+def copy_folders_without_git(workspaces) -> None:
+    """Copy folders a worktree cannot use, as tasks created before folder copies stopped did.
+
+    Folder copies are no longer made, but tasks that have one keep working, so
+    their tests still need one.
+    """
+    from cowork.coding.workspace import WorkspaceError
+
+    prepare = workspaces.prepare
+
+    def prepare_or_copy(session_id, raw_path, *args, **kwargs):
+        try:
+            return prepare(session_id, raw_path, *args, **kwargs)
+        except WorkspaceError as exc:
+            if "Initialize Git" not in str(exc) and "first commit" not in str(exc):
+                raise
+            inspection = workspaces.inspect(raw_path)
+            return workspaces._prepare_local_copy(
+                session_id, Path(inspection.repository_root or inspection.path)
+            )
+
+    workspaces.check_source = lambda raw_path: None
+    workspaces.prepare = prepare_or_copy
