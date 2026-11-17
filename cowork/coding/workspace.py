@@ -72,6 +72,7 @@ NO_COMMITS = "This repository has no commits yet. Make a first commit to use a W
 # works in the folder but has nothing to compare to.
 NO_REVIEW_WITHOUT_GIT = "This folder isn't a Git repository, so the task's changes cannot be reviewed. Initialize Git to review them."
 NO_REVIEW_WITHOUT_COMMITS = "This repository has no commits yet, so the task's changes cannot be reviewed. Make a first commit to review them."
+WRITES_HELD = "Until you allow writes, the agent can read the folder but must ask before changing it."
 MAX_DIFF_FILES = 250
 MAX_TEXT_DIFF_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_DIFF_BYTES = 4 * 1024 * 1024

@@ -411,6 +411,10 @@ class CodingSession(BaseModel):
     network_access: bool = False
     web_search: bool = False
     additional_dirs: list[str] = Field(default_factory=list)
+    # A task working in a folder with no starting commit has no review and no
+    # undo, so it starts with a read-only sandbox until the user allows writes.
+    # Full access ignores it. Tasks saved before this field keep writing.
+    writes_allowed: bool = True
     status: SessionStatus = SessionStatus.ready
     # Compatibility projection of the durable control-plane records. The
     # session remains the existing renderer/runtime contract while Task and
@@ -616,6 +620,7 @@ class SessionUpdateRequest(BaseModel):
     network_access: bool | None = None
     web_search: bool | None = None
     additional_dirs: list[str] | None = Field(default=None, max_length=16)
+    writes_allowed: bool | None = None
 
 
 class SessionRecoverRequest(BaseModel):
