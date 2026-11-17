@@ -245,18 +245,37 @@ def test_codex_runtime_home_is_persistent_and_isolated_from_shell_config(
     assert codex_config.user_skills_root() == tmp_path / "unrelated-user-home" / "skills"
 
 
-def test_turn_input_preserves_native_mentions_and_local_images() -> None:
-    assert codex_config.turn_input(
+def test_turn_input_lists_attached_files_as_text_and_keeps_local_images() -> None:
+    # Codex drops a file sent as a ``mention`` input, so the model must be
+    # told the path in text to read it.
+    items = codex_config.turn_input(
         "Compare these files",
         (
             EngineInputReference(name="src/app.ts", path="/work/src/app.ts", kind="mention"),
             EngineInputReference(name="design.png", path="/tmp/design.png", kind="local_image"),
+            EngineInputReference(
+                name="notes.md", path="/home/me/notes.md", kind="mention", line_start=3, line_end=7,
+            ),
         ),
-    ) == [
+    )
+
+    assert items == [
         {"type": "text", "text": "Compare these files"},
-        {"type": "mention", "name": "src/app.ts", "path": "/work/src/app.ts"},
+        {
+            "type": "text",
+            "text": (
+                "Attached files and folders. Read them from these paths:\n"
+                "- src/app.ts: /work/src/app.ts\n"
+                "- notes.md, lines 3-7: /home/me/notes.md"
+            ),
+        },
         {"type": "localImage", "path": "/tmp/design.png"},
     ]
+    assert all(item["type"] != "mention" for item in items)
+
+
+def test_turn_input_without_attachments_is_just_the_prompt() -> None:
+    assert codex_config.turn_input("Do it", ()) == [{"type": "text", "text": "Do it"}]
 
 
 def test_codex_launch_policy_is_resolved_once_for_client_and_thread(monkeypatch) -> None:

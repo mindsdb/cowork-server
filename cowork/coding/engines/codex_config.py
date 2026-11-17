@@ -70,13 +70,23 @@ def turn_input(
     prompt: str,
     attachments: tuple[EngineInputReference, ...],
 ) -> list[dict[str, str]]:
+    # Codex's ``mention`` input names an app, connector or skill, and a file
+    # path sent that way never reaches the model. Files and folders are listed
+    # as text instead, so the agent can read them from their paths.
     items: list[dict[str, str]] = [{"type": "text", "text": prompt}]
-    for item in attachments:
-        if item.kind == "local_image":
-            items.append({"type": "localImage", "path": item.path})
-        else:
-            items.append({"type": "mention", "name": item.name, "path": item.path})
+    references = [item for item in attachments if item.kind != "local_image"]
+    if references:
+        items.append({"type": "text", "text": _references_text(references)})
+    items.extend({"type": "localImage", "path": item.path} for item in attachments if item.kind == "local_image")
     return items
+
+
+def _references_text(references: list[EngineInputReference]) -> str:
+    lines = ["Attached files and folders. Read them from these paths:"]
+    for item in references:
+        span = f", lines {item.line_start}-{item.line_end}" if item.line_start and item.line_end else ""
+        lines.append(f"- {item.name}{span}: {item.path}")
+    return "\n".join(lines)
 
 
 def approval_policy(permission_mode: PermissionMode) -> str:
