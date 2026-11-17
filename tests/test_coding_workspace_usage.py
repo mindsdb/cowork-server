@@ -7,7 +7,7 @@ import threading
 from datetime import timedelta
 from pathlib import Path
 
-from coding_service_fakes import CREDS, FakeEngine, copy_folders_without_git, git, repository, service_with, wait_for_status
+from tests.support.coding.service_fakes import CREDS, FakeEngine, copy_folders_without_git, git, repository, service_with, wait_for_status
 
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode
 from cowork.coding.project_models import ProjectCreateRequest, ProjectFolder
@@ -283,6 +283,7 @@ def test_deleting_a_folder_copy_frees_its_storage(tmp_path: Path) -> None:
     (Path(session.workspace_path) / "edit.txt").write_text("unsaved work\n", encoding="utf-8")
 
     service.delete_session(session.id)
+    assert service.workspaces.pending_removals.wait(30)
     page = service.workspace_usage.measure()
 
     assert session.id not in {item.session_id for item in page.items}

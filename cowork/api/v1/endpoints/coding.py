@@ -50,6 +50,7 @@ from cowork.coding.contracts import (
     WorkspaceModeOptions,
     WorkspaceReasonCode,
     WorkspaceUsagePage,
+    WorkspaceCleanupStatus,
 )
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
 from cowork.coding.contracts import ModeTurnRequest
@@ -260,6 +261,16 @@ def workspace_usage(session_id: str | None = Query(default=None, min_length=1, m
     Passing the task being looked at measures again if the last measurement predates it.
     """
     return _service().workspace_usage_page(session_id)
+
+
+@router.get("/workspace-cleanup", response_model=WorkspaceCleanupStatus)
+def workspace_cleanup():
+    return _call(_service().workspaces.pending_removals.status)
+
+
+@router.post("/workspace-cleanup/retry", response_model=WorkspaceCleanupStatus)
+def retry_workspace_cleanup():
+    return _call(_service().workspaces.pending_removals.retry)
 
 
 @router.get("/workspace-modes", response_model=WorkspaceModeOptions)

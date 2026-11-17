@@ -99,10 +99,10 @@ def _titles(session) -> tuple[set[str], set[str]]:
     The Live Artifacts panel calls the project-scoped one, which is why a stale
     row emptied the panel while the chat cards still resolved.
     """
-    by_id = list_artifacts(
+    by_id = [card.to_json() for card in list_artifacts(
         artifacts_sources_for_project(session, GENERAL_PROJECT_ID)
-    )
-    unfiltered = list_artifacts(artifacts_sources_for_scope(session))
+    )]
+    unfiltered = [card.to_json() for card in list_artifacts(artifacts_sources_for_scope(session))]
     return {c["title"] for c in by_id}, {c["title"] for c in unfiltered}
 
 

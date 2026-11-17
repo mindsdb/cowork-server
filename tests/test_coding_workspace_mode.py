@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from coding_service_fakes import CREDS, FakeEngine, git, repository, service_with, wait_for_status, wait_for_workspace
+from tests.support.coding.service_fakes import CREDS, FakeEngine, git, repository, service_with, wait_for_status, wait_for_workspace
 
 from cowork.coding.contracts import (
     CodingSession, SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode, WorkspaceReasonCode,

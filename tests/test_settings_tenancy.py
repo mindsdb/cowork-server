@@ -336,7 +336,7 @@ def test_operator_pinned_keys_are_the_deployment_wide_ones():
 
     for key in (
         "memory_enabled", "memory_mode", "episodic_memory",
-        "planning_provider", "planning_model", "coding_model", "router_model",
+        "planning_provider", "planning_model", "coding_model", "router_model", "image_model",
         "coding_reasoning_effort", "model_mode", "model_overrides", "providers_json",
         "minds_url", "openai_base_url", "publish_url",
         "max_tool_rounds", "max_continuations", "max_turn_tokens",

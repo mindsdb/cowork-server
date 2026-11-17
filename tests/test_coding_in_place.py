@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from coding_service_fakes import (
+from tests.support.coding.service_fakes import (
     CREDS,
     FakeEngine,
     git,
