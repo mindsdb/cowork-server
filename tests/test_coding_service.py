@@ -74,6 +74,7 @@ from cowork.coding.project_models import (
     ProjectCommand,
     ProjectCreateRequest,
     ProjectFolder,
+    ProjectEnvironment,
     ProjectUpdateRequest,
     PublishRequest,
     PullRequestActionRequest,
@@ -261,6 +262,41 @@ def test_task_bound_to_a_duplicate_local_computer_recovers_on_restart(tmp_path: 
     listed = {item.id: item for item in restarted.control.list_computers().items}
     assert [item.id for item in listed.values() if item.is_local] == [local_id]
     assert remote.id in listed
+
+
+def test_repaired_project_task_can_fork_without_expanding_its_frozen_scope(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Scoped", default_engine_id="fake", default_model="fake-model",
+        folders=[ProjectFolder(id="repo", name="Repo", path=str(repo))],
+        environment=ProjectEnvironment(port_names=[]),
+    ))
+    session = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Go", workspace_mode=WorkspaceMode.in_place),
+        CREDS, "fake", "fake-model",
+    )
+    session = wait_for_status(service, session.id, SessionStatus.completed)
+    snapshot = service.control.store.get_task(session.task_id).execution_project.model_dump(mode="json")
+    old_id = service.control.local_computer.id
+    # A newer live project must not replace the task's frozen resources.
+    changed = service.project_store.get(project.id)
+    changed.resources.append(LocalFolderResource(id="later", name="Later", path=str(tmp_path), computer_id=old_id))
+    service.project_store.save(changed)
+    service.close_all()
+    (service.control.root / "control" / "local-computer-id").write_text("computer-survivor\n")
+
+    for _ in range(2):
+        service = service_with(tmp_path, FakeEngine())
+        repaired = service.control.store.get_task(session.task_id).execution_project.model_dump(mode="json")
+        expected = {**snapshot, "resources": [
+            {**resource, "computer_id": "computer-survivor"} for resource in snapshot["resources"]
+        ]}
+        assert repaired == expected
+        child = service.fork_session(session.id, CREDS)
+        assert child.computer_id == "computer-survivor"
+        assert child.resource_ids == ["repo"]
+        service.close_all()
 
 
 def test_finishing_a_turn_with_a_pending_approval_completes_the_run(tmp_path: Path) -> None:

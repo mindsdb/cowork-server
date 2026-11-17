@@ -949,6 +949,20 @@ class ControlPlaneService:
             return frozenset()
         local_id = self.local_computer.id
 
+        # Existing tasks fork and recover from their frozen project, not the
+        # live project. Repair ownership there without changing their scope.
+        for task in self.store.list_tasks():
+            project = task.execution_project
+            if project is None:
+                continue
+            changed = False
+            for resource in project.resources:
+                if resource.computer_id in stale:
+                    resource.computer_id = local_id
+                    changed = True
+            if changed:
+                self.store.save_task(task)
+
         def rebind(run: TaskRun) -> None:
             run.computer_id = local_id
 
