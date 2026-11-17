@@ -124,7 +124,10 @@ def changed_lines(doc: dict[str, Any], touched: dict[str, list[str]]) -> str:
 
 # ---------------------------------------------------------------- HTML
 
-_INLINE_CODE = re.compile(r"`([^`]+)`")
+# A backslash-escaped mark, or a code span, read in one pass from the left as
+# the editor reads them (docModel.inlineToHtml): an escaped backtick opens no
+# code span, and a backslash inside a code span is the code's own.
+_ESCAPE_OR_CODE = re.compile(r"\\([*`~\[\]{}_\\])|`([^`]+)`")
 _BOLD = re.compile(r"\*\*(.+?)\*\*")
 _ITALIC = re.compile(r"(?<![*\w])\*(?!\s)(.+?)(?<!\s)\*(?![*\w])|(?<![_\w])_(?!\s)(.+?)(?<!\s)_(?![_\w])")
 _STRIKE = re.compile(r"~~(.+?)~~")
@@ -136,9 +139,10 @@ _HELD = re.compile(r"\x00(\d+)\x00")
 def inline_html(text: str) -> str:
     """A block's inline Markdown as HTML: code, links, bold, italic, strike and chips.
 
-    Code spans and link addresses are set aside before anything else runs, so
-    escaping and emphasis never reach inside them (``https://x.com/_p_/``
-    keeps its underscores; ``?a=1&b=2`` is escaped once).
+    Escaped marks, code spans and link addresses are set aside before anything
+    else runs, so escaping and emphasis never reach inside them
+    (``https://x.com/_p_/`` keeps its underscores; ``?a=1&b=2`` is escaped
+    once; ``\\_draft\\_`` is the words "_draft_", not italics).
     """
     held: list[str] = []
 
@@ -147,7 +151,10 @@ def inline_html(text: str) -> str:
         return f"\x00{len(held) - 1}\x00"
 
     s = (text or "").replace("\x00", "")
-    s = _INLINE_CODE.sub(lambda m: hold(f"<code>{html.escape(m.group(1))}</code>"), s)
+    s = _ESCAPE_OR_CODE.sub(
+        lambda m: hold(html.escape(m.group(1)) if m.group(1) is not None else f"<code>{html.escape(m.group(2))}</code>"),
+        s,
+    )
     # The link's words stay in the text (they may be bold); only its address is held.
     s = _LINK.sub(lambda m: hold(f'<a href="{html.escape(m.group(2))}">') + m.group(1) + hold("</a>"), s)
     s = html.escape(s, quote=False)
