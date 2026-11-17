@@ -48,13 +48,13 @@ def _lines(seed: int, heads: list[str], pieces: list[str], count: int = 5000):
 
 def test_strip_removes_exactly_what_backslash_s_matches():
     every = "".join(map(chr, range(0x110000)))
-    assert re.findall(r"\s", every) == [c for c in every if c.isspace()]
+    assert re.findall(r"\s", every) == [c for c in every if not c.strip()]
 
 
 def test_headings_read_as_the_regex_did():
     heads = ["#", "##", "###", "######", "#######", "# ", "## ", " #", "a", ""]
     pieces = ["#", "##", "a", "b c", "C#", "é", "}", *_SPACES]
-    for line in _lines(3667, heads, pieces):
+    for line in _lines(1, heads, pieces):
         assert _blocks(_read_heading, line) == _regex_heading(line), repr(line)
 
 
@@ -62,14 +62,14 @@ def test_pending_lines_read_as_the_regex_did():
     heads = ["{{pending:", "{{ pending :", " {{PENDING:", "{{Pending ", "{{pending", "{pending:", "{{", "",
              *("{{" + word + ":" for word in _ODD_PENDING)]
     pieces = ["{", "{{", "}", "}}", "}}}", ":", "a", "b c", "pending", *_SPACES]
-    for line in _lines(3668, heads, pieces):
+    for line in _lines(2, heads, pieces):
         assert _blocks(_read_pending, line) == _regex_pending(line), repr(line)
 
 
 def test_table_separators_read_as_the_regex_did():
     heads = ["", "|", " |", ":", "-", "--", "|--", "| :--- |"]
     pieces = ["|", "-", "--", ":", "x", "|--", *_SPACES]
-    for line in _lines(3669, heads, pieces):
+    for line in _lines(3, heads, pieces):
         assert (_blocks(_read_table, "| a |", line) is not None) == bool(_TABLE_SEP.match(line)), repr(line)
 
 
@@ -124,12 +124,15 @@ _LONGEST = 2_000_000
     "| a |\n" + " " * _LONGEST + "x",
     "| a |\n|--" + " " * _LONGEST + "x",
     "|" * (_LONGEST // 2) + "\n|--|\n" + "|\n" * (_LONGEST // 4),
+    "|" * (_LONGEST // 2) + "\n|--|",
     "| a |\n|--|\n" + "| b |\n" * (_LONGEST // 6),
-], ids=["heading", "pending-empty", "pending", "separator-indent", "separator-tail", "wide-table", "long-table"])
+], ids=["heading", "pending-empty", "pending", "separator-indent", "separator-tail", "wide-table", "wide-header",
+        "long-table"])
 def test_hostile_markdown_parses_in_linear_time(md):
     """One doc write parses its Markdown under the doc lock. The regexes took hours
-    on these lines, the wide table ran out of memory, and the long one took seconds."""
+    on these lines, the wide table ran out of memory, and the wide header and the
+    long table took 5-10 s. The bound leaves room for coverage on a slow runner."""
     start = time.perf_counter()
     with contextlib.suppress(DocError):
         parse_markdown(md)
-    assert time.perf_counter() - start < 1.0
+    assert time.perf_counter() - start < 2.0

@@ -35,19 +35,19 @@ from .model import (
     tone_for,
 )
 
-# Headings, pending lines and table separators are read from the stripped line.
-# A lazy group or a backtracking run followed by `\s*$` rescans a run of spaces
-# from every position: one long line held the server for hours.
 _LIST = re.compile(r"^(\s*)([-*+]|\d{1,3}[.)])\s+(?:\[([ xX])\]\s+)?(.*)$")
 _FENCE = re.compile(r"^\s*(```+|~~~+)\s*([\w+-]*)\s*(.*)$")
-_TABLE_SEP = re.compile(r"\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?")  # fullmatch on the stripped line
 _DIVIDER = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
 _CALLOUT = re.compile(r"^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION|INFO|SUCCESS|DANGER)\]\s*(.*)$", re.I)
-_PENDING_OPEN = re.compile(r"\s*\{\{\s*pending\s*:\s*", re.I)
 # Alt text and caption may hold backslash escapes; a source with spaces or
 # brackets in it is written in <angle brackets>.
 _IMAGE = re.compile(r'^\s*!\[((?:[^\]\\]|\\.)*)\]\(\s*(<[^<>\n]+>|[^)\s]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\)\s*$')
 _ESCAPED = re.compile(r"\\(.)")
+# A lazy group or a backtracking run before `\s*$` rescans a run of spaces from
+# every position, quadratic in the line's length. Headings, pending lines and
+# table separators are therefore read from the stripped line.
+_TABLE_SEP = re.compile(r"\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?")  # fullmatch on the stripped line
+_PENDING_OPEN = re.compile(r"\s*\{\{\s*pending\s*:\s*", re.I)
 
 # A callout's `[!MARKER]` → its tone, and back (TIP is written for success).
 _TONE_OF_MARKER = {
