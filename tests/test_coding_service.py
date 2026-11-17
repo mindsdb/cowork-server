@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import itertools
 import logging
@@ -56,7 +57,9 @@ from cowork.coding.context import is_context_exhaustion_error
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import (
     CodeTask,
+    Computer,
     ComputerCapabilities,
+    ComputerStatus,
     RunStatus,
     RuntimeEvent,
     TaskCapability,
@@ -74,10 +77,13 @@ from cowork.coding.project_models import (
     ProjectUpdateRequest,
     PublishRequest,
     PullRequestActionRequest,
+    CodeProject,
+    LocalFolderResource,
     RepositoryResource,
 )
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.remote_execution import RemoteExecutionCoordinator
+from cowork.coding import service as coding_service_module
 from cowork.coding.store import CodingStore
 from cowork.coding.turns import EventBuffer, finish_turn, mark_running, terminal_status
 from cowork.coding.workspace import WorkspaceError
@@ -176,6 +182,85 @@ def stored_local_session(tmp_path: Path, status: SessionStatus) -> CodingSession
     )
     CodingStore(tmp_path / "coding").save_session(session)
     return session
+
+
+def test_concurrent_first_requests_share_one_coding_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    built: list[object] = []
+
+    class SlowService:
+        def __init__(self, _root: Path) -> None:
+            time.sleep(0.05)
+            built.append(self)
+
+    monkeypatch.setattr(coding_service_module, "CodingService", SlowService)
+    monkeypatch.setattr(
+        coding_service_module,
+        "get_app_settings",
+        lambda: SimpleNamespace(coding=SimpleNamespace(root_dir="unused")),
+    )
+    coding_service_module.get_coding_service.cache_clear()
+    try:
+        barrier = threading.Barrier(8)
+
+        def first_request() -> object:
+            barrier.wait()
+            return coding_service_module.get_coding_service()
+
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:
+            services = list(pool.map(lambda _: first_request(), range(8)))
+    finally:
+        coding_service_module.get_coding_service.cache_clear()
+
+    assert len(built) == 1
+    assert all(item is built[0] for item in services)
+
+
+def test_task_bound_to_a_duplicate_local_computer_recovers_on_restart(tmp_path: Path) -> None:
+    session = stored_local_session(tmp_path, SessionStatus.completed)
+    service = service_with(tmp_path, FakeEngine())
+    local_id = service.control.local_computer.id
+    remote, _ = service.control.register_runtime(
+        service.control.issue_registration_token(),
+        "Build computer",
+        service.control.local_computer.capabilities,
+    )
+    # Reproduce what a lost first-start race left behind: a second local
+    # record that never heartbeats, with the task and a project folder on it.
+    duplicate = service.control.store.save_computer(Computer(
+        id="computer-duplicate",
+        name="This computer",
+        is_local=True,
+        status=ComputerStatus.offline,
+        capabilities=service.control.local_computer.capabilities,
+    ))
+    bound = service.get_session(session.id)
+    service.control.store.update_run(bound.run_id, lambda run: setattr(run, "computer_id", duplicate.id))
+    for workspace in service.control.store.list_workspaces(bound.run_id):
+        workspace.computer_id = duplicate.id
+        service.control.store.save_workspace(workspace)
+    service.store.save_session(
+        service.store.load_session(session.id).model_copy(update={"computer_id": duplicate.id}),
+        touch_updated_at=False,
+    )
+    service.project_store.save(CodeProject(
+        id="stranded-project",
+        name="Stranded",
+        resources=[LocalFolderResource(id="notes", name="Notes", path=str(tmp_path), computer_id=duplicate.id)],
+    ))
+    service.close_all()
+
+    restarted = service_with(tmp_path, FakeEngine())
+
+    recovered = restarted.get_session(session.id)
+    assert restarted.control.local_computer.id == local_id
+    assert recovered.computer_id == local_id
+    assert recovered.computer_is_local
+    assert recovered.computer_status == "online"
+    assert restarted.control.continue_task(recovered.task_id, recovered.run_id).computer_id == local_id
+    assert restarted.project_store.get("stranded-project").resources[0].computer_id == local_id
+    listed = {item.id: item for item in restarted.control.list_computers().items}
+    assert [item.id for item in listed.values() if item.is_local] == [local_id]
+    assert remote.id in listed
 
 
 def test_finishing_a_turn_with_a_pending_approval_completes_the_run(tmp_path: Path) -> None:
