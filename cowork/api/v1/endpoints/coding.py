@@ -7,6 +7,7 @@ import logging
 from collections.abc import Callable
 from datetime import timedelta
 from typing import Annotated
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -47,6 +48,7 @@ from cowork.coding.contracts import (
     GitIdentityRequest,
     InitializeGitRequest,
     WorkspaceModeOptions,
+    WorkspaceReasonCode,
     WorkspaceUsagePage,
 )
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
@@ -206,10 +208,25 @@ def _http_error(exc: Exception) -> HTTPException:
             headers={"X-MindsHub-Error-Code": exc.code},
         )
     if isinstance(exc, (StateConflict, WorkspaceError, RuntimeError)):
-        return HTTPException(status_code=409, detail=redact_text(str(exc))[:4_000])
+        return HTTPException(status_code=409, detail=redact_text(str(exc))[:4_000], headers=_reason_headers(exc))
     if isinstance(exc, ValueError):
-        return HTTPException(status_code=400, detail=redact_text(str(exc))[:4_000])
+        return HTTPException(status_code=400, detail=redact_text(str(exc))[:4_000], headers=_reason_headers(exc))
     return HTTPException(status_code=500, detail="Coding operation failed")
+
+
+def _reason_headers(exc: Exception) -> dict[str, str] | None:
+    """Name a workspace-mode refusal so the client can word it in the person's language.
+
+    The folder is percent-encoded because a header carries only Latin-1.
+    """
+    reason = getattr(exc, "reason", None)
+    if not isinstance(reason, WorkspaceReasonCode):
+        return None
+    headers = {"X-MindsHub-Error-Code": reason.value}
+    folder = getattr(exc, "folder", None)
+    if folder:
+        headers["X-MindsHub-Error-Folder"] = quote(folder, safe="")
+    return headers
 
 
 def _call[Result](operation: Callable[..., Result], *args, **kwargs) -> Result:

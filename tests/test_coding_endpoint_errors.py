@@ -7,10 +7,12 @@ import pytest
 from fastapi import HTTPException
 
 from cowork.api.v1.endpoints import coding
+from cowork.coding.contracts import WorkspaceReasonCode
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
 from cowork.coding.run_recovery import NoEligibleComputer
 from cowork.coding.run_state import InvalidRunTransition
 from cowork.coding.workspace import GitIdentityMissingError, WorkspaceError
+from cowork.coding.workspace_mode import WorkspaceModeUnavailable
 
 
 @pytest.mark.parametrize(
@@ -187,3 +189,16 @@ def test_switching_models_clears_a_stored_effort_the_new_model_lacks(monkeypatch
         ("unlisted", None, False),
         ("gemini", None, False),
     ]
+
+
+def test_a_refused_workspace_mode_names_its_reason_and_folder() -> None:
+    error = coding._http_error(WorkspaceError(
+        "Café: This folder isn't a Git repository", reason=WorkspaceReasonCode.not_a_repository, folder="Café",
+    ))
+
+    assert error.status_code == 409
+    assert error.headers == {"X-MindsHub-Error-Code": "not_a_repository", "X-MindsHub-Error-Folder": "Caf%C3%A9"}
+    unsupported = coding._http_error(WorkspaceModeUnavailable("No", WorkspaceReasonCode.in_place_other_computer))
+    assert unsupported.status_code == 400
+    assert unsupported.headers == {"X-MindsHub-Error-Code": "in_place_other_computer"}
+    assert coding._http_error(WorkspaceError("Choose an existing local folder")).headers is None

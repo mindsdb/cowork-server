@@ -9,10 +9,14 @@ from pathlib import Path
 import pytest
 from coding_service_fakes import CREDS, FakeEngine, git, repository, service_with, wait_for_status, wait_for_workspace
 
-from cowork.coding.contracts import CodingSession, SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode
+from cowork.coding.contracts import (
+    CodingSession, SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode, WorkspaceReasonCode,
+)
 from cowork.coding.workspace import WorkspaceError
 from cowork.coding.project_models import ProjectCreateRequest, ProjectFolder, ProjectUpdateRequest
-from cowork.coding.workspace_mode import resolve_workspace_mode, supported_workspace_modes
+from cowork.coding.workspace_mode import (
+    WorkspaceModeUnavailable, resolve_workspace_mode, supported_workspace_modes, workspace_mode_options,
+)
 
 
 @pytest.mark.parametrize("platform", ["darwin", "linux"])
@@ -153,6 +157,7 @@ def test_the_composer_learns_which_modes_a_new_task_can_use(tmp_path: Path, monk
     unavailable = service.workspace_mode_options(None, None)
     assert unavailable.supported == [WorkspaceMode.worktree]
     assert "not available on this platform" in (unavailable.in_place_unavailable_reason or "")
+    assert unavailable.in_place_unavailable_code == WorkspaceReasonCode.in_place_unsupported_platform
 
 
 @pytest.mark.parametrize("kind", ["repository", "plain", "repositories", "empty repository"])
@@ -189,10 +194,14 @@ def test_the_modes_offered_for_a_folder_are_the_modes_creation_accepts(
     assert WorkspaceMode.in_place in options.supported
     if kind in {"plain", "repositories"}:
         assert "Initialize Git" in (options.worktree_unavailable_reason or "")
+        assert options.worktree_unavailable_code == WorkspaceReasonCode.not_a_repository
         assert options.can_initialize_git is True
     elif kind == "empty repository":
         assert "first commit" in (options.worktree_unavailable_reason or "")
         assert options.can_initialize_git is False
+        assert options.worktree_unavailable_code == WorkspaceReasonCode.no_commits
+    if kind == "repository":
+        assert options.worktree_unavailable_code is None
 
 
 def test_where_in_place_is_unavailable_a_folder_without_git_has_no_mode(
@@ -208,8 +217,9 @@ def test_where_in_place_is_unavailable_a_folder_without_git_has_no_mode(
     assert options.supported == []
     assert options.default is None
     assert options.can_initialize_git is True
-    with pytest.raises(WorkspaceError, match="Initialize Git to use a Worktree"):
+    with pytest.raises(WorkspaceError, match="Initialize Git to use a Worktree") as raised:
         service.create_session(SessionCreateRequest(path=str(folder), prompt="Go"), CREDS, "fake", "fake-model")
+    assert raised.value.reason == WorkspaceReasonCode.not_a_repository
 
 
 def test_initializing_git_offers_a_worktree_after_a_first_commit(
@@ -237,3 +247,14 @@ def test_initializing_git_offers_a_worktree_after_a_first_commit(
     git(folder, "add", "notes.md")
     git(folder, "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-m", "first")
     assert WorkspaceMode.worktree in service.workspace_mode_options(None, None, str(folder)).supported
+
+
+def test_a_mode_this_computer_cannot_prepare_is_refused_with_a_code() -> None:
+    with pytest.raises(WorkspaceModeUnavailable) as raised:
+        resolve_workspace_mode(WorkspaceMode.in_place, None, runs_locally=False, org_mode=False)
+    assert raised.value.reason == WorkspaceReasonCode.in_place_other_computer
+
+    options = workspace_mode_options(None, runs_locally=False, org_mode=False)
+    assert options.in_place_unavailable_code == WorkspaceReasonCode.in_place_other_computer
+    # Older clients still read the sentence.
+    assert "another computer" in (options.in_place_unavailable_reason or "")

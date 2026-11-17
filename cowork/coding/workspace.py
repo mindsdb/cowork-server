@@ -20,6 +20,7 @@ from cowork.coding.contracts import (
     GitState,
     WorkspaceInspection,
     WorkspaceKind,
+    WorkspaceReasonCode,
 )
 from cowork.coding.git_transport import ALLOWED_GIT_PROTOCOLS
 from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
@@ -37,7 +38,23 @@ class UsageRoots:
 
 
 class WorkspaceError(RuntimeError):
-    pass
+    """A workspace cannot be prepared or used as asked.
+
+    ``reason`` names the cases a client words itself, in the person's
+    language; ``folder`` is the project folder the message is about.
+    """
+
+    def __init__(
+        self, message: str = "", *, reason: WorkspaceReasonCode | None = None, folder: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.folder = folder
+
+    @classmethod
+    def in_folder(cls, folder: str, exc: Exception) -> WorkspaceError:
+        """``exc`` about one of a project's folders, named so the person knows which."""
+        return cls(f"{folder}: {exc}", reason=getattr(exc, "reason", None), folder=folder)
 
 
 class GitUnavailableError(WorkspaceError):
@@ -276,9 +293,9 @@ class WorkspaceManager:
             raise WorkspaceError("Choose an existing local folder")
         root = self._git_root(path)
         if root is None:
-            raise WorkspaceError(NOT_A_REPOSITORY)
+            raise WorkspaceError(NOT_A_REPOSITORY, reason=WorkspaceReasonCode.not_a_repository)
         if self._head_revision(root) is None:
-            raise WorkspaceError(NO_COMMITS)
+            raise WorkspaceError(NO_COMMITS, reason=WorkspaceReasonCode.no_commits)
 
     def initialize_git(self, raw_path: str) -> None:
         """Run ``git init`` in a folder that isn't in a Git repository yet.
@@ -348,7 +365,7 @@ class WorkspaceManager:
             if not inspection.exists or not inspection.is_directory:
                 raise WorkspaceError("Choose an existing local folder")
             if not inspection.is_git:
-                raise WorkspaceError(NOT_A_REPOSITORY)
+                raise WorkspaceError(NOT_A_REPOSITORY, reason=WorkspaceReasonCode.not_a_repository)
 
             repo = Path(inspection.repository_root or inspection.path)
             revision = inspection.revision
@@ -358,7 +375,7 @@ class WorkspaceManager:
                     raise WorkspaceError(f"Base branch is unavailable: {base_branch}")
             # Git cannot create a worktree until the repository has a commit.
             if revision is None:
-                raise WorkspaceError(NO_COMMITS)
+                raise WorkspaceError(NO_COMMITS, reason=WorkspaceReasonCode.no_commits)
 
             worktree = self.worktrees_root / managed_key(session_id)
             if worktree.exists():
