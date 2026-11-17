@@ -15,7 +15,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from coding_service_fakes import (
+from tests.support.coding.service_fakes import (
     CREDS,
     copy_folders_without_git,
     FakeEngine,
