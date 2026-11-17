@@ -87,11 +87,11 @@ async def _run(state, **kwargs):
     return json.loads(state["redis"].added[0][1]["payload"])["params"], items
 
 
-async def test_the_members_connections_travel_by_id_with_the_grants_versions_and_the_turn_key(turn):
+async def test_the_members_connections_travel_by_id_with_the_grants_versions_and_no_turn_key(turn):
     params, _ = await _run(turn)
 
     assert params["custom_api"] == {
-        "turn_key": params["llm"]["api_key"],
+        "protocol_version": 1,
         "connections": [
             {"connection_id": 3, "connector_id": "beta_api", "name": "Ops", "credential_version": 1},
             {"connection_id": 5, "connector_id": "acme_crm", "name": "Prod", "credential_version": 2},
@@ -104,6 +104,22 @@ async def test_the_members_connections_travel_by_id_with_the_grants_versions_and
     assert (granted["turn_key_id"], granted["correlation_id"]) == ("turnkey", "r")
 
 
+async def test_the_block_the_producer_sends_is_one_anton_parses_with_the_same_connections(turn):
+    params, _ = await _run(turn)
+
+    request = TurnRequestV1.from_json(json.dumps({
+        "protocol_version": 1, "conversation_id": "conv-1", "input": "hi", "llm": params["llm"],
+        "custom_api": params["custom_api"],
+    }))
+
+    assert request.custom_api is not None
+    assert [
+        {"connection_id": ref.connection_id, "connector_id": ref.connector_id,
+         "name": ref.name, "credential_version": ref.credential_version}
+        for ref in request.custom_api.connections
+    ] == params["custom_api"]["connections"]
+
+
 async def test_a_routed_turn_binds_to_the_key_the_gate_minted(turn, monkeypatch):
     for name in ("mint_turn_key", "mint_turn_key_details"):
         monkeypatch.setattr(prod, name, AsyncMock(side_effect=AssertionError(f"{name} minted a second key")))
@@ -113,7 +129,8 @@ async def test_a_routed_turn_binds_to_the_key_the_gate_minted(turn, monkeypatch)
     params, _ = await _run(turn, correlation_id="r", llm=block, turn_key_id="mdb_gate")
 
     assert turn["list"].await_args.kwargs["turn_key_id"] == "mdb_gate"
-    assert params["custom_api"]["turn_key"] == "mdb_gate.secret"
+    assert "turn_key" not in params["custom_api"]
+    assert params["llm"]["api_key"] == "mdb_gate.secret"
 
 
 async def test_a_turn_that_arrives_with_a_key_but_no_prefix_runs_without_them(turn):

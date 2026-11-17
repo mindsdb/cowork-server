@@ -256,4 +256,4 @@ markers = [
 # Temporary, for this PR's environment only: anton with `call_minds_api` and the
 # custom API prompt sections (mindsdb/anton#777), which no release carries yet.
 # Replaced by a floor on the anton release that carries it before this merges.
-anton-agent = { git = "https://github.com/mindsdb/anton", rev = "ede4e0d8b39ca3d6634e3073452beb137ba98399" }
+anton-agent = { git = "https://github.com/mindsdb/anton", rev = "5077c5edab1b3c078e3a936df0ee0816e6c7846f" }
