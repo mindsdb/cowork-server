@@ -37,7 +37,7 @@ test/services: ## Run the tests that need a local Redis or PostgreSQL (COWORK_TE
 	$(PYTEST) -v -rs tests/ -m "redis_service or postgres_service"
 
 test/unit/coverage: ## Run unit tests with coverage
-	$(PYTEST) -n $(PYTEST_WORKERS) --cov=cowork $(TESTS)
+	$(PYTEST) -n $(PYTEST_WORKERS) --cov=cowork -v -o faulthandler_timeout=300 $(TESTS)
 
 coverage/html: ## Generate HTML coverage report
 	$(PYTEST) -n $(PYTEST_WORKERS) --cov=cowork $(TESTS) --cov-report=html
