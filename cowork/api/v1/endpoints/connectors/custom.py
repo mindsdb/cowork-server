@@ -25,6 +25,7 @@ from cowork.services.connectors.custom_connections import (
     create_custom_connection,
 )
 from cowork.services.connectors.custom_connectors import (
+    NO_CHECK_REASON,
     CustomConnectorService,
     UnstorableFormError,
     is_builtin_connector_id,
@@ -77,7 +78,7 @@ def save_connector_draft(
 
     Raises:
         HTTPException: 404 outside org mode or with the setting off, 422 for
-            a draft outside the allowlist or a built-in id.
+            a draft outside the allowlist, a built-in id or no check.
     """
     if not session.scope.org_mode or not TurnQueueSettings().connector_drafts_enabled:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
@@ -88,6 +89,8 @@ def save_connector_draft(
     connector_id = parsed.connector_id
     if is_builtin_connector_id(connector_id):
         raise _unprocessable(f"{connector_id!r} is already a built-in connector.")
+    if parsed.check is None:
+        raise _unprocessable(f"{connector_id!r} {NO_CHECK_REASON}")
     try:
         row = CustomConnectorService(session).save_member_draft(parsed)
     except UnstorableFormError as e:
@@ -178,7 +181,10 @@ async def connect_custom_connector(
     Org mode only, with the setting on and the turn queue on Redis, which
     counts each member's attempts. auth is asked first whether it would take
     the connection (dry run), then the check runs against the typed address
-    only, then auth stores it verified.
+    only, then auth stores it verified. A member may skip a field the
+    template marks optional; auth then gets the template's section with the
+    skipped field's placements taken out, and a member holding no secret
+    field is checked once on the template's public path.
 
     Returns:
         201 with the stored connection. A refusal answers its own status with
@@ -195,7 +201,8 @@ async def connect_custom_connector(
         fields, template = await run_db(lambda session: _connect_template(connector_id, session), scope=scope)
         origin = custom_connect.normalize_address(body.address, settings.custom_connect_refused_domains)
         values = custom_connect.check_values(fields, body.values)
-        custom_connect.place_values(template.auth, values)
+        auth = custom_connect.reduced_auth(template, values)
+        custom_connect.place_values(auth, values)
     except custom_connect.ConnectRefused as refused:
         return _refusal(refused.code, refused.status_code, refused.message)
     payload = {
@@ -203,14 +210,14 @@ async def connect_custom_connector(
         "name": body.name,
         "fields": {**values, custom_connect.BASE_URL_FIELD: origin},
         "secure_keys": sorted(values),
-        "auth": template.auth,
+        "auth": auth,
     }
     credential = request.headers.get("authorization", "")
     try:
         await create_custom_connection(
             credential=credential, organization_id=str(scope.org_id), payload=payload, dry_run=True, settings=settings,
         )
-        failure = await custom_connect.run_check(origin, template, values)
+        failure = await custom_connect.run_check(origin, template, values, auth)
         if failure is not None:
             return JSONResponse(
                 {"detail": {"code": failure.code, "provider_status": failure.provider_status, "excerpt": failure.excerpt}},

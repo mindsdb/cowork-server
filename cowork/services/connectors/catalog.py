@@ -87,8 +87,9 @@ class ConnectorCatalog(ConnectorSpecRegistry):
 
         A custom connector's notes are model-written and, there, read with the
         caller's credentials in reach, so they are used only in one person's
-        scope (scope_is_one_persons), never in org mode, and pass anton's
-        output scrubber first. Otherwise only the built-ins' notes.
+        scope (scope_is_one_persons) and pass anton's output scrubber first.
+        Otherwise only the built-ins' notes. An org-mode member's own notes
+        reach their own cloud turns through member_turn_templates instead.
         """
         wanted = list(engines)
         notes = self._base.usage_notes_for(wanted)
