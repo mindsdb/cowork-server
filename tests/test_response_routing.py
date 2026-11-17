@@ -1182,11 +1182,11 @@ async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("datasource", "drafts", "prefixed"), [
+@pytest.mark.parametrize(("datasource", "custom_api", "prefixed"), [
     ("false", "true", True), ("true", "false", True), ("false", "false", False),
 ])
-async def test_the_gate_mints_a_prefixed_key_when_either_setting_needs_one(monkeypatch, datasource, drafts, prefixed):
-    """Custom connector grants bind to the prefix as datasource grants do, so the gate mints it for either."""
+async def test_the_gate_mints_a_prefixed_key_when_either_setting_needs_one(monkeypatch, datasource, custom_api, prefixed):
+    """Custom API grants bind to the prefix as datasource grants do, so the gate mints it for either."""
     import cowork.handlers.responses as responses
     import cowork.turnqueue.producer as producer
     from cowork.common.settings.user_settings import Provider
@@ -1194,7 +1194,7 @@ async def test_the_gate_mints_a_prefixed_key_when_either_setting_needs_one(monke
     handler = _routing_handler(monkeypatch)
     monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", datasource)
-    monkeypatch.setenv("COWORK_TURN_CONNECTOR_DRAFTS_ENABLED", drafts)
+    monkeypatch.setenv("COWORK_TURN_CUSTOM_API_ENABLED", custom_api)
     monkeypatch.setattr(
         responses, "get_user_settings",
         lambda scope: SimpleNamespace(resolved_router_provider=Provider.MINDS_CLOUD, resolved_router_model="kimi",

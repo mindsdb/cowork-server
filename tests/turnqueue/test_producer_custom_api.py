@@ -2,9 +2,10 @@
 turn key's owner, with grants bound to that key, never a field value."""
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from anton.cloud_turn.contract import TurnRequestV1
@@ -56,9 +57,9 @@ def _granted(versions, **overrides):
 
 @pytest.fixture()
 def turn(monkeypatch):
-    """Org tenancy, the custom connector setting on, a producer key; auth faked."""
+    """Org tenancy, the custom API setting on, a producer key; auth faked."""
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
-    monkeypatch.setenv("COWORK_TURN_CONNECTOR_DRAFTS_ENABLED", "true")
+    monkeypatch.setenv("COWORK_TURN_CUSTOM_API_ENABLED", "true")
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID", "producer")
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_PRODUCER_KEY", "producer-secret")
     get_app_settings.cache_clear()
@@ -134,7 +135,7 @@ async def test_outside_a_members_org_turn_nothing_is_listed(turn, monkeypatch, c
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
     monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[]))
     if case == "setting off":
-        monkeypatch.setenv("COWORK_TURN_CONNECTOR_DRAFTS_ENABLED", "false")
+        monkeypatch.setenv("COWORK_TURN_CUSTOM_API_ENABLED", "false")
     elif case == "local tenancy":
         monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
         monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
@@ -222,14 +223,56 @@ async def test_a_grant_set_that_differs_from_the_request_fails_the_turn(turn, gr
     [_listed(3, name="n" * 129)],
 ], ids=["not verified", "repeated", "zero id", "not an object", "no name", "uppercase and dash id",
         "id too long", "dashed id", "name too long"])
-async def test_a_listing_that_contradicts_itself_fails_the_turn(turn, listing):
-    turn["list"].return_value = listing
+async def test_a_listing_that_contradicts_itself_runs_the_turn_without_them(turn, monkeypatch, listing):
+    """One bad row from auth costs the feature for this turn, as an auth outage does, not the turn."""
+    turn["list"].return_value = [_listed(5), *listing]
+    logged = MagicMock()
+    monkeypatch.setattr(prod, "logger", logged)
+
+    params, _ = await _run(turn)
+
+    assert params is not None and "custom_api" not in params
+    turn["grant"].assert_not_awaited()
+    assert any("custom API connections left out" in call.args[0] for call in logged.warning.call_args_list)
+
+
+async def test_the_custom_listing_runs_alongside_the_datasource_listing(turn, monkeypatch):
+    """The datasource listing waits for the custom one to start; run one after the other, it never does."""
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    get_app_settings.cache_clear()
+    custom_started = asyncio.Event()
+    overlapped: list[bool] = []
+
+    async def datasource_listing(**_kwargs):
+        try:
+            await asyncio.wait_for(custom_started.wait(), 2.0)
+            overlapped.append(True)
+        except TimeoutError:
+            overlapped.append(False)
+        return []
+
+    async def custom_listing(**_kwargs):
+        custom_started.set()
+        return [_listed(5), _listed(3, "beta_api", "Ops")]
+
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(side_effect=datasource_listing))
+    turn["list"].side_effect = custom_listing
+
+    params, _ = await _run(turn)
+
+    assert overlapped == [True]
+    assert [ref["connection_id"] for ref in params["custom_api"]["connections"]] == [3, 5]
+
+
+async def test_a_datasource_refusal_still_fails_the_turn_beside_custom_connections(turn, monkeypatch):
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    get_app_settings.cache_clear()
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=["not an object"]))
 
     params, items = await _run(turn)
 
     assert params is None
     assert items[-1][0] == "turn_failed"
-    turn["grant"].assert_not_awaited()
 
 
 @pytest.mark.parametrize(("org_id", "user_id"), [("o1", "u2"), ("o2", "u1")], ids=["same org", "another org"])
