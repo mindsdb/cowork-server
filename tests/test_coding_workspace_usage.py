@@ -283,6 +283,7 @@ def test_deleting_a_folder_copy_frees_its_storage(tmp_path: Path) -> None:
     (Path(session.workspace_path) / "edit.txt").write_text("unsaved work\n", encoding="utf-8")
 
     service.delete_session(session.id)
+    assert service.workspaces.pending_removals.wait(30)
     page = service.workspace_usage.measure()
 
     assert session.id not in {item.session_id for item in page.items}
