@@ -273,7 +273,7 @@ async def doc_events(
     project_ref: str, artifact_id: ArtifactIdDep, request: Request, scope: TenantScope = Depends(get_tenant_scope)
 ):
     _source, folder, _metadata, _is_own = await _resolve(scope, project_ref, artifact_id, write=False)
-    return _sse(request, doc_topic(artifact_id), initial=folder, scope=scope)
+    return _sse(request, doc_topic(folder), initial=folder, scope=scope)
 
 
 # How a refused or failed Word or PDF export answers, as the artifact export does.

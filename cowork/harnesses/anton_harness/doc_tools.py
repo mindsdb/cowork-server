@@ -300,7 +300,7 @@ def build_doc_tools(ctx: DocToolContext) -> list[ToolDef]:
             return
         _track(session, artifacts_dir, made.slug, "Created doc")
         doc = made.doc
-        announce(made.artifact_id, doc, None, by="agent", conversation_id=ctx.conversation_id,
+        announce(made.artifact_id, doc, None, folder=made.folder, by="agent", conversation_id=ctx.conversation_id,
                  created=True, card=ctx.card(made.folder))
         yield _outcome(
             f"Created doc “{doc['title']}” — it is open beside the chat and the user can see it.\n"
