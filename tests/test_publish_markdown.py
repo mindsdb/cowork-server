@@ -324,7 +324,8 @@ async def test_an_autopublish_the_slot_refused_is_deferred_and_asked_for_again(
     assert artifact_autopublish.acquire(tmp_path, root.name, ttl_s=60)
 
     landed = await artifact_autopublish._publish_one(
-        tmp_path, root.name, "key", "https://4nton.ai", 30.0, LOCAL_SCOPE, project_id="p1"
+        tmp_path, root.name, "key", "https://4nton.ai", 30.0, LOCAL_SCOPE, project_id="p1",
+        job_budget_s=30.0,
     )
 
     assert landed is False

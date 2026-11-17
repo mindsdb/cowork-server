@@ -80,6 +80,10 @@ def model_catalog(
         return
     for row in models:
         row.setdefault("supports_parallel_tool_calls", False)
+        # Codex's approval reviewer defaults to a model MindsHub does not
+        # serve. Review with the task's own model unless the gateway names one.
+        if _is_served(row) and row.get("auto_review_model_override") is None:
+            row["auto_review_model_override"] = row["slug"]
 
     with TemporaryDirectory(prefix="cowork-codex-models-") as directory:
         path = Path(directory) / "models.json"

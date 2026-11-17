@@ -112,12 +112,26 @@ MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
 # The agent roles a model is resolved for, in the order the picker's
 # `recommendedPair` lists them. One declaration, because three places used to
 # spell it out: this order, the derived dicts below, and the pair overlay in the
-# recommended-models endpoint. Mirrors the role enum in the MindsHub model
-# policy's JSON Schema; the two are a cross-repo contract and a role in one and
-# not the other is silently dropped at the parse in fetch_minds_models.
+# recommended-models endpoint. With IMAGE_ROLE below, mirrors the role enum in
+# the MindsHub model policy's JSON Schema; the two are a cross-repo contract and
+# a role in one and not the other is silently dropped at the parse in
+# fetch_minds_models.
 # `test_role_default_dicts_match_the_source_table` holds it to the table above.
 AGENT_ROLE_ORDER: tuple[str, ...] = ("planning", "coding", "router")
 AGENT_ROLE_NAMES: frozenset[str] = frozenset(AGENT_ROLE_ORDER)
+
+# The role the agent's `generate_image` tool and the scratchpad's image helper
+# run on. Not one of the chat roles above: it has no slot in `recommendedPair`
+# and no per-provider table, because only MindsHub serves image models, and only
+# a `kind: "image"` catalog row may claim it (fetch_minds_models).
+IMAGE_ROLE = "image"
+# What the image role starts on until the catalog's `default_for: ["image"]`
+# declaration has been cached, and whenever it cannot be reached. Demoted the
+# same way the chat roles' compiled defaults are (_defaults_with_declared).
+IMAGE_MODEL_DEFAULT = "gpt-image-2.6-flare"
+# Every role a catalog row's `default_for` may name, which is what the parse
+# keeps and the `minds_role_defaults` cache holds.
+CATALOG_ROLE_NAMES: frozenset[str] = AGENT_ROLE_NAMES | {IMAGE_ROLE}
 
 # The table above, pivoted: role -> provider -> model. Anything that resolves a
 # role it was handed the name of reads this, so no caller has to line a role up

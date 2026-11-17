@@ -14,7 +14,9 @@ import pkgutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
+from unittest.mock import AsyncMock
 
 # Resolved: macOS links /var to /private/var, and a COWORK_HOME under that
 # link takes branches a Linux run doesn't, so the blocking guard
@@ -152,7 +154,7 @@ def app_settings_rebuilt_after_a_test_replaced_them():
 @pytest.fixture(autouse=True)
 def close_coding_services():
     yield
-    from coding_service_fakes import close_services
+    from tests.support.coding.service_fakes import close_services
 
     close_services()
 
@@ -502,6 +504,24 @@ def managed_postgres_service():
     }
     yield "managed_pg", "direct"
     raw.pop("managed_pg", None)
+
+
+@pytest.fixture
+def empty_decisions_proxy_records(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Return an empty-record lookup and patch the Redis factory for one test."""
+    # Application imports must follow bootstrap's blocking-guard installation.
+    from cowork.turnqueue import redis_client
+
+    client = SimpleNamespace(get=AsyncMock(return_value=None))
+    monkeypatch.setattr(redis_client, "get_redis", lambda: client)
+    return client
+
+
+@pytest.fixture
+def router_wire_budget(monkeypatch) -> None:
+    """Give real SDK wire checks setup headroom; deadline tests override their own bounds."""
+    monkeypatch.setattr("cowork.handlers.response_routing._GATE_FIRST_EVENT_SECONDS", 10.0)
+    monkeypatch.setattr("cowork.handlers.response_routing._GATE_TOTAL_SECONDS", 15.0)
 
 
 @pytest.fixture

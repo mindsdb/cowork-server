@@ -15,6 +15,7 @@ import pytest
 import yaml
 
 from cowork.services.artifact_draft_review import draft_review_grant
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_revisions import (
     active_agent_repair,
     agent_repair_detail,
@@ -44,8 +45,8 @@ def folder(tmp_path) -> Path:
     return folder
 
 
-def _metadata(folder: Path) -> dict:
-    return json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
+def _metadata(folder: Path) -> ArtifactMetadata:
+    return ArtifactMetadata.parse((folder / "metadata.json").read_text(encoding="utf-8"))
 
 
 def _journal(folder: Path, name: str) -> bytes:
@@ -82,14 +83,14 @@ def test_a_restore_and_a_decision_keep_every_record_they_do_not_change(folder):
     restored = save_source(
         folder,
         metadata,
-        metadata["id"],
+        metadata.id,
         content=revision_with_content(folder, first["id"])["content"],
         expected_revision_id=head["id"],
         actor_id="alice",
         summary=f"Restored revision {first['number']}",
     )["revision"]
     finalize_agent_repair(
-        folder, metadata, metadata["id"], READY, "accepted", expected_head_revision_id=restored["id"]
+        folder, metadata, metadata.id, READY, "accepted", expected_head_revision_id=restored["id"]
     )
 
     manifest = json.loads(_journal(folder, "manifest.json"))
@@ -125,7 +126,7 @@ def test_a_rejection_of_a_planted_repair_reads_and_is_kept(folder, rejection):
 
     revisions = list_revisions(folder)
     metadata = _metadata(folder)
-    save_source(folder, metadata, metadata["id"], content="# Later\n", expected_revision_id=revisions[0]["id"])
+    save_source(folder, metadata, metadata.id, content="# Later\n", expected_revision_id=revisions[0]["id"])
 
     assert [revision["id"] for revision in revisions] == [revision["id"] for revision in EXPECTED["revisions"]]
     # As JSON text, since True and 1 compare equal.
