@@ -5,6 +5,7 @@ edited, one holding a link, and one someone deleted are left as they are.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -20,6 +21,8 @@ from cowork.services.skills import (
     BUILTIN_SKILLS_MARKER,
     BUILTIN_SKILLS_SHIPPED,
     BUILTIN_SKILLS_VERSION,
+    CODE_BUILTIN_SKILLS_VERSION,
+    CODE_ONLY_BUILTIN_SKILL_NAMES,
     SkillService,
     builtin_fingerprint,
     build_turn_skills,
@@ -175,4 +178,46 @@ def test_every_packaged_builtin_is_in_the_shipped_list():
         entry = shipped.get(src.name)
         assert entry, f"{src.name} is missing from {BUILTIN_SKILLS_SHIPPED.name}"
         assert builtin_fingerprint(src) in entry["shipped"], f"{src.name}'s current content is not listed"
-        assert 1 <= entry["introduced"] <= BUILTIN_SKILLS_VERSION
+        # Edited without regenerating: the script, which refuses a change
+        # without a version bump, never saw this content.
+        assert entry["current"] == builtin_fingerprint(src), (
+            f"{src.name} changed since {BUILTIN_SKILLS_SHIPPED.name} was written: bump the version, "
+            "then run python scripts/builtin_skills_shipped.py"
+        )
+        store_version = (
+            CODE_BUILTIN_SKILLS_VERSION if src.name in CODE_ONLY_BUILTIN_SKILL_NAMES else BUILTIN_SKILLS_VERSION
+        )
+        assert 1 <= entry["introduced"] <= entry["version"] <= store_version
+
+
+def _shipped_script():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "builtin_skills_shipped.py"
+    spec = importlib.util.spec_from_file_location("builtin_skills_shipped", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_new_builtin_is_introduced_in_the_bumped_version():
+    script = _shipped_script()
+    previous = {"pdf": {"introduced": 1, "version": 3, "current": "a"}}
+    # Added and regenerated before the bump: refused, or stores at 3 would
+    # take it for a builtin they deleted and never get it.
+    with pytest.raises(script.NeedsVersionBump):
+        script.entry_for("new-skill", "n", 3, previous, store_last=3)
+    # After the bump: introduced in 4, and it stays 4 when regenerated again.
+    entry = script.entry_for("new-skill", "n", 4, previous, store_last=3)
+    assert entry == {"introduced": 4, "version": 4, "current": "n"}
+    again = script.entry_for("new-skill", "n", 5, {**previous, "new-skill": entry}, store_last=4)
+    assert again["introduced"] == 4 and again["version"] == 4
+
+
+def test_a_changed_builtin_needs_a_version_bump():
+    script = _shipped_script()
+    previous = {"pdf": {"introduced": 1, "version": 3, "current": "old"}}
+    with pytest.raises(script.NeedsVersionBump):
+        script.entry_for("pdf", "new", 3, previous, store_last=3)
+    assert script.entry_for("pdf", "new", 4, previous, store_last=3) == {
+        "introduced": 1, "version": 4, "current": "new"}
+    # Unchanged content keeps the version it shipped under.
+    assert script.entry_for("pdf", "old", 4, previous, store_last=3)["version"] == 3

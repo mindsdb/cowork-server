@@ -22,9 +22,15 @@ Seeding is versioned by `BUILTIN_SKILLS_VERSION`:
 - A builtin the store has is replaced only when its files are exactly a version
   we shipped (`shipped.json`; anton's `stats.json` sidecar is ignored and kept).
   A copy someone edited, or one holding a link, is left as it is.
-- To ship a new or changed builtin: edit it here, run
-  `python scripts/builtin_skills_shipped.py` in a full clone (it reads git
-  history), and bump `BUILTIN_SKILLS_VERSION`.
+- To ship a new or changed builtin, in this order:
+  1. Bump `BUILTIN_SKILLS_VERSION` (`CODE_BUILTIN_SKILLS_VERSION` for a Code
+     skill). A store already at the old version would never see the change.
+  2. Edit or add the skill here.
+  3. Run `python scripts/builtin_skills_shipped.py` in a full clone (it reads
+     git history). It refuses a new or changed builtin until the version is
+     bumped, and records a new one as introduced in the bumped version.
+  `test_every_packaged_builtin_is_in_the_shipped_list` fails if a builtin was
+  edited without running the script.
 
 On desktop, seeded copies remain ordinary editable/deletable file-backed skills.
 In org mode, packaged slugs are reserved and immutable for members, admins, and

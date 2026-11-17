@@ -1,68 +1,88 @@
 {
   "documents": {
+    "current": "c5a838e45badcb6ba920a9e10e2cd05e55569964c5002de52c1a888173897501",
     "introduced": 1,
     "shipped": [
       "c5a838e45badcb6ba920a9e10e2cd05e55569964c5002de52c1a888173897501"
-    ]
+    ],
+    "version": 3
   },
   "docx": {
+    "current": "7066078acb21e1e93bfc056ddf3e31e6473647c3c4d721ca2f622802d20c9340",
     "introduced": 1,
     "shipped": [
       "7066078acb21e1e93bfc056ddf3e31e6473647c3c4d721ca2f622802d20c9340"
-    ]
+    ],
+    "version": 3
   },
   "gmail": {
+    "current": "a962727b55e1260e10d422c2a2b89458ccae0c7cc54328273e17f8762790bfb6",
     "introduced": 1,
     "shipped": [
       "a962727b55e1260e10d422c2a2b89458ccae0c7cc54328273e17f8762790bfb6"
-    ]
+    ],
+    "version": 3
   },
   "google-sheets": {
+    "current": "8fa662bf4636a31ff2a68b2da4fa694a2766139c6c247b55bc7ea76395df807d",
     "introduced": 1,
     "shipped": [
       "8fa662bf4636a31ff2a68b2da4fa694a2766139c6c247b55bc7ea76395df807d"
-    ]
+    ],
+    "version": 3
   },
   "google-slides": {
+    "current": "17ed81dcb9bd6e15cf810a2f3215891de6735d694e9b5560c8d72f19351d6143",
     "introduced": 1,
     "shipped": [
       "17ed81dcb9bd6e15cf810a2f3215891de6735d694e9b5560c8d72f19351d6143"
-    ]
+    ],
+    "version": 3
   },
   "pdf": {
+    "current": "b5b73045438fc4f2cbab7636ddf73fd3bfae366dc25336ef69a6a9b01c7ada34",
     "introduced": 1,
     "shipped": [
       "b5b73045438fc4f2cbab7636ddf73fd3bfae366dc25336ef69a6a9b01c7ada34",
       "cb834d7eda82d40315fa7fee6eabd985aa9610062565900e3ffad08917a416c4"
-    ]
+    ],
+    "version": 3
   },
   "presentations": {
+    "current": "f2e23e5f9a052b90e81d0daf6df0b61ff17249271be9ccc8107581cc1c771fb4",
     "introduced": 1,
     "shipped": [
       "f2e23e5f9a052b90e81d0daf6df0b61ff17249271be9ccc8107581cc1c771fb4"
-    ]
+    ],
+    "version": 3
   },
   "scheduled-artifact-refresh": {
+    "current": "6389e685490a1984f6a66f5926292ddf230e9791481a493421514fa9aeb2e509",
     "introduced": 2,
     "shipped": [
       "5d1588f9f5e9afd28ff7d0d3a31c53e7f60f16f903a9ca4bc8bf5a0e5c9069d0",
       "6389e685490a1984f6a66f5926292ddf230e9791481a493421514fa9aeb2e509",
       "6e55b2af4ed3e415f3f97df1f2935a18208b32bc95626134f7336335f5a84795",
       "baeee1ab1b1d39f4d447f0ba931608079cef806d2c587572e7e6e802b20b8d2b"
-    ]
+    ],
+    "version": 3
   },
   "skill-creator": {
+    "current": "5f20d8a9f8d5811a4f5d3b2194c94f82e524ef50944f1efa19b06856e8163fe9",
     "introduced": 1,
     "shipped": [
       "175bb0287771cd478abf90a5b782e8e0d652ddaeb1e835d37286f6ed4ccbdfaa",
       "5f20d8a9f8d5811a4f5d3b2194c94f82e524ef50944f1efa19b06856e8163fe9",
       "e924645f2017f78adcd527a9a8aaa221f2aadab01bdc14c12e1688e678a876a9"
-    ]
+    ],
+    "version": 3
   },
   "thermo-nuclear-code-quality-review": {
+    "current": "ebc49d4d13efd65a18469abc235400eef31c3f39d173b8c4c42a642930757bc9",
     "introduced": 1,
     "shipped": [
       "ebc49d4d13efd65a18469abc235400eef31c3f39d173b8c4c42a642930757bc9"
-    ]
+    ],
+    "version": 1
   }
 }

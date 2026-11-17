@@ -10,10 +10,17 @@ deleted.
     python scripts/builtin_skills_shipped.py --check  # exit 1 if it is stale
 
 Run it in a full clone (it reads history), after any change to a builtin.
+Bump BUILTIN_SKILLS_VERSION (CODE_BUILTIN_SKILLS_VERSION for a Code skill)
+first: a new or changed builtin is refused until the version is higher than the
+one the manifest on origin/staging recorded for that store, because a store
+already at that version would never see the change. Comparing with staging, not
+with the working copy, lets a branch edit a builtin more than once under one bump. A new builtin records the bumped version as
+the one it was introduced in.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -79,21 +86,75 @@ def version_when_added(slug: str, refs: list[str]) -> int:
     return int(match.group(1)) if match else 1
 
 
+class NeedsVersionBump(Exception):
+    pass
+
+
+def entry_for(slug: str, fingerprint: str, version: int, previous: dict, *,
+              store_last: int, bootstrap_introduced: int = 0) -> dict:
+    """The manifest fields for one builtin, except `shipped`.
+
+    `version` is its store's version now; `store_last` is the highest version
+    the previous manifest recorded for that store (0 when there is none, i.e.
+    the manifest is being created). A new or changed builtin needs `version`
+    above what was recorded, or stores already there would never get it.
+    """
+    prev = previous.get(slug)
+    if prev is None:
+        if store_last and version <= store_last:
+            raise NeedsVersionBump(f"{slug} is new: bump its store's version above {store_last} first")
+        introduced = version if store_last else (bootstrap_introduced or version)
+        return {"introduced": introduced, "version": version, "current": fingerprint}
+    if fingerprint == prev.get("current"):
+        return {"introduced": prev["introduced"], "version": prev.get("version", version), "current": fingerprint}
+    if "current" in prev and version <= prev.get("version", 0):
+        raise NeedsVersionBump(f"{slug} changed: bump its store's version above {prev['version']} first")
+    return {"introduced": prev["introduced"], "version": version, "current": fingerprint}
+
+
+def store_versions() -> dict[str, int]:
+    source = (ROOT / "cowork/services/skills.py").read_text()
+    return {name: int(re.search(rf"^{name} = (\d+)", source, re.M).group(1))
+            for name in ("BUILTIN_SKILLS_VERSION", "CODE_BUILTIN_SKILLS_VERSION")}
+
+
+def store_of(slug: str) -> str:
+    return "CODE_BUILTIN_SKILLS_VERSION" if slug in CODE_ONLY_BUILTIN_SKILL_NAMES else "BUILTIN_SKILLS_VERSION"
+
+
+def released_manifest() -> dict:
+    """shipped.json as origin/staging has it, or {} before it existed there.
+    BUILTIN_SKILLS_BASELINE_REF names another ref, for trying the rules out."""
+    rel = BUILTIN_SKILLS_SHIPPED.relative_to(ROOT).as_posix()
+    baseline = os.environ.get("BUILTIN_SKILLS_BASELINE_REF", "origin/staging")
+    shown = subprocess.run(["git", "-C", str(ROOT), "show", f"{baseline}:{rel}"],
+                           capture_output=True)
+    return json.loads(shown.stdout) if shown.returncode == 0 else {}
+
+
 def build() -> dict:
     refs = existing_refs()
     previous = {}
     if BUILTIN_SKILLS_SHIPPED.exists():
         previous = json.loads(BUILTIN_SKILLS_SHIPPED.read_text(encoding="utf-8"))
-    current_version = int(re.search(
-        r"^BUILTIN_SKILLS_VERSION = (\d+)",
-        (ROOT / "cowork/services/skills.py").read_text(), re.M).group(1))
+    released = released_manifest()
+    versions = store_versions()
+    store_last = {store: 0 for store in versions}
+    for slug, entry in released.items():
+        recorded = entry.get("version", entry.get("introduced", 0))
+        store_last[store_of(slug)] = max(store_last[store_of(slug)], recorded)
     manifest = {}
     for src in sorted(p for p in BUILTIN_SKILLS_DIR.iterdir() if (p / SKILL_FILE).is_file()):
         slug = src.name
+        fingerprint = builtin_fingerprint(src)
+        entry = entry_for(
+            slug, fingerprint, versions[store_of(slug)], released,
+            store_last=store_last[store_of(slug)],
+            bootstrap_introduced=0 if released else version_when_added(slug, refs),
+        )
         shipped = committed_fingerprints(slug, refs) | set(previous.get(slug, {}).get("shipped", ()))
-        shipped.add(builtin_fingerprint(src))
-        introduced = previous.get(slug, {}).get("introduced") or version_when_added(slug, refs) or current_version
-        manifest[slug] = {"introduced": introduced, "shipped": sorted(shipped)}
+        shipped.add(fingerprint)
+        manifest[slug] = {**entry, "shipped": sorted(shipped)}
     return manifest
 
 
@@ -102,7 +163,11 @@ def render(manifest: dict) -> str:
 
 
 def main() -> int:
-    text = render(build())
+    try:
+        text = render(build())
+    except NeedsVersionBump as exc:
+        print(f"refused: {exc}")
+        return 1
     if "--check" in sys.argv:
         if not BUILTIN_SKILLS_SHIPPED.exists() or BUILTIN_SKILLS_SHIPPED.read_text(encoding="utf-8") != text:
             print(f"{BUILTIN_SKILLS_SHIPPED} is stale: run python scripts/builtin_skills_shipped.py")
