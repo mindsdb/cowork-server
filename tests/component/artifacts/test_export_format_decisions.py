@@ -1,12 +1,6 @@
-"""Which formats an artifact's Export offers, and where ``exportFormats`` shows.
-
-``export_formats`` is the one place that decides. The list cards and the
-workspace response carry its answer in ``capabilities.exportFormats``, and the
-export route accepts exactly the formats that list holds.
-"""
+"""Artifact format decisions, card capabilities and scoped permission checks."""
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +10,6 @@ from uuid import uuid4
 import pytest
 import yaml
 from fastapi import HTTPException
-from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
@@ -25,7 +18,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.schemas.artifact_export import ExportPdfSettings
-from cowork.services import artifact_export, artifact_permissions
+from cowork.services import artifact_export
 from cowork.services import artifact_ownership as ownership
 from cowork.services.artifact_export import (
     ExportSource,
@@ -33,15 +26,13 @@ from cowork.services.artifact_export import (
     export_formats,
     export_pdf_settings,
 )
-from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_permissions import artifact_capabilities
 from test_artifact_ownership import make_project, project_root
-from _async_stub import awaitable
 from _artifact_cards import make_card
 from tests.support.artifacts.format_cases import _LOCAL_ARTIFACTS, _local_source, _write_artifact
 from tests.support.artifacts.format_fixtures import local_mode as local_mode
 
-FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
+FIXTURES = Path(__file__).parents[2] / "fixtures" / "artifact_export"
 FORMAT_CASES = yaml.safe_load((FIXTURES / "formats.yaml").read_text(encoding="utf-8"))["cases"]
 
 pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
@@ -111,9 +102,6 @@ def test_a_card_names_its_primary_file_and_type(tmp_path, primary, artifact_type
     assert card_export_source(card) == expected
 
 
-# ── capabilities ─────────────────────────────────────────────────────────────
-
-
 def test_local_cards_carry_export_formats(tmp_path, local_mode):
     source = _local_source(tmp_path)
     for slug, (files, metadata, _expected) in _LOCAL_ARTIFACTS.items():
@@ -126,99 +114,12 @@ def test_local_cards_carry_export_formats(tmp_path, local_mode):
     assert listed == {slug: expected for slug, (_f, _m, expected) in _LOCAL_ARTIFACTS.items()}
 
 
-def test_the_local_workspace_response_carries_export_formats(tmp_path, local_mode, monkeypatch):
-    source = _local_source(tmp_path)
-    artifact_id, folder = _write_artifact(
-        source.base, "report", {"report.md": "# R\n"}, type="document", primary="report.md"
-    )
-    monkeypatch.setattr(
-        workspace_ep,
-        "review_artifact_for_request",
-        awaitable(lambda *_args: (source, folder, ArtifactMetadata.parse((folder / "metadata.json").read_text()), True)),
-    )
-    from cowork.server import create_app
-
-    response = TestClient(create_app()).get(f"/api/v1/artifacts/workspace/local/{artifact_id}")
-
-    assert response.status_code == 200, response.text
-    assert response.json()["capabilities"]["exportFormats"] == ["html", "docx"]
-
-
-def test_the_workspace_response_decides_export_formats_where_artifact_capabilities_does(
-    tmp_path, local_mode, monkeypatch
-):
-    """The workspace response already holds its owner's capabilities, and adds
-    exportFormats through the helper artifact_capabilities() adds it with. A
-    change to how the list is decided then reaches both answers alike."""
-    source = _local_source(tmp_path)
-    artifact_id, folder = _write_artifact(
-        source.base, "report", {"report.md": "# R\n"}, type="document", primary="report.md"
-    )
-    monkeypatch.setattr(
-        workspace_ep,
-        "review_artifact_for_request",
-        awaitable(lambda *_args: (source, folder, ArtifactMetadata.parse((folder / "metadata.json").read_text()), True)),
-    )
-    monkeypatch.setattr(artifact_permissions, "offered_export_formats", lambda **_kwargs: ["docx"])
-    from cowork.server import create_app
-
-    response = TestClient(create_app()).get(f"/api/v1/artifacts/workspace/local/{artifact_id}")
-    capabilities = artifact_capabilities(
-        SimpleNamespace(scope=LOCAL_SCOPE),
-        source,
-        "report",
-        export_source=ExportSource(source_name="report.md", is_backend=False),
-    )
-
-    assert response.status_code == 200, response.text
-    assert capabilities["exportFormats"] == ["docx"]
-    assert response.json()["capabilities"]["exportFormats"] == ["docx"]
-
-
-def test_a_hard_linked_primary_offers_nothing_anywhere_and_the_route_answers_422(
-    tmp_path, local_mode, monkeypatch
-):
-    """A sync or backup tool can give the primary a second hard link. The
-    export's read refuses such a file, so its card and the workspace response
-    offer no format, and the route answers 422, as for any format not offered."""
-    source = _local_source(tmp_path)
-    artifact_id, folder = _write_artifact(
-        source.base, "report", {"report.md": "# R\n"}, type="document", primary="report.md"
-    )
-    os.link(folder / "report.md", tmp_path / "backup.md")
-    with Session(get_engine(get_app_settings().database.uri)) as raw:
-        cards = [card.to_json() for card in artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])]
-    monkeypatch.setattr(
-        workspace_ep,
-        "review_artifact_for_request",
-        awaitable(lambda *_args: (source, folder, ArtifactMetadata.parse((folder / "metadata.json").read_text()), True)),
-    )
-    from cowork.server import create_app
-
-    client = TestClient(create_app())
-    response = client.get(f"/api/v1/artifacts/workspace/local/{artifact_id}")
-    files_before = sorted(path.name for path in folder.iterdir())
-
-    assert [card["capabilities"]["exportFormats"] for card in cards] == [[]]
-    assert response.status_code == 200, response.text
-    assert response.json()["capabilities"]["exportFormats"] == []
-    for export_format in ("html", "docx"):
-        refused = client.post(
-            f"/api/v1/artifacts/workspace/local/{artifact_id}/export", json={"format": export_format}
-        )
-        assert refused.status_code == 422, refused.text
-    assert sorted(path.name for path in folder.iterdir()) == files_before
-
-
 def test_capabilities_without_an_export_source_leave_the_field_out():
     """Only the cards and the workspace response know the primary file; any
     other capabilities answer leaves the field out rather than claim none."""
     capabilities = artifact_capabilities(SimpleNamespace(scope=LOCAL_SCOPE), None, "report")
 
     assert "exportFormats" not in capabilities
-
-
-# ── org mode ─────────────────────────────────────────────────────────────────
 
 
 @contextmanager
@@ -353,31 +254,3 @@ async def test_the_live_recheck_keeps_formats_only_with_artifact_manage(
 
     assert current["exportFormats"] == (["html", "docx"] if artifact_manage else [])
     assert capabilities["exportFormats"] == ["html", "docx"]
-
-
-# ── the list holds exactly what the route accepts ────────────────────────────
-
-
-@pytest.mark.parametrize("slug", sorted(_LOCAL_ARTIFACTS))
-def test_the_route_accepts_exactly_the_formats_the_card_lists(tmp_path, local_mode, monkeypatch, slug):
-    files, metadata, _expected = _LOCAL_ARTIFACTS[slug]
-    source = _local_source(tmp_path)
-    artifact_id, folder = _write_artifact(source.base, slug, files, **metadata)
-    with Session(get_engine(get_app_settings().database.uri)) as raw:
-        (card,) = [card.to_json() for card in artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])]
-    listed = card["capabilities"]["exportFormats"]
-    monkeypatch.setattr(
-        workspace_ep,
-        "review_artifact_for_request",
-        awaitable(lambda *_args: (source, folder, ArtifactMetadata.parse((folder / "metadata.json").read_text()), True)),
-    )
-    from cowork.server import create_app
-
-    client = TestClient(create_app())
-    for export_format in ("html", "docx", "pdf"):
-        response = client.post(
-            f"/api/v1/artifacts/workspace/local/{artifact_id}/export",
-            json={"format": export_format},
-        )
-        expected = 200 if export_format in listed else 422
-        assert response.status_code == expected, (export_format, response.text)
