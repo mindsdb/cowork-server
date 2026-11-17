@@ -13,7 +13,7 @@ from _fakes import FakeRequest
 
 def _listing(
     ids, efforts=None, enabled=None, labels=None, providers=None, families=None, role_defaults=None,
-    disabled_reasons=None,
+    disabled_reasons=None, image_models=None,
 ):
     """A MindsModelListing with everything a test doesn't care about left empty.
 
@@ -32,6 +32,7 @@ def _listing(
         families or {},
         role_defaults or {},
         disabled_reasons or {},
+        image_models or {},
     )
 
 
@@ -682,7 +683,8 @@ def test_org_catalog_cache_is_scoped_by_caller_within_one_org(monkeypatch):
     calls = []
 
     async def fake_get(url, headers=None, **kw):
-        calls.append(headers.get("Authorization"))
+        if "?kind=" not in url:  # the image half of the same fetch
+            calls.append(headers.get("Authorization"))
         restricted = headers["Authorization"].startswith("Bearer tok-member")
 
         class R:
