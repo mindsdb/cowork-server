@@ -129,11 +129,109 @@ def changed_lines(doc: dict[str, Any], touched: dict[str, list[str]]) -> str:
 # code span, and a backslash inside a code span is the code's own.
 _ESCAPE_OR_CODE = re.compile(r"\\([*`~\[\]{}_\\])|`([^`]+)`")
 _BOLD = re.compile(r"\*\*(.+?)\*\*")
-_ITALIC = re.compile(r"(?<![*\w])\*(?!\s)(.+?)(?<!\s)\*(?![*\w])|(?<![_\w])_(?!\s)(.+?)(?<!\s)_(?![_\w])")
 _STRIKE = re.compile(r"~~(.+?)~~")
-_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+|mailto:[^)\s]+)\)")
-_CHIP = re.compile(r"\{\{\s*(date|status|user)\s*:\s*([^}]+?)\s*\}\}")
 _HELD = re.compile(r"\x00(\d+)\x00")
+
+# Italic, links and chips are scanned rather than matched by one regex each:
+# such a regex rescans the rest of the line (or text) from every opener that
+# never closes, which is quadratic, and a long block stalls the server. (Bold,
+# strike and code stay regexes: only the last openers of a line or text fail.)
+# Each scan reads exactly what its regex reads (docModel.inlineToHtml in the
+# editor uses the same lookups but reads all marks in one pass):
+#   italic  (?<![*\w])\*(?!\s)(.+?)(?<!\s)\*(?![*\w])  and the same with _
+#   link    \[([^\]]+)\]\((https?://[^)\s]+|mailto:[^)\s]+)\)
+#   chip    \{\{\s*(date|status|user)\s*:\s*([^}]+?)\s*\}\}
+# The mark comes first so that a search jumps to it rather than testing every position.
+_EM_OPEN = re.compile(r"\*(?<![*\w]\*)(?!\s)|_(?<![_\w]_)(?!\s)")
+_EM_CLOSE = {"*": re.compile(r"\*(?<!\s\*)(?![*\w])"), "_": re.compile(r"_(?<!\s_)(?![_\w])")}
+_NEWLINE = re.compile(r"\n")
+_LINK_OPEN = re.compile(r"\[")
+_LINK_CLOSE = re.compile(r"\]")
+_LINK_HREF = re.compile(r"\]\((?:https?://|mailto:)")
+_HREF_END = re.compile(r"[)\s]")
+_CHIP_HEAD = re.compile(r"\{\{\s*(date|status|user)\s*:")
+_CHIP_CLOSE = re.compile(r"\}")
+
+
+class _Next:
+    """The first match of ``pattern`` in ``s`` at or after a position (``len(s)`` if none).
+
+    Asked for positions that only grow, it searches each stretch of ``s`` once.
+    """
+
+    def __init__(self, pattern: re.Pattern[str], s: str) -> None:
+        self._pattern, self._s = pattern, s
+        self._from, self._at = 1, 0  # an empty span: the first ask searches
+
+    def __call__(self, pos: int) -> int:
+        if not self._from <= pos <= self._at:
+            m = self._pattern.search(self._s, pos)
+            self._from, self._at = pos, m.start() if m else len(self._s)
+        return self._at
+
+
+def _replace(s: str, starts: re.Pattern[str], read: Callable[[re.Match[str]], tuple[int, str] | None]) -> str:
+    """``re.sub`` for a mark found by its start: ``read`` gives a start's (end, markup), or None."""
+    out, done = [], 0
+    for m in starts.finditer(s):
+        if m.start() >= done and (hit := read(m)):
+            out += (s[done:m.start()], hit[1])
+            done = hit[0]
+    out.append(s[done:])
+    return "".join(out)
+
+
+def _italics(s: str) -> str:
+    if "*" not in s and "_" not in s:
+        return s
+    close = {mark: _Next(pattern, s) for mark, pattern in _EM_CLOSE.items()}
+    newline = _Next(_NEWLINE, s)
+
+    def read(m: re.Match[str]) -> tuple[int, str] | None:
+        i = m.start()
+        # The words run to the first closing mark, which is on the same line.
+        j = close[s[i]](i + 2)
+        return (j + 1, f"<em>{s[i + 1:j]}</em>") if j < len(s) and newline(i + 1) > j else None
+
+    return _replace(s, _EM_OPEN, read)
+
+
+def _links(s: str, hold: Callable[[str], str]) -> str:
+    if "](" not in s:
+        return s
+    close, href_end = _Next(_LINK_CLOSE, s), _Next(_HREF_END, s)
+
+    def read(m: re.Match[str]) -> tuple[int, str] | None:
+        i = m.start()
+        q = close(i + 1)  # the words run to the first "]"
+        if q == i + 1 or not (head := _LINK_HREF.match(s, q)):
+            return None
+        e = href_end(head.end())
+        if e == head.end() or not s.startswith(")", e):
+            return None
+        # The words stay in the text (they may be bold); only the address is held.
+        return e + 1, hold(f'<a href="{html.escape(s[q + 2:e])}">') + s[i + 1:q] + hold("</a>")
+
+    return _replace(s, _LINK_OPEN, read)
+
+
+def _chips(s: str) -> str:
+    if "{{" not in s:
+        return s
+    close = _Next(_CHIP_CLOSE, s)
+
+    def read(head: re.Match[str]) -> tuple[int, str] | None:
+        q = close(head.end())  # the value runs to the first "}"
+        if q == head.end() or not s.startswith("}}", q):
+            return None
+        kind, raw = head.group(1), s[head.end():q]
+        # The regex's lazy value sheds the spaces around it but keeps at least one character.
+        value = raw.strip() or raw[-1]
+        if kind == "date":
+            value = _date_label(value)
+        return q + 2, f'<span class="chip chip-{kind}">{value}</span>'
+
+    return _replace(s, _CHIP_HEAD, read)
 
 
 def inline_html(text: str) -> str:
@@ -155,20 +253,12 @@ def inline_html(text: str) -> str:
         lambda m: hold(html.escape(m.group(1)) if m.group(1) is not None else f"<code>{html.escape(m.group(2))}</code>"),
         s,
     )
-    # The link's words stay in the text (they may be bold); only its address is held.
-    s = _LINK.sub(lambda m: hold(f'<a href="{html.escape(m.group(2))}">') + m.group(1) + hold("</a>"), s)
+    s = _links(s, hold)
     s = html.escape(s, quote=False)
     s = _BOLD.sub(r"<strong>\1</strong>", s)
-    s = _ITALIC.sub(lambda m: f"<em>{m.group(1) or m.group(2)}</em>", s)
+    s = _italics(s)
     s = _STRIKE.sub(r"<s>\1</s>", s)
-
-    def chip(m: re.Match) -> str:
-        kind, value = m.group(1), m.group(2)
-        if kind == "date":
-            value = _date_label(value)
-        return f'<span class="chip chip-{kind}">{value}</span>'
-
-    s = _CHIP.sub(chip, s)
+    s = _chips(s)
     return _HELD.sub(lambda m: held[int(m.group(1))], s)
 
 
