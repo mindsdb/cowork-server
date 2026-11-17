@@ -38,6 +38,7 @@ from cowork.services.artifact_identity import artifact_key
 from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.publish import publish_artifact
 from tests._org_sharing import TEAM_ELSEWHERE, TEAM_ENG, TEAM_OPS, TEAM_QA, member_request, mindshub_sharing_answers
+from tests.anton_minds_fake import fake_minds_requests
 
 
 class AuthIssuer:
@@ -1015,7 +1016,7 @@ async def test_an_autopublish_never_publishes_over_a_restricted_rule_after_an_ag
     with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
         published = await ap._publish_one(
             folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-            ap._access_for(decision), project_id=str(project.id),
+            ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
         )
 
     assert published is False
@@ -1049,7 +1050,7 @@ async def test_an_autopublish_with_the_metadata_removed_and_the_entry_key_blanke
     with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
         published = await ap._publish_one(
             folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-            ap._access_for(decision), project_id=str(project.id),
+            ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
         )
 
     assert published is False
@@ -1485,7 +1486,7 @@ async def test_a_page_in_a_subfolder_its_owner_made_public_keeps_syncing(
             decision = ap.PublishDecision("changed", published_entry=entry)
             saved = await ap._publish_one(
                 folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-                ap._access_for(decision), project_id=str(project.id),
+                ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
             )
 
     assert saved is True, [record.reason for record in _mode_changed_records(caplog)]
@@ -1614,7 +1615,7 @@ async def _autopublish_once(folder, scope, project):
     decision = ap.PublishDecision("changed", published_entry=_entry(folder))
     return await ap._publish_one(
         folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-        ap._access_for(decision), project_id=str(project.id),
+        ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
     )
 
 
@@ -1769,7 +1770,7 @@ def _upload_ends(monkeypatch, ending: UploadEnding, *, meanwhile=None) -> None:
 
     local = ending.raises in ("state_publish_blocked", "os_error")
     monkeypatch.setattr("anton.publisher.publish", publish_fails_before_sending if local else _ANTON_PUBLISH)
-    monkeypatch.setattr("anton.publisher.minds_request", request)
+    fake_minds_requests(monkeypatch, request)
 
 
 def _owner_choice(key, scope):
@@ -1913,7 +1914,7 @@ def test_a_markdown_render_that_fails_leaves_the_owners_choice_as_it_was(
     run, _uploads = _org_publisher(issuer, folder, scope, project, monkeypatch)
     key = run({"mode": "public"}, owner_save=True)["artifactKey"]
 
-    def render_fails(_md_path, _out_dir):
+    def render_fails(_md_path, _out_dir, **_kwargs):
         raise OSError("Could not read notes.md")
 
     monkeypatch.setattr("cowork.services.publish._render_markdown_to_html", render_fails)
@@ -1942,9 +1943,9 @@ def test_a_markdown_save_whose_narrowing_fails_removes_its_rendered_page(
     rendered = []
     render = publish_module._render_markdown_to_html
 
-    def render_and_note(md_path, out_dir):
+    def render_and_note(md_path, out_dir, **kwargs):
         rendered.append(out_dir)
-        return render(md_path, out_dir)
+        return render(md_path, out_dir, **kwargs)
 
     def narrowing_fails(**_kwargs):
         raise ArtifactAccessUnavailable("Could not record the sharing the artifact's owner chose")

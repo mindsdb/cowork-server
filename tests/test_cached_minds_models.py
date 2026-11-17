@@ -20,7 +20,7 @@ def _listing(ids):
     return providers.MindsModelListing(
         ids=ids, efforts={"gpt": {"efforts": ["low", "max"], "default": "low"}} if ids else {},
         enabled={}, labels={}, providers={}, families={}, role_defaults={},
-        disabled_reasons={},
+        disabled_reasons={}, image_models={},
     )
 
 
@@ -83,7 +83,8 @@ def _serve(monkeypatch, calls: list[str]) -> None:
 
     async def fake_get(url, headers=None, **kw):
         bearer = headers["Authorization"]
-        calls.append(bearer)
+        if "?kind=" not in url:  # the image half of the same fetch
+            calls.append(bearer)
         restricted = "account-a" in bearer
 
         class R:
@@ -110,7 +111,7 @@ def _serve(monkeypatch, calls: list[str]) -> None:
 
 
 def _fetch(api_key: str):
-    return asyncio.run(providers.fetch_minds_models(_URL, api_key))
+    return asyncio.run(providers.fetch_minds_models(_URL, api_key, mindshub=True))
 
 
 def test_two_desktop_credentials_do_not_share_a_listing(monkeypatch) -> None:
@@ -153,6 +154,18 @@ def test_expired_entries_are_dropped_on_the_next_write(monkeypatch) -> None:
     assert expired not in providers._minds_models_cache
     assert fresh in providers._minds_models_cache
     assert _key(_URL, api_key="newcomer") in providers._minds_models_cache
+
+
+def test_an_expired_success_survives_other_writes_for_the_retain_window(monkeypatch) -> None:
+    # The freshness TTL is short; the coding endpoints still read the last listing.
+    _serve(monkeypatch, [])
+    member = _key(_URL, api_key="member-a")
+    past_fresh = time.monotonic() - providers._MINDS_MODELS_TTL - 60
+    providers._minds_models_cache[member] = (past_fresh, _listing(["gpt"]))
+
+    _fetch("member-b")
+
+    assert providers.cached_minds_models(_URL, api_key="member-a").ids == ["gpt"]
 
 
 def test_the_cache_holds_at_most_the_cap_and_drops_the_least_recently_used(monkeypatch) -> None:

@@ -72,10 +72,11 @@ def published(monkeypatch):
     calls = []
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url, password=None,
-                     access=None, scope=None, project_id=None):
+                     access=None, scope=None, project_id=None, background=False,
+                     job_budget_s=None, on_job_accepted=None):
         # The access as anton's publisher is handed it.
         calls.append({"folder": artifact, "api_key": api_key, "access": access.publisher_access(),
-                      "scope": scope, "project_id": project_id})
+                      "scope": scope, "project_id": project_id, "background": background})
         (artifact / ".published.json").write_text(json.dumps({
             "index.html": {"report_id": "rid", "url": "u", "published": True,
                            "last_md5": "m", "published_mtime": 9_999_999_999},
@@ -297,6 +298,32 @@ async def test_key_is_revoked_after_reconciliation(base, enabled, key, published
     await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert key.revoked is True
+
+
+async def test_key_outlives_a_publish_thread_left_polling(base, enabled, key, monkeypatch):
+    """A timed-out publish thread keeps polling its job with the key, so the
+    key is left to its TTL rather than revoked under it."""
+    import threading
+
+    release = threading.Event()
+
+    def polling_publish(artifact, **kwargs):
+        kwargs["on_job_accepted"]({"job_id": "j"})
+        release.wait(5.0)
+
+    monkeypatch.setattr(ap, "publish_artifact", polling_publish)
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+
+    try:
+        out = await ap.autopublish_project_artifacts(
+            base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"}, timeout_s=0.2,
+        )
+    finally:
+        release.set()
+
+    assert out == set()
+    assert key.revoked is False
 
 
 async def test_nothing_to_publish_mints_no_key(base, enabled, published, monkeypatch):
@@ -607,6 +634,8 @@ async def test_project_id_reaches_publish_artifact(base, enabled, key, published
     await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert published[0]["project_id"] == PROJECT_ID
+    # No person asked for it, so a Markdown page the conversion stopped isn't rendered again.
+    assert published[0]["background"] is True
 
 
 # ─── owner filter (F1) ───────────────────────────────────────────────────

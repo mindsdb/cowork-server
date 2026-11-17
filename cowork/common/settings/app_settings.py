@@ -112,12 +112,26 @@ MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
 # The agent roles a model is resolved for, in the order the picker's
 # `recommendedPair` lists them. One declaration, because three places used to
 # spell it out: this order, the derived dicts below, and the pair overlay in the
-# recommended-models endpoint. Mirrors the role enum in the MindsHub model
-# policy's JSON Schema; the two are a cross-repo contract and a role in one and
-# not the other is silently dropped at the parse in fetch_minds_models.
+# recommended-models endpoint. With IMAGE_ROLE below, mirrors the role enum in
+# the MindsHub model policy's JSON Schema; the two are a cross-repo contract and
+# a role in one and not the other is silently dropped at the parse in
+# fetch_minds_models.
 # `test_role_default_dicts_match_the_source_table` holds it to the table above.
 AGENT_ROLE_ORDER: tuple[str, ...] = ("planning", "coding", "router")
 AGENT_ROLE_NAMES: frozenset[str] = frozenset(AGENT_ROLE_ORDER)
+
+# The role the agent's `generate_image` tool and the scratchpad's image helper
+# run on. Not one of the chat roles above: it has no slot in `recommendedPair`
+# and no per-provider table, because only MindsHub serves image models, and only
+# a `kind: "image"` catalog row may claim it (fetch_minds_models).
+IMAGE_ROLE = "image"
+# What the image role starts on until the catalog's `default_for: ["image"]`
+# declaration has been cached, and whenever it cannot be reached. Demoted the
+# same way the chat roles' compiled defaults are (_defaults_with_declared).
+IMAGE_MODEL_DEFAULT = "gpt-image-2.6-flare"
+# Every role a catalog row's `default_for` may name, which is what the parse
+# keeps and the `minds_role_defaults` cache holds.
+CATALOG_ROLE_NAMES: frozenset[str] = AGENT_ROLE_NAMES | {IMAGE_ROLE}
 
 # The table above, pivoted: role -> provider -> model. Anything that resolves a
 # role it was handed the name of reads this, so no caller has to line a role up
@@ -624,6 +638,10 @@ class OAuthSettings(Settings):
 
     posthog_client_id: str = Field(default="", validation_alias=AliasChoices("POSTHOG_CLIENT_ID"))
 
+    # Notion MCP is a public client like PostHog: the id is our hosted Client
+    # ID Metadata Document's URL, and there is no secret.
+    notion_client_id: str = Field(default="", validation_alias=AliasChoices("NOTION_CLIENT_ID"))
+
     # HubSpot's MCP Auth App — a fixed client_id/secret pair, same shape as
     # Google/Linear/GitHub/Supabase, but the resulting token can only call
     # HubSpot's remote MCP server, never its REST API.
@@ -685,6 +703,59 @@ class StreamSettings(Settings):
     )
 
 
+class PushSettings(Settings):
+    """Mobile push credentials (cowork.services.push). Every field is optional:
+    a platform whose credentials are missing sends nothing, and push as a whole
+    runs only in org mode. The two secrets take their contents as they are or
+    base64-encoded, so a Kubernetes secret can hold either."""
+
+    enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_PUSH_ENABLED"),
+        description="Kill switch for mobile push. On by default; sends only where credentials are set.",
+    )
+    apns_key_p8: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_KEY_P8"),
+        description="APNs auth key (.p8 PEM from Apple Developer > Keys), as PEM or base64 of it.",
+    )
+    apns_key_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_KEY_ID"),
+        description="Key ID of the APNs auth key.",
+    )
+    apns_team_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_TEAM_ID"),
+        description="Apple Developer team ID that owns the APNs key.",
+    )
+    apns_topic: str = Field(
+        default="ai.mindshub.cowork",
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_TOPIC"),
+        description="APNs topic: the iOS app's bundle id.",
+    )
+    fcm_service_account_json: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON"),
+        description="Firebase service-account JSON for FCM HTTP v1, as JSON or base64 of it.",
+    )
+
+
+@lru_cache
+def get_push_settings() -> PushSettings:
+    """Cached push settings; tests clear the cache after changing the env."""
+    return PushSettings()
+
+
+#: auth's turn_key_max_ttl_seconds (API_KEYS__TURN_KEY_MAX_TTL_SECONDS in
+#: mindsdb/auth): the longest a turn key may live from now, at mint and at each
+#: extension. Mirrored here only to refuse a time limit whose key window auth
+#: would refuse; change both together.
+AUTH_TURN_KEY_MAX_TTL_SECONDS = 6600
+#: Kept free under that cap for clock skew between cowork-server and auth.
+AUTH_TURN_KEY_SKEW_SECONDS = 300
+
+
 class TurnQueueSettings(Settings):
     model_config = SettingsConfigDict(env_prefix="COWORK_TURN_")
 
@@ -715,12 +786,16 @@ class TurnQueueSettings(Settings):
         default=600.0,
         description=(
             "Fail a remote turn after this many seconds with no reply for it on the reply "
-            "stream (worker down, crashed, or wedged). Generous on purpose: the reply "
-            "protocol has no heartbeat, so a long tool run legitimately produces no reply "
-            "for minutes — tighten it once the pod sends one. <= 0 disables the bound, "
-            "which means an unresponsive worker leaves the turn spinning forever."
-            " An open ask_user question produces no reply either: keep this above the "
-            "pod's question timeout (ANTON_CLOUD_ASK_USER_TIMEOUT_SECONDS, 300 s)."
+            "stream (worker down, crashed, or wedged). A scratchpad-controller that relays "
+            "liveness sends a busy pod's heartbeat as a `worker_alive` progress reply once a "
+            "minute (its SCRATCHPAD_CONTROLLER__LIVENESS_RELAY_SECONDS), which counts as a "
+            "reply here, so a long tool run or an open ask_user question no longer goes "
+            "quiet; the UI also shows it as a model_wait frame after a quiet stretch, but "
+            "not over an open question. Keep this well above that interval. A controller too old to relay sends nothing during either, so until "
+            "every controller does, keep this above the longest quiet step and above the "
+            "pod's question timeout (ANTON_CLOUD_ASK_USER_TIMEOUT_SECONDS, 300 s). <= 0 "
+            "disables the bound, which means an unresponsive worker leaves the turn "
+            "spinning forever."
         ),
     )  # COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS
     auth_internal_base_url: str = Field(
@@ -734,12 +809,60 @@ class TurnQueueSettings(Settings):
     turn_key_ttl_seconds: int = Field(
         default=1200,
         description=(
-            "TTL, in seconds, of the minted per-turn MindsHub key (20 min; keep within "
-            "auth's turn_key_max_ttl_seconds). scratchpad-controller's "
-            "MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from it (TTL - 120); change "
-            "both together."
+            "TTL, in seconds, of the minted per-turn MindsHub key for a turn without a "
+            "time limit (20 min; keep within auth's turn_key_max_ttl_seconds). "
+            "scratchpad-controller's MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from "
+            "it (TTL - 120); change both together."
         ),
     )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
+    time_limit_seconds: int = Field(
+        default=0,
+        ge=0,
+        # Sized elsewhere for four 60-minute windows: scratchpad-controller's
+        # time_limited_turn_ceiling_seconds (16 800) and auth's
+        # turn_key_max_lifetime_seconds (17 100). A longer limit would end its
+        # last window on one of them, with no summary; raise those first.
+        le=3600,
+        description=(
+            "Per-turn time limit sent to the pod as params.limits.max_turn_seconds. "
+            "anton asks \"Keep going / Stop here\" at it and ends with a summary. 0 sends "
+            "none, and the turn keeps today's caps. Turn it on only where auth extends "
+            "turn keys and scratchpad-controller raises its backstop for time-limited "
+            "turns; a turn key then lives one time-limit window at a time "
+            "(turn_key_lifetime_seconds) and is extended on each \"Keep going\"."
+        ),
+    )  # COWORK_TURN_TIME_LIMIT_SECONDS
+    time_limit_key_margin_seconds: int = Field(
+        default=2400,
+        ge=0,
+        description=(
+            "How far past the time limit a turn key window reaches: the pod starts "
+            "after the key is minted, a cell that is already running finishes before "
+            "anton asks (the pod caps one cell at 15 minutes), then the summary is "
+            "written. The limit plus this must stay within auth's per-window cap "
+            "(AUTH_TURN_KEY_MAX_TTL_SECONDS) less clock-skew headroom."
+        ),
+    )  # COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS
+
+    @model_validator(mode="after")
+    def _time_limit_key_fits_auth(self) -> "TurnQueueSettings":
+        if self.time_limit_seconds > 0 and self.turn_key_lifetime_seconds > (
+            AUTH_TURN_KEY_MAX_TTL_SECONDS - AUTH_TURN_KEY_SKEW_SECONDS
+        ):
+            raise ValueError(
+                f"COWORK_TURN_TIME_LIMIT_SECONDS + COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS "
+                f"({self.turn_key_lifetime_seconds}s) must leave {AUTH_TURN_KEY_SKEW_SECONDS}s "
+                f"under auth's turn-key cap ({AUTH_TURN_KEY_MAX_TTL_SECONDS}s), or every web "
+                f"turn's key mint is refused"
+            )
+        return self
+
+    @property
+    def turn_key_lifetime_seconds(self) -> int:
+        """How long a turn key minted now, or extended now, must last."""
+        if self.time_limit_seconds > 0:
+            return self.time_limit_seconds + self.time_limit_key_margin_seconds
+        return self.turn_key_ttl_seconds
     pod_shared_mount_root: str = Field(
         default="/mnt/cowork-shared",
         description=(
@@ -780,6 +903,23 @@ class TurnQueueSettings(Settings):
             "direct model can still delegate. See scripts/eval_jev_route before raising it."
         ),
     )  # COWORK_TURN_JEV_ROUTE_MIN_P_DIRECT
+    addon_routing_enabled: bool = Field(
+        default=True,
+        description=(
+            "Let Jev add a message sent while a turn runs to that turn (POST /responses/addon) "
+            "instead of queueing it as the next one. A kill switch, on by default: with no Jev "
+            "to ask, or any doubt, the message is queued anyway. Off: every such message is queued."
+        ),
+    )  # COWORK_TURN_ADDON_ROUTING_ENABLED
+    addon_min_p_add: float = Field(
+        default=0.6,
+        ge=0,
+        le=1,
+        description=(
+            "Jev's probability of adding needed to add a mid-turn message to the running turn; "
+            "below it the message is queued, which is the behaviour without this feature."
+        ),
+    )  # COWORK_TURN_ADDON_MIN_P_ADD
     minds_coding_model: str = Field(
         default="",
         description=(
@@ -795,6 +935,14 @@ class TurnQueueSettings(Settings):
             "until the controller and pod support the datasource block."
         ),
     )  # COWORK_TURN_DATASOURCE_ENABLED
+    datasource_labels_enabled: bool = Field(
+        default=False,
+        description=(
+            "Send each datasource connection's name and connector id with its reference, "
+            "so the agent can tell the connections apart. Keep false until every pod runs "
+            "an anton that accepts them: an older one refuses the turn."
+        ),
+    )  # COWORK_TURN_DATASOURCE_LABELS_ENABLED
     datasource_producer_key_id: str = Field(
         default="",
         description="Key id for the dedicated datasource producer service role.",
@@ -984,6 +1132,19 @@ class AppSettings(Settings):
             "kill switch because a renderer that does not know the event "
             "drops it silently, stalling the agent until the question times "
             "out. Set to false to degrade to plain-text questions (ENG-1984)."
+        ),
+    )
+    quick_edit_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_QUICK_EDIT_ENABLED"),
+        description=(
+            "Whether the artifact viewer's chat bar may edit an artifact "
+            "directly with anton's artifact editor, without a chat turn "
+            "(POST .../quick-edits, ENG-4227). Exposed to the app as the "
+            "artifact capability `canQuickEdit`, which is also false while "
+            "the installed anton has no quick editor. A kill switch: off, "
+            "the route answers 501 and the app sends every bar message to "
+            "the artifact's chat instead."
         ),
     )
     surface_override: str = Field(
@@ -1194,6 +1355,41 @@ class AppSettings(Settings):
                 "path (no query, fragment or credentials)"
             )
         return normalized
+
+    browser_decisions_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_DECISIONS_URL"),
+        description=(
+            "The full URL at which a cloud pod reaches this server's decisions proxy "
+            "(POST /api/v1/browse/decisions), for example "
+            "https://cowork.mindshub.ai/api/v1/browse/decisions. A web turn's browser "
+            "asks the organization's own decision model through it with the turn's "
+            "key, so the organization's key never reaches the pod "
+            "(cowork.services.decisions_proxy). https with an optional path; the "
+            "trailing slash is dropped. Blank (default): the route under "
+            "COWORK_PUBLIC_BASE_URL when that is https; without either, web turns "
+            "pick browser steps with Jev on MindsHub."
+        ),
+    )
+
+    @field_validator("browser_decisions_url", mode="before")
+    @classmethod
+    def _check_browser_decisions_url(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            return "" if value is None else value
+        normalized = _router_url(value)
+        if normalized is None:
+            raise ValueError(
+                "COWORK_BROWSER_DECISIONS_URL must be an https URL with an optional "
+                "path (no query, fragment or credentials)"
+            )
+        return normalized
+
+    voice_operator_model: str = Field(
+        default=MINDS_FREE_MODEL,
+        validation_alias=AliasChoices("COWORK_VOICE_OPERATOR_MODEL"),
+        description="The MindsHub model that turns a voice call's requests into app actions (cowork.services.voice_operator).",
+    )
 
     browser_scope_key_file: str = Field(
         default="",

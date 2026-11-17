@@ -6,6 +6,8 @@
 PYTEST := uv run --locked python -m pytest
 TESTS := tests/ --ignore=tests/integration
 INTEGRATION_TESTS := tests/integration
+# One pytest-xdist worker per logical CPU; `make test/unit PYTEST_WORKERS=0` runs serially.
+PYTEST_WORKERS ?= logical
 
 help: ## Display this help message
 	@echo "Usage: make [target]"
@@ -21,7 +23,7 @@ help: ## Display this help message
 	@echo "  \033[36mcheck/wheels\033[0m           Check every shipped platform resolves to versions with wheels"
 
 test/unit: ## Run unit tests
-	$(PYTEST) $(TESTS)
+	$(PYTEST) -n $(PYTEST_WORKERS) $(TESTS)
 
 test: test/unit ## Run unit tests (alias)
 
@@ -35,10 +37,10 @@ test/services: ## Run the tests that need a local Redis or PostgreSQL (COWORK_TE
 	$(PYTEST) -v -rs tests/ -m "redis_service or postgres_service"
 
 test/unit/coverage: ## Run unit tests with coverage
-	$(PYTEST) --cov=cowork $(TESTS)
+	$(PYTEST) -n $(PYTEST_WORKERS) --cov=cowork $(TESTS)
 
 coverage/html: ## Generate HTML coverage report
-	$(PYTEST) --cov=cowork $(TESTS) --cov-report=html
+	$(PYTEST) -n $(PYTEST_WORKERS) --cov=cowork $(TESTS) --cov-report=html
 
 check/wheels: ## Check every shipped platform resolves to versions with wheels
 	bash scripts/check_wheels_available.sh

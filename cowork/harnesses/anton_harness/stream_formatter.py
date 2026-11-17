@@ -29,6 +29,7 @@ from typing import Annotated, Any, AsyncIterator, Callable, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
+from cowork.common.event_clock import event_at_ms
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.figure_sources import (
     CellResult,
@@ -53,6 +54,7 @@ from cowork.schemas.responses import (
     Role,
 )
 from cowork.schemas.artifact_card import ArtifactCard
+from cowork.streaming.addons import TurnAddon
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
 
 logger = logging.getLogger(__name__)
@@ -127,6 +129,19 @@ class TurnHistory:
     # instead; None means `rows` are what the agent read. The pod's rows
     # arrive unchecked, so an entry may not be a row at all.
     read: list[object] | None = None
+
+
+@dataclass
+class PreviewCheckRequest:
+    """Synthetic event: a remote turn's anton asks the open preview whether an
+    artifact runs (turnqueue/preview_checks.py). Written to the stream as the
+    same ``response.artifact_check`` frame an in-process turn writes
+    (preview_checker.artifact_check_sse), and like that one never saved:
+    it means something only while the pod waits on it."""
+
+    check_id: str
+    artifact_slug: str
+    timeout_s: int
 
 
 @dataclass
@@ -721,6 +736,71 @@ def _replayed_cell(result: str, *, arguments: _CellArguments) -> CellResult:
     return CellResult(code=arguments.code, stdout=stdout, description=arguments.one_line_description)
 
 
+# anton's image tool. Its result names the file it wrote by path, never by its
+# bytes.
+GENERATE_IMAGE_TOOL = "generate_image"
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+# Well past the per-turn image cap, so a result is never cut short by this.
+_MAX_IMAGES_PER_RESULT = 16
+
+
+# The keys a generate_image result names a file under: `absolute_path` is the
+# path the agent's OS wrote it at, `path` the same file in the project's terms.
+_PATH_KEYS = ("absolute_path", "path")
+
+
+def _named_files(value: Any, *, depth: int = 0) -> list[tuple[str, ...]]:
+    """Each object in a parsed tool result that names a file, as the paths it
+    gives for it, in ``_PATH_KEYS`` order."""
+    if depth > 4:
+        return []
+    found: list[tuple[str, ...]] = []
+    if isinstance(value, dict):
+        names = tuple(name for key in _PATH_KEYS if isinstance(name := value.get(key), str) and name)
+        if names:
+            found.append(names)
+        for key, item in value.items():
+            if key not in _PATH_KEYS:
+                found.extend(_named_files(item, depth=depth + 1))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_named_files(item, depth=depth + 1))
+    return found
+
+
+def generated_images(content: str, files: AgentFiles) -> list[dict[str, str]]:
+    """The images a ``generate_image`` result names, as project files the UI
+    can fetch (``GET /projects/{name}/files-raw/{path}``): ``[{"path": ...}]``.
+
+    Each image is read by the path the agent's OS wrote it at first, then by
+    its path in the project's terms (AgentFiles.reported_file), since on a
+    cloud pod neither is a project path: the working directory is the
+    conversation's folder, and a new image artifact is written to the
+    project's artifacts folder through the pod's own mount of it. An image
+    that resolves to no image file in the project, an attachment included, is
+    left out, and a result that is not a JSON object or list (a refusal, an
+    error) names none.
+    """
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        return []
+    images: list[dict[str, str]] = []
+    for names in _named_files(parsed):
+        for literal in names:
+            if not literal.lower().endswith(_IMAGE_SUFFIXES):
+                continue
+            named = files.reported_file(literal)
+            if named is None or named.path is None:
+                continue
+            if {"path": named.path} not in images:
+                images.append({"path": named.path})
+            break
+        if len(images) >= _MAX_IMAGES_PER_RESULT:
+            break
+    return images
+
+
 async def format_responses_stream(
     event_stream: AsyncIterator,
     model: str,
@@ -797,6 +877,11 @@ async def format_responses_stream(
     # What the last spent boundary set aside, returned if the turn hands back
     # instead of delivering the replacement it promised.
     superseded_stash = ""
+    # Where in `collected_text` the current answer starts: just past the last
+    # tool call. Text before a tool call is narration, which the app files as
+    # a step (ENG-3554), so a boundary sets aside only the text after it and a
+    # hand-back gives back the answer alone (ENG-4194).
+    answer_from = 0
     # Why a turn that handed back stopped (anton's `ended_by`); None if it finished.
     ended_by: str | None = None
 
@@ -808,9 +893,11 @@ async def format_responses_stream(
         # reducer would otherwise see every `now()` collapse to the
         # same JS-tick value, producing 0ms across the board.
         # Persisted into the turns sidecar via `event_sink`, so the
-        # field is also there for future replays.
+        # field is also there for future replays. A held step's card
+        # compares it with the approvals-off stamp, which event_clock
+        # keeps at or after it.
         if "at_ms" not in data:
-            data["at_ms"] = int(time.time() * 1000)
+            data["at_ms"] = event_at_ms()
         if event_sink is not None:
             try:
                 event_sink(event_type, data)
@@ -872,8 +959,13 @@ async def format_responses_stream(
                 # answer it promised; if it hands back instead, the answer that
                 # was already read has to come back rather than be lost from the
                 # transcript and from the history the next turn is rebuilt from.
-                superseded_stash = "".join(collected_text)
+                # The answer the user read: the text after the last tool
+                # call, or all of it when nothing followed that call.
+                superseded_stash = "".join(collected_text[answer_from:]).lstrip("\n")
+                if not superseded_stash.strip():
+                    superseded_stash = "".join(collected_text)
                 collected_text.clear()
+                answer_from = 0
                 # The armed paragraph break belongs between two rounds of the
                 # answer being discarded, not in front of its replacement.
                 round_break = False
@@ -903,6 +995,7 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, StreamToolUseStart):
+            answer_from = len(collected_text)
             tool_names[event.id] = event.name
             tool_json_parts[event.id] = []
             if is_evidence_tool(name=event.name):
@@ -991,6 +1084,40 @@ async def format_responses_stream(
                 "tool_use_id": getattr(event, "id", None) or "",
             })
 
+        elif isinstance(event, StreamToolResult) and getattr(event, "name", "") == GENERATE_IMAGE_TOOL:
+            # An image the agent generated, shown inline in the chat: the
+            # result's JSON (path, size, type, model, usage) under its own role,
+            # so the UI renders it rather than patching it into a scratchpad
+            # cell, and so neither the cell replay nor the figure sources read
+            # it (it is not in turn_results). Through _event, so it is saved with
+            # the turn and a reload shows it too.
+            seq += 1
+            image_payload = {
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "thought_role": Role.thought_tool_call_result.value,
+                "content": event.content[:65536],
+                "tool_name": GENERATE_IMAGE_TOOL,
+                "tool_use_id": getattr(event, "id", None) or "",
+            }
+            # The result's path is the one the agent's OS read: the project's
+            # on the desktop, but a mount of the conversation's folder on a cloud
+            # pod, which the UI cannot map. So the files it names are also
+            # given as project paths, the ones files-raw serves. Always present,
+            # empty when none resolves to an image in the project, so the UI
+            # shows nothing rather than guessing from the raw path, which on a
+            # pod can name a different file at the project root.
+            images: list[dict[str, str]] = []
+            if turn_context.files is not None:
+                try:
+                    images = await asyncio.to_thread(generated_images, event.content, turn_context.files)
+                except Exception:
+                    # Never fail the turn over showing an image: the content
+                    # still names the file.
+                    logger.warning("Could not resolve the images a generate_image result names", exc_info=True)
+            image_payload["generated_images"] = images
+            yield _event("response.in_progress", image_payload)
+
         elif isinstance(event, StreamToolResult):
             tool_use_id = getattr(event, "id", None) or ""
             turn_results.append(StreamedResult(
@@ -1064,6 +1191,7 @@ async def format_responses_stream(
                 superseded_pending = False
                 if superseded_stash:
                     collected_text.insert(0, superseded_stash)
+                    answer_from = 0
                     seq += 1
                     yield _event("response.answer_restore", {
                         "type": "response.answer_restore",
@@ -1268,6 +1396,20 @@ async def format_responses_stream(
 
         elif isinstance(event, TurnContext):
             turn_context = event
+
+        elif isinstance(event, PreviewCheckRequest):
+            from cowork.harnesses.anton_harness.preview_checker import artifact_check_sse
+
+            # Not through _event: never recorded with the turn's events.
+            yield artifact_check_sse(
+                check_id=event.check_id, artifact_slug=event.artifact_slug, timeout_s=event.timeout_s,
+            )
+
+        elif isinstance(event, TurnAddon):
+            # A message the person added mid-turn: accepted, read by the
+            # model, or returned to run next (cowork.streaming.addons).
+            seq += 1
+            yield _event("response.addon", {**event.payload(), "sequence_number": seq})
 
         elif isinstance(event, SkillCreated):
             seq += 1

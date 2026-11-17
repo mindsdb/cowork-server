@@ -33,7 +33,13 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 # run_db unit.
 
 
-def _serialize_conversation(c, updated_at=None) -> ConversationListItem:
+def _scheduled_ids(scoped, conversations) -> dict:
+    from cowork.services.schedules import ScheduleRunService
+
+    return ScheduleRunService(scoped).schedules_for_conversations([c.id for c in conversations])
+
+
+def _serialize_conversation(c, updated_at=None, scheduled_id=None) -> ConversationListItem:
     # `updated_at` is the conversation's last-activity time, derived from its
     # messages (ENG-961) — the stored `modified_at` only moves on rename/move,
     # so it can't be trusted as "recent". Callers pass the derived value;
@@ -49,6 +55,8 @@ def _serialize_conversation(c, updated_at=None) -> ConversationListItem:
         "project_id": c.project_id,
         "harness": c.harness,
         "model": c.model,
+        "reasoning_effort": c.reasoning_effort,
+        "scheduled_id": scheduled_id,
     })
 
 
@@ -78,8 +86,12 @@ def _list_conversations(
     convs = ConversationService(scoped).list_conversations_with_activity(
         project_id=resolved_project_id, limit=limit, all_projects=all_projects,
     )
+    scheduled = _scheduled_ids(scoped, [c for c, _ in convs])
     return ConversationListResponse(
-        conversations=[_serialize_conversation(c, updated_at=activity) for c, activity in convs]
+        conversations=[
+            _serialize_conversation(c, updated_at=activity, scheduled_id=scheduled.get(c.id))
+            for c, activity in convs
+        ]
     )
 
 
@@ -117,7 +129,10 @@ def get_conversation(conversation_id: UUID, scoped: ScopedSessionDep):
         conversation = svc.get_conversation(conversation_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    return _serialize_conversation(conversation, updated_at=svc.last_message_at(conversation_id))
+    return _serialize_conversation(
+        conversation, updated_at=svc.last_message_at(conversation_id),
+        scheduled_id=_scheduled_ids(scoped, [conversation]).get(conversation.id),
+    )
 
 
 @router.patch("/{conversation_id}", response_model=ConversationListItem)
@@ -141,7 +156,10 @@ def _update_conversation(
         conversation = svc.update_conversation(
             conversation_id, topic=body.topic or body.title, project_id=project_id
         )
-        return _serialize_conversation(conversation, updated_at=svc.last_message_at(conversation_id))
+        return _serialize_conversation(
+            conversation, updated_at=svc.last_message_at(conversation_id),
+            scheduled_id=_scheduled_ids(scoped, [conversation]).get(conversation.id),
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
@@ -180,7 +198,10 @@ def _move_conversation(
         TaskObjectService(scoped).relocate_to_project(conversation, source, dest)
 
     conversation = svc.update_conversation(conversation_id, project_id=dest.id)
-    return _serialize_conversation(conversation, updated_at=svc.last_message_at(conversation_id))
+    return _serialize_conversation(
+        conversation, updated_at=svc.last_message_at(conversation_id),
+        scheduled_id=_scheduled_ids(scoped, [conversation]).get(conversation.id),
+    )
 
 
 @router.get("/{conversation_id}/items")

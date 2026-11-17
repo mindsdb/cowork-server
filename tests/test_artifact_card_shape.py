@@ -48,11 +48,11 @@ _HEAD = [
 ]
 DESKTOP = _HEAD + [
     "accessEmails", "orgAllowed", "ownerOnly", "allowedTeamIds", "allowedUserIds",
-    "accessMode", "accessProtected", "accessPassword", "artifactKey", "serveUrl", "draftUrl",
+    "accessMode", "accessProtected", "accessPassword", "artifactKey", "reportId", "serveUrl", "draftUrl",
 ]
 ORG = _HEAD + [
     "orgAllowed", "ownerOnly", "allowedTeamIds", "allowedUserIds",
-    "accessMode", "accessProtected", "artifactKey", "serveUrl", "draftUrl",
+    "accessMode", "accessProtected", "artifactKey", "reportId", "serveUrl", "draftUrl",
 ]
 
 
@@ -151,5 +151,5 @@ def test_a_desktop_status_answers_its_own_shape(session, tmp_path, monkeypatch, 
     assert res.status_code == 200
     assert list(res.json()) == [
         "publishedUrl", "modified", "accessMode", "accessProtected", "accessEmails",
-        "orgAllowed", "ownerOnly", "artifactKey", "linkOwnerRecorded",
+        "orgAllowed", "ownerOnly", "artifactKey", "reportId", "linkOwnerRecorded",
     ]

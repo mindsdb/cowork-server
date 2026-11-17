@@ -88,7 +88,7 @@ def test_the_desktop_publish_route_hands_anton_each_mode(artifact, anton_access,
         routes, "_desktop_context", lambda raw, *, scope: (artifact, artifact.parent, "desktop-key", PUBLISH_URL)
     )
 
-    asyncio.run(routes.publish_artifact(routes._PublishBody(path=str(artifact), access=asked), LOCAL_SCOPE))
+    routes.publish_artifact(routes._PublishBody(path=str(artifact), access=asked), LOCAL_SCOPE)
 
     assert anton_access == [handed]
 
@@ -100,7 +100,7 @@ def test_the_desktop_publish_route_without_access_hands_anton_none(artifact, ant
         routes, "_desktop_context", lambda raw, *, scope: (artifact, artifact.parent, "desktop-key", PUBLISH_URL)
     )
 
-    asyncio.run(routes.publish_artifact(routes._PublishBody(path=str(artifact), password="pw"), LOCAL_SCOPE))
+    routes.publish_artifact(routes._PublishBody(path=str(artifact), password="pw"), LOCAL_SCOPE)
 
     assert anton_access == [None]
     assert json.loads((artifact / ".published.json").read_text())["index.html"]["mode"] == "password"

@@ -60,6 +60,7 @@ class ArtifactCard(BaseModel):
     access_protected: bool = False
     access_password: str = ""
     artifact_key: str = ""
+    report_id: str = ""
     serve_url: str
     draft_url: str = ""
     capabilities: dict | None = None

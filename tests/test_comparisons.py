@@ -1603,6 +1603,22 @@ def test_a_side_turn_runs_on_the_sides_model_whatever_the_client_sends(client, h
     assert call["trace_metadata"]["response_route_reason"] == "comparison_side"
 
 
+def test_a_side_turn_leaves_the_sides_saved_model_and_effort_alone(client, harness):
+    side = _create(client).json()["sides"][1]
+    before = _conversation(side["conversationId"])
+
+    with patch("cowork.handlers.responses.blocked_connections", AsyncMock(return_value=[])):
+        r = _turn(client, side["conversationId"], model="something-else", reasoning_effort="low")
+        assert r.status_code == 200, r.text
+        r = _turn(client, side["conversationId"], reset_picks=["model", "reasoning_effort"])
+        assert r.status_code == 200, r.text
+
+    after = _conversation(side["conversationId"])
+    assert (after.model, after.reasoning_effort) == (before.model, before.reasoning_effort)
+    assert after.reasoning_effort != "low"
+    assert after.model is not None
+
+
 def test_a_side_turn_fails_closed_when_connections_cannot_be_listed(client, harness):
     side = _create(client).json()["sides"][0]
     with patch(

@@ -36,6 +36,18 @@ from anton.core.llm.provider import (
     FreeServingPausedError,
     WalletEmptyError,
 )
+
+try:
+    from anton.core.llm.provider import BudgetExceededError
+except ImportError:  # TODO(ENG-1585): import it above once uv.lock pins an anton that has it.
+
+    class BudgetExceededError(Exception):  # type: ignore[no-redef]
+        """Stand-in for an anton without the type, with anton's signature; anton never raises it."""
+
+        def __init__(self, message: str, *, reason: str = "", status_code: int | None = None, **_: object):
+            super().__init__(message)
+            self.reason = reason
+            self.status_code = status_code
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.settings.app_settings import default_minds_url
@@ -162,6 +174,17 @@ FREE_SERVING_PAUSED_CODE = "free_serving_paused"
 FREE_SERVING_PAUSED_USER_MESSAGE = (
     "Free MindsHub Air is paused for everyone until the daily budget resets. "
     "Add credits to keep working now."
+)
+
+# Curated copy + wire code for a spent organization budget (gateway 402
+# `budget_exceeded`). An admin set a hard spending cap and paid requests hit it,
+# so credits do not lift it: the card sends the user to the console's Budgets
+# tab. MindsHub Air keeps working while its free allowance lasts. The gate sends
+# no reset instant, so this code is not in RESET_AT_CODES.
+BUDGET_EXCEEDED_CODE = "budget_exceeded"
+BUDGET_EXCEEDED_USER_MESSAGE = (
+    "Your organization's spending budget is used up. "
+    "An owner or admin can raise it in Budgets."
 )
 
 # Codes whose failure frame carries the gate's `X-MindsHub-Reset-At` instant as
@@ -312,12 +335,13 @@ MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
 # billing decision precisely. Preferred over status/message heuristics.
 #
 # mindshub_inference (`denial_error()` and `credential_rejected()` in
-# minds/inference/errors.py) emits eight reasons today: unknown_model,
+# minds/inference/errors.py) emits nine reasons today: unknown_model,
 # rate_limited, wallet_empty, included_allowance_exhausted,
-# free_air_daily_spend_fuse_exceeded, policy_unavailable, permission_denied and
-# invalid_credentials. Any other gate reason fails closed to policy_unavailable.
+# free_air_daily_spend_fuse_exceeded, budget_exceeded, policy_unavailable,
+# permission_denied and invalid_credentials. Any other gate reason fails closed
+# to policy_unavailable.
 #
-# This module maps the first six, below. permission_denied (403) and
+# This module maps the first seven, below. permission_denied (403) and
 # invalid_credentials (401) are credential rejections with no reason mapping
 # here: they fall through to the rest of `friendly_turn_error`'s ladder, where
 # `is_auth_error` picks up anton's typed ProviderAuthError for a 401 and a 403
@@ -326,6 +350,7 @@ MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
 _REASON_WALLET_EMPTY = "wallet_empty"
 _REASON_ALLOWANCE_EXHAUSTED = "included_allowance_exhausted"
 _REASON_FREE_AIR_FUSE = "free_air_daily_spend_fuse_exceeded"
+_REASON_BUDGET_EXCEEDED = "budget_exceeded"
 _REASON_POLICY_UNAVAILABLE = "policy_unavailable"
 _REASON_UNKNOWN_MODEL = "unknown_model"
 _REASON_RATE_LIMITED = "rate_limited"
@@ -398,6 +423,9 @@ STALLED_TURN_MESSAGE = "The response stalled and was ended. Please try sending a
 POD_STREAM_ENDED_PREFIX = "pod stream ended without a terminal event"
 POD_STREAM_ENDED_USER_MESSAGE = "The turn ended unexpectedly. Please try again."
 TURN_ABORTED_TIMEOUT_PREFIX = "turn aborted: hard turn timeout"
+# The controller's other turn ceiling, which also counts time a question waited
+# on the user. Same outcome for the user, so the same copy.
+TURN_ABORTED_WALL_CLOCK_PREFIX = "turn aborted: wall-clock limit"
 TURN_ABORTED_TIMEOUT_USER_MESSAGE = (
     "This turn took too long and was stopped. Try again with a smaller request."
 )
@@ -1000,6 +1028,7 @@ def _gateway_body_denial(*, exc: BaseException) -> _BodyDenial | None:
         _REASON_WALLET_EMPTY,
         _REASON_ALLOWANCE_EXHAUSTED,
         _REASON_FREE_AIR_FUSE,
+        _REASON_BUDGET_EXCEEDED,
         _REASON_POLICY_UNAVAILABLE,
         _REASON_UNKNOWN_MODEL,
         _REASON_RATE_LIMITED,
@@ -1256,7 +1285,8 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     NOT, because that user has never paid, so it has its own code and copy.
     The free-Air spend fuse is neither: free serving is paused for
     every org whose wallet cannot pay, not just this one, so it has its own code
-    and copy too. A policy outage is transient. An unknown model can't be fixed
+    and copy too. A spent budget is not out of credits either: an admin
+    raises it. A policy outage is transient. An unknown model can't be fixed
     with credits.
 
     A velocity ``rate_limited`` is NOT out of credits and must never share that
@@ -1270,6 +1300,8 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
         return ALLOWANCE_EXHAUSTED_CODE, ALLOWANCE_EXHAUSTED_USER_MESSAGE
     if reason == _REASON_FREE_AIR_FUSE:
         return FREE_SERVING_PAUSED_CODE, FREE_SERVING_PAUSED_USER_MESSAGE
+    if reason == _REASON_BUDGET_EXCEEDED:
+        return BUDGET_EXCEEDED_CODE, BUDGET_EXCEEDED_USER_MESSAGE
     if reason == _REASON_WALLET_EMPTY:
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
     if reason == _REASON_POLICY_UNAVAILABLE:
@@ -1299,6 +1331,7 @@ PROBE_DENIAL_REASONS: frozenset[str] = frozenset(
         _REASON_WALLET_EMPTY,
         _REASON_ALLOWANCE_EXHAUSTED,
         _REASON_FREE_AIR_FUSE,
+        _REASON_BUDGET_EXCEEDED,
         _REASON_RATE_LIMITED,
         _REASON_POLICY_UNAVAILABLE,
     }
@@ -1456,6 +1489,8 @@ def friendly_turn_error(
         return _map_gateway_reason(_REASON_ALLOWANCE_EXHAUSTED)
     if isinstance(exc, FreeServingPausedError):
         return _map_gateway_reason(_REASON_FREE_AIR_FUSE)
+    if isinstance(exc, BudgetExceededError):
+        return _map_gateway_reason(_REASON_BUDGET_EXCEEDED)
 
     # Precedence per ENG-673: token_limit / the billing-status fallback /
     # provider_auth / the ENG-598 model gate all WIN over provider_overloaded
@@ -1534,7 +1569,7 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
     WORKER_UNRESPONSIVE_TYPE_NAME: _RemoteTypeMapping(
         WORKER_UNRESPONSIVE_CODE, WORKER_UNRESPONSIVE_MESSAGE
     ),
-    # The three MindsHub billing stops, each named by its own anton type so the
+    # The MindsHub billing stops, each named by its own anton type so the
     # hosted card matches the desktop one. The reset instant does not ride the
     # error string: the worker sends it as `reset_at` beside `error`, and
     # `turnqueue/producer.py` keeps it for the RESET_AT_CODES only.
@@ -1544,6 +1579,9 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
     ),
     "FreeServingPausedError": _RemoteTypeMapping(
         FREE_SERVING_PAUSED_CODE, FREE_SERVING_PAUSED_USER_MESSAGE
+    ),
+    "BudgetExceededError": _RemoteTypeMapping(
+        BUDGET_EXCEEDED_CODE, BUDGET_EXCEEDED_USER_MESSAGE
     ),
     # Older worker images raise the parent type for every billing stop, and so
     # does any plain raise of it. Both keep the out-of-credits card.
@@ -1631,7 +1669,7 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
     # returned rather than any part of the wire text.
     if text.startswith(POD_STREAM_ENDED_PREFIX):
         return GENERIC_TURN_ERROR_CODE, POD_STREAM_ENDED_USER_MESSAGE
-    if text.startswith(TURN_ABORTED_TIMEOUT_PREFIX):
+    if text.startswith((TURN_ABORTED_TIMEOUT_PREFIX, TURN_ABORTED_WALL_CLOCK_PREFIX)):
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_TIMEOUT_USER_MESSAGE
     if text.startswith(TURN_ABORTED_STALL_PREFIX):
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_STALL_USER_MESSAGE
@@ -1675,7 +1713,7 @@ def remote_error_label(*, error: str | None) -> str:
         return text.partition(":")[0]
     if text.startswith(POD_STREAM_ENDED_PREFIX):
         return "pod_stream_ended"
-    if text.startswith(TURN_ABORTED_TIMEOUT_PREFIX):
+    if text.startswith((TURN_ABORTED_TIMEOUT_PREFIX, TURN_ABORTED_WALL_CLOCK_PREFIX)):
         return "turn_aborted_timeout"
     if text.startswith(TURN_ABORTED_STALL_PREFIX):
         return "turn_aborted_stall"

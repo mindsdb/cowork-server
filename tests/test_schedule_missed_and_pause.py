@@ -114,7 +114,7 @@ def turns(monkeypatch):
     during: list = []
 
     class CountingHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -707,7 +707,7 @@ async def test_a_shutdown_before_the_turn_does_not_count(made, turns, monkeypatc
     import cowork.handlers.responses as responses_mod
 
     class RefusingHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
