@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, StringConstraints, field_validator, model_validator
 
 from cowork.coding.redaction import redact_text, sanitize
 from cowork.coding.questions import PendingQuestion
@@ -31,6 +31,39 @@ class WorkspaceKind(str, Enum):
     git_worktree = "git_worktree"
     local_copy = "local_copy"
     direct_folder = "direct_folder"
+
+
+class WorkspaceMode(str, Enum):
+    """How a task's workspace relates to the user's folder.
+
+    The mode is the user's choice; ``WorkspaceKind`` is what preparation
+    produced for it. ``in_place`` works in the user's own folder and maps to
+    ``direct_folder``; ``worktree`` isolates the task in a ``git_worktree``
+    and needs a Git repository with a commit. ``local_copy`` remains only for
+    tasks created before folders stopped being copied.
+    """
+
+    in_place = "in_place"
+    worktree = "worktree"
+
+
+class WorkspaceModeOptions(BaseModel):
+    """The modes a new task could run in, and the one it gets if it asks for none."""
+
+    supported: list[WorkspaceMode]
+    # ``None`` when no mode is possible for the folder, for example a folder
+    # without Git where working in place is not offered.
+    default: WorkspaceMode | None
+    # Why working in the original folder is not offered, when it is not.
+    in_place_unavailable_reason: str | None = None
+    # Why a worktree is not offered for the folder, when it is not.
+    worktree_unavailable_reason: str | None = None
+    # The folder isn't a Git repository and could be made one here.
+    can_initialize_git: bool = False
+
+
+class InitializeGitRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=32_768)
 
 
 class PermissionMode(str, Enum):
@@ -399,6 +432,9 @@ class CodingSession(BaseModel):
     source_path: str
     workspace_path: str
     workspace_kind: WorkspaceKind
+    # ``None`` identifies tasks created before the mode was recorded; they
+    # were all isolated, so treat them as ``worktree``.
+    workspace_mode: WorkspaceMode | None = None
     workspaces: list[TaskWorkspace] = Field(default_factory=list)
     repository_root: str | None = None
     base_revision: str | None = None
@@ -536,7 +572,15 @@ class SessionCreateRequest(BaseModel):
     web_search: bool = False
     additional_dirs: list[str] = Field(default_factory=list, max_length=16)
     attachments: list[InputReference] = Field(default_factory=list, max_length=20)
-    allow_direct_folder: bool = False
+    # ``None`` lets the server choose from the project and the computer.
+    workspace_mode: WorkspaceMode | None = None
+    # Ignored: folders are no longer copied. A folder without Git runs in
+    # place, and Worktree needs a repository. Still accepted, also as
+    # ``allow_direct_folder``, so older clients' requests validate.
+    allow_folder_copy: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("allow_folder_copy", "allow_direct_folder"),
+    )
     source_contexts: list[SourceContext] = Field(default_factory=list, max_length=12)
 
     @model_validator(mode="after")

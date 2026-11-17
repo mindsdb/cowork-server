@@ -32,6 +32,8 @@ from cowork.coding.contracts import (
     TaskCapabilities,
     TaskCapability,
     WorkspaceInspection,
+    WorkspaceMode,
+    WorkspaceModeOptions,
     WorkspaceUsagePage,
 )
 from cowork.coding.control_errors import StateConflict
@@ -72,6 +74,7 @@ from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager, _org_mode
+from cowork.coding.workspace_mode import without_in_place, without_worktree, workspace_mode_options
 from cowork.coding.workspace_retention import RetentionPolicy, WorkspaceRetention
 from cowork.coding.workspace_usage import WorkspaceUsage
 from cowork.common.settings.app_settings import get_app_settings
@@ -131,6 +134,9 @@ class CodingService(
         self._lock = threading.RLock()
         self._running: dict[str, RunningTurn] = {}
         self._maintenance: set[str] = set()
+        # Folders outside a task's own workspace that a maintenance operation
+        # is changing, so no other task's turn or operation changes them too.
+        self._maintenance_roots: dict[str, frozenset[Path]] = {}
         self.approvals = ApprovalBroker(
             self._approval_opened, self._approval_closed,
             lambda session_id: self.store.load_session(session_id).command_approval_grants,
@@ -304,6 +310,53 @@ class CodingService(
 
     def capabilities(self) -> list[EngineCapabilities]:
         return self.registry.capabilities()
+
+    def workspace_mode_options(
+        self, project_id: str | None, computer_id: str | None, path: str | None = None,
+    ) -> WorkspaceModeOptions:
+        """The workspace modes a new task on this project and computer could use.
+
+        A task with no computer chosen is shown as running here, matching the
+        composer's default target. For a project, or given the folder a
+        folder task would use, the answer also reflects what those folders
+        allow, checked the same way creating the task checks them: any
+        existing folder can be worked in, and a worktree needs a Git
+        repository with a commit.
+        """
+        project = self.projects.get(project_id) if project_id else None
+        runs_locally = computer_id in {None, self.control.local_computer.id}
+        options = workspace_mode_options(
+            project.default_workspace_mode if project else None,
+            runs_locally=runs_locally,
+            org_mode=_org_mode(),
+        )
+        if not runs_locally:
+            return options
+        if WorkspaceMode.in_place in options.supported and (project is not None or path):
+            try:
+                self.session_factory.in_place_roots(project, None, path)
+            except (WorkspaceError, ValueError) as exc:
+                options = without_in_place(options, str(exc))
+        if project is not None:
+            problem = self.project_workspaces.worktree_problem(project)
+            return without_worktree(options, problem) if problem else options
+        if not path:
+            return options
+        try:
+            self.workspaces.check_source(path)
+        except WorkspaceError as exc:
+            inspection = self.workspaces.inspect(path)
+            options = without_worktree(
+                options,
+                str(exc),
+                can_initialize_git=inspection.is_directory and not inspection.is_git and not _org_mode(),
+            )
+        return options
+
+    def initialize_git(self, path: str) -> WorkspaceModeOptions:
+        """Make a folder on this computer a Git repository, then say what it allows."""
+        self.workspaces.initialize_git(path)
+        return self.workspace_mode_options(None, None, path)
 
     def inspect_workspace(self, path: str) -> WorkspaceInspection:
         return self.workspaces.inspect(path)
@@ -805,20 +858,34 @@ class CodingService(
         self,
         session_id: str,
         active_turn_error: str,
+        *,
+        touches_source: bool = False,
     ) -> Iterator[CodingSession]:
-        """Reserve an idle task for a potentially slow lifecycle operation."""
+        """Reserve an idle task for a potentially slow lifecycle operation.
+
+        The reservation also covers every folder the operation may change that
+        another task can work in: an in-place task's folders, and the source
+        folders when ``touches_source``. It is refused while another task's
+        turn or operation is changing an overlapping folder.
+        """
         with self._lock:
             session = self.get_session(session_id)
             if session_id in self._running:
                 raise RuntimeError(active_turn_error)
             if session_id in self._maintenance:
                 raise RuntimeError("This coding task is already being updated")
+            roots = self._shared_roots(session, touches_source=touches_source)
+            busy = self._shared_folder_conflict(session_id, roots)
+            if busy:
+                raise RuntimeError(busy)
             self._maintenance.add(session_id)
+            self._maintenance_roots[session_id] = roots
         try:
             yield session
         finally:
             with self._lock:
                 self._maintenance.discard(session_id)
+                self._maintenance_roots.pop(session_id, None)
 
 @lru_cache(maxsize=1)
 def get_coding_service() -> CodingService:

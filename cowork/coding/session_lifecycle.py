@@ -10,9 +10,12 @@ from cowork.coding.contracts import (
     EventType,
     SessionStatus,
     TaskWorkspace,
+    WorkspaceKind,
+    WorkspaceMode,
     utc_now,
 )
 from cowork.coding.control_errors import StateConflict
+from cowork.coding.session_factory import IN_PLACE_PROJECT_INSTRUCTION, ISOLATED_PROJECT_INSTRUCTION
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.control_models import RunStatus
 from cowork.coding.control_service import ControlPlaneService
@@ -210,6 +213,13 @@ class SessionLifecycleOperations:
                     "scope_all_project_resources": True,
                     "workspace_path": str(prepared.workspace_path),
                     "workspace_kind": prepared_kind,
+                    # An in-place task forks into a worktree of its changes.
+                    "workspace_mode": (
+                        WorkspaceMode.worktree
+                        if parent.workspace_mode == WorkspaceMode.in_place
+                        and prepared_kind != WorkspaceKind.direct_folder
+                        else parent.workspace_mode
+                    ),
                     "repository_root": str(prepared.repository_root) if prepared.repository_root else None,
                     "base_revision": prepared.base_revision,
                     "source_dirty": prepared.source_dirty,
@@ -293,6 +303,9 @@ class SessionLifecycleOperations:
         """Retarget the parent's frozen instructions without rereading live project state."""
 
         instructions = parent.developer_instructions
+        # A fork of an in-place task is isolated, whatever its parent was told.
+        if all(workspace.workspace_kind != WorkspaceKind.direct_folder for workspace in child_workspaces):
+            instructions = instructions.replace(IN_PLACE_PROJECT_INSTRUCTION, ISOLATED_PROJECT_INSTRUCTION)
         child_by_id = {workspace.folder_id: workspace for workspace in child_workspaces}
         for workspace in parent.workspaces:
             child = child_by_id.get(workspace.folder_id)
