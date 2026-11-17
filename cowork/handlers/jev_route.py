@@ -8,6 +8,9 @@ leans direct. Its wording and the default threshold were chosen with
 ``scripts/eval_jev_route`` (results in that folder): rerun it before changing
 either.
 
+Jev also decides where a message sent while a turn runs goes
+(`ADDON_ROUTE_QUESTION`, `decide_addon`): into that turn, or the queue.
+
 Every failure, a refusal, a bad response, a timeout, a network error, comes
 back as an `error` on the decision, never raised. Jev bills like any MindsHub
 model, so a refusal (a spent allowance, a restriction on the organization) is
@@ -22,8 +25,9 @@ import math
 import socket
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -95,6 +99,42 @@ SEARCH_QUESTION: dict[str, Any] = {
     },
 }
 
+# Asked when the person sends a message while a turn is still running
+# (POST /responses/addon): fold it into that turn, or keep it as the next one.
+# Queueing is today's behaviour, so the question leans that way: only a clear
+# correction or refinement of the running task is added.
+_ADD_TO_CURRENT = "add_to_current_task"
+_ADDON_CHOICES = frozenset({_ADD_TO_CURRENT, "queue_as_next_task"})
+ADDON_ROUTE_QUESTION: dict[str, Any] = {
+    "type": "choice",
+    "instructions": (
+        "The assistant is in the middle of a task when the user sends a new "
+        "message. Decide whether the message belongs to the running task, so the "
+        "assistant should take it into account before it finishes, or is a request "
+        "to handle after the task is done. Each recent_progress line is a step of "
+        "the running task: '[done] what it did (tool)' finished, '[in progress] what "
+        "it is doing (tool)' is running now. A correction can still change steps in "
+        "progress and steps not started yet. Earlier messages the user added to the "
+        "task are listed too."
+    ),
+    "criteria": {
+        _ADD_TO_CURRENT: (
+            "The message corrects, narrows or adds detail to the running task: use "
+            "a different source, table, period or filter; also include or skip "
+            "something; change the format, length or style of the result; fix a "
+            "wrong assumption; answer something the running task needs; or follow "
+            "up on a message already added to it."
+        ),
+        "queue_as_next_task": (
+            "The message is a new, separate request; a question unrelated to the "
+            "running task; or something that needs the running task's result first, "
+            "such as sending, sharing, emailing, publishing or building on what the "
+            "task is producing."
+        ),
+    },
+}
+
+
 # Separates the gate's Jev traces from user turns in Langfuse; the same tag
 # the LLM gate's calls carry, since this is that gate.
 JEV_ROUTE_TAG = "cowork-gate"
@@ -108,7 +148,9 @@ class JevTarget:
     (MindsHub ``/v1/decisions``, TypeSafe ``/v1/systemone``)."""
 
     url: str
-    api_key: str
+    # Kept out of repr: a target that reaches a log line or a traceback must
+    # not carry the key (often one minted for the decision, ENG-4194).
+    api_key: str = field(repr=False)
     # MindsHub's own endpoint: only it reads the Langfuse trace headers, and
     # they carry user, organization and conversation ids, so an organization's
     # own decision endpoint never receives them.
@@ -153,6 +195,17 @@ def own_decision_target(settings) -> "JevTarget | None":
     return JevTarget(url=url, api_key=key) if key and url else None
 
 
+def is_web_address(*, url: str) -> bool:
+    """An http(s) URL with a host and no user: what a decision model's
+    endpoint must be, as anton's ``DecisionsTarget`` takes it. Settings checks
+    a saved or tested URL with it, and `decisions_model` a stored one."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # an unclosed IPv6 bracket, say
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname) and "@" not in parts.netloc
+
+
 def gate_mode(settings) -> GateMode:
     """Which gate decides a turn, from settings alone. One source for the turn
     handler and for the settings response, so the UI shows what turns do.
@@ -167,13 +220,55 @@ def gate_mode(settings) -> GateMode:
     A decision MindsHub refuses (an organization it does not serve Jev to)
     needs no mode of its own: the turn falls back to the LLM gate.
     """
-    from cowork.common.settings.user_settings import Provider
-
     if own_decision_target(settings) is not None:
         return "own"
+    return _mode_without_own_model(settings=settings)
+
+
+def _mode_without_own_model(*, settings) -> Literal["jev", "off", "llm"]:
+    """`gate_mode` for settings with no decision model of the organization's own."""
+    from cowork.common.settings.user_settings import Provider
+
     if settings.resolved_planning_provider is not Provider.MINDS_CLOUD:
         return "llm"
     return "jev" if settings.jev_decisions_enabled else "off"
+
+
+DecisionsModel = Literal["mindshub", "own"]
+
+
+def decisions_model(settings) -> "DecisionsModel | None":
+    """What picks the shared browser's steps: the organization's own decision
+    model ("own"), Jev on MindsHub for an LLM on MindsHub that the
+    organization didn't turn Jev off for ("mindshub"), or None. The same
+    precedence as `gate_mode`, except that "own" needs a URL the browser
+    takes (`is_web_address`: one stored before Settings checked it may not
+    be) and this deployment's browser to reach that model
+    (`browser.own_model_reaches_browser`): where it can't, the browser never
+    asks it, so this answers what the browser asks instead. Without one every
+    browser step goes back to the LLM, which is too slow to offer, so the
+    browser is off (`decisions_available`)."""
+    from cowork.services.browser import own_model_reaches_browser
+
+    target = own_decision_target(settings)
+    if target is not None and is_web_address(url=target.url) and own_model_reaches_browser():
+        return "own"
+    return "mindshub" if _mode_without_own_model(settings=settings) == "jev" else None
+
+
+def decisions_available(settings) -> bool:
+    """Whether the shared browser may run: it needs a decisions model."""
+    return decisions_model(settings) is not None
+
+
+async def probe(target: JevTarget, *, model: str, timeout_seconds: float) -> JevRoute:
+    """One minimal route decision, to check a decision endpoint answers
+    before the organization relies on it (Settings' test). Never raises; the
+    result's `error` is empty when the endpoint answered a usable decision."""
+    return await decide(
+        target=target, messages=[{"role": "user", "content": "Hello"}], model=model,
+        timeout_seconds=timeout_seconds, min_p_direct=0.5,
+    )
 
 
 def _elapsed_ms(started: float) -> int:
@@ -338,29 +433,23 @@ def _needs_search(body: dict) -> bool:
         return True
 
 
-async def decide(
-    *,
-    target: JevTarget,
-    messages: list[dict],
-    model: str,
-    timeout_seconds: float,
-    min_p_direct: float,
-) -> JevRoute:
-    """One `/v1/decisions` call: direct when Jev gives a direct answer at
-    least `min_p_direct`, and whether the reply needs a web search. Never
-    raises.
+class _Failed(Exception):
+    """A decision call that got no usable response, with its error class."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__(error)
+        self.error = error
+
+
+async def _post_decision(target: JevTarget, payload: dict, *, timeout_seconds: float) -> dict:
+    """POST one `/v1/decisions` request and return its JSON body; raises
+    `_Failed` with the error class for every failure.
 
     Wrapped in `asyncio.timeout`, not just httpx's own timeout kwarg: httpx's
     applies per phase (connect/write/read/pool) and measures inactivity, not
     total elapsed time, so a trickling response could run past the budget
-    without tripping it. This call sits ahead of every turn on MindsHub.
+    without tripping it. The route call sits ahead of every turn on MindsHub.
     """
-    payload = {
-        "model": model,
-        "state": route_state(messages),
-        "questions": {"route": ROUTE_QUESTION, "search": SEARCH_QUESTION},
-    }
-    started = time.monotonic()
     try:
         async with asyncio.timeout(timeout_seconds):
             headers = {
@@ -377,21 +466,72 @@ async def decide(
                 )
     except _EndpointRefused:
         # Falls back to the LLM gate, as any failure but a timeout does.
-        return JevRoute(ms=_elapsed_ms(started), error="endpoint_refused")
+        raise _Failed("endpoint_refused")
     except (TimeoutError, httpx.TimeoutException):
         # httpx's own timeouts fire at the same budget: the gate's time is
         # spent either way, so both read as a timeout (no LLM gate after it).
-        return JevRoute(ms=_elapsed_ms(started), error="timeout")
+        raise _Failed("timeout")
     except httpx.HTTPError:
-        return JevRoute(ms=_elapsed_ms(started), error="transport_error")
+        raise _Failed("transport_error")
     except Exception as exc:  # the gate must never raise into the turn
-        return JevRoute(ms=_elapsed_ms(started), error=type(exc).__name__)
-
-    ms = _elapsed_ms(started)
+        raise _Failed(type(exc).__name__)
     if response.status_code != 200:
-        return JevRoute(ms=ms, error=f"http_{response.status_code}")
+        raise _Failed(f"http_{response.status_code}")
     try:
         body = response.json()
+    except Exception:
+        raise _Failed("malformed_response")
+    if not isinstance(body, dict):
+        raise _Failed("malformed_response")
+    return body
+
+
+class DecisionFailed(Exception):
+    """A forwarded decision that got no usable answer, with its error class
+    (``http_401``, ``timeout``, ``endpoint_refused``, ...)."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__(error)
+        self.error = error
+
+
+async def forward_decision(target: JevTarget, payload: dict, *, timeout_seconds: float) -> dict:
+    """POST a decision body as given (model, state, questions) to ``target``
+    and return the answer's JSON object, out through the gate's own egress:
+    on the hosted server an organization's endpoint is dialed only at a
+    vetted public address over https (`_post_pinned`), within
+    ``timeout_seconds`` overall. For the browser's decisions proxy
+    (cowork.services.decisions_proxy). Raises `DecisionFailed`."""
+    try:
+        return await _post_decision(target, payload, timeout_seconds=timeout_seconds)
+    except _Failed as exc:
+        raise DecisionFailed(exc.error) from None
+
+
+async def decide(
+    *,
+    target: JevTarget,
+    messages: list[dict],
+    model: str,
+    timeout_seconds: float,
+    min_p_direct: float,
+) -> JevRoute:
+    """One `/v1/decisions` call: direct when Jev gives a direct answer at
+    least `min_p_direct`, and whether the reply needs a web search. Never
+    raises.
+    """
+    payload = {
+        "model": model,
+        "state": route_state(messages),
+        "questions": {"route": ROUTE_QUESTION, "search": SEARCH_QUESTION},
+    }
+    started = time.monotonic()
+    try:
+        body = await _post_decision(target, payload, timeout_seconds=timeout_seconds)
+    except _Failed as failed:
+        return JevRoute(ms=_elapsed_ms(started), error=failed.error)
+    ms = _elapsed_ms(started)
+    try:
         answer = body["answers"]["route"]
         if answer["choice"] not in _VALID_CHOICES:
             raise ValueError(f"unexpected choice {answer['choice']!r}")
@@ -400,5 +540,69 @@ async def decide(
         return JevRoute(ms=ms, error="malformed_response")
     return JevRoute(
         direct=p_direct >= min_p_direct, p_direct=p_direct, needs_search=_needs_search(body),
+        ms=ms, model=str(body.get("model") or ""),
+    )
+
+
+@dataclass(frozen=True)
+class AddonRoute:
+    """Jev's verdict on a message sent while a turn runs. Content-free, like
+    `JevRoute`."""
+
+    add: bool = False
+    # Whether Jev chose to add, whatever its confidence: an add below the
+    # threshold is queued as low confidence rather than as a new task.
+    chose_add: bool = False
+    p_add: float | None = None
+    ms: int = 0
+    model: str = ""
+    # Empty on a usable answer; otherwise why Jev could not decide. The
+    # message is queued either way.
+    error: str = ""
+
+
+def addon_state(
+    *, task: str, progress: list[str], added: list[str], message: str,
+) -> dict:
+    """What Jev reads for `ADDON_ROUTE_QUESTION`: the running task's request,
+    its recent steps as `[done] ...` / `[in progress] ...` lines
+    (response_routing.progress_line), the messages already added to it, and
+    the new message."""
+    return {
+        "running_task": task,
+        "recent_progress": progress,
+        "already_added_to_task": added,
+        "new_user_message": message,
+    }
+
+
+async def decide_addon(
+    *,
+    target: JevTarget,
+    state: dict,
+    model: str,
+    timeout_seconds: float,
+    min_p_add: float,
+) -> AddonRoute:
+    """One `/v1/decisions` call for `ADDON_ROUTE_QUESTION`: add when Jev
+    chooses to add with at least `min_p_add`. Never raises."""
+    payload = {"model": model, "state": state, "questions": {"addon_route": ADDON_ROUTE_QUESTION}}
+    started = time.monotonic()
+    try:
+        body = await _post_decision(target, payload, timeout_seconds=timeout_seconds)
+    except _Failed as failed:
+        return AddonRoute(ms=_elapsed_ms(started), error=failed.error)
+    ms = _elapsed_ms(started)
+    try:
+        answer = body["answers"]["addon_route"]
+        choice = answer["choice"]
+        if choice not in _ADDON_CHOICES:
+            raise ValueError(f"unexpected choice {choice!r}")
+        p_add = _probability(answer, _ADD_TO_CURRENT)
+    except Exception:
+        return AddonRoute(ms=ms, error="malformed_response")
+    return AddonRoute(
+        add=choice == _ADD_TO_CURRENT and p_add >= min_p_add,
+        chose_add=choice == _ADD_TO_CURRENT, p_add=p_add,
         ms=ms, model=str(body.get("model") or ""),
     )

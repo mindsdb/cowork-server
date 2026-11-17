@@ -7,7 +7,11 @@ test asserts the set of sites EQUALS the allowlist, so a new one fails and a
 removed one also fails (keeping the list honest).
 
 Each allowlisted site must be guarded by `_org_mode()`; see
-tests/test_no_execution_in_org_mode.py for the runtime half of this.
+tests/test_no_execution_in_org_mode.py for the runtime half of this. Two
+entries run in every tenancy by design, and each says why: the code sandbox's
+self-test, and the export's conversion process, which runs cowork's own
+`export_child` module from a fixed command so the server can kill a
+conversion. Neither runs a file an agent wrote.
 
 A site is keyed by (file, enclosing function/method, labeled call), NOT by
 (file, callable name). Keying by (file, callable) alone lets two different
@@ -168,8 +172,10 @@ BANNED_IMPORT_PATHS = {"anton.core.artifacts.backend_launcher"}
 
 #: (relative path, enclosing function/method or "<module>", labeled call,
 #: reason). Desktop-only, each guarded by _org_mode(), EXCEPT the
-#: build_chat_session entry, which is itself the guard. One entry per
-#: occurrence: two identical sites need two entries (see the module docstring).
+#: build_chat_session entry, which is itself the guard, and the code sandbox's
+#: self-test and the export conversion process, which run in every tenancy and
+#: never run an agent's file. One entry per occurrence: two identical sites
+#: need two entries (see the module docstring).
 ALLOWLIST = (
     (
         "coding/project_actions.py",
@@ -260,6 +266,21 @@ ALLOWLIST = (
         "open_artifact",
         "subprocess.run(open)",
         "open_artifact endpoint",
+    ),
+    (
+        "services/export_runner.py",
+        "<module>",
+        "subprocess",
+        "import backing the export conversion process below",
+    ),
+    (
+        "services/export_runner.py",
+        "_run",
+        "subprocess.Popen",
+        "the export's conversion process, in every tenancy so the server can kill "
+        "a conversion: a fixed command that runs cowork's own "
+        "cowork.services.export_child module, never a name or path from input or "
+        "an agent's file",
     ),
     (
         "common/chat_session.py",

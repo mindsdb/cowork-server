@@ -12,6 +12,7 @@ from tests._event_loop import on_the_event_loop
 from tests._logging_assertions import assert_log_fields
 
 import asyncio
+import itertools
 import json
 from contextlib import contextmanager
 import logging
@@ -23,12 +24,14 @@ from uuid import UUID, uuid4
 import pytest
 
 import cowork.handlers.responses as responses_mod
+from cowork.common import event_clock
 from cowork.handlers.responses import ResponsesHandler, _RemoteArtifactsDir
 from cowork.services.artifact_identity import ListedIds
 from cowork.streaming.registry import TurnLifecycle
+from cowork.turnqueue import producer as prod
 from cowork.turnqueue.producer import RemoteWorkspace
 
-from _fakes import inline_run_db, opens
+from _fakes import QueuedPipeline, inline_run_db, opens
 
 
 class _FakeScope:
@@ -58,6 +61,7 @@ class _FakeBuffer:
 
 def _handler() -> ResponsesHandler:
     handler = object.__new__(ResponsesHandler)
+    handler.schedule_id = None
     handler.scope = _FakeScope()
     handler.interactive = True
     return handler
@@ -1375,6 +1379,234 @@ async def test_produce_remote_persists_pending_user_then_finalizes_and_saves_ass
 
 
 @pytest.mark.asyncio
+async def test_a_relayed_liveness_reply_after_a_quiet_stretch_reaches_the_buffer(monkeypatch):
+    """The controller relays `worker_alive` on a timer while the pod is busy.
+    After a quiet stretch it becomes one model_wait frame, which resets the
+    UI's and the registry's idle bounds; right after other output it shows
+    nothing. Neither is saved with the turn."""
+    import asyncio
+
+    from cowork.streaming import liveness
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    monkeypatch.setattr(liveness, "MODEL_WAIT_TICK_SECONDS", 0.05)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "he"}
+        yield "progress", {"phase": "worker_alive"}
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_delta", {"text": "llo"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    waits = [f for f in buffer.frames if '"phase": "model_wait"' in f or '"phase":"model_wait"' in f]
+    assert len(waits) == 1
+    assert '"message": "Still working"' in waits[0] or '"message":"Still working"' in waits[0]
+    assert saved["assistant"] == "hello"
+    assert not any(e.get("phase") == "model_wait" for e in saved["events"])
+
+
+@pytest.mark.asyncio
+async def test_a_relayed_liveness_reply_right_after_output_shows_nothing(monkeypatch):
+    """Quiet means quiet since the pod's last output, not since the turn
+    started: a relay that lands just after text that followed a long pause
+    must not flash "Still working" over the answer."""
+    import asyncio
+
+    from cowork.streaming import liveness
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    monkeypatch.setattr(liveness, "MODEL_WAIT_TICK_SECONDS", 0.05)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        await asyncio.sleep(0.1)
+        yield "turn_delta", {"text": "hello"}
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    assert not [f for f in buffer.frames if "model_wait" in f]
+    assert saved["assistant"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_no_still_working_line_over_an_open_question(monkeypatch):
+    """The pod heartbeats while a question waits on the user. A relay then must
+    not put "Still working" over the question card; once it's answered, a
+    quiet stretch shows the line again."""
+    import asyncio
+
+    from cowork.streaming import liveness
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    monkeypatch.setattr(liveness, "MODEL_WAIT_TICK_SECONDS", 0.05)
+    asked = {"step": "ask_user", "id": "q1", "prompt": "Which one?", "timeout_s": 300,
+             "options": [{"value": "a", "label": "A"}, {"value": "b", "label": "B"}]}
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", asked
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_step", {"step": "ask_user_answered", "id": "q1", "status": "answered", "values": ["a"]}
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_delta", {"text": "done"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    kinds = [
+        "question" if "response.ask_user\"" in f or '"type": "response.ask_user"' in f
+        else "answered" if "ask_user_answered" in f
+        else "wait" if "model_wait" in f
+        else None
+        for f in buffer.frames
+    ]
+    kinds = [k for k in kinds if k]
+    assert kinds == ["question", "answered", "wait"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_output", [
+    ("turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}),
+    ("turn_delta", {"text": "Working on it."}),
+    # A question asked after its cell's tool_start (the step or time limit, a
+    # write approval): the cell it gated runs on with no new start or text.
+    ("turn_step", {"step": "progress", "id": "t0", "message": "Reading the file"}),
+    ("turn_step", {"step": "tool_end", "id": "t0", "name": "scratchpad"}),
+])
+async def test_a_lost_answered_reply_does_not_hide_still_working_for_the_rest_of_the_turn(
+    monkeypatch, next_output,
+):
+    """The producer applies a turn whose reply numbers skip one. If the skipped
+    reply is the question's ask_user_answered, the pod's next text or cell
+    still shows the question is over, and a later quiet stretch shows
+    "Still working"."""
+    import asyncio
+
+    from cowork.streaming import liveness
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    monkeypatch.setattr(liveness, "MODEL_WAIT_TICK_SECONDS", 0.05)
+    asked = {"step": "ask_user", "id": "q1", "prompt": "Which one?", "timeout_s": 300,
+             "options": [{"value": "a", "label": "A"}, {"value": "b", "label": "B"}]}
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", asked
+        # ask_user_answered never arrives.
+        yield next_output
+        await asyncio.sleep(0.1)
+        yield "progress", {"phase": "worker_alive"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    assert any("model_wait" in f for f in buffer.frames)
+
+
+@pytest.mark.asyncio
+async def test_a_question_with_a_malformed_id_does_not_fail_the_turn(monkeypatch):
+    """The pod is semi-trusted: an ask_user whose id is not a string must not
+    end the turn on an unhashable id."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", {"step": "ask_user", "id": {"not": "a string"}, "prompt": "Which one?"}
+        yield "turn_step", {"step": "ask_user_answered", "id": ["nor", "this"]}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _RecordingBuffer(_FakeBuffer):
+        def __init__(self):
+            self.frames = []
+
+        async def append(self, type_, data):
+            self.frames.append(data.get("sse", ""))
+            return len(self.frames)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    assert any("response.completed" in f for f in buffer.frames)
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_persists_on_failure(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
@@ -2574,11 +2806,11 @@ def test_remote_workspace_is_the_project_relative_to_the_org_root(monkeypatch):
     from cowork.db.scoped import LOCAL_SCOPE
 
     root = Path(get_app_settings().project.root_dir)
-    project = SimpleNamespace(path=str(root / "proj"), id=uuid4())
+    project = SimpleNamespace(path=str(root / "proj"), id=uuid4(), name="proj")
     _patch_conversation_service(monkeypatch, SimpleNamespace(project=project))
 
     assert ResponsesHandler._remote_workspace(SimpleNamespace(scope=LOCAL_SCOPE), uuid4()) == RemoteWorkspace(
-        project_id=str(project.id), workspace_rel_path=f"{root.name}/proj",
+        project_id=str(project.id), workspace_rel_path=f"{root.name}/proj", project_name="proj",
     )
 
 
@@ -2970,8 +3202,9 @@ async def test_a_record_of_a_remote_turn_that_lost_only_the_listed_check_says_so
     the diff listed. Either the turn created nothing, so the unit's failure
     lost only that check, or it created a folder and record_new_artifacts
     raised at the check, once that folder's rows were written
-    (ListedLocationsUnchecked). The line says the check failed, not that
-    created folders went unrecorded."""
+    (ListedLocationsUnchecked), which a failed hold of the root or a failed
+    write of the sort times raises too. The line names the check, the hold
+    and the sort times, not created folders gone unrecorded."""
     from cowork.services import task_objects
 
     handler = _remote_handler(monkeypatch, {})
@@ -3021,7 +3254,8 @@ async def test_a_record_of_a_remote_turn_that_lost_only_the_listed_check_says_so
         if r.name == responses_mod.logger.name and r.levelno == logging.ERROR
     ]
     assert [r.getMessage() for r in errors] == [
-        "[responses] could not check the locations of the artifacts a remote turn listed",
+        "[responses] could not check the locations of the artifacts a remote turn found,"
+        " or record the folder that holds them or their sort times",
     ]
     assert errors[0].exc_info[1] is error
 
@@ -3104,7 +3338,8 @@ async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(m
     indexed = {"new": set()}
 
     def spy_index_new(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
+        untimed=(),
     ):
         indexed["new"] = set(slugs)
 
@@ -3150,7 +3385,8 @@ async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(mon
     indexed = {"new": set()}
 
     def spy_index_new(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
+        untimed=(),
     ):
         indexed["new"] = set(slugs)
 
@@ -3611,6 +3847,41 @@ async def test_produce_remote_retires_an_open_question(monkeypatch, ending):
 
 
 @pytest.mark.asyncio
+async def test_produce_remote_saves_the_ask_user_time_its_live_frame_carried(monkeypatch):
+    """The app approves a held browser step for the person only when the
+    card's `at_ms` comes after the approvals-off stamp, live and after a
+    reload. A reload replays the record this turn's sink saved, so that record
+    keeps the live frame's time: a later one would approve, after a reload, a
+    card held before approvals went off. The clock ticks a second on every
+    read, so a second stamp can't land on the same value."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    _fake_redis(monkeypatch, flag_set=False)
+    seconds = itertools.count(1_000)
+    monkeypatch.setattr(event_clock, "time", SimpleNamespace(time=lambda: float(next(seconds))))
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", _ASK_STEP
+        yield "turn_step", {"step": "ask_user_answered", "id": "ask:1", "status": "answered",
+                            "values": ["pg"], "text": "", "answer_id": "a1"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    buffer = _RecBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    assert buffer.frames[-1] == "CLOSE:completed"
+    live = next(json.loads(f.split("data: ", 1)[1]) for f in buffer.frames
+                if f.startswith("event: response.ask_user\n"))
+    stored = next(e for e in saved["events"] if e.get("type") == "response.ask_user")
+    assert stored["at_ms"] == live["at_ms"]
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_does_not_retire_an_answered_question(monkeypatch):
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
@@ -3768,6 +4039,74 @@ async def test_a_pod_model_call_timeout_saves_its_own_code_and_request_id(monkey
     assert failed["code"] == "model_timeout"
     assert failed["error"] == "The model sent no output for 10 minutes, so the call was stopped."
     assert failed["request_id"] == "corr-deadline"
+
+
+class _QueueRedis:
+    """Records queued jobs and answers each with its own terminal reply."""
+
+    def __init__(self):
+        self.jobs: list[dict] = []
+        self._replies: list[dict] = []
+
+    async def sadd(self, *a): return 1
+    async def hset(self, *a, **k): return 1
+    async def expire(self, *a): return 1
+    async def delete(self, *keys): return len(keys)
+    async def xrevrange(self, *a, **k): return []
+    def pipeline(self, transaction=True): return QueuedPipeline(self)
+
+    async def xadd(self, stream, fields):
+        job = json.loads(fields["payload"])
+        self.jobs.append(job)
+        for kind, data in (
+            ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}),
+            ("turn_completed", {}),
+        ):
+            self._replies.append({"payload": json.dumps(
+                {"correlation_id": job["correlation_id"], "kind": kind, "data": data}
+            )})
+        return "1-0"
+
+    async def xread(self, streams, count=None, block=None):
+        if self._replies:
+            return [[next(iter(streams)), [["9-0", self._replies.pop(0)]]]]
+        await asyncio.sleep(0)
+        return None
+
+
+@pytest.mark.asyncio
+async def test_the_selected_effort_reaches_the_queued_job_on_every_turn(monkeypatch):
+    """Handler to the real producer: the job a turn enqueues carries the
+    composer's effort, and a second turn on the conversation carries it again."""
+    redis = _QueueRedis()
+    monkeypatch.setattr(prod, "get_redis", lambda: redis)
+
+    async def mint(**kw):
+        return "fake_turn_key"
+
+    async def no_connections(**kw):
+        return []
+
+    monkeypatch.setattr(prod, "mint_turn_key", mint)
+    monkeypatch.setattr(prod, "list_active_connections", no_connections)
+
+    async def allowed(scope, permission):
+        return True
+
+    async def require(scope, permission):
+        return None
+
+    monkeypatch.setattr(prod, "require_product_permission", require)
+    monkeypatch.setattr(prod.product_permissions, "has_product_permission", allowed)
+    handler = _remote_handler(monkeypatch, {})
+    conv_id = uuid4()
+    for effort in ("high", "high", None):
+        await handler._produce_remote(
+            conv_id=conv_id, input_text="hi", original_content="hi", model="anton",
+            harness_id="anton", buffer=_FakeBuffer(), reasoning_effort=effort,
+        )
+    efforts = [job["params"].get("reasoning_effort", "absent") for job in redis.jobs]
+    assert efforts == ["high", "high", "absent"]
 
 
 @pytest.mark.asyncio
@@ -4136,3 +4475,27 @@ async def test_a_stop_while_the_diff_holds_an_artifacts_revision_lock_waits_for_
     assert let_go and closed and let_go[0] <= closed[0], "the stream ended while the diff held the lock"
     assert not (folder / ".revisions" / ".lock").exists()
     assert turn.recorded == [["mine"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interactive,schedule_id,expected", [(True, None, True), (False, None, False), (True, "s1", False)])
+async def test_produce_remote_asks_for_preview_checks_only_where_a_viewer_can_answer(
+    monkeypatch, interactive, schedule_id, expected,
+):
+    """ENG-4227: a person's web turn may have the artifact's viewer open; a
+    scheduled run or a non-interactive caller has none."""
+    saved, captured = {}, {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler.interactive = interactive
+    handler.schedule_id = schedule_id
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_RecBuffer(),
+    )
+    assert captured["preview_checks"] is expected

@@ -67,3 +67,26 @@ async def test_proxy_delete_propagates_auths_404_detail(monkeypatch):
 
     assert exc_info.value.status_code == 404
     assert "work" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_proxy_remove_picked_file_calls_auths_route(monkeypatch):
+    seen = {}
+
+    class _Recording(_FakeClient):
+        async def request(self, method, url, params=None, json=None, headers=None):
+            seen.update(method=method, url=url, params=params)
+            return self._resp
+
+    remaining = [{"id": "p2", "projects": ["beta"]}]
+    resp = _Resp(200, text="{...}", json_body={"files": remaining})
+    monkeypatch.setattr(auth_proxy, "httpx", type("_H", (), {"AsyncClient": _Recording(resp)}))
+
+    result = await auth_proxy.proxy_remove_picked_file("notion", "ws-a", "page/1", "alpha", FakeRequest(), _settings())
+
+    assert seen == {
+        "method": "DELETE",
+        "url": "https://auth.internal/v1/oauth/notion/ws-a/picked-files/page%2F1",
+        "params": {"project": "alpha"},
+    }
+    assert result == remaining
