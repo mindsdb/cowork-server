@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -48,7 +49,7 @@ def test_turn_reply_accepts_every_kind_the_controller_publishes():
 
     published = {
         "progress", "cell", "error", "turn_delta", "turn_step",
-        "turn_memory", "turn_skill", "turn_history", "turn_compaction",
+        "turn_memory", "turn_skill", "turn_connector", "turn_history", "turn_compaction",
         "turn_completed", "turn_failed",
     }
     accepted = set(typing.get_args(TurnReply.model_fields["kind"].annotation))
@@ -61,6 +62,14 @@ def test_turn_reply_parses_a_skill_draft():
         '{"correlation_id":"r","kind":"turn_skill","data":'
         '{"entries":[{"slug":"my-skill","files":{"SKILL.md":"body"}}]}}')
     assert reply.data["entries"][0]["slug"] == "my-skill"
+
+
+def test_turn_reply_parses_a_connector_draft():
+    """The controller's relay of the pod's connector line validates as a reply."""
+    fixture = json.loads((Path(__file__).parents[1] / "fixtures" / "turn_connector_reply.json").read_text())
+    reply = TurnReply(correlation_id="r", **fixture)
+    assert reply.kind == "turn_connector"
+    assert reply.data["entries"][0]["connector_id"] == "acme_crm"
 
 
 def test_deadline_ms_is_a_duration_not_an_epoch():
