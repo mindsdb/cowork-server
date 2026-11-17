@@ -385,11 +385,14 @@ class CodingSessionFactory:
         selected = self._selected_project(project, resource_ids)
         return {root for _, root in self.project_workspaces.in_place_roots(selected)}
 
-    def complete(self, pending: PendingLocalSession, cancelled: Callable[[], bool]) -> CodingSession:
+    def complete(
+        self, pending: PendingLocalSession, cancelled: Callable[[], bool], *, deleted: Callable[[], bool],
+    ) -> CodingSession:
         """Prepare a pending task's workspace and run its setup commands.
 
         On failure the workspace is released and the Run fails, but the task
-        record stays so the user can see why it did not start.
+        record stays so the user can see why it did not start. A task deleted
+        during preparation instead rolls back without saving recovery data.
         """
         session_id = pending.session_id
         request = pending.request
@@ -433,7 +436,7 @@ class CodingSessionFactory:
         except Exception:
             self.skills.cleanup(session_id)
             if preparation is not None:
-                self._release_workspaces(session_id, preparation)
+                self._release_workspaces(session_id, preparation, keep_recovery=not deleted())
                 if request.repository_setup and request.repository_setup.branch:
                     for workspace in preparation.task_workspaces:
                         self.project_workspaces.rollback_task_branch(workspace)
@@ -509,9 +512,11 @@ class CodingSessionFactory:
             )
         self.skills.cleanup(session.id)
 
-    def _release_workspaces(self, session_id: str, preparation: LocalSessionPreparation) -> None:
+    def _release_workspaces(
+        self, session_id: str, preparation: LocalSessionPreparation, *, keep_recovery: bool = True,
+    ) -> None:
         if preparation.task_workspaces:
-            self.project_workspaces.cleanup(session_id, list(preparation.task_workspaces))
+            self.project_workspaces.cleanup(session_id, list(preparation.task_workspaces), keep_recovery=keep_recovery)
             return
         workspace = preparation.fallback_workspace
         if workspace and workspace.workspace_kind in {WorkspaceKind.git_worktree, WorkspaceKind.local_copy}:
@@ -521,6 +526,7 @@ class CodingSessionFactory:
                 workspace.workspace_path,
                 workspace.workspace_kind,
                 workspace.base_revision,
+                keep_recovery=keep_recovery,
             )
 
     @staticmethod
