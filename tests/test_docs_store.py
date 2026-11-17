@@ -361,3 +361,15 @@ def test_a_doc_nested_too_deeply_is_a_bad_doc_and_the_list_skips_it(made):
         load_doc(made.folder)
     assert refused.value.code == "bad_doc"
     assert list_doc_folders(made.folder.parent) == []
+
+
+def test_a_docs_topic_is_its_folder_never_an_id_its_files_claim(tmp_path):
+    """Two docs whose files claim one id (the agent's code can write them) never
+    share a topic, so one's editor can't read or be fed the other's writes."""
+    from cowork.docs.hub import doc_topic
+
+    a = create_doc(tmp_path / "a", title="A", markdown="Mine.", by="user")
+    b = create_doc(tmp_path / "b", title="B", markdown="Theirs.", by="user")
+    assert doc_topic(a.folder) != doc_topic(b.folder)
+    # One folder, however it is spelled, is one topic.
+    assert doc_topic(a.folder) == doc_topic(a.folder.parent / "." / a.folder.name)

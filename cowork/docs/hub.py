@@ -2,9 +2,11 @@
 
 Two kinds of topic:
 
-- ``doc:<artifact id>``: every write to that doc, with the doc itself, for
+- ``doc:<doc folder>``: every write to that doc, with the doc itself, for
   each editor that has it open (so the person watches the agent's sections
-  land, and two windows on one doc stay in step);
+  land, and two windows on one doc stay in step). Keyed by the folder the
+  server resolved, never by an id read from the doc's files, which the
+  agent's code can write: a doc can't be made to share another one's topic;
 - ``conv:<conversation id>``: "the agent created / changed a doc in this
   conversation", so the chat can show the doc's card and open it the moment
   the agent makes it, instead of at the end of the turn.
@@ -18,9 +20,11 @@ loses events rather than blocking the writer; every event carries the doc's
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 _QUEUE_MAX = 64
@@ -94,8 +98,9 @@ def _offer(queue: asyncio.Queue, event: dict[str, Any]) -> None:
 hub = DocHub()
 
 
-def doc_topic(artifact_id: str) -> str:
-    return "doc:" + str(artifact_id).replace("-", "").lower()
+def doc_topic(folder: Path | str) -> str:
+    # Normalized without touching the disk, so it is safe on the event loop.
+    return "doc:" + os.path.normpath(os.path.abspath(folder))
 
 
 def conv_topic(conversation_id: str) -> str:
