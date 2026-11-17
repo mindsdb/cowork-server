@@ -26,6 +26,8 @@ WAITING_FOR_APPROVAL = "Waiting for you to allow a private address."
 WAITING_FOR_CONFIRMATION = "Waiting for you to confirm the test result."
 NOT_ALLOWED = "Not saved: you did not allow the private address."
 CANCELLED = "Not saved: you cancelled the test result."
+# Any end the member did not choose: a new form, a closed panel, a cleared form.
+ENDED = "Not saved: the connection test ended before it was answered."
 
 
 async def advance(entry: PendingTest) -> dict[str, Any]:

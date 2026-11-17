@@ -29,6 +29,7 @@ from cowork.services.connectors.custom_connectors import (
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.connector_test_flow import (
     CANCELLED,
+    ENDED,
     NOT_ALLOWED,
     advance,
     failed_patch,
@@ -186,15 +187,21 @@ async def confirm_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> d
     "/cancel", name="submission_cancel", status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require(SingleUserOnly))],
 )
-async def cancel_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> None:
+async def cancel_route(answer: ConnectorTestAnswer, scope: TenantScopeDep, reason: str | None = None) -> None:
     """Drop a waiting test and the values it holds. Idempotent: an unknown id
-    is not an error, and another scope's entry is left in place."""
+    is not an error, and another scope's entry is left in place.
+
+    ``reason`` (query) says who ended it: ``declined`` or none records that the
+    member declined; any other value records that it ended without an answer.
+    It is never refused, so a waiting test's values are always dropped.
+    """
     if (answer.approval_id is None) == (answer.confirm_id is None):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Send one of approval_id or confirm_id.")
+    declined = reason in (None, "declined")
     if answer.approval_id is not None:
-        entry, text = pending_tests.pop(answer.approval_id, "approval", scope), NOT_ALLOWED
+        entry, text = pending_tests.pop(answer.approval_id, "approval", scope), NOT_ALLOWED if declined else ENDED
     else:
-        entry, text = pending_tests.pop(answer.confirm_id, "confirm", scope), CANCELLED
+        entry, text = pending_tests.pop(answer.confirm_id, "confirm", scope), CANCELLED if declined else ENDED
     if entry is not None:
         await record_outcome(entry, text)
 
