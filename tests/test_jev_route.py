@@ -296,6 +296,95 @@ def test_gate_mode(fields, mode):
     assert jev_route.gate_mode(_user(**fields)) == mode
 
 
+@pytest.mark.parametrize(("fields", "model"), [
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k"}, "mindshub"),
+    # Jev turned off, and no decision model of the organization's own.
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k", "jev_decisions_enabled": False}, None),
+    ({"planning_provider": "anthropic", "anthropic_api_key": "k"}, None),
+    ({"planning_provider": "anthropic", "anthropic_api_key": "k",
+      "decision_model_url": "https://api.typesafe.ai/v1/systemone", "decision_model_api_key": "own"}, "own"),
+    # The organization's own wins over Jev on MindsHub, as in the gate.
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k",
+      "decision_model_url": "https://api.typesafe.ai/v1/systemone", "decision_model_api_key": "own"}, "own"),
+    ({"planning_provider": "anthropic", "anthropic_api_key": "k", "decision_model_api_key": "own"}, None),
+])
+def test_the_browsers_decisions_model(fields, model, monkeypatch):
+    from cowork.services import browser
+
+    monkeypatch.setattr(browser, "own_model_reaches_browser", lambda: True)
+    settings = _user(**fields)
+    assert jev_route.decisions_model(settings) == model
+    assert jev_route.decisions_available(settings) is (model is not None)
+
+
+_OWN = {"decision_model_url": "https://api.typesafe.ai/v1/systemone", "decision_model_api_key": "own"}
+
+
+@pytest.mark.parametrize(("fields", "model"), [
+    # What the settings otherwise allow: Jev on MindsHub for an LLM on it...
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k", **_OWN}, "mindshub"),
+    # ...and nothing when Jev is off or the LLM is elsewhere.
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k", "jev_decisions_enabled": False, **_OWN}, None),
+    ({"planning_provider": "anthropic", "anthropic_api_key": "k", **_OWN}, None),
+])
+def test_an_own_model_the_browser_cant_reach_is_not_what_picks_its_steps(fields, model, monkeypatch):
+    """No proxy URL on the web, or an anton without the host's own model on
+    the desktop: the browser never asks the organization's model, so status
+    and Settings don't say it does. The turn gate still asks it."""
+    from cowork.services import browser
+
+    monkeypatch.setattr(browser, "own_model_reaches_browser", lambda: False)
+    settings = _user(**fields)
+    assert jev_route.decisions_model(settings) == model
+    assert jev_route.decisions_available(settings) is (model is not None)
+    assert jev_route.gate_mode(settings) == "own"
+
+
+@pytest.mark.parametrize("url", ["decisions.example.test/v1", "https://u:p@decide.example.test/v1"])
+@pytest.mark.parametrize(("jev", "model"), [(True, "mindshub"), (False, None)])
+def test_an_own_model_at_a_url_the_browser_refuses_is_not_what_picks_its_steps(url, jev, model, monkeypatch):
+    """A URL stored before Settings checked it: anton's browser refuses it
+    (`browser._decisions_block` leaves it out), so status and Settings don't
+    say "own" even where the browser reaches the organization's model. The
+    turn gate still asks it."""
+    from cowork.services import browser
+
+    monkeypatch.setattr(browser, "own_model_reaches_browser", lambda: True)
+    settings = _user(
+        planning_provider="minds_cloud", minds_api_key="k", jev_decisions_enabled=jev,
+        decision_model_url=url, decision_model_api_key="own",
+    )
+    assert jev_route.decisions_model(settings) == model
+    assert jev_route.gate_mode(settings) == "own"
+
+
+@pytest.mark.parametrize(("url", "takes"), [
+    ("https://decide.example.test/v1", True), ("http://10.0.0.5:8080/decide", True),
+    ("decisions.example.test/v1", False), ("ftp://decide.example.test/v1", False), ("https:///v1", False),
+    ("https://u:p@decide.example.test/v1", False), ("http://[::1", False),
+])
+def test_a_decision_model_url_is_a_web_address_as_anton_takes_it(url, takes):
+    assert jev_route.is_web_address(url=url) is takes
+
+
+@pytest.mark.asyncio
+async def test_probe_sends_one_minimal_decision_to_the_endpoint_as_given(monkeypatch):
+    captured = {}
+    client = _FakeAsyncClient(response=_FakeResponse(200, _body()), captured=captured)
+    monkeypatch.setattr(jev_route, "_http_client", lambda: client)
+    target = jev_route.JevTarget(url="https://api.typesafe.ai/v1/systemone", api_key="own")
+
+    result = await jev_route.probe(target, model="jev", timeout_seconds=1.0)
+
+    assert result.error == ""
+    assert captured["url"] == "https://api.typesafe.ai/v1/systemone"
+    assert captured["headers"] == {"Authorization": "Bearer own"}
+    assert captured["json"]["state"] == {"latest_user_message": "Hello", "earlier_conversation": []}
+    bad = _FakeAsyncClient(response=_FakeResponse(401, {}))
+    monkeypatch.setattr(jev_route, "_http_client", lambda: bad)
+    assert (await jev_route.probe(target, model="jev", timeout_seconds=1.0)).error == "http_401"
+
+
 def test_own_decision_target_unwraps_the_key_and_trims_the_url():
     settings = _user(decision_model_url=" https://api.typesafe.ai/v1/systemone ", decision_model_api_key="own-key")
 

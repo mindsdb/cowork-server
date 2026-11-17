@@ -17,7 +17,7 @@ import asyncio
 import hashlib
 import logging
 import time
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from enum import StrEnum
 from typing import Any, Generic, NamedTuple, Protocol, TypeVar
 from uuid import UUID
@@ -378,10 +378,16 @@ class CallerTtlCache(Generic[_V]):
         self._entries.clear()
 
 
-def sweep_cache(cache: MutableMapping[Any, tuple[Any, ...]], *, max_ttl_s: float) -> None:
+def sweep_cache(
+    cache: MutableMapping[Any, tuple[Any, ...]],
+    *,
+    max_ttl_s: float,
+    stamp: Callable[[tuple[Any, ...]], float] = lambda entry: entry[0],
+) -> None:
     """Drop the entries of a cache of ``(stored_at, ...)`` tuples that no TTL
     up to ``max_ttl_s`` could still consider fresh, for a cache that keeps
-    its own entries (the model catalog, cowork.services.providers)."""
+    its own entries (the model catalog, cowork.services.providers). ``stamp``
+    reads an entry's age when it isn't ``entry[0]``."""
     cutoff = time.monotonic() - max_ttl_s
-    for key in [k for k, entry in cache.items() if entry[0] < cutoff]:
+    for key in [k for k, entry in cache.items() if stamp(entry) < cutoff]:
         del cache[key]

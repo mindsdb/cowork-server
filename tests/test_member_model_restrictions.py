@@ -165,7 +165,7 @@ def test_the_restriction_list_is_per_member_and_the_map_per_org():
 def test_desktop_keeps_restrictions_in_the_map(session, monkeypatch):
     _mode(monkeypatch, "local")
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         return _listing(restricted=True)
 
     monkeypatch.setattr(ep, "fetch_minds_models", fake_fetch)
@@ -182,3 +182,37 @@ def test_desktop_keeps_restrictions_in_the_map(session, monkeypatch):
         assert settings.resolved_planning_model == MINDS_FREE_MODEL
     finally:
         us.get_app_settings.cache_clear()
+
+
+@pytest.mark.parametrize("refresh_scope, overlay_forced", [("minds", False), ("all", True)])
+def test_org_refresh_scope_forces_the_catalog_and_scopes_the_custom_endpoint(
+    session, monkeypatch, refresh_scope, overlay_forced
+):
+    _mode(monkeypatch, "org")
+    seen = {}
+
+    async def fake_org_catalog(*, org_id, user_id, bearer_token, refresh=False):
+        seen["catalog_refresh"] = refresh
+        return _listing(restricted=False)
+
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **kw):
+        seen["overlay"] = (force_refresh, kw.get("mindshub", False))
+        return MindsModelListing(["local-llama"], {}, {}, {}, {}, {}, {}, {})
+
+    monkeypatch.setattr(ep, "fetch_org_model_catalog", fake_org_catalog)
+    monkeypatch.setattr(ep, "fetch_minds_models", fake_fetch)
+    try:
+        service = SettingService(session, _scope(MEMBER_A))
+        service.upsert_setting("providers_json", json.dumps(
+            [{"type": "openai-compatible", "baseUrl": "https://llm.local/v1", "apiKey": "***"}]
+        ))
+        service.upsert_setting("openai_api_key", "sk-test")
+
+        asyncio.run(ep.recommended_models(
+            FakeRequest({"Authorization": "Bearer jwt-a"}), _scope(MEMBER_A),
+            refresh=True, refresh_scope=refresh_scope,
+        ))
+    finally:
+        us.get_app_settings.cache_clear()
+
+    assert seen == {"catalog_refresh": True, "overlay": (overlay_forced, False)}

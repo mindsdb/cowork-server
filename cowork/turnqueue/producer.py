@@ -17,6 +17,7 @@ from datetime import datetime
 from functools import partial
 from typing import TYPE_CHECKING
 
+import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
 from redis.exceptions import RedisError
 
@@ -31,7 +32,8 @@ from cowork.coding.reasoning import advertised_levels
 from cowork.schemas.turn_skills import TurnSkillEntry, TurnSkills, turn_skills_wire
 from cowork.services.providers import cached_org_model_catalog, minds_chat_base_url
 from cowork.db.scoped import scope_for_identity
-from cowork.services import product_permissions
+from cowork.services import decisions_proxy, product_permissions
+from cowork.services.connectors.notion_pages import describe_project_pages
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
@@ -42,7 +44,15 @@ from cowork.turnqueue.auth_keys import (
     register_datasource_grants,
     revoke_turn_key,
 )
-from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnJobHeader, TurnReply, TurnReplyHeader
+from cowork.turnqueue.models import (
+    MAX_DATASOURCE_CONNECTIONS,
+    TurnJob,
+    TurnJobHeader,
+    TurnReply,
+    TurnReplyHeader,
+    is_connection_engine,
+    is_connection_label,
+)
 from cowork.streaming.cancellation import stop_controller_turn
 from cowork.streaming.liveness import WORKER_ALIVE_PHASE
 from cowork.streaming.turn_index import record_channel_turn
@@ -81,6 +91,8 @@ class RemoteWorkspace(BaseModel):
 
     project_id: str
     workspace_rel_path: str
+    # Picked Notion pages are tagged with project names, as on desktop.
+    project_name: str | None = None
 
 
 def _trace_block(*, user_id: str | None = None, org_id: str | None = None) -> dict[str, str]:
@@ -323,7 +335,85 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
     }
 
 
-def _connectors_block(oauth_connections: dict | None) -> dict | None:
+class _ConnectorKeyUnavailable(Exception):
+    """The connector key could not be minted for a reason other than an auth
+    service that doesn't know the purpose yet."""
+
+
+def _purpose_not_supported(exc: BaseException) -> bool:
+    """Whether the auth service refused the mint for its ``purpose``: a 400
+    whose JSON body names the field, as an auth without the connector_token
+    purpose answers. The mint raises ProductPermissionUnavailable from it."""
+    cause = exc.__cause__
+    if not isinstance(cause, httpx.HTTPStatusError) or cause.response.status_code != 400:
+        return False
+    try:
+        body = cause.response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and "purpose" in body
+
+
+async def _mint_connector_key(*, org_id: str, user_id: str, correlation_id: str,
+                              settings: TurnQueueSettings, workspace_id: str | None) -> str | None:
+    """A connector-token key for anton's own token fetches.
+
+    None falls back to the turn key, only when the auth service predates the
+    connector_token purpose: there the turn key still fetches MCP tokens. Any
+    other failure raises _ConnectorKeyUnavailable, and the turn runs without
+    its MCP connections rather than hand their tokens to the turn key.
+    """
+    try:
+        return await mint_turn_key(
+            user_id=user_id, org_id=org_id, correlation_id=correlation_id,
+            ttl_seconds=settings.turn_key_lifetime_seconds, settings=settings,
+            purpose="connector_token", workspace_id=workspace_id,
+        )
+    except Exception as exc:
+        if _purpose_not_supported(exc):
+            logger.info(
+                "[producer] auth has no connector_token purpose correlation_id=%s; using the turn key",
+                correlation_id,
+            )
+            return None
+        raise _ConnectorKeyUnavailable() from exc
+
+
+async def _oauth_block_and_connector_key(*, org_id: str | None, user_id: str | None,
+                                         disabled: list[dict] | None, correlation_id: str,
+                                         settings: TurnQueueSettings,
+                                         workspace_id: str | None) -> tuple[dict | None, str | None]:
+    """The oauth connections, then a connector key when one of them is MCP.
+
+    The auth service hands an MCP engine's token only to a connector-token
+    key, which anton alone holds; the scratchpad keeps the turn key, so cell
+    code can't fetch the token and skip the connection's access mode.
+
+    Chained so the key is minted only for turns that need it, while the pair
+    still runs alongside the turn-key mint."""
+    oauth_connections = await _mint_oauth_block(
+        org_id=org_id, user_id=user_id, disabled=disabled, settings=settings,
+    )
+    connections = (oauth_connections or {}).get("connections") or []
+    mcp_engines = registry.mcp_engines()
+    if not any(c.get("engine") in mcp_engines for c in connections):
+        return oauth_connections, None
+    try:
+        connector_key = await _mint_connector_key(
+            org_id=org_id, user_id=user_id, correlation_id=correlation_id,
+            settings=settings, workspace_id=workspace_id,
+        )
+    except _ConnectorKeyUnavailable:
+        logger.warning(
+            "[producer] connector key mint failed correlation_id=%s; MCP connections left out of this turn",
+            correlation_id, exc_info=True,
+        )
+        others = [c for c in connections if c.get("engine") not in mcp_engines]
+        return ({**oauth_connections, "connections": others} if others else None), None
+    return oauth_connections, connector_key
+
+
+def _connectors_block(oauth_connections: dict | None, project_name: str | None = None) -> dict | None:
     """The turn's `connectors` block: {engine: {"usage_notes": ...}} for the
     engines of this turn's connections whose spec declares usage notes. None
     when there is nothing to send; the key is then left out of params, like
@@ -332,10 +422,39 @@ def _connectors_block(oauth_connections: dict | None) -> dict | None:
     Built from the same, already disabled-filtered, connection list as the
     `oauth` block: anton renders notes only for engines its vault connects,
     and on web that vault is built from `oauth` alone.
+
+    Notion's notes also list the pages added to this turn's project, the
+    same text the desktop harness puts in its prompt.
     """
     connections = (oauth_connections or {}).get("connections") or []
     notes = registry.usage_notes_for(dict.fromkeys(c.get("engine") for c in connections))
+    pages = describe_project_pages(_project_notion_pages(connections, project_name))
+    if pages:
+        notes = {**notes, "notion": (notes.get("notion", "") + pages).strip()}
     return {engine: {"usage_notes": text} for engine, text in notes.items()} or None
+
+
+def _project_notion_pages(connections: list[dict], project_name: str | None) -> dict[str, list[dict]]:
+    """Notion pages tagged to `project_name`, keyed by connection name: the
+    same rule as ConnectionsService.picked_files_by_project on desktop."""
+    if not project_name:
+        return {}
+    by_connection: dict[str, list[dict]] = {}
+    for c in connections:
+        if c.get("engine") != "notion" or not isinstance(c.get("picked_files"), list):
+            continue
+        scoped = [
+            f for f in c["picked_files"]
+            if isinstance(f, dict) and project_name in (f.get("projects") or [])
+        ]
+        if scoped:
+            by_connection[str(c.get("name"))] = scoped
+    return by_connection
+
+
+def _oauth_connections_wire(connections: list[dict]) -> list[dict]:
+    # The pod's vault needs only engine and name; picked pages go in `connectors`.
+    return [{k: v for k, v in c.items() if k != "picked_files"} for c in connections]
 
 
 def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermissionUnavailable:
@@ -346,7 +465,9 @@ def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermiss
     return product_permissions.ProductPermissionUnavailable()
 
 
-def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | None) -> list[dict]:
+def _datasource_connection_refs(
+    connections: list[dict], disabled: list[dict] | None, *, with_labels: bool = False
+) -> list[dict]:
     """The grant set: every verified connection auth listed, minus the
     conversation's disabled ones. A disabled entry carries ``engine`` and
     ``name``; auth's ``connector_id`` is the same value, so the join is exact."""
@@ -381,7 +502,10 @@ def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | 
         ):
             raise _refuse_datasource_grants("listing carries a malformed or repeated connection reference")
         seen.add(connection_id)
-        refs.append({"connection_id": connection_id, "credential_version": credential_version})
+        ref = {"connection_id": connection_id, "credential_version": credential_version}
+        if with_labels:
+            ref.update(_connection_labels(connection))
+        refs.append(ref)
     # Auth caps what is registered, so the cap applies after the disabled ones are gone.
     if len(refs) > MAX_DATASOURCE_CONNECTIONS:
         raise _refuse_datasource_grants("more enabled connections than a grant set may hold")
@@ -396,6 +520,16 @@ def _same_identifier(echoed: object, ours: str) -> bool:
         return uuid.UUID(echoed) == uuid.UUID(ours)
     except ValueError:
         return echoed == ours
+
+
+def _connection_labels(connection: dict) -> dict[str, str]:
+    """The connection's ``label`` and ``engine``, each only when the queue check accepts it; anton cleans them for the prompt."""
+    labels: dict[str, str] = {}
+    if is_connection_label(connection["name"]):
+        labels["label"] = connection["name"]
+    if is_connection_engine(connection["connector_id"]):
+        labels["engine"] = connection["connector_id"]
+    return labels
 
 
 async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
@@ -424,7 +558,7 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
             org_id, exc_info=True,
         )
         return None
-    refs = _datasource_connection_refs(connections, disabled)
+    refs = _datasource_connection_refs(connections, disabled, with_labels=settings.datasource_labels_enabled)
     if not refs:
         return None
     response = await register_datasource_grants(
@@ -741,6 +875,35 @@ async def _scoped_browser_block(
     return config.to_dict() if config is not None else None
 
 
+async def _admit_decisions_proxy(
+    r, browser_block: dict | None, *, turn_key: str, org_id: str | None, user_id: str | None,
+    correlation_id: str, settings: TurnQueueSettings,
+) -> dict | None:
+    """The browser block as the job carries it. One that names the decisions
+    proxy (the organization's own decision model, through this server) needs
+    the turn's key recorded first, which is how the proxy knows the key and
+    its organization (cowork.services.decisions_proxy). If that fails the
+    block goes without the proxy, and the pod's browser asks Jev on MindsHub
+    rather than a proxy that would refuse its key."""
+    if not browser_block or not browser_block.get("decisions_proxy"):
+        return browser_block
+    try:
+        if not turn_key or not org_id or not user_id:
+            raise ValueError("no turn key or identity to record")
+        await decisions_proxy.admit(
+            r, turn_key=turn_key, org_id=org_id, user_id=user_id, correlation_id=correlation_id,
+            ttl_seconds=settings.turn_key_lifetime_seconds,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[producer] could not record the turn for the decisions proxy; its browser asks Jev on MindsHub",
+            extra={"event": "decisions_proxy_admit_failed", "correlation_id": correlation_id,
+                   "error_type": type(exc).__name__},
+        )
+        return {k: v for k, v in browser_block.items() if k != "decisions_proxy"}
+    return browser_block
+
+
 async def revoke_turn_key_quietly(correlation_id: str) -> None:
     """Revoke the key the routing gate minted for a turn that never runs,
     logging rather than raising: a failed revoke leaves it to its own expiry."""
@@ -763,6 +926,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
                                 tool_messages: bool = False,
+                                preview_checks: bool = False,
                                 ui_locale: str | None = None,
                                 reasoning_effort: str | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
@@ -776,6 +940,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
     user (the cowork UI does; channel turns never).
+    `preview_checks` lets the pod's artifact editor ask the app's open
+    preview whether an edit runs (ENG-4227, turnqueue/preview_checks.py).
+    Only with `interactive`: the answer reaches the pod on the stdin an
+    interactive turn keeps open. Channel turns never.
     `ui_locale` is the app's language (cowork.common.ui_locale), which the
     pod's anton replies in when the user's message does not say; None for a
     turn with no request behind it.
@@ -823,34 +991,39 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # An outage here happens before anything is queued. Reported as a
     # turn_failed so both callers stream permission_unavailable, not a generic error.
     try:
-        oauth_connections_coro = _mint_oauth_block(
-            org_id=org_id, user_id=user_id, disabled=disabled, settings=settings,
+        from cowork.common.settings.user_settings import get_user_settings
+        from cowork.db.units import run_on_unit_threads
+
+        user_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+        workspace_id = getattr(user_settings, "hub_workspace_id", "") or None
+        oauth_connections_coro = _oauth_block_and_connector_key(
+            org_id=org_id, user_id=user_id, disabled=disabled, correlation_id=corr,
+            settings=settings, workspace_id=workspace_id,
         )
         if llm:
             llm_block = llm
-            oauth_connections = await oauth_connections_coro
+            oauth_connections, connector_key = await oauth_connections_coro
         else:
-            from cowork.common.settings.user_settings import get_user_settings
-            from cowork.db.units import run_on_unit_threads
-
-            user_settings = await run_on_unit_threads(partial(get_user_settings, scope))
-            workspace_id = getattr(user_settings, "hub_workspace_id", "") or None
+            mint_llm = _mint_llm_block_with_turn_key_id if settings.datasource_enabled else mint_llm_block
+            # Both run to the end, so a connector key minted beside a failed
+            # turn-key mint is known here and revoked rather than left live.
+            llm_result, oauth_result = await asyncio.gather(
+                mint_llm(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+                         workspace_id=workspace_id),
+                oauth_connections_coro,
+                return_exceptions=True,
+            )
+            if isinstance(oauth_result, BaseException):
+                raise oauth_result
+            oauth_connections, connector_key = oauth_result
+            if isinstance(llm_result, BaseException):
+                if connector_key:
+                    await _revoke_turn_key_at_turn_end(corr, settings)
+                raise llm_result
             if settings.datasource_enabled:
-                (llm_block, turn_key_id), oauth_connections = await asyncio.gather(
-                    _mint_llm_block_with_turn_key_id(
-                        org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
-                        workspace_id=workspace_id,
-                    ),
-                    oauth_connections_coro,
-                )
+                llm_block, turn_key_id = llm_result
             else:
-                llm_block, oauth_connections = await asyncio.gather(
-                    mint_llm_block(
-                        org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
-                        workspace_id=workspace_id,
-                    ),
-                    oauth_connections_coro,
-                )
+                llm_block = llm_result
         datasource_block = await _mint_datasource_block(
             org_id=org_id,
             user_id=user_id,
@@ -867,14 +1040,29 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         yield "turn_failed", _setup_permission_failure()
         return
 
-    # Reuses the turn key already minted for llm_block — never mints a
-    # second one. Org/cloud mode only: local-mode turns build in-process
-    # and never reach this function at all.
-    oauth_block = {**oauth_connections, "turn_key": llm_block.get("api_key", "")} if oauth_connections else None
-    connectors_block = _connectors_block(oauth_connections)
+    # anton fetches connector tokens with the connector key when the turn has
+    # an MCP connection, else with the turn key llm_block already carries. The
+    # connector key goes only here, never into llm_block or the scratchpad.
+    # Org/cloud mode only: local-mode turns never reach this function.
+    oauth_block = (
+        {
+            **oauth_connections,
+            "connections": _oauth_connections_wire(oauth_connections.get("connections") or []),
+            "turn_key": connector_key or llm_block.get("api_key", ""),
+        }
+        if oauth_connections
+        else None
+    )
+    connectors_block = _connectors_block(
+        oauth_connections, workspace.project_name if workspace is not None else None,
+    )
     browser_block = await _scoped_browser_block(
         scope=scope, conversation_id=conversation_id, turn_key=llm_block.get("api_key", ""),
         project_id=workspace.project_id if workspace is not None else None,
+    )
+    browser_block = await _admit_decisions_proxy(
+        r, browser_block, turn_key=llm_block.get("api_key", ""), org_id=org_id, user_id=user_id,
+        correlation_id=corr, settings=settings,
     )
 
     # Org-relative, never absolute. cowork-server sees the shared tree at
@@ -912,6 +1100,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # The cowork UI renders a tool's message to the user as an
               # agent message; without this the pod hands it to the agent.
               "tool_messages": tool_messages,
+              # The pod asks the app's preview to check its edits only when
+              # this is a real true, and only an interactive turn keeps the
+              # stdin its answer comes back on (scratchpad-controller#134
+              # relays it; an older controller drops it and the pod never asks).
+              **({"preview_checks": True} if preview_checks and interactive else {}),
               # False when the organization opted out of Jev: the pod's
               # completion check then never asks it. A controller that
               # predates the field drops it, and the pod keeps Jev on.
@@ -1148,6 +1341,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     finally:
         if llm_block.get("api_key") and (ended or await _stopped(r, corr)):
             await _revoke_turn_key_at_turn_end(corr, settings)
+            if browser_block and browser_block.get("decisions_proxy"):
+                await decisions_proxy.forget(r, correlation_id=corr)
 
 
 async def _stopped(r, corr: str) -> bool:

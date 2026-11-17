@@ -1,5 +1,7 @@
 # libxml2 log entries, as each version writes them, and whether each means
-# the parser stopped and dropped the rest of the document.
+# the parser stopped and dropped the rest of the document. An entry with
+# out_of_memory means libxml2 ran out of memory: parse_stopped raises
+# MemoryError for it, and the export refuses the document.
 - id: resource-limit-2-12-and-later
   type_name: ERR_RESOURCE_LIMIT
   message: "Excessive depth in document: 256, use XML_PARSE_HUGE option"
@@ -28,3 +30,11 @@
   type_name: HTML_UNKNOWN_TAG
   message: "Tag portal invalid"
   stopped: false
+- id: out-of-memory
+  type_name: ERR_NO_MEMORY
+  message: "Memory allocation failed"
+  out_of_memory: true
+- id: out-of-memory-growing-a-buffer
+  type_name: ERR_NO_MEMORY
+  message: "Memory allocation failed : growing buffer"
+  out_of_memory: true

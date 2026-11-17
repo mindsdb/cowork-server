@@ -50,7 +50,9 @@ from cowork.services.artifact_permissions import (
     with_export_formats,
 )
 from cowork.services import artifact_files
+from cowork.services.artifact_autopublish import job_budget_for, lock_ttl_for
 from cowork.services.preview_html import prepare_preview_html
+from cowork.services.quick_edit import direct_edit_available, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.schemas.artifact_access import (
@@ -107,7 +109,7 @@ _DRAFT_RESPONSE_HEADERS = {
     "X-Content-Type-Options": "nosniff",
 }
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
-_LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
+_LIVE_PUBLISH_LOCK_TTL_S = lock_ttl_for(_LIVE_PUBLISH_TIMEOUT_S)
 # The stats tracking toggle waits only briefly for an in-flight publish:
 # the full publish wait would freeze the switch for a minute.
 _STATS_TRACKING_LOCK_TIMEOUT_S = 5.0
@@ -499,6 +501,8 @@ async def _sync_live_artifact(
     """
     from cowork.services.publish import (
         AccessModeChanged,
+        MarkdownNotPublishable,
+        MarkdownRenderBusy,
         PublishOwnedByOtherUser,
         PublishTooLarge,
         ShareOrgRequired,
@@ -506,7 +510,7 @@ async def _sync_live_artifact(
         publish_artifact,
         published_artifact_access,
     )
-    from cowork.services.artifact_locks import release
+    from cowork.services.artifact_locks import refresh, release
 
     artifacts_base = folder.parent
     if not await _acquire_live_publish_lock(folder, scope):
@@ -557,6 +561,8 @@ async def _sync_live_artifact(
                     access=access,
                     scope=scope,
                     project_id=project_id,
+                    job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S),
+                    on_job_accepted=lambda _job: refresh(folder.parent, folder.name),
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -577,6 +583,16 @@ async def _sync_live_artifact(
     except PublishTooLarge:
         # Repeats on every save until the artifact shrinks, so no traceback.
         logger.warning("Could not synchronize live artifact %s: it is too large to publish", folder)
+        return False
+    except MarkdownNotPublishable:
+        # Repeats on every save until the Markdown changes, so no traceback.
+        logger.warning(
+            "Could not synchronize live artifact %s: its Markdown page can't be rendered", folder
+        )
+        return False
+    except MarkdownRenderBusy:
+        # Another conversion held the server's one slot; the next save tries again.
+        logger.warning("Could not synchronize live artifact %s: another conversion runs", folder)
         return False
     except (AccessModeChanged, ShareOrgRequired):
         # publish_artifact logged the refusal: a mode changed after the
@@ -621,16 +637,29 @@ async def _acquire_live_publish_lock(
 
 
 async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
+    """*capabilities* narrowed by the caller's current product permissions.
+
+    ``canQuickEdit`` (ENG-4227): the viewer's chat bar is offered. It needs
+    what an agent repair needs, plus the server setting and an anton with the
+    quick editor (``quick_edit_available``), so it is false on a server whose
+    anton predates it. ``quickEditDirect``: the bar can also edit directly,
+    because a decisions model serves the caller's provider; without one the
+    bar still shows and hands every message to the chat.
+    """
     if not capabilities["canEdit"]:
-        return capabilities
+        return {**capabilities, "canQuickEdit": False, "quickEditDirect": False}
     can_edit = await has_product_permission(scope, "artifact.manage")
     can_execute = await has_product_permission(scope, "product.execute")
+    can_address = capabilities["canAddressWithAgent"] and can_edit and can_execute
     current = {
         **capabilities,
         "canEdit": can_edit,
-        "canAddressWithAgent": capabilities["canAddressWithAgent"] and can_edit and can_execute,
+        "canAddressWithAgent": can_address,
         "canResolveComments": capabilities["canResolveComments"] and can_edit,
     }
+    can_quick_edit = bool(can_address and quick_edit_available())
+    current["canQuickEdit"] = can_quick_edit
+    current["quickEditDirect"] = can_quick_edit and await direct_edit_available(scope)
     # The export route needs `artifact.manage` too, so it offers nothing here.
     if not can_edit and "exportFormats" in capabilities:
         current["exportFormats"] = []
@@ -1171,7 +1200,7 @@ def _owner_publish_context(scope: TenantScope, folder: Path):
         _publish_url(scope),
         PublishKey(
             str(scope.user_id), str(scope.org_id),
-            min_ttl_s=_LIVE_PUBLISH_TIMEOUT_S + 60.0,
+            min_ttl_s=_LIVE_PUBLISH_LOCK_TTL_S + 60.0,
             workspace_id=_active_workspace_id(scope),
         ),
     )
@@ -1275,6 +1304,27 @@ async def artifact_access(
     return state if rule is None else state.restricted_to(rule)
 
 
+def _push_share(scope, principal: Principal | None, notices: list) -> None:
+    """Push the people the save asked to notify, the ones MindsHub emails:
+    individuals by id only. People named by address alone, and the members
+    of a team or the whole organization a share opens to, get no push, as
+    they get no email. Never raises."""
+    try:
+        from cowork.services.push.hooks import artifact_shared
+
+        for notice in notices:
+            artifact_shared(
+                org_id=scope.org_id if scope.org_mode else None,
+                sharer_id=principal.user_id if principal else None,
+                sharer_name=principal.email if principal else None,
+                recipient_ids=notice.recipients.user_ids,
+                artifact_title=notice.artifact_title,
+                url=notice.artifact_url,
+            )
+    except Exception:
+        logger.warning("Could not push an artifact share", exc_info=True, extra={"event": "push_share_failed"})
+
+
 async def set_artifact_access(
     project_ref: str,
     artifact_id: ArtifactIdDep,
@@ -1294,6 +1344,7 @@ async def set_artifact_access(
     from cowork.services.publish import PublishRejected, PublisherUnavailable, ShareOrgRequired
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
+    from cowork.services.artifact_locks import refresh
 
     source, folder, metadata, _capabilities = await _owner_workspace(
         scope, project_ref, artifact_id
@@ -1350,8 +1401,9 @@ async def set_artifact_access(
                 detail="Publishing is unavailable right now. Try again in a moment.",
             )
         publish_started = True
+        notices: list = []
         try:
-            return await asyncio.wait_for(
+            published = await asyncio.wait_for(
                 asyncio.to_thread(
                     _publish_bundle,
                     folder,
@@ -1364,9 +1416,14 @@ async def set_artifact_access(
                     notify=notify or None,
                     stored=checked.stored,
                     owner_save=True,
+                    job_budget_s=job_budget_for(_LIVE_PUBLISH_LOCK_TTL_S),
+                    on_job_accepted=lambda _job: refresh(folder.parent, folder.name),
+                    notices=notices,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
+            _push_share(scope, principal, notices)
+            return published
         except asyncio.TimeoutError as exc:
             publish_abandoned = True
             raise HTTPException(

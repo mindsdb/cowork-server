@@ -71,6 +71,35 @@ def test_records_a_subprocess():
     assert "subprocess.Popen" in _events(recorder)
 
 
+def test_lets_through_only_the_command_it_allows():
+    allowed = [sys.executable, "-c", "pass"]
+    with no_fetch(allowed_command=allowed) as recorder:
+        subprocess.run(allowed, check=True)
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        [sys.executable, "-c", "pass", "extra"],
+        [sys.executable, "-c", "pass;"],
+        [sys.executable, "-I", "-c", "pass"],
+    ],
+    ids=["an-extra-argument", "other-code", "another-flag"],
+)
+def test_records_every_command_but_the_one_it_allows(command):
+    with no_fetch(allowed_command=[sys.executable, "-c", "pass"]) as recorder:
+        subprocess.run(command, check=True)
+    assert "subprocess.Popen" in _events(recorder)
+
+
+def test_records_the_allowed_command_run_through_a_shell():
+    allowed = [sys.executable, "-c", "pass"]
+    with no_fetch(allowed_command=allowed) as recorder:
+        subprocess.run(subprocess.list2cmdline(allowed), shell=True, check=True)
+    assert "subprocess.Popen" in _events(recorder)
+
+
 def test_records_a_process_start_by_spawn():
     """Spawn launches through _posixsubprocess, which raises no audit event."""
     context = multiprocessing.get_context("spawn")

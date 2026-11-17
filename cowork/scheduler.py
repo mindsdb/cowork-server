@@ -398,6 +398,8 @@ class _TurnEvidence:
     acted: bool
     shutdown_interrupted: bool = False
     failure: _TurnFailure | None = None
+    # Why a turn that ended on its own stopped early (anton's `ended_by`).
+    stopped_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -424,12 +426,33 @@ _UNCERTAIN_ERROR = (
 )
 
 
+# The limits a turn can stop at, by the setting that controls each. In chat
+# the agent asks "Keep going?" there; a scheduled run has nobody to answer.
+_LIMIT_ERRORS = {
+    "round_cap": (
+        "Run reached its step limit and stopped before it finished. "
+        "Raise Max Steps per Task in Settings to let it do more."
+    ),
+    "spend_ceiling": (
+        "Run reached its token limit and stopped before it finished. "
+        "Raise Max Tokens per Task in Settings to let it do more."
+    ),
+    "handback_budget": (
+        "Run used all its automatic continuations and stopped before it finished. "
+        "Raise Max Auto-Continues in Settings to let it do more."
+    ),
+}
+
+
 def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
     """What the turn's ending says about whether its agent acted, and what to
     tell the user: the turn's own failure text when it gave one. When in doubt
     it says the agent may have acted."""
     reason = evidence.reason
     if reason == "completed":
+        limit_error = _LIMIT_ERRORS.get(evidence.stopped_by or "")
+        if limit_error:
+            return _AttemptEnd(outcome=AttemptOutcome.stopped_at_limit, error=limit_error)
         return _AttemptEnd(outcome=AttemptOutcome.completed)
     if reason == "cancelled":
         return _AttemptEnd(outcome=AttemptOutcome.cancelled)
@@ -645,7 +668,8 @@ def _record_turn_outcome(
         # for, so it neither suppresses the next slot nor ends a failure
         # streak. It doesn't extend the streak either: an unreadable record
         # says nothing about the task, and auto-pause is for tasks that keep
-        # failing.
+        # failing. A run stopped at a limit is left out of the streak for the
+        # same reason: it worked as far as its settings allowed.
         outcome = _RunOutcome(status=RunStatus.failed, error=end.error or _FAILED_DURING_ERROR)
         schedule.last_error = outcome.error
         session.add(schedule)
@@ -659,7 +683,11 @@ def _record_turn_outcome(
         # wouldn't block the restart).
         if not is_manual:
             _advance_next_run_at(schedule, session)
-            if outcome.status == RunStatus.failed and end.outcome != AttemptOutcome.uncertain and not shutdown_interrupted:
+            if (
+                outcome.status == RunStatus.failed
+                and end.outcome != AttemptOutcome.uncertain
+                and not shutdown_interrupted
+            ):
                 count_settled_slot(session, schedule_id, failed=True)
         if trial:
             # A trial tries the task out: it leaves the streak and a one-off's
@@ -863,6 +891,10 @@ async def _execute_schedule(
     timed_out = False
     end: _AttemptEnd | None = None
     shutdown_interrupted = False
+    scheduled: _ScheduledTurn | None = None
+    # Set once the run's ending is recorded: True finished, False didn't, and
+    # None sends no push (_push_run_ending).
+    push_succeeded: bool | None = None
     try:
         scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
 
@@ -1027,6 +1059,10 @@ async def _execute_schedule(
         )
         final_status, error = recorded.status, recorded.error
         slot_consumed = not is_manual
+        if end.outcome == AttemptOutcome.completed:
+            push_succeeded = True
+        elif end.outcome != AttemptOutcome.cancelled:
+            push_succeeded = False
 
     except _LeaseLost:
         # Recorded by the reaper; the finally leaves the run row alone.
@@ -1100,12 +1136,17 @@ async def _execute_schedule(
                             AttemptOutcome.failed_before_execution,
                             AttemptOutcome.failed_during_execution,
                             AttemptOutcome.interrupted,
+                            AttemptOutcome.stopped_at_limit,
                         }
                         and not shutdown_interrupted
                     ),
                 ),
                 schedule_id=schedule_id,
             )
+            # A blip before the turn started leaves a cron slot due for the
+            # next poll, which runs it again: nothing to tell anyone yet.
+            if not (transient and not is_manual):
+                push_succeeded = False
         except _LeaseLost:
             lease_lost.set()
         except Exception:
@@ -1140,6 +1181,48 @@ async def _execute_schedule(
         finally:
             with _active_run_lock:
                 _active_run_ids.discard(run_id)
+            if push_succeeded is not None and not lease_lost.is_set() and trigger != RunTrigger.trial:
+                _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
+
+
+def _push_run_ending(
+    scheduled: _ScheduledTurn | None, *, conversation_id: UUID | None, succeeded: bool,
+) -> None:
+    """Tell the schedule's owner on their phone how its run ended. Fire and
+    forget: push never holds up or fails a run.
+
+    Not for a trial: whoever tried the task out is watching it in the
+    editor. Not for a run the user cancelled, one a shutdown cut (the process
+    is going away; the run is reaped or retried elsewhere), one that lost its
+    claim before its turn started (its slot runs again), or one another
+    replica reaped (the reaper pushes, _reap_lapsed_runs). The callers leave
+    ``succeeded`` None for those.
+    """
+    principal = scheduled.principal if scheduled is not None else None
+    if principal is None:
+        return
+    try:
+        from cowork.services.push.hooks import scheduled_run_ended
+
+        scheduled_run_ended(
+            org_id=principal.org_id, user_id=principal.user_id, schedule_name=scheduled.title,
+            conversation_id=str(conversation_id) if conversation_id else None, succeeded=succeeded,
+        )
+    except Exception:
+        logger.warning("Could not push a scheduled run's ending", exc_info=True, extra={"event": "push_schedule_failed"})
+
+
+def _push_reaped_run(push: ReapedRunPush) -> None:
+    """Tell a reaped run's owner it didn't finish. Fire and forget."""
+    try:
+        from cowork.services.push.hooks import scheduled_run_ended
+
+        scheduled_run_ended(
+            org_id=push.org_id, user_id=push.user_id, schedule_name=push.schedule_name,
+            conversation_id=push.conversation_id, succeeded=False,
+        )
+    except Exception:
+        logger.warning("Could not push a reaped run's ending", exc_info=True, extra={"event": "push_schedule_failed"})
 
 
 class _LeaseLost(Exception):
@@ -1371,7 +1454,40 @@ async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
         acted=acted,
         failure=failure,
         shutdown_interrupted=shutdown_interrupted,
+        stopped_by=await _turn_stopped_by(conversation_id) if reason == "completed" else None,
     )
+
+
+async def _turn_stopped_by(conversation_id: str) -> str | None:
+    """Why a turn that ended on its own stopped early, from its final
+    response frame: a hand-back still ends `completed`, and only that frame's
+    `incomplete` status says the work was not finished. None when the turn
+    finished, or when the frame can't be read.
+
+    Only call after the turn's stream has been fully drained."""
+    handle = registry.get(conversation_id)
+    if handle is None:
+        return None
+    stopped_by: str | None = None
+    try:
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for rec in handle.buffer.tail(0):
+                if rec.is_terminal:
+                    break
+                for event, data in _sse_frames(rec):
+                    if event != "response.completed":
+                        continue
+                    response = data.get("response")
+                    details = response.get("incomplete_details") if isinstance(response, dict) else None
+                    reason = details.get("reason") if isinstance(details, dict) else None
+                    stopped_by = reason if isinstance(reason, str) and reason else None
+    except Exception:
+        logger.exception(
+            "Could not read how the turn's response ended",
+            extra=log_context(conversation_id=conversation_id)
+        )
+        return None
+    return stopped_by
 
 
 async def _turn_activity(conversation_id: str) -> tuple[bool, _TurnFailure | None]:
@@ -1517,8 +1633,20 @@ def _duration_error(limit: float) -> str:
     return f"Run exceeded the {int(limit)}-second limit and was stopped."
 
 
+@dataclass(frozen=True)
+class ReapedRunPush:
+    """A reaped run's push to its schedule's owner, sent once the reap
+    commits (_reap_lapsed_runs runs in a database unit's thread)."""
+
+    org_id: str | None
+    user_id: str | None
+    schedule_name: str
+    conversation_id: str | None
+
+
 def _reap_lapsed_runs(
     session: ScopedSession, now: datetime, abandoned: list[AbandonedTurn] | None = None,
+    pushes: list[ReapedRunPush] | None = None,
 ) -> None:
     """Fail the runs whose process stopped renewing their lease.
 
@@ -1528,12 +1656,19 @@ def _reap_lapsed_runs(
     paused schedule moves on too, so it resumes at its next occurrence rather
     than on a slot this run still holds. Every reaped run whose turn may have
     started goes on ``abandoned``, so the poll can ask its pod to stop.
+
+    Every reaped run that claimed execution, other than a trial, goes on
+    ``pushes``: it ended without finishing, and its slot doesn't run again,
+    so its schedule's owner hears it didn't finish. The replica that ran it
+    stopped renewing it and pushes nothing (_push_run_ending).
     """
     with _active_run_lock:
         active = frozenset(_active_run_ids)
     committed_abandoned: list[AbandonedTurn] = []
+    executed: list[ScheduleRun] = []
     for run in ScheduleRunService(session).reap_lapsed_runs(
         now=now, error=_LAPSED_RUN_ERROR, abandoned=committed_abandoned, exclude_run_ids=active,
+        executed=executed,
     ):
         logger.warning(
             "Reaped a scheduled run whose server stopped renewing it",
@@ -1548,16 +1683,30 @@ def _reap_lapsed_runs(
             _advance_next_run_at(schedule, session)
             # The dead run's turn may have acted, so its slot settles failed.
             count_settled_slot(session, schedule.id, failed=True)
+    committed_pushes: list[ReapedRunPush] = []
+    for run in executed:
+        schedule = session.get(Schedule, run.schedule_id)
+        if schedule is not None and not run.trial:
+            committed_pushes.append(ReapedRunPush(
+                org_id=schedule.org_id, user_id=schedule.created_by, schedule_name=schedule.title,
+                conversation_id=str(run.conversation_id) if run.conversation_id else None,
+            ))
     session.commit()
     if abandoned is not None:
         abandoned.extend(committed_abandoned)
+    if pushes is not None:
+        pushes.extend(committed_pushes)
 
 
-def _poll(session: ScopedSession, abandoned: list[AbandonedTurn] | None = None) -> list[DueSlot]:
+def _poll(
+    session: ScopedSession, abandoned: list[AbandonedTurn] | None = None,
+    pushes: list[ReapedRunPush] | None = None,
+) -> list[DueSlot]:
     """One poll's unit: reap runs whose server died, settle missed runs, then
     the schedules due now with the slot each one's run claims. Reaped runs
-    whose turns may still be going in a pod go on ``abandoned``."""
-    _reap_lapsed_runs(session, datetime.now(timezone.utc), abandoned)
+    whose turns may still be going in a pod go on ``abandoned``, and the
+    pushes their endings send on ``pushes``."""
+    _reap_lapsed_runs(session, datetime.now(timezone.utc), abandoned, pushes)
     _handle_missed_runs(session)
     due: list[DueSlot] = []
     limit = _org_run_limit()
@@ -1577,6 +1726,7 @@ def _poll(session: ScopedSession, abandoned: list[AbandonedTurn] | None = None) 
 
 async def _scheduler_loop() -> None:
     from cowork.services.artifact_autopublish import start_due_self_heals
+    from cowork.services.artifact_heal_sweep import start_heal_sweep
 
     logger.info("Scheduler loop started")
     # Replicas a rollout starts together would otherwise poll in step, and two
@@ -1585,11 +1735,12 @@ async def _scheduler_loop() -> None:
     while True:
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
         abandoned: list[AbandonedTurn] = []
+        pushes: list[ReapedRunPush] = []
         try:
             # A unit in a worker thread: when the pool has no connection to
             # give, the poll is refused after POOL_TIMEOUT instead of stalling
             # the event loop, and the next poll tries again.
-            due = await run_db(partial(_poll, abandoned=abandoned), scope=SYSTEM_SCOPE)
+            due = await run_db(partial(_poll, abandoned=abandoned, pushes=pushes), scope=SYSTEM_SCOPE)
         except PoolTimeoutError:
             logger.warning("Scheduler poll found no free database connection; the next poll retries")
             due = []
@@ -1599,6 +1750,8 @@ async def _scheduler_loop() -> None:
         finally:
             for turn in {turn.conversation_id: turn for turn in abandoned}.values():
                 asyncio.create_task(_cancel_abandoned_turn(turn))
+            for push in pushes:
+                _push_reaped_run(push)
 
         for index, slot in enumerate(due):
             if not _admission.reserve():
@@ -1614,6 +1767,10 @@ async def _scheduler_loop() -> None:
         # The artifact self-heals remote turn ends asked for, each project at
         # its own slower cadence.
         start_due_self_heals()
+        # The heal sweep of every project with a recent message, which needs
+        # no request: one replica of the cluster claims it once per
+        # self-heal interval, in a task of its own.
+        start_heal_sweep()
 
 
 def start_scheduler() -> None:

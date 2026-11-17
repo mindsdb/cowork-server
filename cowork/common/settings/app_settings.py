@@ -624,6 +624,10 @@ class OAuthSettings(Settings):
 
     posthog_client_id: str = Field(default="", validation_alias=AliasChoices("POSTHOG_CLIENT_ID"))
 
+    # Notion MCP is a public client like PostHog: the id is our hosted Client
+    # ID Metadata Document's URL, and there is no secret.
+    notion_client_id: str = Field(default="", validation_alias=AliasChoices("NOTION_CLIENT_ID"))
+
     # HubSpot's MCP Auth App — a fixed client_id/secret pair, same shape as
     # Google/Linear/GitHub/Supabase, but the resulting token can only call
     # HubSpot's remote MCP server, never its REST API.
@@ -683,6 +687,50 @@ class StreamSettings(Settings):
         validation_alias=AliasChoices("COWORK_STREAMS_DIR"),
         description="Root directory for file-backed turn-stream buffers",
     )
+
+
+class PushSettings(Settings):
+    """Mobile push credentials (cowork.services.push). Every field is optional:
+    a platform whose credentials are missing sends nothing, and push as a whole
+    runs only in org mode. The two secrets take their contents as they are or
+    base64-encoded, so a Kubernetes secret can hold either."""
+
+    enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_PUSH_ENABLED"),
+        description="Kill switch for mobile push. On by default; sends only where credentials are set.",
+    )
+    apns_key_p8: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_KEY_P8"),
+        description="APNs auth key (.p8 PEM from Apple Developer > Keys), as PEM or base64 of it.",
+    )
+    apns_key_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_KEY_ID"),
+        description="Key ID of the APNs auth key.",
+    )
+    apns_team_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_TEAM_ID"),
+        description="Apple Developer team ID that owns the APNs key.",
+    )
+    apns_topic: str = Field(
+        default="ai.mindshub.cowork",
+        validation_alias=AliasChoices("COWORK_PUSH_APNS_TOPIC"),
+        description="APNs topic: the iOS app's bundle id.",
+    )
+    fcm_service_account_json: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_PUSH_FCM_SERVICE_ACCOUNT_JSON"),
+        description="Firebase service-account JSON for FCM HTTP v1, as JSON or base64 of it.",
+    )
+
+
+@lru_cache
+def get_push_settings() -> PushSettings:
+    """Cached push settings; tests clear the cache after changing the env."""
+    return PushSettings()
 
 
 #: auth's turn_key_max_ttl_seconds (API_KEYS__TURN_KEY_MAX_TTL_SECONDS in
@@ -873,6 +921,14 @@ class TurnQueueSettings(Settings):
             "until the controller and pod support the datasource block."
         ),
     )  # COWORK_TURN_DATASOURCE_ENABLED
+    datasource_labels_enabled: bool = Field(
+        default=False,
+        description=(
+            "Send each datasource connection's name and connector id with its reference, "
+            "so the agent can tell the connections apart. Keep false until every pod runs "
+            "an anton that accepts them: an older one refuses the turn."
+        ),
+    )  # COWORK_TURN_DATASOURCE_LABELS_ENABLED
     datasource_producer_key_id: str = Field(
         default="",
         description="Key id for the dedicated datasource producer service role.",
@@ -1062,6 +1118,19 @@ class AppSettings(Settings):
             "kill switch because a renderer that does not know the event "
             "drops it silently, stalling the agent until the question times "
             "out. Set to false to degrade to plain-text questions (ENG-1984)."
+        ),
+    )
+    quick_edit_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_QUICK_EDIT_ENABLED"),
+        description=(
+            "Whether the artifact viewer's chat bar may edit an artifact "
+            "directly with anton's artifact editor, without a chat turn "
+            "(POST .../quick-edits, ENG-4227). Exposed to the app as the "
+            "artifact capability `canQuickEdit`, which is also false while "
+            "the installed anton has no quick editor. A kill switch: off, "
+            "the route answers 501 and the app sends every bar message to "
+            "the artifact's chat instead."
         ),
     )
     surface_override: str = Field(
@@ -1272,6 +1341,41 @@ class AppSettings(Settings):
                 "path (no query, fragment or credentials)"
             )
         return normalized
+
+    browser_decisions_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_BROWSER_DECISIONS_URL"),
+        description=(
+            "The full URL at which a cloud pod reaches this server's decisions proxy "
+            "(POST /api/v1/browse/decisions), for example "
+            "https://cowork.mindshub.ai/api/v1/browse/decisions. A web turn's browser "
+            "asks the organization's own decision model through it with the turn's "
+            "key, so the organization's key never reaches the pod "
+            "(cowork.services.decisions_proxy). https with an optional path; the "
+            "trailing slash is dropped. Blank (default): the route under "
+            "COWORK_PUBLIC_BASE_URL when that is https; without either, web turns "
+            "pick browser steps with Jev on MindsHub."
+        ),
+    )
+
+    @field_validator("browser_decisions_url", mode="before")
+    @classmethod
+    def _check_browser_decisions_url(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            return "" if value is None else value
+        normalized = _router_url(value)
+        if normalized is None:
+            raise ValueError(
+                "COWORK_BROWSER_DECISIONS_URL must be an https URL with an optional "
+                "path (no query, fragment or credentials)"
+            )
+        return normalized
+
+    voice_operator_model: str = Field(
+        default=MINDS_FREE_MODEL,
+        validation_alias=AliasChoices("COWORK_VOICE_OPERATOR_MODEL"),
+        description="The MindsHub model that turns a voice call's requests into app actions (cowork.services.voice_operator).",
+    )
 
     browser_scope_key_file: str = Field(
         default="",

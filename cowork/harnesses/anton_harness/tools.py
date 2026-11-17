@@ -20,6 +20,7 @@ here as needed; same pattern.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -367,7 +368,9 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
 
     from cowork.services.publish import (
         ARTIFACT_TOO_LARGE_MESSAGE,
+        MARKDOWN_NOT_PUBLISHABLE_CODE,
         OWNED_BY_OTHER_USER_MESSAGE,
+        MarkdownNotPublishable,
         PublishOwnedByOtherUser,
         PublishRejected,
         PublishTooLarge,
@@ -376,7 +379,10 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     from cowork.services.sharing_contract import SHARE_ORG_REQUIRED_INSTRUCTION
 
     try:
-        result = _publish_artifact(abs_path, access=access)
+        # A thread of its own: a Markdown page renders in the conversion
+        # process, for up to its 30 s, and the upload blocks too. This handler
+        # runs on the server's event loop.
+        result = await asyncio.to_thread(_publish_artifact, abs_path, access=access)
     except PublishOwnedByOtherUser:
         # The model can edit files, so spell out that it must not work around
         # the refusal (e.g. by dropping the stored report_id). Not a ban for the
@@ -398,6 +404,16 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             "Tell the user, or remove or shrink large files in the artifact "
             "(PDFs, images) and publish again.",
             reason="too_large",
+        )
+    except MarkdownNotPublishable as exc:
+        # The same file is refused on every try, and each try can hold the
+        # server's one conversion for 30 s; the model can shorten the file.
+        message = exc.detail["message"]
+        logger.info("Cowork publish refused: %s", message)
+        return _fail(
+            f"PUBLISH FAILED: {message} Do not retry with the same file. "
+            "Tell the user, or shorten or simplify the Markdown and publish again.",
+            reason=MARKDOWN_NOT_PUBLISHABLE_CODE,
         )
     except ShareOrgRequired as exc:
         # The reason is MindsHub's, and classify_upload_error already logged

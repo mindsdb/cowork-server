@@ -29,6 +29,8 @@ from cowork.turnqueue import producer
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 
 
+from cowork.turnqueue.preview_checks import ARTIFACT_CHECK_STEP, CHECK_ID, queue_check_result  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 
@@ -159,6 +161,16 @@ async def remote_turn_events(
             elif kind == "turn_step":
                 if data.get("step") == "compacted":
                     compacted = True
+                if data.get("step") == ARTIFACT_CHECK_STEP:
+                    # No app watches a channel turn, so no preview can answer:
+                    # say so at once rather than leave the pod to time out.
+                    check_id = data.get("check_id")
+                    if isinstance(check_id, str) and CHECK_ID.fullmatch(check_id) and correlation_id:
+                        try:
+                            await queue_check_result(correlation_id=correlation_id, check_id=check_id, body=None)
+                        except Exception:
+                            logger.warning("Could not answer a channel turn's preview check", exc_info=True)
+                    continue
                 for event in step_stream_events(data):
                     yield event
             elif kind == "turn_memory":
@@ -243,6 +255,7 @@ async def remote_turn_events(
                     completed_cleanly=completed_cleanly,
                     touched=pod_touched,
                     repairs=repairs,
+                    summaries=_summaries(turn_rows, input_text),
                 ),
                 record=TurnEndRecord(
                     conversation_id=conv_id, project_id=artifacts.project_id, touched=tuple(sorted(pod_touched or ())),
@@ -269,6 +282,19 @@ async def remote_turn_events(
         )
 
 
+def _summaries(turn_rows: list, input_text: str):
+    """The revision labels' sources a channel turn has: the editor's
+    summaries in the pod's tool rows and the request. Its reply is not kept
+    here, so a turn without the editor is labelled by its request."""
+    from cowork.services.revision_summaries import summaries_from_messages
+
+    try:
+        return summaries_from_messages(turn_rows, reply="", request=input_text)
+    except Exception:
+        logger.warning("Could not read the turn's edits for the revision labels", exc_info=True)
+        return None
+
+
 async def _record_turn_artifacts(
     artifacts: _RemoteArtifactsDir,
     *,
@@ -279,6 +305,7 @@ async def _record_turn_artifacts(
     completed_cleanly: bool,
     touched: set[str] | None = None,
     repairs: QueuedRepairs | None = None,
+    summaries=None,
 ) -> ArtifactChanges:
     """What the turn did to the project's artifacts. The folders it created
     are indexed as this conversation's (and, in org mode, its creator's), in
@@ -293,9 +320,14 @@ async def _record_turn_artifacts(
     folder, or the project's folder itself, asks for the project's location
     check again (request_self_heal_for_unread_folders), and a diff or a
     record that fails asks for the project's self-heal
-    (request_turn_end_self_heal)."""
+    (request_turn_end_self_heal). With the list or without it, a folder
+    whose sort time the diff could not read has its root held by the record
+    and asks for the project's location check
+    (request_self_heal_for_untimed_folders), whose listing reads the time
+    again."""
     from cowork.services.artifact_autopublish import (
         request_self_heal_for_unread_folders,
+        request_self_heal_for_untimed_folders,
         request_turn_end_self_heal,
     )
     from cowork.services.task_objects import ListedLocationsUnchecked, record_new_artifacts, turn_artifact_changes
@@ -327,6 +359,7 @@ async def _record_turn_artifacts(
                 completed_cleanly=completed_cleanly,
                 repair_slugs=repairs.slugs if repairs is not None else None,
                 scope=scope,
+                summaries=summaries,
             ),
             scope=scope,
             deadline=False,
@@ -345,11 +378,14 @@ async def _record_turn_artifacts(
         return ArtifactChanges(created=[], touched=set())
     note_turn_end_slugs(slugs=changes.created)
     # Even when the listing found no id: the self-heal lists the folders it
-    # could not read again.
+    # could not read again, and reads again the times it could not read.
     request_self_heal_for_unread_folders(
         listing=changes.listed_ids, artifacts_base=artifacts.base, scope=scope, project_id=artifacts.project_id,
     )
-    if changes.created or changes.listed_ids.ids:
+    request_self_heal_for_untimed_folders(
+        folders=changes.untimed, artifacts_base=artifacts.base, scope=scope, project_id=artifacts.project_id,
+    )
+    if changes.needs_record:
         try:
             await run_db(
                 partial(
@@ -362,28 +398,47 @@ async def _record_turn_artifacts(
                     creator=artifacts.creator,
                     artifact_ids=changes.created_ids,
                     listed_ids=changes.listed_ids,
+                    sort_times=changes.sort_times,
+                    untimed=changes.untimed,
                 ),
                 scope=scope,
             )
         except Exception as exc:
-            # record_new_artifacts logs each slug whose index or owner write
-            # fails itself; this covers the unit's own refusal (a busy pool),
-            # a failed commit, or a failed check of the folders the diff
-            # listed, which it raises once its other writes have committed.
-            # In org mode nothing records these folders later, so they keep
-            # no index row and their owner stays unknown. A turn that created
-            # nothing, or whose record failed only at that check, lost only
-            # the check, so its line says that. Without the pod's list
-            # nothing else checks the listed folders, so the project's
-            # self-heal does.
+            # record_new_artifacts logs each write that fails itself; this
+            # covers the unit's own refusal (a busy pool), a failed commit,
+            # or ListedLocationsUnchecked, which it raises once its other
+            # writes have committed when a write the project's self-heal
+            # makes again failed: the check of the folders the diff listed,
+            # the hold of their root, or their sort times. The self-heal's
+            # listing writes those three again
+            # (artifact_autopublish._record_listing), but nothing writes a
+            # created folder's index row or owner later, so after a failed
+            # unit those folders keep no index row and their owner stays
+            # unknown, which the line then says. Otherwise the turn lost
+            # only what the self-heal writes again, and the line names it:
+            # the location check only when the diff listed the whole folder,
+            # so an edit-only turn never claims a check it did not make.
+            # Without the pod's list nothing has asked for the project's
+            # self-heal yet, so it is asked for here; with the list, it was
+            # asked for before the diff.
             if touched is None:
                 request_turn_end_self_heal(
                     artifacts_base=artifacts.base, scope=scope, project_id=artifacts.project_id,
                 )
+            if changes.created and not isinstance(exc, ListedLocationsUnchecked):
+                unrecorded = "Could not record the artifacts a channel turn created"
+            elif changes.listed_ids.ids:
+                unrecorded = (
+                    "Could not check the locations of the artifacts a channel turn found,"
+                    " or record the folder that holds them or their sort times"
+                )
+            else:
+                unrecorded = (
+                    "Could not record the sort times of the artifacts a channel turn made or changed,"
+                    " or the folder that holds them"
+                )
             logger.error(
-                "Could not record the artifacts a channel turn created"
-                if changes.created and not isinstance(exc, ListedLocationsUnchecked)
-                else "Could not check the locations of the artifacts a channel turn listed",
+                unrecorded,
                 exc_info=True,
                 extra=log_context(
                     conversation_id=conv_id,
