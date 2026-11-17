@@ -31,6 +31,7 @@ from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.artifact_access import ArtifactAccessRequest
 from cowork.principal import ORG_MANAGE_ROLE, Principal
 from cowork.services import artifact_locks
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.publish import ARTIFACT_ORG_REFUSAL
 from _async_stub import awaitable
 from tests._org_sharing import (
@@ -81,7 +82,7 @@ def as_owner(monkeypatch, folder):
     monkeypatch.setattr(
         aw, "_owner_workspace",
         awaitable(lambda scope, project_ref, artifact_id: (
-            SimpleNamespace(project_id="proj-1"), folder, {"slug": "rep"}, {},
+            SimpleNamespace(project_id="proj-1"), folder, ArtifactMetadata.model_validate({"slug": "rep"}), {},
         )),
     )
     return folder
@@ -93,10 +94,15 @@ def publish_calls(monkeypatch):
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url,
                      password=None, access=None, scope=None, project_id=None,
-                     notify=None, stored=None, owner_save=False, notices=None):
+                     notify=None, stored=None, owner_save=False, notices=None, job_budget_s=None,
+                     on_job_accepted=None):
         # publish_artifact takes the model; what it hands anton is its
         # publisher_access.
         assert isinstance(access, ArtifactAccessRequest)
+        # The thread outlives the route's wait, so its job poll must end
+        # before the live-publish lock does.
+        assert job_budget_s is not None and job_budget_s > 0
+        assert on_job_accepted is not None
         calls.append({
             "folder": artifact, "artifacts_base": artifacts_base, "api_key": api_key,
             "publish_url": publish_url, "access": access.publisher_access(), "scope": scope,

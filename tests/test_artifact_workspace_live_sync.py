@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
+import time
 
 import pytest
 
 from cowork.api.v1.endpoints import artifact_workspace as workspace
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.services import artifact_locks
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_revisions import current_source
 from cowork.services.artifacts import ProjectArtifacts
 from _async_stub import awaitable
@@ -30,7 +33,7 @@ def artifact(tmp_path):
     (folder / "report.html").write_text("<html>before</html>", encoding="utf-8")
     metadata = {"slug": "report", "type": "html-app", "primary": "report.html"}
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
-    return folder, metadata
+    return folder, ArtifactMetadata.model_validate(metadata)
 
 
 def _source_for(folder):
@@ -259,6 +262,31 @@ async def test_desktop_save_uses_the_configured_publish_environment(artifact, mo
     assert calls[0][1]["publish_url"] == "https://api.desktop.example"
     assert calls[0][1]["access"].publisher_access() == {"mode": "public"}
     assert calls[0][1]["scope"] is LOCAL_SCOPE
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_publish_job_restarts_the_lock_ttl(artifact, monkeypatch):
+    folder, _metadata = artifact
+    _publish(folder, {"mode": "public"})
+    lock_file = folder.parent / artifact_locks.LOCKS_DIRNAME / f"{folder.name}.lock"
+    ages = []
+
+    monkeypatch.setattr(
+        "cowork.services.publish.desktop_publish_credential",
+        lambda: ("desktop-key", "https://api.desktop.example"),
+    )
+
+    def accepted_after_a_slow_upload(artifact_path, **kwargs):
+        old = time.time() - workspace._LIVE_PUBLISH_LOCK_TTL_S + 10
+        os.utime(lock_file, (old, old))
+        kwargs["on_job_accepted"]({"job_id": "j"})
+        ages.append(time.time() - lock_file.stat().st_mtime)
+        return {"status": "ok"}
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", accepted_after_a_slow_upload)
+
+    assert await workspace._sync_live_artifact(LOCAL_SCOPE, folder) is True
+    assert ages and ages[0] < 5
 
 
 @pytest.mark.asyncio

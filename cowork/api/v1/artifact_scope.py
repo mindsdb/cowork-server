@@ -31,6 +31,7 @@ from cowork.services.artifact_locations import (
     keeps_locations,
     record_checked_folders,
 )
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_roots import (
     RootsPlan,
     discover_roots,
@@ -164,7 +165,7 @@ class ResolvedArtifact(NamedTuple):
 
     source: ProjectArtifacts
     folder: Path
-    metadata: dict
+    metadata: ArtifactMetadata
     is_own: bool
 
 
