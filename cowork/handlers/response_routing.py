@@ -784,14 +784,18 @@ def ineligible_reason(
     has_attachments: bool,
     has_disabled_connections: bool,
     is_comparison_side: bool = False,
+    is_pinned_schedule: bool = False,
 ) -> str | None:
     """Return a deterministic delegation reason for unsupported turn shapes.
 
     A model-comparison side always goes to the agent: the gate answers on its
     own model, so a direct answer would compare the gate against itself.
+    A pinned schedule also requires its selected model to answer.
     """
     if is_comparison_side:
         return "comparison_side"
+    if is_pinned_schedule:
+        return "pinned_schedule"
     if has_non_text_input:
         return "non_text_input"
     if has_attachments:
@@ -859,6 +863,7 @@ async def decide_route(
     has_attachments: bool,
     has_disabled_connections: bool,
     after_router_answer: bool = False,
+    has_files: bool = False,
     binding: RouterBinding | None = None,
     binding_factory: Callable[[], RouterBinding | None] | None = None,
     jev: Callable[[list[dict]], Awaitable[JevRoute]] | None = None,
@@ -877,6 +882,11 @@ async def decide_route(
     rows don't carry. Such a turn always goes to the agent: whatever the reply
     says, in any language, the router could only act out what its own answer
     asked, and a typed "yes" would then read as an approval.
+
+    `has_files` says the conversation has files only the agent reads: an
+    attachment on any turn, or the project's own. When Jev routes such a turn
+    direct but expects a web search, it goes to the agent, which reads the
+    files first: the web would answer a question the files may hold.
 
     `binding` lets the caller supply a pre-built gate target (org mode mints a
     per-turn key); when None the binding comes from stored settings or the
@@ -918,6 +928,11 @@ async def decide_route(
     if jev is not None:
         result = await jev(jev_history(history))
         if not result.error:
+            if result.direct and result.needs_search and has_files:
+                return RouteDecision(
+                    route=DELEGATED_AGENTIC, reason="files_present", provider="jev",
+                    model=result.model or None, p_direct=result.p_direct,
+                )
             return RouteDecision(
                 route=DIRECT_CONTEXT if result.direct else DELEGATED_AGENTIC,
                 reason="jev_direct" if result.direct else "jev_needs_agent",

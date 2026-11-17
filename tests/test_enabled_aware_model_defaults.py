@@ -375,11 +375,11 @@ def test_recommended_models_caches_enabled_map(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         from cowork.services.providers import MindsModelListing
 
         return MindsModelListing(
-            ["mindshub_air", "sonnet"], {}, {"mindshub_air": True, "sonnet": False}, {}, {}, {}, {}, {}
+            ["mindshub_air", "sonnet"], {}, {"mindshub_air": True, "sonnet": False}, {}, {}, {}, {}, {}, {}
         )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
@@ -400,7 +400,7 @@ def test_recommended_models_failed_fetch_preserves_cache(monkeypatch):
     from cowork.db.session import get_open_session
     from cowork.services.settings import SettingService
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         from cowork.services.providers import _empty_listing
 
         return _empty_listing()  # fetch failed

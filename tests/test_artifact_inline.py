@@ -41,7 +41,7 @@ from cowork.schemas.artifact_export import (
     InlineMode,
     OmittedReason,
 )
-from cowork.services import artifact_files, artifact_inline
+from cowork.services import artifact_css, artifact_files, artifact_inline
 from cowork.services.artifact_inline import TRUNCATION_NOTE, inline_artifact_html
 from cowork.services.markdown_render import render_markdown
 from tests._no_fetch import RecordingServer, no_fetch, recording_server
@@ -415,7 +415,7 @@ def test_links_into_another_partition_are_refused(tmp_path, outside):
 def test_a_segment_holding_a_colon_is_refused_before_the_file_walk(reference):
     """The file walk refuses ':' too, so only a direct call shows this step holds."""
     with pytest.raises(artifact_inline.ArtifactFileRefused) as refused:
-        artifact_inline._reference_parts(reference=reference)
+        artifact_inline.reference_parts(reference=reference)
 
     assert refused.value.reason is OmittedReason.TRAVERSAL
 
@@ -426,7 +426,7 @@ def test_a_request_path_and_a_reference_refuse_the_same_segments(path):
     with pytest.raises(ValueError):
         artifact_files.relative_file_parts(path)
     with pytest.raises(artifact_files.ArtifactFileRefused):
-        artifact_inline._reference_parts(reference=path)
+        artifact_inline.reference_parts(reference=path)
 
 
 def test_the_drafts_path_a_reference_and_the_read_share_one_segment_rule(monkeypatch):
@@ -435,7 +435,7 @@ def test_the_drafts_path_a_reference_and_the_read_share_one_segment_rule(monkeyp
     with pytest.raises(ValueError):
         artifact_files.relative_file_parts("sub/blocked")
     with pytest.raises(artifact_files.ArtifactFileRefused):
-        artifact_inline._reference_parts(reference="sub/blocked")
+        artifact_inline.reference_parts(reference="sub/blocked")
     with pytest.raises(artifact_files.ArtifactFileRefused):
         artifact_files.refuse_unsafe_parts(parts=("sub", "blocked"))
 
@@ -477,13 +477,17 @@ def test_an_event_handler_goes_even_where_an_allowlist_would_keep_it(
 ):
     """The allowlists drop every on* name today; this check must not lean on them."""
     monkeypatch.setattr(artifact_inline, "_attribute_allowed", lambda **_: True)
-    inliner = artifact_inline._Inliner(
-        folder=None,
+    def no_read(parts):
+        raise AssertionError(f"the walk read {parts}")
+
+    state = artifact_inline.InlineState(
+        read_asset=no_read,
         base_parts=(),
         mode=InlineMode.PDF,
         limits=_limits(),
         deadline=time.monotonic() + artifact_inline.DEADLINE_SECONDS,
     )
+    inliner = artifact_inline._Inliner(state=state, css=artifact_css.CssRewriter(state=state))
 
     kept = inliner._kept_attribute(tag=tag, namespace=namespace, name=name, value="alert(1)")
 
@@ -730,9 +734,9 @@ def test_a_refused_asset_is_read_once_per_kind(artifact, monkeypatch):
     reads = []
     read = artifact_inline.read_artifact_file_entry
 
-    def counting_read(*, folder, parts, max_bytes):
+    def counting_read(*, folder, parts, max_bytes, scan_budget):
         reads.append(parts)
-        return read(folder=folder, parts=parts, max_bytes=max_bytes)
+        return read(folder=folder, parts=parts, max_bytes=max_bytes, scan_budget=scan_budget)
 
     monkeypatch.setattr(artifact_inline, "read_artifact_file_entry", counting_read)
     html = (
@@ -788,9 +792,9 @@ def test_a_file_past_the_spent_budget_is_still_read_then_left_out(artifact, monk
     reads = []
     read = artifact_inline.read_artifact_file_entry
 
-    def counting_read(*, folder, parts, max_bytes):
+    def counting_read(*, folder, parts, max_bytes, scan_budget):
         reads.append(parts)
-        return read(folder=folder, parts=parts, max_bytes=max_bytes)
+        return read(folder=folder, parts=parts, max_bytes=max_bytes, scan_budget=scan_budget)
 
     monkeypatch.setattr(artifact_inline, "read_artifact_file_entry", counting_read)
     html = b'<img src="chart.png"><img src="photo.jpg"><img src="anim.gif">'
@@ -861,7 +865,9 @@ def test_deadline_stops_a_stylesheet_with_its_blocks_closed(artifact, monkeypatc
 
 
 def test_deadline_stops_a_style_attribute(artifact, monkeypatch):
-    monkeypatch.setattr(artifact_inline, "time", _clock_past_the_deadline_after(readings=4))
+    # One reading more than the walk takes before it: the attribute checks the
+    # deadline before it parses, then again before each declaration.
+    monkeypatch.setattr(artifact_inline, "time", _clock_past_the_deadline_after(readings=5))
     declarations = ";".join(f"--d{index}:1" for index in range(200))
     document = _inline(artifact=artifact, html=f'<p style="{declarations}">x</p>'.encode())
     _assert_output_invariants(text=document.html, mode=InlineMode.WORD)
@@ -876,7 +882,27 @@ STOPPED_PARSES = _cases(name="stopped_parses.yaml")
 def test_a_stopped_parse_is_recognized_in_every_libxml2_version(case):
     entry = types.SimpleNamespace(type_name=case["type_name"], message=case["message"])
 
-    assert artifact_inline.parse_stopped(error_log=[entry]) is case["stopped"]
+    if case.get("out_of_memory"):
+        with pytest.raises(MemoryError):
+            artifact_inline.parse_stopped(error_log=[entry])
+    else:
+        assert artifact_inline.parse_stopped(error_log=[entry]) is case["stopped"]
+
+
+def _out_of_memory_parse(*_args, **_kwargs):
+    """What lxml raises when libxml2 runs out of memory mid-parse."""
+    failed = lxml.etree.XMLSyntaxError("Memory allocation failed", 2, 1, 1)
+    failed.error_log = [types.SimpleNamespace(type_name="ERR_NO_MEMORY", message="Memory allocation failed")]
+    raise failed
+
+
+def test_a_parse_libxml2_fails_for_want_of_memory_raises_memory_error(artifact, monkeypatch):
+    """Under the conversion's memory limit libxml2 fails the parse; the
+    export refuses the document rather than answering 500."""
+    monkeypatch.setattr(lxml.html, "document_fromstring", _out_of_memory_parse)
+
+    with pytest.raises(MemoryError):
+        _inline(artifact=artifact, html=b"<p>x</p>")
 
 
 def test_a_source_parse_cut_short_by_libxml2_ends_with_the_note(artifact, outside):
@@ -919,7 +945,7 @@ def test_omitted_list_stops_growing_but_drops_continue(artifact, outside):
 
 
 def test_css_nesting_past_the_cap_is_dropped(artifact, outside):
-    depth = artifact_inline._MAX_CSS_NESTING
+    depth = artifact_css._MAX_CSS_NESTING
     nested = "a{" * (depth + 5) + "color:red" + "}" * (depth + 5)
     deep_value = ".b{width:" + "calc(" * 500 + "1px" + ")" * 500 + ";color:blue}"
     html = f"<style>{nested}{deep_value}</style>".encode()
@@ -1077,8 +1103,9 @@ def _css(*, rules: int) -> str:
 
 
 def test_css_past_the_document_cap_is_dropped_and_the_text_stays(artifact):
-    """A style that fits is kept; once too little of the cap is left, later CSS goes."""
-    kept = _css(rules=40_000).ljust(artifact_inline._MAX_CSS_BYTES - 8)
+    """A style that fits is kept; once too little of the cap is left, later
+    style elements go. Attributes draw on no total, so a later one stays."""
+    kept = _css(rules=40_000).ljust(artifact_css._MAX_CSS_BYTES - 8)
     html = (
         f"<html><head><style>{kept}</style><style>.late{{color:blue}}</style></head>"
         f'<body><p style="color:green">END</p></body></html>'
@@ -1086,15 +1113,58 @@ def test_css_past_the_document_cap_is_dropped_and_the_text_stays(artifact):
     document = _inline(artifact=artifact, html=html)
     assert ".r39999{color:red;}" in document.html
     assert ".late" not in document.html
-    assert "color:green" not in document.html
+    assert "color:green" in document.html
     assert ">END</p>" in document.html
     assert TRUNCATION_NOTE not in document.html
+
+
+def test_attributes_past_the_document_css_cap_keep_their_values(artifact):
+    """A chart's later transform and clip path, and an alt holding "(", stay
+    after the style elements spent the document's cap; nothing is listed."""
+    spent = _css(rules=40_000).ljust(artifact_css._MAX_CSS_BYTES - 8)
+    html = (
+        f"<html><head><style>{spent}</style></head><body>"
+        '<svg><defs><clipPath id="p1"><rect width="1" height="1"/></clipPath></defs>'
+        '<g transform="translate(1,2)" clip-path="url(#p1)"><rect width="1" height="1"/></g></svg>'
+        f'<img alt="Revenue (USD)" src="data:image/png;base64,{base64.b64encode(CHART_PNG).decode()}">'
+        "</body></html>"
+    ).encode()
+    document = _inline(artifact=artifact, html=html)
+    assert 'transform="translate(1,2)"' in document.html
+    assert 'clip-path="url(#p1)"' in document.html
+    assert 'alt="Revenue (USD)"' in document.html
+    assert document.omitted == []
+
+
+def test_an_attribute_over_its_own_css_bound_is_dropped_and_listed(artifact):
+    value = "translate(1,2)" + " " * artifact_css._MAX_ATTRIBUTE_CSS_BYTES
+    html = f'<html><body><svg><g transform="{value}"><rect/></g></svg><p>END</p></body></html>'
+    document = _inline(artifact=artifact, html=html.encode())
+    assert "transform=" not in document.html
+    assert ">END</p>" in document.html
+    assert [entry.reason for entry in document.omitted] == [OmittedReason.TOO_LARGE]
+
+
+def test_the_deadline_stops_each_attribute_before_its_css_parses(artifact, monkeypatch):
+    """Attributes have no total, so the deadline is checked before every one.
+
+    Readings: the deadline, then the walk's checks for body, svg and the
+    first g, all in time. The fifth, the first g's attribute check, is past
+    the deadline: the g stays without its transform, and the walk stops at
+    the next element.
+    """
+    monkeypatch.setattr(artifact_inline, "time", _clock_past_the_deadline_after(readings=4))
+    attributes = "".join(f'<g transform="translate({index},0)"></g>' for index in range(50))
+    document = _inline(artifact=artifact, html=f"<html><body><svg>{attributes}</svg></body></html>".encode())
+    assert "<g></g>" in document.html
+    assert "transform=" not in document.html
+    assert document.html.endswith(f"<p>{TRUNCATION_NOTE}</p></body></html>")
 
 
 def test_a_style_over_the_cap_alone_leaves_room_for_the_rest(artifact):
     """A refused style costs nothing, so smaller CSS after it still fits."""
     huge = _css(rules=80_000)
-    assert len(huge) > artifact_inline._MAX_CSS_BYTES
+    assert len(huge) > artifact_css._MAX_CSS_BYTES
     html = (
         f"<html><head><style>{huge}</style></head>"
         f'<body><p style="color:green">END</p></body></html>'

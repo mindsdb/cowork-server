@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from cowork.api.v1 import artifact_scope
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
+from cowork.services.artifact_metadata import ArtifactMetadata
 from _async_stub import awaitable
 from draft_host_support import reviewed_and_read
 
@@ -164,7 +165,7 @@ def served_xlsx(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         workspace_ep, "review_artifact_and_read",
-        reviewed_and_read(lambda *_args: (source, folder, {"type": "file"}, True)),
+        reviewed_and_read(lambda *_args: (source, folder, ArtifactMetadata.model_validate({"type": "file"}), True)),
     )
     return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef/model.xlsx"
 
@@ -213,7 +214,7 @@ def cancel_route(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         workspace_ep, "review_artifact_for_request",
-        awaitable(lambda *_args: (source, folder, {"type": "document"}, True)),
+        awaitable(lambda *_args: (source, folder, ArtifactMetadata.model_validate({"type": "document"}), True)),
     )
     monkeypatch.setattr(workspace_ep, "require_artifact_owner", lambda *_args: {"role": "owner"})
     seen: list[bool] = []
@@ -263,7 +264,7 @@ def release_route(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         workspace_ep, "review_artifact_for_request",
-        awaitable(lambda *_args: (source, folder, {"type": "document"}, True)),
+        awaitable(lambda *_args: (source, folder, ArtifactMetadata.model_validate({"type": "document"}), True)),
     )
     monkeypatch.setattr(workspace_ep, "require_artifact_owner", lambda *_args: {"role": "owner"})
     seen: list[str] = []
@@ -348,7 +349,7 @@ def editable_artifact(tmp_path, monkeypatch):
         base=base, project_id=None, project_name="project",
         trusted_anchor=project, root_parts=(".anton", "artifacts"),
     )
-    metadata = {"type": "file", "primary": "brief.md"}
+    metadata = ArtifactMetadata.model_validate({"type": "file", "primary": "brief.md"})
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
         awaitable(lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True})),
@@ -507,7 +508,7 @@ def reported_source_artifact(request, tmp_path, monkeypatch):
         base=base, project_id=None, project_name="project",
         trusted_anchor=project, root_parts=(".anton", "artifacts"),
     )
-    metadata = dict(request.param)
+    metadata = ArtifactMetadata.model_validate(dict(request.param))
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
         awaitable(lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True})),
@@ -644,7 +645,7 @@ def mixed_case_artifact(tmp_path, monkeypatch):
         base=base, project_id=None, project_name="project",
         trusted_anchor=project, root_parts=(".anton", "artifacts"),
     )
-    metadata = {"type": "file", "primary": "Brief.md"}
+    metadata = ArtifactMetadata.model_validate({"type": "file", "primary": "Brief.md"})
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
         awaitable(lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True})),
@@ -783,7 +784,7 @@ def served_html_app(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         workspace_ep, "review_artifact_and_read",
-        reviewed_and_read(lambda *_args: (source, folder, {"type": "html-app"}, True)),
+        reviewed_and_read(lambda *_args: (source, folder, ArtifactMetadata.model_validate({"type": "html-app"}), True)),
     )
     return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef"
 

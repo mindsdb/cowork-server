@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from coding_service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
+from tests.support.coding.service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
 from cowork.coding.approvals import ApprovalBroker
 from cowork.coding.contracts import ApprovalDecision, EventType, PermissionMode, SessionCreateRequest, SessionStatus, SessionUpdateRequest
 from cowork.coding.store import CodingStore
@@ -148,7 +148,7 @@ def test_read_only_task_declines_every_request_without_a_card(tmp_path, method, 
     refusal = next(event for event in events if event.type == EventType.command_result)
     assert refusal.phase == "failed"
     assert refusal.title == "Declined: this task is Read only"
-    assert "Switch the task to Ask first" in refusal.text
+    assert "Switch the task to Ask for approval" in refusal.text
     assert service.get_session(task.id).command_approval_grants == []
 
 

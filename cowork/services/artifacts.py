@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import partial
@@ -32,9 +33,11 @@ from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import quote
 
 from cowork.code_sandbox import backends_off_message, build_cell_sandbox, code_sandbox_on
+from cowork.common.minds_tls import minds_ssl_verify
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
+    dir_child_stat,
     dir_open,
     dir_rmtree,
     dir_scandir,
@@ -45,6 +48,8 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
+from cowork.schemas.artifact_card import ArtifactCard
+from cowork.services.artifact_metadata import ArtifactMetadata, lenient_text
 from anton.core.artifacts.internal_files import (
     NON_CONTENT_NAMES,
     REVISIONS_DIRNAME,
@@ -315,16 +320,16 @@ def _scan_artifact_dirs(*, scope: TenantScope | None) -> list[Path]:
     return list(dirs.values())
 
 
-def _load_metadata(folder: Path) -> dict | None:
+def _load_metadata(folder: Path) -> ArtifactMetadata | None:
     path = folder / "metadata.json"
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return ArtifactMetadata.parse(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         logger.warning("Skipping artifact with unreadable metadata: %s", path, exc_info=True)
         return None
 
 
-def origin_conversation_id(meta: dict | None) -> str:
+def origin_conversation_id(meta: ArtifactMetadata | None) -> str:
     """The conversation that first created this artifact, from its metadata
     `provenance` (written by the shared ArtifactStore for every harness) — the
     creating conversation is the first entry. Empty when unknown: artifacts
@@ -334,13 +339,8 @@ def origin_conversation_id(meta: dict | None) -> str:
     Takes the already-parsed metadata so the card builder does not read
     `metadata.json` a second time; `task_objects` passes what it loaded.
     """
-    provenance = (meta or {}).get("provenance") or []
-    if not isinstance(provenance, list) or not provenance:
-        return ""
-    first = provenance[0]
-    if not isinstance(first, dict):
-        return ""
-    return str(first.get("conversation") or "")
+    first = meta.provenance[0] if meta is not None and meta.provenance else None
+    return (first.conversation if first is not None else None) or ""
 
 
 def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
@@ -521,8 +521,27 @@ def _published_url_for(
         # have no `published` field; a url means they're live.
         if not entry.get("published", True):
             return ""
-        return entry.get("url", "") or ""
+        # The record sits in the agent-writable folder: only text the card
+        # can carry counts as a link.
+        return lenient_text(entry.get("url")) or ""
     return ""
+
+
+def _report_id_for(
+    folder: Path,
+    primary: Path | None,
+    *,
+    published_map: dict | None = None,
+) -> str:
+    """The publish service's id for the artifact's live page, "" when it has
+    none. Read beside the URL and under the same rule, so a soft-deleted record
+    that keeps its report_id for a later re-publish reports none. The id is
+    already in the page's URL; the client sends it with its sharing analytics."""
+    pmap = published_map if published_map is not None else _load_published_map(folder)
+    if primary is None or not _published_url_for(folder, primary, published_map=pmap):
+        return ""
+    report_id = pmap[primary.name].get("report_id")
+    return report_id if isinstance(report_id, str) else ""
 
 
 def _modified_state(
@@ -559,14 +578,17 @@ def _modified_state(
 
     # Local import: publish imports this module, so import lazily to avoid a
     # circular import (mirrors _unpublish_folder below).
-    from cowork.services.publish import compute_publish_md5
+    from cowork.services.publish import MarkdownRenderBusy, compute_publish_md5
 
     # `folder.parent` IS the artifacts root: artifacts always live at
     # `<base>/<slug>/`. Passing it explicitly is what makes the badge work in org
     # mode, where the module-level FS scan finds no roots at all.
-    current_md5 = compute_publish_md5(
-        folder, artifacts_base=artifacts_base or folder.parent
-    )
+    try:
+        current_md5 = compute_publish_md5(
+            folder, artifacts_base=artifacts_base or folder.parent
+        )
+    except MarkdownRenderBusy:
+        return False, False  # another conversion runs: can't tell yet
     if current_md5 is None:
         return False, False  # can't tell — don't raise a false "modified"
     if current_md5 != entry.get("last_md5"):
@@ -670,24 +692,27 @@ def published_access_view(
         recorded = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
         mode = AccessMode(recorded) if recorded in set(AccessMode) else AccessMode.PUBLIC
         artifact_key = entry.get("artifact_key", "") or ""
+        report_id = _report_id_for(folder, primary, published_map=pmap)
         if mode is AccessMode.PASSWORD:
             return ArtifactAccessView(
                 access_mode=mode,
                 artifact_key=artifact_key,
+                report_id=report_id,
                 access_protected=True,
                 access_password=entry.get("access_password", "") or "",
             )
         if mode is AccessMode.RESTRICTED and _org_mode():
-            return ArtifactAccessView.audience_unknown(artifact_key=artifact_key)
+            return ArtifactAccessView.audience_unknown(artifact_key=artifact_key, report_id=report_id)
         if mode is AccessMode.RESTRICTED:
             return ArtifactAccessView(
                 access_mode=mode,
                 artifact_key=artifact_key,
+                report_id=report_id,
                 access_emails=entry.get("emails", []) or [],
                 org_allowed=bool(entry.get("org_allowed")),
                 owner_only=bool(entry.get("owner_only")),
             )
-        return ArtifactAccessView(access_mode=mode, artifact_key=artifact_key)
+        return ArtifactAccessView(access_mode=mode, artifact_key=artifact_key, report_id=report_id)
     except Exception:
         return ArtifactAccessView()
 
@@ -1087,7 +1112,7 @@ def _unpublish_identifier(
 
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
-    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+    ssl_verify = minds_ssl_verify()
     try:
         unpublish(
             identifier,
@@ -1472,7 +1497,7 @@ def draft_url_for(*, project_id: str | None, artifact_id: str, rel_path: str) ->
 class _PreparedArtifactCard:
     """Pure card result plus the inputs needed for its modified badge."""
 
-    card: dict
+    card: ArtifactCard
     io_folder: Path
     io_root: Path | None
     primary: Path | None
@@ -1484,7 +1509,7 @@ def _prepare_artifact_card(
     idx: int = 0,
     *,
     artifact_id: str,
-    meta: dict,
+    meta: ArtifactMetadata,
     published_map: dict,
     project_id: str | None,
     project_name: str,
@@ -1509,7 +1534,7 @@ def _prepare_artifact_card(
     primary = _pick_primary(
         io_folder,
         files,
-        primary_hint=meta.get("primary"),
+        primary_hint=meta.primary,
         preserve_folder_path=pinned_folder is not None,
     )
     logical_primary = None
@@ -1520,7 +1545,7 @@ def _prepare_artifact_card(
             primary = None
     primary_path = str(logical_primary) if logical_primary is not None else str(logical_folder)
     primary_ext = logical_primary.suffix.lower() if logical_primary is not None else ""
-    artifact_type = meta.get("type") or "mixed"
+    artifact_type = meta.type or "mixed"
     kind = KIND_BY_TYPE.get(artifact_type) or KIND_BY_EXT.get(primary_ext, "File")
     is_live = False
     if primary is not None:
@@ -1535,65 +1560,67 @@ def _prepare_artifact_card(
     # — already sorted mtime desc, so this is its first entry.
     mtime_seconds = (files_with_mtimes[0][1] // 1_000_000_000) if files_with_mtimes else 0
 
-    card = {
+    from cowork.services.artifact_identity import artifact_key
+
+    access = published_access_view(io_folder, primary, published_map=published_map)
+    # Left out here, at the one card builder, so inline chat cards are covered
+    # too. In org mode the owner reads the password and the emails from GET
+    # .../access, which can tell owner from co-member. `accessMode` stays:
+    # ArtifactStatus draws its badge from it.
+    access_fields = access.model_dump(
+        exclude={"access_password", "access_emails"} if _org_mode() else None
+    )
+    # Drafts and every published version share this key. A legacy
+    # `.published.json` key is intentionally overridden here so comments do not
+    # fork when an artifact is re-published under a different report URL.
+    access_fields["artifact_key"] = artifact_key(artifact_id)
+    card = ArtifactCard(
         # The one identity: drafts, published versions, revisions, comments
         # and the workspace API all key off it.
-        "id": artifact_id,
-        "slug": meta.get("slug") or folder.name,
-        "title": meta.get("name") or folder.name,
-        "description": meta.get("description") or "",
-        "type": artifact_type,
-        "kind": kind,
-        "ext": primary_ext,
-        "updated": _human_mtime(mtime_seconds),
-        "mtime": mtime_seconds,
-        "live": is_live,
-        "bg": BG_CYCLE[idx % len(BG_CYCLE)],
-        "fileCount": len(files),
+        id=artifact_id,
+        slug=meta.slug or folder.name,
+        title=meta.name or folder.name,
+        description=meta.description or "",
+        type=artifact_type,
+        kind=kind,
+        ext=primary_ext,
+        updated=_human_mtime(mtime_seconds),
+        mtime=mtime_seconds,
+        live=is_live,
+        bg=BG_CYCLE[idx % len(BG_CYCLE)],
+        file_count=len(files),
         # `folder`/`path` stay in the payload even in org mode: the renderer uses
         # `path` as an opaque state key (the in-flight `busyPaths` set, live-row
         # matching, title fallbacks), and it is no secret — a client of its own
         # organization already knows `<root>/<org_id>`. Isolation comes from
         # `projectId` plus the server-side scope, not from hiding the path.
-        "folder": str(logical_folder),
-        "path": primary_path,
-        "primary": meta.get("primary") or None,
-        "projectId": project_id,
+        folder=str(logical_folder),
+        path=primary_path,
+        primary=meta.primary or None,
+        project_id=project_id,
         # What the card shows. The serve URL below carries `project_name`
         # instead, because serve_artifact_file resolves that segment by name
         # (_project_artifacts_base).
-        "projectName": project_label or project_name,
+        project_name=project_label or project_name,
         # The conversation that produced the artifact, so a comment addressed
         # with the agent from the artifacts list resumes that chat instead of
         # opening a fresh one. Empty for artifacts written before provenance —
         # the client then falls back to a new conversation. Whether the chat is
         # still reachable is the client's call: it already knows its own
         # conversations and can fetch the rest.
-        "originConversationId": origin_conversation_id(meta),
-        "publishedUrl": _published_url_for(
-            io_folder, primary, published_map=published_map
-        ),
-        # Filled by one of the two callers below. Keeping the slot here preserves
-        # the canonical response shape and key order.
-        "modified": False,
-        # Owner-side access state (lock badge + eye-reveal). accessPassword
-        # is the plaintext, returned only to the owner's own session.
-        **_published_access_for(
-            io_folder, primary, published_map=published_map
-        ),
-        "serveUrl": serve_url_for(
+        origin_conversation_id=origin_conversation_id(meta),
+        published_url=_published_url_for(io_folder, primary, published_map=published_map),
+        # Set explicitly so `to_json()` (exclude_unset) keeps the key for a caller
+        # that doesn't assign it.
+        modified=False,
+        **access_fields,
+        serve_url=serve_url_for(
             primary_path,
             scope=scope,
             artifacts_base=artifacts_base,
             project_name=project_name,
         ),
-    }
-    from cowork.services.artifact_identity import artifact_key
-
-    # Drafts and every published version share this key. A legacy
-    # `.published.json` key is intentionally overridden here so comments do not
-    # fork when an artifact is re-published under a different report URL.
-    card["artifactKey"] = artifact_key(artifact_id)
+    )
     if primary is not None:
         # macOS commonly exposes the same temporary directory through both
         # ``/var`` and ``/private/var``. Canonicalize both sides before deriving
@@ -1610,18 +1637,9 @@ def _prepare_artifact_card(
         except ValueError:
             logger.warning("Artifact primary resolves outside its folder: %s", folder)
         else:
-            card["draftUrl"] = draft_url_for(
+            card.draft_url = draft_url_for(
                 project_id=project_id, artifact_id=artifact_id, rel_path=rel
             )
-    if _org_mode():
-        # Dropped at the single card builder so inline chat cards are covered
-        # too: they call this function as well, and a filter applied only at the
-        # list endpoint would still hand the plaintext password to the chat.
-        # In org mode the owner reads the password and the emails from GET
-        # .../access, which can tell owner from co-member, so the card carries
-        # neither. `accessMode` stays: ArtifactStatus draws its badge from it.
-        card.pop("accessPassword", None)
-        card.pop("accessEmails", None)
     return _PreparedArtifactCard(
         card=card,
         io_folder=io_folder,
@@ -1642,7 +1660,7 @@ def card_for_folder(
     _pinned_folder: PinnedDir | None = None,
     _pinned_root: PinnedDir | None = None,
     artifacts_base: Path | None = None,
-) -> dict | None:
+) -> ArtifactCard | None:
     """Build one card, retaining legacy metadata and publish-map self-heals.
 
     Inline chat cards and status refreshes historically migrate legacy ids and
@@ -1684,7 +1702,7 @@ def card_for_folder(
     )
     if prepared is None:
         return None
-    prepared.card["modified"] = _is_modified(
+    prepared.card.modified = _is_modified(
         prepared.io_folder,
         prepared.primary,
         prepared.mtime_seconds,
@@ -1704,7 +1722,7 @@ def _listed_card_for_pinned_folder(
     pinned_folder: PinnedDir,
     pinned_root: PinnedDir,
     artifacts_base: Path,
-) -> dict | None:
+) -> ArtifactCard | None:
     """Build one list card through a call graph containing no artifact writes.
 
     The caller names the card's artifacts root, so its serve URL is built from
@@ -1738,7 +1756,7 @@ def _listed_card_for_pinned_folder(
     )
     if prepared is None:
         return None
-    prepared.card["modified"] = _is_modified_read_only(
+    prepared.card.modified = _is_modified_read_only(
         prepared.io_folder,
         prepared.primary,
         prepared.mtime_seconds,
@@ -1767,6 +1785,19 @@ def _pinned_directory_path(directory: PinnedDir | None) -> Path | None:
         return None
 
 
+def loose_file_status(
+    folder: Path, file: Path, *, published_map: dict | None = None
+) -> ArtifactStatusView:
+    """The status of a file with no metadata.json, from its folder's publish
+    record, read once."""
+    if published_map is None:
+        published_map = _load_published_map(folder)
+    return ArtifactStatusView.of_access(
+        published_access_view(folder, file, published_map=published_map),
+        published_url=_published_url_for(folder, file, published_map=published_map),
+    )
+
+
 def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -> ArtifactStatusView:
     """Fresh owner-side status for an already resolved artifact path.
 
@@ -1791,15 +1822,9 @@ def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -
     if card is None:
         # Loose / legacy file (no metadata.json anywhere up to the artifacts
         # container root).
-        card = {
-            "publishedUrl": _published_url_for(folder, artifact),
-            "modified": False,
-            **_published_access_for(folder, artifact),
-        }
-    # One response shape for BOTH branches: explicitly the published /
-    # modified / access subset, and NEVER `accessPassword` — that owner-only
-    # plaintext (which `_published_access_for` and the card both carry) must
-    # not leave this endpoint. ArtifactStatusView has no field for it.
+        return loose_file_status(folder, artifact)
+    # ArtifactStatusView has no field for the owner-only plaintext password,
+    # so it never leaves this endpoint.
     return ArtifactStatusView.of_card(card)
 
 
@@ -1814,26 +1839,68 @@ def artifact_status(raw_path: str, *, scope: TenantScope | None) -> ArtifactStat
     return artifact_status_for_resolved(artifact, scope=scope)
 
 
-def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
-    """Every artifact under the given roots, newest first, capped at 80.
+#: The cards a list shows, newest first.
+LIST_CARDS = 80
+
+
+class ListCandidate(NamedTuple):
+    """One folder a list may show: the time it sorts by, its root's place in
+    the list's roots (which breaks a tie), its name, and its root."""
+
+    sort_time: float
+    source_index: int
+    name: str
+    source: ProjectArtifacts
+
+
+class ListedCards(NamedTuple):
+    """What cards_for_candidates built: the cards, newest first, and the
+    candidates whose folder opened and built no card. A folder lands in
+    `no_card` when the read of its id raises any OSError or ValueError
+    (artifact_identity.read_full_id): it holds no metadata.json, one that
+    is a link or not a regular file, one with no valid id, or one whose
+    read fails, as on EIO or ESTALE. It lands there too when the card
+    builder finds no procfs path for the open folder or its root
+    (_pinned_directory_path), on a Linux host without procfs. A folder
+    that fails to open, or whose card build raises, is skipped and is in
+    neither field."""
+
+    cards: list[ArtifactCard]
+    no_card: tuple[ListCandidate, ...]
+
+
+def list_artifacts(sources: list[ProjectArtifacts]) -> list[ArtifactCard]:
+    """Every artifact under the given roots, newest first, capped at
+    LIST_CARDS.
 
     Roots come from the caller (see services.artifact_roots) — this function
     never discovers them, because a filesystem scan cannot tell which tenant is
-    asking. The 80-item cap is pre-existing but matters more in org mode, where
+    asking. The cap is pre-existing but matters more in org mode, where
     `sources` spans every project of the organization instead of one tree.
 
     Two passes so the cap is applied before card work, not after: a collect
-    pass opens each artifact once and reads only its `metadata.json` mtime (no
-    card built), then a build pass walks the sorted candidates and stops once
-    80 cards have been produced.
+    pass (list_candidates) opens each artifact once and reads only its
+    `metadata.json` mtime (no card built), then a build pass
+    (cards_for_candidates) walks the sorted candidates and stops once
+    LIST_CARDS cards have been produced. In org mode, once the sort times are
+    recorded, the list runs the collect pass only over the roots of the
+    projects whose rows it cannot trust, and passes the newest rows as the
+    other candidates (cowork.services.artifact_sort_times).
     """
-    from cowork.services.artifact_identity import (
-        _opened_child_directory,
-        opened_artifact_root,
-    )
+    return cards_for_candidates(list_candidates(sources, indexes=range(len(sources)))).cards
 
-    candidates: list[tuple[float, int, str, ProjectArtifacts]] = []
-    for source_idx, source in enumerate(sources):
+
+def list_candidates(sources: list[ProjectArtifacts], *, indexes: Iterable[int]) -> list[ListCandidate]:
+    """The collect pass of list_artifacts over the roots of `sources` at
+    `indexes`: one candidate for each folder of those roots, with its root's
+    index in `sources`, so candidates from separate calls over the same
+    `sources` sort together as one walk's (cards_for_candidates). A root that
+    fails to open or list gives none."""
+    from cowork.services.artifact_identity import opened_artifact_root
+
+    candidates: list[ListCandidate] = []
+    for source_idx in indexes:
+        source = sources[source_idx]
         try:
             with opened_artifact_root(source) as root:
                 with dir_scandir(root) as entries:
@@ -1857,21 +1924,35 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                         except OSError:
                             continue
                 for child_name in sorted(child_names):
+                    # One no-follow open of the folder and one stat of its
+                    # metadata.json (dir_child_stat), the least a sort by that
+                    # time can cost on the file store. A folder that would not
+                    # open, or holds no metadata.json, sorts last at 0; the
+                    # build pass opens it no-follow again and skips it.
                     try:
-                        with _opened_child_directory(root, child_name) as pinned_folder:
-                            try:
-                                mtime = dir_stat(pinned_folder, "metadata.json").st_mtime
-                            except OSError:
-                                mtime = 0.0
-                            candidates.append((mtime, source_idx, child_name, source))
-                    except (OSError, ValueError):
-                        continue
+                        mtime = dir_child_stat(root, child_name, "metadata.json").st_mtime
+                    except OSError:
+                        mtime = 0.0
+                    candidates.append(ListCandidate(mtime, source_idx, child_name, source))
         except (OSError, ValueError):
             continue
+    return candidates
 
-    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
 
-    cards: list[dict] = []
+def cards_for_candidates(candidates: Iterable[ListCandidate]) -> ListedCards:
+    """The cards of `candidates`, newest first, then by root and name, capped
+    at LIST_CARDS: each folder opened without following a link, and one
+    that fails to open or builds no card skipped. Each candidate whose
+    folder opened and built no card comes back in ListedCards.no_card,
+    which says when that happens."""
+    from cowork.services.artifact_identity import (
+        _opened_child_directory,
+        opened_artifact_root,
+    )
+
+    ordered = sorted(candidates, key=lambda item: (-item.sort_time, item.source_index, item.name))
+    cards: list[ArtifactCard] = []
+    no_card: list[ListCandidate] = []
     # One root open per source, not per surviving candidate: opening a root
     # costs an openat+stat per path component, so re-opening it per card
     # would undo what capping the candidates before this pass just saved.
@@ -1888,9 +1969,10 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                     opened_roots[source_idx] = None
             return opened_roots[source_idx]
 
-        for _mtime, source_idx, child_name, source in candidates:
-            if len(cards) >= 80:
+        for candidate in ordered:
+            if len(cards) >= LIST_CARDS:
                 break
+            _mtime, source_idx, child_name, source = candidate
             root = _root_for(source_idx, source)
             if root is None:
                 continue
@@ -1906,13 +1988,14 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                         pinned_root=root,
                         artifacts_base=source.base,
                     )
-                    if card is None:
-                        continue
-                    cards.append(card)
             except (OSError, ValueError):
                 continue
+            if card is None:
+                no_card.append(candidate)
+                continue
+            cards.append(card)
 
-    return cards
+    return ListedCards(cards=cards, no_card=tuple(no_card))
 
 
 def _line_breaks(text: str, start: int, end: int, has_cr: bool) -> int:
@@ -2014,10 +2097,7 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
     metadata_path = root / "metadata.json"
     if metadata_path.is_file():
         try:
-            meta = json.loads(metadata_path.read_text(encoding="utf-8"))
-            raw_port = meta.get("port")
-            if isinstance(raw_port, int) and 0 < raw_port < 65536:
-                backend_port = raw_port
+            backend_port = ArtifactMetadata.parse(metadata_path.read_text(encoding="utf-8")).port
         except Exception:
             backend_port = None
 
@@ -2170,7 +2250,8 @@ def _publishable_in_folder(
         and REVISIONS_DIRNAME not in path.relative_to(folder).parts
     ]
     meta = _load_metadata(folder) if (folder / "metadata.json").is_file() else None
-    if (meta or {}).get("type") not in fullstack_types:
+    meta = meta or ArtifactMetadata.empty()
+    if meta.type not in fullstack_types:
         return [
             _PublishableCandidate(st.st_mtime_ns, path, st.st_size, path.parent, _humanize(path.stem))
             for path, st in pages
@@ -2179,7 +2260,7 @@ def _publishable_in_folder(
     # Fullstack apps are found by their metadata, not by having a page, so an
     # app whose primary is not HTML/Markdown is still listed.
     newest = max(pages, key=lambda page: page[1].st_mtime_ns, default=None)
-    primary = meta.get("primary")
+    primary = meta.primary
     entry_path = folder / primary if primary else None
     if entry_path is None or not entry_path.is_file() or is_non_content_path(entry_path, container):
         entry_path = newest[0] if newest else None
@@ -2190,7 +2271,7 @@ def _publishable_in_folder(
     except OSError:
         return []
     mtime_ns = newest[1].st_mtime_ns if newest else st.st_mtime_ns
-    title = meta.get("name") or _humanize(folder.name)
+    title = meta.name or _humanize(folder.name)
     return [_PublishableCandidate(mtime_ns, entry_path, st.st_size, folder, title)]
 
 
@@ -2232,6 +2313,7 @@ def html_artifacts(*, scope: TenantScope | None) -> list[dict]:
             "path": str(c.path),
             "bytes": c.size,
             "publishedUrl": _published_url_for(c.published_dir, c.path),
+            "reportId": _report_id_for(c.published_dir, c.path),
         }
         for c in newest
     ]
@@ -2398,6 +2480,17 @@ async def _ensure_backend_running(
         )
 
 
+def _record_backend_port(artifact_dir: Path, port: int) -> None:
+    """Write the relaunched backend's port into metadata.json, changing only
+    that key. Backends launch only with the sandbox off, so the file is
+    written as on the desktop: in place, through a metadata.json the project
+    links. The encoding is metadata.json's own (ArtifactMetadata.encoded), so
+    on Windows the file gets LF line ends."""
+    meta_path = artifact_dir / "metadata.json"
+    latest = ArtifactMetadata.parse(meta_path.read_text(encoding="utf-8"))
+    meta_path.write_bytes(latest.with_value("port", port).encoded())
+
+
 async def _launch_backend_locked(
     artifact_dir: Path, *, project_root: Path, scope: TenantScope | None
 ) -> BackendStatus:
@@ -2429,8 +2522,8 @@ async def _launch_backend_locked(
     # explicit env mapping and let the launcher merge it for the spawn.
     extra_env: dict[str, str] = {}
     try:
-        meta = _load_metadata(artifact_dir) or {}
-        datasources = meta.get("datasources") or []
+        meta = _load_metadata(artifact_dir) or ArtifactMetadata.empty()
+        datasources = meta.datasources
         if datasources:
             from cowork.services.connectors.persist import turn_vault_for_scope
 
@@ -2441,7 +2534,7 @@ async def _launch_backend_locked(
 
             comparison_side = path_in_comparison_sandbox(project_root)
             for ds in datasources:
-                engine, name = ds.get("engine"), ds.get("name")
+                engine, name = ds.engine, ds.name
                 if not engine or not name:
                     continue
                 if comparison_side:
@@ -2502,13 +2595,7 @@ async def _launch_backend_locked(
     # dialing the stale port even though the backend is healthy on a
     # different one.
     try:
-        meta_path = artifact_dir / "metadata.json"
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta["port"] = new_port
-        meta_path.write_text(
-            json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        _record_backend_port(artifact_dir, new_port)
     except Exception as exc:
         # Metadata write failure shouldn't abort an otherwise-working
         # relaunch — the backend is up and we return the new port. But

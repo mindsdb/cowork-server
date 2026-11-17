@@ -1605,7 +1605,7 @@ def test_a_backend_pad_without_the_policy_is_refused_under_the_sandbox(landlock_
     monkeypatch.setattr(_RecordingRuntime, "calls", [])
     monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _RecordingRuntime)
     monkeypatch.setattr(scratchpad_runtime, "_pads", {})
-    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda **coding: tuple(coding.values()))
+    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda settings=None, **coding: tuple(coding.values()))
     refusal = "a backend pool's scratchpad was built without a code-sandbox policy"
 
     with pytest.raises(RuntimeError, match=refusal):
@@ -1774,7 +1774,7 @@ async def test_the_pool_hands_its_policy_to_each_pad(monkeypatch, tmp_path):
     monkeypatch.setattr(_RecordingRuntime, "calls", [])
     monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _RecordingRuntime)
     monkeypatch.setattr(scratchpad_runtime, "_pads", {})
-    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda **coding: tuple(coding.values()))
+    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda settings=None, **coding: tuple(coding.values()))
     pool = scratchpad_runtime.WorkspaceScopedPool(str(tmp_path), cell_sandbox=policy)
 
     await pool.get_or_create("app")
@@ -1794,7 +1794,7 @@ def test_a_pad_is_never_handed_to_a_caller_under_another_policy(monkeypatch, tmp
     monkeypatch.setattr(_RecordingRuntime, "calls", [])
     monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _RecordingRuntime)
     monkeypatch.setattr(scratchpad_runtime, "_pads", {})
-    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda **coding: tuple(coding.values()))
+    monkeypatch.setattr(scratchpad_runtime, "_resolve_coding", lambda settings=None, **coding: tuple(coding.values()))
     workspace = str(tmp_path)
 
     pad = scratchpad_runtime.get_or_create("app", workspace_path=workspace, cell_sandbox=alices)
