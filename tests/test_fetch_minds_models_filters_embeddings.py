@@ -59,7 +59,7 @@ def test_fetch_minds_models_drops_embedding_rows(monkeypatch):
     monkeypatch.setattr(providers.httpx, "AsyncClient", _FakeClient)
     providers._minds_models_cache.clear()
 
-    listing = asyncio.run(fetch_minds_models("https://api.mindshub.ai", "mdb_test"))
+    listing = asyncio.run(fetch_minds_models("https://api.mindshub.ai", "mdb_test", mindshub=True))
     ids, efforts, enabled, labels = listing.ids, listing.efforts, listing.enabled, listing.labels
 
     assert ids == ["mindshub_air", "sonnet"]
@@ -95,7 +95,7 @@ def test_decision_models_are_excluded_from_picker_and_cached_catalog(monkeypatch
     monkeypatch.setattr(providers.httpx, "AsyncClient", _client_returning(rows))
     providers._minds_models_cache.clear()
 
-    listing = asyncio.run(fetch_minds_models("https://api.mindshub.ai", "mdb_test"))
+    listing = asyncio.run(fetch_minds_models("https://api.mindshub.ai", "mdb_test", mindshub=True))
 
     assert listing.ids == ["mindshub_air", "sonnet"]
     assert listing.enabled == {}
