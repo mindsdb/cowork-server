@@ -290,6 +290,191 @@
     }
   } catch (e) { /* XMLHttpRequest not patchable: no XHR reports */ }
 
+  /* View reporter. The app's inline editor is a separate frame built from the
+     source, so it opens on the first slide or the top of the page. This tells
+     the app where the user is in the preview, so the editor can open there
+     too: the hash, the window's scroll and the last scrolled container, the
+     user's own navigation inputs since load (to replay in a deck that keeps
+     its current slide in script state), and the heading on screen (to check
+     the replay landed on the same view).
+
+     Only trusted inputs count, and only ones the page reacted to: a key or
+     click is kept when the DOM changed within SETTLE_MS after it. That keeps
+     scrolling with the arrow keys and clicks on plain text out of the list.
+     Inputs land on the page's own elements, named by a path of tag:index
+     steps from <body> (or from the nearest element with an id). Every value
+     is capped; the app validates them again, as untrusted data. */
+  try {
+    var NAV_KEYS = {
+      ArrowRight: 1, ArrowLeft: 1, ArrowUp: 1, ArrowDown: 1,
+      PageDown: 1, PageUp: 1, Home: 1, End: 1, ' ': 1
+    };
+    /* The same list as the editor's (htmlVisualEditorRuntime.js INTERACTIVE). */
+    var CONTROL = 'a[href], button, summary, label, select, [role="button"], [role="tab"], ' +
+      '[role="link"], [role="menuitem"], [role="option"], [onclick]';
+    var FIELD = 'input, textarea, select, [contenteditable]:not([contenteditable="false"])';
+    /* The comment layer's own UI (comments_layer.py). */
+    var LAYER_UI = '#act-mk, .act-hl, .act-pop, .act-menu';
+    var MAX_INPUTS = 50, MAX_STEPS = 32, MAX_PATH = 300, MAX_HASH = 512, MAX_HEADING = 120;
+    var MAX_LABEL = 80, SETTLE_MS = 250;
+    var ID_RE = /^[A-Za-z][\w.:-]{0,99}$/;
+    var viewInputs = [], viewOverflow = false, scrolled = null, lastView = '';
+    var viewTimers = [], scrollTimer = 0;
+
+    var inLayer = function (el) {
+      return !!(el && el.closest && el.closest(LAYER_UI));
+    };
+    var isLayer = function (el) {
+      return !!(el && el.matches && el.matches(LAYER_UI));
+    };
+
+    /* tag:index steps up to <body>, the index counting same-tag siblings only
+       (the comment layer's elements skipped), so the editor's copy of the
+       page resolves the same element. An element with a unique id anchors
+       the path. '' for anything outside <body>. */
+    var pathOf = function (el) {
+      var steps = [];
+      while (el && el.nodeType === 1 && el !== document.body) {
+        if (steps.length >= MAX_STEPS) return '';
+        var id = el.id;
+        if (id && ID_RE.test(id) && document.getElementById(id) === el) {
+          steps.unshift('#' + id);
+          break;
+        }
+        var tag = el.localName, index = 0;
+        for (var s = el.previousElementSibling; s; s = s.previousElementSibling) {
+          if (s.localName === tag && !isLayer(s)) index += 1;
+        }
+        steps.unshift(tag + ':' + index);
+        el = el.parentElement;
+      }
+      if (!el || (el !== document.body && steps[0].charAt(0) !== '#')) return '';
+      var path = steps.join('/');
+      return path.length <= MAX_PATH ? path : '';
+    };
+
+    /* The topmost heading on screen. The editor runs the same rule
+       (htmlVisualEditorRuntime.js visibleHeading). */
+    var visibleHeading = function () {
+      var best = null, bestTop = 0, bestLeft = 0;
+      var width = window.innerWidth, height = window.innerHeight;
+      var nodes = document.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]');
+      for (var i = 0; i < nodes.length && i < 500; i++) {
+        var node = nodes[i];
+        if (inLayer(node)) continue;
+        var r = node.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0 || r.bottom <= 0 || r.right <= 0 ||
+          r.top >= height || r.left >= width) continue;
+        if (node.checkVisibility &&
+          !node.checkVisibility({ opacityProperty: true, visibilityProperty: true })) continue;
+        if (!best || r.top < bestTop - 1 || (Math.abs(r.top - bestTop) <= 1 && r.left < bestLeft)) {
+          best = node; bestTop = r.top; bestLeft = r.left;
+        }
+      }
+      return best ? clip(best.textContent, MAX_HEADING) : '';
+    };
+
+    var sendView = function () {
+      var view = {
+        type: 'view',
+        hash: String(window.location.hash || '').slice(0, MAX_HASH),
+        scrollX: Math.round(window.scrollX || 0),
+        scrollY: Math.round(window.scrollY || 0),
+        container: null,
+        inputs: viewOverflow ? [] : viewInputs.slice(),
+        overflow: viewOverflow,
+        heading: visibleHeading()
+      };
+      if (scrolled && scrolled.isConnected) {
+        var where = pathOf(scrolled);
+        if (where) {
+          view.container = {
+            path: where,
+            top: Math.round(scrolled.scrollTop || 0),
+            left: Math.round(scrolled.scrollLeft || 0)
+          };
+        }
+      }
+      var text = JSON.stringify(view);
+      if (text === lastView) return;
+      lastView = text;
+      post(view);
+    };
+
+    /* Twice: once the page has reacted, and again once a slide transition is
+       likely over, so the heading is the one the user ends up looking at. */
+    var scheduleView = function () {
+      for (var t = 0; t < viewTimers.length; t++) clearTimeout(viewTimers[t]);
+      viewTimers = [setTimeout(sendView, 150), setTimeout(sendView, 900)];
+    };
+
+    /* Kept only when the page changed its DOM in response. */
+    var record = function (input) {
+      if (viewOverflow || typeof MutationObserver !== 'function' || !document.body) return;
+      var changed = false;
+      var observer = new MutationObserver(function (list) {
+        for (var i = 0; i < list.length; i++) {
+          if (!inLayer(list[i].target)) { changed = true; return; }
+        }
+      });
+      observer.observe(document.body, {
+        attributes: true, childList: true, subtree: true, characterData: true
+      });
+      setTimeout(function () {
+        try {
+          observer.disconnect();
+          if (!changed) return;
+          if (viewInputs.length >= MAX_INPUTS) {
+            viewOverflow = true;
+            viewInputs = [];
+          } else {
+            viewInputs.push(input);
+          }
+          scheduleView();
+        } catch (inner) { /* never break the page */ }
+      }, SETTLE_MS);
+    };
+
+    window.addEventListener('keydown', function (ev) {
+      try {
+        if (!ev.isTrusted || ev.ctrlKey || ev.metaKey || ev.altKey || !NAV_KEYS[ev.key]) return;
+        var target = ev.target;
+        /* Typing in a field is not navigation, and Space or Enter on a
+           control also fires a click, which is recorded on its own. */
+        if (target && target.closest && (target.closest(FIELD) || target.closest(CONTROL))) return;
+        record({ type: 'key', key: ev.key, shiftKey: !!ev.shiftKey });
+      } catch (inner) { /* never break the page */ }
+    }, true);
+
+    window.addEventListener('click', function (ev) {
+      try {
+        if (!ev.isTrusted || ev.button !== 0) return;
+        var target = ev.target;
+        if (!target || !target.closest || inLayer(target)) return;
+        /* A click in comment mode places a comment; the page never sees it. */
+        if (document.body && document.body.classList.contains('act-mode')) return;
+        var control = target.closest(CONTROL) || target;
+        var where = pathOf(control);
+        if (!where) return;
+        record({ type: 'click', path: where, label: clip(control.textContent, MAX_LABEL) });
+      } catch (inner) { /* never break the page */ }
+    }, true);
+
+    window.addEventListener('hashchange', function () {
+      try { scheduleView(); } catch (inner) { /* never break the page */ }
+    });
+
+    /* capture: a container's scroll does not bubble. */
+    window.addEventListener('scroll', function (ev) {
+      try {
+        var target = ev.target;
+        if (target && target.nodeType === 1 && !inLayer(target)) scrolled = target;
+        clearTimeout(scrollTimer);
+        scrollTimer = setTimeout(sendView, 200);
+      } catch (inner) { /* never break the page */ }
+    }, { capture: true, passive: true });
+  } catch (e) { /* no view reports: the page still runs */ }
+
   var nativeStorageWorks = true;
   try { void window.localStorage; } catch (e) { nativeStorageWorks = false; }
   /* One probe stands for the whole opaque-origin condition: where localStorage
