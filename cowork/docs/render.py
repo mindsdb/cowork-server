@@ -134,14 +134,16 @@ _HELD = re.compile(r"\x00(\d+)\x00")
 
 # Italic, links and chips are scanned rather than matched by one regex each:
 # such a regex rescans the rest of the line (or text) from every opener that
-# never closes, which is quadratic, and a long block stalls the server. Each
-# scan reads exactly what its regex reads (docModel.inlineToHtml in the editor
-# uses the same lookups but reads all marks in one pass):
+# never closes, which is quadratic, and a long block stalls the server. (Bold,
+# strike and code stay regexes: only the last openers of a line or text fail.)
+# Each scan reads exactly what its regex reads (docModel.inlineToHtml in the
+# editor uses the same lookups but reads all marks in one pass):
 #   italic  (?<![*\w])\*(?!\s)(.+?)(?<!\s)\*(?![*\w])  and the same with _
 #   link    \[([^\]]+)\]\((https?://[^)\s]+|mailto:[^)\s]+)\)
 #   chip    \{\{\s*(date|status|user)\s*:\s*([^}]+?)\s*\}\}
-_EM_OPEN = re.compile(r"(?<![*\w])\*(?!\s)|(?<![_\w])_(?!\s)")
-_EM_CLOSE = {"*": re.compile(r"(?<!\s)\*(?![*\w])"), "_": re.compile(r"(?<!\s)_(?![_\w])")}
+# The mark comes first so that a search jumps to it rather than testing every position.
+_EM_OPEN = re.compile(r"\*(?<![*\w]\*)(?!\s)|_(?<![_\w]_)(?!\s)")
+_EM_CLOSE = {"*": re.compile(r"\*(?<!\s\*)(?![*\w])"), "_": re.compile(r"_(?<!\s_)(?![_\w])")}
 _NEWLINE = re.compile(r"\n")
 _LINK_OPEN = re.compile(r"\[")
 _LINK_CLOSE = re.compile(r"\]")
@@ -180,6 +182,8 @@ def _replace(s: str, starts: re.Pattern[str], read: Callable[[re.Match[str]], tu
 
 
 def _italics(s: str) -> str:
+    if "*" not in s and "_" not in s:
+        return s
     close = {mark: _Next(pattern, s) for mark, pattern in _EM_CLOSE.items()}
     newline = _Next(_NEWLINE, s)
 
@@ -193,13 +197,14 @@ def _italics(s: str) -> str:
 
 
 def _links(s: str, hold: Callable[[str], str]) -> str:
+    if "](" not in s:
+        return s
     close, href_end = _Next(_LINK_CLOSE, s), _Next(_HREF_END, s)
 
     def read(m: re.Match[str]) -> tuple[int, str] | None:
         i = m.start()
         q = close(i + 1)  # the words run to the first "]"
-        head = _LINK_HREF.match(s, q) if q > i + 1 else None
-        if head is None:
+        if q == i + 1 or not (head := _LINK_HREF.match(s, q)):
             return None
         e = href_end(head.end())
         if e == head.end() or not s.startswith(")", e):
@@ -211,6 +216,8 @@ def _links(s: str, hold: Callable[[str], str]) -> str:
 
 
 def _chips(s: str) -> str:
+    if "{{" not in s:
+        return s
     close = _Next(_CHIP_CLOSE, s)
 
     def read(head: re.Match[str]) -> tuple[int, str] | None:

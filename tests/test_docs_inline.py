@@ -8,18 +8,14 @@ import time
 
 import pytest
 
-from cowork.docs.render import _date_label, inline_html
+from cowork.docs.render import _BOLD, _ESCAPE_OR_CODE, _HELD, _STRIKE, _date_label, inline_html
 
 # inline_html as it was when every mark was one regex. Italic, links and chips
 # are scanned now (these regexes are quadratic on marks that never close); the
 # scans must read every text the same way.
-_ESCAPE_OR_CODE = re.compile(r"\\([*`~\[\]{}_\\])|`([^`]+)`")
-_BOLD = re.compile(r"\*\*(.+?)\*\*")
 _ITALIC = re.compile(r"(?<![*\w])\*(?!\s)(.+?)(?<!\s)\*(?![*\w])|(?<![_\w])_(?!\s)(.+?)(?<!\s)_(?![_\w])")
-_STRIKE = re.compile(r"~~(.+?)~~")
 _LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+|mailto:[^)\s]+)\)")
 _CHIP = re.compile(r"\{\{\s*(date|status|user)\s*:\s*([^}]+?)\s*\}\}")
-_HELD = re.compile(r"\x00(\d+)\x00")
 
 
 def _regex_inline_html(text: str) -> str:
