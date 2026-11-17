@@ -623,12 +623,12 @@ class ProjectWorkspaceManager:
                     "Handoff failed before completion. Every source folder was restored; the task changes remain available to retry."
                 ) from exc
 
-    def cleanup(self, session_id: str, workspaces: list[TaskWorkspace]) -> None:
+    def cleanup(self, session_id: str, workspaces: list[TaskWorkspace], *, keep_recovery: bool = True) -> None:
         with self._lock:
             failures: list[str] = []
             for workspace in reversed(workspaces):
                 try:
-                    self._cleanup_one(session_id, workspace)
+                    self._cleanup_one(session_id, workspace, keep_recovery=keep_recovery)
                 except WorkspaceError as exc:
                     failures.append(f"{workspace.folder_name}: {exc}")
             self.ports.release(session_id)
@@ -636,13 +636,14 @@ class ProjectWorkspaceManager:
                 raise WorkspaceError("; ".join(failures))
             self.workspaces.prune_task_root(session_id)
 
-    def _cleanup_one(self, session_id: str, workspace: TaskWorkspace) -> None:
+    def _cleanup_one(self, session_id: str, workspace: TaskWorkspace, *, keep_recovery: bool = True) -> None:
         self.workspaces.cleanup(
             self._key(session_id, workspace.folder_id),
             workspace.source_path,
             workspace.workspace_path,
             workspace.workspace_kind,
             workspace.base_revision,
+            keep_recovery=keep_recovery,
         )
 
     def _rollback_commits(self, checkpoints: list[tuple[TaskWorkspace, str]]) -> list[str]:

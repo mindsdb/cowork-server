@@ -591,6 +591,52 @@ def test_deleting_task_survives_a_moved_source_repository(tmp_path: Path) -> Non
     assert not workspace.exists()
 
 
+def test_deleting_a_changed_folder_copy_task_leaves_no_recovery_data(tmp_path: Path) -> None:
+    folder = tmp_path / "plain-folder"
+    folder.mkdir()
+    (folder / "notes.txt").write_text("v1\n", encoding="utf-8")
+    service = service_with(tmp_path, FakeEngine())
+    copy_folders_without_git(service.workspaces)
+    created = service.create_session(
+        SessionCreateRequest(path=str(folder), prompt="Edit it", workspace_mode=WorkspaceMode.worktree),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    created = wait_for_status(service, created.id, SessionStatus.completed)
+    assert created.workspace_kind == WorkspaceKind.local_copy
+    workspace = Path(created.workspace_path)
+    (workspace / "notes.txt").write_text("v2\n", encoding="utf-8")
+    recovery = service.workspaces.snapshots_root / created.id
+
+    service.delete_session(created.id)
+
+    assert not workspace.exists()
+    assert not recovery.exists()
+    assert (folder / "notes.txt").read_text(encoding="utf-8") == "v1\n"
+
+
+def test_deleting_a_released_task_removes_its_saved_recovery_data(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Edit it", workspace_mode=WorkspaceMode.worktree),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    created = wait_for_status(service, created.id, SessionStatus.completed)
+    (Path(created.workspace_path) / "draft.txt").write_text("unsaved\n", encoding="utf-8")
+    service.retention.release(created.id)
+    recovery = service.workspaces.snapshots_root / created.id
+    # Releasing keeps the task's changes so reopening it can restore them.
+    assert recovery.is_dir()
+
+    service.delete_session(created.id)
+
+    assert not recovery.exists()
+
+
 def test_remote_runtime_reuses_one_run_for_follow_ups_and_persisted_queue(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())

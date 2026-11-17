@@ -493,7 +493,7 @@ class CodingSessionFactory:
     def release(self, session: CodingSession, request: SessionCreateRequest) -> None:
         """Release a prepared task's workspaces, task branches and skills after it was deleted."""
         if session.workspaces:
-            self.project_workspaces.cleanup(session.id, session.workspaces)
+            self.project_workspaces.cleanup(session.id, session.workspaces, keep_recovery=False)
             if request.repository_setup and request.repository_setup.branch:
                 # Only a branch still at its base revision is deleted.
                 for workspace in session.workspaces:
@@ -505,6 +505,7 @@ class CodingSessionFactory:
                 session.workspace_path,
                 session.workspace_kind,
                 session.base_revision,
+                keep_recovery=False,
             )
         self.skills.cleanup(session.id)
 
