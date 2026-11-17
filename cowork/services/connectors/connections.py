@@ -318,11 +318,10 @@ class ConnectionsService:
     ) -> dict[str, list[dict]]:
         """Picked files of `engine`'s connections visible to `project_name`,
         keyed by connection name. Callers (the Anton harness, once per chat
-        turn) use this to tell the agent about them: for google_drive, files a
-        plain files.list()/files.search() call won't return, since the
-        drive.file scope only covers files the app created plus these
-        specifically granted ones; for notion, pages the user added to the
-        project, which nothing else would point the agent at.
+        turn) use this to tell the agent which files the user added to the
+        project: for google_drive, files added with the Google Picker; for
+        notion, pages the user added to the project, which nothing else would
+        point the agent at.
 
         A file is visible if it's explicitly tagged to `project_name`, or, for
         google_drive only, untagged (picked with no project context — a
