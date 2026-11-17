@@ -31,16 +31,18 @@ import errno
 import json
 import logging
 import os
+import re
 import stat
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, TypeVar
 
 from anton.core.artifacts import ArtifactStore
+from anton.core.artifacts.models import ARTIFACT_ID_SLUG_PREFIX_LEN
 
 from cowork.common.paths import (
     O_NOFOLLOW,
@@ -89,6 +91,8 @@ SESSION_PAUSE_S = 5 * 60
 SESSION_MAX_S = 30 * 60
 MAX_DOC_BYTES = 8 * 1024 * 1024
 _MAX_DOC_MB = MAX_DOC_BYTES // (1024 * 1024)
+
+_HEX_ID = re.compile(r"[0-9a-f]{32}")
 
 _locks: dict[str, _DocLock] = {}
 _locks_guard = threading.Lock()
@@ -266,9 +270,8 @@ def _read_meta(folder: Path) -> dict[str, Any]:
     return meta if isinstance(meta, dict) else {}
 
 
-def doc_file(folder: Path) -> Path:
-    """The doc file in an artifact folder: the recorded primary, else the default name."""
-    primary = _read_meta(folder).get("primary")
+def _doc_file(folder: Path, meta: dict[str, Any]) -> Path:
+    primary = meta.get("primary")
     if is_doc_primary(primary):
         candidate = (folder / primary).resolve()
         if candidate.parent == folder.resolve():
@@ -276,8 +279,19 @@ def doc_file(folder: Path) -> Path:
     return folder / DOC_FILENAME
 
 
+def doc_file(folder: Path) -> Path:
+    """The doc file in an artifact folder: the recorded primary, else the default name."""
+    return _doc_file(folder, _read_meta(folder))
+
+
+def _doc_meta(folder: Path) -> dict[str, Any] | None:
+    """The artifact's metadata ({} when unreadable) if ``folder`` holds a doc, else None."""
+    meta = _read_meta(folder)
+    return meta if child_exists(folder, _doc_file(folder, meta).name) else None
+
+
 def is_doc_folder(folder: Path) -> bool:
-    return child_exists(folder, doc_file(folder).name)
+    return _doc_meta(folder) is not None
 
 
 def _read_json(folder: Path, *, missing: DocError) -> Any:
@@ -536,27 +550,55 @@ def _remove_folder(artifacts_dir: Path, slug: str) -> None:
         logger.warning("could not remove the unfinished doc %s", artifacts_dir / slug, exc_info=True)
 
 
-def _doc_folders(artifacts_dir: Path) -> list[Path]:
-    base = Path(artifacts_dir)
-    if not base.is_dir():
-        return []
-    return sorted(f for f in base.iterdir() if f.is_dir() and not f.name.startswith(".") and is_doc_folder(f))
+def _listed_names(base: Path) -> list[str]:
+    return [child.name for child in sorted(base.iterdir())] if base.is_dir() else []
+
+
+def _doc_folders(base: Path, names: Iterable[str]) -> Iterator[tuple[Path, dict[str, Any]]]:
+    """The doc folders among ``names`` in ``base``, in that order, each with its metadata.
+
+    ``names`` come from listing ``base``, never from a caller's ref, so no name
+    can reach outside it.
+    """
+    for name in names:
+        folder = base / name
+        if name.startswith(".") or not folder.is_dir():
+            continue
+        meta = _doc_meta(folder)
+        if meta is not None:
+            yield folder, meta
+
+
+def _has_id(meta: dict[str, Any], hexref: str) -> bool:
+    return str(meta.get("id", "")).replace("-", "").lower() == hexref
 
 
 def find_doc_folder(artifacts_dir: Path, ref: str) -> Path:
-    """A doc folder by artifact id (dashed or not), slug, or exact title."""
+    """A doc folder by artifact id (dashed or not), slug, or exact title.
+
+    A slug is a folder's name, and a slug anton made ends in ``-<id[:8]>``, so
+    those lookups read only the folders they name. A title, or an id whose slug
+    doesn't carry it, reads every artifact's metadata.
+    """
     ref = (ref or "").strip()
     if not ref:
         raise DocError("no_doc", "name the doc: its id, slug or title (list_docs shows them).")
-    if not Path(artifacts_dir).is_dir():
+    base = Path(artifacts_dir)
+    if not base.is_dir():
         raise DocError("no_doc", f"no doc {ref!r}: this project has no artifacts yet.")
-    hexref = ref.replace("-", "").lower()
-    by_title = []
-    for folder in _doc_folders(artifacts_dir):
-        if folder.name == ref:
+    names = _listed_names(base)
+    if ref in names:
+        for folder, _meta in _doc_folders(base, [ref]):
             return folder
-        meta = _read_meta(folder)
-        if str(meta.get("id", "")).replace("-", "").lower() == hexref:
+    hexref = ref.replace("-", "").lower()
+    if _HEX_ID.fullmatch(hexref):
+        suffix = f"-{hexref[:ARTIFACT_ID_SLUG_PREFIX_LEN]}"
+        for folder, meta in _doc_folders(base, [name for name in names if name.endswith(suffix)]):
+            if _has_id(meta, hexref):
+                return folder
+    by_title = []
+    for folder, meta in _doc_folders(base, names):
+        if _has_id(meta, hexref):
             return folder
         if str(meta.get("name", "")).strip().lower() == ref.lower():
             by_title.append(folder)
@@ -574,7 +616,8 @@ def list_doc_folders(artifacts_dir: Path) -> list[dict[str, Any]]:
     docs lists quickly; a doc that won't open says so when it is opened.
     """
     out = []
-    for folder in _doc_folders(artifacts_dir):
+    base = Path(artifacts_dir)
+    for folder, meta in _doc_folders(base, _listed_names(base)):
         try:
             raw = _read_json(folder, missing=DocError("no_doc", ""))
         except DocError:
@@ -583,7 +626,7 @@ def list_doc_folders(artifacts_dir: Path) -> list[dict[str, Any]]:
             continue
         tabs = [t for t in raw["tabs"] if isinstance(t, dict)]
         out.append({
-            "id": _read_meta(folder).get("id") or raw.get("id", ""),
+            "id": meta.get("id") or raw.get("id", ""),
             "slug": folder.name,
             "title": str(raw.get("title") or "Untitled doc"),
             "rev": raw.get("rev", 0),
