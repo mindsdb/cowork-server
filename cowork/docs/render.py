@@ -5,6 +5,8 @@ from __future__ import annotations
 import html
 import math
 import re
+import unicodedata
+from datetime import date
 from typing import Any
 
 from collections.abc import Callable
@@ -124,33 +126,74 @@ def changed_lines(doc: dict[str, Any], touched: dict[str, list[str]]) -> str:
 
 # ---------------------------------------------------------------- HTML
 
-# A backslash-escaped mark, or a code span, read in one pass from the left as
-# the editor reads them (docModel.inlineToHtml): an escaped backtick opens no
-# code span, and a backslash inside a code span is the code's own.
-_ESCAPE_OR_CODE = re.compile(r"\\([*`~\[\]{}_\\])|`([^`]+)`")
-_BOLD = re.compile(r"\*\*(.+?)\*\*")
-_STRIKE = re.compile(r"~~(.+?)~~")
-_HELD = re.compile(r"\x00(\d+)\x00")
+# Inline Markdown is read as CommonMark reads it, for the marks a doc uses:
+# backslash escapes, `code`, [links](https://…), {{chips}}, *emphasis*,
+# **strong** (with * or _) and ~~strike~~. The editor (docModel.inlineToHtml)
+# reads it with the same steps; tests/fixtures/docs_inline/cases.json holds
+# the cases both must render alike.
+#
+# One pass from the left finds escapes, code spans, chips and links. They bind
+# tighter than emphasis, so a mark inside them never opens or closes emphasis.
+# Emphasis is paired by CommonMark's delimiter-run rules: inside each link's
+# words on their own (at the link's "]"), then over the rest, so tags always
+# nest. Every look ahead is a cached "next match from here", which keeps all
+# of it linear in the length of the text.
+#
+# Looser than CommonMark: a run of * or ~~ opens unless white space follows it
+# and closes unless white space precedes it, so "**Note:**text" and
+# "价格**$5**起" are bold, as the editor writes them. "_" keeps CommonMark's
+# rule, so snake_case stays as typed.
+#
+# Narrower than CommonMark: a code span is one backtick each side, kept
+# verbatim; only these marks escape; a link is inline, has words, and its
+# address is http(s):// or mailto: plus at least one character, up to ")";
+# strike is exactly two tildes; no raw HTML, entities, autolinks or hard breaks.
+_ESCAPABLE = r"[*`~\[\]{}_\\]"
+_TOKEN = re.compile(rf"\\{_ESCAPABLE}|[`\[\]{{]|\*+|_+|~+")
+_BACKTICK = re.compile("`")
+_BRACE = re.compile(r"\}")
+# CommonMark's white space: tab, line feed, form feed, carriage return and the Unicode Zs spaces.
+_SPACE_CHARS = "\t\n\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000"
+_SPACE = f"[{re.escape(_SPACE_CHARS)}]"
+_CHIP_HEAD = re.compile(r"\{\{" + _SPACE + r"*(date|status|user)" + _SPACE + "*:")
+_LINK_HEAD = re.compile(r"\]\((?:https?://|mailto:)")
+_HREF_END = re.compile(r"[)\x00-\x20\x7f]")  # where CommonMark ends an address not in <…>
+_HREF_ESCAPE = re.compile(rf"\\({_ESCAPABLE})")
+_EM, _STRONG, _STRIKE = ("<em>", "</em>"), ("<strong>", "</strong>"), ("<s>", "</s>")
 
-# Italic, links and chips are scanned rather than matched by one regex each:
-# such a regex rescans the rest of the line (or text) from every opener that
-# never closes, which is quadratic, and a long block stalls the server. (Bold,
-# strike and code stay regexes: only the last openers of a line or text fail.)
-# Each scan reads exactly what its regex reads (docModel.inlineToHtml in the
-# editor uses the same lookups but reads all marks in one pass):
-#   italic  (?<![*\w])\*(?!\s)(.+?)(?<!\s)\*(?![*\w])  and the same with _
-#   link    \[([^\]]+)\]\((https?://[^)\s]+|mailto:[^)\s]+)\)
-#   chip    \{\{\s*(date|status|user)\s*:\s*([^}]+?)\s*\}\}
-# The mark comes first so that a search jumps to it rather than testing every position.
-_EM_OPEN = re.compile(r"\*(?<![*\w]\*)(?!\s)|_(?<![_\w]_)(?!\s)")
-_EM_CLOSE = {"*": re.compile(r"\*(?<!\s\*)(?![*\w])"), "_": re.compile(r"_(?<!\s_)(?![_\w])")}
-_NEWLINE = re.compile(r"\n")
-_LINK_OPEN = re.compile(r"\[")
-_LINK_CLOSE = re.compile(r"\]")
-_LINK_HREF = re.compile(r"\]\((?:https?://|mailto:)")
-_HREF_END = re.compile(r"[)\s]")
-_CHIP_HEAD = re.compile(r"\{\{\s*(date|status|user)\s*:")
-_CHIP_CLOSE = re.compile(r"\}")
+
+def _char_class(ch: str) -> int:
+    """A character beside a run of marks: white space (0), punctuation (1: CommonMark's
+    Unicode P and S categories) or anything else (2).
+
+    P and S come from Python's Unicode tables; the editor's may be newer and class a
+    character assigned since then apart.
+    """
+    return 0 if ch in _SPACE_CHARS else 1 if unicodedata.category(ch)[0] in "PS" else 2
+
+
+def _flanks(before: int, after: int, underscore: bool) -> tuple[bool, bool]:
+    """Whether a run can open and close emphasis, by the classes of the characters around it."""
+    space_before, punct_before, space_after, punct_after = before == 0, before == 1, after == 0, after == 1
+    if not underscore:
+        return not space_after, not space_before
+    left = not space_after and (not punct_after or space_before or punct_before)
+    right = not space_before and (not punct_before or space_after or punct_after)
+    # "_" never opens or closes inside a word.
+    return left and (not right or punct_before), right and (not left or punct_after)
+
+
+_FLANKS = {u: tuple(_flanks(b, a, u) for b in range(3) for a in range(3)) for u in (False, True)}
+
+
+def _escape(text: str) -> str:
+    """Text for HTML, escaped as the editor's escapeHtml does."""
+    return html.escape(text, quote=False).replace('"', "&quot;")
+
+
+def _text_html(text: str) -> str:
+    """Plain text as HTML, a line feed as the line break the editor shows."""
+    return _escape(text).replace("\n", "<br>")
 
 
 class _Next:
@@ -170,96 +213,196 @@ class _Next:
         return self._at
 
 
-def _replace(s: str, starts: re.Pattern[str], read: Callable[[re.Match[str]], tuple[int, str] | None]) -> str:
-    """``re.sub`` for a mark found by its start: ``read`` gives a start's (end, markup), or None."""
-    out, done = [], 0
-    for m in starts.finditer(s):
-        if m.start() >= done and (hit := read(m)):
-            out += (s[done:m.start()], hit[1])
-            done = hit[0]
-    out.append(s[done:])
-    return "".join(out)
+class _Atom:
+    """Text replaced by markup of its own: an escape, a code span, a chip or a link's end."""
+
+    __slots__ = ("start", "end", "markup")
+
+    def __init__(self, start: int, end: int, markup: str) -> None:
+        self.start, self.end, self.markup = start, end, markup
+
+    def html(self) -> str:
+        return self.markup
 
 
-def _italics(s: str) -> str:
-    if "*" not in s and "_" not in s:
-        return s
-    close = {mark: _Next(pattern, s) for mark, pattern in _EM_CLOSE.items()}
-    newline = _Next(_NEWLINE, s)
+class _Bracket:
+    """A "[" that opens a link once its "](address)" is found."""
 
-    def read(m: re.Match[str]) -> tuple[int, str] | None:
-        i = m.start()
-        # The words run to the first closing mark, which is on the same line.
-        j = close[s[i]](i + 2)
-        return (j + 1, f"<em>{s[i + 1:j]}</em>") if j < len(s) and newline(i + 1) > j else None
+    __slots__ = ("start", "end", "runs", "href")
 
-    return _replace(s, _EM_OPEN, read)
+    def __init__(self, start: int, runs: _Run) -> None:
+        self.start, self.end, self.runs, self.href = start, start + 1, runs, None
+
+    def html(self) -> str:
+        return "[" if self.href is None else f'<a href="{_escape(self.href)}">'
 
 
-def _links(s: str, hold: Callable[[str], str]) -> str:
-    if "](" not in s:
-        return s
-    close, href_end = _Next(_LINK_CLOSE, s), _Next(_HREF_END, s)
+class _Run:
+    """A run of *, _ or ~~ that may open or close emphasis (CommonMark's delimiter run).
 
-    def read(m: re.Match[str]) -> tuple[int, str] | None:
-        i = m.start()
-        q = close(i + 1)  # the words run to the first "]"
-        if q == i + 1 or not (head := _LINK_HREF.match(s, q)):
-            return None
-        e = href_end(head.end())
-        if e == head.end() or not s.startswith(")", e):
-            return None
-        # The words stay in the text (they may be bold); only the address is held.
-        return e + 1, hold(f'<a href="{html.escape(s[q + 2:e])}">') + s[i + 1:q] + hold("</a>")
+    Live runs form a list through ``prev``/``next``. Pairing spends marks from
+    the run's inner side: an opener's from its end, a closer's from its start.
+    """
 
-    return _replace(s, _LINK_OPEN, read)
+    __slots__ = ("start", "end", "mark", "length", "left", "can_open", "can_close", "prev", "next", "opens", "closes")
+
+    def __init__(self, start: int, end: int, mark: str, can_open: bool, can_close: bool, prev: _Run | None) -> None:
+        self.start, self.end, self.mark = start, end, mark
+        self.length = self.left = end - start
+        self.can_open, self.can_close = can_open, can_close
+        self.prev, self.next = prev, None
+        # The tags it opens after its marks and closes before them, innermost first; most runs pair with nothing.
+        self.opens: list[str] | None = None
+        self.closes: list[str] | None = None
+
+    def pairs_with(self, closer: _Run) -> bool:
+        # CommonMark's rule of 3: "*a**b*" is one emphasis, not two.
+        return self.mark == closer.mark and self.can_open and not (
+            (self.can_close or closer.can_open) and closer.length % 3 and (self.length + closer.length) % 3 == 0
+        )
+
+    def html(self) -> str:
+        marks = self.mark * self.left
+        closes = "".join(self.closes) if self.closes else ""
+        return closes + marks + "".join(reversed(self.opens)) if self.opens else closes + marks
+
+    def drop(self) -> None:
+        self.prev.next = self.next
+        if self.next is not None:
+            self.next.prev = self.prev
 
 
-def _chips(s: str) -> str:
-    if "{{" not in s:
-        return s
-    close = _Next(_CHIP_CLOSE, s)
+def _pair_runs(bottom: _Run) -> None:
+    """Pair the live runs above ``bottom`` into emphasis, then drop them (CommonMark's "process emphasis")."""
+    # Per kind of closer, the start at or before which no opener pairs with it.
+    floor: dict[tuple[str, bool, int], int] = {}
+    closer = bottom.next
+    while closer is not None:
+        if not closer.can_close:
+            closer = closer.next
+            continue
+        kind = (closer.mark, closer.can_open, closer.length % 3)
+        lowest = floor.get(kind, bottom.start)
+        opener = closer.prev
+        while opener.start > lowest and not opener.pairs_with(closer):
+            opener = opener.prev
+        if opener.start <= lowest:
+            floor[kind] = closer.prev.start
+            if not closer.can_open:
+                closer.drop()
+            closer = closer.next
+            continue
+        used = 2 if opener.left >= 2 and closer.left >= 2 else 1
+        open_tag, close_tag = _STRIKE if closer.mark == "~" else _STRONG if used == 2 else _EM
+        opener.left -= used
+        closer.left -= used
+        if opener.opens is None:
+            opener.opens = []
+        opener.opens.append(open_tag)
+        if closer.closes is None:
+            closer.closes = []
+        closer.closes.append(close_tag)
+        opener.next, closer.prev = closer, opener  # the runs between pair with nothing now
+        if not opener.left:
+            opener.drop()
+        if not closer.left:
+            closer.drop()
+            closer = closer.next
+    bottom.next = None
 
-    def read(head: re.Match[str]) -> tuple[int, str] | None:
-        q = close(head.end())  # the value runs to the first "}"
-        if q == head.end() or not s.startswith("}}", q):
-            return None
-        kind, raw = head.group(1), s[head.end():q]
-        # The regex's lazy value sheds the spaces around it but keeps at least one character.
-        value = raw.strip() or raw[-1]
-        if kind == "date":
-            value = _date_label(value)
-        return q + 2, f'<span class="chip chip-{kind}">{value}</span>'
 
-    return _replace(s, _CHIP_HEAD, read)
+def _read_chip(s: str, i: int, brace: _Next) -> _Atom | None:
+    if not (head := _CHIP_HEAD.match(s, i)):
+        return None
+    q = brace(head.end())  # the value runs to the first "}"
+    if q == head.end() or not s.startswith("}}", q):
+        return None
+    kind, raw = head.group(1), s[head.end():q]
+    value = raw.strip(_SPACE_CHARS) or raw[-1]  # at least one character, as typed
+    label = _date_label(value) if kind == "date" else value
+    return _Atom(i, q + 2, f'<span class="chip chip-{kind}">{_escape(label)}</span>')
+
+
+def _link_end(s: str, q: int, href_end: _Next) -> tuple[str, int] | None:
+    """The address and end of a "](address)" at ``q``, or None."""
+    if not (head := _LINK_HEAD.match(s, q)):
+        return None
+    e = href_end(head.end())
+    if e == head.end() or not s.startswith(")", e):
+        return None
+    return _HREF_ESCAPE.sub(r"\1", s[q + 2:e]), e + 1
+
+
+def _read_inline(s: str) -> list[_Atom | _Bracket | _Run]:
+    """What replaces parts of ``s``, in text order: atoms (escapes, code spans, chips, a
+    link's end) with their HTML, "[" brackets, and delimiter runs."""
+    n = len(s)
+    items: list[_Atom | _Bracket | _Run] = []
+    base = top = _Run(-1, -1, "", False, False, None)  # below every live run
+    backtick, brace, href_end = _Next(_BACKTICK, s), _Next(_BRACE, s), _Next(_HREF_END, s)
+    brackets: list[_Bracket] = []
+    pos = 0
+    while m := _TOKEN.search(s, pos):
+        i, pos = m.span()
+        c = s[i]
+        if c in "*_~":
+            if c == "~" and pos - i != 2:
+                continue
+            before = _char_class(s[i - 1]) if i else 0  # the text's edges count as white space
+            after = _char_class(s[pos]) if pos < n else 0
+            can_open, can_close = _FLANKS[c == "_"][before * 3 + after]
+            if can_open or can_close:
+                run = _Run(i, pos, c, can_open, can_close, top)
+                top.next = run
+                top = run
+                items.append(run)
+        elif c == "\\":
+            items.append(_Atom(i, pos, s[i + 1]))  # no escapable mark is special to HTML
+        elif c == "`":
+            k = backtick(pos)  # the code runs to the next backtick
+            if pos < k < n:
+                items.append(_Atom(i, k + 1, f"<code>{_escape(s[pos:k])}</code>"))
+                pos = k + 1
+        elif c == "{":
+            if chip := _read_chip(s, i, brace):
+                items.append(chip)
+                pos = chip.end
+        elif c == "[":
+            brackets.append(_Bracket(i, top))
+            items.append(brackets[-1])
+        elif brackets:  # "]": the last "[" pairs with it or with none
+            opener = brackets.pop()
+            # A link needs words: "[](…)" would be a link no one sees.
+            if i > opener.end and (link := _link_end(s, i, href_end)):
+                opener.href, pos = link
+                items.append(_Atom(i, pos, "</a>"))
+                _pair_runs(opener.runs)
+                top = opener.runs
+                brackets.clear()  # links never nest: a "[" before this link opens none
+    _pair_runs(base)
+    for item in items:
+        if item.__class__ is _Run:  # unlinked, the runs free without the cycle collector
+            item.prev = item.next = None
+    return items
 
 
 def inline_html(text: str) -> str:
-    """A block's inline Markdown as HTML: code, links, bold, italic, strike and chips.
+    """A block's inline Markdown as HTML: escapes, code, links, emphasis, strike and chips.
 
-    Escaped marks, code spans and link addresses are set aside before anything
-    else runs, so escaping and emphasis never reach inside them
-    (``https://x.com/_p_/`` keeps its underscores; ``?a=1&b=2`` is escaped
-    once; ``\\_draft\\_`` is the words "_draft_", not italics).
+    Every text run is escaped, so text never becomes markup, and only
+    http(s):// and mailto: addresses become links.
     """
-    held: list[str] = []
-
-    def hold(markup: str) -> str:
-        held.append(markup)
-        return f"\x00{len(held) - 1}\x00"
-
     s = (text or "").replace("\x00", "")
-    s = _ESCAPE_OR_CODE.sub(
-        lambda m: hold(html.escape(m.group(1)) if m.group(1) is not None else f"<code>{html.escape(m.group(2))}</code>"),
-        s,
-    )
-    s = _links(s, hold)
-    s = html.escape(s, quote=False)
-    s = _BOLD.sub(r"<strong>\1</strong>", s)
-    s = _italics(s)
-    s = _STRIKE.sub(r"<s>\1</s>", s)
-    s = _chips(s)
-    return _HELD.sub(lambda m: held[int(m.group(1))], s)
+    if not _TOKEN.search(s):
+        return _text_html(s)
+    out, done = [], 0
+    for item in _read_inline(s):
+        if done < item.start:
+            out.append(_text_html(s[done:item.start]))
+        out.append(item.html())
+        done = item.end
+    out.append(_text_html(s[done:]))
+    return "".join(out)
 
 
 def _chart_rows(doc_tab: dict[str, Any], b: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]]]:
@@ -544,10 +687,16 @@ _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
 
 
 def _date_label(value: str) -> str:
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", (value or "").strip())
-    if not m or not 1 <= int(m.group(2)) <= 12:
-        return value
-    return f"{_MONTHS[int(m.group(2)) - 1]} {int(m.group(3))}, {m.group(1)}"
+    """``2026-10-21`` as ``Oct 21, 2026``; anything but a real day of a four-digit year unchanged.
+
+    The editor's formatDate refuses the same values (it formats the rest in the app's language).
+    """
+    m = re.match(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})$", (value or "").strip(_SPACE_CHARS))
+    try:
+        day = date(int(m[1]), int(m[2]), int(m[3])) if m and m[1] >= "1000" else None
+    except ValueError:
+        day = None
+    return f"{_MONTHS[day.month - 1]} {day.day}, {day.year}" if day else value
 
 
 def _cell_html(col: dict[str, Any], value: str, rich: bool) -> str:
