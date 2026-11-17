@@ -653,6 +653,11 @@ class RenameSessionRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
 
 
+class WorkspaceCleanupStatus(BaseModel):
+    failed: int = 0
+    running: bool = False
+
+
 class WorkspaceUsageItem(BaseModel):
     session_id: str
     bytes: int

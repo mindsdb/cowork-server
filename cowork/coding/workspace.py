@@ -22,7 +22,8 @@ from cowork.coding.contracts import (
     WorkspaceKind,
 )
 from cowork.coding.git_transport import ALLOWED_GIT_PROTOCOLS
-from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
+from cowork.coding.local_copy import LocalCopyError, LocalCopyManager, force_remove
+from cowork.coding.pending_removals import PendingRemovals
 from cowork.coding.workspace_key import managed_key
 from cowork.common.paths import O_NOFOLLOW, open_fd
 from cowork.common.settings.app_settings import get_app_settings
@@ -230,6 +231,8 @@ class WorkspaceManager:
         self.snapshots_root = root / "snapshots"
         self.git = git or GitRunner()
         self.local_copies = LocalCopyManager(root, self.worktrees_root)
+        # Under the coding root so moving a task folder here is a same-disk rename.
+        self.pending_removals = PendingRemovals(root / "pending-removal")
         self._mutation_lock = threading.RLock()
         self._refusals: dict[str, str] = {}
         self.worktrees_root.mkdir(parents=True, exist_ok=True)
@@ -813,9 +816,17 @@ class WorkspaceManager:
         keep_recovery: bool = True,
     ) -> None:
         with self._mutation_lock:
+            # Without recovery the task is being deleted, so its folders are
+            # moved aside and removed in the background instead of holding the
+            # request for as long as a large tree takes to remove.
             if kind == WorkspaceKind.local_copy:
                 try:
-                    self.local_copies.cleanup(session_id, Path(workspace_path), keep_recovery=keep_recovery)
+                    self.local_copies.cleanup(
+                        session_id,
+                        Path(workspace_path),
+                        keep_recovery=keep_recovery,
+                        remove=None if keep_recovery else self._discard,
+                    )
                 except LocalCopyError as exc:
                     raise WorkspaceError(str(exc)) from exc
                 return
@@ -830,8 +841,17 @@ class WorkspaceManager:
             if actual not in expected:
                 raise WorkspaceError("Refusing to remove an unmanaged worktree path")
             source = Path(source_path)
+            if not keep_recovery:
+                self._discard(actual)
+                if source.is_dir():
+                    # The moved folder no longer exists where Git registered it,
+                    # so prune drops the registration and frees the task branch.
+                    # A failure only leaves a stale entry Git prunes itself later,
+                    # which must not stop the task from being deleted.
+                    self.git.run(source, "worktree", "prune", check=False)
+                return
             if actual.exists():
-                if keep_recovery and base_revision and source.is_dir():
+                if base_revision and source.is_dir():
                     self._snapshot_changes(session_id, actual, base_revision, "cleanup.patch", truncate=True)
                 if source.is_dir():
                     self.git.run(source, "worktree", "remove", "--force", str(actual))
@@ -852,6 +872,8 @@ class WorkspaceManager:
         """
         return UsageRoots(
             workspace=(
+                # Folders waiting here belong to no task, so they count as removed.
+                self.pending_removals.root,
                 self.worktrees_root,
                 self.legacy_worktrees_root,
                 self.local_copies.legacy_copies_root,
@@ -1105,7 +1127,12 @@ class WorkspaceManager:
             if task_dir.is_symlink():
                 task_dir.unlink()
             elif task_dir.is_dir():
-                shutil.rmtree(task_dir)
+                self._discard(task_dir)
+
+    def _discard(self, path: Path) -> None:
+        """Remove a managed folder in the background, or now if it cannot be moved aside."""
+        if not self.pending_removals.discard(path):
+            force_remove(path)
 
     def prune_task_root(self, session_id: str) -> None:
         """Remove an empty project-task parent without discarding task files."""
