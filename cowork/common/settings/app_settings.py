@@ -642,6 +642,12 @@ class OAuthSettings(Settings):
     # ID Metadata Document's URL, and there is no secret.
     notion_client_id: str = Field(default="", validation_alias=AliasChoices("NOTION_CLIENT_ID"))
 
+    # Desktop's own Figma app. The cloud uses a separate app held by auth:
+    # Figma keeps one access token per app per user, so a shared app would
+    # let a connect on one surface invalidate the other's token.
+    figma_client_id: str = Field(default="", validation_alias=AliasChoices("FIGMA_CLIENT_ID"))
+    figma_client_secret: str = Field(default="", validation_alias=AliasChoices("FIGMA_CLIENT_SECRET"))
+
     # HubSpot's MCP Auth App — a fixed client_id/secret pair, same shape as
     # Google/Linear/GitHub/Supabase, but the resulting token can only call
     # HubSpot's remote MCP server, never its REST API.
