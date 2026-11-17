@@ -23,6 +23,7 @@ from cowork.coding.contracts import (
     SessionStatus,
     WorkspaceKind,
     WorkspaceMode,
+    WorkspaceReasonCode,
 )
 from cowork.coding.engines.codex_config import sandbox_policy
 from cowork.coding.project_models import ProjectCommand, ProjectCreateRequest, ProjectFolder, RepositoryResource
@@ -174,6 +175,75 @@ def test_only_one_in_place_task_runs_in_a_repository_at_a_time(tmp_path: Path) -
     engine.block_until_release = False
     second = wait_for_workspace(service, in_place(service, repo, "Second").id)
     assert second.workspace_kind == WorkspaceKind.direct_folder
+
+
+FOLDER_BUSY_NOTICE = "Another task is working in this folder, so this one works in a worktree."
+
+
+def folder_busy_notices(service: CodingService, session_id: str) -> list[str]:
+    return [event.text for event in service.events(session_id).items if event.data.get("reason") == "folder_busy"]
+
+
+@pytest.mark.parametrize(
+    "mode", [{}, {"workspace_mode": WorkspaceMode.in_place, "workspace_mode_is_default": True}],
+    ids=["server-default", "client-default"],
+)
+def test_a_default_local_task_on_a_busy_repository_works_in_a_worktree(tmp_path: Path, mode: dict) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    engine.block_until_release = True
+    service = service_with(tmp_path, engine)
+    try:
+        first = in_place(service, repo, "First")
+        assert engine.started.wait(timeout=3)
+
+        second = service.create_session(
+            SessionCreateRequest(path=str(repo), prompt="Second", **mode), CREDS, "fake", "fake-model",
+        )
+        assert second.workspace_mode == WorkspaceMode.worktree
+        assert folder_busy_notices(service, second.id) == [FOLDER_BUSY_NOTICE]
+        # An explicit Local choice never silently moves; it is refused.
+        with pytest.raises(RuntimeError, match="choose Worktree"):
+            in_place(service, repo, "Third")
+    finally:
+        engine.release_events.set()
+    session = wait_for_workspace(service, second.id)
+    assert session.workspace_kind == WorkspaceKind.git_worktree
+    assert Path(session.workspace_path) != repo.resolve()
+    wait_for_status(service, first.id, SessionStatus.completed)
+    # A free folder keeps the default and says nothing.
+    engine.block_until_release = False
+    fourth = service.create_session(SessionCreateRequest(path=str(repo), prompt="Fourth"), CREDS, "fake", "fake-model")
+    assert fourth.workspace_mode == WorkspaceMode.in_place
+    assert folder_busy_notices(service, fourth.id) == []
+
+
+def test_a_default_local_task_moves_to_a_worktree_while_the_folder_is_being_updated(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    first = wait_for_status(service, in_place(service, repo, "First").id, SessionStatus.completed)
+
+    with service._maintenance_session(first.id, "busy"):
+        second = service.create_session(SessionCreateRequest(path=str(repo), prompt="Second"), CREDS, "fake", "fake-model")
+
+    assert second.workspace_mode == WorkspaceMode.worktree
+    assert folder_busy_notices(service, second.id) == [FOLDER_BUSY_NOTICE]
+
+
+def test_a_busy_folder_without_git_still_refuses_a_second_local_task(tmp_path: Path) -> None:
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    engine = FakeEngine()
+    engine.block_until_release = True
+    service = service_with(tmp_path, engine)
+    try:
+        first = in_place(service, folder, "First")
+        assert engine.started.wait(timeout=3)
+        with pytest.raises(RuntimeError, match="Another task is working in this folder"):
+            service.create_session(SessionCreateRequest(path=str(folder), prompt="Second"), CREDS, "fake", "fake-model")
+    finally:
+        engine.release_events.set()
+    wait_for_status(service, first.id, SessionStatus.completed)
 
 
 def test_a_follow_up_waits_while_another_in_place_task_runs_in_the_repository(tmp_path: Path) -> None:
@@ -409,7 +479,9 @@ def test_committing_an_in_place_project_task_commits_in_the_users_repositories(t
         service.apply_to_source(session.id)
 
 
-def test_in_place_project_tasks_are_refused_where_they_cannot_work(tmp_path: Path) -> None:
+def test_in_place_project_tasks_are_refused_where_they_cannot_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     service = service_with(tmp_path, FakeEngine())
     project, _, _ = two_repo_project(service, tmp_path)
     with pytest.raises(ValueError, match="Branch choices"):
@@ -421,9 +493,17 @@ def test_in_place_project_tasks_are_refused_where_they_cannot_work(tmp_path: Pat
         default_engine_id="fake",
         default_model="fake-model",
     ))
-    with pytest.raises(WorkspaceError, match="lib has no checkout on this computer"):
+    with pytest.raises(WorkspaceError, match="lib has no checkout on this computer") as raised:
         start_project_task(service, remote.id)
+    assert (raised.value.reason, raised.value.folder) == (WorkspaceReasonCode.no_local_checkout, "lib")
     assert service.list_sessions().items == []
+
+    # Project validation keeps one repository per project; a folder that later
+    # becomes part of another's repository is still refused when preparing.
+    monkeypatch.setattr(service.session_factory.project_workspaces.workspaces, "in_place_root", lambda _path: tmp_path)
+    options = service.workspace_mode_options(project.id, None)
+    assert options.in_place_unavailable_code == WorkspaceReasonCode.shared_repository
+    assert options.in_place_unavailable_folder is None
 
 
 def test_a_project_of_folders_without_git_works_in_place_and_cannot_use_a_worktree(tmp_path: Path) -> None:
@@ -442,15 +522,18 @@ def test_a_project_of_folders_without_git_works_in_place_and_cannot_use_a_worktr
     assert options.supported == [WorkspaceMode.in_place]
     assert options.default == WorkspaceMode.in_place
     assert "Notes: This folder isn't a Git repository" in (options.worktree_unavailable_reason or "")
+    assert options.worktree_unavailable_code == WorkspaceReasonCode.not_a_repository
+    assert options.worktree_unavailable_folder == "Notes"
     created = service.create_session(SessionCreateRequest(project_id=notes.id, prompt="Go"), CREDS, "fake", "fake-model")
     session = wait_for_status(service, created.id, SessionStatus.completed)
     assert session.workspace_mode == WorkspaceMode.in_place
     assert Path(session.workspaces[0].workspace_path) == plain.resolve()
-    with pytest.raises(WorkspaceError, match="Notes: This folder isn't a Git repository"):
+    with pytest.raises(WorkspaceError, match="Notes: This folder isn't a Git repository") as raised:
         service.create_session(
             SessionCreateRequest(project_id=notes.id, prompt="Isolate", workspace_mode=WorkspaceMode.worktree),
             CREDS, "fake", "fake-model",
         )
+    assert (raised.value.reason, raised.value.folder) == (WorkspaceReasonCode.not_a_repository, "Notes")
 
 
 def test_a_project_default_of_local_falls_back_where_it_cannot_apply(
@@ -490,6 +573,28 @@ def test_a_project_task_and_a_folder_task_cannot_both_work_in_one_repository(tmp
             in_place(service, api)
     finally:
         engine.release_events.set()
+    wait_for_status(service, first.id, SessionStatus.completed)
+
+
+def test_a_project_default_of_local_moves_to_a_worktree_when_a_repository_is_busy(tmp_path: Path) -> None:
+    engine = FakeEngine()
+    engine.block_until_release = True
+    service = service_with(tmp_path, engine)
+    project, _, api = two_repo_project(service, tmp_path, default_workspace_mode=WorkspaceMode.in_place)
+    try:
+        # One busy repository is enough: the task cannot work in place in it.
+        first = in_place(service, api, "First")
+        assert engine.started.wait(timeout=3)
+
+        second = service.create_session(SessionCreateRequest(project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model")
+        assert second.workspace_mode == WorkspaceMode.worktree
+        assert folder_busy_notices(service, second.id) == [FOLDER_BUSY_NOTICE]
+        with pytest.raises(RuntimeError, match="choose Worktree"):
+            start_project_task(service, project.id)
+    finally:
+        engine.release_events.set()
+    session = wait_for_status(service, second.id, SessionStatus.completed)
+    assert {item.workspace_kind for item in session.workspaces} == {WorkspaceKind.git_worktree}
     wait_for_status(service, first.id, SessionStatus.completed)
 
 

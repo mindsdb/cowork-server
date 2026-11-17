@@ -119,6 +119,7 @@ class CodingService(
             control_store,
         )
         self.project_store = CodeProjectStore(root, self.control.local_computer.id)
+        self._rebind_retired_local_projects()
         self.skill_library = SkillLibraryService(root, self.project_store, self.workspaces.git)
         self.projects = CodeProjectService(
             root,
@@ -251,6 +252,9 @@ class CodingService(
                     exc,
                 )
                 project = None
+            if session.computer_id in self.control.retired_local_computer_ids:
+                session.computer_id = self.control.local_computer.id
+                self.store.save_session(session, touch_updated_at=False)
             snapshot = self.control.migrate_session(session, project)
             if not session.task_id or not session.run_id or not session.computer_id:
                 session.task_id = snapshot.task.id
@@ -270,6 +274,26 @@ class CodingService(
             daemon=True,
         )
         self._expiry_thread.start()
+
+    def _rebind_retired_local_projects(self) -> None:
+        """Point project folders recorded against a retired local computer at the live one."""
+        retired = self.control.retired_local_computer_ids
+        if not retired:
+            return
+        local_id = self.control.local_computer.id
+
+        def rebind(project: CodeProject) -> None:
+            for resource in project.resources:
+                if resource.computer_id in retired:
+                    resource.computer_id = local_id
+
+        affected = {
+            project.id: rebind
+            for project in self.project_store.list()
+            if any(resource.computer_id in retired for resource in project.resources)
+        }
+        if affected:
+            self.project_store.update_many(affected)
 
     def expire_stale_state(self) -> None:
         """Mark silent computers offline and abandoned leases recovering."""
@@ -336,7 +360,7 @@ class CodingService(
             try:
                 self.session_factory.in_place_roots(project, None, path)
             except (WorkspaceError, ValueError) as exc:
-                options = without_in_place(options, str(exc))
+                options = without_in_place(options, exc)
         if project is not None:
             problem = self.project_workspaces.worktree_problem(project)
             return without_worktree(options, problem) if problem else options
@@ -348,7 +372,7 @@ class CodingService(
             inspection = self.workspaces.inspect(path)
             options = without_worktree(
                 options,
-                str(exc),
+                exc,
                 can_initialize_git=inspection.is_directory and not inspection.is_git and not _org_mode(),
             )
         return options
@@ -831,7 +855,7 @@ class CodingService(
     def _apply_config_update(session: CodingSession, values: dict) -> None:
         if any(
             name in values and values[name] != getattr(session, name)
-            for name in ("permission_mode", "network_access", "additional_dirs")
+            for name in ("permission_mode", "network_access", "additional_dirs", "writes_allowed")
         ):
             session.command_approval_grants = []
         for name, value in values.items():
@@ -887,6 +911,21 @@ class CodingService(
                 self._maintenance.discard(session_id)
                 self._maintenance_roots.pop(session_id, None)
 
+
+_coding_service_lock = threading.Lock()
+
+
 @lru_cache(maxsize=1)
-def get_coding_service() -> CodingService:
+def _cached_coding_service() -> CodingService:
     return CodingService(Path(get_app_settings().coding.root_dir))
+
+
+def get_coding_service() -> CodingService:
+    # lru_cache does not serialize a miss: concurrent first requests would each
+    # build a CodingService, each with its own local computer and expiry thread
+    # that marks the other's local computer offline.
+    with _coding_service_lock:
+        return _cached_coding_service()
+
+
+get_coding_service.cache_clear = _cached_coding_service.cache_clear  # type: ignore[attr-defined]
