@@ -1,28 +1,28 @@
 """Inline Markdown on the page: the cases shared with the editor, tags that always nest, and linear time."""
 from __future__ import annotations
 
-import gc
 import hashlib
 import json
 import random
 import re
-import time
 from pathlib import Path
 
 import pytest
 
 from cowork.docs.render import inline_html
+from tests._linear_time import MAX_LINEAR_GROWTH, growth
 
 # The editor (cowork docModel.inlineToHtml) runs an identical copy of this file.
-_CASES_FILE = Path(__file__).parent / "fixtures" / "docs_inline" / "cases.json"
-_SHARED = json.loads(_CASES_FILE.read_text(encoding="utf-8"))
+_CASES_BYTES = (Path(__file__).parent / "fixtures" / "docs_inline" / "cases.json").read_bytes()
+_SHARED = json.loads(_CASES_BYTES)
 # The same digest is pinned in cowork's docModel.inline.test.js.
-_CASES_SHA256 = "9d979b16ea87cc93abe4e00acdd19f1927c2db08bdd0cd290aeb6b440970603f"
+_CASES_SHA256 = "6297ddd5c762e12e18f2353dfce5869093267e0458001f22d71ad7256bd5cf0c"
 
 
-def test_the_shared_cases_are_the_copy_the_editor_runs():
-    """Changed here alone, the page and the editor drift apart unseen: copy the file to cowork and pin the new digest in both."""
-    assert hashlib.sha256(_CASES_FILE.read_bytes()).hexdigest() == _CASES_SHA256
+def test_the_shared_cases_are_the_pinned_copy():
+    """A change to the cases stops here until its digest is pinned: the reminder to copy the file to cowork
+    and pin the same digest there. Neither suite reads the other repo's copy."""
+    assert hashlib.sha256(_CASES_BYTES).hexdigest() == _CASES_SHA256
 
 
 @pytest.mark.parametrize("case", _SHARED["cases"], ids=[c["name"] for c in _SHARED["cases"]])
@@ -48,8 +48,8 @@ def _nests(markup: str) -> bool:
 # Pieces that open, close or break marks, and characters CommonMark counts as white space or punctuation.
 _PIECES = [
     "*", "**", "***", "_", "__", "~", "~~", "`", "\\", "\\*", "\\_", "\\`", "[", "]", "(", ")", "](", "](http://x)",
-    "](https://", "](mailto:a)", "{{", "}}", "{{date:", "{{ status :", "2026-10-21", " ", "\n", "\r", " ",
-    " ", "　", "a", "b c", "é", "1", ".", "&", "<", '"', "\U0001F600", "\x00",
+    "](https://", "](mailto:a)", "{{", "}}", "{{date:", "{{ status :", "2026-10-21", " ", "\n", "\r", "\u00a0",
+    "\u2028", "\u3000", "a", "b c", "é", "1", ".", "&", "<", '"', "\U0001F600", "\x00",
 ]
 
 
@@ -64,49 +64,27 @@ def test_any_text_renders_to_tags_that_nest_and_nothing_else():
         assert "<" not in _TAG.sub("", out), repr(text)
 
 
-@pytest.mark.parametrize("text", [
-    "*a " * 33_334,
-    "_a " * 33_334,
-    "[" * 100_000,
-    "[a](http://" * 9_091,
-    "{{date:" * 14_286,
-    "{{date:a" + " " * 100_000,
-    "*a " * 33_334 + "b* " * 33_334,
-    "[" * 50_000 + "[a](http://x)" * 4_000,
-    "[" * 50_000 + "](http://a" * 5_000,
-    "*_" * 50_000,
-    "*a**" * 25_000,
-    "a* " * 33_334 + " *a" * 33_334,
+@pytest.mark.parametrize(("make", "n"), [
+    (lambda n: "*a " * n, 33_334),
+    (lambda n: "_a " * n, 33_334),
+    (lambda n: "[" * n, 100_000),
+    (lambda n: "[a](http://" * n, 9_091),
+    (lambda n: "{{date:" * n, 14_286),
+    (lambda n: "{{date:a" + " " * n, 100_000),
+    (lambda n: "*a " * n + "b* " * n, 16_667),
+    (lambda n: "[" * n + "[a](http://x)" * (n // 12), 50_000),
+    (lambda n: "[" * n + "](http://a" * (n // 10), 50_000),
+    (lambda n: "*_" * n, 50_000),
+    (lambda n: "*a**" * n, 25_000),
+    (lambda n: "a* " * n + " *a" * n, 16_667),
+    (lambda n: " *a" * n + "b" + "*" * n, 25_000),
+    (lambda n: "*" * n + "a" + "b* " * n, 25_000),
 ], ids=[
     "italic-star", "italic-underscore", "link-words", "link-address", "chip-value", "chip-spaces",
     "nested", "brackets-before-links", "brackets-before-addresses", "mixed-marks", "rule-of-3",
-    "closers-before-openers",
+    "closers-before-openers", "one-run-opens-many", "one-run-closes-many",
 ])
-def test_adversarial_marks_render_in_linear_time(text):
-    """A doc write renders every block under the doc lock; quadratic readings took 5-25 s on inputs like these."""
-    start = time.perf_counter()
-    inline_html(text)
-    assert time.perf_counter() - start < 1.0
-
-
-def _seconds(text: str) -> float:
-    """The best of three runs, without the collector, whose passes grow with the rest of the test session's heap."""
-    best = float("inf")
-    gc.disable()
-    try:
-        for _ in range(3):
-            start = time.perf_counter()
-            inline_html(text)
-            best = min(best, time.perf_counter() - start)
-    finally:
-        gc.enable()
-    return best
-
-
-@pytest.mark.parametrize("make", [
-    lambda n: " *a" * n + "b" + "*" * n,
-    lambda n: "*" * n + "a" + "b* " * n,
-], ids=["one-run-opens-many", "one-run-closes-many"])
-def test_a_long_run_paired_many_times_renders_in_linear_time(make):
-    """Rebuilding a run's tags on every pairing grew with the square of the run (10 s at 320k marks)."""
-    assert _seconds(make(80_000)) < 8 * _seconds(make(20_000))
+def test_adversarial_marks_render_in_linear_time(make, n):
+    """A doc write renders every block under the doc lock; quadratic readings took 5-25 s on 100k characters
+    like these, and rebuilding a long run's tags on every pairing took 10 s at 320k marks."""
+    assert growth(inline_html, small=make(n // 10), large=make(n)).ratio < MAX_LINEAR_GROWTH

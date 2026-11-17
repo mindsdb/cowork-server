@@ -5,7 +5,6 @@ from __future__ import annotations
 import html
 import math
 import re
-import string
 import unicodedata
 from datetime import date
 from typing import Any
@@ -149,7 +148,8 @@ def changed_lines(doc: dict[str, Any], touched: dict[str, list[str]]) -> str:
 # verbatim; only these marks escape; a link is inline, has words, and its
 # address is http(s):// or mailto: plus at least one character, up to ")";
 # strike is exactly two tildes; no raw HTML, entities, autolinks or hard breaks.
-_TOKEN = re.compile(r"\\[*`~\[\]{}_\\]|[`\[\]{]|\*+|_+|~+")
+_ESCAPABLE = r"[*`~\[\]{}_\\]"
+_TOKEN = re.compile(rf"\\{_ESCAPABLE}|[`\[\]{{]|\*+|_+|~+")
 _BACKTICK = re.compile("`")
 _BRACE = re.compile(r"\}")
 # CommonMark's white space: tab, line feed, form feed, carriage return and the Unicode Zs spaces.
@@ -158,20 +158,18 @@ _SPACE = f"[{re.escape(_SPACE_CHARS)}]"
 _CHIP_HEAD = re.compile(r"\{\{" + _SPACE + r"*(date|status|user)" + _SPACE + "*:")
 _LINK_HEAD = re.compile(r"\]\((?:https?://|mailto:)")
 _HREF_END = re.compile(r"[)\x00-\x20\x7f]")  # where CommonMark ends an address not in <…>
-_HREF_ESCAPE = re.compile(r"\\([*`~\[\]{}_\\])")
-
-# A character beside a run of marks is white space (0), punctuation (1: CommonMark's
-# Unicode P and S categories) or anything else (2). The text's edges count as white space.
-# P and S come from Python's Unicode tables; the editor's may be newer and class a
-# character assigned since then apart.
-_ASCII_CLASS = {chr(c): 0 if chr(c) in _SPACE_CHARS else 1 if chr(c) in string.punctuation else 2 for c in range(128)}
+_HREF_ESCAPE = re.compile(rf"\\({_ESCAPABLE})")
+_EM, _STRONG, _STRIKE = ("<em>", "</em>"), ("<strong>", "</strong>"), ("<s>", "</s>")
 
 
 def _char_class(ch: str) -> int:
-    cls = _ASCII_CLASS.get(ch)
-    if cls is None:
-        cls = 0 if ch in _SPACE_CHARS else 1 if unicodedata.category(ch)[0] in "PS" else 2
-    return cls
+    """A character beside a run of marks: white space (0), punctuation (1: CommonMark's
+    Unicode P and S categories) or anything else (2).
+
+    P and S come from Python's Unicode tables; the editor's may be newer and class a
+    character assigned since then apart.
+    """
+    return 0 if ch in _SPACE_CHARS else 1 if unicodedata.category(ch)[0] in "PS" else 2
 
 
 def _flanks(before: int, after: int, underscore: bool) -> tuple[bool, bool]:
@@ -186,6 +184,16 @@ def _flanks(before: int, after: int, underscore: bool) -> tuple[bool, bool]:
 
 
 _FLANKS = {u: tuple(_flanks(b, a, u) for b in range(3) for a in range(3)) for u in (False, True)}
+
+
+def _escape(text: str) -> str:
+    """Text for HTML, escaped as the editor's escapeHtml does."""
+    return html.escape(text, quote=False).replace('"', "&quot;")
+
+
+def _text_html(text: str) -> str:
+    """Plain text as HTML, a line feed as the line break the editor shows."""
+    return _escape(text).replace("\n", "<br>")
 
 
 class _Next:
@@ -205,16 +213,6 @@ class _Next:
         return self._at
 
 
-def _text_html(text: str) -> str:
-    """Plain text as HTML: escaped, a line feed as the line break the editor shows."""
-    return html.escape(text, quote=False).replace("\n", "<br>")
-
-
-def _attr(value: str) -> str:
-    """``value`` escaped for a double-quoted attribute."""
-    return html.escape(value, quote=False).replace('"', "&quot;")
-
-
 class _Atom:
     """Text replaced by markup of its own: an escape, a code span, a chip or a link's end."""
 
@@ -230,13 +228,13 @@ class _Atom:
 class _Bracket:
     """A "[" that opens a link once its "](address)" is found."""
 
-    __slots__ = ("start", "end", "runs", "seq", "href")
+    __slots__ = ("start", "end", "runs", "href")
 
-    def __init__(self, start: int, runs: _Run, seq: int) -> None:
-        self.start, self.end, self.runs, self.seq, self.href = start, start + 1, runs, seq, None
+    def __init__(self, start: int, runs: _Run) -> None:
+        self.start, self.end, self.runs, self.href = start, start + 1, runs, None
 
     def html(self) -> str:
-        return "[" if self.href is None else f'<a href="{_attr(self.href)}">'
+        return "[" if self.href is None else f'<a href="{_escape(self.href)}">'
 
 
 class _Run:
@@ -253,8 +251,9 @@ class _Run:
         self.length = self.left = end - start
         self.can_open, self.can_close = can_open, can_close
         self.prev, self.next = prev, None
-        self.opens: list[str] = []  # the tags it opens after its marks, innermost first
-        self.closes: list[str] = []  # the tags it closes before its marks, innermost first
+        # The tags it opens after its marks and closes before them, innermost first; most runs pair with nothing.
+        self.opens: list[str] | None = None
+        self.closes: list[str] | None = None
 
     def pairs_with(self, closer: _Run) -> bool:
         # CommonMark's rule of 3: "*a**b*" is one emphasis, not two.
@@ -263,7 +262,9 @@ class _Run:
         )
 
     def html(self) -> str:
-        return "".join(self.closes) + self.mark * self.left + "".join(reversed(self.opens))
+        marks = self.mark * self.left
+        closes = "".join(self.closes) if self.closes else ""
+        return closes + marks + "".join(reversed(self.opens)) if self.opens else closes + marks
 
     def drop(self) -> None:
         self.prev.next = self.next
@@ -271,7 +272,7 @@ class _Run:
             self.next.prev = self.prev
 
 
-def _pair(bottom: _Run) -> None:
+def _pair_runs(bottom: _Run) -> None:
     """Pair the live runs above ``bottom`` into emphasis, then drop them (CommonMark's "process emphasis")."""
     # Per kind of closer, the start at or before which no opener pairs with it.
     floor: dict[tuple[str, bool, int], int] = {}
@@ -281,34 +282,36 @@ def _pair(bottom: _Run) -> None:
             closer = closer.next
             continue
         kind = (closer.mark, closer.can_open, closer.length % 3)
-        lowest = floor.get(kind, -1)
+        lowest = floor.get(kind, bottom.start)
         opener = closer.prev
-        while opener is not bottom and opener.start > lowest and not opener.pairs_with(closer):
+        while opener.start > lowest and not opener.pairs_with(closer):
             opener = opener.prev
-        if opener is bottom or opener.start <= lowest:
+        if opener.start <= lowest:
             floor[kind] = closer.prev.start
-            after = closer.next
             if not closer.can_open:
                 closer.drop()
-            closer = after
+            closer = closer.next
             continue
         used = 2 if opener.left >= 2 and closer.left >= 2 else 1
-        tag = "s" if closer.mark == "~" else "strong" if used == 2 else "em"
+        open_tag, close_tag = _STRIKE if closer.mark == "~" else _STRONG if used == 2 else _EM
         opener.left -= used
         closer.left -= used
-        opener.opens.append(f"<{tag}>")
-        closer.closes.append(f"</{tag}>")
+        if opener.opens is None:
+            opener.opens = []
+        opener.opens.append(open_tag)
+        if closer.closes is None:
+            closer.closes = []
+        closer.closes.append(close_tag)
         opener.next, closer.prev = closer, opener  # the runs between pair with nothing now
         if not opener.left:
             opener.drop()
         if not closer.left:
-            after = closer.next
             closer.drop()
-            closer = after
+            closer = closer.next
     bottom.next = None
 
 
-def _chip(s: str, i: int, brace: _Next) -> _Atom | None:
+def _read_chip(s: str, i: int, brace: _Next) -> _Atom | None:
     if not (head := _CHIP_HEAD.match(s, i)):
         return None
     q = brace(head.end())  # the value runs to the first "}"
@@ -317,7 +320,7 @@ def _chip(s: str, i: int, brace: _Next) -> _Atom | None:
     kind, raw = head.group(1), s[head.end():q]
     value = raw.strip(_SPACE_CHARS) or raw[-1]  # at least one character, as typed
     label = _date_label(value) if kind == "date" else value
-    return _Atom(i, q + 2, f'<span class="chip chip-{kind}">{html.escape(label, quote=False)}</span>')
+    return _Atom(i, q + 2, f'<span class="chip chip-{kind}">{_escape(label)}</span>')
 
 
 def _link_end(s: str, q: int, href_end: _Next) -> tuple[str, int] | None:
@@ -330,29 +333,22 @@ def _link_end(s: str, q: int, href_end: _Next) -> tuple[str, int] | None:
     return _HREF_ESCAPE.sub(r"\1", s[q + 2:e]), e + 1
 
 
-def inline_html(text: str) -> str:
-    """A block's inline Markdown as HTML: escapes, code, links, emphasis, strike and chips.
-
-    Every text run is escaped, so text never becomes markup, and only
-    http(s):// and mailto: addresses become links.
-    """
-    s = (text or "").replace("\x00", "")
+def _read_inline(s: str) -> list[_Atom | _Bracket | _Run]:
+    """What replaces parts of ``s``, in text order: atoms (escapes, code spans, chips, a
+    link's end) with their HTML, "[" brackets, and delimiter runs."""
     n = len(s)
-    items: list[_Atom | _Bracket | _Run] = []  # what replaces parts of the text, in text order
+    items: list[_Atom | _Bracket | _Run] = []
     base = top = _Run(-1, -1, "", False, False, None)  # below every live run
     backtick, brace, href_end = _Next(_BACKTICK, s), _Next(_BRACE, s), _Next(_HREF_END, s)
     brackets: list[_Bracket] = []
-    seq = links_from = 0  # a "[" numbered below links_from is before a link and opens none: links never nest
     pos = 0
-    for m in _TOKEN.finditer(s):
-        i, j = m.span()
-        if i < pos:  # inside a code span, chip or link address read already
-            continue
-        c, pos = s[i], j
+    while m := _TOKEN.search(s, pos):
+        i, pos = m.span()
+        c = s[i]
         if c in "*_~":
             if c == "~" and pos - i != 2:
                 continue
-            before = _char_class(s[i - 1]) if i else 0
+            before = _char_class(s[i - 1]) if i else 0  # the text's edges count as white space
             after = _char_class(s[pos]) if pos < n else 0
             can_open, can_close = _FLANKS[c == "_"][before * 3 + after]
             if can_open or can_close:
@@ -361,32 +357,46 @@ def inline_html(text: str) -> str:
                 top = run
                 items.append(run)
         elif c == "\\":
-            items.append(_Atom(i, pos, html.escape(s[i + 1])))
+            items.append(_Atom(i, pos, s[i + 1]))  # no escapable mark is special to HTML
         elif c == "`":
             k = backtick(pos)  # the code runs to the next backtick
             if pos < k < n:
-                items.append(_Atom(i, k + 1, f"<code>{html.escape(s[pos:k], quote=False)}</code>"))
+                items.append(_Atom(i, k + 1, f"<code>{_escape(s[pos:k])}</code>"))
                 pos = k + 1
         elif c == "{":
-            if chip := _chip(s, i, brace):
+            if chip := _read_chip(s, i, brace):
                 items.append(chip)
                 pos = chip.end
         elif c == "[":
-            brackets.append(_Bracket(i, top, seq))
+            brackets.append(_Bracket(i, top))
             items.append(brackets[-1])
-            seq += 1
         elif brackets:  # "]": the last "[" pairs with it or with none
             opener = brackets.pop()
             # A link needs words: "[](…)" would be a link no one sees.
-            if opener.seq >= links_from and i > opener.end and (link := _link_end(s, i, href_end)):
+            if i > opener.end and (link := _link_end(s, i, href_end)):
                 opener.href, pos = link
                 items.append(_Atom(i, pos, "</a>"))
-                _pair(opener.runs)
+                _pair_runs(opener.runs)
                 top = opener.runs
-                links_from = seq
-    _pair(base)
-    out, done = [], 0
+                brackets.clear()  # links never nest: a "[" before this link opens none
+    _pair_runs(base)
     for item in items:
+        if item.__class__ is _Run:  # unlinked, the runs free without the cycle collector
+            item.prev = item.next = None
+    return items
+
+
+def inline_html(text: str) -> str:
+    """A block's inline Markdown as HTML: escapes, code, links, emphasis, strike and chips.
+
+    Every text run is escaped, so text never becomes markup, and only
+    http(s):// and mailto: addresses become links.
+    """
+    s = (text or "").replace("\x00", "")
+    if not _TOKEN.search(s):
+        return _text_html(s)
+    out, done = [], 0
+    for item in _read_inline(s):
         if done < item.start:
             out.append(_text_html(s[done:item.start]))
         out.append(item.html())
