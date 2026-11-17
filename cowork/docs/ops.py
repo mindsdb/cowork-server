@@ -377,6 +377,12 @@ def _op_update(op: dict[str, Any], ctx: _Ctx) -> dict[str, Any]:
     nb["id"] = b["id"]
     tab["blocks"][i] = nb
     ctx.mark(tab, nb)
+    if nb["type"] == "table" and b["type"] == "table" and "columns" in changes:
+        # A column renamed in place (same id) stays plotted, as update_column keeps it.
+        renamed = {c["id"]: c["name"] for c in nb["columns"]}
+        for c in b["columns"]:
+            if c["id"] in renamed and renamed[c["id"]] != c["name"]:
+                _rename_in_charts(tab, b["id"], c["name"], renamed[c["id"]], ctx)
     return {"tab": tab["id"], "ids": [nb["id"]]}
 
 

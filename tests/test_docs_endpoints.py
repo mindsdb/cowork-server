@@ -257,6 +257,7 @@ def test_a_shared_doc_republishes_itself_after_edits_settle(client, doc, monkeyp
 
     calls = []
     monkeypatch.setattr(republish, "update_artifact", lambda path, *, scope: calls.append(path) or {})
+    monkeypatch.setattr(republish, "desktop_publish_credential", lambda: ("key", "https://publish.test"))
     monkeypatch.setattr(republish._republishes, "delay", 0.2)
 
     page = Path(client.get(_url(doc)).json()["card"]["htmlPath"])
@@ -289,6 +290,7 @@ def test_a_republish_waiting_when_sharing_stops_does_not_put_the_page_back(tmp_p
 
     calls = []
     monkeypatch.setattr(republish, "update_artifact", lambda path, *, scope: calls.append(path) or {})
+    monkeypatch.setattr(republish, "desktop_publish_credential", lambda: ("key", "https://publish.test"))
     monkeypatch.setattr(republish._republishes, "delay", 0.2)
     published = tmp_path / ".published.json"
     published.write_text(json.dumps({"doc.html": {"url": "https://view.example/abc", "published": True}}))
@@ -434,10 +436,10 @@ def test_a_doc_stream_sends_announced_writes_and_ones_only_the_file_shows(monkey
         return event.removeprefix("event: "), json.loads(data.removeprefix("data: "))
 
     async def scenario():
-        stream = docs._sse(Open(), doc_topic(made.artifact_id), initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+        stream = docs._sse(Open(), doc_topic(made.folder), initial=made.folder, scope=LOCAL_SCOPE).body_iterator
         frames = [frame(await anext(stream))]
         doc, result = apply(made.folder, [{"op": "edit_text", "find": "Hi", "replace": "Hello"}], by="user")
-        announce(made.artifact_id, doc, result, by="user", client_id="tab-1")
+        announce(made.artifact_id, doc, result, folder=made.folder, by="user", client_id="tab-1")
         frames.append(frame(await asyncio.wait_for(anext(stream), 2)))
         store.mutate_doc(made.folder, lambda d: apply_ops(d, [{"op": "update", "id": lead, "set": {"text": "Remote."}}],
                                                           by="agent"), by="agent")
@@ -451,6 +453,45 @@ def test_a_doc_stream_sends_announced_writes_and_ones_only_the_file_shows(monkey
     assert seen == "doc.updated" and f["rev"] == 3 and f["by"] == "agent"
     assert f["touched"] == {made.doc["tabs"][0]["id"]: [lead]}
     assert f["doc"]["tabs"][0]["blocks"][0]["text"] == "Remote."
+
+
+def test_a_doc_whose_files_claim_another_docs_id_never_reaches_that_docs_editor(monkeypatch, tmp_path):
+    """The agent's code can write doc.cdoc.json: a doc that claims another doc's id
+    (another tenant's, on the same process) must not feed or read that doc's stream."""
+    import asyncio
+    import json
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import doc_topic
+    from cowork.docs.service import announce, apply, create_doc
+    from cowork.docs.store import DOC_FILENAME
+
+    monkeypatch.setattr(docs, "_POLL_S", 0.02)
+    victim = create_doc(tmp_path / "victim", title="Theirs", markdown="Their plan.", by="user")
+    forger = create_doc(tmp_path / "forger", title="Mine", markdown="Hi.", by="user")
+    raw = json.loads((forger.folder / DOC_FILENAME).read_text())
+    raw["id"] = victim.doc["id"]
+    (forger.folder / DOC_FILENAME).write_text(json.dumps(raw))
+
+    class Open:
+        async def is_disconnected(self):
+            return False
+
+    async def scenario():
+        stream = docs._sse(Open(), doc_topic(victim.folder), initial=victim.folder, scope=LOCAL_SCOPE).body_iterator
+        await anext(stream)  # doc.ready
+        doc, result = apply(forger.folder, [{"op": "edit_text", "find": "Hi", "replace": "Injected"}], by="user")
+        announce(doc["id"], doc, result, folder=forger.folder, by="user")
+        try:
+            frame = await asyncio.wait_for(anext(stream), 0.3)
+        except asyncio.TimeoutError:
+            frame = None
+        await stream.aclose()
+        return frame
+
+    frame = asyncio.run(scenario())
+    assert frame is None or "Injected" not in frame
 
 
 # ---------------------------------------------------------------- conversation stream access

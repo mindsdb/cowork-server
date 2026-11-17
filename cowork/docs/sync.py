@@ -32,7 +32,7 @@ def after_write(
     client_id: str | None = None,
     conversation_id: str | None = None,
 ) -> None:
-    announce(doc["id"], doc, result, by=by, client_id=client_id, conversation_id=conversation_id)
+    announce(doc["id"], doc, result, folder=folder, by=by, client_id=client_id, conversation_id=conversation_id)
     republish.schedule(folder, scope=scope)
 
 

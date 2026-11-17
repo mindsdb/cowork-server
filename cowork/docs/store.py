@@ -130,6 +130,9 @@ class _DocLock:
         self._depth += 1
 
     def _lock_file(self) -> None:
+        if self._folder.is_symlink():
+            # Never followed: the lock's folder would be made wherever it points.
+            raise DocError("no_doc", "this doc no longer exists.")
         try:
             # Made here, without its parents: artifact_lock makes them, and a
             # write racing the doc's deletion would bring its folder back.
@@ -149,12 +152,16 @@ class _DocLock:
             self._local.release()
 
 
-def _lock_for(path: Path) -> _DocLock:
-    key = str(path.resolve())
+def _lock_for(folder: Path) -> _DocLock:
+    # Keyed by the doc's folder, its parents resolved but not the folder or the
+    # doc file: a link planted there must not move the lock, and the
+    # .revisions folder it makes, outside the artifact.
+    folder = Path(folder)
+    key = str(folder.parent.resolve() / folder.name)
     with _locks_guard:
         lock = _locks.get(key)
         if lock is None:
-            lock = _locks[key] = _DocLock(Path(key).parent)
+            lock = _locks[key] = _DocLock(Path(key))
         return lock
 
 
@@ -291,6 +298,8 @@ def _read_json(folder: Path, *, missing: DocError) -> Any:
         return json.loads(raw.decode("utf-8"))
     except ValueError as exc:
         raise DocError("bad_doc", f"{name} is not valid JSON ({exc}).") from exc
+    except RecursionError as exc:
+        raise DocError("bad_doc", f"{name} is nested too deeply to read.") from exc
 
 
 def load_doc(folder: Path) -> Doc:
@@ -453,7 +462,7 @@ def doc_lock(folder: Path) -> _DocLock:
     Re-entrant: a write may be made while holding it. Raises DocError("busy")
     when another process has held it for longer than ``artifact_lock`` waits.
     """
-    return _lock_for(doc_file(folder))
+    return _lock_for(folder)
 
 
 def with_doc(folder: Path, fn: Callable[[Doc], T]) -> T:
@@ -481,7 +490,7 @@ def mutate_doc(
     from it can't be overtaken by an older one.
     """
     path = doc_file(folder)
-    with _lock_for(path):
+    with _lock_for(folder):
         current = load_doc(folder)
         new_doc, result = change(current)
         if new_doc is current:
