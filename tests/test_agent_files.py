@@ -25,7 +25,8 @@ from cowork.harnesses.anton_harness.agent_files import (
     read_conversation_attachments,
 )
 from cowork.harnesses.anton_harness.figure_sources import SourceKind, ToolInput, TurnStep, find_figure_sources
-from cowork.services.files import FileService, attachment_purpose
+from _fakes import stored_file
+from cowork.services.files import attachment_purpose
 
 
 @pytest.fixture
@@ -547,7 +548,7 @@ class TestTheConversationsAttachments:
             yield ScopedSession(session, LOCAL_SCOPE)
 
     def _attach(self, scoped: ScopedSession, *, purpose: str):
-        return FileService(scoped).create_file_from_bytes(
+        return stored_file(scoped=scoped,
             filename="stock.csv", content_type="text/csv", data=b"qty\n250\n", purpose=purpose,
         )
 

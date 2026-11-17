@@ -1,0 +1,22 @@
+{
+  "description": "POST {router}/_warm, sent with the person's own credential. prefs carries the time zone and language the app sent when they look like an IANA zone and a BCP 47 tag. A key left out keeps what the router holds.",
+  "examples": {
+    "time zone and language": {
+      "where": "POST /_warm",
+      "kind": "request",
+      "body": {
+        "prefs": {
+          "timezone": "America/Los_Angeles",
+          "locale": "en-US"
+        }
+      }
+    },
+    "nothing to change": {
+      "where": "POST /_warm",
+      "kind": "request",
+      "body": {
+        "prefs": {}
+      }
+    }
+  }
+}

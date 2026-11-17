@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+import pytest
 
 import cowork.schedule_timing as schedule_timing
 from cowork.schedule_timing import (
@@ -102,6 +104,15 @@ def test_hourly_advance_is_elapsed_time():
     first = datetime(2026, 6, 25, 10, 15, tzinfo=timezone.utc)
     second = advance_occurrence(Cadence.hourly, first, "America/New_York")
     assert second == datetime(2026, 6, 25, 11, 15, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    ("cadence", "minutes"), [(Cadence.every_15_minutes, 15), (Cadence.every_30_minutes, 30)],
+)
+def test_short_cadences_advance_by_elapsed_time_across_a_dst_change(cadence, minutes):
+    # 2026-11-01 06:00 UTC is when New York falls back an hour.
+    first = datetime(2026, 11, 1, 5, 50, tzinfo=timezone.utc)
+    assert advance_occurrence(cadence, first, "America/New_York") == first + timedelta(minutes=minutes)
 
 
 def test_next_future_occurrence_steps_until_after_now():

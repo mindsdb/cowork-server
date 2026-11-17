@@ -19,6 +19,8 @@ from fastapi.testclient import TestClient
 from cowork.api.v1 import artifact_scope
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
+from _async_stub import awaitable
+from draft_host_support import reviewed_and_read
 
 
 @pytest.fixture
@@ -41,7 +43,7 @@ def no_resolution(monkeypatch):
     def explode(*_args, **_kwargs):
         raise AssertionError("resolution reached with an unvalidated identity")
 
-    monkeypatch.setattr("cowork.api.v1.artifact_scope._resolve_in", explode)
+    monkeypatch.setattr("cowork.api.v1.artifact_scope.artifact_folders_holding", explode)
 
 
 @pytest.mark.parametrize(
@@ -66,11 +68,11 @@ def test_both_uuid_spellings_address_the_same_artifact(client, monkeypatch):
     the canonical 32-hex spelling either way — that is what metadata carries."""
     seen: list[str] = []
 
-    def capture(_sources, artifact_id):
+    def capture(_sources, *, artifact_id):
         seen.append(artifact_id)
         raise AssertionError("stop here; the id is what this test is about")
 
-    monkeypatch.setattr("cowork.api.v1.artifact_scope._resolve_in", capture)
+    monkeypatch.setattr("cowork.api.v1.artifact_scope.artifact_folders_holding", capture)
 
     dashed = "0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b"
     undashed = dashed.replace("-", "")
@@ -105,11 +107,11 @@ def test_project_root_discovery_receives_the_scoped_catalog_id(monkeypatch):
     monkeypatch.setattr(artifact_scope, "_refuse_a_persons_project_in_the_operator_view", lambda *_args: None)
     monkeypatch.setattr(
         artifact_scope,
-        "artifacts_sources_for_project",
-        lambda _session, project_id, **_kwargs: seen.append(project_id) or [],
+        "plan_project_roots",
+        lambda _session, project_id, **_kwargs: seen.append(project_id) or "plan",
     )
 
-    assert artifact_scope._sources_for_project_ref(object(), request_ref) == []
+    assert artifact_scope._plan_for_project_ref(object(), project_ref=request_ref) == "plan"
     assert seen == [server_id]
     assert seen[0] is server_id
 
@@ -161,8 +163,8 @@ def served_xlsx(tmp_path, monkeypatch):
         trusted_anchor=project, root_parts=(".anton", "artifacts"),
     )
     monkeypatch.setattr(
-        workspace_ep, "review_artifact_for_request",
-        lambda *_args: (source, folder, {"type": "file"}, True),
+        workspace_ep, "review_artifact_and_read",
+        reviewed_and_read(lambda *_args: (source, folder, {"type": "file"}, True)),
     )
     return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef/model.xlsx"
 
@@ -211,7 +213,7 @@ def cancel_route(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         workspace_ep, "review_artifact_for_request",
-        lambda *_args: (source, folder, {"type": "document"}, True),
+        awaitable(lambda *_args: (source, folder, {"type": "document"}, True)),
     )
     monkeypatch.setattr(workspace_ep, "require_artifact_owner", lambda *_args: {"role": "owner"})
     seen: list[bool] = []
@@ -261,7 +263,7 @@ def release_route(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         workspace_ep, "review_artifact_for_request",
-        lambda *_args: (source, folder, {"type": "document"}, True),
+        awaitable(lambda *_args: (source, folder, {"type": "document"}, True)),
     )
     monkeypatch.setattr(workspace_ep, "require_artifact_owner", lambda *_args: {"role": "owner"})
     seen: list[str] = []
@@ -300,7 +302,7 @@ def test_release_is_refused_without_owner_access(client, tmp_path, monkeypatch):
     def deny(*_args):
         raise _HTTPException(status_code=403, detail="Not the owner")
 
-    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", deny)
+    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", awaitable(deny))
     monkeypatch.setattr(
         workspace_ep, "release_repairs_for_comment",
         lambda *_a, **_k: pytest.fail("release ran without an owner check"),
@@ -349,7 +351,7 @@ def editable_artifact(tmp_path, monkeypatch):
     metadata = {"type": "file", "primary": "brief.md"}
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
-        lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}),
+        awaitable(lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True})),
     )
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 
@@ -386,13 +388,13 @@ def test_the_service_receives_the_resolved_path_on_both_routes(
 
     requested = "docs/notes.md"
     asyncio.run(workspace_ep.artifact_source(
-        "local", "0123456789abcdef0123456789abcdef", session=SimpleNamespace(scope=LOCAL_SCOPE), path=requested,
+        "local", "0123456789abcdef0123456789abcdef", scope=LOCAL_SCOPE, path=requested,
     ))
     body = workspace_ep._SourceUpdateBody(
         content="x", expectedRevisionId="r1", path=requested,
     )
     asyncio.run(workspace_ep.update_artifact_source(
-        "local", "0123456789abcdef0123456789abcdef", body=body, session=SimpleNamespace(scope=LOCAL_SCOPE),
+        "local", "0123456789abcdef0123456789abcdef", body=body, scope=LOCAL_SCOPE,
     ))
 
     assert received == ["docs/notes.md", "docs/notes.md"]
@@ -508,7 +510,7 @@ def reported_source_artifact(request, tmp_path, monkeypatch):
     metadata = dict(request.param)
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
-        lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}),
+        awaitable(lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True})),
     )
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 
@@ -645,7 +647,7 @@ def mixed_case_artifact(tmp_path, monkeypatch):
     metadata = {"type": "file", "primary": "Brief.md"}
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
-        lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}),
+        awaitable(lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True})),
     )
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 
@@ -780,8 +782,8 @@ def served_html_app(tmp_path, monkeypatch):
         trusted_anchor=project, root_parts=(".anton", "artifacts"),
     )
     monkeypatch.setattr(
-        workspace_ep, "review_artifact_for_request",
-        lambda *_args: (source, folder, {"type": "html-app"}, True),
+        workspace_ep, "review_artifact_and_read",
+        reviewed_and_read(lambda *_args: (source, folder, {"type": "html-app"}, True)),
     )
     return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef"
 

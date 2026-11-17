@@ -40,6 +40,7 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str | None]] = {
     "posthog":          ("posthog_client_id",           None),
     "figma":            ("figma_client_id",             "figma_client_secret"),
     "hubspot":          ("hubspot_client_id",           "hubspot_client_secret"),
+    "notion":           ("notion_client_id",            None),
 }
 
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
@@ -338,11 +339,26 @@ def _revoke_posthog(token: str, client_id: str, client_secret: str) -> None:
         pass
 
 
+def _revoke_notion(token: str, client_id: str, client_secret: str) -> None:
+    """Public client, same shape as `_revoke_posthog`. Notion documents no
+    client-side revoke, but its metadata advertises this endpoint; revoke()
+    already treats any failure as local-cleanup-only."""
+    request = Request(
+        "https://mcp.notion.com/token",
+        data=urlencode({"token": token, "client_id": client_id}).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urlopen(request, timeout=10):
+        pass
+
+
 # engine → custom revoke function, for providers whose revoke call doesn't
 # fit the generic revoke_url/POST/form-body shape (see OAuthConfig.revoke_url).
 # Checked before the generic path in revoke() below.
 _REVOKE_HANDLERS: dict[str, Callable[[str, str, str], None]] = {
     "github": _revoke_github,
+    "notion": _revoke_notion,
     "posthog": _revoke_posthog,
     "supabase": _revoke_supabase,
 }
@@ -634,7 +650,17 @@ class OAuthService:
             fields = _vault_for(connector_settings, scope).load(engine, name) or {}
         except Exception:
             return
+        from cowork.services.connectors import app_held
+        from cowork.services.connectors.persist import own_vault_root
+
+        # An MCP connection's token may be held in memory only, not in the file.
+        fields = app_held.overlay(own_vault_root(scope), engine, name, fields, keys=("access_token",))
         if fields.get("auth_type") != "oauth":
+            return
+        if engine == "notion" and fields.get("_method") != "mcp":
+            # The hidden `oauth` method's token is api.notion.com's; only an
+            # MCP sign-in's token belongs to mcp.notion.com's revoke endpoint.
+            _log.debug("Not revoking %s/%s remotely: not an MCP sign-in", engine, name)
             return
         token = fields.get("refresh_token", "").strip() or fields.get("access_token", "").strip()
         if not token:

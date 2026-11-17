@@ -30,10 +30,11 @@ OAUTH_SERVICES: dict[str, OAuthServiceConfig] = {
     "supabase": OAuthServiceConfig(engine="supabase"),
     "posthog": OAuthServiceConfig(engine="posthog"),
     "figma": OAuthServiceConfig(engine="figma"),
-    # HubSpot's method id is "mcp", not `browser_oauth_builtin`, so the local
+    # HubSpot's (and Notion's) method id is "mcp", not `browser_oauth_builtin`, so the local
     # `_oauth_config_for()` finds nothing and `start()`/`callback()` 500 here.
     # That path is unused: desktop runs PKCE in Electron and only needs
     # `/credentials` (engine-keyed, hence this entry), while web forwards
     # start/callback to auth in org mode, keyed by the spec's `service_id`.
     "hubspot": OAuthServiceConfig(engine="hubspot"),
+    "notion": OAuthServiceConfig(engine="notion"),
 }

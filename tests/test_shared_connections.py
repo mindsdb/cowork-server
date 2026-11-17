@@ -184,7 +184,7 @@ async def _every_change_is_refused(scope: TenantScope, name: str = "erp") -> Non
             "postgres", name, PatchPickedFilesBody(files=[{"id": "f1", "name": "f"}]), scope, None
         )
     )
-    _refused(lambda: connections_ep.delete_picked_file("postgres", name, "f1", "general", scope))
+    await _refused_async(lambda: connections_ep.delete_picked_file("postgres", name, "f1", "general", scope))
     await _refused_async(
         lambda: connections_ep.patch_access_mode(
             "postgres", name, connections_ep.PatchAccessModeBody(access_mode="write"), scope, None
@@ -894,7 +894,7 @@ async def test_the_desktop_keeps_every_connections_route(desktop, monkeypatch):
         LOCAL_SCOPE,
         None,
     )
-    connections_ep.delete_picked_file("postgres", "erp", "f1", "p", LOCAL_SCOPE)
+    await connections_ep.delete_picked_file("postgres", "erp", "f1", "p", LOCAL_SCOPE)
     await connections_ep.patch_access_mode(
         "postgres", "erp", connections_ep.PatchAccessModeBody(access_mode="none"), LOCAL_SCOPE, None
     )
@@ -961,4 +961,4 @@ async def test_hosted_org_tenancy_keeps_every_connections_route(hosted, monkeypa
     assert Path(vault._dir) == hosted / "shared" / ORG_ID / "data-vault"
     assert CREATED_BY_FIELD not in vault.read_record("postgres", saved["name"])["fields"]
     ConnectionsService(ORG).merge_picked_files("postgres", "erp", [{"id": "f1", "projects": ["p"]}])
-    assert connections_ep.delete_picked_file("postgres", "erp", "f1", "p", ORG)["ok"] is True
+    assert (await connections_ep.delete_picked_file("postgres", "erp", "f1", "p", ORG))["ok"] is True

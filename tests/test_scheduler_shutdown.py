@@ -196,7 +196,7 @@ def refused_for_shutdown(monkeypatch, caplog, due_schedule):
     import cowork.handlers.responses as responses_mod
 
     class ClosedRegistryHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):
@@ -272,6 +272,55 @@ async def test_a_manual_run_refused_for_shutdown_keeps_the_conversation_its_requ
     assert conversations == [conversation_id]
 
 
+async def test_a_run_whose_turn_claim_redis_cannot_answer_leaves_its_slot_due_and_its_streak_alone(
+    monkeypatch, caplog, due_schedule,
+):
+    """On the Redis backend, a Redis call that fails or answers late refuses
+    the turn in RunRegistry.start before it starts, the 503 an HTTP client
+    waits out and sends again. The scheduler sends nothing again, so the run
+    leaves its cron slot due for the next poll, counts nothing toward the
+    failures that pause the schedule, and deletes the conversation it made.
+    It used to use the slot up as a failed run: a daily task skipped its day
+    over a Redis blip, and three in a row paused it."""
+    import cowork.handlers.responses as responses_mod
+    from cowork.common.datetime_utils import ensure_utc
+    from cowork.schemas.schedules import RunStatus
+    from cowork.streaming import turn_claim, turn_index
+    from _fakes import UnreachableRedis
+
+    class ClaimingHandler:
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
+            pass
+
+        async def handle(self, request):
+            await registry.start(
+                conversation_id=request.conversation, turn_id=0, open_buffer=None, produce=None,
+            )
+
+    monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
+    for module in (turn_claim, turn_index):
+        monkeypatch.setattr(module, "get_redis", lambda: UnreachableRedis())
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", ClaimingHandler)
+    monkeypatch.setattr(scheduler.logger, "disabled", False)
+    caplog.set_level(logging.INFO, logger=scheduler.logger.name)
+
+    await scheduler.execute_schedule(due_schedule.id, is_manual=False)
+
+    fresh, run, conversations = due_schedule.state()
+    assert run.status == RunStatus.failed
+    assert run.error == "Run did not start: Cowork was busy."
+    assert run.conversation_id is None
+    assert fresh.last_error is None
+    assert fresh.consecutive_failures == 0
+    assert ensure_utc(fresh.next_run_at) == ensure_utc(due_schedule.next_run_at)
+    assert conversations == []
+    records = [
+        r for r in caplog.records
+        if r.name == scheduler.logger.name and getattr(r, "event", None) == "schedule_run_claim_unavailable"
+    ]
+    assert [r.levelno for r in records] == [logging.WARNING]
+
+
 @pytest.mark.parametrize("is_manual", [False, True], ids=["cron", "run-now"])
 async def test_a_run_a_shutdown_cancels_mid_turn_is_saved_failed_and_its_slot_stays_due(
     monkeypatch, due_schedule, is_manual,
@@ -289,7 +338,7 @@ async def test_a_run_a_shutdown_cancels_mid_turn_is_saved_failed_and_its_slot_st
     streaming = asyncio.Event()
 
     class MidTurnHandler:
-        def __init__(self, *, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True, schedule_id=None):
             pass
 
         async def handle(self, request):

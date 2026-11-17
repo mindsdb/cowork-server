@@ -19,6 +19,7 @@ def test_env_aliases_reference_only_real_fields():
     # Model keys are CLI-only and must never be aliased into a bulk .env sync.
     assert "planning_model" not in SETTING_ENV_ALIASES
     assert "coding_model" not in SETTING_ENV_ALIASES
+    assert "image_model" not in SETTING_ENV_ALIASES
 
 
 def test_env_alias_inverse_is_exact():
@@ -147,3 +148,9 @@ def test_autopublish_description_names_the_override_that_works(monkeypatch):
     # Naming the alias is fine — saying it is the override is not. The
     # description must mark it as NOT the bypass.
     assert "NOT that" in text or "not that" in text
+
+
+def test_keeping_the_desktop_awake_for_scheduled_tasks_defaults_on():
+    # On unless the user turns it off: a task that comes due while the
+    # laptop idle-sleeps does not run.
+    assert UserSettings.model_fields["schedule_keep_awake"].get_default() is True

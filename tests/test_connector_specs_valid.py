@@ -330,6 +330,8 @@ def test_method_descriptions_stay_short(path: Path):
 # The two connectors enabled for cloud execution. Every other method
 # in the corpus carries no `cloud` block and is therefore desktop-only.
 CLOUD_DATABASE_METHODS = {"postgres": "host-port", "mysql": "host-password"}
+# Engines whose cloud method is marked available; managed services follow them.
+RELEASED_CLOUD_DATABASES = frozenset({"mysql", "postgres"})
 
 # The desktop fields as (name, type, required, secret, default), pinned from
 # the specs before the cloud blocks existed. The cloud block is a second,
@@ -511,7 +513,7 @@ def test_no_other_method_declares_cloud_support(path: Path):
 #: What each cloud form collects. PostgreSQL alone names a schema.
 CLOUD_DATABASE_FIELDS = {
     "postgres": {"host", "port", "database", "schema", "username", "password", "tls_verify"},
-    "mysql": {"host", "port", "database", "username", "password", "tls_verify"},
+    "mysql": {"host", "port", "database", "username", "password", "tls_mode", "ca_pem"},
 }
 
 # Guidance each connector's desktop copy gives for choices the hosted path
@@ -526,8 +528,9 @@ class TestCloudDatabaseSpecs:
     """The cloud blocks on postgres and mysql.
 
     The desktop forms offer choices the hosted path does not: an SSL on/off
-    toggle, a CA field, a localhost server. An edit that collapses the two forms back
-    together is the failure this class exists to catch.
+    toggle, a localhost server, and for PostgreSQL a CA field. An edit that
+    collapses the two forms back together is the failure this class exists to
+    catch.
     """
 
     @pytest.fixture(
@@ -552,25 +555,52 @@ class TestCloudDatabaseSpecs:
         method = next(m for m in spec.form.methods if m.id == "connection-string")
         assert method.cloud is None
 
-    def test_cloud_is_not_advertised_before_the_adapters_are_proven(
+    def test_cloud_is_advertised_only_for_the_released_engines(
         self, spec, connector_id
     ):
-        assert self._cloud(spec, connector_id).available is False
+        """Each engine is released on its own once its adapter is proven, so the
+        released set is pinned here and moves only with that decision."""
+        expected = connector_id in RELEASED_CLOUD_DATABASES
+        assert self._cloud(spec, connector_id).available is expected
 
-    def test_the_form_asks_one_yes_or_no_about_certificates(self, spec, connector_id):
-        """The cloud form collects a connection and one question about trust:
-        verify the certificate, or take the server's default, which encrypts
-        where it is offered and checks nothing. The modes that need a pasted
-        certificate or turn encryption off have no answer most people can give,
-        so the form does not ask them."""
+    def test_the_form_collects_the_connection_and_how_to_trust_it(self, spec, connector_id):
         fields = {f.name: f for f in self._cloud(spec, connector_id).fields}
         assert set(fields) == CLOUD_DATABASE_FIELDS[connector_id]
+
+    def test_postgresql_asks_one_yes_or_no_about_certificates(self, spec, connector_id):
+        """Verify the certificate, or take the server's default, which encrypts
+        where it is offered and checks nothing. Its logins never send the
+        password itself, so a pasted certificate is not needed to connect."""
+        if connector_id != "postgres":
+            pytest.skip("MySQL chooses a trust mode")
+        fields = {f.name: f for f in self._cloud(spec, connector_id).fields}
         assert fields["tls_verify"].type == "boolean"
         assert fields["tls_verify"].required is False
         assert fields["tls_verify"].checkbox_label, "the checkbox needs its sentence"
         # Unchecked unless the person checks it: a default would decide for
         # them, and `"false"` reads as true to a checkbox.
         assert fields["tls_verify"].default is None
+
+    def test_mysql_chooses_a_trust_mode_and_may_paste_its_authority(self, spec, connector_id):
+        """A MySQL 8 server asks for the password itself when the account is
+        not in its login cache, and the gateway sends it only to a server it
+        verified, so a server signed by its own authority needs a way in. The
+        renderer submits `tls_mode` as chosen and `ca_pem` only for
+        `custom_ca`; the modes that turn checks or encryption off stay off the
+        form."""
+        if connector_id != "mysql":
+            pytest.skip("PostgreSQL asks yes or no")
+        fields = {f.name: f for f in self._cloud(spec, connector_id).fields}
+        mode = fields["tls_mode"]
+        assert mode.type == "select" and mode.required is True
+        # Today's behaviour stays the default, so a form left alone stores what
+        # it did before.
+        assert mode.default == "prefer"
+        assert [option["value"] for option in mode.options] == ["prefer", "system", "custom_ca"]
+        assert all(option.get("label") for option in mode.options)
+        ca = fields["ca_pem"]
+        assert ca.type == "textarea" and ca.required is False
+        assert ca.secret is False
 
     def test_only_postgresql_asks_for_a_schema(self, spec, connector_id):
         """A PostgreSQL database holds many schemas, so a connection may name

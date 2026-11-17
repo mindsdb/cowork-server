@@ -85,6 +85,7 @@ class _FakeBuffer:
 def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
     """A handler whose turn publishes one ask_user and then blocks forever."""
     handler = object.__new__(ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = object()
 
     class FakeConversationService:

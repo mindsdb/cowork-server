@@ -143,7 +143,7 @@
           }
         ],
         "cloud": {
-          "available": false,
+          "available": true,
           "engine": "postgres:host-port",
           "description": "Enter the host, port, database, username and password. Saved and read as a PostgreSQL connection.",
           "how_to": "## Connect Heroku Postgres\n\nCloud saves this connection in your encrypted connection store and reads it through the hosted gateway.\n\n### Where to find each value\n\n1. Open the database in the Heroku dashboard and choose **Settings**, then **View Credentials**.\n2. Copy **Host**, **Port**, **Database**, **User** and **Password** into the matching fields.\n\nThe server must be reachable from the public internet, and its firewall must allow the hosted gateway. Use a database user that can read only the data you want to query.\n\nHeroku rotates these credentials from time to time; edit the connection when they change.",

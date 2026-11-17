@@ -6,7 +6,7 @@ import json
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
-from typing import TYPE_CHECKING, Annotated, Any, Callable, get_args
+from typing import TYPE_CHECKING, Annotated, Any, Callable, NamedTuple, get_args
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
@@ -14,8 +14,10 @@ if TYPE_CHECKING:
 from pydantic import Field, PrivateAttr, SecretStr, ValidationInfo, field_validator, model_validator
 
 from cowork.common.settings.app_settings import (
-    AGENT_ROLE_NAMES,
+    CATALOG_ROLE_NAMES,
     CODING_MODEL_DEFAULTS,
+    IMAGE_MODEL_DEFAULT,
+    IMAGE_ROLE,
     MINDS_FREE_MODEL,
     PLANNING_MODEL_DEFAULTS,
     ROLE_MODEL_DEFAULTS,
@@ -221,6 +223,17 @@ def _enabled_aware_default(
             if served is not None:
                 return served
         return MINDS_FREE_MODEL
+    return _availability_adjusted(default, enabled_map)
+
+
+def _availability_adjusted(default: str | None, enabled_map: dict[str, bool]) -> str | None:
+    """``default``, moved off a model the availability map says cannot be used.
+
+    The desktop half of ``_enabled_aware_default``, and the whole rule for the
+    image role, which has no free model for org mode to fall back to: every
+    image alias bills the wallet, so a locked image default is kept (it is
+    refused with a top-up path) rather than swapped for a chat model.
+    """
     if not enabled_map:
         return default
     if default is None or enabled_map.get(default) is True:
@@ -445,9 +458,9 @@ def _coding_engine_options() -> list[str]:
 # dashboards and publish_url), which is exactly the class of bug ENG-941/ENG-1125
 # retires.
 #
-# planning_model / coding_model are DELIBERATELY absent (ENG-739): a model in
-# .env is CLI-only and must never ride a bulk .env→DB sync, or a login /
-# token-refresh would re-pin a picker choice from a stale ``latest:`` line.
+# planning_model / coding_model / image_model are DELIBERATELY absent (ENG-739):
+# a model in .env is CLI-only and must never ride a bulk .env→DB sync, or a
+# login / token-refresh would re-pin a picker choice from a stale line.
 #
 # max_tool_rounds / max_continuations / max_turn_tokens are DELIBERATELY absent
 # too, for the
@@ -648,7 +661,22 @@ class UserSettings(Settings):
             "provider (see resolved_gate_model), except on openai-compatible, "
             "where this is the only model there is. Defaults to the recommended "
             "model for the selected provider (MindsHub → MindsHub Air; other "
-            "providers → their smallest model)."
+            "providers → their smallest model). Outside MindsHub mode it can be "
+            "set with the ROUTER_MODEL environment variable, meant for an own "
+            "inference provider: Settings hides the choice once turns are "
+            "routed by Jev or an own decision model."
+        ),
+    )
+    # Image role: the model the agent's generate_image tool and the scratchpad's
+    # image helper draw with. No provider of its own, because MindsHub is the
+    # only gateway that serves image models; Anton calls it with the MindsHub key
+    # and URL it already holds.
+    image_model: Annotated[str | None, PINNED] = Field(
+        default=None,
+        title="Image Model",
+        description=(
+            "The model used to generate and edit images. Defaults to the image model "
+            "MindsHub recommends."
         ),
     )
     harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
@@ -694,6 +722,14 @@ class UserSettings(Settings):
         title="Show Figure Sources",
         description="Mark each figure in an answer with the steps it came from, and flag figures with no source.",
     )
+    schedule_keep_awake: bool = Field(
+        default=True,
+        title="Keep Awake For Scheduled Tasks",
+        description=(
+            "Keep the desktop from idle-sleeping while a scheduled task is running "
+            "or about to run."
+        ),
+    )
     nav_title: str = Field(
         default="",
         title="Nav Title",
@@ -738,6 +774,48 @@ class UserSettings(Settings):
         default=True,
         title="Memory Enabled",
         description="Enable conversation memory.",
+    )
+    # The agent's browser. Untagged, so per-user in org mode and the single
+    # global row on desktop, like `hub_workspace_id`: whether the agent may use
+    # a browser is the person's own choice. Off by default while the browser
+    # is in beta; once on, it only does something where a browser is
+    # available, the browser router on the web or the desktop app's own
+    # browser (cowork.services.browser).
+    browser_enabled: bool = Field(
+        # Beta: off until the person turns it on in Settings.
+        default=False,
+        title="Browser Enabled",
+        description="Let the agent use a browser, shown beside the chat (beta).",
+    )
+    # Untagged like browser_enabled: the person's own choice. The app reads it
+    # (as browserApproveSteps) to decide whether a browser step waits for the
+    # person's approval. This server stores it, and a write of it as false
+    # stamps browser_approve_steps_off_at below.
+    browser_approve_steps: bool = Field(
+        default=True,
+        title="Approve Browser Steps",
+        description="Ask before the agent's browser steps run.",
+    )
+    # Untagged (user scope) like browser_approve_steps. SettingService
+    # (_stamp_approvals_off) stamps it, by this server's clock, on every write
+    # of browser_approve_steps as false, and the settings routes refuse a
+    # client's write of it. The app reads it as browserApproveStepsOffAt and
+    # approves for the person only a step held after it, by the `at_ms` this
+    # server puts on the step's event. "" until approvals first go off, and a
+    # string, not 0, so an unset stamp approves nothing.
+    browser_approve_steps_off_at: str = Field(
+        default="",
+        max_length=20,
+        title="Browser Approvals Off Since",
+        description="When the person last turned browser step approvals off, epoch milliseconds.",
+    )
+    # Untagged like browser_enabled. The app reads it (as
+    # browserOnlyWhenNeeded): on, the browser pane opens by itself only when
+    # it is the person's turn, and a turn's browser steps show as one row.
+    browser_only_when_needed: bool = Field(
+        default=True,
+        title="Show The Browser Only When Needed",
+        description="Show the agent's browser only when it needs the person.",
     )
     # `hub_workspace_id`, not `workspace_id`: in this repo `workspace` already
     # means a filesystem location (the per-conversation private directory, the
@@ -810,6 +888,48 @@ class UserSettings(Settings):
             "stopping to ask. Turn off for a more cautious, ask-first agent."
         ),
     )
+    # One switch for every call to Jev on MindsHub: the route gate (jev_route)
+    # and anton's completion check (verifier_jev, overlaid in anton_harness).
+    # Off is the opt-out for organizations that cannot send conversation text
+    # to it; with no decision model of their own configured below, every turn
+    # on MindsHub then runs the full agent. Jev is billed like any MindsHub
+    # model; when MindsHub refuses a call (allowance spent, a restriction on the
+    # organization), the gate falls back to the LLM gate (jev_route.decide).
+    jev_decisions_enabled: Annotated[bool, ORG] = Field(
+        default=True,
+        title="Use Jev on MindsHub",
+        description=(
+            "Send each message and the recent conversation to Jev, MindsHub's decision model, "
+            "to decide whether your chosen model can answer it directly instead of running the "
+            "full agent. Jev also checks whether the agent finished its work. Turn off to have "
+            "every message run the full agent, unless you configure a decision model of your own."
+        ),
+    )
+    # A decision model of the organization's own, for teams that bring their
+    # own inference keys or cannot use Jev on MindsHub. Any endpoint taking
+    # TypeSafe's decision body works: TypeSafe's own (/v1/systemone), a
+    # gateway serving Jev (MindsHub's or Portkey's /v1/decisions), or a
+    # MindsHub account used only for decisions. Configured (URL and key both set), it
+    # routes every turn whatever the provider, and jev_decisions_enabled does
+    # not apply to it: setting it up is the opt-in.
+    decision_model_url: Annotated[str, ORG, PINNED] = Field(
+        default="",
+        title="Decision Model Endpoint",
+        description=(
+            "Full URL of your decision model's endpoint, which must take TypeSafe's decision "
+            "request (model, state, questions), for example https://api.typesafe.ai/v1/systemone."
+        ),
+    )
+    decision_model_api_key: SecretStr | None = Field(
+        default=None,
+        title="Decision Model API Key",
+        description="API key for your own decision model.",
+    )
+    decision_model: Annotated[str, ORG, PINNED] = Field(
+        default="jev",
+        title="Decision Model",
+        description="The model name your decision endpoint expects.",
+    )
     first_take_enabled: bool = Field(
         default=True,
         title="Instant first take",
@@ -818,13 +938,26 @@ class UserSettings(Settings):
             "what it is about to do, until the agent starts writing."
         ),
     )
+    # Off: turns run to the deployment defaults of the budgets below
+    # (``effective_turn_limits``), whatever is stored for them. A stored budget
+    # row is kept, so turning the switch back on restores it.
+    # ``enable_limits_for_saved_budgets`` turns it on wherever a budget row was
+    # saved before the switch existed.
+    limits_enabled: Annotated[bool, ORG, PINNED] = Field(
+        default=False,
+        title="Limit how much a task can do",
+        description=(
+            "Off: a task runs until it's done, up to a high safety limit where "
+            "it asks before going further. On: a task stops or asks at the "
+            "steps, auto-continues and tokens you set below."
+        ),
+    )
+
     # ── Advanced agent budgets ──
-    # Overlaid onto AntonSettings per conversation (anton_harness.harness);
-    # anton's own CLI defaults (25/3) are lower — Cowork deliberately runs
-    # with more headroom so long tasks finish without a mid-task check-in.
-    # Defaults come from app settings so hosted deployments (operator-paid
-    # inference, no Settings UI on web) can lower them via env without
-    # touching per-user rows.
+    # Overlaid onto AntonSettings per conversation (anton_harness.harness).
+    # The defaults are safety limits that a normal task never reaches, the
+    # values anton's own defaults move to; they come from app settings so a
+    # deployment can change them via env without touching per-user rows.
     max_tool_rounds: Annotated[int, ORG, PINNED] = Field(
         default_factory=lambda: get_app_settings().default_max_tool_rounds,
         ge=5,
@@ -858,19 +991,16 @@ class UserSettings(Settings):
         # Plain contiguous range. "No limit" in the UI is the TOP of it
         # (50_000_000), not a sentinel.
         #
-        # "No limit" is EFFECTIVELY, not literally, true — and the bound is
-        # closer than it looks. A turn makes about
-        # `max_tool_rounds x (max_continuations + 1)` LLM calls, which at THIS
-        # repo's defaults (50 x 6) is ~306 calls, so 50M is reached at ~163k per
-        # call — below the ~190k context a long conversation carries. At the
-        # maxima a user can set (500 x 25) it is ~13,000 calls and ~3.8k per
-        # call. So the step cap does NOT always land first; it merely always has
-        # so far. The largest turn in 30 days of production was 8.26M, because
-        # real turns end and compaction intervenes long before that shape.
+        # "No limit" is EFFECTIVELY, not literally, true. `max_tool_rounds`
+        # counts across the whole turn, continuations included, so a turn makes
+        # about `max_tool_rounds + max_continuations + 1` LLM calls: ~260 at
+        # the defaults, so 50M is reached at ~190k per call, the context a long
+        # conversation carries; ~530 at the maxima a user can set (500 + 26),
+        # so there the ceiling lands first on a long conversation. The largest
+        # turn in 30 days of production (2026-10-14) was 34.4M.
         # Do not restate this as "the ceiling can never fire at max" — an
         # earlier version of this comment did, using anton's own 25x3 defaults
-        # rather than Cowork's, which put the threshold at 480k per call and
-        # made it look unreachable.
+        # rather than Cowork's, which made it look unreachable.
         #
         # A 0-means-unlimited sentinel was built
         # and then removed — it needed a hole in the range, a validator to guard
@@ -1009,9 +1139,27 @@ class UserSettings(Settings):
         ),
     )
 
+    # The image models' own availability map, apart from `minds_model_enabled`:
+    # the chat roles fall back to the first enabled entry of theirs, which must
+    # never be an image model, and the image role must never fall back to a chat
+    # model. Org-wide like that map, with the member's restricted ids laid over
+    # it the same way.
+    minds_image_model_enabled: Annotated[str, ORG, PINNED] = Field(
+        default="{}",
+        title="MindsHub Image Model Availability",
+        description=(
+            "JSON-encoded map of MindsHub image model id → enabled flag, cached "
+            "from /v1/models whenever recommended-models fetches it live. Lets the "
+            "image model resolve off a locked or retired model without a network "
+            "call in the turn path."
+        ),
+    )
+
     # Memoized parse of `minds_model_enabled` (see `_minds_enabled_map`). Not a
     # settings field — never validated or serialized.
     _enabled_map_cache: dict[str, bool] | None = PrivateAttr(default=None)
+    # Same, for `minds_image_model_enabled` (see `_minds_image_enabled_map`).
+    _image_enabled_map_cache: dict[str, bool] | None = PrivateAttr(default=None)
     # Same, for `minds_role_defaults` (see `_minds_role_default_map`).
     _role_default_cache: dict[str, str] | None = PrivateAttr(default=None)
 
@@ -1061,10 +1209,24 @@ class UserSettings(Settings):
         Parsed once per instance and memoized: this is called from
         ``apply_model_defaults`` and both ``resolved_*_model`` properties.
         """
-        if self._enabled_map_cache is not None:
-            return self._enabled_map_cache
+        if self._enabled_map_cache is None:
+            self._enabled_map_cache = self._parse_enabled_map(self.minds_model_enabled)
+        return self._enabled_map_cache
+
+    def _minds_image_enabled_map(self) -> dict[str, bool]:
+        """``_minds_enabled_map`` for the image models: id → enabled, or {}.
+
+        Sourced from ``minds_image_model_enabled``, refreshed the same way, with
+        this member's restricted ids laid over it the same way.
+        """
+        if self._image_enabled_map_cache is None:
+            self._image_enabled_map_cache = self._parse_enabled_map(self.minds_image_model_enabled)
+        return self._image_enabled_map_cache
+
+    def _parse_enabled_map(self, stored: str) -> dict[str, bool]:
+        """A stored availability map, with this member's restricted ids as ``False``."""
         try:
-            raw = json.loads(self.minds_model_enabled or "{}")
+            raw = json.loads(stored or "{}")
         except (ValueError, TypeError):
             raw = {}
         # Accept only real booleans. The map is written from real bools, but a
@@ -1082,7 +1244,6 @@ class UserSettings(Settings):
         restricted = self._minds_restricted_ids()
         if restricted:
             result = {k: (False if k in restricted else v) for k, v in result.items()}
-        self._enabled_map_cache = result
         return result
 
     def _minds_restricted_ids(self) -> frozenset[str]:
@@ -1127,7 +1288,7 @@ class UserSettings(Settings):
             {
                 k: v
                 for k, v in raw.items()
-                if isinstance(k, str) and isinstance(v, str) and k in AGENT_ROLE_NAMES and v
+                if isinstance(k, str) and isinstance(v, str) and k in CATALOG_ROLE_NAMES and v
             }
             if isinstance(raw, dict)
             else {}
@@ -1187,7 +1348,21 @@ class UserSettings(Settings):
                 self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
                 enabled_map,
             )
+        if self.image_model is None:
+            self.image_model = self._image_model_default()
         return self
+
+    def _image_model_default(self) -> str:
+        """The model the image role starts on: the catalog's declared default, else
+        the compiled one, adjusted for the image models' availability.
+
+        Never a chat model, in either tenancy mode. The chat roles' org-mode
+        fallback is the free chat model, and no image model is free, so the image
+        role keeps the desktop rule (``_availability_adjusted``): a locked default
+        stays and is refused with a top-up path.
+        """
+        declared = self._minds_role_default_map().get(IMAGE_ROLE) or IMAGE_MODEL_DEFAULT
+        return _availability_adjusted(declared, self._minds_image_enabled_map()) or declared
 
     def _has_key(self, p: Provider) -> bool:
         # Org mode mints a per-turn key, so minds-cloud is usable with nothing
@@ -1299,6 +1474,68 @@ class UserSettings(Settings):
             self._minds_enabled_map(),
             wallet_aware=True,
         )
+
+    @property
+    def resolved_image_model(self) -> str:
+        """The image model Anton is handed (``ANTON_IMAGE_MODEL``).
+
+        wallet_aware for the coding role's reason (ENG-1632): the image model runs
+        inside a tool call, where a pin the wallet cannot pay for, an admin
+        restricted, or MindsHub no longer serves fails every image with nothing
+        in Settings to explain it. Checked against the image models' own map, so
+        the fallback is always another image model. There is no provider switch
+        to honour, and the pick is never empty (``apply_model_defaults`` fills
+        it), so resolution never reaches the chat roles' default path.
+        """
+        default = self._image_model_default()
+        return _resolved_model(
+            Provider.MINDS_CLOUD,
+            Provider.MINDS_CLOUD,
+            self.image_model or default,
+            {Provider.MINDS_CLOUD.value: default},
+            self._minds_image_enabled_map(),
+            wallet_aware=True,
+        ) or default
+
+    @property
+    def image_model_for_agent(self) -> str | None:
+        """The image model to hand Anton and its scratchpads, or None to hand none.
+
+        Every image model here is a MindsHub alias, so one goes over only when
+        Anton's images go to MindsHub (``_images_go_to_mindshub``) and the cached
+        catalog lists an image model this member is not restricted from. A pick
+        follows the same rule: on another provider it would fail every image
+        call. A wallet-locked model is still handed over, since a top-up lifts it.
+        """
+        if not self._images_go_to_mindshub():
+            return None
+        available = self._minds_image_enabled_map()
+        if not available:
+            return None
+        model = self.resolved_image_model
+        restricted = self._minds_restricted_ids()
+        if model in restricted:
+            # Only reached with nothing enabled: prefer a wallet-locked model, else none.
+            return next((m for m in available if m not in restricted), None)
+        return model
+
+    def _images_go_to_mindshub(self) -> bool:
+        """Whether Anton sends image calls to MindsHub.
+
+        Mirrors anton's ``LLMClient.image_provider``: a role on MindsHub wins,
+        else the first role on an OpenAI-API endpoint, so with no MindsHub role
+        the images go elsewhere. Org mode turns always run on MindsHub.
+        """
+        if get_app_settings().tenancy_mode == "org":
+            return True
+        from cowork.services.providers import is_minds_host
+
+        for p in (self.resolved_planning_provider, self.resolved_coding_provider, self.resolved_router_provider):
+            if p is Provider.MINDS_CLOUD:
+                return True
+            if p is Provider.OPENAI_COMPATIBLE and is_minds_host(self.openai_base_url):
+                return True
+        return False
 
     @property
     def resolved_gate_model(self) -> str | None:
@@ -1416,7 +1653,8 @@ def setting_is_org_scoped(key: str) -> bool:
 def setting_is_operator_pinned(key: str) -> bool:
     """True for a key the operator sets for the whole deployment: the model and
     provider choices, their endpoints and credentials, memory, the per-turn
-    budgets, and how the agent acts (act_first, proactive_dashboards).
+    budgets and the switch that applies them, and how the agent acts
+    (act_first, proactive_dashboards).
     SecretStr credentials are pinned structurally; other fields iff
     tagged with the PINNED marker. A personal partition resolves these from the
     global row, then the environment, and ignores a row of its own
@@ -1427,6 +1665,51 @@ def setting_is_operator_pinned(key: str) -> bool:
     if UserSettings.field_is_sensitive(key):
         return True
     return any(isinstance(m, _OperatorPinned) for m in field.metadata)
+
+
+#: The per-turn budgets the ``limits_enabled`` switch governs.
+BUDGET_SETTING_KEYS: tuple[str, ...] = ("max_turn_tokens", "max_tool_rounds", "max_continuations")
+
+#: What a renderer that predates the switch stores when a budget field is
+#: cleared, its way to reset it: the old defaults.
+_PRE_SWITCH_RESET_VALUES: dict[str, int] = {
+    "max_turn_tokens": 1_250_000, "max_tool_rounds": 50, "max_continuations": 5,
+}
+
+
+def is_chosen_budget(key: str, value: str) -> bool:
+    """Whether a stored budget is a limit the user chose, so it turns the
+    limits switch on. A value equal to the old default is most likely a
+    pre-switch reset, which meant "use the default", so it doesn't."""
+    try:
+        return int(value) != _PRE_SWITCH_RESET_VALUES[key]
+    except (KeyError, ValueError):
+        return True
+
+
+class TurnLimits(NamedTuple):
+    max_turn_tokens: int
+    max_tool_rounds: int
+    max_continuations: int
+
+
+def default_turn_limits() -> TurnLimits:
+    """The deployment defaults (``COWORK_DEFAULT_MAX_*``): the safety limits a
+    turn runs to while ``limits_enabled`` is off."""
+    app = get_app_settings()
+    return TurnLimits(app.default_max_turn_tokens, app.default_max_tool_rounds, app.default_max_continuations)
+
+
+def effective_turn_limits(settings: UserSettings) -> TurnLimits:
+    """The budgets a turn runs with.
+
+    With ``limits_enabled`` off these are ``default_turn_limits()``, and stored
+    budget values are ignored, not deleted. With it on, they are the resolved
+    settings.
+    """
+    if settings.limits_enabled:
+        return TurnLimits(settings.max_turn_tokens, settings.max_tool_rounds, settings.max_continuations)
+    return default_turn_limits()
 
 
 _current_scope: ContextVar["TenantScope | None"] = ContextVar("settings_scope", default=None)

@@ -413,3 +413,13 @@ def test_skill_links_run_only_where_skills_and_projects_are_shared(
     assert SkillService(_person(resources=frozenset()))._link_projects is True
     assert SkillService(LOCAL_SCOPE)._link_projects is True
     assert SkillService(_org())._link_projects is False
+
+
+def test_an_org_seeded_before_the_refresh_skill_gets_it(skills_root):
+    """Version 2 ships scheduled-artifact-refresh to stores seeded at version 1."""
+    ensure_builtin_skills(_org())
+    shutil.rmtree(_store() / "scheduled-artifact-refresh")
+    (_store() / BUILTIN_SKILLS_MARKER).write_text("1")
+
+    assert ensure_builtin_skills(_org()) is True
+    assert (_store() / "scheduled-artifact-refresh" / "SKILL.md").is_file()
