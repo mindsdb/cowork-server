@@ -22,8 +22,6 @@ NAME_CHARS = 20
 # Bookkeeping a block carries that isn't its content: who last wrote it, and when (its rev).
 _BOOKKEEPING = ("v", "by")
 
-_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
-_CHIP = re.compile(r"\{\{(?:date:)?([^}]*)\}\}")
 _EMPHASIS = re.compile(r"\*+|`+|~~")
 
 
@@ -228,9 +226,55 @@ def _metrics_changes(where: str, old: Block, new: Block) -> list[Change]:
 
 def _plain(text: Any) -> str:
     """Text as it reads on the page: no Markdown marks, chips as their value, one space apart."""
-    t = _LINK.sub(r"\1", str(text or ""))
-    t = _CHIP.sub(lambda m: m.group(1).removeprefix("pending:").strip(), t)
+    t = _chips(_links(str(text or "")))
     return " ".join(_EMPHASIS.sub("", t).split())
+
+
+# Links and chips are scanned rather than matched with one regex each: a regex
+# restarts at every opener that never closes and rereads the rest of the text
+# from there, which is quadratic. The scans read each stretch of text once.
+
+
+def _links(s: str) -> str:
+    """``[words](address)`` as its words.
+
+    The words run to the first ``]`` after the ``[``, so every ``[`` before that
+    ``]`` makes a link or none does; the address runs to the first ``)``.
+    """
+    out, done, i = [], 0, s.find("[")
+    while i != -1:
+        j = s.find("]", i + 1)
+        if j == -1:
+            break
+        if s.startswith("(", j + 1):
+            e = s.find(")", j + 2)
+            if e == -1:
+                break
+            out += (s[done:i], s[i + 1:j])
+            done = j = e + 1
+        i = s.find("[", j)
+    out.append(s[done:])
+    return "".join(out)
+
+
+def _chips(s: str) -> str:
+    """``{{value}}`` or ``{{date:value}}`` as its value, trimmed and without a ``pending:`` prefix.
+
+    The value runs to the first ``}`` after the ``{{``, so every ``{{`` before that
+    ``}`` makes a chip or none does: one does when a second ``}`` follows it.
+    """
+    out, done, i = [], 0, s.find("{{")
+    while i != -1:
+        j = s.find("}", i + 2)
+        if j == -1:
+            break
+        if s.startswith("}", j + 1):
+            value = s[i + 7 if s.startswith("date:", i + 2) else i + 2:j]
+            out += (s[done:i], value.removeprefix("pending:").strip())
+            done = j = j + 2
+        i = s.find("{{", j)
+    out.append(s[done:])
+    return "".join(out)
 
 
 def _short(text: Any, limit: int) -> str:
