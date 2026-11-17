@@ -298,7 +298,7 @@ def build_doc_tools(ctx: DocToolContext) -> list[ToolDef]:
             return
         _track(session, artifacts_dir, made.slug, "Created doc")
         doc = made.doc
-        announce(made.artifact_id, doc, None, by="agent", conversation_id=ctx.conversation_id,
+        announce(made.artifact_id, doc, None, folder=made.folder, by="agent", conversation_id=ctx.conversation_id,
                  created=True, card=ctx.card(made.folder))
         yield _outcome(
             f"Created doc “{doc['title']}” — it is open beside the chat and the user can see it.\n"
@@ -346,7 +346,7 @@ def build_doc_tools(ctx: DocToolContext) -> list[ToolDef]:
             yield _refusal(err, await asyncio.to_thread(load_doc, folder) if err.code == "stale" else None)
             return
         _track(session, artifacts_dir, folder.name, "Edited doc")
-        announce(doc["id"], doc, result, by="agent", conversation_id=ctx.conversation_id)
+        announce(doc["id"], doc, result, folder=folder, by="agent", conversation_id=ctx.conversation_id)
         yield _outcome(_edit_report(before, doc, result, ops))
 
     async def handle_list(session: Any, tc_input: dict) -> Any:

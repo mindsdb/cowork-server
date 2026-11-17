@@ -232,13 +232,15 @@ def test_the_conversation_hears_about_a_new_doc_as_it_is_made(tools):
         try:
             await _drain(defs["create_doc"].handler(session, {"title": "Live", "markdown": "{{pending: Body}}"}))
             created = await asyncio.wait_for(conv_q.get(), 1)
-            doc_q = hub.subscribe(doc_topic(created["artifactId"]))
+            # The editor follows the doc's folder, as the docs route resolves it.
+            folder = find_doc_folder(session._workspace.artifacts_dir, "Live")
+            doc_q = hub.subscribe(doc_topic(folder))
             try:
                 await _drain(defs["edit_doc"].handler(session, {"doc": "Live", "ops": [
                     {"op": "replace", "target": {"find": "Body"}, "markdown": "## Body\n\nDone."}]}))
                 updated = await asyncio.wait_for(doc_q.get(), 1)
             finally:
-                hub.unsubscribe(doc_topic(created["artifactId"]), doc_q)
+                hub.unsubscribe(doc_topic(folder), doc_q)
             return created, updated
         finally:
             hub.unsubscribe(conv_topic(conv), conv_q)
