@@ -831,7 +831,7 @@ class CodingService(
     def _apply_config_update(session: CodingSession, values: dict) -> None:
         if any(
             name in values and values[name] != getattr(session, name)
-            for name in ("permission_mode", "network_access", "additional_dirs")
+            for name in ("permission_mode", "network_access", "additional_dirs", "writes_allowed")
         ):
             session.command_approval_grants = []
         for name, value in values.items():

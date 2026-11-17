@@ -3126,3 +3126,55 @@ def test_a_read_only_command_does_not_continue_a_completed_task(tmp_path: Path) 
     assert len(status_events) == 1
     assert status_events[0].text.startswith("Status: completed")
     assert status_events[0].data["command"] == "status"
+
+
+def test_a_task_on_a_folder_without_git_starts_read_only_until_writes_are_allowed(tmp_path: Path) -> None:
+    folder = tmp_path / "plain-folder"
+    folder.mkdir()
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(folder), prompt="Edit a file"), CREDS, "fake", "fake-model"
+    )
+    created = wait_for_status(service, created.id, SessionStatus.completed)
+
+    assert created.writes_allowed is False
+    assert engine.configs[-1].writes_allowed is False
+    ready = next(event for event in service.events(created.id).items if event.title == "Task workspace ready")
+    assert "Until you allow writes" in (ready.text or "")
+
+    allowed = service.update_session_config(created.id, SessionUpdateRequest(writes_allowed=True))
+    assert allowed.writes_allowed is True
+    assert engine.closed == 1
+    engine.is_closed = False
+    service.submit_turn(created.id, "Edit it now", CREDS)
+    wait_for_status(service, created.id, SessionStatus.completed)
+    assert engine.configs[-1].writes_allowed is True
+
+
+def test_a_repository_without_commits_starts_read_only(tmp_path: Path) -> None:
+    repo = tmp_path / "unborn"
+    repo.mkdir()
+    git(repo, "init")
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Edit a file"), CREDS, "fake", "fake-model"
+    )
+
+    assert wait_for_status(service, created.id, SessionStatus.completed).writes_allowed is False
+
+
+@pytest.mark.parametrize("mode", [WorkspaceMode.in_place, WorkspaceMode.worktree])
+def test_a_task_on_a_git_repository_keeps_write_access(tmp_path: Path, mode: WorkspaceMode) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Edit a file", workspace_mode=mode), CREDS, "fake", "fake-model"
+    )
+    created = wait_for_status(service, created.id, SessionStatus.completed)
+
+    assert created.writes_allowed is True
+    assert engine.configs[-1].writes_allowed is True
+    ready = next(event for event in service.events(created.id).items if event.title == "Task workspace ready")
+    assert "Until you allow writes" not in (ready.text or "")
