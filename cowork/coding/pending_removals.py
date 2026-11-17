@@ -64,10 +64,32 @@ class PendingRemovals:
         # Markers survive a restart and live outside the removal queue. Never
         # expose local paths or raw filesystem errors to the renderer.
         with self._lock:
-            names = self._failed | {marker.name for marker in self.errors_root.iterdir()}
+            names = self._failed | self._marker_names()
             running = self._thread is not None
-        failed = sum((self.root / name).exists() or (self.root / name).is_symlink() for name in names)
+        failed = 0
+        for name in names:
+            if (self.root / name).exists() or (self.root / name).is_symlink():
+                failed += 1
+            else:
+                # The folder went some other way, so its failure is over.
+                self._forget(name)
         return WorkspaceCleanupStatus(failed=failed, running=running)
+
+    def _marker_names(self) -> set[str]:
+        # A missing or unreadable markers folder means no recorded failures,
+        # not a status request that errors.
+        try:
+            return {marker.name for marker in self.errors_root.iterdir()}
+        except OSError:
+            return set()
+
+    def _forget(self, name: str) -> None:
+        with self._lock:
+            self._failed.discard(name)
+        try:
+            (self.errors_root / name).unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove cleanup failure marker %s", name, exc_info=True)
 
     def retry(self) -> WorkspaceCleanupStatus:
         self._start()
@@ -112,6 +134,7 @@ class PendingRemovals:
                     with self._lock:
                         self._failed.add(entry.name)
                     try:
+                        self.errors_root.mkdir(parents=True, exist_ok=True)
                         (self.errors_root / entry.name).touch(exist_ok=True)
                     except OSError:
                         # Even a full disk must not strand the worker or make

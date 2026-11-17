@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -158,6 +159,37 @@ def test_a_suppressed_filesystem_error_is_still_reported(tmp_path: Path, monkeyp
     assert pending.discard(folder)
     assert pending.wait(30)
     assert pending.status().failed == 1
+
+
+def test_cleanup_status_survives_a_missing_markers_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pending = PendingRemovals(tmp_path / "pending")
+    shutil.rmtree(pending.errors_root)
+
+    assert pending.status().failed == 0
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    monkeypatch.setattr(pending_module, "force_remove", lambda _path: None)
+    assert pending.discard(folder)
+    assert pending.wait(30)
+    # The worker recreates the folder, so the failure still survives a restart.
+    assert PendingRemovals(tmp_path / "pending").status().failed == 1
+
+
+def test_a_failure_whose_folder_is_gone_is_forgotten(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    monkeypatch.setattr(pending_module, "force_remove", lambda _path: None)
+    pending = PendingRemovals(tmp_path / "pending")
+    assert pending.discard(folder)
+    assert pending.wait(30)
+    assert pending.status().failed == 1
+
+    for leftover in pending.root.iterdir():
+        shutil.rmtree(leftover)
+
+    assert pending.status().failed == 0
+    assert list(pending.errors_root.iterdir()) == []
 
 
 def test_a_folder_that_cannot_be_moved_is_removed_in_place(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
