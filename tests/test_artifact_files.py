@@ -108,17 +108,35 @@ _FILE_CALLS = (
 )
 
 
+def _refused_unless_coverage(original):
+    """Refuse a file call, except one made by coverage's tracer.
+
+    Coverage resolves the real path of each file the first time it traces it,
+    which can happen inside the patched window. Whether it does depends on
+    which tests ran earlier in the same worker, so allowing only those calls
+    keeps the check as strict without failing on test order.
+    """
+
+    def call(*args, **kwargs):
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_globals.get("__name__", "").startswith("coverage"):
+                return original(*args, **kwargs)
+            frame = frame.f_back
+        return _unexpected_file_call(*args, **kwargs)
+
+    return call
+
+
 def _refusal_without_file_calls(
     *, folder: Path, parts: tuple[str, ...], monkeypatch
 ) -> OmittedReason:
-    # pytest.raises is entered before the file calls are replaced: a coverage
-    # run looks up each source file the first time it runs, with os.stat,
-    # and pytest's own code must not be first seen while that is a trap.
-    with pinned_dir(folder) as pinned, pytest.raises(ArtifactFileRefused) as refused:
+    with pinned_dir(folder) as pinned:
         with monkeypatch.context() as patch:
             for module, name in _FILE_CALLS:
-                patch.setattr(module, name, _unexpected_file_call)
-            read_artifact_file_entry(folder=pinned, parts=parts, max_bytes=1024)
+                patch.setattr(module, name, _refused_unless_coverage(getattr(module, name)))
+            with pytest.raises(ArtifactFileRefused) as refused:
+                read_artifact_file_entry(folder=pinned, parts=parts, max_bytes=1024)
     return refused.value.reason
 
 
