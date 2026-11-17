@@ -31,7 +31,7 @@ from cowork.common.logger import log_context
 from cowork.db.units import run_efs, run_efs_cleanup, run_on_unit_threads
 from cowork.models.artifact_owner_choice import AccessMode
 from cowork.schemas.artifact_access import ArtifactAccessRequest
-from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
+from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, refresh, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.services.publish import (
@@ -69,6 +69,34 @@ AUTOPUBLISH_ACCESS = ArtifactAccessRequest(mode=AccessMode.RESTRICTED, allowed_e
 # `wait_for` with a sliver of time only guarantees a timeout, an abandoned upload
 # thread and a held lock.
 _MIN_START_BUDGET_S = 5.0
+
+# Time budgets. The publish runs in a thread that asyncio.wait_for(...)
+# abandons but cannot cancel, so it may still write .published.json after the
+# wait_for window; the slug lock must outlive it. The thread restarts the lock's
+# TTL (artifact_locks.refresh) once the upload service accepts the job, which
+# splits its run in two, each within one lock_ttl:
+#   - from the acquire to the accepted job: the key, the owner and MindsHub
+#     reads, zipping and the POST /upload. Unbounded in theory (urllib's timeout
+#     is per socket operation), but far under a lock_ttl in practice;
+#   - from the refresh: job_budget + PUBLISH_THREAD_SLACK_S + LOCK_HEADROOM_S
+#     == lock_ttl.
+# PUBLISH_THREAD_SLACK_S covers writing .published.json and the last poll
+# request running past the budget. Live sync holds its lock for the same
+# factor of its own timeout and uses these helpers too.
+# Enforced by tests/test_autopublish_budgets.py. Defaults: 135 + 15 + 30 = 180.
+PUBLISH_THREAD_SLACK_S = 15.0
+LOCK_HEADROOM_S = 30.0
+DEFAULT_TIMEOUT_S = 60.0
+LOCK_TTL_FACTOR = 3
+
+
+def lock_ttl_for(timeout_s: float) -> float:
+    return timeout_s * LOCK_TTL_FACTOR
+
+
+def job_budget_for(lock_ttl: float) -> float:
+    return lock_ttl - PUBLISH_THREAD_SLACK_S - LOCK_HEADROOM_S
+
 
 # Reasons a candidate is skipped. Kept distinct because a single None would make
 # the skip log unusable: "nothing to do" and "cannot be published at all" demand
@@ -321,9 +349,10 @@ def _plan(artifacts_base: Path, slugs: list[str]) -> PlannedPhase:
     """Decide and order one phase's work: static before fullstack, newest first.
 
     Static goes first because publishing a fullstack artifact triggers a dependency
-    install on the backend and regularly hits the gateway timeout
-    (ENG-1547/ENG-1580); with the opposite order one slow fullstack would eat the
-    whole budget and the static artifacts would never get a link.
+    install on the backend and regularly runs longer than this reconciler's
+    per-turn budget (the server builds it asynchronously, but the
+    poll still takes minutes); with the opposite order one slow fullstack would
+    eat the whole budget and the static artifacts would never get a link.
 
     Skips are counted, not logged per artifact: `needs_publish` runs for every
     candidate on every turn, so a per-artifact line would bury `published` and
@@ -393,13 +422,31 @@ async def _publish_one(
     scope,
     access: ArtifactAccessRequest | None = None,
     project_id: str | None = None,
+    *,
+    job_budget_s: float,
+    abandoned: set[str] | None = None,
 ) -> bool:
     """Publish one artifact. True when it landed. Never raises.
 
     `access` defaults to the first-publish owner-only access; callers pass
     `_access_for(decision)` so a re-publish keeps the owner's own choice.
+
+    `job_budget_s` is the caller's per-reconciliation budget for polling an
+    asynchronously accepted (202) publish job; it is threaded through to
+    `publish_artifact` unchanged.
+
+    `abandoned` receives the slug when the publish thread is left running
+    (a timeout or a cancel), so the caller keeps its key alive for it.
     """
     folder = Path(artifacts_base) / slug
+    # Which phase the abandoned thread was in when wait_for gave up: "upload"
+    # (POST in flight) or "polling" (server accepted the job).
+    progress = {"phase": "upload"}
+
+    def accepted(_job: dict) -> None:
+        progress.update(phase="polling")
+        refresh(artifacts_base, slug)
+
     try:
         await asyncio.wait_for(
             asyncio.to_thread(
@@ -415,6 +462,8 @@ async def _publish_one(
                 # than falling back to the shared namespace root. We only ever
                 # get here with an org scope in hand (see the caller's guard).
                 scope=scope,
+                job_budget_s=job_budget_s,
+                on_job_accepted=accepted,
                 project_id=project_id,
                 # No person asked for this publish: a Markdown page the
                 # conversion stopped before is refused without a new render.
@@ -422,7 +471,13 @@ async def _publish_one(
             ),
             timeout=timeout_s,
         )
+    except asyncio.CancelledError:
+        if abandoned is not None:
+            abandoned.add(slug)
+        raise
     except asyncio.TimeoutError:
+        if abandoned is not None:
+            abandoned.add(slug)
         # to_thread is not cancellable: an upload already running goes on and
         # may yet write .published.json. So the lock is deliberately NOT
         # released and no retry is attempted: the next turn reads the record
@@ -431,7 +486,7 @@ async def _publish_one(
         # its thread, since nothing here tells the two apart. A cancel (a
         # Stop, a shutdown) that lands once the upload is handed to its thread
         # keeps the lock the same way: it propagates past every handler here.
-        _record("timeout", slug=slug, timeout_s=f"{timeout_s:.1f}")
+        _record("timeout", slug=slug, timeout_s=f"{timeout_s:.1f}", phase=progress["phase"])
         return False
     except PublishOwnedByOtherUser:
         # The upload service holds this report_id for another account, so a
@@ -487,7 +542,7 @@ async def autopublish_project_artifacts(
     limit: int = 5,
     budget_s: float = 60.0,
     touched_budget_s: float = 30.0,
-    timeout_s: float = 60.0,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> set[str]:
     """Publish every artifact in this project that needs it. Returns the slugs
     actually (re)published, so the caller can build their cards.
@@ -564,12 +619,16 @@ async def autopublish_project_artifacts(
     # Settings reads, each through a session of its own: off the loop.
     publish_url = await run_on_unit_threads(partial(_publish_url, scope))
     workspace_id = await run_on_unit_threads(partial(_active_workspace_id, scope))
+    lock_ttl = lock_ttl_for(timeout_s)
+    job_budget_s = job_budget_for(lock_ttl)
+    # An abandoned publish thread polls its job with this key until it ends,
+    # which the lock TTL bounds.
     key = PublishKey(
-        scope.user_id, scope.org_id, min_ttl_s=timeout_s + 60.0, workspace_id=workspace_id
+        scope.user_id, scope.org_id, min_ttl_s=lock_ttl + 60.0, workspace_id=workspace_id
     )
     started = time.monotonic()
     published: set[str] = set()
-    lock_ttl = timeout_s * 3
+    abandoned: set[str] = set()
 
     try:
         for phase_slugs, phase_deadline in (
@@ -632,7 +691,7 @@ async def autopublish_project_artifacts(
                     return published
                 if await _publish_one(
                     base, slug, api_key, publish_url, min(timeout_s, remaining), scope,
-                    access, project_id=project_id,
+                    access, project_id=project_id, job_budget_s=job_budget_s, abandoned=abandoned,
                 ):
                     published.add(slug)
     except asyncio.CancelledError:
@@ -640,7 +699,11 @@ async def autopublish_project_artifacts(
     except Exception:
         logger.warning("artifact autopublish reconciliation failed", exc_info=True)
     finally:
-        await key.revoke()
+        # A revoked key would fail an abandoned thread's next job poll, and
+        # that thread would then never record a publish the server finishes.
+        # Such a key expires with its TTL instead, as live sync's does.
+        if not abandoned:
+            await key.revoke()
     return published
 
 

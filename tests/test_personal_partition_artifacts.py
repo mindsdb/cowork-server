@@ -1014,7 +1014,7 @@ def fake_pads(monkeypatch):
     monkeypatch.setattr(
         scratchpad_runtime,
         "_resolve_coding",
-        lambda **coding: tuple(coding.values()),
+        lambda settings=None, **coding: tuple(coding.values()),
     )
     monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _FakePad)
     return scratchpad_runtime
