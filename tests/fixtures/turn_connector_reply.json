@@ -31,6 +31,9 @@
             "Authorization": "Bearer {api_key}",
             "X-Region": "{region}"
           }
+        },
+        "check": {
+          "path": "/v2/me"
         }
       }
     ]
