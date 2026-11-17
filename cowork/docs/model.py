@@ -168,6 +168,8 @@ def _indent(value: Any) -> int:
 
 
 def normalize_column(col: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(col, dict):
+        raise DocError("bad_column", "a column is {\"name\", \"kind\"}.")
     kind = col.get("kind") or "text"
     if kind not in COLUMN_KINDS:
         raise DocError("bad_column", f"column kind {kind!r} is not one of {', '.join(COLUMN_KINDS)}.")
@@ -179,9 +181,14 @@ def normalize_column(col: dict[str, Any]) -> dict[str, Any]:
     if kind == "status":
         options = []
         seen = set()
-        for opt in col.get("options") or []:
+        raw_options = col.get("options") or []
+        if not isinstance(raw_options, list):
+            raise DocError("bad_column", "a status column's options are a list.")
+        for opt in raw_options:
             if isinstance(opt, str):
                 opt = {"name": opt}
+            if not isinstance(opt, dict):
+                raise DocError("bad_column", "a status option is a name, or {\"name\", \"tone\"}.")
             name = clean_text(opt.get("name"), "option").strip()
             if not name or name.lower() in seen:
                 continue
@@ -259,12 +266,15 @@ def _pending_fields(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _table_fields(raw: dict[str, Any]) -> dict[str, Any]:
-    cols = [normalize_column(c) for c in raw.get("columns") or []]
+    raw_cols, raw_rows = raw.get("columns") or [], raw.get("rows") or []
+    if not isinstance(raw_cols, list) or not isinstance(raw_rows, list):
+        raise DocError("bad_table", "a table's columns and rows are lists.")
+    cols = [normalize_column(c) for c in raw_cols]
     if not cols:
         raise DocError("bad_table", "a table needs at least one column.")
     col_ids = [c["id"] for c in cols]
     rows = []
-    for row in raw.get("rows") or []:
+    for row in raw_rows:
         cells_in = row.get("cells") if isinstance(row, dict) else row
         cells: dict[str, str] = {}
         if isinstance(cells_in, list):
@@ -325,6 +335,10 @@ def normalize_chart(raw: dict[str, Any]) -> dict[str, Any]:
         y = source.get("y") or []
         if isinstance(y, str):
             y = [y]
+        if not isinstance(y, list):
+            raise DocError("bad_chart", "a chart source's y is a column name or a list of them.")
+        if len(y) > MAX_CHART_SERIES:
+            raise DocError("bad_chart", f"a chart draws at most {MAX_CHART_SERIES} series; this one has {len(y)}.")
         out["source"] = {"table": str(source["table"]), "x": clean_text(source.get("x"), "x"),
                          "y": [clean_text(v, "y") for v in y]}
         return out
@@ -501,9 +515,14 @@ def normalize_doc(raw: dict[str, Any]) -> dict[str, Any]:
     tabs = raw.get("tabs") or []
     if not isinstance(tabs, list):
         raise DocError("bad_doc", "the doc's tabs are a list.")
+    # The same limits the edit operations keep, so no path saves a doc past them.
+    if len(tabs) > MAX_TABS:
+        raise DocError("too_big", f"a doc holds at most {MAX_TABS} tabs.")
     for tab in tabs:
         if not isinstance(tab, dict) or not isinstance(tab.get("blocks") or [], list):
             raise DocError("bad_doc", "each tab is an object with a title and blocks.")
+        if len(tab.get("blocks") or []) > MAX_BLOCKS_PER_TAB:
+            raise DocError("too_big", f"a tab holds at most {MAX_BLOCKS_PER_TAB} blocks; split it into tabs.")
         blocks = [normalize_block(b, doc["rev"]) for b in tab.get("blocks") or []]
         doc["tabs"].append({"id": tab.get("id") or new_id("t_"),
                             "title": clean_text(tab.get("title"), "tab title") or "Untitled",

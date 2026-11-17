@@ -46,6 +46,8 @@ EDITS = {
                                {"op": "update", "id": _ids(d, "paragraph")[2], "set": {"text": ""}}],
     "delete the first block": lambda d: [{"op": "delete", "target": [_ids(d)[0]]}],
     "move a block up": lambda d: [{"op": "move", "ids": [_ids(d, "paragraph")[2]], "position": "start"}],
+    "move several blocks to the end": lambda d: [{"op": "move", "ids": _ids(d)[:2], "position": "end"}],
+    "move several blocks to the start": lambda d: [{"op": "move", "ids": _ids(d)[-3:], "position": "start"}],
     "edit a cell": lambda d: [{"op": "update_cell", "table": _table(d)["id"], "row": _table(d)["rows"][1]["id"],
                                "col": _table(d)["columns"][1]["id"], "value": "Priya"}],
     "add a row": lambda d: [{"op": "add_rows", "table": _table(d)["id"], "index": 1,

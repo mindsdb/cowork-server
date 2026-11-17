@@ -31,6 +31,16 @@ def _position(order: list[str], i: int, present: list[str]) -> Any:
     return {"before": present[0]} if present else "start"
 
 
+def _place(ids: list[str], bid: str, position: Any) -> list[str]:
+    """``ids`` with ``bid`` put where ``position`` (from _position) puts it."""
+    rest = [x for x in ids if x != bid]
+    anchor = position.get("after") or position.get("before") if isinstance(position, dict) else None
+    if anchor in rest:
+        k = rest.index(anchor) + (1 if "after" in position else 0)
+        return rest[:k] + [bid] + rest[k:]
+    return [bid, *rest] if position == "start" else [*rest, bid]
+
+
 def _undo_in_tab(before: Tab, after: Tab, changed: set[str]) -> list[dict[str, Any]]:
     tid = before["id"]
     ops: list[dict[str, Any]] = []
@@ -47,15 +57,20 @@ def _undo_in_tab(before: Tab, after: Tab, changed: set[str]) -> list[dict[str, A
         if bid not in changed:
             continue
         old = was[bid]
+        # `left` follows each op as it is emitted, so a later block is placed
+        # against the order the undo has already put back, not the one it found.
         if bid not in now:
-            ops.append({"op": "insert", "tab": tid, "position": _position(order, i, left), "blocks": [_plain(old)]})
+            position = _position(order, i, left)
+            ops.append({"op": "insert", "tab": tid, "position": position, "blocks": [_plain(old)]})
+            left = _place(left, bid, position)
             continue
         if _plain(old) != _plain(now[bid]):
             ops.append({"op": "replace", "tab": tid, "target": bid, "blocks": [_plain(old)]})
         at = left.index(bid)
         if (left[at - 1] if at else None) != (order[i - 1] if i else None):
-            ops.append({"op": "move", "tab": tid, "ids": [bid],
-                        "position": _position(order, i, [x for x in left if x != bid])})
+            position = _position(order, i, [x for x in left if x != bid])
+            ops.append({"op": "move", "tab": tid, "ids": [bid], "position": position})
+            left = _place(left, bid, position)
     return ops
 
 
