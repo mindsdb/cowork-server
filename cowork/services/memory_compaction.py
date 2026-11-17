@@ -38,7 +38,7 @@ from redis.exceptions import WatchError
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
 from cowork.common.settings.user_settings import UserSettings, get_user_settings
 from cowork.db.scoped import TenantScope
-from cowork.db.units import run_db, run_to_completion
+from cowork.db.units import run_db, run_efs, run_efs_unit, run_on_unit_threads
 from cowork.harnesses.memory.registry import SLOT_REGISTRY, MemorySlot
 from cowork.harnesses.memory.store import GlobalMemoryStore
 from cowork.principal import Principal
@@ -240,14 +240,15 @@ async def _compact_tier(
 ) -> None:
     root, slots = target
     turn_settings = TurnQueueSettings()
-    settings = await asyncio.to_thread(get_user_settings, scope)
+    settings = await run_on_unit_threads(partial(get_user_settings, scope))
     if not settings.memory_enabled or settings.memory_mode == "off":
         return
-    if not await is_due(tier, await asyncio.to_thread(_entry_count, root)):
+    entry_count = partial(run_efs, partial(_entry_count, root), scope=scope)
+    if not await is_due(tier, await entry_count()):
         return
     async with tier_lock(tier) as held:
         # Asked again under the lock: another replica may have just finished.
-        if not held or not await is_due(tier, await asyncio.to_thread(_entry_count, root)):
+        if not held or not await is_due(tier, await entry_count()):
             return
         counted = True
         try:
@@ -263,11 +264,25 @@ async def _compact_tier(
             )
         # Not reached on a cancel: a shutdown mid-call does not use up the attempt.
         if counted:
-            await record_attempt(tier, await asyncio.to_thread(_entry_count, root))
+            await record_attempt(tier, await entry_count())
 
 
 def _entry_count(root: Path) -> int:
     return Hippocampus(root).entry_count()
+
+
+def _read_sources(
+    root: Path, slots: list[MemorySlot]
+) -> list[tuple[MemorySlot, CompactionInput]]:
+    """The files of `slots` long enough to be worth a model call."""
+    sources: list[tuple[MemorySlot, CompactionInput]] = []
+    for slot, kind in _FILE_KINDS:
+        if slot not in slots:
+            continue
+        source = read_compaction_input(root / SLOT_REGISTRY[slot].filename, kind)
+        if len(source.entries) >= COMPACTION_MIN_ENTRIES:
+            sources.append((slot, source))
+    return sources
 
 
 async def _plan_files(
@@ -278,15 +293,7 @@ async def _plan_files(
     root: Path,
     slots: list[MemorySlot],
 ) -> list[tuple[MemorySlot, CompactionPlan]]:
-    sources: list[tuple[MemorySlot, CompactionInput]] = []
-    for slot, kind in _FILE_KINDS:
-        if slot not in slots:
-            continue
-        source = await asyncio.to_thread(
-            read_compaction_input, root / SLOT_REGISTRY[slot].filename, kind
-        )
-        if len(source.entries) >= COMPACTION_MIN_ENTRIES:
-            sources.append((slot, source))
+    sources = await run_efs(partial(_read_sources, root, slots), scope=scope)
     if not sources:
         return []
     # The same key and model a cloud turn of this person gets: minted for their
@@ -339,8 +346,8 @@ async def _apply(
     release runs while it still writes.
     """
     if tier.kind == "person":
-        return await run_to_completion(asyncio.to_thread(_apply_personal, root, plans))
-    return await run_db(
+        return await run_efs(partial(_apply_personal, root, plans), scope=scope)
+    return await run_efs_unit(
         partial(
             apply_project_compaction,
             principal=principal,

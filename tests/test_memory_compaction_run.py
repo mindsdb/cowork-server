@@ -19,7 +19,7 @@ from cowork.services import memory_compaction
 from cowork.services.memory_compaction import MemoryTier, record_attempt
 from cowork.services.product_permissions import ProductPermissionUnavailable
 
-SCOPE = SimpleNamespace(org_id="org-1", user_id="user-1")
+SCOPE = SimpleNamespace(org_id="org-1", user_id="user-1", partitioned=True)
 PERSON = MemoryTier(org_id="org-1", kind="person", owner_id="user-1")
 SLOTS = [MemorySlot.LESSONS, MemorySlot.RULES]
 COUNT_KEY = "cowork:memory-compaction:count:org-1:person:user-1"
