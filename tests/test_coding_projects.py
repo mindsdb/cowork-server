@@ -31,7 +31,7 @@ from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.session_factory import project_instructions, task_title
 from cowork.coding.workspace import GitIdentityMissingError, GitRunner, WorkspaceError, WorkspaceManager
-from coding_service_fakes import copy_folders_without_git
+from tests.support.coding.service_fakes import copy_folders_without_git
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -45,9 +45,12 @@ def git(cwd: Path, *args: str) -> str:
 
 
 def repository(root: Path, name: str) -> Path:
+    """Create a disposable repository without background changes to its object store."""
     repo = root / name
     repo.mkdir()
     git(repo, "init")
+    git(repo, "config", "maintenance.auto", "false")
+    git(repo, "config", "gc.auto", "0")
     git(repo, "config", "user.email", "cowork@example.invalid")
     git(repo, "config", "user.name", "Cowork Test")
     # A commit starts a detached `git maintenance`, which since git 2.55 holds

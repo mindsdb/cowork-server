@@ -65,6 +65,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Choose test evidence directory
+        run: echo "TEST_REPORT_DIR=$RUNNER_TEMP/test-inventory/services" >> "$GITHUB_ENV"
+
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
         with:
@@ -75,4 +78,25 @@ jobs:
         run: uv sync --locked --group dev
 
       - name: Run service tests
-        run: make test/services
+        run: >-
+          make test/services MAKEOVERRIDES=
+          PYTEST="uv run --locked python -m pytest -p scripts.pytest_inventory
+          --test-cohort=services --test-inventory='$TEST_REPORT_DIR/inventory.json'
+          --junitxml='$TEST_REPORT_DIR/junit.xml'"
+
+      - name: Check and summarize test evidence
+        if: always()
+        run: >-
+          uv run --locked python scripts/test_inventory.py check
+          "$TEST_REPORT_DIR/inventory.json" --junit "$TEST_REPORT_DIR/junit.xml"
+
+      - name: Upload test evidence
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: test-inventory-services-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.TEST_REPORT_DIR }}/inventory.json
+            ${{ env.TEST_REPORT_DIR }}/junit.xml
+          if-no-files-found: error
+          retention-days: 14
