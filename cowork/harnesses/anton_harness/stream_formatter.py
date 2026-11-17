@@ -53,6 +53,7 @@ from cowork.schemas.responses import (
     ResponseStatus,
     Role,
 )
+from cowork.schemas.artifact_card import ArtifactCard
 from cowork.streaming.addons import TurnAddon
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
 
@@ -79,7 +80,7 @@ class ArtifactCreated:
     renderer shows an inline card for every artifact type, identically and
     deterministically — live and on reload."""
 
-    artifact: dict
+    artifact: ArtifactCard
 
 
 @dataclass(frozen=True)
@@ -279,6 +280,15 @@ class SkillCreated:
     skill: dict
 
 
+@dataclass
+class ConnectorDrafted:
+    """A connector template a cloud turn built, already checked again with the
+    draft parser. Mapped to a `response.connector_drafted` SSE event; nothing
+    is stored until the member saves it from the card."""
+
+    connector: dict
+
+
 PHASE_LABELS = {
     "planning": "Planning",
     "analyzing": "Analyzing",
@@ -297,6 +307,8 @@ PHASE_LABELS = {
     # A skill draft the pod reported was rejected, or trimmed a sibling file —
     # see `remote_skill_draft_result` (cowork/services/task_objects.py).
     "skill_draft_dropped": "Skill draft",
+    # A connector template the pod reported was refused or over the per-turn cap.
+    "connector_draft_dropped": "Connector template",
     # The completion verifier forced a continuation; the text after this
     # replaces the answer streamed before it.
     "continuation": "Continuing",
@@ -1209,7 +1221,7 @@ async def format_responses_stream(
             # A lost/trimmed skill draft is one-shot per draft, same shape as
             # the rate-limit notice — throttling it away would silently
             # recreate the exact bug it exists to surface.
-            is_skill_draft_notice = phase_str == "skill_draft_dropped"
+            is_draft_notice = phase_str in ("skill_draft_dropped", "connector_draft_dropped")
             is_tool_progress = phase_str == "tool_progress"
             is_tool_done = phase_str == "tool_done" and event.id in progress_tool_ids
 
@@ -1245,7 +1257,7 @@ async def format_responses_stream(
                     or is_tool_done
                     or is_tool_progress
                     or is_rate_limited_notice
-                    or is_skill_draft_notice
+                    or is_draft_notice
                 )
                 now = time.time()
                 should_emit = never_throttle or (now - last_progress >= PROGRESS_THROTTLE)
@@ -1342,7 +1354,7 @@ async def format_responses_stream(
             yield _event("response.artifact_created", {
                 "type": "response.artifact_created",
                 "sequence_number": seq,
-                "artifact": event.artifact,
+                "artifact": event.artifact.to_json(),
             })
 
         elif isinstance(event, StreamAskUser):
@@ -1416,6 +1428,14 @@ async def format_responses_stream(
                 "type": "response.skill_created",
                 "sequence_number": seq,
                 "skill": event.skill,
+            })
+
+        elif isinstance(event, ConnectorDrafted):
+            seq += 1
+            yield _event("response.connector_drafted", {
+                "type": "response.connector_drafted",
+                "sequence_number": seq,
+                "connector": event.connector,
             })
 
         elif isinstance(event, TurnMemoryRead):
