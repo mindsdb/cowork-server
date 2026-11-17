@@ -10,7 +10,7 @@ import os
 import shutil
 import stat
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -72,7 +72,7 @@ def _writable(directory: Path) -> Iterator[None]:
             os.chmod(directory, stat.S_IMODE(mode))
 
 
-def _force_remove(path: Path) -> None:
+def force_remove(path: Path) -> None:
     """Remove a managed tree even where its directories are read-only."""
 
     def retry_writable(function, failed: str, _exc: BaseException) -> None:
@@ -126,8 +126,8 @@ class LocalCopyManager:
             self._copy_tree(source, baseline)
             self._copy_tree(source, workspace)
         except Exception as exc:
-            _force_remove(workspace)
-            _force_remove(baseline)
+            force_remove(workspace)
+            force_remove(baseline)
             if isinstance(exc, OSError):
                 raise self._copy_failure("The task folder could not be copied", exc) from exc
             raise
@@ -149,8 +149,8 @@ class LocalCopyManager:
             self._copy_tree(current_workspace, workspace)
             self._copy_tree(parent_baseline, baseline)
         except Exception as exc:
-            _force_remove(workspace)
-            _force_remove(baseline)
+            force_remove(workspace)
+            force_remove(baseline)
             if isinstance(exc, OSError):
                 raise self._copy_failure("The existing task copy could not be duplicated", exc) from exc
             raise
@@ -244,7 +244,21 @@ class LocalCopyManager:
                 shutil.copy2(desired_path, temp)
                 os.replace(temp, target)
 
-    def cleanup(self, key: str, workspace: Path) -> None:
+    def cleanup(
+        self,
+        key: str,
+        workspace: Path,
+        *,
+        keep_recovery: bool = True,
+        remove: Callable[[Path], None] | None = None,
+    ) -> None:
+        """Remove a task copy and its baseline.
+
+        With ``keep_recovery`` a changed copy is saved under the recovery root
+        first. Deleting a task passes False: nothing could reopen the copy, and
+        the diff and copy are the slowest part of removing a large folder.
+        ``remove`` replaces the in-place removal, such as to finish it later.
+        """
         relative = managed_key(key)
         actual = workspace.resolve()
         expected_roots = (self.copies_root, self.legacy_copies_root)
@@ -252,7 +266,7 @@ class LocalCopyManager:
             raise LocalCopyError("Refusing to remove an unmanaged task copy")
         baseline = self.baselines_root / relative
         recovery = self.recovery_root / relative / "local-copy"
-        if workspace.exists() and self.diff(workspace):
+        if keep_recovery and workspace.exists() and self.diff(workspace):
             recovery.parent.mkdir(parents=True, exist_ok=True)
             if recovery.exists():
                 shutil.rmtree(recovery)
@@ -260,6 +274,10 @@ class LocalCopyManager:
                 self._copy_tree(workspace, recovery)
             except OSError as exc:
                 raise self._copy_failure("The task copy could not be saved for recovery", exc) from exc
+        if remove is not None:
+            remove(workspace)
+            remove(baseline)
+            return
         shutil.rmtree(workspace, ignore_errors=True)
         shutil.rmtree(baseline, ignore_errors=True)
 
@@ -296,7 +314,7 @@ class LocalCopyManager:
             logger.debug("Falling back to a byte copy of %s: %s", source, exc)
             # A failed clone or sweep can leave a partial tree behind, possibly
             # with read-only directories.
-            _force_remove(target)
+            force_remove(target)
             shutil.copytree(source, target, symlinks=True, ignore=cls._skip_unsupported)
 
     @classmethod

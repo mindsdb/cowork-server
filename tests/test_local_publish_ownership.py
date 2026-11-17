@@ -73,7 +73,7 @@ def publisher(personal_deployment, monkeypatch, tmp_path):
             )
 
         def remove(self, page, scope=ALICE):
-            return asyncio.run(routes.unpublish_artifact(scope=scope, path=str(page)))
+            return routes.unpublish_artifact(scope=scope, path=str(page))
 
         def entry(self, page):
             return json.loads((page.parent / ".published.json").read_text())[page.name]

@@ -247,7 +247,7 @@ def test_cards_for_slugs_builds_one_card_per_slug(tmp_path):
     _make_artifact(base, "dash", files={"index.html": "<html></html>"},
                    meta={"slug": "dash", "name": "Dash", "type": "html-app"})
 
-    cards = t.cards_for_slugs(base, ["dash"], scope=LOCAL_SCOPE)
+    cards = [card.to_json() for card in t.cards_for_slugs(base, ["dash"], scope=LOCAL_SCOPE)]
 
     assert [c["slug"] for c in cards] == ["dash"]
     assert cards[0]["title"] == "Dash"
@@ -270,7 +270,7 @@ def test_cards_carry_project_identity_when_given(tmp_path):
     _make_artifact(base, "dash", files={"index.html": "<html></html>"},
                    meta={"slug": "dash", "name": "Dash", "type": "html-app"})
 
-    card = t.cards_for_slugs(base, ["dash"], project_id="p-1", project_name="Alpha", scope=LOCAL_SCOPE)[0]
+    card = t.cards_for_slugs(base, ["dash"], project_id="p-1", project_name="Alpha", scope=LOCAL_SCOPE)[0].to_json()
 
     assert card["projectId"] == "p-1"
     assert card["projectName"] == "Alpha"
@@ -285,9 +285,9 @@ async def test_local_mode_cards_an_edited_slug_without_publishing(tmp_path):
     _make_artifact(base, "dash", files={"index.html": "v2"},
                    meta={"slug": "dash", "name": "Dash", "type": "html-app"})
 
-    cards = await t.publish_and_card_turn_artifacts(
+    cards = [card.to_json() for card in await t.publish_and_card_turn_artifacts(
         base, new_slugs=[], touched_slugs={"dash"}, scope=LOCAL_SCOPE,
-    )
+    )]
 
     assert [c["slug"] for c in cards] == ["dash"]
 
@@ -312,9 +312,9 @@ async def test_org_mode_still_requires_a_successful_republish_to_card_an_edit(
     )
     org_scope = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
 
-    cards = await t.publish_and_card_turn_artifacts(
+    cards = [card.to_json() for card in await t.publish_and_card_turn_artifacts(
         base, new_slugs=[], touched_slugs={"dash"}, scope=org_scope,
-    )
+    )]
 
     assert cards == []
 

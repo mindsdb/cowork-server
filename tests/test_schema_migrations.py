@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import uuid
 from types import SimpleNamespace
@@ -595,6 +596,129 @@ def test_a_skill_sharing_downgrade_takes_the_backfill_marker_with_the_rows(tmp_p
     assert marker == 0
 
 
+def test_held_artifact_roots_keep_one_row_per_root_and_take_their_sentinel_on_downgrade(tmp_path, monkeypatch):
+    """One row per root: a project's shared root (no conversation) and each
+    legacy root once. The settings row that says the backfill filled them
+    goes with the table on a downgrade: left behind, a re-upgrade's list
+    would trust an empty table and show no card. So does the backfill's
+    progress, which would let a re-upgrade's backfill skip projects."""
+    from cowork.services.held_artifact_roots import PROGRESS_KEY, SENTINEL_KEY
+
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "held-roots.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    project, conversation = uuid.uuid4().hex, uuid.uuid4().hex
+    insert = text(
+        "INSERT INTO held_artifact_roots (id, org_id, project_id, conversation_id) "
+        "VALUES (:id, :org, :project, :conversation)"
+    )
+
+    def add(conversation_id) -> None:
+        with engine.begin() as connection:
+            connection.execute(
+                insert, {"id": uuid.uuid4().hex, "org": _ORG, "project": project, "conversation": conversation_id}
+            )
+
+    add(None)
+    add(conversation)
+    for again in (None, conversation):
+        with pytest.raises(IntegrityError):
+            add(again)
+    with engine.begin() as connection:
+        _insert_setting(connection, key=SENTINEL_KEY, value='{"unread": []}')
+        _insert_setting(connection, key=PROGRESS_KEY, value='{"after": null, "unread": []}')
+        _insert_setting(connection, key="tone", value="balanced", scope="org", org_id=_ORG)
+
+    _downgrade_to(engine, uri, "f93151b5bad1")
+    with engine.connect() as connection:
+        keys = {row[0] for row in connection.execute(text("SELECT key FROM settings"))}
+    assert "held_artifact_roots" not in inspect(engine).get_table_names()
+    assert SENTINEL_KEY not in keys and PROGRESS_KEY not in keys
+    assert "tone" in keys
+
+    _upgrade_to(engine, uri, "head")
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT count(*) FROM held_artifact_roots")).scalar_one()
+        sentinel = connection.execute(
+            text("SELECT count(*) FROM settings WHERE key = :key"), {"key": SENTINEL_KEY}
+        ).scalar_one()
+    assert (rows, sentinel) == (0, 0)
+
+
+def test_artifact_sort_times_keep_one_row_per_folder_and_take_their_sentinel_on_downgrade(tmp_path, monkeypatch):
+    """One row per folder: a shared root's folder (no conversation) and a
+    legacy root's folder each once. The sentinel that says the backfill read
+    every held root goes with the table on a downgrade, and so does the
+    backfill's progress, which would let a re-upgrade's backfill skip
+    projects; the held roots stay with theirs. The revision sits on the
+    merge of the held-root and the org appearance heads. The list's newest
+    rows come through an index per form of the list: a project's
+    (project_id, sort_time) and an organization's (org_id, sort_time), the
+    same in the revision as in the model."""
+    from cowork.models.artifact_sort_time import ArtifactSortTime
+    from cowork.services.artifact_sort_times import PROGRESS_KEY, SENTINEL_KEY
+    from cowork.services.held_artifact_roots import PROGRESS_KEY as HELD_PROGRESS_KEY
+    from cowork.services.held_artifact_roots import SENTINEL_KEY as HELD_KEY
+
+    script = ScriptDirectory.from_config(_alembic_config("sqlite://"))
+    assert script.get_revision("33c9ba9927ad").down_revision == "7a18a01d56a0"
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    db_path = tmp_path / "sort-times.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    migrated = {index["name"]: index["column_names"] for index in inspect(engine).get_indexes("artifact_sort_times")}
+    modeled = {index.name: [column.name for column in index.columns] for index in ArtifactSortTime.__table__.indexes}
+    assert migrated["ix_artifact_sort_times_org_time"] == ["org_id", "sort_time"]
+    assert migrated["ix_artifact_sort_times_project_time"] == ["project_id", "sort_time"]
+    for name in ("ix_artifact_sort_times_org_time", "ix_artifact_sort_times_project_time"):
+        assert modeled[name] == migrated[name], name
+    project, conversation = uuid.uuid4().hex, uuid.uuid4().hex
+    insert = text(
+        "INSERT INTO artifact_sort_times (id, org_id, project_id, conversation_id, slug, sort_time) "
+        "VALUES (:id, :org, :project, :conversation, :slug, 1.0)"
+    )
+
+    def add(conversation_id, slug="report") -> None:
+        with engine.begin() as connection:
+            connection.execute(
+                insert,
+                {"id": uuid.uuid4().hex, "org": _ORG, "project": project, "conversation": conversation_id, "slug": slug},
+            )
+
+    add(None)
+    add(conversation)
+    add(None, slug="chart")
+    for again in (None, conversation):
+        with pytest.raises(IntegrityError):
+            add(again)
+    with engine.begin() as connection:
+        _insert_setting(connection, key=SENTINEL_KEY, value='{"unread": []}')
+        _insert_setting(connection, key=PROGRESS_KEY, value='{"after": null, "unread": []}')
+        _insert_setting(connection, key=HELD_KEY, value='{"unread": []}')
+        _insert_setting(connection, key=HELD_PROGRESS_KEY, value='{"after": null, "unread": []}')
+
+    _downgrade_to(engine, uri, "7a18a01d56a0")
+    with engine.connect() as connection:
+        keys = {row[0] for row in connection.execute(text("SELECT key FROM settings"))}
+    tables = inspect(engine).get_table_names()
+    assert "artifact_sort_times" not in tables and "held_artifact_roots" in tables
+    assert SENTINEL_KEY not in keys and PROGRESS_KEY not in keys
+    assert HELD_KEY in keys and HELD_PROGRESS_KEY in keys
+
+    _upgrade_to(engine, uri, "head")
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT count(*) FROM artifact_sort_times")).scalar_one()
+        sentinel = connection.execute(
+            text("SELECT count(*) FROM settings WHERE key = :key"), {"key": SENTINEL_KEY}
+        ).scalar_one()
+    assert (rows, sentinel) == (0, 0)
+
+
 def test_artifact_owner_choices_upgrade_and_downgrade(tmp_path, monkeypatch):
     """One row per artifact per organization, keyed by its authorization key;
     the downgrade drops the table, so a re-upgrade never judges a re-publish
@@ -995,14 +1119,17 @@ def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monk
     assert "reports" in names and "untitled-project" in names
 
 
-def _insert_custom_connector(connection, *, connector_id, org_id=None):
+def _insert_custom_connector(connection, *, connector_id, org_id=None, created_by=None):
     connection.execute(
         text(
             "insert into custom_connectors "
-            "(id, connector_id, label, description, spec, featured, org_id) "
-            "values (:id, :connector_id, :label, '', '{}', 1, :org_id)"
+            "(id, connector_id, label, description, spec, featured, org_id, created_by) "
+            "values (:id, :connector_id, :label, '', '{}', 1, :org_id, :created_by)"
         ),
-        {"id": uuid.uuid4().hex, "connector_id": connector_id, "label": connector_id, "org_id": org_id},
+        {
+            "id": uuid.uuid4().hex, "connector_id": connector_id, "label": connector_id,
+            "org_id": org_id, "created_by": created_by,
+        },
     )
 
 
@@ -1033,17 +1160,63 @@ def test_custom_connector_id_is_unique_per_scope(tmp_path, monkeypatch):
 
     with engine.begin() as connection:
         _insert_custom_connector(connection, connector_id="httpbin")
-        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
-        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-b")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a", created_by="user-1")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-b", created_by="user-1")
 
     with pytest.raises(IntegrityError):
         with engine.begin() as connection:
             _insert_custom_connector(connection, connector_id="httpbin")
     with pytest.raises(IntegrityError):
         with engine.begin() as connection:
-            _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
+            _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a", created_by="user-1")
 
 
+#: The revision before org custom connectors became one per builder.
+PRIOR_TO_PER_BUILDER = "1d5fe417cc0a"
+
+
+def test_custom_connector_id_is_unique_per_builder_in_an_org(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    uri = _sqlite_uri(tmp_path / "custom_connectors_builder.db")
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-2")
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+
+
+def test_custom_connectors_per_builder_upgrade_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db = tmp_path / "custom_connectors_per_builder.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, PRIOR_TO_PER_BUILDER)
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+    _upgrade_to(engine, uri, "head")
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-2")
+
+    # Two members share the id, which the one-per-org index cannot hold.
+    with pytest.raises(Exception, match="cannot downgrade custom connectors per builder"):
+        _downgrade_to(engine, uri, PRIOR_TO_PER_BUILDER)
+    assert _alembic_version(db) == expected_head()
+
+    with engine.begin() as connection:
+        connection.execute(text("delete from custom_connectors where created_by = 'user-2'"))
+    _downgrade_to(engine, uri, PRIOR_TO_PER_BUILDER)
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-2")
 def _insert_queued_repair(connection, *, conversation_id: str, org_id=None):
     connection.execute(
         text(
@@ -1528,3 +1701,61 @@ def test_artifact_locations_downgrade_guards_missing_table(tmp_path, monkeypatch
     _downgrade_to(engine, uri, "dce94d4bafc0")  # must not raise
 
     assert _alembic_versions(db_path) == {"dce94d4bafc0", MAINS_OWNER_INDEX, ORG_APPEARANCE_DROP}
+
+
+def test_the_custom_connector_check_column_upgrades_and_downgrades(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db = tmp_path / "custom_connector_check.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "d4b8e2f6a9c1")
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+    _upgrade_to(engine, uri, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            text("update custom_connectors set connection_check = :check where connector_id = 'acme'"),
+            {"check": '{"path": "/v1/me", "headers": {"X-Key": "{api_key}"}}'},
+        )
+
+    _downgrade_to(engine, uri, "d4b8e2f6a9c1")
+
+    with engine.begin() as connection:
+        columns = {row[1] for row in connection.execute(text("pragma table_info(custom_connectors)"))}
+        kept = connection.execute(text("select count(*) from custom_connectors")).scalar()
+    assert "connection_check" not in columns
+    assert kept == 1
+
+
+def test_the_custom_connector_auth_column_upgrades_and_downgrades(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db = tmp_path / "custom_connector_auth.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "e5f1a3c7b9d2")
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="acme", org_id="org-a", created_by="user-1")
+        connection.execute(
+            text("update custom_connectors set connection_check = :check where connector_id = 'acme'"),
+            {"check": '{"path": "/v1/me"}'},
+        )
+    _upgrade_to(engine, uri, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            text("update custom_connectors set connection_auth = :auth where connector_id = 'acme'"),
+            {"auth": '{"type": "header", "headers": {"X-Key": "{api_key}"}}'},
+        )
+        stored = connection.execute(text("select connection_auth from custom_connectors")).scalar()
+    assert json.loads(stored) == {"type": "header", "headers": {"X-Key": "{api_key}"}}
+
+    _downgrade_to(engine, uri, "e5f1a3c7b9d2")
+
+    with engine.begin() as connection:
+        columns = {row[1] for row in connection.execute(text("pragma table_info(custom_connectors)"))}
+        check = connection.execute(text("select connection_check from custom_connectors")).scalar()
+    assert "connection_auth" not in columns
+    assert json.loads(check) == {"path": "/v1/me"}

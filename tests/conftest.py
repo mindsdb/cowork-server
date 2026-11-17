@@ -5,6 +5,7 @@ module is imported (settings/engine are read at import time), then builds the
 schema directly and seeds the ``general`` project the runtime depends on.
 """
 import copy
+import gc
 import importlib
 import io
 import logging
@@ -13,7 +14,9 @@ import pkgutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
+from unittest.mock import AsyncMock
 
 # Resolved: macOS links /var to /private/var, and a COWORK_HOME under that
 # link takes branches a Linux run doesn't, so the blocking guard
@@ -26,6 +29,10 @@ os.environ["DATABASE_URI"] = f"sqlite:///{TMP / 'test.db'}"
 # whichever test decrypts first after get_fernet's cache clears. Hosted pods
 # take the key from COWORK_MASTER_KEY and read no file.
 os.environ["MASTER_KEY_PATH"] = str(Path(tempfile.mkdtemp(prefix="cowork-test-key-")) / "master.key")
+# Org mode's pod-local stores (publish state.json, probe env files, the
+# harness's temporary vault) default to <system temp>/cowork, which every test
+# process shares; per process, and outside COWORK_HOME for the same reason as the key.
+os.environ["COWORK_POD_SCRATCH_DIR"] = str(Path(tempfile.mkdtemp(prefix="cowork-test-pod-scratch-")).resolve())
 os.environ["COWORK_PUBLIC_BASE_URL"] = "https://hooks.example.com"
 os.environ["COWORK_CONVERSATION_LINK_TEMPLATE"] = "https://app.example.com/c/{conversation_id}"
 # Org mode roots every filesystem store at cowork_home() (see
@@ -126,9 +133,28 @@ def keep_seeded_general_path():
 
 
 @pytest.fixture(autouse=True)
+def app_settings_rebuilt_after_a_test_replaced_them():
+    """Clear the cached app settings when a test left a different object there.
+
+    A fixture that sets an env var and clears ``get_app_settings`` leaves the
+    env to monkeypatch, which restores it last; a teardown in between that
+    reads settings caches the test's env for the next test. Autouse fixtures
+    set up before ``monkeypatch``, so this tears down after it, and the next
+    read uses the restored env. A test that never replaced the cached object
+    costs no rebuild.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    before = get_app_settings()
+    yield
+    if get_app_settings.cache_info().currsize and get_app_settings() is not before:
+        get_app_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
 def close_coding_services():
     yield
-    from coding_service_fakes import close_services
+    from tests.support.coding.service_fakes import close_services
 
     close_services()
 
@@ -154,6 +180,35 @@ def shared_root_resolved_at_startup():
     from cowork.services.projects import resolve_shared_root
 
     resolve_shared_root()
+
+
+@pytest.fixture(scope="session")
+def child_runs_this_checkout():
+    """Fail at once when a conversion process would import another checkout's cowork.
+
+    The process starts with ``-I``, which drops ``PYTHONPATH`` and the current
+    folder, so it imports cowork from the interpreter's own site-packages. A
+    venv whose editable install points at another checkout would test that
+    checkout's conversion.
+    """
+    import subprocess
+
+    import cowork
+    from cowork.schemas.export_child import ChildLimits
+    from cowork.services import export_runner
+
+    command = export_runner.child_command(limits=ChildLimits(wall_seconds=30.0, memory_bytes=1))
+    interpreter = command.argv[: command.argv.index("-m")]
+    finished = subprocess.run(
+        [*interpreter, "-c", "import cowork; print(cowork.__file__)"],
+        env=command.environment, capture_output=True, text=True, timeout=60,
+    )
+    found = finished.stdout.strip()
+    if finished.returncode != 0 or Path(found).resolve() != Path(cowork.__file__).resolve():
+        pytest.fail(
+            f"a conversion process imports cowork from {found or finished.stderr!r}, "
+            f"not {cowork.__file__}: reinstall this checkout into the venv (uv sync)"
+        )
 
 
 @pytest.fixture
@@ -451,6 +506,24 @@ def managed_postgres_service():
 
 
 @pytest.fixture
+def empty_decisions_proxy_records(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Return an empty-record lookup and patch the Redis factory for one test."""
+    # Application imports must follow bootstrap's blocking-guard installation.
+    from cowork.turnqueue import redis_client
+
+    client = SimpleNamespace(get=AsyncMock(return_value=None))
+    monkeypatch.setattr(redis_client, "get_redis", lambda: client)
+    return client
+
+
+@pytest.fixture
+def router_wire_budget(monkeypatch) -> None:
+    """Give real SDK wire checks setup headroom; deadline tests override their own bounds."""
+    monkeypatch.setattr("cowork.handlers.response_routing._GATE_FIRST_EVENT_SECONDS", 10.0)
+    monkeypatch.setattr("cowork.handlers.response_routing._GATE_TOTAL_SECONDS", 15.0)
+
+
+@pytest.fixture
 def openai_compatible_api(monkeypatch):
     """Set COWORK_OPENAI_COMPATIBLE_API for one test, or unset it with None.
 
@@ -606,3 +679,19 @@ def pytest_sessionstart(session):
         _blocking_guard.StaleEntryCheck(tests_dir=Path(__file__).parent, reached=_GUARD_REACHED),
         "cowork-blocking-guard-stale-entries",
     )
+
+
+@pytest.fixture
+def without_gc_pauses():
+    """Collect now, then hold the cyclic garbage collector off for the test.
+
+    Late in a full run the heap is large, and one full collection stops the
+    event loop for over a second on a CI runner. A test that times the loop
+    would then blame the code under test for the collector's pause.
+    """
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()

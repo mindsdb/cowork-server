@@ -63,6 +63,7 @@ from cowork.harnesses.anton_harness.figure_sources import has_figures
 from cowork.harnesses.memory.policy import memory_policy
 from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
 from cowork.harnesses.anton_harness.stream_formatter import (
+    ConnectorDrafted,
     PreviewCheckRequest,
     SkillCreated,
     TurnContext,
@@ -145,6 +146,7 @@ from cowork.db.scoped import (
     unsafe_unscoped_session,
 )
 from cowork.principal import Principal, identity_trace_metadata
+from cowork.services.connectors.custom_connectors import turn_connector_cards
 from cowork.schemas.connectors import DisabledConnection
 from cowork.services.comparisons import (
     COMPARISON_HARNESS,
@@ -1790,7 +1792,7 @@ class ResponsesHandler:
         queue_settings = TurnQueueSettings()
         turn_key_id = None
         workspace_id = getattr(settings, "hub_workspace_id", "") or None
-        if queue_settings.datasource_enabled:
+        if queue_settings.needs_turn_key_id:
             block, turn_key_id = await _mint_llm_block_with_turn_key_id(
                 org_id=self.scope.org_id,
                 user_id=self.scope.user_id,
@@ -2523,7 +2525,11 @@ class ResponsesHandler:
             conversation = ConversationService(session).get_conversation(conv_id)
             org_root = projects_root(scope=session.scope).parent
             rel = Path(conversation.project.path).relative_to(org_root).as_posix()
-            return RemoteWorkspace(project_id=str(conversation.project.id), workspace_rel_path=rel)
+            return RemoteWorkspace(
+                project_id=str(conversation.project.id),
+                workspace_rel_path=rel,
+                project_name=getattr(conversation.project, "name", None),
+            )
         except Exception:
             logger.exception("[responses] failed to resolve workspace", extra=log_context(conversation_id=conv_id))
             return None
@@ -2931,11 +2937,16 @@ class ResponsesHandler:
             a folder, or the project's folder itself, asks for that check
             again once it returns (request_self_heal_for_unread_folders), and
             a diff or a record that fails asks for the project's self-heal
-            (request_turn_end_self_heal). The caller drops the rows of the
-            repair folders the diff checked once the turn's cards are out
+            (request_turn_end_self_heal). With the list or without it, a
+            folder whose sort time the diff could not read has its root held
+            by the record and asks for the project's location check
+            (request_self_heal_for_untimed_folders), whose listing reads the
+            time again. The caller drops the rows of the repair folders the
+            diff checked once the turn's cards are out
             (forget_checked_repairs)."""
             from cowork.services.artifact_autopublish import (
                 request_self_heal_for_unread_folders,
+                request_self_heal_for_untimed_folders,
                 request_turn_end_self_heal,
             )
             from cowork.services.revision_summaries import summaries_from_messages
@@ -3003,12 +3014,17 @@ class ResponsesHandler:
                         )
                     return None
                 # Even when the listing found no id: the self-heal lists the
-                # folders it could not read again.
+                # folders it could not read again, and reads again the times
+                # it could not read.
                 request_self_heal_for_unread_folders(
                     listing=changes.listed_ids, artifacts_base=directory.base, scope=scope,
                     project_id=directory.project_id,
                 )
-                if not (changes.created or changes.listed_ids.ids):
+                request_self_heal_for_untimed_folders(
+                    folders=changes.untimed, artifacts_base=directory.base, scope=scope,
+                    project_id=directory.project_id,
+                )
+                if not changes.needs_record:
                     return changes
                 note_turn_end_slugs(slugs=changes.created)
                 try:
@@ -3021,31 +3037,51 @@ class ResponsesHandler:
                             creator=directory.creator,
                             artifact_ids=changes.created_ids,
                             listed_ids=changes.listed_ids,
+                            sort_times=changes.sort_times,
+                            untimed=changes.untimed,
                         ),
                         scope=scope,
                     )
                 except Exception as exc:
-                    # record_new_artifacts logs each slug whose index or
-                    # owner write fails itself; this covers the unit's own
-                    # refusal (a busy pool), a failed commit, or a failed
-                    # check of the folders the diff listed, which it raises
-                    # once its other writes have committed. In org mode
-                    # nothing records these folders later:
+                    # record_new_artifacts logs each write that fails itself;
+                    # this covers the unit's own refusal (a busy pool), a
+                    # failed commit, or ListedLocationsUnchecked, which it
+                    # raises once its other writes have committed when a
+                    # write the project's self-heal makes again failed: the
+                    # check of the folders the diff listed, the hold of
+                    # their root, or their sort times. The self-heal's
+                    # listing writes those three again
+                    # (artifact_autopublish._record_listing), but nothing
+                    # writes a created folder's index row or owner later:
                     # reconcile_conversation skips org roots and the owner
-                    # backfill runs once, at startup, so they keep no
-                    # index row and their owner stays unknown. A turn that
-                    # created nothing, or whose record failed only at that
-                    # check, lost only the check, so its line says that.
-                    # Without the pod's list nothing else checks the listed
-                    # folders, so the project's self-heal does.
+                    # backfill runs once, at startup. So after a failed unit
+                    # those folders keep no index row and their owner stays
+                    # unknown, which the line then says. Otherwise the turn
+                    # lost only what the self-heal writes again, and the
+                    # line names it: the location check only when the diff
+                    # listed the whole folder, so an edit-only turn never
+                    # claims a check it did not make. Without the pod's list
+                    # nothing has asked for the project's self-heal yet, so
+                    # it is asked for here; with the list, it was asked for
+                    # before the diff.
                     if touched is None:
                         request_turn_end_self_heal(
                             artifacts_base=directory.base, scope=scope, project_id=directory.project_id,
                         )
+                    if changes.created and not isinstance(exc, ListedLocationsUnchecked):
+                        unrecorded = "[responses] could not record the artifacts a remote turn created"
+                    elif changes.listed_ids.ids:
+                        unrecorded = (
+                            "[responses] could not check the locations of the artifacts a remote turn found,"
+                            " or record the folder that holds them or their sort times"
+                        )
+                    else:
+                        unrecorded = (
+                            "[responses] could not record the sort times of the artifacts a remote turn made"
+                            " or changed, or the folder that holds them"
+                        )
                     logger.error(
-                        "[responses] could not record the artifacts a remote turn created"
-                        if changes.created and not isinstance(exc, ListedLocationsUnchecked)
-                        else "[responses] could not check the locations of the artifacts a remote turn listed",
+                        unrecorded,
                         exc_info=True,
                         extra=log_context(
                             request_id=corr,
@@ -3299,6 +3335,8 @@ class ResponsesHandler:
                 # not it can answer questions. Channel turns build their
                 # own request in turnqueue/remote_turn.py and leave it off.
                 tool_messages=True,
+                # A member's turn in the cowork UI, where the card is saved.
+                connector_drafts=True,
                 # Rides the queued job, so the pod's anton gets it (ENG-4149).
                 ui_locale=self.ui_locale,
             ):
@@ -3400,6 +3438,14 @@ class ResponsesHandler:
                             yield SkillCreated(payload)
                         for reason in reasons:
                             yield StreamTaskProgress(phase="skill_draft_dropped", message=reason)
+                elif kind == "turn_connector":
+                    # Shown as cards, never stored: the member saves one
+                    # through POST /connectors/custom, which checks it again.
+                    cards, notices = turn_connector_cards(data.get("entries"))
+                    for card in cards:
+                        yield ConnectorDrafted(card)
+                    for notice in notices:
+                        yield StreamTaskProgress(phase="connector_draft_dropped", message=notice)
                 elif kind == "turn_completed":
                     # `break`, not `return`: the record/publish/card block
                     # below must still run on a clean finish.
