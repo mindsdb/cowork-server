@@ -7,7 +7,7 @@ import threading
 from datetime import timedelta
 from pathlib import Path
 
-from coding_service_fakes import CREDS, FakeEngine, copy_folders_without_git, git, repository, service_with, wait_for_status
+from tests.support.coding.service_fakes import CREDS, FakeEngine, copy_folders_without_git, git, repository, service_with, wait_for_status
 
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode
 from cowork.coding.project_models import ProjectCreateRequest, ProjectFolder

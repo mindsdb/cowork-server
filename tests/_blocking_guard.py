@@ -96,6 +96,8 @@ from sqlalchemy import event
 from sqlalchemy.pool import Pool
 
 import cowork
+from scripts.blocking_guard_evidence import sidecar
+from scripts.pytest_inventory import _publish, source_identity
 from cowork.common import paths
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db import units
@@ -632,6 +634,8 @@ class StaleEntryCheck:
         self.collected: set[Path] = set()
         self.deselected = False
         self.workers_lost: list[str] = []
+        self.workers: set[str] = set()
+        self.ineligible_workers: set[str] = set()
         self.skipped_because: str | None = None
         self.stale: list[Allowed] = []
 
@@ -651,23 +655,28 @@ class StaleEntryCheck:
         if error or output is None:
             self.workers_lost.append(node.gateway.id)
             return
+        if node.gateway.id in self.workers:
+            raise ValueError("Duplicate blocking guard worker handoff")
+        self.workers.add(node.gateway.id)
+        if output["ineligible_because"] is not None:
+            self.ineligible_workers.add(node.gateway.id)
         # execnet carries only builtin types, so Site and Path cross as tuple and str.
         self.reached.update(Site(*site) for site in output["reached"])
         self.collected.update(Path(path) for path in output["collected"])
         self.deselected = self.deselected or output["deselected"]
 
-    def hand_over_to_controller(self, session: pytest.Session) -> None:
+    def hand_over_to_controller(self, session: pytest.Session, *, exitstatus: int) -> None:
         """On an xdist worker: put what this worker saw where the controller's
         ``pytest_testnodedown`` reads it."""
         session.config.workeroutput[self.WORKER_OUTPUT_KEY] = {
             "reached": [tuple(site) for site in self.reached],
             "collected": [str(path) for path in self.collected],
             "deselected": self.deselected,
+            "ineligible_because": self.not_an_execution(session, exitstatus=exitstatus),
         }
 
-    def not_a_full_run(self, session: pytest.Session, *, exitstatus: int) -> str | None:
-        """Why this run can't tell a stale entry from an unreached one, or
-        None when it can."""
+    def not_an_execution(self, session: pytest.Session, *, exitstatus: int) -> str | None:
+        """Explain incomplete execution independently of which modules were selected."""
         config = session.config
         option = config.option
         if exitstatus not in (pytest.ExitCode.OK, pytest.ExitCode.TESTS_FAILED):
@@ -681,28 +690,74 @@ class StaleEntryCheck:
             return "tests were deselected"
         if session.shouldstop or session.shouldfail:
             return "the run stopped early"
-        every_file = {
+        if self.ineligible_workers:
+            return "a worker did not complete execution"
+        return None
+
+    def required_files(self) -> set[Path]:
+        """Return the original guard's complete non-integration test-file scope."""
+        return {
             path
             for path in self.tests_dir.rglob("test_*.py")
             if "integration" not in path.relative_to(self.tests_dir).parts
         }
+
+    def not_a_full_run(self, session: pytest.Session, *, exitstatus: int) -> str | None:
+        """Explain incomplete execution or collection of only part of the suite."""
+        reason = self.not_an_execution(session, exitstatus=exitstatus)
+        if reason is not None:
+            return reason
+        every_file = self.required_files()
         collected = every_file & self.collected
         if collected != every_file:
             return f"it collected {len(collected)} of {len(every_file)} test files"
         return None
 
+    def export(self, session: pytest.Session, *, exitstatus: int) -> None:
+        """Publish an opted-in broad controller's declaration and normalized observations."""
+        inventory = session.config.pluginmanager.getplugin("cowork-test-inventory")
+        if inventory is None or session.config.option.test_cohort not in (
+            "broad", "broad-shard-0", "broad-shard-1", "broad-shard-2", "broad-shard-3"
+        ):
+            return
+        path = sidecar(inventory.path)
+        if path.resolve().is_relative_to(inventory.root) or path.exists() or path.is_symlink():
+            raise ValueError("Blocking guard output must be fresh and outside the checkout")
+        if listed_twice():
+            raise ValueError("Duplicate blocking guard declaration")
+        required = {Site(entry.path, entry.function, entry.kind, leaf) for entry in ALLOWLIST for leaf in entry.leaves}
+        missing = {Site(entry.path, entry.function, entry.kind, leaf) for entry in unreached(self.reached)
+                   for leaf in entry.leaves}
+        collection = session.config.option.collectonly
+        _publish(path, {
+            "schema_version": 1, "mode": "collection" if collection else "execution",
+            "cohort": session.config.option.test_cohort,
+            "revision": inventory.revision, "revision_end": source_identity(inventory.root),
+            "run_id": os.environ.get("GITHUB_RUN_ID"), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "required": [site._asdict() for site in sorted(required)],
+            "reached": [] if collection else [site._asdict() for site in sorted(required - missing)],
+            "required_files": sorted(path.relative_to(inventory.root).as_posix() for path in self.required_files()),
+            "collected_files": sorted(path.relative_to(inventory.root).as_posix() for path in self.collected),
+            "workers": sorted(self.workers), "workers_lost": sorted(self.workers_lost),
+            "ineligible_because": "collection only" if collection else self.not_an_execution(session, exitstatus=exitstatus),
+        })
+
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         option = session.config.option
-        if option.collectonly or option.showfixtures or option.show_fixtures_per_test:
+        if option.showfixtures or option.show_fixtures_per_test:
             return
         if hasattr(session.config, "workerinput"):
-            self.hand_over_to_controller(session)
+            self.hand_over_to_controller(session, exitstatus=exitstatus)
+            return
+        if option.collectonly:
+            self.export(session, exitstatus=exitstatus)
             return
         self.skipped_because = self.not_a_full_run(session, exitstatus=exitstatus)
         if self.skipped_because is None:
             self.stale = unreached(self.reached)
         if self.stale:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        self.export(session, exitstatus=exitstatus)
 
     def pytest_terminal_summary(self, terminalreporter) -> None:
         if self.skipped_because is not None:

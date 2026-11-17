@@ -41,7 +41,7 @@ def test_list_artifacts_reads_the_given_root(source):
     _make_artifact(source.base, "dash", files={"index.html": "<html></html>"},
                    meta={"slug": "dash", "name": "Dash", "type": "html-app"})
 
-    cards = a.list_artifacts([source])
+    cards = [card.to_json() for card in a.list_artifacts([source])]
 
     assert [c["slug"] for c in cards] == ["dash"]
 
@@ -50,7 +50,7 @@ def test_card_carries_project_identity(source):
     _make_artifact(source.base, "dash", files={"index.html": "<html></html>"},
                    meta={"slug": "dash", "name": "Dash", "type": "html-app"})
 
-    card = a.list_artifacts([source])[0]
+    card = a.list_artifacts([source])[0].to_json()
 
     assert card["projectId"] == "p-1"
     assert card["projectName"] == "Proj"
@@ -64,7 +64,7 @@ def test_list_artifacts_merges_several_roots(tmp_path):
     _make_artifact(first.base, "one", files={"a.md": "1"}, meta={"slug": "one", "type": "document"})
     _make_artifact(second.base, "two", files={"b.md": "2"}, meta={"slug": "two", "type": "document"})
 
-    cards = a.list_artifacts([first, second])
+    cards = [card.to_json() for card in a.list_artifacts([first, second])]
 
     assert {c["slug"]: c["projectName"] for c in cards} == {"one": "A", "two": "B"}
 
@@ -102,7 +102,7 @@ def test_list_derives_legacy_id_without_mutating_metadata(source):
     before = metadata_path.read_bytes()
     before_identity = _file_identity(metadata_path)
 
-    card = a.list_artifacts([source])[0]
+    card = a.list_artifacts([source])[0].to_json()
 
     assert UUID(card["id"]).hex == card["id"]
     assert card["id"].startswith("a1b2c3d4")
@@ -130,7 +130,7 @@ def test_list_uses_stable_id_without_persisting_the_normalized_metadata(source):
     metadata_path = folder / "metadata.json"
     before = metadata_path.read_bytes()
 
-    card = a.list_artifacts([source])[0]
+    card = a.list_artifacts([source])[0].to_json()
 
     assert card["id"] == UUID(stable_id).hex
     assert metadata_path.read_bytes() == before
@@ -150,7 +150,7 @@ def test_list_derives_an_id_for_idless_metadata_without_persisting_it(source):
     )
     metadata_path = folder / "metadata.json"
 
-    card = a.list_artifacts([source])[0]
+    card = a.list_artifacts([source])[0].to_json()
 
     assert UUID(card["id"]).hex == card["id"]
     assert "id" not in json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -170,12 +170,12 @@ def test_list_call_graph_does_not_reach_mutating_identity_or_card_helpers(
         pytest.fail("read-only listing reached a mutating helper")
 
     monkeypatch.setattr(artifact_identity, "ensure_full_id", unexpected)
-    monkeypatch.setattr(artifact_identity, "_atomic_json", unexpected)
+    monkeypatch.setattr(artifact_identity, "_write_metadata", unexpected)
     monkeypatch.setattr(artifact_identity.os, "utime", unexpected)
     monkeypatch.setattr(a, "_is_modified", unexpected)
     monkeypatch.setattr(a, "_write_published_map_pinned", unexpected)
 
-    assert a.list_artifacts([source])[0]["slug"] == "dash"
+    assert a.list_artifacts([source])[0].to_json()["slug"] == "dash"
 
 
 def test_list_does_not_self_heal_the_published_map(source, monkeypatch):
@@ -216,7 +216,7 @@ def test_list_does_not_self_heal_the_published_map(source, monkeypatch):
         lambda *_args, **_kwargs: pytest.fail("listing attempted publish-map heal"),
     )
 
-    card = a.list_artifacts([source])[0]
+    card = a.list_artifacts([source])[0].to_json()
 
     assert card["modified"] is False
     assert published_path.read_bytes() == before
@@ -253,7 +253,7 @@ def test_list_still_reports_a_real_published_content_change(source, monkeypatch)
         lambda *_args, **_kwargs: "after",
     )
 
-    assert a.list_artifacts([source])[0]["modified"] is True
+    assert a.list_artifacts([source])[0].to_json()["modified"] is True
 
 
 def test_read_only_list_card_matches_the_canonical_card_shape(source, monkeypatch):
@@ -271,7 +271,7 @@ def test_read_only_list_card_matches_the_canonical_card_shape(source, monkeypatc
     )
     monkeypatch.setattr(a.time, "time", lambda: folder.stat().st_mtime + 1)
 
-    listed = a.list_artifacts([source])[0]
+    listed = a.list_artifacts([source])[0].to_json()
     # The list names each card's own root, so its serve URL is built from that
     # root rather than found by a scan; the canonical card is given the same.
     canonical = a.card_for_folder(
@@ -280,7 +280,7 @@ def test_read_only_list_card_matches_the_canonical_card_shape(source, monkeypatc
         project_id=source.project_id,
         project_name=source.project_name,
         artifacts_base=source.base,
-    )
+    ).to_json()
 
     assert listed == canonical
 
@@ -290,7 +290,7 @@ def test_serve_url_is_empty_in_org_mode(source, monkeypatch):
                             meta={"slug": "dash", "type": "html-app"})
     monkeypatch.setattr(a, "_org_mode", lambda: True)
 
-    card = a.card_for_folder(folder, project_id="p-1", project_name="Proj", scope=LOCAL_SCOPE)
+    card = a.card_for_folder(folder, project_id="p-1", project_name="Proj", scope=LOCAL_SCOPE).to_json()
 
     assert card["serveUrl"] == ""
 
@@ -321,7 +321,7 @@ def test_owner_side_access_fields_are_absent_in_org_mode(source, monkeypatch):
     }))
     monkeypatch.setattr(a, "_org_mode", lambda: True)
 
-    card = a.card_for_folder(folder, project_id="p-1", project_name="Proj", scope=LOCAL_SCOPE)
+    card = a.card_for_folder(folder, project_id="p-1", project_name="Proj", scope=LOCAL_SCOPE).to_json()
 
     assert "accessPassword" not in card
     assert "accessEmails" not in card
@@ -338,7 +338,7 @@ def test_owner_side_access_fields_remain_in_desktop_mode(source, monkeypatch):
     }))
     monkeypatch.setattr(a, "_org_mode", lambda: False)
 
-    card = a.card_for_folder(folder, scope=LOCAL_SCOPE)
+    card = a.card_for_folder(folder, scope=LOCAL_SCOPE).to_json()
 
     assert card["accessPassword"] == "s3cret"
 
@@ -464,7 +464,7 @@ def test_list_artifacts_caps_before_building_cards(source, monkeypatch):
 
     monkeypatch.setattr(a, "_listed_card_for_pinned_folder", counting_builder)
 
-    cards = a.list_artifacts([source])
+    cards = [card.to_json() for card in a.list_artifacts([source])]
 
     assert len(build_calls) <= 80
     assert len(cards) <= 80
@@ -501,7 +501,7 @@ def test_list_artifacts_opens_each_root_once_in_the_build_pass(source, monkeypat
 
     monkeypatch.setattr(artifact_identity, "opened_artifact_root", counting_open)
 
-    cards = a.list_artifacts([source])
+    cards = [card.to_json() for card in a.list_artifacts([source])]
 
     assert len(cards) == 80
     # One open for the collect pass, one for the build pass — not one per card.

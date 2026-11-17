@@ -11,7 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from coding_service_fakes import FakeEngine, service_with
+from tests.support.coding.service_fakes import FakeEngine, service_with
 
 from cowork.api.v1.endpoints import coding_runtime, health
 from cowork.coding.control_models import ComputerCapabilities

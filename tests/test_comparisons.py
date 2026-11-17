@@ -10,8 +10,11 @@ from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from cowork.api.v1.endpoints import comparisons as comparisons_ep
+from cowork.api.v1.endpoints import projects as projects_ep
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.db.session import get_open_session
 from cowork.models.comparison import ComparisonSide
@@ -46,10 +49,29 @@ def harness():
 
 @pytest.fixture()
 def client(harness):
+    """Yield a fresh feature client under the fake harness and close it after use."""
+    with patch("cowork.handlers.responses.get_harness", return_value=harness):
+        app = FastAPI()
+        app.include_router(projects_ep.router, prefix="/api/v1/projects")
+        app.include_router(comparisons_ep.router, prefix="/api/v1/comparisons")
+        test_client = TestClient(app)
+        try:
+            yield test_client
+        finally:
+            test_client.close()
+
+
+@pytest.fixture()
+def canonical_client(harness):
+    """Build and close a full-server client while the fake harness is installed."""
     from cowork.server import create_app
 
     with patch("cowork.handlers.responses.get_harness", return_value=harness):
-        yield TestClient(create_app())
+        test_client = TestClient(create_app())
+        try:
+            yield test_client
+        finally:
+            test_client.close()
 
 
 def _create(client, *, title="Build a sales dashboard", source_project_id=None, sides=None):
@@ -97,8 +119,8 @@ def _real_project(client, name: str) -> dict:
     return r.json()
 
 
-def test_create_makes_two_sides_each_in_its_own_sandbox(client):
-    r = _create(client)
+def test_create_makes_two_sides_each_in_its_own_sandbox(canonical_client):
+    r = _create(canonical_client)
     assert r.status_code == 201, r.text
     body = r.json()
     assert [s["label"] for s in body["sides"]] == ["a", "b"]
@@ -129,8 +151,8 @@ def test_both_sandboxes_read_the_same_to_the_agent(client):
     assert labels == {"Same label"}
 
 
-def test_create_rejects_anything_but_two_sides(client):
-    r = client.post(
+def test_create_rejects_anything_but_two_sides(canonical_client):
+    r = canonical_client.post(
         "/api/v1/comparisons/",
         json={"title": "x", "sides": [{"model": "kimi"}]},
     )
@@ -148,39 +170,39 @@ def test_create_from_an_unknown_project_is_404(client):
     assert r.status_code == 404, r.text
 
 
-def test_sandboxes_and_their_tasks_are_hidden_from_lists(client):
-    body = _create(client, title="hidden-from-lists").json()
+def test_sandboxes_and_their_tasks_are_hidden_from_lists(canonical_client):
+    body = _create(canonical_client, title="hidden-from-lists").json()
     project_ids = {s["projectId"] for s in body["sides"]}
     conversation_ids = {s["conversationId"] for s in body["sides"]}
 
-    listed = {p["id"] for p in client.get("/api/v1/projects/").json()}
+    listed = {p["id"] for p in canonical_client.get("/api/v1/projects/").json()}
     assert not project_ids & listed
 
-    all_tasks = client.get("/api/v1/conversations/", params={"project": "all", "limit": 500}).json()
+    all_tasks = canonical_client.get("/api/v1/conversations/", params={"project": "all", "limit": 500}).json()
     assert not conversation_ids & {c["id"] for c in all_tasks["conversations"]}
 
-    results = client.get("/api/v1/search", params={"q": "hidden-from-lists"}).json()["results"]
+    results = canonical_client.get("/api/v1/search", params={"q": "hidden-from-lists"}).json()["results"]
     assert not conversation_ids & {r["id"] for r in results}
 
     # Still reachable directly: the Compare screen opens each side.
     side = body["sides"][0]
-    assert client.get(f"/api/v1/conversations/{side['conversationId']}").status_code == 200
-    in_project = client.get("/api/v1/conversations/", params={"project_id": side["projectId"]}).json()
+    assert canonical_client.get(f"/api/v1/conversations/{side['conversationId']}").status_code == 200
+    in_project = canonical_client.get("/api/v1/conversations/", params={"project_id": side["projectId"]}).json()
     assert side["conversationId"] in {c["id"] for c in in_project["conversations"]}
 
 
-def test_a_project_whose_name_only_resembles_the_prefix_stays_listed(client):
+def test_a_project_whose_name_only_resembles_the_prefix_stays_listed(canonical_client):
     # `_` is a LIKE wildcard. Unescaped, the cross-project filter would also
     # hide a real project named `acomparison-...`.
-    project = _real_project(client, "acomparison-quarterly")
-    r = client.post("/api/v1/conversations/", json={"title": "kept", "projectId": project["id"]})
+    project = _real_project(canonical_client, "acomparison-quarterly")
+    r = canonical_client.post("/api/v1/conversations/", json={"title": "kept", "projectId": project["id"]})
     assert r.status_code == 201, r.text
-    all_tasks = client.get("/api/v1/conversations/", params={"project": "all", "limit": 500}).json()
+    all_tasks = canonical_client.get("/api/v1/conversations/", params={"project": "all", "limit": 500}).json()
     assert r.json()["id"] in {c["id"] for c in all_tasks["conversations"]}
 
 
-def test_sandbox_artifacts_are_hidden_from_the_unfiltered_list_only(client):
-    body = _create(client).json()
+def test_sandbox_artifacts_are_hidden_from_the_unfiltered_list_only(canonical_client):
+    body = _create(canonical_client).json()
     side = body["sides"][0]
     slug = f"side-dashboard-{uuid4().hex[:8]}"
     folder = Path(_project(side["projectId"]).path) / ".anton" / "artifacts" / slug
@@ -191,9 +213,9 @@ def test_sandbox_artifacts_are_hidden_from_the_unfiltered_list_only(client):
     def titles(cards):
         return {card.get("title") for card in cards}
 
-    own = client.get("/api/v1/artifacts/", params={"project_id": side["projectId"]}).json()
+    own = canonical_client.get("/api/v1/artifacts/", params={"project_id": side["projectId"]}).json()
     assert slug in titles(own)
-    everything = client.get("/api/v1/artifacts/").json()
+    everything = canonical_client.get("/api/v1/artifacts/").json()
     assert slug not in titles(everything)
 
 
@@ -368,24 +390,24 @@ def test_copy_budget_counts_bytes_as_read(tmp_path, monkeypatch):
         comparisons.copy_project_files(src, dest, org_mode=False)
 
 
-def test_verdicts_are_kept_per_turn_and_the_latest_is_the_verdict(client):
-    cid = _create(client).json()["id"]
-    r = client.put(f"/api/v1/comparisons/{cid}/verdicts/0", json={"winner": "a"})
+def test_verdicts_are_kept_per_turn_and_the_latest_is_the_verdict(canonical_client):
+    cid = _create(canonical_client).json()["id"]
+    r = canonical_client.put(f"/api/v1/comparisons/{cid}/verdicts/0", json={"winner": "a"})
     assert r.status_code == 200, r.text
     assert r.json()["verdict"] == "a"
 
-    r = client.put(f"/api/v1/comparisons/{cid}/verdicts/1", json={"winner": "b"})
+    r = canonical_client.put(f"/api/v1/comparisons/{cid}/verdicts/1", json={"winner": "b"})
     assert r.json()["verdict"] == "b"
     # Changing an earlier turn's verdict rewrites that turn, not the latest.
-    r = client.put(f"/api/v1/comparisons/{cid}/verdicts/0", json={"winner": "tie"})
+    r = canonical_client.put(f"/api/v1/comparisons/{cid}/verdicts/0", json={"winner": "tie"})
     body = r.json()
     assert [(v["turnIndex"], v["winner"]) for v in body["verdicts"]] == [(0, "tie"), (1, "b")]
     assert body["verdict"] == "b"
 
 
-def test_verdict_rejects_an_unknown_winner(client):
-    cid = _create(client).json()["id"]
-    r = client.put(f"/api/v1/comparisons/{cid}/verdicts/0", json={"winner": "both"})
+def test_verdict_rejects_an_unknown_winner(canonical_client):
+    cid = _create(canonical_client).json()["id"]
+    r = canonical_client.put(f"/api/v1/comparisons/{cid}/verdicts/0", json={"winner": "both"})
     assert r.status_code == 422
 
 
@@ -395,35 +417,35 @@ def test_verdict_rejects_a_negative_turn(client):
     assert r.status_code == 400
 
 
-def test_list_and_get(client):
-    cid = _create(client, title="listed one").json()["id"]
-    listed = client.get("/api/v1/comparisons/").json()["comparisons"]
+def test_list_and_get(canonical_client):
+    cid = _create(canonical_client, title="listed one").json()["id"]
+    listed = canonical_client.get("/api/v1/comparisons/").json()["comparisons"]
     assert cid in {c["id"] for c in listed}
-    assert client.get(f"/api/v1/comparisons/{cid}").json()["title"] == "listed one"
-    assert client.get(f"/api/v1/comparisons/{uuid4()}").status_code == 404
+    assert canonical_client.get(f"/api/v1/comparisons/{cid}").json()["title"] == "listed one"
+    assert canonical_client.get(f"/api/v1/comparisons/{uuid4()}").status_code == 404
 
 
-def test_continue_moves_the_side_into_a_real_project(client):
-    body = _create(client).json()
+def test_continue_moves_the_side_into_a_real_project(canonical_client):
+    body = _create(canonical_client).json()
     side_a = body["sides"][0]
-    project = _real_project(client, "continue-target")
+    project = _real_project(canonical_client, "continue-target")
 
-    r = client.post(
+    r = canonical_client.post(
         f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]}
     )
     assert r.status_code == 200, r.text
     assert r.json() == {"conversationId": side_a["conversationId"], "projectId": project["id"], "carriedAll": True}
     assert str(_conversation(side_a["conversationId"]).project_id) == project["id"]
 
-    after = client.get(f"/api/v1/comparisons/{body['id']}").json()
+    after = canonical_client.get(f"/api/v1/comparisons/{body['id']}").json()
     continued = after["sides"][0]
     assert continued["continuedAt"] is not None
     assert continued["continuedTurnCount"] == 0
     # It is an ordinary task now: listed across projects again.
-    all_tasks = client.get("/api/v1/conversations/", params={"project": "all", "limit": 500}).json()
+    all_tasks = canonical_client.get("/api/v1/conversations/", params={"project": "all", "limit": 500}).json()
     assert side_a["conversationId"] in {c["id"] for c in all_tasks["conversations"]}
 
-    again = client.post(
+    again = canonical_client.post(
         f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]}
     )
     assert again.status_code == 409
@@ -449,29 +471,29 @@ def test_continue_refuses_while_the_side_is_running(client):
     assert r.status_code == 409
 
 
-def test_continue_rejects_an_unknown_side(client):
-    body = _create(client).json()
-    project = _real_project(client, "side-c-target")
-    r = client.post(
+def test_continue_rejects_an_unknown_side(canonical_client):
+    body = _create(canonical_client).json()
+    project = _real_project(canonical_client, "side-c-target")
+    r = canonical_client.post(
         f"/api/v1/comparisons/{body['id']}/sides/c/continue", json={"projectId": project["id"]}
     )
     assert r.status_code == 422
 
 
-def test_delete_removes_the_sandboxes_but_not_a_continued_task(client):
-    body = _create(client).json()
+def test_delete_removes_the_sandboxes_but_not_a_continued_task(canonical_client):
+    body = _create(canonical_client).json()
     a, b = body["sides"]
-    project = _real_project(client, "delete-target")
+    project = _real_project(canonical_client, "delete-target")
     # Something the side wrote outside its artifacts.
     (Path(_project(a["projectId"]).path) / "analysis.csv").write_text("region,total\n")
-    client.post(
+    canonical_client.post(
         f"/api/v1/comparisons/{body['id']}/sides/a/continue",
         json={"projectId": project["id"], "modelLabel": "Kimi"},
     )
     b_path = Path(_project(b["projectId"]).path)
 
-    assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 204
-    assert client.get(f"/api/v1/comparisons/{body['id']}").status_code == 404
+    assert canonical_client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 204
+    assert canonical_client.get(f"/api/v1/comparisons/{body['id']}").status_code == 404
     assert _project(b["projectId"]) is None
     assert not b_path.exists()
     assert _conversation(b["conversationId"]) is None
@@ -1580,12 +1602,12 @@ def _turn(client, conversation_id, **extra):
     )
 
 
-def test_a_side_turn_runs_on_the_sides_model_whatever_the_client_sends(client, harness):
-    side = _create(client).json()["sides"][1]
+def test_a_side_turn_runs_on_the_sides_model_whatever_the_client_sends(canonical_client, harness):
+    side = _create(canonical_client).json()["sides"][1]
     blocked = [{"engine": "slack", "name": "team"}]
     with patch("cowork.handlers.responses.blocked_connections", AsyncMock(return_value=blocked)):
         r = _turn(
-            client,
+            canonical_client,
             side["conversationId"],
             model="something-else",
             reasoning_effort="low",
@@ -1603,14 +1625,14 @@ def test_a_side_turn_runs_on_the_sides_model_whatever_the_client_sends(client, h
     assert call["trace_metadata"]["response_route_reason"] == "comparison_side"
 
 
-def test_a_side_turn_leaves_the_sides_saved_model_and_effort_alone(client, harness):
-    side = _create(client).json()["sides"][1]
+def test_a_side_turn_leaves_the_sides_saved_model_and_effort_alone(canonical_client, harness):
+    side = _create(canonical_client).json()["sides"][1]
     before = _conversation(side["conversationId"])
 
     with patch("cowork.handlers.responses.blocked_connections", AsyncMock(return_value=[])):
-        r = _turn(client, side["conversationId"], model="something-else", reasoning_effort="low")
+        r = _turn(canonical_client, side["conversationId"], model="something-else", reasoning_effort="low")
         assert r.status_code == 200, r.text
-        r = _turn(client, side["conversationId"], reset_picks=["model", "reasoning_effort"])
+        r = _turn(canonical_client, side["conversationId"], reset_picks=["model", "reasoning_effort"])
         assert r.status_code == 200, r.text
 
     after = _conversation(side["conversationId"])
@@ -1619,22 +1641,22 @@ def test_a_side_turn_leaves_the_sides_saved_model_and_effort_alone(client, harne
     assert after.model is not None
 
 
-def test_a_side_turn_fails_closed_when_connections_cannot_be_listed(client, harness):
-    side = _create(client).json()["sides"][0]
+def test_a_side_turn_fails_closed_when_connections_cannot_be_listed(canonical_client, harness):
+    side = _create(canonical_client).json()["sides"][0]
     with patch(
         "cowork.handlers.responses.blocked_connections", AsyncMock(side_effect=RuntimeError("auth down"))
     ):
-        r = _turn(client, side["conversationId"])
+        r = _turn(canonical_client, side["conversationId"])
     assert r.status_code == 503
     assert harness.calls == []
 
 
-def test_an_ordinary_turn_is_untouched(client, harness):
-    project = _real_project(client, "ordinary")
-    conv = client.post("/api/v1/conversations/", json={"title": "t", "projectId": project["id"]}).json()
+def test_an_ordinary_turn_is_untouched(canonical_client, harness):
+    project = _real_project(canonical_client, "ordinary")
+    conv = canonical_client.post("/api/v1/conversations/", json={"title": "t", "projectId": project["id"]}).json()
     lister = AsyncMock(return_value=[{"engine": "slack", "name": "team"}])
     with patch("cowork.handlers.responses.blocked_connections", lister):
-        r = _turn(client, conv["id"], model="picked", reasoning_effort="low")
+        r = _turn(canonical_client, conv["id"], model="picked", reasoning_effort="low")
     assert r.status_code == 200, r.text
     call = harness.calls[0]
     assert call["model"] == "picked"
@@ -1644,12 +1666,12 @@ def test_an_ordinary_turn_is_untouched(client, harness):
     lister.assert_not_called()
 
 
-def test_a_continued_side_is_an_ordinary_task(client, harness):
-    body = _create(client).json()
-    project = _real_project(client, "continued-turns")
-    client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]})
+def test_a_continued_side_is_an_ordinary_task(canonical_client, harness):
+    body = _create(canonical_client).json()
+    project = _real_project(canonical_client, "continued-turns")
+    canonical_client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]})
     with patch("cowork.handlers.responses.blocked_connections", AsyncMock(return_value=[])) as lister:
-        r = _turn(client, body["sides"][0]["conversationId"], model="now-mine")
+        r = _turn(canonical_client, body["sides"][0]["conversationId"], model="now-mine")
     assert r.status_code == 200, r.text
     assert harness.calls[0]["model"] == "now-mine"
     lister.assert_not_called()
@@ -1783,12 +1805,12 @@ async def test_a_side_reads_memory_in_process_but_never_writes_it(monkeypatch, t
             assert turn.learns is True
 
 
-def test_a_side_never_writes_memory_remotely(client):
+def test_a_side_never_writes_memory_remotely(canonical_client):
     from cowork.handlers.responses import ResponsesHandler
 
-    side = _create(client).json()["sides"][0]
-    project = _real_project(client, "remote-memory")
-    conv = client.post("/api/v1/conversations/", json={"title": "t", "projectId": project["id"]}).json()
+    side = _create(canonical_client).json()["sides"][0]
+    project = _real_project(canonical_client, "remote-memory")
+    conv = canonical_client.post("/api/v1/conversations/", json={"title": "t", "projectId": project["id"]}).json()
     session = ScopedSession(get_open_session(), LOCAL_SCOPE)
     with patch("cowork.handlers.responses.apply_turn_memory", return_value=1) as apply:
         ResponsesHandler._persist_turn_memory(session, UUID(side["conversationId"]), [{"x": 1}], None)
@@ -1870,8 +1892,8 @@ def test_a_comparison_is_invisible_to_another_member(tmp_path, monkeypatch):
 
 
 
-def test_sandboxes_are_hidden_from_search_and_memories(client):
-    body = _create(client).json()
+def test_sandboxes_are_hidden_from_search_and_memories(canonical_client):
+    body = _create(canonical_client).json()
     side = body["sides"][0]
     sandbox = _project(side["projectId"])
     folder = Path(sandbox.path) / ".anton" / "artifacts" / "searchable-side"
@@ -1880,16 +1902,16 @@ def test_sandboxes_are_hidden_from_search_and_memories(client):
     (folder / "metadata.json").write_text('{"type": "html-app", "primary": "index.html"}')
 
     # Search scores projects on name and path, so query the sandbox's own name.
-    results = client.get("/api/v1/search", params={"q": sandbox.name}).json()["results"]
+    results = canonical_client.get("/api/v1/search", params={"q": sandbox.name}).json()["results"]
     assert sandbox.name not in {r["id"] for r in results if r["type"] == "project"}
-    results = client.get("/api/v1/search", params={"q": "searchable-side"}).json()["results"]
+    results = canonical_client.get("/api/v1/search", params={"q": "searchable-side"}).json()["results"]
     assert not [r for r in results if r["type"] == "artifact"]
 
-    memories = client.get("/api/v1/memory/").json()
+    memories = canonical_client.get("/api/v1/memory/").json()
     listed = {m.get("projectId") or m.get("project_id") for m in memories}
     assert side["projectId"] not in listed
     # Asked for by id, a side's memory still answers.
-    own = client.get("/api/v1/memory/", params={"project_id": side["projectId"]}).json()
+    own = canonical_client.get("/api/v1/memory/", params={"project_id": side["projectId"]}).json()
     assert side["projectId"] in {m.get("projectId") or m.get("project_id") for m in own}
 
 
