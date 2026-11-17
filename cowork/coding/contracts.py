@@ -605,6 +605,12 @@ class SessionCreateRequest(BaseModel):
     attachments: list[InputReference] = Field(default_factory=list, max_length=20)
     # ``None`` lets the server choose from the project and the computer.
     workspace_mode: WorkspaceMode | None = None
+    # True when the client filled ``workspace_mode`` from a default (the
+    # project's, its remembered last choice or the server's) rather than a
+    # choice made for this task. A default is a preference the server may
+    # override, for example to isolate a task from one already working in
+    # the folder; an explicit choice is honoured or refused.
+    workspace_mode_is_default: bool = False
     # Ignored: folders are no longer copied. A folder without Git runs in
     # place, and Worktree needs a repository. Still accepted, also as
     # ``allow_direct_folder``, so older clients' requests validate.
@@ -626,6 +632,11 @@ class SessionCreateRequest(BaseModel):
     @classmethod
     def unique_resources(cls, value: list[str] | None) -> list[str] | None:
         return list(dict.fromkeys(value)) if value is not None else None
+
+    @property
+    def explicit_workspace_mode(self) -> WorkspaceMode | None:
+        """The mode chosen for this task, which must be honoured or refused."""
+        return None if self.workspace_mode_is_default else self.workspace_mode
 
 
 class SessionUpdateRequest(BaseModel):
