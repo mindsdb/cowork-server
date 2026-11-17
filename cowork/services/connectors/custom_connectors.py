@@ -5,14 +5,23 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 
+from anton.core.tools.connector_draft import (
+    MAX_DRAFTS_PER_TURN,
+    ConnectorDraft,
+    ConnectorDraftError,
+    parse_connector_draft,
+)
 from anton.utils.datasources import scrub_output
 from pydantic import ValidationError
 from sqlalchemy import false
+from sqlalchemy.exc import IntegrityError
 
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope, tenant_scope_required
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorForm, CustomConnectorUpdate
+from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
+from cowork.services.connectors.specs._registry import registry
 
 # Top-level keys a handcrafted form may carry that ConnectorForm doesn't model
 # but the connect form still renders.
@@ -98,15 +107,16 @@ def scope_is_one_persons(scope: TenantScope) -> bool:
     """Whether ``scope``'s custom connector definitions belong to one person.
 
     True on a single-user install, and in a personal scope whose connections
-    are personal. False in org mode, where an organization shares them, in a
-    personal scope with shared connections, and in the operator view of a
-    deployment that trusts identity headers.
+    are personal. False in org mode, in a personal scope with shared
+    connections, and in the operator view of a deployment that trusts
+    identity headers.
 
     Everything in a definition (label, description, help text, the form,
     usage notes) is model-written and may hold what its builder typed, in
-    any encoding. Custom connectors are therefore built only where this is
-    True, and served outside org mode only there, so none reaches another
-    person. Sharing them across people (org mode included) is not built yet.
+    any encoding. A handcrafted form is therefore kept only where this is
+    True. In org mode a member keeps only checked drafts
+    (save_member_draft), seen by that member alone (scope_definitions).
+    Sharing definitions across people is not built yet.
     """
     if scope.personal:
         return scope.partitioned_for(PersonalResource.CONNECTIONS)
@@ -146,6 +156,69 @@ def stored_form(connector_id: str, form_spec: dict[str, Any]) -> dict[str, Any]:
     return form
 
 
+def is_builtin_connector_id(connector_id: str) -> bool:
+    """Whether ``connector_id`` names a built-in connector or cloud datasource."""
+    return bool(
+        registry.get_connector(connector_id)
+        or load_datasource_capabilities().is_cloud_datasource(connector_id)
+    )
+
+
+def turn_connector_cards(entries: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    """Check one ``turn_connector`` reply's drafts again before they are shown.
+
+    The pod is semi-trusted, so each entry goes through the same parser as the
+    save endpoint. Only the first MAX_DRAFTS_PER_TURN entries are read.
+
+    Returns:
+        The drafts to show as cards, and one notice per refused entry plus one
+        for any entries past the cap. Notices name the field, never a value.
+    """
+    items = entries if isinstance(entries, list) else []
+    cards: list[dict[str, Any]] = []
+    notices: list[str] = []
+    for entry in items[:MAX_DRAFTS_PER_TURN]:
+        try:
+            draft = parse_connector_draft(entry)
+        except ConnectorDraftError as e:
+            notices.append(f"A connector template was not shown: {e}")
+            continue
+        if is_builtin_connector_id(draft.connector_id):
+            notices.append(f"A connector template was not shown: {draft.connector_id!r} is a built-in connector.")
+            continue
+        cards.append(draft.to_dict())
+    if len(items) > MAX_DRAFTS_PER_TURN:
+        notices.append(f"{len(items) - MAX_DRAFTS_PER_TURN} more connector template(s) from this turn were not shown.")
+    return cards, notices
+
+
+def draft_form(draft: ConnectorDraft) -> dict[str, Any]:
+    """Build the connection form for a checked connector draft.
+
+    One method of plain fields: no OAuth and nothing the draft did not
+    describe, so a draft can only ever ask for typed values.
+    """
+    form: dict[str, Any] = {
+        "form_id": f"{draft.connector_id}-connector",
+        "title": f"Connect {draft.label}",
+        "fields": [
+            {
+                "name": f.name,
+                "label": f.label,
+                "type": "password" if f.secret else "text",
+                "secret": f.secret,
+                "required": f.required,
+                "placeholder": f.placeholder,
+                "description": f.help,
+            }
+            for f in draft.fields
+        ],
+    }
+    if draft.help_url:
+        form["help_url"] = draft.help_url
+    return form
+
+
 def scope_definitions(session: ScopedSession) -> ScopedSelect:
     """Select the custom connector definitions ``session``'s scope sees.
 
@@ -153,12 +226,18 @@ def scope_definitions(session: ScopedSession) -> ScopedSelect:
     connections are personal), the scoped session already keys rows by the
     scope's org_id. Elsewhere the session adds no filter, so only the shared
     rows (org_id NULL) are the scope's; another scope's rows are left out.
-    Outside org mode, a scope that is not one person's sees none
-    (scope_is_one_persons), rows written before that rule included.
+    In org mode a definition is its builder's alone: the scope sees only rows
+    its user created, and a scope with no user sees none. Outside org mode, a
+    scope that is not one person's sees none (scope_is_one_persons), rows
+    written before that rule included.
     """
     scope = session.scope
     stmt = session.select(CustomConnector)
-    if not scope.org_mode and not scope_is_one_persons(scope):
+    if scope.org_mode:
+        if not scope.user_id:
+            return stmt.where(false())
+        return stmt.where(CustomConnector.created_by == scope.user_id)
+    if not scope_is_one_persons(scope):
         return stmt.where(false())
     if not scope.partitioned_for(PersonalResource.CONNECTIONS):
         stmt = stmt.where(CustomConnector.org_id.is_(None))
@@ -177,9 +256,9 @@ class CustomConnectorService:
         self.session = session
 
     def _kept_notes(self, notes: Any) -> str | None:
-        """``notes`` as stored: the text in one person's scope, else None.
-        In org mode a definition is served to every member, and its notes
-        were typed by one of them."""
+        """``notes`` as stored from a form: the text in one person's scope,
+        else None. Org mode takes no form here; save_member_draft keeps a
+        checked draft's notes itself."""
         return _text(notes) if scope_is_one_persons(self.session.scope) else None
 
     def get(self, connector_id: str) -> CustomConnector | None:
@@ -201,8 +280,9 @@ class CustomConnectorService:
 
         Raises:
             UnstorableFormError: when the form is invalid or unsafe to keep,
-                or the scope is shared by several people, org mode included
-                (scope_is_one_persons), where a definition would reach them all.
+                or the scope is not one person's (scope_is_one_persons). In
+                org mode a member saves a checked draft instead
+                (save_member_draft).
 
         Side effects:
             Commits the session.
@@ -227,6 +307,52 @@ class CustomConnectorService:
         else:
             for key, value in values.items():
                 setattr(row, key, value)
+        return self._commit(row)
+
+    def save_member_draft(self, draft: ConnectorDraft) -> CustomConnector:
+        """Save a checked draft as the org-mode member's own definition.
+
+        Args:
+            draft: The draft, already parsed by ``parse_connector_draft`` and
+                checked against the built-in ids.
+
+        Returns:
+            The stored row. The member's definition with the same id is
+            updated in place, featured flag included.
+
+        Raises:
+            UnstorableFormError: when the scope is not one member's in org
+                mode, or the built form is invalid.
+
+        Side effects:
+            Commits the session.
+        """
+        scope = self.session.scope
+        if not scope.org_mode or not scope.user_id:
+            raise UnstorableFormError("connector drafts are saved only for a member of an organization.")
+        values = {
+            "label": draft.label,
+            "description": draft.description or "",
+            "category": draft.category,
+            "usage_notes": draft.usage_notes,
+            "spec": stored_form(draft.connector_id, draft_form(draft)),
+        }
+        row = self.get(draft.connector_id)
+        if row is None:
+            try:
+                return self._commit(CustomConnector(connector_id=draft.connector_id, **values))
+            except IntegrityError:
+                # The same member saved this id at the same moment: update theirs.
+                self.session.rollback()
+                row = self.get(draft.connector_id)
+                if row is None:
+                    raise
+        for key, value in values.items():
+            setattr(row, key, value)
+        return self._commit(row)
+
+    def _commit(self, row: CustomConnector) -> CustomConnector:
+        """Add, commit and refresh ``row``."""
         self.session.add(row)
         self.session.commit()
         self.session.refresh(row)
@@ -277,10 +403,7 @@ class CustomConnectorService:
             row.description = changes.description or ""
         if "category" in sent:
             row.category = changes.category
-        self.session.add(row)
-        self.session.commit()
-        self.session.refresh(row)
-        return row
+        return self._commit(row)
 
     def delete(self, connector_id: str) -> bool:
         """Delete a definition. Saved connections that use it are kept.

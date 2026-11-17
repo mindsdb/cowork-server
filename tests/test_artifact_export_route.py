@@ -41,6 +41,7 @@ from cowork.services import artifact_export, export_runner
 from cowork.services import artifact_ownership as ownership
 from cowork.services import artifacts as artifacts_service
 from cowork.services.artifact_export import ExportRefused, ExportSource, export_slot
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.markdown_render import MAX_FENCE_LENGTH
 from cowork.services.render_pdf_client import RenderServicePdf
@@ -150,7 +151,7 @@ def local_artifact(tmp_path, monkeypatch):
         monkeypatch.setattr(
             workspace_ep,
             "review_artifact_for_request",
-            awaitable(lambda *_args: (source, folder, _metadata(folder), True)),
+            awaitable(lambda *_args: (source, folder, ArtifactMetadata.model_validate(_metadata(folder)), True)),
         )
         return folder
 
@@ -673,7 +674,7 @@ def _card(folder: Path) -> dict:
         trusted_anchor=folder.parent.parent.parent,
         root_parts=(".anton", "artifacts"),
     )
-    (card,) = artifacts_service.list_artifacts([source])
+    (card,) = [card.to_json() for card in artifacts_service.list_artifacts([source])]
     # A card with no primary file has no draftUrl.
     return {key: card.get(key) for key in ("path", "publishedUrl", "accessMode", "draftUrl")}
 
@@ -1080,7 +1081,7 @@ async def test_the_word_inline_budget_and_conversion_memory_are_smaller_in_org_m
     artifact_export.export_primary_file(
         source=source,
         folder_name=folder.name,
-        metadata=_metadata(folder),
+        metadata=ArtifactMetadata.model_validate(_metadata(folder)),
         artifact_id=org_world.artifacts["mine"].id,
         export_format="docx",
         can_edit=True,

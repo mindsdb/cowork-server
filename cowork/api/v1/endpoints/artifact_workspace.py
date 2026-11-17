@@ -54,6 +54,7 @@ from cowork.services.artifact_autopublish import job_budget_for, lock_ttl_for
 from cowork.services.preview_html import prepare_preview_html
 from cowork.services.quick_edit import direct_edit_available, quick_edit_available
 from cowork.services.artifact_identity import opened_artifact_folder
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.schemas.artifact_access import (
     ArtifactAccessRequest,
@@ -139,7 +140,7 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
     """Translate a request-supplied source path into the folder's own spelling.
 
     ``None`` (or blank) leaves the choice to the service, which falls back to
-    ``metadata["primary"]``. That is not a trusted value either: it is read
+    ``metadata.primary``. That is not a trusted value either: it is read
     from `metadata.json` inside the artifact folder, which is pod-writable on
     shared storage, so what makes the fallback safe is the inner gate's own
     containment, symlink and extension checks rather than where it came from.
@@ -197,12 +198,12 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
     return "/".join(disk_parts)
 
 
-def _recorded_source_selector(source, folder: Path, metadata: dict) -> str | None:
+def _recorded_source_selector(source, folder: Path, metadata: ArtifactMetadata) -> str | None:
     """The folder's own spelling of the source `metadata` records.
 
     Without this the two routes disagree: the request path is translated to
     the disk spelling while an absent one leaves the service reporting
-    `metadata["primary"]` verbatim, and the revision journal is keyed by
+    `metadata.primary` verbatim, and the revision journal is keyed by
     whichever string arrived. A read under one spelling and a write under the
     other then answer 409 rather than the 404 a case-exact boundary gave.
 
@@ -214,8 +215,8 @@ def _recorded_source_selector(source, folder: Path, metadata: dict) -> str | Non
     therefore about not adding a second, earlier failure for the same cause,
     not about rescuing stale metadata.
     """
-    recorded = metadata.get("primary")
-    if not isinstance(recorded, str) or not recorded.strip():
+    recorded = metadata.primary
+    if not recorded or not recorded.strip():
         return None
     try:
         return _editable_source_selector(source, folder, recorded)
@@ -301,7 +302,7 @@ def _draft_selectors(project_ref: str, artifact_id: str) -> tuple[str, str]:
     return project_selector, artifact_selector
 
 
-def _draft_file_parts(rel_path: str, metadata: dict) -> tuple[str, ...]:
+def _draft_file_parts(rel_path: str, metadata: ArtifactMetadata) -> tuple[str, ...]:
     """Validate a draft file path against the artifact it is read from.
 
     Shared by the authenticated ``/drafts`` route, the draft-link route and the
@@ -318,11 +319,9 @@ def _draft_file_parts(rel_path: str, metadata: dict) -> tuple[str, ...]:
         ) from exc
     if parts[0] in _PRIVATE_DRAFT_ENTRIES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
-    if str(metadata.get("type") or "").startswith("fullstack-"):
+    if (metadata.type or "").startswith("fullstack-"):
         try:
-            primary_parts = artifact_files.relative_file_parts(
-                str(metadata.get("primary") or "static/index.html")
-            )
+            primary_parts = artifact_files.relative_file_parts(metadata.primary or "static/index.html")
         except ValueError:
             primary_parts = ()
         public_parts = primary_parts[:-1]
@@ -666,7 +665,7 @@ async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
     return current
 
 
-def _selected_source(source, folder: Path, metadata: dict, requested: str | None) -> str | None:
+def _selected_source(source, folder: Path, metadata: ArtifactMetadata, requested: str | None) -> str | None:
     """The source file a workspace read or write addresses: the request's own
     path when it names an editable file, else the one the folder records."""
     selected = _editable_source_selector(source, folder, requested)
@@ -688,7 +687,7 @@ class _WorkspaceState(NamedTuple):
 def _workspace_state(
     source,
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     requested: str | None,
     *,
@@ -711,7 +710,7 @@ def _workspace_state(
 def _save_selected_source(
     source,
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     requested: str | None,
     *,
@@ -908,7 +907,7 @@ async def artifact_revisions(
     return {"revisions": await run_efs(partial(list_revisions, folder, rel_path=path), scope=scope)}
 
 
-def _current_revision(folder: Path, metadata: dict, artifact_id: str) -> dict | None:
+def _current_revision(folder: Path, metadata: ArtifactMetadata, artifact_id: str) -> dict | None:
     """The revision comments anchor to, or None for an artifact with no
     editable source."""
     try:
@@ -1206,13 +1205,13 @@ def _owner_publish_context(scope: TenantScope, folder: Path):
     )
 
 
-def _artifact_primary(folder: Path, metadata: dict | None):
+def _artifact_primary(folder: Path, metadata: ArtifactMetadata | None):
     from cowork.services.artifacts import _pick_primary, _user_files
 
-    return _pick_primary(folder, _user_files(folder), primary_hint=(metadata or {}).get("primary"))
+    return _pick_primary(folder, _user_files(folder), primary_hint=metadata.primary if metadata is not None else None)
 
 
-def _access_state(folder: Path, metadata: dict) -> ArtifactAccessView:
+def _access_state(folder: Path, metadata: ArtifactMetadata) -> ArtifactAccessView:
     """The access state of the folder's primary file, in one file store hop;
     404 when the folder has no publishable file."""
     from cowork.services.artifacts import published_access_view
@@ -1236,7 +1235,7 @@ class _AccessRead(NamedTuple):
 
 
 def _access_read(
-    folder: Path, metadata: dict, *, scope: TenantScope, project_id: str | None
+    folder: Path, metadata: ArtifactMetadata, *, scope: TenantScope, project_id: str | None
 ) -> _AccessRead:
     """_access_state, and in MindsHub mode the rule's keys: those
     stored_artifact_rule reads for a restricted entry, else those
@@ -1587,7 +1586,7 @@ async def set_artifact_stats_tracking(
 
 def _open_comments(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     *,
     review_scope: TenantScope | None,
@@ -1706,7 +1705,7 @@ async def artifact_revision(
 
 def _restore_revision(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     revision_id: str,
     *,
@@ -1959,7 +1958,7 @@ def _primary_rel_path(folder: Path, primary: Path | None) -> str:
         ) from exc
 
 
-def _draft_link_file_parts(folder: Path, metadata: dict) -> tuple[str, ...]:
+def _draft_link_file_parts(folder: Path, metadata: ArtifactMetadata) -> tuple[str, ...]:
     """Name the draft's primary file for the link.
 
     Blocking (path resolution on the file store), so the endpoint runs it in
@@ -1967,7 +1966,7 @@ def _draft_link_file_parts(folder: Path, metadata: dict) -> tuple[str, ...]:
     """
     from cowork.services.artifacts import _pick_primary
 
-    hint = metadata.get("primary")
+    hint = metadata.primary
     # A recorded primary that resolves needs no walk of the artifact tree.
     primary = _pick_primary(folder, [], primary_hint=hint) if hint else None
     if primary is None:
