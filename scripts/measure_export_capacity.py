@@ -381,6 +381,7 @@ def _measure_case(*, case_id: str, budget_seconds: float) -> Row:
     from fastapi import HTTPException
 
     from cowork.services import artifact_export, publish
+    from cowork.services.artifact_metadata import ArtifactMetadata
     from cowork.services.artifacts import ProjectArtifacts
 
     # The org inline budget, without an org deployment's database and identity,
@@ -442,7 +443,7 @@ def _measure_case(*, case_id: str, budget_seconds: float) -> Row:
                         lambda: artifact_export.export_primary_file(
                             source=source,
                             folder_name="report",
-                            metadata=metadata,
+                            metadata=ArtifactMetadata.model_validate(metadata),
                             artifact_id=metadata["id"],
                             export_format="docx",
                             can_edit=True,
