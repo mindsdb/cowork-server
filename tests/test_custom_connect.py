@@ -16,7 +16,7 @@ from anton.core.tools.connector_draft import parse_connector_draft
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from cowork.api.v1.endpoints.connectors import custom as custom_endpoints
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, get_scoped_session, get_tenant_scope
@@ -84,6 +84,33 @@ HEADER_KEY_DRAFT = {
     "auth": {"type": "header", "headers": {"X-Api-Key": "{api_key}", "X-Api-Version": "2024-01"}},
     "check": {"path": "/v1/status"},
 }
+OPTIONAL_KEY_DRAFT = {
+    "connector_id": "optional_key_api",
+    "label": "Optional Key API",
+    "fields": [
+        {"name": "api_key", "label": "API key", "secret": True, "required": False},
+        {"name": "account", "label": "Account", "secret": False},
+    ],
+    "auth": {"type": "header", "headers": {"Authorization": "Bearer {api_key}", "X-Account": "{account}"}},
+    "check": {"path": "/v1/me", "public_path": "/v1/public"},
+}
+ONLY_OPTIONAL_KEY_DRAFT = {
+    "connector_id": "only_key_api",
+    "label": "Only Key API",
+    "fields": [{"name": "api_key", "label": "API key", "secret": True, "required": False}],
+    "auth": {"type": "header", "headers": {"X-Api-Key": "{api_key}"}},
+    "check": {"path": "/v1/me", "public_path": "/v1/public"},
+}
+OPTIONAL_PASSWORD_DRAFT = {
+    "connector_id": "optional_password_api",
+    "label": "Optional Password API",
+    "fields": [
+        {"name": "login", "label": "Login", "secret": True},
+        {"name": "pass", "label": "Password", "secret": True, "required": False},
+    ],
+    "auth": {"type": "basic", "username": "{login}", "password": "{pass}"},
+    "check": {"path": "/v1/me"},
+}
 STORED = {
     "id": 7, "connector_id": "acme_crm", "name": "Acme", "secure_keys": ["api_key"], "status": "verified",
     "credential_version": 1, "created_at": "2026-11-09T10:00:00Z", "updated_at": "2026-11-09T10:00:00Z",
@@ -100,7 +127,8 @@ def engine():
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(eng)
     service = CustomConnectorService(_scoped(eng, BUILDER))
-    for draft in (DRAFT, BASIC_DRAFT, QUERY_DRAFT, TWO_SLOT_DRAFT, HEADER_KEY_DRAFT, PAIRED_DRAFT):
+    for draft in (DRAFT, BASIC_DRAFT, QUERY_DRAFT, TWO_SLOT_DRAFT, HEADER_KEY_DRAFT, PAIRED_DRAFT,
+                  OPTIONAL_KEY_DRAFT, ONLY_OPTIONAL_KEY_DRAFT, OPTIONAL_PASSWORD_DRAFT):
         service.save_member_draft(parse_connector_draft(draft))
     service.save_member_draft(parse_connector_draft({k: v for k, v in DRAFT.items() if k != "check"} | {"connector_id": "no_check_api"}))
     return eng
@@ -684,3 +712,119 @@ def test_the_excerpt_keeps_template_text_that_places_no_value():
 
     assert "2024-01" not in forms
     assert {SECRET, f"Bearer {SECRET}", "w1"} <= forms
+
+
+def _auth_payloads(world) -> list[dict]:
+    """The auth section each of auth's calls (dry run first) received."""
+    return [json.loads(request.content)["auth"] for request in world["auth"]]
+
+
+def test_the_same_template_connects_with_the_key_in_two_sends_and_the_full_auth(engine, world, monkeypatch):
+    res = _connect(_client(engine, monkeypatch), "optional_key_api", values={"api_key": SECRET, "account": "a1"})
+
+    assert res.status_code == 201, res.text
+    assert [request.url.raw_path for request in world["provider"]] == [b"/v1/me", b"/v1/me"]
+    assert _auth_payloads(world) == [OPTIONAL_KEY_DRAFT["auth"]] * 2
+
+
+def test_the_same_template_connects_without_the_key_in_one_send_to_the_public_path(engine, world, monkeypatch):
+    world["unprotected"] = (200, b"[]")
+
+    res = _connect(_client(engine, monkeypatch), "optional_key_api", values={"account": "a1"})
+
+    assert res.status_code == 201, res.text
+    (sent,) = world["provider"]
+    assert sent.url.raw_path == b"/v1/public"
+    assert sent.headers["x-account"] == "a1" and "authorization" not in sent.headers
+    reduced = {"type": "header", "headers": {"X-Account": "{account}"}}
+    assert _auth_payloads(world) == [reduced] * 2
+    assert json.loads(world["auth"][1].content)["fields"] == {"account": "a1", "base_url": "https://api.acme.example"}
+
+
+def test_a_connection_holding_no_field_at_all_is_stored_with_a_none_section(engine, world, monkeypatch):
+    world["unprotected"] = (204, b"")
+
+    res = _connect(_client(engine, monkeypatch), "only_key_api", values={})
+
+    assert res.status_code == 201, res.text
+    assert [request.url.raw_path for request in world["provider"]] == [b"/v1/public"]
+    assert _auth_payloads(world) == [{"type": "none"}] * 2
+
+
+@pytest.mark.parametrize("skipped", [{}, {"api_key": ""}, {"api_key": "   "}, {"api_key": None}],
+                         ids=["absent", "empty", "spaces only", "null"])
+def test_an_empty_or_blank_optional_value_counts_as_skipped(engine, world, monkeypatch, skipped):
+    world["unprotected"] = (200, b"[]")
+
+    res = _connect(_client(engine, monkeypatch), "optional_key_api", values={"account": "a1", **skipped})
+
+    assert res.status_code == 201, res.text
+    assert [request.url.raw_path for request in world["provider"]] == [b"/v1/public"]
+    assert "api_key" not in json.loads(world["auth"][1].content)["fields"]
+
+
+@pytest.mark.parametrize("status", [302, 304, 401, 403, 404, 500])
+def test_a_failed_public_check_has_its_own_code_and_no_excerpt(engine, world, monkeypatch, status):
+    world["unprotected"] = (status, b'{"error":"planted answer text"}')
+
+    res = _connect(_client(engine, monkeypatch), "optional_key_api", values={"account": "a1"})
+
+    assert res.status_code == 422
+    assert res.json()["detail"] == {"code": "public_check_failed", "provider_status": status, "excerpt": ""}
+    assert len(world["provider"]) == 1 and len(world["auth"]) == 1
+
+
+def test_a_skipped_required_field_is_still_refused_before_anything_is_sent(engine, world, monkeypatch):
+    res = _connect(_client(engine, monkeypatch), "optional_key_api", values={"api_key": SECRET})
+
+    assert res.status_code == 422
+    assert res.json()["detail"] == {"code": "invalid_values", "message": "account is required."}
+    assert not world["provider"] and not world["auth"]
+
+
+def test_a_skipped_basic_password_beside_a_required_secret_login_is_a_keyed_connect(engine, world, monkeypatch):
+    res = _connect(_client(engine, monkeypatch), "optional_password_api", values={"login": SECRET})
+
+    assert res.status_code == 201, res.text
+    assert [request.url.raw_path for request in world["provider"]] == [b"/v1/me", b"/v1/me"]
+    token = base64.b64encode(f"{SECRET}:".encode()).decode()
+    assert world["provider"][1].headers["authorization"] == f"Basic {token}"
+    reduced = {"type": "basic", "username": "{login}", "password": ""}
+    assert _auth_payloads(world) == [reduced] * 2
+
+
+def test_a_bad_request_without_the_key_proves_it_when_a_skipped_password_leaves_the_login_the_one_value(
+    engine, world, monkeypatch
+):
+    world["unprotected"] = (400, b'{"error":"no sign-in"}')
+
+    res = _connect(_client(engine, monkeypatch), "optional_password_api", values={"login": SECRET})
+
+    assert res.status_code == 201, res.text
+    assert [request.url.raw_path for request in world["provider"]] == [b"/v1/me", b"/v1/me"]
+
+
+def test_a_keyless_check_without_a_public_path_is_refused_not_sent():
+    template = custom_connect.StoredTemplate(
+        path="/v1/me", auth={"type": "none"}, public_path=None, optional=frozenset({"api_key"}),
+        secrets=frozenset({"api_key"}),
+    )
+
+    with pytest.raises(custom_connect.ConnectRefused) as refused:
+        asyncio.run(custom_connect.run_check("https://api.example.com", template, {}, {"type": "none"}))
+
+    assert (refused.value.code, refused.value.status_code) == ("no_check", 409)
+
+
+def test_a_template_with_an_optional_key_and_no_public_path_cannot_connect(engine, world, monkeypatch):
+    session = Session(engine)
+    row = session.exec(select(CustomConnector).where(CustomConnector.connector_id == "optional_key_api")).one()
+    row.connection_check = {"path": "/v1/me"}
+    session.add(row)
+    session.commit()
+
+    res = _connect(_client(engine, monkeypatch), "optional_key_api", values={"account": "a1"})
+
+    assert res.status_code == 409
+    assert res.json()["detail"]["code"] == "no_check"
+    assert not world["provider"] and not world["auth"]

@@ -5,9 +5,11 @@ member's values go on a request; the member types the API's address, and
 only that origin is dialed, through the pinned public-only helper. The
 values are filled in by anton's shared rules, as the gateway fills them.
 The check must first be refused without the placed credentials, then pass
-with them. Nothing here logs or raises a submitted value: errors name a
-field or a code, and a failure's excerpt has every submitted value, and
-every form of it that went on the request, replaced before it leaves.
+with them. A member who skips every optional key is checked once, on the
+template's public path, which must answer 2xx. Nothing here logs or raises
+a submitted value: errors name a field or a code, and a failure's excerpt
+has every submitted value, and every form of it that went on the request,
+replaced before it leaves.
 """
 
 from __future__ import annotations
@@ -85,10 +87,18 @@ class CheckFailure:
 
 @dataclass(frozen=True)
 class StoredTemplate:
-    """What connect needs of a saved template, parsed again: its check path and auth section."""
+    """What connect needs of a saved template, parsed again.
+
+    ``auth`` is the template's full section; ``optional`` names the fields a
+    member may skip and ``secrets`` the secret ones. ``public_path`` is set
+    only when every secret field is optional.
+    """
 
     path: str
     auth: dict[str, Any]
+    public_path: str | None = None
+    optional: frozenset[str] = frozenset()
+    secrets: frozenset[str] = frozenset()
 
 
 def parse_stored(row: CustomConnector) -> StoredTemplate | None:
@@ -119,7 +129,13 @@ def parse_stored(row: CustomConnector) -> StoredTemplate | None:
         return None
     if parsed.check is None:
         return None
-    return StoredTemplate(path=parsed.check.path, auth=parsed.auth.to_dict())
+    return StoredTemplate(
+        path=parsed.check.path,
+        auth=parsed.auth.to_dict(),
+        public_path=parsed.check.public_path,
+        optional=frozenset(f.name for f in parsed.fields if not f.required),
+        secrets=frozenset(f.name for f in parsed.fields if f.secret),
+    )
 
 
 def stored_template(row: CustomConnector) -> StoredTemplate:
@@ -187,7 +203,11 @@ def normalize_address(text: Any, refused_domains: Iterable[str]) -> str:
 
 
 def check_values(fields: list[dict[str, Any]], values: Any) -> dict[str, str]:
-    """Return the non-empty values for the template's own fields, or refuse.
+    """Return the values the member gave for the template's own fields, or refuse.
+
+    A field the template marks ``required: false`` may be absent, empty or
+    only spaces; it is then skipped and left out of the result. Any other
+    field must have a value.
 
     Raises:
         ConnectRefused: 422 ``invalid_values`` naming the field, never the value.
@@ -200,6 +220,10 @@ def check_values(fields: list[dict[str, Any]], values: Any) -> dict[str, str]:
     accepted: dict[str, str] = {}
     for name in known:
         value = values.get(name)
+        if known[name].get("required", True) is False and (
+            value is None or (isinstance(value, str) and not value.strip())
+        ):
+            continue
         if value is None or value == "":
             raise ConnectRefused("invalid_values", 422, f"{name} is required.")
         if not isinstance(value, str) or len(value) > VALUE_MAX or not all(0x20 <= ord(c) <= 0x7E for c in value):
@@ -211,6 +235,28 @@ def check_values(fields: list[dict[str, Any]], values: Any) -> dict[str, str]:
             raise ConnectRefused("invalid_values", 422, f"{name} cannot start or end with a space.")
         accepted[name] = value
     return accepted
+
+
+def reduced_auth(template: StoredTemplate, values: Mapping[str, str]) -> dict[str, Any]:
+    """The template's auth section with the placements of skipped optional fields taken out.
+
+    Computed once per connect from the stored template and the checked
+    values, never from the request; it is what is placed, sent to auth and
+    checked with.
+
+    Raises:
+        ConnectRefused: 422 ``invalid_values`` when a field that is not
+            optional has no value.
+    """
+    try:
+        return connector_auth_rules.without_missing(template.auth, values, template.optional)
+    except connector_auth_rules.AuthRuleError as exc:
+        raise ConnectRefused("invalid_values", 422, "A field the connector needs has no value.") from exc
+
+
+def is_keyless(template: StoredTemplate, values: Mapping[str, str]) -> bool:
+    """Whether the connection holds no secret field, whatever other values it holds."""
+    return not template.secrets & set(values)
 
 
 @dataclass(frozen=True, repr=False)
@@ -225,6 +271,8 @@ class PlacedRequest:
 
 def place_values(auth: Mapping[str, Any], values: Mapping[str, str]) -> PlacedRequest:
     """Fill the auth section with the values by anton's shared rules, as the gateway will.
+
+    ``auth`` is the connection's section (``reduced_auth``), which may be ``none``.
 
     The bare request keeps only the headers and params whose template has no
     ``{field}`` slot; ``basic`` has none.
@@ -379,27 +427,51 @@ async def _send(
     return CheckFailure(code, None, "")
 
 
-async def run_check(origin: str, template: StoredTemplate, values: Mapping[str, str]) -> CheckFailure | None:
-    """Send the check without the placed credentials, then with them; None when it passed.
+async def run_check(
+    origin: str, template: StoredTemplate, values: Mapping[str, str], auth: Mapping[str, Any]
+) -> CheckFailure | None:
+    """Check the connection against the API; None when it passed.
 
-    Without them it must answer 401 or 403, or 400 or 422 when the auth
-    places a single field, or a passing check would prove
-    nothing. With them, 2xx passes, 401 or 403 is ``authentication_failed``
-    and any other status ``provider_error``. A 404 to either send is
-    ``check_path_not_found``. Only the answer to the request that carried
-    the credentials is excerpted.
+    A connection that holds a secret field is sent the check without the
+    placed credentials, then with them, both to ``template.path``. Without
+    them it must answer 401 or 403, or 400 or 422 when the auth places a
+    single field, or a passing check would prove nothing. With them, 2xx
+    passes, 401 or 403 is ``authentication_failed`` and any other status
+    ``provider_error``. A 404 to either send is ``check_path_not_found``.
+    Only the answer to the request that carried the credentials is excerpted.
+
+    A connection that holds no secret field is sent one request to
+    ``template.public_path``: 2xx passes and any other status is
+    ``public_check_failed`` with no excerpt, since no credential was sent.
+
+    Args:
+        origin: The member's normalized API address.
+        template: The stored template.
+        values: The member's checked values.
+        auth: The connection's section from ``reduced_auth``.
 
     Raises:
         ConnectRefused: 422 ``invalid_values`` when a value cannot be placed.
     """
-    placed = place_values(template.auth, values)
+    placed = place_values(auth, values)
+    if is_keyless(template, values):
+        # The parser requires a public path whenever every secret field is optional; refused, not asserted,
+        # so a stored template without one never sends to a missing path.
+        if template.public_path is None:
+            raise ConnectRefused("no_check", 409, "This connector cannot be connected as saved. " + _NO_CHECK_NEXT)
+        answer = await _send(origin, template.public_path, placed.headers, placed.params)
+        if isinstance(answer, CheckFailure):
+            return answer
+        if 200 <= answer.status_code < 300:
+            return None
+        return CheckFailure("public_check_failed", answer.status_code, "")
     unprotected = await _send(origin, template.path, placed.bare_headers, placed.bare_params)
     if isinstance(unprotected, CheckFailure):
         return unprotected
     refused = _REFUSED_WITHOUT_KEY
     # The auth rules make every auth place a secret field, so a lone slot is the key; with a second
     # slot the 400 could be about that value, whatever its secret flag says.
-    if len(_slot_names(template.auth)) == 1:
+    if len(_slot_names(auth)) == 1:
         refused = refused | _BAD_REQUEST_WITHOUT_KEY
     if unprotected.status_code not in refused:
         # Its body is never shown: an excerpt would let connect read any page our egress can reach.
@@ -416,5 +488,5 @@ async def run_check(origin: str, template: StoredTemplate, values: Mapping[str, 
         code = "check_path_not_found"
     else:
         code = "provider_error"
-    scrubbed = scrub_excerpt(answer.body, sent_forms(template.auth, placed, values.values()))
+    scrubbed = scrub_excerpt(answer.body, sent_forms(auth, placed, values.values()))
     return CheckFailure(code, answer.status_code, scrubbed)
