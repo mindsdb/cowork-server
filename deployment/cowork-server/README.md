@@ -146,8 +146,10 @@ gives a member's org-mode turns the custom API connections they connected. It
 is `"false"` in `values.yaml`; an environment sets `"true"` in its own values
 file and is listed in `CUSTOM_API_ENVIRONMENTS` in `tests/test_chart_values.py`.
 Turn it on only after auth serves the custom API connection listing and grants,
-mindshub_inference serves the custom API gateway, and a scratchpad image whose
-anton reads the version 1 custom API block is deployed. Rollback removes the
+mindshub_inference serves the custom API gateway, the turn controller forwards
+the `custom_api` block, a scratchpad image whose anton reads the version 1
+custom API block is deployed, and the producer key bundle
+(`datasource-service-keys`) exists in the namespace. Rollback removes the
 line from the environment's values file and the environment from
 `CUSTOM_API_ENVIRONMENTS` in the same change.
 
