@@ -49,6 +49,7 @@ from cowork.api.v1.endpoints import (
 from cowork.api.v1.endpoints.connectors import (
     connections,
     custom,
+    custom_connections,
     datasources,
     notion,
     oauth,
@@ -77,6 +78,9 @@ api_router.include_router(
 )
 api_router.include_router(specs.router, prefix="/connectors/specs", tags=["connectors"])
 api_router.include_router(custom.router, prefix="/connectors/custom", tags=["connectors"])
+api_router.include_router(
+    custom_connections.router, prefix="/connectors/custom-connections", tags=["connectors"]
+)
 api_router.include_router(submissions.router, prefix="/connectors/submissions", tags=["connectors"])
 api_router.include_router(posthog.router, prefix="/connectors/posthog", tags=["connectors"])
 api_router.include_router(notion.router, prefix="/connectors/notion", tags=["connectors"])
