@@ -1204,6 +1204,76 @@ def _preview_error_lines(entries: object, source_path: str) -> list[str]:
     return lines
 
 
+_MAX_ANCHOR_QUOTE = 500
+_MAX_ANCHOR_TEXT = 200
+_MAX_ANCHOR_TAG = 200
+# The comment layer's page-level anchor: the whole page, not an element.
+_PAGE_SELECTORS = {"", "body", "html"}
+# Parsing is in the request: a source past this size is not parsed for the hint.
+_MAX_ANCHOR_PARSE = 2_000_000
+
+
+def _source_element(content: str, selector: str) -> str:
+    """How the saved HTML source writes the element `selector` points at, or "".
+
+    The comment layer anchors a thread with ``document.querySelector`` on a
+    positional CSS path (``div:nth-of-type(2) > h2``), which a model reading
+    raw HTML places poorly. The element's opening tag and text are what it can
+    find. ``select_one`` takes the first match in document order, as
+    ``querySelector`` does; a page that builds the element in script has no
+    match here, and then the selector alone is passed on. Best-effort: a parse
+    or selector failure only drops this hint.
+    """
+    if len(content) > _MAX_ANCHOR_PARSE:
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+
+        element = BeautifulSoup(content, "html.parser").select_one(selector)
+    except Exception:
+        return ""
+    if element is None:
+        return ""
+    attrs = "".join(
+        f' {name}="{" ".join(value) if isinstance(value, list) else value}"'
+        for name, value in element.attrs.items()
+    )
+    tag = _flatten(f"<{element.name}{attrs}>")[:_MAX_ANCHOR_TAG]
+    text = _flatten(element.get_text(" "))[:_MAX_ANCHOR_TEXT]
+    return f"{tag} with the text \u201c{text}\u201d" if text else tag
+
+
+def _anchor_line(selector: str | None, source_path: str, content: str) -> str:
+    """Where the thread is anchored, in words an editor can place: the quoted
+    text, or the element (its selector and, when the source has it, how the
+    source writes it), in the source file.
+
+    Every value is flattened to one line: the desktop reads this prompt's
+    lines back into a card, and a newline here could forge one.
+    """
+    raw = (selector or "").strip()
+    if raw.startswith("{"):
+        # A text comment (TextSelectionComment): {type: "text-quote", path, quote}.
+        try:
+            quoted = json.loads(raw)
+        except ValueError:
+            quoted = None
+        if isinstance(quoted, dict) and quoted.get("type") == "text-quote":
+            quote = _flatten(str(quoted.get("quote") or ""))[:_MAX_ANCHOR_QUOTE]
+            path = _flatten(str(quoted.get("path") or "")) or source_path
+            if quote:
+                return f"the text \u201c{quote}\u201d in {path}"
+    flat = _flatten(raw)
+    if flat.lower() in _PAGE_SELECTORS:
+        return f"the artifact as a whole ({source_path})"
+    line = f"the element matching the CSS selector `{flat}` in {source_path}"
+    if source_path.lower().endswith((".html", ".htm")):
+        found = _source_element(content, flat)
+        if found:
+            line += f", which the source writes as: {found}"
+    return line
+
+
 def create_agent_repair(
     folder: Path,
     metadata: dict,
@@ -1256,21 +1326,34 @@ def create_agent_repair(
             + "\n".join(preview_lines)
             + "\n"
         )
+    anchor = _anchor_line(selector, source.path, source.content)
+    # The same route as an edit asked for in chat: one `edit_artifact` call
+    # (anton's diff-based artifact editor), which reads, edits, checks and
+    # repairs the page itself, so the turn needs no list_artifacts round, no
+    # file reads and no scratchpad patch. Its writes land in the folder like
+    # any other, so the repair is finalized from the folder as before. An
+    # anton without the editor falls back to the old route.
     prompt = (
         "Address this artifact review thread. Work on the existing artifact source; "
         "do not create a replacement artifact and do not resolve the comment yourself.\n\n"
         f"Artifact id: {artifact_id}\n"
         f"Source path: {source.path}\n"
-        "Find the artifact with `list_artifacts` by passing this artifact id in "
-        "`match`; `Source path` is relative to the artifact folder.\n"
+        f"Make the change with one `edit_artifact` call: pass `{folder.name}` as `slug`, and as "
+        "`task` what the thread asks for, in your own words, followed by where it is anchored "
+        "(the `Anchor` line below, verbatim) so the edit lands on that element. Do not call "
+        "`list_artifacts` or read the files first. Only if `edit_artifact` is not offered, find "
+        "the artifact with `list_artifacts` by passing this artifact id in `match`; `Source path` "
+        "is relative to the artifact folder.\n"
         f"Base revision: {current.id}\n"
         f"Repair id: {repair_id}\n"
         f"Selected element: {selector or 'General artifact feedback'}\n"
+        f"Anchor: {anchor}\n"
         f"{preview_block}"
         "Complete comment thread:\n"
         f"{json.dumps(thread, ensure_ascii=False, indent=2)}\n\n"
-        "Make the smallest coherent fix, preserve unrelated behavior and styling, "
-        "and verify the artifact still renders."
+        "Make the smallest coherent fix and preserve unrelated behavior and styling. "
+        "`edit_artifact` checks the page in a browser itself: once it reports the change "
+        "applied, do not re-read or re-verify the files."
     )
     return {"repair": repair.to_json(), "prompt": prompt}
 
