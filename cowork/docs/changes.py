@@ -180,15 +180,14 @@ def _table_changes(where: str, old: Block, new: Block) -> list[Change]:
         label = None
         for col in shared_cols:
             before, after = was["cells"].get(col["id"], ""), row["cells"].get(col["id"], "")
-            if _plain(before) == _plain(after):
+            if before == after or _plain(before) == _plain(after):
                 continue
             if col["id"] == label_col:
                 out.append(_row_label_change(where, before, after))
                 continue
             if label is None:
                 label = _short(_plain(row["cells"].get(label_col, "")), NAME_CHARS)
-            column = names[col["id"]]
-            out.append(_cell_change(where, f"{label} · {column}" if wide and label else (label or column), before, after))
+            out.append(_cell_change(where, before, after, label=label, column=names[col["id"]], wide=wide))
     if not added and not removed and _first_moved([r["id"] for r in old["rows"]], [r["id"] for r in new["rows"]]):
         out.append(Change(where, "sorted a table"))
     return out
@@ -209,8 +208,9 @@ def _row_label_change(where: str, before: str, after: str) -> Change:
     return Change(where, f"renamed row {_quote(before)} → {_quote(after)}", cell=True)
 
 
-def _cell_change(where: str, head: str, before: str, after: str) -> Change:
+def _cell_change(where: str, before: str, after: str, *, label: str, column: str, wide: bool) -> Change:
     """"Paid search 72 → 80"; in a wider table, "Paid search · Budget 72 → 80"."""
+    head = f"{label} · {column}" if wide and label else (label or column)
     if not _plain(before):
         return Change(where, f"{head} set to {_short(after, VALUE_CHARS)}", cell=True)
     if not _plain(after):
@@ -282,10 +282,7 @@ def _chips(s: str) -> str:
         if not s.startswith("}", j + 1):
             i = s.find("{{", j)
             continue
-        start = i + 2
-        if s.startswith("date:", start):
-            start += len("date:")
-        out += (s[done:i], s[start:j].removeprefix("pending:").strip())
+        out += (s[done:i], s[i + 2:j].removeprefix("date:").removeprefix("pending:").strip())
         done = j + 2
         i = s.find("{{", done)
     out.append(s[done:])

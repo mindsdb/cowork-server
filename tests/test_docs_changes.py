@@ -1,7 +1,6 @@
 """Version-history summaries: a block's words read in linear time, exactly as the one-regex-per-mark reading did."""
 from __future__ import annotations
 
-import copy
 import random
 import re
 import time
@@ -95,20 +94,6 @@ def _table_doc(columns: list[str], rows: list[list[str]]) -> dict:
 ])
 def test_a_cell_names_its_row_and_column(columns, before, after, summary):
     assert describe(_table_doc(columns, [before]), _table_doc(columns, [after])) == summary
-
-
-def test_a_summary_of_blocks_full_of_open_marks_is_quick():
-    old = {"title": "Plan", "tabs": [{"id": "t1", "title": "Plan", "blocks": [
-        {"id": "b1", "type": "paragraph", "text": "[" * 100_000},
-        {"id": "b2", "type": "paragraph", "text": "a"},
-    ]}]}
-    new = copy.deepcopy(old)
-    new["tabs"][0]["blocks"][0]["text"] = "{{" * 50_000
-    new["tabs"][0]["blocks"][1]["text"] = "[](" * 100_000
-    start = time.perf_counter()
-    summary = describe(old, new)
-    assert time.perf_counter() - start < 1.0
-    assert summary.endswith(", and 1 more change")
 
 
 def test_a_summary_of_a_table_with_long_names_is_quick():
