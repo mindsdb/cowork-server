@@ -12,12 +12,15 @@ never share an entry.
 """
 from __future__ import annotations
 
+import json
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from cowork.app_secret import get_app_secret
-from cowork.services.connectors.layered_vault import FilteredDataVault
+from cowork.services.connectors.custom_mcp import CUSTOM_MCP_ENGINE, is_custom_mcp, refuse_generic_write
+from cowork.services.connectors.layered_vault import FilteredDataVault, LayeredDataVault
 
 MCP_METHOD = "mcp"
 
@@ -65,6 +68,55 @@ def _hold_token_and_default_mode(root: Path, engine: str, name: str, token: str 
 def release(root: Path, engine: str, name: str) -> None:
     with _lock:
         _entries.pop(_key(root, engine, name), None)
+        if is_custom_mcp(engine):
+            _custom.pop(_key(root, engine, name), None)
+
+
+#: A custom MCP connection's held settings and token. Kept apart from the
+#: generic entries: none of these may ever come from the vault file.
+CUSTOM_FIELDS = (
+    "server_url",
+    "label",
+    "resource",
+    "authorization_endpoint",
+    "token_endpoint",
+    "revocation_endpoint",
+    "client_id",
+    "allowed_tools",
+    "access_token",
+    "expires_at",
+)
+
+_custom: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+
+def hold_custom(root: Path, name: str, values: dict[str, Any]) -> dict[str, Any]:
+    """Merge ``values`` (CUSTOM_FIELDS keys, None meaning unchanged) into a
+    custom MCP connection's held entry and return it. A server URL that
+    differs from the held one drops the held token and its expiry, unless the
+    same call brings new ones, so a token never pairs with another server."""
+    with _lock:
+        entry = _custom.setdefault(_key(root, CUSTOM_MCP_ENGINE, name), {})
+        url = values.get("server_url")
+        if url and entry.get("server_url") and url != entry["server_url"]:
+            entry.pop("access_token", None)
+            entry.pop("expires_at", None)
+        for key in CUSTOM_FIELDS:
+            value = values.get(key)
+            if value is None:
+                continue
+            entry[key] = list(value) if key == "allowed_tools" else str(value)
+        return _copy(entry)
+
+
+def held_custom(root: Path, name: str) -> dict[str, Any]:
+    """A custom MCP connection's held entry, empty when nothing is held."""
+    with _lock:
+        return _copy(_custom.get(_key(root, CUSTOM_MCP_ENGINE, name), {}))
+
+
+def _copy(entry: dict[str, Any]) -> dict[str, Any]:
+    return {key: list(value) if isinstance(value, list) else value for key, value in entry.items()}
 
 
 def overlay(root: Path, engine: str, name: str, fields: dict, keys: tuple[str, ...] = tuple(VAULT_FIELD)) -> dict:
@@ -97,28 +149,71 @@ class AppHeldVault(FilteredDataVault):
     the secret-guarded routes may set a mode. A save of an MCP connection keeps
     the token out of the file, holds it here, ignores any mode it carries and
     holds "read" when no mode is held.
+
+    A custom MCP connection (``custom_mcp``) reads nothing from the file but
+    its existence: its URL, label and allowed tools come from the held entry,
+    and only for a record in the user's own layer (``is_own``). With nothing
+    held its record carries ``_method`` alone, which anton skips.
     """
 
-    def __init__(self, *, source: Any, root: Path) -> None:
+    def __init__(self, *, source: Any, root: Path, is_own: Callable[[str, str], bool] | None = None) -> None:
+        """``is_own(engine, name)`` says whether the record comes from the
+        user's own vault rather than a managed or shared one; without it every
+        record counts as the user's own."""
         super().__init__(source=source, hidden=frozenset())
         self._root = root
+        self._is_own = is_own or (lambda _engine, _name: True)
 
     def _held_mode(self, engine: str, name: str, fields: dict) -> dict:
         if not active() or fields.get("_method") != MCP_METHOD:
             return fields
         return {**fields, "_access_mode": held(self._root, engine, name).get("access_mode") or "read"}
 
+    def _custom_fields(self, name: str, *, with_token: bool) -> dict[str, str]:
+        """A custom connection's fields, from the held entry only."""
+        fields = {"_method": MCP_METHOD}
+        if not active() or not self._is_own(CUSTOM_MCP_ENGINE, name):
+            return fields
+        entry = held_custom(self._root, name)
+        if not entry.get("server_url") or "allowed_tools" not in entry:
+            return fields
+        fields.update(
+            {
+                "_server_url": entry["server_url"],
+                "_allowed_tools": json.dumps(entry["allowed_tools"]),
+                "_label": entry.get("label") or name,
+                # Which tools run is decided by _allowed_tools; the access mode
+                # only has to let the list through.
+                "_access_mode": "write",
+            }
+        )
+        if with_token and entry.get("access_token"):
+            fields["access_token"] = entry["access_token"]
+            if entry.get("expires_at"):
+                fields["expires_at"] = entry["expires_at"]
+        return fields
+
     def load(self, engine: str, name: str) -> dict[str, str] | None:
         fields = super().load(engine, name)
         if fields is None:
             return None
+        if is_custom_mcp(engine):
+            return self._custom_fields(name, with_token=True)
         return self._held_mode(engine, name, overlay(self._root, engine, name, fields))
 
     def read_record(self, engine: str, name: str) -> dict[str, Any] | None:
         record = super().read_record(engine, name)
         if record is None:
             return None
+        if is_custom_mcp(engine):
+            return {**record, "fields": self._custom_fields(name, with_token=False)}
         return {**record, "fields": self._held_mode(engine, name, record.get("fields") or {})}
+
+    def delete(self, engine: str, name: str) -> bool:
+        deleted = super().delete(engine, name)
+        if is_custom_mcp(engine):
+            release(self._root, engine, name)
+        return deleted
 
     def save(
         self,
@@ -128,9 +223,25 @@ class AppHeldVault(FilteredDataVault):
         *,
         secure_keys: list[str] | None = None,
     ) -> object:
+        refuse_generic_write(engine)
         if active() and credentials.get("_method") == MCP_METHOD:
             credentials = dict(credentials)
             token = credentials.pop("access_token", None)
             credentials.pop("_access_mode", None)
             _hold_token_and_default_mode(self._root, engine, name, token, credentials.get("expires_at"))
         return super().save(engine, name, credentials, secure_keys=secure_keys)
+
+
+def turn_vault(data_vault: Any, *, source_vault: Any, root: Path) -> Any:
+    """The vault a turn reads: with the app secret held, ``data_vault`` read
+    through AppHeldVault; without it, ``data_vault`` with every custom MCP
+    connection hidden, since nothing then holds their settings and their
+    vault file is not to be trusted. ``source_vault`` is the scope's vault,
+    asked which layer a record comes from."""
+    if active():
+        return AppHeldVault(
+            source=data_vault,
+            root=root,
+            is_own=source_vault.answers_from_own if isinstance(source_vault, LayeredDataVault) else None,
+        )
+    return FilteredDataVault(source=data_vault, hidden=frozenset(), hidden_engines=frozenset({CUSTOM_MCP_ENGINE}))
