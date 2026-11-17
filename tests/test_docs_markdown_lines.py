@@ -4,12 +4,12 @@ from __future__ import annotations
 import contextlib
 import random
 import re
-import time
 
 import pytest
 
 from cowork.docs.markdown import _read_heading, _read_pending, _read_table, parse_markdown
-from cowork.docs.model import MAX_TABLE_COLS, MAX_TABLE_ROWS, DocError
+from cowork.docs.model import MAX_TABLE_COLS, MAX_TABLE_ROWS, MAX_TEXT, DocError
+from tests._linear_time import MAX_LINEAR_GROWTH, cpu_seconds_per_call, growth
 
 # The regexes these lines were read with. A run of spaces inside the line made
 # them quadratic (cubic for an empty pending line); the readers must read every
@@ -113,26 +113,48 @@ def test_a_table_at_the_limits_reads_and_one_past_them_is_refused_as_before():
         assert refused.value.code == "bad_table"
 
 
+_BAD_CHART = "\n\n```chart\n{not json}\n```"
+
+
+@pytest.mark.parametrize(("md", "code"), [
+    ("# " + "a" * (MAX_TEXT + 1) + "\n\n" + _table(MAX_TABLE_COLS + 1, 1), "too_long"),
+    (_table(MAX_TABLE_COLS + 1, 1) + _BAD_CHART, "bad_markdown"),
+    (_table(MAX_TABLE_COLS, MAX_TABLE_ROWS + 1) + _BAD_CHART, "bad_markdown"),
+], ids=["too-long-heading-first", "wide-table-then-bad-chart", "long-table-then-bad-chart"])
+def test_a_doc_with_a_table_past_the_limits_and_another_error_reports_the_same_error(md, code):
+    with pytest.raises(DocError) as refused:
+        parse_markdown(md)
+    assert refused.value.code == code
+
+
+def _parse(md: str) -> None:
+    with contextlib.suppress(DocError):
+        parse_markdown(md)
+
+
+@pytest.mark.parametrize("build", [
+    lambda n: "# a" + " " * n + "b",
+    lambda n: "{{pending:" + " " * n,
+    lambda n: "{{pending: a" + " " * n + "b",
+    lambda n: "| a |\n" + " " * n + "x",
+    lambda n: "| a |\n|--" + " " * n + "x",
+    lambda n: "|" * n + "\n|--|\n" + "|\n" * n,
+], ids=["heading", "pending-empty", "pending", "separator-indent", "separator-tail", "wide-table"])
+def test_hostile_markdown_parses_in_linear_time(build):
+    """One doc write parses its Markdown under the doc lock. The regexes and the row
+    padding grew with the square of the length (an empty pending line: the cube);
+    at 20,000 characters these took from 1 s to half an hour."""
+    assert growth(_parse, small=build(2_000), large=build(20_000)).ratio < MAX_LINEAR_GROWTH
+
+
 # HTTP create takes Markdown up to this length.
 _LONGEST = 2_000_000
 
 
 @pytest.mark.parametrize("md", [
-    "# a" + " " * _LONGEST + "b",
-    "{{pending:" + " " * _LONGEST,
-    "{{pending: a" + " " * _LONGEST + "b",
-    "| a |\n" + " " * _LONGEST + "x",
-    "| a |\n|--" + " " * _LONGEST + "x",
-    "|" * (_LONGEST // 2) + "\n|--|\n" + "|\n" * (_LONGEST // 4),
     "|" * (_LONGEST // 2) + "\n|--|",
     "| a |\n|--|\n" + "| b |\n" * (_LONGEST // 6),
-], ids=["heading", "pending-empty", "pending", "separator-indent", "separator-tail", "wide-table", "wide-header",
-        "long-table"])
-def test_hostile_markdown_parses_in_linear_time(md):
-    """One doc write parses its Markdown under the doc lock. The regexes took hours
-    on these lines, the wide table ran out of memory, and the wide header and the
-    long table took 5-10 s. The bound leaves room for coverage on a slow runner."""
-    start = time.perf_counter()
-    with contextlib.suppress(DocError):
-        parse_markdown(md)
-    assert time.perf_counter() - start < 2.0
+], ids=["wide-header", "long-table"])
+def test_a_table_past_the_limits_is_read_no_further_than_it_needs(md):
+    """Linear before too, but every column and row got an id: 10 s on the wide header, 5 s on the long table."""
+    assert cpu_seconds_per_call(lambda: _parse(md)) < 2.0

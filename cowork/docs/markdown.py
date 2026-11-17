@@ -24,9 +24,10 @@ from typing import Any
 
 from .model import (
     LIST_TYPES,
+    MAX_TABLE_COLS,
+    MAX_TABLE_ROWS,
     Block,
     DocError,
-    check_table_limits,
     image_src_ok,
     is_number,
     new_id,
@@ -46,7 +47,7 @@ _ESCAPED = re.compile(r"\\(.)")
 # A lazy group or a backtracking run before `\s*$` rescans a run of spaces from
 # every position, quadratic in the line's length. Headings, pending lines and
 # table separators are therefore read from the stripped line.
-_TABLE_SEP = re.compile(r"\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?")  # fullmatch on the stripped line
+_TABLE_SEP = re.compile(r"\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?")
 _PENDING_OPEN = re.compile(r"\s*\{\{\s*pending\s*:\s*", re.I)
 
 # A callout's `[!MARKER]` → its tone, and back (TIP is written for success).
@@ -178,18 +179,20 @@ def _read_fence(lines: list[str], i: int, in_para: bool) -> _Read:
 
 def _read_pending(lines: list[str], i: int, in_para: bool) -> _Read:
     opened = _PENDING_OPEN.match(lines[i])
-    rest = lines[i][opened.end():].rstrip() if opened else ""
+    if not opened:
+        return None
+    rest = lines[i][opened.end():].rstrip()
     if not rest.endswith("}}"):
         return None
     return [{"type": "pending", "intent": rest[:-2].rstrip()}], i + 1
 
 
 def _read_heading(lines: list[str], i: int, in_para: bool) -> _Read:
-    text = lines[i].lstrip("#")
-    level = len(lines[i]) - len(text)
-    if not 1 <= level <= 6 or not text[:1].isspace():
+    after = lines[i].lstrip("#")
+    level = len(lines[i]) - len(after)
+    if not 1 <= level <= 6 or not after[:1].isspace():
         return None
-    text = text.strip()
+    text = after.strip()
     # A closing run of #s is stripped only after a space: "## Learning C#" keeps its #.
     body = text.rstrip("#")
     if body[-1:].isspace():
@@ -220,15 +223,14 @@ def _read_image(lines: list[str], i: int, in_para: bool) -> _Read:
 def _read_table(lines: list[str], i: int, in_para: bool) -> _Read:
     if not (lines[i].strip().startswith("|") and i + 1 < len(lines) and _TABLE_SEP.fullmatch(lines[i + 1].strip())):
         return None
-    header = _split_row(lines[i])
-    # A table past the limits is refused as soon as that shows, before its rows
-    # are padded to the header's width and given ids.
-    check_table_limits({"columns": header, "rows": []})
+    # Kept to one column and one row past the limits: normalize_block refuses
+    # such a table all the same, and every row would be padded to the full width.
+    header = _split_row(lines[i])[: MAX_TABLE_COLS + 1]
     i += 2
     rows: list[list[str]] = []
     while i < len(lines) and lines[i].strip().startswith("|"):
-        rows.append((_split_row(lines[i]) + [""] * len(header))[: len(header)])
-        check_table_limits({"columns": header, "rows": rows})
+        if len(rows) <= MAX_TABLE_ROWS:
+            rows.append((_split_row(lines[i]) + [""] * len(header))[: len(header)])
         i += 1
     cols = _infer_columns(header, rows)
     return [{
