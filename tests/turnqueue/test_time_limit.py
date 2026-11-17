@@ -106,7 +106,7 @@ def test_only_keep_going_at_a_limit_extends(question_id, values, extends):
 
 
 @pytest.mark.asyncio
-async def test_keep_going_gives_the_key_another_window(time_limit, monkeypatch):
+async def test_keep_going_gives_the_key_another_window(time_limit, monkeypatch, empty_decisions_proxy_records):
     from cowork.api.v1.endpoints import responses as endpoint
 
     extend = AsyncMock(return_value=True)
@@ -117,7 +117,7 @@ async def test_keep_going_gives_the_key_another_window(time_limit, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_refused_extension_is_tried_again_after_a_pause(time_limit, monkeypatch):
+async def test_a_refused_extension_is_tried_again_after_a_pause(time_limit, monkeypatch, empty_decisions_proxy_records):
     """One blip in auth must not turn the user's Keep going into Stop here, so
     the second try waits a moment rather than following straight on."""
     import time
@@ -281,7 +281,7 @@ def test_a_time_limit_longer_than_the_backstop_and_key_lifetime_cover_is_rejecte
 
 
 @pytest.mark.asyncio
-async def test_a_failed_extension_is_retried_once(time_limit, monkeypatch):
+async def test_a_failed_extension_is_retried_once(time_limit, monkeypatch, empty_decisions_proxy_records):
     from cowork.api.v1.endpoints import responses as endpoint
 
     extend = AsyncMock(side_effect=[False, True])

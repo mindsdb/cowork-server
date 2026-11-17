@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import itertools
 import logging
@@ -15,7 +16,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from coding_service_fakes import (
+from tests.support.coding.service_fakes import (
     CREDS,
     copy_folders_without_git,
     FakeEngine,
@@ -56,7 +57,9 @@ from cowork.coding.context import is_context_exhaustion_error
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import (
     CodeTask,
+    Computer,
     ComputerCapabilities,
+    ComputerStatus,
     RunStatus,
     RuntimeEvent,
     TaskCapability,
@@ -71,13 +74,17 @@ from cowork.coding.project_models import (
     ProjectCommand,
     ProjectCreateRequest,
     ProjectFolder,
+    ProjectEnvironment,
     ProjectUpdateRequest,
     PublishRequest,
     PullRequestActionRequest,
+    CodeProject,
+    LocalFolderResource,
     RepositoryResource,
 )
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.remote_execution import RemoteExecutionCoordinator
+from cowork.coding import service as coding_service_module
 from cowork.coding.store import CodingStore
 from cowork.coding.turns import EventBuffer, finish_turn, mark_running, terminal_status
 from cowork.coding.workspace import WorkspaceError
@@ -176,6 +183,120 @@ def stored_local_session(tmp_path: Path, status: SessionStatus) -> CodingSession
     )
     CodingStore(tmp_path / "coding").save_session(session)
     return session
+
+
+def test_concurrent_first_requests_share_one_coding_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    built: list[object] = []
+
+    class SlowService:
+        def __init__(self, _root: Path) -> None:
+            time.sleep(0.05)
+            built.append(self)
+
+    monkeypatch.setattr(coding_service_module, "CodingService", SlowService)
+    monkeypatch.setattr(
+        coding_service_module,
+        "get_app_settings",
+        lambda: SimpleNamespace(coding=SimpleNamespace(root_dir="unused")),
+    )
+    coding_service_module.get_coding_service.cache_clear()
+    try:
+        barrier = threading.Barrier(8)
+
+        def first_request() -> object:
+            barrier.wait()
+            return coding_service_module.get_coding_service()
+
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:
+            services = list(pool.map(lambda _: first_request(), range(8)))
+    finally:
+        coding_service_module.get_coding_service.cache_clear()
+
+    assert len(built) == 1
+    assert all(item is built[0] for item in services)
+
+
+def test_task_bound_to_a_duplicate_local_computer_recovers_on_restart(tmp_path: Path) -> None:
+    session = stored_local_session(tmp_path, SessionStatus.completed)
+    service = service_with(tmp_path, FakeEngine())
+    local_id = service.control.local_computer.id
+    remote, _ = service.control.register_runtime(
+        service.control.issue_registration_token(),
+        "Build computer",
+        service.control.local_computer.capabilities,
+    )
+    # Reproduce what a lost first-start race left behind: a second local
+    # record that never heartbeats, with the task and a project folder on it.
+    duplicate = service.control.store.save_computer(Computer(
+        id="computer-duplicate",
+        name="This computer",
+        is_local=True,
+        status=ComputerStatus.offline,
+        capabilities=service.control.local_computer.capabilities,
+    ))
+    bound = service.get_session(session.id)
+    service.control.store.update_run(bound.run_id, lambda run: setattr(run, "computer_id", duplicate.id))
+    for workspace in service.control.store.list_workspaces(bound.run_id):
+        workspace.computer_id = duplicate.id
+        service.control.store.save_workspace(workspace)
+    service.store.save_session(
+        service.store.load_session(session.id).model_copy(update={"computer_id": duplicate.id}),
+        touch_updated_at=False,
+    )
+    service.project_store.save(CodeProject(
+        id="stranded-project",
+        name="Stranded",
+        resources=[LocalFolderResource(id="notes", name="Notes", path=str(tmp_path), computer_id=duplicate.id)],
+    ))
+    service.close_all()
+
+    restarted = service_with(tmp_path, FakeEngine())
+
+    recovered = restarted.get_session(session.id)
+    assert restarted.control.local_computer.id == local_id
+    assert recovered.computer_id == local_id
+    assert recovered.computer_is_local
+    assert recovered.computer_status == "online"
+    assert restarted.control.continue_task(recovered.task_id, recovered.run_id).computer_id == local_id
+    assert restarted.project_store.get("stranded-project").resources[0].computer_id == local_id
+    listed = {item.id: item for item in restarted.control.list_computers().items}
+    assert [item.id for item in listed.values() if item.is_local] == [local_id]
+    assert remote.id in listed
+
+
+def test_repaired_project_task_can_fork_without_expanding_its_frozen_scope(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Scoped", default_engine_id="fake", default_model="fake-model",
+        folders=[ProjectFolder(id="repo", name="Repo", path=str(repo))],
+        environment=ProjectEnvironment(port_names=[]),
+    ))
+    session = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Go", workspace_mode=WorkspaceMode.in_place),
+        CREDS, "fake", "fake-model",
+    )
+    session = wait_for_status(service, session.id, SessionStatus.completed)
+    snapshot = service.control.store.get_task(session.task_id).execution_project.model_dump(mode="json")
+    old_id = service.control.local_computer.id
+    # A newer live project must not replace the task's frozen resources.
+    changed = service.project_store.get(project.id)
+    changed.resources.append(LocalFolderResource(id="later", name="Later", path=str(tmp_path), computer_id=old_id))
+    service.project_store.save(changed)
+    service.close_all()
+    (service.control.root / "control" / "local-computer-id").write_text("computer-survivor\n")
+
+    for _ in range(2):
+        service = service_with(tmp_path, FakeEngine())
+        repaired = service.control.store.get_task(session.task_id).execution_project.model_dump(mode="json")
+        expected = {**snapshot, "resources": [
+            {**resource, "computer_id": "computer-survivor"} for resource in snapshot["resources"]
+        ]}
+        assert repaired == expected
+        child = service.fork_session(session.id, CREDS)
+        assert child.computer_id == "computer-survivor"
+        assert child.resource_ids == ["repo"]
+        service.close_all()
 
 
 def test_finishing_a_turn_with_a_pending_approval_completes_the_run(tmp_path: Path) -> None:
@@ -3126,3 +3247,55 @@ def test_a_read_only_command_does_not_continue_a_completed_task(tmp_path: Path) 
     assert len(status_events) == 1
     assert status_events[0].text.startswith("Status: completed")
     assert status_events[0].data["command"] == "status"
+
+
+def test_a_task_on_a_folder_without_git_starts_read_only_until_writes_are_allowed(tmp_path: Path) -> None:
+    folder = tmp_path / "plain-folder"
+    folder.mkdir()
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(folder), prompt="Edit a file"), CREDS, "fake", "fake-model"
+    )
+    created = wait_for_status(service, created.id, SessionStatus.completed)
+
+    assert created.writes_allowed is False
+    assert engine.configs[-1].writes_allowed is False
+    ready = next(event for event in service.events(created.id).items if event.title == "Task workspace ready")
+    assert "Until you allow writes" in (ready.text or "")
+
+    allowed = service.update_session_config(created.id, SessionUpdateRequest(writes_allowed=True))
+    assert allowed.writes_allowed is True
+    assert engine.closed == 1
+    engine.is_closed = False
+    service.submit_turn(created.id, "Edit it now", CREDS)
+    wait_for_status(service, created.id, SessionStatus.completed)
+    assert engine.configs[-1].writes_allowed is True
+
+
+def test_a_repository_without_commits_starts_read_only(tmp_path: Path) -> None:
+    repo = tmp_path / "unborn"
+    repo.mkdir()
+    git(repo, "init")
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Edit a file"), CREDS, "fake", "fake-model"
+    )
+
+    assert wait_for_status(service, created.id, SessionStatus.completed).writes_allowed is False
+
+
+@pytest.mark.parametrize("mode", [WorkspaceMode.in_place, WorkspaceMode.worktree])
+def test_a_task_on_a_git_repository_keeps_write_access(tmp_path: Path, mode: WorkspaceMode) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Edit a file", workspace_mode=mode), CREDS, "fake", "fake-model"
+    )
+    created = wait_for_status(service, created.id, SessionStatus.completed)
+
+    assert created.writes_allowed is True
+    assert engine.configs[-1].writes_allowed is True
+    ready = next(event for event in service.events(created.id).items if event.title == "Task workspace ready")
+    assert "Until you allow writes" not in (ready.text or "")

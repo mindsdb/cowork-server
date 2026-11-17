@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ import sys
 import sysconfig
 from asyncio import to_thread as to_thread_bound_at_import
 from collections.abc import Callable, Iterator
+from copy import deepcopy
 from pathlib import Path
 
 import anyio
@@ -27,6 +29,11 @@ from fastapi.responses import FileResponse
 from sqlalchemy import text
 
 import _blocking_guard as guard
+from scripts.blocking_guard_evidence import read_evidence, sidecar
+from scripts.test_shards import (
+    _collection, _compatible, _global_guard, _guard_evidence, aggregate, latest_artifact, partition,
+)
+from tests.test_pytest_inventory import _shard_evidence, inventory_suite
 from cowork.common.paths import cowork_home, safe_join
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE
@@ -756,6 +763,26 @@ def test_sites_reached_on_different_workers_count_together(tmp_path):
     assert result.returncode == pytest.ExitCode.OK, result.stdout
 
 
+@pytest.mark.parametrize("workers,reach", [(0, False), (2, False), (2, True)])
+def test_inventory_keeps_the_stale_check_and_its_final_status(tmp_path, workers, reach):
+    """Inventory handoff preserves stale-entry failure and merged-worker success."""
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
+    (source / ".gitignore").write_text("__pycache__/\nhome/\ntest.db*\nmaster.key\n.pytest_cache/\n")
+    report_path = tmp_path / "inventory.json"
+    result = _run_the_stale_check(
+        source, "-n", str(workers), "-p", "scripts.pytest_inventory", "--test-cohort=guard",
+        f"--test-inventory={report_path}", "tests",
+        env={"REACH_THE_ALLOWLIST_SPLIT_BY_WORKER": "1"} if reach else {},
+    )
+    assert result.returncode == (0 if reach else 1), result.stdout + result.stderr
+    report = json.loads(report_path.read_text())
+    assert report["completion"]["exitstatus"] == result.returncode
+    assert report["completion"]["complete"]
+    assert "stale-entry check skipped" not in result.stdout
+
+
 def test_a_worker_that_dies_skips_the_stale_check_instead_of_blaming_its_sites(tmp_path):
     result = _run_the_stale_check(tmp_path, "-n", "2", "tests", crash_a_worker=True)
 
@@ -794,3 +821,248 @@ def test_a_run_that_is_not_full_skips_the_stale_check_in_one_line(tmp_path, args
     assert f"The blocking guard's stale-entry check skipped: {reason} (tests/_blocking_guard.py)." in result.stdout
     assert "ALLOWLIST names sites no test reached" not in result.stdout, result.stdout
     assert result.returncode == pytest.ExitCode.OK, result.stdout
+
+
+@pytest.fixture
+def guarded_shards(inventory_suite, monkeypatch, guard_runtime_sources):
+    """Execute real watched operations through the existing isolated shard builder."""
+    sources, _ = guard_runtime_sources
+
+    def prepare(root):
+        """Copy actual imported runtime sources and define separately exercised allowed sites."""
+        for relative in sources:
+            original = _ROOT / relative
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(original, target)
+            assert target.read_bytes() == original.read_bytes()
+        shutil.copyfile(_ROOT / "tests/_blocking_guard.py", root / "tests/_blocking_guard.py")
+        (root / "cowork/guard_probe.py").write_text('''
+import os
+async def left():
+    os.stat(os.environ["COWORK_HOME"])
+async def right():
+    os.stat(os.environ["COWORK_HOME"])
+async def third():
+    os.stat(os.environ["COWORK_HOME"])
+async def fourth():
+    os.stat(os.environ["COWORK_HOME"])
+''')
+        conftest = _STALE_CONFTEST.replace("reached=_this_workers_share_of_the_allowlist()", "reached=REACHED")
+        (root / "tests/conftest.py").write_text(conftest + '''
+import pytest
+import sys
+REACHED = set()
+_blocking_guard.ALLOWLIST = (
+    _blocking_guard.Allowed("cowork/guard_probe.py", "left", _blocking_guard.LOOP_FILE_STORE,
+                           ("cowork/guard_probe.py:left",), "probe's explicit leaf"),
+    _blocking_guard.Allowed("cowork/guard_probe.py", "right", _blocking_guard.LOOP_FILE_STORE,
+                           ("*",), "probe's wildcard leaf"),
+    _blocking_guard.Allowed("cowork/guard_probe.py", "third", _blocking_guard.LOOP_FILE_STORE,
+                           ("cowork/guard_probe.py:third",), "probe's explicit leaf"),
+    _blocking_guard.Allowed("cowork/guard_probe.py", "fourth", _blocking_guard.LOOP_FILE_STORE,
+                           ("cowork/guard_probe.py:fourth",), "probe's explicit leaf"),
+)
+@pytest.fixture(autouse=True)
+def watch(monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    with _blocking_guard.watching() as found:
+        yield
+    REACHED.update(found)
+    assert not _blocking_guard.unlisted(found)
+
+def pytest_sessionfinish(session):
+    package = (Path(__file__).parent.parent / "cowork").resolve()
+    assert all(Path(module.__file__).resolve().is_relative_to(package)
+               for name, module in tuple(sys.modules.items())
+               if (name == "cowork" or name.startswith("cowork.")) and getattr(module, "__file__", None))
+''')
+        (root / "tests/test_left é.py").write_text('''
+import asyncio
+from cowork.guard_probe import left
+def test_left():
+    asyncio.run(left())
+''')
+        (root / "tests/test_right.py").write_text('''
+import asyncio
+from cowork.guard_probe import right
+def test_right():
+    asyncio.run(right())
+''')
+        for name in ("third", "fourth"):
+            (root / f"tests/test_{name}.py").write_text(f'''
+import asyncio
+from cowork.guard_probe import {name}
+def test_{name}():
+    asyncio.run({name}())
+''')
+        (root / "tests/test_empty.py").write_text('"""Collected module with no test cases."""\n')
+
+    return _shard_evidence(inventory_suite, monkeypatch, prepare=prepare)
+
+
+@pytest.fixture(scope="session")
+def guard_runtime_sources(tmp_path_factory) -> tuple[tuple[str, ...], Path]:
+    """Discover the real guard's source dependencies in a fresh interpreter, per worker."""
+    directory = tmp_path_factory.mktemp("guard-runtime")
+    script = directory / "guard-runtime.py"
+    manifest = directory / "sources.json"
+    script.write_text('''
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve()
+sys.path[:0] = [str(root / "tests"), str(root)]
+import _blocking_guard
+
+sources = {Path(module.__file__).resolve() for module in tuple(sys.modules.values())
+           if getattr(module, "__file__", None)}
+files = sorted(path.relative_to(root).as_posix() for path in sources
+               if path.is_relative_to(root / "cowork"))
+assert files and all((root / name).is_file() and Path(name).suffix == ".py" for name in files)
+Path(sys.argv[2]).write_text(json.dumps(files) + "\\n")
+''')
+    environment = {key: value for key, value in os.environ.items() if key not in {
+        "COVERAGE_FILE", "COVERAGE_PROCESS_START", "COV_CORE_SOURCE", "COV_CORE_CONFIG", "COV_CORE_DATAFILE",
+        "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTHONPATH",
+    }}
+    home = directory / "home"
+    home.mkdir()
+    environment.update(COWORK_HOME=str(home), DATABASE_URI=f"sqlite:///{directory / 'test.db'}",
+                       MASTER_KEY_PATH=str(directory / "master.key"))
+    subprocess.run([sys.executable, str(script), str(_ROOT), str(manifest)], cwd=directory,
+                   env=environment, capture_output=True, check=True, timeout=30)
+    sources = tuple(json.loads(manifest.read_text()))
+    assert {"cowork/__init__.py", "cowork/common/paths.py", "cowork/db/units.py"} <= set(sources)
+    assert all((_ROOT / name).resolve().is_relative_to(_ROOT / "cowork") for name in sources)
+    return sources, manifest
+
+
+def test_shards_keep_the_whole_suite_guard(guarded_shards, monkeypatch):
+    """Only the complete union reaches all real sites; stale leaves still fail aggregation."""
+    root, run, inputs, _, execute = guarded_shards
+    packets = [sidecar(inputs / f"test-inventory-broad-shard-{index}-1234-1/inventory.json") for index in range(4)]
+    evidence = [read_evidence(path) for path in packets]
+    assert all(len(packet.reached) == 1 and len(packet.workers) == 4 for packet in evidence)
+    assert {leaf.leaf for packet in evidence for leaf in packet.reached} == {
+        "*", "cowork/guard_probe.py:left", "cowork/guard_probe.py:third", "cowork/guard_probe.py:fourth"
+    }
+    output = root.parent / "combined-guard"
+    combined = aggregate(inputs, output)
+    assert combined["blocking_guard"] == {"complete": True, "required_leaves": 4, "reached_leaves": 4, "collected_files": 6}
+    assert any("tests/test_empty.py" in packet.collected_files for packet in evidence)
+    assert any("tests/test_skip.py" in packet.collected_files for packet in evidence)
+    for index, path in enumerate(packets):
+        assert sidecar(output / f"shard-{index}/inventory.json").read_bytes() == path.read_bytes()
+    for path in packets:
+        original = path.read_bytes()
+        altered = json.loads(original)
+        altered["reached"] = []
+        try:
+            path.write_text(json.dumps(altered))
+            with pytest.raises(ValueError, match="sites no test reached"):
+                aggregate(inputs, root.parent / "stale-guard")
+        finally:
+            path.write_bytes(original)
+
+    def guard_composition():
+        """Audit actual guard inputs without repeating full package coverage rendering."""
+        collected_path, report, _ = _collection(inputs)
+        declaration = _guard_evidence(collected_path, report)
+        producers = [latest_artifact(inputs, f"test-inventory-broad-shard-{index}") for index in range(4)]
+        for _, shard, _ in producers:
+            _compatible(report, shard)
+        result = _global_guard(declaration, [path for path, _, _ in producers],
+                               [shard for _, shard, _ in producers], partition(report, declaration.collected_files))
+        return result, [attempt for _, _, attempt in producers]
+
+    collection = inputs / "test-inventory-broad-collection-1234-1"
+    held = root.parent / "held-collection"
+    collection.rename(held)
+    try:
+        for name in ("inventory.json", "inventory.json.blocking-guard.json"):
+            shutil.copyfile(held / name, inputs / name)
+        flat, _ = guard_composition()
+        assert flat == combined["blocking_guard"]
+    finally:
+        for name in ("inventory.json", "inventory.json.blocking-guard.json"):
+            (inputs / name).unlink(missing_ok=True)
+        held.rename(collection)
+    result, _ = execute(0, attempt=2)
+    assert result.returncode == 0, result.stdout + result.stderr
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    carried, attempts = guard_composition()
+    assert carried == combined["blocking_guard"]
+    assert attempts == [2, 1, 1, 1]
+    for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB"):
+        monkeypatch.delenv(key, raising=False)
+    # Both local inventories share a directory, so a fixed sidecar name would collide.
+    result, _, collection_path = run("tests/", "--ignore=tests/integration", "--collect-only", "-n", "0", "--test-cohort=broad")
+    assert result.returncode == 0, result.stdout + result.stderr
+    result, _, execution_path = run("tests/", "--ignore=tests/integration", "-n", "0", "--test-cohort=broad")
+    assert result.returncode == 0, result.stdout + result.stderr
+    local = [read_evidence(sidecar(path)) for path in (collection_path, execution_path)]
+    assert all(packet.run_id is None and packet.run_attempt is None for packet in local)
+    assert not local[0].reached and len(local[1].reached) == 4
+    assert "stale-entry check skipped" not in result.stdout
+
+
+def test_shard_guard_refuses_incomplete_or_altered_evidence(guarded_shards, monkeypatch):
+    """Damage actual producer bytes and require every completeness/provenance rejection."""
+    root, _, inputs, _, _ = guarded_shards
+    fourth = sidecar(inputs / "test-inventory-broad-shard-3-1234-1/inventory.json")
+    original_fourth = fourth.read_bytes()
+    try:
+        fourth.unlink()
+        with pytest.raises(ValueError, match="Missing or invalid artifact input"):
+            aggregate(inputs, root.parent / "missing-fourth-guard")
+        fourth.write_text('{"schema_version": 1}')
+        with pytest.raises(ValueError, match="Invalid blocking guard structure"):
+            aggregate(inputs, root.parent / "invalid-fourth-guard")
+    finally:
+        fourth.write_bytes(original_fourth)
+    path = sidecar(inputs / "test-inventory-broad-shard-0-1234-1/inventory.json")
+    original = path.read_bytes()
+    raw = json.loads(original)
+    mutations = []
+    for field, value in (
+        ("workers", raw["workers"][:-1]), ("workers_lost", ["gw0"]),
+        ("ineligible_because", "tests were deselected"), ("ineligible_because", "the run stopped early"),
+        ("run_id", "999"), ("run_attempt", "2"), ("schema_version", 2),
+        ("collected_files", []), ("required_files", []), ("workers", raw["workers"] * 2),
+    ):
+        changed = deepcopy(raw)
+        changed[field] = value
+        mutations.append(changed)
+    changed = deepcopy(raw)
+    changed["revision"]["tree_digest"] = "0" * 64
+    mutations.append(changed)
+    changed = deepcopy(raw)
+    changed["required"][0]["leaf"] = "altered"
+    mutations.append(changed)
+    changed = deepcopy(raw)
+    changed["reached"][0]["leaf"] = "unobserved-wildcard-leaf"
+    mutations.append(changed)
+    mutations.extend([{"schema_version": 1}, []])
+    try:
+        for index, changed in enumerate(mutations):
+            path.write_text(json.dumps(changed))
+            with pytest.raises(ValueError):
+                aggregate(inputs, root.parent / f"damaged-guard-{index}")
+        path.unlink()
+        with pytest.raises(ValueError):
+            aggregate(inputs, root.parent / "missing-guard")
+        path.write_bytes(original)
+        # A partial rerun must validate the newest packet, never reuse its older success.
+        newest = path.parent.with_name("test-inventory-broad-shard-0-1234-2")
+        shutil.copytree(path.parent, newest)
+        report_path = newest / "inventory.json"
+        report = json.loads(report_path.read_bytes())
+        report["environment"]["ci"]["GITHUB_RUN_ATTEMPT"] = "2"
+        report_path.write_text(json.dumps(report))
+        monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+        with pytest.raises(ValueError, match="producer identity"):
+            aggregate(inputs, root.parent / "invalid-newest-guard")
+    finally:
+        path.write_bytes(original)
