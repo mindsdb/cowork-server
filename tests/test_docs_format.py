@@ -370,3 +370,17 @@ def test_a_chart_drawn_from_a_table_keeps_the_series_cap():
     assert refused.value.code == "bad_chart"
     with pytest.raises(DocError):
         normalize_block({"type": "chart", "source": {"table": "b_1", "x": "Month", "y": {"a": 1}}}, 1)
+
+
+@pytest.mark.parametrize(("text", "html_out"), [
+    ("\\_draft\\_", "_draft_"),
+    ("\\*not bold\\*", "*not bold*"),
+    ("snake_case stays", "snake_case stays"),
+    ("_draft_", "<em>draft</em>"),
+    ("a \\\\ b", "a \\ b"),
+    ("`C:\\path\\_x_`", "<code>C:\\path\\_x_</code>"),
+    ("\\`not code\\`", "`not code`"),
+])
+def test_escaped_marks_read_as_the_editor_reads_them(text, html_out):
+    """The editor saves a typed * or _ escaped; the shared page and the exports show it as typed."""
+    assert inline_html(text) == html_out
