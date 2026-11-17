@@ -170,14 +170,25 @@ def _table_changes(where: str, old: Block, new: Block) -> list[Change]:
 
     wide = len(new["columns"]) > 2
     shared_cols = [c for c in new["columns"] if c["id"] in old_cols]
+    # A row's label and a column's name are read once each, not once per changed cell:
+    # long ones would otherwise be reread across a whole table.
+    names = {c["id"]: _short(c["name"], NAME_CHARS) for c in shared_cols}
     for row in new["rows"]:
         was = old_rows.get(row["id"])
         if was is None:
             continue
+        label = None
         for col in shared_cols:
             before, after = was["cells"].get(col["id"], ""), row["cells"].get(col["id"], "")
-            if _plain(before) != _plain(after):
-                out.append(_cell_change(where, row, col, before, after, label_col=label_col, wide=wide))
+            if _plain(before) == _plain(after):
+                continue
+            if col["id"] == label_col:
+                out.append(_row_label_change(where, before, after))
+                continue
+            if label is None:
+                label = _short(_plain(row["cells"].get(label_col, "")), NAME_CHARS)
+            column = names[col["id"]]
+            out.append(_cell_change(where, f"{label} · {column}" if wide and label else (label or column), before, after))
     if not added and not removed and _first_moved([r["id"] for r in old["rows"]], [r["id"] for r in new["rows"]]):
         out.append(Change(where, "sorted a table"))
     return out
@@ -192,16 +203,14 @@ def _rows_change(where: str, verb: str, rows: list[dict[str, Any]], label_col: s
     return [Change(where, f"{verb} row {_quote(label)}" if label else f"{verb} a row")]
 
 
-def _cell_change(where: str, row: dict[str, Any], col: dict[str, Any], before: str, after: str, *,
-                 label_col: str, wide: bool) -> Change:
+def _row_label_change(where: str, before: str, after: str) -> Change:
+    if not _plain(before) or not _plain(after):
+        return Change(where, f"named a row {_quote(after)}" if _plain(after) else "cleared a row's name", cell=True)
+    return Change(where, f"renamed row {_quote(before)} → {_quote(after)}", cell=True)
+
+
+def _cell_change(where: str, head: str, before: str, after: str) -> Change:
     """"Paid search 72 → 80"; in a wider table, "Paid search · Budget 72 → 80"."""
-    if col["id"] == label_col:
-        if not _plain(before) or not _plain(after):
-            return Change(where, f"named a row {_quote(after)}" if _plain(after) else "cleared a row's name", cell=True)
-        return Change(where, f"renamed row {_quote(before)} → {_quote(after)}", cell=True)
-    label = _short(_plain(row["cells"].get(label_col, "")), NAME_CHARS)
-    column = _short(col["name"], NAME_CHARS)
-    head = f"{label} · {column}" if wide and label else (label or column)
     if not _plain(before):
         return Change(where, f"{head} set to {_short(after, VALUE_CHARS)}", cell=True)
     if not _plain(after):
@@ -246,13 +255,15 @@ def _links(s: str) -> str:
         j = s.find("]", i + 1)
         if j == -1:
             break
-        if s.startswith("(", j + 1):
-            e = s.find(")", j + 2)
-            if e == -1:
-                break
-            out += (s[done:i], s[i + 1:j])
-            done = j = e + 1
-        i = s.find("[", j)
+        if not s.startswith("(", j + 1):
+            i = s.find("[", j)
+            continue
+        e = s.find(")", j + 2)
+        if e == -1:
+            break
+        out += (s[done:i], s[i + 1:j])
+        done = e + 1
+        i = s.find("[", done)
     out.append(s[done:])
     return "".join(out)
 
@@ -261,18 +272,22 @@ def _chips(s: str) -> str:
     """``{{value}}`` or ``{{date:value}}`` as its value, trimmed and without a ``pending:`` prefix.
 
     The value runs to the first ``}`` after the ``{{``, so every ``{{`` before that
-    ``}`` makes a chip or none does: one does when a second ``}`` follows it.
+    ``}`` makes a chip or none does: they do when that ``}`` is directly followed by another.
     """
     out, done, i = [], 0, s.find("{{")
     while i != -1:
         j = s.find("}", i + 2)
         if j == -1:
             break
-        if s.startswith("}", j + 1):
-            value = s[i + 7 if s.startswith("date:", i + 2) else i + 2:j]
-            out += (s[done:i], value.removeprefix("pending:").strip())
-            done = j = j + 2
-        i = s.find("{{", j)
+        if not s.startswith("}", j + 1):
+            i = s.find("{{", j)
+            continue
+        start = i + 2
+        if s.startswith("date:", start):
+            start += len("date:")
+        out += (s[done:i], s[start:j].removeprefix("pending:").strip())
+        done = j + 2
+        i = s.find("{{", done)
     out.append(s[done:])
     return "".join(out)
 

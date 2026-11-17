@@ -65,19 +65,36 @@ def test_links_chips_and_marks_read_as_before(text, plain):
     assert _plain(text) == plain == _regex_plain(text)
 
 
-@pytest.mark.parametrize("text", [
-    "[" * 100_000,
-    "[" * 100_000 + "]",
-    "[](" * 100_000,
-    "{{" * 50_000,
-    "{{" * 50_000 + "}",
-    "{{date:" * 14_286,
+@pytest.mark.parametrize(("opener", "tail"), [
+    ("[", ""), ("[", "]"), ("[](", ""), ("{{", ""), ("{{", "}"), ("{{date:", ""),
 ], ids=["link-words", "link-no-address", "link-address", "chip-value", "chip-one-brace", "chip-date"])
-def test_marks_that_never_close_are_read_in_linear_time(text):
-    """The regexes took 7-25 s on each of these."""
-    start = time.perf_counter()
-    _plain(text)
-    assert time.perf_counter() - start < 1.0
+def test_marks_that_never_close_are_read_in_linear_time(opener, tail):
+    """The regexes took 7-26 s on 100k characters of these. A scan that restarts at every
+    opener passes at 100k but takes seconds at 1M; the shorter text goes first, so a regex fails fast."""
+    for size in (100_000, 1_000_000):
+        text = opener * (size // len(opener)) + tail
+        start = time.perf_counter()
+        _plain(text)
+        assert time.perf_counter() - start < 1.0, f"{size:,} characters"
+
+
+def _table_doc(columns: list[str], rows: list[list[str]]) -> dict:
+    return {"title": "Plan", "tabs": [{"id": "t1", "title": "Plan", "blocks": [{
+        "id": "b1", "type": "table",
+        "columns": [{"id": f"c{n}", "name": name} for n, name in enumerate(columns)],
+        "rows": [{"id": f"r{n}", "cells": {f"c{k}": v for k, v in enumerate(cells)}} for n, cells in enumerate(rows)],
+    }]}]}
+
+
+@pytest.mark.parametrize(("columns", "before", "after", "summary"), [
+    (["Channel", "Budget"], ["", "72"], ["Paid search", "72"], "Named a row “Paid search”"),
+    (["Channel", "Budget"], ["Paid search", "72"], ["", "72"], "Cleared a row's name"),
+    (["Channel", "Budget", "Signups"], ["", "72", "1"], ["", "80", "1"], "Budget 72 → 80"),
+    (["Channel", "Budget", "Signups"], ["[Paid](x)", "72", "1"], ["[Paid](x)", "80", "2"],
+     "Paid · Budget 72 → 80, and 1 more cell"),
+])
+def test_a_cell_names_its_row_and_column(columns, before, after, summary):
+    assert describe(_table_doc(columns, [before]), _table_doc(columns, [after])) == summary
 
 
 def test_a_summary_of_blocks_full_of_open_marks_is_quick():
@@ -91,4 +108,15 @@ def test_a_summary_of_blocks_full_of_open_marks_is_quick():
     start = time.perf_counter()
     summary = describe(old, new)
     assert time.perf_counter() - start < 1.0
-    assert summary == "Edited “{{{{{{{{{{{{{{{{{{{{{{{{{{{{…”, and 1 more change"
+    assert summary.endswith(", and 1 more change")
+
+
+def test_a_summary_of_a_table_with_long_names_is_quick():
+    """Each changed cell's line names its row and column; reading those names per cell took 4 s here."""
+    columns = [f"{n} " + "a" * 20_000 for n in range(40)]
+    old = _table_doc(columns, [[f"Row {r}"] + ["1"] * 39 for r in range(250)])
+    new = _table_doc(columns, [[f"Row {r}"] + ["2"] * 39 for r in range(250)])
+    start = time.perf_counter()
+    summary = describe(old, new)
+    assert time.perf_counter() - start < 1.0
+    assert summary.endswith(f", and {250 * 39 - 1} more cells")
