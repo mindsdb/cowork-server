@@ -526,3 +526,32 @@ def test_a_restore_needs_permission_to_manage_artifacts(monkeypatch, tmp_path):
     with pytest.raises(HTTPException):
         asyncio.run(docs.restore_version("local", "0" * 32, 1, SimpleNamespace(scope=None), None))
     assert json.loads((folder / DOC_FILENAME).read_text())["tabs"][0]["blocks"][0]["text"] == "Typed."
+
+
+def test_a_restore_whose_replaced_version_cant_be_kept_writes_nothing(made, monkeypatch):
+    """A restore replaces the whole doc; with the doc as it was lost, it couldn't be undone."""
+    _type(made.folder, "Typed.")
+    before = (made.folder / DOC_FILENAME).read_bytes()
+
+    def unwritable(*_a, **_kw):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(store, "_record_write", unwritable)
+    with pytest.raises(DocError) as refused:
+        history.restore(made.folder, 1)
+    assert refused.value.code == "busy"
+    assert (made.folder / DOC_FILENAME).read_bytes() == before
+    # An ordinary edit still goes ahead: history is a safety net there.
+    _type(made.folder, "Typed again.")
+    assert load_doc(made.folder)["tabs"][0]["blocks"][0]["text"] == "Typed again."
+
+
+def test_a_status_columns_new_choices_are_a_change():
+    old = build_new_doc("Plan", markdown="| Task | State |\n| --- | --- |\n| Copy | Open |")
+    table = next(b for b in old["tabs"][0]["blocks"] if b["type"] == "table")
+    state = table["columns"][1]
+    new, _ = apply_ops(old, [{"op": "update_column", "table": table["id"], "col": state["id"],
+                              "kind": "status", "options": [{"name": "Open", "tone": "green"}]}])
+    retoned, _ = apply_ops(new, [{"op": "update_column", "table": table["id"], "col": state["id"],
+                                  "options": [{"name": "Open", "tone": "red"}]}])
+    assert describe(new, retoned) == "Changed the choices in “State”"

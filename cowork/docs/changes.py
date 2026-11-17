@@ -156,6 +156,10 @@ def _table_changes(where: str, old: Block, new: Block) -> list[Change]:
             out.append(Change(where, f"renamed {_quote(was['name'])} → {_quote(col['name'])}"))
         elif was.get("kind") != col.get("kind"):
             out.append(Change(where, f"made {_quote(col['name'])} a {col.get('kind')} column"))
+        elif was.get("options") != col.get("options"):
+            # The choices a status column offers, or their colours: its cells
+            # read the same text but can change colour.
+            out.append(Change(where, f"changed the choices in {_quote(col['name'])}"))
     out.extend(Change(where, f"removed column {_quote(c['name'])}") for c in old["columns"] if c["id"] not in new_col_ids)
 
     label_col = new["columns"][0]["id"]

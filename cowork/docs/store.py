@@ -500,7 +500,12 @@ def mutate_doc(
         payload = _encode(new_doc)
         try:
             _record_write(folder, current, by=by, turn=turn, own=own_version)
-        except OSError:
+        except OSError as exc:
+            if own_version is not None:
+                # A restore replaces the whole doc: without the version it
+                # replaces kept, it couldn't be undone, so it doesn't go ahead.
+                raise DocError("busy", "the doc's version history couldn't be saved, so it wasn't restored; "
+                               "try again in a moment.") from exc
             # History is a safety net; never fail the edit over it.
             logger.warning("could not keep a version of %s", folder, exc_info=True)
         write_child(folder, path.name, payload)
