@@ -38,12 +38,32 @@ class WorkspaceMode(str, Enum):
 
     The mode is the user's choice; ``WorkspaceKind`` is what preparation
     produced for it. ``in_place`` works in the user's own folder and maps to
-    ``direct_folder``; ``worktree`` isolates the task and maps to
-    ``git_worktree`` or, for a folder without Git, ``local_copy``.
+    ``direct_folder``; ``worktree`` isolates the task in a ``git_worktree``
+    and needs a Git repository with a commit. ``local_copy`` remains only for
+    tasks created before folders stopped being copied.
     """
 
     in_place = "in_place"
     worktree = "worktree"
+
+
+class WorkspaceModeOptions(BaseModel):
+    """The modes a new task could run in, and the one it gets if it asks for none."""
+
+    supported: list[WorkspaceMode]
+    # ``None`` when no mode is possible for the folder, for example a folder
+    # without Git where working in place is not offered.
+    default: WorkspaceMode | None
+    # Why working in the original folder is not offered, when it is not.
+    in_place_unavailable_reason: str | None = None
+    # Why a worktree is not offered for the folder, when it is not.
+    worktree_unavailable_reason: str | None = None
+    # The folder isn't a Git repository and could be made one here.
+    can_initialize_git: bool = False
+
+
+class InitializeGitRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=32_768)
 
 
 class PermissionMode(str, Enum):
@@ -51,6 +71,16 @@ class PermissionMode(str, Enum):
     supervised = "supervised"
     workspace = "workspace"
     full_access = "full_access"
+
+
+# The names people see for each mode, matching the pickers in the app. Read
+# only is no longer offered for new work, but saved projects and tasks keep it.
+PERMISSION_LABELS: dict[PermissionMode, str] = {
+    PermissionMode.read_only: "Read only",
+    PermissionMode.supervised: "Ask for approval",
+    PermissionMode.workspace: "Approve for me",
+    PermissionMode.full_access: "Full access",
+}
 
 
 # A reasoning effort is the model gateway's word for a level, advertised per
@@ -554,9 +584,9 @@ class SessionCreateRequest(BaseModel):
     attachments: list[InputReference] = Field(default_factory=list, max_length=20)
     # ``None`` lets the server choose from the project and the computer.
     workspace_mode: WorkspaceMode | None = None
-    # Lets an isolated task on a folder without Git copy that folder. Older
-    # clients send it as ``allow_direct_folder``, a name from before tasks
-    # could run in the folder itself.
+    # Ignored: folders are no longer copied. A folder without Git runs in
+    # place, and Worktree needs a repository. Still accepted, also as
+    # ``allow_direct_folder``, so older clients' requests validate.
     allow_folder_copy: bool = Field(
         default=False,
         validation_alias=AliasChoices("allow_folder_copy", "allow_direct_folder"),
