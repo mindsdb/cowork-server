@@ -137,9 +137,27 @@ def test_a_failed_removal_does_not_block_later_deletes(tmp_path: Path, monkeypat
     assert not first.exists() and not second.exists()
     # Only the folder that failed is left, for the next pass to retry.
     assert list(pending.root.iterdir()) == stuck
+    assert pending.status().failed == 1
+    # A failed restart retry retains the warning. A user-triggered retry can
+    # clear it without restarting or deleting another task.
+    restarted = PendingRemovals(pending.root)
+    assert restarted.wait(30)
+    assert restarted.status().failed == 1
     monkeypatch.setattr(pending_module, "force_remove", remove)
-    assert PendingRemovals(pending.root).wait(30)
+    restarted.retry()
+    assert restarted.wait(30)
+    assert restarted.status().failed == 0
     assert not any(pending.root.iterdir())
+
+
+def test_a_suppressed_filesystem_error_is_still_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    monkeypatch.setattr(pending_module, "force_remove", lambda _path: None)
+    pending = PendingRemovals(tmp_path / "pending")
+    assert pending.discard(folder)
+    assert pending.wait(30)
+    assert pending.status().failed == 1
 
 
 def test_a_folder_that_cannot_be_moved_is_removed_in_place(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

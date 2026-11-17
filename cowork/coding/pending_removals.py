@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 
 from cowork.coding.local_copy import force_remove
+from cowork.coding.contracts import WorkspaceCleanupStatus
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,10 @@ logger = logging.getLogger(__name__)
 class PendingRemovals:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.errors_root = root.with_name(root.name + "-errors")
+        self.errors_root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._failed: set[str] = set()
         self._thread: threading.Thread | None = None
         self._requested = False
         self.root.mkdir(parents=True, exist_ok=True)
@@ -56,6 +60,19 @@ class PendingRemovals:
             return not thread.is_alive()
         return True
 
+    def status(self) -> WorkspaceCleanupStatus:
+        # Markers survive a restart and live outside the removal queue. Never
+        # expose local paths or raw filesystem errors to the renderer.
+        with self._lock:
+            names = self._failed | {marker.name for marker in self.errors_root.iterdir()}
+            running = self._thread is not None
+        failed = sum((self.root / name).exists() or (self.root / name).is_symlink() for name in names)
+        return WorkspaceCleanupStatus(failed=failed, running=running)
+
+    def retry(self) -> WorkspaceCleanupStatus:
+        self._start()
+        return self.status()
+
     def _entries(self) -> list[Path]:
         try:
             return [Path(entry.path) for entry in os.scandir(self.root)]
@@ -83,6 +100,21 @@ class PendingRemovals:
                         entry.unlink(missing_ok=True)
                     else:
                         force_remove(entry)
+                    # force_remove's permission-repair callback can suppress
+                    # an OS error. A remaining tree is still a failed cleanup.
+                    if entry.exists() or entry.is_symlink():
+                        raise OSError("The task folder could not be fully removed")
+                    (self.errors_root / entry.name).unlink(missing_ok=True)
+                    with self._lock:
+                        self._failed.discard(entry.name)
                 except OSError as exc:
                     # Left for the next pass: the next delete or server start.
+                    with self._lock:
+                        self._failed.add(entry.name)
+                    try:
+                        (self.errors_root / entry.name).touch(exist_ok=True)
+                    except OSError:
+                        # Even a full disk must not strand the worker or make
+                        # the failure invisible for the rest of this process.
+                        logger.warning("Could not persist cleanup failure for %s", entry, exc_info=True)
                     logger.warning("Could not remove %s: %s", entry, exc)
