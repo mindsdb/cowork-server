@@ -7,7 +7,7 @@ import threading
 from datetime import timedelta
 from pathlib import Path
 
-from coding_service_fakes import CREDS, FakeEngine, git, repository, service_with, wait_for_status
+from coding_service_fakes import CREDS, FakeEngine, copy_folders_without_git, git, repository, service_with, wait_for_status
 
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode
 from cowork.coding.project_models import ProjectCreateRequest, ProjectFolder
@@ -15,14 +15,6 @@ from cowork.coding.workspace import UsageRoots
 from cowork.coding.workspace_usage import WorkspaceUsage, tree_bytes
 
 
-
-def copying_folders_as_before(service) -> None:
-    """Make the service copy folders without Git, as tasks created before copies stopped were."""
-    workspaces = service.workspaces
-    workspaces.check_source = lambda raw_path: None
-    workspaces.prepare = lambda session_id, raw_path, *args, **kwargs: workspaces._prepare_local_copy(
-        session_id, Path(raw_path).resolve()
-    )
 
 def write(path: Path, size: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,7 +182,7 @@ def test_preparing_a_task_invalidates_the_last_measurement(tmp_path: Path) -> No
     folder = tmp_path / "notes"
     write(folder / "big.bin", 300_000)
     service = service_with(tmp_path, FakeEngine())
-    copying_folders_as_before(service)
+    copy_folders_without_git(service.workspaces)
     service.workspace_usage.measure()
 
     wait_for_status(
@@ -235,7 +227,7 @@ def test_a_request_once_the_path_is_visible_measures_again_while_setup_runs(tmp_
 
     factory._prepare_local_session = paused_prepare
     factory._run_setup = paused_setup
-    session_id = service.create_session(SessionCreateRequest(project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model").id
+    session_id = service.create_session(SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model").id
     try:
         assert preparing.wait(timeout=10)
         usage = service.workspace_usage
@@ -277,7 +269,7 @@ def test_a_deleted_folder_copy_keeps_counting_its_recovery_copy(tmp_path: Path) 
     folder = tmp_path / "notes"
     write(folder / "big.bin", 300_000)
     service = service_with(tmp_path, FakeEngine())
-    copying_folders_as_before(service)
+    copy_folders_without_git(service.workspaces)
     session = wait_for_status(
         service,
         service.create_session(
@@ -313,7 +305,7 @@ def test_a_project_task_is_measured_across_its_folders(tmp_path: Path) -> None:
     ))
     session = wait_for_status(
         service,
-        service.create_session(SessionCreateRequest(project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model").id,
+        service.create_session(SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model").id,
         SessionStatus.completed,
     )
 

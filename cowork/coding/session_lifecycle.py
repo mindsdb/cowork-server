@@ -15,6 +15,7 @@ from cowork.coding.contracts import (
     utc_now,
 )
 from cowork.coding.control_errors import StateConflict
+from cowork.coding.session_factory import IN_PLACE_PROJECT_INSTRUCTION, ISOLATED_PROJECT_INSTRUCTION
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.control_models import RunStatus
 from cowork.coding.control_service import ControlPlaneService
@@ -301,6 +302,9 @@ class SessionLifecycleOperations:
         """Retarget the parent's frozen instructions without rereading live project state."""
 
         instructions = parent.developer_instructions
+        # A fork of an in-place task is isolated, whatever its parent was told.
+        if all(workspace.workspace_kind != WorkspaceKind.direct_folder for workspace in child_workspaces):
+            instructions = instructions.replace(IN_PLACE_PROJECT_INSTRUCTION, ISOLATED_PROJECT_INSTRUCTION)
         child_by_id = {workspace.folder_id: workspace for workspace in child_workspaces}
         for workspace in parent.workspaces:
             child = child_by_id.get(workspace.folder_id)
