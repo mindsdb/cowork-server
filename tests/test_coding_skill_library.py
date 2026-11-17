@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from coding_service_fakes import CREDS, FakeEngine, service_with, wait_for_status
+from tests.support.coding.service_fakes import CREDS, FakeEngine, service_with, wait_for_status
 
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus
 from cowork.coding.control_errors import StateConflict
