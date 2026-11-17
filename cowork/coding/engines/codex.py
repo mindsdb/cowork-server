@@ -171,7 +171,8 @@ class CodexEngine:
         for row in payload.get("data", []) if isinstance(payload, dict) else []:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                 continue
-            if row.get("kind") == "decision" or row.get("embedding") is True:
+            # Image models share the listing too and cannot run a coding task.
+            if row.get("kind") in ("decision", "image") or row.get("embedding") is True:
                 continue
             # Discovery describes what the MindsHub Responses API can run, not
             # what the current wallet can start right now. Keep disabled rows
