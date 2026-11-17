@@ -1,14 +1,11 @@
 """A doc as a file to download: Markdown, its page as HTML, Word or PDF.
 
-Word and PDF are made the way an artifact's export makes them
-(cowork.services.artifact_export): the doc's page goes to the export's
-conversion process, which the server kills past its time or memory limit.
-There the fetch-free inliner makes the page self-contained, so an image comes
-from the doc itself or its folder and a web image is left out, never fetched.
-Word is written by the Word writer in that process; a PDF comes from the render
-service, which only a deployment that configures one offers. While org export
-is off, an organization deployment offers neither. Markdown and HTML need no
-conversion and are always offered.
+Word and PDF convert the doc's page as an artifact's export converts its
+source (``artifact_export.convert_document``), so an image comes from the doc
+itself or its folder and a web image is left out, never fetched. A PDF needs
+the render service, which only a deployment that configures one offers. While
+org export is off, an organization deployment offers neither. Markdown and
+HTML need no conversion and are always offered.
 """
 
 from __future__ import annotations
@@ -17,8 +14,6 @@ import html
 
 from cowork.common.paths import PinnedDir
 from cowork.services import artifact_export
-from cowork.services.artifact_export import ExportRefusal, ExportRefused
-from cowork.services.docx_writer import MAX_TITLE_LENGTH
 
 from .markdown import doc_to_markdown
 from .model import Doc
@@ -34,7 +29,6 @@ MEDIA_TYPES = {
 CONVERTED_FORMATS = ("docx", "pdf")
 # The order the doc's Export menu lists them in.
 _MENU_ORDER = ("docx", "pdf", "md", "html")
-_TOO_LARGE = "This doc is too large to export."
 
 
 def offered_formats(*, org_mode: bool) -> list[str]:
@@ -59,7 +53,7 @@ def export_bytes(doc: Doc, fmt: str, *, folder: PinnedDir | None = None, org_mod
     """``doc`` as ``fmt``. Word and PDF need the doc's pinned ``folder``, which
     an image beside the doc is read from, and run in an anyio worker thread: a
     PDF reaches the event loop from there for the render service. They raise
-    ``ExportRefused`` and ``RenderPdfFailed`` as an artifact's export does."""
+    what ``convert_document`` raises."""
     if fmt == "md":
         body = doc_to_markdown(doc)
         if not body.lstrip().startswith("# "):
@@ -69,28 +63,14 @@ def export_bytes(doc: Doc, fmt: str, *, folder: PinnedDir | None = None, org_mod
         return doc_html(doc).encode("utf-8")
     if folder is None:
         raise ValueError(f"a {fmt} export reads the doc's folder")
-    page = _document(doc)
-    # The bound an artifact's HTML source is read with.
-    if len(page) > artifact_export.HTML_SOURCE_MAX_BYTES:
-        raise ExportRefused(ExportRefusal.TOO_LARGE, _TOO_LARGE)
-    try:
-        return artifact_export.convert_document(
-            source=page,
-            suffix=".html",
-            # The conversion request's header is bounded, and Word keeps no
-            # longer a title anyway.
-            title=doc["title"][:MAX_TITLE_LENGTH],
-            base_parts=(),
-            source_name="doc.html",
-            folder=folder,
-            export_format=fmt,
-            org_mode=org_mode,
-        ).data
-    except ExportRefused as exc:
-        # The artifact export words this refusal for a file.
-        if exc.refusal is ExportRefusal.TOO_LARGE:
-            raise ExportRefused(ExportRefusal.TOO_LARGE, _TOO_LARGE) from exc
-        raise
+    return artifact_export.convert_document(
+        source=_document(doc),
+        parts=("doc.html",),
+        title=doc["title"],
+        folder=folder,
+        export_format=fmt,
+        org_mode=org_mode,
+    ).data
 
 
 def export_filename(doc: Doc, fmt: str) -> str:

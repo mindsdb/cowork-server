@@ -50,6 +50,7 @@ from cowork.services.artifact_identity import (
 )
 from cowork.services.artifact_inline import folder_reader
 from cowork.services.artifact_metadata import ArtifactMetadata, MetadataNotAnObject
+from cowork.services.docx_writer import MAX_TITLE_LENGTH
 from cowork.services.artifacts import (
     ProjectArtifacts,
     _is_single_named_file,
@@ -123,6 +124,7 @@ _METADATA = "metadata.json"
 _BUSY = "An export is already running; try again in a moment."
 _NOT_OFFERED = "This file can't be exported to that format."
 _CANT_EXPORT = "This file can't be exported."
+_TOO_LARGE = "This file is too large to export."
 
 # Org mode offers no export format, and the route answers 403 there. With the
 # conversion in a process of its own (export_runner), measured with
@@ -358,13 +360,19 @@ def _render_pdf(*, source_name: str, html: str) -> bytes:
     return anyio.from_thread.run(lambda: client.render(request=request))
 
 
-def _read_source(*, folder: PinnedDir, parts: tuple[str, ...], suffix: str) -> bytes:
-    max_bytes = HTML_SOURCE_MAX_BYTES if suffix in HTML_SOURCES else TEXT_SOURCE_MAX_BYTES
+def _source_max_bytes(parts: tuple[str, ...]) -> int:
+    suffix = PurePosixPath(parts[-1]).suffix.lower()
+    return HTML_SOURCE_MAX_BYTES if suffix in HTML_SOURCES else TEXT_SOURCE_MAX_BYTES
+
+
+def _read_source(*, folder: PinnedDir, parts: tuple[str, ...]) -> bytes:
     try:
-        return artifact_files.read_artifact_file(folder=folder, parts=parts, max_bytes=max_bytes)
+        return artifact_files.read_artifact_file(
+            folder=folder, parts=parts, max_bytes=_source_max_bytes(parts)
+        )
     except artifact_files.ArtifactFileRefused as exc:
         if exc.reason is OmittedReason.TOO_LARGE:
-            raise ExportRefused(ExportRefusal.TOO_LARGE, "This file is too large to export.") from exc
+            raise ExportRefused(ExportRefusal.TOO_LARGE, _TOO_LARGE) from exc
         if exc.reason is OmittedReason.HOUSEKEEPING:
             raise ExportRefused(ExportRefusal.NOT_OFFERED, _NOT_OFFERED) from exc
         raise ExportRefused(ExportRefusal.NOT_FOUND, "Artifact source not found") from exc
@@ -395,23 +403,24 @@ def _convert(
 def convert_document(
     *,
     source: bytes,
-    suffix: str,
+    parts: tuple[str, ...],
     title: str,
-    base_parts: tuple[str, ...],
-    source_name: str,
     folder: PinnedDir,
     export_format: ExportFormat,
     org_mode: bool,
 ) -> Conversion:
-    """Convert *source* to *export_format* as an export does, writing nothing.
+    """Convert *source*, the file *parts* names, to *export_format* as an export does, writing nothing.
 
-    The conversion runs in a conversion process that reads the files it names
-    through *folder*, below *base_parts*; a PDF is then the render service's
-    PDF of the inlined *source_name*. Blocking, like ``_render_pdf``. Raises
-    ``ExportRefused`` as ``_convert`` does, ``ConversionError`` for a
-    conversion that failed, and ``RenderPdfFailed`` when no usable PDF came
-    back.
+    The suffix of *parts* says how the source converts, and every file the
+    source names is read through *folder*, from the source's own folder or
+    below it. The conversion runs in a conversion process; a PDF is then the
+    render service's PDF of the inlined source. Blocking, like
+    ``_render_pdf``. Raises ``ExportRefused`` for a source over its read
+    bound and as ``_convert`` does, ``ConversionError`` for a conversion that
+    failed, and ``RenderPdfFailed`` when no usable PDF came back.
     """
+    if len(source) > _source_max_bytes(parts):
+        raise ExportRefused(ExportRefusal.TOO_LARGE, _TOO_LARGE)
     if export_format == "pdf":
         budget = PDF_INLINE_BUDGET_BYTES
     else:
@@ -419,9 +428,10 @@ def convert_document(
     conversion = _convert(
         request=ConvertRequest(
             export_format=export_format,
-            suffix=suffix,
-            title=title,
-            base_parts=base_parts,
+            suffix=PurePosixPath(parts[-1]).suffix.lower(),
+            # The request's header is bounded, and Word keeps no longer a title.
+            title=title[:MAX_TITLE_LENGTH],
+            base_parts=parts[:-1],
             limits=InlineLimits(max_total_bytes=budget),
         ),
         source=source,
@@ -430,7 +440,7 @@ def convert_document(
     )
     if export_format != "pdf":
         return conversion
-    pdf = _render_pdf(source_name=source_name, html=conversion.data.decode("utf-8"))
+    pdf = _render_pdf(source_name=parts[-1], html=conversion.data.decode("utf-8"))
     return replace(conversion, data=pdf)
 
 
@@ -691,13 +701,10 @@ def export_primary_file(
         extension = _OUTPUT_EXTENSIONS.get(export_format)
         if parts is None or export_format not in offered or extension is None:
             raise ExportRefused(ExportRefusal.NOT_OFFERED, _NOT_OFFERED)
-        suffix = PurePosixPath(parts[-1]).suffix.lower()
         conversion = convert_document(
-            source=_read_source(folder=folder, parts=parts, suffix=suffix),
-            suffix=suffix,
+            source=_read_source(folder=folder, parts=parts),
+            parts=parts,
             title=PurePosixPath(parts[-1]).stem,
-            base_parts=parts[:-1],
-            source_name=parts[-1],
             folder=folder,
             export_format=export_format,
             org_mode=org_mode,

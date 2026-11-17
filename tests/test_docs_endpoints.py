@@ -587,21 +587,27 @@ def test_an_edit_answers_its_undo_and_posting_it_puts_the_doc_back(client, doc):
 
 # ---------------------------------------------------------------- Word and PDF in the conversion process
 
+_CONVERTED = b"<p>what the conversion process made</p>"
+
+
+def _converted(**_kwargs):
+    from cowork.services.export_child import Conversion
+
+    return Conversion(data=_CONVERTED, omitted_count=0, scripts_dropped=False)
+
 
 @pytest.fixture
 def conversions(monkeypatch):
-    """Each conversion an export runs, as (the call's arguments, its result); it still runs."""
+    """The arguments of each conversion an export asks for, answered at once with _CONVERTED."""
     from cowork.services import artifact_export
 
     calls = []
-    convert = artifact_export.convert_in_child
 
-    def spy(**kwargs):
-        result = convert(**kwargs)
-        calls.append((kwargs, result))
-        return result
+    def stub(**kwargs):
+        calls.append(kwargs)
+        return _converted()
 
-    monkeypatch.setattr(artifact_export, "convert_in_child", spy)
+    monkeypatch.setattr(artifact_export, "convert_in_child", stub)
     return calls
 
 
@@ -612,39 +618,41 @@ def test_word_and_pdf_convert_the_docs_page_in_the_conversion_process(client, do
     res = client.get(_url(doc, f"/export?format={fmt}"))
 
     assert res.status_code == 200, res.text
-    [(call, result)] = conversions
+    [call] = conversions
     request = call["request"]
     assert (request.export_format, request.suffix, request.base_parts, request.title) == (fmt, ".html", (), "Hiring plan")
     assert request.limits.max_total_bytes == (PDF_INLINE_BUDGET_BYTES if fmt == "pdf" else INLINE_BUDGET_BYTES)
     assert call["limits"].memory_bytes == CONVERSION_MEMORY_BYTES
     assert b"<h1>Hiring plan</h1>" in call["source"]
     if fmt == "docx":
-        assert res.content == result.data
+        assert res.content == _CONVERTED
     else:
         # The render service gets the page the conversion process inlined, and only that.
-        assert [r.html for r in render_service.requests] == [result.data.decode("utf-8")]
+        assert [r.html for r in render_service.requests] == [_CONVERTED.decode("utf-8")]
         assert res.content == FAKE_PDF
 
 
 def test_in_org_mode_a_doc_converts_with_the_org_budget_and_memory(conversions, tmp_path):
     from cowork.common.paths import pinned_dir
     from cowork.docs.export import export_bytes
-    from cowork.docs.model import new_doc, new_tab
+    from cowork.docs.ops import build_new_doc
     from cowork.services.artifact_export import ORG_CONVERSION_MEMORY_BYTES, ORG_INLINE_BUDGET_BYTES
 
-    doc = {**new_doc("Plan"), "tabs": [new_tab("Plan")]}
     with pinned_dir(tmp_path) as pinned:
-        assert export_bytes(doc, "docx", folder=pinned, org_mode=True)[:2] == b"PK"
+        assert export_bytes(build_new_doc("Plan"), "docx", folder=pinned, org_mode=True) == _CONVERTED
 
-    [(call, _result)] = conversions
+    [call] = conversions
     assert call["request"].limits.max_total_bytes == ORG_INLINE_BUDGET_BYTES
     assert call["limits"].memory_bytes == ORG_CONVERSION_MEMORY_BYTES
 
 
+@pytest.mark.usefixtures("child_runs_this_checkout")
 def test_a_title_past_the_requests_header_bound_still_exports_to_word(client, doc):
     import io
 
     from docx import Document
+
+    from cowork.services.docx_writer import MAX_TITLE_LENGTH
 
     title = "計" * 20_000
     renamed = client.post(_url(doc, "/ops"), json={"ops": [{"op": "rename_doc", "title": title}]})
@@ -654,7 +662,7 @@ def test_a_title_past_the_requests_header_bound_still_exports_to_word(client, do
 
     assert exported.status_code == 200, exported.text
     assert _docx_paragraphs(exported.content)[0][1] == title
-    assert Document(io.BytesIO(exported.content)).core_properties.title == title[:255]
+    assert Document(io.BytesIO(exported.content)).core_properties.title == title[:MAX_TITLE_LENGTH]
 
 
 @pytest.mark.parametrize("second_fmt", ["docx", "pdf"])
@@ -664,12 +672,11 @@ def test_a_second_export_while_one_converts_answers_429_at_once(client, doc, ren
     from cowork.services import artifact_export
 
     entered, release = threading.Event(), threading.Event()
-    convert = artifact_export.convert_in_child
 
     def held(**kwargs):
         entered.set()
         assert release.wait(timeout=10)
-        return convert(**kwargs)
+        return _converted()
 
     monkeypatch.setattr(artifact_export, "convert_in_child", held)
     answers = []
@@ -715,15 +722,12 @@ def test_a_page_past_the_source_bound_answers_413_and_is_never_converted(client,
     assert conversions == []
 
 
+@pytest.mark.usefixtures("child_runs_this_checkout")
 @pytest.mark.parametrize("fmt", ["docx", "pdf"])
 def test_a_conversion_past_its_limits_answers_413_and_renders_nothing(client, doc, render_service, monkeypatch, fmt):
-    from cowork.schemas.export_child import ChildLimits
     from cowork.services import artifact_export
 
-    monkeypatch.setattr(
-        artifact_export, "conversion_limits",
-        lambda *, org_mode: ChildLimits(wall_seconds=0.0, memory_bytes=artifact_export.CONVERSION_MEMORY_BYTES),
-    )
+    monkeypatch.setattr(artifact_export, "CONVERSION_WALL_SECONDS", 0.0)
 
     res = client.get(_url(doc, f"/export?format={fmt}"))
 
