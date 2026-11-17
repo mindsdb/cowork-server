@@ -141,7 +141,7 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.11.16.1rc2"
+version = "2.26.11.17.1rc4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
@@ -163,9 +163,9 @@ dependencies = [
     { name = "truststore" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7b/3e/2229086fe098d1e160d677ca389f09afaae707b9daf96eae71219b2b97ac/anton_agent-2.26.11.16.1rc2.tar.gz", hash = "sha256:6ef68adfc3b2ba297d4cf79b9d1db25dc71dcde166c811dde9d8c2fbf9d1f4f7", size = 7507037, upload-time = "2026-11-16T16:02:11.736Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2e/57/b347ba719c2f5adf565a953cb7562c7d1e558496a0e2bc8d56ebed6480e4/anton_agent-2.26.11.17.1rc4.tar.gz", hash = "sha256:58e263ea9f85141ebdbb2dd7b90cde97a1f56f3615b3a483ef83b9933d16c8c1", size = 7578926, upload-time = "2026-11-17T14:43:44.958Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/03/90/7ff3a944d6970bf45051b9c3cac24d2c32e3dd2312cda6321704caf4eaef/anton_agent-2.26.11.16.1rc2-py3-none-any.whl", hash = "sha256:98c8fde8a5f2047694d461d8dff2ae8b665783d71d45751247d08f7ead188af2", size = 4474075, upload-time = "2026-11-16T16:02:09.036Z" },
+    { url = "https://files.pythonhosted.org/packages/00/af/e8dfed25afccf9fd9f99d45980566caf7bd8e956a0509790e54c914719fb/anton_agent-2.26.11.17.1rc4-py3-none-any.whl", hash = "sha256:0f18286971929507e48a7417cd777105e99aa5969401ae4c6aca12b75734670b", size = 4508061, upload-time = "2026-11-17T14:43:42.421Z" },
 ]
 
 [[package]]

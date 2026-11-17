@@ -4060,6 +4060,7 @@ def _anton_connector_entries() -> list[dict]:
         "fields": [{"name": "api_key", "label": "API key", "help": "Settings, then API."},
                    {"name": "region", "label": "Region", "secret": False, "placeholder": "eu"}],
         "auth": {"type": "header", "headers": {"Authorization": "Bearer {api_key}", "X-Region": "{region}"}},
+        "check": {"path": "/v2/me"},
     }))
     return drain_pending_connectors(SimpleNamespace(_connector_drafts=box))
 
@@ -4141,11 +4142,14 @@ async def test_a_refused_draft_is_a_notice_without_its_value(monkeypatch):
 
     frames, _ = await _connector_frames(monkeypatch, ("turn_connector", {"entries": entries}))
 
-    assert _payloads(frames, "response.connector_drafted") == []
+    # A built-in id is not refused: the template takes its own id.
+    assert [c["connector"]["connector_id"] for c in _payloads(frames, "response.connector_drafted")] == [
+        "postgres_custom",
+    ]
     notices = [p["message"] for p in _payloads(frames, "response.in_progress")
                if p.get("phase") == "connector_draft_dropped"]
-    assert len(notices) == 3
-    assert "label" in notices[0] and "built-in" in notices[1] and "not allowed" in notices[2]
+    assert len(notices) == 2
+    assert "label" in notices[0] and "not allowed" in notices[1]
     assert not any(token in f for f in frames)
     assert frames[-1] == "CLOSE:completed"
 
