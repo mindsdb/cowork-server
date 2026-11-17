@@ -46,7 +46,7 @@ def _run_harness(monkeypatch, session):
     monkeypatch.setattr(autopublish, "autopublish_project_artifacts", _no_autopublish)
 
     async def _fake_build(
-        self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
+        self, conversation, model=None, reasoning_effort=None, disabled_connections=None,
         tool_messages=False, interactive=True, ui_locale=None,
     ):
         return BuiltChatSession(session=session, turn_scratch_dir=None, seed_info=None, learns=True)

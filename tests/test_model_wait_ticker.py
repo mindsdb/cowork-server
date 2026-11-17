@@ -107,7 +107,7 @@ class _Harness:
     async def stream_response(
         self, *, conversation, input, model=None, reasoning_effort=None,
         disabled_connections=None, trace_tags=None, trace_metadata=None,
-        channel_context=None, tool_messages=False, model_wait=None,
+        tool_messages=False, model_wait=None,
         interactive=True,
         ui_locale=None, schedule_id=None,
     ):

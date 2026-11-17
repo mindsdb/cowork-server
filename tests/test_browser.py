@@ -577,14 +577,14 @@ def test_the_harness_gives_a_desktop_turn_the_apps_browser(app_browser):
     from cowork.harnesses.anton_harness.harness import _browser_config
 
     on = SimpleNamespace(browser_enabled=True)
-    config = asyncio.run(_browser_config(on, channel_context=None, conversation_id="conv-1", project_id="proj-1"))
+    config = asyncio.run(_browser_config(on, conversation_id="conv-1", project_id="proj-1"))
     assert config.in_app
     assert (config.base_url, config.profile, config.project) == (
         APP_BROWSER.url, svc.task_session(None, "conv-1"), svc.project_key(None, "proj-1"),
     )
     assert config.token.get_secret_value() == APP_BROWSER.token.get_secret_value()
     off = SimpleNamespace(browser_enabled=False)
-    assert asyncio.run(_browser_config(off, channel_context=None, conversation_id="conv-1", project_id=None)) is None
+    assert asyncio.run(_browser_config(off, conversation_id="conv-1", project_id=None)) is None
 
 
 def test_without_a_decisions_model_no_turn_gets_the_browser(app_browser, web, decisions):
@@ -594,7 +594,7 @@ def test_without_a_decisions_model_no_turn_gets_the_browser(app_browser, web, de
 
     decisions.model = None
     on = SimpleNamespace(browser_enabled=True)
-    assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)) is None
+    assert asyncio.run(_browser_config(on, conversation_id="c", project_id=None)) is None
     assert svc.turn_block(on, user_id="u", conversation_id="c", project_id=None) is None
 
 
@@ -647,12 +647,12 @@ def test_the_harness_hands_anton_the_organizations_own_decision_model(app_browse
     decisions.own = JevTarget(url="https://decide.example.test/v1/systemone", api_key="own-key")
     for model, expected in (("jev-own", "jev-own"), ("", "jev")):
         user = SimpleNamespace(browser_enabled=True, decision_model=model)
-        config = asyncio.run(_browser_config(user, channel_context=None, conversation_id="c", project_id=None))
+        config = asyncio.run(_browser_config(user, conversation_id="c", project_id=None))
         assert (config.decisions.url, config.decisions.api_key.get_secret_value(), config.decisions.model) == (
             "https://decide.example.test/v1/systemone", "own-key", expected,
         )
     decisions.own = None
-    config = asyncio.run(_browser_config(user, channel_context=None, conversation_id="c", project_id=None))
+    config = asyncio.run(_browser_config(user, conversation_id="c", project_id=None))
     assert config.decisions is None
 
 
@@ -851,24 +851,11 @@ def test_web_status_is_unavailable_off_mindshub_and_asks_nothing(web_client, not
     assert nothing_goes_out == []
 
 
-def test_a_channel_turn_gets_no_browser(app_browser):
-    """A chat anyone can write to must never drive the desktop owner's
-    signed-in browser."""
-    from cowork.harnesses.anton_harness.harness import _browser_config
-    from cowork.harnesses.base import ChannelContext
-
-    on = SimpleNamespace(browser_enabled=True)
-    group = ChannelContext("telegram", is_group=True)
-    assert asyncio.run(_browser_config(on, channel_context=group, conversation_id="c", project_id=None)) is None
-    assert asyncio.run(_browser_config(on, channel_context=ChannelContext("slack"), conversation_id="c", project_id=None)) is None
-    assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)).in_app
-
-
-def test_the_session_builder_passes_the_channel_to_the_browser():
+def test_the_session_builder_passes_the_browser_through():
     from cowork.harnesses.anton_harness import harness
 
     source = inspect.getsource(harness.AntonHarness._build_turn_session)
-    assert re.search(r"turn_browser = await _browser_config\(\s*user, channel_context=channel_context,", source)
+    assert re.search(r"turn_browser = await _browser_config\(\s*user, conversation_id=", source)
     assert "browser=turn_browser," in source
     assert "supported_kwargs(ChatSessionConfig, browser=" not in source
 
@@ -898,7 +885,7 @@ def test_in_process_turn_never_gets_the_router(monkeypatch, nothing_goes_out):
     get_app_settings.cache_clear()
     try:
         on = SimpleNamespace(browser_enabled=True)
-        assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id="p")) is None
+        assert asyncio.run(_browser_config(on, conversation_id="c", project_id="p")) is None
     finally:
         get_app_settings.cache_clear()
     assert nothing_goes_out == []
@@ -912,7 +899,7 @@ def test_personal_deployment_holds_no_browser_host(personal_deployment):
     runtime_credential.set_browser_host(APP_BROWSER)
     assert runtime_credential.get_browser_host() is None
     on = SimpleNamespace(browser_enabled=True)
-    assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)) is None
+    assert asyncio.run(_browser_config(on, conversation_id="c", project_id=None)) is None
 
 
 def test_a_refused_app_browser_is_logged_without_its_key(caplog):
@@ -1054,14 +1041,14 @@ def test_a_signed_in_desktop_whose_organization_turned_the_browser_off_gets_none
     from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
 
     on = SimpleNamespace(browser_enabled=True)
-    assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)).in_app
+    assert asyncio.run(_browser_config(on, conversation_id="c", project_id=None)).in_app
     signed_in_desktop.replies["desktop-jwt"] = MindsHubReply(
         MindsHubAnswer.OK, payload=_entitlements(False, reason="organization_off"),
     )
     from cowork.services import mindshub_teams
 
     mindshub_teams.reset_caches_for_tests()
-    assert asyncio.run(_browser_config(on, channel_context=None, conversation_id="c", project_id=None)) is None
+    assert asyncio.run(_browser_config(on, conversation_id="c", project_id=None)) is None
     assert _core(client.get("/api/v1/browse/status").json()) == {"enabled": False, "available": False, "status": "organization_off"}
     assert ("/entitlements/me/", "desktop-jwt") in signed_in_desktop.asked
 
