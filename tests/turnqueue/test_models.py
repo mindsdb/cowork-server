@@ -182,7 +182,7 @@ _CUSTOM_REF = {"connection_id": 7, "connector_id": "acme_crm", "name": "Prod", "
 
 
 def test_turn_job_carries_a_custom_api_block():
-    custom_api = {"turn_key": "mdb_x.secret", "connections": [_CUSTOM_REF]}
+    custom_api = {"protocol_version": 1, "connections": [_CUSTOM_REF]}
     job = TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
                   reply_stream="scratchpad:reply:c", params={"input": "hi", "custom_api": custom_api})
     assert TurnJob.model_validate_json(job.model_dump_json()).params["custom_api"] == custom_api
@@ -193,18 +193,22 @@ def test_turn_job_carries_a_custom_api_block():
     [
         "tk_abc",
         {"connections": [_CUSTOM_REF]},
-        {"turn_key": "", "connections": [_CUSTOM_REF]},
-        {"turn_key": "k", "connections": [_CUSTOM_REF], "fields": {"api_key": "s"}},
-        {"turn_key": "k", "connections": []},
-        {"turn_key": "k", "connections": [{**_CUSTOM_REF, "connection_id": i} for i in range(1, 27)]},
-        {"turn_key": "k", "connections": [{**_CUSTOM_REF, "connection_id": True}]},
-        {"turn_key": "k", "connections": [{**_CUSTOM_REF, "credential_version": 0}]},
-        {"turn_key": "k", "connections": [{**_CUSTOM_REF, "name": ""}]},
-        {"turn_key": "k", "connections": [{**_CUSTOM_REF, "connector_id": 5}]},
-        {"turn_key": "k", "connections": [{**_CUSTOM_REF, "api_key": "s"}]},
-        {"turn_key": "k", "connections": [_CUSTOM_REF, _CUSTOM_REF]},
+        {"protocol_version": 1, "connections": [_CUSTOM_REF], "turn_key": "mdb_x.secret"},
+        {"protocol_version": 2, "connections": [_CUSTOM_REF]},
+        {"protocol_version": True, "connections": [_CUSTOM_REF]},
+        {"protocol_version": "1", "connections": [_CUSTOM_REF]},
+        {"protocol_version": 1, "connections": [_CUSTOM_REF], "fields": {"api_key": "s"}},
+        {"protocol_version": 1, "connections": []},
+        {"protocol_version": 1, "connections": [{**_CUSTOM_REF, "connection_id": i} for i in range(1, 27)]},
+        {"protocol_version": 1, "connections": [{**_CUSTOM_REF, "connection_id": True}]},
+        {"protocol_version": 1, "connections": [{**_CUSTOM_REF, "credential_version": 0}]},
+        {"protocol_version": 1, "connections": [{**_CUSTOM_REF, "name": ""}]},
+        {"protocol_version": 1, "connections": [{**_CUSTOM_REF, "connector_id": 5}]},
+        {"protocol_version": 1, "connections": [{**_CUSTOM_REF, "api_key": "s"}]},
+        {"protocol_version": 1, "connections": [_CUSTOM_REF, _CUSTOM_REF]},
     ],
-    ids=["not_an_object", "no_turn_key", "empty_turn_key", "extra_field", "empty", "over_the_cap",
+    ids=["not_an_object", "no_version", "turn_key_still_sent", "other_version", "bool_version",
+         "text_version", "extra_field", "empty", "over_the_cap",
          "bool_id", "zero_version", "empty_name", "non_text_connector", "secret_bearing_reference",
          "duplicate_id"],
 )

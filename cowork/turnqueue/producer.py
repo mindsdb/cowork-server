@@ -49,6 +49,7 @@ from cowork.turnqueue.auth_keys import (
     revoke_turn_key,
 )
 from cowork.turnqueue.models import (
+    CUSTOM_API_PROTOCOL_VERSION,
     MAX_CUSTOM_API_CONNECTIONS,
     MAX_DATASOURCE_CONNECTIONS,
     TurnJob,
@@ -1260,7 +1261,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         oauth_connections, workspace.project_name if workspace is not None else None,
     )
     custom_api_block = (
-        {"turn_key": llm_block.get("api_key", ""), **custom_api_connections} if custom_api_connections else None
+        {"protocol_version": CUSTOM_API_PROTOCOL_VERSION, **custom_api_connections}
+        if custom_api_connections
+        else None
     )
     if custom_api_block:
         connectors_block = await _with_custom_usage_notes(connectors_block, scope, custom_api_block)

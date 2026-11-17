@@ -22,6 +22,8 @@ DATASOURCE_PROTOCOL_VERSION = 1
 MAX_DATASOURCE_CONNECTIONS = 100
 #: The most custom API connections one turn carries (anton holds the same).
 MAX_CUSTOM_API_CONNECTIONS = 25
+#: The `custom_api` block's wire version; anton drops a block carrying any other.
+CUSTOM_API_PROTOCOL_VERSION = 1
 _REQUIRED_REF_KEYS = frozenset({"connection_id", "credential_version"})
 #: Names for the prompt only. anton's `anton/cloud_turn/contract.py` allows the
 #: same two, cleans each value for the prompt and drops what it cannot use, so
@@ -97,10 +99,11 @@ def _is_positive_int(value: object) -> bool:
 
 
 def _validate_custom_api_block(value: object) -> None:
-    if not isinstance(value, dict) or set(value) != {"turn_key", "connections"}:
-        raise ValueError("custom_api must carry exactly turn_key and connections")
-    if not isinstance(value["turn_key"], str) or not value["turn_key"]:
-        raise ValueError("custom_api turn key is missing")
+    if not isinstance(value, dict) or set(value) != {"protocol_version", "connections"}:
+        raise ValueError("custom_api must carry exactly protocol_version and connections")
+    version = value["protocol_version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != CUSTOM_API_PROTOCOL_VERSION:
+        raise ValueError("custom_api protocol version is unsupported")
     connections = value["connections"]
     if not isinstance(connections, list) or not connections or len(connections) > MAX_CUSTOM_API_CONNECTIONS:
         raise ValueError("custom_api connections are invalid")
