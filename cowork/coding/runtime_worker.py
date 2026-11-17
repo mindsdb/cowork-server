@@ -14,7 +14,7 @@ import httpx
 
 from cowork.coding.context import classify_engine_failure, goal_status_text
 from cowork.coding.approvals import ApprovalBroker, read_only_refusal
-from cowork.coding.contracts import CodingEvent, EventType, PermissionMode
+from cowork.coding.contracts import PERMISSION_LABELS, CodingEvent, EventType, PermissionMode
 from cowork.coding.control_models import RuntimeCommand
 from cowork.coding.engines.base import (
     EngineCredentials,
@@ -384,7 +384,7 @@ class CodeOnlyRuntime:
                 "Task status",
                 "\n".join((
                     f"Model: {lease.execution.model}",
-                    f"Permissions: {lease.execution.permission_mode.value}",
+                    f"Permissions: {PERMISSION_LABELS[lease.execution.permission_mode]}",
                     f"Network: {'on' if lease.execution.network_access else 'off'}",
                     goal_line,
                 )),

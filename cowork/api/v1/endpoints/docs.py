@@ -47,7 +47,7 @@ from cowork.models.conversation import Conversation
 from cowork.services.artifact_ownership import record_artifact_owner
 from cowork.services.artifact_permissions import artifact_capabilities, current_capabilities, require_artifact_owner
 from cowork.services.artifact_roots import plan_project_roots, readable_sources
-from cowork.services.artifacts import card_for_folder
+from cowork.services.artifacts import card_for_folder, origin_conversation_id
 from cowork.services.conversations import ConversationService
 from cowork.services.product_permissions import require_product_permission
 
@@ -86,18 +86,12 @@ async def _resolve(scope: TenantScope, project_ref: str, artifact_id: str, *, wr
     return source, folder, metadata, is_own
 
 
-def _origin_conversation(metadata: dict[str, Any]) -> str:
-    prov = metadata.get("provenance") or []
-    if prov and isinstance(prov[0], dict):
-        return str(prov[0].get("conversation") or "")
-    return ""
-
-
 def _card(scope: TenantScope, source, folder: Path) -> dict[str, Any] | None:
     """The doc's artifact card: its publish state, access and paths, as the library shows them (owner only)."""
     try:
-        return card_for_folder(folder, scope=scope, project_id=source.project_id,
+        card = card_for_folder(folder, scope=scope, project_id=source.project_id,
                                project_name=source.project_name, artifacts_base=folder.parent)
+        return card.to_json() if card is not None else None
     except Exception:  # noqa: BLE001 - the doc is there either way; the card is what the library adds
         logger.warning("no card for doc %s", folder, exc_info=True)
         return None
@@ -219,7 +213,7 @@ async def get_doc(project_ref: str, artifact_id: ArtifactIdDep, scope: TenantSco
         "doc": doc,
         "card": card,
         "capabilities": capabilities,
-        "originConversationId": _origin_conversation(metadata),
+        "originConversationId": origin_conversation_id(metadata),
     }
 
 

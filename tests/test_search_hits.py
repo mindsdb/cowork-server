@@ -4,6 +4,7 @@ from __future__ import annotations
 from cowork.api.v1.endpoints import search
 from cowork.api.v1.endpoints.search import SearchHit, _artifact_rows, _RowMatches, search_cowork
 from cowork.db.scoped import LOCAL_SCOPE
+from _artifact_cards import make_card
 
 
 def _hit(*, kind: str, score: int) -> SearchHit:
@@ -11,7 +12,7 @@ def _hit(*, kind: str, score: int) -> SearchHit:
 
 
 def test_an_artifact_card_becomes_a_typed_hit():
-    card = {"title": "Quarterly forecast", "description": "", "path": "/p/dash/index.html", "kind": "HTML"}
+    card = make_card(title="Quarterly forecast", description="", path="/p/dash/index.html", kind="HTML")
 
     assert _artifact_rows([card], "quarterly") == [SearchHit(
         type="artifact",
@@ -34,7 +35,7 @@ async def test_the_route_lists_hits_by_score_and_keeps_the_order_of_a_tie(monkey
         return _RowMatches(before_artifacts=[task, project], after_artifacts=[pin])
 
     async def run_efs(fn, *, scope, deadline=True):
-        return [{"title": "Quarterly forecast", "description": "", "path": "/p/dash/index.html", "kind": "HTML"}]
+        return [make_card(title="Quarterly forecast", description="", path="/p/dash/index.html", kind="HTML")]
 
     monkeypatch.setattr(search, "run_db", run_db)
     monkeypatch.setattr(search, "run_efs", run_efs)

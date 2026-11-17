@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 import httpx
 from pydantic import BaseModel, Field
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 import yaml
 
@@ -35,6 +36,7 @@ from cowork.services import (
 )
 from cowork.services.artifact_access import ArtifactAccessUnavailable
 from cowork.services.artifact_identity import artifact_key
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.publish import publish_artifact
 from tests._org_sharing import TEAM_ELSEWHERE, TEAM_ENG, TEAM_OPS, TEAM_QA, member_request, mindshub_sharing_answers
 from tests.anton_minds_fake import fake_minds_requests
@@ -280,13 +282,52 @@ def test_unavailable_auth_preserves_pending_nonce_for_retry(issuer, scope, local
 
 
 def test_concurrent_first_use_reuses_one_durable_allocation_nonce(
-    issuer, scope, local_id
+    issuer, scope, local_id, monkeypatch
 ):
+    """Two genuine absent reads race their inserts and reuse the winner after rollback."""
+    reads = Barrier(2)
+    state_lock = Lock()
+    initial_sessions = set()
+    collisions = []
+    real_row = identities._row
+    real_commit = ScopedSession.commit
+
+    def simultaneous_absent_reads(session, artifact_id, *, lock=False):
+        """Rendezvous only the two real initial reads, leaving retry/locking reads untouched."""
+        row = real_row(session, artifact_id, lock=lock)
+        with state_lock:
+            initial = row is None and not lock and session not in initial_sessions
+            if initial:
+                initial_sessions.add(session)
+        if initial:
+            reads.wait(timeout=5)
+        return row
+
+    def observe_commit(session):
+        """Observe a real unique-constraint failure and preserve the production retry path."""
+        try:
+            return real_commit(session)
+        except IntegrityError as error:
+            with state_lock:
+                collisions.append(error)
+            raise
+
+    monkeypatch.setattr(identities, "_row", simultaneous_absent_reads)
+    monkeypatch.setattr(ScopedSession, "commit", observe_commit)
     issuer.barrier = Barrier(2)
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _: _ensure(local_id, scope), range(2)))
     assert results[0] == results[1]
     assert len(issuer.allocations) == 1
+    assert len(initial_sessions) == 2
+    assert len(collisions) == 1
+    with identities.authorization_session(scope) as session:
+        rows = session.exec(session.select(identities.ArtifactIdentity).where(
+            identities.ArtifactIdentity.local_artifact_id == UUID(local_id).hex
+        )).all()
+        assert len(rows) == 1
+        assert issuer.allocations == {str(rows[0].id): results[0]}
+        assert rows[0].canonical_artifact_id == results[0]
 
 
 def test_lost_allocation_reply_retries_the_same_issued_identity(
@@ -459,7 +500,7 @@ async def test_live_editor_sync_preserves_canonical_identity_and_refuses_peer(
         scope=scope,
         project_id=str(project.id),
     )
-    metadata = json.loads((folder / "metadata.json").read_text())
+    metadata = ArtifactMetadata.parse((folder / "metadata.json").read_text())
     initial = current_source(folder, metadata, local_id)
     body = artifact_workspace._SourceUpdateBody(
         content="<html>Updated owner bytes</html>",
@@ -1015,7 +1056,7 @@ async def test_an_autopublish_never_publishes_over_a_restricted_rule_after_an_ag
     with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
         published = await ap._publish_one(
             folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-            ap._access_for(decision), project_id=str(project.id),
+            ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
         )
 
     assert published is False
@@ -1049,7 +1090,7 @@ async def test_an_autopublish_with_the_metadata_removed_and_the_entry_key_blanke
     with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
         published = await ap._publish_one(
             folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-            ap._access_for(decision), project_id=str(project.id),
+            ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
         )
 
     assert published is False
@@ -1485,7 +1526,7 @@ async def test_a_page_in_a_subfolder_its_owner_made_public_keeps_syncing(
             decision = ap.PublishDecision("changed", published_entry=entry)
             saved = await ap._publish_one(
                 folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-                ap._access_for(decision), project_id=str(project.id),
+                ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
             )
 
     assert saved is True, [record.reason for record in _mode_changed_records(caplog)]
@@ -1614,7 +1655,7 @@ async def _autopublish_once(folder, scope, project):
     decision = ap.PublishDecision("changed", published_entry=_entry(folder))
     return await ap._publish_one(
         folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-        ap._access_for(decision), project_id=str(project.id),
+        ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
     )
 
 
