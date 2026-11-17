@@ -37,4 +37,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(_INDEX, table_name="notices")
+    # Guarded like upgrade(): an interrupted downgrade may have dropped it already.
+    inspector = sa.inspect(op.get_bind())
+    if not inspector.has_table("notices"):
+        return
+    if _INDEX in {index["name"] for index in inspector.get_indexes("notices")}:
+        op.drop_index(_INDEX, table_name="notices")
