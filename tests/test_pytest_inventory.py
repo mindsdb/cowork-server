@@ -19,8 +19,185 @@ from scripts.blocking_guard_evidence import sidecar
 from scripts.pytest_inventory import source_identity
 from scripts.test_inventory import Report, compare, preserve, read_report, summary, validate, validate_junit
 from scripts.test_shards import aggregate, latest_artifact, partition
+from scripts import test_shards
 
 _ROOT = Path(__file__).resolve().parents[1]
+
+
+def _timing_document(modules=None):
+    """Build explicit timing input for isolated runners without production weights."""
+    return {"schema_version": 1, "producer": {"run_id": 1, "attempt": 1,
+            "checkout_sha": "0" * 40, "source_digest": "0" * 64, "python": "3.12",
+            "platform": "Linux", "cost_method": "sum_setup_call_teardown_ms"},
+            "fallback_ms": 1, "modules": modules or {}}
+
+
+@pytest.fixture
+def weighted_collection(inventory_suite, monkeypatch):
+    """Collect real unequal-size modules with independently supplied measured costs."""
+    root, run = inventory_suite
+    tests = root / "tests"
+    tests.mkdir()
+    costs = {"cheap": 1, "heavy": 1000, "medium": 500, "small": 200, "tiny": 100}
+    entries = {}
+    for name, cost in costs.items():
+        path = tests / f"test_{name}.py"
+        cases = 6 if name == "cheap" else 1
+        path.write_text("\n".join(f"def test_{i}(): assert True" for i in range(cases)))
+        entries[path.relative_to(root).as_posix()] = {
+            "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "cases": cases, "work_ms": cost,
+        }
+    (tests / "test_empty.py").write_text("")
+    (tests / "test_skipped.py").write_text('import pytest\npytest.skip("platform", allow_module_level=True)')
+    scripts = root / "scripts"
+    scripts.mkdir()
+    table = scripts / "test_shard_timings.json"
+    table.write_text(json.dumps(_timing_document(entries)))
+    monkeypatch.setattr(test_shards, "_TIMINGS_PATH", table, raising=False)
+    monkeypatch.chdir(root)
+    result, document, _ = run("tests/", "--ignore=tests/integration", "--collect-only", "--test-cohort=broad")
+    assert result.returncode == 0, result.stdout + result.stderr
+    return root, Report.model_validate(document), table
+
+
+def test_weighted_partition_balances_work_not_case_counts(weighted_collection):
+    """A small expensive module leads allocation while every whole module stays owned once."""
+    _, collection, _ = weighted_collection
+    groups = partition(collection, ["tests/test_empty.py"])
+    assert "tests/test_heavy.py" in groups[0]
+    assert "tests/test_cheap.py" not in groups[0]
+    assert len({name for group in groups for name in group}) == sum(map(len, groups)) == 7
+    assert sum(len([case for case in collection.collection.items if case.module in group]) for group in groups) == 10
+    assert groups == partition(collection, reversed(["tests/test_empty.py"]))
+
+
+@pytest.mark.parametrize("change", ["missing", "source", "count"])
+def test_weighted_partition_falls_back_without_losing_changed_modules(weighted_collection, change):
+    """Unavailable estimates lose their scheduling priority, never their test ownership."""
+    root, collection, path = weighted_collection
+    table = json.loads(path.read_text())
+    entry = table["modules"]["tests/test_heavy.py"]
+    if change == "missing":
+        del table["modules"]["tests/test_heavy.py"]
+    elif change == "source":
+        (root / "tests/test_heavy.py").write_text("def test_0(): assert 2 > 1")
+    else:
+        entry["cases"] += 1
+    path.write_text(json.dumps(table))
+    groups = partition(collection)
+    assert "tests/test_medium.py" in groups[0]
+    assert "tests/test_heavy.py" not in groups[0]
+    assert sum("tests/test_heavy.py" in group for group in groups) == 1
+
+
+def test_weighted_partition_keeps_new_and_deleted_module_entries_separate(weighted_collection):
+    """New tests use fallback while historical deleted entries cannot add or remove tests."""
+    root, collection, path = weighted_collection
+    table = json.loads(path.read_text())
+    table["modules"]["tests/test_deleted.py"] = table["modules"]["tests/test_heavy.py"]
+    path.write_text(json.dumps(table))
+    (root / "tests/test_new.py").write_text("def test_new(): assert True")
+    collection.collection.items.append(collection.collection.items[0].model_copy(update={
+        "nodeid": "tests/test_new.py::test_new", "module": "tests/test_new.py",
+    }))
+    groups = partition(collection)
+    assert sum("tests/test_new.py" in group for group in groups) == 1
+    assert all("tests/test_deleted.py" not in group for group in groups)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("work_ms", 0), ("work_ms", -1), ("work_ms", True), ("work_ms", 1.5),
+    ("work_ms", float("nan")), ("work_ms", float("inf")), ("work_ms", 86400001),
+    ("cases", 0), ("cases", True), ("cases", 1000001), ("source_sha256", "x" * 64),
+    ("source_sha256", "0" * 63),
+])
+def test_timing_table_refuses_invalid_costs_and_identity(weighted_collection, field, value):
+    """Invalid scheduling hints fail explicitly instead of selecting an accidental policy."""
+    _, collection, path = weighted_collection
+    table = json.loads(path.read_text())
+    table["modules"]["tests/test_heavy.py"][field] = value
+    path.write_text(json.dumps(table))
+    with pytest.raises(ValueError, match="timing"):
+        partition(collection)
+
+
+@pytest.mark.parametrize("name", [
+    "../test_escape.py", "/tests/test_escape.py", "tests/../test_escape.py",
+    "tests\\test_escape.py", "tests/test_escape.py::case", "tests//test_escape.py",
+    "tests/not_a_test.py", "tests/test_escape.txt", "tests/" + "x" * 500 + "/test_x.py",
+])
+def test_timing_table_refuses_unsafe_even_stale_paths(weighted_collection, name):
+    """Unused historical entries still obey the test-root path contract."""
+    _, collection, path = weighted_collection
+    table = json.loads(path.read_text())
+    table["modules"][name] = table["modules"]["tests/test_heavy.py"]
+    path.write_text(json.dumps(table))
+    with pytest.raises(ValueError, match="timing module path"):
+        partition(collection)
+
+
+@pytest.mark.parametrize("change", ["schema", "unknown", "duplicate", "fallback", "producer", "module_count"])
+def test_timing_table_refuses_ambiguous_or_unbounded_documents(weighted_collection, change):
+    """Malformed configuration cannot silently become an accepted source-bound schedule."""
+    _, collection, path = weighted_collection
+    table = json.loads(path.read_text())
+    if change == "schema":
+        table["schema_version"] = True
+    elif change == "unknown":
+        table["extra"] = 1
+    elif change == "fallback":
+        table["fallback_ms"] = 86400001
+    elif change == "producer":
+        table["producer"]["checkout_sha"] = "0" * 39
+    elif change == "module_count":
+        table["modules"] = {f"tests/test_{i}.py": table["modules"]["tests/test_heavy.py"] for i in range(10001)}
+    text = json.dumps(table)
+    if change == "duplicate":
+        text = text[:-1] + ', "fallback_ms": 2}'
+    path.write_text(text)
+    with pytest.raises(ValueError, match="timing"):
+        partition(collection)
+
+
+@pytest.mark.parametrize("boundary", ["cost", "count", "size", "entries"])
+def test_timing_table_accepts_declared_numeric_boundaries(weighted_collection, boundary):
+    """Maximum supported values remain usable rather than being rejected off by one."""
+    _, collection, path = weighted_collection
+    table = json.loads(path.read_text())
+    entry = table["modules"]["tests/test_heavy.py"]
+    if boundary == "cost":
+        entry["work_ms"] = 86400000
+        table["fallback_ms"] = 86400000
+    elif boundary == "count":
+        entry["cases"] = 1000000
+    elif boundary == "entries":
+        table["modules"] = {f"tests/test_{i}.py": entry for i in range(10000)}
+    text = json.dumps(table)
+    path.write_text(text + " " * (2 * 1024 * 1024 - len(text)) if boundary == "size" else text)
+    assert len({name for group in partition(collection) for name in group}) == 6
+    if boundary == "size":
+        path.write_text(path.read_text() + " ")
+        with pytest.raises(ValueError, match="too large"):
+            partition(collection)
+
+
+@pytest.mark.parametrize("target", ["table", "module", "missing"])
+def test_timing_table_refuses_unbound_files(weighted_collection, target):
+    """Symlink targets cannot evade inventory identity or escape the test root."""
+    root, collection, path = weighted_collection
+    external = root.parent / "external"
+    external.write_text(path.read_text())
+    if target in {"table", "missing"}:
+        path.unlink()
+        if target == "table":
+            path.symlink_to(external)
+    else:
+        (root / "tests/test_link.py").symlink_to(external)
+        table = json.loads(path.read_text())
+        table["modules"]["tests/test_link.py"] = table["modules"]["tests/test_heavy.py"]
+        path.write_text(json.dumps(table))
+    with pytest.raises(ValueError, match="timing"):
+        partition(collection)
 
 
 @pytest.fixture
@@ -490,8 +667,11 @@ def _shard_evidence(inventory_suite, monkeypatch, *, prepare=None):
     root, run = inventory_suite
     scripts = root / "scripts"
     scripts.mkdir()
-    for name in ("test_shards.py", "test_inventory.py", "pytest_inventory.py", "blocking_guard_evidence.py"):
+    for name in ("__init__.py", "test_shards.py", "test_inventory.py", "pytest_inventory.py", "blocking_guard_evidence.py"):
         shutil.copyfile(_ROOT / "scripts" / name, scripts / name)
+    timing_path = scripts / "test_shard_timings.json"
+    timing_path.write_text(json.dumps(_timing_document()))
+    monkeypatch.setattr(test_shards, "_TIMINGS_PATH", timing_path)
     package = root / "cowork"
     package.mkdir()
     (package / "__init__.py").write_text("")
@@ -618,6 +798,38 @@ def pytest_sessionfinish(session):
             counts = json.loads((root.parent / f"directories-broad-shard-{index}-gw{worker}.json").read_text())
             assert counts["tests"] == 1
             assert all(visits == 1 for visits in counts.values())
+
+
+def test_weighted_partition_is_shared_by_real_producer_and_aggregate_clis(inventory_suite, monkeypatch):
+    """Source-bound timing data changes placement while all four real executions reconcile."""
+    def weights(root):
+        """Give one smaller module more work than either two-case module."""
+        entries = {}
+        for name, cases, work in (("left é", 2, 10), ("right", 2, 5), ("third", 1, 100), ("fourth", 1, 50)):
+            path = root / "tests" / f"test_{name}.py"
+            entries[path.relative_to(root).as_posix()] = {
+                "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "cases": cases, "work_ms": work,
+            }
+        (root / "scripts/test_shard_timings.json").write_text(json.dumps(_timing_document(entries)))
+
+    root, run, inputs, collection, _ = _shard_evidence(inventory_suite, monkeypatch, prepare=weights)
+    assert "tests/test_third.py" in partition(collection)[0]
+    output = root.parent / "weighted-combined"
+    environment = {key: value for key, value in os.environ.items() if key not in {"COVERAGE_FILE", "PYTEST_ADDOPTS", "PYTHONPATH"}}
+    completed = subprocess.run([sys.executable, "-m", "scripts.test_shards", "aggregate",
+        "--inputs", str(inputs), "--output", str(output)], cwd=root, env=environment,
+        capture_output=True, text=True, timeout=120)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["collected"] == 6 and len(summary["shards"]) == 4
+    assert {case.module for case in read_report(output / "shard-0/inventory.json").collection.items} == {"tests/test_third.py"}
+    assert sorted(case.nodeid for i in range(4) for case in read_report(output / f"shard-{i}/inventory.json").collection.items) == sorted(case.nodeid for case in collection.collection.items)
+    result, _, _ = run("tests/", "--ignore=tests/integration", "-n", "0", "-p", "pytest_cov.plugin", "--cov=cowork", "--cov-report=")
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual, expected = [CoverageData(basename=str(path)) for path in (output / "coverage.data", root / ".coverage")]
+    actual.read()
+    expected.read()
+    assert {name: set(actual.lines(name) or []) for name in actual.measured_files()} == {name: set(expected.lines(name) or []) for name in expected.measured_files()}
 
 
 def test_shards_accept_flat_single_collection_download(shard_evidence, monkeypatch):
