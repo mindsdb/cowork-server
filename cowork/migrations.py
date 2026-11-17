@@ -307,7 +307,7 @@ def seed_builtin_skills(session: Session) -> bool:
     # The base store, named explicitly: a deployment that trusts identity
     # headers refuses a store with no scope.
     store = SkillService(LOCAL_SCOPE)
-    copied = store._copy_builtin_skills()
+    copied = store._copy_builtin_skills(current)
 
     if copied:
         logger.info("Seeded %d builtin skill(s) into %s", copied, store.root)

@@ -17,8 +17,14 @@ Seeding is versioned by `BUILTIN_SKILLS_VERSION`:
   so a lost durable volume reseeds instead of being masked by a surviving DB
   row.
 - Seeding runs only when the stored version < `BUILTIN_SKILLS_VERSION`.
-- Existing folders in the store are never overwritten. Add new skills here and
-  bump `BUILTIN_SKILLS_VERSION` to ship them in a later release.
+- A builtin the store lacks is copied only if it is new since the store's
+  version, so a builtin someone deleted stays deleted.
+- A builtin the store has is replaced only when its files are exactly a version
+  we shipped (`shipped.json`; anton's `stats.json` sidecar is ignored and kept).
+  A copy someone edited, or one holding a link, is left as it is.
+- To ship a new or changed builtin: edit it here, run
+  `python scripts/builtin_skills_shipped.py` in a full clone (it reads git
+  history), and bump `BUILTIN_SKILLS_VERSION`.
 
 On desktop, seeded copies remain ordinary editable/deletable file-backed skills.
 In org mode, packaged slugs are reserved and immutable for members, admins, and
