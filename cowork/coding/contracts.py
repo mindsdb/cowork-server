@@ -47,6 +47,17 @@ class WorkspaceMode(str, Enum):
     worktree = "worktree"
 
 
+class WorkspaceReasonCode(str, Enum):
+    """Why a workspace mode is refused, stable so a client can word it in its own language."""
+
+    not_a_repository = "not_a_repository"
+    no_commits = "no_commits"
+    in_place_unsupported_platform = "in_place_unsupported_platform"
+    in_place_other_computer = "in_place_other_computer"
+    no_local_checkout = "no_local_checkout"
+    shared_repository = "shared_repository"
+
+
 class WorkspaceModeOptions(BaseModel):
     """The modes a new task could run in, and the one it gets if it asks for none."""
 
@@ -58,6 +69,12 @@ class WorkspaceModeOptions(BaseModel):
     in_place_unavailable_reason: str | None = None
     # Why a worktree is not offered for the folder, when it is not.
     worktree_unavailable_reason: str | None = None
+    # The reasons above as codes, with the project folder each names, if any.
+    # The English text stays for clients that predate the codes.
+    in_place_unavailable_code: WorkspaceReasonCode | None = None
+    in_place_unavailable_folder: str | None = None
+    worktree_unavailable_code: WorkspaceReasonCode | None = None
+    worktree_unavailable_folder: str | None = None
     # The folder isn't a Git repository and could be made one here.
     can_initialize_git: bool = False
 

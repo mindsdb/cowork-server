@@ -360,7 +360,7 @@ class CodingService(
             try:
                 self.session_factory.in_place_roots(project, None, path)
             except (WorkspaceError, ValueError) as exc:
-                options = without_in_place(options, str(exc))
+                options = without_in_place(options, exc)
         if project is not None:
             problem = self.project_workspaces.worktree_problem(project)
             return without_worktree(options, problem) if problem else options
@@ -372,7 +372,7 @@ class CodingService(
             inspection = self.workspaces.inspect(path)
             options = without_worktree(
                 options,
-                str(exc),
+                exc,
                 can_initialize_git=inspection.is_directory and not inspection.is_git and not _org_mode(),
             )
         return options
