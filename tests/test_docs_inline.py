@@ -79,6 +79,8 @@ def test_the_scans_read_any_text_as_the_regexes_did():
     ("[a](http://x y)", "[a](http://x y)"),
     ("[a]](http://x.io)", "[a]](http://x.io)"),
     ("[](http://x.io)", "[](http://x.io)"),
+    ("[a](http://)", "[a](http://)"),
+    ("[a](mailto:)", "[a](mailto:)"),
     ("[a](https:x)", "[a](https:x)"),
     ("{{ date : 2026-10-21 }}", '<span class="chip chip-date">Oct 21, 2026</span>'),
     ("{{status: in progress  }} and {{user:me}}",

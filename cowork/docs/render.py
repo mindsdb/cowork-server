@@ -135,7 +135,8 @@ _HELD = re.compile(r"\x00(\d+)\x00")
 # Italic, links and chips are scanned rather than matched by one regex each:
 # such a regex rescans the rest of the line (or text) from every opener that
 # never closes, which is quadratic, and a long block stalls the server. Each
-# scan reads exactly what its regex reads (docModel.inlineToHtml scans alike):
+# scan reads exactly what its regex reads (docModel.inlineToHtml in the editor
+# uses the same lookups but reads all marks in one pass):
 #   italic  (?<![*\w])\*(?!\s)(.+?)(?<!\s)\*(?![*\w])  and the same with _
 #   link    \[([^\]]+)\]\((https?://[^)\s]+|mailto:[^)\s]+)\)
 #   chip    \{\{\s*(date|status|user)\s*:\s*([^}]+?)\s*\}\}
