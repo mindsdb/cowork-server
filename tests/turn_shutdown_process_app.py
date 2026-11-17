@@ -58,11 +58,6 @@ async def _noop():
     return None
 
 
-async def _start_channels(app):
-    app.state.channel_ingress = SimpleNamespace(stop_all=_noop)
-    app.state.channel_adapters = SimpleNamespace(shutdown=_noop)
-
-
 async def _formatter(stream, model, event_sink, **_kwargs):
     yield sse_frame("response.created", {"type": "response.created"})
     payload = {"type": "response.output_text.delta", "delta": PARTIAL}
@@ -75,7 +70,6 @@ async def _formatter(stream, model, event_sink, **_kwargs):
 server.run_dev_setup = _seed_schema
 server._warm_model_map_on_boot = _noop
 server.start_scheduler = lambda: None
-server._start_channels = _start_channels
 responses.get_harness = lambda name: SimpleNamespace(
     stream_response=lambda **kwargs: None, formatter=_formatter,
 )

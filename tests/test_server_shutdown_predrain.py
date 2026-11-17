@@ -200,22 +200,14 @@ def quiet_lifespan(monkeypatch):
     do with turns stubbed, as tests/turn_shutdown_process_app.py does."""
     import cowork.coding.service as coding_service
 
-    async def _noop(*args, **kwargs):
-        return None
-
     async def _no_model_map():
         return False
-
-    async def _start_channels(app):
-        app.state.channel_ingress = SimpleNamespace(stop_all=_noop)
-        app.state.channel_adapters = SimpleNamespace(shutdown=_noop)
 
     monkeypatch.setattr(server, "run_dev_setup", lambda: None)
     monkeypatch.setattr(server, "consume_pending_credential_clear", lambda *args: None)
     monkeypatch.setattr(server, "_warm_agent_runtime", lambda: None)
     monkeypatch.setattr(server, "_warm_model_map_on_boot", _no_model_map)
     monkeypatch.setattr(server, "start_scheduler", lambda: None)
-    monkeypatch.setattr(server, "_start_channels", _start_channels)
     monkeypatch.setattr(coding_service, "get_coding_service", lambda: SimpleNamespace(close_all=lambda: None))
 
 

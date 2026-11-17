@@ -21,10 +21,8 @@ import tokenize
 
 import pytest
 
-from cowork.channels import runtime as rt
 from cowork.handlers import _turn_history
 from cowork.handlers import responses as r
-from cowork.turnqueue import remote_turn
 
 
 def _norm(obj) -> str:
@@ -49,7 +47,6 @@ PERSISTERS = [
     pytest.param(r.ResponsesHandler._run_turn, id="in-process-streaming"),
     pytest.param(r.ResponsesHandler._collect, id="in-process-non-streaming"),
     pytest.param(r.ResponsesHandler._run_remote_turn, id="remote"),
-    pytest.param(rt.AntonChannelRuntime._run_anton, id="channels"),
 ]
 
 
@@ -98,7 +95,6 @@ def test_remote_path_gates_rows_on_a_clean_finish():
 IN_PROCESS_PERSISTERS = [
     pytest.param(r.ResponsesHandler._run_turn, id="in-process-streaming"),
     pytest.param(r.ResponsesHandler._collect, id="in-process-non-streaming"),
-    pytest.param(rt.AntonChannelRuntime._run_anton, id="channels"),
 ]
 
 
@@ -108,7 +104,7 @@ def test_in_process_paths_id_check_before_persisting(persister):
     permanently — every later turn replays it and the provider rejects the
     whole request.
 
-    Pinned for the same reason this file exists at all: reverting all three of
+    Pinned for the same reason this file exists at all: reverting all of
     these call sites to `data.get("rows") or []` left the entire unit suite
     green, because the behavioural tests that exercise these rows end to end
     only ever use well-formed ids (review: pnewsam on #520).
@@ -122,19 +118,17 @@ def test_in_process_paths_id_check_before_persisting(persister):
 def test_the_in_process_guard_is_not_the_pod_sanitizer():
     """The two must not be collapsed into one.
 
-    Asserted over the three IN-PROCESS persisters — the ones that must NOT
+    Asserted over the two IN-PROCESS persisters — the ones that must NOT
     reach the pod sanitizer — so a well-meaning simplification that routes
     everything through a single function fails here rather than silently
     truncating desktop tool output against the pod's size budgets."""
-    for p in (r.ResponsesHandler._run_turn, r.ResponsesHandler._collect,
-              rt.AntonChannelRuntime._run_anton):
+    for p in (r.ResponsesHandler._run_turn, r.ResponsesHandler._collect):
         assert "sanitize_turn_history_rows(" not in _norm(p)
 
 
 def test_remote_path_sanitizes_before_persisting():
-    """The pod is semi-trusted; unvalidated rows must not reach the DB. Both
-    remote reply loops take the pod's frame through remote_turn_history,
+    """The pod is semi-trusted; unvalidated rows must not reach the DB. The
+    remote reply loop takes the pod's frame through remote_turn_history,
     which sanitizes the rows a turn stores."""
     assert "remote_turn_history(" in _norm(r.ResponsesHandler._run_remote_turn)
-    assert "remote_turn_history(" in _norm(remote_turn.remote_turn_events)
     assert "sanitize_turn_history_rows(" in _norm(_turn_history.remote_turn_history)

@@ -274,6 +274,52 @@ def org_deployment(monkeypatch):
     get_app_settings.cache_clear()
 
 
+def _empty_public_schema(uri: str) -> None:
+    """Drop everything the migrations built. A downgrade to base leaves tables
+    behind on PostgreSQL (see test_skill_access_backfill_postgres.py); the lock
+    timeout turns a session left open into an error, not a hung teardown."""
+    from sqlalchemy import text
+    from sqlalchemy.pool import NullPool
+    from sqlmodel import create_engine
+
+    engine = create_engine(uri, poolclass=NullPool)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("SET LOCAL lock_timeout = '15s'"))
+            connection.execute(text("DROP SCHEMA public CASCADE"))
+            connection.execute(text("CREATE SCHEMA public"))
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture()
+def postgres_engine(monkeypatch: pytest.MonkeyPatch):
+    """A disposable PostgreSQL migrated to head from an empty schema, emptied again after."""
+    from alembic import command
+    from alembic.config import Config
+    from sqlmodel import create_engine
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from tests.integration.prereq import missing_prerequisite
+
+    uri = os.environ.get("COWORK_TEST_POSTGRES_URI")
+    if not uri:
+        missing_prerequisite(
+            "set COWORK_TEST_POSTGRES_URI to a disposable database", required_by="COWORK_REQUIRE_SERVICES",
+        )
+    monkeypatch.setenv("DATABASE_URI", uri)
+    get_app_settings.cache_clear()
+    _empty_public_schema(uri)
+    command.upgrade(Config("alembic.ini"), "head")
+    engine = create_engine(uri)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+        _empty_public_schema(uri)
+        get_app_settings.cache_clear()
+
+
 def stub_landlock_kernel(monkeypatch, *, abi: int = 6) -> None:
     """Answer the code sandbox's kernel checks without a kernel: the ABI probe
     reports ``abi`` and the launcher's self-test passes. The one seam

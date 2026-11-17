@@ -10,13 +10,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import cowork.handlers.responses as responses_mod
 import cowork.services.task_objects as task_objects
-from cowork.handlers.responses import _RemoteArtifactsDir
+from cowork.handlers.responses import ResponsesHandler, _RemoteArtifactsDir
 from cowork.services import local_artifact_comments
 
-import test_remote_turn
 from test_harness_scratchpad_teardown import _completes, _drain, turns  # noqa: F401 (turns: a fixture)
 from test_local_draft_comments import _threads, client, deployment, draft  # noqa: F401 (fixtures)
+from test_responses_remote_backend import _no_workspace_or_memory_units, _RecBuffer, _remote_handler
 from tests._event_loop import on_the_event_loop
 from tests._live_apps import PARTITION_A, SUB_A, A, person_scope
 
@@ -54,7 +55,9 @@ async def test_the_remote_turn_end_capture_runs_off_the_loop(monkeypatch):
         return task_objects.ArtifactChanges(created=[], touched=set())
 
     context = _RemoteArtifactsDir(base=Path("/project/artifacts"), project_id="project", project_name="Project", creator=None)
-    test_remote_turn._fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
+    handler = _remote_handler(monkeypatch, {})
+    _no_workspace_or_memory_units(monkeypatch)
+    monkeypatch.setattr(ResponsesHandler, "_remote_artifacts_context", staticmethod(lambda *_: context))
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
     monkeypatch.setattr(task_objects, "turn_artifact_changes", changes)
     monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
@@ -63,12 +66,11 @@ async def test_the_remote_turn_end_capture_runs_off_the_loop(monkeypatch):
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
         yield "turn_completed", {}
 
-    monkeypatch.setattr(test_remote_turn.remote_turn_mod, "stream_remote_replies", replies)
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
 
-    await test_remote_turn._drain(test_remote_turn.remote_turn_events(
-        scope=test_remote_turn._FakeScope(), conv_id=uuid4(), org_id="org", user_id="user",
-        input_text="run", model="m", turn_rows=[],
-    ))
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="run", original_content="run", model="m", harness_id="anton", buffer=_RecBuffer(),
+    )
 
     assert seen == [False]
 

@@ -33,7 +33,6 @@ import pytest
 from sqlmodel import Session
 
 import cowork.handlers.responses as responses_mod
-import cowork.turnqueue.remote_turn as remote_turn_mod
 from cowork.api.v1.endpoints import artifacts as artifacts_ep
 from cowork.db import units
 from cowork.db.scoped import TenantScope
@@ -55,7 +54,6 @@ from cowork.services.artifact_roots import project_artifacts_base
 from cowork.services.artifact_sort_times import record_sort_times
 from cowork.services.held_artifact_roots import HeldRoot
 from cowork.services.task_objects import ListedLocationsUnchecked
-from cowork.turnqueue.remote_turn import remote_turn_events
 from test_artifact_heal_sweep import _talked_in
 from test_artifact_locations import _write
 from test_artifact_ownership import _engine, make_conversation, make_project, project_root, scoped, write_artifact
@@ -73,7 +71,6 @@ from test_org_list_scaling import (  # noqa: F401  (fixtures)
     held_roots,
     org,
 )
-from test_remote_turn import _drain, _fake_handler
 from test_responses_remote_backend import (
     _no_workspace_or_memory_units,
     _RecBuffer,
@@ -663,36 +660,12 @@ async def test_a_sweep_check_that_falls_short_keeps_the_project_for_its_retries(
 # ── the turn ends ────────────────────────────────────────────────────────
 
 
-def _remote_turn_end(monkeypatch, *, during_turn, touched: list[str] | None) -> None:
-    """A remote turn whose inputs are read and whose end is recorded in real
-    units on the test database. `during_turn` runs once the turn's snapshot
-    is taken, before the pod's `turn_completed`, which names `touched` as
-    the artifacts its tools touched, or names none for None, so the turn end
-    lists the project's whole shared root."""
-    _fake_handler(monkeypatch, remote_artifacts_context=ResponsesHandler._remote_artifacts_context)
-    monkeypatch.setattr(remote_turn_mod, "run_db", units.run_db)
-    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
-
-    async def replies(**kwargs):
-        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
-        during_turn()
-        yield "turn_completed", {} if touched is None else {"artifacts_touched": touched}
-
-    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
-
-
-async def _run_turn(*, scope: TenantScope, conversation_id) -> None:
-    _, failure = await _drain(remote_turn_events(
-        scope=scope, conv_id=conversation_id, org_id=scope.org_id, user_id=scope.user_id,
-        input_text="hi", model="anton", turn_rows=[],
-    ))
-    assert failure is None
-
-
 async def _responses_turn(monkeypatch, *, project, scope: TenantScope, conversation_id, during_turn, touched) -> None:
     """The responses handler's remote turn (ResponsesHandler._produce_remote)
-    in `project`, its units real and on the test database, with
-    `during_turn` and `touched` as _remote_turn_end takes them."""
+    in `project`, its units real and on the test database. `during_turn` runs
+    once the turn's snapshot is taken, before the pod's `turn_completed`,
+    which names `touched` as the artifacts its tools touched, or names none
+    for None, so the turn end lists the project's whole shared root."""
     source = project_root(project)
     handler = _remote_handler(monkeypatch, {})
     _units_on_the_test_database(monkeypatch, scope=scope)
@@ -734,17 +707,6 @@ class _Producer(NamedTuple):
 
 
 _PRODUCERS = {
-    "remote_turn": _Producer(
-        logger=remote_turn_mod.logger.name,
-        listed_lost=(
-            "Could not check the locations of the artifacts a channel turn found, or record the folder that holds"
-            " them or their sort times"
-        ),
-        edited_lost=(
-            "Could not record the sort times of the artifacts a channel turn made or changed, or the folder that"
-            " holds them"
-        ),
-    ),
     "responses": _Producer(
         logger=responses_mod.logger.name,
         listed_lost=(
@@ -762,16 +724,19 @@ _PRODUCERS = {
 async def _turn_end(
     monkeypatch, producer: str, *, project, scope: TenantScope, conversation_id, during_turn, touched,
 ) -> None:
-    """One remote turn in `project` through `producer`'s turn end: the turn
-    queue's (remote_turn) or the responses handler's (responses)."""
-    if producer == "remote_turn":
-        _remote_turn_end(monkeypatch, during_turn=during_turn, touched=touched)
-        await _run_turn(scope=scope, conversation_id=conversation_id)
-    else:
-        await _responses_turn(
-            monkeypatch, project=project, scope=scope, conversation_id=conversation_id,
-            during_turn=during_turn, touched=touched,
-        )
+    """One remote turn in `project` through `producer`'s turn end."""
+    await _responses_turn(
+        monkeypatch, project=project, scope=scope, conversation_id=conversation_id,
+        during_turn=during_turn, touched=touched,
+    )
+
+
+def _listed_project(org: str, project_path: Path) -> Project:
+    """The organization's project at `project_path`, detached from its session."""
+    with Session(_engine()) as raw:
+        project = raw.get(Project, _project_id(org, project_path))
+        raw.expunge(project)
+        return project
 
 
 def _turn_end_errors(caplog, producer: str) -> list[logging.LogRecord]:
@@ -799,15 +764,12 @@ async def test_a_turn_whose_only_change_is_a_metadata_rewrite_moves_its_card_to_
         return [card["slug"] for card in client.get(listed, headers=_headers(org, ALICE)).json()]
 
     assert order() == ["third", "second", "first"]
-    _remote_turn_end(
-        monkeypatch,
+
+    await _responses_turn(
+        monkeypatch, project=_listed_project(org, path), scope=TenantScope(org_mode=True, org_id=org, user_id=ALICE),
+        conversation_id=_alices_conversation(org, path),
         during_turn=lambda: _rewrite_metadata(path / ".anton" / "artifacts" / "first", 1_000_400.0),
         touched=["first"],
-    )
-
-    await _run_turn(
-        scope=TenantScope(org_mode=True, org_id=org, user_id=ALICE),
-        conversation_id=_alices_conversation(org, path),
     )
 
     assert order() == ["first", "third", "second"]
@@ -886,10 +848,9 @@ async def test_newest_folders_that_hold_no_id_leave_the_list_on_its_rows(
         for index in range(100):
             _idless_folder(base, f"scratch-{index:03d}", 2_000_000.0 + index)
 
-    _remote_turn_end(monkeypatch, during_turn=during_turn, touched=None)
-    await _run_turn(
-        scope=TenantScope(org_mode=True, org_id=org, user_id=ALICE),
-        conversation_id=_alices_conversation(org, path),
+    await _responses_turn(
+        monkeypatch, project=_listed_project(org, path), scope=TenantScope(org_mode=True, org_id=org, user_id=ALICE),
+        conversation_id=_alices_conversation(org, path), during_turn=during_turn, touched=None,
     )
     reads = _read_in_full(monkeypatch)
 

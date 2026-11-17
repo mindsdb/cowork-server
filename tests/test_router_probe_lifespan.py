@@ -29,9 +29,7 @@ def boot(monkeypatch):
     monkeypatch.setattr(server, "_warm_agent_runtime", lambda: None)
     monkeypatch.setattr(server, "_warm_model_map_on_boot", AsyncMock(return_value=False))
     monkeypatch.setattr(server, "start_scheduler", lambda: None)
-    monkeypatch.setattr(server, "_start_channels", AsyncMock())
     monkeypatch.setattr(server, "_run_artifact_owner_backfill", AsyncMock())
-    monkeypatch.setattr("cowork.channels.ingress.start_reconciler", lambda *args: None)
 
     monkeypatch.setattr(router_probe, "run_router_startup_probe", AsyncMock())
 
@@ -77,10 +75,10 @@ async def test_probe_starts_after_bootstrap_without_blocking_and_is_drained_at_s
             await asyncio.sleep(0)
             stopped.set()
 
-    async def stop_ingress():
+    async def drain_pushes(**_kwargs):
         assert stopped.is_set()
 
-    monkeypatch.setattr(app.state.channel_ingress, "stop_all", stop_ingress)
+    monkeypatch.setattr("cowork.services.push.dispatch.drain_background_tasks", drain_pushes)
     probe_module.run_router_startup_probe.side_effect = waiting_probe
     async with asyncio.timeout(2):
         async with server.lifespan(app):

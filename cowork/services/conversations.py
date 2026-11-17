@@ -33,7 +33,6 @@ from cowork.models.project import Project
 from cowork.schemas.conversations import ConversationItemsPage
 from cowork.schemas.figure_sources import EarlierAnswer
 from cowork.schemas.responses import Role, TurnPick
-from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
 from cowork.services.task_objects import TaskObjectService
@@ -599,12 +598,10 @@ class ConversationService:
         harness: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
-        channel_type: str | None = None,
     ) -> Conversation:
         """`conversation_id` lets the caller adopt a client-allocated id —
         the composer allocates one up front so attachments can be uploaded
-        against it before the first stream creates the conversation.
-        `channel_type` is set only by the channel runtime, never from a request."""
+        against it before the first stream creates the conversation."""
         # Anchor the parent: the target project must be visible in scope —
         # otherwise org A could link a conversation to org B's project and
         # leak its name/path through serialization.
@@ -617,7 +614,6 @@ class ConversationService:
             harness=harness,
             model=model,
             reasoning_effort=reasoning_effort,
-            channel_type=channel_type,
         )
         if conversation_id is not None:
             conversation.id = conversation_id
@@ -796,16 +792,14 @@ class ConversationService:
             attachment_dirs = file_service.delete_by_purpose_for_parent_cascade(purpose)
         else:
             attachment_dirs = file_service.delete_by_purpose(purpose)
-        # Three more tables point at this conversation, and unlike the rows above
+        # Two more tables point at this conversation, and unlike the rows above
         # they are not the conversation's own data: a schedule and its runs record
-        # the conversation a run produced, and a channel binding records the one
-        # its external chat is pinned to. No foreign key in this schema declares
-        # an `ondelete`, so Postgres refuses the delete below while any of them
-        # still points here, and SQLite (desktop, and the whole test suite) runs
-        # with foreign keys off and orphans them instead. Each owning service
-        # releases its own link and keeps its rows, staged into this transaction.
+        # the conversation a run produced. No foreign key in this schema declares
+        # an `ondelete`, so Postgres refuses the delete below while either still
+        # points here, and SQLite (desktop, and the whole test suite) runs with
+        # foreign keys off and orphans them instead. The owning service releases
+        # its link and keeps its rows, staged into this transaction.
         ScheduleService(self.session).release_conversation(conversation_id)
-        ChannelBindingService(self.session).release_conversation(conversation_id)
         # anton snapshots the scratchpad namespace to
         # `<project>/.anton/scratchpad-sessions/<conversation_id>/` so variables survive
         # the pad process being replaced each turn (ENG-1124). Nothing else prunes those

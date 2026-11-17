@@ -1231,6 +1231,35 @@ async def test_a_record_that_waits_for_the_database_at_shutdowns_last_wait_names
     assert buffer.frames[-1] == "CLOSE:completed"
 
 
+async def _hold_a_share(*, scope, share: int, stall) -> list[asyncio.Task]:
+    """``share`` file store calls in ``scope``, each running and stuck until
+    ``stall`` is set, the way calls stuck on a stalled mount hold a share."""
+    import threading
+
+    from cowork.db import units
+
+    running = threading.Semaphore(0)
+
+    def stuck():
+        running.release()
+        stall.wait(timeout=30)
+
+    held = [asyncio.create_task(units.run_efs(stuck, scope=scope)) for _ in range(share)]
+    for _ in held:
+        assert await asyncio.to_thread(running.acquire, True, 5)
+    return held
+
+
+async def _until_the_turn_end_waits_for_the_share(*, scope) -> None:
+    from cowork.db import units
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while units._efs_share(scope).statistics().tasks_waiting == 0:
+        assert loop.time() < deadline, "the turn's end never waited for the share"
+        await asyncio.sleep(0.01)
+
+
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("cleanup_tmp_projects")
 @pytest.mark.parametrize(
@@ -1253,7 +1282,6 @@ async def test_a_record_whose_diff_a_stall_holds_at_shutdowns_last_wait_names_th
     from cowork.db.scoped import TenantScope
     from cowork.services import task_objects
     from test_artifact_ownership import make_conversation, make_project, project_root, write_artifact
-    from test_remote_turn import _hold_a_share, _until_the_turn_end_waits_for_the_share
 
     org_id, creator = str(uuid4()), str(uuid4())
     scope = TenantScope(org_mode=True, org_id=org_id, user_id=creator)

@@ -23,7 +23,7 @@ from cowork.principal import (
 )
 
 ORIGIN = "http://localhost:1234"
-WEBHOOK = "/api/v1/channels/slack/events"
+EXEMPT = "/api/v1/live-apps/slot/check"
 
 USER_ID = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
 ORG_ID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
@@ -52,8 +52,8 @@ def _app(org_mode: bool = True, enforce: bool = True, personal_partitions: bool 
             "roles": sorted(principal.roles),
         }
 
-    @app.post(WEBHOOK)
-    async def slack_webhook():
+    @app.post(EXEMPT)
+    async def self_checked():
         return {"ack": True}
 
     # The web UI's page shell, which a browser loads with no identity.
@@ -79,7 +79,7 @@ def _app(org_mode: bool = True, enforce: bool = True, personal_partitions: bool 
     if org_mode:
         app.add_middleware(
             TrustedHeaderMiddleware,
-            exempt_paths={WEBHOOK},
+            exempt_paths={EXEMPT},
             enforce=enforce,
             personal_partitions=personal_partitions,
         )
@@ -178,8 +178,8 @@ def test_health_is_exempt_without_identity():
     assert _client().get("/api/v1/health").status_code == 200
 
 
-def test_channel_webhook_is_exempt_without_identity():
-    assert _client().post(WEBHOOK).status_code == 200
+def test_an_exempt_path_is_exempt_without_identity():
+    assert _client().post(EXEMPT).status_code == 200
 
 
 def test_options_preflight_is_allowed_without_identity():
@@ -486,9 +486,9 @@ def test_health_is_exempt_from_organization_boundary():
     assert res.status_code == 200
 
 
-def test_channel_webhook_is_exempt_from_organization_boundary():
+def test_an_exempt_path_is_exempt_from_organization_boundary():
     res = _client().post(
-        WEBHOOK, headers=_browser_headers(OTHER_ORG_ID)
+        EXEMPT, headers=_browser_headers(OTHER_ORG_ID)
     )
 
     assert res.status_code == 200

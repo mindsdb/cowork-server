@@ -28,7 +28,6 @@ from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.models.task_object import TaskObject
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
 from cowork.services.schedules import ScheduleRunService
-from tests.test_channel_binding_delete import postgres_engine  # noqa: F401  (fixture)
 
 
 def _fk_enforced_session() -> Session:

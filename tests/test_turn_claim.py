@@ -1289,13 +1289,13 @@ async def test_the_boot_pass_stops_the_sandbox_turns_of_this_pods_claims_only(re
 
 def test_the_lifespan_releases_this_pods_claims_before_it_admits_a_turn():
     """The boot pass's own tests call it directly, so they pass with the
-    lifespan's call gone. The call has to run, and before the scheduler,
-    channels and the port start turns: a turn of this process would hold a
-    claim the pass then releases."""
+    lifespan's call gone. The call has to run, and before the scheduler and
+    the port start turns: a turn of this process would hold a claim the pass
+    then releases."""
     from cowork import server
 
     source = inspect.getsource(server.lifespan)
-    calls = ["await _release_own_turn_claims()", "start_scheduler()", "await _start_channels(app)", "        yield\n"]
+    calls = ["await _release_own_turn_claims()", "start_scheduler()", "        yield\n"]
     positions = [source.find(call) for call in calls]
     assert -1 not in positions, dict(zip(calls, positions))
     assert positions == sorted(positions), dict(zip(calls, positions))

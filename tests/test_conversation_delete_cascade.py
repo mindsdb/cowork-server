@@ -536,7 +536,7 @@ def test_delete_turn_discards_stream_buffers(session):
     assert not buf.exists(), "stale stream buffers must be discarded on turn delete"
 
 
-# ── schedule + channel references: released, not deleted ──────────────────
+# ── schedule references: released, not deleted ─────────────────────────────
 from datetime import datetime, timezone  # noqa: E402
 
 import sqlalchemy as sa  # noqa: E402
@@ -544,11 +544,9 @@ from sqlalchemy import event  # noqa: E402
 from sqlalchemy.pool import StaticPool  # noqa: E402
 from sqlmodel import SQLModel, create_engine  # noqa: E402
 
-from cowork.models.channel import ChannelBinding, ChannelSession  # noqa: E402
 from cowork.models.schedule import Schedule, ScheduleRun  # noqa: E402
 from cowork.schemas.schedules import RunStatus  # noqa: E402
 from cowork.scheduler import _apply_success_write_back  # noqa: E402
-from cowork.services.channel_bindings import ChannelBindingService  # noqa: E402
 from cowork.services.schedules import ScheduleRunService, ScheduleService  # noqa: E402
 
 _WHEN = datetime(2030, 1, 1, tzinfo=timezone.utc)
@@ -578,23 +576,6 @@ def _finished_run(session, schedule_id, conversation_id) -> ScheduleRun:
     return runs.finish_run(run.id, conversation_id=conversation_id)
 
 
-def _binding(
-    session, conversation_id, group_id, project_id=GENERAL_PROJECT_ID
-) -> ChannelBinding:
-    binding = ChannelBinding(
-        channel_type="telegram",
-        external_group_id=group_id,
-        external_thread_key="__default__",
-        anton_conversation_id=conversation_id,
-        anton_project_id=project_id,
-        trigger_rule="always",
-    )
-    session.add(binding)
-    session.commit()
-    session.refresh(binding)
-    return binding
-
-
 def _orphaned_run_count(session, schedule_id) -> int:
     """The desktop-side check from the ticket's walkthrough: SQLite will not
     raise on its own, so a left join is the only thing that catches an orphan.
@@ -613,26 +594,17 @@ def _orphaned_run_count(session, schedule_id) -> int:
     )
 
 
-def test_delete_conversation_releases_its_schedule_and_binding(session):
-    """The three references nothing else clears. On Postgres leaving any of them
-    is a ForeignKeyViolation that 500s the delete; on SQLite it is a silent
-    orphan. Either way the rows themselves must survive: a run is audit history,
-    and a binding is a live external chat."""
+def test_delete_conversation_releases_its_schedule(session):
+    """The two references nothing else clears. On Postgres leaving either of
+    them is a ForeignKeyViolation that 500s the delete; on SQLite it is a
+    silent orphan. Either way the rows themselves must survive: a run is audit
+    history."""
     svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     conv = svc.create_conversation("scheduled run", project_id=GENERAL_PROJECT_ID)
     schedule = _schedule(session)
     run = _finished_run(session, schedule.id, conv.id)
     schedule.last_result_conversation_id = conv.id
     session.add(schedule)
-    session.commit()
-    binding = _binding(session, conv.id, "release-on-delete-test")
-    session.add(
-        ChannelSession(
-            binding_id=binding.id,
-            external_session_key="k",
-            anton_session_id=str(conv.id),
-        )
-    )
     session.commit()
     run_status, run_duration = run.status, run.duration_ms
     assert run_duration is not None, "precondition: the run recorded a duration"
@@ -651,24 +623,8 @@ def test_delete_conversation_releases_its_schedule_and_binding(session):
         kept_schedule = session.get(Schedule, schedule.id)
         assert kept_schedule is not None and kept_schedule.enabled is True
         assert kept_schedule.last_result_conversation_id is None
-        # So does the binding, so the external chat stays bound to its project.
-        kept_binding = session.get(ChannelBinding, binding.id)
-        assert kept_binding is not None
-        assert kept_binding.anton_conversation_id is None
-        assert kept_binding.anton_project_id == GENERAL_PROJECT_ID
-        # Its session rows go with the pointer, as in every other detach.
-        # anton_session_id would otherwise name a conversation that is gone.
-        assert (
-            session.exec(
-                select(ChannelSession).where(ChannelSession.binding_id == binding.id)
-            ).all()
-            == []
-        )
         assert _orphaned_run_count(session, schedule.id) == 0
     finally:
-        row = session.get(ChannelBinding, binding.id)
-        if row is not None:
-            ChannelBindingService(ScopedSession(session, LOCAL_SCOPE)).delete(row.id)
         ScheduleService(ScopedSession(session, LOCAL_SCOPE)).delete_schedule(
             schedule.id
         )
@@ -752,7 +708,6 @@ def test_delete_conversation_does_not_violate_a_foreign_key(tmp_path):
         schedule.last_result_conversation_id = conv.id
         s.add(schedule)
         s.commit()
-        binding = _binding(s, conv.id, "fk-group", project_id=project.id)
 
         assert ConversationService(scoped).delete_conversation(conv.id) is True
 
@@ -760,7 +715,6 @@ def test_delete_conversation_does_not_violate_a_foreign_key(tmp_path):
         assert s.get(Conversation, conv.id) is None
         assert s.get(ScheduleRun, run.id).conversation_id is None
         assert s.get(Schedule, schedule.id).last_result_conversation_id is None
-        assert s.get(ChannelBinding, binding.id).anton_conversation_id is None
 
 
 def test_finishing_a_run_whose_conversation_was_deleted_mid_flight(tmp_path):
