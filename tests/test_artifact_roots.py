@@ -346,7 +346,8 @@ def test_listing_shows_project_base_artifacts_to_every_member_and_keeps_legacy_o
             scoped = ScopedSession(
                 caller_session, TenantScope(org_mode=True, org_id=ORG_A, user_id=user_id)
             )
-            return {c["slug"] for c in list_artifacts(artifacts_sources_for_project(scoped, project_id))}
+            cards = [card.to_json() for card in list_artifacts(artifacts_sources_for_project(scoped, project_id))]
+            return {c["slug"] for c in cards}
 
     assert _slugs_for(USER_A) == {"legacy-report", "shared-report"}
     assert _slugs_for(USER_A2) == {"shared-report"}

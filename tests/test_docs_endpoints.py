@@ -286,6 +286,7 @@ def test_a_reviewer_reads_the_doc_without_the_owners_card(monkeypatch, tmp_path,
 
     from cowork.api.v1.endpoints import docs
     from cowork.docs.service import create_doc
+    from cowork.services.artifact_metadata import ArtifactMetadata
 
     folder = create_doc(tmp_path, title="Plan", markdown="Hi.").folder
     reviewer = {"role": "reviewer", "canPreview": True, "canComment": True, "canEdit": False,
@@ -295,7 +296,7 @@ def test_a_reviewer_reads_the_doc_without_the_owners_card(monkeypatch, tmp_path,
         return capabilities
 
     async def resolved(*_a, **_kw):
-        return SimpleNamespace(), folder, {}, False
+        return SimpleNamespace(), folder, ArtifactMetadata(), False
 
     monkeypatch.setattr(docs, "_resolve", resolved)
     monkeypatch.setattr(docs, "artifact_capabilities", lambda *a: reviewer)

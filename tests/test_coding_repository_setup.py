@@ -6,7 +6,7 @@ import sys
 import pytest
 from pydantic import ValidationError
 
-from coding_service_fakes import CREDS, FakeEngine, service_with, wait_for_status, wait_for_workspace
+from tests.support.coding.service_fakes import CREDS, FakeEngine, service_with, wait_for_status, wait_for_workspace
 from test_coding_projects import git, repository
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus
 from cowork.coding.control_models import TaskResourceScope
@@ -152,7 +152,7 @@ def test_conflicting_local_changes_fail_without_touching_either_checkout(tmp_pat
     manager = WorkspaceManager(tmp_path / "runtime")
     index = (repo / ".git/index").read_bytes()
     with pytest.raises(WorkspaceError, match="conflict"):
-        manager.prepare("task", str(repo), True, "old", include_local_changes=True)
+        manager.prepare("task", str(repo), "old", include_local_changes=True)
     assert (repo / "README.md").read_text() == "my work\n"
     assert (repo / ".git/index").read_bytes() == index
     assert not (manager.worktrees_root / "task").exists()
@@ -213,7 +213,7 @@ def test_oversized_changes_fail_without_altering_source_or_leaking_worktree(
     index = (repo / ".git/index").read_bytes()
     monkeypatch.setattr("cowork.coding.workspace.MAX_TOTAL_DIFF_BYTES", 8)
     with pytest.raises(WorkspaceError, match="too large"):
-        manager.prepare("task", str(repo), True, include_local_changes=True)
+        manager.prepare("task", str(repo), include_local_changes=True)
     assert (repo / ".git/index").read_bytes() == index
     assert (repo / "large.txt").read_text() == "a large patch"
     assert not (manager.worktrees_root / "task").exists()
@@ -275,16 +275,16 @@ def test_copy_keeps_temporary_blobs_out_of_source_objects(tmp_path, monkeypatch,
     if reject_patch:
         monkeypatch.setattr("cowork.coding.workspace.MAX_TOTAL_DIFF_BYTES", 8)
         with pytest.raises(WorkspaceError, match="too large"):
-            manager.prepare("task", str(source), True, include_local_changes=True)
+            manager.prepare("task", str(source), include_local_changes=True)
     else:
-        prepared = manager.prepare("task", str(source), True, include_local_changes=True)
+        prepared = manager.prepare("task", str(source), include_local_changes=True)
         assert (prepared.workspace_path / "new.bin").read_bytes() == (source / "new.bin").read_bytes()
         assert (prepared.workspace_path / "README.md").read_text() == "modified working file\n"
     after = {str(path.relative_to(objects)): path.read_bytes() for path in objects.rglob("*") if path.is_file()}
     assert after == before
 
 
-def test_local_folders_are_copied_and_cannot_receive_branch_overrides(tmp_path):
+def test_local_folders_are_never_copied_and_cannot_receive_branch_overrides(tmp_path):
     folder = tmp_path / "notes"
     folder.mkdir()
     (folder / "note.md").write_text("original")
@@ -301,10 +301,11 @@ def test_local_folders_are_copied_and_cannot_receive_branch_overrides(tmp_path):
         task_project(
             project, TaskRepositorySetup(base_branches={"notes": "main"}), None
         )
-    prepared = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "runtime")).prepare(
-        "task", project, TaskRepositorySetup()
-    )
-    (Path(prepared.primary.workspace_path) / "note.md").write_text("task")
+    # A worktree needs Git, and the folder is never copied instead.
+    with pytest.raises(WorkspaceError, match="Notes: This folder isn't a Git repository"):
+        ProjectWorkspaceManager(WorkspaceManager(tmp_path / "runtime")).prepare(
+            "task", project, TaskRepositorySetup()
+        )
     assert (folder / "note.md").read_text() == "original"
 
 
@@ -332,7 +333,7 @@ def test_copy_preserves_worktree_representation_of_filtered_files(tmp_path, trac
     path.write_text("WORKTREE:new\n")
     index = (repo / ".git/index").read_bytes()
     prepared = WorkspaceManager(tmp_path / "runtime").prepare(
-        "task", str(repo), True, include_local_changes=True,
+        "task", str(repo), include_local_changes=True,
     )
     assert (prepared.workspace_path / path.name).read_bytes() == path.read_bytes()
     assert (repo / ".git/index").read_bytes() == index
@@ -345,7 +346,7 @@ def test_copy_rejects_untracked_embedded_repositories_without_losing_files(tmp_p
     index = (repo / ".git/index").read_bytes()
     manager = WorkspaceManager(tmp_path / "runtime")
     with pytest.raises(WorkspaceError, match="embedded repositor"):
-        manager.prepare("task", str(repo), True, include_local_changes=True)
+        manager.prepare("task", str(repo), include_local_changes=True)
     assert (repo / ".git/index").read_bytes() == index
     assert (nested / "README.md").read_text() == "nested\n"
     assert (nested / "untracked.txt").read_text() == "keep this too"
@@ -546,10 +547,9 @@ def test_empty_repository_never_silently_ignores_branch_or_exclude_choice(tmp_pa
     ):
         with pytest.raises(WorkspaceError, match="no commits"):
             manager.prepare("task", project_for(repo), options)
-    prepared = manager.prepare(
-        "task", project_for(repo), TaskRepositorySetup(include_local_changes=True)
-    )
-    assert Path(prepared.primary.workspace_path, "uncommitted.txt").read_text() == "new"
+    # A worktree needs a commit, so even without branch choices nothing is copied.
+    with pytest.raises(WorkspaceError, match="Make a first commit"):
+        manager.prepare("task", project_for(repo), TaskRepositorySetup(include_local_changes=True))
 
 
 def test_failure_after_preparation_removes_only_the_new_unmodified_branch(
