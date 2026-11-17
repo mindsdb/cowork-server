@@ -771,7 +771,7 @@ class TurnQueueSettings(Settings):
     @property
     def needs_turn_key_id(self) -> bool:
         """Whether a turn key's public prefix is minted, which auth binds turn grants to."""
-        return self.datasource_enabled or self.connector_drafts_enabled
+        return self.datasource_enabled or self.custom_api_enabled
 
     redis_url: str = Field(
         default="redis://localhost:6379/0",
@@ -944,10 +944,18 @@ class TurnQueueSettings(Settings):
         default=False,
         description=(
             "Let cloud turns build custom connector templates a member saves "
-            "from a card, connects and uses on their turns. The code default is false; "
+            "from a card and connects. The code default is false; "
             "the Helm chart turns it on in every environment (connectorDraftsEnabled)."
         ),
     )  # COWORK_TURN_CONNECTOR_DRAFTS_ENABLED
+    custom_api_enabled: bool = Field(
+        default=False,
+        description=(
+            "Give a member's org-mode cloud turns the custom API connections they "
+            "connected. Keep false until auth, the inference gateway and the pod's "
+            "anton that serve those connections are deployed."
+        ),
+    )  # COWORK_TURN_CUSTOM_API_ENABLED
     custom_connect_refused_domains: list[str] = Field(
         default=[
             "mindshub.ai", "mindshub.co", "mindsdb.com", "mindsdb.cloud", "mindscloud.ai",

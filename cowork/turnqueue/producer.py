@@ -663,15 +663,13 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
 
 
 
-def _custom_api_connection_refs(connections: list[dict], disabled: list[dict] | None) -> list[dict]:
+def _custom_api_connection_refs(connections: list[dict], disabled: list[dict] | None) -> list[dict] | None:
     """The custom API connections auth listed, minus the conversation's disabled ones.
 
-    A listing that contradicts itself (not verified, malformed, repeated, or a connector id or name
-    the pod would refuse) fails the turn, as the datasource listing does. Past
-    MAX_CUSTOM_API_CONNECTIONS, the lowest ids are kept.
-
-    Raises:
-        ProductPermissionUnavailable: the listing is malformed.
+    None, logged, when the listing contradicts itself (not verified, malformed,
+    repeated, or a connector id or name the pod would refuse): the turn then
+    runs without custom connections, as it does when auth cannot list them.
+    Past MAX_CUSTOM_API_CONNECTIONS, the lowest ids are kept.
     """
     disabled_keys = {
         (entry.get("engine"), entry.get("name")) for entry in (disabled or []) if isinstance(entry, dict)
@@ -680,7 +678,8 @@ def _custom_api_connection_refs(connections: list[dict], disabled: list[dict] | 
     seen: set[int] = set()
     for connection in connections:
         if not isinstance(connection, dict):
-            raise _refuse_custom_api("listing carries a connection that is not an object")
+            logger.warning("[producer] custom API connections left out: the listing carries a non-object")
+            return None
         connection_id = connection.get("id")
         if (
             not is_custom_connector_id(connection.get("connector_id"))
@@ -691,7 +690,9 @@ def _custom_api_connection_refs(connections: list[dict], disabled: list[dict] | 
             or connection_id < 1
             or connection_id in seen
         ):
-            raise _refuse_custom_api("listing carries a malformed or repeated connection")
+            logger.warning("[producer] custom API connections left out: the listing carries a malformed "
+                           "or repeated connection")
+            return None
         seen.add(connection_id)
         if (connection["connector_id"], connection["name"]) in disabled_keys:
             continue
@@ -717,21 +718,20 @@ async def _mint_custom_api_block(*, scope: TenantScope, correlation_id: str, tur
 
     None, logged, when the turn cannot carry them: outside org mode, the
     setting off, no turn key prefix (a channel turn), no producer key, a
-    listing that failed, or a grant call auth refused. The turn then runs
-    without custom connections. Only an answer that contradicts this turn
-    fails it.
+    listing that failed or contradicts itself, or a grant call auth refused.
+    The turn then runs without custom connections. Only a grant answer that
+    contradicts this turn fails it.
 
     Returns:
         ``{"connections": [{connection_id, connector_id, name, credential_version}]}``;
         the caller adds ``protocol_version``. Versions are the grants', not the listing's.
 
     Raises:
-        ProductPermissionUnavailable: the listing is malformed, or the grant
-            answer names another member, organization, key, correlation,
-            scope or connection set.
+        ProductPermissionUnavailable: the grant answer names another member,
+            organization, key, correlation, scope or connection set.
     """
     org_id, user_id = scope.org_id, scope.user_id
-    if not settings.connector_drafts_enabled or not scope.org_mode or not org_id or not user_id:
+    if not settings.custom_api_enabled or not scope.org_mode or not org_id or not user_id:
         return None
     if not isinstance(turn_key_id, str) or not turn_key_id.strip():
         logger.info("[producer] custom API connections left out: the turn has no turn key prefix")
@@ -1227,17 +1227,26 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                 llm_block, turn_key_id = llm_result
             else:
                 llm_block = llm_result
-        datasource_block = await _mint_datasource_block(
-            org_id=org_id,
-            user_id=user_id,
-            correlation_id=corr,
-            turn_key_id=turn_key_id,
-            disabled=disabled,
-            settings=settings,
+        # Independent auth round trips, run together so custom connections add
+        # no turn start time. Both run to the end; the datasource failure wins.
+        datasource_result, custom_api_result = await asyncio.gather(
+            _mint_datasource_block(
+                org_id=org_id,
+                user_id=user_id,
+                correlation_id=corr,
+                turn_key_id=turn_key_id,
+                disabled=disabled,
+                settings=settings,
+            ),
+            _mint_custom_api_block(
+                scope=scope, correlation_id=corr, turn_key_id=turn_key_id, disabled=disabled, settings=settings,
+            ),
+            return_exceptions=True,
         )
-        custom_api_connections = await _mint_custom_api_block(
-            scope=scope, correlation_id=corr, turn_key_id=turn_key_id, disabled=disabled, settings=settings,
-        )
+        for result in (datasource_result, custom_api_result):
+            if isinstance(result, BaseException):
+                raise result
+        datasource_block, custom_api_connections = datasource_result, custom_api_result
     except product_permissions.ProductPermissionUnavailable:
         logger.warning(
             "[producer] turn setup unavailable conversation=%s correlation_id=%s", conversation_id, corr,
