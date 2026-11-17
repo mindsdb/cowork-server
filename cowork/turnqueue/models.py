@@ -32,6 +32,9 @@ _OPTIONAL_REF_KEYS = frozenset({"label", "engine"})
 #: Auth's cap on a connection's name.
 _MAX_CONNECTION_LABEL_CHARS = 128
 _CONNECTION_ENGINE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,31}")
+#: Anton's `cloud_turn/contract.py` holds the same custom connector id rule and
+#: drops the whole block when one reference breaks it.
+_CUSTOM_CONNECTOR_ID_PATTERN = re.compile(r"[a-z][a-z0-9_]{1,40}")
 
 #: The ``turn_completed`` key that names the artifact folders the turn's tools
 #: touched. anton holds the same name as ``ARTIFACTS_TOUCHED_KEY`` in
@@ -117,10 +120,8 @@ def _validate_custom_api_block(value: object) -> None:
         if (
             not _is_positive_int(connection_id)
             or not _is_positive_int(connection["credential_version"])
-            or not isinstance(connection["connector_id"], str)
-            or not connection["connector_id"]
-            or not isinstance(connection["name"], str)
-            or not connection["name"]
+            or not is_custom_connector_id(connection["connector_id"])
+            or not is_connection_label(connection["name"])
             or connection_id in seen
         ):
             raise ValueError("custom_api connection reference is invalid")
@@ -130,6 +131,11 @@ def _validate_custom_api_block(value: object) -> None:
 def is_connection_label(value: object) -> bool:
     """Whether ``value`` has the shape of a connection name the producer sends: a non-empty string within auth's cap."""
     return isinstance(value, str) and 0 < len(value) <= _MAX_CONNECTION_LABEL_CHARS
+
+
+def is_custom_connector_id(value: object) -> bool:
+    """Whether ``value`` is a custom connector id the pod accepts; ``fullmatch``, so a trailing newline fails."""
+    return isinstance(value, str) and _CUSTOM_CONNECTOR_ID_PATTERN.fullmatch(value) is not None
 
 
 def is_connection_engine(value: object) -> bool:

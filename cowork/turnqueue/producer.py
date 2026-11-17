@@ -58,6 +58,7 @@ from cowork.turnqueue.models import (
     TurnReplyHeader,
     is_connection_engine,
     is_connection_label,
+    is_custom_connector_id,
 )
 from cowork.streaming.cancellation import stop_controller_turn
 from cowork.streaming.liveness import WORKER_ALIVE_PHASE
@@ -652,8 +653,8 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
 def _custom_api_connection_refs(connections: list[dict], disabled: list[dict] | None) -> list[dict]:
     """The custom API connections auth listed, minus the conversation's disabled ones.
 
-    A listing that contradicts itself (not verified, malformed, repeated)
-    fails the turn, as the datasource listing does. Past
+    A listing that contradicts itself (not verified, malformed, repeated, or a connector id or name
+    the pod would refuse) fails the turn, as the datasource listing does. Past
     MAX_CUSTOM_API_CONNECTIONS, the lowest ids are kept.
 
     Raises:
@@ -669,10 +670,8 @@ def _custom_api_connection_refs(connections: list[dict], disabled: list[dict] | 
             raise _refuse_custom_api("listing carries a connection that is not an object")
         connection_id = connection.get("id")
         if (
-            not isinstance(connection.get("connector_id"), str)
-            or not connection["connector_id"]
-            or not isinstance(connection.get("name"), str)
-            or not connection["name"]
+            not is_custom_connector_id(connection.get("connector_id"))
+            or not is_connection_label(connection.get("name"))
             or connection.get("status") != "verified"
             or isinstance(connection_id, bool)
             or not isinstance(connection_id, int)
@@ -711,7 +710,7 @@ async def _mint_custom_api_block(*, scope: TenantScope, correlation_id: str, tur
 
     Returns:
         ``{"connections": [{connection_id, connector_id, name, credential_version}]}``;
-        the caller adds the turn key. Versions are the grants', not the listing's.
+        the caller adds ``protocol_version``. Versions are the grants', not the listing's.
 
     Raises:
         ProductPermissionUnavailable: the listing is malformed, or the grant

@@ -2,7 +2,9 @@ import json
 from pathlib import Path
 
 import pytest
+from anton.cloud_turn import contract
 
+from cowork.turnqueue import models
 from cowork.turnqueue.models import TurnJob, TurnReply
 
 
@@ -206,11 +208,15 @@ def test_turn_job_carries_a_custom_api_block():
         {"protocol_version": 1, "connections": [{**_CUSTOM_REF, "connector_id": 5}]},
         {"protocol_version": 1, "connections": [{**_CUSTOM_REF, "api_key": "s"}]},
         {"protocol_version": 1, "connections": [_CUSTOM_REF, _CUSTOM_REF]},
+        {"protocol_version": 1, "connections": [{**_CUSTOM_REF, "connector_id": "Bad-One"}]},
+        {"protocol_version": 1, "connections": [{**_CUSTOM_REF, "connector_id": "a" * 42}]},
+        {"protocol_version": 1, "connections": [{**_CUSTOM_REF, "connector_id": "acme-crm"}]},
+        {"protocol_version": 1, "connections": [{**_CUSTOM_REF, "name": "n" * 129}]},
     ],
     ids=["not_an_object", "no_version", "turn_key_still_sent", "other_version", "bool_version",
          "text_version", "extra_field", "empty", "over_the_cap",
          "bool_id", "zero_version", "empty_name", "non_text_connector", "secret_bearing_reference",
-         "duplicate_id"],
+         "duplicate_id", "uppercase_and_dash_id", "id_too_long", "dashed_id", "name_too_long"],
 )
 def test_turn_job_refuses_a_malformed_custom_api_block_before_it_is_queued(custom_api):
     from pydantic import ValidationError
@@ -218,3 +224,8 @@ def test_turn_job_refuses_a_malformed_custom_api_block_before_it_is_queued(custo
     with pytest.raises(ValidationError):
         TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
                 reply_stream="scratchpad:reply:c", params={"input": "hi", "custom_api": custom_api})
+
+
+def test_the_custom_reference_rules_match_the_pods():
+    assert models._CUSTOM_CONNECTOR_ID_PATTERN.pattern == contract._CUSTOM_CONNECTOR_ID.pattern
+    assert models._MAX_CONNECTION_LABEL_CHARS == contract._CUSTOM_NAME_MAX
