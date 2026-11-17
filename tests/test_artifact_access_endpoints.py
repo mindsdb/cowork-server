@@ -93,10 +93,15 @@ def publish_calls(monkeypatch):
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url,
                      password=None, access=None, scope=None, project_id=None,
-                     notify=None, stored=None, owner_save=False, notices=None):
+                     notify=None, stored=None, owner_save=False, notices=None, job_budget_s=None,
+                     on_job_accepted=None):
         # publish_artifact takes the model; what it hands anton is its
         # publisher_access.
         assert isinstance(access, ArtifactAccessRequest)
+        # The thread outlives the route's wait, so its job poll must end
+        # before the live-publish lock does.
+        assert job_budget_s is not None and job_budget_s > 0
+        assert on_job_accepted is not None
         calls.append({
             "folder": artifact, "artifacts_base": artifacts_base, "api_key": api_key,
             "publish_url": publish_url, "access": access.publisher_access(), "scope": scope,

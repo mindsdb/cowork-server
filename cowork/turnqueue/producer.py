@@ -1233,6 +1233,16 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         yield "turn_failed", _setup_permission_failure()
         return
 
+    # The user's image model, resolved against what the wallet can pay for, rides
+    # on whichever block reaches the pod: Anton reads `llm["image_model"]` and,
+    # without it, falls back to the catalog's default image model. None until the
+    # cached catalog lists an image model (image_model_for_agent), so a MindsHub
+    # that has not published its image models yet is not handed one it cannot
+    # serve.
+    image_model = getattr(user_settings, "image_model_for_agent", None)
+    if image_model and "image_model" not in llm_block:
+        llm_block = {**llm_block, "image_model": image_model}
+
     # anton fetches connector tokens with the connector key when the turn has
     # an MCP connection, else with the turn key llm_block already carries. The
     # connector key goes only here, never into llm_block or the scratchpad.

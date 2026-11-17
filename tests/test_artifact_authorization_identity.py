@@ -1015,7 +1015,7 @@ async def test_an_autopublish_never_publishes_over_a_restricted_rule_after_an_ag
     with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
         published = await ap._publish_one(
             folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-            ap._access_for(decision), project_id=str(project.id),
+            ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
         )
 
     assert published is False
@@ -1049,7 +1049,7 @@ async def test_an_autopublish_with_the_metadata_removed_and_the_entry_key_blanke
     with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
         published = await ap._publish_one(
             folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-            ap._access_for(decision), project_id=str(project.id),
+            ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
         )
 
     assert published is False
@@ -1485,7 +1485,7 @@ async def test_a_page_in_a_subfolder_its_owner_made_public_keeps_syncing(
             decision = ap.PublishDecision("changed", published_entry=entry)
             saved = await ap._publish_one(
                 folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-                ap._access_for(decision), project_id=str(project.id),
+                ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
             )
 
     assert saved is True, [record.reason for record in _mode_changed_records(caplog)]
@@ -1614,7 +1614,7 @@ async def _autopublish_once(folder, scope, project):
     decision = ap.PublishDecision("changed", published_entry=_entry(folder))
     return await ap._publish_one(
         folder.parent, folder.name, "key", "https://view.test", 30.0, scope,
-        ap._access_for(decision), project_id=str(project.id),
+        ap._access_for(decision), project_id=str(project.id), job_budget_s=30.0,
     )
 
 

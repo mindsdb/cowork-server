@@ -22,6 +22,7 @@ from cowork.coding.contracts import (
     InputReference,
     SessionCreateRequest,
     SessionStatus,
+    WorkspaceMode,
 )
 from cowork.coding.control_models import RunStatus
 from cowork.coding.project_models import (
@@ -135,6 +136,7 @@ def test_a_task_whose_workspace_cannot_be_prepared_stays_visible_as_failed(
         raise RuntimeError("disk is full")
 
     monkeypatch.setattr(service.session_factory.workspaces, "prepare", fail)
+    monkeypatch.setattr(service.session_factory.workspaces, "prepare_in_place", fail)
     started, release = hold_preparation(monkeypatch, service)
 
     created = create(service, repo)
@@ -202,20 +204,21 @@ def test_invalid_attachments_are_rejected_before_the_task_is_created(tmp_path: P
 
 
 @pytest.mark.parametrize(
-    ("folder", "allow_direct_folder", "message"),
+    ("folder", "mode", "message"),
     [
-        ("missing", True, "Choose an existing local folder"),
-        ("plain", False, "Local folder isolation was not enabled"),
+        ("missing", None, "Choose an existing local folder"),
+        ("missing", WorkspaceMode.worktree, "Choose an existing local folder"),
+        ("plain", WorkspaceMode.worktree, "Initialize Git to use a Worktree"),
     ],
 )
 def test_a_folder_preparation_would_refuse_is_rejected_before_the_task_is_created(
-    folder: str, allow_direct_folder: bool, message: str, tmp_path: Path
+    folder: str, mode: WorkspaceMode | None, message: str, tmp_path: Path
 ) -> None:
     (tmp_path / "plain").mkdir()
     service = service_with(tmp_path, FakeEngine())
     with pytest.raises(WorkspaceError, match=message):
         service.create_session(
-            SessionCreateRequest(path=str(tmp_path / folder), prompt="Go", allow_direct_folder=allow_direct_folder),
+            SessionCreateRequest(path=str(tmp_path / folder), prompt="Go", workspace_mode=mode),
             CREDS,
             "fake",
             "fake-model",
@@ -315,7 +318,7 @@ def test_setup_commands_report_progress_while_they_run(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(project_workspaces.ProjectCommandRunner, "_run_one", staticmethod(slow))
     created = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Build it"), CREDS, "fake", "fake-model"
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Build it"), CREDS, "fake", "fake-model"
     )
     assert running.wait(timeout=3)
 
@@ -393,6 +396,7 @@ def test_deleting_a_task_before_its_first_turn_rolls_back_its_new_branch(
     monkeypatch.setattr(service.session_factory, "complete", held)
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             prompt="Build it",
             repository_setup=TaskRepositorySetup(branch="feat/aborted"),
