@@ -43,6 +43,7 @@ from cowork.harnesses.anton_harness.figure_sources import (
 )
 from cowork.schemas.figure_sources import EarlierAnswer
 from tests._hubspot_records import HUBSPOT_DEALS, SEARCH_DEALS
+from tests._linear_time import MAX_LINEAR_GROWTH, growth
 
 # The current code reads each timed input in about a second or less on a
 # laptop under coverage, so a CI runner several times slower still passes; the
@@ -3478,14 +3479,28 @@ class TestManyHolders:
         assert MAX_FIGURE_SOURCES == 3
         assert [s.tool_use_id for s in _figure(sources, "250").sources] == ["toolu_0", "toolu_2", "toolu_4"]
 
-    def test_a_large_turn_names_every_holding_step_quickly(self, monkeypatch):
-        printed: list[set[int]] = []
-        steps = []
-        for i in range(25):
-            values = [(i * 37 + k * 11) % 2_000 for k in range(800)]
-            printed.append(set(values))
-            steps.append(_cell(f"toolu_{i}", code="print(rows)", stdout="\n".join(f"{v}, {v}.25" for v in values)))
-        answer = "Values: " + ", ".join(str(v) for v in range(0, 2_000, 5)) + "."
+    def test_a_large_turn_names_every_holding_step_in_linear_time(self, monkeypatch):
+        def turn(scale: int) -> tuple[str, list[TurnStep], list[set[int]]]:
+            # Figures and values per step both grow with ``scale``, so a scan
+            # of every value per figure grows with its square. Every integer
+            # is a figure so that scan outweighs reading the output.
+            printed: list[set[int]] = []
+            steps = []
+            for i in range(25):
+                values = [(i * 37 + k * 11) % (200 * scale) for k in range(80 * scale)]
+                printed.append(set(values))
+                steps.append(_cell(f"toolu_{i}", code="print(rows)", stdout="\n".join(f"{v}, {v}.25" for v in values)))
+            answer = "Values: " + ", ".join(str(v) for v in range(0, 200 * scale)) + "."
+            return answer, steps, printed
+
+        def run(given: tuple[str, list[TurnStep], list[set[int]]]) -> FigureSources:
+            return find_figure_sources(answer=given[0], question="", steps=given[1])
+
+        large = turn(10)
+        measured = growth(run, small=turn(1), large=large)
+        printed = large[2]
+
+        assert measured.ratio < MAX_LINEAR_GROWTH
         compared = 0
         same_value = figure_sources_mod._same_value
 
@@ -3495,15 +3510,13 @@ class TestManyHolders:
             return same_value(*args, **kwargs)
 
         monkeypatch.setattr(figure_sources_mod, "_same_value", counted)
-        start = time.perf_counter()
 
-        sources = find_figure_sources(answer=answer, question="", steps=steps)
+        sources = run(large)
 
-        # A scan of every output value per figure and step compares 400 x 25 x
-        # 1,600 times; the sorted index compares none.
-        assert compared < 400 * 25
-        assert time.perf_counter() - start < TIME_BOUND_SECONDS
-        assert len(sources.figures) == 400
+        # A scan of every output value per figure and step compares 2,000 x 25
+        # x 1,600 times; the sorted index compares none.
+        assert compared < 2_000 * 25
+        assert len(sources.figures) == 2_000
         for figure in sources.figures:
             holders = [f"toolu_{i}" for i, values in enumerate(printed) if int(figure.text) in values]
             assert [s.tool_use_id for s in figure.sources] == holders[:MAX_FIGURE_SOURCES]
