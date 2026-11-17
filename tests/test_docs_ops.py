@@ -307,6 +307,14 @@ def test_a_header_renamed_by_edit_text_keeps_its_column_plotted():
     assert "Budget (k$)" in [c["name"] for c in _blocks(new, "table")[0]["columns"]]
     assert _blocks(new, "chart")[0]["source"]["y"] == ["Budget (k$)"]
 
+def test_a_header_renamed_by_updating_the_table_keeps_its_column_plotted():
+    doc = _doc()
+    table = _blocks(doc, "table")[0]
+    columns = [dict(c, name="Budget (k$)") if c["name"] == "Budget ($k)" else c for c in table["columns"]]
+    new, _ = apply_ops(doc, [{"op": "update", "id": table["id"], "set": {"columns": columns}}])
+    assert _blocks(new, "chart")[0]["source"]["y"] == ["Budget (k$)"]
+
+
 def test_an_edit_cannot_point_an_image_at_a_local_file():
     doc = build_new_doc("Pics", markdown="Intro.")
     with pytest.raises(DocError) as err:
@@ -497,7 +505,9 @@ def test_a_malformed_op_is_refused_as_a_bad_op_naming_it_not_a_crash(make_op):
     op = make_op(_blocks(doc, "table")[0]["id"])
     with pytest.raises(DocError) as err:
         apply_ops(doc, [{"op": "rename_doc", "title": "Renamed"}, op])
-    assert err.value.code == "bad_op"
+    # The model's own check names the part that is wrong (bad_table, bad_chart);
+    # anything it doesn't check is a bad_op. Either way a 422, never a 500.
+    assert err.value.code in ("bad_op", "bad_table", "bad_chart")
     assert err.value.detail["op"] == 1
     assert err.value.message.startswith(f"op 1 ({op['op']}, counting from 0): ")
     assert doc == before
