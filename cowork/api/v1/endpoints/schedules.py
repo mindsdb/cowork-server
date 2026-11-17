@@ -16,7 +16,7 @@ from cowork.schemas.schedules import (
     ScheduleRunResponse,
     ScheduleUpdateRequest,
 )
-from cowork.services.schedules import ScheduleConflict, ScheduleRunService, ScheduleService
+from cowork.services.schedules import InvalidSchedule, ScheduleConflict, ScheduleRunService, ScheduleService
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,7 @@ def _create_schedule(scoped: ScopedSession, *, body: ScheduleCreateRequest) -> S
             title=body.title,
             prompt=body.prompt,
             cadence=body.cadence,
+            recurrence=body.recurrence.stored() if body.recurrence else None,
             next_run_at=body.next_run_at,
             model=body.model or DEFAULT_MODEL_SENTINEL,
             timezone=body.timezone,
@@ -96,6 +97,8 @@ def update_schedule(schedule_id: UUID, body: ScheduleUpdateRequest, scoped: Scop
         changes["project_id"] = None
     try:
         schedule = ScheduleService(scoped).update_schedule(schedule_id, **changes)
+    except InvalidSchedule as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(e))
     except ScheduleConflict as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:

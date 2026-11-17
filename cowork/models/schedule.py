@@ -12,7 +12,16 @@ class Schedule(BaseSQLModel, table=True):
 
     title: str = Field(description="Display name for the schedule")
     prompt: str = Field(description="The prompt to run on each execution")
-    cadence: str = Field(description="Execution cadence: once | every_15_minutes | every_30_minutes | hourly | daily | weekdays | weekly")
+    cadence: str = Field(description="Execution cadence: once | every_15_minutes | every_30_minutes | hourly | daily | weekdays | weekly | monthly")
+    recurrence: dict | None = Field(
+        default=None,
+        sa_type=sa.JSON,  # type: ignore
+        description=(
+            "Weekly or monthly days to run on: {days: [mon..sun]}, {month_day: 1-31} "
+            "or {week: 1-4|-1, weekday: mon..sun}. NULL on other cadences, and on "
+            "a weekly task that runs on its next run's weekday"
+        ),
+    )
     timezone: str = Field(default="UTC", description="IANA timezone name")
     next_run_at: datetime = Field(
         sa_type=sa.DateTime(timezone=True),  # type: ignore
