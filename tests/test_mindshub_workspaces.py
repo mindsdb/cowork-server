@@ -933,4 +933,5 @@ def test_the_mindshub_routes_are_listed_under_mindshubs_name():
         "/api/v1/hub/teams/": ["mindshub-teams"],
         "/api/v1/hub/people/": ["mindshub-people"],
         "/api/v1/hub/org-icons": ["mindshub-org-icons"],
+        "/api/v1/hub/deletion-request/": ["mindshub-account-deletion"],
     }
