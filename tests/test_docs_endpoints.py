@@ -257,6 +257,7 @@ def test_a_shared_doc_republishes_itself_after_edits_settle(client, doc, monkeyp
 
     calls = []
     monkeypatch.setattr(republish, "update_artifact", lambda path, *, scope: calls.append(path) or {})
+    monkeypatch.setattr(republish, "desktop_publish_credential", lambda: ("key", "https://publish.test"))
     monkeypatch.setattr(republish._republishes, "delay", 0.2)
 
     page = Path(client.get(_url(doc)).json()["card"]["htmlPath"])
@@ -289,6 +290,7 @@ def test_a_republish_waiting_when_sharing_stops_does_not_put_the_page_back(tmp_p
 
     calls = []
     monkeypatch.setattr(republish, "update_artifact", lambda path, *, scope: calls.append(path) or {})
+    monkeypatch.setattr(republish, "desktop_publish_credential", lambda: ("key", "https://publish.test"))
     monkeypatch.setattr(republish._republishes, "delay", 0.2)
     published = tmp_path / ".published.json"
     published.write_text(json.dumps({"doc.html": {"url": "https://view.example/abc", "published": True}}))
