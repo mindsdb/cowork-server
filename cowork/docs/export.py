@@ -18,6 +18,7 @@ import html
 from cowork.common.paths import PinnedDir
 from cowork.services import artifact_export
 from cowork.services.artifact_export import ExportRefusal, ExportRefused
+from cowork.services.docx_writer import MAX_TITLE_LENGTH
 
 from .markdown import doc_to_markdown
 from .model import Doc
@@ -33,10 +34,7 @@ MEDIA_TYPES = {
 CONVERTED_FORMATS = ("docx", "pdf")
 # The order the doc's Export menu lists them in.
 _MENU_ORDER = ("docx", "pdf", "md", "html")
-# The most of the title a conversion request carries: its header is bounded,
-# and a doc title can run to 20,000 characters. Nothing is lost, since Word
-# takes its title from the page's own <title>.
-_REQUEST_TITLE_CHARS = 255
+_TOO_LARGE = "This doc is too large to export."
 
 
 def offered_formats(*, org_mode: bool) -> list[str]:
@@ -74,17 +72,25 @@ def export_bytes(doc: Doc, fmt: str, *, folder: PinnedDir | None = None, org_mod
     page = _document(doc)
     # The bound an artifact's HTML source is read with.
     if len(page) > artifact_export.HTML_SOURCE_MAX_BYTES:
-        raise ExportRefused(ExportRefusal.TOO_LARGE, "This doc is too large to export.")
-    return artifact_export.convert_document(
-        source=page,
-        suffix=".html",
-        title=doc["title"][:_REQUEST_TITLE_CHARS],
-        base_parts=(),
-        source_name="doc.html",
-        folder=folder,
-        export_format=fmt,
-        org_mode=org_mode,
-    ).data
+        raise ExportRefused(ExportRefusal.TOO_LARGE, _TOO_LARGE)
+    try:
+        return artifact_export.convert_document(
+            source=page,
+            suffix=".html",
+            # The conversion request's header is bounded, and Word keeps no
+            # longer a title anyway.
+            title=doc["title"][:MAX_TITLE_LENGTH],
+            base_parts=(),
+            source_name="doc.html",
+            folder=folder,
+            export_format=fmt,
+            org_mode=org_mode,
+        ).data
+    except ExportRefused as exc:
+        # The artifact export words this refusal for a file.
+        if exc.refusal is ExportRefusal.TOO_LARGE:
+            raise ExportRefused(ExportRefusal.TOO_LARGE, _TOO_LARGE) from exc
+        raise
 
 
 def export_filename(doc: Doc, fmt: str) -> str:

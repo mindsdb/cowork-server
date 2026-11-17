@@ -408,8 +408,9 @@ def convert_document(
     The conversion runs in a conversion process that reads the files it names
     through *folder*, below *base_parts*; a PDF is then the render service's
     PDF of the inlined *source_name*. Blocking, like ``_render_pdf``. Raises
-    ``ExportRefused`` as ``_convert`` does, and ``RenderPdfFailed`` when no
-    usable PDF came back.
+    ``ExportRefused`` as ``_convert`` does, ``ConversionError`` for a
+    conversion that failed, and ``RenderPdfFailed`` when no usable PDF came
+    back.
     """
     if export_format == "pdf":
         budget = PDF_INLINE_BUDGET_BYTES

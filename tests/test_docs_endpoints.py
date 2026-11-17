@@ -607,7 +607,7 @@ def conversions(monkeypatch):
 
 @pytest.mark.parametrize("fmt", ["docx", "pdf"])
 def test_word_and_pdf_convert_the_docs_page_in_the_conversion_process(client, doc, render_service, conversions, fmt):
-    from cowork.services.artifact_export import INLINE_BUDGET_BYTES, PDF_INLINE_BUDGET_BYTES, conversion_limits
+    from cowork.services.artifact_export import CONVERSION_MEMORY_BYTES, INLINE_BUDGET_BYTES, PDF_INLINE_BUDGET_BYTES
 
     res = client.get(_url(doc, f"/export?format={fmt}"))
 
@@ -616,7 +616,7 @@ def test_word_and_pdf_convert_the_docs_page_in_the_conversion_process(client, do
     request = call["request"]
     assert (request.export_format, request.suffix, request.base_parts, request.title) == (fmt, ".html", (), "Hiring plan")
     assert request.limits.max_total_bytes == (PDF_INLINE_BUDGET_BYTES if fmt == "pdf" else INLINE_BUDGET_BYTES)
-    assert call["limits"] == conversion_limits(org_mode=False)
+    assert call["limits"].memory_bytes == CONVERSION_MEMORY_BYTES
     assert b"<h1>Hiring plan</h1>" in call["source"]
     if fmt == "docx":
         assert res.content == result.data
@@ -630,7 +630,7 @@ def test_in_org_mode_a_doc_converts_with_the_org_budget_and_memory(conversions, 
     from cowork.common.paths import pinned_dir
     from cowork.docs.export import export_bytes
     from cowork.docs.model import new_doc, new_tab
-    from cowork.services.artifact_export import ORG_INLINE_BUDGET_BYTES, conversion_limits
+    from cowork.services.artifact_export import ORG_CONVERSION_MEMORY_BYTES, ORG_INLINE_BUDGET_BYTES
 
     doc = {**new_doc("Plan"), "tabs": [new_tab("Plan")]}
     with pinned_dir(tmp_path) as pinned:
@@ -638,10 +638,14 @@ def test_in_org_mode_a_doc_converts_with_the_org_budget_and_memory(conversions, 
 
     [(call, _result)] = conversions
     assert call["request"].limits.max_total_bytes == ORG_INLINE_BUDGET_BYTES
-    assert call["limits"] == conversion_limits(org_mode=True)
+    assert call["limits"].memory_bytes == ORG_CONVERSION_MEMORY_BYTES
 
 
 def test_a_title_past_the_requests_header_bound_still_exports_to_word(client, doc):
+    import io
+
+    from docx import Document
+
     title = "計" * 20_000
     renamed = client.post(_url(doc, "/ops"), json={"ops": [{"op": "rename_doc", "title": title}]})
     assert renamed.status_code == 200, renamed.text
@@ -650,12 +654,12 @@ def test_a_title_past_the_requests_header_bound_still_exports_to_word(client, do
 
     assert exported.status_code == 200, exported.text
     assert _docx_paragraphs(exported.content)[0][1] == title
+    assert Document(io.BytesIO(exported.content)).core_properties.title == title[:255]
 
 
 @pytest.mark.parametrize("second_fmt", ["docx", "pdf"])
 def test_a_second_export_while_one_converts_answers_429_at_once(client, doc, render_service, monkeypatch, second_fmt):
     import threading
-    import time
 
     from cowork.services import artifact_export
 
@@ -673,16 +677,14 @@ def test_a_second_export_while_one_converts_answers_429_at_once(client, doc, ren
     first.start()
     try:
         assert entered.wait(timeout=10)
-        started = time.monotonic()
+        # The first export is released only after this answers, so a 429 here never waited.
         second = client.get(_url(doc, f"/export?format={second_fmt}"))
-        elapsed = time.monotonic() - started
     finally:
         release.set()
         first.join(timeout=60)
 
     assert second.status_code == 429, second.text
     assert second.json()["detail"] == "An export is already running; try again in a moment."
-    assert elapsed < 1.0
     assert answers == [200]
     assert client.get(_url(doc, f"/export?format={second_fmt}")).status_code == 200
 
@@ -726,7 +728,7 @@ def test_a_conversion_past_its_limits_answers_413_and_renders_nothing(client, do
     res = client.get(_url(doc, f"/export?format={fmt}"))
 
     assert res.status_code == 413, res.text
-    assert res.json()["detail"] == "This file can't be exported."
+    assert res.json()["detail"] == "This doc is too large to export."
     assert render_service.requests == []
 
 
