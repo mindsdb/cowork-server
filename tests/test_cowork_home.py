@@ -446,6 +446,14 @@ _ACCOUNT_LEVEL_COWORK_HOME_CALLS = Counter(
             "_sandbox_root",
             "scoped_storage_root(cowork_home() / 'sandbox', scope, store='sandbox')",
         ),
+        # What a cloud turn's copy of its project's files holds. Only a cloud
+        # turn copies them, so the desktop never writes it, and an org
+        # deployment keys it per organization through scoped_storage_root.
+        (
+            "cowork/services/project_file_copy.py",
+            "copy_records_root",
+            "scoped_storage_root(cowork_home() / 'project-file-copies', scope, store='project-file-copies')",
+        ),
         ("cowork/code_sandbox.py", "_forbidden_roots.forbidden", "cowork_home()"),
         ("cowork/code_sandbox.py", "_trusted_roots", "cowork_home()"),
         ("cowork/code_sandbox.py", "_run_self_test.scratch", "cowork_home() / 'tmp'"),

@@ -132,6 +132,10 @@ STORE_RESOURCE: dict[str, PersonalResource | None] = {
     # Publish history (cowork.services.publish), part of an artifact's
     # publish state.
     "publish": PersonalResource.PROJECTS,
+    # What the server copied into each conversation's project-files folder
+    # (cowork.services.project_file_copy.stage_project_files), kept where no pod and no
+    # route reaches it.
+    "project-file-copies": PersonalResource.PROJECTS,
     "files": PersonalResource.FILES,
     "skills": PersonalResource.SKILLS,
     "code-skills": PersonalResource.SKILLS,

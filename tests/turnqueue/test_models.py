@@ -48,11 +48,20 @@ def test_turn_reply_accepts_every_kind_the_controller_publishes():
 
     published = {
         "progress", "cell", "error", "turn_delta", "turn_step",
-        "turn_memory", "turn_skill", "turn_history", "turn_compaction",
-        "turn_completed", "turn_failed",
+        "turn_memory", "turn_memory_forget", "turn_skill", "turn_connector", "turn_history",
+        "turn_compaction", "turn_completed", "turn_failed",
     }
     accepted = set(typing.get_args(TurnReply.model_fields["kind"].annotation))
     assert published == accepted
+
+
+def test_turn_reply_parses_a_connector_draft():
+    """The controller relays a pod's connector line as turn_connector, which
+    this build does nothing with; the reply still parses, so it is dropped
+    rather than failing its turn."""
+    reply = TurnReply.model_validate_json(
+        '{"correlation_id":"r","kind":"turn_connector","data":{"entries":[{"name":"crm"}]}}')
+    assert reply.kind == "turn_connector"
 
 
 def test_turn_reply_parses_a_skill_draft():

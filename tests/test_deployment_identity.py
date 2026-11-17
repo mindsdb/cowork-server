@@ -242,13 +242,55 @@ def test_explicit_identity_requires_anton_memory_support(monkeypatch, tmp_path, 
         cowork_server.create_app()
 
 
-async def test_unset_builds_a_real_harness_config_with_an_older_anton(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        "anton.core.session.ChatSessionConfig", _older_config("deployment_identity", "learned_memory_scope")
-    )
-    async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=LOCAL_SCOPE) as turn:
-        assert not hasattr(turn.config, "deployment_identity")
-        assert not hasattr(turn.config, "learned_memory_scope")
+@pytest.mark.parametrize("kind_set", [False, True], ids=["no-identity", "identity"])
+async def test_shared_memory_reaches_anton_with_or_without_an_identity(
+    monkeypatch, tmp_path, personal_deployment, kind_set
+):
+    """A deployment that trusts identity headers and leaves memory out of
+    COWORK_PERSONAL_RESOURCES shares one memory store whether or not it sets
+    COWORK_DEPLOYMENT_KIND. Its turns name the scope either way, which
+    anton's forget tool reads to refuse one person's removal of a line
+    everyone reads; only a deployment with an identity names that too. The
+    installed anton reads the scope into its prompt only with an identity, so
+    without one the prompt is the one a turn that names no scope gets."""
+    from anton.core.memory.hippocampus import Hippocampus
+    from anton.core.session import ChatSession
+    from cowork.harnesses.memory.store import GlobalMemoryStore
+
+    resources = ALL_PERSONAL_RESOURCES - {PersonalResource.MEMORY}
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(resources)))
+    if kind_set:
+        _enable(monkeypatch, _pack(tmp_path))
+    else:
+        get_app_settings.cache_clear()
+    cowork_server.create_app()
+    scope = TenantScope(personal=True, org_id=PARTITION, user_id=SUB, personal_resources=resources)
+    Hippocampus(GlobalMemoryStore(scope=scope).root).rewrite_identity(["Prefers calendar quarters"])
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=scope) as turn:
+        assert turn.config.learned_memory_scope == "shared"
+        assert turn.config.deployment_identity is identity_for_turn()
+        assert (turn.config.deployment_identity is not None) is kind_set
+        if kind_set:
+            return
+        for method in ("plan", "code"):
+            monkeypatch.setattr(
+                turn.config.llm_client, method,
+                AsyncMock(side_effect=AssertionError("Prompt capture must not call a model")),
+            )
+        prompts = []
+        for memory_scope in ("shared", None):
+            # No session id, so neither prompt reuses the other's pinned memory.
+            session = ChatSession(dataclasses.replace(
+                turn.config, learned_memory_scope=memory_scope, session_id=None,
+            ))
+            try:
+                prompts.append(await session._build_system_prompt("What do you remember?"))
+            finally:
+                await session.close()
+        assert "Prefers calendar quarters" in prompts[0]
+        assert "Shared Memory" not in prompts[0]
+        assert prompts[0] == prompts[1]
 
 
 @pytest.mark.parametrize("name", ["Cowork", PRODUCT])

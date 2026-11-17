@@ -329,19 +329,20 @@ def test_a_locked_folder_hides_only_itself_from_the_listing(shared):
 
 
 def test_a_folder_swapped_for_a_link_hides_only_itself_from_the_listing(shared, monkeypatch):
-    from cowork.services import shared_projects
+    # The listing walks with the shared rule for a project's ordinary files.
+    from cowork.services import project_file_view
 
     client, project, root, registry, entry = shared
     (root / "swapped").mkdir()
     (root / "swapped" / "inside.txt").write_text("behind a link")
-    original = shared_projects.open_pinned_child
+    original = project_file_view.open_pinned_child
 
     def open_child(directory, name, **options):
         if name == "swapped":
             raise OSError(errno.ELOOP, os.strerror(errno.ELOOP))
         return original(directory, name, **options)
 
-    monkeypatch.setattr(shared_projects, "open_pinned_child", open_child)
+    monkeypatch.setattr(project_file_view, "open_pinned_child", open_child)
     assert _listed_paths(client, project) == ["report.txt"]
 
 
@@ -414,3 +415,18 @@ def test_shared_download_serves_a_non_latin1_name(shared):
     assert response.status_code == 200, response.text
     assert response.content == b"shared report bytes"
     assert response.headers["content-disposition"] == attachment_disposition("Отчёт.pdf")
+
+
+def test_a_name_that_is_not_utf8_is_left_out_of_the_listing(shared):
+    """The listing's JSON can't hold such a name, so the walk leaves the file
+    out, as a cloud turn's copy does, and lists the rest."""
+    client, project, root, registry, entry = shared
+    try:
+        fd = os.open(os.fsencode(root) + b"/report-\xff.txt", os.O_WRONLY | os.O_CREAT, 0o600)
+    except OSError as error:
+        if error.errno in (errno.EILSEQ, errno.EINVAL):
+            pytest.skip("this file system takes UTF-8 names only")
+        raise
+    os.close(fd)
+
+    assert _listed_paths(client, project) == ["report.txt"]

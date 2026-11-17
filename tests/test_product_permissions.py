@@ -149,6 +149,7 @@ async def test_queued_reuse_denial_precedes_redis_even_with_an_existing_key(
             conversation_id="conversation",
             input_text="Run",
             model="free-model",
+            memory_writable=True,
             llm={"api_key": "old-key"},
         ):
             pass
@@ -629,6 +630,7 @@ async def test_hosted_queue_cannot_hide_missing_identity_as_desktop(monkeypatch)
                 conversation_id="conversation",
                 input_text="Run",
                 model="free-model",
+                memory_writable=True,
                 llm={"api_key": "old-key"},
             ):
                 pass

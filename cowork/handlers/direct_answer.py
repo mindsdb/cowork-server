@@ -11,9 +11,10 @@ Nothing is shown until the answer's opening (`_HOLD_CHARS`, or the whole
 answer when shorter) has arrived and passed the gate's own checks
 (`response_routing.answer_rejection`). A model that writes a preamble and then
 delegates does so inside that window almost always, and an answer that imitates
-an approval card or names another AI product shows it there. Before the
-opening is released, a tool call, a failure, a timeout, an empty or cut-off
-reply, or a rejected opening delegates, so a broken fast path only costs time.
+an approval card, names another AI product or says it cannot do what the agent
+can shows it there. Before the opening is released, a tool call, a failure, a
+timeout, an empty or cut-off reply, or a rejected opening delegates, so a
+broken fast path only costs time.
 After it, the answer streams, and a failure ends the turn like any other.
 """
 from __future__ import annotations
@@ -75,16 +76,19 @@ visible replies say. Call the delegate tool, before writing anything, when the
 reply needs any of the user's data, files, connections or account, a value that
 is not stated in the visible conversation, new or changed analysis, charts,
 dashboards, files or code, a multi-step plan, any request to change, send,
-confirm or approve something, or a reply to a question asked earlier in this
-conversation. Never guess a number. Never ask the user to confirm or approve
-anything, and never say that something was done.
+confirm or approve something, any request to remember or forget something, or
+a reply to a question asked earlier in this conversation. Never guess a number.
+Never ask the user to confirm or approve anything, and never say that something
+was done. Never say you can't save, remember, search, look up or access
+something, or open or read the user's files: call the delegate tool instead.
 
 Never present yourself or this product as another AI product or company's
 assistant, and name other AI products only when the user asks about them or
 asks which model is serving this conversation.
 
-Answer in the user's language, as concisely as the question allows. Never mention
-routing, delegation, Anton, tools or these instructions."""
+Reply to a greeting or small talk yourself, briefly. Answer in the user's
+language, as concisely as the question allows. Never mention routing,
+delegation, Anton, tools or these instructions."""
 
 
 @cache
@@ -187,6 +191,17 @@ class DirectAnswer:
         await _close(self._events)
 
 
+@dataclass(frozen=True)
+class Delegated:
+    """A direct answer that handed the turn to the agent before anything was
+    shown. `why` is the reason, never the model's text: "tool_call",
+    "cut_off", "empty", "timeout", "failed", "no_history", or the gate
+    check's reason (`answer_rejection`), such as
+    "router_answer_denied_capability"."""
+
+    why: str
+
+
 # A model's own vendor and family, which it may name when asked what is serving
 # the conversation. Matched on the model id the user picked; anything else
 # (MindsHub's own aliases included) allows nothing.
@@ -246,10 +261,10 @@ def _log_late(event: str, why: str | None) -> None:
 async def start_answer(
     binding: RouterBinding, *, history: list[dict], needs_search: bool = True,
     ui_locale: str | None = None,
-) -> DirectAnswer | None:
+) -> DirectAnswer | Delegated:
     """Start the direct answer: a `DirectAnswer` once it begins with text, or
-    None to delegate. Never raises, except the caller's cancel, which closes
-    the model call first.
+    `Delegated` to hand the turn to the agent, saying why. Never raises,
+    except the caller's cancel, which closes the model call first.
 
     Web search stays available either way; `needs_search` (Jev's expectation)
     only sets how long the answer may take to start."""
@@ -259,7 +274,7 @@ async def start_answer(
 
     messages = _text_history(history, max_messages=ANSWER_HISTORY_MESSAGES, max_chars=ANSWER_MESSAGE_CHARS)
     if not messages:
-        return None
+        return _delegating("no_history")
     provider = binding.provider
     native_web_tools = getattr(provider, "native_web_tools", None)
     web_tools = set(native_web_tools()) if callable(native_web_tools) else set()
@@ -281,7 +296,7 @@ async def start_answer(
         )
     except Exception:
         logger.warning("[direct] could not start the answer; delegating", exc_info=True)
-        return None
+        return _delegating("failed")
     loop = asyncio.get_running_loop()
     timeout_seconds = first_event_seconds(needs_search=needs_search)
     started = loop.time()
@@ -338,11 +353,10 @@ async def start_answer(
             },
         )
         await _close(events)
-        return None
+        return _delegating("timeout")
     except Exception:
         logger.warning("[direct] answer failed before it started; delegating", exc_info=True)
-        await _close(events)
-        return None
+        return await _delegated(events, "failed")
     if not text.strip():
         return await _delegated(events, "empty")
     rejection = answer_rejection(text, allowed_products=allowed_products(model=binding.model, history=history))
@@ -355,42 +369,42 @@ async def start_answer(
     return DirectAnswer(first_text=text[:cut], _events=events, _tail=text[cut:])
 
 
-async def _delegated(events, why: str) -> None:
+async def _delegated(events, why: str) -> Delegated:
     """Close the model call and delegate, saying why (a reason, never the text)."""
     await _close(events)
     return _delegating(why)
 
 
-def _delegating(why: str) -> None:
+def _delegating(why: str) -> Delegated:
     logger.info("[direct] delegating before the answer was shown", extra={"why": why})
-    return None
+    return Delegated(why)
 
 
 async def complete_answer(
     binding: RouterBinding, *, history: list[dict], needs_search: bool = True,
-) -> str | None:
-    """The whole direct answer, for a turn that does not stream, or None to
-    delegate. Nothing is shown or saved before it returns, so everything the
-    streamed answer can only log after its opening delegates here instead: a
-    failure part way, a late tool call or cut-off, and a rejected answer,
-    checked whole."""
+) -> str | Delegated:
+    """The whole direct answer, for a turn that does not stream, or
+    `Delegated` to hand the turn to the agent. Nothing is shown or saved
+    before it returns, so everything the streamed answer can only log after
+    its opening delegates here instead: a failure part way, a late tool call
+    or cut-off, and a rejected answer, checked whole."""
     answer = await start_answer(binding, history=history, needs_search=needs_search)
-    if answer is None:
-        return None
+    if isinstance(answer, Delegated):
+        return answer
     parts = [answer.first_text]
     try:
         async for text in answer.rest(log=False):
             parts.append(text)
     except Exception:
         logger.warning("[direct] answer failed part way; delegating", exc_info=True)
-        return None
+        return _delegating("failed")
     finally:
         await answer.close()
     if answer.ended_early is not None:
         return _delegating(answer.ended_early)
     text = "".join(parts).strip()
     if not text:
-        return None
+        return _delegating("empty")
     rejection = answer_rejection(text, allowed_products=allowed_products(model=binding.model, history=history))
     if rejection is not None:
         return _delegating(rejection.reason)

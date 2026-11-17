@@ -43,12 +43,14 @@ def _no_memory(session, conv_id, entries, principal):
 
 def _fake_handler(
     monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_seed_history=None,
-    remote_agent_files=None, remote_workspace=None, earlier_answers=None,
+    remote_agent_files=None, remote_workspace=None, earlier_answers=None, memory_writable=True,
 ):
     """Replace the reads of ResponsesHandler that the turn's input unit makes
     (ResponsesHandler._read_remote_turn_inputs, which the channel turn shares)
     with stand-ins. The earlier answers' read is replaced too, by
-    ``earlier_answers`` or by one that finds none."""
+    ``earlier_answers`` or by one that finds none. The settings and project
+    read (ResponsesHandler._remote_memory_writable) answers
+    ``memory_writable``."""
 
     async def no_earlier_answers(*, conversation_id, scope):
         return ()
@@ -65,6 +67,7 @@ def _fake_handler(
         "_remote_workspace": remote_workspace or (lambda s, c: None),
         "_remote_agent_files": remote_agent_files or (lambda s, c, *, workspace: None),
         "_remote_started_at": lambda s, c: None,
+        "_remote_memory_writable": lambda s, c: memory_writable,
     }.items():
         monkeypatch.setattr(responses_mod.ResponsesHandler, name, staticmethod(read))
     # The pod's memory and compaction go through the helpers the browser

@@ -484,12 +484,12 @@ async def test_a_persons_scheduled_run_gets_its_creators_tiers(
         assert global_dir == expected_global
         assert project_dir == expected_global / "projects" / str(project_id)
         assert seen["mode"] == "autopilot"
+        # The memory scope reaches anton with or without an identity.
+        assert seen["memory_scope"] == "personal"
         if self_hosted:
             assert seen["identity"].product_name == "Scheduled Workbench"
-            assert seen["memory_scope"] == "personal"
         else:
             assert seen["identity"] is None
-            assert seen["memory_scope"] is None
     finally:
         with get_open_session() as db:
             ScheduleService(ScopedSession(db, SYSTEM_SCOPE)).delete_schedule(schedule_id)

@@ -137,8 +137,10 @@ def get_conversation(conversation_id: UUID, scoped: ScopedSessionDep):
 
 @router.patch("/{conversation_id}", response_model=ConversationListItem)
 async def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, scope: TenantScopeDep):
-    # A project named by name may be the general one, provisioned on first use.
-    unit = run_efs_unit if body.project_id is None and body.project else run_db
+    # A project named by name may be the general one, provisioned on first
+    # use, and a move removes the conversation's copy of the files of the
+    # project it leaves: both work on the file store.
+    unit = run_efs_unit if body.project_id is not None or body.project else run_db
     return await unit(partial(_update_conversation, conversation_id=conversation_id, body=body), scope=scope)
 
 

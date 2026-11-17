@@ -53,7 +53,8 @@ def remote_turn(monkeypatch):
 
 def _run(**kwargs):
     return prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", **kwargs,
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        memory_writable=True, **kwargs,
     )
 
 
