@@ -43,6 +43,7 @@ from cowork.services import artifact_export, export_runner
 from cowork.services import artifact_ownership as ownership
 from cowork.services import artifacts as artifacts_service
 from cowork.services.artifact_export import ExportRefused, ExportSource, export_slot
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.markdown_render import MAX_FENCE_LENGTH
 from cowork.services.render_pdf_client import RenderServicePdf
@@ -80,14 +81,57 @@ def _metadata(folder: Path) -> dict:
 
 
 @pytest.fixture
-def client(monkeypatch):
-    from cowork.server import create_app
-
+def export_environment(monkeypatch):
+    """Isolate local export settings and restore their cache after each test."""
     monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
     monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS", raising=False)
     get_app_settings.cache_clear()
-    yield TestClient(create_app())
-    get_app_settings.cache_clear()
+    try:
+        yield
+    finally:
+        get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def app(export_environment):
+    """Mount the real workspace routes for one export request scenario."""
+    application = FastAPI()
+    application.include_router(workspace_ep.router, prefix="/api/v1/artifacts")
+    return application
+
+
+@pytest.fixture
+def canonical_app(export_environment):
+    """Build the full server for mounting, validation and dispatch checks."""
+    from cowork.server import create_app
+
+    return create_app()
+
+
+@pytest.fixture
+def client(app):
+    """Close the feature client without starting the server lifespan."""
+    test_client = TestClient(app)
+    try:
+        yield test_client
+    finally:
+        try:
+            test_client.close()
+        finally:
+            get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def canonical_client(canonical_app):
+    """Close the full-server client without starting its lifespan."""
+    test_client = TestClient(canonical_app)
+    try:
+        yield test_client
+    finally:
+        try:
+            test_client.close()
+        finally:
+            get_app_settings.cache_clear()
 
 
 @pytest.fixture
@@ -122,7 +166,7 @@ def local_artifact(tmp_path, monkeypatch):
         monkeypatch.setattr(
             workspace_ep,
             "review_artifact_for_request",
-            awaitable(lambda *_args: (source, folder, _metadata(folder), True)),
+            awaitable(lambda *_args: (source, folder, ArtifactMetadata.model_validate(_metadata(folder)), True)),
         )
         return folder
 
@@ -139,13 +183,13 @@ def _assert_reloads(path: Path, export_format: str) -> None:
 
 
 @pytest.mark.parametrize("case", ROUTE_CASES, ids=[case["id"] for case in ROUTE_CASES])
-def test_route_cases(client, local_artifact, case):
+def test_route_cases(canonical_client, local_artifact, case):
     folder = local_artifact(
         case["files"], primary=case["primary"], artifact_type=case.get("type", "document")
     )
     before = _snapshot(folder)
 
-    response = client.post(EXPORT_URL, json={"format": case["format"]})
+    response = canonical_client.post(EXPORT_URL, json={"format": case["format"]})
 
     assert response.status_code == case["status"], response.text
     after = _snapshot(folder)
@@ -179,7 +223,7 @@ def test_route_cases(client, local_artifact, case):
     ],
 )
 def test_any_body_but_one_format_answers_422_and_writes_nothing(
-    client, local_artifact, monkeypatch, body
+    canonical_client, local_artifact, monkeypatch, body
 ):
     folder = local_artifact({"report.md": "# R\n"}, primary="report.md")
     before = _snapshot(folder)
@@ -187,7 +231,7 @@ def test_any_body_but_one_format_answers_422_and_writes_nothing(
         workspace_ep, "export_primary_file", Mock(side_effect=AssertionError("no export"))
     )
 
-    response = client.post(EXPORT_URL, json=body)
+    response = canonical_client.post(EXPORT_URL, json=body)
 
     assert response.status_code == 422, response.text
     assert _snapshot(folder) == before
@@ -645,7 +689,7 @@ def _card(folder: Path) -> dict:
         trusted_anchor=folder.parent.parent.parent,
         root_parts=(".anton", "artifacts"),
     )
-    (card,) = artifacts_service.list_artifacts([source])
+    (card,) = [card.to_json() for card in artifacts_service.list_artifacts([source])]
     # A card with no primary file has no draftUrl.
     return {key: card.get(key) for key in ("path", "publishedUrl", "accessMode", "draftUrl")}
 
@@ -820,21 +864,21 @@ def _held_export(monkeypatch):
 
 @pytest.mark.parametrize("second_format", ["docx", "html"])
 def test_a_second_export_while_one_runs_answers_429_at_once(
-    client, local_artifact, monkeypatch, second_format
+    canonical_client, local_artifact, monkeypatch, second_format
 ):
     local_artifact({"report.md": "# R\n"}, primary="report.md")
     answers: list[int] = []
     with _held_export(monkeypatch) as held:
         first = threading.Thread(
             target=lambda: answers.append(
-                client.post(EXPORT_URL, json={"format": "docx"}).status_code
+                canonical_client.post(EXPORT_URL, json={"format": "docx"}).status_code
             )
         )
         first.start()
         assert held.entered.wait(timeout=10)
 
         started = time.monotonic()
-        second = client.post(EXPORT_URL, json={"format": second_format})
+        second = canonical_client.post(EXPORT_URL, json={"format": second_format})
         elapsed = time.monotonic() - started
 
         held.release.set()
@@ -845,7 +889,7 @@ def test_a_second_export_while_one_runs_answers_429_at_once(
     assert elapsed < 1.0
     assert answers == [200]
     # The slot is free again once the first export answers.
-    after = client.post(EXPORT_URL, json={"format": "html"})
+    after = canonical_client.post(EXPORT_URL, json={"format": "html"})
     assert after.status_code == 200, after.text
 
 
@@ -1052,7 +1096,7 @@ async def test_the_word_inline_budget_and_conversion_memory_are_smaller_in_org_m
     artifact_export.export_primary_file(
         source=source,
         folder_name=folder.name,
-        metadata=_metadata(folder),
+        metadata=ArtifactMetadata.model_validate(_metadata(folder)),
         artifact_id=org_world.artifacts["mine"].id,
         export_format="docx",
         can_edit=True,
@@ -1197,10 +1241,10 @@ def test_pdf_is_offered_only_with_a_render_service_and_never_in_org_mode(monkeyp
     assert offered(report, org_mode=True) == []
 
 
-def test_a_pdf_export_writes_the_render_services_pdf(client, local_artifact, render_service):
+def test_a_pdf_export_writes_the_render_services_pdf(canonical_client, local_artifact, render_service):
     folder = local_artifact({"report.md": "# Report\n\nRevenue rose.\n"})
 
-    response = client.post(EXPORT_URL, json={"format": "pdf"})
+    response = canonical_client.post(EXPORT_URL, json={"format": "pdf"})
 
     assert response.status_code == 200, response.text
     assert response.json()["filename"] == "report.pdf"

@@ -14,7 +14,6 @@ cowork.services.publish.publish_artifact.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import urlparse
@@ -26,6 +25,7 @@ from cowork.schemas.artifact_access import (
     ArtifactAccessRequest,
     ShareNotifyRequest,
 )
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.mindshub_client import canonical_uuid
 from cowork.services.sharing_contract import (
     MAX_NOTIFY_EMAILS,
@@ -152,9 +152,8 @@ def share_notice(
     allowlist's call."""
     title = ""
     try:
-        meta = json.loads((published_dir / "metadata.json").read_text(encoding="utf-8"))
-        if isinstance(meta, dict):
-            title = str(meta.get("title") or meta.get("name") or "")
+        meta = ArtifactMetadata.parse((published_dir / "metadata.json").read_text(encoding="utf-8"))
+        title = meta.title or meta.name or ""
     except (OSError, ValueError):
         pass
     title = " ".join((title or published_dir.name or published_key or "").split())
