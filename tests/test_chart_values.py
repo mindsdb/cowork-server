@@ -80,6 +80,9 @@ ENABLED_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
 LABELS_FLAG = "COWORK_TURN_DATASOURCE_LABELS_ENABLED"
 DRAFTS_FLAG = "COWORK_TURN_CONNECTOR_DRAFTS_ENABLED"
 CUSTOM_API_FLAG = "COWORK_TURN_CUSTOM_API_ENABLED"
+# Environments where auth, the inference gateway and the pod's anton serve custom
+# API connections; the change that turns one on adds it here and to its values file.
+CUSTOM_API_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
 # The exact methods each enabled environment offers.
 OFFERED_METHODS: dict[str, frozenset[str]] = {"staging": frozenset({"mysql:host-password", "postgres:host-port"})}
 # The draft host of each environment. cowork's web build frames exactly these
@@ -205,13 +208,20 @@ def test_connector_drafts_are_on_in_the_base_and_an_environment_may_only_opt_out
         )
 
 
-def test_custom_api_turns_are_off_in_the_code_and_no_values_file_turns_them_on(monkeypatch):
-    """Turns carry custom connections only once auth, the gateway and the pod's anton
-    serve them; turning them on in an environment is its own change to this test."""
+def test_custom_api_turns_are_off_in_the_code_and_the_base_and_on_only_where_listed(base, monkeypatch):
+    """Turns carry custom connections only where auth, the gateway and the pod's anton
+    serve them; a PR environment, which renders the base alone, stays off."""
     monkeypatch.delenv(CUSTOM_API_FLAG, raising=False)
     assert TurnQueueSettings().custom_api_enabled is False
-    for path in (BASE, *ENVIRONMENTS):
-        assert not [e for e in _env(path) if e.name == CUSTOM_API_FLAG], f"{path.name} declares {CUSTOM_API_FLAG}"
+    assert _deployment(BASE)["customApiTurnsEnabled"] == "false"
+    assert _entry(base, CUSTOM_API_FLAG).value == "{{ $.Values.customApiTurnsEnabled }}"
+    for env_values in ENVIRONMENTS:
+        environment = env_values.stem.removeprefix("values-")
+        expected = "true" if environment in CUSTOM_API_ENVIRONMENTS else None
+        assert _deployment(env_values).get("customApiTurnsEnabled") == expected, f"{env_values.name} flips custom API turns"
+        assert not [e for e in _env(env_values) if e.name == CUSTOM_API_FLAG], (
+            f"{env_values.name} declares {CUSTOM_API_FLAG}; set deployment.customApiTurnsEnabled instead"
+        )
 
 
 def test_datasource_methods_are_offered_exactly_where_the_gate_passed(base):
