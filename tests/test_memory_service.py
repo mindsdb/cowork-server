@@ -84,7 +84,7 @@ async def test_list_memory_returns_all_global_slots(session, memory_root, memory
     store = GlobalMemoryStore(root=memory_root)
     store.write(MemorySlot.PROFILE, "user prefs")
 
-    items = await MemoryService(session).list_memory()
+    items = MemoryService(session).list_memory_sync()
     global_slots = {item.category for item in items if item.scope == MemoryScope.global_}
 
     assert global_slots == {MemorySlot.PROFILE, MemorySlot.RULES, MemorySlot.LESSONS}
@@ -95,7 +95,7 @@ async def test_list_memory_returns_all_global_slots(session, memory_root, memory
 @pytest.mark.asyncio
 async def test_update_global_memory(session, memory_root, memory_settings):
     service = MemoryService(session)
-    await service.update_memory(
+    service.update_memory_sync(
         scope=MemoryScope.global_,
         category=MemorySlot.RULES,
         content="Always use TypeScript",
@@ -110,7 +110,7 @@ async def test_delete_global_memory(session, memory_root, memory_settings):
     store = GlobalMemoryStore(root=memory_root)
     store.write(MemorySlot.LESSONS, "lesson one")
 
-    await MemoryService(session).delete_memory(
+    MemoryService(session).delete_memory_sync(
         scope=MemoryScope.global_,
         category=MemorySlot.LESSONS,
     )
@@ -122,7 +122,7 @@ async def test_delete_global_memory(session, memory_root, memory_settings):
 async def test_project_memory_rules_and_lessons(session, project, memory_settings):
     service = MemoryService(session)
 
-    await service.update_memory(
+    service.update_memory_sync(
         scope=MemoryScope.project,
         category=MemorySlot.RULES,
         content="project rule",
@@ -136,7 +136,7 @@ async def test_project_memory_rules_and_lessons(session, project, memory_setting
 @pytest.mark.asyncio
 async def test_profile_rejected_for_project_scope(session, project, memory_settings):
     with pytest.raises(ValueError, match="not supported for project-scoped memory"):
-        await MemoryService(session).update_memory(
+        MemoryService(session).update_memory_sync(
             scope=MemoryScope.project,
             category=MemorySlot.PROFILE,
             content="should fail",
@@ -244,20 +244,20 @@ async def test_list_memory_filters_by_project_id(session, tmp_path, memory_setti
     session.refresh(other)
 
     service = MemoryService(session)
-    await service.update_memory(
+    service.update_memory_sync(
         scope=MemoryScope.project,
         category=MemorySlot.LESSONS,
         content="project lesson",
         project_id=project.id,
     )
-    await service.update_memory(
+    service.update_memory_sync(
         scope=MemoryScope.project,
         category=MemorySlot.LESSONS,
         content="other lesson",
         project_id=other.id,
     )
 
-    filtered = await service.list_memory(project_id=project.id)
+    filtered = service.list_memory_sync(project_id=project.id)
     project_items = [item for item in filtered if item.scope == MemoryScope.project]
     assert len(project_items) == 2
     assert all(item.project_id == project.id for item in project_items)
@@ -325,7 +325,7 @@ async def test_deleting_a_symlinked_project_slot_unlinks_the_link(org_engine, tm
     everyone else. It is never followed, and never a failed request."""
     project_dir = tmp_path / "squatted-project"
     project_id = _org_project(org_engine, project_dir)
-    await _org_memory(org_engine, ALICE).update_memory(
+    _org_memory(org_engine, ALICE).update_memory_sync(
         scope=MemoryScope.project,
         category=MemorySlot.RULES,
         content="Deploy on green only",
@@ -338,7 +338,7 @@ async def test_deleting_a_symlinked_project_slot_unlinks_the_link(org_engine, tm
     slot.unlink()
     slot.symlink_to(outsider)
 
-    squatted = await _org_memory(org_engine, BOB).get_memory(
+    squatted = _org_memory(org_engine, BOB).get_memory_sync(
         scope=MemoryScope.project,
         category=MemorySlot.RULES,
         project_id=project_id,
@@ -347,7 +347,7 @@ async def test_deleting_a_symlinked_project_slot_unlinks_the_link(org_engine, tm
     assert squatted.capabilities.can_delete is False
 
     with pytest.raises(HTTPException) as denied:
-        await _org_memory(org_engine, BOB).delete_memory(
+        _org_memory(org_engine, BOB).delete_memory_sync(
             scope=MemoryScope.project,
             category=MemorySlot.RULES,
             project_id=project_id,
@@ -355,7 +355,7 @@ async def test_deleting_a_symlinked_project_slot_unlinks_the_link(org_engine, tm
     assert denied.value.status_code == 403
     assert slot.is_symlink()
 
-    await _org_memory(org_engine, ALICE).delete_memory(
+    _org_memory(org_engine, ALICE).delete_memory_sync(
         scope=MemoryScope.project,
         category=MemorySlot.RULES,
         project_id=project_id,
@@ -442,14 +442,14 @@ def test_turn_memory_keeps_global_entries_when_the_project_half_fails(
 async def test_clearing_a_project_slot_keeps_its_first_author(org_engine, tmp_path):
     project_dir = tmp_path / "cleared-project"
     project_id = _org_project(org_engine, project_dir)
-    await _org_memory(org_engine, ALICE).update_memory(
+    _org_memory(org_engine, ALICE).update_memory_sync(
         scope=MemoryScope.project,
         category=MemorySlot.RULES,
         content="Deploy on green only",
         project_id=project_id,
     )
 
-    emptied = await _org_memory(org_engine, ALICE).update_memory(
+    emptied = _org_memory(org_engine, ALICE).update_memory_sync(
         scope=MemoryScope.project,
         category=MemorySlot.RULES,
         content="",
@@ -457,7 +457,7 @@ async def test_clearing_a_project_slot_keeps_its_first_author(org_engine, tmp_pa
     )
     assert emptied.attribution.created_by.user_id == ALICE
     with pytest.raises(HTTPException) as denied_after_empty:
-        await _org_memory(org_engine, BOB).update_memory(
+        _org_memory(org_engine, BOB).update_memory_sync(
             scope=MemoryScope.project,
             category=MemorySlot.RULES,
             content="Bob claims the emptied slot",
@@ -465,12 +465,12 @@ async def test_clearing_a_project_slot_keeps_its_first_author(org_engine, tmp_pa
         )
     assert denied_after_empty.value.status_code == 403
 
-    await _org_memory(org_engine, ALICE).delete_memory(
+    _org_memory(org_engine, ALICE).delete_memory_sync(
         scope=MemoryScope.project,
         category=MemorySlot.RULES,
         project_id=project_id,
     )
-    deleted = await _org_memory(org_engine, BOB).get_memory(
+    deleted = _org_memory(org_engine, BOB).get_memory_sync(
         scope=MemoryScope.project,
         category=MemorySlot.RULES,
         project_id=project_id,
@@ -479,7 +479,7 @@ async def test_clearing_a_project_slot_keeps_its_first_author(org_engine, tmp_pa
     assert deleted.attribution.created_by.user_id == ALICE
     assert deleted.capabilities.can_edit is False
     with pytest.raises(HTTPException) as denied_after_delete:
-        await _org_memory(org_engine, BOB).update_memory(
+        _org_memory(org_engine, BOB).update_memory_sync(
             scope=MemoryScope.project,
             category=MemorySlot.RULES,
             content="Bob claims the deleted slot",
@@ -546,8 +546,8 @@ async def test_hosted_org_mode_keeps_its_capabilities_and_gets_no_reset(org_engi
     keeps its author's rights, and the reset refuses with 403."""
     project_id = _org_project(org_engine, tmp_path / "org-project")
     alice = _org_memory(org_engine, ALICE)
-    await alice.update_memory(MemoryScope.global_, MemorySlot.RULES, "alice rule")
-    await alice.update_memory(MemoryScope.project, MemorySlot.LESSONS, "alice lesson", project_id)
+    alice.update_memory_sync(MemoryScope.global_, MemorySlot.RULES, "alice rule")
+    alice.update_memory_sync(MemoryScope.project, MemorySlot.LESSONS, "alice lesson", project_id)
 
     items = alice.list_memory_sync()
 

@@ -128,7 +128,7 @@ def publish_key(monkeypatch):
 async def test_list_returns_own_org_artifacts(session, tmp_path, org_mode):
     _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
 
-    cards = ep.artifacts_for_request(_scoped(session, ORG_A))
+    cards = await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=None, project_path=None)
 
     assert "dash" in [c["slug"] for c in cards]
 
@@ -137,13 +137,14 @@ async def test_list_hides_other_org_artifacts(session, tmp_path, org_mode):
     _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
     _project_with_artifact(session, tmp_path, name="theirs", org_id=ORG_B, slug="secret")
 
-    slugs = [c["slug"] for c in ep.artifacts_for_request(_scoped(session, ORG_A))]
+    cards = await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=None, project_path=None)
+    slugs = [c["slug"] for c in cards]
 
     assert "dash" in slugs          # not vacuously empty
     assert "secret" not in slugs
 
 
-def test_list_hides_another_members_legacy_artifacts(session, tmp_path, org_mode):
+async def test_list_hides_another_members_legacy_artifacts(session, tmp_path, org_mode):
     """Same org, different chat, LEGACY layout. Artifacts written before
     ENG-2056 live inside a conversation workspace, so they inherit that
     conversation's privacy. New artifacts land in the shared project base and
@@ -162,17 +163,20 @@ def test_list_hides_another_members_legacy_artifacts(session, tmp_path, org_mode
         session, tmp_path, name="also-mine", org_id=ORG_A, slug="mine", owner=USER_A
     )
 
-    slugs = [c["slug"] for c in ep.artifacts_for_request(_scoped(session, ORG_A, USER_A))]
+    cards = await ep.list_artifacts(
+        _scoped(session, ORG_A, USER_A).scope, project_id=None, project_path=None
+    )
+    slugs = [c["slug"] for c in cards]
 
     assert "mine" in slugs
     assert "theirs" not in slugs
 
 
-def test_list_by_project_id_narrows_to_that_project(session, tmp_path, org_mode):
+async def test_list_by_project_id_narrows_to_that_project(session, tmp_path, org_mode):
     row, _ = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
     _project_with_artifact(session, tmp_path, name="other", org_id=ORG_A, slug="second")
 
-    cards = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)
+    cards = await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=row.id, project_path=None)
 
     assert [c["slug"] for c in cards] == ["dash"]
 
@@ -181,7 +185,7 @@ async def test_list_by_foreign_project_id_is_404(session, tmp_path, org_mode):
     row, _ = _project_with_artifact(session, tmp_path, name="theirs", org_id=ORG_B, slug="secret")
 
     with pytest.raises(HTTPException) as err:
-        ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)
+        await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=row.id, project_path=None)
 
     assert err.value.status_code == 404
 
@@ -190,7 +194,7 @@ async def test_list_rejects_project_path_in_org_mode(session, tmp_path, org_mode
     row, _ = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
 
     with pytest.raises(HTTPException) as err:
-        ep.artifacts_for_request(_scoped(session, ORG_A), project_path=row.path)
+        await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=None, project_path=row.path)
 
     assert err.value.status_code == 400
 
@@ -199,7 +203,7 @@ async def test_list_merges_projects_and_labels_them(session, tmp_path, org_mode)
     _project_with_artifact(session, tmp_path, name="alpha", org_id=ORG_A, slug="one")
     _project_with_artifact(session, tmp_path, name="beta", org_id=ORG_A, slug="two")
 
-    cards = ep.artifacts_for_request(_scoped(session, ORG_A))
+    cards = await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=None, project_path=None)
     labels = {c["slug"]: c["projectName"] for c in cards}
 
     assert labels["one"] == "alpha"
@@ -220,7 +224,7 @@ async def test_list_is_capped_at_eighty(session, tmp_path, org_mode):
             json.dumps({"slug": f"a-{i:03d}", "type": "html-app"})
         )
 
-    cards = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)
+    cards = await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=row.id, project_path=None)
 
     assert len(cards) == 80
 
@@ -228,7 +232,7 @@ async def test_list_is_capped_at_eighty(session, tmp_path, org_mode):
 async def test_card_omits_owner_side_access_fields_in_org_mode(session, tmp_path, org_mode):
     _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
 
-    card = (ep.artifacts_for_request(_scoped(session, ORG_A)))[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=None, project_path=None))[0]
 
     assert "accessPassword" not in card
     assert "accessEmails" not in card
@@ -278,7 +282,7 @@ async def test_an_org_card_says_it_does_not_know_who_a_restricted_artifact_reach
 
     cards = {
         card["slug"]: card
-        for card in await ep.list_artifacts(_scoped(session, ORG_A), project_id=None, project_path=None)
+        for card in await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=None, project_path=None)
     }
 
     for slug in ("draft", "team"):
@@ -293,7 +297,9 @@ async def test_a_desktop_card_says_who_a_restricted_artifact_reaches(session, tm
     row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=None, slug="draft")
     _published(folder, **_OWNER_ONLY)
 
-    [card] = ep.artifacts_for_request(ScopedSession(session, LOCAL_SCOPE), project_id=row.id)
+    [card] = await ep.list_artifacts(
+        LOCAL_SCOPE, project_id=row.id, project_path=None
+    )
 
     assert (card["accessMode"], card["accessEmails"], _audience(card)) == (
         "restricted", [], (False, True, [], []),
@@ -332,7 +338,7 @@ async def test_card_has_one_identity_for_draft_and_comments(session, tmp_path, o
         session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
     )
 
-    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=row.id, project_path=None))[0]
     artifact_id = card["id"]
 
     assert UUID(artifact_id).hex == artifact_id
@@ -355,10 +361,10 @@ async def test_org_source_read_and_manual_edit_are_project_scoped(
     row, folder = _project_with_artifact(
         session, tmp_path, name="mine", org_id=ORG_A, slug="dash"
     )
-    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=row.id, project_path=None))[0]
 
     source = await workspace_ep.artifact_source(
-        str(row.id), card["id"], _scoped(session, ORG_A), path="index.html"
+        str(row.id), card["id"], _scoped(session, ORG_A).scope, path="index.html"
     )
     saved = await workspace_ep.update_artifact_source(
         str(row.id),
@@ -369,7 +375,7 @@ async def test_org_source_read_and_manual_edit_are_project_scoped(
             path="index.html",
             summary="Edit heading",
         ),
-        _scoped(session, ORG_A),
+        _scoped(session, ORG_A).scope,
     )
 
     assert saved["revision"]["actor"] == {"kind": "manual", "id": USER_A}
@@ -380,17 +386,33 @@ async def test_org_source_read_cannot_cross_org(session, tmp_path, org_mode):
     row, _folder = _project_with_artifact(
         session, tmp_path, name="theirs", org_id=ORG_B, slug="secret"
     )
-    card = ep.artifacts_for_request(_scoped(session, ORG_B), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_B).scope, project_id=row.id, project_path=None))[0]
 
     # A raw SQLAlchemy session is intentionally single-tenant once wrapped.
     # Use another request-like session for the foreign caller.
     with Session(session.get_bind()) as foreign_session:
         with pytest.raises(HTTPException) as err:
             await workspace_ep.artifact_source(
-                str(row.id), card["id"], _scoped(foreign_session, ORG_A), path="index.html"
+                str(row.id), card["id"], _scoped(foreign_session, ORG_A).scope, path="index.html"
             )
 
         assert err.value.status_code == 404
+
+
+async def _sent_body(response) -> bytes:
+    """The body ``response`` sends when the server runs it over ASGI, which
+    is where a response that owns descriptors releases them."""
+    sent: list[bytes] = []
+
+    async def receive():
+        raise AssertionError("an ASGI 2.4 response does not listen for a disconnect")
+
+    async def send(message):
+        if message["type"] == "http.response.body":
+            sent.append(message.get("body", b""))
+
+    await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+    return b"".join(sent)
 
 
 async def _grant_draft_review(session, tmp_path, monkeypatch, *, slug="dash", org_id=ORG_A):
@@ -403,7 +425,7 @@ async def _grant_draft_review(session, tmp_path, monkeypatch, *, slug="dash", or
     row, folder = _project_with_artifact(
         session, tmp_path, name="mine", org_id=org_id, slug=slug
     )
-    card = ep.artifacts_for_request(_scoped(session, org_id), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, org_id).scope, project_id=row.id, project_path=None))[0]
 
     async def fake_provision(*_args, **_kwargs):
         return card["artifactKey"]
@@ -417,7 +439,7 @@ async def _grant_draft_review(session, tmp_path, monkeypatch, *, slug="dash", or
         lambda *_args: card["artifactKey"],
     )
     enabled = await workspace_ep.enable_artifact_comments(
-        str(row.id), card["id"], _scoped(session, org_id)
+        str(row.id), card["id"], _scoped(session, org_id).scope
     )
     assert enabled.enabled is True
     return row, folder, card
@@ -429,18 +451,18 @@ async def test_same_org_reviewer_can_preview_but_cannot_edit_source(
     row, _folder, card = await _grant_draft_review(session, tmp_path, monkeypatch)
     with Session(session.get_bind()) as reviewer_session:
         reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
-        entry = await workspace_ep.artifact_review_entry(str(row.id), card["id"], reviewer)
+        entry = await workspace_ep.artifact_review_entry(str(row.id), card["id"], reviewer.scope)
         assert entry["capabilities"]["role"] == "reviewer"
         assert entry["capabilities"]["canEdit"] is False
 
         draft = await workspace_ep.serve_private_draft(
-            str(row.id), card["id"], "index.html", MagicMock(query_params={}), reviewer
+            str(row.id), card["id"], "index.html", MagicMock(query_params={}), reviewer.scope
         )
         assert draft.status_code == 200
 
         with pytest.raises(HTTPException) as err:
             await workspace_ep.artifact_source(
-                str(row.id), card["id"], reviewer, path="index.html"
+                str(row.id), card["id"], reviewer.scope, path="index.html"
             )
         assert err.value.status_code == 403
 
@@ -456,9 +478,9 @@ async def test_ungranted_draft_stays_invisible_to_a_co_member(session, tmp_path,
         reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
 
         for call in (
-            workspace_ep.artifact_review_entry(str(row.id), artifact_id, reviewer),
+            workspace_ep.artifact_review_entry(str(row.id), artifact_id, reviewer.scope),
             workspace_ep.serve_private_draft(
-                str(row.id), artifact_id, "index.html", MagicMock(query_params={}), reviewer
+                str(row.id), artifact_id, "index.html", MagicMock(query_params={}), reviewer.scope
             ),
         ):
             with pytest.raises(HTTPException) as err:
@@ -473,10 +495,46 @@ async def test_reviewer_cannot_provision_draft_review(session, tmp_path, org_mod
     with Session(session.get_bind()) as reviewer_session:
         with pytest.raises(HTTPException) as err:
             await workspace_ep.enable_artifact_comments(
-                str(row.id), card["id"], _scoped(reviewer_session, ORG_A, user_id=USER_A2)
+                str(row.id), card["id"], _scoped(reviewer_session, ORG_A, user_id=USER_A2).scope
             )
 
     assert err.value.status_code == 403
+
+
+async def test_a_comparison_sides_draft_is_never_opened_to_the_org(session, tmp_path, org_mode, monkeypatch):
+    """Turning review on opens the draft to the organization, and nothing
+    leaves a model comparison until the user continues with a side."""
+    from cowork.services.projects import COMPARISON_SANDBOX_PREFIX
+
+    row, folder = _project_with_artifact(
+        session, tmp_path, name=f"{COMPARISON_SANDBOX_PREFIX}{'c' * 32}", org_id=ORG_A, slug="dash"
+    )
+    card = (await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=row.id, project_path=None))[0]
+    provisioned = []
+
+    async def fake_provision(*args, **kwargs):
+        provisioned.append(args)
+        return card["artifactKey"]
+
+    monkeypatch.setattr("cowork.services.artifact_access.provision_draft_review_access", fake_provision)
+    monkeypatch.setattr(
+        "cowork.services.artifact_authorization_identity._allocate_or_adopt",
+        lambda *_args: card["artifactKey"],
+    )
+
+    with pytest.raises(HTTPException) as err:
+        await workspace_ep.enable_artifact_comments(str(row.id), card["id"], _scoped(session, ORG_A).scope)
+
+    assert err.value.status_code == 409
+    assert "Continue with this side" in err.value.detail
+    assert provisioned == []
+    assert not (folder / ".revisions" / "draft-review.json").exists()
+    with Session(session.get_bind()) as reviewer_session:
+        with pytest.raises(HTTPException) as err:
+            await workspace_ep.artifact_review_entry(
+                str(row.id), card["id"], _scoped(reviewer_session, ORG_A, user_id=USER_A2).scope
+            )
+        assert err.value.status_code == 404
 
 
 async def test_same_org_reviewer_receives_the_current_revision_for_comments(
@@ -487,7 +545,7 @@ async def test_same_org_reviewer_receives_the_current_revision_for_comments(
         result = await workspace_ep.artifact_review_entry(
             str(row.id),
             card["id"],
-            _scoped(reviewer_session, ORG_A, user_id=USER_A2),
+            _scoped(reviewer_session, ORG_A, user_id=USER_A2).scope,
         )
 
     assert result["capabilities"]["role"] == "reviewer"
@@ -510,17 +568,21 @@ async def test_fullstack_draft_preview_cannot_read_backend_source(
         "type": "fullstack-stateless-app",
         "primary": "static/index.html",
     }))
-    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=row.id, project_path=None))[0]
     with Session(session.get_bind()) as reviewer_session:
         reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
         asset = await workspace_ep.serve_private_draft(
-            str(row.id), card["id"], "static/app.js", MagicMock(query_params={}), reviewer
+            str(row.id), card["id"], "static/app.js", MagicMock(query_params={}), reviewer.scope
         )
         assert asset.status_code == 200
+        # Send the body as the server does: the response's own end closes the
+        # pinned file and folders it holds (PinnedStreamingResponse), rather
+        # than leaving them to the GC on whichever thread drops them.
+        assert await _sent_body(asset) == b"console.log('safe')"
 
         with pytest.raises(HTTPException) as err:
             await workspace_ep.serve_private_draft(
-                str(row.id), card["id"], "backend.py", MagicMock(query_params={}), reviewer
+                str(row.id), card["id"], "backend.py", MagicMock(query_params={}), reviewer.scope
             )
         assert err.value.status_code == 404
 
@@ -538,12 +600,12 @@ async def test_fullstack_draft_preview_refuses_a_root_level_primary(
         "type": "fullstack-stateless-app",
         "primary": "index.html",
     }))
-    card = ep.artifacts_for_request(_scoped(session, ORG_A), project_id=row.id)[0]
+    card = (await ep.list_artifacts(_scoped(session, ORG_A).scope, project_id=row.id, project_path=None))[0]
     with Session(session.get_bind()) as reviewer_session:
         reviewer = _scoped(reviewer_session, ORG_A, user_id=USER_A2)
         with pytest.raises(HTTPException) as err:
             await workspace_ep.serve_private_draft(
-                str(row.id), card["id"], "index.html", MagicMock(query_params={}), reviewer
+                str(row.id), card["id"], "index.html", MagicMock(query_params={}), reviewer.scope
             )
         assert err.value.status_code == 404
 
@@ -553,7 +615,7 @@ async def test_fullstack_draft_preview_refuses_a_root_level_primary(
 async def test_delete_by_slug_removes_the_folder(session, tmp_path, org_mode, publish_key):
     row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
 
-    await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+    await ep.delete_artifact_for_request(_scoped(session, ORG_A).scope, "dash", project_id=row.id)
 
     assert not folder.exists()
 
@@ -587,7 +649,7 @@ async def test_delete_threads_the_active_workspace_into_the_publish_key(
     monkeypatch.setattr(PublishKey, "get", fake_get)
     monkeypatch.setattr(PublishKey, "revoke", fake_revoke)
 
-    await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+    await ep.delete_artifact_for_request(_scoped(session, ORG_A).scope, "dash", project_id=row.id)
 
     assert captured["workspace_id"] == "ws-1"
 
@@ -629,7 +691,7 @@ async def test_delete_preserves_authority_failures_and_keeps_artifact_files(
     monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
     monkeypatch.setattr("anton.publisher.unpublish", unpublish)
     with pytest.raises(error_type) as error:
-        await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+        await ep.delete_artifact_for_request(_scoped(session, ORG_A).scope, "dash", project_id=row.id)
     assert error.value.status_code == status
     assert (folder / "index.html").read_text() == "<html></html>"
     assert json.loads((folder / ".published.json").read_text()) == record
@@ -662,7 +724,7 @@ async def test_delete_keeps_artifact_files_when_the_upload_service_is_unavailabl
     monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
     monkeypatch.setattr("anton.publisher.unpublish", unpublish)
     with pytest.raises(UploadServiceUnavailable):
-        await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+        await ep.delete_artifact_for_request(_scoped(session, ORG_A).scope, "dash", project_id=row.id)
     assert (folder / "index.html").read_text() == "<html></html>"
     assert json.loads((folder / ".published.json").read_text()) == record
 
@@ -685,13 +747,114 @@ async def test_delete_revokes_with_the_verified_owner_and_tenant_before_removing
     monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
 
     await ep.delete_artifact_for_request(
-        _scoped(session, ORG_A), artifact_id if by_id else "dash", project_id=row.id
+        _scoped(session, ORG_A).scope, artifact_id if by_id else "dash", project_id=row.id
     )
 
     assert [(UUID(identifier).hex, owner, org) for identifier, owner, org in calls] == [
         (artifact_id, USER_A, ORG_A)
     ]
     assert not folder.exists()
+
+
+@pytest.mark.parametrize("by_id", [False, True])
+async def test_a_delete_past_its_draft_rule_revoke_is_never_refused_a_file_store_slot(
+    session, tmp_path, org_mode, publish_key, monkeypatch, by_id
+):
+    """Once the draft review rule is gone, a busy file store must not refuse
+    the delete: the folder would keep its review marker, which still lets
+    co-members open the draft here, with no rule behind it. The lookup before
+    the revoke still refuses a busy store before anything irreversible runs."""
+    from cowork.db import units
+
+    row, folder = _project_with_artifact(session, tmp_path, name="owned", org_id=ORG_A, slug="dash")
+    artifact_id, _metadata = ensure_full_id(folder)
+
+    async def revoke(identifier, scope):
+        return True
+
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
+    real_run_efs = units.run_efs
+    delete_steps: list[tuple[str, bool]] = []
+
+    async def recorded(fn, *, scope, deadline=True):
+        delete_steps.append((getattr(fn, "func", fn).__name__, deadline))
+        return await real_run_efs(fn, scope=scope, deadline=deadline)
+
+    # The delete's own steps import run_efs when they run; the lookups bind it
+    # at import, so only the delete's steps are recorded.
+    monkeypatch.setattr(units, "run_efs", recorded)
+
+    await ep.delete_artifact_for_request(
+        _scoped(session, ORG_A).scope, artifact_id if by_id else "dash", project_id=row.id
+    )
+
+    assert delete_steps == [("pin", False), ("_finish_delete", False)]
+    assert not folder.exists()
+
+
+async def test_deletes_waiting_on_a_slow_publish_service_leave_their_member_file_store_slots(
+    session, tmp_path, org_mode, publish_key, monkeypatch
+):
+    """A member deletes a share's worth of published artifacts while the
+    publish service hangs. The take-downs wait on the network, not in file
+    store calls, so that member's own artifact review still gets a slot."""
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import cowork.db.session as db_session
+    from cowork.api.v1.artifact_scope import review_artifact_for_request
+
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 1)
+    share = db_session.settings.storage.efs_share
+    deleting = []
+    for n in range(share):
+        row, folder = _project_with_artifact(session, tmp_path, name=f"published-{n}", org_id=ORG_A, slug="dash")
+        (folder / ".published.json").write_text(
+            json.dumps({"index.html": {"report_id": f"rid-{n}", "published": True}})
+        )
+        deleting.append((row, folder, ensure_full_id(folder)[0]))
+    review_row, review_folder = _project_with_artifact(session, tmp_path, name="kept", org_id=ORG_A, slug="kept")
+    review_id, _metadata = ensure_full_id(review_folder)
+    publish_service = threading.Event()
+    waiting = threading.Semaphore(0)
+    taken_down: list[str] = []
+
+    def unpublish(identifier, **kwargs):
+        waiting.release()
+        publish_service.wait(timeout=10)
+        taken_down.append(identifier)
+
+    async def revoke(identifier, scope):
+        return True
+
+    monkeypatch.setattr("anton.publisher.unpublish", unpublish)
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
+    # The take-downs and this test's own waits run on the loop's default
+    # executor, whose size follows the CPU count. Sized here, the whole share
+    # hangs at once on any runner.
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=share + 2))
+    deletes = [
+        asyncio.create_task(ep.delete_artifact_for_request(_scoped(session, ORG_A).scope, artifact_id, project_id=row.id))
+        for row, _folder, artifact_id in deleting
+    ]
+    try:
+        for _ in deleting:
+            assert await asyncio.to_thread(waiting.acquire, True, 10)
+        scope = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
+        resolved = await asyncio.wait_for(
+            review_artifact_for_request(scope, str(review_row.id), review_id), timeout=5,
+        )
+        assert resolved.folder == review_folder
+        assert taken_down == []
+    finally:
+        publish_service.set()
+        await asyncio.gather(*deletes, return_exceptions=True)
+
+    for task in deletes:
+        assert task.exception() is None
+    assert sorted(taken_down) == sorted(f"rid-{n}" for n in range(share))
+    assert not any(folder.exists() for _row, folder, _id in deleting)
 
 
 async def test_delete_keeps_files_when_draft_authorization_is_unavailable(
@@ -711,7 +874,7 @@ async def test_delete_keeps_files_when_draft_authorization_is_unavailable(
 
     with pytest.raises(HTTPException) as err:
         await ep.delete_artifact_for_request(
-            _scoped(session, ORG_A), artifact_id, project_id=row.id
+            _scoped(session, ORG_A).scope, artifact_id, project_id=row.id
         )
 
     assert err.value.status_code == 503
@@ -760,7 +923,7 @@ async def test_delete_by_artifact_id_selects_the_exact_duplicate_slug(
     second_artifact_id, _metadata = ensure_full_id(second_folder)
 
     await ep.delete_artifact_for_request(
-        _scoped(session, ORG_A), second_artifact_id, project_id=row.id
+        _scoped(session, ORG_A).scope, second_artifact_id, project_id=row.id
     )
 
     assert first_folder.exists()
@@ -783,7 +946,7 @@ async def test_reviewer_cannot_delete_an_owners_artifact(
     with Session(session.get_bind()) as reviewer_session:
         with pytest.raises(HTTPException) as err:
             await ep.delete_artifact_for_request(
-                _scoped(reviewer_session, ORG_A, user_id=USER_A2),
+                _scoped(reviewer_session, ORG_A, user_id=USER_A2).scope,
                 card["id"],
                 project_id=row.id,
             )
@@ -802,7 +965,7 @@ async def test_ungranted_delete_by_a_co_member_is_404(
 
     with pytest.raises(HTTPException) as err:
         await ep.delete_artifact_for_request(
-            _scoped(session, ORG_A, user_id=USER_A2), artifact_id, project_id=row.id
+            _scoped(session, ORG_A, user_id=USER_A2).scope, artifact_id, project_id=row.id
         )
 
     assert err.value.status_code == 404
@@ -821,7 +984,7 @@ async def test_delete_cannot_reach_another_members_artifact(
 
     with pytest.raises(HTTPException) as err:
         await ep.delete_artifact_for_request(
-            _scoped(session, ORG_A, USER_A2), "theirs", project_id=row.id
+            _scoped(session, ORG_A, USER_A2).scope, "theirs", project_id=row.id
         )
 
     assert err.value.status_code == 404
@@ -836,7 +999,7 @@ async def test_delete_in_foreign_project_is_404_and_keeps_files(
     )
 
     with pytest.raises(HTTPException) as err:
-        await ep.delete_artifact_for_request(_scoped(session, ORG_A), "secret", project_id=row.id)
+        await ep.delete_artifact_for_request(_scoped(session, ORG_A).scope, "secret", project_id=row.id)
 
     assert err.value.status_code == 404
     assert folder.exists()
@@ -856,7 +1019,7 @@ async def test_delete_in_desktop_hits_the_named_project_not_the_first_one(
     )
 
     await ep.delete_artifact_for_request(
-        ScopedSession(session, LOCAL_SCOPE), "dash", project_id=second.id
+        ScopedSession(session, LOCAL_SCOPE).scope, "dash", project_id=second.id
     )
 
     assert not second_folder.exists()
@@ -911,9 +1074,9 @@ async def test_desktop_project_id_filter_keeps_project_addressed_cards(
         session, tmp_path, name="mine", org_id=None, slug="dash"
     )
 
-    card = ep.artifacts_for_request(
-        ScopedSession(session, LOCAL_SCOPE), project_id=row.id
-    )[0]
+    card = (await ep.list_artifacts(
+        LOCAL_SCOPE, project_id=row.id, project_path=None
+    ))[0]
 
     assert card["projectId"] == str(row.id)
     assert card["draftUrl"].startswith(
@@ -944,8 +1107,8 @@ async def test_desktop_project_path_narrows_to_that_project(
         ],
     )
 
-    cards = ep.artifacts_for_request(
-        ScopedSession(session, LOCAL_SCOPE), project_path=str(mine_project_dir),
+    cards = await ep.list_artifacts(
+        LOCAL_SCOPE, project_id=None, project_path=str(mine_project_dir)
     )
 
     assert [c["slug"] for c in cards] == ["dash"]
@@ -965,11 +1128,11 @@ async def test_desktop_project_path_that_matches_nothing_yields_nothing(
         ],
     )
 
-    cards = ep.artifacts_for_request(
-        ScopedSession(session, LOCAL_SCOPE), project_path="/nowhere/at/all",
+    cards = await ep.list_artifacts(
+        LOCAL_SCOPE, project_id=None, project_path="/nowhere/at/all"
     )
 
     assert cards == []
 
 
-pytestmark = pytest.mark.usefixtures("granted_product_permissions")
+pytestmark = pytest.mark.usefixtures("granted_product_permissions", "cleanup_tmp_projects")

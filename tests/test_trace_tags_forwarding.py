@@ -38,7 +38,6 @@ class _SessionWithoutTraceKwargs:
 
 def _run_harness(monkeypatch, session):
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_a, **_k: (set(), {}))
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", lambda *_a, **_k: ([], set(), None))
     monkeypatch.setattr(task_objects, "cards_for_slugs", lambda *_a, **_k: [])
 
     async def _no_autopublish(*_a, **_k):
@@ -48,7 +47,7 @@ def _run_harness(monkeypatch, session):
 
     async def _fake_build(
         self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
-        tool_messages=False,
+        tool_messages=False, interactive=True, ui_locale=None,
     ):
         return BuiltChatSession(session=session, turn_scratch_dir=None, seed_info=None, learns=True)
 

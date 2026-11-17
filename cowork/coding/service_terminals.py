@@ -15,6 +15,9 @@ class CodingTerminalOperations:
 
     task_terminals: TaskTerminalService
 
+    def ensure_workspace(self, session_id: str, *, reserved: bool = False) -> None:  # pragma: no cover - mixin contract
+        raise NotImplementedError
+
     def terminals(self, session_id: str) -> TerminalTabPage:
         return self.task_terminals.list(session_id)
 
@@ -48,6 +51,7 @@ class CodingTerminalOperations:
         rows: int,
         shell: TerminalShellPreference = TerminalShellPreference.auto,
     ) -> TerminalPage:
+        self.ensure_workspace(session_id)
         return self.task_terminals.start(session_id, terminal_id, credentials, cols, rows, shell)
 
     def write_terminal_tab(self, session_id: str, terminal_id: str, data_base64: str) -> TerminalPage:
@@ -76,6 +80,7 @@ class CodingTerminalOperations:
         rows: int,
         shell: TerminalShellPreference = TerminalShellPreference.auto,
     ) -> TerminalPage:
+        self.ensure_workspace(session_id)
         return self.task_terminals.legacy_start(session_id, credentials, cols, rows, shell)
 
     def write_terminal(self, session_id: str, data_base64: str) -> TerminalPage:

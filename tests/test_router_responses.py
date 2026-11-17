@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -131,12 +132,8 @@ class _Endpoint:
 
 
 @pytest.fixture
-async def endpoint(monkeypatch, openai_compatible_api):
+async def endpoint(monkeypatch, openai_compatible_api, router_wire_budget):
     openai_compatible_api("responses")
-    # Wire-contract tests must not measure cold SDK imports on a busy runner.
-    # The timeout test below supplies its own short deadline.
-    monkeypatch.setattr(routing, "_GATE_FIRST_EVENT_SECONDS", 10.0)
-    monkeypatch.setattr(routing, "_GATE_TOTAL_SECONDS", 15.0)
     endpoint = _Endpoint(monkeypatch)
     yield endpoint
     await asyncio.gather(*(client.aclose() for client in endpoint.clients))
@@ -189,8 +186,36 @@ async def test_responses_startup_event_does_not_extend_router_deadline(endpoint,
         "type": "response.created", "response": _response("in_progress", usage=None),
     }, hold_open=True)
 
-    decision = await asyncio.wait_for(_route(endpoint.binding()), timeout=0.5)
+    budgets = []
 
+    async def wait_after_startup(awaitable, timeout):
+        """Wait for transport readiness, then enforce the gate's supplied timeout."""
+        budgets.append(timeout)
+        event = asyncio.create_task(awaitable, name="router-startup-next-event")
+        ready = asyncio.create_task(endpoint.stream.waiting.wait(), name="router-startup-ready")
+        try:
+            done, _ = await asyncio.wait(
+                {event, ready}, timeout=routing._GATE_TOTAL_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert ready in done and ready.result(), "The startup event was not consumed"
+            assert not event.done(), "Startup metadata reached the router as an event"
+            return await asyncio.wait_for(event, timeout=timeout)
+        finally:
+            for task in (event, ready):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(event, ready, return_exceptions=True)
+
+    # Observe the router's budget without charging SDK setup to this wire check.
+    monkeypatch.setattr(routing, "asyncio", SimpleNamespace(
+        get_running_loop=asyncio.get_running_loop, wait_for=wait_after_startup,
+    ))
+    decision = await asyncio.wait_for(
+        _route(endpoint.binding()), timeout=routing._GATE_TOTAL_SECONDS,
+    )
+
+    assert budgets == [0.05]
     endpoint.request_body()
     assert endpoint.stream.waiting.is_set()
     assert endpoint.stream.closed
@@ -262,19 +287,27 @@ async def test_in_band_responses_failure_discards_partial_gate_text(endpoint, ki
 
 
 async def test_cancelling_the_gate_closes_the_responses_stream(endpoint):
+    """Cancel an active transport without requiring SDK startup to finish in one second."""
     endpoint.stream = _Stream({
         "type": "response.created", "response": _response("in_progress", usage=None),
     }, hold_open=True)
-    task = asyncio.create_task(_route(endpoint.binding()))
+    task = asyncio.create_task(_route(endpoint.binding()), name="router-cancellation")
+    ready = asyncio.create_task(endpoint.stream.waiting.wait(), name="router-stream-ready")
     try:
-        await asyncio.wait_for(endpoint.stream.waiting.wait(), timeout=1)
+        done, _ = await asyncio.wait(
+            {task, ready}, timeout=routing._GATE_TOTAL_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert ready in done and ready.result(), "The stream did not become ready before the router ended or timed out"
+        assert not task.done(), "The router completed before cancellation"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
     finally:
-        if not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        for pending in (task, ready):
+            if not pending.done():
+                pending.cancel()
+        await asyncio.gather(task, ready, return_exceptions=True)
 
     endpoint.request_body()
     assert endpoint.stream.closed

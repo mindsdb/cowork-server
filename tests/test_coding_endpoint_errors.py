@@ -96,7 +96,7 @@ def test_git_identity_routes_read_and_fill_the_global_identity(monkeypatch: pyte
 
 # gemini advertises three levels; gpt is deliberately absent from the listing, so
 # the gateway remains the judge for it.
-LEVELS = SimpleNamespace(ids=["gemini"], efforts={"gemini": {"efforts": ["low", "medium", "high"], "default": "high"}})
+LEVELS = SimpleNamespace(ids=["gemini", "kimi"], efforts={"gemini": {"efforts": ["low", "medium", "high"], "default": "high"}})
 
 
 def _settings_with(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -157,3 +157,33 @@ def test_task_controls_check_the_effort_against_the_model_they_switch_to(monkeyp
 
     coding.update_session("s1", SessionUpdateRequest(model="gemini", reasoning_effort="low"), session=None, scope=None)
     assert applied == [("s1", "low")]
+
+
+def test_switching_models_clears_a_stored_effort_the_new_model_lacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    from cowork.coding.contracts import SessionUpdateRequest
+
+    _settings_with(monkeypatch)
+    applied: list = []
+    stored = SimpleNamespace(model="gpt", reasoning_effort="max")
+    service = SimpleNamespace(
+        get_session=lambda _id: stored,
+        update_session_config=lambda _id, body: applied.append(
+            (body.model, body.reasoning_effort, "reasoning_effort" in body.model_fields_set)
+        ),
+    )
+    monkeypatch.setattr(coding, "_service", lambda: service)
+
+    # kimi offers no levels and gemini doesn't offer "max": both clear it.
+    coding.update_session("s1", SessionUpdateRequest(model="kimi"), session=None, scope=None)
+    coding.update_session("s1", SessionUpdateRequest(model="gemini"), session=None, scope=None)
+    # A model missing from the listing leaves the gateway to judge, so the level stays.
+    coding.update_session("s1", SessionUpdateRequest(model="unlisted"), session=None, scope=None)
+    stored.reasoning_effort = "high"
+    coding.update_session("s1", SessionUpdateRequest(model="gemini"), session=None, scope=None)
+
+    assert applied == [
+        ("kimi", None, True),
+        ("gemini", None, True),
+        ("unlisted", None, False),
+        ("gemini", None, False),
+    ]

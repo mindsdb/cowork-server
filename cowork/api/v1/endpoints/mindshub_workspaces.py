@@ -42,11 +42,10 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlmodel import Session
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
-from cowork.db.session import get_session
+from cowork.db.units import run_db
 from cowork.principal import mindshub_credential
 from cowork.schemas.mindshub_workspaces import (
     MindsHubWorkspaceActivateRequest,
@@ -58,27 +57,26 @@ from cowork.services.mindshub_workspaces import (
     resolve_active,
     selectable,
 )
-from cowork.services.settings import SettingService
+from cowork.services.settings import unit_setting_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
-SessionDep = Annotated[Session, Depends(get_session)]
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 SETTING_KEY = "hub_workspace_id"
 
 
-async def _build_view(
-    request: Request, session: Session, scope: TenantScope
-) -> MindsHubWorkspaceView:
+async def _build_view(request: Request, scope: TenantScope) -> MindsHubWorkspaceView:
     """The selector's whole state: the caller's workspaces and which is active."""
     bearer = mindshub_credential(request)
     org_id = scope.org_id or ""
     user_id = scope.user_id or ""
     listing = await fetch_mindshub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
-    stored = SettingService(session, scope).load().hub_workspace_id
+    stored = await run_db(
+        lambda session: unit_setting_service(session).load().hub_workspace_id, scope=scope
+    )
     active = resolve_active(listing.workspaces, stored)
     active_id = active.id if active else None
     return MindsHubWorkspaceView(
@@ -93,17 +91,14 @@ async def _build_view(
 
 
 @router.get("/", response_model=MindsHubWorkspaceView)
-async def get_mindshub_workspaces(
-    request: Request, session: SessionDep, scope: ScopeDep
-) -> MindsHubWorkspaceView:
-    return await _build_view(request, session, scope)
+async def get_mindshub_workspaces(request: Request, scope: ScopeDep) -> MindsHubWorkspaceView:
+    return await _build_view(request, scope)
 
 
 @router.put("/active", response_model=MindsHubWorkspaceView)
 async def set_active_mindshub_workspace(
     body: MindsHubWorkspaceActivateRequest,
     request: Request,
-    session: SessionDep,
     scope: ScopeDep,
 ) -> MindsHubWorkspaceView:
     """Switch the caller into another workspace.
@@ -154,5 +149,8 @@ async def set_active_mindshub_workspace(
             detail="that workspace is archived",
         )
 
-    SettingService(session, scope).upsert_setting(SETTING_KEY, body.workspace_id)
-    return await _build_view(request, session, scope)
+    await run_db(
+        lambda session: unit_setting_service(session).upsert_setting(SETTING_KEY, body.workspace_id),
+        scope=scope,
+    )
+    return await _build_view(request, scope)

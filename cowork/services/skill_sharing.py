@@ -24,8 +24,9 @@ An org admin (cowork.principal.can_manage_org) sees, changes and shares
 every skill on the skills page, but their turns use only what they'd see
 without the role (SkillViewer.for_turns). Every skill of the store has a row:
 a new skill gets one with its folder, and a skill from before sharing gets
-one shared with everyone, owned by its recorded creator, the first time its
-org's rows are read (cowork.services.skill_access.backfill_legacy_access). A
+one shared with everyone, owned by its recorded creator, the first time
+SkillService reads its org's rows
+(cowork.services.skill_access.backfill_legacy_access). A
 folder with no row after that is its recorded creator's alone, or nobody's
 when it has none, so only an admin sees it (access_rule_for).
 Built-in and managed skills stay visible to everyone and read-only. Outside
@@ -83,9 +84,11 @@ if TYPE_CHECKING:
 OrgMemberLookup = Callable[[Iterable[str]], Awaitable[frozenset[str] | None]]
 
 
-def get_org_member_lookup(request: Request) -> OrgMemberLookup:
+async def get_org_member_lookup(request: Request) -> OrgMemberLookup:
     """The org membership check, asked with the Authorization the gateway
-    validated (cowork.principal.caller_bearer)."""
+    validated (cowork.principal.caller_bearer). A coroutine, so the dependency
+    takes none of anyio's default threads: it does no I/O until the lookup it
+    returns is awaited."""
     bearer_token = caller_bearer(request)
 
     async def lookup(ids: Iterable[str]) -> frozenset[str] | None:

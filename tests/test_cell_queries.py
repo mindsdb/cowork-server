@@ -4,6 +4,7 @@ import random
 import re
 import textwrap
 import time
+from collections.abc import Callable
 from itertools import pairwise
 
 import pytest
@@ -14,17 +15,23 @@ from cowork.harnesses.anton_harness.cell_queries import (
     MAX_FUNCTION_GLOBALS,
     MAX_RENDERED_CHARS,
     MAX_STRING_CHARS,
+    CellReading,
     FunctionReading,
     HttpRequest,
     is_sql,
     read_cell,
     strip_url,
 )
+from tests._linear_time import MAX_LINEAR_GROWTH, growth
 
-# The current code reads each timed input in about a second or less on a
-# laptop under coverage, so a CI runner several times slower still passes; the
-# slow form each test guards against takes 15 s or more on the same laptop.
+# The placeholder check reads its input in under a second on a laptop under
+# coverage; checking per placeholder takes 15 s or more. It counts this
+# thread's CPU time, which a busy machine doesn't add to.
 TIME_BOUND_SECONDS = 5.0
+
+
+def _read(code: str) -> CellReading:
+    return read_cell(code, names={})
 
 
 def _queries(code: str, **names: str) -> list[str]:
@@ -647,10 +654,10 @@ class TestWhatIsNotAQuery:
         assert not is_sql("SELECT 1 -- from x")
 
     def test_unclosed_comments_read_in_linear_time(self):
-        start = time.perf_counter()
+        measured = growth(is_sql, small="/* a" * 5_000, large="/* a" * 50_000)
 
-        assert not is_sql("/* a" * 50_000)
-        assert time.perf_counter() - start < TIME_BOUND_SECONDS
+        assert measured.ratio < MAX_LINEAR_GROWTH
+        assert not measured.result
 
     def test_a_comment_that_reads_like_sql_is_not_a_query(self):
         assert _queries("""
@@ -877,47 +884,52 @@ class TestStatementsInOneString:
     # string and never closes it, so the rest of the string is one statement.
     # A splitter that tries each opener again reads the rest of the string
     # once per opener.
-    @pytest.mark.parametrize(("filler", "ambiguous"), [
-        ("/*'';" * 40_000, False),
-        ("\\'" * 60_000, False),
-        ('\\"' * 60_000, False),
-        ("".join(f"$t{i}x$;" for i in range(15_000)), True),
-        ("[;" * 60_000, False),
+    @pytest.mark.parametrize(("filler", "count", "ambiguous"), [
+        (lambda n: "/*'';" * n, 40_000, False),
+        (lambda n: "\\'" * n, 60_000, False),
+        (lambda n: '\\"' * n, 60_000, False),
+        (lambda n: "".join(f"$t{i}x$;" for i in range(n)), 15_000, True),
+        (lambda n: "[;" * n, 60_000, False),
     ], ids=["comment", "literal", "quoted-name", "dollar-quote", "bracketed-name"])
-    def test_a_string_left_open_splits_into_statements_in_linear_time(self, filler: str, ambiguous: bool):
-        sql = "SELECT qty FROM stock WHERE note = " + filler
-        code = f"cur.execute({sql!r})"
-        start = time.perf_counter()
+    def test_a_string_left_open_splits_into_statements_in_linear_time(
+        self, filler: Callable[[int], str], count: int, ambiguous: bool,
+    ):
+        def sql(n: int) -> str:
+            return "SELECT qty FROM stock WHERE note = " + filler(n)
 
-        reading = read_cell(code, names={})
+        measured = growth(
+            _read, small=f"cur.execute({sql(count // 10)!r})", large=f"cur.execute({sql(count)!r})",
+        )
 
-        assert time.perf_counter() - start < TIME_BOUND_SECONDS
-        assert reading.queries == (() if ambiguous else (sql,))
+        assert measured.ratio < MAX_LINEAR_GROWTH
+        assert measured.result.queries == (() if ambiguous else (sql(count),))
 
     # Every reading splits this string alike, so each one scans it to the
     # end: 20,000 closed block comments, each checked for a nested /*, and
     # 20,000 statements after the query.
     def test_a_string_every_reading_splits_alike_splits_in_linear_time(self):
-        sql = "SELECT qty FROM stock WHERE note = 'a'; " + "/**/;" * 20_000
-        code = f"cur.execute({sql!r})"
-        start = time.perf_counter()
+        def code(n: int) -> str:
+            sql = "SELECT qty FROM stock WHERE note = 'a'; " + "/**/;" * n
+            return f"cur.execute({sql!r})"
 
-        reading = read_cell(code, names={})
+        measured = growth(_read, small=code(2_000), large=code(20_000))
 
-        assert time.perf_counter() - start < TIME_BOUND_SECONDS
-        assert reading.queries == ("SELECT qty FROM stock WHERE note = 'a';",)
+        assert measured.ratio < MAX_LINEAR_GROWTH
+        assert measured.result.queries == ("SELECT qty FROM stock WHERE note = 'a';",)
 
     # The same string after a literal that holds every character the
     # readings are told apart by, so every reading scans it to the end.
     def test_a_string_that_runs_every_reading_splits_in_linear_time(self, monkeypatch: pytest.MonkeyPatch):
-        sql = "SELECT qty FROM stock WHERE note = 'a\\b #c //d --e [f] $g$'; " + "/**/;" * 20_000
+        def code(n: int) -> str:
+            sql = "SELECT qty FROM stock WHERE note = 'a\\b #c //d --e [f] $g$'; " + "/**/;" * n
+            return f"cur.execute({sql!r})"
+
+        measured = growth(_read, small=code(2_000), large=code(20_000))
         reads = _counting_reads(monkeypatch)
-        start = time.perf_counter()
+        _read(code(2_000))
 
-        reading = read_cell(f"cur.execute({sql!r})", names={})
-
-        assert time.perf_counter() - start < TIME_BOUND_SECONDS
-        assert reading.queries == ("SELECT qty FROM stock WHERE note = 'a\\b #c //d --e [f] $g$';",)
+        assert measured.ratio < MAX_LINEAR_GROWTH
+        assert measured.result.queries == ("SELECT qty FROM stock WHERE note = 'a\\b #c //d --e [f] $g$';",)
         assert len(reads) == len(cell_queries_mod._SQL_READINGS)
 
     # The readings differ only where a text holds a backslash (the quote
@@ -938,18 +950,15 @@ class TestStatementsInOneString:
 
         assert len(counted) == reads
 
-    # 20 reads of a 64 KiB query whose characters no reading tells apart.
-    # 20 reads with every reading take about 2 s on a laptop; with one
-    # reading, about 0.05 s.
-    def test_a_long_query_no_reading_tells_apart_reads_quickly(self):
+    # A 64 KiB query whose characters no reading tells apart is split once:
+    # with every reading, it took about 40x as long.
+    def test_a_long_query_no_reading_tells_apart_reads_quickly(self, monkeypatch: pytest.MonkeyPatch):
         sql = "SELECT id FROM orders WHERE id IN (" + "'ord-0000001', " * 4_350 + "'x')"
-        code = f"cur.execute({sql!r})"
-        start = time.perf_counter()
+        reads = _counting_reads(monkeypatch)
 
-        for _ in range(20):
-            reading = read_cell(code, names={})
+        reading = read_cell(f"cur.execute({sql!r})", names={})
 
-        assert time.perf_counter() - start < 1.0
+        assert len(reads) == 1
         assert reading.queries == (sql,)
 
     # Skipping a reading never changes a split: on texts of the characters
@@ -1407,14 +1416,14 @@ class TestBoundedReading:
             return check(text)
 
         monkeypatch.setattr(cell_queries_mod, "is_sql", counted)
-        start = time.perf_counter()
+        start = time.thread_time()
 
         read_cell(code, names={})
 
         # Checking the name once per placeholder reads 60,000 characters
         # 10,000 times; a check per distinct string reads them once.
         assert checked < 10_000
-        assert time.perf_counter() - start < TIME_BOUND_SECONDS
+        assert time.thread_time() - start < TIME_BOUND_SECONDS
 
     def test_a_large_query_read_in_many_placeholders_stays_within_the_cells_budget(self):
         base = "SELECT " + "a" * 60_000 + " FROM t"
@@ -1425,13 +1434,13 @@ class TestBoundedReading:
         assert sum(len(text) for text in reading.strings) <= MAX_RENDERED_CHARS + len(code)
 
     def test_many_placeholders_in_a_long_cell_read_in_linear_time(self):
-        code = "a=1\n" * 10_000 + 'x = f"' + "{a}" * 10_000 + '"\n'
-        start = time.perf_counter()
+        def code(n: int) -> str:
+            return "a=1\n" * n + 'x = f"' + "{a}" * n + '"\n'
 
-        reading = read_cell(code, names={})
+        measured = growth(_read, small=code(1_000), large=code(10_000))
 
-        assert time.perf_counter() - start < TIME_BOUND_SECONDS
-        assert reading.strings == ("{a}" * 10_000,)
+        assert measured.ratio < MAX_LINEAR_GROWTH
+        assert measured.result.strings == ("{a}" * 10_000,)
 
     def test_placeholders_read_as_written_past_non_ascii_text_and_crlf_line_ends(self):
         code = (

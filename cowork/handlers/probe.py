@@ -21,7 +21,11 @@ from cowork.handlers.turn_errors import server_busy_message
 from cowork.schemas.connectors import ConnectorSpecResponse
 from cowork.schemas.responses import Role
 from cowork.services.connectors.catalog import ConnectorCatalog
-from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError
+from cowork.services.connectors.custom_connectors import (
+    USAGE_NOTES_MAX,
+    CustomConnectorService,
+    UnstorableFormError,
+)
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
@@ -104,6 +108,20 @@ def _is_oauth_grant(form_spec: dict, method: str | None, credentials: dict) -> b
         ):
             return True
     return False
+
+
+def _form_usage_notes(form_spec: dict) -> str | None:
+    """A handcrafted form's own ``connector.usage_notes``, for its probe.
+
+    Returns the stripped text, or None when the form has none or they exceed
+    USAGE_NOTES_MAX. The cap is checked again here rather than trusting that
+    every route staging a form ran check_handcrafted_form.
+    """
+    meta = form_spec.get("connector")
+    notes = meta.get("usage_notes") if isinstance(meta, dict) else None
+    if not isinstance(notes, str) or len(notes) > USAGE_NOTES_MAX:
+        return None
+    return notes.strip() or None
 
 
 _GRANT_UNLISTED = (
@@ -454,6 +472,10 @@ class ProbeHandler:
             pending_cell: dict = {}
 
             usage_notes, notes_define_pass = await self._usage_notes(connector_id)
+            if spec is None and not usage_notes:
+                # The submitter wrote this form and its probe uses only their own
+                # credentials, so its notes are hints in every scope, never the rule.
+                usage_notes, notes_define_pass = _form_usage_notes(form_spec), False
             probe = CredentialProbe(
                 engine=connector_id,
                 credentials=probe_credentials,
@@ -671,8 +693,9 @@ class ProbeHandler:
         return None
 
     async def _usage_notes(self, connector_id: str) -> tuple[str | None, bool]:
-        """The connector's agent-facing notes, or None when it has none or they
-        could not be read; the probe runs without them then. The flag is True
+        """The connector's agent-facing notes from the catalog, or None when it
+        has none or they could not be read; a handcrafted form's own notes may
+        then stand in (``_form_usage_notes``). The flag is True
         only for a built-in spec's notes, the ones reviewed like code, which
         may tell the probe what counts as a pass."""
         try:
@@ -680,7 +703,7 @@ class ProbeHandler:
                 lambda session: ConnectorCatalog(session).usage_notes_for([connector_id]), scope=self.scope,
             )
         except Exception:
-            logger.exception("Could not read the usage notes for %s; probing without them", connector_id)
+            logger.exception("Could not read the catalog usage notes for %s", connector_id)
             return None, False
         text = notes.get(connector_id)
         return text, text is not None and text == registry.usage_notes_for([connector_id]).get(connector_id)

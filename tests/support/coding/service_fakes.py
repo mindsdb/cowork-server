@@ -1,0 +1,365 @@
+from __future__ import annotations
+
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+from cowork.coding.contracts import (
+    CodingEvent,
+    CodingSession,
+    EngineCapabilities,
+    EngineCommand,
+    EventType,
+    PermissionMode,
+    SessionStatus,
+)
+from cowork.coding.engines.base import EngineCredentials
+from cowork.coding.engines.registry import CodingEngineRegistry
+from cowork.coding.service import CodingService
+
+CREDS = EngineCredentials(minds_url="https://example.invalid", minds_api_key="test-key")
+
+
+def git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def repository(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init")
+    git(repo, "config", "user.email", "cowork@example.invalid")
+    git(repo, "config", "user.name", "Cowork Test")
+    # A commit starts a detached `git maintenance`, which since git 2.55 holds
+    # .git/objects/maintenance.lock after the commit returns.
+    git(repo, "config", "maintenance.auto", "false")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    return repo
+
+
+def wait_for_status(service: CodingService, session_id: str, status: SessionStatus) -> CodingSession:
+    """Wait for a task to reach ``status`` and return it as it is then."""
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        session = service.get_session(session_id)
+        if session.status == status:
+            return session
+        time.sleep(0.01)
+    session = service.get_session(session_id)
+    assert session.status == status
+    return session
+
+
+def wait_for_run_to_follow(service: CodingService, session_id: str) -> CodingSession:
+    """Wait for a local task's run status to match its session status, and
+    return the task as it is then.
+
+    The run follows the session in a separate save, so a read between the two
+    sees them disagree. A remote runtime owns its run's status; not for those.
+    """
+    deadline = time.monotonic() + 3
+    session = service.get_session(session_id)
+    while time.monotonic() < deadline and session.run_status != session.status.value:
+        time.sleep(0.01)
+        session = service.get_session(session_id)
+    return session
+
+
+def wait_for_turn_thread(session_id: str) -> None:
+    """Wait for a task's turn thread to exit.
+
+    The thread reports the turn's end, then drains the task's queue
+    (``Turns._continue_queue``). A test that queues work as soon as it sees
+    ``completed`` races that drain for the task's reservation, so it waits
+    here first.
+    """
+    for thread in threading.enumerate():
+        if thread.name == f"coding-turn-{session_id[:8]}":
+            thread.join(timeout=3)
+            assert not thread.is_alive(), "the turn thread did not exit"
+
+
+def wait_for_workspace(service: CodingService, session_id: str) -> CodingSession:
+    """Wait for a new task's background preparation to give it a workspace."""
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        session = service.get_session(session_id)
+        if session.workspace_path or session.status == SessionStatus.failed:
+            return session
+        time.sleep(0.01)
+    session = service.get_session(session_id)
+    assert session.workspace_path, "the task workspace was not prepared"
+    return session
+
+
+def wait_for_steerable_turn(service: CodingService, session_id: str) -> None:
+    """Wait until the running turn routes a steer straight to its engine.
+
+    ``FakeEngine.started`` fires inside ``start_turn``, before the turn records
+    its id. A steer sent in that gap is held for the turn instead of reaching
+    the engine, so a test that needs the engine's answer waits here first.
+    """
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        running = service._running.get(session_id)
+        if running is not None and running.engine is not None and running.turn_id:
+            return
+        time.sleep(0.01)
+    raise AssertionError("the turn did not become ready for steering")
+
+
+def wait_for_steers(engine: FakeEngine) -> None:
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not engine.steers:
+        time.sleep(0.01)
+
+
+class FakeSession:
+    def __init__(self, engine: FakeEngine, existing: str | None) -> None:
+        self.engine = engine
+        self._session_id = existing or "engine-session-1"
+        self.cancelled = threading.Event()
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @property
+    def is_closed(self) -> bool:
+        return self.engine.is_closed
+
+    def start_turn(self, prompt: str, attachments=()) -> str:
+        self.engine.prompts.append(prompt)
+        self.engine.attachments.append(attachments)
+        self.engine.started.set()
+        return f"turn-{len(self.engine.prompts)}"
+
+    def start_goal(self, objective: str) -> str:
+        self.engine.goals.append(objective)
+        self.engine.goal = {"objective": objective, "status": "active"}
+        self.engine.started.set()
+        return f"goal-{len(self.engine.goals)}"
+
+    def resume_goal(self) -> str:
+        self.engine.goal_resumes += 1
+        if self.engine.goal is not None:
+            self.engine.goal["status"] = "active"
+        self.engine.started.set()
+        return f"goal-resume-{self.engine.goal_resumes}"
+
+    def update_goal(self, action: str, objective: str | None = None):
+        if action == "clear":
+            self.engine.goal = None
+        elif action == "pause":
+            if self.engine.goal is None:
+                raise RuntimeError("There is no goal to update")
+            self.engine.goal["status"] = "paused"
+        elif action == "edit":
+            if self.engine.goal is None:
+                raise RuntimeError("There is no goal to update")
+            self.engine.goal["objective"] = objective
+        return self.engine.goal
+
+    def start_review(self) -> str:
+        self.engine.reviews += 1
+        self.engine.started.set()
+        return f"review-{self.engine.reviews}"
+
+    def events(self, turn_id: str):
+        if self.engine.events_error:
+            raise RuntimeError(self.engine.events_error_message)
+        if self.engine.block_until_release:
+            self.engine.release_events.wait(timeout=2)
+        if self.engine.block_until_cancel:
+            self.cancelled.wait(timeout=2)
+            yield CodingEvent(type=EventType.session, data={"status": "interrupted"})
+            return
+        yield CodingEvent(type=EventType.agent_message, text="done", item_id="message-1")
+        if self.engine.turn_failure_message:
+            yield CodingEvent(type=EventType.error, title="Agent error", text=self.engine.turn_failure_message, phase="failed")
+            yield CodingEvent(type=EventType.session, title="Task failed", phase="failed", data={"status": "failed"})
+            return
+        yield CodingEvent(type=EventType.session, data={"status": "completed"})
+
+    def steer(self, turn_id: str, prompt: str, attachments=()):
+        if self.engine.steer_error:
+            raise RuntimeError("adapter rejected steer")
+        self.engine.steers.append((turn_id, prompt))
+        self.engine.steer_attachments.append(attachments)
+        return self.engine.steer_pending
+
+    def cancel(self, turn_id: str) -> None:
+        self.engine.cancels.append(turn_id)
+        self.cancelled.set()
+
+    def compact(self) -> None:
+        if self.engine.block_compact:
+            self.engine.compact_started.set()
+            self.engine.release_compact.wait(timeout=2)
+        self.engine.compactions += 1
+
+    def goal_status(self):
+        return self.engine.goal
+
+    def fork(self, workspace: str, additional_dirs: tuple[str, ...] = ()) -> str:
+        self.engine.forked_workspaces.append(workspace)
+        self.engine.forked_additional_dirs.append(additional_dirs)
+        return f"forked-engine-session-{len(self.engine.forked_workspaces)}"
+
+    def start_terminal(self, process_id, cols, rows, shell, output_handler, exit_handler) -> None:
+        if self.engine.terminal_start_error:
+            raise RuntimeError("terminal secret-ish failure")
+        self.engine.terminal_process_id = process_id
+        self.engine.terminal_size = (cols, rows)
+        self.engine.terminal_output = output_handler
+        self.engine.terminal_exit = exit_handler
+        self.engine.terminal_process_ids.append(process_id)
+        self.engine.terminal_sizes[process_id] = (cols, rows)
+        self.engine.terminal_outputs[process_id] = output_handler
+        self.engine.terminal_exits[process_id] = exit_handler
+
+    def write_terminal(self, process_id: str, data_base64: str) -> None:
+        self.engine.terminal_writes.append((process_id, data_base64))
+
+    def resize_terminal(self, process_id: str, cols: int, rows: int) -> None:
+        self.engine.terminal_size = (cols, rows)
+        self.engine.terminal_sizes[process_id] = (cols, rows)
+
+    def stop_terminal(self, process_id: str) -> None:
+        self.engine.terminal_stops.append(process_id)
+
+    def close(self) -> None:
+        if not self.engine.is_closed:
+            self.engine.is_closed = True
+            self.engine.closed += 1
+            self.engine.release_events.set()
+
+
+class FakeEngine:
+    id = "fake"
+
+    def __init__(self, *, block_open: bool = False, block_until_cancel: bool = False) -> None:
+        self.block_open = block_open
+        self.block_until_cancel = block_until_cancel
+        self.block_until_release = False
+        self.events_error = False
+        self.events_error_message = "adapter stream disconnected"
+        self.turn_failure_message = ""
+        self.block_compact = False
+        self.compact_started = threading.Event()
+        self.release_compact = threading.Event()
+        self.release_events = threading.Event()
+        self.opened = threading.Event()
+        self.release_open = threading.Event()
+        self.started = threading.Event()
+        self.existing_ids: list[str | None] = []
+        self.permission_modes: list[PermissionMode] = []
+        self.configs = []
+        self.prompts: list[str] = []
+        self.attachments = []
+        self.goals: list[str] = []
+        self.goal_resumes = 0
+        self.reviews = 0
+        self.goal: dict | None = None
+        self.forked_workspaces: list[str] = []
+        self.forked_additional_dirs: list[tuple[str, ...]] = []
+        self.opened_workspaces: list[str] = []
+        self.compactions = 0
+        self.steers: list[tuple[str, str]] = []
+        self.steer_pending = None  # a SteerOutcome to hand back as "not confirmed yet"
+        self.steer_error = False
+        self.steer_attachments = []
+        self.cancels: list[str] = []
+        self.closed = 0
+        self.is_closed = False
+        self.terminal_process_id: str | None = None
+        self.terminal_process_ids: list[str] = []
+        self.terminal_size: tuple[int, int] | None = None
+        self.terminal_sizes: dict[str, tuple[int, int]] = {}
+        self.terminal_output = None
+        self.terminal_exit = None
+        self.terminal_outputs = {}
+        self.terminal_exits = {}
+        self.terminal_writes: list[tuple[str, str]] = []
+        self.terminal_stops: list[str] = []
+        self.terminal_start_error = False
+
+    def capabilities(self) -> EngineCapabilities:
+        return EngineCapabilities(
+            id=self.id,
+            label="Fake",
+            adapter_version="1",
+            available=True,
+            commands=[
+                EngineCommand(name="goal", label="Goal", description="Goal", action="goal"),
+                EngineCommand(name="review", label="Review", description="Review", action="turn"),
+                EngineCommand(name="compact", label="Compact", description="Compact", action="compact"),
+                EngineCommand(name="status", label="Status", description="Status", action="status"),
+                EngineCommand(name="init", label="Init", description="Init", action="turn"),
+                EngineCommand(
+                    name="permissions",
+                    label="Permissions",
+                    description="Permissions",
+                    action="client",
+                    client_action="controls",
+                ),
+            ],
+        )
+
+    def open_session(self, *, existing_session_id: str | None, **kwargs) -> FakeSession:
+        self.existing_ids.append(existing_session_id)
+        self.permission_modes.append(kwargs["config"].permission_mode)
+        self.configs.append(kwargs["config"])
+        self.opened_workspaces.append(kwargs["workspace"])
+        self.opened.set()
+        if self.block_open:
+            self.release_open.wait(timeout=2)
+        return FakeSession(self, existing_session_id)
+
+    def discover_models(self, _credentials: EngineCredentials) -> list[str]:
+        return ["fake-model"]
+
+
+_open_services: list[CodingService] = []
+
+
+def service_with(tmp_path: Path, engine: FakeEngine, **options) -> CodingService:
+    registry = CodingEngineRegistry()
+    registry.register(engine)
+    service = CodingService(tmp_path / "coding", registry=registry, **options)
+    _open_services.append(service)
+    return service
+
+
+def close_services() -> None:
+    """Stop every service a test built through ``service_with``; the conftest fixture calls this per test."""
+    while _open_services:
+        _open_services.pop().close_all()
+
+
+def copy_folders_without_git(workspaces) -> None:
+    """Copy folders a worktree cannot use, as tasks created before folder copies stopped did.
+
+    Folder copies are no longer made, but tasks that have one keep working, so
+    their tests still need one.
+    """
+    from cowork.coding.workspace import WorkspaceError
+
+    prepare = workspaces.prepare
+
+    def prepare_or_copy(session_id, raw_path, *args, **kwargs):
+        try:
+            return prepare(session_id, raw_path, *args, **kwargs)
+        except WorkspaceError as exc:
+            if "Initialize Git" not in str(exc) and "first commit" not in str(exc):
+                raise
+            inspection = workspaces.inspect(raw_path)
+            return workspaces._prepare_local_copy(
+                session_id, Path(inspection.repository_root or inspection.path)
+            )
+
+    workspaces.check_source = lambda raw_path: None
+    workspaces.prepare = prepare_or_copy

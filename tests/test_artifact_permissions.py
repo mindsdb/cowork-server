@@ -159,13 +159,13 @@ async def test_creator_can_open_the_workspace_of_a_project_root_artifact(
     )
     with scoped(org_id, creator) as session:
         result = await artifact_workspace.artifact_source(
-            str(project.id), local_id, session, path=None
+            str(project.id), local_id, session.scope, path=None
         )
         assert result["capabilities"]["role"] == "owner"
         assert result["capabilities"]["canEdit"] is True
     with scoped(org_id, member) as session:
         with pytest.raises(HTTPException) as refused:
-            await artifact_workspace.artifact_source(str(project.id), local_id, session, path=None)
+            await artifact_workspace.artifact_source(str(project.id), local_id, session.scope, path=None)
         assert refused.value.status_code == 403
 
 
@@ -204,7 +204,7 @@ async def test_owner_delete_removes_the_owner_row(
     org_id, creator, _member, project, source = world
     local_id, folder = _write(source, "mine")
     with scoped(org_id, creator) as session:
-        await artifacts_ep.delete_artifact_for_request(session, local_id, project_id=project.id)
+        await artifacts_ep.delete_artifact_for_request(session.scope, local_id, project_id=project.id)
     assert not folder.exists()
     with scoped(org_id, creator) as session:
         assert ownership.resolve_artifact_owner(session, source, "mine").unknown
@@ -231,11 +231,11 @@ async def test_admin_may_delete_an_ownerless_artifact_but_not_an_owned_one(
         ids.commit()
     with scoped(org_id, admin) as session:
         await artifacts_ep.delete_artifact_for_request(
-            session, orphan_id, project_id=project.id, principal=principal
+            session.scope, orphan_id, project_id=project.id, principal=principal
         )
         with pytest.raises(HTTPException) as refused:
             await artifacts_ep.delete_artifact_for_request(
-                session, owned_id, project_id=project.id, principal=principal
+                session.scope, owned_id, project_id=project.id, principal=principal
             )
         assert refused.value.status_code == 403
     assert not orphan.exists()
@@ -250,7 +250,7 @@ async def test_without_a_principal_there_is_no_admin_exception(
     orphan_id, orphan = _write(source, "orphan")
     with scoped(org_id, str(uuid4())) as session:
         with pytest.raises(HTTPException) as refused:
-            await artifacts_ep.delete_artifact_for_request(session, orphan_id, project_id=project.id)
+            await artifacts_ep.delete_artifact_for_request(session.scope, orphan_id, project_id=project.id)
         assert refused.value.detail == "Artifact owner is unknown"
     assert orphan.exists()
 
@@ -273,7 +273,7 @@ async def test_delete_resolves_the_owner_once(
     monkeypatch.setattr(ownership, "resolve_artifact_owner", counting)
     with scoped(org_id, creator) as session:
         await artifacts_ep.delete_artifact_for_request(
-            session, local_id, project_id=project.id,
+            session.scope, local_id, project_id=project.id,
             principal=_principal(org_id, creator, admin=True),
         )
     assert not folder.exists()

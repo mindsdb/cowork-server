@@ -33,7 +33,7 @@ from cowork.common.settings.user_settings import setting_is_org_scoped
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.services.providers import MindsModelListing
 from cowork.services.settings import SettingService
-from _fakes import FakeRequest
+from _fakes import FakeRequest, units_on_engine
 
 ORG = "org-member-rules"
 MEMBER_A = "u-team-a"
@@ -45,7 +45,7 @@ def _listing(*, restricted: bool, flags: bool = True) -> MindsModelListing:
     """The catalog one caller gets: ``PINNED`` restricted for them or not."""
     enabled = {MINDS_FREE_MODEL: True, PINNED: not restricted} if flags else {}
     reasons = {PINNED: "model_restricted"} if restricted and flags else {}
-    return MindsModelListing([MINDS_FREE_MODEL, PINNED], {}, enabled, {}, {}, {}, {}, reasons)
+    return MindsModelListing([MINDS_FREE_MODEL, PINNED], {}, enabled, {}, {}, {}, {}, reasons, {})
 
 
 def _mode(monkeypatch, mode: str) -> None:
@@ -54,11 +54,12 @@ def _mode(monkeypatch, mode: str) -> None:
 
 
 @pytest.fixture()
-def session():
+def session(monkeypatch):
     import cowork.models.setting  # noqa: F401
 
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
+    units_on_engine(monkeypatch, engine)
     with Session(engine) as s:
         yield s
 
@@ -83,7 +84,7 @@ def _scope(user_id: str) -> TenantScope:
 
 def _open_picker(session, user_id: str) -> None:
     request = FakeRequest({"Authorization": f"Bearer jwt-{user_id}"})
-    asyncio.run(ep.recommended_models(request, session, _scope(user_id)))
+    asyncio.run(ep.recommended_models(request, _scope(user_id)))
 
 
 def _pin(session, user_id: str) -> None:
@@ -164,7 +165,7 @@ def test_the_restriction_list_is_per_member_and_the_map_per_org():
 def test_desktop_keeps_restrictions_in_the_map(session, monkeypatch):
     _mode(monkeypatch, "local")
 
-    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **_kw):
         return _listing(restricted=True)
 
     monkeypatch.setattr(ep, "fetch_minds_models", fake_fetch)
@@ -173,7 +174,7 @@ def test_desktop_keeps_restrictions_in_the_map(session, monkeypatch):
     service.upsert_setting("planning_provider", "minds_cloud")
     service.upsert_setting("planning_model", PINNED)
     try:
-        asyncio.run(ep.recommended_models(FakeRequest(), session, LOCAL_SCOPE))
+        asyncio.run(ep.recommended_models(FakeRequest(), LOCAL_SCOPE))
 
         settings = SettingService(session, LOCAL_SCOPE).load()
         assert json.loads(settings.minds_model_enabled) == {MINDS_FREE_MODEL: True, PINNED: False}
@@ -181,3 +182,37 @@ def test_desktop_keeps_restrictions_in_the_map(session, monkeypatch):
         assert settings.resolved_planning_model == MINDS_FREE_MODEL
     finally:
         us.get_app_settings.cache_clear()
+
+
+@pytest.mark.parametrize("refresh_scope, overlay_forced", [("minds", False), ("all", True)])
+def test_org_refresh_scope_forces_the_catalog_and_scopes_the_custom_endpoint(
+    session, monkeypatch, refresh_scope, overlay_forced
+):
+    _mode(monkeypatch, "org")
+    seen = {}
+
+    async def fake_org_catalog(*, org_id, user_id, bearer_token, refresh=False):
+        seen["catalog_refresh"] = refresh
+        return _listing(restricted=False)
+
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None, **kw):
+        seen["overlay"] = (force_refresh, kw.get("mindshub", False))
+        return MindsModelListing(["local-llama"], {}, {}, {}, {}, {}, {}, {}, {})
+
+    monkeypatch.setattr(ep, "fetch_org_model_catalog", fake_org_catalog)
+    monkeypatch.setattr(ep, "fetch_minds_models", fake_fetch)
+    try:
+        service = SettingService(session, _scope(MEMBER_A))
+        service.upsert_setting("providers_json", json.dumps(
+            [{"type": "openai-compatible", "baseUrl": "https://llm.local/v1", "apiKey": "***"}]
+        ))
+        service.upsert_setting("openai_api_key", "sk-test")
+
+        asyncio.run(ep.recommended_models(
+            FakeRequest({"Authorization": "Bearer jwt-a"}), _scope(MEMBER_A),
+            refresh=True, refresh_scope=refresh_scope,
+        ))
+    finally:
+        us.get_app_settings.cache_clear()
+
+    assert seen == {"catalog_refresh": True, "overlay": (overlay_forced, False)}

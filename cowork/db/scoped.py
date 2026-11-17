@@ -32,7 +32,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import sqlalchemy as sa
-from fastapi import Depends, Request
+from fastapi import Depends
 from sqlalchemy import event, inspect
 from sqlalchemy.sql import Select
 from sqlmodel import Session, select
@@ -146,9 +146,14 @@ def scope_for_org(org_id: str | None) -> TenantScope:
     return LOCAL_SCOPE if org_id is None else scope_for_identity(org_id=org_id, user_id=None)
 
 
-def get_tenant_scope(request: Request) -> TenantScope:
-    """FastAPI dependency: the request's tenant scope."""
-    return scope_from_principal(get_principal(request))
+async def get_tenant_scope(principal: Principal | None = Depends(get_principal)) -> TenantScope:
+    """FastAPI dependency: the request's tenant scope, built from the principal
+    ``get_principal`` gives, so the scope and the authorization checks read one
+    identity. A coroutine for the reason get_principal is one."""
+    return scope_from_principal(principal)
+
+
+TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 def scope_for_background_context() -> TenantScope:
@@ -563,11 +568,12 @@ def adopt_scoped_session(session: Session) -> ScopedSession:
     return ScopedSession(session, scope)
 
 
-def get_scoped_session(
+async def get_scoped_session(
     session: Session = Depends(get_session),
     scope: TenantScope = Depends(get_tenant_scope),
 ) -> ScopedSession:
-    """FastAPI dependency: the request's tenant-scoped session."""
+    """FastAPI dependency: the request's tenant-scoped session. A coroutine
+    for the reason get_principal is one."""
     return ScopedSession(session, scope)
 
 

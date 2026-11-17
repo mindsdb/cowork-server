@@ -1,0 +1,104 @@
+{
+  "description": "The router's error body, {error, message}. A 401, 403 or 429 reaches the app with its own status; any other reaches it as 424, since Cloudflare, in front of the cowork host, swaps a 502 or 504 body for its own page. The router sends browser_unavailable and browser_starting as 503 for the same reason. The code always passes on. daily_limit comes only from the agent's POST /sessions, which no /browse route calls.",
+  "examples": {
+    "a stale sign-in": {
+      "where": "any",
+      "kind": "response",
+      "status": 401,
+      "body": {
+        "error": "unauthorized",
+        "message": "Sign in again to use the browser."
+      }
+    },
+    "an account the browser isn't enabled for": {
+      "where": "any",
+      "kind": "response",
+      "status": 403,
+      "body": {
+        "error": "not_entitled",
+        "message": "The browser isn't available for your account."
+      }
+    },
+    "a turn key on a person's route": {
+      "where": "POST /_embed",
+      "kind": "response",
+      "status": 403,
+      "body": {
+        "error": "person_only",
+        "message": "Only the person signed in to the app can do that."
+      }
+    },
+    "today's allowance used up": {
+      "where": "POST /sessions",
+      "kind": "response",
+      "status": 429,
+      "body": {
+        "error": "daily_limit",
+        "message": "Today's browsing allowance is used up. It resets at 00:00 UTC."
+      }
+    },
+    "a key scoped to another session": {
+      "where": "POST /_scope",
+      "kind": "response",
+      "status": 409,
+      "body": {
+        "error": "scope_conflict",
+        "message": "This task's key is already scoped to another session."
+      }
+    },
+    "a scope without the scope key": {
+      "where": "POST /_scope",
+      "kind": "response",
+      "status": 403,
+      "body": {
+        "error": "scope_key_invalid",
+        "message": "This server can't scope a turn's key."
+      }
+    },
+    "an approval that lapsed": {
+      "where": "POST /sessions/{id}/approve",
+      "kind": "response",
+      "status": 409,
+      "body": {
+        "error": "approval_lapsed",
+        "message": "That step is no longer waiting for approval."
+      }
+    },
+    "entitlements unknown": {
+      "where": "any",
+      "kind": "response",
+      "status": 503,
+      "body": {
+        "error": "entitlements_unavailable",
+        "message": "Browser access can't be checked right now. Try again in a moment."
+      }
+    },
+    "an approval with no running browser": {
+      "where": "POST /sessions/{id}/approve",
+      "kind": "response",
+      "status": 404,
+      "body": {
+        "error": "session_not_found",
+        "message": "That browser session isn't running."
+      }
+    },
+    "a sign-out while the browser starts": {
+      "where": "DELETE /logins",
+      "kind": "response",
+      "status": 503,
+      "body": {
+        "error": "browser_starting",
+        "message": "Your browser is still starting. Nothing changed; try again in a moment."
+      }
+    },
+    "a sign-out the running browser didn't answer": {
+      "where": "DELETE /logins",
+      "kind": "response",
+      "status": 503,
+      "body": {
+        "error": "browser_unavailable",
+        "message": "Your browser didn't answer. Nothing changed; try again in a moment."
+      }
+    }
+  }
+}
