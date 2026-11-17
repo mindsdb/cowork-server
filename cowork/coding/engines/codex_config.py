@@ -32,6 +32,7 @@ class CodexLaunchConfig:
     """Fully resolved Codex policy at the engine-adapter boundary."""
 
     approval_policy: str
+    approvals_reviewer: str
     sandbox_policy: dict[str, Any]
     config_overrides: tuple[str, ...]
     thread_params: dict[str, Any]
@@ -79,7 +80,16 @@ def turn_input(
 
 
 def approval_policy(permission_mode: PermissionMode) -> str:
-    return "on-request" if permission_mode in {PermissionMode.read_only, PermissionMode.supervised} else "never"
+    return "never" if permission_mode == PermissionMode.full_access else "on-request"
+
+
+def approvals_reviewer(permission_mode: PermissionMode) -> str:
+    """Who answers a request to leave the sandbox: the person, or Codex's reviewer.
+
+    Approve for me keeps the workspace sandbox and hands each request to the
+    reviewer agent, which allows or denies it without opening a card.
+    """
+    return "auto_review" if permission_mode == PermissionMode.workspace else "user"
 
 
 def sandbox_mode(permission_mode: PermissionMode) -> str:
@@ -209,6 +219,7 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
     """Translate Cowork runtime controls into one consistent Codex launch policy."""
     permission = PermissionMode.read_only if config.task_mode == "plan" else config.permission_mode
     resolved_approval = "never" if config.task_mode == "plan" else approval_policy(permission)
+    resolved_reviewer = approvals_reviewer(permission)
     resolved_sandbox = sandbox_mode(permission)
     resolved_policy = sandbox_policy(
         permission,
@@ -258,7 +269,7 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         "model": config.model,
         "modelProvider": "mindshub",
         "approvalPolicy": resolved_approval,
-        "approvalsReviewer": "user",
+        "approvalsReviewer": resolved_reviewer,
         "sandbox": resolved_sandbox,
         "serviceTier": config.service_tier,
         "personality": config.personality,
@@ -267,6 +278,7 @@ def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) 
         thread_params["developerInstructions"] = config.developer_instructions
     return CodexLaunchConfig(
         approval_policy=resolved_approval,
+        approvals_reviewer=resolved_reviewer,
         sandbox_policy=resolved_policy,
         config_overrides=tuple(overrides),
         thread_params=thread_params,
