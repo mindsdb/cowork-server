@@ -51,6 +51,7 @@ from cowork.services import (
 from cowork.services.artifact_export import ExportRefusal, ExportRefused
 from cowork.services.artifact_files import ArtifactFileContent, ArtifactFileRefused
 from cowork.services.artifact_inline import TRUNCATION_NOTE, folder_reader
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
 from scripts import measure_export_capacity as capacity
 from test_artifact_export_route import _snapshot
@@ -85,7 +86,7 @@ def short_wall(monkeypatch):
     monkeypatch.setattr(artifact_export, "CONVERSION_WALL_SECONDS", WALL_SECONDS)
 
 
-def _artifact(project: Path, case: capacity.Case) -> tuple[ProjectArtifacts, Path, dict]:
+def _artifact(project: Path, case: capacity.Case) -> tuple[ProjectArtifacts, Path, ArtifactMetadata]:
     """An artifact holding *case*'s files, in the general project at *project*."""
     folder = project / ".anton" / "artifacts" / f"report-{uuid4().hex[:8]}"
     folder.mkdir(parents=True)
@@ -99,7 +100,7 @@ def _artifact(project: Path, case: capacity.Case) -> tuple[ProjectArtifacts, Pat
         trusted_anchor=project,
         root_parts=(".anton", "artifacts"),
     )
-    return source, folder, metadata
+    return source, folder, ArtifactMetadata.model_validate(metadata)
 
 
 def _report(text: str, primary: str = "report.md") -> capacity.Case:
@@ -111,12 +112,12 @@ def _report(text: str, primary: str = "report.md") -> capacity.Case:
 ORDINARY = _report("# Quarterly\n\nRevenue grew.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n")
 
 
-def _export(source: ProjectArtifacts, folder: Path, metadata: dict, export_format: str = "docx"):
+def _export(source: ProjectArtifacts, folder: Path, metadata: ArtifactMetadata, export_format: str = "docx"):
     return artifact_export.export_primary_file(
         source=source,
         folder_name=folder.name,
         metadata=metadata,
-        artifact_id=metadata["id"],
+        artifact_id=metadata.id,
         export_format=export_format,
         can_edit=True,
     )
@@ -303,6 +304,7 @@ from scripts import measure_export_capacity as capacity
 from cowork.schemas.artifact_export import InlineLimits
 from cowork.schemas.export_child import ConvertRequest
 from cowork.services import artifact_export
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.export_child import convert
 
@@ -334,7 +336,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     server = peak_from_here()
     artifact_export.export_primary_file(source=source, folder_name="report",
-        metadata={"id": "a" * 32, "primary": "report.md", "type": "document"},
+        metadata=ArtifactMetadata.model_validate({"id": "a" * 32, "primary": "report.md", "type": "document"}),
         artifact_id="a" * 32, export_format="docx", can_edit=True)
     server = server()
     # The same conversion in this process, as before it moved out.
@@ -401,7 +403,7 @@ async def test_liveness_answers_at_once_while_a_hostile_export_converts(
         started = loop.time()
         export = asyncio.create_task(
             client.post(
-                f"/api/v1/artifacts/workspace/local/{metadata['id']}/export", json={"format": "docx"}
+                f"/api/v1/artifacts/workspace/local/{metadata.id}/export", json={"format": "docx"}
             )
         )
         try:

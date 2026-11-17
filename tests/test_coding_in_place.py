@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from coding_service_fakes import (
+from tests.support.coding.service_fakes import (
     CREDS,
     FakeEngine,
     git,
@@ -23,6 +23,7 @@ from cowork.coding.contracts import (
     SessionStatus,
     WorkspaceKind,
     WorkspaceMode,
+    WorkspaceReasonCode,
 )
 from cowork.coding.engines.codex_config import sandbox_policy
 from cowork.coding.project_models import ProjectCommand, ProjectCreateRequest, ProjectFolder, RepositoryResource
@@ -478,7 +479,9 @@ def test_committing_an_in_place_project_task_commits_in_the_users_repositories(t
         service.apply_to_source(session.id)
 
 
-def test_in_place_project_tasks_are_refused_where_they_cannot_work(tmp_path: Path) -> None:
+def test_in_place_project_tasks_are_refused_where_they_cannot_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     service = service_with(tmp_path, FakeEngine())
     project, _, _ = two_repo_project(service, tmp_path)
     with pytest.raises(ValueError, match="Branch choices"):
@@ -490,9 +493,17 @@ def test_in_place_project_tasks_are_refused_where_they_cannot_work(tmp_path: Pat
         default_engine_id="fake",
         default_model="fake-model",
     ))
-    with pytest.raises(WorkspaceError, match="lib has no checkout on this computer"):
+    with pytest.raises(WorkspaceError, match="lib has no checkout on this computer") as raised:
         start_project_task(service, remote.id)
+    assert (raised.value.reason, raised.value.folder) == (WorkspaceReasonCode.no_local_checkout, "lib")
     assert service.list_sessions().items == []
+
+    # Project validation keeps one repository per project; a folder that later
+    # becomes part of another's repository is still refused when preparing.
+    monkeypatch.setattr(service.session_factory.project_workspaces.workspaces, "in_place_root", lambda _path: tmp_path)
+    options = service.workspace_mode_options(project.id, None)
+    assert options.in_place_unavailable_code == WorkspaceReasonCode.shared_repository
+    assert options.in_place_unavailable_folder is None
 
 
 def test_a_project_of_folders_without_git_works_in_place_and_cannot_use_a_worktree(tmp_path: Path) -> None:
@@ -511,15 +522,18 @@ def test_a_project_of_folders_without_git_works_in_place_and_cannot_use_a_worktr
     assert options.supported == [WorkspaceMode.in_place]
     assert options.default == WorkspaceMode.in_place
     assert "Notes: This folder isn't a Git repository" in (options.worktree_unavailable_reason or "")
+    assert options.worktree_unavailable_code == WorkspaceReasonCode.not_a_repository
+    assert options.worktree_unavailable_folder == "Notes"
     created = service.create_session(SessionCreateRequest(project_id=notes.id, prompt="Go"), CREDS, "fake", "fake-model")
     session = wait_for_status(service, created.id, SessionStatus.completed)
     assert session.workspace_mode == WorkspaceMode.in_place
     assert Path(session.workspaces[0].workspace_path) == plain.resolve()
-    with pytest.raises(WorkspaceError, match="Notes: This folder isn't a Git repository"):
+    with pytest.raises(WorkspaceError, match="Notes: This folder isn't a Git repository") as raised:
         service.create_session(
             SessionCreateRequest(project_id=notes.id, prompt="Isolate", workspace_mode=WorkspaceMode.worktree),
             CREDS, "fake", "fake-model",
         )
+    assert (raised.value.reason, raised.value.folder) == (WorkspaceReasonCode.not_a_repository, "Notes")
 
 
 def test_a_project_default_of_local_falls_back_where_it_cannot_apply(

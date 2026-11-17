@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import partial
 import inspect
 import os
@@ -75,10 +76,21 @@ if TYPE_CHECKING:
     from anton.core.browser.config import BrowserConfig
     from anton.core.session import ChatSession
 
+    from cowork.schemas.artifact_card import ArtifactCard
     from cowork.services.conversations import ReplayHistory
 
 
 logger = get_logger(__name__)
+
+# Anton stamps live input in UTC but older versions omit its offset. Keep this
+# interpretation cache-stable and shared by live turns and persisted history.
+_MESSAGE_TIME_CONTEXT = (
+    "\n\nMESSAGE TIMES: Message send-time prefixes are UTC, including live and "
+    "historical prefixes formatted as [YYYY-MM-DD HH:MM] without a timezone label. "
+    "Use the latest message timestamp as the current time, and convert that instant "
+    "to the user's timezone before reasoning about local dates or scheduling. "
+    "Never attach a local UTC offset to the unchanged UTC clock reading."
+)
 
 
 def _anton_mcp_wiring():
@@ -217,8 +229,19 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     """
     applied: list[str] = []
     limits = effective_turn_limits(user)._asdict()
-    for attr in _OVERLAID_SETTINGS:
-        db_val = limits[attr] if attr in limits else getattr(user, attr, None)
+    values = [
+        (attr, limits[attr] if attr in limits else getattr(user, attr, None))
+        for attr in _OVERLAID_SETTINGS
+    ]
+    # anton's `image_model` (ANTON_IMAGE_MODEL), which its generate_image tool
+    # and scratchpad helper draw with. Resolved rather than raw: the planning and
+    # coding pins are corrected afterwards from the built client
+    # (_apply_client_models), and nothing corrects this one, so a pin MindsHub no
+    # longer serves or the wallet cannot pay for is swapped here (ENG-1632).
+    # None where no image model can be served, so anton offers no image tool
+    # (UserSettings.image_model_for_agent).
+    values.append(("image_model", getattr(user, "image_model_for_agent", None)))
+    for attr, db_val in values:
         if db_val is None:
             continue
         if not hasattr(anton_settings, attr):
@@ -1129,7 +1152,7 @@ class AntonHarness:
         skill_drafts_base = project_path / ".anton" / "skill_drafts"
         before_drafts = snapshot_skill_drafts(skill_drafts_base)
         before_strays = snapshot_stray_skills(project_path / "skills")
-        cards: list[dict] = []
+        cards: list[ArtifactCard] = []
         skill_drafts: list[dict] = []
         new_slugs: list[str] = []
         touched_slugs: set[str] = set()
@@ -1391,7 +1414,14 @@ class AntonHarness:
         directly against fake messages, same reasoning as _seed_history.
         """
         om = scrubbed_openai_dump(m)
-        ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
+        created_at = getattr(m, "created_at", None)
+        # Naive database timestamps are UTC; aware timestamps must be converted.
+        if created_at is not None:
+            created_at = (
+                created_at.replace(tzinfo=timezone.utc)
+                if created_at.tzinfo is None else created_at.astimezone(timezone.utc)
+            )
+        ts = created_at.strftime("%Y-%m-%d %H:%M UTC") if created_at else None
         if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
             om["content"] = f"[{ts}] {om['content']}"
         return om
@@ -1545,6 +1575,13 @@ class AntonHarness:
                     "type": "text",
                     "text": f"[Attached file '{block['filename']}' is at: {block['path']}]",
                 })
+        # Anton stamps plain strings, but leaves image/file block lists alone.
+        # Put the clock on this turn too, so a resumed chat cannot mistake the
+        # last historical message's timestamp for now. Keep it out of the
+        # system prompt so the settled prompt prefix remains cache-stable.
+        if anton_blocks:
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            anton_blocks.insert(0, {"type": "text", "text": f"[{stamp}]"})
         return anton_blocks
         
     async def _build_chat_session(
@@ -2145,6 +2182,7 @@ class AntonHarness:
                     runtime_context=build_runtime_context(anton_settings),
                     suffix=(
                         _turn_style_context(channel_context)
+                        + _MESSAGE_TIME_CONTEXT
                         + f"{project_context}"
                         + f"{output_context}"
                         + f"{skill_output_context}"

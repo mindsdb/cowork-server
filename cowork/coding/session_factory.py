@@ -36,6 +36,7 @@ from cowork.coding.store import CodingStore
 from cowork.coding.workspace import (
     NO_REVIEW_WITHOUT_COMMITS,
     NO_REVIEW_WITHOUT_GIT,
+    WRITES_HELD,
     WorkspaceError,
     WorkspaceManager,
     _org_mode,
@@ -109,6 +110,8 @@ _PREPARED_FIELDS = (
 def _adopt_preparation(current: CodingSession, prepared: CodingSession) -> None:
     for name in _PREPARED_FIELDS:
         setattr(current, name, getattr(prepared, name))
+    # Writes allowed while the task prepared stay allowed.
+    current.writes_allowed = current.writes_allowed and prepared.writes_allowed
     # Other project folders are prepared as extra directories; keep any the
     # user added while the task prepared.
     current.additional_dirs = list(dict.fromkeys([*prepared.additional_dirs, *current.additional_dirs]))
@@ -329,7 +332,7 @@ class CodingSessionFactory:
                     # default as a preference. An explicit mode or branch
                     # choice must never silently change where the task works.
                     if explicit_mode is not None or request.repository_setup is not None:
-                        raise WorkspaceError(problem)
+                        raise problem
                     try:
                         workspace_mode = resolve_workspace_mode(
                             WorkspaceMode.in_place, None,
@@ -337,7 +340,7 @@ class CodingSessionFactory:
                         )
                         self.in_place_roots(project, request.resource_ids, request.path)
                     except (ValueError, WorkspaceError) as exc:
-                        raise WorkspaceError(problem) from exc
+                        raise problem from exc
             validate_directories(request.additional_dirs)
         except Exception:
             with suppress(KeyError, ValueError):
@@ -631,14 +634,14 @@ class CodingSessionFactory:
             },
         )
 
-    def _worktree_problem(self, project: CodeProject | None, request: SessionCreateRequest) -> str | None:
+    def _worktree_problem(self, project: CodeProject | None, request: SessionCreateRequest) -> WorkspaceError | None:
         """Why a worktree cannot be made for this task's folders, if it cannot."""
         if project is not None:
             return self.project_workspaces.worktree_problem(self._selected_project(project, request.resource_ids))
         try:
             self.workspaces.check_source(request.path or "")
         except WorkspaceError as exc:
-            return str(exc)
+            return exc
         return None
 
     @staticmethod
@@ -676,6 +679,11 @@ class CodingSessionFactory:
         if skill_resolution.developer_instructions:
             instructions = f"{instructions}\n\n{skill_resolution.developer_instructions}".strip()
         primary = preparation.primary
+        # Working in place without a starting commit leaves nothing to review
+        # or restore, so such a task starts read-only.
+        untracked = workspace_mode == WorkspaceMode.in_place and any(
+            not item.base_revision for item in (preparation.task_workspaces or (primary,))
+        )
         return CodingSession(
             id=session_id,
             title=task_title(request.prompt),
@@ -690,6 +698,7 @@ class CodingSessionFactory:
             network_access=request.network_access or preparation.permission_mode.value == "full_access",
             web_search=request.web_search,
             additional_dirs=list(dict.fromkeys(preparation.additional_dirs)),
+            writes_allowed=not untracked,
             task_id=control_snapshot.task.id,
             run_id=control_snapshot.run.id,
             computer_id=control_snapshot.computer.id,
@@ -826,6 +835,8 @@ class CodingSessionFactory:
             )
             if not session.base_revision and len(session.workspaces) <= 1:
                 text += " " + (NO_REVIEW_WITHOUT_COMMITS if session.repository_root else NO_REVIEW_WITHOUT_GIT)
+            if not session.writes_allowed and session.permission_mode != PermissionMode.full_access:
+                text += " " + WRITES_HELD
         elif count > 1:
             text = f"Created an isolated task workspace across {count} folders."
         else:

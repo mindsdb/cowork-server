@@ -6,7 +6,7 @@ import sys
 import pytest
 from pydantic import ValidationError
 
-from coding_service_fakes import CREDS, FakeEngine, service_with, wait_for_status, wait_for_workspace
+from tests.support.coding.service_fakes import CREDS, FakeEngine, service_with, wait_for_status, wait_for_workspace
 from test_coding_projects import git, repository
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus
 from cowork.coding.control_models import TaskResourceScope

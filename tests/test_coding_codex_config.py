@@ -66,3 +66,53 @@ def test_codex_retry_budget_is_bounded_on_the_mindshub_provider() -> None:
     assert "model_providers.mindshub.request_max_retries=1" in launch.config_overrides
     assert "model_providers.mindshub.stream_max_retries=2" in launch.config_overrides
     assert (codex_config.REQUEST_MAX_RETRIES + 1) * (codex_config.STREAM_MAX_RETRIES + 1) <= 6
+
+
+def _launch(permission_mode: PermissionMode, *, writes_allowed: bool, task_mode: str = "build"):
+    return codex_config.prepare_launch(
+        EngineSessionConfig(
+            model="gpt",
+            permission_mode=permission_mode,
+            task_mode=task_mode,
+            writes_allowed=writes_allowed,
+        ),
+        Path("/workspace"),
+        "http://127.0.0.1:1/api/v1/coding/inference",
+    )
+
+
+@pytest.mark.parametrize("mode", [PermissionMode.supervised, PermissionMode.workspace])
+def test_held_writes_give_a_read_only_sandbox_that_asks_the_person(mode: PermissionMode) -> None:
+    launch = _launch(mode, writes_allowed=False)
+
+    assert launch.sandbox_policy["type"] == "readOnly"
+    assert launch.thread_params["sandbox"] == "read-only"
+    assert 'sandbox_mode="read-only"' in launch.config_overrides
+    assert launch.approval_policy == "on-request"
+    assert launch.approvals_reviewer == "user"
+
+
+@pytest.mark.parametrize(
+    ("mode", "reviewer"),
+    [(PermissionMode.supervised, "user"), (PermissionMode.workspace, "auto_review")],
+)
+def test_allowed_writes_keep_the_workspace_write_sandbox(mode: PermissionMode, reviewer: str) -> None:
+    launch = _launch(mode, writes_allowed=True)
+
+    assert launch.sandbox_policy == {"type": "workspaceWrite", "networkAccess": False, "writableRoots": ["/workspace"]}
+    assert launch.thread_params["sandbox"] == "workspace-write"
+    assert launch.approvals_reviewer == reviewer
+
+
+def test_full_access_ignores_held_writes() -> None:
+    launch = _launch(PermissionMode.full_access, writes_allowed=False)
+
+    assert launch.sandbox_policy == {"type": "dangerFullAccess"}
+    assert launch.approval_policy == "never"
+
+
+def test_plan_mode_stays_read_only_without_approvals_when_writes_are_held() -> None:
+    launch = _launch(PermissionMode.supervised, writes_allowed=False, task_mode="plan")
+
+    assert launch.sandbox_policy["type"] == "readOnly"
+    assert launch.approval_policy == "never"
