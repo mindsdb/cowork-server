@@ -16,13 +16,14 @@ sharedStorage:
 
 # Who may open a connection to the cowork-server pods. See
 # templates/network-policy.yaml for why this is the boundary the identity
-# headers depend on.
+# headers depend on, and README.md, "Who can reach the pod", for what it admits.
 #
-# Off by default so a bare install, a desktop chart or an environment nobody
-# has validated yet cannot lock itself out. Turn it on one environment at a
-# time and watch pod readiness while it rolls: rule (b) is what keeps the
-# kubelet's probes working, and a wrong CIDR there fails the readiness probe
-# rather than anything a user would notice first.
+# Off by default so a bare install or an environment nobody has validated yet
+# cannot lock itself out. dev, staging and prod turn it on in their values
+# files, and the PR-environment deploy turns it on for every PR environment.
+# Watch pod readiness while it rolls out to a new environment: the kubelet's
+# probes need no rule (see nodeCidrs below), but a policy that refused them
+# would fail readiness before anything a user would notice.
 #
 # Enforcement is not the same on both clusters. newdev runs the AWS VPC CNI's
 # policy controller AND Cilium; newprod runs Cilium alone, installed 2026-08-20.
@@ -35,12 +36,14 @@ sharedStorage:
 # THIS CHART. The first and third fail loudly. The second does not fail at all
 # until users notice.
 #
-#   1. The CI deploy identity can create the kind. `helm upgrade` runs
-#      in-cluster as `system:serviceaccount:infrastructure:<env>-gha-runner`,
-#      which holds `create networkpolicies` only in the namespaces listed under
-#      `runner_deploy_namespaces` in Kubernetes-Foundational-Services. staging
-#      and prod are in that set and a PR environment is not. Where it is
-#      missing, the release fails and `--atomic` rolls the whole deploy back.
+#   1. Whatever deploys the release can create the kind. dev, staging and prod
+#      deploy with `helm upgrade` in-cluster as
+#      `system:serviceaccount:infrastructure:<env>-gha-runner`, which holds
+#      `create networkpolicies` only in the namespaces its deploy role lists;
+#      dev, staging and prod are among them. PR environments deploy through
+#      Argo CD, whose PR-environment project allows the kind. Where the
+#      deployer lacks it, the release fails and `--atomic` rolls the whole
+#      deploy back.
 #        kubectl --context <ctx> -n <ns> auth can-i create networkpolicies \
 #          --as=system:serviceaccount:infrastructure:<env>-gha-runner
 #   2. That cluster's ingress controller actually matches the selectors below,
@@ -73,8 +76,8 @@ networkPolicy:
   port: ""            # defaults to deployment.service.targetPort
   podSelectorLabels: {}   # defaults to {app: deployment.name}
 
-  # The nginx ingress controller, which is the only thing that should ever
-  # reach these pods over the network. It runs in `infrastructure`, NOT in
+  # The nginx ingress controllers, the only pods that should ever reach these
+  # pods over the network. They run in `infrastructure`, NOT in
   # `ingress-nginx`. Kubernetes stamps kubernetes.io/metadata.name on every
   # namespace, so that label needs nothing added to the cluster. Confirm with:
   #   kubectl get ns -L kubernetes.io/metadata.name | grep -i infra
@@ -83,9 +86,11 @@ networkPolicy:
   # admits every pod in `infrastructure`, and that namespace also runs the
   # GitHub Actions runners and openvpn, which MASQUERADEs VPN client traffic to
   # its own pod IP. Either could then send forged identity headers, which is the
-  # exact caller this policy exists to refuse. The label below is stamped by
-  # Kubernetes-Foundational-Services (nginx-ingress values `controller.podLabels`)
-  # with no per-environment override, so nothing needs adding to the cluster:
+  # exact caller this policy exists to refuse. The label below comes from the
+  # shared nginx-ingress values (`controller.podLabels`) with no
+  # per-environment override, so nothing needs adding to the cluster. It is on
+  # both the public controller and the internal (VPN) one; only the public one
+  # routes to cowork-server today:
   #   kubectl -n infrastructure get pods -l nginx-ingress-controller=true
   ingressController:
     enabled: true
@@ -158,9 +163,11 @@ deployment:
     repository: 168681354662.dkr.ecr.us-east-1.amazonaws.com/mindsdb-cowork-server
     # No command or args here: the image's CMD (Dockerfile) owns the uvicorn
     # command, one worker per pod, scaled with replicas. That includes
-    # --forwarded-allow-ips '*', which trusts the in-cluster ingress for
-    # X-Forwarded-* headers, and --timeout-graceful-shutdown, the bound on the
-    # shutdown drain that terminationGracePeriodSeconds below counts.
+    # --forwarded-allow-ips '*', which takes X-Forwarded-For and
+    # X-Forwarded-Proto from every peer that reaches the pod (networkPolicy
+    # above decides which peers those are), and --timeout-graceful-shutdown,
+    # the bound on the shutdown drain that terminationGracePeriodSeconds below
+    # counts.
     # tests/test_chart_values.py fails if a values file sets either key again.
 
   # A shutdown, counted from the pod's deletion (README.md, "What a shutdown

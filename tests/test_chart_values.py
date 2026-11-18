@@ -1,5 +1,5 @@
 """The cowork-server chart's values: datasource switches, the draft-preview
-host and the pod's shutdown.
+host, the pod's shutdown and who may reach the pod.
 
 Cloud datasource grants for hosted turns sit behind ``COWORK_TURN_DATASOURCE_ENABLED``
 and ``COWORK_DATASOURCE_CAPABILITIES``. Three facts about the values files hold
@@ -49,6 +49,11 @@ neither of which touches the database, the file store or settings, and the
 liveness delay leaves the boot room to finish. The ``deployment`` subchart
 that renders them is pinned to one version, so a new release of it can't
 change them unreviewed.
+
+The NetworkPolicy decides who may reach the pod. dev, staging and prod each
+turn it on and set nothing else in it, the base keeps it off, and every
+rendering admits only the labeled ingress controller pods in
+``infrastructure``.
 """
 
 from __future__ import annotations
@@ -108,9 +113,14 @@ class _Env:
     optional: bool = False
 
 
+def _block(path: Path, key: str) -> dict:
+    """One top-level block of a values file, such as ``deployment:``."""
+    return (yaml.safe_load(path.read_text()) or {}).get(key) or {}
+
+
 def _deployment(path: Path) -> dict:
     """The ``deployment:`` block of a values file, the subchart's own values."""
-    return (yaml.safe_load(path.read_text()) or {}).get("deployment") or {}
+    return _block(path, "deployment")
 
 
 def _env(path: Path) -> list[_Env]:
@@ -328,9 +338,9 @@ def _merged(base: dict, overlay: dict) -> dict:
     return merged
 
 
-def _rendered(path: Path) -> dict:
-    """The ``deployment:`` values an environment renders with."""
-    return _deployment(BASE) if path == BASE else _merged(_deployment(BASE), _deployment(path))
+def _rendered(path: Path, key: str = "deployment") -> dict:
+    """The values an environment renders a top-level block with, ``deployment:`` by default."""
+    return _block(BASE, key) if path == BASE else _merged(_block(BASE, key), _block(path, key))
 
 
 def _prestop_seconds(deployment: dict) -> int:
@@ -519,3 +529,28 @@ def test_the_scope_key_file_is_the_routers_secret_mounted_where_the_server_reads
     assert mount.get("readOnly") is True
     [item] = [i for i in volume["secret"]["items"] if i["key"] == "scope_key"]
     assert path == Path(mount["mountPath"]) / item["path"]
+
+
+def test_every_named_environment_admits_only_the_ingress_controllers():
+    """dev, staging and prod run org mode, where the pod trusts the identity
+    headers of whoever reaches it, so each renders the policy. A PR
+    environment renders the base, which keeps it off, and its deploy turns it
+    on with a parameter of its own. Every rendering admits the same peer, the
+    labeled controller pods in ``infrastructure``, and nothing wider. An
+    environment sets ``enabled`` and nothing else, so the port and the pod
+    labels, which fail silently when they drift, stay the base's."""
+    assert _rendered(BASE, "networkPolicy")["enabled"] is False
+    assert {path.stem.removeprefix("values-") for path in ENVIRONMENTS} == {"dev", "staging", "prod"}
+    for path in ENVIRONMENTS:
+        assert set(_block(path, "networkPolicy")) == {"enabled"}, path.name
+    for path in RENDERED:
+        policy = _rendered(path, "networkPolicy")
+        assert policy["enabled"] is (path != BASE), path.name
+        assert policy["ingressController"] == {
+            "enabled": True,
+            "namespaceSelector": {"kubernetes.io/metadata.name": "infrastructure"},
+            "podSelector": {"nginx-ingress-controller": "true"},
+        }, path.name
+        assert policy["nodeCidrs"] == [], path.name
+        assert (policy["port"], policy["podSelectorLabels"]) == ("", {}), path.name
+        assert policy["extraIngress"] == [], path.name

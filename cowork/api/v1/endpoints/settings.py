@@ -25,7 +25,6 @@ from cowork.api.v1.endpoints.guards import require_local_in_desktop_mode
 from cowork.api.v1.permissions import (
     AuthenticatedInOrgMode,
     LoopbackDesktopOnly,
-    LoopbackOnly,
     OpenByDesign,
     require,
 )
@@ -364,9 +363,11 @@ def install_status():
     return {"antonInstalled": True, "serverDepsReady": True}
 
 
-# LoopbackOnly: returns an unmasked provider secret, so the credential is the
-# caller being on this machine, not who they are (ENG-457).
-@router.get("/reveal-key/{name}", dependencies=[Depends(require(LoopbackOnly))])
+# LoopbackDesktopOnly: returns an unmasked provider secret, so the credential
+# is the caller being on this machine, not who they are. Only the desktop app
+# calls it. An org deployment refuses it outright: loopback inside a hosted pod
+# says nothing about which member is calling, and no hosted caller needs it.
+@router.get("/reveal-key/{name}", dependencies=[Depends(require(LoopbackDesktopOnly))])
 def reveal_key(name: str, session: SessionDep, scope: ScopeDep):
     name_map = {
         "anthropic": Provider.ANTHROPIC,

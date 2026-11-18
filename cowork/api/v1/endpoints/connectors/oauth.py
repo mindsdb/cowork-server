@@ -8,7 +8,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackDesktopOnly, OpenByDesign, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_efs
@@ -84,10 +84,10 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
     return oauth_service.start(service, OAuthSettings(), client_id=body.client_id, client_secret=body.client_secret, extra_fields=body.extra_fields)
 
 
-# LoopbackOnly: returns a raw client_secret, so the credential is the caller
-# being on this machine — same restriction as settings reveal-key and /raw
-# (ENG-868).
-@router.get("/{engine}/credentials", dependencies=[Depends(require(LoopbackOnly))])
+# LoopbackDesktopOnly: returns a raw client_secret, so the credential is the
+# caller being on this machine, the same restriction as settings reveal-key.
+# Only Electron main calls it, so an org deployment refuses it outright.
+@router.get("/{engine}/credentials", dependencies=[Depends(require(LoopbackDesktopOnly))])
 def get_oauth_credentials(engine: str):
     """Return client_id and client_secret for a builtin-OAuth engine.
     Called by Electron main process only — never exposed to the renderer."""
@@ -165,14 +165,14 @@ def _parse_mcp_identity(user_details: Any, org_details: Any) -> tuple[str, str]:
     return email, name
 
 
-# LoopbackOnly: same restriction as /credentials above — this hands back
+# LoopbackDesktopOnly: same restriction as /credentials above. This hands back
 # account identity derived from the caller-supplied access token, so the
 # credential is the caller being on this machine. Called by Electron's
 # oauth-identity.ts (fetchHubspotIdentity) — Electron can't speak MCP
 # itself (it's TypeScript, the client is Python), so it hands the
 # freshly-obtained access token here instead of calling the provider
 # directly, unlike every other FETCHERS entry.
-@router.post("/{engine}/mcp/identity", dependencies=[Depends(require(LoopbackOnly))])
+@router.post("/{engine}/mcp/identity", dependencies=[Depends(require(LoopbackDesktopOnly))])
 async def get_mcp_identity(engine: str, body: McpIdentityRequest):
     """Resolve {account_email, account_name} for an MCP-based connector by
     calling its `get_user_details`/`get_organization_details` tools directly
