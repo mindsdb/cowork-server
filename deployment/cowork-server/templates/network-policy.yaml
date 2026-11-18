@@ -18,24 +18,24 @@
 # matters: the ingress controller runs in the `infrastructure` namespace here,
 # not in `ingress-nginx`, which is what the auth chart's default still says.
 #
-# Guarded by networkPolicy.enabled (default false) so no environment locks
-# itself by inheriting it. Enable one environment at a time and watch pod
-# readiness: a policy that refuses the kubelet takes the deployment down.
+# Guarded by networkPolicy.enabled (default false) so a bare install never
+# inherits it. dev, staging and prod turn it on in their values files, and the
+# PR-environment deploy turns it on for every PR environment. Watch pod
+# readiness when it reaches a new environment: a policy that refused the
+# kubelet would take the deployment down.
 #
-# BEFORE ENABLING THIS IN A NEW ENVIRONMENT: the CI deploy identity must be able
-# to create the kind. `helm upgrade` runs in-cluster as
-# `system:serviceaccount:infrastructure:<env>-gha-runner`, which holds
-# `create networkpolicies` only in the namespaces listed under
-# `runner_deploy_namespaces` in Kubernetes-Foundational-Services
-# (`gha-runners/deployment/gha-runner-scale-set`). Anywhere else the release
-# fails and --atomic rolls the whole deploy back. Check it, do not assume:
+# BEFORE ENABLING THIS IN A NEW ENVIRONMENT: whatever deploys the release must
+# be able to create the kind. dev, staging and prod deploy with `helm upgrade`
+# in-cluster as `system:serviceaccount:infrastructure:<env>-gha-runner`, which
+# holds `create networkpolicies` only in the namespaces its deploy role lists.
+# Anywhere else the release fails and --atomic rolls the whole deploy back.
+# Check it, do not assume:
 #   kubectl --context <ctx> -n <ns> auth can-i create networkpolicies \
 #     --as=system:serviceaccount:infrastructure:<env>-gha-runner
 # A server-side dry-run under your own kubeconfig does NOT answer this: it tells
 # you the API server accepts the manifest, not that the deployer may create it.
-#
-# A PR environment is one of the places it cannot be created, which is the other
-# reason this stays off in base values.
+# PR environments deploy through Argo CD instead, whose PR-environment project
+# allows the kind.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

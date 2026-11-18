@@ -18,7 +18,7 @@ from anton.core.mcp.errors import McpEgressBlocked, McpHostUnresolved, McpTokenR
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from cowork.api.v1.endpoints.connectors.connections import require_app_secret
-from cowork.api.v1.permissions import LoopbackOnly, require
+from cowork.api.v1.permissions import LoopbackDesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.custom_mcp import AllowedToolsRequest, CheckUrlRequest, CreateCustomMcpRequest, CustomMcpSettings
 from cowork.services.connectors import app_held
@@ -32,7 +32,7 @@ from cowork.services.connectors.persist import (
 
 _log = logging.getLogger("cowork.connectors.custom_mcp")
 
-router = APIRouter(dependencies=[Depends(require(LoopbackOnly)), Depends(require_app_secret)])
+router = APIRouter(dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require_app_secret)])
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 MISSING = {"error": "custom_connection_missing"}
