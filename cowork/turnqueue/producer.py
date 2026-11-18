@@ -1151,8 +1151,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     `host_tools` are tools this server runs for the pod
     (turnqueue/host_tools.py), sent only with `interactive`: their answers
     reach the pod on the stdin an interactive turn keeps open, and only for
-    a persistent workspace, which keeps what they write. Channel turns never
-    send them.
+    a persistent workspace: the doc tools write into the project's folder from
+    this server whatever the pod mounts, but without artifact.manage the
+    caller may not change artifacts, and the turn end records nothing for a
+    workspace that is not persistent. Channel turns never send them.
     `ui_locale` is the app's language (cowork.common.ui_locale), which the
     pod's anton replies in when the user's message does not say; None for a
     turn with no request behind it.

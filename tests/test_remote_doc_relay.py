@@ -244,3 +244,49 @@ async def test_the_turn_end_waits_for_a_late_call_names_its_doc_and_sends_nothin
     await asyncio.sleep(0.2)
     kinds = [json.loads(e)["kind"] for e in await redis.lrange(answer_queue_key(corr["id"]), 0, -1)]
     assert "host_tool_result" not in kinds
+
+
+async def test_a_call_in_a_workspace_that_keeps_nothing_is_refused_at_once(monkeypatch, tmp_path, redis):
+    handler, base = _doc_turn(monkeypatch, tmp_path)
+    sent: dict = {}
+
+    async def pod(**kwargs):
+        # Persistent was asked for; the controller authorizes ephemeral.
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "ephemeral"}
+        yield _call("create_doc", title="Plan", markdown="Lead.")
+        sent["entries"] = await _answered(redis, kwargs["correlation_id"])
+        yield "turn_completed", {"artifacts_touched": []}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", pod)
+    await _produce(handler, uuid4())
+    (result,) = [e for e in sent["entries"] if e["kind"] == "host_tool_result"]
+    assert result["ok"] is False and result["last"] is True
+    assert result["text"] == "Refused (not_allowed): this turn cannot change files."
+    assert list(base.iterdir()) == []
+
+
+async def test_a_failing_artifacts_re_read_leaves_the_turn_running_without_doc_tools(
+    monkeypatch, tmp_path, redis, caplog,
+):
+    handler, _base = _doc_turn(monkeypatch, tmp_path)
+    reads: list[int] = []
+
+    def broken(session, conv_id):
+        reads.append(1)
+        if len(reads) > 1:
+            raise RuntimeError("database down")
+        return None
+
+    monkeypatch.setattr(ResponsesHandler, "_remote_artifacts_context", staticmethod(broken))
+    sent: dict = {}
+
+    async def pod(**kwargs):
+        sent.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", pod)
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        await _produce(handler, uuid4())
+    assert len(reads) == 2
+    assert sent.get("host_tools") is None
+    assert any("could not read the artifacts folder" in r.getMessage() for r in caplog.records)

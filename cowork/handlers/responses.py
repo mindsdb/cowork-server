@@ -3317,12 +3317,22 @@ class ResponsesHandler:
                 # The pod's input already carries the doc blocks: without a folder
                 # it would get no tools for them. Read the project's artifacts
                 # folder (project_artifacts_base) again, in a unit of its own.
-                artifacts = await run_db(partial(self._remote_artifacts_context, conv_id=conv_id), scope=scope)
-                if artifacts is None:
+                try:
+                    artifacts = await run_db(partial(self._remote_artifacts_context, conv_id=conv_id), scope=scope)
+                except Exception:
                     logger.warning(
-                        "[responses] a remote turn whose input carries the open doc found no artifacts folder; "
-                        "its pod gets no doc tools", extra=log_context(request_id=corr, conversation_id=conv_id),
+                        "[responses] a remote turn whose input carries the open doc could not read the "
+                        "artifacts folder; its pod gets no doc tools", exc_info=True,
+                        extra=log_context(request_id=corr, conversation_id=conv_id),
                     )
+                    artifacts = None
+                else:
+                    if artifacts is None:
+                        logger.warning(
+                            "[responses] a remote turn whose input carries the open doc found no artifacts "
+                            "folder; its pod gets no doc tools",
+                            extra=log_context(request_id=corr, conversation_id=conv_id),
+                        )
             if artifacts is not None:
                 # The worker writes artifacts into the shared tree while this
                 # turn runs, so cowork-server does the same before/after diff
@@ -3453,7 +3463,14 @@ class ResponsesHandler:
                     if step == HOST_TOOL_CALL_STEP:
                         # Runs as a task of its own, so this loop goes on reading Stop and liveness.
                         if doc_tools is not None:
-                            doc_tools.runner.start(data)
+                            # The turn end records nothing for a workspace that is not
+                            # persistent, so a write would go unclaimed: refuse it at once
+                            # rather than let the pod wait out its timeout.
+                            may_write = turn_artifacts is not None and turn_artifacts.writes_allowed
+                            doc_tools.runner.start(
+                                data,
+                                refusal=None if may_write else "Refused (not_allowed): this turn cannot change files.",
+                            )
                         continue
                     if step == ADDON_STEP:
                         # A message added mid-task (ENG-4194): relayed only for

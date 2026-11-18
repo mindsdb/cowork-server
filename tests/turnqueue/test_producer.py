@@ -2998,7 +2998,8 @@ async def test_host_tools_reach_the_job_only_for_an_interactive_turn(monkeypatch
 @pytest.mark.asyncio
 @pytest.mark.parametrize("can_manage,expected", [(True, True), (False, False)])
 async def test_host_tools_reach_the_job_only_for_a_persistent_workspace(monkeypatch, can_manage, expected):
-    """An ephemeral workspace keeps nothing a doc tool writes, so its pod gets none."""
+    """Without artifact.manage the caller may not change artifacts, and the turn end
+    records nothing for a workspace that is not persistent: no doc tools then."""
     async def allowed(scope, permission):
         return permission == "product.execute" or can_manage
 

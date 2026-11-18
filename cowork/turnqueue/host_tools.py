@@ -150,8 +150,10 @@ class HostToolRunner:
         self._waited = False
         self._calls: dict[str, tuple[HostCall, asyncio.Task]] = {}
 
-    def start(self, data: Mapping[str, Any]) -> None:
-        """Run the call a ``host_tool_call`` step names, as a task. Never raises."""
+    def start(self, data: Mapping[str, Any], *, refusal: str | None = None) -> None:
+        """Run the call a ``host_tool_call`` step names, as a task; with
+        ``refusal``, answer it with that text (``ok: false``) instead of
+        running it. Never raises."""
         call_id, tool, raw = data.get("call_id"), data.get("tool"), data.get("input")
         if not isinstance(call_id, str) or not CALL_ID.fullmatch(call_id) or not isinstance(tool, str):
             logger.info("host tool call dropped: malformed correlation_id=%s", self._corr)
@@ -159,7 +161,7 @@ class HostToolRunner:
         if self._closed or call_id in self._calls:
             return
         call = HostCall(call_id=call_id, tool=tool, input=raw if isinstance(raw, dict) else {})
-        self._calls[call_id] = (call, asyncio.create_task(self._run(call), name=f"host-tool:{call_id}"))
+        self._calls[call_id] = (call, asyncio.create_task(self._run(call, refusal), name=f"host-tool:{call_id}"))
 
     def pending_tasks(self) -> list[asyncio.Task]:
         return [task for _call, task in self._calls.values() if not task.done()]
@@ -184,7 +186,7 @@ class HostToolRunner:
             await asyncio.wait(pending, timeout=TURN_END_WAIT_S if timeout is None else timeout)
         return [call for call, task in self._calls.values() if not task.done()]
 
-    async def _run(self, call: HostCall) -> None:
+    async def _run(self, call: HostCall, refusal: str | None = None) -> None:
         r = self._r or get_redis()
         timeout = self._timeouts.get(call.tool)
         try:
@@ -198,7 +200,9 @@ class HostToolRunner:
         if not first:
             logger.info("host tool call already run correlation_id=%s call_id=%s", self._corr, call.call_id)
             return
-        if timeout is None:
+        if refusal is not None:
+            outcome = HostToolOutcome(refusal, ok=False)
+        elif timeout is None:
             outcome = HostToolOutcome(
                 f"Unknown host tool {call.tool!r}. This turn offers: {', '.join(sorted(self._timeouts))}.", ok=False,
             )
