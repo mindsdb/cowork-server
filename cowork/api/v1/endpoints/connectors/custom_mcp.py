@@ -62,15 +62,17 @@ def _record_file_present(scope: TenantScope, name: str) -> bool:
     """Whether a file stands where the vault keeps the record of ``name``.
 
     anton names it ``<engine>-<name>`` after keeping only word characters and
-    dashes, which a checked connection id and ``custom_mcp`` already are. Any
-    other name, or a path that leaves the vault folder, is no record."""
+    dashes, which a checked connection id and ``custom_mcp`` already are. The
+    vault folder's entries are compared by name, so no path is ever built
+    from ``name``; any other name is no record. A broken link or a folder at
+    that name counts as present."""
     if not is_connection_id(name):
         return False
-    root = own_vault_root(scope).resolve()
-    path = root / f"{CUSTOM_MCP_ENGINE}-{name}"
-    if not path.parent.resolve().is_relative_to(root):
+    wanted = f"{CUSTOM_MCP_ENGINE}-{name}"
+    try:
+        return any(entry.name == wanted for entry in own_vault_root(scope).iterdir())
+    except FileNotFoundError:
         return False
-    return path.is_symlink() or path.exists()
 
 
 def _require_connection(scope: TenantScope, name: str) -> None:
