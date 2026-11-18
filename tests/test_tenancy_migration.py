@@ -322,3 +322,79 @@ def test_postgres_custom_connectors_are_unique_per_builder(monkeypatch):
             connection.execute(text("delete from custom_connectors"))
         command.downgrade(cfg, "base")
         get_app_settings.cache_clear()
+
+
+@pytest.mark.postgres_service
+def test_postgres_channel_archive_keeps_rows_drops_bot_passwords_and_unpins_conversations(monkeypatch):
+    """f73ba3db8974 on Postgres, where the binding's key carries a server
+    name and key comparison is case-sensitive: the channel rows and the
+    non-secret fields stay, every other channel key goes whatever its case,
+    and a binding left pointing at a deleted conversation is unpinned, not
+    deleted, by the downgrade."""
+    if not POSTGRES_URI:
+        missing_prerequisite(
+            "set COWORK_TEST_POSTGRES_URI to a disposable database",
+            required_by="COWORK_REQUIRE_SERVICES",
+        )
+    monkeypatch.setenv("DATABASE_URI", POSTGRES_URI)
+    get_app_settings.cache_clear()
+    cfg = Config("alembic.ini")
+    engine = create_engine(POSTGRES_URI)
+
+    def conversation_key() -> bool:
+        return any(
+            fk["referred_table"] == "conversations"
+            for fk in inspect(create_engine(POSTGRES_URI)).get_foreign_keys("channel_bindings")
+        )
+
+    try:
+        command.upgrade(cfg, "f6a2c4e8b1d3")
+        project_id, conversation_id, binding_id = uuid4(), uuid4(), uuid4()
+        with engine.begin() as connection:
+            connection.execute(
+                text("INSERT INTO projects (id, name, path, is_active) VALUES (:id, 'chat', '', false)"),
+                {"id": project_id},
+            )
+            connection.execute(
+                text("INSERT INTO conversations (id, topic, project_id, channel_type) VALUES (:id, 'group', :p, 'telegram')"),
+                {"id": conversation_id, "p": project_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO channel_bindings (id, channel_type, external_group_id, external_thread_key, "
+                    "trigger_rule, anton_conversation_id) VALUES (:id, 'telegram', 'g-1', '__default__', 'always', :c)"
+                ),
+                {"id": binding_id, "c": conversation_id},
+            )
+            for key in (
+                "channel.telegram.bot_token", "Channel.Slack.bot_token", "channel.whatsapp.verify_token",
+                "channel.telegram.bot_username", "channels_harness", "greeting",
+            ):
+                connection.execute(
+                    text("INSERT INTO settings (id, key, value) VALUES (:id, :k, 'v')"), {"id": uuid4(), "k": key}
+                )
+        assert conversation_key()
+
+        command.upgrade(cfg, "head")
+
+        with engine.begin() as connection:
+            assert connection.execute(text("select count(*) from channel_bindings")).scalar() == 1
+            assert sorted(row[0] for row in connection.execute(text("select key from settings"))) == [
+                "channel.telegram.bot_username", "channels_harness", "greeting",
+            ]
+            connection.execute(text("delete from conversations where id = :id"), {"id": conversation_id})
+        assert not conversation_key()
+
+        command.downgrade(cfg, "f6a2c4e8b1d3")
+
+        assert conversation_key()
+        with engine.begin() as connection:
+            assert connection.execute(
+                text("select anton_conversation_id from channel_bindings where id = :id"), {"id": binding_id}
+            ).one() == (None,)
+    finally:
+        with engine.begin() as connection:
+            for table in ("channel_bindings", "settings", "conversations", "projects"):
+                connection.execute(text(f"delete from {table}"))
+        command.downgrade(cfg, "base")
+        get_app_settings.cache_clear()

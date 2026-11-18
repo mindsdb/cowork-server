@@ -30,15 +30,16 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
-# The `channel.<type>.<field>` keys services/channels.py stored unencrypted,
-# for the fields the last plugins declared `secret=False`. Every other
-# `channel.` key is erased: deny by default, so a secret field an older
-# release had, or one this list missed, cannot survive.
+# The `channel.<type>.<field>` keys services/channels.py stored unencrypted
+# that identify a bot rather than let anyone act as it. WhatsApp's
+# verify_token was stored unencrypted too, but Meta checks it when a webhook
+# subscribes, so it goes with the passwords. Every other `channel.` key is
+# erased: deny by default, so a secret field an older release had, or one
+# this list missed, cannot survive.
 _NON_SECRET_KEYS = (
     "channel.discord.public_key",
     "channel.telegram.bot_username",
     "channel.whatsapp.phone_number_id",
-    "channel.whatsapp.verify_token",
 )
 
 # b7c1d2e3f4a5_channels.py creates this FK unnamed. Postgres auto-names it,
@@ -64,7 +65,8 @@ def _conversation_fk() -> dict | None:
 def upgrade() -> None:
     """Upgrade schema. The erased passwords are not kept anywhere."""
     op.execute(
-        sa.text("DELETE FROM settings WHERE key LIKE 'channel.%' AND key NOT IN :kept").bindparams(
+        # lower(): Postgres compares case-sensitively and SQLite does not.
+        sa.text("DELETE FROM settings WHERE lower(key) LIKE 'channel.%' AND key NOT IN :kept").bindparams(
             sa.bindparam("kept", value=list(_NON_SECRET_KEYS), expanding=True)
         )
     )
