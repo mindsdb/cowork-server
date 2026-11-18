@@ -837,3 +837,244 @@ def test_a_busy_file_store_answers_503_not_a_failed_export(client, doc, monkeypa
 
     assert res.status_code == 503, res.text
     assert "Retry-After" in res.headers
+
+
+# ---------------------------------------------------------------- another replica's writes
+
+
+class _Open:
+    async def is_disconnected(self):
+        return False
+
+
+def _sse_frame(chunk):
+    import json
+
+    event, data = chunk.split("\n")[:2]
+    return event.removeprefix("event: "), json.loads(data.removeprefix("data: "))
+
+
+async def _no_frame(stream, wait=0.3):
+    import asyncio
+
+    try:
+        chunk = await asyncio.wait_for(anext(stream), wait)
+    except asyncio.TimeoutError:
+        return True
+    raise AssertionError(f"unexpected frame: {chunk[:200]}")
+
+
+def test_a_nudge_for_the_write_on_disk_sends_the_doc_with_the_writers_client_id(monkeypatch, tmp_path):
+    """Another replica's write arrives as a nudge: the stream reads the doc and sends
+    it like the mtime poll would, plus the writer's clientId, since the doc read is
+    exactly that write."""
+    import asyncio
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import DocHub, doc_topic
+    from cowork.docs.service import apply, create_doc
+
+    # Only the nudge can deliver a frame within the test's waits.
+    monkeypatch.setattr(docs, "_POLL_S", 5.0)
+    monkeypatch.setattr(docs, "hub", DocHub())
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    topic = doc_topic(made.folder)
+    lead = made.doc["tabs"][0]["blocks"][0]["id"]
+
+    async def scenario():
+        stream = docs._sse(_Open(), topic, initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+        frames = [_sse_frame(await anext(stream))]
+        doc, _ = apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "Agent."}}], by="agent")
+        docs.hub.deliver_remote({"type": "doc.updated", "rev": doc["rev"], "clientId": "tab-1",
+                                 "origin": "other", "topic": topic})
+        frames.append(_sse_frame(await asyncio.wait_for(anext(stream), 3)))
+        await _no_frame(stream)
+        await stream.aclose()
+        return frames
+
+    (ready, _r), (name, f) = asyncio.run(scenario())
+    assert ready == "doc.ready"
+    assert name == "doc.updated" and f["rev"] == 2 and f["clientId"] == "tab-1"
+    assert f["by"] == "agent" and f["touched"] == {made.doc["tabs"][0]["id"]: [lead]}
+    assert f["doc"]["tabs"][0]["blocks"][0]["text"] == "Agent."
+
+
+def test_two_nudges_after_both_writes_send_one_frame_without_the_first_writers_client_id(monkeypatch, tmp_path):
+    """The client's own write N went through another replica, then the agent wrote
+    N+1. The nudge for N already reads N+1 and sends nothing (with the client's
+    clientId the client would skip the agent's write); the nudge for N+1 sends the
+    doc with the agent's write's clientId, which is none."""
+    import asyncio
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import DocHub, doc_topic
+    from cowork.docs.service import apply, create_doc
+
+    monkeypatch.setattr(docs, "_POLL_S", 5.0)
+    monkeypatch.setattr(docs, "hub", DocHub())
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    topic = doc_topic(made.folder)
+    lead = made.doc["tabs"][0]["blocks"][0]["id"]
+
+    async def scenario():
+        stream = docs._sse(_Open(), topic, initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+        await anext(stream)  # doc.ready
+        own, _ = apply(made.folder, [{"op": "edit_text", "find": "Hi", "replace": "Hello"}], by="user")
+        agent, _ = apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "Agent."}}], by="agent")
+        for rev, client_id in ((own["rev"], "tab-1"), (agent["rev"], None)):
+            docs.hub.deliver_remote({"type": "doc.updated", "rev": rev, "clientId": client_id,
+                                     "origin": "other", "topic": topic})
+        frame = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+        await _no_frame(stream)
+        await stream.aclose()
+        return frame
+
+    name, f = asyncio.run(scenario())
+    assert name == "doc.updated" and f["rev"] == 3
+    assert "clientId" not in f
+    assert f["by"] == "agent" and f["doc"]["tabs"][0]["blocks"][0]["text"] == "Agent."
+
+
+def test_a_nudge_that_reads_a_newer_doc_leaves_it_to_that_writes_nudge(monkeypatch, tmp_path):
+    """The agent wrote N, then the client's own write N+1 went through another
+    replica. The nudge for N already reads N+1: sent without a clientId, it would
+    reach the client before its own write's answer and apply that write twice. So
+    nudge N sends nothing, and nudge N+1 sends the doc with the client's clientId."""
+    import asyncio
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import DocHub, doc_topic
+    from cowork.docs.service import apply, create_doc
+
+    monkeypatch.setattr(docs, "_POLL_S", 5.0)
+    monkeypatch.setattr(docs, "hub", DocHub())
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    topic = doc_topic(made.folder)
+    lead = made.doc["tabs"][0]["blocks"][0]["id"]
+
+    async def scenario():
+        stream = docs._sse(_Open(), topic, initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+        await anext(stream)  # doc.ready
+        agent, _ = apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "Agent."}}], by="agent")
+        own, _ = apply(made.folder, [{"op": "edit_text", "find": "Agent", "replace": "Mine"}], by="user")
+        docs.hub.deliver_remote({"type": "doc.updated", "rev": agent["rev"], "clientId": None,
+                                 "origin": "other", "topic": topic})
+        # One pending read across both nudges: cancelling it would end the stream.
+        following = asyncio.ensure_future(anext(stream))
+        done, _ = await asyncio.wait({following}, timeout=0.3)
+        assert not done, "the nudge for the agent's write sent the newer doc"
+        docs.hub.deliver_remote({"type": "doc.updated", "rev": own["rev"], "clientId": "tab-1",
+                                 "origin": "other", "topic": topic})
+        frame = _sse_frame(await asyncio.wait_for(following, 3))
+        await _no_frame(stream)
+        await stream.aclose()
+        return frame
+
+    name, f = asyncio.run(scenario())
+    assert name == "doc.updated" and f["rev"] == 3 and f["clientId"] == "tab-1"
+    assert f["doc"]["tabs"][0]["blocks"][0]["text"] == "Mine."
+
+
+def test_a_read_older_than_the_nudge_keeps_both_marks(monkeypatch, tmp_path):
+    import asyncio
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import NUDGE
+    from cowork.docs.service import create_doc
+
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    monkeypatch.setattr(docs, "_mtime", lambda folder: 999)
+    nudge = {"type": NUDGE, "rev": made.doc["rev"] + 1, "clientId": "tab-1"}
+    result = asyncio.run(docs._nudged(made.folder, nudge, last_rev=0, last_mtime=7, pending_rev=-1,
+                                      scope=LOCAL_SCOPE))
+    assert result == (None, 0, 7, made.doc["rev"] + 1)
+
+
+def test_after_a_lagging_read_the_mtime_poll_still_sends_the_write(monkeypatch, tmp_path):
+    """This host's view of the file can lag the other replica's write: the mtime
+    already moved but the read returns the old doc. The nudge then sends nothing
+    and leaves last_mtime alone, so the next poll reads the file again and sends
+    the write (without a clientId, as the poll always does)."""
+    import asyncio
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import DocHub, doc_topic
+    from cowork.docs.service import apply, create_doc
+    from cowork.docs.store import load_doc
+
+    monkeypatch.setattr(docs, "_POLL_S", 0.2)
+    monkeypatch.setattr(docs, "hub", DocHub())
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    topic = doc_topic(made.folder)
+    lead = made.doc["tabs"][0]["blocks"][0]["id"]
+    seen = {"mtime": 1, "stale": None}
+
+    def lagging_load(folder):
+        stale, seen["stale"] = seen["stale"], None
+        return stale if stale is not None else load_doc(folder)
+
+    monkeypatch.setattr(docs, "_mtime", lambda folder: seen["mtime"])
+    monkeypatch.setattr(docs, "load_doc", lagging_load)
+
+    async def scenario():
+        stream = docs._sse(_Open(), topic, initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+        await anext(stream)  # doc.ready at rev 1, last_mtime 1
+        old = load_doc(made.folder)
+        doc, _ = apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "Agent."}}], by="agent")
+        seen.update(mtime=2, stale=old)
+        docs.hub.deliver_remote({"type": "doc.updated", "rev": doc["rev"], "clientId": "tab-1",
+                                 "origin": "other", "topic": topic})
+        frame = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+        await stream.aclose()
+        return frame
+
+    name, f = asyncio.run(scenario())
+    assert name == "doc.updated" and f["rev"] == 2 and "clientId" not in f
+    assert f["doc"]["tabs"][0]["blocks"][0]["text"] == "Agent."
+
+
+def test_a_lagging_read_is_read_again_even_when_the_mtime_never_moves(monkeypatch, tmp_path):
+    """This host can see the old doc under an mtime that already shows the write.
+    The nudge leaves its rev pending, so the poll rereads the file until it shows
+    that rev, though the mtime never changes again."""
+    import asyncio
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import DocHub, doc_topic
+    from cowork.docs.service import apply, create_doc
+    from cowork.docs.store import load_doc
+
+    monkeypatch.setattr(docs, "_POLL_S", 0.2)
+    monkeypatch.setattr(docs, "hub", DocHub())
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    topic = doc_topic(made.folder)
+    lead = made.doc["tabs"][0]["blocks"][0]["id"]
+    stale = {"doc": None}
+
+    def lagging_load(folder):
+        doc, stale["doc"] = stale["doc"], None
+        return doc if doc is not None else load_doc(folder)
+
+    monkeypatch.setattr(docs, "_mtime", lambda folder: 1)
+    monkeypatch.setattr(docs, "load_doc", lagging_load)
+
+    async def scenario():
+        stream = docs._sse(_Open(), topic, initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+        await anext(stream)  # doc.ready at rev 1, last_mtime 1
+        old = load_doc(made.folder)
+        doc, _ = apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "Agent."}}], by="agent")
+        stale["doc"] = old
+        docs.hub.deliver_remote({"type": "doc.updated", "rev": doc["rev"], "clientId": "tab-1",
+                                 "origin": "other", "topic": topic})
+        frame = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+        await stream.aclose()
+        return frame
+
+    name, f = asyncio.run(scenario())
+    assert name == "doc.updated" and f["rev"] == 2 and "clientId" not in f

@@ -219,3 +219,102 @@ async def test_the_redis_backend_starts_the_relay_on_the_process_hub(monkeypatch
         await relay_mod.stop_doc_relay(relay)
     assert hub_mod.hub._relay is None
 
+
+
+# ---------------------------------------------------------------- an editor on the other replica
+
+
+class _Open:
+    async def is_disconnected(self):
+        return False
+
+
+def _sse_frame(chunk):
+    event, data = chunk.split("\n")[:2]
+    return event.removeprefix("event: "), json.loads(data.removeprefix("data: "))
+
+
+@pytest.fixture
+def two_replicas(monkeypatch, server):
+    """Replica A announces writes (cowork.docs.service's hub); replica B serves the
+    editor's stream (the docs endpoint's hub). Each has its own relay."""
+    from cowork.api.v1.endpoints import docs
+    from cowork.docs import service
+
+    hub_a, hub_b = DocHub(), DocHub()
+    monkeypatch.setattr(service, "hub", hub_a)
+    monkeypatch.setattr(docs, "hub", hub_b)
+    # Only the relay can deliver a frame within the test's waits.
+    monkeypatch.setattr(docs, "_POLL_S", 5.0)
+    return DocRelay(hub_a, _client(server)), DocRelay(hub_b, _client(server))
+
+
+def test_an_edit_announced_on_one_replica_reaches_the_editor_on_the_other(two_replicas, server, tmp_path):
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.service import announce, apply, create_doc
+
+    relay_a, relay_b = two_replicas
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    lead = made.doc["tabs"][0]["blocks"][0]["id"]
+
+    async def scenario():
+        relay_a.start()
+        relay_b.start()
+        try:
+            await _subscribed(relay_b, server)
+            stream = docs._sse(_Open(), doc_topic(made.folder), initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+            ready = _sse_frame(await anext(stream))
+            doc, result = apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "Agent."}}], by="agent")
+            announce(made.artifact_id, doc, result, folder=made.folder, by="agent", client_id="tab-1")
+            updated = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+            await stream.aclose()
+            return ready, updated
+        finally:
+            await relay_a.stop()
+            await relay_b.stop()
+
+    (ready, _r), (name, f) = asyncio.run(scenario())
+    assert ready == "doc.ready"
+    assert name == "doc.updated" and f["rev"] == 2 and f["clientId"] == "tab-1"
+    assert f["by"] == "agent" and f["touched"] == {made.doc["tabs"][0]["id"]: [lead]}
+    assert f["doc"]["tabs"][0]["blocks"][0]["text"] == "Agent."
+
+
+def test_the_editors_write_and_the_agents_through_the_other_replica_arrive_as_one_frame_without_a_client_id(
+    two_replicas, server, tmp_path
+):
+    """Both writes land on replica A before replica B reads the doc."""
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.service import announce, apply, create_doc
+
+    relay_a, relay_b = two_replicas
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    lead = made.doc["tabs"][0]["blocks"][0]["id"]
+
+    async def scenario():
+        relay_a.start()
+        relay_b.start()
+        try:
+            await _subscribed(relay_b, server)
+            stream = docs._sse(_Open(), doc_topic(made.folder), initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+            await anext(stream)  # doc.ready
+            own, result = apply(made.folder, [{"op": "edit_text", "find": "Hi", "replace": "Hello"}], by="user")
+            announce(made.artifact_id, own, result, folder=made.folder, by="user", client_id="tab-1")
+            agent, result = apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "Agent."}}], by="agent")
+            announce(made.artifact_id, agent, result, folder=made.folder, by="agent")
+            frame = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+            try:
+                extra = await asyncio.wait_for(anext(stream), 0.5)
+            except asyncio.TimeoutError:
+                extra = None
+            await stream.aclose()
+            return frame, extra
+        finally:
+            await relay_a.stop()
+            await relay_b.stop()
+
+    (name, f), extra = asyncio.run(scenario())
+    assert name == "doc.updated" and f["rev"] == 3 and "clientId" not in f
+    assert f["by"] == "agent" and f["doc"]["tabs"][0]["blocks"][0]["text"] == "Agent."

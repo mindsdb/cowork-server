@@ -38,7 +38,7 @@ from cowork.services.artifact_export import ExportRefusal, ExportRefused, export
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.services.render_pdf_client import RenderPdfFailed
 from cowork.docs.history import LIST_LIMIT, LIST_MAX, list_versions, read_version, restore
-from cowork.docs.hub import conv_topic, doc_topic, hub
+from cowork.docs.hub import NUDGE, conv_topic, doc_topic, hub
 from cowork.docs.images import MAX_IMAGE_BYTES, store_image
 from cowork.docs.model import DocError
 from cowork.docs.ops import MAX_OPS
@@ -440,6 +440,44 @@ def _latest_write(doc: dict[str, Any]) -> tuple[dict[str, list[str]], str]:
     return touched, by
 
 
+def _updated_frame(doc: dict[str, Any], *, client_id: str | None = None) -> str:
+    """``doc.updated`` for a write this stream learned of from the file, not from its own hub."""
+    touched, by = _latest_write(doc)
+    data = {"type": "doc.updated", "rev": doc["rev"], "by": by, "doc": doc, "touched": touched, "removed": {}}
+    if client_id:
+        data["clientId"] = client_id
+    return _frame("doc.updated", data)
+
+
+async def _nudged(
+    folder: Path, event: dict[str, Any], *, last_rev: int, last_mtime: int, pending_rev: int,
+    scope: TenantScope | None,
+) -> tuple[str | None, int, int, int]:
+    """Answer another replica's write to the doc: (frame or None, last_rev, last_mtime, pending_rev).
+
+    A frame goes out only when the doc read is exactly that write's rev, with
+    the write's ``clientId``. A newer doc is left to its own nudge: sent now
+    without a ``clientId``, it would reach the client whose write it also
+    holds while that write's answer is still on its way, and the client would
+    apply the write twice. An older doc (this host's view of the file lags)
+    is left to the mtime poll, which rereads until it reaches ``pending_rev``.
+    Neither moves ``last_rev`` or ``last_mtime``.
+    """
+    try:
+        mtime = await run_efs(partial(_mtime, folder), scope=scope)
+        doc = await run_efs(partial(load_doc, folder), scope=scope)
+    except (DocError, FilesystemBusy):
+        return None, last_rev, last_mtime, pending_rev
+    rev = event["rev"]
+    if doc["rev"] < rev:
+        return None, last_rev, last_mtime, max(pending_rev, rev)
+    if doc["rev"] > rev:
+        return None, last_rev, last_mtime, pending_rev
+    if doc["rev"] <= last_rev:
+        return None, last_rev, mtime, pending_rev
+    return _updated_frame(doc, client_id=event.get("clientId")), doc["rev"], mtime, pending_rev
+
+
 def _sse(
     request: Request,
     topic: str,
@@ -450,10 +488,12 @@ def _sse(
 ) -> StreamingResponse:
     """Hub events for ``topic``; for a doc stream, also catch writes the hub never saw.
 
-    The hub is this process's own. A write made by another process (the other
-    replica serving the same shared tree, or a hand edit of the file) changes
-    the file without an announcement here, so a doc stream also watches the
-    file's mtime and sends the doc when it moved without an event for that rev.
+    The hub is this process's own. Another replica's write reaches it as a
+    ``NUDGE`` through the relay (``cowork.docs.relay``), and the stream answers
+    with the doc read from the file. A write no hub announced (a lost relay
+    message, a hand edit of the file) changes the file all the same, so a doc
+    stream also watches the file's mtime and sends the doc when it moved
+    without an event for that rev.
     A doc stream (``initial``) needs ``scope``: the file reads run on the file
     store's threads.
     """
@@ -469,6 +509,8 @@ def _sse(
         queue = hub.subscribe(topic, replay=replay)
         last_rev = -1
         last_mtime = 0
+        # The newest rev a nudge named that this host could not read yet.
+        pending_rev = -1
         try:
             if initial is not None:
                 last_mtime = await poll_mtime(0)
@@ -490,7 +532,9 @@ def _sse(
                     idle += _POLL_S
                     if initial is not None:
                         mtime = await poll_mtime(last_mtime)
-                        if mtime != last_mtime:
+                        # This host's view can lag a write in content as well as in mtime:
+                        # until a read reaches the rev a nudge named, reread on every poll.
+                        if mtime != last_mtime or pending_rev > last_rev:
                             last_mtime = mtime
                             try:
                                 doc = await run_efs(partial(load_doc, initial), scope=scope)
@@ -498,14 +542,22 @@ def _sse(
                                 continue
                             if doc["rev"] != last_rev:
                                 last_rev = doc["rev"]
-                                touched, by = _latest_write(doc)
-                                yield _frame("doc.updated", {"type": "doc.updated", "rev": doc["rev"],
-                                                             "by": by, "doc": doc, "touched": touched, "removed": {}})
+                                yield _updated_frame(doc)
                                 idle = 0.0
                                 continue
                     if idle >= _KEEPALIVE_S:
                         idle = 0.0
                         yield ": keepalive\n\n"
+                    continue
+                if event.get("type") == NUDGE:
+                    if initial is None:
+                        continue
+                    frame, last_rev, last_mtime, pending_rev = await _nudged(
+                        initial, event, last_rev=last_rev, last_mtime=last_mtime, pending_rev=pending_rev,
+                        scope=scope)
+                    if frame is not None:
+                        idle = 0.0
+                        yield frame
                     continue
                 idle = 0.0
                 if initial is not None:
