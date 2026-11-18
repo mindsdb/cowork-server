@@ -318,3 +318,4 @@ def test_the_editors_write_and_the_agents_through_the_other_replica_arrive_as_on
     (name, f), extra = asyncio.run(scenario())
     assert name == "doc.updated" and f["rev"] == 3 and "clientId" not in f
     assert f["by"] == "agent" and f["doc"]["tabs"][0]["blocks"][0]["text"] == "Agent."
+    assert extra is None

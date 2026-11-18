@@ -1078,3 +1078,72 @@ def test_a_lagging_read_is_read_again_even_when_the_mtime_never_moves(monkeypatc
 
     name, f = asyncio.run(scenario())
     assert name == "doc.updated" and f["rev"] == 2 and "clientId" not in f
+
+
+def test_two_nudges_for_the_same_rev_send_one_frame(monkeypatch, tmp_path):
+    import asyncio
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import DocHub, doc_topic
+    from cowork.docs.service import apply, create_doc
+
+    monkeypatch.setattr(docs, "_POLL_S", 5.0)
+    monkeypatch.setattr(docs, "hub", DocHub())
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    topic = doc_topic(made.folder)
+    lead = made.doc["tabs"][0]["blocks"][0]["id"]
+
+    async def scenario():
+        stream = docs._sse(_Open(), topic, initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+        await anext(stream)  # doc.ready
+        doc, _ = apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "Agent."}}], by="agent")
+        for _ in range(2):
+            docs.hub.deliver_remote({"type": "doc.updated", "rev": doc["rev"], "clientId": "tab-1",
+                                     "origin": "other", "topic": topic})
+        frame = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+        await _no_frame(stream)
+        await stream.aclose()
+        return frame
+
+    name, f = asyncio.run(scenario())
+    assert name == "doc.updated" and f["rev"] == 2 and f["clientId"] == "tab-1"
+
+
+def test_a_steady_stream_of_silent_nudges_does_not_starve_the_mtime_poll(monkeypatch, tmp_path):
+    """Each nudge names a rev older than the file, so none sends a frame; the poll
+    must still run once per interval and send the doc."""
+    import asyncio
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import DocHub, doc_topic
+    from cowork.docs.service import apply, create_doc
+
+    monkeypatch.setattr(docs, "_POLL_S", 0.3)
+    monkeypatch.setattr(docs, "hub", DocHub())
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    topic = doc_topic(made.folder)
+    lead = made.doc["tabs"][0]["blocks"][0]["id"]
+
+    async def scenario():
+        stream = docs._sse(_Open(), topic, initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+        await anext(stream)  # doc.ready
+        apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "A."}}], by="agent")
+        doc, _ = apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "B."}}], by="agent")
+
+        async def flood():
+            while True:
+                docs.hub.deliver_remote({"type": "doc.updated", "rev": 2, "clientId": None,
+                                         "origin": "other", "topic": topic})
+                await asyncio.sleep(0.05)
+
+        task = asyncio.ensure_future(flood())
+        try:
+            return _sse_frame(await asyncio.wait_for(anext(stream), 1.5))
+        finally:
+            task.cancel()
+            await stream.aclose()
+
+    name, f = asyncio.run(scenario())
+    assert name == "doc.updated" and f["rev"] == 3 and "clientId" not in f

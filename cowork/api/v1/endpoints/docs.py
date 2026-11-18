@@ -505,6 +505,20 @@ def _sse(
         except FilesystemBusy:
             return last
 
+    async def poll_step(last_rev: int, last_mtime: int, pending_rev: int) -> tuple[str | None, int, int]:
+        mtime = await poll_mtime(last_mtime)
+        # This host's view can lag a write in content as well as in mtime:
+        # until a read reaches the rev a nudge named, reread on every poll.
+        if mtime == last_mtime and pending_rev <= last_rev:
+            return None, last_rev, last_mtime
+        try:
+            doc = await run_efs(partial(load_doc, initial), scope=scope)
+        except (DocError, FilesystemBusy):
+            return None, last_rev, mtime
+        if doc["rev"] == last_rev:
+            return None, last_rev, mtime
+        return _updated_frame(doc), doc["rev"], mtime
+
     async def events():
         queue = hub.subscribe(topic, replay=replay)
         last_rev = -1
@@ -523,32 +537,30 @@ def _sse(
             else:
                 yield _frame("ready", {})
             idle = 0.0
+            clock = asyncio.get_running_loop().time
+            last_poll = clock()
             while True:
                 if await request.is_disconnected():
                     return
+                # The poll and the keepalive run by elapsed time, so a steady stream
+                # of events that send nothing cannot starve them.
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=_POLL_S)
+                    event = await asyncio.wait_for(queue.get(), timeout=max(0.0, last_poll + _POLL_S - clock()))
                 except asyncio.TimeoutError:
+                    event = None
+                if event is None or clock() - last_poll >= _POLL_S:
+                    last_poll = clock()
                     idle += _POLL_S
                     if initial is not None:
-                        mtime = await poll_mtime(last_mtime)
-                        # This host's view can lag a write in content as well as in mtime:
-                        # until a read reaches the rev a nudge named, reread on every poll.
-                        if mtime != last_mtime or pending_rev > last_rev:
-                            last_mtime = mtime
-                            try:
-                                doc = await run_efs(partial(load_doc, initial), scope=scope)
-                            except (DocError, FilesystemBusy):
-                                continue
-                            if doc["rev"] != last_rev:
-                                last_rev = doc["rev"]
-                                yield _updated_frame(doc)
-                                idle = 0.0
-                                continue
+                        frame, last_rev, last_mtime = await poll_step(last_rev, last_mtime, pending_rev)
+                        if frame is not None:
+                            idle = 0.0
+                            yield frame
                     if idle >= _KEEPALIVE_S:
                         idle = 0.0
                         yield ": keepalive\n\n"
-                    continue
+                    if event is None:
+                        continue
                 if event.get("type") == NUDGE:
                     if initial is None:
                         continue
