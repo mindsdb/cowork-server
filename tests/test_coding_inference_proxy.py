@@ -249,6 +249,33 @@ async def test_proxy_passes_a_spent_budgets_scope_to_codex(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream", "period"),
+    [
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_period": "month"}}}, "month"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded"}}, "headers": {"x-mindshub-budget-period": "day"}}, "day"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_period": "week"}}}, None),
+    ],
+    ids=["body", "header", "unknown"],
+)
+async def test_proxy_passes_a_spent_budgets_period_to_codex(monkeypatch: pytest.MonkeyPatch, upstream, period) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, **upstream)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inference_proxy_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    request = _request([(b"content-type", b"application/json")], b'{"model": "gpt", "input": "hi"}')
+
+    response = await proxy_inference(request, "responses", EngineCredentials(minds_url="https://api.example", minds_api_key="mdb_key"))
+
+    assert json.loads(response.body)["error"].get("budget_period") == period
+
+
+@pytest.mark.asyncio
 async def test_proxy_streams_successful_and_retryable_responses_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, content=b"busy", headers={"retry-after": "2"})

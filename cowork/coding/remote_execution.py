@@ -6,7 +6,7 @@ from functools import partial
 
 from cowork.coding.commands import CommandIntent
 from cowork.coding.connector_capabilities import ConnectorCapability
-from cowork.coding.context import BUDGET_SCOPE_PATTERN, is_context_exhaustion_error
+from cowork.coding.context import BUDGET_PERIOD_ADJECTIVES, BUDGET_SCOPE_PATTERN, is_context_exhaustion_error
 from cowork.coding.contracts import (
     CodingEvent,
     CodingSession,
@@ -548,14 +548,13 @@ class RemoteExecutionCoordinator:
             for key in ("code", "detail", "model")
             if run.status == RunStatus.failed and event.payload.get(key)
         }
-        # A budget stop's scope rides along like a local run's, so the app can name it.
-        scope = event.payload.get("budget_scope")
-        if (
-            failure.get("code") == "budget_exceeded"
-            and isinstance(scope, str)
-            and BUDGET_SCOPE_PATTERN.fullmatch(scope)
-        ):
-            failure["budget_scope"] = scope
+        # A budget stop's scope and period ride along like a local run's, so the app can name them.
+        if failure.get("code") == "budget_exceeded":
+            scope, period = event.payload.get("budget_scope"), event.payload.get("budget_period")
+            if isinstance(scope, str) and BUDGET_SCOPE_PATTERN.fullmatch(scope):
+                failure["budget_scope"] = scope
+            if isinstance(period, str) and period in BUDGET_PERIOD_ADJECTIVES:
+                failure["budget_period"] = period
         return None, CodingEvent(
             type=EventType.error if run.status == RunStatus.failed else EventType.session,
             title=title,

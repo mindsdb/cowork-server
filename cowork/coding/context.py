@@ -167,11 +167,18 @@ class EngineFailure:
     code: str = ""
     detail: str = ""
     model: str = ""
-    # Whose budget a budget_exceeded failure names, so the card can say so.
+    # Whose budget a budget_exceeded failure names, and its period, so the card can say so.
     budget_scope: str = ""
+    budget_period: str = ""
 
     def event_data(self) -> dict[str, str]:
-        fields = (("code", self.code), ("detail", self.detail), ("model", self.model), ("budget_scope", self.budget_scope))
+        fields = (
+            ("code", self.code),
+            ("detail", self.detail),
+            ("model", self.model),
+            ("budget_scope", self.budget_scope),
+            ("budget_period", self.budget_period),
+        )
         return {key: value for key, value in fields if value}
 
 
@@ -193,9 +200,18 @@ FAILURE_MESSAGES = {
     ),
 }
 
-# Whose budget a budget_exceeded failure names; any other scope keeps the neutral copy above.
-_BUDGET_SCOPE_OWNERS = {"org": "Your organization's", "workspace": "This workspace's", "api_key": "This API key's"}
+# Whose budget a budget_exceeded failure names; any other scope keeps neutral wording.
+_BUDGET_SCOPE_OWNERS = {
+    "org": "Your organization's",
+    "workspace": "This workspace's",
+    "api_key": "This API key's",
+    "team": "Your team's",
+    "user": "Your",
+    "all_members": "Your",
+}
 BUDGET_SCOPE_PATTERN = re.compile(r"[a-z_]{1,32}")
+# The periods a budget_exceeded failure can name; anything else is left out.
+BUDGET_PERIOD_ADJECTIVES = {"day": "daily", "month": "monthly", "year": "yearly"}
 
 _FAILURE_MARKERS = (
     ("insufficient_credits", ("402 payment required", "wallet has no balance", "insufficient credits")),
@@ -240,15 +256,17 @@ def classify_engine_failure(
     if code == "budget_exceeded":
         scope = _string_field(error, "budget_scope")
         scope = scope if BUDGET_SCOPE_PATTERN.fullmatch(scope) else ""
+        period = _string_field(error, "budget_period")
+        period = period if period in BUDGET_PERIOD_ADJECTIVES else ""
+        adjective = BUDGET_PERIOD_ADJECTIVES.get(period)
+        budget = f"{adjective} spending budget" if adjective else "spending budget"
         owner = _BUDGET_SCOPE_OWNERS.get(scope)
+        lead = f"{owner} {budget}" if owner else f"A {budget}"
         who = "An owner or admin" if scope == "org" else "An administrator"
-        text = (
-            f"{owner} spending budget is used up. {who} can raise it in Budgets, "
-            "or choose a model that is still available."
-            if owner
-            else FAILURE_MESSAGES[code]
+        text = f"{lead} is used up. {who} can raise it in Budgets, or choose a model that is still available."
+        return EngineFailure(
+            message=text, code=code, detail=detail, model=model, budget_scope=scope, budget_period=period
         )
-        return EngineFailure(message=text, code=code, detail=detail, model=model, budget_scope=scope)
     return EngineFailure(message=FAILURE_MESSAGES[code], code=code, detail=detail, model=model)
 
 

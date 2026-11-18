@@ -9,7 +9,7 @@ from fastapi import HTTPException, Request
 from starlette.responses import Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
-from cowork.coding.context import BUDGET_SCOPE_PATTERN
+from cowork.coding.context import BUDGET_PERIOD_ADJECTIVES, BUDGET_SCOPE_PATTERN
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.inference_trace import trace_headers
 
@@ -129,8 +129,22 @@ def upstream_budget_scope(body: bytes, header: str | None = None) -> str:
     return ""
 
 
+def upstream_budget_period(body: bytes, header: str | None = None) -> str:
+    """The spent budget's period a ``budget_exceeded`` rejection names, from the body or the header."""
+    try:
+        payload = json.loads(body[:MAX_REJECTION_BODY_BYTES])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    period = error.get("budget_period") if isinstance(error, dict) else None
+    for candidate in (period, header):
+        if isinstance(candidate, str) and candidate in BUDGET_PERIOD_ADJECTIVES:
+            return candidate
+    return ""
+
+
 def terminal_rejection(
-    status_code: int, body: bytes, code: str | None = None, budget_scope: str = ""
+    status_code: int, body: bytes, code: str | None = None, budget_scope: str = "", budget_period: str = ""
 ) -> tuple[str, bytes] | None:
     """Return the (code, body) of a non-retryable 400 for a deterministic upstream rejection."""
     code = code or TERMINAL_UPSTREAM_CODES.get(status_code)
@@ -144,6 +158,8 @@ def terminal_rejection(
     }
     if budget_scope:
         error["budget_scope"] = budget_scope
+    if budget_period:
+        error["budget_period"] = budget_period
     return code, json.dumps({"error": error}, ensure_ascii=False).encode()
 
 
@@ -277,10 +293,11 @@ def _response_headers(upstream: httpx.Response) -> dict[str, str]:
 
 
 def _terminal_response(upstream: httpx.Response, raw: bytes, code: str | None = None) -> Response:
-    scope = ""
+    scope = period = ""
     if code == "budget_exceeded":
         scope = upstream_budget_scope(raw, upstream.headers.get("x-mindshub-budget-scope"))
-    rejection = terminal_rejection(upstream.status_code, raw, code, scope)
+        period = upstream_budget_period(raw, upstream.headers.get("x-mindshub-budget-period"))
+    rejection = terminal_rejection(upstream.status_code, raw, code, scope, period)
     assert rejection is not None
     code, body = rejection
     headers = _response_headers(upstream)

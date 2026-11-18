@@ -55,7 +55,9 @@ def test_status_line_and_embedded_json_shapes_are_classified(message: str, code:
         ("workspace", "This workspace's spending budget is used up.", "workspace"),
         ("api_key", "This API key's spending budget is used up.", "api_key"),
         ("org", "Your organization's spending budget is used up.", "org"),
-        ("team", "A spending budget is used up.", "team"),
+        ("team", "Your team's spending budget is used up.", "team"),
+        ("user", "Your spending budget is used up.", "user"),
+        ("guild", "A spending budget is used up.", "guild"),
         ("Bad Scope", "A spending budget is used up.", None),
     ],
 )
@@ -69,6 +71,25 @@ def test_a_spent_budget_names_its_scope(scope: str, message: str, event_scope: s
     # Only an org budget names owners; workspace and key budgets may be managed below the org.
     who = "An owner or admin" if scope == "org" else "An administrator"
     assert f"{who} can raise it in Budgets, or choose a model that is still available." in failure.message
+
+
+@pytest.mark.parametrize(
+    ("period", "message", "event_period"),
+    [
+        ("day", "This workspace's daily spending budget is used up.", "day"),
+        ("year", "This workspace's yearly spending budget is used up.", "year"),
+        ("week", "This workspace's spending budget is used up.", None),
+    ],
+)
+def test_a_spent_budget_names_its_period(period: str, message: str, event_period: str | None) -> None:
+    raw = (
+        'unexpected status 400 Bad Request: {"error": {"code": "budget_exceeded", '
+        f'"budget_scope": "workspace", "budget_period": "{period}"}}}}'
+    )
+    failure = classify_engine_failure(raw, CREDS)
+
+    assert failure.message.startswith(message)
+    assert failure.event_data().get("budget_period") == event_period
 
 
 def test_unrelated_failures_keep_their_redacted_text_and_no_code() -> None:

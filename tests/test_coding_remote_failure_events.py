@@ -65,3 +65,15 @@ def test_a_remote_failure_drops_a_malformed_or_misplaced_scope() -> None:
 
     assert "budget_scope" not in bad.data
     assert "budget_scope" not in other.data
+
+
+def test_a_remote_budget_stop_keeps_its_period_for_the_app() -> None:
+    _, event = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "code": "budget_exceeded", "budget_scope": "team", "budget_period": "month",
+    }))
+    _, bad = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "code": "budget_exceeded", "budget_period": "week",
+    }))
+
+    assert event.data["budget_period"] == "month"
+    assert "budget_period" not in bad.data

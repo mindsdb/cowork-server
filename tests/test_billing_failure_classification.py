@@ -186,3 +186,14 @@ def test_a_spent_budget_names_its_scope_live_and_on_reload(
     assert failed["error"].startswith(f"{owner} spending budget is used up.")
     assert failed.get("budget_scope") == scope
     assert "reset_at" not in failed
+
+
+def test_a_spent_budget_names_its_period_live_and_on_reload(monkeypatch, self_hosted_minds_url, conversation_id):
+    error = _billing_stop(status=402, reason="budget_exceeded")
+    error.__cause__.response.headers["X-MindsHub-Budget-Scope"] = "workspace"
+    error.__cause__.response.headers["X-MindsHub-Budget-Period"] = "day"
+
+    failed = _saved_and_streamed_failure(monkeypatch, conversation_id, error)
+
+    assert failed["error"].startswith("This workspace's daily spending budget is used up.")
+    assert failed.get("budget_period") == "day"

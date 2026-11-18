@@ -305,6 +305,24 @@ async def test_turn_failed_keeps_the_workers_budget_scope_and_names_it(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_turn_failed_keeps_the_workers_budget_period_and_names_it(monkeypatch):
+    data = await _failed_turn(monkeypatch, {"error": _BUDGET_STOP, "budget_scope": "team", "budget_period": "month"})
+    assert data["budget_period"] == "month"
+    assert data["message"].startswith("Your team's monthly spending budget is used up.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "period"),
+    [(_BUDGET_STOP, "week"), (_WALLET_STOP, "day"), (_BUDGET_STOP, None)],
+)
+async def test_turn_failed_drops_a_budget_period_it_cannot_use(monkeypatch, error, period):
+    reply = {"error": error} if period is None else {"error": error, "budget_period": period}
+    data = await _failed_turn(monkeypatch, reply)
+    assert "budget_period" not in data
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error", "scope"),
     [(_BUDGET_STOP, "Not A Scope!"), (_WALLET_STOP, "workspace"), (_BUDGET_STOP, None)],

@@ -1306,7 +1306,60 @@ def test_a_spent_budget_names_its_scope(carrier, scope):
     assert te.gate_budget_scope(failure) == scope
 
 
-@pytest.mark.parametrize("scope", ["team", "Not A Scope!", "x" * 33])
+@pytest.mark.parametrize(
+    ("scope", "lead"),
+    [
+        ("team", "Your team's spending budget is used up. An administrator"),
+        ("user", "Your spending budget is used up. An administrator"),
+        ("all_members", "Your spending budget is used up. An administrator"),
+    ],
+)
+def test_team_and_member_budgets_are_named(scope, lead):
+    code, message = te.friendly_turn_error(_scoped_budget_via_header(scope))
+    assert code == te.BUDGET_EXCEEDED_CODE
+    assert message.startswith(lead)
+
+
+@pytest.mark.parametrize(
+    ("scope", "period", "message"),
+    [
+        ("org", "month", "Your organization's monthly spending budget is used up. An owner or admin can raise it in Budgets."),
+        ("workspace", "day", "This workspace's daily spending budget is used up. An administrator can raise it in Budgets."),
+        ("user", "year", "Your yearly spending budget is used up. An administrator can raise it in Budgets."),
+        ("guild", "day", "A daily spending budget is used up. An administrator can raise it in Budgets."),
+        ("org", "week", "Your organization's spending budget is used up. An owner or admin can raise it in Budgets."),
+    ],
+)
+def test_a_spent_budget_names_its_period(scope, period, message):
+    exc = _scoped_budget_via_header(scope)
+    exc.__cause__.response.headers["X-MindsHub-Budget-Period"] = period
+    assert te.friendly_turn_error(exc) == (te.BUDGET_EXCEEDED_CODE, message)
+    assert te.gate_budget_period(exc) == (period if period != "week" else None)
+
+
+def test_the_period_is_read_from_the_body_and_the_typed_error():
+    exc = _scoped_budget_via_body("workspace")
+    exc.__cause__.body["error"]["budget_period"] = "month"
+    assert te.gate_budget_period(exc) == "month"
+    typed = _scoped_budget_via_type("org")
+    typed.budget_period = "year"
+    assert te.gate_budget_period(typed) == "year"
+
+
+def test_the_failed_payload_carries_the_budget_period_only_when_set():
+    assert te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE, budget_period="day")["budget_period"] == "day"
+    assert "budget_period" not in te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE)
+
+
+def test_a_remote_budget_stop_names_scope_and_period():
+    code, message = te.remote_turn_error("BudgetExceededError: x", "team", "month")
+    assert (code, message) == (
+        te.BUDGET_EXCEEDED_CODE,
+        "Your team's monthly spending budget is used up. An administrator can raise it in Budgets.",
+    )
+
+
+@pytest.mark.parametrize("scope", ["guild", "Not A Scope!", "x" * 33])
 def test_a_scope_the_copy_does_not_know_reads_as_neutral(scope):
     code, message = te.friendly_turn_error(_scoped_budget_via_header(scope))
     assert (code, message) == (te.BUDGET_EXCEEDED_CODE, te.BUDGET_EXCEEDED_USER_MESSAGE)
@@ -1317,6 +1370,15 @@ def test_only_a_well_formed_scope_is_forwarded():
     assert te.gate_budget_scope(_scoped_budget_via_header("team")) == "team"
     assert te.gate_budget_scope(_scoped_budget_via_header("Not A Scope!")) is None
     assert te.gate_budget_scope(_gateway_failure(402, reason="budget_exceeded")) is None
+
+
+@pytest.mark.parametrize("name", ["X-MindsHub-Budget-Scope", "x-mindshub-budget-scope", "X-Mindshub-Budget-Scope"])
+def test_a_plain_dict_header_is_read_in_any_casing(name):
+    class Denied(Exception):
+        headers = {name: "team", name.replace("Scope", "Period").replace("scope", "period"): "day"}
+
+    assert te.gate_budget_scope(Denied()) == "team"
+    assert te.gate_budget_period(Denied()) == "day"
 
 
 def test_the_failed_payload_carries_the_budget_scope_only_when_set():

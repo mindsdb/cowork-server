@@ -186,12 +186,18 @@ BUDGET_EXCEEDED_USER_MESSAGE = (
     "An administrator can raise it in Budgets."
 )
 # Whose budget the gateway's `budget_scope` names; any other scope gets the copy above.
+# `user` and `all_members` both cap the caller's own spend.
 _BUDGET_SCOPE_OWNERS = {
     "org": "Your organization's",
     "workspace": "This workspace's",
     "api_key": "This API key's",
+    "team": "Your team's",
+    "user": "Your",
+    "all_members": "Your",
 }
 _BUDGET_SCOPE_PATTERN = re.compile(r"[a-z_]{1,32}")
+# The gateway's `budget_period`, as the copy names it; any other value is left out.
+_BUDGET_PERIOD_ADJECTIVES = {"day": "daily", "month": "monthly", "year": "yearly"}
 
 # Codes whose failure frame carries the gate's `X-MindsHub-Reset-At` instant as
 # `reset_at`, so the card can say when the free way forward comes back.
@@ -1375,7 +1381,7 @@ def friendly_turn_error(
     """
     friendly = _classify_turn_error(exc, model_info)
     if friendly is not None and friendly[0] == BUDGET_EXCEEDED_CODE:
-        return BUDGET_EXCEEDED_CODE, budget_exceeded_message(gate_budget_scope(exc))
+        return BUDGET_EXCEEDED_CODE, budget_exceeded_message(gate_budget_scope(exc), gate_budget_period(exc))
     return friendly
 
 
@@ -1665,7 +1671,9 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
 }
 
 
-def remote_turn_error(error: str | None, budget_scope: str | None = None) -> tuple[str, str]:
+def remote_turn_error(
+    error: str | None, budget_scope: str | None = None, budget_period: str | None = None
+) -> tuple[str, str]:
     """Map a remote pod's ``turn_failed`` error STRING to ``(code, message)``.
 
     The in-process path classifies exceptions (`friendly_turn_error`); remote
@@ -1707,7 +1715,7 @@ def remote_turn_error(error: str | None, budget_scope: str | None = None) -> tup
     mapping = _REMOTE_TYPE_MAPPINGS.get(type_name)
     if mapping is not None:
         if mapping.code == BUDGET_EXCEEDED_CODE:
-            return mapping.code, budget_exceeded_message(budget_scope)
+            return mapping.code, budget_exceeded_message(budget_scope, budget_period)
         if mapping.passes_message_through and message:
             return mapping.code, message
         return mapping.code, mapping.message
@@ -1761,45 +1769,63 @@ def clean_budget_scope(value: object) -> str | None:
     return None
 
 
-def budget_exceeded_message(scope: str | None) -> str:
-    """The budget_exceeded copy naming whose budget is spent, or the neutral copy."""
+def clean_budget_period(value: object) -> str | None:
+    """``value`` when it is a period the copy can name (``day``, ``month``, ``year``), else None."""
+    return value if isinstance(value, str) and value in _BUDGET_PERIOD_ADJECTIVES else None
+
+
+def budget_exceeded_message(scope: str | None, period: str | None = None) -> str:
+    """The budget_exceeded copy naming whose budget is spent and its period, when known."""
+    adjective = _BUDGET_PERIOD_ADJECTIVES.get(period or "")
+    budget = f"{adjective} spending budget" if adjective else "spending budget"
     owner = _BUDGET_SCOPE_OWNERS.get(scope or "")
     if owner is None:
-        return BUDGET_EXCEEDED_USER_MESSAGE
-    # Workspace and key budgets may be managed below the org, so only the org copy names owners.
+        return f"A {budget} is used up. An administrator can raise it in Budgets."
+    # Only org budgets are certainly the org owners'; others may be managed below the org.
     who = "An owner or admin" if scope == "org" else "An administrator"
-    return f"{owner} spending budget is used up. {who} can raise it in Budgets."
+    return f"{owner} {budget} is used up. {who} can raise it in Budgets."
 
 
-def gate_budget_scope(exc: BaseException) -> str | None:
-    """Whose budget a budget_exceeded denial names, from anywhere in the cause chain.
-
-    Read from anton's ``budget_scope``, then the ``X-MindsHub-Budget-Scope`` header, then
-    ``error.budget_scope`` in the body. Only called once the denial is classified as the gateway's.
-    """
+def _gate_budget_field(exc: BaseException, name: str, clean) -> str | None:
+    """A ``budget_<name>`` field from anywhere in the cause chain: anton's attribute, the
+    ``X-MindsHub-Budget-<Name>`` header, then the body. Only read once the denial is the gateway's."""
+    attr, header = f"budget_{name}", f"x-mindshub-budget-{name}"
     for cur in _cause_chain(exc=exc):
-        scope = clean_budget_scope(getattr(cur, "budget_scope", None))
-        if scope is not None:
-            return scope
+        value = clean(getattr(cur, attr, None))
+        if value is not None:
+            return value
         resp = getattr(cur, "response", None)
         headers = getattr(resp, "headers", None) or getattr(cur, "headers", None)
         if headers is not None:
             try:
-                raw = headers.get("x-mindshub-budget-scope") or headers.get("X-MindsHub-Budget-Scope")
+                raw = headers.get(header)
+                if raw is None and hasattr(headers, "items"):
+                    # A plain dict is case-sensitive; match the header name in any casing.
+                    raw = next((v for k, v in headers.items() if str(k).lower() == header.lower()), None)
             except Exception:
                 raw = None
-            scope = clean_budget_scope(raw)
-            if scope is not None:
-                return scope
+            value = clean(raw)
+            if value is not None:
+                return value
         body = getattr(cur, "body", None)
         if isinstance(body, list) and body and isinstance(body[0], dict):
             body = body[0]
         if isinstance(body, dict):
             env = body.get("error") if isinstance(body.get("error"), dict) else {}
-            scope = clean_budget_scope(body.get("budget_scope") or env.get("budget_scope"))
-            if scope is not None:
-                return scope
+            value = clean(body.get(attr) or env.get(attr))
+            if value is not None:
+                return value
     return None
+
+
+def gate_budget_scope(exc: BaseException) -> str | None:
+    """Whose budget a budget_exceeded denial names, from anywhere in the cause chain."""
+    return _gate_budget_field(exc, "scope", clean_budget_scope)
+
+
+def gate_budget_period(exc: BaseException) -> str | None:
+    """The spent budget's period a budget_exceeded denial names, from anywhere in the cause chain."""
+    return _gate_budget_field(exc, "period", clean_budget_period)
 
 
 def response_failed_payload(
@@ -1813,6 +1839,7 @@ def response_failed_payload(
     retry_at: str | None = None,
     reset_at: str | None = None,
     budget_scope: str | None = None,
+    budget_period: str | None = None,
     request_id: str | None = None,
     assistant_message_id: str | None = None,
 ) -> dict:
@@ -1822,8 +1849,8 @@ def response_failed_payload(
     ``provider_auth`` case so the renderer can offer "Reconnect" (MindsHub) vs
     "Open Settings" (BYOK); ``model`` only for the model-403 case so the card
     can name the locked model ("Sonnet needs credits"); ``retry_after`` only for
-    ``rate_limited`` so the card can time-gate its Retry; ``budget_scope`` only for
-    ``budget_exceeded``, naming whose budget is spent — omitted otherwise to
+    ``rate_limited`` so the card can time-gate its Retry; ``budget_scope`` and
+    ``budget_period`` only for ``budget_exceeded``, naming whose budget is spent and its period — omitted otherwise to
     keep the shape unchanged for every other failure. All additive: an older
     client ignores fields it doesn't read.
 
@@ -1855,6 +1882,8 @@ def response_failed_payload(
         payload["reset_at"] = reset_at
     if budget_scope is not None:
         payload["budget_scope"] = budget_scope
+    if budget_period is not None:
+        payload["budget_period"] = budget_period
     if request_id is not None:
         payload["request_id"] = request_id
     if assistant_message_id is not None:
@@ -1873,6 +1902,7 @@ def response_failed_sse(
     retry_at: str | None = None,
     reset_at: str | None = None,
     budget_scope: str | None = None,
+    budget_period: str | None = None,
     request_id: str | None = None,
     assistant_message_id: str | None = None,
 ) -> str:
@@ -1888,6 +1918,7 @@ def response_failed_sse(
         retry_at=retry_at,
         reset_at=reset_at,
         budget_scope=budget_scope,
+        budget_period=budget_period,
         request_id=request_id,
         assistant_message_id=assistant_message_id,
     )
