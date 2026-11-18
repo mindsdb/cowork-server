@@ -1809,6 +1809,8 @@ def test_the_channel_archive_keeps_rows_drops_bot_passwords_and_unpins_conversat
         )
         _insert_setting(connection, key="channel.telegram.bot_token", value="not-a-real-token")
         _insert_setting(connection, key="channel.slack.signing_secret", value="not-a-real-secret")
+        # A field no plugin of the last release declared is erased too.
+        _insert_setting(connection, key="channel.slack.client_secret", value="not-a-real-secret")
         _insert_setting(connection, key="channel.telegram.bot_username", value="a_bot")
         _insert_setting(connection, key="channels_harness", value="anton")
         _insert_setting(connection, key="greeting", value="hello there")

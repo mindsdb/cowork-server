@@ -2,9 +2,10 @@
 
 Channels are gone from the server. Their rows stay where they are, as a record
 nobody reads: the four channel tables, their non-secret settings and
-`conversations.channel_type`. What goes is every bot password: the `settings`
-rows of the fields the Slack, Discord, Telegram and WhatsApp plugins marked
-secret. It also drops the foreign key from `channel_bindings` to
+`conversations.channel_type`. What goes is every bot password: every
+`channel.*` row in `settings` except the few fields the plugins marked
+non-secret, so a secret field this list never named is erased too. It also
+drops the foreign key from `channel_bindings` to
 `conversations`, so a binding row cannot block a conversation delete.
 
 The tables stay: during a rolling deploy the previous release still reads and
@@ -29,17 +30,15 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
-# The `channel.<type>.<field>` keys services/channels.py wrote for each field
-# its plugin declared `secret=True`. The plugins are gone, so the list is fixed.
-_SECRET_KEYS = (
-    "channel.slack.bot_token",
-    "channel.slack.app_token",
-    "channel.slack.signing_secret",
-    "channel.discord.bot_token",
-    "channel.telegram.bot_token",
-    "channel.telegram.secret_token",
-    "channel.whatsapp.access_token",
-    "channel.whatsapp.app_secret",
+# The `channel.<type>.<field>` keys services/channels.py stored unencrypted,
+# for the fields the last plugins declared `secret=False`. Every other
+# `channel.` key is erased: deny by default, so a secret field an older
+# release had, or one this list missed, cannot survive.
+_NON_SECRET_KEYS = (
+    "channel.discord.public_key",
+    "channel.telegram.bot_username",
+    "channel.whatsapp.phone_number_id",
+    "channel.whatsapp.verify_token",
 )
 
 # b7c1d2e3f4a5_channels.py creates this FK unnamed. Postgres auto-names it,
@@ -65,8 +64,8 @@ def _conversation_fk() -> dict | None:
 def upgrade() -> None:
     """Upgrade schema. The erased passwords are not kept anywhere."""
     op.execute(
-        sa.text("DELETE FROM settings WHERE key IN :keys").bindparams(
-            sa.bindparam("keys", value=list(_SECRET_KEYS), expanding=True)
+        sa.text("DELETE FROM settings WHERE key LIKE 'channel.%' AND key NOT IN :kept").bindparams(
+            sa.bindparam("kept", value=list(_NON_SECRET_KEYS), expanding=True)
         )
     )
     fk = _conversation_fk()
