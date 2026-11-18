@@ -1665,9 +1665,12 @@ async def read_project_file(
     scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    return await run_efs_unit(
+    result = await run_efs_unit(
         partial(_read_project_file, project_name=project_name, path=path, principal=principal), scope=scope
     )
+    from cowork.services.content_safety import check_content
+    await check_content(result['content'], purpose='output', scope=scope)
+    return result
 
 
 def _read_project_file(
@@ -1976,6 +1979,8 @@ async def write_project_file(
     scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
+    from cowork.services.content_safety import check_content
+    await check_content(req.content, purpose='input', scope=scope)
     return await run_efs_unit(
         partial(_write_project_file, project_name=project_name, path=path, req=req, principal=principal), scope=scope
     )
@@ -2163,7 +2168,25 @@ async def upload_project_files(
     # threads. Each upload is read there from its own spool, one at a time and
     # only once the project is found, so a request holds at most one file's
     # bytes in memory.
-    return await run_efs_unit(partial(_write_uploads, project_name=project_name, uploads=files), scope=scope)
+    from cowork.services.content_safety import ContentSafetySettings, MAX_FILE_BYTES, check_file_bytes
+    if not ContentSafetySettings().required:
+        return await run_efs_unit(partial(_write_uploads, project_name=project_name, uploads=files), scope=scope)
+    from io import BytesIO
+    approved = []
+    total = 0
+    try:
+        for upload in files:
+            data = await upload.read(MAX_FILE_BYTES + 1)
+            total += len(data)
+            if total > MAX_FILE_BYTES:
+                raise HTTPException(413, 'These files are too large for a safety check.')
+            await check_file_bytes(data, content_type=upload.content_type or '', purpose='input', scope=scope)
+            # The writer gets exactly the checked bytes, not the mutable spool.
+            approved.append(UploadFile(BytesIO(data), filename=upload.filename, headers=upload.headers))
+        return await run_efs_unit(partial(_write_uploads, project_name=project_name, uploads=approved), scope=scope)
+    finally:
+        for upload in approved:
+            await upload.close()
 
 
 def _write_uploads(scoped: ScopedSession, *, project_name: str, uploads: list[UploadFile]) -> ProjectUploadResponse:

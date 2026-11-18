@@ -1,0 +1,147 @@
+from uuid import uuid4
+from datetime import datetime, timezone
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from sqlmodel import Session, select
+from cowork.api.v1.endpoints import content_reports as endpoint
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.session import get_engine
+from cowork.models.content_report import ContentReport
+from cowork.models.conversation import Conversation
+from cowork.models.message import Message
+from cowork.models.project import Project
+from cowork.principal import Principal, get_principal
+
+@pytest.fixture
+def setup(monkeypatch):
+    monkeypatch.setenv('COWORK_TENANCY_MODE', 'org')
+    get_app_settings.cache_clear()
+    engine = get_engine(get_app_settings().database.uri)
+    org, user = str(uuid4()), str(uuid4())
+    caller = [Principal(user_id=user, org_id=org)]
+    with Session(engine) as db:
+        project = Project(name=str(uuid4()), path='/unused', org_id=org, created_by=user)
+        db.add(project)
+        db.flush()
+        conversation = Conversation(topic='Report test', project_id=project.id, org_id=org, created_by=user)
+        db.add(conversation)
+        db.flush()
+        message = Message(conversation_id=conversation.id, role='assistant', content='Reported response')
+        db.add(message)
+        db.commit()
+        body = {'conversation_id': str(conversation.id), 'message_id': str(message.id)}
+    app = FastAPI()
+    app.include_router(endpoint.router, prefix='/reports')
+    app.dependency_overrides[get_principal] = lambda: caller[0]
+    with TestClient(app) as client:
+        yield client, caller, engine, body
+    get_app_settings.cache_clear()
+
+
+def test_durable_report_and_retry_return_same_receipt(setup):
+    client, caller, engine, body = setup
+    first = client.post('/reports/', json=body)
+    assert first.status_code == 201, first.text
+    assert client.post('/reports/', json=body).json() == first.json()
+    with Session(engine) as db:
+        rows = db.exec(select(ContentReport).where(ContentReport.user_id == caller[0].user_id)).all()
+        assert len(rows) == 1
+        assert rows[0].evidence == '"Reported response"'
+        assert rows[0].status == 'pending'
+    assert 'evidence' not in first.json()
+    assert client.get('/reports/').status_code == 405
+
+@pytest.mark.parametrize('other_org', [False, True])
+def test_cannot_report_another_persons_task(setup, other_org):
+    client, caller, _, body = setup
+    caller[0] = Principal(user_id=str(uuid4()), org_id=str(uuid4()) if other_org else caller[0].org_id)
+    assert client.post('/reports/', json=body).status_code == 404
+
+
+def test_cannot_substitute_evidence_or_target(setup):
+    client, _, _, body = setup
+    assert client.post('/reports/', json={**body, 'evidence': 'fabricated'}).status_code == 422
+    assert client.post('/reports/', json={**body, 'message_id': str(uuid4())}).status_code == 404
+    assert client.post('/reports/', json={**body, 'conversation_id': str(uuid4())}).status_code == 404
+
+
+def test_anonymous_cannot_report(setup):
+    client, caller, _, body = setup
+    caller[0] = None
+    assert client.post('/reports/', json=body).status_code == 401
+
+
+def test_daily_report_limit(setup):
+    client, caller, engine, body = setup
+    with Session(engine) as db:
+        for _ in range(100):
+            db.add(ContentReport(org_id=caller[0].org_id, user_id=caller[0].user_id,
+                target_key=str(uuid4()), conversation_id=uuid4(), message_id=uuid4(), evidence='test', created_at=datetime.now(timezone.utc)))
+        db.commit()
+    assert client.post('/reports/', json=body).status_code == 429
+
+@pytest.mark.parametrize('allowed', [False, True])
+def test_artifact_report_uses_viewers_access_check(setup, monkeypatch, allowed):
+    from unittest.mock import AsyncMock
+    from fastapi import HTTPException
+    from cowork.api.v1 import artifact_scope
+    client, caller, engine, _ = setup
+    project_id, artifact_id = uuid4(), uuid4()
+    resolver = AsyncMock(return_value=(None, None, {'title': 'Reported artifact'}, False))
+    if not allowed:
+        resolver.side_effect = HTTPException(404, 'Artifact not found')
+    monkeypatch.setattr(artifact_scope, 'review_artifact_for_request', resolver)
+    body = {'project_id': str(project_id), 'artifact_id': str(artifact_id)}
+    response = client.post('/reports/artifact', json=body)
+    assert response.status_code == (201 if allowed else 404), response.text
+    assert resolver.await_args.args[0].user_id == caller[0].user_id
+    assert resolver.await_args.args[1:] == (str(project_id), artifact_id.hex)
+    with Session(engine) as db:
+        rows=db.exec(select(ContentReport).where(ContentReport.user_id == caller[0].user_id)).all()
+        assert len(rows) == int(allowed)
+        if allowed:
+            assert rows[0].artifact_id == artifact_id
+            assert rows[0].message_id is None
+    if allowed:
+        assert client.post('/reports/artifact',json=body).json() == response.json()
+
+
+def test_report_migration_preserves_other_tables_and_round_trips():
+    import importlib
+    import sqlalchemy as sa
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from unittest.mock import patch
+    migration=importlib.import_module('cowork.db.alembic.versions.a5c8721e09dd_content_reports')
+    engine=sa.create_engine('sqlite://')
+    with engine.begin() as connection:
+        connection.exec_driver_sql('CREATE TABLE existing_data (value TEXT)')
+        connection.exec_driver_sql("INSERT INTO existing_data VALUES ('preserve')")
+        with patch.object(migration, 'op', Operations(MigrationContext.configure(connection))):
+            migration.upgrade()
+            migration.upgrade()  # databases bootstrapped from metadata are safe too
+            names={column['name'] for column in sa.inspect(connection).get_columns('content_reports')}
+            assert {'target_key','artifact_id','message_id','reviewed_by','resolution'} <= names
+            migration.downgrade()
+            assert 'content_reports' not in sa.inspect(connection).get_table_names()
+            assert connection.exec_driver_sql('SELECT value FROM existing_data').scalar() == 'preserve'
+
+
+def test_operator_can_inspect_and_record_disposition_once(setup, monkeypatch, capsys):
+    from cowork import content_report_admin
+    client, _, engine, body = setup
+    report_id=client.post('/reports/',json=body).json()['id']
+    monkeypatch.setattr('sys.argv',['content-report-admin','show',report_id])
+    content_report_admin.main()
+    assert 'Reported response' in capsys.readouterr().out
+    monkeypatch.setattr('sys.argv',['content-report-admin','resolve',report_id,'--reviewer','test-operator','--resolution','Reviewed synthetic test evidence.'])
+    content_report_admin.main()
+    with Session(engine) as db:
+        from uuid import UUID
+        row=db.get(ContentReport,UUID(report_id))
+        assert row.status == 'resolved'
+        assert row.reviewed_by == 'test-operator'
+        assert row.resolution == 'Reviewed synthetic test evidence.'
+    with pytest.raises(SystemExit):
+        content_report_admin.main()

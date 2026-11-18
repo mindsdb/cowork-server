@@ -765,7 +765,8 @@ def _start_first_take(
     Its trace is its own (tag ``cowork-first-take``), joined to the gate's by
     the correlation id, so its cost is countable apart from the gate's.
     """
-    if not _first_take_enabled():
+    from cowork.services.content_safety import ContentSafetySettings
+    if ContentSafetySettings().required or not _first_take_enabled():
         return None
     binding = _first_take_binding(minted, binding_factory=binding_factory)
     if binding is None:
@@ -868,6 +869,8 @@ class ResponsesHandler:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
 
         await require_product_permission(self.scope, "product.execute")
+        from cowork.services.content_safety import check_request
+        await check_request(request, scope=self.scope)
 
         # "memory": "off" runs the turn as MEMORY_ENABLED=false would. On a
         # deployment where that still reads stored memory (memory_policy: the
@@ -1807,6 +1810,8 @@ class ResponsesHandler:
         # which registry.start records in the turn index on the Redis backend,
         # so there the Reference a user reports resolves in the index too; the
         # non-streaming half leaves only the log line.
+        from cowork.services.content_safety import check_content
+        await check_content(route.text, purpose="output", scope=self.scope)
         corr = f"direct-{uuid4()}"
         if not request.stream:
             text = route.text
@@ -2216,6 +2221,20 @@ class ResponsesHandler:
 
             if first_take is not None:
                 first_take.cancel()
+            from cowork.services.content_safety import ContentSafetySettings, check_content
+            if ContentSafetySettings().required:
+                held = [answer.first_text]
+                async for chunk in answer.rest():
+                    held.append(chunk)
+                    if sum(map(len, held)) > 100_000:
+                        raise HTTPException(413, "This content is too large for a safety check.")
+                checked_text = "".join(held)
+                await check_content(checked_text, purpose="output", scope=scope)
+                async def checked_rest():
+                    if False:
+                        yield ""
+                from types import SimpleNamespace
+                answer = SimpleNamespace(first_text=checked_text, rest=checked_rest)
             parts.append(answer.first_text)
             response = Response(status=ResponseStatus.created, model=binding.model)
             await buffer.append("sse", {"sse": sse_frame("response.created", {
