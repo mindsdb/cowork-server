@@ -741,6 +741,8 @@ LAYER_JS = r"""
       markerEls[k].el.classList.toggle('act-active', k === id); });
   }
   function closePop(){
+    // Closing the card any way keeps an edit in progress.
+    if (editing) editing.commit();
     closeMenu();
     if (ghost) { ghost.remove(); ghost = null; }
     pendingCreate = false;
@@ -928,8 +930,17 @@ LAYER_JS = r"""
 
   // Inline editor: hides the message text, mounts the growing input prefilled;
   // Enter saves (no-op edits skip the PATCH), Escape cancels.
+  // The edit in progress, if any: `commit()` saves it (or drops a no-op),
+  // so a click anywhere else keeps the change instead of losing it.
+  var editing = null;
+
+  // Inline editor: hides the message text, mounts the growing input prefilled.
+  // Enter, the save button, or clicking away saves; Escape cancels; a no-op
+  // edit skips the PATCH. Saving shows the new text in place and leaves the
+  // card open (ENG-4383); the parent's next 'list' push confirms it.
   function startEdit(msgEl, oldText, onSave){
     if (!msgEl || msgEl.querySelector('.act-editbox')) return;
+    if (editing) editing.commit();
     var textEl = msgEl.querySelector('.act-msg-text');
     textEl.style.display = 'none';
     var box = document.createElement('div');
@@ -942,16 +953,33 @@ LAYER_JS = r"""
     // markers go back after them on save.
     var words = splitText(oldText).body, marks = marksOf(oldText);
     ta.value = words;
-    function cancel(){ box.remove(); textEl.style.display = ''; clampPopV(); }
-    wireInput(box, function(text){
-      if (text === words) { cancel(); return; }  // no-op edit: skip the PATCH
-      if (!text && !marks) return;
-      ta.disabled = true;
-      onSave(marks ? (text ? text + '\n\n' + marks : marks) : text);
-    });
+    var done = false;
+    function close(){
+      done = true;
+      if (editing && editing.box === box) editing = null;
+      box.remove(); textEl.style.display = ''; clampPopV();
+    }
+    function save(text){
+      if (done) return;
+      text = String(text || '').trim();
+      if (text === words || (!text && !marks)) { close(); return; }  // no-op: skip the PATCH
+      var full = marks ? (text ? text + '\n\n' + marks : marks) : text;
+      textEl.textContent = splitText(full).body;
+      close();
+      onSave(full);
+    }
+    editing = {box: box, commit: function(){ save(ta.value); }};
+    wireInput(box, function(text){ save(text); });
     ta.dispatchEvent(new Event('input'));  // size to the prefilled text
     ta.addEventListener('keydown', function(e){
-      if (e.key === 'Escape') { e.stopPropagation(); cancel(); }
+      if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    });
+    // Focus leaving the box for anything outside it (another field in the
+    // card, the page, the app) saves, as clicking away does.
+    ta.addEventListener('blur', function(){
+      setTimeout(function(){
+        if (!done && !box.contains(document.activeElement)) save(ta.value);
+      }, 0);
     });
   }
 
@@ -1028,7 +1056,7 @@ LAYER_JS = r"""
       menu.querySelector('[data-act="edit"]').onclick = function(){
         closeMenu();
         startEdit(p.querySelector('[data-root="1"]'), c.text,
-          function(t){ mutate({type:'edit', id: id, text: t}); });
+          function(t){ c.text = t; send({type:'edit', id: id, text: t}); });
       };
       menu.querySelector('[data-act="del"]').onclick = function(){
         closeMenu();
@@ -1042,7 +1070,7 @@ LAYER_JS = r"""
     if (rootEdit) rootEdit.onclick = function(ev){
       ev.stopPropagation();
       startEdit(p.querySelector('[data-root="1"]'), c.text,
-        function(t){ mutate({type:'edit', id: id, text: t}); });
+        function(t){ c.text = t; send({type:'edit', id: id, text: t}); });
     };
     // Hover actions on own replies.
     Array.prototype.forEach.call(p.querySelectorAll('.act-m-edit'), function(btn){
@@ -1053,7 +1081,7 @@ LAYER_JS = r"""
           return String(x.id) === String(rid); })[0];
         if (!rep) return;
         startEdit(btn.closest('.act-msg'), rep.text,
-          function(t){ mutate({type:'edit-reply', id: id, replyId: rid, text: t}); });
+          function(t){ rep.text = t; send({type:'edit-reply', id: id, replyId: rid, text: t}); });
       };
     });
     Array.prototype.forEach.call(p.querySelectorAll('.act-m-del'), function(btn){
@@ -1147,6 +1175,9 @@ LAYER_JS = r"""
     if (!mode) return;
     if (e.target.closest && e.target.closest('#act-mk,.act-pop,.act-menu')) return;
     e.preventDefault(); e.stopPropagation();
+    // A click away from an edit in progress saves it; it doesn't start a
+    // new comment as well.
+    if (editing) { editing.commit(); return; }
     var el = hoverEl || e.target;
     // Gap clicks resolve like hover: containing box -> nearest sibling ->
     // the page itself. The full-page highlight makes a body pick obvious.
@@ -1192,11 +1223,13 @@ LAYER_JS = r"""
     closeMenu();
   }, true);
 
-  // Outside click closes the popover.
+  // Outside click closes the popover, unless a comment is being edited
+  // there: then the click saves the edit and the card stays open.
   document.addEventListener('click', function(e){
     if (!pop) return;
     var t = e.target;
     if (t.closest && (t.closest('.act-pop') || t.closest('#act-mk'))) return;
+    if (editing) { editing.commit(); return; }
     closePop();
   });
 

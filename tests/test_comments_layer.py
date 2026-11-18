@@ -183,7 +183,7 @@ def test_layer_shows_only_images_the_app_pushes():
 
 def test_layer_edit_keeps_image_markers_out_of_the_box():
     assert "var words = splitText(oldText).body, marks = marksOf(oldText);" in LAYER_JS
-    assert "onSave(marks ? (text ? text + '\\n\\n' + marks : marks) : text);" in LAYER_JS
+    assert "var full = marks ? (text ? text + '\\n\\n' + marks : marks) : text;" in LAYER_JS
 
 
 def _node():
@@ -253,6 +253,22 @@ def test_layer_offers_a_hover_edit_on_your_own_comment():
         "class=\"act-m-edit-root\"",
         "aria-label=\"Edit comment\"",
         "var rootEdit = p.querySelector('.act-m-edit-root');",
-        "mutate({type:'edit', id: id, text: t});",
+        "send({type:'edit', id: id, text: t});",
     ]:
         assert token in LAYER_JS, token
+
+
+def test_layer_saves_an_edit_on_click_away_and_keeps_the_card():
+    # Clicking anywhere else (or the card closing) keeps an edit in progress;
+    # saving shows the text in place and leaves the card open (ENG-4383).
+    for token in [
+        "var editing = null;",
+        "if (editing) { editing.commit(); return; }",
+        "if (editing) editing.commit();",
+        "ta.addEventListener('blur'",
+        "textEl.textContent = splitText(full).body;",
+        "function(t){ c.text = t; send({type:'edit', id: id, text: t}); }",
+        "function(t){ rep.text = t; send({type:'edit-reply', id: id, replyId: rid, text: t}); }",
+    ]:
+        assert token in LAYER_JS, token
+    assert "mutate({type:'edit'" not in LAYER_JS
