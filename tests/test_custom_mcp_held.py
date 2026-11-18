@@ -183,6 +183,22 @@ class TestTurnsReadOnlyHeldSettings:
         loaded = vault.for_connecting().load("postgres", "erp")
         assert loaded is not None and "password" not in loaded and "host" not in loaded
 
+    def test_a_turned_off_custom_connection_reads_as_its_label_alone_in_the_protected_connecting_view(self, protected):
+        _write_file({"_method": "mcp"})
+        _hold()
+        source = turn_vault_for_scope(LOCAL_SCOPE)
+        filtered = FilteredDataVault(source=source, hidden=frozenset({(CUSTOM_MCP_ENGINE, CONN)}))
+        vault = app_held.turn_vault(filtered, source_vault=source, root=own_vault_root(LOCAL_SCOPE))
+        assert vault.load(CUSTOM_MCP_ENGINE, CONN) is None
+        connecting = vault.for_connecting()
+        assert connecting.load(CUSTOM_MCP_ENGINE, CONN) == {}
+        assert connecting.read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == {}
+
+    def test_a_file_without_the_mcp_method_reads_as_its_labels_alone(self, protected):
+        _write_file({key: value for key, value in AGENT_WRITTEN.items() if key != "_method"})
+        _hold()
+        assert _turn_vault().load(CUSTOM_MCP_ENGINE, CONN) == {"_label": "Renamed by agent"}
+
     def test_without_the_app_secret_every_custom_connection_is_hidden(self, stores):
         _write_file(AGENT_WRITTEN)
         own_vault_for_scope(LOCAL_SCOPE).save("hubspot", "acme", {"_method": "mcp", "access_token": "t"})

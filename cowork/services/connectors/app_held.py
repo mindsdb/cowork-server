@@ -20,7 +20,7 @@ from typing import Any
 
 from cowork.app_secret import get_app_secret
 from cowork.services.connectors.custom_mcp import CUSTOM_MCP_ENGINE, is_custom_mcp, refuse_generic_write
-from cowork.services.connectors.layered_vault import FilteredDataVault, LayeredDataVault
+from cowork.services.connectors.layered_vault import LABEL_FIELDS, FilteredDataVault, LayeredDataVault
 
 MCP_METHOD = "mcp"
 
@@ -152,7 +152,7 @@ class AppHeldVault(FilteredDataVault):
     holds "read" when no mode is held.
 
     A custom MCP connection (``custom_mcp``) reads nothing from the file but
-    its existence: its URL, label and allowed tools come from the held entry,
+    its existence and ``_method``: its URL, label and allowed tools come from the held entry,
     and only for a record in the user's own layer (``is_own``). With nothing
     held its record carries ``_method`` alone, which anton skips.
     """
@@ -194,12 +194,20 @@ class AppHeldVault(FilteredDataVault):
                 fields["expires_at"] = entry["expires_at"]
         return fields
 
+    def _custom_or_labels(self, name: str, source_fields: dict, *, with_token: bool) -> dict[str, str]:
+        """The held fields of a custom connection, or only the label fields
+        when the source gave no ``_method``: a connecting view lists a
+        turned-off connection by its labels alone, and memory must not refill it."""
+        if source_fields.get("_method") != MCP_METHOD:
+            return {key: value for key, value in source_fields.items() if key in LABEL_FIELDS}
+        return self._custom_fields(name, with_token=with_token)
+
     def load(self, engine: str, name: str) -> dict[str, str] | None:
         fields = super().load(engine, name)
         if fields is None:
             return None
         if is_custom_mcp(engine):
-            return self._custom_fields(name, with_token=True)
+            return self._custom_or_labels(name, fields, with_token=True)
         return self._held_mode(engine, name, overlay(self._root, engine, name, fields))
 
     def read_record(self, engine: str, name: str) -> dict[str, Any] | None:
@@ -207,7 +215,7 @@ class AppHeldVault(FilteredDataVault):
         if record is None:
             return None
         if is_custom_mcp(engine):
-            return {**record, "fields": self._custom_fields(name, with_token=False)}
+            return {**record, "fields": self._custom_or_labels(name, record.get("fields") or {}, with_token=False)}
         return {**record, "fields": self._held_mode(engine, name, record.get("fields") or {})}
 
     def for_connecting(self) -> AppHeldVault:

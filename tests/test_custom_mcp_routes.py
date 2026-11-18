@@ -137,8 +137,7 @@ class TestCreate:
         _create(server_url="https://MCP.example.com/mcp")
         record = own_vault_for_scope(LOCAL_SCOPE).read_record(CUSTOM_MCP_ENGINE, CONN)
         # Bookkeeping only: nothing that says where a token goes or what runs.
-        assert set(record["fields"]) <= {"_method", "_connector_id", "_created_by"}
-        assert record["fields"]["_method"] == "mcp"
+        assert record["fields"] == {"_method": "mcp", "_connector_id": CUSTOM_MCP_ENGINE}
         assert _held()["server_url"] == "https://mcp.example.com/mcp"
         assert _held()["allowed_tools"] == []
         assert _turn_fields()["access_token"] == "AT-1"
