@@ -41,12 +41,12 @@ def test_desktop_lead_asks_for_an_opening_sentence_not_step_narration():
 
 
 def test_desktop_lead_names_artifact_retrieval_path():
-    """ENG-1636: the desktop lead must point users at the Live Artifacts panel
+    """The desktop lead must point users at the Live Artifacts panel
     and forbid the inert-local-path / fabricated-sandbox-link reflex."""
     text = _TURN_STYLE_CONTEXT
     assert "Live Artifacts" in text
     # Download is named unconditionally; Open is qualified as desktop-only,
-    # since hosted web has no Open control (ENG-1636 review).
+    # since hosted web has no Open control.
     assert "Download control" in text
     assert "Open, on desktop" in text
     assert "Open and Download controls" not in text

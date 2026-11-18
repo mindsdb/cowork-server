@@ -24,7 +24,7 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -33,13 +33,12 @@ from sqlmodel import Session
 import cowork.handlers.responses as responses_mod
 from cowork.db import units
 from cowork.db.scoped import ScopedSession, TenantScope
-from cowork.handlers.responses import ResponsesHandler
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
 from cowork.services import artifact_autopublish as ap
 from cowork.services import artifact_ownership as ownership
-from cowork.services import comparisons, held_artifact_roots, task_objects
+from cowork.services import comparisons, held_artifact_roots
 from cowork.services.artifact_identity import ListedIds
 from cowork.services.artifact_locations import Location, LocationRow, find_location, record_checked_folders
 from cowork.services.comparisons import ComparisonService, SideSpec

@@ -731,10 +731,10 @@ async def _turn_end(
     )
 
 
-def _listed_project(org: str, project_path: Path) -> Project:
+def _listed_project(org_id: str, project_path: Path) -> Project:
     """The organization's project at `project_path`, detached from its session."""
     with Session(_engine()) as raw:
-        project = raw.get(Project, _project_id(org, project_path))
+        project = raw.get(Project, _project_id(org_id, project_path))
         raw.expunge(project)
         return project
 

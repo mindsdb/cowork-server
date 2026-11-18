@@ -36,10 +36,9 @@ import cowork.handlers.responses as responses_mod
 import cowork.scheduler as scheduler
 import cowork.services.history_recall as history_recall
 from cowork.common.datetime_utils import ensure_utc
-from cowork.common.settings.user_settings import UserSettings
 from cowork.db import units
 from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE
-from cowork.db.units import DatabaseBusy, conversation_writes, unit_session
+from cowork.db.units import DatabaseBusy, unit_session
 from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, RouteDecision
 from cowork.handlers.turn_errors import (
     INTERRUPTED_TURN_MESSAGE,
@@ -62,7 +61,7 @@ from cowork.streaming import discard_conversation, registry
 from cowork.streaming.buffer import FileStreamBuffer, read_records
 from cowork.streaming.recovery import seal_orphan_turns_in_history
 
-from _fakes import PausedModel, inline_run_db
+from _fakes import PausedModel
 
 # Seconds; the one_connection_pool fixture's POOL_TIMEOUT.
 WAIT = 2
