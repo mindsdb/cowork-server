@@ -414,8 +414,7 @@ def test_an_untrusted_name_keeps_its_last_component_or_nothing(name, basename):
 
 
 async def test_a_cancel_while_the_uploads_row_commits_keeps_its_bytes(units_read_engine, monkeypatch):
-    """A cancel lands while the row's unit runs, as at process exit for a
-    channel turn's attachment. run_db lets the unit commit before the cancel
+    """A cancel lands while the row's unit runs, as at process exit. run_db lets the unit commit before the cancel
     propagates, so the bytes the row names must stay on disk."""
     import asyncio
     import threading

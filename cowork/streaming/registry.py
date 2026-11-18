@@ -374,8 +374,8 @@ async def _stale_turn(
 
     There the index entry decides. The local handle counts only where the
     entry cannot say: when it names the handle's run with no saved-question
-    stamp (both of the run's stamps failed), or when it is a channel turn's,
-    which names no run. Even then it counts only until
+    stamp (both of the run's stamps failed), or when it names no run, as an
+    entry an older release wrote for a channel turn does. Even then it counts only until
     STALE_START_WINDOW_SECONDS after the handle's task ended, the bound the
     stamp would have set. An entry that names another run decides for that
     run: another replica truncated the conversation, or ran a turn at this

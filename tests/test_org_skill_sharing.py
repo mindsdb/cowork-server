@@ -1524,7 +1524,7 @@ def test_the_pod_gets_only_visible_skills_with_always_on_first(org):
 
 
 def test_a_turn_without_a_viewer_gets_only_skills_shared_with_everyone_always_on(org):
-    """No caller credential (a scheduled or channel turn): the fail-closed
+    """No caller credential (a scheduled turn): the fail-closed
     viewer's set, so only skills shared with everyone apply always on, and no team-only
     skill is there to recall."""
     _turn_fixture(org)

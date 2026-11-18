@@ -487,7 +487,7 @@ def _step(state, **extra):
 @pytest.mark.parametrize("state", ["added", "read", "returned", "withdrawn", "ready"])
 def test_the_sync_step_mapping_renders_no_addon_step(state):
     """Addon steps go through relay_addon_step (tests/turnqueue/test_remote_addons.py),
-    which checks the addon is this turn's; a channel turn renders none."""
+    which checks the addon is this turn's."""
     assert step_stream_events(_step(state, text="use the sales DB", decided_by="jev")) == []
 
 

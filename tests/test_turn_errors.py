@@ -1436,8 +1436,8 @@ _ALLOWANCE_WINDOW_CLAIMS = (
             id="in-process-no-reset-at",
         ),
         pytest.param(
-            # The hosted path: channels/runtime.py posts this verbatim to Slack
-            # and Discord, and reads no reset instant beside it.
+            # The hosted path: a consumer that renders no card shows this
+            # verbatim and reads no reset instant beside it.
             lambda: te.remote_turn_error(
                 "AllowanceExhaustedError: Your included allowance for 'x' is exhausted."
             )[1],

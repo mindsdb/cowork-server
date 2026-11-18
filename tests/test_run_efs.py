@@ -24,7 +24,7 @@ from cowork.services.artifact_lock import artifact_lock
 
 ALICE = TenantScope(org_mode=True, org_id="org-1", user_id="alice")
 BOB = TenantScope(org_mode=True, org_id="org-1", user_id="bob")
-# A channel turn's scope (scope_for_org): the organization's, no person's.
+# A scope with no person (scope_for_org): the organization's.
 ORG_1_CHANNELS = TenantScope(org_mode=True, org_id="org-1")
 # Identities a request carries: the app reads X-User-Id as a UUID.
 ORG_UUID = "6f0d1c2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f"

@@ -3,8 +3,7 @@ the work that caused it.
 
 ``spawn`` runs a push as a detached task, kept in ``_background_tasks`` so it
 is not collected mid-send, and ``drain_background_tasks`` waits for the ones
-still going at shutdown, as cowork.channels.webhooks does for inbound
-messages. ``notify_user`` itself never raises: a push that fails is logged
+still going at shutdown. ``notify_user`` itself never raises: a push that fails is logged
 and dropped.
 
 Push runs only in org mode (COWORK_TENANCY_MODE=org), with

@@ -10,7 +10,7 @@ Writes go through ScheduleService, so the tools get the same ownership and
 project checks as the Scheduled Tasks page. The page's own form rules (a
 prompt, a future start time) live in its client, so they are restated here.
 Built only for a turn someone can answer a card in: never for a scheduled
-run, a channel bot, or a turn without questions (see AntonHarness).
+run or a turn without questions (see AntonHarness).
 """
 
 from __future__ import annotations

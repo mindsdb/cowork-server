@@ -527,7 +527,7 @@ def test_turn_block_needs_the_router_a_person_and_the_switch(web, monkeypatch):
     on, off = SimpleNamespace(browser_enabled=True), SimpleNamespace(browser_enabled=False)
     assert svc.turn_block(on, user_id="u", conversation_id="c", project_id=None) is not None
     assert svc.turn_block(off, user_id="u", conversation_id="c", project_id=None) is None
-    # An organization's channel turn has no person behind it.
+    # A turn with no person behind it.
     assert svc.turn_block(on, user_id=None, conversation_id="c", project_id=None) is None
     monkeypatch.setattr(svc, "router_url", lambda: "")
     assert svc.turn_block(on, user_id="u", conversation_id="c", project_id=None) is None

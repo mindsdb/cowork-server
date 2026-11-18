@@ -75,7 +75,7 @@ def _add_message_with_server_default_created_at(session, conversation, *, role, 
     """Like _add_message, but omits created_at so the DB's own
     `server_default=sa.func.now()` populates it — the way save_assistant_turn
     writes. save_user_message takes the opposite path and binds an explicit
-    Python datetime (handlers/responses.py, channels/runtime.py), so a single
+    Python datetime (handlers/responses.py), so a single
     turn stores the two formats side by side: SQLite keeps a bare
     second-precision string for one and a microsecond-formatted value for the
     other. Ordering must not depend on the two being comparable."""

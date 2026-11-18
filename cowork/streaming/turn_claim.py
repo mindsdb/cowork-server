@@ -25,9 +25,7 @@ earlier run saved its question (turn_index.TurnIndexEntry.makes_stale).
 
 Compare-and-set runs as WATCH/MULTI rather than a Lua script: the fakeredis
 the tests use runs no EVAL without lupa, which this repository does not
-install. Same choice as cowork.channels.ingress_lease, whose renew never takes
-a lapsed lease back and reads a Redis error as a lost lease; a turn needs both
-the other way round, so this module does not reuse it.
+install.
 
 The claim does not order database writes. A save that outlives its producer
 at shutdown (handlers.responses._saves_past_their_deadline) can still be

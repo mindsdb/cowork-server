@@ -170,14 +170,13 @@ def test_delete_project_releases_a_channel_binding_without_deleting_it(
     """The fourth foreign key into projects, found in review.
 
     `channel_bindings.anton_project_id` is nullable and had no `ondelete`, so a
-    project that a Slack/Telegram route pointed at could not be deleted at all.
+    project that a channel route pointed at could not be deleted at all. The
+    table stays until a later release drops it, and an older release still
+    writes it during a rollout.
 
-    SET NULL rather than CASCADE is the point of this test: deleting a project
-    must NOT delete someone's channel route. The runtime reads the column as
-    optional (`binding.anton_project_id or self._resolve_default_project_id(...)`
-    at runtime.py:357 and :417), so a released binding keeps serving on the
-    default project. Asserting only "the delete stopped throwing" would pass
-    just as happily with CASCADE, which would silently destroy the route.
+    SET NULL rather than CASCADE is the point of this test: the key releases
+    the row and keeps it. Asserting only "the delete stopped throwing" would
+    pass just as happily with CASCADE.
     """
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
     session = _fk_enforced_session()

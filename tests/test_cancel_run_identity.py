@@ -127,7 +127,7 @@ async def test_ordinary_cancel_reaches_a_successor_when_this_replica_retains_the
     monkeypatch.setattr(responses, "registry", old_owner)
     try:
         if legacy_index:
-            # Older replicas and channel turns publish a correlation without a run ID.
+            # Older replicas publish a correlation without a run ID.
             await turn_index.record_turn(
                 "c", turn_id=new.turn_id, correlation_id=new.lifecycle.identity.correlation_id,
                 org_id=None, user_id=None,

@@ -267,19 +267,19 @@ async def test_the_self_heal_publishes_what_the_turn_end_left(base, enabled, key
     ("scope", "asks"),
     [
         (ORG_SCOPE, True),
-        # A channel turn's: its organization's, with no member behind it.
+        # Its organization's, with no member behind it.
         (TenantScope(org_mode=True, org_id=ORG_SCOPE.org_id), True),
         # The desktop's, where artifacts have no location rows.
         (TenantScope(), False),
     ],
-    ids=["member", "channel", "desktop"],
+    ids=["member", "no-member", "desktop"],
 )
 async def test_with_autopublish_off_a_turn_end_with_the_pods_list_still_asks_for_the_location_check(
     base, published, monkeypatch, scope, asks,  # noqa: F811
 ):
     """The self-heal's listing is the only one such a turn end gets, so the
     turn end asks for it wherever artifacts have location rows, whether or
-    not autopublish is on, and for a channel turn too. Its run checks the
+    not autopublish is on, and for a scope with no member too. Its run checks the
     locations and publishes nothing while autopublish is off."""
     monkeypatch.setattr(ap, "_is_enabled", lambda scope: False)
     _make(base, "made", files={"index.html": "<html>new</html>"}, meta={"slug": "made", "type": "html-app"})

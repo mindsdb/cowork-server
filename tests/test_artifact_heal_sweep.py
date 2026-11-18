@@ -475,8 +475,8 @@ async def test_a_check_that_falls_short_is_counted_and_kept_off_the_poll(
 
 
 async def test_a_request_this_replica_held_before_the_check_stays(org_deployment, tmp_path, monkeypatch):
-    """A channel turn end on this replica asked for the self-heal of each
-    project before the sweep checked it. Its request, and the publish asked
+    """A turn end on this replica asked for the self-heal of each project
+    before the sweep checked it. Its request, and the publish asked
     with it, stay for this replica's poll, whether the sweep's check reads
     every folder or falls short, and a check that falls short is still
     counted."""
@@ -497,9 +497,9 @@ async def test_a_request_this_replica_held_before_the_check_stays(org_deployment
 
 
 async def test_a_request_another_task_makes_during_the_check_stays(org_deployment, tmp_path, monkeypatch, caplog):
-    """A channel turn end on this replica asks for the project's self-heal
-    while the sweep's check of it is listing. Its scope is the
-    organization's with no user, so its self-heal is the sweep's own. The
+    """A turn end on this replica in the organization's scope with no user
+    asks for the project's self-heal while the sweep's check of it is
+    listing, so its self-heal is the sweep's own. The
     check read every folder, so it counts as checked, and the turn end's
     request, with its publish, stays for this replica's poll."""
     org_id = str(uuid4())
@@ -514,18 +514,17 @@ async def test_a_request_another_task_makes_during_the_check_stays(org_deploymen
         assert turn_end_asked.wait(5)
         return real(artifacts_base=artifacts_base)
 
-    async def channel_turn_end():
+    async def turn_end_with_no_user():
         while not listing_started.is_set():
             await asyncio.sleep(0.005)
-        # What remote_turn.remote_turn_events asks for as a channel turn's
-        # record starts.
+        # What a turn end asks for as its record starts.
         ap.request_turn_end_self_heal(
             artifacts_base=project_artifacts_base(project.path), scope=scope_for_org(org_id), project_id=str(project.id),
         )
         turn_end_asked.set()
 
     monkeypatch.setattr(ap, "_listed_artifact_ids", listing)
-    turn_end = asyncio.create_task(channel_turn_end())
+    turn_end = asyncio.create_task(turn_end_with_no_user())
     with caplog.at_level(logging.WARNING, logger=sweep.logger.name):
         counts = await sweep.run_heal_sweep(project_ids=[project.id])
     await turn_end

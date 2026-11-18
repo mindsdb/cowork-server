@@ -151,9 +151,8 @@ TOKEN_LIMIT_CODE = "token_limit"
 # `cowork/services/mindshub_usage.py` relays MindsHub's `free_grant_eligible: false` as
 # `freeTokens.limit` 0, and the card says there is no grant when it reads that.
 # The failure frame's `reset_at` only supplies the refill time. This string is
-# the fallback for consumers that don't render the card, including the channel
-# replies `cowork/channels/runtime.py` posts to Slack and Discord, which read
-# no `reset_at`. So it makes no refill claim and never states how large the
+# the fallback for consumers that don't render the card, which read no
+# `reset_at`. So it makes no refill claim and never states how large the
 # allowance or its window is: either would be false for one of the two cases,
 # and the window is plan config.
 ALLOWANCE_EXHAUSTED_CODE = "included_allowance_exhausted"

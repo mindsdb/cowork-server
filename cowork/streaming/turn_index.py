@@ -76,8 +76,8 @@ class TurnOwner(BaseModel):
 
 
 class TurnIndexEntry(BaseModel):
-    """A conversation's turn index entry, every field its hash holds. A
-    channel turn's entry has no ``run_id``: no registry handle covers it."""
+    """A conversation's turn index entry, every field its hash holds. An
+    entry an older release wrote for a channel turn has no ``run_id``."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -117,8 +117,8 @@ class TurnIndexEntry(BaseModel):
         entry's run saved its question: the run saved it at this entry's
         number, and the start names that number or an earlier one. Only
         until STALE_START_WINDOW_SECONDS after the run released its claim,
-        with ``now`` the caller's Unix time. A channel turn's entry names no
-        run, so it never does."""
+        with ``now`` the caller's Unix time. An entry that names no run
+        never does."""
         return (
             self.run_id is not None and self.saved_question and turn_id <= self.turn_id
             and (self.released_at is None or now < self.released_at + STALE_START_WINDOW_SECONDS)

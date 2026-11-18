@@ -2260,8 +2260,8 @@ async def test_tool_messages_reaches_the_job_params(monkeypatch, tool_messages):
 
 @pytest.mark.asyncio
 async def test_tool_messages_defaults_to_false(monkeypatch):
-    """Channel turns (turnqueue/remote_turn.py) never pass it: a bot cannot
-    render a tool's message, so the tool hands the content to the agent."""
+    """A caller that does not pass it gets the default: the tool hands the
+    content to the agent."""
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
@@ -2735,7 +2735,7 @@ async def test_an_unexpected_scope_error_still_queues_the_turn_without_a_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["no person", "browser off", "no decisions model", "not on MindsHub"])
 async def test_a_turn_without_a_browser_scopes_its_key_to_nothing(browser_router, case):
-    """A channel turn has no person behind it, a person can turn the browser
+    """A turn can have no person behind it, a person can turn the browser
     off, and with Jev turned off and no decision model of the organization's
     own, or an LLM other than MindsHub, it can't run: none carries a block,
     and each still binds its key to no session first, so code in the turn
