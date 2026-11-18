@@ -16,6 +16,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from cowork import app_secret
+from cowork.api.v1.endpoints.connectors.custom_mcp import _record_file_present
+from cowork.api.v1.permissions import LoopbackDesktopOnly
+from cowork.api.v1.route_walker import declared_permissions, route_key
 from cowork.api.v1.router import api_router
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope, get_tenant_scope
 from cowork.services.connectors import app_held
@@ -98,6 +101,26 @@ class TestCheckUrl:
         response = _client().post(f"{ROUTES}/check-url", json={"url": url}, headers=HEADERS)
         assert response.status_code == 422
         assert response.json()["detail"]["error"] == "invalid_url"
+
+
+def test_every_custom_route_declares_loopback_desktop_only():
+    """The router's guard is what refuses a non-loopback peer, a hostile Host
+    or Origin, and org mode, before the app secret is checked."""
+    routes = [route for route in api_router.routes if route_key(route)[0].startswith("/api/v1/connectors/connections/custom_mcp")]
+    assert len(routes) == 6
+    assert all(declared_permissions(route) == [LoopbackDesktopOnly] for route in routes)
+
+
+@pytest.mark.parametrize("name", ["../custom_mcp-x", "cm-" + "0" * 31, "cm-" + "0" * 32 + "/x", ""])
+def test_a_name_that_is_no_connection_id_has_no_record_file(protected, name):
+    assert _record_file_present(LOCAL_SCOPE, name) is False
+
+
+def test_a_name_that_leads_out_of_the_vault_folder_has_no_record_file(protected):
+    root = own_vault_root(LOCAL_SCOPE)
+    (root / f"{CUSTOM_MCP_ENGINE}-a").mkdir(parents=True)
+    (root.parent / "outside").write_text("x", encoding="utf-8")
+    assert _record_file_present(LOCAL_SCOPE, "a/../../outside") is False
 
 
 class TestGuards:
