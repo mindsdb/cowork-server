@@ -96,6 +96,7 @@ class ControlPlaneService:
         now = utc_now()
         self.store.prune(now - timedelta(days=30), now - timedelta(days=90))
         self.local_computer = self._register_local(capabilities)
+        self.retired_local_computer_ids = self._retire_duplicate_local_computers()
 
     @staticmethod
     def default_capabilities(agent_engines: list[str], shells: list[str]) -> ComputerCapabilities:
@@ -930,6 +931,59 @@ class ControlPlaneService:
                 capabilities=capabilities,
             ))
 
+    def _retire_duplicate_local_computers(self) -> frozenset[str]:
+        """Fold stray local Computer records for this home into the live one.
+
+        Concurrent first starts used to mint more than one local identity. Only
+        the id in ``local-computer-id`` heartbeats, so work bound to any other
+        local record reads as offline forever. Remote runtimes register with
+        ``is_local=False`` and are never touched here. Already retired records
+        stay in the set so an interrupted repair finishes on the next start.
+        """
+        stale = {
+            computer.id
+            for computer in self.store.list_computers()
+            if computer.is_local and computer.id != self.local_computer.id
+        }
+        if not stale:
+            return frozenset()
+        local_id = self.local_computer.id
+
+        # Existing tasks fork and recover from their frozen project, not the
+        # live project. Repair ownership there without changing their scope.
+        for task in self.store.list_tasks():
+            project = task.execution_project
+            if project is None:
+                continue
+            changed = False
+            for resource in project.resources:
+                if resource.computer_id in stale:
+                    resource.computer_id = local_id
+                    changed = True
+            if changed:
+                self.store.save_task(task)
+
+        def rebind(run: TaskRun) -> None:
+            run.computer_id = local_id
+
+        for run in self.store.list_runs():
+            if run.computer_id in stale:
+                self.store.update_run(run.id, rebind)
+        for workspace in self.store.list_workspaces():
+            if workspace.computer_id in stale:
+                workspace.computer_id = local_id
+                self.store.save_workspace(workspace)
+        now = utc_now()
+        for computer_id in stale:
+            computer = self.store.get_computer(computer_id)
+            if computer.revoked_at is not None:
+                continue
+            computer.status = ComputerStatus.offline
+            computer.active_run_count = 0
+            computer.revoked_at = now
+            self.store.save_computer(computer)
+        return frozenset(stale)
+
     def _read_local_computer_name(self) -> str | None:
         try:
             value = (self.root / "control" / "local-computer-name").read_text(encoding="utf-8").strip()
@@ -957,9 +1011,21 @@ class ControlPlaneService:
             pass
         value = f"computer-{uuid.uuid4().hex}"
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_suffix(".tmp")
-        temp.write_text(value + "\n", encoding="utf-8")
-        os.replace(temp, path)
+        temp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            temp.write_text(value + "\n", encoding="utf-8")
+            try:
+                # Linking fails if the id already exists, so a concurrent
+                # first start adopts the winner's id instead of minting a
+                # second local computer.
+                os.link(temp, path)
+            except FileExistsError:
+                existing = path.read_text(encoding="utf-8").strip()
+                if existing:
+                    return existing
+                os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
         return value
 
     @staticmethod

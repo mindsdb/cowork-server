@@ -7,7 +7,7 @@ import os
 import subprocess
 import sys
 import textwrap
-import time
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
@@ -43,11 +43,7 @@ from cowork.harnesses.anton_harness.figure_sources import (
 )
 from cowork.schemas.figure_sources import EarlierAnswer
 from tests._hubspot_records import HUBSPOT_DEALS, SEARCH_DEALS
-
-# The current code reads each timed input in about a second or less on a
-# laptop under coverage, so a CI runner several times slower still passes; the
-# slow form each test guards against takes 15 s or more on the same laptop.
-TIME_BOUND_SECONDS = 5.0
+from tests._linear_time import MAX_LINEAR_GROWTH, growth
 
 
 def _cell(tool_use_id: str, *, code: str, stdout: str, description: str = "", pad: str = "main") -> TurnStep:
@@ -2305,32 +2301,37 @@ class TestSecretsInQueries:
         assert "XyZ" not in event
 
     @pytest.mark.parametrize(
-        "filler",
+        ("filler", "count"),
         [
-            "a" * 100_000, "password" * 7_500, "x://a:" * 25_000, "x://a:''" * 10_240, "eyJ-" * 65_536,
+            (lambda n: "a" * n, 100_000), (lambda n: "password" * n, 7_500), (lambda n: "x://a:" * n, 25_000),
+            (lambda n: "x://a:''" * n, 10_240), (lambda n: "eyJ-" * n, 65_536),
             # Many :// or many EZConnect starts, from each of which a URL or
             # EZConnect rule reads up to its window or to the end of the run,
             # or an EZConnect password with many words that almost name a
             # secret key: a rule that read the same text again from each
             # start would take time that grows with the square of the length.
-            ("x://''x:" * 125 + " ") * 63, ("x://" + "a" * 300 + "/") * 200, 'a/"' + ' b/""' * 13_000,
-            "x:///" * 13_000, ' "' + 'a""' * 21_000, "a/" + ("#" + "x" * 60 + "passwor") * 1_500 + "@a",
+            (lambda n: ("x://''x:" * 125 + " ") * n, 63), (lambda n: ("x://" + "a" * 300 + "/") * n, 200),
+            (lambda n: 'a/"' + ' b/""' * n, 13_000), (lambda n: "x:///" * n, 13_000),
+            (lambda n: ' "' + 'a""' * n, 21_000), (lambda n: "a/" + ("#" + "x" * 60 + "passwor") * n + "@a", 1_500),
             # A braced value left open, a proxy login's bracket before each /,
             # closed or with its quote left open, and URL users holding lone
             # and escaped quotes.
-            "pwd={" + "x;" * 50_000, ("a[" + "b" * 127 + "]/") * 700, ('a["' + "b" * 127 + "/") * 700,
-            "x://o'b\\\"c" * 12_500,
+            (lambda n: "pwd={" + "x;" * n, 50_000), (lambda n: ("a[" + "b" * 127 + "]/") * n, 700),
+            (lambda n: ('a["' + "b" * 127 + "/") * n, 700), (lambda n: "x://o'b\\\"c" * n, 12_500),
             # Keywords that start a password a statement sets, each without
             # its value or with a plugin's quote left open, and a REPLACE
             # after each masked password.
-            ("password for " + "x" * 250 + " ") * 380, "identified with p by\t" * 4_800,
-            ('identified with "' + "p" * 60 + " ") * 850, "identified by x replace " * 2_700,
+            (lambda n: ("password for " + "x" * 250 + " ") * n, 380), (lambda n: "identified with p by\t" * n, 4_800),
+            (lambda n: ('identified with "' + "p" * 60 + " ") * n, 850),
+            (lambda n: "identified by x replace " * n, 2_700),
             # URL users holding an @ in every other character up to the user
             # window, before a short or a long password; introducers after a
             # secret key with no quote after them; and EZConnect logins
             # before a placeholder's first character.
-            ("://" + "a@" * 128 + ":") * 1_000, ("://" + "a@" * 128 + ":" + "p" * 1_100 + " ") * 160,
-            "password=N" * 25_000, ("password=_" + "x" * 40) * 5_000, "a/b@{" * 50_000,
+            (lambda n: ("://" + "a@" * 128 + ":") * n, 1_000),
+            (lambda n: ("://" + "a@" * 128 + ":" + "p" * 1_100 + " ") * n, 160),
+            (lambda n: "password=N" * n, 25_000), (lambda n: ("password=_" + "x" * 40) * n, 5_000),
+            (lambda n: "a/b@{" * n, 50_000),
         ],
         ids=[
             "word", "secret-key", "userinfo", "quoted-userinfo", "jwt",
@@ -2341,14 +2342,14 @@ class TestSecretsInQueries:
             "introducer-without-a-quote", "charset-introducer-without-a-quote", "ezconnect-placeholder-host",
         ],
     )
-    def test_a_long_query_is_redacted_quickly(self, filler: str):
-        sql = f"SELECT qty FROM read_source('{filler}')"
-        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
-        start = time.perf_counter()
+    def test_a_long_query_is_redacted_in_linear_time(self, filler: Callable[[int], str], count: int):
+        def step(n: int) -> TurnStep:
+            sql = f"SELECT qty FROM read_source('{filler(n)}')"
+            return _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
 
-        _event(step)
+        measured = growth(_event, small=step(count // 10), large=step(count))
 
-        assert time.perf_counter() - start < TIME_BOUND_SECONDS
+        assert measured.ratio < MAX_LINEAR_GROWTH
 
     def test_a_quoted_passphrase_is_redacted_whole_and_keeps_its_quotes(self):
         sql = "SELECT qty FROM pg_scan(host='db', password='correct horse battery staple', table='stock')"
@@ -2883,16 +2884,22 @@ class TestWhatIsNotAFigure:
         assert find_figure_sources(answer=answer, question="", steps=[READ_STOCK]) == FigureSources()
 
     @pytest.mark.parametrize(
-        "filler", ["](" * 49_152, "[^1]" * 24_576, "10/14/2026 " * 12_000], ids=["link", "citation", "date"],
+        ("filler", "count"),
+        [(lambda n: "](" * n, 49_152), (lambda n: "[^1]" * n, 24_576), (lambda n: "10/14/2026 " * n, 12_000)],
+        ids=["link", "citation", "date"],
     )
-    def test_a_long_answer_full_of_skipped_spans_is_read_quickly(self, filler: str):
-        text = filler + " S1 holds 250 units."
-        start = time.perf_counter()
+    def test_a_long_answer_full_of_skipped_spans_is_read_in_linear_time(
+        self, filler: Callable[[int], str], count: int,
+    ):
+        def read(text: str) -> FigureSources:
+            return find_figure_sources(answer=text, question=text, steps=[READ_STOCK])
 
-        sources = find_figure_sources(answer=text, question=text, steps=[READ_STOCK])
+        measured = growth(
+            read, small=filler(count // 10) + " S1 holds 250 units.", large=filler(count) + " S1 holds 250 units.",
+        )
 
-        assert time.perf_counter() - start < TIME_BOUND_SECONDS
-        assert [f.text for f in sources.figures] == ["250"]
+        assert measured.ratio < MAX_LINEAR_GROWTH
+        assert [f.text for f in measured.result.figures] == ["250"]
 
     def test_an_answer_with_no_numbers_has_no_figures(self):
         assert find_figure_sources(
@@ -3478,14 +3485,28 @@ class TestManyHolders:
         assert MAX_FIGURE_SOURCES == 3
         assert [s.tool_use_id for s in _figure(sources, "250").sources] == ["toolu_0", "toolu_2", "toolu_4"]
 
-    def test_a_large_turn_names_every_holding_step_quickly(self, monkeypatch):
-        printed: list[set[int]] = []
-        steps = []
-        for i in range(25):
-            values = [(i * 37 + k * 11) % 2_000 for k in range(800)]
-            printed.append(set(values))
-            steps.append(_cell(f"toolu_{i}", code="print(rows)", stdout="\n".join(f"{v}, {v}.25" for v in values)))
-        answer = "Values: " + ", ".join(str(v) for v in range(0, 2_000, 5)) + "."
+    def test_a_large_turn_names_every_holding_step_in_linear_time(self, monkeypatch):
+        def turn(scale: int) -> tuple[str, list[TurnStep], list[set[int]]]:
+            # Figures and values per step both grow with ``scale``, so a scan
+            # of every value per figure grows with its square. Every integer
+            # is a figure so that scan outweighs reading the output.
+            printed: list[set[int]] = []
+            steps = []
+            for i in range(25):
+                values = [(i * 37 + k * 11) % (200 * scale) for k in range(80 * scale)]
+                printed.append(set(values))
+                steps.append(_cell(f"toolu_{i}", code="print(rows)", stdout="\n".join(f"{v}, {v}.25" for v in values)))
+            answer = "Values: " + ", ".join(str(v) for v in range(0, 200 * scale)) + "."
+            return answer, steps, printed
+
+        def run(given: tuple[str, list[TurnStep], list[set[int]]]) -> FigureSources:
+            return find_figure_sources(answer=given[0], question="", steps=given[1])
+
+        large = turn(10)
+        measured = growth(run, small=turn(1), large=large)
+        printed = large[2]
+
+        assert measured.ratio < MAX_LINEAR_GROWTH
         compared = 0
         same_value = figure_sources_mod._same_value
 
@@ -3495,15 +3516,13 @@ class TestManyHolders:
             return same_value(*args, **kwargs)
 
         monkeypatch.setattr(figure_sources_mod, "_same_value", counted)
-        start = time.perf_counter()
 
-        sources = find_figure_sources(answer=answer, question="", steps=steps)
+        sources = run(large)
 
-        # A scan of every output value per figure and step compares 400 x 25 x
-        # 1,600 times; the sorted index compares none.
-        assert compared < 400 * 25
-        assert time.perf_counter() - start < TIME_BOUND_SECONDS
-        assert len(sources.figures) == 400
+        # A scan of every output value per figure and step compares 2,000 x 25
+        # x 1,600 times; the sorted index compares none.
+        assert compared < 2_000 * 25
+        assert len(sources.figures) == 2_000
         for figure in sources.figures:
             holders = [f"toolu_{i}" for i, values in enumerate(printed) if int(figure.text) in values]
             assert [s.tool_use_id for s in figure.sources] == holders[:MAX_FIGURE_SOURCES]
@@ -3563,14 +3582,16 @@ class TestDisplayMath:
         assert [f.text for f in sources.figures] == ["$30", "$45"]
 
     @pytest.mark.parametrize("opener", ["\\[", "\\("])
-    def test_math_left_open_runs_to_the_end_and_is_read_quickly(self, opener: str):
-        text = opener * 49_152 + " S1 holds 250 units."
-        start = time.perf_counter()
+    def test_math_left_open_runs_to_the_end_and_is_read_in_linear_time(self, opener: str):
+        def read(text: str) -> FigureSources:
+            return find_figure_sources(answer=text, question=text, steps=[READ_STOCK])
 
-        sources = find_figure_sources(answer=text, question=text, steps=[READ_STOCK])
+        measured = growth(
+            read, small=opener * 4_915 + " S1 holds 250 units.", large=opener * 49_152 + " S1 holds 250 units.",
+        )
 
-        assert time.perf_counter() - start < TIME_BOUND_SECONDS
-        assert sources == FigureSources()
+        assert measured.ratio < MAX_LINEAR_GROWTH
+        assert measured.result == FigureSources()
 
 
 class TestUrlsInProse:

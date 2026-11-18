@@ -10,30 +10,65 @@ from fastapi import HTTPException, Request, status
 _TRUSTED_LOOPBACK_HOSTS = frozenset({"localhost"})
 
 
-def _trusted_loopback_host(value: str) -> bool:
-    parsed = urlparse(f"//{value}")
-    hostname = (parsed.hostname or "").casefold()
-    if hostname in _TRUSTED_LOOPBACK_HOSTS:
-        return True
+def _is_loopback_ip(value: str | None) -> bool:
+    """Whether an address literal is loopback. A host name never is.
+
+    Unwraps an IPv4-mapped IPv6 address first. A dual-stack socket reports an
+    IPv4 loopback connection as ``::ffff:127.0.0.1``, and ``is_loopback`` does
+    not answer True for that form on every Python this server runs on.
+    """
     try:
-        return ipaddress.ip_address(hostname).is_loopback
+        address = ipaddress.ip_address((value or "").strip().strip("[]"))
     except ValueError:
         return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback
+
+
+def _is_loopback_address(value: str | None) -> bool:
+    """Whether an address literal, or a host name trusted as local, is loopback."""
+    name = (value or "").strip().strip("[]").casefold()
+    return name in _TRUSTED_LOOPBACK_HOSTS or _is_loopback_ip(name)
+
+
+def _trusted_loopback_host(value: str) -> bool:
+    try:
+        hostname = urlparse(f"//{value}").hostname
+    except ValueError:
+        # An unbalanced IPv6 literal such as "[::1" names no host.
+        return False
+    return _is_loopback_address(hostname)
 
 
 def require_local(request: Request) -> None:
-    """Reject the request unless it originates from loopback.
+    """Reject the request unless it comes from this machine.
 
-    Endpoints that return unmasked secrets (settings reveal-key and /raw,
-    OAuth client credentials) are restricted to loopback so a network-exposed
-    deployment (e.g. the self-host compose that binds 0.0.0.0) can't hand
-    secrets to a remote peer (ENG-457, ENG-868). The desktop sidecar, UI, and
-    Electron main process all talk over 127.0.0.1, so the legitimate flows are
-    unaffected; hosted-web builds call `/settings/raw` on boot and treat the 403
-    as expected (ENG-817).
+    For routes only the desktop sidecar, its renderer and the Electron main
+    process call, all over 127.0.0.1: the ones that return unmasked secrets
+    (settings reveal-key and /raw, OAuth client credentials) or write
+    credentials. A network-exposed deployment, such as a self-host compose
+    that binds 0.0.0.0, must not answer them to a remote peer. Hosted-web
+    builds call ``/settings/raw`` on boot and treat the 403 as expected.
     """
-    client = request.client.host if request.client else ""
-    if client not in {"127.0.0.1", "::1"}:
+    # The peer is an address uvicorn read off the socket, or the one an
+    # X-Forwarded-For named. Either way it must be a loopback literal: a name
+    # such as "localhost" can only have come from a header.
+    client = request.client.host if request.client else None
+    if not _is_loopback_ip(client):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="local requests only")
+
+    # The peer address alone is forgeable wherever uvicorn trusts a proxy: the
+    # image passes --forwarded-allow-ips '*', so an X-Forwarded-For from any
+    # peer rewrites request.client. scope["server"] is the local address of
+    # the accepted socket. The proxy middleware never rewrites it and no caller
+    # chooses it, so a request that landed on a loopback socket really came
+    # from this machine. uvicorn reports a TCP socket as (address, port) and a
+    # unix socket as (path, None); a proxy in front of a unix socket would make
+    # every request look local, so only a TCP socket counts. The host name
+    # allowance is for TestClient, which reports its base_url host here.
+    server = request.scope.get("server") or ()
+    if not (len(server) == 2 and isinstance(server[1], int) and _is_loopback_address(server[0])):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="local requests only")
 
     # A loopback TCP peer is not sufficient in a browser: DNS rebinding can
