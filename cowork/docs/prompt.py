@@ -269,6 +269,13 @@ LIST_DOCS_DESCRIPTION = (
 
 LIST_DOCS_SCHEMA = {"type": "object", "properties": {}}
 
+# Only a remote turn's doc tools can go unanswered (the server runs them for the
+# pod), so only their prompt carries this; the desktop prompt and its cache stay.
+REMOTE_RETRY_RULE = (
+    "\n\nA doc tool call can come back with \"The host did not answer\". The call may still have been "
+    "applied: check the doc with read_doc or list_docs before you call it again."
+)
+
 
 
 # ---------------------------------------------------------------- turn context

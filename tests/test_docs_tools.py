@@ -255,7 +255,7 @@ def test_the_conversation_hears_about_a_new_doc_as_it_is_made(tools):
 def test_a_card_that_fails_is_logged_as_a_warning_and_the_doc_still_opens(tools, monkeypatch, caplog):
     """The card is extra: the doc is already written. But a failure must be seen,
     not dropped at debug, where a bug left every doc.created without its card."""
-    from cowork.harnesses.anton_harness import doc_tools
+    from cowork.docs import tools as doc_tools
 
     defs, session, _ = tools
     conv = "c0ffee00-0000-4000-8000-000000000001"
