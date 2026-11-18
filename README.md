@@ -607,6 +607,7 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/browse` | The agent's browser: whether this deployment offers it to the caller and, on the web, a warm-up, viewer links, the person's approval of a held step and signing out of every site. See [The agent's browser](#the-agents-browser) |
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
 | `/hub/usage` | The caller's free Air allowance (as a proportion), balance, auto top up and credit spend, for the desktop's usage warnings. An organization with no free grant reads `freeTokens.limit` 0 and `freeTokens.resetsAt` null, since nothing refills |
+| `/hub/deletion-request` | The caller's request to delete their MindsHub account: `GET` answers the open request or 404, `POST` opens one (202). MindsHub's support deletes the account. 404 outside MindsHub mode |
 
 ### Declaring who may call a route
 
