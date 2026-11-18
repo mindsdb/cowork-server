@@ -100,6 +100,20 @@ def acquire(artifacts_base: Path, slug: str, *, ttl_s: float) -> bool:
     return _create_exclusive(path)
 
 
+def refresh(artifacts_base: Path, slug: str) -> None:
+    """Restart the lock's TTL from now. A publish thread calls it once the
+    upload service accepts the job, so the TTL then covers the job poll alone,
+    however long the work before it and the upload took. Silent when the lock
+    is gone.
+    """
+    try:
+        os.utime(_lock_path(artifacts_base, slug))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("Could not refresh publish lock for %s", slug, exc_info=True)
+
+
 def release(artifacts_base: Path, slug: str) -> None:
     """Drop the lock. Call this on a way out where the upload was never handed
     to its thread, or has returned or raised. Never call it after a publish

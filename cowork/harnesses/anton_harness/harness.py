@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     from anton.core.browser.config import BrowserConfig
     from anton.core.session import ChatSession
 
+    from cowork.schemas.artifact_card import ArtifactCard
     from cowork.services.conversations import ReplayHistory
 
 
@@ -217,8 +218,19 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     """
     applied: list[str] = []
     limits = effective_turn_limits(user)._asdict()
-    for attr in _OVERLAID_SETTINGS:
-        db_val = limits[attr] if attr in limits else getattr(user, attr, None)
+    values = [
+        (attr, limits[attr] if attr in limits else getattr(user, attr, None))
+        for attr in _OVERLAID_SETTINGS
+    ]
+    # anton's `image_model` (ANTON_IMAGE_MODEL), which its generate_image tool
+    # and scratchpad helper draw with. Resolved rather than raw: the planning and
+    # coding pins are corrected afterwards from the built client
+    # (_apply_client_models), and nothing corrects this one, so a pin MindsHub no
+    # longer serves or the wallet cannot pay for is swapped here (ENG-1632).
+    # None where no image model can be served, so anton offers no image tool
+    # (UserSettings.image_model_for_agent).
+    values.append(("image_model", getattr(user, "image_model_for_agent", None)))
+    for attr, db_val in values:
         if db_val is None:
             continue
         if not hasattr(anton_settings, attr):
@@ -1130,7 +1142,7 @@ class AntonHarness:
         skill_drafts_base = project_path / ".anton" / "skill_drafts"
         before_drafts = snapshot_skill_drafts(skill_drafts_base)
         before_strays = snapshot_stray_skills(project_path / "skills")
-        cards: list[dict] = []
+        cards: list[ArtifactCard] = []
         skill_drafts: list[dict] = []
         new_slugs: list[str] = []
         touched_slugs: set[str] = set()

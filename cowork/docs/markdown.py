@@ -24,6 +24,8 @@ from typing import Any
 
 from .model import (
     LIST_TYPES,
+    MAX_TABLE_COLS,
+    MAX_TABLE_ROWS,
     Block,
     DocError,
     image_src_ok,
@@ -34,18 +36,19 @@ from .model import (
     tone_for,
 )
 
-# A closing run of #s is stripped only after a space: "## Learning C#" keeps its #.
-_HEADING = re.compile(r"^(#{1,6})\s+(.*?)(?:\s+#+)?\s*$")
 _LIST = re.compile(r"^(\s*)([-*+]|\d{1,3}[.)])\s+(?:\[([ xX])\]\s+)?(.*)$")
 _FENCE = re.compile(r"^\s*(```+|~~~+)\s*([\w+-]*)\s*(.*)$")
-_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
 _DIVIDER = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
 _CALLOUT = re.compile(r"^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION|INFO|SUCCESS|DANGER)\]\s*(.*)$", re.I)
-_PENDING = re.compile(r"^\s*\{\{\s*pending\s*:\s*(.*?)\s*\}\}\s*$", re.I)
 # Alt text and caption may hold backslash escapes; a source with spaces or
 # brackets in it is written in <angle brackets>.
 _IMAGE = re.compile(r'^\s*!\[((?:[^\]\\]|\\.)*)\]\(\s*(<[^<>\n]+>|[^)\s]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\)\s*$')
 _ESCAPED = re.compile(r"\\(.)")
+# A lazy group or a backtracking run before `\s*$` rescans a run of spaces from
+# every position, quadratic in the line's length. Headings, pending lines and
+# table separators are therefore read from the stripped line.
+_TABLE_SEP = re.compile(r"\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?")
+_PENDING_OPEN = re.compile(r"\s*\{\{\s*pending\s*:\s*", re.I)
 
 # A callout's `[!MARKER]` → its tone, and back (TIP is written for success).
 _TONE_OF_MARKER = {
@@ -175,15 +178,26 @@ def _read_fence(lines: list[str], i: int, in_para: bool) -> _Read:
 
 
 def _read_pending(lines: list[str], i: int, in_para: bool) -> _Read:
-    pending = _PENDING.match(lines[i])
-    return ([{"type": "pending", "intent": pending.group(1)}], i + 1) if pending else None
+    opened = _PENDING_OPEN.match(lines[i])
+    if not opened:
+        return None
+    rest = lines[i][opened.end():].rstrip()
+    if not rest.endswith("}}"):
+        return None
+    return [{"type": "pending", "intent": rest[:-2].rstrip()}], i + 1
 
 
 def _read_heading(lines: list[str], i: int, in_para: bool) -> _Read:
-    heading = _HEADING.match(lines[i])
-    if not heading:
+    after = lines[i].lstrip("#")
+    level = len(lines[i]) - len(after)
+    if not 1 <= level <= 6 or not after[:1].isspace():
         return None
-    return [{"type": "heading", "level": min(3, len(heading.group(1))), "text": heading.group(2)}], i + 1
+    text = after.strip()
+    # A closing run of #s is stripped only after a space: "## Learning C#" keeps its #.
+    body = text.rstrip("#")
+    if body[-1:].isspace():
+        text = body.rstrip()
+    return [{"type": "heading", "level": min(3, level), "text": text}], i + 1
 
 
 def _read_divider(lines: list[str], i: int, in_para: bool) -> _Read:
@@ -207,13 +221,16 @@ def _read_image(lines: list[str], i: int, in_para: bool) -> _Read:
 
 
 def _read_table(lines: list[str], i: int, in_para: bool) -> _Read:
-    if not (lines[i].strip().startswith("|") and i + 1 < len(lines) and _TABLE_SEP.match(lines[i + 1])):
+    if not (lines[i].strip().startswith("|") and i + 1 < len(lines) and _TABLE_SEP.fullmatch(lines[i + 1].strip())):
         return None
-    header = _split_row(lines[i])
+    # Kept to one column and one row past the limits: normalize_block refuses
+    # such a table all the same, and every row would be padded to the full width.
+    header = _split_row(lines[i])[: MAX_TABLE_COLS + 1]
     i += 2
     rows: list[list[str]] = []
     while i < len(lines) and lines[i].strip().startswith("|"):
-        rows.append((_split_row(lines[i]) + [""] * len(header))[: len(header)])
+        if len(rows) <= MAX_TABLE_ROWS:
+            rows.append((_split_row(lines[i]) + [""] * len(header))[: len(header)])
         i += 1
     cols = _infer_columns(header, rows)
     return [{

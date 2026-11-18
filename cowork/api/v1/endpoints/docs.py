@@ -49,7 +49,7 @@ from cowork.models.conversation import Conversation
 from cowork.services.artifact_ownership import record_artifact_owner
 from cowork.services.artifact_permissions import artifact_capabilities, current_capabilities, require_artifact_owner
 from cowork.services.artifact_roots import plan_project_roots, readable_sources
-from cowork.services.artifacts import card_for_folder
+from cowork.services.artifacts import card_for_folder, origin_conversation_id
 from cowork.services.conversations import ConversationService
 from cowork.services.product_permissions import require_product_permission
 
@@ -89,18 +89,12 @@ async def _resolve(scope: TenantScope, project_ref: str, artifact_id: str, *, wr
     return source, folder, metadata, is_own
 
 
-def _origin_conversation(metadata: dict[str, Any]) -> str:
-    prov = metadata.get("provenance") or []
-    if prov and isinstance(prov[0], dict):
-        return str(prov[0].get("conversation") or "")
-    return ""
-
-
 def _card(scope: TenantScope, source, folder: Path) -> dict[str, Any] | None:
     """The doc's artifact card: its publish state, access and paths, as the library shows them (owner only)."""
     try:
-        return card_for_folder(folder, scope=scope, project_id=source.project_id,
+        card = card_for_folder(folder, scope=scope, project_id=source.project_id,
                                project_name=source.project_name, artifacts_base=folder.parent)
+        return card.to_json() if card is not None else None
     except Exception:  # noqa: BLE001 - the doc is there either way; the card is what the library adds
         logger.warning("no card for doc %s", folder, exc_info=True)
         return None
@@ -222,7 +216,7 @@ async def get_doc(project_ref: str, artifact_id: ArtifactIdDep, scope: TenantSco
         "doc": doc,
         "card": card,
         "capabilities": capabilities,
-        "originConversationId": _origin_conversation(metadata),
+        "originConversationId": origin_conversation_id(metadata),
     }
 
 
@@ -282,7 +276,7 @@ async def doc_events(
     project_ref: str, artifact_id: ArtifactIdDep, request: Request, scope: TenantScope = Depends(get_tenant_scope)
 ):
     _source, folder, _metadata, _is_own = await _resolve(scope, project_ref, artifact_id, write=False)
-    return _sse(request, doc_topic(artifact_id), initial=folder, scope=scope)
+    return _sse(request, doc_topic(folder), initial=folder, scope=scope)
 
 
 # How a refused or failed Word or PDF export answers, as the artifact export does.
@@ -292,6 +286,8 @@ _EXPORT_REFUSAL_STATUS = {
     ExportRefusal.NOT_FOUND: status.HTTP_404_NOT_FOUND,
     ExportRefusal.BUSY: status.HTTP_429_TOO_MANY_REQUESTS,
 }
+# The artifact export words this refusal for a file.
+_EXPORT_REFUSAL_DETAIL = {ExportRefusal.TOO_LARGE: "This doc is too large to export."}
 _PDF_FAILURE_DETAIL = {
     413: "This doc can't be exported as a PDF.",
     422: "This doc can't be exported as a PDF.",
@@ -315,8 +311,8 @@ async def export_doc(
     format: Literal["md", "html", "pdf", "docx"] = Query(default="md"),
 ):
     """The doc as a file to download. Markdown and HTML always; Word and PDF as
-    the deployment offers them (``offered_formats``): one conversion at a time,
-    a busy server answering 429 at once, as the artifact export does."""
+    the deployment offers them (``offered_formats``), converted, admitted and
+    refused as the artifact export does them."""
     org_mode = bool(scope.org_mode)
     if format not in offered_formats(org_mode=org_mode):
         if org_export_refused(org_mode=org_mode):
@@ -339,11 +335,16 @@ async def export_doc(
     except DocError as err:
         raise _doc_error(err) from err
     except ExportRefused as exc:
-        raise HTTPException(status_code=_EXPORT_REFUSAL_STATUS[exc.refusal], detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=_EXPORT_REFUSAL_STATUS[exc.refusal],
+            detail=_EXPORT_REFUSAL_DETAIL.get(exc.refusal, str(exc)),
+        ) from exc
     except RenderPdfFailed as exc:
         # The reason never quotes the render service, so it is safe to log.
         logger.info("PDF export of a doc failed: %s", exc)
         raise HTTPException(status_code=exc.status, detail=_PDF_FAILURE_DETAIL[exc.status]) from exc
+    except FilesystemBusy:
+        raise  # 503 with Retry-After (cowork.server), not a failed export
     except Exception as exc:
         logger.warning("doc export to %s failed", format, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Could not export the doc as {format.upper()}") from exc

@@ -62,6 +62,8 @@ Initializes the database and validates configuration.
 
 ### Testing
 
+The existing CI jobs retain case inventories, phase timings and JUnit results. See [test evidence and execution cohorts](docs/testing.md) for collection, comparison and preservation checks.
+
 ```sh
 make test/unit
 ```
@@ -1324,3 +1326,15 @@ See [structured logging](docs/structured-logging.md) for defaults, troubleshooti
 overrides, retained evidence streams and rollout requirements.
 Shared-memory startup warnings state whether turns learn into the shared store
 or leave it unread, without logging its private path.
+
+### Production dependency gate
+
+Production accepts only final dependency versions. `scripts/release_contract.py
+--check --require-final` checks the lock export before tagging, publishing, or
+building the production image. Staging may still lock release candidates.
+
+A repository administrator must also require the `final-release-lock` GitHub
+Actions status check on `main`. This is a branch-rule setting, not something
+merging this workflow enables. Preserve existing protections when adding it.
+Verify a PR into `main` with an RC lock cannot merge and that a final lock passes.
+The publish-time gate remains the backstop if the merge rule is absent.

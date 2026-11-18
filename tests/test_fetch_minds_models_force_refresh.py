@@ -35,7 +35,9 @@ def _client_factory(status_code, body, calls):
             return False
 
         async def get(self, url, headers=None):
-            calls.append(url)
+            # One listing per fetch: its `?kind=image` half goes out alongside.
+            if "?kind=" not in url:
+                calls.append(url)
             return _Resp(status_code, body)
 
     return _FakeClient

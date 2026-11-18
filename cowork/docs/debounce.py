@@ -17,6 +17,10 @@ class Debouncer:
     daemon timer thread, in a copy of the context ``schedule`` was called in
     (the turn's settings scope rides on a contextvar). A failing run is logged:
     the write it follows already landed, and the next one runs again.
+
+    One run per key at a time: a call that comes due while its key's run is
+    still going waits for it, then runs, so two runs of one key never overlap
+    and the newest still goes last.
     """
 
     def __init__(self, delay: float, *, what: str) -> None:
@@ -24,6 +28,7 @@ class Debouncer:
         self.what = what
         self._lock = threading.Lock()
         self._waiting: dict[str, threading.Timer] = {}
+        self._running: dict[str, threading.Lock] = {}
 
     def schedule(self, key: str, fn: Callable[[], None], *, delay: float | None = None) -> None:
         ctx = contextvars.copy_context()
@@ -43,10 +48,14 @@ class Debouncer:
             if self._waiting.get(key) is not threading.current_thread():
                 return
             del self._waiting[key]
-        try:
-            ctx.run(fn)
-        except Exception:  # noqa: BLE001 - see the class docstring
-            logger.warning("%s failed for %s", self.what, key, exc_info=True)
+            running = self._running.setdefault(key, threading.Lock())
+        # Kept per key for the process's life: one small lock per page it ever
+        # ran for, and no window where two runs of a key hold different locks.
+        with running:
+            try:
+                ctx.run(fn)
+            except Exception:  # noqa: BLE001 - see the class docstring
+                logger.warning("%s failed for %s", self.what, key, exc_info=True)
 
     def cancel(self, key: str) -> None:
         with self._lock:

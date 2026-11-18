@@ -262,7 +262,7 @@ def apply_edit(event: dict[str, Any]) -> dict[str, Any] | None:
                 return _rejected(getattr(err, "code", "bad_op"), str(err))
             outcome = {"status": "applied", "rev": doc["rev"]}
             _remember_applied(folder, edit_id, outcome)
-            announce(doc["id"], doc, result, by="user", client_id=event.get("client_id"))
+            announce(doc["id"], doc, result, folder=folder, by="user", client_id=event.get("client_id"))
             republish.schedule(folder, scope=LOCAL_SCOPE)
     mirror_now(folder)  # before reporting: the page rereads the copy when it hears back
     return outcome

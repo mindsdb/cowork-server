@@ -334,3 +334,53 @@ def test_a_doc_whose_tabs_or_blocks_are_not_lists_is_refused_as_a_bad_doc(tabs):
     with pytest.raises(DocError) as refused:
         normalize_doc({"schema": SCHEMA, "title": "T", "rev": 1, "tabs": tabs})
     assert refused.value.code == "bad_doc"
+
+
+def test_a_doc_past_the_tab_or_block_limit_is_refused_wherever_it_comes_from():
+    """The edit ops keep these limits; a doc written whole (created, or read off disk) keeps them too."""
+    from cowork.docs.model import MAX_BLOCKS_PER_TAB, MAX_TABS
+
+    tabs = [{"id": f"t_{i}", "title": f"Tab {i}", "blocks": []} for i in range(MAX_TABS + 1)]
+    with pytest.raises(DocError) as too_many_tabs:
+        normalize_doc({"schema": SCHEMA, "title": "T", "rev": 1, "tabs": tabs})
+    assert too_many_tabs.value.code == "too_big"
+    blocks = [{"type": "paragraph", "text": "x"}] * (MAX_BLOCKS_PER_TAB + 1)
+    with pytest.raises(DocError) as too_many_blocks:
+        normalize_doc({"schema": SCHEMA, "title": "T", "rev": 1, "tabs": [{"id": "t_1", "title": "T", "blocks": blocks}]})
+    assert too_many_blocks.value.code == "too_big"
+
+
+@pytest.mark.parametrize("table", [
+    {"columns": 1, "rows": []},
+    {"columns": [{"name": "A"}], "rows": 1},
+    {"columns": ["A"], "rows": []},
+    {"columns": [{"name": "S", "kind": "status", "options": 1}], "rows": []},
+    {"columns": [{"name": "S", "kind": "status", "options": [1]}], "rows": []},
+])
+def test_a_table_whose_parts_are_the_wrong_shape_is_refused_as_a_doc_error(table):
+    """A stored file the agent can write must be refused, never crash the read (a 500)."""
+    with pytest.raises(DocError):
+        normalize_block({"type": "table", **table}, 1)
+
+
+def test_a_chart_drawn_from_a_table_keeps_the_series_cap():
+    y = [f"col {i}" for i in range(MAX_CHART_SERIES + 1)]
+    with pytest.raises(DocError) as refused:
+        normalize_block({"type": "chart", "source": {"table": "b_1", "x": "Month", "y": y}}, 1)
+    assert refused.value.code == "bad_chart"
+    with pytest.raises(DocError):
+        normalize_block({"type": "chart", "source": {"table": "b_1", "x": "Month", "y": {"a": 1}}}, 1)
+
+
+@pytest.mark.parametrize(("text", "html_out"), [
+    ("\\_draft\\_", "_draft_"),
+    ("\\*not bold\\*", "*not bold*"),
+    ("snake_case stays", "snake_case stays"),
+    ("_draft_", "<em>draft</em>"),
+    ("a \\\\ b", "a \\ b"),
+    ("`C:\\path\\_x_`", "<code>C:\\path\\_x_</code>"),
+    ("\\`not code\\`", "`not code`"),
+])
+def test_escaped_marks_read_as_the_editor_reads_them(text, html_out):
+    """The editor saves a typed * or _ escaped; the shared page and the exports show it as typed."""
+    assert inline_html(text) == html_out

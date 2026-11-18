@@ -14,7 +14,8 @@ from pathlib import Path
 
 from cowork.db.scoped import TenantScope
 from cowork.services.artifacts import load_published_map
-from cowork.services.publish import compute_publish_md5, update_artifact
+from cowork.services.publish import compute_publish_md5, desktop_publish_credential, update_artifact
+from cowork.services.published_page_ownership import publication_owner
 
 from .debounce import Debouncer
 from .service import refresh_page
@@ -33,10 +34,14 @@ def schedule(folder: Path, *, scope: TenantScope | None = None) -> bool:
     page = str(folder / DOC_HTML)
 
     def republish() -> None:
-        # Asked again when it runs: "Stop sharing" in the seconds since the
-        # write must not see the page put back up.
-        if is_shared(folder):
-            update_artifact(page, scope=scope)
+        # Asked again when it runs, under the page's publish lock, which Stop
+        # sharing (unpublish_artifact) holds while it takes the page down: an
+        # unshare can't land between the check and the upload and see the page
+        # put back up. The lock is re-entrant, so the publish inside takes it too.
+        _api_key, publish_url = desktop_publish_credential()
+        with publication_owner(folder / DOC_HTML, published_dir=folder, publish_url=publish_url, scope=scope):
+            if is_shared(folder):
+                update_artifact(page, scope=scope)
 
     _republishes.schedule(page, republish)
     return True

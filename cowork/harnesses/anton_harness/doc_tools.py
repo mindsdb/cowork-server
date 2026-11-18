@@ -82,7 +82,7 @@ class DocToolContext:
 
     def card(self, folder: Path) -> dict[str, Any] | None:
         try:
-            return card_for_folder(
+            card = card_for_folder(
                 folder,
                 scope=current_settings_scope(),
                 project_id=self.project_id,
@@ -90,6 +90,8 @@ class DocToolContext:
                 project_label=self.project_label,
                 artifacts_base=folder.parent,
             )
+            # The card rides on a JSON event (cowork.docs.service.announce).
+            return card.to_json() if card is not None else None
         except Exception:  # noqa: BLE001 - the doc is written; failing here would have the agent make it again
             # At warning, with the stack: a bug here once sent every doc.created out without its card, unseen.
             logger.warning("doc card unavailable for %s", folder, exc_info=True)
@@ -298,7 +300,7 @@ def build_doc_tools(ctx: DocToolContext) -> list[ToolDef]:
             return
         _track(session, artifacts_dir, made.slug, "Created doc")
         doc = made.doc
-        announce(made.artifact_id, doc, None, by="agent", conversation_id=ctx.conversation_id,
+        announce(made.artifact_id, doc, None, folder=made.folder, by="agent", conversation_id=ctx.conversation_id,
                  created=True, card=ctx.card(made.folder))
         yield _outcome(
             f"Created doc “{doc['title']}” — it is open beside the chat and the user can see it.\n"

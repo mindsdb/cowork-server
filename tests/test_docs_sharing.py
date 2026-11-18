@@ -117,3 +117,55 @@ def test_a_replaced_run_that_already_fired_stands_down():
     assert runs == [] and debouncer.pending() == ["k"]
     debouncer.cancel_all()
     assert debouncer.pending() == []
+
+
+def test_a_republish_asks_whether_the_doc_is_still_shared_under_the_pages_publish_lock(tmp_path, monkeypatch):
+    """Stop sharing takes the page's publish lock while it takes the page down, so
+    the check and the upload under it can't have an unshare land between them."""
+    import contextlib
+
+    folder = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user").folder
+    events = []
+
+    @contextlib.contextmanager
+    def publish_lock(artifact, *, published_dir, publish_url, scope):
+        assert (artifact, published_dir) == (folder / DOC_HTML, folder)
+        events.append("lock")
+        yield
+        events.append("unlock")
+
+    monkeypatch.setattr(republish, "publication_owner", publish_lock)
+    monkeypatch.setattr(republish, "desktop_publish_credential", lambda: ("key", "https://publish.test"))
+    monkeypatch.setattr(republish, "is_shared", lambda f: events.append("shared?") or True)
+    monkeypatch.setattr(republish, "update_artifact", lambda page, *, scope: events.append("upload"))
+    monkeypatch.setattr(republish._republishes, "delay", 0.0)
+    assert republish.schedule(folder)
+    _settle(republish.pending)
+    end = time.monotonic() + 2
+    while "unlock" not in events and time.monotonic() < end:
+        time.sleep(0.01)
+    assert events == ["shared?", "lock", "shared?", "upload", "unlock"]
+
+
+def test_two_runs_of_one_key_never_overlap():
+    """A publish that outlasts the delay: the next one waits for it rather than racing it."""
+    active, most, runs = [0], [0], []
+    guard = threading.Lock()
+
+    def run(n):
+        with guard:
+            active[0] += 1
+            most[0] = max(most[0], active[0])
+        time.sleep(0.15)
+        with guard:
+            active[0] -= 1
+        runs.append(n)
+
+    debouncer = Debouncer(0.0, what="test")
+    debouncer.schedule("k", lambda: run(1))
+    time.sleep(0.05)  # the first is running now
+    debouncer.schedule("k", lambda: run(2))
+    end = time.monotonic() + 2
+    while len(runs) < 2 and time.monotonic() < end:
+        time.sleep(0.01)
+    assert runs == [1, 2] and most[0] == 1
