@@ -107,8 +107,10 @@ def entry_for(slug: str, fingerprint: str, version: int, previous: dict, *,
         return {"introduced": introduced, "version": version, "current": fingerprint}
     if fingerprint == prev.get("current"):
         return {"introduced": prev["introduced"], "version": prev.get("version", version), "current": fingerprint}
-    if "current" in prev and version <= prev.get("version", 0):
-        raise NeedsVersionBump(f"{slug} changed: bump its store's version above {prev['version']} first")
+    # Compared with the store's last version, not this skill's: a store at
+    # store_last never re-seeds, even if this skill was recorded lower.
+    if "current" in prev and version <= store_last:
+        raise NeedsVersionBump(f"{slug} changed: bump its store's version above {store_last} first")
     return {"introduced": prev["introduced"], "version": version, "current": fingerprint}
 
 

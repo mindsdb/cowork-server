@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import zipfile
@@ -2295,11 +2296,39 @@ class SkillService:
             raise
         try:
             self._rename_direct_child(staging, staged_name, self.root, entry.name)
-        except Exception:
+        except BaseException:
+            # BaseException too: an interrupt here would otherwise leave the
+            # skill only in staging. If this restore also fails,
+            # _recover_stranded_builtin brings it back on the next pass.
             self._rename_direct_child(staging, old_name, self.root, entry.name)
             self._rmtree_direct_child(staging, staged_name, ignore_errors=True)
             raise
         self._rmtree_direct_child(staging, old_name, ignore_errors=True)
+        return True
+
+    def _recover_stranded_builtin(self, slug: str) -> bool:
+        """Put back a builtin a failed swap left only in `.builtin-staging`.
+
+        `_refresh_builtin_skill` moves the live copy to `old-<slug>-<token>`
+        before moving the new one in. If the process dies, or both that move
+        and the restore fail, the slug is missing and would be taken for one
+        someone deleted. Returns True when a copy was moved back. Nothing
+        behind a link is followed.
+        """
+        staging = self.root / ".builtin-staging"
+        if staging.is_symlink() or not staging.is_dir():
+            return False
+        pattern = re.compile(rf"old-{re.escape(slug)}-[0-9a-f]{{12}}")
+        stranded = [
+            p for p in staging.iterdir()
+            if pattern.fullmatch(p.name) and not p.is_symlink() and p.is_dir()
+            and (p / SKILL_FILE).is_file()
+        ]
+        if not stranded:
+            return False
+        newest = max(stranded, key=lambda p: p.stat().st_mtime)
+        self._rename_direct_child(staging, newest.name, self.root, slug)
+        logger.warning("Recovered builtin %r from an interrupted update in %s", slug, self.root)
         return True
 
     def _copy_builtin_skill(self, src: Path) -> bool:
@@ -2339,7 +2368,7 @@ class SkillService:
                 continue
             slug = src.name
             try:
-                if os.path.lexists(self._skill_entry(slug)):
+                if os.path.lexists(self._skill_entry(slug)) or self._recover_stranded_builtin(slug):
                     if not self._refresh_builtin_skill(src):
                         continue  # current already, or edited: leave it
                 elif seeded_version and builtin_introduced_in(slug) <= seeded_version:

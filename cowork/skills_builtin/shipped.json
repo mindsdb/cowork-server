@@ -40,11 +40,12 @@
     "version": 3
   },
   "pdf": {
-    "current": "b5b73045438fc4f2cbab7636ddf73fd3bfae366dc25336ef69a6a9b01c7ada34",
+    "current": "dddd8f8f4ba85d12decfc460467f35a4ff390ed1572303f1ee6c6ec02b450285",
     "introduced": 1,
     "shipped": [
       "b5b73045438fc4f2cbab7636ddf73fd3bfae366dc25336ef69a6a9b01c7ada34",
-      "cb834d7eda82d40315fa7fee6eabd985aa9610062565900e3ffad08917a416c4"
+      "cb834d7eda82d40315fa7fee6eabd985aa9610062565900e3ffad08917a416c4",
+      "dddd8f8f4ba85d12decfc460467f35a4ff390ed1572303f1ee6c6ec02b450285"
     ],
     "version": 3
   },

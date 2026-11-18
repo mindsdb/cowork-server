@@ -221,3 +221,59 @@ def test_a_changed_builtin_needs_a_version_bump():
         "introduced": 1, "version": 4, "current": "new"}
     # Unchanged content keeps the version it shipped under.
     assert script.entry_for("pdf", "old", 4, previous, store_last=3)["version"] == 3
+
+
+def test_a_change_is_compared_with_the_stores_last_version_not_the_skills():
+    # A bump that changed only docx leaves pdf recorded at 3 while stores are
+    # at 4. Editing pdf with the version still at 4 must be refused: stores at
+    # marker 4 never re-seed, so the edit would never arrive.
+    script = _shipped_script()
+    released = {
+        "pdf": {"introduced": 1, "version": 3, "current": "pdf-v3"},
+        "docx": {"introduced": 1, "version": 4, "current": "docx-v4"},
+    }
+    with pytest.raises(script.NeedsVersionBump, match="above 4"):
+        script.entry_for("pdf", "pdf-edited", 4, released, store_last=4)
+    assert script.entry_for("pdf", "pdf-edited", 5, released, store_last=4)["version"] == 5
+
+
+def _rename_failing_on(calls_to_fail: set[int], error: BaseException, monkeypatch):
+    real = SkillService._rename_direct_child
+    calls = {"n": 0}
+
+    def flaky(*args):
+        calls["n"] += 1
+        if calls["n"] in calls_to_fail:
+            raise error
+        return real(*args)
+
+    monkeypatch.setattr(SkillService, "_rename_direct_child", staticmethod(flaky))
+    return real
+
+
+def test_a_swap_that_fails_partway_does_not_lose_the_builtin(skills_root, monkeypatch):
+    # The old copy is moved into .builtin-staging, then both the move of the new
+    # copy into place and the restore of the old one fail (a Windows lock, say).
+    _seed_at_previous_version_with(OLD_BODY, shipped=True, monkeypatch=monkeypatch)
+    real = _rename_failing_on({2, 3}, PermissionError(13, "locked"), monkeypatch)
+
+    assert SkillService(_org()).ensure_builtin_skills() is False
+    assert not (_store() / SLUG).exists()
+
+    monkeypatch.setattr(SkillService, "_rename_direct_child", staticmethod(real))
+    SkillService(_org()).ensure_builtin_skills()
+
+    # The stranded copy is recovered and then updated, not taken for a deletion.
+    assert (_store() / SLUG / "SKILL.md").read_bytes() == (BUILTIN_SKILLS_DIR / SLUG / "SKILL.md").read_bytes()
+    assert (_store() / SLUG / "stats.json").read_text() == '{"total_recalls": 3}'
+    assert SLUG in {s.name for s in SkillService(_org()).list_skills()}
+
+
+def test_an_interrupt_during_the_swap_puts_the_old_copy_back(skills_root, monkeypatch):
+    _seed_at_previous_version_with(OLD_BODY, shipped=True, monkeypatch=monkeypatch)
+    _rename_failing_on({2}, KeyboardInterrupt(), monkeypatch)
+
+    with pytest.raises(KeyboardInterrupt):
+        SkillService(_org()).ensure_builtin_skills()
+
+    assert (_store() / SLUG / "SKILL.md").read_text() == OLD_BODY

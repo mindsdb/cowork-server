@@ -237,11 +237,11 @@ the table carefully.
 For scanned PDFs:
 
 - Treat the PDF as image-based until text extraction proves otherwise.
-- There is no OCR engine such as tesseract. Read scanned pages with the model:
-  recall the `reading-files` skill, which renders each page with `pypdfium2`,
-  sends it to `get_llm()` as an image, saves the text page by page, and asks
-  before reading more than 20 pages. If that skill isn't available, render each
-  page as above and send the image to `get_llm()` yourself.
+- There is no OCR engine such as tesseract. Read scanned pages with the model.
+  If `reading-files` is listed in your skills, recall it: it renders each page
+  with `pypdfium2`, sends it to `get_llm()` as an image, saves the text page by
+  page, and asks before reading more than 20 pages. Otherwise render each page
+  as above (list `pypdfium2` in `packages`) and send it to `get_llm()`.
 - Read each page separately so page numbers remain traceable.
 - Mention uncertainty when the scan is low-resolution, skewed, handwritten, or noisy.
 - After OCR, search for important terms and spot-check against the page image.
