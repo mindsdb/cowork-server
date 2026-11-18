@@ -135,6 +135,20 @@ def overlay(root: Path, engine: str, name: str, fields: dict, keys: tuple[str, .
     return out
 
 
+def _secure_keys_naming_token(secure_keys: Any, fields: dict) -> list[str] | None:
+    """A record's ``secure_keys`` that anton reads as covering a held token.
+
+    anton takes an explicit list as authoritative, so a token it doesn't name
+    would be neither scrubbed nor withheld. Agent code can write the file:
+    anything but a list of names falls back to anton's name heuristic, which
+    treats every field named like a token as secret."""
+    if not isinstance(secure_keys, list) or not all(isinstance(key, str) for key in secure_keys):
+        return None
+    if "access_token" in fields and "access_token" not in secure_keys:
+        return [*secure_keys, "access_token"]
+    return secure_keys
+
+
 class AppHeldVault(FilteredDataVault):
     """A vault whose MCP connections read their app-held values.
 
@@ -222,12 +236,11 @@ class AppHeldVault(FilteredDataVault):
         if record is None:
             return None
         fields = self._held_fields(engine, name, record.get("fields") or {})
-        secure_keys = record.get("secure_keys")
-        # An explicit list is authoritative to anton; a held token it doesn't
-        # name would be neither scrubbed nor withheld.
-        if "access_token" in fields and isinstance(secure_keys, list) and "access_token" not in secure_keys:
-            secure_keys = [*secure_keys, "access_token"]
-        return {**record, "fields": fields, "secure_keys": secure_keys}
+        if is_custom_mcp(engine):
+            # The token is here for the scrub; its expiry would only make the
+            # agent's listing name a variable no environment has.
+            fields.pop("expires_at", None)
+        return {**record, "fields": fields, "secure_keys": _secure_keys_naming_token(record.get("secure_keys"), fields)}
 
     def for_connecting(self) -> AppHeldVault:
         """The connecting view anton's connect_new_datasource matches against,

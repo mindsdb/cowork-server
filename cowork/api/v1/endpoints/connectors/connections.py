@@ -34,7 +34,7 @@ from cowork.services.connectors.identity import oauth_default_label
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, SharedConnectionError
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
-from cowork.services.connectors.persist import own_vault_root, persist_connection, vault_for_scope
+from cowork.services.connectors.persist import own_vault_for_scope, own_vault_root, persist_connection, vault_for_scope
 from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 
 _log = logging.getLogger("cowork.connectors.connections")
@@ -208,6 +208,20 @@ def _refuse_custom_mcp(engine: str) -> None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="custom_mcp_reserved")
 
 
+def _names_custom_connection(scope: TenantScope, engine: str, name: str) -> bool:
+    """Whether ``engine``/``name`` reach a custom MCP connection: by their own
+    form, or by the record the vault resolves them to, which other spellings
+    (case, punctuation the file name drops) reach on a case-insensitive disk."""
+    if is_custom_mcp(engine) and is_connection_id(name):
+        return True
+    try:
+        record = own_vault_for_scope(scope).read_record(engine, name)
+    except OSError:
+        # Unreadable here means unreadable to the delete too; ask for the secret.
+        return True
+    return bool(record) and is_custom_mcp(str(record.get("engine"))) and is_connection_id(str(record.get("name")))
+
+
 def _persist_direct_connection(
     body: DirectSaveRequest,
     scope: TenantScope,
@@ -280,7 +294,7 @@ async def delete_connection(engine: str, name: str, scope: ScopeDep, request: Re
         # credential proxy as the other OAuth Connector Lifecycle endpoints.
         await auth_proxy.proxy_delete(engine, name, request, OAuthSettings())
         return
-    if is_custom_mcp(engine) and is_connection_id(name):
+    if _names_custom_connection(scope, engine, name):
         # Deleting it drops its held settings, after which the app removes its
         # keychain entries; only the app, which revokes the token first, may.
         require_app_secret(request)

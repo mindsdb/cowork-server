@@ -205,6 +205,22 @@ class TestHeldAndTools:
             clear_ds_env()
         assert "AT-1" not in scrubbed
 
+    @pytest.mark.parametrize("planted", ["access", {"access_token": False}, [1], ["expires_at"]])
+    def test_secure_keys_planted_in_the_file_never_unhide_the_token(self, protected, planted):
+        _create()
+        vault_dir = own_vault_root(LOCAL_SCOPE)
+        [path] = [entry for entry in vault_dir.iterdir() if entry.name == f"{CUSTOM_MCP_ENGINE}-{CONN}"]
+        record = json.loads(path.read_text())
+        path.write_text(json.dumps({**record, "secure_keys": planted}))
+        source = turn_vault_for_scope(LOCAL_SCOPE)
+        vault = app_held.turn_vault(source, source_vault=source, root=vault_dir)
+        try:
+            restore_namespaced_env(vault)
+            scrubbed = scrub_credentials("the server said: bad token AT-1")
+        finally:
+            clear_ds_env()
+        assert "AT-1" not in scrubbed
+
     def test_a_new_server_url_drops_the_token(self, protected):
         _create()
         _client().put(f"{ROUTES}/{CONN}/held", json={"server_url": "https://other.example.com/mcp"}, headers=HEADERS)

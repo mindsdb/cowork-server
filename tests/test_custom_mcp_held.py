@@ -97,7 +97,8 @@ EXPECTED_RECORD_FIELDS = {
     "_label": "Acme Tracker",
     "_access_mode": "write",
 }
-HELD_FIELDS = {**EXPECTED_RECORD_FIELDS, "access_token": "AT-held", "expires_at": "2030-01-01T00:00:00Z"}
+RECORD_WITH_TOKEN = {**EXPECTED_RECORD_FIELDS, "access_token": "AT-held"}
+HELD_FIELDS = {**RECORD_WITH_TOKEN, "expires_at": "2030-01-01T00:00:00Z"}
 
 
 class TestTurnsReadOnlyHeldSettings:
@@ -105,7 +106,7 @@ class TestTurnsReadOnlyHeldSettings:
         _write_file(AGENT_WRITTEN)
         _hold()
         vault = _turn_vault()
-        assert vault.read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == HELD_FIELDS
+        assert vault.read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == RECORD_WITH_TOKEN
         assert vault.load(CUSTOM_MCP_ENGINE, CONN) == HELD_FIELDS
 
     def test_a_tool_result_that_echoes_the_held_token_is_scrubbed(self, protected):
@@ -143,7 +144,7 @@ class TestTurnsReadOnlyHeldSettings:
         _hold()
         for path, content in saved.items():
             path.write_bytes(content)
-        assert _turn_vault().read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == HELD_FIELDS
+        assert _turn_vault().read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == RECORD_WITH_TOKEN
 
     def test_deleting_through_the_turn_vault_drops_the_held_entry(self, protected):
         _write_file({"_method": "mcp"})
@@ -158,6 +159,27 @@ class TestTurnsReadOnlyHeldSettings:
         _hold()
         response = _client().delete(f"{BASE}/{CUSTOM_MCP_ENGINE}/{CONN}")
         assert response.status_code == 403
+        assert app_held.held_custom(own_vault_root(LOCAL_SCOPE), CONN) == HELD
+        assert own_vault_for_scope(LOCAL_SCOPE).read_record(CUSTOM_MCP_ENGINE, CONN) is not None
+
+    @pytest.mark.parametrize(
+        ("engine", "name"),
+        [
+            ("custom.mcp", CONN),
+            ("custom%20mcp", CONN),
+            ("_custom_mcp", CONN),
+            ("custom_mcp_", CONN),
+            ("CUSTOM_MCP", CONN),
+            (CUSTOM_MCP_ENGINE, "cm-" + CONN[3:].upper()),
+            (CUSTOM_MCP_ENGINE, CONN + "."),
+        ],
+    )
+    def test_no_other_spelling_deletes_it_without_the_app_secret(self, protected, engine, name):
+        _write_file({"_method": "mcp"})
+        _hold()
+        response = _client().delete(f"{BASE}/{engine}/{name}")
+        # 404 where the disk tells names apart by case, 403 where it doesn't.
+        assert response.status_code in (403, 404)
         assert app_held.held_custom(own_vault_root(LOCAL_SCOPE), CONN) == HELD
         assert own_vault_for_scope(LOCAL_SCOPE).read_record(CUSTOM_MCP_ENGINE, CONN) is not None
 
