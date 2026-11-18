@@ -18,6 +18,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
+from cowork.common.event_clock import event_at_ms
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import log_context
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings, get_app_settings
@@ -243,6 +244,25 @@ def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
             "text": "",
         })
     return synthesized
+
+
+#: The terminal a Stop saves with the turn's events. The live stream ends a
+#: stopped turn with this frame too, but the stream is not saved, so without it
+#: a reload could not tell a stopped turn from one still running (ENG-4345).
+STOPPED_EVENT = "response.cancelled"
+
+
+def stopped_turn_events(events: list[dict]) -> list[dict]:
+    """What a Stop adds to the turn's saved *events*: a retirement for each
+    question it left open, then the ``response.cancelled`` terminal. Its
+    ``at_ms`` is when the turn stopped, so a reload ends the turn's time there.
+
+    Nothing when the turn produced no events: a Stop that came before any
+    output saves no answer row, and the terminal alone must not create one.
+    """
+    if not events:
+        return []
+    return [*cancelled_ask_user_retirements(events), {"type": STOPPED_EVENT, "at_ms": event_at_ms()}]
 
 
 async def _remote_cancel_confirmed(error: str | None, correlation_id: str) -> bool:
@@ -2141,6 +2161,8 @@ class ResponsesHandler:
             reaches the open stream before Uvicorn's request drain cuts it."""
             # A turn stopped before its answer started saves no answer row.
             events = [text_delta("".join(parts), sequence_number=2), _DIRECT_MEMORY_READ.payload()] if parts else []
+            if reason == "cancelled":
+                events.extend(stopped_turn_events(events))
             if lifecycle.shutdown_frame_deadline is None:
                 saved = await persist(events)
             else:
@@ -3558,8 +3580,8 @@ class ResponsesHandler:
                 )))
                 return
             # Partial text generated before cancellation is persisted, with
-            # every question the Stop left open retired.
-            collected_events.extend(cancelled_ask_user_retirements(collected_events))
+            # every question the Stop left open retired, and the Stop itself.
+            collected_events.extend(stopped_turn_events(collected_events))
             await run_to_completion(end_turn("cancelled"))
         except Exception as exc:
             if isinstance(exc, PoolTimeoutError):
@@ -3853,13 +3875,13 @@ class ResponsesHandler:
                     message, code, request_id=corr, assistant_message_id=message_id,
                 )))
                 return
-            # Nothing special is emitted on cancellation.
             # The partial text and events generated before cancellation are persisted.
             # A question that was on screen when Stop was pressed never got its
             # `response.ask_user_answered` (see cancelled_ask_user_retirements),
             # so retire it here — otherwise the persisted log holds a published
-            # question that nothing in it ever closes.
-            collected_events.extend(cancelled_ask_user_retirements(collected_events))
+            # question that nothing in it ever closes. The Stop's own terminal
+            # follows, so a reload shows the turn as stopped.
+            collected_events.extend(stopped_turn_events(collected_events))
             await run_to_completion(end_turn("cancelled"))
             return
         except Exception as exc:
