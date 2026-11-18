@@ -380,6 +380,12 @@ class FilteredDataVault:
     def _hides(self, engine: str, name: str) -> bool:
         return engine in self._hidden_engines or (engine, name) in self._hidden
 
+    def hides(self, engine: str, name: str) -> bool:
+        """Whether this vault, or a filtered vault it reads through, turned
+        the connection off."""
+        source_hides = getattr(self._source, "hides", None)
+        return self._hides(engine, name) or (source_hides is not None and source_hides(engine, name))
+
     def save(
         self,
         engine: str,

@@ -194,10 +194,17 @@ class TestTurnsReadOnlyHeldSettings:
         assert connecting.load(CUSTOM_MCP_ENGINE, CONN) == {}
         assert connecting.read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == {}
 
-    def test_a_file_without_the_mcp_method_reads_as_its_labels_alone(self, protected):
-        _write_file({key: value for key, value in AGENT_WRITTEN.items() if key != "_method"})
+    @pytest.mark.parametrize("method", [None, "MCP", " mcp", "mcp\n"])
+    def test_the_file_method_does_not_decide_whether_held_settings_are_read(self, protected, method):
+        written = {key: value for key, value in AGENT_WRITTEN.items() if key != "_method"}
+        if method is not None:
+            written["_method"] = method
+        _write_file(written)
         _hold()
-        assert _turn_vault().load(CUSTOM_MCP_ENGINE, CONN) == {"_label": "Renamed by agent"}
+        assert _turn_vault().load(CUSTOM_MCP_ENGINE, CONN) == EXPECTED_RECORD_FIELDS | {
+            "access_token": "AT-held",
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
 
     def test_without_the_app_secret_every_custom_connection_is_hidden(self, stores):
         _write_file(AGENT_WRITTEN)

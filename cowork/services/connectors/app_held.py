@@ -152,7 +152,7 @@ class AppHeldVault(FilteredDataVault):
     holds "read" when no mode is held.
 
     A custom MCP connection (``custom_mcp``) reads nothing from the file but
-    its existence and ``_method``: its URL, label and allowed tools come from the held entry,
+    its existence: its URL, label and allowed tools come from the held entry,
     and only for a record in the user's own layer (``is_own``). With nothing
     held its record carries ``_method`` alone, which anton skips.
     """
@@ -195,10 +195,11 @@ class AppHeldVault(FilteredDataVault):
         return fields
 
     def _custom_or_labels(self, name: str, source_fields: dict, *, with_token: bool) -> dict[str, str]:
-        """The held fields of a custom connection, or only the label fields
-        when the source gave no ``_method``: a connecting view lists a
-        turned-off connection by its labels alone, and memory must not refill it."""
-        if source_fields.get("_method") != MCP_METHOD:
+        """The held fields of a custom connection, or the source's label fields
+        when the source turned it off: a connecting view lists a turned-off
+        connection by its labels alone, and memory must not refill it. The
+        file's own fields never decide which."""
+        if self.hides(CUSTOM_MCP_ENGINE, name):
             return {key: value for key, value in source_fields.items() if key in LABEL_FIELDS}
         return self._custom_fields(name, with_token=with_token)
 
