@@ -66,6 +66,7 @@ from cowork.db.scoped import TenantScope
 from cowork.db.units import run_db, run_efs, run_to_completion
 from cowork.harnesses.anton_harness.preview_checker import ask_preview
 from cowork.services import artifact_quick_edits
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services import quick_edit as quick_edit_service
 from cowork.services.artifact_revisions import (
     RepairAlreadyPending,
@@ -203,9 +204,8 @@ def _broker_key(artifact_id: str) -> str:
     return f"quick-edit:{artifact_id}"
 
 
-def _artifact_kind(metadata: dict) -> str:
-    kind = metadata.get("type") if isinstance(metadata, dict) else None
-    return kind if isinstance(kind, str) and kind else "html-app"
+def _artifact_kind(metadata: ArtifactMetadata) -> str:
+    return metadata.type or "html-app"
 
 
 def _router_input(
@@ -322,7 +322,7 @@ def _capture_for_undo(anton: AntonQuickEdit, folder: Path, kind: str, source_pat
 
 def _finish_applied(
     folder: Path,
-    metadata: dict,
+    metadata: ArtifactMetadata,
     artifact_id: str,
     *,
     source_path: str,
@@ -410,7 +410,7 @@ class QuickEditRun:
     anton: AntonQuickEdit
     scope: TenantScope
     folder: Path
-    metadata: dict
+    metadata: ArtifactMetadata
     artifact_id: str
     body: _QuickEditBody
     # From begin_quick_edit: the tracked source and the head the edit follows.
@@ -628,7 +628,7 @@ class QuickEditRun:
                         conversation_id=self.body.conversationId,
                         artifact_id=self.artifact_id,
                         artifact_slug=self.folder.name,
-                        artifact_title=str(self.metadata.get("name") or "") if isinstance(self.metadata, dict) else "",
+                        artifact_title=self.metadata.name or "",
                         edit=quick_edit_service.quick_edit_entry(
                             edit_id=edit_id,
                             request=self.body.message,

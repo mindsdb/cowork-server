@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from coding_service_fakes import CREDS, repository
+from tests.support.coding.service_fakes import CREDS, repository
 from cowork.coding.contracts import (
     ApprovalDecision,
     EventType,

@@ -26,7 +26,6 @@ from cowork.api.v1.endpoints.guards import require_local_in_desktop_mode
 from cowork.api.v1.permissions import (
     AuthenticatedInOrgMode,
     LoopbackDesktopOnly,
-    LoopbackOnly,
     OpenByDesign,
     require,
 )
@@ -53,6 +52,7 @@ from cowork.services.providers import (
     fetch_org_model_catalog,
     model_value_rejection,
     persist_enabled_model_map,
+    persist_image_model_map,
     persist_org_model_availability,
     persist_role_defaults_map,
     ping_providers,
@@ -65,7 +65,7 @@ from cowork.services.settings import SettingService, unit_setting_service
 
 logger = logging.getLogger(__name__)
 from cowork.common.settings.app_settings import (
-    AGENT_ROLE_NAMES,
+    CATALOG_ROLE_NAMES,
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
@@ -146,7 +146,7 @@ def _reject_malformed_role_defaults(updates: dict[str, Any]) -> None:
     bad = None
     if not isinstance(parsed, dict):
         bad = "must be a JSON object of agent role -> model id"
-    elif unknown := sorted(k for k in parsed if k not in AGENT_ROLE_NAMES):
+    elif unknown := sorted(k for k in parsed if k not in CATALOG_ROLE_NAMES):
         bad = f"names no agent role: {', '.join(unknown)}"
     elif empty := sorted(k for k, v in parsed.items() if not isinstance(v, str) or not v.strip()):
         bad = f"gives no model id for: {', '.join(empty)}"
@@ -447,9 +447,11 @@ def install_status():
     return {"antonInstalled": True, "serverDepsReady": True}
 
 
-# LoopbackOnly: returns an unmasked provider secret, so the credential is the
-# caller being on this machine, not who they are (ENG-457).
-@router.get("/reveal-key/{name}", dependencies=[Depends(require(LoopbackOnly))])
+# LoopbackDesktopOnly: returns an unmasked provider secret, so the credential
+# is the caller being on this machine, not who they are. Only the desktop app
+# calls it. An org deployment refuses it outright: loopback inside a hosted pod
+# says nothing about which member is calling, and no hosted caller needs it.
+@router.get("/reveal-key/{name}", dependencies=[Depends(require(LoopbackDesktopOnly))])
 def reveal_key(name: str, session: SessionDep, scope: ScopeDep):
     name_map = {
         "anthropic": Provider.ANTHROPIC,
@@ -782,6 +784,7 @@ def _persist_catalog_maps(
             persist_enabled_model_map(
                 raw, scope, prior.minds_model_enabled, listing.enabled, listing.ids
             )
+            persist_image_model_map(raw, scope, prior.minds_image_model_enabled, listing)
     persist_role_defaults_map(raw, scope, prior.minds_role_defaults, listing.role_defaults)
 
 
@@ -803,7 +806,8 @@ async def recommended_models(
     refresh_scope: str = "all",
     principal: PrincipalDep = None,
 ):
-    """Per-provider model picker options for the Settings UI.
+    """Per-provider model picker options for the Settings UI, and the image
+    picker's (`imageModels`, `imageModelDefault`).
 
     Returns the static `RECOMMENDED_MODELS`/`RECOMMENDED_PAIR` maps, with
     the `minds-cloud` bucket overlaid by MindsHub's live `/v1/models` list
@@ -870,6 +874,13 @@ async def recommended_models(
     # Every model id MindsHub listed, whether or not it described it. The custom
     # endpoint overlay below reserves these ids for the grouping maps.
     minds_ids: set[str] = set()
+
+    # `imageModels` is MindsHub's image models (`kind: "image"`), in its order:
+    # the image picker's whole list, and never in `recommendedModels`, whose
+    # lists feed the chat pickers. Their lock state, reasons, labels and grouping
+    # ride the id-keyed maps above with the chat models'. Empty with no MindsHub
+    # key, or from a MindsHub that predates `kind`.
+    image_models: list[str] = []
 
     s = await run_db(lambda session: unit_setting_service(session).load(), scope=scope)
     listing = None
@@ -955,11 +966,14 @@ async def recommended_models(
             )
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
+        model_enabled.update(listing.image_models)
         model_disabled_reasons.update(listing.disabled_reasons)
         model_labels.update(live_labels)
         model_providers.update(listing.providers)
         model_families.update(listing.families)
         minds_ids.update(live or ())
+        minds_ids.update(listing.image_models)
+        image_models = list(listing.image_models)
 
     # Overlay a configured custom OpenAI-compatible endpoint the same way as
     # minds-cloud. The provider card's own baseUrl is authoritative — the
@@ -1071,9 +1085,19 @@ async def recommended_models(
         "canSetDecisionModel": not scope.org_mode or can_manage_org(principal),
     }
 
+    # No image picker where Anton's images won't go to MindsHub: a pick there does nothing.
+    if not gate_settings._images_go_to_mindshub():
+        image_models = []
+
     return {
         "recommendedModels": recommended,
         "recommendedPair": pair,
+        "imageModels": image_models,
+        # What an unset `image_model` resolves to, from the same reload as the
+        # gate below, so the picker's default is the model a turn would use.
+        # Left out while MindsHub lists no image model (a gateway that has not
+        # published them yet), so the picker has nothing to show.
+        **({"imageModelDefault": gate_settings._image_model_default()} if image_models else {}),
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
         "modelDisabledReasons": model_disabled_reasons,
