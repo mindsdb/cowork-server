@@ -618,10 +618,8 @@ Every route declares its permission at its own definition, and `create_app()` re
 | `LoopbackOnly` | the caller being on this machine (`require_local`) |
 | `DesktopOnly` | not MindsHub mode (`require_local_tenancy` 403s the route there) |
 | `LoopbackDesktopOnly` | both of the above |
-| `PlatformSignature` | the calling platform's HMAC over the body (channel webhooks) |
 | `Authenticated` | a verified `Principal` |
 | `AuthenticatedInOrgMode` | a verified `Principal`, in MindsHub mode only; a no-op on desktop |
-| `AuthenticatedOrgAdmin` | ... plus org-admin standing |
 
 ```python
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require

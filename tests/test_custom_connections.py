@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from cowork.api.v1.endpoints.connectors import custom_connections as custom_connections_endpoints
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin
+from cowork.api.v1.permissions import AuthenticatedInOrgMode
 from cowork.api.v1.route_walker import declared_permissions
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, get_scoped_session, get_tenant_scope
@@ -154,7 +154,6 @@ def test_both_routes_need_an_authenticated_member_not_an_admin():
     assert {tuple(sorted(r.methods)) for r in routes} == {("GET",), ("DELETE",)}
     for route in routes:
         assert AuthenticatedInOrgMode in declared_permissions(route)
-        assert AuthenticatedOrgAdmin not in declared_permissions(route)
 
 
 # ── the internal create ─────────────────────────────────────────────────────

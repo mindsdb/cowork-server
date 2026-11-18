@@ -23,7 +23,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from cowork.api.v1.endpoints.connectors import connections as connections_endpoints
 from cowork.api.v1.endpoints.connectors.custom import delete_custom_connector, update_custom_connector
 from cowork.api.v1.endpoints.connectors.custom import router as custom_router
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin
+from cowork.api.v1.permissions import AuthenticatedInOrgMode
 from cowork.api.v1.route_walker import declared_permissions
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, get_scoped_session
@@ -254,7 +254,6 @@ def test_both_routes_require_an_authenticated_member_not_an_admin():
     assert {tuple(sorted(r.methods)) for r in routes} == {("POST",), ("PATCH",), ("DELETE",)}
     for route in routes:
         assert AuthenticatedInOrgMode in declared_permissions(route)
-        assert AuthenticatedOrgAdmin not in declared_permissions(route)
 
 
 def _anton_draft(**overrides) -> dict:

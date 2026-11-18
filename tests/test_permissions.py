@@ -19,14 +19,12 @@ from fastapi.testclient import TestClient
 from cowork.api.v1.permissions import (
     Authenticated,
     AuthenticatedInOrgMode,
-    AuthenticatedOrgAdmin,
     OpenByDesign,
     require,
 )
-from cowork.principal import ORG_MANAGE_ROLE, Principal, get_principal
+from cowork.principal import Principal, get_principal
 
 MEMBER = Principal(user_id="u1", org_id="o1")
-ADMIN = Principal(user_id="u2", org_id="o1", roles=frozenset({ORG_MANAGE_ROLE}))
 
 
 @pytest.fixture(autouse=True)
@@ -54,10 +52,6 @@ def _app() -> FastAPI:
         principal: Principal | None = Depends(require(AuthenticatedInOrgMode)),
     ):
         return {"user_id": principal.user_id if principal else None}
-
-    @app.get("/org-admin", dependencies=[Depends(require(AuthenticatedOrgAdmin))])
-    def org_admin_route():
-        return {"ok": True}
 
     return app
 
@@ -119,32 +113,6 @@ def test_in_org_mode_is_a_no_op_in_local_mode():
     assert resp.json() == {"user_id": None}
 
 
-# ── AuthenticatedOrgAdmin ────────────────────────────────────────────
-
-
-def test_org_admin_403s_a_member_in_org_mode(monkeypatch):
-    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
-    resp = _client(MEMBER).get("/org-admin")
-    assert resp.status_code == 403
-    assert resp.json()["detail"] == "requires an org admin"
-
-
-def test_org_admin_allows_an_admin_in_org_mode(monkeypatch):
-    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
-    assert _client(ADMIN).get("/org-admin").status_code == 200
-
-
-def test_org_admin_401s_before_403ing_when_there_is_no_principal(monkeypatch):
-    # Who you are is resolved before what you may do, so an anonymous caller
-    # gets 401 rather than a 403 that implies a known identity.
-    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
-    assert _client().get("/org-admin").status_code == 401
-
-
-def test_org_admin_is_a_no_op_in_local_mode():
-    assert _client().get("/org-admin").status_code == 200
-
-
 # ── require() itself ─────────────────────────────────────────────────
 
 
@@ -152,7 +120,6 @@ def test_require_stamps_permission_cls_for_the_ci_walker():
     assert require(OpenByDesign).permission_cls is OpenByDesign
     assert require(Authenticated).permission_cls is Authenticated
     assert require(AuthenticatedInOrgMode).permission_cls is AuthenticatedInOrgMode
-    assert require(AuthenticatedOrgAdmin).permission_cls is AuthenticatedOrgAdmin
 
 
 def test_require_is_cached_so_every_call_site_shares_one_dependency():
