@@ -1725,28 +1725,16 @@ class ResponsesHandler:
                 or provider_api_key(settings, Provider.MINDS_CLOUD) is not None):
             return None, None
         from anton.core.llm.openai import OpenAIProvider
-        from cowork.turnqueue.producer import _mint_llm_block_with_turn_key_id, mint_llm_block
+        from cowork.turnqueue.producer import mint_turn_llm
 
         corr = str(uuid4())
-        queue_settings = TurnQueueSettings()
-        turn_key_id = None
-        workspace_id = getattr(settings, "hub_workspace_id", "") or None
-        if queue_settings.needs_turn_key_id:
-            block, turn_key_id = await _mint_llm_block_with_turn_key_id(
-                org_id=self.scope.org_id,
-                user_id=self.scope.user_id,
-                correlation_id=corr,
-                settings=queue_settings,
-                workspace_id=workspace_id,
-            )
-        else:
-            block = await mint_llm_block(
-                org_id=self.scope.org_id,
-                user_id=self.scope.user_id,
-                correlation_id=corr,
-                settings=queue_settings,
-                workspace_id=workspace_id,
-            )
+        block, turn_key_id, ttl_seconds = await mint_turn_llm(
+            org_id=self.scope.org_id,
+            user_id=self.scope.user_id,
+            correlation_id=corr,
+            settings=TurnQueueSettings(),
+            workspace_id=getattr(settings, "hub_workspace_id", "") or None,
+        )
         provider = OpenAIProvider(
             api_key=block["api_key"],
             base_url=block["base_url"],
@@ -1759,7 +1747,7 @@ class ResponsesHandler:
             model=settings.resolved_gate_model or MINDS_FREE_MODEL,
             label=Provider.MINDS_CLOUD.value,
         )
-        turn_context = {"correlation_id": corr, "llm": block}
+        turn_context = {"correlation_id": corr, "llm": block, "turn_key_ttl_seconds": ttl_seconds}
         if turn_key_id is not None:
             turn_context["turn_key_id"] = turn_key_id
         return binding, turn_context
@@ -3257,6 +3245,7 @@ class ResponsesHandler:
                 run_id=lifecycle.identity.run_id,
                 llm=(turn_llm or {}).get("llm"),
                 turn_key_id=(turn_llm or {}).get("turn_key_id"),
+                turn_key_ttl_seconds=(turn_llm or {}).get("turn_key_ttl_seconds"),
                 disabled=disabled,
                 # Questions need someone to answer them: this path serves
                 # the web UI, which renders the card and posts /answer.

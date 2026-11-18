@@ -815,7 +815,8 @@ class TurnQueueSettings(Settings):
         default=1200,
         description=(
             "TTL, in seconds, of the minted per-turn MindsHub key for a turn without a "
-            "time limit (20 min; keep within auth's turn_key_max_ttl_seconds). "
+            "time limit, and for a time-limited turn whose longer key auth refused "
+            "(20 min; keep within auth's turn_key_max_ttl_seconds). "
             "scratchpad-controller's MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from "
             "it (TTL - 120); change both together."
         ),
@@ -834,7 +835,9 @@ class TurnQueueSettings(Settings):
             "none, and the turn keeps today's caps. Turn it on only where auth extends "
             "turn keys and scratchpad-controller raises its backstop for time-limited "
             "turns; a turn key then lives one time-limit window at a time "
-            "(turn_key_lifetime_seconds) and is extended on each \"Keep going\"."
+            "(turn_key_lifetime_seconds) and is extended on each \"Keep going\". "
+            "An auth whose turn-key cap is below that window refuses the key; the "
+            "turn then runs untimed on a turn_key_ttl_seconds key."
         ),
     )  # COWORK_TURN_TIME_LIMIT_SECONDS
     time_limit_key_margin_seconds: int = Field(

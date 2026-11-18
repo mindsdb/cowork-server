@@ -111,7 +111,7 @@ async def test_a_routed_turn_binds_to_the_key_the_gate_minted(turn, monkeypatch)
     block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "https://minds.internal/v1"}
     turn["grant"].return_value = _granted({3: 1, 5: 2}, turn_key_id="mdb_gate")
 
-    params, _ = await _run(turn, correlation_id="r", llm=block, turn_key_id="mdb_gate")
+    params, _ = await _run(turn, correlation_id="r", llm=block, turn_key_id="mdb_gate", turn_key_ttl_seconds=1200)
 
     assert turn["list"].await_args.kwargs["turn_key_id"] == "mdb_gate"
     assert "turn_key" not in params["custom_api"]
@@ -122,7 +122,7 @@ async def test_a_turn_that_arrives_with_a_key_but_no_prefix_runs_without_them(tu
     """A channel turn hands the producer a minted key and no prefix to bind grants to."""
     block = {"provider": "minds-cloud", "api_key": "mdb_x.secret", "base_url": "https://minds.internal/v1"}
 
-    params, _ = await _run(turn, llm=block)
+    params, _ = await _run(turn, llm=block, turn_key_ttl_seconds=1200)
 
     assert "custom_api" not in params
     turn["list"].assert_not_awaited()

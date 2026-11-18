@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import datetime
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -272,11 +272,27 @@ def _build_llm_block(api_key: str, settings: TurnQueueSettings) -> dict:
     return block
 
 
-async def _mint_llm_block_with_turn_key_id(
+class TurnLlm(NamedTuple):
+    """A web or channel turn's llm block, with what the job needs to know about its key."""
+
+    block: dict
+    #: The key's public prefix, which auth binds datasource and custom API
+    #: grants to; None when neither setting is on.
+    turn_key_id: str | None
+    #: The lifetime auth minted the key for: the turn's, or the untimed one
+    #: when auth refused that (auth_keys._request_turn_key).
+    ttl_seconds: int
+
+
+async def mint_turn_llm(
     *, org_id: str | None, user_id: str | None, correlation_id: str, settings: TurnQueueSettings,
     workspace_id: str | None = None,
-) -> tuple[dict, str]:
-    """As mint_llm_block, also returning the key's public prefix the datasource grants bind to."""
+) -> TurnLlm:
+    """Mint a turn's key for its lifetime and build the job's `llm` block.
+
+    The routing gate and stream_remote_replies both mint through here, so the
+    job always knows the lifetime auth gave the key.
+    """
     minted = await mint_turn_key_details(
         user_id=user_id,
         org_id=org_id,
@@ -285,7 +301,11 @@ async def _mint_llm_block_with_turn_key_id(
         settings=settings,
         workspace_id=workspace_id,
     )
-    return _build_llm_block(minted.key, settings), minted.prefix
+    return TurnLlm(
+        block=_build_llm_block(minted.key, settings),
+        turn_key_id=minted.prefix if settings.needs_turn_key_id else None,
+        ttl_seconds=minted.ttl_seconds,
+    )
 
 
 async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
@@ -293,7 +313,7 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
                             settings: TurnQueueSettings) -> dict | None:
     """Build everything the job's `oauth` block needs except the turn key —
     the list of connections anton is allowed to use this turn. Deliberately
-    doesn't take the turn key `mint_llm_block` mints: this function's own
+    doesn't take the turn key `mint_turn_llm` mints: this function's own
     network call (listing active connections) never uses it, only the final
     block does, so the caller runs the two mints concurrently and folds the
     turn key in afterward instead of sequencing this behind the llm mint.
@@ -1075,8 +1095,8 @@ async def _scoped_browser_block(
 
 
 async def _admit_decisions_proxy(
-    r, browser_block: dict | None, *, turn_key: str, org_id: str | None, user_id: str | None,
-    correlation_id: str, settings: TurnQueueSettings,
+    r, browser_block: dict | None, *, turn_key: str, turn_key_ttl_seconds: int, org_id: str | None,
+    user_id: str | None, correlation_id: str,
 ) -> dict | None:
     """The browser block as the job carries it. One that names the decisions
     proxy (the organization's own decision model, through this server) needs
@@ -1091,7 +1111,7 @@ async def _admit_decisions_proxy(
             raise ValueError("no turn key or identity to record")
         await decisions_proxy.admit(
             r, turn_key=turn_key, org_id=org_id, user_id=user_id, correlation_id=correlation_id,
-            ttl_seconds=settings.turn_key_lifetime_seconds,
+            ttl_seconds=turn_key_ttl_seconds,
         )
     except Exception as exc:
         logger.warning(
@@ -1121,6 +1141,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 run_id: str | None = None,
                                 llm: dict | None = None,
                                 turn_key_id: str | None = None,
+                                turn_key_ttl_seconds: int | None = None,
                                 disabled: list[dict] | None = None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
@@ -1135,7 +1156,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     exactly one terminal: turn_completed, or turn_failed (classified with the
     same (code, message) the caller streams and persists; synthesized locally
     when the worker goes quiet past the idle timeout).
-    `correlation_id`/`llm` reuse a turn key the routing gate already minted.
+    `correlation_id`/`llm` reuse a turn key the routing gate already minted,
+    with its `turn_key_id` and the `turn_key_ttl_seconds` auth minted it for
+    (mint_turn_llm); an `llm` without that lifetime raises ValueError.
     `interactive` tells the pod it may ask `ask_user` questions (web UI turns;
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
@@ -1160,6 +1183,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     (cowork.handlers.responses.remote_turn_skills).
     `reasoning_effort` is the composer's pick for this turn; None leaves the
     pod's configured default."""
+    if llm and turn_key_ttl_seconds is None:
+        raise ValueError("an llm block minted upstream needs the lifetime auth minted its key for")
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
@@ -1204,15 +1229,14 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
             settings=settings, workspace_id=workspace_id,
         )
         if llm:
-            llm_block = llm
+            llm_block, key_ttl_seconds = llm, turn_key_ttl_seconds
             oauth_connections, connector_key = await oauth_connections_coro
         else:
-            mint_llm = _mint_llm_block_with_turn_key_id if settings.needs_turn_key_id else mint_llm_block
             # Both run to the end, so a connector key minted beside a failed
             # turn-key mint is known here and revoked rather than left live.
             llm_result, oauth_result = await asyncio.gather(
-                mint_llm(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
-                         workspace_id=workspace_id),
+                mint_turn_llm(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+                              workspace_id=workspace_id),
                 oauth_connections_coro,
                 return_exceptions=True,
             )
@@ -1223,10 +1247,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                 if connector_key:
                     await _revoke_turn_key_at_turn_end(corr, settings)
                 raise llm_result
-            if settings.needs_turn_key_id:
-                llm_block, turn_key_id = llm_result
-            else:
-                llm_block = llm_result
+            llm_block, turn_key_id, key_ttl_seconds = llm_result
         # Independent auth round trips, run together so custom connections add
         # no turn start time. Both run to the end; the datasource failure wins.
         datasource_result, custom_api_result = await asyncio.gather(
@@ -1293,8 +1314,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         project_id=workspace.project_id if workspace is not None else None,
     )
     browser_block = await _admit_decisions_proxy(
-        r, browser_block, turn_key=llm_block.get("api_key", ""), org_id=org_id, user_id=user_id,
-        correlation_id=corr, settings=settings,
+        r, browser_block, turn_key=llm_block.get("api_key", ""), turn_key_ttl_seconds=key_ttl_seconds,
+        org_id=org_id, user_id=user_id, correlation_id=corr,
     )
 
     # Org-relative, never absolute. cowork-server sees the shared tree at
@@ -1322,7 +1343,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # them through a session of its own.
     turn_settings = await run_on_unit_threads(partial(get_user_settings, scope))
     jev_decisions = getattr(turn_settings, "jev_decisions_enabled", True) is not False
-    time_limit = settings.time_limit_seconds
+    # A key shorter than the time-limited window comes from an auth that
+    # refused that window (auth_keys._request_turn_key), so the turn runs
+    # untimed: no "Keep going" ask the key couldn't outlive.
+    time_limit = settings.time_limit_seconds if key_ttl_seconds >= settings.turn_key_lifetime_seconds else 0
     offer_connector_drafts = bool(
         connector_drafts and settings.connector_drafts_enabled and scope.org_mode and user_id
     )

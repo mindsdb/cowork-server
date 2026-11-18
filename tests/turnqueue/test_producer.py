@@ -29,11 +29,23 @@ def _stub_llm_mint(monkeypatch):
         return "mdb_turnkey"
 
     async def _fake_mint_details(**kw):
-        return MintedTurnKey(key="mdb_turnkey", prefix="turnkey")
+        return MintedTurnKey(key="mdb_turnkey", prefix="turnkey", ttl_seconds=kw["ttl_seconds"])
 
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(_fake_mint))
     # Minted when a turn key prefix is needed: the datasource or the custom connector setting.
     monkeypatch.setattr(prod, "mint_turn_key_details", _fake_mint_details)
+
+
+def turn_key_details_from(mint):
+    """The turn-key mint as mint_turn_llm calls it, answered by a fake of
+    mint_turn_key: the turn key now comes from mint_turn_key_details, the
+    connector key still from mint_turn_key."""
+
+    async def details(**kw):
+        return MintedTurnKey(key=await mint(**kw), prefix="turnkey", ttl_seconds=kw["ttl_seconds"])
+
+    return details
 
 
 class FakeRedis:
@@ -454,6 +466,7 @@ async def test_stream_remote_replies_forwards_started_at_only_when_known(monkeyp
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(fake_mint))
 
     async def fake_list_active_connections(**kw):
         return []
@@ -729,6 +742,7 @@ async def test_stream_remote_replies_attaches_oauth_block_with_the_llm_turn_key(
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(fake_mint))
 
     async def fake_list_active_connections(**kw):
         assert kw["org_id"] == "o1" and kw["user_id"] == "u1"
@@ -787,11 +801,13 @@ async def test_the_connector_key_lives_as_long_as_the_turn_key(monkeypatch, time
     assert by_purpose["execution"] == prod.TurnQueueSettings().turn_key_lifetime_seconds
 
 
-async def _turn_params(monkeypatch, connections, mint):
+async def _turn_params(monkeypatch, connections, mint, *, details=None):
+    """The job of one turn; ``mint`` answers both mints unless ``details`` answers the turn key's."""
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setattr(prod, "mint_turn_key", mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", details or turn_key_details_from(mint))
 
     async def fake_list_active_connections(**kw):
         return connections
@@ -826,12 +842,12 @@ async def test_an_mcp_connection_gets_anton_a_connector_key_and_the_scratchpad_k
 @pytest.mark.asyncio
 async def test_with_datasource_grants_on_an_mcp_connection_still_gets_a_connector_key(monkeypatch):
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
-    monkeypatch.setattr(prod, "mint_turn_key_details", AsyncMock(
-        return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix"),
-    ))
+    details = AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200))
     monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[]))
     calls = []
-    params = await _turn_params(monkeypatch, [{"engine": "notion", "name": "acme"}], _purpose_keyed_mint(calls))
+    params = await _turn_params(
+        monkeypatch, [{"engine": "notion", "name": "acme"}], _purpose_keyed_mint(calls), details=details,
+    )
     assert params["oauth"]["turn_key"] == "mdb_connector"
     assert params["llm"]["api_key"] == "mdb_prefix.secret"
 
@@ -937,6 +953,7 @@ async def test_a_failed_turn_key_mint_revokes_the_connector_key(monkeypatch):
         revoked.append((instance_id, list(minted)))
 
     monkeypatch.setattr(prod, "mint_turn_key", mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(mint))
     monkeypatch.setattr(prod, "revoke_turn_key", revoke)
     monkeypatch.setenv("COWORK_TURN_AUTH_INTERNAL_BASE_URL", "http://auth")
     monkeypatch.setenv("COWORK_TURN_AUTH_INTERNAL_SECRET", "s")
@@ -997,6 +1014,7 @@ async def test_stream_remote_replies_omits_oauth_block_when_no_connections(monke
         return []
 
     monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(fake_mint))
     monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
 
     await _drain(prod.stream_remote_replies(
@@ -1118,7 +1136,7 @@ async def test_datasource_grants_are_registered_before_refs_are_enqueued(monkeyp
 
     async def fake_mint_details(**_kw):
         events.append("mint")
-        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")
+        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)
 
     async def fake_list(**kw):
         events.append("list")
@@ -1184,7 +1202,7 @@ async def test_datasource_grant_mismatch_fails_before_enqueue(monkeypatch):
     monkeypatch.setattr(
         prod,
         "mint_turn_key_details",
-        AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+        AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)),
     )
     monkeypatch.setattr(
         prod,
@@ -1231,7 +1249,7 @@ async def test_datasource_grant_binding_mismatch_fails_before_enqueue(monkeypatc
     monkeypatch.setattr(
         prod,
         "mint_turn_key_details",
-        AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+        AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)),
     )
     monkeypatch.setattr(
         prod,
@@ -1283,7 +1301,7 @@ async def test_an_auth_outage_during_turn_setup_ends_the_turn_as_permission_unav
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
     calls = {
-        "mint_turn_key_details": AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+        "mint_turn_key_details": AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)),
         "list_verified_datasource_connections": AsyncMock(return_value=[{
             "id": 7, "connector_id": "postgres", "name": "events", "status": "verified", "credential_version": 3,
         }]),
@@ -1326,6 +1344,7 @@ async def test_llm_mint_and_oauth_connections_fetch_run_concurrently(monkeypatch
         return []
 
     monkeypatch.setattr(prod, "mint_turn_key", slow_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(slow_mint))
     monkeypatch.setattr(prod, "list_active_connections", tracking_list_active_connections)
 
     try:
@@ -1353,6 +1372,7 @@ async def test_stream_remote_replies_mints_and_attaches_llm_block(monkeypatch):
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(_fake_mint))
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
@@ -1400,6 +1420,7 @@ async def test_stream_remote_replies_forwards_the_active_hub_workspace(monkeypat
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(_fake_mint))
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
@@ -1429,7 +1450,7 @@ async def test_the_active_hub_workspace_binds_the_key_with_datasources_on_too(mo
 
     async def _fake_mint(**kw):
         captured.update(kw)
-        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")
+        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)
 
     monkeypatch.setattr(prod, "mint_turn_key_details", _fake_mint)
     monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[]))
@@ -1462,6 +1483,7 @@ async def test_stream_remote_replies_omits_workspace_id_when_none_picked(monkeyp
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(_fake_mint))
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
@@ -1951,7 +1973,7 @@ async def test_artifact_authority_outage_stops_before_queue_side_effects(monkeyp
     with pytest.raises(prod.product_permissions.ProductPermissionUnavailable):
         await _drain(prod.stream_remote_replies(
             conversation_id="conv-1", org_id="org", user_id="user", input_text="run",
-            model="m", llm={"api_key": "already-minted-key"},
+            model="m", llm={"api_key": "already-minted-key"}, turn_key_ttl_seconds=1200,
         ))
     assert permissions == ["product.execute", "artifact.manage"]
     redis.assert_not_called()
@@ -1983,7 +2005,7 @@ async def test_a_hosted_turn_registers_grants_against_the_gate_minted_key(monkey
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
     assert TurnQueueSettings().datasource_enabled is True
-    for name in ("mint_turn_key", "mint_turn_key_details", "mint_llm_block", "_mint_llm_block_with_turn_key_id"):
+    for name in ("mint_turn_key", "mint_turn_key_details", "mint_llm_block", "mint_turn_llm"):
         monkeypatch.setattr(prod, name, AsyncMock(side_effect=AssertionError(f"{name} minted a second key")))
     monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[_verified(7)]))
     register = AsyncMock(return_value=_echo([(7, 3)], turn_key_id="mdb_gate"))
@@ -1992,7 +2014,7 @@ async def test_a_hosted_turn_registers_grants_against_the_gate_minted_key(monkey
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block, turn_key_id="mdb_gate",
+        correlation_id="r", llm=block, turn_key_id="mdb_gate", turn_key_ttl_seconds=1200,
     ))
 
     assert register.await_args.kwargs["turn_key_id"] == "mdb_gate"
@@ -2025,7 +2047,7 @@ async def test_a_listing_auth_cannot_answer_costs_the_turn_its_databases_not_the
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block, turn_key_id="mdb_gate",
+        correlation_id="r", llm=block, turn_key_id="mdb_gate", turn_key_ttl_seconds=1200,
     ))
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
@@ -2068,7 +2090,7 @@ async def _queued_datasource(monkeypatch, listing, *, labels: bool) -> dict | No
     block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "https://minds.internal/v1"}
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block, turn_key_id="mdb_gate",
+        correlation_id="r", llm=block, turn_key_id="mdb_gate", turn_key_ttl_seconds=1200,
     ))
     return json.loads(fake.added[0][1]["payload"])["params"].get("datasource")
 
@@ -2516,7 +2538,9 @@ async def test_the_users_image_model_reaches_the_pod_and_an_upstream_pick_is_kep
         return fake
 
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    monkeypatch.setattr(prod, "mint_turn_key", AsyncMock(return_value="mdb_turnkey"))
+    mint = AsyncMock(return_value="mdb_turnkey")
+    monkeypatch.setattr(prod, "mint_turn_key", mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(mint))
     monkeypatch.setattr(
         user_settings.UserSettings,
         "image_model_for_agent",
@@ -2533,7 +2557,7 @@ async def test_the_users_image_model_reaches_the_pod_and_an_upstream_pick_is_kep
     block = {"provider": "minds-cloud", "api_key": "k", "base_url": "https://minds.internal/v1", "image_model": "x"}
     await asyncio.wait_for(_drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block,
+        correlation_id="r", llm=block, turn_key_ttl_seconds=1200,
     )), timeout=5)
     assert json.loads(fake.added[0][1]["payload"])["params"]["llm"]["image_model"] == "x"
 
@@ -2547,7 +2571,9 @@ async def test_no_image_model_reaches_the_pod_before_mindshub_lists_one(monkeypa
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-    monkeypatch.setattr(prod, "mint_turn_key", AsyncMock(return_value="mdb_turnkey"))
+    mint = AsyncMock(return_value="mdb_turnkey")
+    monkeypatch.setattr(prod, "mint_turn_key", mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(mint))
     monkeypatch.setattr(user_settings.UserSettings, "image_model_for_agent", property(lambda self: None))
 
     await asyncio.wait_for(_drain(prod.stream_remote_replies(
@@ -2811,6 +2837,7 @@ def _turn_with_key(monkeypatch, replies):
     return prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
         llm={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
+        turn_key_ttl_seconds=1200,
     )
 
 
@@ -2862,6 +2889,7 @@ async def _cancel_mid_turn(monkeypatch, *, stopped: bool) -> None:
     task = asyncio.create_task(_drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
         llm={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
+        turn_key_ttl_seconds=1200,
     )))
     await fake.waiting.wait()
     if stopped:

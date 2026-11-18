@@ -1067,9 +1067,9 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
         minted["corr"] = correlation_id
         minted["workspace_id"] = workspace_id
-        return block
+        return producer.TurnLlm(block=block, turn_key_id=None, ttl_seconds=1200)
 
-    monkeypatch.setattr(producer, "mint_llm_block", fake_mint)
+    monkeypatch.setattr(producer, "mint_turn_llm", fake_mint)
 
     trace_token = set_trace_context(TraceContext(session_id="conv-router"))
     try:
@@ -1096,7 +1096,7 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     # with an older dependency that never reads it when building headers.
     metadata = json.loads(requests[0].headers["Langfuse-Metadata"])
     assert metadata["role"] == "router"
-    assert turn_llm == {"correlation_id": minted["corr"], "llm": block}
+    assert turn_llm == {"correlation_id": minted["corr"], "llm": block, "turn_key_ttl_seconds": 1200}
     # The routing gate's own pre-mint must carry the caller's picked workspace
     # too — this key is what a delegated remote turn ends up reusing as its
     # `llm` block, so skipping it here would silently exempt every hosted-org
@@ -1129,9 +1129,12 @@ async def test_router_binding_omits_workspace_id_when_none_picked(monkeypatch):
 
     async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
         minted["workspace_id"] = workspace_id
-        return {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
+        return producer.TurnLlm(
+            block={"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"},
+            turn_key_id=None, ttl_seconds=1200,
+        )
 
-    monkeypatch.setattr(producer, "mint_llm_block", fake_mint)
+    monkeypatch.setattr(producer, "mint_turn_llm", fake_mint)
 
     await handler._router_binding()
 
@@ -1168,15 +1171,17 @@ async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_
 
     async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
         minted["workspace_id"] = workspace_id
-        return block, "mdb_gate"
+        return producer.TurnLlm(block=block, turn_key_id="mdb_gate", ttl_seconds=6000)
 
-    monkeypatch.setattr(producer, "_mint_llm_block_with_turn_key_id", fake_mint)
+    monkeypatch.setattr(producer, "mint_turn_llm", fake_mint)
     monkeypatch.setattr(producer, "mint_llm_block", AsyncMock(side_effect=AssertionError("minted without the prefix")))
 
     _, turn_llm = await handler._router_binding()
 
     assert turn_llm["llm"] == block
     assert turn_llm["turn_key_id"] == "mdb_gate"
+    # The producer sizes the job's time limit to the key auth actually minted.
+    assert turn_llm["turn_key_ttl_seconds"] == 6000
     # The workspace a person picked binds the key whether or not datasources are on.
     assert minted["workspace_id"] == "ws-picked"
 
@@ -1200,9 +1205,10 @@ async def test_the_gate_mints_a_prefixed_key_when_either_setting_needs_one(monke
         lambda scope: SimpleNamespace(resolved_router_provider=Provider.MINDS_CLOUD, resolved_router_model="kimi",
                                       resolved_gate_model="mindshub_air", hub_workspace_id=""),
     )
-    block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "http://gw/v1"}
-    monkeypatch.setattr(producer, "_mint_llm_block_with_turn_key_id", AsyncMock(return_value=(block, "mdb_gate")))
-    monkeypatch.setattr(producer, "mint_llm_block", AsyncMock(return_value=block))
+    from cowork.turnqueue.auth_keys import MintedTurnKey
+
+    monkeypatch.setattr(producer, "mint_turn_key_details", AsyncMock(
+        return_value=MintedTurnKey(key="mdb_gate.secret", prefix="mdb_gate", ttl_seconds=1200)))
 
     _, turn_llm = await handler._router_binding()
 

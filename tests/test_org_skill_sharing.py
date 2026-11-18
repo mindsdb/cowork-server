@@ -1918,7 +1918,7 @@ def test_the_producer_sends_the_skills_block(monkeypatch):
         monkeypatch.setattr(producer, "_mint_datasource_block", datasource)
         gen = producer.stream_remote_replies(
             conversation_id="c", org_id=ORG_ID, user_id=BOB, input_text="hi", model="m",
-            llm={"api_key": "k"}, skills=skills,
+            llm={"api_key": "k"}, turn_key_ttl_seconds=1200, skills=skills,
         )
         with pytest.raises(RuntimeError):
             await gen.__anext__()

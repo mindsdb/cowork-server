@@ -150,6 +150,7 @@ async def test_queued_reuse_denial_precedes_redis_even_with_an_existing_key(
             input_text="Run",
             model="free-model",
             llm={"api_key": "old-key"},
+            turn_key_ttl_seconds=1200,
         ):
             pass
     redis.assert_not_called()
@@ -630,6 +631,7 @@ async def test_hosted_queue_cannot_hide_missing_identity_as_desktop(monkeypatch)
                 input_text="Run",
                 model="free-model",
                 llm={"api_key": "old-key"},
+                turn_key_ttl_seconds=1200,
             ):
                 pass
         assert calls == []
