@@ -1165,6 +1165,17 @@ class AppSettings(Settings):
             "out. Set to false to degrade to plain-text questions (ENG-1984)."
         ),
     )
+    remote_docs: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_REMOTE_DOCS"),
+        description=(
+            "Org mode: whether a remote (pod) turn's agent gets the doc tools, which "
+            "this server runs for the pod (cowork/turnqueue/host_tools.py). Off by "
+            "default. Turn it on only once the anton image and scratchpad-controller "
+            "that relay host tools are deployed: before that the turn's input tells "
+            "the agent to call doc tools its pod does not have."
+        ),
+    )
     quick_edit_enabled: bool = Field(
         default=True,
         validation_alias=AliasChoices("COWORK_QUICK_EDIT_ENABLED"),

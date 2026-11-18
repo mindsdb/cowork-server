@@ -177,6 +177,12 @@ def health() -> dict:
         # through signed links (cowork/draft_host). The web client reads it at
         # boot and then opens an HTML draft by link instead of through srcdoc.
         "draft_links": get_app_settings().draft_links_enabled(),
+        # Whether the agent works on docs here: always on the desktop; in org
+        # mode only with remote docs and ask_user both on, because doc tools
+        # answer the pod on the stdin only an interactive turn keeps open.
+        "docs_enabled": (not _org_mode) or bool(
+            get_app_settings().remote_docs and get_app_settings().ask_user_enabled
+        ),
         "minds_runtime_credential_required": _minds_runtime_credential_required(
             settings, org_mode=_org_mode
         ),
