@@ -283,3 +283,42 @@ def test_postgres_upgrade_downgrade_cycle(monkeypatch):
     finally:
         command.downgrade(cfg, "base")
         get_app_settings.cache_clear()
+
+
+def _insert_connector(engine, *, created_by):
+    """One org-a custom connector row under the id acme, built by ``created_by``."""
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "insert into custom_connectors "
+                "(id, connector_id, label, description, spec, featured, org_id, created_by) "
+                "values (:id, 'acme', 'Acme', '', '{}', true, 'org-a', :created_by)"
+            ),
+            {"id": uuid4(), "created_by": created_by},
+        )
+
+
+@pytest.mark.postgres_service
+def test_postgres_custom_connectors_are_unique_per_builder(monkeypatch):
+    # The partial indexes' WHERE clauses are dialect-specific, so check them on
+    # Postgres too: two members share an id, one member cannot repeat it.
+    if not POSTGRES_URI:
+        missing_prerequisite(
+            "set COWORK_TEST_POSTGRES_URI to a disposable database",
+            required_by="COWORK_REQUIRE_SERVICES",
+        )
+    monkeypatch.setenv("DATABASE_URI", POSTGRES_URI)
+    get_app_settings.cache_clear()
+    cfg = Config("alembic.ini")
+    engine = create_engine(POSTGRES_URI)
+    try:
+        command.upgrade(cfg, "head")
+        _insert_connector(engine, created_by="user-1")
+        _insert_connector(engine, created_by="user-2")
+        with pytest.raises(IntegrityError):
+            _insert_connector(engine, created_by="user-1")
+    finally:
+        with engine.begin() as connection:
+            connection.execute(text("delete from custom_connectors"))
+        command.downgrade(cfg, "base")
+        get_app_settings.cache_clear()

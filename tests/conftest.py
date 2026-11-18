@@ -675,6 +675,47 @@ def blocking_work_guard():
         )
 
 
+@pytest.fixture(autouse=True)
+def pinned_responses_released():
+    """Fail a test that leaves a PinnedStreamingResponse's descriptors open.
+
+    Only the response's ASGI call releases them. A test that reads
+    ``body_iterator`` or only the headers leaves the artifact folder's
+    descriptors to the garbage collector, and a later collection can close
+    them on the event loop of whichever test is running then, which the
+    blocking guard pins on that innocent test. The leak is closed here, off
+    the loop, so it fails only the test that made it.
+
+    It patches by hand, not with ``monkeypatch``: an autouse fixture that asks
+    for ``monkeypatch`` sets it up first, so a test's own patches would then
+    be undone after every other fixture's teardown has run against them.
+    """
+    from cowork.api.v1.pinned_response import PinnedStreamingResponse
+
+    made: list[PinnedStreamingResponse] = []
+    init = PinnedStreamingResponse.__init__
+
+    def recording_init(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        made.append(self)
+
+    PinnedStreamingResponse.__init__ = recording_init
+    try:
+        yield
+    finally:
+        PinnedStreamingResponse.__init__ = init
+    open_ones = [response for response in made if response._resources._exit_callbacks]
+    for response in open_ones:
+        response._resources.close()
+    if open_ones:
+        pytest.fail(
+            f"{len(open_ones)} PinnedStreamingResponse(s) never released their descriptors: "
+            "send the response through its ASGI call (tests/support/pinned_responses.py "
+            "served_body) instead of reading body_iterator",
+            pytrace=False,
+        )
+
+
 def pytest_sessionstart(session):
     session.config.pluginmanager.register(
         _blocking_guard.StaleEntryCheck(tests_dir=Path(__file__).parent, reached=_GUARD_REACHED),
