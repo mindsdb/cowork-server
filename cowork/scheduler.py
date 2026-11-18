@@ -400,6 +400,9 @@ class _TurnEvidence:
     failure: _TurnFailure | None = None
     # Why a turn that ended on its own stopped early (anton's `ended_by`).
     stopped_by: str | None = None
+    # What the turn handed the browser to a person for (its hand-over's
+    # reason), when it did. A scheduled run has nobody to take it.
+    handed_over: str | None = None
 
 
 @dataclass(frozen=True)
@@ -444,12 +447,23 @@ _LIMIT_ERRORS = {
 }
 
 
+def _hand_over_error(reason: str) -> str:
+    return (
+        f"Run needed someone in the browser and stopped there: {reason} "
+        "A scheduled run has nobody to do that. Check the task's connections and sign-ins, then run it again."
+    )
+
+
 def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
     """What the turn's ending says about whether its agent acted, and what to
     tell the user: the turn's own failure text when it gave one. When in doubt
     it says the agent may have acted."""
     reason = evidence.reason
     if reason == "completed":
+        if evidence.handed_over is not None:
+            # The agent ends its turn once nobody takes the browser, so the
+            # turn reads as finished though its work stopped at that step.
+            return _AttemptEnd(outcome=AttemptOutcome.needed_person, error=_hand_over_error(evidence.handed_over))
         limit_error = _LIMIT_ERRORS.get(evidence.stopped_by or "")
         if limit_error:
             return _AttemptEnd(outcome=AttemptOutcome.stopped_at_limit, error=limit_error)
@@ -1136,6 +1150,7 @@ async def _execute_schedule(
                             AttemptOutcome.failed_during_execution,
                             AttemptOutcome.interrupted,
                             AttemptOutcome.stopped_at_limit,
+                            AttemptOutcome.needed_person,
                         }
                         and not shutdown_interrupted
                     ),
@@ -1454,6 +1469,7 @@ async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
         failure=failure,
         shutdown_interrupted=shutdown_interrupted,
         stopped_by=await _turn_stopped_by(conversation_id) if reason == "completed" else None,
+        handed_over=await _turn_handed_over(conversation_id) if reason == "completed" else None,
     )
 
 
@@ -1487,6 +1503,56 @@ async def _turn_stopped_by(conversation_id: str) -> str | None:
         )
         return None
     return stopped_by
+
+
+# anton's browser tool, and its action that gives the browser to the person.
+_BROWSER_TOOL = "browser"
+_HAND_OVER_ACTION = "hand_to_user"
+_HAND_OVER_DEFAULT_REASON = "This step needs you."
+
+
+async def _turn_handed_over(conversation_id: str) -> str | None:
+    """The reason of the last browser hand-over the turn's agent called, read
+    from its tool frames: a tool's first frame names it and a later one holds
+    its input. None when it called none, or when the frames can't be read.
+
+    Only call after the turn's stream has been fully drained."""
+    handle = registry.get(conversation_id)
+    if handle is None:
+        return None
+    named: dict[str, str] = {}
+    handed_over: str | None = None
+    try:
+        async with asyncio.timeout(_EVIDENCE_READ_TIMEOUT_SECONDS):
+            async for rec in handle.buffer.tail(0):
+                if rec.is_terminal:
+                    break
+                for event, data in _sse_frames(rec):
+                    call_id, content = data.get("tool_use_id"), data.get("content")
+                    if event != "response.in_progress" or not isinstance(call_id, str) or not isinstance(content, str):
+                        continue
+                    if call_id not in named:
+                        named[call_id] = content
+                        continue
+                    if named[call_id] != _BROWSER_TOOL:
+                        continue
+                    try:
+                        call = json.loads(content)
+                    except ValueError:
+                        continue
+                    if isinstance(call, dict) and call.get("action") == _HAND_OVER_ACTION:
+                        reason = call.get("reason")
+                        handed_over = (
+                            " ".join(reason.split()) if isinstance(reason, str) and reason.strip()
+                            else _HAND_OVER_DEFAULT_REASON
+                        )
+    except Exception:
+        logger.exception(
+            "Could not read whether the turn handed over its browser",
+            extra=log_context(conversation_id=conversation_id)
+        )
+        return None
+    return handed_over
 
 
 async def _turn_activity(conversation_id: str) -> tuple[bool, _TurnFailure | None]:

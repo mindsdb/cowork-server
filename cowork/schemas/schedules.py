@@ -62,6 +62,9 @@ class AttemptOutcome(str, Enum):
     # The turn ended on its own, but at one of its limits (steps, tokens or
     # automatic continuations) with nobody there to say "keep going".
     stopped_at_limit = "stopped_at_limit"
+    # The turn ended on its own after handing the browser to a person (a
+    # sign-in, a code, a payment) with nobody there to do it.
+    needed_person = "needed_person"
     # Failed before the agent could act: setup or permission, or a turn whose
     # stream shows nothing but its start, its memory read and its failure.
     failed_before_execution = "failed_before_execution"
