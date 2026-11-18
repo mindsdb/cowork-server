@@ -398,7 +398,9 @@ class CodingSessionFactory:
         request = pending.request
         preparation: LocalSessionPreparation | None = None
         try:
-            preparation = self._prepare_local_session(session_id, request, pending.project, pending.workspace_mode)
+            preparation = self._prepare_local_session(
+                session_id, request, pending.project, pending.workspace_mode, deleted=deleted,
+            )
             contexts = list(request.source_contexts)
             skill_resolution = self.skills.resolve(session_id, preparation.project, pending.code_skills)
             session = self._build_local_session(
@@ -542,6 +544,8 @@ class CodingSessionFactory:
         request: SessionCreateRequest,
         project: CodeProject | None,
         workspace_mode: WorkspaceMode = WorkspaceMode.worktree,
+        *,
+        deleted: Callable[[], bool],
     ) -> LocalSessionPreparation:
         requested_dirs = validate_directories(request.additional_dirs)
         if project is None:
@@ -582,7 +586,7 @@ class CodingSessionFactory:
         prepared = (
             self.project_workspaces.prepare_in_place(session_id, selected_project)
             if workspace_mode == WorkspaceMode.in_place
-            else self.project_workspaces.prepare(session_id, selected_project, request.repository_setup)
+            else self.project_workspaces.prepare(session_id, selected_project, request.repository_setup, deleted=deleted)
         )
         permission_mode = (
             request.permission_mode
