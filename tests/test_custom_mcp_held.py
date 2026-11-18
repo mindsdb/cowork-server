@@ -194,6 +194,36 @@ class TestTurnsReadOnlyHeldSettings:
         assert connecting.load(CUSTOM_MCP_ENGINE, CONN) == {}
         assert connecting.read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == {}
 
+    def test_a_turned_off_custom_connection_keeps_only_its_file_labels_in_the_connecting_view(self, protected):
+        _write_file({**AGENT_WRITTEN, "_user_label": "Tracker"})
+        _hold()
+        source = turn_vault_for_scope(LOCAL_SCOPE)
+        filtered = FilteredDataVault(source=source, hidden=frozenset({(CUSTOM_MCP_ENGINE, CONN)}))
+        connecting = app_held.turn_vault(filtered, source_vault=source, root=own_vault_root(LOCAL_SCOPE)).for_connecting()
+        labels = {"_label": "Renamed by agent", "_user_label": "Tracker"}
+        assert connecting.load(CUSTOM_MCP_ENGINE, CONN) == labels
+        assert connecting.read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == labels
+
+    def test_a_source_that_cannot_say_what_it_hides_reads_as_hiding(self, protected):
+        _write_file(AGENT_WRITTEN)
+        _hold()
+
+        class Wrapper:
+            """A vault wrapper with no ``hides``, which could stand in front of a hidden view."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def load(self, engine, name):
+                return self._inner.load(engine, name)
+
+            def read_record(self, engine, name):
+                return self._inner.read_record(engine, name)
+
+        vault = app_held.AppHeldVault(source=Wrapper(turn_vault_for_scope(LOCAL_SCOPE)), root=own_vault_root(LOCAL_SCOPE))
+        assert vault.load(CUSTOM_MCP_ENGINE, CONN) == {"_label": "Renamed by agent"}
+        assert vault.read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == {"_label": "Renamed by agent"}
+
     @pytest.mark.parametrize("method", [None, "MCP", " mcp", "mcp\n"])
     def test_the_file_method_does_not_decide_whether_held_settings_are_read(self, protected, method):
         written = {key: value for key, value in AGENT_WRITTEN.items() if key != "_method"}

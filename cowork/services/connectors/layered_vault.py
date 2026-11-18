@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
-from anton.core.datasources.data_vault import DataVault, _slug_env_prefix
+from anton.core.datasources.data_vault import DataVault, LocalDataVault, _slug_env_prefix
 
 from cowork.creators import Changer
 from cowork.managed import SharedConnection
@@ -382,9 +382,13 @@ class FilteredDataVault:
 
     def hides(self, engine: str, name: str) -> bool:
         """Whether this vault, or a filtered vault it reads through, turned
-        the connection off."""
-        source_hides = getattr(self._source, "hides", None)
-        return self._hides(engine, name) or (source_hides is not None and source_hides(engine, name))
+        the connection off. A source of any other kind than a filtered,
+        layered or plain vault counts as hiding it, since it cannot be asked."""
+        if self._hides(engine, name):
+            return True
+        if isinstance(self._source, FilteredDataVault):
+            return self._source.hides(engine, name)
+        return not isinstance(self._source, (LayeredDataVault, LocalDataVault))
 
     def save(
         self,
