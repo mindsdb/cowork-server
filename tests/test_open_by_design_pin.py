@@ -19,9 +19,8 @@ that has stopped protecting anything, and a route with no entry is the case
 this exists for.
 
 Only ``OpenByDesign`` is pinned. The other non-identity declarations
-(``LoopbackOnly``, ``DesktopOnly``, ``LoopbackDesktopOnly``) each carry a
-check that refuses, so a route inheriting
-one of those from a router inherits a closed door. ``OpenByDesign`` is the
+(``DesktopOnly``, ``LoopbackDesktopOnly``) each carry a check that refuses, so a route inheriting one of those from a router
+inherits a closed door. ``OpenByDesign`` is the
 only declaration where inheriting it is the hazard.
 """
 from __future__ import annotations
