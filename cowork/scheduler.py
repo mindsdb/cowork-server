@@ -514,16 +514,15 @@ def org_runs_full(session: ScopedSession, schedule: Schedule) -> bool:
 
 
 def _renew_run_lease(session: ScopedSession, *, run_id: UUID) -> bool | None:
-    if session.get(ScheduleRun, run_id) is None:
-        return None
     return ScheduleRunService(session).renew_lease(run_id, _RUN_LEASE_SECONDS)
 
 
 async def _renew_lease(run_id: UUID, *, schedule_id: UUID, lost: asyncio.Event | None = None) -> None:
     """Renew the run's lease until cancelled, so no replica reaps it while it
     lives. A renewal the pool refuses is tried again at the next interval. A
-    run that is no longer `running` was reaped by another replica, so renewing
-    stops there and ``lost`` is set."""
+    run that is no longer `running` was reaped by another replica, and a run
+    that is gone was deleted with its task; renewing stops there and ``lost``
+    is set."""
     while True:
         await asyncio.sleep(_LEASE_RENEW_SECONDS)
         try:
