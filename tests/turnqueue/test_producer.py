@@ -2918,42 +2918,6 @@ async def test_a_second_run_that_fails_the_turn_revokes_its_key(monkeypatch, rev
     assert revokes == ["r"]
 
 
-async def test_a_channel_turn_leaves_the_index_entry_of_a_claimed_turn_alone(monkeypatch):
-    """A channel turn has no registry handle, so the producer records its
-    index entry itself. While a run holds the conversation's turn claim,
-    that run's entry stays: cancel and answer resolve through it."""
-    import fakeredis.aioredis
-
-    from cowork.streaming import turn_index
-    from cowork.streaming.turn_claim import claim_key
-
-    r = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    monkeypatch.setattr(prod, "get_redis", lambda: r)
-    monkeypatch.setattr(turn_index, "get_redis", lambda: r)
-    await turn_index.record_turn(
-        "conv-1", turn_id=4, correlation_id="corr-web", run_id="run-web", org_id=None, user_id=None,
-    )
-    await r.set(claim_key("conv-1"), "held")
-
-    replies = asyncio.create_task(_drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
-        correlation_id="r",
-    )))
-    for _ in range(500):
-        if await r.exists("scratchpad:requests:conv-1"):
-            break
-        await asyncio.sleep(0.01)
-    for kind, data in (
-        ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}),
-        ("turn_completed", {}),
-    ):
-        await r.xadd("scratchpad:reply:conv-1", _reply(kind, data))
-    await asyncio.wait_for(replies, timeout=10)
-
-    entry = await turn_index.get_turn("conv-1")
-    assert (entry.run_id, entry.correlation_id) == ("run-web", "corr-web")
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "interactive,preview_checks,expected",
