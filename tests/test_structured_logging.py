@@ -205,8 +205,17 @@ def test_console_is_json_and_omits_exception_values(monkeypatch):
     assert "test_console_is_json" in event["exception"]
 
 
+def _health_probe_paths() -> list[str]:
+    """Every route of the health router, as the kubelet and clients ask for
+    it: derived from the router, so a new probe route is covered too."""
+    from cowork.api.v1.endpoints import health
+
+    return sorted(f"/api/v1/health{route.path}" for route in health.router.routes)
+
+
+@pytest.mark.parametrize("path", _health_probe_paths())
 @pytest.mark.parametrize("mode", ["errors", "all"])
-def test_successful_probe_is_quiet_but_failed_probe_survives(monkeypatch, mode):
+def test_successful_probe_is_quiet_but_failed_probe_survives(monkeypatch, mode, path):
     from cowork.common.structured_logging import AccessLogFilter, make_formatter
 
     monkeypatch.setenv("ACCESS_LOG_MODE", mode)
@@ -219,7 +228,7 @@ def test_successful_probe_is_quiet_but_failed_probe_survives(monkeypatch, mode):
             __file__,
             1,
             '%s - "%s %s HTTP/%s" %d',
-            ("secret-client", "GET", "/api/v1/health/live?token=secret", "1.1", status),
+            ("secret-client", "GET", f"{path}?token=secret", "1.1", status),
             None,
         )
 

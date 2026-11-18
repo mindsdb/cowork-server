@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
+from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 
@@ -30,6 +32,8 @@ from cowork.coding.contracts import (
     TaskCapabilities,
     TaskCapability,
     WorkspaceInspection,
+    WorkspaceMode,
+    WorkspaceModeOptions,
     WorkspaceUsagePage,
 )
 from cowork.coding.control_errors import StateConflict
@@ -69,7 +73,9 @@ from cowork.coding.store import CodingStore
 from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn
-from cowork.coding.workspace import WorkspaceError, WorkspaceManager
+from cowork.coding.workspace import WorkspaceError, WorkspaceManager, _org_mode
+from cowork.coding.workspace_mode import without_in_place, without_worktree, workspace_mode_options
+from cowork.coding.workspace_retention import RetentionPolicy, WorkspaceRetention
 from cowork.coding.workspace_usage import WorkspaceUsage
 from cowork.common.settings.app_settings import get_app_settings
 
@@ -85,6 +91,7 @@ class CodingService(
     CodingTurnOperations,
 ):
     EXPIRY_INTERVAL_SECONDS = 5.0
+    RETENTION_INTERVAL_SECONDS = 3600.0
 
     def __init__(
         self,
@@ -112,6 +119,7 @@ class CodingService(
             control_store,
         )
         self.project_store = CodeProjectStore(root, self.control.local_computer.id)
+        self._rebind_retired_local_projects()
         self.skill_library = SkillLibraryService(root, self.project_store, self.workspaces.git)
         self.projects = CodeProjectService(
             root,
@@ -127,6 +135,9 @@ class CodingService(
         self._lock = threading.RLock()
         self._running: dict[str, RunningTurn] = {}
         self._maintenance: set[str] = set()
+        # Folders outside a task's own workspace that a maintenance operation
+        # is changing, so no other task's turn or operation changes them too.
+        self._maintenance_roots: dict[str, frozenset[Path]] = {}
         self.approvals = ApprovalBroker(
             self._approval_opened, self._approval_closed,
             lambda session_id: self.store.load_session(session_id).command_approval_grants,
@@ -137,6 +148,17 @@ class CodingService(
         )
         self.questions = QuestionBroker(self._question_opened, self._question_closed)
         self.runtimes = RuntimeManager(root, self.registry, self._engine_request)
+        self.retention = WorkspaceRetention(
+            store=self.store,
+            workspaces=self.workspaces,
+            runtimes=self.runtimes,
+            lock=self._lock,
+            running=self._running,
+            maintenance=self._maintenance,
+            is_remote=self._is_remote,
+            control_view=self._control_view,
+            on_disk_change=self.workspace_usage.invalidate,
+        )
         self.lifecycle = SessionLifecycleOperations(
             maintenance_session=self._maintenance_session,
             emit=self._emit,
@@ -230,6 +252,9 @@ class CodingService(
                     exc,
                 )
                 project = None
+            if session.computer_id in self.control.retired_local_computer_ids:
+                session.computer_id = self.control.local_computer.id
+                self.store.save_session(session, touch_updated_at=False)
             snapshot = self.control.migrate_session(session, project)
             if not session.task_id or not session.run_id or not session.computer_id:
                 session.task_id = snapshot.task.id
@@ -240,6 +265,8 @@ class CodingService(
                 self.store.save_session(session, touch_updated_at=False)
             self.project_workspaces.restore_ports(session.id, session.allocated_ports)
         self._expiry_stop = threading.Event()
+        # The first retention pass waits one expiry interval so startup is not delayed.
+        self._next_retention_at = time.monotonic()
         self._expiry_thread = threading.Thread(
             target=self._expire_periodically,
             args=(expiry_interval_seconds,),
@@ -247,6 +274,26 @@ class CodingService(
             daemon=True,
         )
         self._expiry_thread.start()
+
+    def _rebind_retired_local_projects(self) -> None:
+        """Point project folders recorded against a retired local computer at the live one."""
+        retired = self.control.retired_local_computer_ids
+        if not retired:
+            return
+        local_id = self.control.local_computer.id
+
+        def rebind(project: CodeProject) -> None:
+            for resource in project.resources:
+                if resource.computer_id in retired:
+                    resource.computer_id = local_id
+
+        affected = {
+            project.id: rebind
+            for project in self.project_store.list()
+            if any(resource.computer_id in retired for resource in project.resources)
+        }
+        if affected:
+            self.project_store.update_many(affected)
 
     def expire_stale_state(self) -> None:
         """Mark silent computers offline and abandoned leases recovering."""
@@ -259,6 +306,27 @@ class CodingService(
                 self.expire_stale_state()
             except Exception:
                 logger.exception("Could not expire stale coding control-plane state")
+            if time.monotonic() >= self._next_retention_at:
+                self._next_retention_at = time.monotonic() + self.RETENTION_INTERVAL_SECONDS
+                try:
+                    self.run_workspace_retention()
+                except Exception:
+                    logger.exception("Could not release idle coding task workspaces")
+
+    def run_workspace_retention(self) -> list[str]:
+        """Release workspaces of archived and long-idle tasks to reclaim disk."""
+        if _org_mode():
+            return []
+        settings = get_app_settings().coding
+        return self.retention.run_policy(RetentionPolicy(
+            enabled=settings.workspace_retention_enabled,
+            keep_count=settings.workspace_keep_count,
+            min_idle=timedelta(hours=settings.workspace_min_idle_hours),
+        ))
+
+    def ensure_workspace(self, session_id: str, *, reserved: bool = False) -> None:
+        """Rebuild a task's released workspace, with its changes, before use."""
+        self.retention.ensure_restored(session_id, reserved=reserved)
 
     def workspace_usage_page(self, session_id: str | None = None) -> WorkspaceUsagePage:
         """Approximate storage Cowork manages for each task, measured in the background."""
@@ -266,6 +334,53 @@ class CodingService(
 
     def capabilities(self) -> list[EngineCapabilities]:
         return self.registry.capabilities()
+
+    def workspace_mode_options(
+        self, project_id: str | None, computer_id: str | None, path: str | None = None,
+    ) -> WorkspaceModeOptions:
+        """The workspace modes a new task on this project and computer could use.
+
+        A task with no computer chosen is shown as running here, matching the
+        composer's default target. For a project, or given the folder a
+        folder task would use, the answer also reflects what those folders
+        allow, checked the same way creating the task checks them: any
+        existing folder can be worked in, and a worktree needs a Git
+        repository with a commit.
+        """
+        project = self.projects.get(project_id) if project_id else None
+        runs_locally = computer_id in {None, self.control.local_computer.id}
+        options = workspace_mode_options(
+            project.default_workspace_mode if project else None,
+            runs_locally=runs_locally,
+            org_mode=_org_mode(),
+        )
+        if not runs_locally:
+            return options
+        if WorkspaceMode.in_place in options.supported and (project is not None or path):
+            try:
+                self.session_factory.in_place_roots(project, None, path)
+            except (WorkspaceError, ValueError) as exc:
+                options = without_in_place(options, exc)
+        if project is not None:
+            problem = self.project_workspaces.worktree_problem(project)
+            return without_worktree(options, problem) if problem else options
+        if not path:
+            return options
+        try:
+            self.workspaces.check_source(path)
+        except WorkspaceError as exc:
+            inspection = self.workspaces.inspect(path)
+            options = without_worktree(
+                options,
+                exc,
+                can_initialize_git=inspection.is_directory and not inspection.is_git and not _org_mode(),
+            )
+        return options
+
+    def initialize_git(self, path: str) -> WorkspaceModeOptions:
+        """Make a folder on this computer a Git repository, then say what it allows."""
+        self.workspaces.initialize_git(path)
+        return self.workspace_mode_options(None, None, path)
 
     def inspect_workspace(self, path: str) -> WorkspaceInspection:
         return self.workspaces.inspect(path)
@@ -283,6 +398,7 @@ class CodingService(
 
     def _prepared_session(self, session_id: str) -> CodingSession:
         """Return a task whose workspace exists, refusing one still preparing."""
+        self.ensure_workspace(session_id)
         session = self.get_session(session_id)
         if not session.workspace_path and not self._is_remote(session):
             raise RuntimeError("The task workspace is still being prepared")
@@ -366,6 +482,12 @@ class CodingService(
                 self.control.delete_task(session.run_id)
             return
         self.lifecycle.delete_session(session_id)
+        self.retention.discard(session)
+        try:
+            self.workspaces.discard_recovery(session.id)
+        except (OSError, WorkspaceError) as exc:
+            # The task is already gone; leftover recovery files must not fail the delete.
+            logger.warning("Could not remove recovery data for deleted coding task %s: %s", session.id, exc)
         if session.run_id:
             self.control.delete_task(session.run_id)
 
@@ -376,7 +498,17 @@ class CodingService(
         session = self.get_session(session_id)
         if archived and self._is_remote(session):
             self.remote.release_workspace(session)
-        return self.lifecycle.set_archived(session_id, archived)
+        updated = self.lifecycle.set_archived(session_id, archived)
+        if archived and not self._is_remote(session) and not _org_mode():
+            # Archiving is an explicit "done for now", so its disk is reclaimed
+            # straight away. The workspace comes back if the task is reopened.
+            try:
+                self.retention.release(session_id)
+            except Exception:
+                logger.exception("Could not release the workspace of archived coding task %s", session_id)
+            # Released, or kept with the reason recorded.
+            updated = self.get_session(session_id)
+        return updated
 
     def set_pinned(self, session_id: str, pinned: bool) -> CodingSession:
         return self.lifecycle.set_pinned(session_id, pinned)
@@ -431,18 +563,21 @@ class CodingService(
         session = self.get_session(session_id)
         if self._is_remote(session):
             return self.remote.operation(session, "git_state")
+        self.ensure_workspace(session_id)
         return self.project_tasks.git_state(session_id)
 
     def git_states(self, session_id: str):
         session = self.get_session(session_id)
         if self._is_remote(session):
             return list(self.remote.operation(session, "git_states").get("items") or [])
+        self.ensure_workspace(session_id)
         return self.project_tasks.git_states(session_id)
 
     def diff(self, session_id: str):
         session = self.get_session(session_id)
         if self._is_remote(session):
             return list(self.remote.operation(session, "diff").get("files") or [])
+        self.ensure_workspace(session_id)
         return self.project_tasks.diff(session_id)
 
     def review_file_action(self, session_id: str, folder_id: str | None, path: str, action: str):
@@ -454,6 +589,7 @@ class CodingService(
                 "path": path,
                 "action": action,
             }).get("files") or [])
+        self.ensure_workspace(session_id)
         return self.project_tasks.review_file_action(session_id, folder_id, path, action)
 
     def create_branch(self, session_id: str, name: str):
@@ -461,6 +597,7 @@ class CodingService(
         if self._is_remote(session):
             self.remote.require_idle(session, "changing task branches")
             return self.remote.operation(session, "branch", {"name": name})
+        self.ensure_workspace(session_id)
         return self.project_tasks.create_branch(session_id, name)
 
     def commit(self, session_id: str, message: str):
@@ -468,12 +605,14 @@ class CodingService(
         if self._is_remote(session):
             self.remote.require_idle(session, "committing task changes")
             return self.remote.operation(session, "commit", {"message": message})
+        self.ensure_workspace(session_id)
         return self.project_tasks.commit(session_id, message)
 
     def apply_to_source(self, session_id: str) -> dict[str, str | None]:
         session = self.get_session(session_id)
         if self._is_remote(session):
             raise RuntimeError("Publish remote task changes with a branch or pull request")
+        self.ensure_workspace(session_id)
         return self.project_tasks.apply_to_source(session_id)
 
     def validate_project(self, session_id: str) -> list[dict]:
@@ -481,6 +620,7 @@ class CodingService(
         if self._is_remote(session):
             self.remote.require_idle(session, "running project validation")
             return list(self.remote.operation(session, "validate", timeout=610).get("items") or [])
+        self.ensure_workspace(session_id)
         return self.project_tasks.validate_project(session_id)
 
     def discover_models(self, engine_id: str, credentials: EngineCredentials) -> list[str]:
@@ -532,6 +672,7 @@ class CodingService(
         request: ProjectActionRunRequest,
         credentials: EngineCredentials,
     ) -> ProjectActionRunResponse:
+        self.ensure_workspace(session_id)
         return self.project_actions.run(session_id, request, credentials)
 
     def project_action_page(self, session_id: str) -> ProjectActionPage:
@@ -714,7 +855,7 @@ class CodingService(
     def _apply_config_update(session: CodingSession, values: dict) -> None:
         if any(
             name in values and values[name] != getattr(session, name)
-            for name in ("permission_mode", "network_access", "additional_dirs")
+            for name in ("permission_mode", "network_access", "additional_dirs", "writes_allowed")
         ):
             session.command_approval_grants = []
         for name, value in values.items():
@@ -741,21 +882,50 @@ class CodingService(
         self,
         session_id: str,
         active_turn_error: str,
+        *,
+        touches_source: bool = False,
     ) -> Iterator[CodingSession]:
-        """Reserve an idle task for a potentially slow lifecycle operation."""
+        """Reserve an idle task for a potentially slow lifecycle operation.
+
+        The reservation also covers every folder the operation may change that
+        another task can work in: an in-place task's folders, and the source
+        folders when ``touches_source``. It is refused while another task's
+        turn or operation is changing an overlapping folder.
+        """
         with self._lock:
             session = self.get_session(session_id)
             if session_id in self._running:
                 raise RuntimeError(active_turn_error)
             if session_id in self._maintenance:
                 raise RuntimeError("This coding task is already being updated")
+            roots = self._shared_roots(session, touches_source=touches_source)
+            busy = self._shared_folder_conflict(session_id, roots)
+            if busy:
+                raise RuntimeError(busy)
             self._maintenance.add(session_id)
+            self._maintenance_roots[session_id] = roots
         try:
             yield session
         finally:
             with self._lock:
                 self._maintenance.discard(session_id)
+                self._maintenance_roots.pop(session_id, None)
+
+
+_coding_service_lock = threading.Lock()
+
 
 @lru_cache(maxsize=1)
-def get_coding_service() -> CodingService:
+def _cached_coding_service() -> CodingService:
     return CodingService(Path(get_app_settings().coding.root_dir))
+
+
+def get_coding_service() -> CodingService:
+    # lru_cache does not serialize a miss: concurrent first requests would each
+    # build a CodingService, each with its own local computer and expiry thread
+    # that marks the other's local computer offline.
+    with _coding_service_lock:
+        return _cached_coding_service()
+
+
+get_coding_service.cache_clear = _cached_coding_service.cache_clear  # type: ignore[attr-defined]

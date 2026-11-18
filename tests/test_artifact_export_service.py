@@ -26,9 +26,11 @@ from cowork.common.paths import PinnedDir
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.schemas.artifact_export import OmittedReason
-from cowork.services import artifact_export, artifact_identity
+from cowork.schemas.export_child import ChildLimits
+from cowork.services import artifact_export, artifact_identity, export_runner
 from cowork.services.artifact_export import ExportRefusal, ExportRefused, export_slot
 from cowork.services.artifact_files import ArtifactFileRefused
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
 from test_artifact_export_route import _snapshot, padded_png
 from test_artifact_files import _symlink
@@ -61,6 +63,17 @@ def partitions(tmp_path):
     secret.parent.mkdir(parents=True)
     secret.write_bytes(padded_png(4096, filler=SENTINEL))
     return mine, secret
+
+
+def _conversion_command() -> list[str]:
+    """The command a local export starts its conversion process with."""
+    command, _environment = export_runner.child_command(
+        limits=ChildLimits(
+            wall_seconds=artifact_export.CONVERSION_WALL_SECONDS,
+            memory_bytes=artifact_export.CONVERSION_MEMORY_BYTES,
+        )
+    )
+    return command
 
 
 def _write_report(project: Path, primary: str, source: str) -> tuple[ProjectArtifacts, Path, str]:
@@ -97,11 +110,11 @@ def test_a_word_export_fetches_nothing_and_takes_nothing_from_another_partition(
         )
         source, folder, artifact_id = _write_report(mine, case["primary"], source_text)
 
-        with no_fetch() as recorder:
+        with no_fetch(allowed_command=_conversion_command()) as recorder:
             result = artifact_export.export_primary_file(
                 source=source,
                 folder_name=folder.name,
-                metadata=json.loads((folder / "metadata.json").read_text()),
+                metadata=ArtifactMetadata.parse((folder / "metadata.json").read_text()),
                 artifact_id=artifact_id,
                 export_format="docx",
                 can_edit=True,
@@ -135,7 +148,7 @@ def test_a_first_export_records_the_primary_the_card_shows(local_mode, partition
     result = artifact_export.export_primary_file(
         source=source,
         folder_name=folder.name,
-        metadata=metadata,
+        metadata=ArtifactMetadata.model_validate(metadata),
         artifact_id=artifact_id,
         export_format="docx",
         can_edit=True,
@@ -154,7 +167,7 @@ def _export_docx(source: ProjectArtifacts, folder: Path, artifact_id: str) -> st
     return artifact_export.export_primary_file(
         source=source,
         folder_name=folder.name,
-        metadata=json.loads((folder / "metadata.json").read_text()),
+        metadata=ArtifactMetadata.parse((folder / "metadata.json").read_text()),
         artifact_id=artifact_id,
         export_format="docx",
         can_edit=True,
@@ -214,21 +227,21 @@ def test_a_parent_folder_swapped_for_a_link_mid_export_is_never_written_through(
     )
     outside = tmp_path / "outside"
     outside.mkdir()
-    inline = artifact_export.inline_artifact_html
+    convert = artifact_export.convert_in_child
 
-    def swap_after_inlining(**kwargs):
-        inlined = inline(**kwargs)
+    def swap_after_converting(**kwargs):
+        conversion = convert(**kwargs)
         (folder / "docs").rename(folder / "docs-moved")
         (folder / "docs").symlink_to(outside, target_is_directory=True)
-        return inlined
+        return conversion
 
-    monkeypatch.setattr(artifact_export, "inline_artifact_html", swap_after_inlining)
+    monkeypatch.setattr(artifact_export, "convert_in_child", swap_after_converting)
 
     with pytest.raises(OSError):
         artifact_export.export_primary_file(
             source=source,
             folder_name=folder.name,
-            metadata=metadata,
+            metadata=ArtifactMetadata.model_validate(metadata),
             artifact_id=artifact_id,
             export_format=export_format,
             can_edit=True,
@@ -308,7 +321,7 @@ def test_rewriting_metadata_keeps_its_permission_bits(local_mode, partitions, wr
         artifact_export.export_primary_file(
             source=source,
             folder_name=folder.name,
-            metadata=metadata,
+            metadata=ArtifactMetadata.model_validate(metadata),
             artifact_id=artifact_id,
             export_format="docx",
             can_edit=True,
@@ -339,7 +352,7 @@ def test_a_volume_that_refuses_a_mode_change_still_records_the_primary(
     result = artifact_export.export_primary_file(
         source=source,
         folder_name=folder.name,
-        metadata=metadata,
+        metadata=ArtifactMetadata.model_validate(metadata),
         artifact_id=artifact_id,
         export_format="docx",
         can_edit=True,

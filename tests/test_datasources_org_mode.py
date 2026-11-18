@@ -469,3 +469,70 @@ def test_switching_a_method_off_never_traps_a_connection_already_captured(
 
     assert res.status_code == scripted["status"]
     assert len(recorded) == 1
+
+
+#: What cowork's buildDatasourcePayload sends for a managed service's cloud
+#: form: the spec's own id and method, structured fields, no TLS choice.
+SERVICE_UI_BODY = {
+    "connector_id": "managed_pg",
+    "method": "direct",
+    "name": "rds reporting",
+    "input_mode": "structured",
+    "host": "db.example.com",
+    "port": None,
+    "database": "appdb",
+    "username": "dbuser",
+    "password": PASSWORD,
+}
+
+_CANONICAL_KEYS = {"connector_id", "method", "name", "host", "port", "database", "schema", "username", "password", "tls"}
+
+
+def test_a_managed_service_is_created_in_auth_as_its_engine(managed_postgres_service, org_client, relay):
+    recorded, scripted = relay
+    scripted["status"] = 201
+
+    res = org_client.post("/api/v1/connectors/datasources/", json=SERVICE_UI_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 201
+    body = json.loads(recorded[0].content)
+    assert (body["connector_id"], body["method"]) == ("postgres", "host-port")
+    assert set(body) <= _CANONICAL_KEYS
+    assert body["port"] == 5432
+
+
+def test_a_managed_service_is_edited_in_auth_as_its_engine(managed_postgres_service, org_client, relay):
+    recorded, _ = relay
+
+    res = org_client.patch(
+        "/api/v1/connectors/datasources/7",
+        json={**SERVICE_UI_BODY, "expected_revision": 5},
+        headers=AUTH_HEADERS,
+    )
+
+    assert res.status_code == 200
+    body = json.loads(recorded[0].content)
+    assert (body["connector_id"], body["method"]) == ("postgres", "host-port")
+    assert body["expected_revision"] == 5
+
+
+def test_a_managed_service_stays_off_while_its_engine_is(managed_postgres_service, default_org_client, relay):
+    recorded, _ = relay
+
+    res = default_org_client.post("/api/v1/connectors/datasources/", json=SERVICE_UI_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 409
+    assert res.json()["detail"]["code"] == "unsupported_capability"
+    assert recorded == []
+
+
+def test_the_real_rds_spec_is_created_in_auth_as_postgres(org_client, relay):
+    recorded, scripted = relay
+    scripted["status"] = 201
+    body = {**SERVICE_UI_BODY, "connector_id": "aws_rds_postgres", "method": "connection-string"}
+
+    res = org_client.post("/api/v1/connectors/datasources/", json=body, headers=AUTH_HEADERS)
+
+    assert res.status_code == 201
+    sent = json.loads(recorded[0].content)
+    assert (sent["connector_id"], sent["method"]) == ("postgres", "host-port")

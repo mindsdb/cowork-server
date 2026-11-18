@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
+from cowork.db.scoped import TenantScope
+
 
 def cloud_key_from_url(url: str) -> str:
     """``{user_dir}/{report_id}`` from a static viewer URL, else "".
@@ -76,3 +78,12 @@ def cloud_comments_scope(entry: dict | None) -> str:
     if echoed:
         return echoed
     return cloud_key_from_url(str(entry.get("url") or ""))
+
+
+def published_comments_route(folder: str, *, scope: TenantScope | None) -> tuple[str, str] | None:
+    """Cloud route for a local artifact, resolved in its owner's tenant scope."""
+    from cowork.services.publish import published_owner_state
+
+    key = cloud_comments_scope(published_owner_state(folder, scope=scope))
+    user_dir, _, report_id = key.partition("/")
+    return (user_dir, report_id) if user_dir and report_id else None

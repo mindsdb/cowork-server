@@ -8,10 +8,12 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackDesktopOnly, OpenByDesign, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.units import run_efs
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
+from cowork.services.connectors.notion_pages import is_token_rejection
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.config import OAUTH_SERVICES
 from cowork.services.connectors.oauth.google import (
@@ -20,16 +22,24 @@ from cowork.services.connectors.oauth.google import (
     _credentials_complete,
     oauth_service,
 )
+from cowork.services.connectors.specs._registry import registry
 
 router = APIRouter()
 _log = logging.getLogger("cowork.connectors.oauth")
 
-# Engines whose identity can only be resolved via an MCP tool call, not a
-# plain REST/GraphQL request Electron can make on its own — see
-# get_mcp_identity below. Only HubSpot today; kept as a set (not a bare
-# `engine == "hubspot"` check) since Stage 1 built this as general MCP
-# infrastructure and Linear/PostHog both already run their own MCP servers.
-_MCP_IDENTITY_ENGINES = {"hubspot"}
+# Shown on the connect form when Notion rejects the fresh token (401/403):
+# what a workspace that allows only admin-approved AI apps answers. The raw
+# error is logged.
+NOTION_ADMIN_APPROVAL_MESSAGE = (
+    "Your Notion workspace only allows AI apps your admin has approved. "
+    "Ask your Notion admin to approve MindsHub Cowork, then connect again."
+)
+# Any other failed identity call: it may be transient, or a block Notion
+# reports some other way.
+NOTION_IDENTITY_FAILED_MESSAGE = (
+    "Notion didn't return your account. Try again; if it keeps failing, "
+    "your workspace admin may need to allow Notion's MCP connection."
+)
 
 # Same alias as connections.py: the vault/relay choice is per-request tenancy
 # context, not a bare settings flag — resolving it once here keeps this file
@@ -83,10 +93,10 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
     return oauth_service.start(service, OAuthSettings(), client_id=body.client_id, client_secret=body.client_secret, extra_fields=body.extra_fields)
 
 
-# LoopbackOnly: returns a raw client_secret, so the credential is the caller
-# being on this machine — same restriction as settings reveal-key and /raw
-# (ENG-868).
-@router.get("/{engine}/credentials", dependencies=[Depends(require(LoopbackOnly))])
+# LoopbackDesktopOnly: returns a raw client_secret, so the credential is the
+# caller being on this machine, the same restriction as settings reveal-key.
+# Only Electron main calls it, so an org deployment refuses it outright.
+@router.get("/{engine}/credentials", dependencies=[Depends(require(LoopbackDesktopOnly))])
 def get_oauth_credentials(engine: str):
     """Return client_id and client_secret for a builtin-OAuth engine.
     Called by Electron main process only — never exposed to the renderer."""
@@ -110,6 +120,10 @@ def get_oauth_credentials(engine: str):
 
 class McpIdentityRequest(BaseModel):
     access_token: str
+    # Notion returns these only in the code-exchange response, so Electron
+    # forwards them; HubSpot ignores them.
+    workspace_id: str | None = None
+    workspace_name: str | None = None
 
 
 def _first_str(*values: Any) -> str:
@@ -164,21 +178,22 @@ def _parse_mcp_identity(user_details: Any, org_details: Any) -> tuple[str, str]:
     return email, name
 
 
-# LoopbackOnly: same restriction as /credentials above — this hands back
+# LoopbackDesktopOnly: same restriction as /credentials above. This hands back
 # account identity derived from the caller-supplied access token, so the
 # credential is the caller being on this machine. Called by Electron's
 # oauth-identity.ts (fetchHubspotIdentity) — Electron can't speak MCP
 # itself (it's TypeScript, the client is Python), so it hands the
 # freshly-obtained access token here instead of calling the provider
 # directly, unlike every other FETCHERS entry.
-@router.post("/{engine}/mcp/identity", dependencies=[Depends(require(LoopbackOnly))])
+@router.post("/{engine}/mcp/identity", dependencies=[Depends(require(LoopbackDesktopOnly))])
 async def get_mcp_identity(engine: str, body: McpIdentityRequest):
     """Resolve {account_email, account_name} for an MCP-based connector by
     calling its `get_user_details`/`get_organization_details` tools directly
     (anton's lightweight `call_mcp_tool` helper — cowork-server already
     depends on anton as a package, so this reuses its client/server-URL
     table rather than a second MCP implementation here)."""
-    if engine not in _MCP_IDENTITY_ENGINES:
+    # Only an MCP engine's identity needs a tool call Electron can't make itself.
+    if engine not in registry.mcp_engines():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No MCP identity resolution for {engine!r}.")
     # Capability-gated like the harness's own discovery call. Every anton this
     # server can start with has anton.core.mcp (ENG-1816): it predates the
@@ -187,6 +202,7 @@ async def get_mcp_identity(engine: str, body: McpIdentityRequest):
     # and says what is true there: this build cannot do MCP identity
     # resolution at all.
     try:
+        from anton.core.mcp.servers import mcp_server_url
         from anton.core.mcp.wiring import call_mcp_tool
     except ImportError as exc:
         _log.warning("MCP identity resolution unavailable for %s: installed anton has no anton.core.mcp", engine)
@@ -194,6 +210,17 @@ async def get_mcp_identity(engine: str, body: McpIdentityRequest):
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail=f"This build's anton has no MCP client, so {engine} identity cannot be resolved.",
         ) from exc
+    # An anton that predates this engine's server URL would otherwise fail
+    # inside call_mcp_tool, and the user would be told to try again.
+    if mcp_server_url(engine) is None:
+        _log.warning("MCP identity resolution unavailable for %s: installed anton has no server URL for it", engine)
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=f"This build's anton has no MCP server for {engine}, so its identity cannot be resolved.",
+        )
+
+    if engine == "notion":
+        return await _resolve_notion_identity(call_mcp_tool, body)
 
     try:
         user_details = await call_mcp_tool(engine, body.access_token, "get_user_details")
@@ -215,6 +242,47 @@ async def get_mcp_identity(engine: str, body: McpIdentityRequest):
     if not account_email:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Could not retrieve {engine} account email.")
     return {"account_email": account_email, "account_name": account_name}
+
+
+def _parse_notion_self_user(result: Any) -> tuple[str, str]:
+    """(email, user_id) from `notion-get-users` called with `self`.
+
+    Accepts a bare user object or a `results` list, as a JSON string or an
+    already-decoded value, since the exact shape isn't verified live yet.
+    """
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            return "", ""
+    if isinstance(result, dict) and isinstance(result.get("results"), list):
+        result = result["results"][0] if result["results"] else {}
+    if not isinstance(result, dict):
+        return "", ""
+    person = result.get("person") if isinstance(result.get("person"), dict) else {}
+    return _first_str(result.get("email"), person.get("email")), _first_str(result.get("id"))
+
+
+async def _resolve_notion_identity(call_mcp_tool, body: McpIdentityRequest) -> dict[str, str]:
+    """Identity is `<email>:<workspace_id>` so each workspace gets its own
+    connection; the tile shows the workspace name, else the email."""
+    try:
+        result = await call_mcp_tool("notion", body.access_token, "notion-get-users", user_id="self")
+    except Exception as exc:
+        _log.warning("Notion identity call failed: %r", exc)
+        if is_token_rejection(exc):
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=NOTION_ADMIN_APPROVAL_MESSAGE) from exc
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=NOTION_IDENTITY_FAILED_MESSAGE) from exc
+
+    email, user_id = _parse_notion_self_user(result)
+    who = email or user_id
+    if not who:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not retrieve notion account email.")
+    workspace_id = _first_str(body.workspace_id)
+    return {
+        "account_email": f"{who}:{workspace_id}" if workspace_id else who,
+        "account_name": _first_str(body.workspace_name, email, user_id),
+    }
 
 
 # AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_catalogue.
@@ -248,13 +316,18 @@ async def oauth_status(request: Request, scope: ScopeDep, state: str = Query(...
 # — there is no principal to check by construction, same as auth's own
 # OAuthCallbackView.
 @router.get("/{service}/callback", response_class=HTMLResponse, dependencies=[Depends(require(OpenByDesign))])
-def oauth_callback(service: str, scope: ScopeDep, code: str = "", state: str = "", error: str = ""):
+async def oauth_callback(service: str, scope: ScopeDep, code: str = "", state: str = "", error: str = ""):
     if service not in OAUTH_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth service: {service!r}")
-    # This runs only on the desktop: start_oauth refuses the sign-in wherever
-    # identity headers are trusted, and in org mode auth runs the handshake
-    # and its own callback.
-    html = oauth_service.callback(service, code, state, error, OAuthSettings(), scope=scope)
+    # A sign-in completes here only on the desktop: start_oauth refuses one
+    # wherever identity headers are trusted, and in org mode auth runs the
+    # handshake and its own callback. Any caller still reaches this route,
+    # and it reads and clears the pending sign-in and records its outcome in
+    # COWORK_HOME, the shared file store where hosted, so the callback runs on
+    # the file store's threads.
+    html = await run_efs(
+        lambda: oauth_service.callback(service, code, state, error, OAuthSettings(), scope=scope), scope=scope
+    )
     return HTMLResponse(content=html)
 
 

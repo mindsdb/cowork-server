@@ -19,6 +19,7 @@ from cowork.common import paths
 from cowork.common.paths import dir_atomic_write, pinned_dir
 from cowork.services import artifact_identity, artifact_journal, artifact_revisions
 from cowork.services.artifact_identity import ensure_full_id
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_revisions import current_source, save_source
 
 POSIX = pytest.mark.skipif(os.name == "nt", reason="Windows has no dir_fd and keeps no permission bits")
@@ -175,7 +176,7 @@ def test_the_journal_and_the_metadata_write_through_the_helper(artifact, monkeyp
     journal_writes = _spy(monkeypatch, artifact_journal, "dir_atomic_write")
     metadata_writes = _spy(monkeypatch, artifact_identity, "dir_atomic_write")
 
-    artifact_id, metadata = ensure_full_id(folder, metadata)
+    artifact_id, metadata = ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
     current_source(folder, metadata, artifact_id)
 
     assert metadata_writes == ["metadata.json"]
@@ -184,7 +185,7 @@ def test_the_journal_and_the_metadata_write_through_the_helper(artifact, monkeyp
 
 def test_a_source_save_syncs_the_sources_folder_through_dir_fsync(artifact, monkeypatch):
     folder, metadata, _ = artifact
-    artifact_id, metadata = ensure_full_id(folder, metadata)
+    artifact_id, metadata = ensure_full_id(folder, ArtifactMetadata.model_validate(metadata))
     head = current_source(folder, metadata, artifact_id)["revision"]
     synced: list[Path] = []
     real = artifact_revisions.dir_fsync

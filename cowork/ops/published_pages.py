@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -24,6 +23,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select
 
+from cowork.common.minds_tls import minds_ssl_verify
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
@@ -96,15 +96,11 @@ def _publisher() -> _Publisher:
     return _Publisher(url=url, key=publisher_key(url), api_key=api_key)
 
 
-def _ssl_verify() -> bool:
-    return os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
-
-
 def _listed(publisher: _Publisher) -> list[_ListedPage]:
     from anton.publisher import list_published
 
     try:
-        values = list_published(api_key=publisher.api_key, publish_url=publisher.url, ssl_verify=_ssl_verify())
+        values = list_published(api_key=publisher.api_key, publish_url=publisher.url, ssl_verify=minds_ssl_verify())
         return [_ListedPage.model_validate(value) for value in values]
     except Exception:
         # An HTTP error can hold the token or the response body: name only the failure.
@@ -222,7 +218,7 @@ def unpublish_page(*, report_id: str, force: bool) -> str:
                     "Run with --force to take it down anyway. Nothing changed."
                 )
             try:
-                unpublish(report_id, api_key=publisher.api_key, publish_url=publisher.url, ssl_verify=_ssl_verify())
+                unpublish(report_id, api_key=publisher.api_key, publish_url=publisher.url, ssl_verify=minds_ssl_verify())
             except Exception:
                 raise OperatorCommandError(f"The publisher could not take down page {report_id}; nothing changed.") from None
             dropped = sum(_drop_entry(artifact_path, report_id) for artifact_path in page.artifact_paths)

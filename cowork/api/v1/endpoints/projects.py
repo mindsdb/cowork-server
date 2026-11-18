@@ -1,11 +1,14 @@
+from collections.abc import Mapping
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSessionDep
+from cowork.db.scoped import ScopedSession, TenantScopeDep
+from cowork.db.units import run_db, run_efs_unit
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import PROJECT_SLOTS, ProjectMemoryStore
 from cowork.models.project import Project
@@ -16,7 +19,7 @@ from cowork.schemas.projects import (
     ProjectUpdateRequest,
 )
 from cowork.schemas.shared_resources import ProjectCapabilities
-from cowork.api.v1.endpoints.guards import ensure_loopback_socket
+from cowork.api.v1.endpoints.guards import require_local
 from cowork.services.projects import (
     GENERAL_PROJECT,
     ProjectInUseError,
@@ -31,6 +34,7 @@ from cowork.services.shared_resources import (
     PROJECT_MEMORY,
     SKILL,
     SKILL_PROJECT_REFERENCES,
+    AttributionSnapshot,
     ResourceDeletion,
     SharedResourceAccess,
     project_memory_resource_key,
@@ -40,7 +44,7 @@ from cowork.services.skills import SkillService
 from cowork.services.shared_projects import SharedProjectFiles
 
 
-# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# AuthenticatedInOrgMode, declared explicitly: a ScopedSession already fails
 # closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
 # whenever org mode has no org in scope. Declaring it too makes the
 # requirement visible to a route walker instead of something only
@@ -208,24 +212,40 @@ def _guard_project_memory_for_move(
         )
 
 
-def _project_response(project: Project, access: SharedResourceAccess) -> dict:
+def _project_response(
+    project: Project,
+    access: SharedResourceAccess,
+    *,
+    snapshots: Mapping[str, AttributionSnapshot] | None = None,
+) -> dict:
+    """One project as the API returns it.
+
+    ``snapshots`` is every project attribution row, as a listing reads them
+    once (SharedResourceAccess.snapshots); without it, this reads the one row.
+    """
     key = project_resource_key(project.id)
-    if access.org_mode and access.has_trusted_actor:
+    snapshot = access.listed_snapshot(PROJECT, key, snapshots)
+    if (
+        access.org_mode
+        and access.has_trusted_actor
+        and snapshot is not None
+        and snapshot.may_be_recoverable()
+    ):
         access.recover_stale_claim(
             PROJECT,
             key,
             resource_exists=lambda: access.session.get(Project, project.id) is not None,
         )
-    pending = access.claim_is_pending(PROJECT, key)
+        snapshot = access.snapshot(PROJECT, key)
+    pending = snapshot is not None and snapshot.pending
     creator_id = project.created_by
     is_general = project.name == GENERAL_PROJECT
     can_change = not pending and not is_general and access.can_change(creator_id)
     directory_is_external = ProjectService(access.session).directory_is_external(project)
     return {
         **project.model_dump(),
-        "attribution": access.attribution(
-            PROJECT,
-            key,
+        "attribution": access.attribution_of(
+            snapshot,
             fallback_creator_id=project.created_by,
             fallback_modified_at=project.modified_at,
         ),
@@ -241,33 +261,68 @@ def _project_response(project: Project, access: SharedResourceAccess) -> dict:
 
 
 @router.get("/", response_model=list[ProjectResponse])
-def list_projects(
-    session: ScopedSessionDep,
+async def list_projects(
+    scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
+    # In org tenancy, once the org's general row exists, the listing reads rows
+    # only: a database unit, which file store slots held by stuck artifact
+    # lookups cannot refuse, and which a stuck mount cannot hold. The org's
+    # first listing makes the general folder, which is file store work.
+    listed = await run_db(partial(_list_projects, principal=principal), scope=scope)
+    if listed is None:
+        listed = await run_efs_unit(partial(_list_projects, principal=principal, provision=True), scope=scope)
+    return listed
+
+
+def _list_projects(
+    session: ScopedSession,
+    *,
+    principal: Principal | None,
+    provision: bool = False,
+) -> list[dict | ProjectResponse] | None:
+    # None in org tenancy when the org has no general project yet and
+    # `provision` is off: making it is file store work, which a database unit
+    # must not do. Outside org tenancy the general project's folder is on a
+    # local disk, so it is checked here as before.
     service = ProjectService(session)
-    # Bootstrap site: adopt the seeded GENERAL project into this org before
-    # the first listing (no-op in local mode / once claimed).
-    service.ensure_general_for_scope()
+    if provision or not session.scope.org_mode:
+        # Bootstrap site: adopt the seeded GENERAL project into this org before
+        # the first listing (no-op in local mode / once claimed).
+        service.ensure_general_for_scope()
+    elif service.get_project_by_name_or_none(GENERAL_PROJECT) is None:
+        return None
     access = SharedResourceAccess(session, principal)
-    owned = [_project_response(project, access) for project in service.list_projects()]
+    projects = service.list_visible_projects()
+    # Read after the projects: create_project commits its claim
+    # (SharedResourceAccess.reserve_claim) before ProjectService.create_project
+    # commits the project row, so every listed project's claim is in this read.
+    snapshots = access.snapshots(PROJECT)
+    owned = [
+        _project_response(project, access, snapshots=snapshots) for project in projects
+    ]
     return [*owned, *SharedProjectFiles(session).list_projects()]
 
 
-def require_local_for_chosen_folder(
+async def require_local_for_chosen_folder(
     body: ProjectCreateRequest, request: Request
 ) -> None:
     """A caller-chosen project folder is only accepted over loopback.
 
     A chosen path plus the project-file endpoints is read and write anywhere
     the server user can reach, so this has to hold on a deployment that is
-    local-mode but not local-only. See `ensure_loopback_socket` for why the
-    socket address is the signal; the service refuses org deployments outright
-    as a further layer.
+    local-mode but not local-only.
+
+    ``require_local`` carries it, because it reads the socket the request
+    landed on, not only the peer address an ``X-Forwarded-For`` rewrites. The
+    configured host can't: the image's CMD passes ``--host 0.0.0.0`` on argv
+    and sets no ``COWORK_SERVER_HOST``, so ``AppSettings.host`` still reads its
+    loopback default inside the container. The service refuses org
+    deployments outright as a second layer.
     """
     if body.path is None:
         return
-    ensure_loopback_socket(request, "a chosen project folder needs a request over loopback")
+    require_local(request)
 
 
 @router.post(
@@ -276,10 +331,19 @@ def require_local_for_chosen_folder(
     response_model=ProjectResponse,
     dependencies=[Depends(require_local_for_chosen_folder)],
 )
-def create_project(
+async def create_project(
     body: ProjectCreateRequest,
-    session: ScopedSessionDep,
+    scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(partial(_create_project, body=body, principal=principal), scope=scope)
+
+
+def _create_project(
+    session: ScopedSession,
+    *,
+    body: ProjectCreateRequest,
+    principal: Principal | None,
 ):
     access = SharedResourceAccess(session, principal)
     access.require_actor()
@@ -346,11 +410,23 @@ def create_project(
 
 
 @router.patch("/{project_id}", response_model=ProjectResponse)
-def update_project(
+async def update_project(
     project_id: UUID,
     body: ProjectUpdateRequest,
-    session: ScopedSessionDep,
+    scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(
+        partial(_update_project, project_id=project_id, body=body, principal=principal), scope=scope
+    )
+
+
+def _update_project(
+    session: ScopedSession,
+    *,
+    project_id: UUID,
+    body: ProjectUpdateRequest,
+    principal: Principal | None,
 ):
     service = ProjectService(session)
     access = SharedResourceAccess(session, principal)
@@ -589,10 +665,19 @@ def update_project(
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_project(
+async def delete_project(
     project_id: UUID,
-    session: ScopedSessionDep,
+    scope: TenantScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(partial(_delete_project, project_id=project_id, principal=principal), scope=scope)
+
+
+def _delete_project(
+    session: ScopedSession,
+    *,
+    project_id: UUID,
+    principal: Principal | None,
 ):
     service = ProjectService(session)
     access = SharedResourceAccess(session, principal)

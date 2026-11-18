@@ -11,7 +11,7 @@ defaults:
     shell: bash
 
 jobs:
-  unit-tests:
+  collect-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -33,16 +33,151 @@ jobs:
       - name: Check exported release dependencies
         run: python scripts/release_contract.py --check
 
-      - name: Run unit tests
-        run: make test/unit/coverage
+      - name: Collect the complete broad selection
+        run: >-
+          uv run --locked python -m pytest tests/ --ignore=tests/integration
+          --collect-only -qq -n 0 -p scripts.pytest_inventory --test-cohort=broad
+          --test-inventory="$RUNNER_TEMP/test-inventory/collection/inventory.json"
 
-  export-tests-windows:
-    # The desktop app runs on Windows, where a pinned folder has no directory
-    # descriptor and the export's path-segment checks are the only guard on
-    # which file it reads. The Windows lxml wheel also bundles a libxml2 that
-    # speaks HTTP and FTP. These tests prove, on Windows itself, that export
-    # reads only the artifact's own files and fetches nothing.
-    runs-on: windows-latest
+      - name: Check and summarize test evidence
+        if: always()
+        run: >-
+          uv run --locked python scripts/test_inventory.py check
+          "$RUNNER_TEMP/test-inventory/collection/inventory.json"
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: test-inventory-broad-collection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/test-inventory/collection/
+          if-no-files-found: error
+          retention-days: 14
+
+  unit-test-shards:
+    name: unit-test-shards-${{ matrix.number }}
+    timeout-minutes: 30
+    needs: collect-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 0
+            number: 1
+          - shard: 1
+            number: 2
+          - shard: 2
+            number: 3
+          - shard: 3
+            number: 4
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.30"
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Download collection evidence
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: test-inventory-broad-collection-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/test-inventory/inputs
+          merge-multiple: false
+
+      - name: Run broad shard
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: >-
+          uv run --locked python -m scripts.test_shards run --index "$SHARD_INDEX"
+          --inputs "$RUNNER_TEMP/test-inventory/inputs"
+          --output "$RUNNER_TEMP/test-inventory/shard-$SHARD_INDEX"
+
+      - name: Check and summarize shard evidence
+        if: always()
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: >-
+          uv run --locked python scripts/test_inventory.py check
+          "$RUNNER_TEMP/test-inventory/shard-$SHARD_INDEX/inventory.json"
+          --junit "$RUNNER_TEMP/test-inventory/shard-$SHARD_INDEX/junit.xml"
+
+      - name: Upload shard evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: test-inventory-broad-shard-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/test-inventory/shard-${{ matrix.shard }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  unit-tests:
+    needs: [collect-tests, unit-test-shards]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the complete broad execution
+        env:
+          COLLECTION_RESULT: ${{ needs.collect-tests.result }}
+          SHARDS_RESULT: ${{ needs.unit-test-shards.result }}
+        run: |
+          test "$COLLECTION_RESULT" = success
+          test "$SHARDS_RESULT" = success
+
+      - uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.30"
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Download collection and shard evidence
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: test-inventory-broad-*-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/test-inventory/inputs
+          merge-multiple: false
+
+      - name: Verify broad union and report combined coverage
+        run: >-
+          uv run --locked python -m scripts.test_shards aggregate
+          --inputs "$RUNNER_TEMP/test-inventory/inputs"
+          --output "$RUNNER_TEMP/test-inventory/broad"
+
+      - name: Upload combined evidence
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: test-inventory-broad-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/test-inventory/broad/
+          if-no-files-found: error
+          retention-days: 14
+
+  export-tests-desktop:
+    # The desktop app runs on Windows and macOS. On Windows a pinned folder has
+    # no directory descriptor and the export's path-segment checks are the
+    # only guard on which file it reads, and the Windows lxml wheel bundles a
+    # libxml2 that speaks HTTP and FTP. On both, the export's conversion
+    # process limits itself less than on Linux: macOS refuses an address-space
+    # limit, and Windows has no resource limits at all, so the server's memory
+    # watch and wall clock are the limits there. These tests prove, on each
+    # desktop OS, that export reads only the artifact's own files, fetches
+    # nothing, and that a conversion past its limits is killed and leaves no
+    # process behind.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - name: Keep line endings as committed
@@ -51,6 +186,9 @@ jobs:
         run: git config --global core.autocrlf false
 
       - uses: actions/checkout@v5
+
+      - name: Choose test evidence directory
+        run: echo "TEST_REPORT_DIR=$RUNNER_TEMP/test-inventory/desktop-export" >> "$GITHUB_ENV"
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
@@ -74,3 +212,25 @@ jobs:
           tests/test_no_fetch.py
           tests/test_artifact_export_contracts.py
           tests/test_artifact_export_service.py
+          tests/test_export_child.py
+          tests/test_publish_markdown.py
+          -p scripts.pytest_inventory --test-cohort=desktop-export
+          --test-inventory="$TEST_REPORT_DIR/inventory.json"
+          --junitxml="$TEST_REPORT_DIR/junit.xml"
+
+      - name: Check and summarize test evidence
+        if: always()
+        run: >-
+          uv run python scripts/test_inventory.py check
+          "$TEST_REPORT_DIR/inventory.json" --junit "$TEST_REPORT_DIR/junit.xml"
+
+      - name: Upload test evidence
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: test-inventory-desktop-export-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.TEST_REPORT_DIR }}/inventory.json
+            ${{ env.TEST_REPORT_DIR }}/junit.xml
+          if-no-files-found: error
+          retention-days: 14

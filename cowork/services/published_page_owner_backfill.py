@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session, select
 
+from cowork.common.minds_tls import minds_ssl_verify
 from cowork.common.paths import O_NOFOLLOW, O_NONBLOCK, cowork_home, dir_open, opened_subdir_nofollow
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
@@ -247,7 +248,7 @@ def _inventory(api_key: str, publish_url: str) -> dict[str, set[str]]:
     try:
         values = list_published(
             api_key=api_key, publish_url=publish_url,
-            ssl_verify=os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true",
+            ssl_verify=minds_ssl_verify(),
         )
         if not isinstance(values, list):
             raise ValueError

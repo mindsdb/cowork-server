@@ -151,6 +151,57 @@ class TestConnectorIdStamp:
         assert block["engine"] == "acme"
 
 
+ORG_BUILDER = TenantScope(org_mode=True, org_id="org-a", user_id="builder-a")
+ORG_OTHER_MEMBER = TenantScope(org_mode=True, org_id="org-a", user_id="member-a2")
+
+
+@pytest.fixture()
+def org_row(engine):
+    """The builder's own org definition of a connector the static registry lacks."""
+    with Session(engine) as session:
+        session.add(CustomConnector(
+            connector_id="acme_crm", label="Acme CRM", description="", spec=HTTPBIN_FORM,
+            org_id=ORG_BUILDER.org_id, created_by=ORG_BUILDER.user_id,
+        ))
+        session.commit()
+    return engine
+
+
+class TestOrgDefinitionsAreTheBuilders:
+    @pytest.mark.asyncio
+    async def test_the_builders_id_is_known_so_a_handcrafted_form_is_refused(self, org_row, staged):
+        req = SubmitFormRequest(form_spec={"form_id": "fm_aaaaaaaaaa", "engine": "acme_crm", "fields": []})
+
+        with pytest.raises(HTTPException) as exc:
+            await submissions_endpoints.submit_form(req, ORG_BUILDER)
+        assert exc.value.status_code == 422
+        assert staged == []
+
+    @pytest.mark.asyncio
+    async def test_the_builders_stamped_form_is_checked_against_their_row(self, org_row, staged):
+        req = SubmitFormRequest(form_spec={"_connector_id": "acme_crm", "form_id": "acme_crm-connector"}, values={})
+
+        with pytest.raises(HTTPException) as exc:
+            await submissions_endpoints.submit_form(req, ORG_BUILDER)
+        assert exc.value.status_code == 400
+        assert "token" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_another_member_submits_the_same_id_as_an_unknown_one(self, org_row, staged):
+        req = SubmitFormRequest(
+            form_spec={"form_id": "fm_aaaaaaaaaa", "engine": "acme_crm", "title": "Connect Acme", "fields": [
+                {"name": "key", "label": "Key", "type": "password", "secret": True},
+            ]},
+            values={"key": "any-key"},
+        )
+
+        await submissions_endpoints.submit_form(req, ORG_OTHER_MEMBER)
+
+        [call] = staged
+        assert call["connector_id"] == "acme_crm"
+        assert call.get("custom_spec") is None
+
+
 class TestSubmitForm:
     @pytest.mark.asyncio
     async def test_a_handcrafted_form_reusing_a_custom_id_is_a_422(self, engine, staged):
@@ -401,3 +452,30 @@ class TestBuildFlowPrompt:
         assert result["match"] == "none"
         assert "can't be saved for reuse" in result["message"]
         assert "Build a custom connector" not in result["message"]
+
+
+_DATA_SAMPLE = "how to fetch a small sample of data"
+
+
+class TestHandcraftedFormsSayHowToFetchData:
+    """The connection test passes only on data, and a handcrafted form's
+    usage_notes are its only guide to an API with no plain GET data route."""
+
+    def test_both_no_match_answers_ask_for_the_data_request(self):
+        assert _DATA_SAMPLE in tools._DATA_REQUEST_NOTE
+        assert tools._DATA_REQUEST_NOTE in tools._BUILD_CUSTOM_CONNECTOR
+        assert tools._DATA_REQUEST_NOTE in tools._NO_CUSTOM_CONNECTOR
+        assert "won't be listed with the connectors" in tools._NO_CUSTOM_CONNECTOR
+
+    def test_the_schema_puts_the_connector_block_on_every_handcrafted_form(self):
+        connector = tools._REQUEST_CREDENTIALS_SCHEMA["properties"]["connector"]
+
+        assert "every handcrafted form" in connector["description"]
+        assert tools._DATA_REQUEST_NOTE in connector["properties"]["usage_notes"]["description"]
+
+    def test_the_connect_skill_asks_for_the_data_request(self):
+        skill = Path(tools.__file__).parent / "skills" / "connect-datasource" / "SKILL.md"
+
+        text = skill.read_text()
+        assert "every handcrafted form" in text
+        assert _DATA_SAMPLE in text

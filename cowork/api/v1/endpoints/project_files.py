@@ -19,8 +19,9 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NamedTuple
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
@@ -36,8 +37,10 @@ from cowork.api.v1.endpoints.connectors.sharepoint import (
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, require
 from cowork.api.v1.pinned_response import PinnedStreamingResponse
 
+from cowork.common.logger import log_context
 from cowork.common.paths import (
     O_NOFOLLOW,
+    O_NONBLOCK,
     PinnedDir,
     dir_lstat,
     dir_mkdir,
@@ -60,6 +63,7 @@ from cowork.db.scoped import (
     TenantScope,
     get_tenant_scope,
 )
+from cowork.db.units import run_efs, run_efs_unit
 from cowork.models.project import Project
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.principal import Principal, get_principal
@@ -70,6 +74,8 @@ from cowork.schemas.project_files import (
     ProjectFileReadResponse,
     ProjectFileWriteResponse,
     ProjectInstructionsResponse,
+    ProjectUploadResponse,
+    ProjectUploadResult,
 )
 from cowork.schemas.shared_resources import MutableResourceCapabilities
 from cowork.services import folder_listing
@@ -78,7 +84,14 @@ from cowork.schemas.sharepoint import (
     SharePointImportResponse,
     SharePointSkippedItem,
 )
-from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
+from cowork.services.artifact_roots import (
+    _ARTIFACTS_SUBPATH,
+    CONVERSATIONS_DIRNAME,
+    SERVER_PROJECT_FOLDERS,
+    ProjectRow,
+    recorded_source,
+    workspace_conversation_id,
+)
 from cowork.services.artifacts import _is_the_projects_secrets
 from cowork.services.connectors.sharepoint import (
     DownloadBudget,
@@ -106,6 +119,8 @@ logger = logging.getLogger(__name__)
 # instead of taking ScopedSessionDep, but the token is scoped per-mount, not
 # a bypass, so it needs nothing of its own here.)
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 ANTON_INSTRUCTIONS_FILENAME = "anton.md"
 TEXT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
@@ -327,8 +342,14 @@ def _validated_project_path(path: str) -> _ValidatedProjectPath:
     return _ValidatedProjectPath(tuple(parts))
 
 
+async def _project_mutation_path(path: str) -> _ValidatedProjectPath:
+    """The validation as a coroutine, so a request needs no default thread
+    for it."""
+    return _validated_project_path(path)
+
+
 ProjectMutationPathDep = Annotated[
-    _ValidatedProjectPath, Depends(_validated_project_path)
+    _ValidatedProjectPath, Depends(_project_mutation_path)
 ]
 
 
@@ -686,7 +707,7 @@ def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -
 
 
 async def _authorize_artifact_file_mutation(
-    path: ProjectMutationPathDep, scoped: ScopedSessionDep,
+    path: ProjectMutationPathDep, scope: ScopeDep,
 ) -> None:
     """Protect artifact bytes reached through the generic file adapter.
 
@@ -697,19 +718,19 @@ async def _authorize_artifact_file_mutation(
     parts = tuple(part.casefold() for part in path.parts)
     if parts[0] == CONVERSATIONS_DIRNAME:
         if len(parts) == 1:
-            await require_product_permission(scoped.scope, "artifact.manage")
+            await require_product_permission(scope, "artifact.manage")
             return
         if len(parts) == 2:
             try:
                 UUID(parts[1])
             except ValueError:
                 return
-            await require_product_permission(scoped.scope, "artifact.manage")
+            await require_product_permission(scope, "artifact.manage")
             return
         parts = parts[2:]
     artifact_root = (".anton", "artifacts")
     if parts[:2] == artifact_root or parts == artifact_root[:1]:
-        await require_product_permission(scoped.scope, "artifact.manage")
+        await require_product_permission(scope, "artifact.manage")
 
 
 def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:
@@ -719,6 +740,34 @@ def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) 
     conversation id is the only workspace the operation can reach.
     """
     if not _conversation_workspace_ok(path.value, scoped):
+        raise HTTPException(status_code=404, detail="File not found")
+
+
+def _require_canonical_workspace(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:
+    """404, the answer a co-member's workspace gets, before a PUT writes into
+    a conversation workspace named by another spelling of its id.
+
+    In org mode the artifacts list and the held rows' backfill read a
+    workspace only under its canonical name, str(conversation_id)
+    (artifact_roots.workspace_conversation_id), so an artifact folder written
+    below another spelling would never be listed. An uppercase spelling is
+    another folder on a case-sensitive store and the same folder on a
+    case-insensitive one. A spelling without hyphens or with braces is another
+    folder on both. Only the PUT calls this, since it is the one route that
+    writes below a workspace: the owner still lists, reads, previews and
+    deletes what such a folder already holds (_conversation_workspace_ok).
+    Elsewhere no artifacts list reads a workspace, so nothing is refused.
+    """
+    if not scoped.scope.org_mode:
+        return
+    parts = path.parts
+    if len(parts) < 2 or parts[0] != CONVERSATIONS_DIRNAME:
+        return
+    try:
+        UUID(parts[1])
+    except ValueError:
+        return  # not a conversation workspace: a shared project folder
+    if workspace_conversation_id(parts[1]) is None:
         raise HTTPException(status_code=404, detail="File not found")
 
 
@@ -737,11 +786,16 @@ def _pinned_fd(target: Path, base: Path, flags: int) -> Iterator[int]:
 
     A planted link raises `OSError` (ELOOP), which callers map to the same 404 a
     genuine miss returns rather than letting it surface as a 500.
+
+    The open never waits: `O_NONBLOCK` returns at once on a FIFO a pod made at
+    the path, which no writer on this node would ever open, so the caller's
+    file type check refuses it rather than the open holding its thread for
+    good. A regular file ignores the flag.
     """
     rel = target.relative_to(base.resolve())
     *dirs, name = rel.parts
     with opened_subdir_nofollow(base, *dirs) as pinned:
-        fd = dir_open(pinned, name, flags | O_NOFOLLOW)
+        fd = dir_open(pinned, name, flags | O_NOFOLLOW | O_NONBLOCK)
         try:
             yield fd
         finally:
@@ -1350,7 +1404,7 @@ def _close_instruction_context(
 
 
 def _pinned_stream(
-    target: Path, base: Path, *, media_type: str, headers: dict
+    target: Path, base: Path, *, media_type: str, headers: dict, scope: TenantScope
 ) -> StreamingResponse:
     """Serve `target` from a pinned descriptor.
 
@@ -1366,19 +1420,16 @@ def _pinned_stream(
     cm, fd, st = _pinned_regular_file(target, base)
     resources = ExitStack()
     resources.push(cm)
-
-    def _chunks():
-        try:
-            yield from read_bounded(fd, st.st_size)
-        finally:
-            resources.close()
-
     try:
         return PinnedStreamingResponse(
-            _chunks(), resources=resources, media_type=media_type, headers=headers
+            read_bounded(fd, st.st_size),
+            resources=resources,
+            scope=scope,
+            media_type=media_type,
+            headers=headers,
         )
     except BaseException:
-        # `_chunks` never ran, so neither it nor the response can close the descriptor.
+        # No response exists to close the descriptor.
         resources.close()
         raise
 
@@ -1388,10 +1439,21 @@ def _pinned_stream(
     response_model=ProjectInstructionsResponse,
     response_model_exclude_unset=True,
 )
-def get_project_instructions(
+async def get_project_instructions(
     project_name: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(
+        partial(_get_project_instructions, project_name=project_name, principal=principal), scope=scope
+    )
+
+
+def _get_project_instructions(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    principal: Principal | None,
 ):
     project = _project_for_name(project_name, scoped)
     base = _project_dir(project_name, scoped)
@@ -1442,10 +1504,19 @@ def get_project_instructions(
     response_model=ProjectFileListResponse,
     response_model_exclude_unset=True,
 )
-def list_project_files(
+async def list_project_files(
     project_name: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(partial(_list_project_files, project_name=project_name, principal=principal), scope=scope)
+
+
+def _list_project_files(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    principal: Principal | None,
 ):
     project = _project_for_name(project_name, scoped)
     base = _project_dir(project_name, scoped)
@@ -1513,11 +1584,23 @@ def list_project_files(
     response_model=ProjectFileReadResponse,
     response_model_exclude_unset=True,
 )
-def read_project_file(
+async def read_project_file(
     project_name: str,
     path: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(
+        partial(_read_project_file, project_name=project_name, path=path, principal=principal), scope=scope
+    )
+
+
+def _read_project_file(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: str,
+    principal: Principal | None,
 ):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
@@ -1579,20 +1662,260 @@ def read_project_file(
     return response
 
 
+class _ArtifactFolder(NamedTuple):
+    """An artifact folder a project files path lies in: the conversation
+    whose legacy root holds it, None for the project's shared root, and the
+    folder's name."""
+
+    conversation_id: UUID | None
+    slug: str
+
+
+class _ArtifactFolderPath(NamedTuple):
+    """A project files path below an artifact folder (_artifact_folder_path)."""
+
+    folder: _ArtifactFolder
+    #: The path's parts below the folder.
+    below: tuple[str, ...]
+
+
+def _artifact_folder_path(path: _ValidatedProjectPath) -> _ArtifactFolderPath | None:
+    """The artifact folder `path` lies in, when it lies in one: below a
+    project's shared root (`.anton/artifacts/<slug>/...`), or below a
+    conversation's legacy root (`conversations/<id>/.anton/artifacts/<slug>/
+    ...`), whose workspace name only counts in its canonical spelling
+    (artifact_roots.workspace_conversation_id). A file directly in a root is
+    no folder, and a folder whose name starts with a dot is none the list
+    opens (held_artifact_roots.listable_folders). Compared by parts,
+    case-sensitive, as the organization's file store is; the PUT and the
+    DELETE refuse a link in every component, so these parts are where they
+    wrote or deleted."""
+    parts = path.parts
+    conversation_id = None
+    if parts[0] == CONVERSATIONS_DIRNAME and len(parts) > 2:
+        conversation_id = workspace_conversation_id(parts[1])
+        if conversation_id is None:
+            return None
+        parts = parts[2:]
+    if len(parts) < 4 or parts[:2] != _ARTIFACTS_SUBPATH or parts[2].startswith("."):
+        return None
+    return _ArtifactFolderPath(
+        folder=_ArtifactFolder(conversation_id=conversation_id, slug=parts[2]), below=parts[3:]
+    )
+
+
+def _artifact_folder_written(path: _ValidatedProjectPath) -> _ArtifactFolder | None:
+    """The artifact folder a PUT of `path` wrote into, when it wrote into one
+    (_artifact_folder_path)."""
+    found = _artifact_folder_path(path)
+    return found.folder if found is not None else None
+
+
+def _artifact_folder_unlisted(path: _ValidatedProjectPath) -> _ArtifactFolder | None:
+    """The artifact folder whose card a DELETE of `path` removed: the
+    folder's own `metadata.json`, without which the artifacts list shows no
+    card for it. A DELETE never removes a folder (_delete_project_entry
+    refuses one), and any other file leaves the folder's card as it was."""
+    found = _artifact_folder_path(path)
+    return found.folder if found is not None and found.below == ("metadata.json",) else None
+
+
+def _record_artifact_folder_write(scoped: ScopedSession, *, project_name: str, path: _ValidatedProjectPath) -> None:
+    """After a PUT wrote into an artifact folder (_artifact_folder_written),
+    record two rows in the PUT's own unit, so the artifacts list shows the
+    folder: that the folder's root holds one (held_artifact_roots.hold_root),
+    so the list opens that root, and the folder's sort time
+    (artifact_sort_times.record_sort_times), so the list counts the folder
+    among the newest. The root is the project's shared root, or the caller's
+    own conversation's legacy root, which after the backfills only this PUT
+    and a comparison side's carry (ComparisonService._hold_carried_workspace)
+    record. Only org tenancy keeps these rows.
+
+    The time is the modification time of the folder's `metadata.json`
+    (_record_folder_time). A folder whose `metadata.json` is not written yet
+    gets no time; the PUT that writes it records one, and a later PUT into
+    the folder only moves the row to a newer time (record_sort_times).
+
+    Best-effort: the file is written already, so a failure is logged at
+    ERROR and the PUT still succeeds. Each row has its own try, so a failed
+    hold still records the time. For a shared root a failed hold asks for
+    the project's location check
+    (_ask_for_location_check), whose listing holds the root and records the
+    time of every folder it reads. A legacy root has no self-heal: its rows
+    wait for the next PUT into the folder."""
+    from cowork.services.artifact_locations import keeps_locations
+    from cowork.services.held_artifact_roots import hold_root
+
+    folder = _artifact_folder_written(path)
+    if folder is None or not keeps_locations(scoped.scope):
+        return
+    project = None
+    try:
+        project = _artifact_folder_project(scoped, project_name)
+        hold_root(scoped, project_id=project.id, conversation_id=folder.conversation_id)
+    except Exception:
+        scoped.rollback()
+        logger.error(
+            "Could not record that a project files write put an artifact folder in its root",
+            exc_info=True,
+            extra={"event": "held_artifact_root_not_recorded", **_folder_write_context(project, folder)},
+        )
+        _ask_for_location_check(scoped, project=project, folder=folder)
+    if project is None:
+        return
+    _record_folder_time(scoped, project=project, folder=folder)
+
+
+def _artifact_folder_project(scoped: ScopedSession, project_name: str) -> ProjectRow:
+    """`project_name`'s row as plain values, which stay readable after a
+    failed commit expires every loaded row. An org project's folder is never
+    one the user chose (ProjectService.directory_is_external)."""
+    found = _project_for_name(project_name, scoped)
+    return ProjectRow(id=found.id, name=found.name, path=found.path, external=False)
+
+
+def _record_folder_time(scoped: ScopedSession, *, project: ProjectRow, folder: _ArtifactFolder) -> None:
+    """Record `folder`'s sort time in `project` (artifact_sort_times.
+    record_sort_times): the modification time of its `metadata.json`, read
+    here (id_holder_times), since the project files units run on the file
+    store's threads (run_efs_unit). A folder with no `metadata.json`, or one
+    that holds no id, gets no time, and a row only moves to a newer time.
+
+    Best-effort: a failed write is rolled back and logged at ERROR. A
+    `metadata.json` the read could not reach, such as on EIO, is logged at
+    WARNING and leaves the folder's row as it was. For a shared root either
+    one asks for the project's location check (_ask_for_location_check),
+    whose listing records the time of every folder it reads."""
+    from cowork.services.artifact_sort_times import id_holder_times, record_sort_times
+
+    try:
+        read = id_holder_times(base=recorded_source(project, folder.conversation_id).base, slugs=[folder.slug])
+        record_sort_times(scoped, project_id=project.id, times=read.times, conversation_id=folder.conversation_id)
+    except Exception:
+        scoped.rollback()
+        logger.error(
+            "Could not record the sort time of an artifact folder a project files request changed",
+            exc_info=True,
+            extra={"event": "artifact_sort_time_not_recorded", **_folder_write_context(project, folder)},
+        )
+        _ask_for_location_check(scoped, project=project, folder=folder)
+        return
+    if read.unreadable:
+        # The event and level a turn end's or the self-heal's read logs for
+        # folders whose time it could not read.
+        logger.warning(
+            "Could not read the metadata.json of an artifact folder a project files request changed, so its sort "
+            "time was not updated",
+            extra={
+                "event": "artifact_sort_times_unreadable",
+                **_folder_write_context(project, folder),
+                "count": len(read.unreadable),
+            },
+        )
+        _ask_for_location_check(scoped, project=project, folder=folder)
+
+
+def _folder_write_context(
+    project: ProjectRow | None, folder: _ArtifactFolder
+) -> dict[str, str | tuple[str, ...]]:
+    """The log fields of a folder a PUT or a DELETE changed: its project,
+    when the request found its row, its conversation for a legacy root, and
+    its name."""
+    return log_context(
+        project_id=project.id if project is not None else None,
+        conversation_id=folder.conversation_id,
+        artifact_slug=folder.slug,
+    )
+
+
+def _ask_for_location_check(
+    scoped: ScopedSession, *, project: ProjectRow | None, folder: _ArtifactFolder
+) -> None:
+    """After a PUT or a DELETE could not record a row of `folder` in
+    `project`'s shared root (_record_artifact_folder_write,
+    _record_folder_time), ask for the project's location check
+    (artifact_autopublish.request_project_location_check). Its listing of
+    the shared root holds the root and records the time of every folder it
+    reads (artifact_autopublish._record_listing). Nothing is asked for a
+    legacy root, which has no self-heal, or when the request found no
+    project row."""
+    from cowork.services.artifact_autopublish import request_project_location_check
+
+    if project is None or folder.conversation_id is not None:
+        return
+    request_project_location_check(
+        artifacts_base=recorded_source(project, None).base, scope=scoped.scope, project_id=str(project.id)
+    )
+
+
+def _forget_artifact_folder_delete(scoped: ScopedSession, *, project_name: str, path: _ValidatedProjectPath) -> None:
+    """After a DELETE removed an artifact folder's `metadata.json`
+    (_artifact_folder_unlisted), drop that folder's sort-time row
+    (artifact_sort_times.forget_sort_time), in the project's shared root or
+    in the caller's own conversation's legacy root, in the DELETE's own
+    unit. Without its `metadata.json` the folder shows no card, so its row
+    would only cost the list a failed open among its newest rows, and no
+    self-heal lists a legacy root to drop it there. Only org tenancy keeps
+    these rows.
+
+    A PUT of the same `metadata.json` may write it again and record its row
+    between the unlink and the drop. So after the drop the DELETE reads the
+    folder's time again and records it (_record_folder_time): the row comes
+    back when the file is back, and none is written when it is still gone.
+
+    Best-effort: the file is deleted already, so a failed drop is rolled
+    back and logged at WARNING, and the DELETE still succeeds."""
+    from cowork.services.artifact_locations import Location, keeps_locations
+    from cowork.services.artifact_sort_times import forget_sort_time
+
+    folder = _artifact_folder_unlisted(path)
+    if folder is None or not keeps_locations(scoped.scope):
+        return
+    project = None
+    try:
+        project = _artifact_folder_project(scoped, project_name)
+        forget_sort_time(
+            scoped, location=Location(project_id=project.id, conversation_id=folder.conversation_id, slug=folder.slug)
+        )
+    except Exception:
+        scoped.rollback()
+        logger.warning(
+            "Could not drop the sort time of an artifact folder whose metadata.json a project files delete removed",
+            exc_info=True,
+            extra={"event": "artifact_sort_time_not_dropped", **_folder_write_context(project, folder)},
+        )
+        return
+    _record_folder_time(scoped, project=project, folder=folder)
+
+
 @router.put(
     "/{project_name}/files/{path:path}",
     response_model=ProjectFileWriteResponse,
     dependencies=[Depends(_authorize_artifact_file_mutation)],
     response_model_exclude_unset=True,
 )
-def write_project_file(
+async def write_project_file(
     project_name: str,
     path: ProjectMutationPathDep,
     req: _FileWriteRequest,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
+    return await run_efs_unit(
+        partial(_write_project_file, project_name=project_name, path=path, req=req, principal=principal), scope=scope
+    )
+
+
+def _write_project_file(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: ProjectMutationPathDep,
+    req: _FileWriteRequest,
+    principal: Principal | None,
+):
     _require_workspace_path(path, scoped)
+    _require_canonical_workspace(path, scoped)
     classification_base = (
         _project_dir(project_name, scoped) if scoped.scope.org_mode else None
     )
@@ -1703,6 +2026,7 @@ def write_project_file(
             )
         raise
     response = {"path": path.value, "size": st.st_size, "modified": st.st_mtime}
+    _record_artifact_folder_write(scoped, project_name=project_name, path=path)
     if instructions_context is not None:
         project = instructions_context.project
         access = instructions_context.access
@@ -1752,13 +2076,23 @@ def write_project_file(
     return response
 
 
-@router.post("/{project_name}/files/upload")
+# Unset fields stay out of each result: a written file has no error, a refused
+# one no size.
+@router.post("/{project_name}/files/upload", response_model=ProjectUploadResponse, response_model_exclude_unset=True)
 async def upload_project_files(
     project_name: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     files: list[UploadFile] = File(...),
 ):
-    results: list[dict[str, Any]] = []
+    # The project lookup and the writes run together on the file store's
+    # threads. Each upload is read there from its own spool, one at a time and
+    # only once the project is found, so a request holds at most one file's
+    # bytes in memory.
+    return await run_efs_unit(partial(_write_uploads, project_name=project_name, uploads=files), scope=scope)
+
+
+def _write_uploads(scoped: ScopedSession, *, project_name: str, uploads: list[UploadFile]) -> ProjectUploadResponse:
+    results: list[ProjectUploadResult] = []
     with _opened_project_directory_inventory(scoped) as inventory:
         selected_project_name = os.path.basename(project_name)
         if (
@@ -1780,32 +2114,27 @@ async def upload_project_files(
         if directory is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
-        for f in files:
-            if not f.filename:
-                results.append({"name": "", "ok": False, "error": "filename missing"})
+        for upload in uploads:
+            if not upload.filename:
+                results.append(ProjectUploadResult(name="", ok=False, error="filename missing"))
                 continue
-            safe_name = os.path.basename(f.filename).strip()
+            safe_name = os.path.basename(upload.filename).strip()
             if not safe_name or safe_name.startswith("."):
-                results.append(
-                    {"name": f.filename, "ok": False, "error": "invalid filename"}
-                )
+                results.append(ProjectUploadResult(name=upload.filename, ok=False, error="invalid filename"))
                 continue
             try:
-                data = await f.read()
+                data = upload.file.read()
                 _write_bytes_at_project_root(
                     directory, _ValidatedProjectPath((safe_name,)), data
                 )
-                results.append({"name": safe_name, "ok": True, "size": len(data)})
+                results.append(ProjectUploadResult(name=safe_name, ok=True, size=len(data)))
             except Exception as exc:
                 logger.error("Failed to write file %s: %s", safe_name, exc)
-                results.append(
-                    {"name": safe_name, "ok": False, "error": "File write failed"}
-                )
-    return {"results": results}
+                results.append(ProjectUploadResult(name=safe_name, ok=False, error="File write failed"))
+    return ProjectUploadResponse(results=results)
 
 
 _SHAREPOINT_IMPORT_FIELDS = frozenset({"connection", "site", "drive_id", "folder", "item_ids"})
-_RESERVED_IMPORT_FOLDERS = frozenset({CONVERSATIONS_DIRNAME, "skills"})
 _IMPORTS_RUNNING: set[UUID] = set()
 _IMPORTS_LOCK = threading.Lock()
 _SHAREPOINT_IMPORT_STATUS = {
@@ -1865,7 +2194,7 @@ def _sharepoint_import_request(body: Any) -> _SharePointImportRequest:
 
 def _reserved_import_folder(name: str) -> bool:
     """Whether a top-level project folder is Cowork's own and closed to imports."""
-    return name.casefold() in _RESERVED_IMPORT_FOLDERS
+    return name.casefold() in SERVER_PROJECT_FOLDERS
 
 
 def _import_folder_parts(folder: str, scoped: ScopedSession) -> tuple[str, ...]:
@@ -1981,11 +2310,23 @@ def import_sharepoint_files(
     response_model=ProjectFileDeleteResponse,
     dependencies=[Depends(_authorize_artifact_file_mutation)],
 )
-def delete_project_file(
+async def delete_project_file(
     project_name: str,
     path: ProjectMutationPathDep,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(
+        partial(_delete_project_file, project_name=project_name, path=path, principal=principal), scope=scope
+    )
+
+
+def _delete_project_file(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: ProjectMutationPathDep,
+    principal: Principal | None,
 ):
     _require_workspace_path(path, scoped)
     classification_base = (
@@ -2093,19 +2434,33 @@ def delete_project_file(
             _close_instruction_context(instructions_context)
             raise
         _close_instruction_context(instructions_context)
+    _forget_artifact_folder_delete(scoped, project_name=project_name, path=path)
     return {"status": "deleted", "path": path.value}
 
 
 @router.delete(
     "/{project_name}/skill_drafts/{slug}", status_code=status.HTTP_204_NO_CONTENT
 )
-def delete_skill_draft(project_name: str, slug: str, scoped: ScopedSessionDep):
+async def delete_skill_draft(
+    project_name: str,
+    slug: str,
+    scope: ScopeDep,
+):
     """Remove a staged skill draft once it is Saved (or dismissed).
 
     Idempotent: a missing draft is a no-op — Save may race the sweep, and a
     lingering draft is the safe default we're clearing, not a hard error. The
     slug is confined to a direct child of the drafts dir (no traversal).
     """
+    return await run_efs_unit(partial(_delete_skill_draft, project_name=project_name, slug=slug), scope=scope)
+
+
+def _delete_skill_draft(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    slug: str,
+):
     safe_slug = os.path.basename(slug)
     if (
         safe_slug != slug
@@ -2135,7 +2490,18 @@ def delete_skill_draft(project_name: str, slug: str, scoped: ScopedSessionDep):
 
 
 @router.post("/preview-mount-file")
-def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
+async def preview_mount_file(
+    req: _PreviewMountRequest,
+    scope: ScopeDep,
+):
+    return await run_efs_unit(partial(_preview_mount_file, req=req), scope=scope)
+
+
+def _preview_mount_file(
+    scoped: ScopedSession,
+    *,
+    req: _PreviewMountRequest,
+):
     base = _project_dir(req.name, scoped)
     target = _safe_relpath(req.path, base)
     _require_workspace_access(target, base, scoped)
@@ -2154,9 +2520,13 @@ def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
 
 
 @router.get("/preview-asset/{token}/{rel_path:path}")
-def preview_asset(
+async def preview_asset(
     token: str, rel_path: str, scope: TenantScope = Depends(get_tenant_scope)
 ):
+    return await run_efs(partial(_preview_asset, token=token, rel_path=rel_path, scope=scope), scope=scope)
+
+
+def _preview_asset(*, token: str, rel_path: str, scope: TenantScope):
     # An unknown token, an expired one and another member's one all answer the
     # same 404: which of the three it was is itself information about somebody
     # else's files.
@@ -2188,11 +2558,25 @@ def preview_asset(
         mount.project_base,
         media_type=media_type,
         headers={"Cache-Control": "private, max-age=300"},
+        scope=scope,
     )
 
 
 @router.get("/{project_name}/files-raw/{path:path}")
-def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
+async def download_project_file(
+    project_name: str,
+    path: str,
+    scope: ScopeDep,
+):
+    return await run_efs_unit(partial(_download_project_file, project_name=project_name, path=path), scope=scope)
+
+
+def _download_project_file(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: str,
+):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
     _require_workspace_access(target, base, scoped)
@@ -2204,4 +2588,5 @@ def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep
         base,
         media_type=media_type,
         headers={"Content-Disposition": attachment_disposition(target.name)},
+        scope=scoped.scope,
     )

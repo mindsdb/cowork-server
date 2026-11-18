@@ -145,7 +145,7 @@ jobs:
           # external `deployment` dependency, so its label scheme is not ours to
           # rely on. Deployment pods are always <deployment>-<hash>-<suffix>.
           # A pod being deleted keeps phase Running through its preStop sleep
-          # and shutdown, up to the chart's 60 s grace, and `helm --wait` does
+          # and shutdown, up to the chart's 62 s grace, and `helm --wait` does
           # not wait for it. Skip any pod with a deletionTimestamp, or a
           # port-forward can land on one that closes mid-test. A go-template
           # rather than jq, which these runners need not have.

@@ -34,9 +34,12 @@ from cowork.services.artifact_export import (
     export_formats,
     export_pdf_settings,
 )
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_permissions import artifact_capabilities
 from cowork.services.artifacts import ProjectArtifacts
 from test_artifact_ownership import make_project, project_root
+from _async_stub import awaitable
+from _artifact_cards import make_card
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_export"
 FORMAT_CASES = yaml.safe_load((FIXTURES / "formats.yaml").read_text(encoding="utf-8"))["cases"]
@@ -103,7 +106,7 @@ def test_a_card_names_its_primary_file_and_type(tmp_path, primary, artifact_type
         path = folder / primary
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("x")
-    card = {"folder": str(folder), "path": str(path), "type": artifact_type}
+    card = make_card(folder=str(folder), path=str(path), type=artifact_type)
 
     assert card_export_source(card) == expected
 
@@ -179,7 +182,7 @@ def test_local_cards_carry_export_formats(tmp_path, local_mode):
         _write_artifact(source.base, slug, files, **metadata)
 
     with Session(get_engine(get_app_settings().database.uri)) as raw:
-        cards = artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])
+        cards = [card.to_json() for card in artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])]
 
     listed = {card["slug"]: card["capabilities"]["exportFormats"] for card in cards}
     assert listed == {slug: expected for slug, (_f, _m, expected) in _LOCAL_ARTIFACTS.items()}
@@ -193,7 +196,7 @@ def test_the_local_workspace_response_carries_export_formats(tmp_path, local_mod
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_for_request",
-        lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True),
+        awaitable(lambda *_args: (source, folder, ArtifactMetadata.parse((folder / "metadata.json").read_text()), True)),
     )
     from cowork.server import create_app
 
@@ -216,7 +219,7 @@ def test_the_workspace_response_decides_export_formats_where_artifact_capabiliti
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_for_request",
-        lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True),
+        awaitable(lambda *_args: (source, folder, ArtifactMetadata.parse((folder / "metadata.json").read_text()), True)),
     )
     monkeypatch.setattr(artifact_permissions, "offered_export_formats", lambda **_kwargs: ["docx"])
     from cowork.server import create_app
@@ -246,11 +249,11 @@ def test_a_hard_linked_primary_offers_nothing_anywhere_and_the_route_answers_422
     )
     os.link(folder / "report.md", tmp_path / "backup.md")
     with Session(get_engine(get_app_settings().database.uri)) as raw:
-        cards = artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])
+        cards = [card.to_json() for card in artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])]
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_for_request",
-        lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True),
+        awaitable(lambda *_args: (source, folder, ArtifactMetadata.parse((folder / "metadata.json").read_text()), True)),
     )
     from cowork.server import create_app
 
@@ -312,7 +315,7 @@ def org_export_on(monkeypatch):
 
 def _org_card_formats(world) -> dict[str, list[str]]:
     with _scoped(world.org_id, world.creator) as session:
-        cards = artifacts_ep._artifact_cards(session, [world.source])
+        cards = [card.to_json() for card in artifacts_ep._artifact_cards(session, [world.source])]
     return {card["slug"]: card["capabilities"]["exportFormats"] for card in cards}
 
 
@@ -344,7 +347,7 @@ async def test_the_org_workspace_response_offers_formats_to_an_owner_who_may_man
     _role_permissions(monkeypatch, artifact_manage=True)
     with _scoped(org_world.org_id, org_world.creator) as session:
         result = await workspace_ep.artifact_source(
-            str(org_world.project.id), org_world.ids["mine"], session, path=None
+            str(org_world.project.id), org_world.ids["mine"], session.scope, path=None
         )
 
     assert result["capabilities"]["exportFormats"] == offered
@@ -361,7 +364,7 @@ async def test_while_org_export_is_off_the_workspace_response_never_walks_the_fo
     _role_permissions(monkeypatch, artifact_manage=True)
     with _scoped(org_world.org_id, org_world.creator) as session:
         result = await workspace_ep.artifact_source(
-            str(org_world.project.id), org_world.ids["mine"], session, path=None
+            str(org_world.project.id), org_world.ids["mine"], session.scope, path=None
         )
 
     assert result["capabilities"]["exportFormats"] == []
@@ -375,7 +378,7 @@ async def test_the_workspace_response_offers_nothing_once_artifact_manage_is_gon
     _role_permissions(monkeypatch, artifact_manage=False)
     with _scoped(org_world.org_id, org_world.creator) as session:
         result = await workspace_ep.artifact_source(
-            str(org_world.project.id), org_world.ids["mine"], session, path=None
+            str(org_world.project.id), org_world.ids["mine"], session.scope, path=None
         )
 
     assert result["capabilities"]["canEdit"] is False
@@ -387,7 +390,7 @@ async def test_a_reviewer_never_reaches_the_workspace_response(org_world, monkey
     with _scoped(org_world.org_id, org_world.member) as session:
         with pytest.raises(HTTPException) as refused:
             await workspace_ep.artifact_source(
-                str(org_world.project.id), org_world.ids["mine"], session, path=None
+                str(org_world.project.id), org_world.ids["mine"], session.scope, path=None
             )
 
     assert refused.value.status_code == 403
@@ -406,7 +409,7 @@ async def test_the_live_recheck_keeps_formats_only_with_artifact_manage(
     }
 
     current = await workspace_ep._current_capabilities(
-        SimpleNamespace(scope=TenantScope(org_mode=True, org_id="org", user_id="user")),
+        TenantScope(org_mode=True, org_id="org", user_id="user"),
         capabilities,
     )
 
@@ -423,12 +426,12 @@ def test_the_route_accepts_exactly_the_formats_the_card_lists(tmp_path, local_mo
     source = _local_source(tmp_path)
     artifact_id, folder = _write_artifact(source.base, slug, files, **metadata)
     with Session(get_engine(get_app_settings().database.uri)) as raw:
-        (card,) = artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])
+        (card,) = [card.to_json() for card in artifacts_ep._artifact_cards(ScopedSession(raw, LOCAL_SCOPE), [source])]
     listed = card["capabilities"]["exportFormats"]
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_for_request",
-        lambda *_args: (source, folder, json.loads((folder / "metadata.json").read_text()), True),
+        awaitable(lambda *_args: (source, folder, ArtifactMetadata.parse((folder / "metadata.json").read_text()), True)),
     )
     from cowork.server import create_app
 

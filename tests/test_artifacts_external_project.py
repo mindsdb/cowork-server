@@ -211,7 +211,7 @@ def test_a_listed_card_from_an_adopted_folder_serves_under_the_row_name(
     )
 
     session = _scoped(engine)
-    cards = list_artifacts(artifacts_sources_for_scope(session))
+    cards = [card.to_json() for card in list_artifacts(artifacts_sources_for_scope(session))]
     card = next(c for c in cards if c["title"] == "Dashboard")
     assert card["serveUrl"] == (
         f"/api/v1/artifacts/serve/{project.name}/dash/index.html"
@@ -221,8 +221,8 @@ def test_a_listed_card_from_an_adopted_folder_serves_under_the_row_name(
 
 def test_the_artifacts_route_lists_an_adopted_folder(projects_root, tmp_path):
     """Through HTTP, not through the resolver. The unit tests above passed
-    while the local branch of `artifact_sources_for_request` still called the
-    filesystem scan directly, so none of this was reachable from the route.
+    while the route's local branch still called the filesystem scan
+    directly, so none of this was reachable from the route.
     """
     import json
 

@@ -42,10 +42,12 @@ therefore no injected identity: those two clients send the headers themselves.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import time
 import uuid
+from collections.abc import Iterable
 
 import httpx
 import pytest
@@ -54,23 +56,22 @@ from tests.integration.prereq import missing_prerequisite
 
 pytestmark = pytest.mark.postdeploy
 
-# A turn that runs for a while, so there is something to cancel and something
-# to reconnect to. Short enough that a failing test does not hang CI.
-SLOW_PROMPT = (
-    "Count slowly from 1 to 40, one number per line, "
-    "pausing to think between each one."
-)
-# The cancel test needs a turn that is still running one HTTP call later, which
-# SLOW_PROMPT does not guarantee: a fast deployment answered all 40 lines before
-# the next call landed, and the test skipped rather than cancelling anything.
-# Ten times the output buys that margin without making a failure hang CI — the
-# turn is cancelled or abandoned either way, so the extra tokens are never
-# actually generated.
+# The cancel test needs a turn that is still running one HTTP call later. A
+# fast deployment answered a 40-line count before the next call landed, and the
+# test skipped rather than cancelling anything. Ten times the output buys that
+# margin without making a failure hang CI — the turn is cancelled or abandoned
+# either way, so the extra tokens are never actually generated.
 CANCEL_PROMPT = (
     "Count slowly from 1 to 400, one number per line, "
     "pausing to think between each one."
 )
+# The reconnect tests need a turn still running after its first answer delta.
+# A 40-line count ended within the same few seconds on a PR environment, so
+# they take the cancel test's length. Unlike cancel, this turn runs to the end.
+RECONNECT_PROMPT = CANCEL_PROMPT
 QUICK_PROMPT = "Reply with exactly the word: pong"
+FIRST_TURN_PROMPT = "Reply with exactly the word: alpha"
+SECOND_TURN_PROMPT = "Reply with exactly the word: bravo"
 
 TURN_TIMEOUT_S = 180.0
 CANCEL_VISIBLE_S = 45.0
@@ -346,24 +347,112 @@ def _sse_events(text: str) -> list[str]:
     ]
 
 
+SseFrame = tuple[str, dict]
+
+_UNSUCCESSFUL_EVENTS = ("response.failed", "response.cancelled", "error")
+
+
+def _read_sse_frames(lines: Iterable[str]) -> list[SseFrame]:
+    """Group SSE lines into (event name, JSON payload) frames, in order.
+
+    Heartbeat comments are skipped. A payload that is not a JSON object is
+    kept as ``{"raw": ...}`` so a malformed frame still shows up in a failure.
+    A frame cut off by the end of the stream is still returned.
+
+    Args:
+        lines: Decoded lines without their line endings, as ``iter_lines`` yields.
+
+    Returns:
+        One tuple per frame that carried an ``event:`` line.
+    """
+    frames: list[SseFrame] = []
+    event: str | None = None
+    data: list[str] = []
+    # The trailing "" flushes a final frame the stream did not terminate.
+    for line in itertools.chain(lines, [""]):
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event = line.removeprefix("event:").strip()
+        elif line.startswith("data:"):
+            data.append(line.removeprefix("data:").strip())
+        elif not line:
+            if event is not None:
+                raw = "\n".join(data)
+                try:
+                    payload = json.loads(raw)
+                except ValueError:
+                    payload = None
+                if not isinstance(payload, dict):
+                    payload = {"raw": raw[:300]}
+                frames.append((event, payload))
+            event, data = None, []
+    return frames
+
+
+def _assert_successful_turn(frames: list[SseFrame]) -> dict:
+    """Fail unless the frames are one turn that finished with an answer.
+
+    Success is exactly one ``response.completed`` whose status is
+    ``completed``, no failure, error or cancel frame, and nonempty answer
+    text. The text comes from the completed payload, not from joined
+    deltas, because answer reset and restore frames rewrite what streamed.
+
+    Args:
+        frames: The turn's frames from ``_read_sse_frames``.
+
+    Returns:
+        The ``response.completed`` frame's payload.
+
+    Raises:
+        AssertionError: naming the first rule the stream broke, with the
+            server's code and message when it reported a failure.
+    """
+    events = [event for event, _ in frames]
+    for event, payload in frames:
+        if event in _UNSUCCESSFUL_EVENTS:
+            message = payload.get("error") or payload.get("message")
+            raise AssertionError(
+                f"turn did not complete: stream reported {event} "
+                f"code={payload.get('code')!r} message={message!r} events={events}"
+            )
+    completed = [payload for event, payload in frames if event == "response.completed"]
+    assert completed, f"turn did not complete: no response.completed frame, events={events}"
+    assert len(completed) == 1, f"turn completed more than once: events={events}"
+
+    response = completed[0].get("response") or {}
+    status = response.get("status")
+    assert status == "completed", (
+        f"turn ended with status {status!r}: {response.get('incomplete_details')}"
+    )
+    assert _answer_text(completed[0]).strip(), (
+        f"turn completed with no answer text: events={events}"
+    )
+    return completed[0]
+
+
+def _answer_text(completed: dict) -> str:
+    """The final answer text carried by a ``response.completed`` payload."""
+    return "".join(
+        part.get("text", "")
+        for output in completed.get("response", {}).get("output", [])
+        for part in output.get("content", [])
+    )
+
+
 def _stream_turn(
     client: httpx.Client,
     conversation_id: str,
     prompt: str,
     *,
     read_timeout: float = TURN_TIMEOUT_S,
-    failures: list[str] | None = None,
+    frames: list[SseFrame] | None = None,
 ) -> list[str]:
     """POST a turn and drain its SSE response, returning the event names.
 
-    Pass ``failures`` to also collect the reason from any ``response.failed`` /
-    ``error`` event (its ``data:`` line carries ``code`` + ``error`` or
-    ``message``) — a bare "did not complete" is unactionable in CI, and the
-    reason says whether the pod never mounted, the worker timed out, or the
-    model was unavailable.
+    Pass ``frames`` to also receive every frame with its payload, which
+    ``_assert_successful_turn`` needs to say why a turn did not succeed.
     """
-    events: list[str] = []
-    current: str | None = None
     with client.stream(
         "POST",
         "/api/v1/responses/",
@@ -371,66 +460,118 @@ def _stream_turn(
         timeout=httpx.Timeout(read_timeout, connect=10.0),
     ) as resp:
         assert resp.status_code == 200, resp.read()[:500]
-        for line in resp.iter_lines():
-            if line.startswith("event:"):
-                current = line.removeprefix("event:").strip()
-                events.append(current)
-            elif (
-                line.startswith("data:")
-                and failures is not None
-                and current in ("response.failed", "error")
-            ):
-                raw = line.removeprefix("data:").strip()
-                try:
-                    payload = json.loads(raw)
-                    message = payload.get("error") or payload.get("message")
-                    failures.append(
-                        f"code={payload.get('code')!r} message={message!r}"
-                    )
-                except (ValueError, AttributeError):
-                    failures.append(raw[:300])
-    return events
+        received = _read_sse_frames(resp.iter_lines())
+    if frames is not None:
+        frames.extend(received)
+    return [event for event, _ in received]
 
 
 def test_a_turn_runs_end_to_end(api, conversation_id):
-    """A turn posted over HTTP reaches a pod and its replies reach the client."""
-    failures: list[str] = []
-    events = _stream_turn(api, conversation_id, QUICK_PROMPT, failures=failures)
+    """A turn posted over HTTP reaches a pod and its answer reaches the client."""
+    frames: list[SseFrame] = []
+    events = _stream_turn(api, conversation_id, QUICK_PROMPT, frames=frames)
 
     assert "response.created" in events
-    assert (
-        "response.completed" in events
-    ), f"turn did not complete: events={events} failure={failures}"
+    _assert_successful_turn(frames)
 
 
-def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
-    """Close the stream mid-turn and tail it back, the page-reload path."""
-    with api.stream(
-        "POST",
-        "/api/v1/responses/",
-        json={"input": SLOW_PROMPT, "conversation": conversation_id, "stream": True},
-        timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
-    ) as resp:
-        assert resp.status_code == 200
-        for line in resp.iter_lines():  # drop the connection early
-            if line.startswith("event:"):
-                break
+_ANSWER_DELTA = "response.output_text.delta"
+_RECONNECT_PREMISE_SKIP = (
+    "the turn ended before the connection dropped, so its replay was checked "
+    "but no mid-turn reconnect happened on this run; the prompt needs to "
+    "outlast the first answer delta on this deployment"
+)
 
-    probe = api.get(
-        "/api/v1/responses/in-flight", params={"conversation_id": conversation_id}
-    ).json()
-    assert probe["has_buffer"] is True, probe
 
-    with api.stream(
+def _drop_after_first_answer_delta(resp: httpx.Response) -> None:
+    """Read a turn's stream until the model has produced answer text, then stop.
+
+    ``response.created`` is written before the model streams anything, so
+    leaving on it would reconnect to a turn that has not started answering.
+    """
+    for line in resp.iter_lines():
+        if line.startswith("event:") and line.removeprefix("event:").strip() == _ANSWER_DELTA:
+            return
+
+
+def _replica_client(base_url: str, headers: dict[str, str]) -> httpx.Client:
+    """A client that talks to one pod directly, bypassing the ingress."""
+    return httpx.Client(base_url=base_url.rstrip("/"), headers=headers, timeout=30.0)
+
+
+def _conversation_items(client: httpx.Client, conversation_id: str) -> list[dict]:
+    """The conversation's saved items, as the renderer loads them on reload."""
+    items = client.get(f"/api/v1/conversations/{conversation_id}/items")
+    assert items.status_code == 200, items.text[:500]
+    body = items.json()
+    return body if isinstance(body, list) else body.get("items", [])
+
+
+def _assert_answer_saved(client: httpx.Client, conversation_id: str, completed: dict) -> None:
+    """Fail unless the completed frame's answer is the saved assistant message.
+
+    The server saves the answer before it writes the completed frame, so one
+    read is enough.
+    """
+    message_id = completed.get("assistant_message_id")
+    assert message_id, "completed frame carried no assistant_message_id"
+    saved = [
+        item
+        for item in _conversation_items(client, conversation_id)
+        if str(item.get("id")) == message_id
+    ]
+    assert len(saved) == 1, f"replayed answer was not saved: assistant_message_id={message_id}"
+    assert saved[0].get("role") == "assistant", f"saved answer has role {saved[0].get('role')!r}"
+    assert saved[0].get("content") == _answer_text(completed), (
+        "replayed answer differs from the saved one: "
+        f"replayed={_answer_text(completed)[:200]!r} saved={str(saved[0].get('content'))[:200]!r}"
+    )
+
+
+def _replay_turn(client: httpx.Client, conversation_id: str) -> dict:
+    """Tail the whole turn from the start and require a successful answer.
+
+    Returns:
+        The replayed ``response.completed`` payload.
+    """
+    with client.stream(
         "GET",
         "/api/v1/responses/tail",
         params={"conversation_id": conversation_id, "from_seq": 0},
         timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
     ) as resp:
         assert resp.status_code == 200
-        replayed = _sse_events(resp.read().decode())
+        replayed = _read_sse_frames(resp.iter_lines())
 
-    assert "response.created" in replayed, replayed
+    assert replayed and replayed[0][0] == "response.created", (
+        f"replay did not start with response.created: {replayed[:1]}"
+    )
+    return _assert_successful_turn(replayed)
+
+
+def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
+    """Close the stream mid-answer and tail it back, the page-reload path."""
+    with api.stream(
+        "POST",
+        "/api/v1/responses/",
+        json={"input": RECONNECT_PROMPT, "conversation": conversation_id, "stream": True},
+        timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
+    ) as resp:
+        assert resp.status_code == 200
+        _drop_after_first_answer_delta(resp)
+
+    probe = api.get(
+        "/api/v1/responses/in-flight", params={"conversation_id": conversation_id}
+    ).json()
+    assert probe["has_buffer"] is True, probe
+    running = _await_running_turn(api, conversation_id)
+
+    completed = _replay_turn(api, conversation_id)
+    _assert_answer_saved(api, conversation_id, completed)
+
+    # Only after the replay passed: a skip must never hide a broken one.
+    if running is None:
+        pytest.skip(_RECONNECT_PREMISE_SKIP)
 
 
 def test_reconnect_works_on_the_other_replica(conversation_id, identity):
@@ -449,42 +590,33 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
         )
 
     headers = _direct_headers(identity)
-    with httpx.Client(
-        base_url=url_a.rstrip("/"), headers=headers, timeout=30.0
-    ) as replica_a:
+    with _replica_client(url_a, headers) as replica_a:
         with replica_a.stream(
             "POST",
             "/api/v1/responses/",
             json={
-                "input": SLOW_PROMPT,
+                "input": RECONNECT_PROMPT,
                 "conversation": conversation_id,
                 "stream": True,
             },
             timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
         ) as resp:
             assert resp.status_code == 200
-            for line in resp.iter_lines():
-                if line.startswith("event:"):
-                    break
+            _drop_after_first_answer_delta(resp)
 
-    with httpx.Client(
-        base_url=url_b.rstrip("/"), headers=headers, timeout=30.0
-    ) as replica_b:
+    with _replica_client(url_b, headers) as replica_b:
         probe = _await_shared_buffer(replica_b, conversation_id)
         # Before the Redis backend this replica had no handle and no buffer,
         # and answered has_buffer=False.
         assert probe["has_buffer"] is True, probe
+        running = _await_running_turn(replica_b, conversation_id)
 
-        with replica_b.stream(
-            "GET",
-            "/api/v1/responses/tail",
-            params={"conversation_id": conversation_id, "from_seq": 0},
-            timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
-        ) as resp:
-            assert resp.status_code == 200
-            replayed = _sse_events(resp.read().decode())
+        completed = _replay_turn(replica_b, conversation_id)
+        _assert_answer_saved(replica_b, conversation_id, completed)
 
-    assert "response.created" in replayed, replayed
+    # Only after the replay passed: a skip must never hide a broken one.
+    if running is None:
+        pytest.skip(_RECONNECT_PREMISE_SKIP)
 
 
 def _await_shared_buffer(
@@ -612,22 +744,43 @@ def test_cancel_ends_the_turn(api, conversation_id):
         )
 
 
-def test_a_second_message_queues_behind_the_first(api, conversation_id):
-    """The controller serialises per conversation, so two messages sent back to
-    back must both finish rather than fight over one pod."""
-    first = _stream_turn(api, conversation_id, QUICK_PROMPT)
-    assert "response.completed" in first, first
+def test_two_successive_turns_complete_and_persist(api, conversation_id):
+    """Two turns sent one after the other both finish and are saved in order.
 
-    second = _stream_turn(api, conversation_id, QUICK_PROMPT)
-    assert "response.completed" in second, second
+    The second is sent only once the first has ended, which is what the UI
+    queue does; a second turn sent while one runs is refused with 409, and
+    tests/test_turn_already_running.py covers that.
+    """
+    expected: list[tuple[str, str, str]] = []
+    for prompt in (FIRST_TURN_PROMPT, SECOND_TURN_PROMPT):
+        frames: list[SseFrame] = []
+        _stream_turn(api, conversation_id, prompt, frames=frames)
+        completed = _assert_successful_turn(frames)
+        created = next(payload for event, payload in frames if event == "response.created")
+        assert created.get("user_message_id"), "created frame carried no user_message_id"
+        assert completed.get("assistant_message_id"), (
+            "completed frame carried no assistant_message_id"
+        )
+        expected.append((created["user_message_id"], "user", prompt))
+        expected.append((completed["assistant_message_id"], "assistant", _answer_text(completed)))
 
-    items = api.get(f"/api/v1/conversations/{conversation_id}/items")
-    assert items.status_code == 200, items.text
-    body = items.json()
-    payload = body if isinstance(body, list) else body.get("items", [])
-    assert (
-        len(payload) >= 4
-    ), f"expected both turns persisted, got {json.dumps(body)[:400]}"
+    items = _conversation_items(api, conversation_id)
+    ids = [str(item.get("id")) for item in items]
+    positions = []
+    for message_id, role, content in expected:
+        assert message_id in ids, f"saved turn missing: {role} message {message_id}"
+        assert ids.count(message_id) == 1, f"{role} message {message_id} saved more than once"
+        item = items[ids.index(message_id)]
+        assert item.get("role") == role, f"{message_id}: role {item.get('role')!r}"
+        assert item.get("content") == content, f"{message_id}: content differs"
+        positions.append(ids.index(message_id))
+    for prompt in (FIRST_TURN_PROMPT, SECOND_TURN_PROMPT):
+        questions = [
+            item for item in items
+            if item.get("role") == "user" and item.get("content") == prompt
+        ]
+        assert len(questions) == 1, f"question saved more than once: {prompt!r}"
+    assert positions == sorted(positions), f"saved turns out of order: {positions}"
 
 
 def test_deleting_a_conversation_leaves_no_replayable_buffer(api, conversation_id):

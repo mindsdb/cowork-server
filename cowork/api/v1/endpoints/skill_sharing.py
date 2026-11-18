@@ -17,11 +17,11 @@ changes a skill is cowork.services.skill_sharing's.
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.exc import IntegrityError
-from starlette.concurrency import run_in_threadpool
 
 from cowork.api.v1.endpoints.skills import (
     SkillViewerDep,
@@ -29,7 +29,8 @@ from cowork.api.v1.endpoints.skills import (
     _skill_response,
 )
 from cowork.api.v1.permissions import Authenticated, AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSession, ScopedSessionDep
+from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
+from cowork.db.units import run_efs_unit
 from cowork.principal import Principal, get_principal
 from cowork.schemas.skills import (
     SkillEnabledForMeRequest,
@@ -61,16 +62,17 @@ from cowork.services.skills import (
     is_builtin_skill,
 )
 
-# AuthenticatedInOrgMode, as the skills router declares it: ScopedSessionDep
+# AuthenticatedInOrgMode, as the skills router declares it: get_tenant_scope
 # already fails closed whenever MindsHub mode has no org in scope, and
 # declaring it makes the requirement visible to a route walker.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 OrgMemberLookupDep = Annotated[OrgMemberLookup, Depends(get_org_member_lookup)]
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 @router.get("/sharing-capabilities", response_model=SkillSharingCapabilities)
-def skill_sharing_capabilities(viewer: SkillViewerDep = None):
+async def skill_sharing_capabilities(viewer: SkillViewerDep = None):
     """What the caller may do with sharing in MindsHub mode.
 
     ``enabled`` is MindsHub mode. The three capabilities are MindsHub's
@@ -97,10 +99,10 @@ def skill_sharing_capabilities(viewer: SkillViewerDep = None):
 
 
 @router.put("/{skill_id}/me", response_model=SkillResponse)
-def set_skill_enabled_for_me(
+async def set_skill_enabled_for_me(
     skill_id: str,
     body: SkillEnabledForMeRequest,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
     viewer: SkillViewerDep = None,
 ):
@@ -110,7 +112,23 @@ def set_skill_enabled_for_me(
     404 for one they don't see. On (the default) keeps no row.
 
     Turning a skill off for everyone is the global ``enabled`` (PUT
-    /skills/{slug}), which takes edit rights."""
+    /skills/{slug}), which takes edit rights. Seeds the built-in skills and
+    reads the skill's folder, so it runs as one unit on the file store's
+    threads (run_efs_unit)."""
+    return await run_efs_unit(
+        partial(_set_skill_enabled_for_me, skill_id=skill_id, body=body, principal=principal, viewer=viewer),
+        scope=scope,
+    )
+
+
+def _set_skill_enabled_for_me(
+    scoped: ScopedSession,
+    *,
+    skill_id: str,
+    body: SkillEnabledForMeRequest,
+    principal: Principal | None,
+    viewer: SkillViewer | None,
+) -> dict:
     service = SkillService(scoped.scope, viewer=viewer, session=scoped)
     service.ensure_builtin_skills()
     try:
@@ -141,7 +159,7 @@ SHARING_RACED_REFUSAL = "This skill's sharing changed while saving. Reload it an
 
 
 async def stored_sharing_rule(
-    skill_id: str, scoped: ScopedSessionDep, viewer: SkillViewerDep
+    skill_id: str, scope: ScopeDep, viewer: SkillViewerDep
 ) -> SkillAccessRule | None:
     """The skill's stored access as ``viewer`` reads it (the default team as
     everyone), for the check PUT /{skill_id}/sharing asks MindsHub
@@ -151,19 +169,21 @@ async def stored_sharing_rule(
     name is refused (SkillNotFoundError, a ValueError), which the route
     refuses itself. Any other failure, a database error included, raises:
     read as "no stored rule" it would ask MindsHub about every person kept
-    and answer 503 for an edit that adds nobody."""
+    and answer 503 for an edit that adds nobody. Read as a unit of its own
+    on the file store's threads (run_efs_unit), since it reads the skill's
+    folder, so the event loop never waits for a pooled connection."""
     if viewer is None:
         return None
 
-    def read() -> SkillAccessRule | None:
-        service = SkillService(scoped.scope, viewer=viewer, session=scoped)
+    def read(session: ScopedSession) -> SkillAccessRule | None:
+        service = SkillService(session.scope, viewer=viewer, session=session)
         try:
             skill = service.get_seen_skill(skill_id)
         except ValueError:
             return None
         return viewer.effective(service.access_rule(skill))
 
-    return await run_in_threadpool(read)
+    return await run_efs_unit(read, scope=scope)
 
 
 StoredRuleDep = Annotated[SkillAccessRule | None, Depends(stored_sharing_rule)]
@@ -186,7 +206,8 @@ async def verify_people_in_org(
     the added ids against this answer under the skill's lock.
 
     A dependency of PUT /{skill_id}/sharing rather than a step in it, so the
-    route stays sync. Nothing to check outside MindsHub mode.
+    route's unit (run_efs_unit) never waits on MindsHub while it holds its
+    connection. Nothing to check outside MindsHub mode.
     """
     if viewer is None or body.allowed_user_ids is None:
         return frozenset()
@@ -207,10 +228,10 @@ VerifiedPeopleDep = Annotated[frozenset[str], Depends(verify_people_in_org)]
 
 
 @router.put("/{skill_id}/sharing", response_model=SkillResponse)
-def set_skill_sharing(
+async def set_skill_sharing(
     skill_id: str,
     body: SkillSharingRequest,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     # Authenticated, beside the router's AuthenticatedInOrgMode: a person
     # shares their own skill, so a caller with no person (the operator view,
     # the desktop) has nothing to share and gets a 401 in either mode.
@@ -219,14 +240,22 @@ def set_skill_sharing(
     verified_people: VerifiedPeopleDep = frozenset(),
 ):
     """Change who one skill is shared with: in MindsHub mode
-    _set_org_skill_sharing, elsewhere _set_personal_skill_sharing."""
+    _set_org_skill_sharing, elsewhere _set_personal_skill_sharing, each as
+    one unit on the file store's threads (run_efs_unit), since both read the
+    skill's folder."""
     if viewer is not None:
-        return _set_org_skill_sharing(skill_id, body, scoped, principal, viewer, verified_people)
+        return await run_efs_unit(
+            lambda scoped: _set_org_skill_sharing(skill_id, body, scoped, principal, viewer, verified_people),
+            scope=scope,
+        )
     if body.shared is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="shared is required."
         )
-    return _set_personal_skill_sharing(skill_id, body.shared, scoped, principal)
+    shared = body.shared
+    return await run_efs_unit(
+        lambda scoped: _set_personal_skill_sharing(skill_id, shared, scoped, principal), scope=scope
+    )
 
 
 SHARING_OWNER_REFUSAL = (

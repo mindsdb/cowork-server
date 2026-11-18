@@ -55,6 +55,8 @@ class DatasourceCapabilities:
     # caller can tell "known but off" from "not a thing".
     methods: dict[str, dict[str, bool]] = field(default_factory=dict)
     _fields: dict[tuple[str, str], list[ConnectorField]] = field(default_factory=dict)
+    # (service connector, method) -> the engine pair it is stored and run as.
+    _targets: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
 
     def is_available(self, connector_id: str, method: str) -> bool:
         return bool(self.methods.get(connector_id, {}).get(method, False))
@@ -73,20 +75,33 @@ class DatasourceCapabilities:
     def cloud_fields(self, connector_id: str, method: str) -> list[ConnectorField]:
         return list(self._fields.get((connector_id, method), []))
 
+    def cloud_target(self, connector_id: str, method: str) -> tuple[str, str]:
+        """Return the (connector, method) pair auth stores this cloud method as.
+
+        A managed service that is an engine underneath maps to that engine's
+        pair; every other method maps to itself.
+        """
+        return self._targets.get((connector_id, method), (connector_id, method))
+
 
 def _candidates(registry: ConnectorSpecRegistry) -> tuple[
-    dict[str, dict[str, bool]], dict[tuple[str, str], list[ConnectorField]], set[tuple[str, str]]
+    dict[str, dict[str, bool]],
+    dict[tuple[str, str], list[ConnectorField]],
+    set[tuple[str, str]],
+    dict[tuple[str, str], str],
 ]:
     """Every spec method that declares a cloud block, all switched off.
 
     The third value is the subset whose block says the hosted path can execute
     the method. A candidate outside it stays a known capability that reports
     itself unavailable, so the response can say "known but off" for a form the
-    adapters do not support yet.
+    adapters do not support yet. The fourth maps each method whose block names
+    an engine to that raw "connector:method" text.
     """
     methods: dict[str, dict[str, bool]] = {}
     fields: dict[tuple[str, str], list[ConnectorField]] = {}
     verified: set[tuple[str, str]] = set()
+    engines: dict[tuple[str, str], str] = {}
     for metadata in registry.list_connectors():
         spec = registry.get_connector(metadata.id)
         for method in (spec.form.methods or []) if spec and spec.form else []:
@@ -96,7 +111,38 @@ def _candidates(registry: ConnectorSpecRegistry) -> tuple[
             fields[(metadata.id, method.id)] = list(method.cloud.fields)
             if method.cloud.available:
                 verified.add((metadata.id, method.id))
-    return methods, fields, verified
+            if method.cloud.engine is not None:
+                engines[(metadata.id, method.id)] = method.cloud.engine
+    return methods, fields, verified, engines
+
+
+def _with_engines(
+    methods: dict[str, dict[str, bool]],
+    fields: dict[tuple[str, str], list[ConnectorField]],
+    engines: dict[tuple[str, str], str],
+) -> DatasourceCapabilities:
+    """Give each service method its engine's availability and build the policy.
+
+    An engine must be another candidate that names no engine itself; anything
+    else leaves the service method off, and the log counts it without naming
+    it.
+    """
+    targets: dict[tuple[str, str], tuple[str, str]] = {}
+    invalid = 0
+    for (connector_id, method), raw in engines.items():
+        engine_connector, _, engine_method = raw.partition(":")
+        pair = (engine_connector, engine_method)
+        if engine_method not in methods.get(engine_connector, {}) or pair in engines:
+            invalid += 1
+            continue
+        targets[(connector_id, method)] = pair
+        methods[connector_id][method] = methods[engine_connector][engine_method]
+    if invalid:
+        logger.warning(
+            "[datasources] %s cloud method(s) name an engine that is not a cloud method of its own; they stay unavailable",
+            invalid,
+        )
+    return DatasourceCapabilities(MANIFEST_VERSION, methods, fields, targets)
 
 
 def _parse(raw: str) -> DatasourceManifest | None:
@@ -121,25 +167,28 @@ def _parse(raw: str) -> DatasourceManifest | None:
 def load_datasource_capabilities(
     settings: AppSettings | None = None, registry: ConnectorSpecRegistry = default_registry
 ) -> DatasourceCapabilities:
-    methods, fields, verified = _candidates(registry)
+    methods, fields, verified, engines = _candidates(registry)
     manifest = _parse((settings or get_app_settings()).datasource_capabilities)
 
     if manifest is None:
-        return DatasourceCapabilities(MANIFEST_VERSION, methods, fields)
+        return _with_engines(methods, fields, engines)
     if manifest.manifest_version != MANIFEST_VERSION:
         logger.warning(
             "[datasources] capability manifest_version %s is not %s; every method stays unavailable",
             manifest.manifest_version,
             MANIFEST_VERSION,
         )
-        return DatasourceCapabilities(MANIFEST_VERSION, methods, fields)
+        return _with_engines(methods, fields, engines)
 
     unknown = 0
     unverified = 0
+    services = 0
     for pair in manifest.enabled:
         connector_id, _, method = str(pair).partition(":")
         if not method or method not in methods.get(connector_id, {}):
             unknown += 1
+        elif (connector_id, method) in engines:
+            services += 1
         elif (connector_id, method) not in verified:
             unverified += 1
         else:
@@ -154,4 +203,9 @@ def load_datasource_capabilities(
             "[datasources] %s enabled capability pair(s) are not adapter-verified in their spec; they stay unavailable",
             unverified,
         )
-    return DatasourceCapabilities(MANIFEST_VERSION, methods, fields)
+    if services:
+        logger.warning(
+            "[datasources] %s enabled capability pair(s) name a managed service; services follow their engine, ignored",
+            services,
+        )
+    return _with_engines(methods, fields, engines)

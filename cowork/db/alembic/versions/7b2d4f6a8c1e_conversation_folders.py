@@ -1,7 +1,7 @@
 """conversation_folders: working folders attached to a desktop chat
 
 Revision ID: 7b2d4f6a8c1e
-Revises: c69488788ac7
+Revises: f6a2c4e8b1d3
 Create Date: 2026-10-06 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "7b2d4f6a8c1e"
-down_revision: Union[str, Sequence[str], None] = "c69488788ac7"
+down_revision: Union[str, Sequence[str], None] = "f6a2c4e8b1d3"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
