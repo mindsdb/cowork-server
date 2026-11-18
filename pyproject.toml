@@ -221,6 +221,11 @@ channels = [
 requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
+[tool.uv.sources]
+# Placeholder until the custom MCP anton change is released: this branch must
+# not merge while anton comes from git. The release replaces it with a floor.
+anton-agent = { git = "https://github.com/mindsdb/anton", rev = "c2f940f2c31ea858890c95885211d6621a837975" }
+
 [tool.hatch.version]
 source = "vcs"
 fallback-version = "0.0.0-dev"
