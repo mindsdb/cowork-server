@@ -1616,31 +1616,10 @@ class AppSettings(Settings):
         default="",
         validation_alias=AliasChoices("COWORK_PUBLIC_BASE_URL", "COWORK_SERVER_ORIGIN"),
         description=(
-            "Public HTTPS base URL of this server (e.g. https://cowork.example.com), "
-            "used to build channel webhook URLs for setWebhook-style registration. "
+            "Public HTTPS base URL of this server (e.g. https://cowork.example.com). "
             "Empty when the server is not publicly reachable."
         ),
     )  # COWORK_PUBLIC_BASE_URL
-
-    conversation_link_template: str = Field(
-        default="",
-        validation_alias=AliasChoices("COWORK_CONVERSATION_LINK_TEMPLATE"),
-        description=(
-            "Link template appended to channel replies whose turn ran tools, "
-            "with a {conversation_id} placeholder. Empty disables the link."
-        ),
-    )  # COWORK_CONVERSATION_LINK_TEMPLATE
-
-    channels_harness: str = Field(
-        default="anton",
-        validation_alias=AliasChoices("COWORK_CHANNELS_HARNESS"),
-        description=(
-            "Harness that serves channel conversations (e.g. 'anton'). "
-            "Applies to NEW channel conversations only — existing ones stay pinned "
-            "to the harness that first served them. Independent of the UI harness "
-            "selection, which never applies to channels."
-        ),
-    )  # COWORK_CHANNELS_HARNESS
 
     openai_compatible_api: OpenAICompatibleAPI = Field(
         default="chat_completions",

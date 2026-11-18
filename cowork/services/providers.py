@@ -834,9 +834,9 @@ async def fetch_org_model_catalog(
 #     3. POST /api/v1/settings/raw    → SettingService.bulk_upsert
 #     4. cowork/migrations.py (first-boot .env→DB seed)
 #     5. cowork/main/minds-auth.ts (login / token refresh) — excludes models
-#   Two more write settings but only their own fixed keys: channels.py
-#   (`channels_harness`) and the `minds_model_enabled` / `minds_image_model_enabled`
-#   / `minds_model_restricted` refresh in settings.py.
+#   One more writes settings but only its own fixed keys: the
+#   `minds_model_enabled` / `minds_image_model_enabled` / `minds_model_restricted`
+#   refresh in settings.py.
 #
 #   OUT OF REACH of this gate: the standalone `anton` CLI reads models from
 #   ~/.anton/.env directly and never touches this DB (ENG-1140 covers its

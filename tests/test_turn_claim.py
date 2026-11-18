@@ -422,13 +422,6 @@ _CAS_RACES = {
         lambda: turn_claim._unlist_lapsed(conversation_id="c", run_id="run-a"),
         lambda result: result is True, lambda result: result is False,
     ),
-    "record_channel_turn": (
-        _nothing, "async", _take_and_drop_the_claim,
-        lambda: turn_index.record_channel_turn(
-            conversation_id="c", turn_id=1, correlation_id="corr-channel", org_id=None, user_id=None,
-        ),
-        lambda result: result is True, WatchError,
-    ),
     "stamp_question": (
         _recorded, "async", _rewrite_the_index,
         lambda: turn_index.stamp_question(conversation_id="c", run_id="run-a", released=False),

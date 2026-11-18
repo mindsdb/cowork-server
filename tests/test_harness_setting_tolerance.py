@@ -16,6 +16,7 @@ from cowork.models.setting import Setting
 from cowork.services.settings import SettingService
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+ORG_B = "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
 USER_A = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
 
 
@@ -37,16 +38,15 @@ def _svc(engine, scope: TenantScope = LOCAL_SCOPE) -> SettingService:
 
 
 def test_unknown_harness_values_resolve_to_anton():
-    s = UserSettings(harness="hermes", channels_harness="hermes")
+    s = UserSettings(harness="hermes")
     assert s.harness == "anton"
-    assert s.channels_harness == "anton"
 
 
 def test_stale_rows_at_every_scope_resolve_to_anton(engine):
     with Session(engine) as session:
         session.add(Setting(key="harness", value="hermes"))
         session.add(Setting(key="greeting", value="hello there"))
-        session.add(Setting(key="channels_harness", value="hermes", scope="org", org_id=ORG_A))
+        session.add(Setting(key="harness", value="hermes", scope="org", org_id=ORG_B))
         session.add(Setting(key="harness", value="hermes", scope="user", org_id=ORG_A, user_id=USER_A))
         session.commit()
 
@@ -54,23 +54,33 @@ def test_stale_rows_at_every_scope_resolve_to_anton(engine):
     assert local.harness == "anton"
     assert local.greeting == "hello there"
 
-    org = _svc(engine, TenantScope(org_mode=True, org_id=ORG_A)).load()
-    assert org.channels_harness == "anton"
+    org = _svc(engine, TenantScope(org_mode=True, org_id=ORG_B)).load()
+    assert org.harness == "anton"
 
     user = _svc(engine, TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)).load()
     assert user.harness == "anton"
 
 
+def test_rows_left_by_the_removed_channel_settings_still_load(engine):
+    """An older release wrote these keys, and an old pod still writes them
+    during a rollout. Loading skips them rather than failing."""
+    with Session(engine) as session:
+        session.add(Setting(key="channels_harness", value="anton"))
+        session.add(Setting(key="channel.telegram.bot_token", value="not-a-real-token"))
+        session.add(Setting(key="greeting", value="hello there"))
+        session.commit()
+
+    assert _svc(engine).load().greeting == "hello there"
+
+
 def test_env_harness_resolves_to_anton_in_local_mode(monkeypatch):
     monkeypatch.setenv("HARNESS", "hermes")
-    monkeypatch.setenv("COWORK_CHANNELS_HARNESS", "hermes")
     from cowork.common.settings.app_settings import get_app_settings
 
     get_app_settings.cache_clear()
     try:
         s = UserSettings()
         assert s.harness == "anton"
-        assert s.channels_harness == "anton"
     finally:
         get_app_settings.cache_clear()
 
@@ -89,17 +99,17 @@ def test_boot_repair_rewrites_stale_rows_at_every_scope(engine):
     with Session(engine) as session:
         session.add(Setting(key="harness", value="hermes"))
         session.add(Setting(key="greeting", value="hello there"))
-        session.add(Setting(key="channels_harness", value="hermes", scope="org", org_id=ORG_A))
+        session.add(Setting(key="harness", value="hermes", scope="org", org_id=ORG_B))
         session.add(Setting(key="harness", value="hermes", scope="user", org_id=ORG_A, user_id=USER_A))
         session.add(Setting(key="harness", value="anton", scope="org", org_id=ORG_A))
         session.commit()
 
     with Session(engine) as session:
         assert normalize_retired_harness_rows(session) is True
-        by_key = {(r.key, r.scope, r.user_id): r.value for r in session.exec(select(Setting)).all()}
-        assert by_key[("harness", None, None)] == "anton"
-        assert by_key[("channels_harness", "org", None)] == "anton"
-        assert by_key[("harness", "user", USER_A)] == "anton"
-        assert by_key[("harness", "org", None)] == "anton"
-        assert by_key[("greeting", None, None)] == "hello there"
+        by_key = {(r.key, r.scope, r.org_id, r.user_id): r.value for r in session.exec(select(Setting)).all()}
+        assert by_key[("harness", None, None, None)] == "anton"
+        assert by_key[("harness", "org", ORG_B, None)] == "anton"
+        assert by_key[("harness", "user", ORG_A, USER_A)] == "anton"
+        assert by_key[("harness", "org", ORG_A, None)] == "anton"
+        assert by_key[("greeting", None, None, None)] == "hello there"
         assert normalize_retired_harness_rows(session) is False

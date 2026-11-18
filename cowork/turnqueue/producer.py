@@ -62,7 +62,6 @@ from cowork.turnqueue.models import (
 )
 from cowork.streaming.cancellation import stop_controller_turn
 from cowork.streaming.liveness import WORKER_ALIVE_PHASE
-from cowork.streaming.turn_index import record_channel_turn
 from cowork.turnqueue.redis_client import (
     REDIS_BLOCK_MS,
     cancel_cause_key,
@@ -1433,17 +1432,6 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # new stream has no consumer group, so the script never retires it, and
     # the controller creates the group when it next reads.
     await r.sadd(registry_key, conversation_id)
-    # Any replica can now find this turn: its turn_id to open the buffer, its
-    # correlation_id to cancel it, its org to authorize the caller. Recorded
-    # here rather than after the first buffer record, because this generator
-    # does not own the buffer; _shared_turn covers the gap between the two.
-    # A turn with a run id was recorded by RunRegistry.start, which holds the
-    # conversation's claim; one without is skipped while such a run holds it.
-    if run_id is None:
-        await record_channel_turn(
-            conversation_id=conversation_id, turn_id=turn_id, correlation_id=corr,
-            org_id=org_id, user_id=user_id, client=r,
-        )
 
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds

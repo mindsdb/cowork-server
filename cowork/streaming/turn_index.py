@@ -32,7 +32,6 @@ from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
 from redis.exceptions import WatchError
 
-from cowork.streaming.turn_claim import claim_key
 from cowork.turnqueue.redis_client import get_redis, get_sync_redis
 
 logger = logging.getLogger(__name__)
@@ -166,8 +165,7 @@ async def record_turn(
 ) -> None:
     """Note this turn as the conversation's current one, replacing any previous.
 
-    For a run that holds the conversation's turn claim (RunRegistry.start). A
-    turn no registry handle covers uses record_channel_turn.
+    For a run that holds the conversation's turn claim (RunRegistry.start).
 
     ``client`` lets a caller that already holds a Redis client reuse it, rather
     than this module reaching for a second one.
@@ -179,40 +177,6 @@ async def record_turn(
             org_id=org_id, user_id=user_id, run_id=run_id,
         )
         await pipe.execute()
-
-
-async def record_channel_turn(
-    *,
-    conversation_id: str,
-    turn_id: int,
-    correlation_id: str,
-    org_id: str | None,
-    user_id: str | None,
-    client=None,
-) -> bool:
-    """record_turn for a turn no registry handle covers (a channel turn),
-    unless a run holds the conversation's turn claim. That run's entry is
-    what cancel and answer resolve through, so it is left as it is. True when
-    it wrote the entry."""
-    r = client or get_redis()
-    key = turn_key(conversation_id)
-    claim = claim_key(conversation_id)
-    for _attempt in range(3):
-        try:
-            async with r.pipeline(transaction=True) as pipe:
-                await pipe.watch(claim, key)
-                if await pipe.exists(claim):
-                    return False
-                pipe.multi()
-                _queue_record(
-                    pipe=pipe, conversation_id=conversation_id, turn_id=turn_id, correlation_id=correlation_id,
-                    org_id=org_id, user_id=user_id, run_id=None,
-                )
-                await pipe.execute()
-                return True
-        except WatchError:
-            continue
-    raise WatchError(f"the turn index entry of {conversation_id} kept changing while it was recorded")
 
 
 async def stamp_question(*, conversation_id: str, run_id: str, released: bool, client=None) -> bool:

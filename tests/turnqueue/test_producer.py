@@ -160,10 +160,8 @@ async def test_job_goes_to_the_conversations_own_stream(monkeypatch):
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
                                             user_id=None, input_text="hi", model="m"))
     assert fake.added[0][0] == "scratchpad:requests:conv-1"
-    # Registered in the controller's queue registry, and in cowork's own turn
-    # index so another replica can find this turn.
+    # Registered in the controller's queue registry.
     assert ("scratchpad:requests:queues", "conv-1") in fake.registered
-    assert ("cowork:turns", "conv-1") in fake.registered
 
 
 @pytest.mark.asyncio

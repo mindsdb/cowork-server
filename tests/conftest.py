@@ -34,7 +34,6 @@ os.environ["MASTER_KEY_PATH"] = str(Path(tempfile.mkdtemp(prefix="cowork-test-ke
 # process shares; per process, and outside COWORK_HOME for the same reason as the key.
 os.environ["COWORK_POD_SCRATCH_DIR"] = str(Path(tempfile.mkdtemp(prefix="cowork-test-pod-scratch-")).resolve())
 os.environ["COWORK_PUBLIC_BASE_URL"] = "https://hooks.example.com"
-os.environ["COWORK_CONVERSATION_LINK_TEMPLATE"] = "https://app.example.com/c/{conversation_id}"
 # Org mode roots every filesystem store at cowork_home() (see
 # scoped_storage_root), not just at the per-store COWORK_*_DIR override below,
 # so this has to be set too, or any test that runs in org mode writes into
