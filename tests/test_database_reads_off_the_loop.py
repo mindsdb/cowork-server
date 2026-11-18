@@ -31,6 +31,7 @@ WAIT = 2
 # A blocked loop holds liveness for the whole WAIT, so half of it still
 # catches one and leaves a loaded CI runner room.
 LIVE_BUDGET = WAIT / 2
+PROBE_CLEANUP_TIMEOUT = WAIT * 5
 
 # These tests time the event loop; see without_gc_pauses.
 pytestmark = pytest.mark.usefixtures("without_gc_pauses")
@@ -89,10 +90,20 @@ async def _while_others_are_served(
         # The prober finishes the ask it is on, so a stall that ends with the
         # work still counts against liveness.
         work_done.set()
-        await prober
-        beat.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await beat
+        try:
+            completed, _ = await asyncio.wait({prober}, timeout=PROBE_CLEANUP_TIMEOUT)
+            if not completed:
+                prober.cancel()
+                raise TimeoutError(
+                    f"/api/v1/health/live probe did not stop within {PROBE_CLEANUP_TIMEOUT:.2f}s"
+                )
+            await prober
+        finally:
+            if not prober.done():
+                prober.cancel()
+            beat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await beat
     return _Measured(outcome, elapsed, ticks, live_answers, slowest_live)
 
 
@@ -182,3 +193,57 @@ async def test_a_loop_blocked_for_the_pool_wait_misses_the_liveness_budget(clien
     measured = await _while_others_are_served(client, held_the_loop)
 
     assert measured.slowest_live >= LIVE_BUDGET, f"liveness waited {measured.slowest_live:.2f}s"
+
+
+async def test_liveness_probe_cleanup_is_bounded(monkeypatch):
+    """A stalled probe fails cleanup without awaiting even a cancellation-resistant client."""
+    class _CancellationResistantClient:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        async def get(self, _path):
+            self.started.set()
+            try:
+                while not self.release.is_set():
+                    try:
+                        await self.release.wait()
+                    except asyncio.CancelledError:
+                        continue
+                return type("Response", (), {"status_code": 200})()
+            finally:
+                self.finished.set()
+
+    client = _CancellationResistantClient()
+    monkeypatch.setitem(globals(), "PROBE_CLEANUP_TIMEOUT", 0.02)
+    tasks = []
+    create_task = asyncio.create_task
+
+    def track_task(coro):
+        task = create_task(coro)
+        tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", track_task)
+
+    async def work():
+        await asyncio.sleep(0.01)
+        return None
+
+    try:
+        with pytest.raises(TimeoutError, match="probe did not stop"):
+            await _while_others_are_served(client, work)
+        assert client.started.is_set()
+        assert len(tasks) == 2
+        assert tasks[0].done()
+        assert not tasks[1].done()
+    finally:
+        client.release.set()
+        if client.started.is_set():
+            await asyncio.wait_for(client.finished.wait(), timeout=1)
+        if len(tasks) == 2:
+            tasks[1].cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(tasks[1], timeout=1)
+            assert tasks[1].done()
