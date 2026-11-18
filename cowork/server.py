@@ -705,7 +705,10 @@ async def lifespan(app: FastAPI):
     from cowork.docs import sync as shared_docs
 
     shared_docs.start()
+    from cowork.docs.relay import start_doc_relay, stop_doc_relay
+
     clock.begin("draft_listener")
+    app.state.doc_relay = None
     app.state.channel_ingress_reconciler = None
     app.state.artifact_owner_backfill = None
     app.state.artifact_location_backfill = None
@@ -742,6 +745,8 @@ async def lifespan(app: FastAPI):
         _end_remote_turns_on_sigterm()
     watchdog = None
     try:
+        # Doc events reach the other replicas' editors; only where replicas share Redis.
+        app.state.doc_relay = start_doc_relay()
         draft_listener = await start_draft_listener()
         clock.finished()
         # Last, once nothing left in startup blocks the loop on purpose.
@@ -788,6 +793,7 @@ async def lifespan(app: FastAPI):
         # push, and the scheduled runs, which push when they finish.
         await drain_push_notifications()
         shared_docs.stop()
+        await stop_doc_relay(getattr(app.state, "doc_relay", None))
         # After both turn drains above: each turn they unwound has queued the
         # close of its scratchpad processes, and those must finish before the
         # event loop stops.
