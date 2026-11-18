@@ -1,14 +1,15 @@
-"""Erase channel data and unpin channel rows from conversations
+"""Keep the removed channels' data as an archive, without their bot passwords
 
-Channels are gone from the server. This erases what they stored: the bot
-credentials and agent choice in `settings`, and every row of the four channel
-tables. It also drops the foreign key from `channel_bindings` to
+Channels are gone from the server. Their rows stay where they are, as a record
+nobody reads: the four channel tables, their non-secret settings and
+`conversations.channel_type`. What goes is every bot password: the `settings`
+rows of the fields the Slack, Discord, Telegram and WhatsApp plugins marked
+secret. It also drops the foreign key from `channel_bindings` to
 `conversations`, so a binding row cannot block a conversation delete.
 
-The tables and `conversations.channel_type` stay for now: during a rolling
-deploy the previous release still reads and writes them. A later release drops
-the empty tables. `channel_type` stays as the record of which conversations a
-chat app started.
+The tables stay: during a rolling deploy the previous release still reads and
+writes them, and a later release decides how to keep their rows before it
+drops them.
 
 Revision ID: f73ba3db8974
 Revises: f6a2c4e8b1d3
@@ -28,6 +29,19 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+# The `channel.<type>.<field>` keys services/channels.py wrote for each field
+# its plugin declared `secret=True`. The plugins are gone, so the list is fixed.
+_SECRET_KEYS = (
+    "channel.slack.bot_token",
+    "channel.slack.app_token",
+    "channel.slack.signing_secret",
+    "channel.discord.bot_token",
+    "channel.telegram.bot_token",
+    "channel.telegram.secret_token",
+    "channel.whatsapp.access_token",
+    "channel.whatsapp.app_secret",
+)
+
 # b7c1d2e3f4a5_channels.py creates this FK unnamed. Postgres auto-names it,
 # so the drop takes that name from the inspector; the downgrade restores it
 # under the default `<table>_<column>_fkey`. SQLite reports no name, and its
@@ -36,8 +50,6 @@ _TABLE = "channel_bindings"
 _PG_FK = "channel_bindings_anton_conversation_id_fkey"
 _NAMING = {"fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s"}
 _SQLITE_FK = "fk_channel_bindings_anton_conversation_id_conversations"
-# Children before parents: channel_sessions points at channel_bindings.
-_CHANNEL_TABLES = ("channel_events", "channel_sessions", "channel_bindings", "channel_installations")
 
 
 def _conversation_fk() -> dict | None:
@@ -51,10 +63,12 @@ def _conversation_fk() -> dict | None:
 
 
 def upgrade() -> None:
-    """Upgrade schema. The erased rows and secrets are not kept anywhere."""
-    op.execute(sa.text("DELETE FROM settings WHERE key LIKE 'channel.%' OR key = 'channels_harness'"))
-    for table in _CHANNEL_TABLES:
-        op.execute(sa.text(f"DELETE FROM {table}"))
+    """Upgrade schema. The erased passwords are not kept anywhere."""
+    op.execute(
+        sa.text("DELETE FROM settings WHERE key IN :keys").bindparams(
+            sa.bindparam("keys", value=list(_SECRET_KEYS), expanding=True)
+        )
+    )
     fk = _conversation_fk()
     if fk is None:
         return
@@ -66,16 +80,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade schema. Restores the foreign key; the erased rows stay erased.
-    A binding the previous release wrote after the upgrade may name a
-    conversation deleted since, so those are dropped first."""
+    """Downgrade schema. Restores the foreign key; the erased passwords stay
+    erased. A binding may name a conversation deleted after the upgrade, so
+    that link is cleared first; the binding row itself is kept."""
     op.execute(sa.text(
-        "DELETE FROM channel_sessions WHERE binding_id IN ("
-        " SELECT id FROM channel_bindings WHERE anton_conversation_id IS NOT NULL"
-        " AND anton_conversation_id NOT IN (SELECT id FROM conversations))"
-    ))
-    op.execute(sa.text(
-        "DELETE FROM channel_bindings WHERE anton_conversation_id IS NOT NULL"
+        "UPDATE channel_bindings SET anton_conversation_id = NULL WHERE anton_conversation_id IS NOT NULL"
         " AND anton_conversation_id NOT IN (SELECT id FROM conversations)"
     ))
     if _conversation_fk() is not None:

@@ -476,7 +476,7 @@ Key tables:
 | `settings` | Key-value user settings; sensitive values Fernet-encrypted |
 | `pins` | User-pinned items (conversations, artifacts, etc.) |
 | `push_devices` | Phones the mobile app registered for push (org mode) |
-| `channel_*` | Installations, bindings, sessions and events of the removed chat-app channels; emptied on upgrade, dropped in a later release |
+| `channel_*` | Installations, bindings, sessions and events of the removed chat-app channels, kept as a record nothing reads; their bot passwords are erased on upgrade |
 | `shared_resource_attributions` | Creator and latest-editor user IDs for org-shared filesystem resources |
 | `shared_resource_mutations` | Append-only actor trail for allowed org-shared mutations, including deletes |
 

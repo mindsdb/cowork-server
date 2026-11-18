@@ -1768,7 +1768,7 @@ def _conversation_fk_on_bindings(connection) -> bool:
     )
 
 
-def test_the_channel_erase_empties_channel_rows_and_unpins_conversations(tmp_path, monkeypatch):
+def test_the_channel_archive_keeps_rows_drops_bot_passwords_and_unpins_conversations(tmp_path, monkeypatch):
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     get_app_settings.cache_clear()
 
@@ -1808,6 +1808,8 @@ def test_the_channel_erase_empties_channel_rows_and_unpins_conversations(tmp_pat
             {"id": uuid.uuid4().hex},
         )
         _insert_setting(connection, key="channel.telegram.bot_token", value="not-a-real-token")
+        _insert_setting(connection, key="channel.slack.signing_secret", value="not-a-real-secret")
+        _insert_setting(connection, key="channel.telegram.bot_username", value="a_bot")
         _insert_setting(connection, key="channels_harness", value="anton")
         _insert_setting(connection, key="greeting", value="hello there")
 
@@ -1815,14 +1817,21 @@ def test_the_channel_erase_empties_channel_rows_and_unpins_conversations(tmp_pat
 
     with engine.begin() as connection:
         for table in ("channel_events", "channel_sessions", "channel_bindings", "channel_installations"):
-            assert connection.execute(text(f"select count(*) from {table}")).scalar() == 0, table
-        assert [row[0] for row in connection.execute(text("select key from settings order by key"))] == ["greeting"]
+            assert connection.execute(text(f"select count(*) from {table}")).scalar() == 1, table
+        assert [row[0] for row in connection.execute(text("select key from settings order by key"))] == [
+            "channel.telegram.bot_username", "channels_harness", "greeting",
+        ]
         assert connection.execute(
             text("select channel_type from conversations where id = :id"), {"id": conversation_id}
         ).scalar() == "telegram"
         assert not _conversation_fk_on_bindings(connection)
+        # With the key gone, the conversation goes and its binding stays, pointing at nothing.
+        connection.execute(text("delete from conversations where id = :id"), {"id": conversation_id})
 
     _downgrade_to(engine, uri, "f6a2c4e8b1d3")
 
     with engine.begin() as connection:
         assert _conversation_fk_on_bindings(connection)
+        assert connection.execute(
+            text("select anton_conversation_id from channel_bindings where id = :id"), {"id": binding_id}
+        ).one() == (None,)
