@@ -68,7 +68,8 @@ def test_layer_hidden_popover_and_hover():
     # with a separate hidden notice; hover does not draw a zero-size box.
     assert "isShown(m.target)" in LAYER_JS
     assert "to see it in place" in LAYER_JS                 # hidden notice (contiguous chunk)
-    assert "el && isShown(el)" in LAYER_JS                 # focus does not scroll to a hidden one
+    # focus scrolls only once the page shows the element (reveal, ENG-4383)
+    assert "if (!found) { openThread(focusId, at); return; }" in LAYER_JS
     assert "!hel || !isShown(hel)" in LAYER_JS             # hl-on suppresses a hidden one
 
 
