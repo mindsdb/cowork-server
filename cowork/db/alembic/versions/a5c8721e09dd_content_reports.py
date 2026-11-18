@@ -33,4 +33,5 @@ def upgrade():
     op.create_index("ix_content_reports_reporter", "content_reports", ["org_id", "user_id", "created_at"])
 
 def downgrade():
-    op.drop_table("content_reports")
+    # SQLite can retain the DROP when a later downgrade step refuses to run.
+    op.drop_table("content_reports", if_exists=True)
