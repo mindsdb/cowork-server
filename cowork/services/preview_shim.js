@@ -319,6 +319,9 @@
     var MAX_LABEL = 80, SETTLE_MS = 250;
     var ID_RE = /^[A-Za-z][\w.:-]{0,99}$/;
     var viewInputs = [], viewOverflow = false, scrolled = null, lastView = '';
+    /* True while a restore (below) replays a view: no report goes out and the
+       user's own input waits, so the page settles where the app asked. */
+    var replaying = false;
     var viewTimers = [], scrollTimer = 0;
 
     var inLayer = function (el) {
@@ -375,6 +378,7 @@
     };
 
     var sendView = function () {
+      if (replaying) return;
       var view = {
         type: 'view',
         hash: String(window.location.hash || '').slice(0, MAX_HASH),
@@ -437,7 +441,7 @@
 
     window.addEventListener('keydown', function (ev) {
       try {
-        if (!ev.isTrusted || ev.ctrlKey || ev.metaKey || ev.altKey || !NAV_KEYS[ev.key]) return;
+        if (replaying || !ev.isTrusted || ev.ctrlKey || ev.metaKey || ev.altKey || !NAV_KEYS[ev.key]) return;
         var target = ev.target;
         /* Typing in a field is not navigation, and Space or Enter on a
            control also fires a click, which is recorded on its own. */
@@ -448,7 +452,7 @@
 
     window.addEventListener('click', function (ev) {
       try {
-        if (!ev.isTrusted || ev.button !== 0) return;
+        if (replaying || !ev.isTrusted || ev.button !== 0) return;
         var target = ev.target;
         if (!target || !target.closest || inLayer(target)) return;
         /* A click in comment mode places a comment; the page never sees it. */
@@ -473,6 +477,291 @@
         scrollTimer = setTimeout(sendView, 200);
       } catch (inner) { /* never break the page */ }
     }, { capture: true, passive: true });
+
+    /* Keeping the place across a reload the app made (ENG-4383). A save, a
+       quick edit or an agent change reloads the preview, which would open on
+       the first slide again. The app keeps the last view this document
+       reported and, once the reloaded document says document-start, sends it
+       back as a `restore`; this replays it the way the app's inline editor
+       does (htmlVisualEditorRuntime.js applyView): the inputs as untrusted
+       events, then the hash and the scroll, then the heading check.
+
+       Only the parent window may ask, with its own tag, once per document,
+       and the view is checked again here with the same caps as a report.
+       After a replay that landed, the recorded inputs ARE the replayed ones,
+       so the next report (and the next save's restore) carries the whole way
+       there. One that did not land reloads the document, which then stays
+       at its start: somewhere random is worse than the beginning. */
+    var PARENT_TAG = 'anton-preview-parent';
+    var KEY_CODES = {
+      ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
+      PageUp: 33, PageDown: 34, End: 35, Home: 36, ' ': 32
+    };
+    var PATH_STEP = /^(?:#[A-Za-z][A-Za-z0-9_.:-]{0,99}|[A-Za-z][A-Za-z0-9-]{0,63}:[0-9]{1,4})$/;
+    var REPLAY_BUDGET_MS = 8000, STEP_WAIT_MS = 1000, MAX_OFFSET = 1e7;
+    var restoreTaken = false;
+
+    var cleanPath = function (path) {
+      if (typeof path !== 'string' || !path || path.length > MAX_PATH) return '';
+      var steps = path.split('/');
+      if (steps.length > MAX_STEPS) return '';
+      for (var i = 0; i < steps.length; i++) {
+        if (!PATH_STEP.test(steps[i]) || (i > 0 && steps[i].charAt(0) === '#')) return '';
+      }
+      return path;
+    };
+    var cleanOffset = function (value) {
+      return typeof value === 'number' && isFinite(value) && value >= 0 ?
+        Math.min(Math.round(value), MAX_OFFSET) : 0;
+    };
+
+    /* The app's restore, rebuilt from known fields; null when any part is off. */
+    var cleanView = function (raw) {
+      if (!raw || typeof raw !== 'object') return null;
+      var rawInputs = raw.inputs == null ? [] : raw.inputs;
+      if (!Array.isArray(rawInputs) || rawInputs.length > MAX_INPUTS) return null;
+      var inputs = [];
+      for (var i = 0; i < rawInputs.length; i++) {
+        var item = rawInputs[i];
+        if (!item || typeof item !== 'object') return null;
+        if (item.type === 'key' && typeof item.key === 'string' &&
+          Object.prototype.hasOwnProperty.call(KEY_CODES, item.key)) {
+          inputs.push({ type: 'key', key: item.key, shiftKey: item.shiftKey === true });
+        } else if (item.type === 'click' && cleanPath(item.path)) {
+          inputs.push({ type: 'click', path: item.path, label: clip(typeof item.label === 'string' ? item.label : '', MAX_LABEL) });
+        } else {
+          return null;
+        }
+      }
+      var container = null;
+      if (raw.container && typeof raw.container === 'object' && cleanPath(raw.container.path)) {
+        container = {
+          path: raw.container.path,
+          top: cleanOffset(raw.container.top),
+          left: cleanOffset(raw.container.left)
+        };
+      }
+      return {
+        hash: typeof raw.hash === 'string' && raw.hash.charAt(0) === '#' && raw.hash.length <= MAX_HASH ? raw.hash : '',
+        scrollX: cleanOffset(raw.scrollX),
+        scrollY: cleanOffset(raw.scrollY),
+        container: container,
+        inputs: inputs,
+        heading: clip(typeof raw.heading === 'string' ? raw.heading : '', MAX_HEADING)
+      };
+    };
+
+    /* pathOf in reverse; the comment layer's elements are skipped the same way. */
+    var resolvePath = function (path) {
+      if (!cleanPath(path) || !document.body) return null;
+      var steps = path.split('/'), el = document.body;
+      for (var i = 0; i < steps.length && el; i++) {
+        var step = steps[i];
+        if (step.charAt(0) === '#') { el = document.getElementById(step.slice(1)); continue; }
+        var colon = step.lastIndexOf(':'), tag = step.slice(0, colon), index = Number(step.slice(colon + 1));
+        var seenCount = -1, found = null;
+        for (var c = 0; c < el.children.length; c++) {
+          var child = el.children[c];
+          if (child.localName !== tag || isLayer(child)) continue;
+          seenCount += 1;
+          if (seenCount === index) { found = child; break; }
+        }
+        el = found;
+      }
+      return el || null;
+    };
+
+    var clickTarget = function (input) {
+      var el = resolvePath(input.path);
+      if (el) return el;
+      if (!input.label) return null;
+      var match = null, nodes = document.querySelectorAll(CONTROL);
+      for (var i = 0; i < nodes.length; i++) {
+        if (inLayer(nodes[i]) || clip(nodes[i].textContent, MAX_LABEL) !== input.label) continue;
+        if (match) return null;
+        match = nodes[i];
+      }
+      return match;
+    };
+
+    var replayKey = function (input) {
+      var code = KEY_CODES[input.key], target = document.body || document.documentElement;
+      var types = ['keydown', 'keyup'];
+      for (var i = 0; i < types.length; i++) {
+        var ev = new KeyboardEvent(types[i], {
+          key: input.key, code: input.key === ' ' ? 'Space' : input.key, shiftKey: input.shiftKey,
+          bubbles: true, cancelable: true, composed: true, view: window
+        });
+        /* The constructor drops keyCode; decks written against it still read it. */
+        try {
+          Object.defineProperty(ev, 'keyCode', { get: function () { return code; } });
+          Object.defineProperty(ev, 'which', { get: function () { return code; } });
+        } catch (inner) { /* key alone */ }
+        target.dispatchEvent(ev);
+      }
+      return true;
+    };
+
+    var replayClick = function (input) {
+      /* In comment mode a click places a comment instead of reaching the page. */
+      if (document.body && document.body.classList.contains('act-mode')) return false;
+      var el = clickTarget(input);
+      if (!el) return false;
+      var r = el.getBoundingClientRect();
+      var init = {
+        bubbles: true, cancelable: true, composed: true, view: window, button: 0,
+        clientX: r.left + r.width / 2, clientY: r.top + r.height / 2
+      };
+      var Pointer = typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+      var pointer = function (type) {
+        var extra = { pointerId: 1, isPrimary: true };
+        for (var k in init) extra[k] = init[k];
+        return new Pointer(type, extra);
+      };
+      el.dispatchEvent(pointer('pointerdown'));
+      el.dispatchEvent(new MouseEvent('mousedown', init));
+      el.dispatchEvent(pointer('pointerup'));
+      el.dispatchEvent(new MouseEvent('mouseup', init));
+      el.dispatchEvent(new MouseEvent('click', init));
+      return true;
+    };
+
+    /* A frame for the page to react, then any short transition it started
+       (a deck often ignores input mid-transition), at most STEP_WAIT_MS. */
+    var settleThen = function (next) {
+      var waited = 0;
+      var check = function () {
+        var busy = false;
+        try {
+          var running = document.getAnimations ? document.getAnimations() : [];
+          for (var i = 0; i < running.length && !busy; i++) {
+            var a = running[i];
+            if (a.playState !== 'running') continue;
+            var timing = a.effect && a.effect.getComputedTiming ? a.effect.getComputedTiming() : null;
+            var left = Number(timing && timing.endTime) - (Number(a.currentTime) || 0);
+            busy = isFinite(left) && left <= 1500;
+          }
+        } catch (inner) { busy = false; }
+        if (busy && waited < STEP_WAIT_MS) { waited += 50; setTimeout(check, 50); return; }
+        setTimeout(next, 30);
+      };
+      setTimeout(check, 60);
+    };
+
+    var whenLoaded = function (next) {
+      if (document.readyState === 'complete') { next(); return; }
+      var done = false;
+      var go = function () { if (!done) { done = true; next(); } };
+      window.addEventListener('load', go);
+      setTimeout(go, 5000);
+    };
+
+    /* An edit to the very heading on screen (a common ask: "retitle this
+       slide") must not count as landing elsewhere. A heading that is gone
+       from the page cannot be checked; one still there but not on screen
+       means the replay went somewhere else. */
+    var headingOnPage = function (text) {
+      var nodes = document.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]');
+      for (var i = 0; i < nodes.length && i < 500; i++) {
+        if (!inLayer(nodes[i]) && clip(nodes[i].textContent, MAX_HEADING) === text) return true;
+      }
+      return false;
+    };
+
+    var finishRestore = function (status, inputs) {
+      replaying = false;
+      post({ type: 'view-restored', status: status });
+      if (status !== 'ok') {
+        try { window.location.reload(); } catch (inner) { /* stays where it is */ }
+        return;
+      }
+      viewInputs = inputs;
+      viewOverflow = false;
+      lastView = '';
+      sendView();
+    };
+
+    var restoreView = function (view) {
+      replaying = true;
+      var timedOut = false, moved = false, missed = false, done = [];
+      var budget = setTimeout(function () { timedOut = true; }, REPLAY_BUDGET_MS);
+      var check = function () {
+        clearTimeout(budget);
+        try {
+          if (view.container) {
+            var box = resolvePath(view.container.path);
+            if (box) { box.scrollTop = view.container.top; box.scrollLeft = view.container.left; }
+          }
+          try { window.scrollTo(view.scrollX, view.scrollY); } catch (inner) { /* no scrolling */ }
+          var status = 'ok';
+          if (view.heading && (moved || missed)) {
+            if (visibleHeading() !== view.heading && (missed || headingOnPage(view.heading))) status = 'mismatch';
+          } else if (missed) {
+            status = 'mismatch';
+          }
+          finishRestore(status, done);
+        } catch (inner) {
+          finishRestore('mismatch', []);
+        }
+      };
+      var hashThen = function () {
+        if (view.hash && view.hash !== window.location.hash) {
+          window.location.hash = view.hash;
+          moved = true;
+          settleThen(check);
+        } else {
+          check();
+        }
+      };
+      var step = function (i) {
+        try {
+          if (i >= view.inputs.length) { hashThen(); return; }
+          if (timedOut) { missed = true; hashThen(); return; }
+          var input = view.inputs[i];
+          var ok = input.type === 'key' ? replayKey(input) : replayClick(input);
+          if (!ok) { missed = true; hashThen(); return; }
+          moved = true;
+          done.push(input);
+          settleThen(function () { step(i + 1); });
+        } catch (inner) {
+          finishRestore('mismatch', []);
+        }
+      };
+      whenLoaded(function () { settleThen(function () { step(0); }); });
+    };
+
+    window.addEventListener('message', function (ev) {
+      try {
+        var data = ev.data;
+        if (IS_TOP || !ev.isTrusted || ev.source !== PARENT || !data || typeof data !== 'object') return;
+        if (data.source !== PARENT_TAG || data.type !== 'restore' || restoreTaken) return;
+        restoreTaken = true;
+        var view = cleanView(data.view);
+        if (!view) { post({ type: 'view-restored', status: 'invalid' }); return; }
+        restoreView(view);
+      } catch (inner) { /* never break the page */ }
+    });
+
+    /* While a restore replays, the user's own input waits (the shim's
+       listeners are the first on window), and a replayed click on a link to
+       another page does not take the preview off the document. */
+    var held = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'keydown'];
+    for (var h = 0; h < held.length; h++) {
+      window.addEventListener(held[h], function (ev) {
+        try {
+          if (!replaying || !ev.isTrusted) return;
+          ev.preventDefault();
+          ev.stopImmediatePropagation();
+        } catch (inner) { /* never break the page */ }
+      }, true);
+    }
+    window.addEventListener('click', function (ev) {
+      try {
+        if (!replaying || ev.isTrusted || !ev.target || !ev.target.closest) return;
+        var link = ev.target.closest('a[href], area[href]');
+        if (link && (link.getAttribute('href') || '').charAt(0) !== '#') ev.preventDefault();
+      } catch (inner) { /* never break the page */ }
+    });
   } catch (e) { /* no view reports: the page still runs */ }
 
   var nativeStorageWorks = true;

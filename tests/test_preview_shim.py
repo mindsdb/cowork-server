@@ -448,12 +448,36 @@ const prev = nav.add(new El('button', { text: 'Prev' }));
 const next = nav.add(new El('button', { text: 'Next' }));
 const nextIcon = next.add(new El('span'));
 const show = (from, to) => { from.rect = null; to.rect = R(20); mutate(to); };
+// Synthetic events for a restore's replay, and the page's own handlers
+// (bound after the shim, as a page's are).
+class FakeEvent {
+  constructor(type, init = {}) { Object.assign(this, init); this.type = type; this.defaultPrevented = false; }
+  preventDefault() { this.defaultPrevented = true; }
+  stopImmediatePropagation() { this.stopped = true; }
+}
+globalThis.KeyboardEvent = class extends FakeEvent {};
+globalThis.MouseEvent = class extends FakeEvent {};
+const pageHandlers = [];
+const reloads = [];
+El.prototype.dispatchEvent = function (ev) {
+  if (!('target' in ev)) ev.target = this;
+  fire(ev.type, ev);
+  if (!ev.stopped) pageHandlers.forEach((fn) => fn(ev));
+  return !ev.defaultPrevented;
+};
+fakeDocument.readyState = 'complete';
+fakeWindow.location.reload = () => reloads.push(1);
+fakeWindow.scrollTo = (x, y) => { fakeWindow.scrollX = x; fakeWindow.scrollY = y; };
+const restore = (view, more = {}) => fire('message', Object.assign({
+  isTrusted: true, source: fakeWindow.parent,
+  data: { source: 'anton-preview-parent', type: 'restore', view },
+}, more));
 (function (window, document, setTimeout, clearTimeout, MutationObserver) {
 __SHIM__
 })(fakeWindow, fakeDocument, fakeSetTimeout, fakeClearTimeout, FakeMutationObserver);
 __SCENARIO__
-advance(5000);
-process.stdout.write(JSON.stringify(posted.filter((m) => m.type === 'view')));
+advance(20000);
+process.stdout.write(JSON.stringify({ posted, reloads: reloads.length }));
 """
 
 
@@ -467,7 +491,7 @@ def _views(scenario: str) -> list[dict]:
     done = subprocess.run(
         [node, "-e", script], capture_output=True, text=True, timeout=30, check=True
     )
-    views = json.loads(done.stdout)
+    views = [m for m in json.loads(done.stdout)["posted"] if m["type"] == "view"]
     for view in views:
         assert view["source"] == "anton-preview"
     return views
@@ -588,3 +612,131 @@ def test_the_heading_is_the_topmost_one_actually_on_screen():
 def test_the_view_reporter_cannot_stop_the_storage_half():
     # A page in the opaque preview origin still gets its storage substitutes.
     assert SHIM_JS.index("View reporter") < SHIM_JS.index("var nativeStorageWorks")
+
+
+# Keeping the place across a reload the app made (ENG-4383): the app sends the
+# last view back to the reloaded document, and the shim replays it.
+
+# The deck in the harness moves to slide Two on ArrowRight (read through the
+# legacy keyCode) or on a click on Next.
+_DECK = """
+pageHandlers.push((ev) => {
+  if (ev.type === 'keydown' && ev.keyCode === 39) show(h1, h2);
+  if (ev.type === 'click' && ev.target === next) show(h1, h2);
+});
+"""
+_KEY = {"type": "key", "key": "ArrowRight", "shiftKey": False}
+_CLICK = {"type": "click", "path": "nav:0/button:1", "label": "Next"}
+
+
+def _run_restore(scenario: str) -> dict:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    script = _VIEW_HARNESS.replace("__SHIM__", SHIM_JS.replace("__LINE_OFFSET__", "0")).replace(
+        "__SCENARIO__", _DECK + scenario
+    )
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30, check=True)
+    out = json.loads(done.stdout)
+    out["restored"] = [m["status"] for m in out["posted"] if m["type"] == "view-restored"]
+    out["views"] = [m for m in out["posted"] if m["type"] == "view"]
+    return out
+
+
+def test_a_restore_replays_the_view_and_reports_the_replayed_inputs_as_its_own():
+    out = _run_restore(f"restore({json.dumps({'inputs': [_KEY], 'heading': 'Two'})});")
+    assert out["restored"] == ["ok"]
+    assert out["reloads"] == 0
+    # The next save restores the whole way again: the replayed input is now
+    # the document's own.
+    assert out["views"][-1]["inputs"] == [_KEY]
+    assert out["views"][-1]["heading"] == "Two"
+
+
+def test_a_restore_replays_a_click_by_its_path():
+    out = _run_restore(f"restore({json.dumps({'inputs': [_CLICK], 'heading': 'Two'})});")
+    assert out["restored"] == ["ok"]
+    assert out["views"][-1]["inputs"] == [_CLICK]
+
+
+def test_inputs_after_a_restore_add_to_the_replayed_ones():
+    out = _run_restore(
+        f"restore({json.dumps({'inputs': [_KEY], 'heading': 'Two'})});\n"
+        "advance(5000); key('ArrowLeft'); mutate(h1); advance(1000);"
+    )
+    assert out["views"][-1]["inputs"] == [_KEY, {"type": "key", "key": "ArrowLeft", "shiftKey": False}]
+
+
+def test_a_restore_that_lands_elsewhere_reloads_to_the_start():
+    # "One" is still on the page and "Two" was expected: the replay went
+    # somewhere else, and a fresh document beats a random slide.
+    out = _run_restore(
+        "pageHandlers.length = 0;\n"
+        f"restore({json.dumps({'inputs': [_KEY], 'heading': 'Two'})});"
+    )
+    assert out["restored"] == ["mismatch"]
+    assert out["reloads"] == 1
+    assert out["views"] == []
+
+
+def test_a_heading_the_change_rewrote_does_not_count_as_a_mismatch():
+    out = _run_restore(f"restore({json.dumps({'inputs': [_KEY], 'heading': 'Old title of two'})});")
+    assert out["restored"] == ["ok"]
+    assert out["reloads"] == 0
+
+
+def test_a_missing_control_is_a_mismatch():
+    view = {"inputs": [{"type": "click", "path": "main:3/button:0", "label": "Gone"}], "heading": ""}
+    out = _run_restore(f"restore({json.dumps(view)});")
+    assert out["restored"] == ["mismatch"]
+    assert out["reloads"] == 1
+
+
+def test_a_restore_is_taken_from_the_parent_only_and_once_per_document():
+    view = json.dumps({"inputs": [_KEY], "heading": "Two"})
+    out = _run_restore(
+        f"restore({view}, {{ source: {{}} }});\n"
+        f"restore({view}, {{ isTrusted: false }});\n"
+        f"restore({view}, {{ data: {{ source: 'anton-preview', type: 'restore', view: {view} }} }});\n"
+        "advance(5000);"
+    )
+    assert out["restored"] == []
+    assert out["views"] == []
+    out = _run_restore(f"restore({view}); advance(5000); restore({view}); advance(5000);")
+    assert out["restored"] == ["ok"]
+
+
+def test_a_malformed_restore_replays_nothing():
+    for view in (
+        {"inputs": [{"type": "key", "key": "Delete"}]},
+        {"inputs": [{"type": "click", "path": "div:0/#x"}]},
+        {"inputs": [_KEY] * 51},
+        "nope",
+    ):
+        out = _run_restore(f"restore({json.dumps(view)});")
+        assert out["restored"] == ["invalid"]
+        assert out["views"] == []
+
+
+def test_the_user_waits_while_a_restore_replays_and_is_not_recorded():
+    out = _run_restore(
+        f"restore({json.dumps({'inputs': [_KEY], 'heading': 'Two'})});\n"
+        "const held = new FakeEvent('click', { isTrusted: true, button: 0, target: prev });\n"
+        "fire('click', held); mutate(h1);\n"
+        "posted.push({ type: 'probe', held: held.defaultPrevented && !!held.stopped });\n"
+    )
+    assert out["restored"] == ["ok"]
+    assert next(m for m in out["posted"] if m["type"] == "probe")["held"] is True
+    assert out["views"][-1]["inputs"] == [_KEY]
+
+
+def test_hash_and_scroll_are_restored():
+    view = {"hash": "#pricing", "scrollY": 900, "container": {"path": "#pane", "top": 40, "left": 0}}
+    out = _run_restore(
+        "const pane = body.add(new El('div', { id: 'pane' }));\n"
+        f"restore({json.dumps(view)});\n"
+        "advance(5000); posted.push({ type: 'probe', hash: window.location.hash, y: window.scrollY, top: pane.scrollTop });"
+    )
+    assert out["restored"] == ["ok"]
+    probe = next(m for m in out["posted"] if m["type"] == "probe")
+    assert probe == {"type": "probe", "hash": "#pricing", "y": 900, "top": 40}
