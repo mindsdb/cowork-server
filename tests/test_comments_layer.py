@@ -223,3 +223,35 @@ def test_layer_reads_the_markers_the_server_reads():
         check=True, capture_output=True, text=True,
     ).stdout
     assert json.loads(out) == comment_image_ids(text) == [image]
+
+
+# ── Going to a comment, and editing it from its author line (ENG-4383) ───────
+
+
+def test_layer_takes_the_page_to_a_comment_before_opening_it():
+    # A comment on another slide, tab or section: controls that point at it
+    # are clicked, <details> opened, and the deck walked with the arrow keys
+    # (bounded, stopping when a key changes nothing) before the card opens;
+    # the "not visible right now" notice is what's left when that fails.
+    for token in [
+        "function reveal(el, done)",
+        "function openControls(el)",
+        "[aria-controls=\"",
+        "det.open = true",
+        "walk(el, 'ArrowRight', WALK_MAX",
+        "walk(el, 'ArrowLeft', WALK_MAX * 2",
+        "if (!moved) { done(false); return; }",
+        "reveal(el, function(found){",
+        "if (!found) { openThread(focusId, at); return; }",
+    ]:
+        assert token in LAYER_JS, token
+
+
+def test_layer_offers_a_hover_edit_on_your_own_comment():
+    for token in [
+        "class=\"act-m-edit-root\"",
+        "aria-label=\"Edit comment\"",
+        "var rootEdit = p.querySelector('.act-m-edit-root');",
+        "mutate({type:'edit', id: id, text: t});",
+    ]:
+        assert token in LAYER_JS, token

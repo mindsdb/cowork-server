@@ -514,6 +514,81 @@ LAYER_JS = r"""
   // detached/removed element.
   function isShown(el){ return !!(el && el.getClientRects().length); }
 
+  // ── Going to a comment's place (ENG-4383) ──────────────────────────────
+  // A comment can sit on a slide, tab or section that isn't showing. The
+  // page's own navigation is all there is to get there, so: an element
+  // shown but moved out of view (a transform deck) counts as hidden too;
+  // a control that points at a hidden ancestor (tab, accordion, #link) is
+  // clicked; a closed <details> is opened; and failing those, the deck is
+  // walked with the arrow keys, right then left, each step waiting for the
+  // page to react and a direction ending when a key changes nothing.
+  function inView(el){
+    if (!isShown(el)) return false;
+    var r = el.getBoundingClientRect();
+    var w = document.documentElement.clientWidth, h = document.documentElement.clientHeight;
+    // Off to the side is another slide; above or below is just a scroll away.
+    return r.right > 0 && r.left < w && (r.width > 0 || r.height > 0) && h > 0;
+  }
+  function cssId(id){ return String(id).replace(/["\\]/g, '\\$&'); }
+  function openControls(el){
+    var det = el.closest && el.closest('details');
+    while (det) { if (!det.open) det.open = true; det = det.parentElement && det.parentElement.closest('details'); }
+    if (inView(el)) return true;
+    for (var node = el; node && node !== document.body; node = node.parentElement) {
+      if (!node.id) continue;
+      var id = cssId(node.id);
+      var ctl = document.querySelector('[aria-controls="' + id + '"],a[href="#' + id + '"],'
+        + '[data-target="#' + id + '"],[data-bs-target="#' + id + '"],[data-tab="' + id + '"]');
+      if (ctl && isShown(ctl) && !(ctl.closest && ctl.closest('.act-pop,#act-mk'))) {
+        try { ctl.click(); } catch (e) {}
+        if (inView(el)) return true;
+      }
+    }
+    return false;
+  }
+  var WALK_MAX = 40, WALK_SETTLE_MS = 140;
+  function pressKey(key){
+    var code = key === 'ArrowRight' ? 39 : 37;
+    var init = {key: key, code: key, keyCode: code, which: code, bubbles: true, cancelable: true};
+    var target = document.activeElement && document.activeElement !== document.body ? document.activeElement : document.body;
+    try { target.dispatchEvent(new KeyboardEvent('keydown', init)); } catch (e) {}
+    try { target.dispatchEvent(new KeyboardEvent('keyup', init)); } catch (e) {}
+  }
+  // One step: press, then wait for the page to settle; `moved` is whether
+  // anything outside this layer changed.
+  function step(key, cb){
+    var moved = false;
+    var mo = new MutationObserver(function(list){
+      for (var i = 0; i < list.length; i++) {
+        var t = list[i].target;
+        if (!(t.closest && t.closest('.act-pop,#act-mk,.act-hl'))) { moved = true; return; }
+      }
+    });
+    mo.observe(document.body, {subtree: true, childList: true, attributes: true, characterData: true});
+    pressKey(key);
+    setTimeout(function(){ mo.disconnect(); cb(moved); }, WALK_SETTLE_MS);
+  }
+  function walk(el, key, left, done){
+    if (inView(el)) { done(true); return; }
+    if (left <= 0) { done(false); return; }
+    step(key, function(moved){
+      if (inView(el)) { done(true); return; }
+      if (!moved) { done(false); return; }
+      walk(el, key, left - 1, done);
+    });
+  }
+  var revealing = false;
+  function reveal(el, done){
+    if (inView(el) || openControls(el)) { done(true); return; }
+    if (revealing) { done(false); return; }
+    revealing = true;
+    var finish = function(found){ revealing = false; done(found); };
+    walk(el, 'ArrowRight', WALK_MAX, function(found){
+      if (found) { finish(true); return; }
+      walk(el, 'ArrowLeft', WALK_MAX * 2, finish);
+    });
+  }
+
   // ── Markers ──────────────────────────────────────────────────────────────
   // One DOM node per live anchored thread, keyed by id and repositioned via
   // transform in a measure-then-write rAF batch (no per-marker reflow).
@@ -828,6 +903,9 @@ LAYER_JS = r"""
   // m = {author, created_at, text, edited_at, mine}; rid set for replies.
   // Own replies get hover edit/delete; the root comment's actions live in
   // the header "…" menu instead.
+  // Own messages get a hover edit on their author line (ENG-4383): replies
+  // edit and delete there; the root comment edits there too, and keeps
+  // delete in the header's "…" menu with the thread's other actions.
   function msgHTML(m, rid){
     var acts = (m.mine && rid)
       ? '<span class="act-msg-acts">'
@@ -835,7 +913,10 @@ LAYER_JS = r"""
         + '" aria-label="Edit reply" title="Edit">' + ICONS.pencil + '</button>'
         + '<button class="act-m-del" data-rid="' + esc(rid)
         + '" aria-label="Delete reply" title="Delete">' + ICONS.trash + '</button></span>'
-      : '';
+      : (m.mine && !rid)
+        ? '<span class="act-msg-acts"><button class="act-m-edit-root"'
+          + ' aria-label="Edit comment" title="Edit">' + ICONS.pencil + '</button></span>'
+        : '';
     return '<div class="act-msg"' + (rid ? '' : ' data-root="1"') + '>'
       + '<div class="act-msg-head"><span class="act-msg-who">'
       + avatar(m.author) + '<span class="act-msg-name">' + esc(displayName(m.author))
@@ -955,6 +1036,13 @@ LAYER_JS = r"""
           mutate({type:'delete', id: id});
       };
       document.body.appendChild(menu);
+    };
+    // Hover edit on the root comment, beside its author and time.
+    var rootEdit = p.querySelector('.act-m-edit-root');
+    if (rootEdit) rootEdit.onclick = function(ev){
+      ev.stopPropagation();
+      startEdit(p.querySelector('[data-root="1"]'), c.text,
+        function(t){ mutate({type:'edit', id: id, text: t}); });
     };
     // Hover actions on own replies.
     Array.prototype.forEach.call(p.querySelectorAll('.act-m-edit'), function(btn){
@@ -1166,13 +1254,16 @@ LAYER_JS = r"""
       if (!c) return;
       var el = null;
       if (c.selector) { try { el = document.querySelector(c.selector); } catch (e) {} }
-      if (el && isShown(el)) {
+      if (!el) { openThread(c.id, d.at || null); return; }  // unanchored / orphaned: notice
+      // Take the page to the comment first (another slide, a closed tab or
+      // section), then open it there; if it can't be reached, the card
+      // opens centred with the "not visible right now" notice.
+      var focusId = c.id, at = d.at || null;
+      reveal(el, function(found){
+        if (!found) { openThread(focusId, at); return; }
         el.scrollIntoView({behavior:'smooth', block:'center'});
-        setTimeout(function(){ openThread(c.id); }, 250);
-      } else {
-        // Unanchored / orphaned / hidden (on another slide): center + notice.
-        openThread(c.id, d.at || null);
-      }
+        setTimeout(function(){ openThread(focusId); }, 250);
+      });
     }
     else if (d.type === 'hl-on') {
       if (mode) return;
