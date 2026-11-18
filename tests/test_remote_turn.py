@@ -43,12 +43,14 @@ def _no_memory(session, conv_id, entries, principal):
 
 def _fake_handler(
     monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_seed_history=None,
-    remote_agent_files=None, remote_workspace=None, earlier_answers=None,
+    remote_agent_files=None, remote_workspace=None, earlier_answers=None, memory_writable=True,
 ):
     """Replace the reads of ResponsesHandler that the turn's input unit makes
     (ResponsesHandler._read_remote_turn_inputs, which the channel turn shares)
     with stand-ins. The earlier answers' read is replaced too, by
-    ``earlier_answers`` or by one that finds none."""
+    ``earlier_answers`` or by one that finds none. The settings and project
+    read (ResponsesHandler._remote_memory_writable) answers
+    ``memory_writable``."""
 
     async def no_earlier_answers(*, conversation_id, scope):
         return ()
@@ -65,6 +67,7 @@ def _fake_handler(
         "_remote_workspace": remote_workspace or (lambda s, c: None),
         "_remote_agent_files": remote_agent_files or (lambda s, c, *, workspace: None),
         "_remote_started_at": lambda s, c: None,
+        "_remote_memory_writable": lambda s, c: memory_writable,
     }.items():
         monkeypatch.setattr(responses_mod.ResponsesHandler, name, staticmethod(read))
     # The pod's memory and compaction go through the helpers the browser
@@ -965,7 +968,8 @@ def _turn_with_a_new_artifact(monkeypatch, *, diff=None, snapshot=None):
     recorded: list[_Recorded] = []
 
     def record_new_artifacts(
-        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None,
+        session, *, conversation_id, project_id, slugs, creator, artifact_ids=None, listed_ids=None, sort_times=None,
+        untimed=(),
     ):
         recorded.append(_Recorded(slugs, project_id, creator, session.scope, on_efs_thread()))
 
@@ -1104,8 +1108,9 @@ async def test_a_record_that_lost_only_the_listed_check_says_so(monkeypatch, cap
     the diff listed. Either the turn created nothing, so the unit's failure
     lost only that check, or it created a folder and record_new_artifacts
     raised at the check, once that folder's rows were written
-    (ListedLocationsUnchecked). The line says the check failed, not that
-    created folders went unrecorded."""
+    (ListedLocationsUnchecked), which a failed hold of the root or a failed
+    write of the sort times raises too. The line names the check, the hold
+    and the sort times, not created folders gone unrecorded."""
     import logging
 
     from cowork.db.scoped import LOCAL_SCOPE
@@ -1137,7 +1142,9 @@ async def test_a_record_that_lost_only_the_listed_check_says_so(monkeypatch, cap
     assert failure is None
     record = _artifact_record_log(caplog)
     assert (record.levelname, record.getMessage()) == (
-        "ERROR", "Could not check the locations of the artifacts a channel turn listed",
+        "ERROR",
+        "Could not check the locations of the artifacts a channel turn found, or record the folder that holds them"
+        " or their sort times",
     )
     assert record.exc_info[1] is error
 

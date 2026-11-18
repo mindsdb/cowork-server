@@ -109,6 +109,7 @@ class _Harness:
         disabled_connections=None, trace_tags=None, trace_metadata=None,
         channel_context=None, tool_messages=False, model_wait=None,
         interactive=True,
+        ui_locale=None, schedule_id=None,
     ):
         if model_wait is not None:
             model_wait.attach(session=self.session)
@@ -134,6 +135,7 @@ class _Harness:
 
 def _handler(monkeypatch, saved: dict, harness: _Harness):
     handler = object.__new__(responses_mod.ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = object()
 
     class FakeConversationService:
@@ -598,3 +600,17 @@ def test_the_frame_omits_a_sequence_number_it_does_not_have():
     assert payload["content"] == "Still working: Waiting for the model (20s)"
     assert payload["eta_seconds"] == 20.0
     assert isinstance(payload["at_ms"], int)
+
+
+def test_a_frame_whose_message_is_the_label_does_not_repeat_it():
+    """The web turn's relay frame carries the label as its message; a client
+    that renders the generic "Label: message" content must not read
+    "Still working: Still working"."""
+    import json
+
+    from cowork.streaming.liveness import MODEL_WAIT_LABEL, model_wait_sse
+
+    frame = model_wait_sse(message=MODEL_WAIT_LABEL, waited_s=None)
+    payload = json.loads(frame.split("data: ", 1)[1])
+    assert payload["content"] == "Still working"
+    assert payload["message"] == "Still working"

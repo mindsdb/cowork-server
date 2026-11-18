@@ -24,9 +24,8 @@ from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.services.artifact_identity import resolve_artifact_folder
 from cowork.services.artifact_roots import artifacts_sources_for_scan
 from cowork.services.comments_proxy import forward_comments_rest, forward_comments_stream
-from cowork.services.comments_scope import cloud_comments_scope
+from cowork.services.comments_scope import published_comments_route
 from cowork.services.local_artifact_comments import handle_local_comments, local_comments_stream
-from cowork.services.publish import published_owner_state
 
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
@@ -97,13 +96,7 @@ def resolve_comments_route(
         )
     except Exception:
         return None
-    scope = cloud_comments_scope(published_owner_state(str(folder), scope=tenant_scope))
-    if not scope:
-        return None
-    upstream_user_dir, _, upstream_report_id = scope.partition("/")
-    if not upstream_user_dir or not upstream_report_id:
-        return None
-    return upstream_user_dir, upstream_report_id
+    return published_comments_route(str(folder), scope=tenant_scope)
 
 
 def _local_report_id_for_request(user_dir: str, report_id: str) -> str | None:

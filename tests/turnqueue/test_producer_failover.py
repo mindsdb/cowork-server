@@ -97,7 +97,7 @@ async def _turn(*, monkeypatch, fake):
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     return [
         item async for item in prod.stream_remote_replies(
-            conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+            conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m", memory_writable=True,
         )
         if item[0] != "progress"
     ]

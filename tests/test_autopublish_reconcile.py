@@ -72,10 +72,10 @@ def published(monkeypatch):
     calls = []
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url, password=None,
-                     access=None, scope=None, project_id=None):
+                     access=None, scope=None, project_id=None, background=False):
         # The access as anton's publisher is handed it.
         calls.append({"folder": artifact, "api_key": api_key, "access": access.publisher_access(),
-                      "scope": scope, "project_id": project_id})
+                      "scope": scope, "project_id": project_id, "background": background})
         (artifact / ".published.json").write_text(json.dumps({
             "index.html": {"report_id": "rid", "url": "u", "published": True,
                            "last_md5": "m", "published_mtime": 9_999_999_999},
@@ -607,6 +607,8 @@ async def test_project_id_reaches_publish_artifact(base, enabled, key, published
     await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert published[0]["project_id"] == PROJECT_ID
+    # No person asked for it, so a Markdown page the conversion stopped isn't rendered again.
+    assert published[0]["background"] is True
 
 
 # ─── owner filter (F1) ───────────────────────────────────────────────────

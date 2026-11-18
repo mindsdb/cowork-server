@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import docx
+import lxml.etree
+import lxml.html
 import pytest
 import yaml
 from docx.document import Document as WordDocument
@@ -238,6 +240,21 @@ def _padded_png(*, index: int, size: int) -> bytes:
 def structure() -> tuple[Package, dict]:
     html = (FIXTURES / "structure.html").read_text(encoding="utf-8")
     return _write(html, title="Fallback title"), _cases("structure.yaml")
+
+
+def test_a_parse_libxml2_fails_for_want_of_memory_raises_memory_error(monkeypatch):
+    """Under the conversion's memory limit libxml2 fails the parse; the
+    export refuses the document rather than answering 500."""
+    failed = lxml.etree.XMLSyntaxError("Memory allocation failed", 2, 1, 1)
+    failed.error_log = [types.SimpleNamespace(type_name="ERR_NO_MEMORY", message="Memory allocation failed")]
+
+    def out_of_memory(*_args, **_kwargs):
+        raise failed
+
+    monkeypatch.setattr(lxml.html, "document_fromstring", out_of_memory)
+
+    with pytest.raises(MemoryError):
+        write_docx(document=InlinedDocument(html="<p>x</p>", omitted=[], inlined_bytes=0, scripts_dropped=False), title="t")
 
 
 def test_headings_map_to_heading_styles(structure):

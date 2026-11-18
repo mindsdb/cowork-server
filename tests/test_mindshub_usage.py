@@ -156,6 +156,44 @@ def test_a_wallet_the_caller_cannot_see_still_leaves_free_tokens(calls):
     assert view.auto_top_up is None
 
 
+# The wallet block auth's entitlements/me gives every member (contracts/examples/entitlements_me.json).
+EMBEDDED_WALLET = {"balance_usd": "12.40", "can_consume": True, "auto_recharge": {"enabled": True}}
+
+
+@pytest.mark.parametrize("can_consume", [True, False])
+def test_a_member_without_wallet_read_gets_only_wallet_can_consume(calls, can_consume):
+    """Members see no new UI, but the client can still tell a top up happened."""
+    calls.answers[svc.ENTITLEMENTS_PATH] = {
+        **ENTITLEMENTS, "is_billing_owner": False,
+        "wallet": {**EMBEDDED_WALLET, "can_consume": can_consume},
+    }
+
+    view = _fetch()
+
+    assert view.balance is None
+    assert view.auto_top_up is None
+    assert view.wallet_can_consume is can_consume
+    assert view.model_dump(by_alias=True)["walletCanConsume"] is can_consume
+
+
+def test_an_owner_gets_the_wallet_and_wallet_can_consume(calls):
+    calls.answers[svc.ENTITLEMENTS_PATH] = {**ENTITLEMENTS, "wallet": {**EMBEDDED_WALLET, "can_consume": False}}
+    calls.answers[svc.WALLET_PATH] = WALLET
+
+    view = _fetch()
+
+    assert view.balance.usd == 8.42
+    assert view.balance.can_consume is True
+    assert view.wallet_can_consume is False
+
+
+def test_no_entitlements_wallet_leaves_wallet_can_consume_unknown(calls):
+    calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
+    calls.answers[svc.WALLET_PATH] = WALLET
+
+    assert _fetch().wallet_can_consume is None
+
+
 def test_both_reads_failing_is_unreachable(calls):
     view = _fetch()
     assert view.reachable is False

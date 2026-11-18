@@ -90,6 +90,9 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     # Written and read only in org mode, where every resource is partitioned,
     # so this entry decides nothing in a personal scope.
     "artifact_locations": PersonalResource.PROJECTS,
+    # Written and read only in org mode, as artifact_locations are.
+    "held_artifact_roots": PersonalResource.PROJECTS,
+    "artifact_sort_times": PersonalResource.PROJECTS,
     # Authorship claims for skills, project memory and project instructions.
     # SharedResourceAccess reads and writes them only in org mode, where every
     # resource is partitioned, so this entry decides nothing in a personal scope.
@@ -114,6 +117,10 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
     "skill_user_setting": PersonalResource.SKILLS,
     "schedules": PersonalResource.SCHEDULES,
     "pins": PersonalResource.PINS,
+    # The phones a person registered for push. Org mode only (cowork.services.push),
+    # where every resource is partitioned, so this entry decides nothing in a
+    # personal scope.
+    "push_devices": PersonalResource.SETTINGS,
     # SettingService routes its own rows; ScopedSession leaves this table alone.
     "settings": PersonalResource.SETTINGS,
 }
@@ -126,7 +133,7 @@ STORE_RESOURCE: dict[str, PersonalResource | None] = {
     # publish state.
     "publish": PersonalResource.PROJECTS,
     # What the server copied into each conversation's project-files folder
-    # (cowork.services.files.stage_project_files), kept where no pod and no
+    # (cowork.services.project_file_copy.stage_project_files), kept where no pod and no
     # route reaches it.
     "project-file-copies": PersonalResource.PROJECTS,
     "files": PersonalResource.FILES,

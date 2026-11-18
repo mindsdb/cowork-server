@@ -6,6 +6,8 @@ setting one env var. These tests pin that contract.
 """
 import ast
 import os
+import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -20,6 +22,8 @@ from cowork.common.settings.app_settings import (
 )
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
+
+_TESTS_DIR = Path(__file__).resolve().parent
 
 
 def test_cowork_home_defaults_to_dot_cowork(monkeypatch):
@@ -225,6 +229,27 @@ def test_pod_local_only_honors_explicit_scratch_dir_override(monkeypatch, tmp_pa
     get_app_settings.cache_clear()
 
 
+def test_the_suites_org_mode_scratch_stores_belong_to_this_test_process(org_deployment):
+    """Each pytest-xdist worker is its own process. Org mode's pod-local stores
+    in one dir shared between processes let one worker's publish state.json
+    rename remove another's. Another process that loads this conftest gets a
+    different dir, outside COWORK_HOME."""
+    another_process = subprocess.run(
+        [sys.executable, "-c", "import os, conftest; print(os.environ['COWORK_POD_SCRATCH_DIR'])"],
+        env={**os.environ, "PYTHONPATH": f"{_TESTS_DIR}{os.pathsep}{_TESTS_DIR.parent}"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    )
+    home = Path(os.environ["COWORK_HOME"])
+    resolved = pod_local_only(home / "publish", "publish")
+
+    assert resolved.parent == Path(os.environ["COWORK_POD_SCRATCH_DIR"])
+    assert Path(another_process.stdout.strip()) != resolved.parent
+    assert home not in resolved.parents
+
+
 def test_bearer_auth_token_env_derives_from_cowork_home(monkeypatch, tmp_path):
     # With COWORK_REQUIRE_AUTH=true the effective token is mirrored to
     # <cowork_home()>/.env so the desktop app can read it. A hardcoded
@@ -425,7 +450,7 @@ _ACCOUNT_LEVEL_COWORK_HOME_CALLS = Counter(
         # turn copies them, so the desktop never writes it, and an org
         # deployment keys it per organization through scoped_storage_root.
         (
-            "cowork/services/files.py",
+            "cowork/services/project_file_copy.py",
             "copy_records_root",
             "scoped_storage_root(cowork_home() / 'project-file-copies', scope, store='project-file-copies')",
         ),

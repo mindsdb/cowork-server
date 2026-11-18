@@ -180,10 +180,10 @@ async def turns(monkeypatch, tmp_path):
         id="conv-1", project_id="proj-1", project=SimpleNamespace(path=str(tmp_path), name="p")
     )
 
-    def run(body):
+    def run(body, **kwargs):
         bodies.append(body)
         return AntonHarness().stream_response(
-            conversation=conversation, input=[{"type": "text", "text": "hi"}]
+            conversation=conversation, input=[{"type": "text", "text": "hi"}], **kwargs
         )
 
     yield SimpleNamespace(run=run, pads=pads, sessions=sessions)

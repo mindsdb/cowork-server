@@ -22,10 +22,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NamedTuple
 from uuid import UUID
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -38,6 +38,7 @@ from cowork.api.v1.endpoints.connectors.sharepoint import (
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, require
 from cowork.api.v1.pinned_response import PinnedStreamingResponse
 
+from cowork.common.logger import log_context
 from cowork.common.paths import (
     O_NOFOLLOW,
     O_NONBLOCK,
@@ -64,7 +65,7 @@ from cowork.db.scoped import (
     TenantScope,
     get_tenant_scope,
 )
-from cowork.db.units import run_efs, run_efs_unit
+from cowork.db.units import FilesystemBusy, run_efs, run_efs_unit
 from cowork.models.project import Project
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.principal import Principal, get_principal
@@ -85,10 +86,14 @@ from cowork.schemas.sharepoint import (
     SharePointSkippedItem,
 )
 from cowork.services.artifact_roots import (
+    _ARTIFACTS_SUBPATH,
     CONVERSATIONS_DIRNAME,
     PROJECT_FILES_DIRNAME,
     REMOVED_DIRNAME,
     SERVER_PROJECT_FOLDERS,
+    ProjectRow,
+    recorded_source,
+    workspace_conversation_id,
 )
 from cowork.services.artifacts import _is_the_projects_secrets
 from cowork.services.connectors.sharepoint import (
@@ -97,7 +102,7 @@ from cowork.services.connectors.sharepoint import (
     SharePointError,
     SharePointErrorKind,
 )
-from cowork.services.project_file_view import ABSENT_ERRNOS, ordinary_path
+from cowork.services.project_file_view import ABSENT_ERRNOS, NOT_A_PROJECT_FILE_NAME, ordinary_path
 from cowork.services.projects import ProjectService
 from cowork.services.product_permissions import require_product_permission
 from cowork.services.shared_resources import (
@@ -794,8 +799,28 @@ def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -
         rel = target.relative_to(base.resolve()).as_posix()
     except (ValueError, OSError):
         raise HTTPException(status_code=404, detail="File not found")
-    if not _conversation_workspace_ok(rel, scoped):
+    if _is_project_files_copy(rel, scoped.scope) or not _conversation_workspace_ok(rel, scoped):
         raise HTTPException(status_code=404, detail="File not found")
+
+
+def _is_project_files_copy(rel_posix: str, scope: TenantScope) -> bool:
+    """Whether a path below the project is in a conversation's copy of the
+    project's files, or in what that copy removed
+    (`conversations/<id>/project-files/…`,
+    `conversations/<id>/.project-files-removed/…`, stage_project_files), in
+    org mode, where cloud turns make them. The listing skips both folders
+    (_iter_project_files), and the user routes answer 404 for them as for a
+    missing file: they are the pod's, the user has the project file itself,
+    and a copy a delete has not reached yet is never served. Compared
+    case-folded, as a case-insensitive file system would open them."""
+    if not scope.org_mode:
+        return False
+    parts = rel_posix.split("/", 3)
+    return (
+        len(parts) >= 3
+        and parts[0].casefold() == CONVERSATIONS_DIRNAME
+        and parts[2].casefold() in _COPY_DIRNAMES
+    )
 
 
 async def _authorize_artifact_file_mutation(
@@ -831,7 +856,35 @@ def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) 
     Mutation helpers refuse symlinks in every component, so the lexical
     conversation id is the only workspace the operation can reach.
     """
-    if not _conversation_workspace_ok(path.value, scoped):
+    if _is_project_files_copy(path.value, scoped.scope) or not _conversation_workspace_ok(path.value, scoped):
+        raise HTTPException(status_code=404, detail="File not found")
+
+
+def _require_canonical_workspace(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:
+    """404, the answer a co-member's workspace gets, before a PUT writes into
+    a conversation workspace named by another spelling of its id.
+
+    In org mode the artifacts list and the held rows' backfill read a
+    workspace only under its canonical name, str(conversation_id)
+    (artifact_roots.workspace_conversation_id), so an artifact folder written
+    below another spelling would never be listed. An uppercase spelling is
+    another folder on a case-sensitive store and the same folder on a
+    case-insensitive one. A spelling without hyphens or with braces is another
+    folder on both. Only the PUT calls this, since it is the one route that
+    writes below a workspace: the owner still lists, reads, previews and
+    deletes what such a folder already holds (_conversation_workspace_ok).
+    Elsewhere no artifacts list reads a workspace, so nothing is refused.
+    """
+    if not scoped.scope.org_mode:
+        return
+    parts = path.parts
+    if len(parts) < 2 or parts[0] != CONVERSATIONS_DIRNAME:
+        return
+    try:
+        UUID(parts[1])
+    except ValueError:
+        return  # not a conversation workspace: a shared project folder
+    if workspace_conversation_id(parts[1]) is None:
         raise HTTPException(status_code=404, detail="File not found")
 
 
@@ -1380,54 +1433,60 @@ def _delete_project_entry(
             if stat.S_ISDIR(target_stat.st_mode):
                 raise HTTPException(status_code=400, detail="Path is a directory")
             dir_unlink(parent, disk_name)
-        if scoped.scope.org_mode:
-            _remove_project_file_copies(directory, path)
 
 
-#: How long one delete spends removing a file's copies from the project's
-#: conversations, so a project with many conversations does not hold the
-#: request's file store slot for all of them.
+#: How long one call of _remove_project_file_copies spends removing a deleted
+#: file's copies from the project's conversations, so it holds a file store
+#: slot no longer than that, however many conversations the project has.
 COPY_PURGE_SECONDS = 2.0
 
 
-def _remove_project_file_copies(project: PinnedDir, path: _ValidatedProjectPath) -> None:
+def _remove_project_file_copies(
+    project_path: Path, path: _ValidatedProjectPath, *, only: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
     """Remove a deleted project file's copy from every conversation's
     project-files folder in the project (stage_project_files), so nobody
-    reads it there, whether or not that conversation runs another turn. Each
-    folder on the way is opened without following a link; a conversation
-    whose copy is missing or reached through a link is skipped, and one that
-    can't be cleared is logged. The file itself is already gone, so nothing
-    here fails the delete. The copy's folders are the pod's, so the path's
-    names, already validated, are opened directly: no folder there is ever
-    listed, and each conversation costs one open per path component.
+    reads it there, whether or not that conversation runs another turn: from
+    the conversation folders named in ``only``, or from each one there when
+    None. Each folder on the way, the project's own included, is opened
+    without following a link; a conversation whose copy is missing or
+    reached through a link is skipped, and one that can't be cleared is
+    logged. The file itself is already gone, so nothing here fails the
+    delete. The copy's folders are the pod's, so the path's names, already
+    validated, are opened directly: no folder there is ever listed, and each
+    conversation costs one open per path component.
 
-    Bounded by COPY_PURGE_SECONDS: the conversations it does not reach in
-    that time are logged with their count. A conversation's next turn removes
-    any copy left behind, since its project file is no longer there to copy."""
+    Runs with no database session (delete_project_file) and stops after
+    COPY_PURGE_SECONDS, once it has reached at least one conversation.
+    Returns the conversation folders it did not reach, for a later call."""
     if not ordinary_path(path.parts):
-        return
+        return ()
     deadline = time.monotonic() + COPY_PURGE_SECONDS
     try:
-        conversations = open_pinned_child(project, CONVERSATIONS_DIRNAME)
+        with ExitStack() as held:
+            parent = held.enter_context(pinned_dir(project_path.parent, nofollow_base=True))
+            project = open_pinned_child(parent, project_path.name)
+            held.callback(project.close)
+            conversations = open_pinned_child(project, CONVERSATIONS_DIRNAME)
     except OSError as error:
         if error.errno not in ABSENT_ERRNOS:
             logger.warning("could not open the project's conversations to remove a deleted file's copies", exc_info=True)
-        return
+        return ()
     try:
-        try:
-            with dir_scandir(conversations) as scan:
-                conversation_names = [entry.name for entry in scan]
-        except OSError:
-            logger.warning("could not list the project's conversations to remove a deleted file's copies", exc_info=True)
-            return
-        for reached, conversation_name in enumerate(conversation_names):
-            if time.monotonic() >= deadline:
+        if only is not None:
+            conversation_names = list(only)
+        else:
+            try:
+                with dir_scandir(conversations) as scan:
+                    conversation_names = [entry.name for entry in scan]
+            except OSError:
                 logger.warning(
-                    "stopped removing a deleted project file's copies at the time limit; "
-                    "%d of %d conversation folders not reached", len(conversation_names) - reached,
-                    len(conversation_names),
+                    "could not list the project's conversations to remove a deleted file's copies", exc_info=True,
                 )
-                return
+                return ()
+        for reached, conversation_name in enumerate(conversation_names):
+            if reached and time.monotonic() >= deadline:
+                return tuple(conversation_names[reached:])
             try:
                 UUID(conversation_name)
             except ValueError:
@@ -1446,16 +1505,41 @@ def _remove_project_file_copies(project: PinnedDir, path: _ValidatedProjectPath)
                     name = os.path.basename(path.parts[-1])
                     if not stat.S_ISDIR(dir_lstat(parent, name).st_mode):
                         dir_unlink(parent, name)
-            except OSError as error:
-                if isinstance(error, FileNotFoundError) or error.errno in ABSENT_ERRNOS:
+            except (OSError, ValueError) as error:
+                # A ValueError is a name dir_unlink refuses (is_child_name).
+                if isinstance(error, OSError) and error.errno in ABSENT_ERRNOS:
                     continue
                 logger.warning(
-                    "could not remove a deleted project file's copy from conversation %s",
-                    conversation_name,
+                    "Could not remove a deleted project file's copy from a conversation",
                     exc_info=True,
+                    extra={
+                        "event": "project_file_copy_not_removed",
+                        **log_context(conversation_id=conversation_name),
+                    },
                 )
+        return ()
     finally:
         conversations.close()
+
+
+async def _finish_removing_project_file_copies(
+    project_path: Path, path: _ValidatedProjectPath, only: tuple[str, ...] | None, *, scope: TenantScope,
+) -> None:
+    """Remove a deleted file's copies from the conversations the delete's own
+    call did not reach (``only``, or every one when None), after the
+    response, a COPY_PURGE_SECONDS call at a time, so no call holds a file
+    store slot longer than the delete's own. Each call waits for its slot as
+    long as it takes (``run_efs`` with no deadline): nothing else removes the
+    copy from a conversation that runs no other turn. Never raises: logged."""
+    try:
+        while True:
+            only = await run_efs(
+                partial(_remove_project_file_copies, project_path, path, only=only), scope=scope, deadline=False,
+            )
+            if not only:
+                return
+    except Exception:
+        logger.exception("could not finish removing a deleted project file's copies")
 
 
 def _read_project_bytes(
@@ -1792,6 +1876,232 @@ def _read_project_file(
     return response
 
 
+class _ArtifactFolder(NamedTuple):
+    """An artifact folder a project files path lies in: the conversation
+    whose legacy root holds it, None for the project's shared root, and the
+    folder's name."""
+
+    conversation_id: UUID | None
+    slug: str
+
+
+class _ArtifactFolderPath(NamedTuple):
+    """A project files path below an artifact folder (_artifact_folder_path)."""
+
+    folder: _ArtifactFolder
+    #: The path's parts below the folder.
+    below: tuple[str, ...]
+
+
+def _artifact_folder_path(path: _ValidatedProjectPath) -> _ArtifactFolderPath | None:
+    """The artifact folder `path` lies in, when it lies in one: below a
+    project's shared root (`.anton/artifacts/<slug>/...`), or below a
+    conversation's legacy root (`conversations/<id>/.anton/artifacts/<slug>/
+    ...`), whose workspace name only counts in its canonical spelling
+    (artifact_roots.workspace_conversation_id). A file directly in a root is
+    no folder, and a folder whose name starts with a dot is none the list
+    opens (held_artifact_roots.listable_folders). Compared by parts,
+    case-sensitive, as the organization's file store is; the PUT and the
+    DELETE refuse a link in every component, so these parts are where they
+    wrote or deleted."""
+    parts = path.parts
+    conversation_id = None
+    if parts[0] == CONVERSATIONS_DIRNAME and len(parts) > 2:
+        conversation_id = workspace_conversation_id(parts[1])
+        if conversation_id is None:
+            return None
+        parts = parts[2:]
+    if len(parts) < 4 or parts[:2] != _ARTIFACTS_SUBPATH or parts[2].startswith("."):
+        return None
+    return _ArtifactFolderPath(
+        folder=_ArtifactFolder(conversation_id=conversation_id, slug=parts[2]), below=parts[3:]
+    )
+
+
+def _artifact_folder_written(path: _ValidatedProjectPath) -> _ArtifactFolder | None:
+    """The artifact folder a PUT of `path` wrote into, when it wrote into one
+    (_artifact_folder_path)."""
+    found = _artifact_folder_path(path)
+    return found.folder if found is not None else None
+
+
+def _artifact_folder_unlisted(path: _ValidatedProjectPath) -> _ArtifactFolder | None:
+    """The artifact folder whose card a DELETE of `path` removed: the
+    folder's own `metadata.json`, without which the artifacts list shows no
+    card for it. A DELETE never removes a folder (_delete_project_entry
+    refuses one), and any other file leaves the folder's card as it was."""
+    found = _artifact_folder_path(path)
+    return found.folder if found is not None and found.below == ("metadata.json",) else None
+
+
+def _record_artifact_folder_write(scoped: ScopedSession, *, project_name: str, path: _ValidatedProjectPath) -> None:
+    """After a PUT wrote into an artifact folder (_artifact_folder_written),
+    record two rows in the PUT's own unit, so the artifacts list shows the
+    folder: that the folder's root holds one (held_artifact_roots.hold_root),
+    so the list opens that root, and the folder's sort time
+    (artifact_sort_times.record_sort_times), so the list counts the folder
+    among the newest. The root is the project's shared root, or the caller's
+    own conversation's legacy root, which after the backfills only this PUT
+    and a comparison side's carry (ComparisonService._hold_carried_workspace)
+    record. Only org tenancy keeps these rows.
+
+    The time is the modification time of the folder's `metadata.json`
+    (_record_folder_time). A folder whose `metadata.json` is not written yet
+    gets no time; the PUT that writes it records one, and a later PUT into
+    the folder only moves the row to a newer time (record_sort_times).
+
+    Best-effort: the file is written already, so a failure is logged at
+    ERROR and the PUT still succeeds. Each row has its own try, so a failed
+    hold still records the time. For a shared root a failed hold asks for
+    the project's location check
+    (_ask_for_location_check), whose listing holds the root and records the
+    time of every folder it reads. A legacy root has no self-heal: its rows
+    wait for the next PUT into the folder."""
+    from cowork.services.artifact_locations import keeps_locations
+    from cowork.services.held_artifact_roots import hold_root
+
+    folder = _artifact_folder_written(path)
+    if folder is None or not keeps_locations(scoped.scope):
+        return
+    project = None
+    try:
+        project = _artifact_folder_project(scoped, project_name)
+        hold_root(scoped, project_id=project.id, conversation_id=folder.conversation_id)
+    except Exception:
+        scoped.rollback()
+        logger.error(
+            "Could not record that a project files write put an artifact folder in its root",
+            exc_info=True,
+            extra={"event": "held_artifact_root_not_recorded", **_folder_write_context(project, folder)},
+        )
+        _ask_for_location_check(scoped, project=project, folder=folder)
+    if project is None:
+        return
+    _record_folder_time(scoped, project=project, folder=folder)
+
+
+def _artifact_folder_project(scoped: ScopedSession, project_name: str) -> ProjectRow:
+    """`project_name`'s row as plain values, which stay readable after a
+    failed commit expires every loaded row. An org project's folder is never
+    one the user chose (ProjectService.directory_is_external)."""
+    found = _project_for_name(project_name, scoped)
+    return ProjectRow(id=found.id, name=found.name, path=found.path, external=False)
+
+
+def _record_folder_time(scoped: ScopedSession, *, project: ProjectRow, folder: _ArtifactFolder) -> None:
+    """Record `folder`'s sort time in `project` (artifact_sort_times.
+    record_sort_times): the modification time of its `metadata.json`, read
+    here (id_holder_times), since the project files units run on the file
+    store's threads (run_efs_unit). A folder with no `metadata.json`, or one
+    that holds no id, gets no time, and a row only moves to a newer time.
+
+    Best-effort: a failed write is rolled back and logged at ERROR. A
+    `metadata.json` the read could not reach, such as on EIO, is logged at
+    WARNING and leaves the folder's row as it was. For a shared root either
+    one asks for the project's location check (_ask_for_location_check),
+    whose listing records the time of every folder it reads."""
+    from cowork.services.artifact_sort_times import id_holder_times, record_sort_times
+
+    try:
+        read = id_holder_times(base=recorded_source(project, folder.conversation_id).base, slugs=[folder.slug])
+        record_sort_times(scoped, project_id=project.id, times=read.times, conversation_id=folder.conversation_id)
+    except Exception:
+        scoped.rollback()
+        logger.error(
+            "Could not record the sort time of an artifact folder a project files request changed",
+            exc_info=True,
+            extra={"event": "artifact_sort_time_not_recorded", **_folder_write_context(project, folder)},
+        )
+        _ask_for_location_check(scoped, project=project, folder=folder)
+        return
+    if read.unreadable:
+        # The event and level a turn end's or the self-heal's read logs for
+        # folders whose time it could not read.
+        logger.warning(
+            "Could not read the metadata.json of an artifact folder a project files request changed, so its sort "
+            "time was not updated",
+            extra={
+                "event": "artifact_sort_times_unreadable",
+                **_folder_write_context(project, folder),
+                "count": len(read.unreadable),
+            },
+        )
+        _ask_for_location_check(scoped, project=project, folder=folder)
+
+
+def _folder_write_context(
+    project: ProjectRow | None, folder: _ArtifactFolder
+) -> dict[str, str | tuple[str, ...]]:
+    """The log fields of a folder a PUT or a DELETE changed: its project,
+    when the request found its row, its conversation for a legacy root, and
+    its name."""
+    return log_context(
+        project_id=project.id if project is not None else None,
+        conversation_id=folder.conversation_id,
+        artifact_slug=folder.slug,
+    )
+
+
+def _ask_for_location_check(
+    scoped: ScopedSession, *, project: ProjectRow | None, folder: _ArtifactFolder
+) -> None:
+    """After a PUT or a DELETE could not record a row of `folder` in
+    `project`'s shared root (_record_artifact_folder_write,
+    _record_folder_time), ask for the project's location check
+    (artifact_autopublish.request_project_location_check). Its listing of
+    the shared root holds the root and records the time of every folder it
+    reads (artifact_autopublish._record_listing). Nothing is asked for a
+    legacy root, which has no self-heal, or when the request found no
+    project row."""
+    from cowork.services.artifact_autopublish import request_project_location_check
+
+    if project is None or folder.conversation_id is not None:
+        return
+    request_project_location_check(
+        artifacts_base=recorded_source(project, None).base, scope=scoped.scope, project_id=str(project.id)
+    )
+
+
+def _forget_artifact_folder_delete(scoped: ScopedSession, *, project_name: str, path: _ValidatedProjectPath) -> None:
+    """After a DELETE removed an artifact folder's `metadata.json`
+    (_artifact_folder_unlisted), drop that folder's sort-time row
+    (artifact_sort_times.forget_sort_time), in the project's shared root or
+    in the caller's own conversation's legacy root, in the DELETE's own
+    unit. Without its `metadata.json` the folder shows no card, so its row
+    would only cost the list a failed open among its newest rows, and no
+    self-heal lists a legacy root to drop it there. Only org tenancy keeps
+    these rows.
+
+    A PUT of the same `metadata.json` may write it again and record its row
+    between the unlink and the drop. So after the drop the DELETE reads the
+    folder's time again and records it (_record_folder_time): the row comes
+    back when the file is back, and none is written when it is still gone.
+
+    Best-effort: the file is deleted already, so a failed drop is rolled
+    back and logged at WARNING, and the DELETE still succeeds."""
+    from cowork.services.artifact_locations import Location, keeps_locations
+    from cowork.services.artifact_sort_times import forget_sort_time
+
+    folder = _artifact_folder_unlisted(path)
+    if folder is None or not keeps_locations(scoped.scope):
+        return
+    project = None
+    try:
+        project = _artifact_folder_project(scoped, project_name)
+        forget_sort_time(
+            scoped, location=Location(project_id=project.id, conversation_id=folder.conversation_id, slug=folder.slug)
+        )
+    except Exception:
+        scoped.rollback()
+        logger.warning(
+            "Could not drop the sort time of an artifact folder whose metadata.json a project files delete removed",
+            exc_info=True,
+            extra={"event": "artifact_sort_time_not_dropped", **_folder_write_context(project, folder)},
+        )
+        return
+    _record_folder_time(scoped, project=project, folder=folder)
+
+
 @router.put(
     "/{project_name}/files/{path:path}",
     response_model=ProjectFileWriteResponse,
@@ -1819,6 +2129,7 @@ def _write_project_file(
     principal: Principal | None,
 ):
     _require_workspace_path(path, scoped)
+    _require_canonical_workspace(path, scoped)
     classification_base = (
         _project_dir(project_name, scoped) if scoped.scope.org_mode else None
     )
@@ -1929,6 +2240,7 @@ def _write_project_file(
             )
         raise
     response = {"path": path.value, "size": st.st_size, "modified": st.st_mtime}
+    _record_artifact_folder_write(scoped, project_name=project_name, path=path)
     if instructions_context is not None:
         project = instructions_context.project
         access = instructions_context.access
@@ -2023,6 +2335,11 @@ def _write_uploads(scoped: ScopedSession, *, project_name: str, uploads: list[Up
             safe_name = os.path.basename(upload.filename).strip()
             if not safe_name or safe_name.startswith("."):
                 results.append(ProjectUploadResult(name=upload.filename, ok=False, error="invalid filename"))
+                continue
+            # A cloud turn's agent reads ordinary files only, so a file it
+            # would never get is refused rather than left for no turn to read.
+            if scoped.scope.org_mode and not ordinary_path((safe_name,)):
+                results.append(ProjectUploadResult(name=safe_name, ok=False, error=NOT_A_PROJECT_FILE_NAME))
                 continue
             try:
                 data = upload.file.read()
@@ -2216,11 +2533,55 @@ async def delete_project_file(
     project_name: str,
     path: ProjectMutationPathDep,
     scope: ScopeDep,
+    background_tasks: BackgroundTasks,
     principal: Principal | None = Depends(get_principal),
 ):
-    return await run_efs_unit(
-        partial(_delete_project_file, project_name=project_name, path=path, principal=principal), scope=scope
+    """Delete a project file. In org mode, once the delete is committed, its
+    copies leave every conversation's project-files folder: within
+    COPY_PURGE_SECONDS on the request, with no database session held, and
+    the conversations that call did not reach after the response."""
+    deleted = await run_efs_unit(
+        partial(_delete_project_file_and_find_copies, project_name=project_name, path=path, principal=principal),
+        scope=scope,
     )
+    if deleted.copies_in is not None:
+        try:
+            rest: tuple[str, ...] | None = await run_efs(
+                partial(_remove_project_file_copies, deleted.copies_in, path), scope=scope,
+            )
+        except FilesystemBusy:
+            # The delete is done; every copy goes after the response.
+            rest = None
+        if rest is None or rest:
+            background_tasks.add_task(
+                _finish_removing_project_file_copies, deleted.copies_in, path, rest, scope=scope,
+            )
+    return deleted.response
+
+
+class _DeletedProjectFile(NamedTuple):
+    response: ProjectFileDeleteResponse
+    #: Org mode: the project's folder, whose conversations hold copies of
+    #: the deleted file for the route to remove next; None otherwise.
+    copies_in: Path | None
+
+
+def _delete_project_file_and_find_copies(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: ProjectMutationPathDep,
+    principal: Principal | None,
+) -> _DeletedProjectFile:
+    """The delete's unit: _delete_project_file, and in org mode the folder
+    whose conversations' copies of an ordinary file go once it commits."""
+    response = ProjectFileDeleteResponse.model_validate(
+        _delete_project_file(scoped, project_name=project_name, path=path, principal=principal)
+    )
+    copies_in = None
+    if scoped.scope.org_mode and ordinary_path(path.parts):
+        copies_in = _project_dir(project_name, scoped)
+    return _DeletedProjectFile(response=response, copies_in=copies_in)
 
 
 def _delete_project_file(
@@ -2336,6 +2697,7 @@ def _delete_project_file(
             _close_instruction_context(instructions_context)
             raise
         _close_instruction_context(instructions_context)
+    _forget_artifact_folder_delete(scoped, project_name=project_name, path=path)
     return {"status": "deleted", "path": path.value}
 
 
@@ -2452,6 +2814,16 @@ def _preview_asset(*, token: str, rel_path: str, scope: TenantScope):
     # member's workspace hangs off it and the containment check above passes for
     # all of them. Same 404 as an unknown token: which it was is information.
     if not mount.serves(target):
+        raise HTTPException(status_code=404, detail="Asset not found")
+    # Nor is a mount on a file in a conversation's folder a way into that
+    # conversation's copy of the project's files.
+    try:
+        rel = target.relative_to(mount.project_base).as_posix()
+    except ValueError:
+        # Inside the mounted directory, which is inside the project, so not
+        # reached; serves() above answers for a path outside the project.
+        rel = ""
+    if _is_project_files_copy(rel, scope):
         raise HTTPException(status_code=404, detail="Asset not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     return _pinned_stream(

@@ -48,11 +48,20 @@ def test_turn_reply_accepts_every_kind_the_controller_publishes():
 
     published = {
         "progress", "cell", "error", "turn_delta", "turn_step",
-        "turn_memory", "turn_skill", "turn_history", "turn_compaction",
-        "turn_completed", "turn_failed",
+        "turn_memory", "turn_memory_forget", "turn_skill", "turn_connector", "turn_history",
+        "turn_compaction", "turn_completed", "turn_failed",
     }
     accepted = set(typing.get_args(TurnReply.model_fields["kind"].annotation))
     assert published == accepted
+
+
+def test_turn_reply_parses_a_connector_draft():
+    """The controller relays a pod's connector line as turn_connector, which
+    this build does nothing with; the reply still parses, so it is dropped
+    rather than failing its turn."""
+    reply = TurnReply.model_validate_json(
+        '{"correlation_id":"r","kind":"turn_connector","data":{"entries":[{"name":"crm"}]}}')
+    assert reply.kind == "turn_connector"
 
 
 def test_turn_reply_parses_a_skill_draft():
@@ -102,6 +111,40 @@ def test_turn_job_carries_a_versioned_datasource_block():
     job = TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
                   reply_stream="scratchpad:reply:c", params={"input": "hi", "datasource": datasource})
     assert TurnJob.model_validate_json(job.model_dump_json()).params["datasource"] == datasource
+
+
+def test_turn_job_carries_a_connection_label_and_engine():
+    datasource = {"protocol_version": 1, "connections": [
+        {"connection_id": 93, "credential_version": 2, "label": "données", "engine": "postgres"},
+        {"connection_id": 80, "credential_version": 1},
+    ]}
+    job = TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
+                  reply_stream="scratchpad:reply:c", params={"input": "hi", "datasource": datasource})
+    assert TurnJob.model_validate_json(job.model_dump_json()).params["datasource"] == datasource
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        {"connection_id": 7, "credential_version": 3, "label": ""},
+        {"connection_id": 7, "credential_version": 3, "label": "x" * 129},
+        {"connection_id": 7, "credential_version": 3, "label": 7},
+        {"connection_id": 7, "credential_version": 3, "engine": "postgres\n"},
+        {"connection_id": 7, "credential_version": 3, "engine": "Postgres"},
+        {"connection_id": 7, "credential_version": 3, "engine": None},
+    ],
+    ids=["empty_label", "label_over_the_cap", "label_not_text", "engine_with_newline", "engine_not_an_id",
+         "engine_null"],
+)
+def test_turn_job_refuses_a_label_or_engine_of_the_wrong_shape(reference):
+    """The producer leaves out a value it cannot use, so a value of the wrong
+    shape here is a producer bug and stops before Redis."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="datasource"):
+        TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
+                reply_stream="scratchpad:reply:c",
+                params={"input": "hi", "datasource": {"protocol_version": 1, "connections": [reference]}})
 
 
 @pytest.mark.parametrize(

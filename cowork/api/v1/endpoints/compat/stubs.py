@@ -24,6 +24,7 @@ from cowork.db.scoped import MissingTenantScopeError, ScopedSession, ScopedSessi
 from cowork.db.units import FilesystemBusy, run_db, run_efs_unit
 from cowork.schemas.files import AttachmentMoveResponse
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
+from cowork.services.project_file_view import NOT_A_PROJECT_FILE_NAME, ordinary_path
 
 logger = logging.getLogger(__name__)
 
@@ -192,15 +193,23 @@ async def attachment_raw(
 
 
 #: Project-root names the server owns. `.anton` holds instructions, memory and
-#: skill drafts; `conversations` holds every member's private workspace. A plain
-#: file landing on either name squats a directory the server has to create later,
-#: so a move that would take one is refused before anything is copied.
+#: skill drafts; `conversations` holds every member's private workspace. An
+#: attachment named for either is refused before anything is copied, rather
+#: than moved under another name.
 _RESERVED_PROJECT_ROOT_NAMES = frozenset({".anton", CONVERSATIONS_DIRNAME})
 
 
-def _project_destination_name(filename: str | None) -> str:
-    """The project-root filename a moved attachment lands on."""
+def _attachment_name(filename: str | None) -> str:
+    """A moved attachment's own filename, as its last path part."""
     return os.path.basename(filename or "upload").strip() or "upload"
+
+
+def _project_destination_name(filename: str | None) -> str:
+    """The project-root filename a moved attachment lands on: its own name
+    with any leading dots taken off. A hidden name is a project file the
+    project's listing hides and no cloud turn reads, so `.budget.csv` lands
+    as `budget.csv`, as a name already taken lands under a new one."""
+    return _attachment_name(filename).lstrip(".").strip() or "upload"
 
 
 def _unique_project_target(project_dir: Path, filename: str) -> Path:
@@ -246,12 +255,19 @@ def _move_attachment_to_project(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
-    destination_name = _project_destination_name(stored.filename)
-    if scoped.scope.org_mode and destination_name in _RESERVED_PROJECT_ROOT_NAMES:
+    # Settled before anything is copied or deleted, so a refused move keeps
+    # the attachment.
+    attachment_name = _attachment_name(stored.filename)
+    if scoped.scope.org_mode and attachment_name in _RESERVED_PROJECT_ROOT_NAMES:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"The {destination_name} project namespace is reserved",
+            detail=f"The {attachment_name} project namespace is reserved",
         )
+    # A cloud turn's agent reads a project's ordinary files only, so a name
+    # that is still not ordinary at the project's root is refused rather
+    # than moved where no turn reads it.
+    if scoped.scope.org_mode and not ordinary_path((_project_destination_name(stored.filename),)):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=NOT_A_PROJECT_FILE_NAME)
 
     project_dir = Path(project.path)
     project_dir.mkdir(parents=True, exist_ok=True)

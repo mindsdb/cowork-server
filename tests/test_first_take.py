@@ -226,14 +226,21 @@ def test_where_the_first_sentence_ends():
 
 
 @pytest.mark.asyncio
-async def test_it_logs_its_outcome_and_time_to_first_word(caplog):
+async def test_it_logs_its_outcome_and_time_to_first_word(owned_logger):
+    """As the hosted JSON log prints it: the formatter keeps only allowlisted
+    fields, and a WARNING with no event of its own reads as a failure."""
+    import logging
+
+    logged = owned_logger(ft.__name__, level=logging.WARNING)
     buffer = _Buffer()
     take = _take(_Provider(["On it."])).start()
     take.attach(buffer)
-    with caplog.at_level("WARNING", logger=ft.__name__):
-        await _settle()
-    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("[first-take]"))
-    assert "model=fast outcome=shown first_word_ms=" in line and "first_word_ms=None" not in line
+    await _settle()
+    (line,) = [json.loads(row) for row in logged.output().splitlines()]
+    assert (line["event"], line["log_level"], line["model_alias"], line["outcome"]) == (
+        "first_take_finished", "WARNING", "fast", "shown",
+    )
+    assert type(line["first_word_ms"]) is int and type(line["duration_ms"]) is int
 
 
 class _ReasoningProvider:
@@ -256,7 +263,7 @@ async def test_reasoning_events_do_not_push_the_first_word_back(monkeypatch, cap
     with caplog.at_level("WARNING", logger=ft.__name__):
         await asyncio.sleep(0.1)
     assert buffer.frames == []
-    assert any("outcome=timeout" in r.getMessage() for r in caplog.records)
+    assert any(getattr(r, "outcome", None) == "timeout" for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -295,7 +302,7 @@ async def test_a_cancelled_take_is_logged(caplog):
     with caplog.at_level("WARNING", logger=ft.__name__):
         take.cancel()
         await _settle()
-    assert any("outcome=cancelled" in r.getMessage() for r in caplog.records)
+    assert any(getattr(r, "outcome", None) == "cancelled" for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -411,7 +418,7 @@ async def test_first_take_and_gate_build_one_provider_per_request(monkeypatch):
         providers.append(provider)
         return SimpleNamespace(router_provider=provider)
 
-    async def gate(binding, *, history):
+    async def gate(binding, *, history, **_kwargs):
         gated.append(binding)
         await _settle()
         return None
@@ -672,6 +679,7 @@ async def test_a_routing_error_cancels_the_take(monkeypatch, tmp_path):
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: SimpleNamespace(id=conv_id, project=SimpleNamespace(path=str(tmp_path))),
             message_count=lambda _conversation: 0,
+            record_turn_picks=lambda **_picks: None,
             get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )

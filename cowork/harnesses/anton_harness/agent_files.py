@@ -16,8 +16,14 @@ from cowork.common.paths import safe_join
 from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.units import run_db
-from cowork.services.artifact_roots import _ARTIFACTS_SUBPATH, CONVERSATIONS_DIRNAME
+from cowork.services.artifact_roots import (
+    _ARTIFACTS_SUBPATH,
+    CONVERSATIONS_DIRNAME,
+    PROJECT_FILES_DIRNAME,
+    REMOVED_DIRNAME,
+)
 from cowork.services.files import FileService, attachment_purpose
+from cowork.services.project_file_view import ordinary_path
 
 logger = get_logger(__name__)
 
@@ -160,7 +166,7 @@ class AgentFiles:
         """The file ``literal`` names, read the way the agent's OS reads it:
         one of the conversation's attachments by its files-store id, or a file
         in the agent's working directory, or a pod's artifacts folder, by its
-        project path.
+        project path. A pod's copy of a project file names the project file.
 
         None when it names no file now, a place outside those folders that is
         no attachment, or a file a link leads out to. A failed lookup other
@@ -219,6 +225,16 @@ class AgentFiles:
             path = _posix_path_in(target, root=working_dir)
             if path is None:
                 return None
+            if self.pod_working_dirs and folder == self.pod_folder:
+                in_folder = PurePosixPath(path).parts
+                # The conversation's copy of the project's files names the
+                # project file it was copied from, which the project's
+                # listing shows; the copy and what it removed are hidden
+                # from the user's routes.
+                if in_folder[:1] == (PROJECT_FILES_DIRNAME,):
+                    return _copied_project_file(root, in_folder[1:])
+                if in_folder[:1] == (REMOVED_DIRNAME,):
+                    return None
             named = NamedFile(path=(folder / path).as_posix())
         return named if stat.S_ISREG(os.stat(target).st_mode) else None
 
@@ -253,6 +269,24 @@ def _posix_path_in(target: PurePath, *, root: PurePath) -> str | None:
     if not target.is_relative_to(root):
         return None
     return target.relative_to(root).as_posix()
+
+
+def _copied_project_file(root: Path, parts: tuple[str, ...]) -> NamedFile | None:
+    """The project file that a copy in the conversation's project-files
+    folder was made from, by the copy's place in that folder (``parts``):
+    stage_project_files copies each of the project's ordinary files there,
+    keeping its folders. None unless ``parts`` make an ordinary path
+    (cowork.services.project_file_view) to a regular file with one name in
+    the project folder ``root``, reached through no link."""
+    if not ordinary_path(parts):
+        return None
+    source = root.joinpath(*parts)
+    if Path(os.path.realpath(source)) != source:
+        return None
+    info = os.lstat(source)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        return None
+    return NamedFile(path="/".join(parts))
 
 
 def conversation_attachments(session: ScopedSession, *, conversation_id: UUID | str) -> tuple[Attachment, ...]:

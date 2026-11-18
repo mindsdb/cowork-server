@@ -52,6 +52,7 @@ from cowork.schemas.responses import (
     ResponseStatus,
     Role,
 )
+from cowork.streaming.addons import TurnAddon
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,19 @@ class TurnHistory:
     # instead; None means `rows` are what the agent read. The pod's rows
     # arrive unchecked, so an entry may not be a row at all.
     read: list[object] | None = None
+
+
+@dataclass
+class PreviewCheckRequest:
+    """Synthetic event: a remote turn's anton asks the open preview whether an
+    artifact runs (turnqueue/preview_checks.py). Written to the stream as the
+    same ``response.artifact_check`` frame an in-process turn writes
+    (preview_checker.artifact_check_sse), and like that one never saved:
+    it means something only while the pod waits on it."""
+
+    check_id: str
+    artifact_slug: str
+    timeout_s: int
 
 
 @dataclass
@@ -796,6 +810,11 @@ async def format_responses_stream(
     # What the last spent boundary set aside, returned if the turn hands back
     # instead of delivering the replacement it promised.
     superseded_stash = ""
+    # Where in `collected_text` the current answer starts: just past the last
+    # tool call. Text before a tool call is narration, which the app files as
+    # a step (ENG-3554), so a boundary sets aside only the text after it and a
+    # hand-back gives back the answer alone (ENG-4194).
+    answer_from = 0
     # Why a turn that handed back stopped (anton's `ended_by`); None if it finished.
     ended_by: str | None = None
 
@@ -871,8 +890,13 @@ async def format_responses_stream(
                 # answer it promised; if it hands back instead, the answer that
                 # was already read has to come back rather than be lost from the
                 # transcript and from the history the next turn is rebuilt from.
-                superseded_stash = "".join(collected_text)
+                # The answer the user read: the text after the last tool
+                # call, or all of it when nothing followed that call.
+                superseded_stash = "".join(collected_text[answer_from:]).lstrip("\n")
+                if not superseded_stash.strip():
+                    superseded_stash = "".join(collected_text)
                 collected_text.clear()
+                answer_from = 0
                 # The armed paragraph break belongs between two rounds of the
                 # answer being discarded, not in front of its replacement.
                 round_break = False
@@ -902,6 +926,7 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, StreamToolUseStart):
+            answer_from = len(collected_text)
             tool_names[event.id] = event.name
             tool_json_parts[event.id] = []
             if is_evidence_tool(name=event.name):
@@ -1063,6 +1088,7 @@ async def format_responses_stream(
                 superseded_pending = False
                 if superseded_stash:
                     collected_text.insert(0, superseded_stash)
+                    answer_from = 0
                     seq += 1
                     yield _event("response.answer_restore", {
                         "type": "response.answer_restore",
@@ -1267,6 +1293,20 @@ async def format_responses_stream(
 
         elif isinstance(event, TurnContext):
             turn_context = event
+
+        elif isinstance(event, PreviewCheckRequest):
+            from cowork.harnesses.anton_harness.preview_checker import artifact_check_sse
+
+            # Not through _event: never recorded with the turn's events.
+            yield artifact_check_sse(
+                check_id=event.check_id, artifact_slug=event.artifact_slug, timeout_s=event.timeout_s,
+            )
+
+        elif isinstance(event, TurnAddon):
+            # A message the person added mid-turn: accepted, read by the
+            # model, or returned to run next (cowork.streaming.addons).
+            seq += 1
+            yield _event("response.addon", {**event.payload(), "sequence_number": seq})
 
         elif isinstance(event, SkillCreated):
             seq += 1

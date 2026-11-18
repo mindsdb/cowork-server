@@ -42,7 +42,7 @@ NOT_PAGE_REQUESTS = [
 def _no_gate(monkeypatch):
     import cowork.handlers.response_routing as routing
 
-    async def gate_must_not_run(binding, *, history):
+    async def gate_must_not_run(binding, *, history, **_kwargs):
         raise AssertionError("the gate must not be called")
 
     monkeypatch.setattr(routing, "_gate", gate_must_not_run)
@@ -54,7 +54,7 @@ def _gate_spy(monkeypatch):
 
     seen = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, **_kwargs):
         seen.append(history)
         return "Hello!"
 

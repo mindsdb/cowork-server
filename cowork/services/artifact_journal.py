@@ -45,6 +45,9 @@ from cowork.common.paths import (
 logger = logging.getLogger(__name__)
 
 JOURNAL_DIRNAME = REVISIONS_DIRNAME
+#: The desktop comment threads' file in the journal folder, written by
+#: local_artifact_comments and read by revision capture.
+COMMENTS_JOURNAL_NAME = "comments.json"
 #: The largest journal JSON file the server reads. A comment journal or an
 #: agent repair, which carries its whole comment thread, can legitimately reach
 #: tens of megabytes; the cap stops a sparse file, which a cell can make with

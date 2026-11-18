@@ -353,9 +353,12 @@ class SettingService:
         switch on at that scope, unless the switch is already stored there, or
         staged by the same write (an explicit off stays off). Without this, a
         budget saved by a renderer that predates the switch would be ignored
-        until the next boot's ``enable_limits_for_saved_budgets``. Call after
-        staging the write's rows: the lookup below sees them through
-        autoflush."""
+        until the next boot's ``enable_limits_for_saved_budgets``. The write's
+        own switch is checked here, not looked up: the app's sessions don't
+        autoflush, so a switch staged by this write isn't visible to the
+        query, and adding another would break the unique key."""
+        if "limits_enabled" in writes:
+            return
         if not any(k in BUDGET_SETTING_KEYS and is_chosen_budget(k, v) for k, v in writes.items()):
             return
         if self._own_row("limits_enabled") is None:

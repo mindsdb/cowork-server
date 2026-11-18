@@ -57,6 +57,11 @@ EVENT_FIELDS = frozenset(
         "attempt",
         "attempts",
         "count",
+        # A heal sweep pass's projects that fell short, and those it listed
+        # again only because an earlier pass fell short
+        # (cowork.services.artifact_heal_sweep.run_heal_sweep).
+        "failed_count",
+        "retried_count",
         # A turn request's size and the cap it was shed to fit
         # (cowork.turnqueue.producer._fit_request).
         "request_bytes",
@@ -69,6 +74,25 @@ EVENT_FIELDS = frozenset(
         "copied",
         "copied_bytes",
         "not_copied",
+        # Why that copy was refused (cowork.services.project_file_copy
+        # .ProjectFilesRefusal), on its project_files_staged line and the
+        # refused turn's line.
+        "refusal",
+        # Why a direct answer handed its turn to the agent
+        # (cowork.handlers.direct_answer.Delegated.why).
+        "why",
+        # Jev's probability of a direct answer, 0 to 1, on the
+        # router_gate_decided line (cowork.handlers.response_routing
+        # .RouteDecision.p_direct).
+        "p_direct",
+        # A direct answer's first-event budget and whether Jev expected a web
+        # search, on its direct_answer_timeout line
+        # (cowork.handlers.direct_answer.start_answer).
+        "timeout_seconds",
+        "needs_search",
+        # A first take's time to its first word, on its first_take_finished
+        # line (cowork.handlers.first_take.FirstTake._write_safely).
+        "first_word_ms",
         # A remote turn reply's number and the last one the relay applied
         # (cowork.turnqueue.producer.stream_remote_replies).
         "reply_n",
@@ -82,6 +106,10 @@ EVENT_FIELDS = frozenset(
         "stack",
         "in_flight",
         "limiter",
+        # The key of the file store share a refused request waited for
+        # (cowork.db.units._efs_share_key): a user id, org:<org id>, or
+        # org:<org id>:copy for an organization's copies of a project's files.
+        "share",
         "step",
         "steps",
     ]
