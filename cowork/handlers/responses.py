@@ -81,6 +81,7 @@ from cowork.streaming.liveness import MODEL_WAIT_PHASE, WORKER_ALIVE_PHASE, Mode
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.registry import RunHandle, RunIdentity, mark_question_saved
 from cowork.turnqueue.addons import ADDON_STEP, relay_addon_step
+from cowork.turnqueue.host_tools import HOST_TOOL_CALL_STEP
 from cowork.turnqueue.preview_checks import ARTIFACT_CHECK_STEP, register_remote_check
 from cowork.turnqueue.producer import (
     RemoteWorkspace,
@@ -96,6 +97,8 @@ from cowork.turnqueue.redis_client import (
     get_redis,
 )
 from cowork.docs.prompt import CONTEXT_PREFIXES, DOC_OUTPUT_NOTE, doc_context_block
+from cowork.docs.remote import RemoteDocTools, start_remote_doc_tools
+from cowork.docs.tools import remote_doc_tool_specs
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -2911,6 +2914,8 @@ class ResponsesHandler:
         question_id: UUID | None = None
         turn_artifacts: _RemoteTurnArtifacts | None = None
         failure: dict = {}
+        # The pod's doc tools, run here, when the request's remote_docs gives them.
+        doc_tools: RemoteDocTools | None = None
         # Resolved once, up front — not left for stream_remote_replies to mint
         # internally on a None — so every failure branch below (classified or
         # not) can attach the SAME id a support/log lookup would use. Each of
@@ -2979,6 +2984,25 @@ class ResponsesHandler:
                 turn_artifact_changes,
             )
 
+            if doc_tools is not None:
+                # Never cancelled: a call's worker thread writes on regardless,
+                # so the turn end waits for the calls, a bounded time, and
+                # claims what they wrote with what the pod's own tools touched.
+                # finish() waits once per turn; later passes return [] at once.
+                for call in await doc_tools.runner.finish():
+                    # The slug is known only once the write landed; a call still
+                    # waiting for the doc's lock is named by the doc it asked for.
+                    asked = str(call.input.get("doc") or call.input.get("title") or "")[:100]
+                    logger.warning(
+                        "[responses] a doc tool call was still running when the turn ended: the pod got no "
+                        "answer, and a doc it writes after this keeps no index or card until the self-heal "
+                        "tool=%s call_id=%s doc=%r", call.tool, call.call_id, asked,
+                        extra=log_context(request_id=corr, conversation_id=conv_id,
+                                          artifact_slug=doc_tools.writes.slug_for(call.call_id)),
+                    )
+                # On every pass, not only the first: each pass records with its own `touched`.
+                if touched is not None:
+                    touched = touched | doc_tools.writes.slugs()
             if turn_artifacts is None or not turn_artifacts.writes_allowed or turn_artifacts.recorded:
                 return None
             turn_artifacts.recorded = True
@@ -3258,7 +3282,7 @@ class ResponsesHandler:
                 await mark_question_saved(lifecycle=lifecycle, conversation_id=str(conv_id))
 
         async def replies_as_stream_events():
-            nonlocal turn_artifacts
+            nonlocal turn_artifacts, doc_tools
             from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
             from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
             from cowork.services.task_objects import (
@@ -3288,7 +3312,18 @@ class ResponsesHandler:
             # A unit of its own, so a failed read can't abort the seed's.
             earlier = await read_earlier_answers(conversation_id=conv_id, scope=scope)
             yield TurnContext(question=question, files=seed.files, history=seed.history, earlier_answers=earlier)
-            if seed.artifacts is not None:
+            artifacts = seed.artifacts
+            if remote_docs and artifacts is None:
+                # The pod's input already carries the doc blocks: without a folder
+                # it would get no tools for them. Read the project's artifacts
+                # folder (project_artifacts_base) again, in a unit of its own.
+                artifacts = await run_db(partial(self._remote_artifacts_context, conv_id=conv_id), scope=scope)
+                if artifacts is None:
+                    logger.warning(
+                        "[responses] a remote turn whose input carries the open doc found no artifacts folder; "
+                        "its pod gets no doc tools", extra=log_context(request_id=corr, conversation_id=conv_id),
+                    )
+            if artifacts is not None:
                 # The worker writes artifacts into the shared tree while this
                 # turn runs, so cowork-server does the same before/after diff
                 # it does for an in-process turn. Snapshotting here rather than
@@ -3296,13 +3331,28 @@ class ResponsesHandler:
                 # stream_remote_replies below only enqueues the job once this
                 # generator is first iterated.
                 before_slugs, before_mtimes = await run_efs(
-                    partial(snapshot_artifact_state, seed.artifacts.base), scope=scope, deadline=False
+                    partial(snapshot_artifact_state, artifacts.base), scope=scope, deadline=False
                 )
                 from cowork.services.queued_repairs import queued_repair_folders
 
                 turn_artifacts = _RemoteTurnArtifacts(
-                    directory=seed.artifacts, before_slugs=before_slugs, before_mtimes=before_mtimes,
+                    directory=artifacts, before_slugs=before_slugs, before_mtimes=before_mtimes,
                     repairs=await queued_repair_folders(conversation_id=conv_id, scope=scope),
+                )
+            if remote_docs and artifacts is not None:
+                # On the folder the pod writes, with this turn's owner and provenance.
+                doc_tools = start_remote_doc_tools(
+                    scope=scope,
+                    correlation_id=corr,
+                    conversation_id=str(conv_id),
+                    # Provenance only: turn_id counts messages, so these indexes
+                    # differ from the desktop's turn count; nothing orders by them.
+                    turn_index=turn_id + 1,
+                    artifacts_base=artifacts.base,
+                    project_id=artifacts.project_id,
+                    project_name=artifacts.project_name,
+                    creator=artifacts.creator,
+                    files=seed.files,
                 )
             # Set only on turn_completed: any other exit (Stop, cancel, failure)
             # may have cut anton off between writing an artifact's metadata and
@@ -3351,6 +3401,8 @@ class ResponsesHandler:
                 # viewer (ENG-4227); the producer sends it only with
                 # interactive, whose stdin the answer comes back on.
                 preview_checks=self.interactive and self.schedule_id is None,
+                # The doc tools this server runs for the pod (cowork/docs/remote.py).
+                host_tools=remote_doc_tool_specs() if doc_tools is not None else None,
                 # This handler serves the cowork UI (scheduled turns show
                 # there too), which renders a tool's message whether or
                 # not it can answer questions. Channel turns build their
@@ -3398,6 +3450,11 @@ class ResponsesHandler:
                         # question waits, so a cell's start, progress or end
                         # means it is over, even if the answered reply was lost.
                         open_questions.clear()
+                    if step == HOST_TOOL_CALL_STEP:
+                        # Runs as a task of its own, so this loop goes on reading Stop and liveness.
+                        if doc_tools is not None:
+                            doc_tools.runner.start(data)
+                        continue
                     if step == ADDON_STEP:
                         # A message added mid-task (ENG-4194): relayed only for
                         # an addon /addon accepted for this turn.
@@ -3674,6 +3731,9 @@ class ResponsesHandler:
                 message, code, request_id=corr, assistant_message_id=message_id, **extra,
             )))
         finally:
+            if doc_tools is not None:
+                # Whichever way the turn ended, nothing more goes to its pod.
+                doc_tools.runner.close()
             await _seal_unterminated_buffer(
                 buffer, lifecycle, conv_id, request_id=corr
             )

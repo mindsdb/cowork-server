@@ -1150,8 +1150,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     interactive turn keeps open. Channel turns never.
     `host_tools` are tools this server runs for the pod
     (turnqueue/host_tools.py), sent only with `interactive`: their answers
-    reach the pod on the stdin an interactive turn keeps open. Channel turns
-    never send them.
+    reach the pod on the stdin an interactive turn keeps open, and only for
+    a persistent workspace, which keeps what they write. Channel turns never
+    send them.
     `ui_locale` is the app's language (cowork.common.ui_locale), which the
     pod's anton replies in when the user's message does not say; None for a
     turn with no request behind it.
@@ -1347,7 +1348,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # relays it; an older controller drops it and the pod never asks).
               **({"preview_checks": True} if preview_checks and interactive else {}),
               # Tools this server runs for the pod; their answers come back on stdin.
-              **({"host_tools": host_tools} if host_tools and interactive else {}),
+              **({"host_tools": host_tools} if host_tools and interactive and workspace_mode == "persistent" else {}),
               # False when the organization opted out of Jev: the pod's
               # completion check then never asks it. A controller that
               # predates the field drops it, and the pod keeps Jev on.

@@ -2993,3 +2993,23 @@ async def test_host_tools_reach_the_job_only_for_an_interactive_turn(monkeypatch
                                             host_tools=host_tools))
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params.get("host_tools") == (host_tools if expected else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("can_manage,expected", [(True, True), (False, False)])
+async def test_host_tools_reach_the_job_only_for_a_persistent_workspace(monkeypatch, can_manage, expected):
+    """An ephemeral workspace keeps nothing a doc tool writes, so its pod gets none."""
+    async def allowed(scope, permission):
+        return permission == "product.execute" or can_manage
+
+    monkeypatch.setattr(prod.product_permissions, "has_product_permission", allowed)
+    host_tools = [{"name": "read_doc", "description": "Read a doc.", "input_schema": {"type": "object"}}]
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))],
+                     workspace_mode="persistent" if can_manage else "ephemeral")
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", interactive=True,
+                                            host_tools=host_tools))
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params.get("host_tools") == (host_tools if expected else None)

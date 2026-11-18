@@ -89,3 +89,17 @@ async def test_the_pods_input_carries_the_open_doc_only_when_the_turn_gets_the_d
     assert (f"<{DOC_VIEW_TAG}>" in sent["input_text"]) is expected
     assert (DOC_OUTPUT_NOTE in sent["input_text"]) is expected
     assert sent["input_text"].endswith("Tighten the intro")
+
+
+@pytest.mark.parametrize("flag,may_manage,expected", [(True, True, True), (True, False, False), (False, True, False)])
+async def test_the_pod_is_offered_the_doc_tools_exactly_when_its_input_carries_the_doc(
+    monkeypatch, flag, may_manage, expected,
+):
+    from cowork.docs.tools import DOC_TOOL_NAMES
+
+    sent = await _remote_turn(monkeypatch, flag=flag, may_manage=may_manage, doc_context=DOC_CONTEXT)
+    assert (f"<{DOC_VIEW_TAG}>" in sent["input_text"]) is expected
+    if expected:
+        assert [spec["name"] for spec in sent.get("host_tools") or []] == list(DOC_TOOL_NAMES)
+    else:
+        assert sent.get("host_tools") is None
