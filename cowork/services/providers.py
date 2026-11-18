@@ -471,6 +471,32 @@ def _is_embedding_row(row: dict, model_id: str) -> bool:
     return any(hint in lowered for hint in _EMBEDDING_ID_HINTS)
 
 
+def cached_minds_model_label(model_id: str) -> str | None:
+    """The catalog label for ``model_id`` from a cached MindsHub ``/v1/models`` listing, or None.
+
+    Labels are catalog-wide, so any MindsHub caller's listing answers. Only entries fetched from the
+    operator's MindsHub URL count, so a user's custom endpoint can never rename a MindsHub model.
+    """
+    try:
+        trusted_base = minds_chat_base_url(_org_catalog_url())
+        entries = list(_minds_models_cache.items())
+    except Exception:
+        return None
+    for key, entry in reversed(entries):
+        if getattr(key, "chat_only", True) or getattr(key, "base_url", None) != trusted_base:
+            continue
+        listing = entry[1] if len(entry) > 1 else None
+        label = getattr(listing, "labels", {}).get(model_id) if listing is not None else None
+        if label:
+            return label
+    return None
+
+
+def budget_model_label(model: str) -> str:
+    """The catalog label for a budget's model alias, or the alias when the catalog has none."""
+    return cached_minds_model_label(model) or model
+
+
 def cached_minds_models(
     minds_url: str,
     tenant_key: str | None = None,

@@ -312,6 +312,26 @@ async def test_turn_failed_keeps_the_workers_budget_period_and_names_it(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_turn_failed_keeps_the_workers_budget_model_and_names_it(monkeypatch):
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: "Claude Haiku")
+    data = await _failed_turn(
+        monkeypatch,
+        {"error": _BUDGET_STOP, "budget_scope": "team", "budget_period": "day", "budget_model": "haiku-4-5"},
+    )
+    assert data["budget_model"] == "haiku-4-5"
+    assert data["message"].startswith("Your team's daily spending budget for Claude Haiku is used up.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("error", "model"), [(_BUDGET_STOP, "bad model"), (_WALLET_STOP, "haiku-4-5")])
+async def test_turn_failed_drops_a_budget_model_it_cannot_use(monkeypatch, error, model):
+    data = await _failed_turn(monkeypatch, {"error": error, "budget_model": model})
+    assert "budget_model" not in data
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error", "period"),
     [(_BUDGET_STOP, "week"), (_WALLET_STOP, "day"), (_BUDGET_STOP, None)],

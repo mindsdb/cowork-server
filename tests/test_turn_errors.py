@@ -3377,3 +3377,60 @@ def test_gateway_denial_reads_the_body_code_only_from_the_gateway_host():
 
 def test_gateway_denial_is_none_for_a_plain_exception():
     assert te.gateway_denial(exc=Exception("boom")) is None
+
+
+def test_a_per_model_budget_names_the_model_by_its_catalog_label(monkeypatch):
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: {"haiku-4-5": "Claude Haiku"}.get(m))
+    exc = _scoped_budget_via_header("workspace")
+    exc.__cause__.response.headers["X-MindsHub-Budget-Period"] = "day"
+    exc.__cause__.response.headers["X-MindsHub-Budget-Model"] = "haiku-4-5"
+    assert te.gate_budget_model(exc) == "haiku-4-5"
+    assert te.friendly_turn_error(exc) == (
+        te.BUDGET_EXCEEDED_CODE,
+        "This workspace's daily spending budget for Claude Haiku is used up. Other models still work. "
+        "An administrator can raise it in Budgets.",
+    )
+
+
+def test_a_model_the_catalog_does_not_know_falls_back_to_its_alias(monkeypatch):
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: None)
+    assert te.budget_exceeded_message("org", "month", "gpt-nano") == (
+        "Your organization's monthly spending budget for gpt-nano is used up. Other models still work. "
+        "An owner or admin can raise it in Budgets."
+    )
+
+
+@pytest.mark.parametrize("model", [None, "", "bad model", "x\r\ny", 7])
+def test_only_a_header_safe_model_is_kept(model):
+    assert te.clean_budget_model(model) is None
+
+
+def test_the_model_is_read_from_the_body_and_the_typed_error():
+    exc = _scoped_budget_via_body("team")
+    exc.__cause__.body["error"]["budget_model"] = "haiku-4-5"
+    assert te.gate_budget_model(exc) == "haiku-4-5"
+    typed = _scoped_budget_via_type("org")
+    typed.budget_model = "sonnet-4-5"
+    assert te.gate_budget_model(typed) == "sonnet-4-5"
+
+
+def test_the_failed_payload_carries_the_budget_model_only_when_set():
+    assert te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE, budget_model="haiku-4-5")["budget_model"] == (
+        "haiku-4-5"
+    )
+    assert "budget_model" not in te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE)
+
+
+def test_a_remote_per_model_budget_stop_names_the_model(monkeypatch):
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: "Claude Haiku")
+    code, message = te.remote_turn_error("BudgetExceededError: x", "team", "month", "haiku-4-5")
+    assert message == (
+        "Your team's monthly spending budget for Claude Haiku is used up. Other models still work. "
+        "An administrator can raise it in Budgets."
+    )

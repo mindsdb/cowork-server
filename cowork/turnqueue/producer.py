@@ -25,6 +25,7 @@ from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metada
 from cowork.handlers.turn_errors import (
     BUDGET_EXCEEDED_CODE,
     RESET_AT_CODES,
+    clean_budget_model,
     clean_budget_period,
     clean_budget_scope,
     WORKER_UNRESPONSIVE_TYPE_NAME,
@@ -1566,7 +1567,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         # A newer worker names a spent budget's scope and period; kept for that code only.
                         budget_scope = clean_budget_scope(data.pop("budget_scope", None))
                         budget_period = clean_budget_period(data.pop("budget_period", None))
-                        code, message = remote_turn_error(data.get("error"), budget_scope, budget_period)
+                        budget_model = clean_budget_model(data.pop("budget_model", None))
+                        code, message = remote_turn_error(data.get("error"), budget_scope, budget_period, budget_model)
                         data = {**data, "code": code, "message": message}
                         reset_at = _remote_reset_at(code=code, value=data.pop("reset_at", None))
                         if reset_at is not None:
@@ -1575,6 +1577,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                             data["budget_scope"] = budget_scope
                         if code == BUDGET_EXCEEDED_CODE and budget_period is not None:
                             data["budget_period"] = budget_period
+                        if code == BUDGET_EXCEEDED_CODE and budget_model is not None:
+                            data["budget_model"] = budget_model
                         logger.warning(
                             "Remote turn failed conversation=%s correlation_id=%s error_type=%s error_code=%s",
                             conversation_id, corr, remote_error_label(error=data.get("error")), code,

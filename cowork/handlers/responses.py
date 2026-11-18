@@ -129,6 +129,7 @@ from cowork.handlers.turn_errors import (
     TURN_LOST_MESSAGE,
     auth_error_detail,
     friendly_turn_error,
+    gate_budget_model,
     gate_budget_period,
     gate_budget_scope,
     gate_reset_at,
@@ -3497,11 +3498,12 @@ class ResponsesHandler:
             # Kept by the producer for budget_exceeded only, already validated.
             budget_scope = failure.get("budget_scope")
             budget_period = failure.get("budget_period")
+            budget_model = failure.get("budget_model")
             # The pod never got to retire a question it was blocked on.
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
             collected_events.append(response_failed_payload(
                 message, code, reset_at=reset_at, budget_scope=budget_scope, budget_period=budget_period,
-                request_id=corr))
+                budget_model=budget_model, request_id=corr))
 
             async def fail() -> None:
                 if code in CONTENT_REPAIR_CODES:
@@ -3534,7 +3536,7 @@ class ResponsesHandler:
                         )
                 await end_turn("error", lambda message_id: response_failed_sse(
                     message, code, reset_at=reset_at, budget_scope=budget_scope, budget_period=budget_period,
-                    request_id=corr, assistant_message_id=message_id,
+                    budget_model=budget_model, request_id=corr, assistant_message_id=message_id,
                 ))
 
             await run_to_completion(fail())
@@ -3940,7 +3942,11 @@ class ResponsesHandler:
                     extra = {"reset_at": _reset}
             elif code == BUDGET_EXCEEDED_CODE:
                 # Whose budget is spent and its period, so the card can name them.
-                _budget = {"budget_scope": gate_budget_scope(exc), "budget_period": gate_budget_period(exc)}
+                _budget = {
+                    "budget_scope": gate_budget_scope(exc),
+                    "budget_period": gate_budget_period(exc),
+                    "budget_model": gate_budget_model(exc),
+                }
                 extra = {key: value for key, value in _budget.items() if value is not None}
             elif code == RATE_LIMITED_CODE:
                 # Pass the server's own wait interval so the card can time-gate
@@ -4226,6 +4232,7 @@ class ResponsesHandler:
                         message, code, request_id=corr,
                         budget_scope=gate_budget_scope(exc) if code == BUDGET_EXCEEDED_CODE else None,
                         budget_period=gate_budget_period(exc) if code == BUDGET_EXCEEDED_CODE else None,
+                        budget_model=gate_budget_model(exc) if code == BUDGET_EXCEEDED_CODE else None,
                     ),
                 )
             logger.exception(

@@ -470,3 +470,30 @@ async def test_proxy_returns_the_upstream_connection_however_the_stream_ends(
     await asyncio.wait_for(response(scope, receive, send), timeout=5)
 
     assert stream.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream", "model"),
+    [
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_model": "haiku-4-5"}}}, "haiku-4-5"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded"}}, "headers": {"x-mindshub-budget-model": "gpt-nano"}}, "gpt-nano"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_model": "bad model"}}}, None),
+    ],
+    ids=["body", "header", "unknown"],
+)
+async def test_proxy_passes_a_spent_budgets_model_to_codex(monkeypatch: pytest.MonkeyPatch, upstream, model) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, **upstream)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inference_proxy_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    request = _request([(b"content-type", b"application/json")], b'{"model": "gpt", "input": "hi"}')
+
+    response = await proxy_inference(request, "responses", EngineCredentials(minds_url="https://api.example", minds_api_key="mdb_key"))
+
+    assert json.loads(response.body)["error"].get("budget_model") == model

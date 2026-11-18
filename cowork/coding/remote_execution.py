@@ -6,7 +6,12 @@ from functools import partial
 
 from cowork.coding.commands import CommandIntent
 from cowork.coding.connector_capabilities import ConnectorCapability
-from cowork.coding.context import BUDGET_PERIOD_ADJECTIVES, BUDGET_SCOPE_PATTERN, is_context_exhaustion_error
+from cowork.coding.context import (
+    BUDGET_MODEL_PATTERN,
+    BUDGET_PERIOD_ADJECTIVES,
+    BUDGET_SCOPE_PATTERN,
+    is_context_exhaustion_error,
+)
 from cowork.coding.contracts import (
     CodingEvent,
     CodingSession,
@@ -555,6 +560,9 @@ class RemoteExecutionCoordinator:
                 failure["budget_scope"] = scope
             if isinstance(period, str) and period in BUDGET_PERIOD_ADJECTIVES:
                 failure["budget_period"] = period
+            budget_model = event.payload.get("budget_model")
+            if isinstance(budget_model, str) and BUDGET_MODEL_PATTERN.fullmatch(budget_model):
+                failure["budget_model"] = budget_model
         return None, CodingEvent(
             type=EventType.error if run.status == RunStatus.failed else EventType.session,
             title=title,

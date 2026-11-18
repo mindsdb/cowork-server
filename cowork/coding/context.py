@@ -170,6 +170,8 @@ class EngineFailure:
     # Whose budget a budget_exceeded failure names, and its period, so the card can say so.
     budget_scope: str = ""
     budget_period: str = ""
+    # A per-model budget's alias; the app turns it into the catalog label.
+    budget_model: str = ""
 
     def event_data(self) -> dict[str, str]:
         fields = (
@@ -178,6 +180,7 @@ class EngineFailure:
             ("model", self.model),
             ("budget_scope", self.budget_scope),
             ("budget_period", self.budget_period),
+            ("budget_model", self.budget_model),
         )
         return {key: value for key, value in fields if value}
 
@@ -212,6 +215,8 @@ _BUDGET_SCOPE_OWNERS = {
 BUDGET_SCOPE_PATTERN = re.compile(r"[a-z_]{1,32}")
 # The periods a budget_exceeded failure can name; anything else is left out.
 BUDGET_PERIOD_ADJECTIVES = {"day": "daily", "month": "monthly", "year": "yearly"}
+# A per-model budget's catalog alias, as the gateway sends it.
+BUDGET_MODEL_PATTERN = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
 
 _FAILURE_MARKERS = (
     ("insufficient_credits", ("402 payment required", "wallet has no balance", "insufficient credits")),
@@ -258,16 +263,31 @@ def classify_engine_failure(
         scope = scope if BUDGET_SCOPE_PATTERN.fullmatch(scope) else ""
         period = _string_field(error, "budget_period")
         period = period if period in BUDGET_PERIOD_ADJECTIVES else ""
+        budget_model = _string_field(error, "budget_model")
+        budget_model = budget_model if BUDGET_MODEL_PATTERN.fullmatch(budget_model) else ""
         adjective = BUDGET_PERIOD_ADJECTIVES.get(period)
         budget = f"{adjective} spending budget" if adjective else "spending budget"
+        if budget_model:
+            budget = f"{budget} for {_budget_model_label(budget_model)}"
         owner = _BUDGET_SCOPE_OWNERS.get(scope)
         lead = f"{owner} {budget}" if owner else f"A {budget}"
+        others = " Other models still work." if budget_model else ""
         who = "An owner or admin" if scope == "org" else "An administrator"
-        text = f"{lead} is used up. {who} can raise it in Budgets, or choose a model that is still available."
+        text = (
+            f"{lead} is used up.{others} {who} can raise it in Budgets, or choose a model that is still available."
+        )
         return EngineFailure(
-            message=text, code=code, detail=detail, model=model, budget_scope=scope, budget_period=period
+            message=text, code=code, detail=detail, model=model, budget_scope=scope, budget_period=period,
+            budget_model=budget_model,
         )
     return EngineFailure(message=FAILURE_MESSAGES[code], code=code, detail=detail, model=model)
+
+
+def _budget_model_label(model: str) -> str:
+    # Imported lazily: providers pulls in the settings stack, which coding modules avoid at import.
+    from cowork.services.providers import budget_model_label
+
+    return budget_model_label(model)
 
 
 def _embedded_error(text: str) -> dict:

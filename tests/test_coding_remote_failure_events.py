@@ -77,3 +77,19 @@ def test_a_remote_budget_stop_keeps_its_period_for_the_app() -> None:
 
     assert event.data["budget_period"] == "month"
     assert "budget_period" not in bad.data
+
+
+def test_a_remote_budget_stop_keeps_its_model_for_the_app() -> None:
+    _, event = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "code": "budget_exceeded", "budget_scope": "team", "budget_model": "haiku-4-5",
+    }))
+    _, bad = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "code": "budget_exceeded", "budget_model": "bad model",
+    }))
+    _, other = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "code": "insufficient_credits", "budget_model": "haiku-4-5",
+    }))
+
+    assert event.data["budget_model"] == "haiku-4-5"
+    assert "budget_model" not in bad.data
+    assert "budget_model" not in other.data

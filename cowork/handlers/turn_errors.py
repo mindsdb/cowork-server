@@ -50,6 +50,7 @@ except ImportError:  # TODO(ENG-1585): import it above once uv.lock pins an anto
             self.status_code = status_code
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+from cowork.coding.context import BUDGET_MODEL_PATTERN, BUDGET_PERIOD_ADJECTIVES, BUDGET_SCOPE_PATTERN
 from cowork.common.settings.app_settings import default_minds_url
 from cowork.db.units import busy_retry_seconds
 
@@ -195,9 +196,10 @@ _BUDGET_SCOPE_OWNERS = {
     "user": "Your",
     "all_members": "Your",
 }
-_BUDGET_SCOPE_PATTERN = re.compile(r"[a-z_]{1,32}")
-# The gateway's `budget_period`, as the copy names it; any other value is left out.
-_BUDGET_PERIOD_ADJECTIVES = {"day": "daily", "month": "monthly", "year": "yearly"}
+# One definition of the budget fields' shapes, shared with the coding path.
+_BUDGET_SCOPE_PATTERN = BUDGET_SCOPE_PATTERN
+_BUDGET_PERIOD_ADJECTIVES = BUDGET_PERIOD_ADJECTIVES
+_BUDGET_MODEL_PATTERN = BUDGET_MODEL_PATTERN
 
 # Codes whose failure frame carries the gate's `X-MindsHub-Reset-At` instant as
 # `reset_at`, so the card can say when the free way forward comes back.
@@ -1381,7 +1383,9 @@ def friendly_turn_error(
     """
     friendly = _classify_turn_error(exc, model_info)
     if friendly is not None and friendly[0] == BUDGET_EXCEEDED_CODE:
-        return BUDGET_EXCEEDED_CODE, budget_exceeded_message(gate_budget_scope(exc), gate_budget_period(exc))
+        return BUDGET_EXCEEDED_CODE, budget_exceeded_message(
+            gate_budget_scope(exc), gate_budget_period(exc), gate_budget_model(exc)
+        )
     return friendly
 
 
@@ -1672,7 +1676,10 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
 
 
 def remote_turn_error(
-    error: str | None, budget_scope: str | None = None, budget_period: str | None = None
+    error: str | None,
+    budget_scope: str | None = None,
+    budget_period: str | None = None,
+    budget_model: str | None = None,
 ) -> tuple[str, str]:
     """Map a remote pod's ``turn_failed`` error STRING to ``(code, message)``.
 
@@ -1715,7 +1722,7 @@ def remote_turn_error(
     mapping = _REMOTE_TYPE_MAPPINGS.get(type_name)
     if mapping is not None:
         if mapping.code == BUDGET_EXCEEDED_CODE:
-            return mapping.code, budget_exceeded_message(budget_scope, budget_period)
+            return mapping.code, budget_exceeded_message(budget_scope, budget_period, budget_model)
         if mapping.passes_message_through and message:
             return mapping.code, message
         return mapping.code, mapping.message
@@ -1774,16 +1781,32 @@ def clean_budget_period(value: object) -> str | None:
     return value if isinstance(value, str) and value in _BUDGET_PERIOD_ADJECTIVES else None
 
 
-def budget_exceeded_message(scope: str | None, period: str | None = None) -> str:
-    """The budget_exceeded copy naming whose budget is spent and its period, when known."""
+def clean_budget_model(value: object) -> str | None:
+    """``value`` when it is a header-safe catalog alias, else None."""
+    return value if isinstance(value, str) and _BUDGET_MODEL_PATTERN.fullmatch(value) else None
+
+
+def budget_model_label(model: str) -> str:
+    """The catalog label for a budget's model alias, or the alias when the catalog has none."""
+    from cowork.services.providers import budget_model_label as _label
+
+    return _label(model)
+
+
+def budget_exceeded_message(scope: str | None, period: str | None = None, model: str | None = None) -> str:
+    """The budget_exceeded copy naming whose budget is spent, its period and its model, when known."""
     adjective = _BUDGET_PERIOD_ADJECTIVES.get(period or "")
     budget = f"{adjective} spending budget" if adjective else "spending budget"
+    if model:
+        # A per-model budget stops that model only.
+        budget = f"{budget} for {budget_model_label(model)}"
     owner = _BUDGET_SCOPE_OWNERS.get(scope or "")
+    others = " Other models still work." if model else ""
     if owner is None:
-        return f"A {budget} is used up. An administrator can raise it in Budgets."
+        return f"A {budget} is used up.{others} An administrator can raise it in Budgets."
     # Only org budgets are certainly the org owners'; others may be managed below the org.
     who = "An owner or admin" if scope == "org" else "An administrator"
-    return f"{owner} {budget} is used up. {who} can raise it in Budgets."
+    return f"{owner} {budget} is used up.{others} {who} can raise it in Budgets."
 
 
 def _gate_budget_field(exc: BaseException, name: str, clean) -> str | None:
@@ -1828,6 +1851,11 @@ def gate_budget_period(exc: BaseException) -> str | None:
     return _gate_budget_field(exc, "period", clean_budget_period)
 
 
+def gate_budget_model(exc: BaseException) -> str | None:
+    """The model a per-model budget_exceeded denial names, from anywhere in the cause chain."""
+    return _gate_budget_field(exc, "model", clean_budget_model)
+
+
 def response_failed_payload(
     error: str,
     code: str,
@@ -1840,6 +1868,7 @@ def response_failed_payload(
     reset_at: str | None = None,
     budget_scope: str | None = None,
     budget_period: str | None = None,
+    budget_model: str | None = None,
     request_id: str | None = None,
     assistant_message_id: str | None = None,
 ) -> dict:
@@ -1849,9 +1878,9 @@ def response_failed_payload(
     ``provider_auth`` case so the renderer can offer "Reconnect" (MindsHub) vs
     "Open Settings" (BYOK); ``model`` only for the model-403 case so the card
     can name the locked model ("Sonnet needs credits"); ``retry_after`` only for
-    ``rate_limited`` so the card can time-gate its Retry; ``budget_scope`` and
-    ``budget_period`` only for ``budget_exceeded``, naming whose budget is spent and its period — omitted otherwise to
-    keep the shape unchanged for every other failure. All additive: an older
+    ``rate_limited`` so the card can time-gate its Retry; ``budget_scope``,
+    ``budget_period`` and ``budget_model`` only for ``budget_exceeded``, naming whose budget is spent, its
+    period and its model — omitted otherwise to keep the shape unchanged for every other failure. All additive: an older
     client ignores fields it doesn't read.
 
     ``request_id`` is the producing turn's own correlation id — present on
@@ -1884,6 +1913,8 @@ def response_failed_payload(
         payload["budget_scope"] = budget_scope
     if budget_period is not None:
         payload["budget_period"] = budget_period
+    if budget_model is not None:
+        payload["budget_model"] = budget_model
     if request_id is not None:
         payload["request_id"] = request_id
     if assistant_message_id is not None:
@@ -1903,6 +1934,7 @@ def response_failed_sse(
     reset_at: str | None = None,
     budget_scope: str | None = None,
     budget_period: str | None = None,
+    budget_model: str | None = None,
     request_id: str | None = None,
     assistant_message_id: str | None = None,
 ) -> str:
@@ -1919,6 +1951,7 @@ def response_failed_sse(
         reset_at=reset_at,
         budget_scope=budget_scope,
         budget_period=budget_period,
+        budget_model=budget_model,
         request_id=request_id,
         assistant_message_id=assistant_message_id,
     )

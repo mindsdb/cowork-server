@@ -123,3 +123,31 @@ def test_transient_upstream_failures_get_plain_copy_without_the_proxy_url(messag
     assert "127.0.0.1" not in failure.detail
     assert failure.detail.startswith("unexpected status 50")
     assert failure.model == "gpt"
+
+
+def test_a_per_model_budget_names_the_model_by_label(monkeypatch) -> None:
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: {"haiku-4-5": "Claude Haiku"}.get(m))
+    raw = (
+        'unexpected status 400 Bad Request: {"error": {"code": "budget_exceeded", '
+        '"budget_scope": "workspace", "budget_period": "day", "budget_model": "haiku-4-5"}}'
+    )
+    failure = classify_engine_failure(raw, CREDS)
+
+    assert failure.message == (
+        "This workspace's daily spending budget for Claude Haiku is used up. Other models still work. "
+        "An administrator can raise it in Budgets, or choose a model that is still available."
+    )
+    assert failure.event_data()["budget_model"] == "haiku-4-5"
+
+
+def test_a_malformed_budget_model_is_dropped() -> None:
+    raw = (
+        'unexpected status 400 Bad Request: {"error": {"code": "budget_exceeded", '
+        '"budget_scope": "org", "budget_model": "bad model"}}'
+    )
+    failure = classify_engine_failure(raw, CREDS)
+
+    assert "budget_model" not in failure.event_data()
+    assert "Other models still work" not in failure.message
