@@ -185,8 +185,9 @@ async def conversation_doc_events(
 ):
     """Docs the agent creates or changes in one conversation, as they happen.
 
-    Only in-process turns announce here (desktop and local). The chat still
-    receives each doc's card at the end of the turn either way.
+    In-process turns announce here, and so do remote turns whose pod gets the
+    doc tools (cowork.docs.remote). The chat still receives each doc's card at
+    the end of the turn either way.
     """
     if not await _may_follow_conversation(scope, conversation_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
