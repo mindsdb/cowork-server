@@ -3380,8 +3380,10 @@ def test_a_message_carries_the_open_doc_and_the_output_choice_ahead_of_the_words
     {"output": "doc"},
 ])
 def test_a_remote_turn_is_answered_without_the_open_doc_or_the_output_choice(monkeypatch, request_extra):
-    """The worker pod has no doc tools: the blocks would have the model call tools it doesn't have.
-    Dropped, the turn is any other turn, the gate's to answer as well."""
+    """Without remote_docs the worker pod has no doc tools: the blocks would have
+    the model call tools it doesn't have. Dropped, the turn is any other turn,
+    the gate's to answer as well. With remote_docs the pod gets the tools, and
+    the blocks stay."""
     from types import SimpleNamespace
 
     import cowork.handlers.responses as responses
@@ -3393,6 +3395,11 @@ def test_a_remote_turn_is_answered_without_the_open_doc_or_the_output_choice(mon
     texts = [b["text"] for b in ResponsesHandler._build_harness_input(SimpleNamespace(), remote, session=None)]
     assert texts == ["Make the risks section shorter"]
     assert responses._turn_has_doc(remote) is False
+
+    # With the request's remote_docs decision, the pod gets the doc tools and the blocks.
+    kept = ResponsesHandler._build_harness_input(SimpleNamespace(), remote, session=None, remote_docs=True)
+    assert len(kept) == 2 and kept[-1]["text"] == "Make the risks section shorter"
+    assert responses._turn_has_doc(remote, remote_docs=True) is True
 
     # A non-streaming turn runs in this process whatever the backend, doc tools and all.
     here = ResponsesRequest(input="Make the risks section shorter", stream=False, **request_extra)

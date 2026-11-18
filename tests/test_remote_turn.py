@@ -1683,3 +1683,21 @@ async def test_a_busy_file_store_fails_the_channel_turn_before_its_seed_history_
             ))
 
     assert seeded == []
+
+
+@pytest.mark.asyncio
+async def test_a_channel_turn_never_offers_the_pod_host_tools(monkeypatch):
+    """No app watches a channel turn, so its pod never gets doc tools."""
+    _fake_handler(monkeypatch)
+    sent: list[dict] = []
+
+    async def fake_replies(**kwargs):
+        sent.append(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+    await _drain(remote_turn_events(
+        scope=_FakeScope(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
+    assert "host_tools" not in sent[0]

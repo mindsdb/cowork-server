@@ -158,6 +158,7 @@ from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService, read_earlier_answers
 from cowork.services.files import FileService, attachment_purpose, project_holds_files
 from cowork.services.live_apps import use_live_app_launcher
+from cowork.services import product_permissions
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
@@ -192,13 +193,14 @@ def _runs_remotely(request: ResponsesRequest) -> bool:
     return bool(request.stream) and TurnQueueSettings().is_remote
 
 
-def _turn_has_doc(request: ResponsesRequest) -> bool:
+def _turn_has_doc(request: ResponsesRequest, *, remote_docs: bool = False) -> bool:
     """Sent with a doc open, or asking for the answer as a doc (see ineligible_reason).
 
-    Never a remote turn: the pod has no doc tools, so there the open doc and
-    Output: Doc are dropped and the turn is answered like any other.
+    A remote turn has it only when the request's one decision gives its pod
+    the doc tools (ResponsesHandler._remote_docs); otherwise the open doc and
+    Output: Doc are dropped there and the turn is answered like any other.
     """
-    if _runs_remotely(request):
+    if _runs_remotely(request) and not remote_docs:
         return False
     return request.doc_context is not None or request.output == "doc"
 
@@ -874,6 +876,30 @@ class ResponsesHandler:
             self.harness = get_harness(self.harness_name)
         return self.harness
 
+    async def _remote_docs(self, request: ResponsesRequest) -> bool:
+        """Whether this remote turn's pod gets the doc tools. Decided once per
+        request, before its first unit (the artifact.manage check is async and
+        the unit is not), and passed to every place that decides about docs: the
+        pod's input, the gate and the host tools never disagree."""
+        settings = get_app_settings()
+        if not (
+            settings.remote_docs
+            and _runs_remotely(request)
+            and _client_shows_docs(request)
+            # A doc tool's answer reaches the pod on the stdin only an
+            # interactive turn keeps open.
+            and self.interactive
+            and settings.ask_user_enabled
+            and self.schedule_id is None
+        ):
+            return False
+        try:
+            return await product_permissions.has_product_permission(self.scope, "artifact.manage")
+        except Exception:
+            logger.warning("[responses] could not check artifact.manage; the turn runs without doc tools",
+                           exc_info=True)
+            return False
+
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
 
@@ -912,6 +938,7 @@ class ResponsesHandler:
         # The unit reads which always-on skills reach the caller, so their
         # teams are read first (cached per caller). A no-op outside MindsHub mode.
         await self._resolve_skill_viewer(self.scope)
+        remote_docs = await self._remote_docs(request)
 
         # The request's reads run as one unit in a worker thread, which holds a
         # connection only while it reads: none is held across the gate's model
@@ -922,7 +949,10 @@ class ResponsesHandler:
         # conversation create without a project id does.
         read_unit = run_efs_unit if _carries_attachments(request) or request.project_id is None else run_db
         start = await read_unit(
-            partial(self._read_turn_start, request=request, has_disabled_connections=bool(disabled)),
+            partial(
+                self._read_turn_start, request=request, has_disabled_connections=bool(disabled),
+                remote_docs=remote_docs,
+            ),
             scope=self.scope,
         )
         if start.always_on_unread:
@@ -988,7 +1018,7 @@ class ResponsesHandler:
                     is_pinned_schedule=self.schedule_id is not None and request.model is not None,
                     trace_metadata=trace_metadata,
                     first_take=bool(request.stream) and self.interactive,
-                    has_doc=_turn_has_doc(request),
+                    has_doc=_turn_has_doc(request, remote_docs=remote_docs),
                 )
             except BaseException:
                 # A refused or cancelled request must not leave the take's model call running.
@@ -1136,6 +1166,7 @@ class ResponsesHandler:
                         turn_llm=turn_llm,
                         first_take=first_take,
                         docs=_client_shows_docs(request),
+                        remote_docs=remote_docs,
                     )
 
                 def produce(buffer: StreamBuffer):
@@ -1232,6 +1263,7 @@ class ResponsesHandler:
 
     def _read_turn_start(
         self, session: ScopedSession, *, request: ResponsesRequest, has_disabled_connections: bool,
+        remote_docs: bool = False,
     ) -> _TurnStart:
         """The request's database work, run as one unit: the turn's settings,
         its attachments, the conversation (read, adopted or created), the turn
@@ -1250,7 +1282,7 @@ class ResponsesHandler:
         if request.harness and request.harness in available_harness_ids():
             harness_name = request.harness
 
-        harness_input = self._build_harness_input(request, session=session)
+        harness_input = self._build_harness_input(request, session=session, remote_docs=remote_docs)
         conversation_service = ConversationService(session)
 
         if request.conversation:
@@ -1340,7 +1372,7 @@ class ResponsesHandler:
             has_disabled_connections=has_disabled_connections,
             is_comparison_side=comparison_pin is not None,
             is_pinned_schedule=self.schedule_id is not None and request.model is not None,
-            has_doc=_turn_has_doc(request),
+            has_doc=_turn_has_doc(request, remote_docs=remote_docs),
         ) is None
         attached_files = False
         project_path = None
@@ -2375,6 +2407,7 @@ class ResponsesHandler:
         turn_llm: dict | None = None,
         first_take: FirstTake | None = None,
         docs: bool = False,
+        remote_docs: bool = False,
     ):
         """Choose the streaming producer coroutine.
 
@@ -2388,7 +2421,8 @@ class ResponsesHandler:
         a fresh one so a directly-called producer (tests) still has a flag to
         read.
 
-        `docs` reaches only the in-process turn: a remote pod has no doc tools.
+        `docs` reaches only the in-process turn. A remote turn's pod gets the
+        doc tools when `remote_docs` says so (ResponsesHandler._remote_docs).
         """
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle(identity=RunIdentity(
             correlation_id=(turn_llm or {}).get("correlation_id") or str(uuid4()),
@@ -2408,6 +2442,10 @@ class ResponsesHandler:
                 turn_llm=turn_llm,
                 disabled=disabled,
                 first_take=first_take,
+                # What the person typed, without the doc blocks ahead of it:
+                # the turn's question and its revision labels read this.
+                question_text=_title_text(harness_input),
+                remote_docs=remote_docs,
             )
         return self._produce(
             lifecycle=lifecycle,
@@ -2837,6 +2875,8 @@ class ResponsesHandler:
         disabled: list[dict] | None = None,
         reasoning_effort: str | None = None,
         first_take: FirstTake | None = None,
+        remote_docs: bool = False,
+        question_text: str | None = None,
     ) -> None:
         """Remote-backend counterpart of _run_turn: pipe the pod's replies
         through the same SSE formatter as the in-process path (full step /
@@ -2878,6 +2918,8 @@ class ResponsesHandler:
         # the deployed environments run at; this INFO line is only the
         # per-turn breadcrumb that ties a successful turn to its id in dev.
         corr = lifecycle.identity.correlation_id
+        # The input may open with the doc blocks; the question is what was typed.
+        question = question_text or input_text
         logger.info(
             "[responses] remote turn conversation=%s correlation_id=%s", conv_id, corr,
         )
@@ -2975,7 +3017,7 @@ class ResponsesHandler:
                             # Each revision's label: the editor's summary in
                             # the pod's tool rows, the reply, or the request.
                             summaries=summaries_from_messages(
-                                turn_rows, reply="".join(collected_text), request=input_text,
+                                turn_rows, reply="".join(collected_text), request=question,
                             ),
                         ),
                         scope=scope,
@@ -3245,7 +3287,7 @@ class ResponsesHandler:
             )
             # A unit of its own, so a failed read can't abort the seed's.
             earlier = await read_earlier_answers(conversation_id=conv_id, scope=scope)
-            yield TurnContext(question=input_text, files=seed.files, history=seed.history, earlier_answers=earlier)
+            yield TurnContext(question=question, files=seed.files, history=seed.history, earlier_answers=earlier)
             if seed.artifacts is not None:
                 # The worker writes artifacts into the shared tree while this
                 # turn runs, so cowork-server does the same before/after diff
@@ -4303,7 +4345,9 @@ class ResponsesHandler:
             output=[self._build_output(str(anchor_id), assistant_text, figure_sources=figure_sources)],
         )
 
-    def _build_harness_input(self, request: ResponsesRequest, *, session: ScopedSession) -> list[dict]:
+    def _build_harness_input(
+        self, request: ResponsesRequest, *, session: ScopedSession, remote_docs: bool = False,
+    ) -> list[dict]:
         blocks: list[dict] = []
 
         # Resolve attachment_ids to image/file blocks
@@ -4326,8 +4370,9 @@ class ResponsesHandler:
         # The doc open beside the chat goes ahead of what the person typed, as
         # data the agent reads ("this section" = their selection), not as part
         # of their message: it is never saved with the user turn. Both blocks
-        # tell the agent to use the doc tools, which only a turn run here has.
-        if _turn_has_doc(request):
+        # tell the agent to use the doc tools, so a remote turn carries them
+        # only when its pod gets those tools (remote_docs).
+        if _turn_has_doc(request, remote_docs=remote_docs):
             if request.doc_context is not None:
                 blocks.append({"type": "text", "text": doc_context_block(request.doc_context.model_dump(exclude_none=True))})
             if request.output == "doc":

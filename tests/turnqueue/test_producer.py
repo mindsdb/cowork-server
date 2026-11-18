@@ -2974,3 +2974,22 @@ async def test_preview_checks_reaches_the_job_only_for_an_interactive_turn(
                                             preview_checks=preview_checks))
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params.get("preview_checks") is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interactive,host_tools,expected", [
+    (True, [{"name": "read_doc", "description": "Read a doc.", "input_schema": {"type": "object"}}], True),
+    (False, [{"name": "read_doc", "description": "Read a doc.", "input_schema": {"type": "object"}}], False),
+    (True, [], False),
+    (True, None, False),
+])
+async def test_host_tools_reach_the_job_only_for_an_interactive_turn(monkeypatch, interactive, host_tools, expected):
+    """Their answers reach the pod on the stdin only an interactive turn keeps open."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", interactive=interactive,
+                                            host_tools=host_tools))
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params.get("host_tools") == (host_tools if expected else None)
