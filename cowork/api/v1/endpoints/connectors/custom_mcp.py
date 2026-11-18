@@ -58,19 +58,29 @@ def canonical_server_url(url: str) -> str:
     return f"https://{shown_host}{'' if port == 443 else f':{port}'}{path}"
 
 
-def _record_exists(scope: TenantScope, name: str) -> bool:
-    """Whether the scope's own vault holds a custom MCP record named ``name``."""
-    return own_vault_for_scope(scope).read_record(CUSTOM_MCP_ENGINE, name) is not None
+def _record_file_present(scope: TenantScope, name: str) -> bool:
+    """Whether a file stands where the vault keeps the record of ``name``.
+
+    anton names it ``<engine>-<name>`` after keeping only word characters and
+    dashes, which a checked connection id and ``custom_mcp`` already are."""
+    path = own_vault_root(scope) / f"{CUSTOM_MCP_ENGINE}-{name}"
+    return path.is_symlink() or path.exists()
 
 
 def _require_connection(scope: TenantScope, name: str) -> None:
     """404 with its own body when ``name`` is no custom MCP connection of this
-    scope, dropping anything still held for it."""
+    scope, dropping anything still held for it. A record file that exists but
+    cannot be read is 503 instead: the app deletes the connection's keychain
+    entries on the 404 body, and that must never happen for a connection
+    whose record is only unreadable for now."""
     if not is_connection_id(name):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=MISSING)
-    if not _record_exists(scope, name):
-        app_held.release(own_vault_root(scope), CUSTOM_MCP_ENGINE, name)
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=MISSING)
+    if own_vault_for_scope(scope).read_record(CUSTOM_MCP_ENGINE, name) is not None:
+        return
+    if _record_file_present(scope, name):
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail={"error": "custom_connection_unreadable"})
+    app_held.release(own_vault_root(scope), CUSTOM_MCP_ENGINE, name)
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=MISSING)
 
 
 def _held_values(settings: CustomMcpSettings) -> dict[str, Any]:

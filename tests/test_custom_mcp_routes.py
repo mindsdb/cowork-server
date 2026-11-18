@@ -212,6 +212,24 @@ class TestHeldAndTools:
         assert response.status_code == 404
         assert app_held.held_custom(own_vault_root(LOCAL_SCOPE), OTHER) == {}
 
+    @pytest.mark.parametrize("damage", ["not json", "unreadable"])
+    def test_a_record_that_cannot_be_read_is_never_called_missing(self, protected, damage):
+        _create()
+        path = own_vault_root(LOCAL_SCOPE) / f"{CUSTOM_MCP_ENGINE}-{CONN}"
+        # The file the vault wrote is where the route looks for it.
+        assert path.is_file()
+        if damage == "not json":
+            path.write_text("{not json", encoding="utf-8")
+        else:
+            path.chmod(0o000)
+        try:
+            response = _client().get(f"{ROUTES}/{CONN}/held-summary", headers=HEADERS)
+        finally:
+            path.chmod(0o600)
+        assert response.status_code == 503
+        assert response.json()["detail"] == {"error": "custom_connection_unreadable"}
+        assert _held()["access_token"] == "AT-1"
+
     def test_the_list_and_detail_show_the_held_label_not_the_file(self, protected):
         _create()
         # The label tool writes the file through the turn vault, as agent code can.
