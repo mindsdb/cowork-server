@@ -166,11 +166,6 @@ def test_an_answer_over_one_mib_becomes_a_refusal():
         "read it by tab", ok=False)
 
 
-def test_the_default_refusal_tells_the_model_to_read_in_parts():
-    refusal = capped(HostToolOutcome("x" * (MAX_RESULT_BYTES + 1)))
-    assert refusal.ok is False and "tab" in refusal.text and "ids" in refusal.text
-
-
 async def test_an_answer_over_one_mib_is_refused_whatever_the_tool_checked(redis):
     async def execute(call, emit):
         return HostToolOutcome("x" * (MAX_RESULT_BYTES + 1))
@@ -181,6 +176,20 @@ async def test_an_answer_over_one_mib_is_refused_whatever_the_tool_checked(redis
     await _settle(runner)
     (result,) = await _queued(redis)
     assert result["ok"] is False and result["last"] is True and result["text"] == "read it by tab"
+
+
+async def test_an_answer_that_cannot_be_encoded_is_refused_and_logged(redis, caplog):
+    async def execute(call, emit):
+        return HostToolOutcome("broken \ud800 text")
+
+    runner = _runner(redis, execute)
+    with caplog.at_level(logging.ERROR, logger=host_tools.logger.name):
+        runner.start(STEP)
+        await _settle(runner)
+    (result,) = await _queued(redis)
+    assert result["ok"] is False and result["last"] is True and "host_error" in result["text"]
+    assert any(CALL in record.getMessage() and record.exc_info for record in caplog.records)
+    assert not any("broken" in record.getMessage() for record in caplog.records)
 
 
 def test_a_step_is_cut_to_500_characters():

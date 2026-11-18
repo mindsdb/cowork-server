@@ -53,10 +53,8 @@ MAX_PROGRESS_CHARS = 500
 #: The turn end's wait for calls still running: a doc lock's wait (5 s) plus
 #: parsing a large doc under it (3-8 s), with room to spare.
 TURN_END_WAIT_S = 20.0
-_TOO_BIG_TEXT = (
-    "Refused (too_big): this answer would be over 1 MiB. Ask for less: pass `tab` for one tab, "
-    "or `ids` for specific items."
-)
+_TOO_BIG_TEXT = "The answer is over 1 MiB, more than the host sends for one call."
+_HOST_ERROR_TEXT = "Refused (host_error): the host could not send this answer."
 
 
 @dataclass(frozen=True)
@@ -209,7 +207,11 @@ class HostToolRunner:
         if self._closed:
             return
         # Capping and cutting up to 1 MiB serialises it many times over: off the event loop.
-        entries = await asyncio.to_thread(self._answer, call.call_id, outcome)
+        try:
+            entries = await asyncio.to_thread(self._answer, call.call_id, outcome)
+        except Exception:
+            logger.exception("host tool answer not built correlation_id=%s call_id=%s", self._corr, call.call_id)
+            entries = [_result_line(call.call_id, 0, last=True, ok=False, text=_HOST_ERROR_TEXT)]
         if self._closed:
             return
         await self._push(r, call, entries)
