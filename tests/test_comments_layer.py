@@ -145,3 +145,81 @@ def test_serve_html_gets_sandbox_csp():
 
             r3 = client.get("/api/v1/artifacts/serve/proj/styles.css")
             assert "content-security-policy" not in r3.headers
+
+
+# ── Images in comments (ENG-4410) ────────────────────────────────────────────
+
+
+def _rendered_layer_js() -> str:
+    import re
+
+    html = inject_layer(_HTML)
+    return next(s for s in re.findall(r"<script>(.*?)</script>", html, re.S) if "antonCommentsLayer" in s)
+
+
+def test_layer_sends_pasted_images_with_create_and_reply():
+    for token in [
+        "send({type:'create', selector: cssPath(el), text: text, images: images})",
+        "send({type:'reply', id: id, text: text, images: images})",
+        "addEventListener('paste'",
+        "addEventListener('drop'",
+        "IMG_MAX = 5 * 1024 * 1024, IMG_COUNT = 4",
+    ]:
+        assert token in LAYER_JS, token
+
+
+def test_layer_shows_only_images_the_app_pushes():
+    # Pictures come only from the parent window, keyed by a stored image id,
+    # as raster Blobs: a script in the page posting as the app plants nothing.
+    for token in [
+        "d.type === 'images'",
+        "if (ev.source !== parent) return;",
+        "!(blob instanceof Blob)",
+        "IMG_TYPES.indexOf(String(blob.type || '').toLowerCase()) < 0",
+    ]:
+        assert token in LAYER_JS, token
+
+
+def test_layer_edit_keeps_image_markers_out_of_the_box():
+    assert "var words = splitText(oldText).body, marks = marksOf(oldText);" in LAYER_JS
+    assert "onSave(marks ? (text ? text + '\\n\\n' + marks : marks) : text);" in LAYER_JS
+
+
+def _node():
+    import shutil
+
+    import pytest
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    return node
+
+
+def test_rendered_layer_js_parses(tmp_path):
+    import subprocess
+
+    script = tmp_path / "layer.js"
+    script.write_text(_rendered_layer_js())
+    subprocess.run([_node(), "--check", str(script)], check=True)
+
+
+def test_layer_reads_the_markers_the_server_reads():
+    # The layer's marker pattern and the server's (services/comment_images)
+    # must agree on what names an image, or a thread would show one thing and
+    # hand the agent another.
+    import json
+    import re
+    import subprocess
+
+    from cowork.services.comment_images import comment_image_ids
+
+    js = _rendered_layer_js()
+    pattern = re.search(r"function imgMarks\(\)\{ return (/.*?/g); \}", js).group(1)
+    image = "0123456789abcdef0123456789abcdef.png"
+    text = f"Make it like this\n\n![shot (1).png](cowork-image:{image})\n![x](cowork-image:not-an-id.png)"
+    out = subprocess.run(
+        [_node(), "-e", f"const t={json.dumps(text)};console.log(JSON.stringify([...t.matchAll({pattern})].map(m=>m[1])))"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert json.loads(out) == comment_image_ids(text) == [image]
