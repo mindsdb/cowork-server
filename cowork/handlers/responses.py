@@ -111,6 +111,7 @@ from cowork.handlers._turn_history import (
 )
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
+    BUDGET_EXCEEDED_CODE,
     CONTENT_REPAIR_CODES,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
@@ -128,6 +129,7 @@ from cowork.handlers.turn_errors import (
     TURN_LOST_MESSAGE,
     auth_error_detail,
     friendly_turn_error,
+    gate_budget_scope,
     gate_reset_at,
     model_unavailable_info,
     provider_overloaded_info,
@@ -3491,10 +3493,12 @@ class ResponsesHandler:
             # an offset-aware instant (`_remote_reset_at` in producer.py), so
             # it rides both the frame and the persisted event as sent.
             reset_at = failure.get("reset_at")
+            # Kept by the producer for budget_exceeded only, already validated.
+            budget_scope = failure.get("budget_scope")
             # The pod never got to retire a question it was blocked on.
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
             collected_events.append(response_failed_payload(
-                message, code, reset_at=reset_at, request_id=corr))
+                message, code, reset_at=reset_at, budget_scope=budget_scope, request_id=corr))
 
             async def fail() -> None:
                 if code in CONTENT_REPAIR_CODES:
@@ -3526,7 +3530,7 @@ class ResponsesHandler:
                             "validation error", extra=log_context(conversation_id=conv_id),
                         )
                 await end_turn("error", lambda message_id: response_failed_sse(
-                    message, code, reset_at=reset_at, request_id=corr,
+                    message, code, reset_at=reset_at, budget_scope=budget_scope, request_id=corr,
                     assistant_message_id=message_id,
                 ))
 
@@ -3931,6 +3935,11 @@ class ResponsesHandler:
                 _reset = gate_reset_at(exc)
                 if _reset is not None:
                     extra = {"reset_at": _reset}
+            elif code == BUDGET_EXCEEDED_CODE:
+                # Whose budget is spent, so the card can name it.
+                _scope = gate_budget_scope(exc)
+                if _scope is not None:
+                    extra = {"budget_scope": _scope}
             elif code == RATE_LIMITED_CODE:
                 # Pass the server's own wait interval so the card can time-gate
                 # its Retry (ENG-1537). An ungated Retry re-sends a large
@@ -4211,7 +4220,10 @@ class ResponsesHandler:
                 # it here. Same wire shape the streaming twin emits.
                 raise HTTPException(
                     status_code=400,
-                    detail=response_failed_payload(message, code, request_id=corr),
+                    detail=response_failed_payload(
+                        message, code, request_id=corr,
+                        budget_scope=gate_budget_scope(exc) if code == BUDGET_EXCEEDED_CODE else None,
+                    ),
                 )
             logger.exception(
                 "[responses] turn failed",

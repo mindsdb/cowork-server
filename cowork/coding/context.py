@@ -167,9 +167,12 @@ class EngineFailure:
     code: str = ""
     detail: str = ""
     model: str = ""
+    # Whose budget a budget_exceeded failure names, so the card can say so.
+    budget_scope: str = ""
 
     def event_data(self) -> dict[str, str]:
-        return {key: value for key, value in (("code", self.code), ("detail", self.detail), ("model", self.model)) if value}
+        fields = (("code", self.code), ("detail", self.detail), ("model", self.model), ("budget_scope", self.budget_scope))
+        return {key: value for key, value in fields if value}
 
 
 FAILURE_MESSAGES = {
@@ -185,10 +188,14 @@ FAILURE_MESSAGES = {
         "Free MindsHub Air is paused until the daily budget resets. Add credits to continue now."
     ),
     "budget_exceeded": (
-        "Your organization's spending budget is used up. An owner or admin can raise it in Budgets, "
+        "A spending budget is used up. An administrator can raise it in Budgets, "
         "or choose a model that is still available."
     ),
 }
+
+# Whose budget a budget_exceeded failure names; any other scope keeps the neutral copy above.
+_BUDGET_SCOPE_OWNERS = {"org": "Your organization's", "workspace": "This workspace's", "api_key": "This API key's"}
+BUDGET_SCOPE_PATTERN = re.compile(r"[a-z_]{1,32}")
 
 _FAILURE_MARKERS = (
     ("insufficient_credits", ("402 payment required", "wallet has no balance", "insufficient credits")),
@@ -222,27 +229,44 @@ def classify_engine_failure(
     for responses that reached it without the rewrite.
     """
     safe = safe_engine_error(message, credentials)
-    code = _embedded_error_code(safe) or next(
+    error = _embedded_error(safe)
+    code = _string_field(error, "code") or next(
         (code for code, markers in _FAILURE_MARKERS if any(marker in safe.casefold() for marker in markers)),
         "",
     )
     if code not in FAILURE_MESSAGES:
         return EngineFailure(message=safe)
     detail = _URL_SUFFIX.sub("", safe).strip() if code == "model_upstream_unavailable" else safe
+    if code == "budget_exceeded":
+        scope = _string_field(error, "budget_scope")
+        scope = scope if BUDGET_SCOPE_PATTERN.fullmatch(scope) else ""
+        owner = _BUDGET_SCOPE_OWNERS.get(scope)
+        who = "An owner or admin" if scope == "org" else "An administrator"
+        text = (
+            f"{owner} spending budget is used up. {who} can raise it in Budgets, "
+            "or choose a model that is still available."
+            if owner
+            else FAILURE_MESSAGES[code]
+        )
+        return EngineFailure(message=text, code=code, detail=detail, model=model, budget_scope=scope)
     return EngineFailure(message=FAILURE_MESSAGES[code], code=code, detail=detail, model=model)
 
 
-def _embedded_error_code(text: str) -> str:
+def _embedded_error(text: str) -> dict:
     start = text.find("{")
     if start < 0:
-        return ""
+        return {}
     try:
         payload = json.loads(text[start:])
     except json.JSONDecodeError:
-        return ""
+        return {}
     error = payload.get("error") if isinstance(payload, dict) else None
-    code = error.get("code") if isinstance(error, dict) else None
-    return code if isinstance(code, str) else ""
+    return error if isinstance(error, dict) else {}
+
+
+def _string_field(error: dict, key: str) -> str:
+    value = error.get(key)
+    return value if isinstance(value, str) else ""
 
 
 def is_context_exhaustion_error(message: str | None) -> bool:

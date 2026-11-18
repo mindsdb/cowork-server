@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request
 from starlette.responses import Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
+from cowork.coding.context import BUDGET_SCOPE_PATTERN
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.inference_trace import trace_headers
 
@@ -113,20 +114,37 @@ def upstream_error_code(body: bytes) -> str:
     return code if isinstance(code, str) else ""
 
 
-def terminal_rejection(status_code: int, body: bytes, code: str | None = None) -> tuple[str, bytes] | None:
+def upstream_budget_scope(body: bytes, header: str | None = None) -> str:
+    """Whose budget a ``budget_exceeded`` rejection names, from ``error.budget_scope`` or the header."""
+    try:
+        payload = json.loads(body[:MAX_REJECTION_BODY_BYTES])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    scope = error.get("budget_scope") if isinstance(error, dict) else None
+    # The first well-formed value wins, so a bad body value can't hide a good header.
+    for candidate in (scope, header):
+        if isinstance(candidate, str) and BUDGET_SCOPE_PATTERN.fullmatch(candidate):
+            return candidate
+    return ""
+
+
+def terminal_rejection(
+    status_code: int, body: bytes, code: str | None = None, budget_scope: str = ""
+) -> tuple[str, bytes] | None:
     """Return the (code, body) of a non-retryable 400 for a deterministic upstream rejection."""
     code = code or TERMINAL_UPSTREAM_CODES.get(status_code)
     if code is None:
         return None
-    payload = {
-        "error": {
-            "message": upstream_error_message(body) or f"MindsHub inference rejected the request ({status_code})",
-            "type": "invalid_request_error",
-            "code": code,
-            "upstream_status": status_code,
-        }
+    error = {
+        "message": upstream_error_message(body) or f"MindsHub inference rejected the request ({status_code})",
+        "type": "invalid_request_error",
+        "code": code,
+        "upstream_status": status_code,
     }
-    return code, json.dumps(payload, ensure_ascii=False).encode()
+    if budget_scope:
+        error["budget_scope"] = budget_scope
+    return code, json.dumps({"error": error}, ensure_ascii=False).encode()
 
 
 def retry_after_seconds(value: str | None) -> float:
@@ -259,7 +277,10 @@ def _response_headers(upstream: httpx.Response) -> dict[str, str]:
 
 
 def _terminal_response(upstream: httpx.Response, raw: bytes, code: str | None = None) -> Response:
-    rejection = terminal_rejection(upstream.status_code, raw, code)
+    scope = ""
+    if code == "budget_exceeded":
+        scope = upstream_budget_scope(raw, upstream.headers.get("x-mindshub-budget-scope"))
+    rejection = terminal_rejection(upstream.status_code, raw, code, scope)
     assert rejection is not None
     code, body = rejection
     headers = _response_headers(upstream)

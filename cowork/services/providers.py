@@ -328,8 +328,8 @@ class MindsModelListing(NamedTuple):
     # Why a model the ``enabled`` map (or ``image_models``) marks false is
     # unavailable, in the gateway's own reason words: "model_restricted" (an
     # admin in the org restricted it), "wallet_empty",
-    # "included_allowance_exhausted" or "budget_exceeded" (an org budget is
-    # spent). Keyed only by ids one of those marks false, so the maps cannot
+    # "included_allowance_exhausted" or "budget_exceeded" (a spending budget
+    # is spent). Keyed only by ids one of those marks false, so the maps cannot
     # disagree. Empty whenever the gateway publishes no reasons, which includes
     # every MindsHub that predates the field and every plain OpenAI-compatible
     # endpoint. Required for the same reason as ``role_defaults``.

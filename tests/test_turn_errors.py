@@ -1273,6 +1273,64 @@ def test_a_budget_stop_carries_no_reset_instant():
     assert te.BUDGET_EXCEEDED_CODE not in te.RESET_AT_CODES
 
 
+_SCOPED_BUDGET_MESSAGES = {
+    "org": "Your organization's spending budget is used up. An owner or admin can raise it in Budgets.",
+    "workspace": "This workspace's spending budget is used up. An administrator can raise it in Budgets.",
+    "api_key": "This API key's spending budget is used up. An administrator can raise it in Budgets.",
+}
+
+
+def _scoped_budget_via_header(scope):
+    exc = _gateway_failure(402, reason="budget_exceeded")
+    exc.__cause__.response.headers["X-MindsHub-Budget-Scope"] = scope
+    return exc
+
+
+def _scoped_budget_via_body(scope):
+    exc = _budget_via_body_code()
+    exc.__cause__.body["error"]["budget_scope"] = scope
+    return exc
+
+
+def _scoped_budget_via_type(scope):
+    stop = te.BudgetExceededError("Server returned 402: budget used up.", reason="budget_exceeded", status_code=402)
+    stop.budget_scope = scope
+    return stop
+
+
+@pytest.mark.parametrize("carrier", [_scoped_budget_via_header, _scoped_budget_via_body, _scoped_budget_via_type])
+@pytest.mark.parametrize("scope", sorted(_SCOPED_BUDGET_MESSAGES))
+def test_a_spent_budget_names_its_scope(carrier, scope):
+    failure = carrier(scope)
+    assert te.friendly_turn_error(failure) == (te.BUDGET_EXCEEDED_CODE, _SCOPED_BUDGET_MESSAGES[scope])
+    assert te.gate_budget_scope(failure) == scope
+
+
+@pytest.mark.parametrize("scope", ["team", "Not A Scope!", "x" * 33])
+def test_a_scope_the_copy_does_not_know_reads_as_neutral(scope):
+    code, message = te.friendly_turn_error(_scoped_budget_via_header(scope))
+    assert (code, message) == (te.BUDGET_EXCEEDED_CODE, te.BUDGET_EXCEEDED_USER_MESSAGE)
+    assert message.startswith("A spending budget is used up.")
+
+
+def test_only_a_well_formed_scope_is_forwarded():
+    assert te.gate_budget_scope(_scoped_budget_via_header("team")) == "team"
+    assert te.gate_budget_scope(_scoped_budget_via_header("Not A Scope!")) is None
+    assert te.gate_budget_scope(_gateway_failure(402, reason="budget_exceeded")) is None
+
+
+def test_the_failed_payload_carries_the_budget_scope_only_when_set():
+    assert te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE, budget_scope="workspace")["budget_scope"] == "workspace"
+    assert "budget_scope" not in te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE)
+
+
+@pytest.mark.parametrize("scope", sorted(_SCOPED_BUDGET_MESSAGES))
+def test_a_remote_budget_stop_names_the_scope_the_worker_sent(scope):
+    error = "BudgetExceededError: Server returned 402: budget used up."
+    assert te.remote_turn_error(error, scope) == (te.BUDGET_EXCEEDED_CODE, _SCOPED_BUDGET_MESSAGES[scope])
+    assert te.remote_turn_error(error) == (te.BUDGET_EXCEEDED_CODE, te.BUDGET_EXCEEDED_USER_MESSAGE)
+
+
 def test_fuse_header_maps_to_free_serving_paused_not_out_of_credits():
     code, message = te.friendly_turn_error(_fuse_via_header())
     assert code == te.FREE_SERVING_PAUSED_CODE

@@ -49,6 +49,28 @@ def test_status_line_and_embedded_json_shapes_are_classified(message: str, code:
     assert failure.message != message
 
 
+@pytest.mark.parametrize(
+    ("scope", "message", "event_scope"),
+    [
+        ("workspace", "This workspace's spending budget is used up.", "workspace"),
+        ("api_key", "This API key's spending budget is used up.", "api_key"),
+        ("org", "Your organization's spending budget is used up.", "org"),
+        ("team", "A spending budget is used up.", "team"),
+        ("Bad Scope", "A spending budget is used up.", None),
+    ],
+)
+def test_a_spent_budget_names_its_scope(scope: str, message: str, event_scope: str | None) -> None:
+    raw = f'unexpected status 400 Bad Request: {{"error": {{"code": "budget_exceeded", "budget_scope": "{scope}"}}}}'
+    failure = classify_engine_failure(raw, CREDS)
+
+    assert failure.code == "budget_exceeded"
+    assert failure.message.startswith(message)
+    assert failure.event_data().get("budget_scope") == event_scope
+    # Only an org budget names owners; workspace and key budgets may be managed below the org.
+    who = "An owner or admin" if scope == "org" else "An administrator"
+    assert f"{who} can raise it in Budgets, or choose a model that is still available." in failure.message
+
+
 def test_unrelated_failures_keep_their_redacted_text_and_no_code() -> None:
     failure = classify_engine_failure("adapter stream disconnected mdb_secret_key_value", CREDS, model="gpt")
 

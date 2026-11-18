@@ -170,3 +170,19 @@ def test_model_deadline_over_a_billing_stop_keeps_its_own_saved_failure(
     assert failed["code"] == turn_errors.MODEL_TIMEOUT_CODE
     assert failed["error"] == str(error)
     assert "reset_at" not in failed
+
+
+@pytest.mark.parametrize(("scope", "owner"), [("workspace", "This workspace's"), (None, "A")])
+def test_a_spent_budget_names_its_scope_live_and_on_reload(
+    monkeypatch, self_hosted_minds_url, conversation_id, scope, owner,
+):
+    error = _billing_stop(status=402, reason="budget_exceeded")
+    if scope is not None:
+        error.__cause__.response.headers["X-MindsHub-Budget-Scope"] = scope
+
+    failed = _saved_and_streamed_failure(monkeypatch, conversation_id, error)
+
+    assert failed["code"] == turn_errors.BUDGET_EXCEEDED_CODE
+    assert failed["error"].startswith(f"{owner} spending budget is used up.")
+    assert failed.get("budget_scope") == scope
+    assert "reset_at" not in failed
