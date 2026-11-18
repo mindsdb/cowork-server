@@ -20,9 +20,11 @@ from cowork.coding.contracts import (
     GitState,
     WorkspaceInspection,
     WorkspaceKind,
+    WorkspaceReasonCode,
 )
 from cowork.coding.git_transport import ALLOWED_GIT_PROTOCOLS
-from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
+from cowork.coding.local_copy import LocalCopyError, LocalCopyManager, force_remove
+from cowork.coding.pending_removals import PendingRemovals
 from cowork.coding.workspace_key import managed_key
 from cowork.common.paths import O_NOFOLLOW, open_fd
 from cowork.common.settings.app_settings import get_app_settings
@@ -37,7 +39,23 @@ class UsageRoots:
 
 
 class WorkspaceError(RuntimeError):
-    pass
+    """A workspace cannot be prepared or used as asked.
+
+    ``reason`` names the cases a client words itself, in the person's
+    language; ``folder`` is the project folder the message is about.
+    """
+
+    def __init__(
+        self, message: str = "", *, reason: WorkspaceReasonCode | None = None, folder: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.folder = folder
+
+    @classmethod
+    def in_folder(cls, folder: str, exc: Exception) -> WorkspaceError:
+        """``exc`` about one of a project's folders, named so the person knows which."""
+        return cls(f"{folder}: {exc}", reason=getattr(exc, "reason", None), folder=folder)
 
 
 class GitUnavailableError(WorkspaceError):
@@ -71,6 +89,7 @@ NO_COMMITS = "This repository has no commits yet. Make a first commit to use a W
 # works in the folder but has nothing to compare to.
 NO_REVIEW_WITHOUT_GIT = "This folder isn't a Git repository, so the task's changes cannot be reviewed. Initialize Git to review them."
 NO_REVIEW_WITHOUT_COMMITS = "This repository has no commits yet, so the task's changes cannot be reviewed. Make a first commit to review them."
+WRITES_HELD = "Until you allow writes, the agent can read the folder but must ask before changing it."
 MAX_DIFF_FILES = 250
 MAX_TEXT_DIFF_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_DIFF_BYTES = 4 * 1024 * 1024
@@ -230,6 +249,8 @@ class WorkspaceManager:
         self.snapshots_root = root / "snapshots"
         self.git = git or GitRunner()
         self.local_copies = LocalCopyManager(root, self.worktrees_root)
+        # Under the coding root so moving a task folder here is a same-disk rename.
+        self.pending_removals = PendingRemovals(root / "pending-removal")
         self._mutation_lock = threading.RLock()
         self._refusals: dict[str, str] = {}
         self.worktrees_root.mkdir(parents=True, exist_ok=True)
@@ -276,9 +297,9 @@ class WorkspaceManager:
             raise WorkspaceError("Choose an existing local folder")
         root = self._git_root(path)
         if root is None:
-            raise WorkspaceError(NOT_A_REPOSITORY)
+            raise WorkspaceError(NOT_A_REPOSITORY, reason=WorkspaceReasonCode.not_a_repository)
         if self._head_revision(root) is None:
-            raise WorkspaceError(NO_COMMITS)
+            raise WorkspaceError(NO_COMMITS, reason=WorkspaceReasonCode.no_commits)
 
     def initialize_git(self, raw_path: str) -> None:
         """Run ``git init`` in a folder that isn't in a Git repository yet.
@@ -348,7 +369,7 @@ class WorkspaceManager:
             if not inspection.exists or not inspection.is_directory:
                 raise WorkspaceError("Choose an existing local folder")
             if not inspection.is_git:
-                raise WorkspaceError(NOT_A_REPOSITORY)
+                raise WorkspaceError(NOT_A_REPOSITORY, reason=WorkspaceReasonCode.not_a_repository)
 
             repo = Path(inspection.repository_root or inspection.path)
             revision = inspection.revision
@@ -358,7 +379,7 @@ class WorkspaceManager:
                     raise WorkspaceError(f"Base branch is unavailable: {base_branch}")
             # Git cannot create a worktree until the repository has a commit.
             if revision is None:
-                raise WorkspaceError(NO_COMMITS)
+                raise WorkspaceError(NO_COMMITS, reason=WorkspaceReasonCode.no_commits)
 
             worktree = self.worktrees_root / managed_key(session_id)
             if worktree.exists():
@@ -813,9 +834,17 @@ class WorkspaceManager:
         keep_recovery: bool = True,
     ) -> None:
         with self._mutation_lock:
+            # Without recovery the task is being deleted, so its folders are
+            # moved aside and removed in the background instead of holding the
+            # request for as long as a large tree takes to remove.
             if kind == WorkspaceKind.local_copy:
                 try:
-                    self.local_copies.cleanup(session_id, Path(workspace_path), keep_recovery=keep_recovery)
+                    self.local_copies.cleanup(
+                        session_id,
+                        Path(workspace_path),
+                        keep_recovery=keep_recovery,
+                        remove=None if keep_recovery else self._discard,
+                    )
                 except LocalCopyError as exc:
                     raise WorkspaceError(str(exc)) from exc
                 return
@@ -830,8 +859,17 @@ class WorkspaceManager:
             if actual not in expected:
                 raise WorkspaceError("Refusing to remove an unmanaged worktree path")
             source = Path(source_path)
+            if not keep_recovery:
+                self._discard(actual)
+                if source.is_dir():
+                    # The moved folder no longer exists where Git registered it,
+                    # so prune drops the registration and frees the task branch.
+                    # A failure only leaves a stale entry Git prunes itself later,
+                    # which must not stop the task from being deleted.
+                    self.git.run(source, "worktree", "prune", check=False)
+                return
             if actual.exists():
-                if keep_recovery and base_revision and source.is_dir():
+                if base_revision and source.is_dir():
                     self._snapshot_changes(session_id, actual, base_revision, "cleanup.patch", truncate=True)
                 if source.is_dir():
                     self.git.run(source, "worktree", "remove", "--force", str(actual))
@@ -852,6 +890,8 @@ class WorkspaceManager:
         """
         return UsageRoots(
             workspace=(
+                # Folders waiting here belong to no task, so they count as removed.
+                self.pending_removals.root,
                 self.worktrees_root,
                 self.legacy_worktrees_root,
                 self.local_copies.legacy_copies_root,
@@ -1105,7 +1145,12 @@ class WorkspaceManager:
             if task_dir.is_symlink():
                 task_dir.unlink()
             elif task_dir.is_dir():
-                shutil.rmtree(task_dir)
+                self._discard(task_dir)
+
+    def _discard(self, path: Path) -> None:
+        """Remove a managed folder in the background, or now if it cannot be moved aside."""
+        if not self.pending_removals.discard(path):
+            force_remove(path)
 
     def prune_task_root(self, session_id: str) -> None:
         """Remove an empty project-task parent without discarding task files."""

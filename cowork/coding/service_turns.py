@@ -69,6 +69,11 @@ class CodingTurnOperations:
         model_levels: ModelLevels | None = None,
     ) -> CodingSession:
         """Record a task and return it; a local task prepares in the background."""
+
+        def folder_busy(roots: set[Path]) -> bool:
+            with self._lock:
+                return self._shared_folder_conflict("", roots) is not None
+
         begun = self.session_factory.begin(
             request,
             credentials,
@@ -76,6 +81,7 @@ class CodingTurnOperations:
             default_model,
             code_skills,
             model_levels=model_levels,
+            folder_busy=folder_busy,
         )
         if isinstance(begun, CodingSession):
             intent = self._validated_command_intent(begun, request.prompt, request.attachments)

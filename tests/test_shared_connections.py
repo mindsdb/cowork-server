@@ -951,8 +951,9 @@ async def test_hosted_org_tenancy_keeps_every_connections_route(hosted, monkeypa
         )
     assert refused.value.status_code == 501
 
-    # The loopback save and the picked-file untag still use the org's vault,
-    # unlayered and unstamped.
+    # Called directly: over HTTP, /save refuses org mode before this runs. The
+    # save and the picked-file untag still use the org's vault, unlayered and
+    # unstamped.
     saved = connections_ep.save_connection_direct(
         DirectSaveRequest(connector_id="postgres", name="erp", values=dict(ERP)), ORG
     )
