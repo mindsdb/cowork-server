@@ -1019,8 +1019,10 @@ def create_app() -> FastAPI:
     # browser sees the 401 rather than an opaque CORS failure.
     #
     # Routes that check their own caller rather than the bearer token or the
-    # identity headers; both auth layers let these paths through.
-    auth_exempt_paths: set[str] = set()
+    # identity headers; both auth layers let these paths through. The Teams
+    # connector adds its routes to this same set through app.state.
+    channel_webhook_paths: set[str] = set()
+    app.state.channel_webhook_paths = channel_webhook_paths
 
     # Trusted identity headers name a person in local tenancy. Only a request
     # that already passed the bearer token may name one, and each person's
@@ -1123,7 +1125,7 @@ def create_app() -> FastAPI:
     # only the visitor's viewer sign-in cookie, and a slot's stop report
     # carries nothing; each route checks its caller itself
     # (cowork.services.live_apps.live_app_slot_paths).
-    auth_exempt_paths.update(live_app_slot_paths())
+    channel_webhook_paths.update(live_app_slot_paths())
     # ANTON_WRITE_APPROVAL needs an anton that reads it, a way to ask, and
     # turns in this process (check_write_approval_startup).
     check_write_approval_startup(
@@ -1140,7 +1142,7 @@ def create_app() -> FastAPI:
         enforce = settings.identity_enforce == "enforce"
         app.add_middleware(
             TrustedHeaderMiddleware,
-            exempt_paths=auth_exempt_paths,
+            exempt_paths=channel_webhook_paths,
             enforce=enforce,
             personal_partitions=settings.trust_identity_headers,
         )
@@ -1205,11 +1207,11 @@ def create_app() -> FastAPI:
         # desktop's API token. These exact routes retain their own constant-time
         # credential check and LoopbackDesktopOnly guard. Do not exempt the
         # coding prefix: that would expose task/filesystem APIs to the agent.
-        auth_exempt_paths.update(
+        channel_webhook_paths.update(
             f"/api/v1/coding/inference/{path}" for path in INFERENCE_PATHS
         )
         app.add_middleware(
-            BearerTokenMiddleware, token=token, exempt_paths=auth_exempt_paths
+            BearerTokenMiddleware, token=token, exempt_paths=channel_webhook_paths
         )
         logger.info("auth: bearer-token authentication enabled")
 
