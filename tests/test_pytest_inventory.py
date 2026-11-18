@@ -213,7 +213,8 @@ def inventory_suite(tmp_path):
     shutil.copyfile(_ROOT / "scripts/pytest_inventory.py", plugins / "pytest_inventory.py")
     sequence = 0
 
-    def run(*args: str, source: str | None = None, conftest: str | None = None):
+    def run(*args: str, source: str | None = None, conftest: str | None = None,
+            active_test_dir: Path | None = None):
         """Run the temporary suite, returning its process result and optional JSON evidence."""
         nonlocal sequence
         sequence += 1
@@ -226,6 +227,8 @@ def inventory_suite(tmp_path):
             "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "COVERAGE_FILE", "COWORK_REQUIRE_SERVICES", "COWORK_REQUIRE_INTEGRATION", "GITHUB_STEP_SUMMARY",
         }}
         env.update(PYTHONPATH=str(plugins), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+        if active_test_dir is not None:
+            env["COWORK_ACTIVE_TEST_DIR"] = str(active_test_dir)
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "-p", "xdist.plugin", "-p", "pytest_inventory",
              "--test-cohort=probe", f"--test-inventory={report}", "-c", str(root / "pytest.ini"),
@@ -235,6 +238,102 @@ def inventory_suite(tmp_path):
         return result, document, report
 
     return root, run
+
+
+def test_active_test_marker_is_cleared_after_success(inventory_suite, tmp_path):
+    """The current worker can read its marker during a test, and it is removed afterward."""
+    _, run = inventory_suite
+    markers = tmp_path / "active-tests"
+    result, _, _ = run(
+        "-n", "1", active_test_dir=markers, source='''
+import os
+from pathlib import Path
+def test_marker(request):
+    marker = Path(os.environ["COWORK_ACTIVE_TEST_DIR"]) / f"{os.environ['PYTEST_XDIST_WORKER']}.txt"
+    assert marker.read_text().strip() == request.node.nodeid
+''',
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert list(markers.glob("*.txt")) == []
+
+
+def test_shard_reports_active_test_while_child_is_running(tmp_path):
+    """The parent flushes a long-running node ID before its supervised child exits."""
+    import select
+
+    markers = tmp_path / "active-tests"
+    markers.mkdir()
+    release = tmp_path / "release-child"
+    child_pid = tmp_path / "child.pid"
+    child = (
+        "import os, time; from pathlib import Path; "
+        f"Path({str(markers / 'gw0.txt')!r}).write_text('test_sample.py::test_hung\\n'); "
+        f"Path({str(child_pid)!r}).write_text(str(os.getpid())); "
+        f"release = Path({str(release)!r}); "
+        "exec('while not release.exists():\\n time.sleep(0.01)')"
+    )
+    driver = (
+        "import sys; from pathlib import Path; from scripts.test_shards import _run_with_active_test_reporting; "
+        f"raise SystemExit(_run_with_active_test_reporting([sys.executable, '-c', {child!r}], {{ }}, "
+        f"Path({str(markers)!r}), threshold=0.15))"
+    )
+    supervisor = subprocess.Popen(
+        [sys.executable, "-c", driver], cwd=_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        assert supervisor.stdout is not None
+        ready, _, _ = select.select([supervisor.stdout], [], [], 3)
+        assert ready, "parent did not flush the active-test line before the child exited"
+        line = supervisor.stdout.readline().strip()
+        assert line == "COWORK_ACTIVE_TEST worker=gw0 nodeid=test_sample.py::test_hung"
+        assert supervisor.poll() is None
+        assert os.kill(int(child_pid.read_text()), 0) is None
+        assert not release.exists()
+        release.touch()
+        remaining, _ = supervisor.communicate(timeout=5)
+        assert "COWORK_ACTIVE_TEST" not in remaining
+    finally:
+        release.touch()
+        if supervisor.poll() is None:
+            try:
+                supervisor.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                supervisor.kill()
+                supervisor.communicate()
+
+
+def test_shard_does_not_report_a_cleared_marker(tmp_path):
+    """A marker cleared before the threshold produces no timeout diagnostic."""
+    markers = tmp_path / "active-tests"
+    markers.mkdir()
+    child = (
+        "import time; from pathlib import Path; "
+        f"marker = Path({str(markers / 'gw0.txt')!r}); "
+        "marker.write_text('test_sample.py::test_quick\\n'); time.sleep(0.05); marker.unlink()"
+    )
+    driver = (
+        "import sys; from pathlib import Path; from scripts.test_shards import _run_with_active_test_reporting; "
+        f"raise SystemExit(_run_with_active_test_reporting([sys.executable, '-c', {child!r}], {{ }}, "
+        f"Path({str(markers)!r}), threshold=0.3))"
+    )
+    result = subprocess.run([sys.executable, "-c", driver], cwd=_ROOT, capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "COWORK_ACTIVE_TEST" not in result.stdout
+
+
+def test_active_test_marker_survives_abrupt_worker_exit(inventory_suite, tmp_path):
+    """A killed xdist worker leaves its active node ID for failure diagnostics."""
+    _, run = inventory_suite
+    markers = tmp_path / "active-tests"
+    result, _, _ = run(
+        "-n", "1", "--max-worker-restart=0", active_test_dir=markers, source='''
+import os
+def test_crash():
+    os._exit(17)
+''',
+    )
+    assert result.returncode != 0
+    assert (markers / "gw0.txt").read_text().strip() == "test_sample.py::test_crash"
 
 
 @pytest.mark.parametrize("workers", [0, 2])

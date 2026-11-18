@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 from coverage import Coverage, CoverageData
 from coverage.exceptions import CoverageException
@@ -26,6 +27,8 @@ _SHARD = "test-inventory-broad-shard-"
 _SHARD_COUNT = 4
 _VARIABLE_CI_FIELDS = {"GITHUB_JOB", "GITHUB_RUN_ATTEMPT"}
 _TIMINGS_PATH = Path(__file__).with_name("test_shard_timings.json")
+_ACTIVE_TEST_LOG_AFTER_SECONDS = 120
+_ACTIVE_TEST_POLL_SECONDS = 0.5
 
 
 def _require(condition: bool, message: str) -> None:
@@ -247,6 +250,46 @@ def _output(path: Path) -> Path:
     return path
 
 
+def _run_with_active_test_reporting(command: list[str], environment: dict[str, str], marker_dir: Path,
+                                    threshold: float = _ACTIVE_TEST_LOG_AFTER_SECONDS) -> int:
+    """Run pytest and report any worker test that remains active past the threshold."""
+    process = subprocess.Popen(command, env=environment)
+    active: dict[str, tuple[tuple[int, str], float, bool]] = {}
+    try:
+        while process.poll() is None:
+            now = time.monotonic()
+            present: set[str] = set()
+            try:
+                markers = list(marker_dir.glob("*.txt"))
+            except OSError:
+                markers = []
+            for marker in markers:
+                try:
+                    signature = (marker.stat().st_mtime_ns, marker.read_text(encoding="utf-8").rstrip("\n"))
+                except OSError:
+                    continue
+                present.add(marker.name)
+                previous = active.get(marker.name)
+                if previous is None or previous[0] != signature:
+                    active[marker.name] = (signature, now, False)
+                    continue
+                if now - previous[1] >= threshold and not previous[2]:
+                    print(f"COWORK_ACTIVE_TEST worker={marker.stem} nodeid={signature[1]}", flush=True)
+                    active[marker.name] = (signature, previous[1], True)
+            for name in active.keys() - present:
+                active.pop(name, None)
+            time.sleep(_ACTIVE_TEST_POLL_SECONDS)
+        return process.wait()
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
 def run_shard(inputs: Path, output: Path, index: int) -> int:
     """Execute one complete module partition and propagate pytest's exit status."""
     _require(index in range(_SHARD_COUNT), "Invalid shard index")
@@ -261,6 +304,9 @@ def run_shard(inputs: Path, output: Path, index: int) -> int:
                *[f"--ignore={name}" for name in ignored], "-p", "scripts.pytest_inventory",
                f"--test-cohort=broad-shard-{index}", f"--test-inventory={output / 'inventory.json'}",
                f"--junitxml={output / 'junit.xml'}", "tests/"]
+    marker_dir = os.environ.get("COWORK_ACTIVE_TEST_DIR")
+    if marker_dir:
+        return _run_with_active_test_reporting(command, environment, Path(marker_dir))
     return subprocess.run(command, env=environment, check=False).returncode
 
 

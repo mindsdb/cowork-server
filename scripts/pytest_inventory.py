@@ -19,6 +19,7 @@ import pytest
 _WORKER_KEY = "cowork_test_inventory"
 _CONFIG_FILES = ("uv.lock", "pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini", "Makefile")
 _CI_FIELDS = ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB", "RUNNER_OS", "RUNNER_ARCH", "ImageOS", "ImageVersion")
+_ACTIVE_TEST_DIR = "COWORK_ACTIVE_TEST_DIR"
 
 
 def _digest(value: object) -> str:
@@ -130,6 +131,22 @@ def _publish(path: Path, document: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _write_active_test(path: Path, nodeid: str) -> None:
+    """Atomically leave the current test ID for inspection if its worker stops."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(nodeid.replace("\r", "\\r").replace("\n", "\\n") + "\n")
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 class Inventory:
     """Observe one pytest session without changing its selection or execution."""
 
@@ -182,6 +199,32 @@ class Inventory:
     def pytest_deselected(self, items: list[pytest.Item]) -> None:
         """Retain actual deselected IDs instead of treating them as skipped executions."""
         self.deselected.extend(item.nodeid for item in items)
+
+    @pytest.hookimpl(hookwrapper=True, tryfirst=True)
+    def pytest_runtest_protocol(self, item: pytest.Item, nextitem: pytest.Item | None) -> Generator[None, Any, None]:
+        """Optionally retain each worker's active case without affecting selection."""
+        marker_root = os.environ.get(_ACTIVE_TEST_DIR)
+        if not marker_root:
+            yield
+            return
+        worker = getattr(self.config, "workerinput", {}).get("workerid", "master")
+        marker = Path(marker_root) / f"{worker}.txt"
+        try:
+            _write_active_test(marker, item.nodeid)
+        except OSError:
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+            marker = None
+        try:
+            yield
+        finally:
+            if marker is not None:
+                try:
+                    marker.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def pytest_collectreport(self, report: pytest.CollectReport) -> None:
         """Record module skips and collection errors separately from executable cases."""
