@@ -224,7 +224,7 @@ async def test_the_turn_end_waits_for_a_late_call_names_its_doc_and_sends_nothin
     async def pod(**kwargs):
         corr["id"] = kwargs["correlation_id"]
         yield PERSISTENT
-        yield _call("create_doc", title="Plan", markdown="Lead.")
+        yield _call("create_doc", title="Secret roadmap", markdown="Lead.")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 5
         while not any(provenance_origin(f) == conv_id for f in base.iterdir()):
@@ -238,9 +238,13 @@ async def test_the_turn_end_waits_for_a_late_call_names_its_doc_and_sends_nothin
             await _produce(handler, conv_id)
     finally:
         release.set()
-    slug = find_doc_folder(base, "Plan").name
-    assert any(getattr(r, "artifact_slug", None) == slug and "still running" in r.getMessage()
-               for r in caplog.records)
+    slug = find_doc_folder(base, "Secret roadmap").name
+    late = [r for r in caplog.records if "still running" in r.getMessage()]
+    assert any(getattr(r, "artifact_slug", None) == slug for r in late)
+    # A title is the person's text: the warning names the doc by its slug only.
+    for record in late:
+        fields = {k: v for k, v in vars(record).items() if k != "artifact_slug"}
+        assert "Secret roadmap" not in record.getMessage() and "Secret roadmap" not in repr(fields)
     await asyncio.sleep(0.2)
     kinds = [json.loads(e)["kind"] for e in await redis.lrange(answer_queue_key(corr["id"]), 0, -1)]
     assert "host_tool_result" not in kinds
@@ -290,3 +294,16 @@ async def test_a_failing_artifacts_re_read_leaves_the_turn_running_without_doc_t
     assert len(reads) == 2
     assert sent.get("host_tools") is None
     assert any("could not read the artifacts folder" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(("asked", "logged"), [
+    ({"doc": "0f8fad5b-d9cb-469f-a165-70867728950e"}, "0f8fad5b-d9cb-469f-a165-70867728950e"),
+    ({"doc": "0f8fad5bd9cb469fa16570867728950e"}, "0f8fad5bd9cb469fa16570867728950e"),
+    ({"doc": "plan-0f8fad5b"}, "plan-0f8fad5b"),
+    ({"doc": "Board minutes"}, None),
+    ({"title": "Board minutes"}, None),
+    ({"doc": "x" * 300}, None),
+    ({}, None),
+])
+def test_a_late_call_names_its_doc_only_by_an_id_or_slug(asked, logged):
+    assert responses_mod._doc_ref_for_log(asked) == logged

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing
@@ -180,15 +181,34 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _title_text(blocks: list[dict]) -> str:
-    """What the person typed, for a new conversation's title.
-
-    The doc open beside the chat and the Output: Doc choice travel as text
-    blocks ahead of the message; titled from those, the sidebar showed
-    "<doc-view-context>{"artifactId"…" instead of the question.
-    """
+def _typed_text(blocks: list[dict]) -> str:
+    """What the person typed, without the blocks the client puts ahead of it:
+    the doc open beside the chat and the Output: Doc choice. Empty when they
+    typed nothing ("Edit with agent")."""
     own = [b for b in blocks if b.get("type") == "text" and not str(b.get("text", "")).startswith(CONTEXT_PREFIXES)]
-    return prompt_text(own) or prompt_text(blocks)
+    return prompt_text(own)
+
+
+def _title_text(blocks: list[dict]) -> str:
+    """What the person typed, for a new conversation's title; titled from the
+    doc blocks, the sidebar showed "<doc-view-context>{"artifactId"…" instead
+    of the question. With nothing typed, the blocks, rather than an empty row."""
+    return _typed_text(blocks) or prompt_text(blocks)
+
+
+_DOC_REF_FOR_LOG = re.compile(
+    r"[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{8}",
+    re.IGNORECASE,
+)
+
+
+def _doc_ref_for_log(call_input: dict) -> str | None:
+    """The doc a doc tool call names, when it names it by an artifact id or a
+    slug; a title is the person's text and stays out of the logs."""
+    ref = call_input.get("doc")
+    if isinstance(ref, str) and len(ref) <= 100 and _DOC_REF_FOR_LOG.fullmatch(ref.strip()):
+        return ref.strip()
+    return None
 
 
 def _runs_remotely(request: ResponsesRequest) -> bool:
@@ -2447,7 +2467,7 @@ class ResponsesHandler:
                 first_take=first_take,
                 # What the person typed, without the doc blocks ahead of it:
                 # the turn's question and its revision labels read this.
-                question_text=_title_text(harness_input),
+                question_text=_typed_text(harness_input),
                 remote_docs=remote_docs,
             )
         return self._produce(
@@ -2924,7 +2944,7 @@ class ResponsesHandler:
         # per-turn breadcrumb that ties a successful turn to its id in dev.
         corr = lifecycle.identity.correlation_id
         # The input may open with the doc blocks; the question is what was typed.
-        question = question_text or input_text
+        question = question_text if question_text is not None else input_text
         logger.info(
             "[responses] remote turn conversation=%s correlation_id=%s", conv_id, corr,
         )
@@ -2991,12 +3011,11 @@ class ResponsesHandler:
                 # finish() waits once per turn; later passes return [] at once.
                 for call in await doc_tools.runner.finish():
                     # The slug is known only once the write landed; a call still
-                    # waiting for the doc's lock is named by the doc it asked for.
-                    asked = str(call.input.get("doc") or call.input.get("title") or "")[:100]
+                    # waiting for the doc's lock is named by the id or slug it asked for.
                     logger.warning(
                         "[responses] a doc tool call was still running when the turn ended: the pod got no "
                         "answer, and a doc it writes after this keeps no index or card until the self-heal "
-                        "tool=%s call_id=%s doc=%r", call.tool, call.call_id, asked,
+                        "tool=%s call_id=%s doc=%s", call.tool, call.call_id, _doc_ref_for_log(call.input),
                         extra=log_context(request_id=corr, conversation_id=conv_id,
                                           artifact_slug=doc_tools.writes.slug_for(call.call_id)),
                     )

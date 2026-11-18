@@ -90,7 +90,25 @@ def test_the_remote_producer_gets_the_typed_question_apart_from_the_doc_blocks(m
     assert called["remote_docs"] is True
 
 
-async def test_the_revision_label_and_the_turns_question_never_start_with_the_doc_block(monkeypatch, tmp_path):
+def test_with_nothing_typed_the_question_is_empty_not_the_doc_block(monkeypatch):
+    """"Edit with agent" sends the doc block and no text of the person's."""
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    called: dict = {}
+    handler = _handler()
+    handler._produce_remote = lambda **kwargs: called.update(kwargs) or "remote"
+    handler._select_producer(
+        conv_id=uuid4(),
+        harness_input=[{"type": "text", "text": doc_context_block(DOC_CONTEXT)},
+                       {"type": "text", "text": DOC_OUTPUT_NOTE}],
+        original_content="", model="anton", disabled=None, harness_name="anton",
+        harness_id="anton", buffer=object(), remote_docs=True,
+    )
+    assert called["input_text"].startswith(OPEN)
+    assert called["question_text"] == ""
+
+
+@pytest.mark.parametrize("typed", ["Tighten the intro", ""])
+async def test_the_revision_label_and_the_turns_question_never_start_with_the_doc_block(monkeypatch, tmp_path, typed):
     from cowork.harnesses.anton_harness.stream_formatter import TurnContext
     from cowork.services import revision_summaries, task_objects
     from test_responses_remote_backend import _no_workspace_or_memory_units, _RecBuffer, _remote_handler
@@ -131,9 +149,9 @@ async def test_the_revision_label_and_the_turns_question_never_start_with_the_do
 
     monkeypatch.setattr(responses_mod, "stream_remote_replies", pod)
     await handler._produce_remote(
-        conv_id=uuid4(), input_text=f"{doc_context_block(DOC_CONTEXT)} Tighten the intro",
-        question_text="Tighten the intro", original_content="Tighten the intro", model="anton",
+        conv_id=uuid4(), input_text=f"{doc_context_block(DOC_CONTEXT)} {typed}".strip(),
+        question_text=typed, original_content=typed, model="anton",
         harness_id="anton", buffer=_RecBuffer(),
     )
-    assert questions == ["Tighten the intro"]
-    assert requests == ["Tighten the intro"]
+    assert questions == [typed]
+    assert requests == [typed]

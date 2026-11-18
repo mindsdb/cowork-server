@@ -8,17 +8,17 @@ server sees every organization's files.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import stat
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-from anton.core.artifacts import ArtifactStore
 
 from cowork.common.logger import log_context
 from cowork.common.paths import O_NOFOLLOW, O_NONBLOCK, dir_open, opened_subdir_nofollow, read_bounded
@@ -26,7 +26,10 @@ from cowork.common.settings.user_settings import use_settings_scope
 from cowork.db.units import DatabaseBusy, run_efs, unit_session
 from cowork.docs.images import MAX_IMAGE_BYTES
 from cowork.docs.model import DocError
+from cowork.docs.store import doc_lock, doc_subfolder, read_child
 from cowork.docs.tools import TOO_BIG_TEXT, DocToolContext, remote_doc_tool_specs, run_doc_tool
+from cowork.services.artifact_identity import _write_metadata
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_ownership import artifact_root_for_base, record_artifact_owner
 from cowork.services.artifact_permissions import artifact_capabilities
 from cowork.turnqueue.host_tools import MAX_RESULT_BYTES, EmitStep, HostCall, HostToolOutcome, HostToolRunner
@@ -102,6 +105,43 @@ def owner_check(*, scope: TenantScope, project_id: str | None, artifacts_base: P
     return check
 
 
+_MAX_METADATA_BYTES = 1024 * 1024
+
+
+def record_turn_provenance(folder: Path, *, conversation_id: str, turn_index: int, summary: str) -> None:
+    """Append this turn to the doc's ``provenance``, in the shape anton's
+    ArtifactStore.record_turn writes, once per turn: a later call of the same
+    turn leaves the entry as the first one wrote it.
+
+    The pod writes this folder, and this server sees every organization's
+    files, so the folder and its ``metadata.json`` are opened without
+    following links (a link or a second name there is refused, not read),
+    the document is replaced rather than written through, and README.md is
+    not written at all. Under the doc's lock, so a write of the editor's
+    can't land in between. Raises DocError, OSError or ValueError when the
+    metadata can't be read or written.
+    """
+    with doc_lock(folder), doc_subfolder(folder) as pinned:
+        raw = read_child(pinned, "metadata.json", max_bytes=_MAX_METADATA_BYTES)
+        metadata = ArtifactMetadata.parse(raw.decode("utf-8"))
+        document = metadata.to_document()
+        provenance = document.get("provenance")
+        provenance = copy.deepcopy(provenance) if isinstance(provenance, list) else []
+        entry = next((p for p in provenance if isinstance(p, dict) and p.get("conversation") == conversation_id),
+                     None)
+        if entry is None:
+            entry = {"conversation": conversation_id, "title": None, "turns": []}
+            provenance.append(entry)
+        turns = entry.get("turns")
+        if not isinstance(turns, list):
+            turns = entry["turns"] = []
+        if any(isinstance(t, dict) and t.get("index") == turn_index for t in turns):
+            return
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        turns.append({"index": turn_index, "timestamp": now, "summary": summary, "files_touched": []})
+        _write_metadata(pinned, metadata.with_value("provenance", provenance).with_value("updatedAt", now))
+
+
 class RemoteDocWrites:
     """What a remote turn's doc tools wrote, recorded from the worker thread
     right after each write, in this order: the owner of a doc a call created,
@@ -141,14 +181,9 @@ class RemoteDocWrites:
                 logger.warning("could not record the owner of a doc a remote turn created", exc_info=True,
                                extra=log_context(conversation_id=self._conversation_id, artifact_slug=slug))
         try:
-            ArtifactStore(self._artifacts_base).record_turn(
-                slug,
-                conversation_id=self._conversation_id,
-                conversation_title=None,
-                turn_index=self._turn_index,
-                summary="Created doc" if created else "Edited doc",
-                files_touched=[],
-            )
+            record_turn_provenance(self._artifacts_base / slug, conversation_id=self._conversation_id,
+                                   turn_index=self._turn_index,
+                                   summary="Created doc" if created else "Edited doc")
         except Exception:
             logger.warning("could not record a remote turn's provenance on a doc", exc_info=True,
                            extra=log_context(conversation_id=self._conversation_id, artifact_slug=slug))

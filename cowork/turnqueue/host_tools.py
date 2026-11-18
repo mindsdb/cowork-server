@@ -84,6 +84,8 @@ def _line(payload: dict[str, Any]) -> str:
 
 
 def progress_entry(call_id: str, n: int, text: str) -> str:
+    # A step label quotes a doc's title: a lone surrogate there would fail the whole push in Redis.
+    text = text.encode("utf-8", "replace").decode("utf-8")
     if len(text) > MAX_PROGRESS_CHARS:
         text = text[: MAX_PROGRESS_CHARS - 1] + "…"
     return _line({"kind": "host_tool_progress", "call_id": call_id, "entry_id": f"{call_id}:{n}", "text": text})
@@ -246,6 +248,6 @@ class HostToolRunner:
                     pipe.rpush(key, entry)
                 pipe.expire(key, ANSWER_TTL_S)
                 await pipe.execute()
-        except RedisError:
-            logger.warning("host tool answer not queued: Redis failed correlation_id=%s call_id=%s",
+        except (RedisError, UnicodeEncodeError, ValueError):
+            logger.warning("host tool answer not queued correlation_id=%s call_id=%s",
                            self._corr, call.call_id, exc_info=True)

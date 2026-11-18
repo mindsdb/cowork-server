@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import fakeredis.aioredis
 import pytest
+from anton.core.artifacts import ArtifactStore
 
 from cowork.api.v1.endpoints import docs as docs_api
 from cowork.common.settings.app_settings import get_app_settings
@@ -228,3 +229,103 @@ async def test_an_agent_edit_reaches_the_editor_on_the_folder_the_docs_api_resol
         assert event["type"] == "doc.updated" and event["by"] == "agent" and event["rev"] == 2
     finally:
         get_app_settings.cache_clear()
+
+
+def _turns_of(folder, conversation_id) -> list[dict]:
+    meta = json.loads((folder / "metadata.json").read_text())
+    (entry,) = [p for p in meta["provenance"] if p["conversation"] == str(conversation_id)]
+    return entry["turns"]
+
+
+async def test_provenance_is_never_written_through_links_the_pod_plants(tmp_path, monkeypatch):
+    """The pod writes the doc's folder: a README.md or metadata.tmp it swaps
+    for a link to a file outside (another org's, on the shared mount) must not
+    be written through when the server records the turn's provenance."""
+    alice = str(uuid4())
+    project = make_project(tmp_path, str(uuid4()))
+    conversation_id = make_conversation(project, alice)
+    source = project_root(project)
+    scope = _member(project, alice)
+    outside = tmp_path / "other-org"
+    outside.mkdir()
+    victims = {name: outside / f"victim-{name}" for name in ("README.md", "metadata.tmp")}
+    for victim in victims.values():
+        victim.write_text("VICTIM ORIGINAL")
+    real_create = doc_tools.create_doc
+
+    def create_then_plant(*args, **kwargs):
+        made = real_create(*args, **kwargs)
+        for name, victim in victims.items():
+            (made.folder / name).unlink(missing_ok=True)
+            (made.folder / name).symlink_to(victim)
+        return made
+
+    monkeypatch.setattr(doc_tools, "create_doc", create_then_plant)
+    tools = _tools(project, scope, conversation_id, alice, fakeredis.aioredis.FakeRedis(decode_responses=True))
+    made = await run_doc_tool(tools.context, "create_doc", {"title": "Plan", "markdown": "Lead."}, _emit,
+                              on_written=partial(tools.writes.written, CALL))
+    assert made.ok
+    folder = source.base / made.touched_slug
+    edited = await run_doc_tool(tools.context, "edit_doc", {
+        "doc": "Plan", "ops": [{"op": "edit_text", "find": "Lead", "replace": "Led"}]}, _emit,
+        on_written=partial(tools.writes.written, "htool:" + "ef" * 16))
+    assert edited.ok
+
+    for victim in victims.values():
+        assert victim.read_text() == "VICTIM ORIGINAL"
+    assert not (folder / "metadata.json").is_symlink()
+    assert ownership.provenance_origin(folder) == conversation_id
+    assert _turns_of(folder, conversation_id)[0]["index"] == 1
+
+
+@pytest.mark.parametrize("planted", ["symlink", "hardlink"])
+async def test_a_metadata_link_the_pod_plants_is_not_read_into_its_folder(tmp_path, planted):
+    alice = str(uuid4())
+    project = make_project(tmp_path, str(uuid4()))
+    conversation_id = make_conversation(project, alice)
+    source = project_root(project)
+    scope = _member(project, alice)
+    made = create_doc(source.base, title="Plan", markdown="Lead.", by="user")
+    other_base = tmp_path / "other" / ".anton" / "artifacts"
+    other_base.mkdir(parents=True)
+    victim = create_doc(other_base, title="Victim secret plan", markdown="Private.", by="user")
+    victim_meta = victim.folder / "metadata.json"
+    victim_before = victim_meta.read_bytes()
+    (made.folder / "metadata.json").unlink()
+    if planted == "symlink":
+        (made.folder / "metadata.json").symlink_to(victim_meta)
+    else:
+        (made.folder / "metadata.json").hardlink_to(victim_meta)
+    tools = _tools(project, scope, conversation_id, alice, fakeredis.aioredis.FakeRedis(decode_responses=True))
+
+    tools.writes.written(CALL, made.slug, "edit_doc")
+
+    assert victim_meta.read_bytes() == victim_before
+    assert tools.writes.slug_for(CALL) == made.slug
+    for child in made.folder.iterdir():
+        if child.name == "metadata.json" or child.is_symlink() or not child.is_file():
+            continue
+        assert b"Victim secret plan" not in child.read_bytes()
+    assert ownership.provenance_origin(made.folder) != conversation_id
+
+
+async def test_two_edits_in_one_turn_leave_one_turn_entry(tmp_path):
+    alice = str(uuid4())
+    project = make_project(tmp_path, str(uuid4()))
+    conversation_id = make_conversation(project, alice)
+    source = project_root(project)
+    scope = _member(project, alice)
+    tools = _tools(project, scope, conversation_id, alice, fakeredis.aioredis.FakeRedis(decode_responses=True))
+    made = await run_doc_tool(tools.context, "create_doc", {"title": "Plan", "markdown": "Lead."}, _emit,
+                              on_written=partial(tools.writes.written, CALL))
+    for find, replace in (("Lead", "Led"), ("Led", "Lid")):
+        edited = await run_doc_tool(tools.context, "edit_doc", {
+            "doc": "Plan", "ops": [{"op": "edit_text", "find": find, "replace": replace}]}, _emit,
+            on_written=partial(tools.writes.written, CALL))
+        assert edited.ok
+    turns = _turns_of(source.base / made.touched_slug, conversation_id)
+    assert [t["index"] for t in turns] == [1]
+    assert turns[0]["summary"] == "Created doc"
+    # anton's own model still loads what the server wrote.
+    (entry,) = ArtifactStore(source.base).read_metadata(made.touched_slug).provenance
+    assert entry.conversation == str(conversation_id) and len(entry.turns) == 1

@@ -192,6 +192,29 @@ async def test_an_answer_that_cannot_be_encoded_is_refused_and_logged(redis, cap
     assert not any("broken" in record.getMessage() for record in caplog.records)
 
 
+async def test_a_step_with_a_lone_surrogate_is_sent_with_it_replaced(redis):
+    async def execute(call, emit):
+        await emit("Reading \ud800 doc")
+        return HostToolOutcome("rev 3")
+
+    runner = _runner(redis, execute)
+    runner.start(STEP)
+    await _settle(runner)
+    progress, result = await _queued(redis)
+    assert progress["kind"] == "host_tool_progress" and progress["text"].startswith("Reading ")
+    assert "\ud800" not in progress["text"]
+    assert result["ok"] is True and result["text"] == "rev 3"
+
+
+async def test_an_entry_redis_cannot_encode_is_dropped_and_logged_by_call_id(redis, caplog):
+    runner = _runner(redis, None)
+    call = HostCall(call_id=CALL, tool="read_doc", input={})
+    with caplog.at_level(logging.WARNING, logger=host_tools.logger.name):
+        await runner._push(redis, call, ["broken \ud800 entry"])
+    assert any(CALL in record.getMessage() for record in caplog.records)
+    assert not any("broken" in record.getMessage() for record in caplog.records)
+
+
 def test_a_step_is_cut_to_500_characters():
     entry = json.loads(progress_entry(CALL, 3, "x" * 900))
     assert entry["entry_id"] == f"{CALL}:3" and len(entry["text"]) == 500
