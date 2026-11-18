@@ -1147,3 +1147,39 @@ def test_a_steady_stream_of_silent_nudges_does_not_starve_the_mtime_poll(monkeyp
 
     name, f = asyncio.run(scenario())
     assert name == "doc.updated" and f["rev"] == 3 and "clientId" not in f
+
+
+def test_a_queued_nudge_past_the_poll_deadline_keeps_its_client_id(monkeypatch, tmp_path):
+    """A slow consumer leaves the generator past the poll deadline with a nudge
+    queued: the nudge is answered first, with its clientId, not by the poll."""
+    import asyncio
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import DocHub, doc_topic
+    from cowork.docs.service import apply, create_doc
+
+    monkeypatch.setattr(docs, "_POLL_S", 0.3)
+    monkeypatch.setattr(docs, "hub", DocHub())
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    topic = doc_topic(made.folder)
+    lead = made.doc["tabs"][0]["blocks"][0]["id"]
+
+    async def scenario():
+        stream = docs._sse(_Open(), topic, initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+        await anext(stream)  # doc.ready
+        doc, _ = apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "A."}}], by="agent")
+        docs.hub.deliver_remote({"type": "doc.updated", "rev": doc["rev"], "clientId": "tab-1",
+                                 "origin": "other", "topic": topic})
+        first = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+        doc, _ = apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "B."}}], by="agent")
+        docs.hub.deliver_remote({"type": "doc.updated", "rev": doc["rev"], "clientId": "tab-2",
+                                 "origin": "other", "topic": topic})
+        await asyncio.sleep(0.5)
+        second = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+        await stream.aclose()
+        return first, second
+
+    (_n1, f1), (n2, f2) = asyncio.run(scenario())
+    assert f1.get("clientId") == "tab-1"
+    assert n2 == "doc.updated" and f2["rev"] == 3 and f2.get("clientId") == "tab-2"

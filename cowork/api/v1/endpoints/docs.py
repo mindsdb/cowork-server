@@ -542,13 +542,37 @@ def _sse(
             while True:
                 if await request.is_disconnected():
                     return
+                # A queued event is always taken before the poll: the poll sends no
+                # clientId, so it must not answer a write whose nudge is waiting.
+                event = None
+                if not queue.empty():
+                    event = queue.get_nowait()
+                else:
+                    # wait_for with no time left raises even when an event just arrived.
+                    left = last_poll + _POLL_S - clock()
+                    if left > 0:
+                        try:
+                            event = await asyncio.wait_for(queue.get(), timeout=left)
+                        except asyncio.TimeoutError:
+                            pass
+                if event is not None:
+                    if event.get("type") == NUDGE:
+                        if initial is not None:
+                            frame, last_rev, last_mtime, pending_rev = await _nudged(
+                                initial, event, last_rev=last_rev, last_mtime=last_mtime,
+                                pending_rev=pending_rev, scope=scope)
+                            if frame is not None:
+                                idle = 0.0
+                                yield frame
+                    else:
+                        idle = 0.0
+                        if initial is not None:
+                            last_rev = max(last_rev, int(event.get("rev") or 0))
+                            last_mtime = await poll_mtime(last_mtime)
+                        yield _frame(event.get("type", "message"), event)
                 # The poll and the keepalive run by elapsed time, so a steady stream
                 # of events that send nothing cannot starve them.
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=max(0.0, last_poll + _POLL_S - clock()))
-                except asyncio.TimeoutError:
-                    event = None
-                if event is None or clock() - last_poll >= _POLL_S:
+                if clock() - last_poll >= _POLL_S and queue.empty():
                     last_poll = clock()
                     idle += _POLL_S
                     if initial is not None:
@@ -559,23 +583,6 @@ def _sse(
                     if idle >= _KEEPALIVE_S:
                         idle = 0.0
                         yield ": keepalive\n\n"
-                    if event is None:
-                        continue
-                if event.get("type") == NUDGE:
-                    if initial is None:
-                        continue
-                    frame, last_rev, last_mtime, pending_rev = await _nudged(
-                        initial, event, last_rev=last_rev, last_mtime=last_mtime, pending_rev=pending_rev,
-                        scope=scope)
-                    if frame is not None:
-                        idle = 0.0
-                        yield frame
-                    continue
-                idle = 0.0
-                if initial is not None:
-                    last_rev = max(last_rev, int(event.get("rev") or 0))
-                    last_mtime = await poll_mtime(last_mtime)
-                yield _frame(event.get("type", "message"), event)
         finally:
             hub.unsubscribe(topic, queue)
 
