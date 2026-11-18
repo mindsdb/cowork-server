@@ -43,6 +43,7 @@ from cowork.services.artifact_journal import (
     write_journal_file,
 )
 from cowork.services.artifact_lock import artifact_lock
+from cowork.services.comment_images import comment_image_ids
 from cowork.services.artifact_revision_records import (
     AgentRepair,
     JournalRecord,
@@ -1327,6 +1328,15 @@ def create_agent_repair(
             + "\n"
         )
     anchor = _anchor_line(selector, source.path, source.content)
+    # The app attaches a thread's images to the message that carries this
+    # prompt, in the order the thread names them (services/comment_images.py).
+    image_ids = comment_image_ids("\n".join(str(entry.get("text") or "") for entry in thread))
+    images_block = (
+        f"Images: the thread's {len(image_ids)} `cowork-image:` reference(s) are the images "
+        "attached to this message, in the order the thread names them. Look at them before editing.\n"
+        if image_ids
+        else ""
+    )
     # The same route as an edit asked for in chat: one `edit_artifact` call
     # (anton's diff-based artifact editor), which reads, edits, checks and
     # repairs the page itself, so the turn needs no list_artifacts round, no
@@ -1349,6 +1359,7 @@ def create_agent_repair(
         f"Selected element: {selector or 'General artifact feedback'}\n"
         f"Anchor: {anchor}\n"
         f"{preview_block}"
+        f"{images_block}"
         "Complete comment thread:\n"
         f"{json.dumps(thread, ensure_ascii=False, indent=2)}\n\n"
         "Make the smallest coherent fix and preserve unrelated behavior and styling. "

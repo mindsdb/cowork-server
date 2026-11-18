@@ -1418,6 +1418,31 @@ def test_agent_repair_prompt_says_how_to_find_the_artifact(artifact):
     assert ":" not in hint.split(" ", 1)[0]
 
 
+def test_agent_repair_prompt_points_the_agent_at_the_thread_s_images(artifact):
+    """ENG-4410: the app attaches a thread's images to the repair message."""
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    image = "0" * 32 + ".png"
+
+    def prompt(thread):
+        return create_agent_repair(
+            folder, metadata, artifact_id,
+            expected_revision_id=initial["revision"]["id"],
+            comment_thread_id="thread-1", selector=None, thread=thread,
+            conversation_id="conversation-1",
+        )
+
+    with_images = prompt([{"text": f"Like this\n\n![shot.png](cowork-image:{image})"}])
+    cancel_agent_repair(folder, with_images["repair"]["id"])
+    without = prompt([{"text": "Fix the title"}])["prompt"]
+
+    lines = with_images["prompt"].splitlines()
+    images = next(line for line in lines if line.startswith("Images: "))
+    assert "1 `cowork-image:` reference(s)" in images
+    assert lines.index(images) < lines.index("Complete comment thread:")
+    assert "Images: " not in without
+
+
 def _repair_prompt(folder, metadata, artifact_id, *, selector):
     initial = current_source(folder, metadata, artifact_id)
     return create_agent_repair(

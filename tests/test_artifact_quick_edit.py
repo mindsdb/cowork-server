@@ -10,6 +10,7 @@ are the real ones, on a real artifact folder.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -1380,3 +1381,112 @@ def test_a_jev_402_is_logged_with_mindshub_s_reason_and_goes_to_the_agent(client
     assert events[1][1]["status"] == "agent"
     assert asked and asked[0]["state"]["artifact"]["outline"].startswith("h1 Sales")
     assert "HTTP 402 (wallet_empty: no free decision allowance left)" in caplog.text
+
+
+# ── images pasted into the bar (ENG-4410) ─────────────────────────────────
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+PNG_B64 = base64.b64encode(PNG).decode()
+
+
+def test_the_bar_s_images_reach_the_editor_s_model_with_the_request(client, fake_anton, artifact):
+    _folder, _metadata, artifact_id = artifact
+
+    async def edit(folder, checker, on_progress):
+        return QuickEditResult("noop", [], "Nothing to change.")
+
+    fake_anton.edit = edit
+    response = post(client, artifact_id, images=[{"name": "shot.png", "data": PNG_B64}])
+
+    assert response.status_code == 200, response.text
+    llm = fake_anton.edit_calls[0]["llm"]
+    assert isinstance(llm, quick_edit_service.RequestImagesLLM)
+    assert llm._llm == "the-llm"
+    assert llm._images == [(PNG_B64, "image/png")]
+    # The router reads the text alone.
+    assert fake_anton.route_calls[0]["message"] == "Make the title blue"
+
+
+def test_without_images_the_editor_gets_the_llm_itself(client, fake_anton, artifact):
+    _folder, _metadata, artifact_id = artifact
+
+    async def edit(folder, checker, on_progress):
+        return QuickEditResult("noop", [], "Nothing to change.")
+
+    fake_anton.edit = edit
+    post(client, artifact_id)
+
+    assert fake_anton.edit_calls[0]["llm"] == "the-llm"
+
+
+@pytest.mark.parametrize("images", [
+    [{"data": base64.b64encode(b"<svg onload=alert(1)>").decode()}],
+    [{"data": "not base64!"}],
+    [{"data": PNG_B64}] * 5,
+])
+def test_an_image_the_editor_would_not_take_is_422_before_anything_runs(client, fake_anton, artifact, images):
+    _folder, _metadata, artifact_id = artifact
+
+    response = post(client, artifact_id, images=images)
+
+    assert response.status_code == 422
+    assert fake_anton.route_calls == [] and fake_anton.edit_calls == []
+    assert not quick_edit_service.quick_edit_locks._held
+
+
+class _StreamingLLM:
+    """Records the messages of each streamed call; refuses images when asked."""
+
+    planning_model = "m"
+
+    def __init__(self, refuse_images=False):
+        self.calls = []
+        self.refuse_images = refuse_images
+
+    async def plan_stream(self, *, system, messages, tools=None, max_tokens=None):
+        self.calls.append(messages)
+        if self.refuse_images and any(
+            isinstance(b, dict) and b.get("type") == "image"
+            for m in messages if isinstance(m.get("content"), list) for b in m["content"]
+        ):
+            from anton.core.llm.provider import ContentValidationError
+
+            raise ContentValidationError("this model takes no images")
+        yield "event"
+
+
+async def _drain(stream):
+    return [event async for event in stream]
+
+
+async def test_the_images_follow_the_request_in_a_copy_of_its_message():
+    inner = _StreamingLLM()
+    llm = quick_edit_service.with_request_images(inner, request="Make the title blue", images=[(PNG_B64, "image/png")])
+    messages = [
+        {"role": "user", "content": "intro"},
+        {"role": "user", "content": [{"type": "tool_result", "content": "x"},
+                                     {"type": "text", "text": "Request:\nMake the title blue"}]},
+    ]
+
+    assert await _drain(llm.plan_stream(system="s", messages=messages, max_tokens=10)) == ["event"]
+
+    sent = inner.calls[0]
+    assert sent[0] == messages[0]
+    assert [b["type"] for b in sent[1]["content"]] == ["tool_result", "text", "image"]
+    assert sent[1]["content"][2]["source"] == {"type": "base64", "media_type": "image/png", "data": PNG_B64}
+    # The editor's own conversation is left as it was.
+    assert [b["type"] for b in messages[1]["content"]] == ["tool_result", "text"]
+    # Everything else is the wrapped client's.
+    assert llm.planning_model == "m"
+
+
+async def test_a_model_that_takes_no_images_edits_on_the_text_alone():
+    inner = _StreamingLLM(refuse_images=True)
+    llm = quick_edit_service.with_request_images(inner, request="Do it", images=[(PNG_B64, "image/png")])
+    messages = [{"role": "user", "content": "Do it"}]
+
+    assert await _drain(llm.plan_stream(system="s", messages=messages)) == ["event"]
+    assert await _drain(llm.plan_stream(system="s", messages=messages)) == ["event"]
+
+    assert len(inner.calls) == 3
+    assert inner.calls[1] == messages and inner.calls[2] == messages
