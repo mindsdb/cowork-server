@@ -24,7 +24,7 @@ from cowork.schemas.connectors import (
 from cowork.services.connectors import app_held
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
-from cowork.services.connectors.custom_mcp import is_custom_mcp
+from cowork.services.connectors.custom_mcp import is_connection_id, is_custom_mcp
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
     DeveloperProviderUnavailable,
@@ -280,6 +280,10 @@ async def delete_connection(engine: str, name: str, scope: ScopeDep, request: Re
         # credential proxy as the other OAuth Connector Lifecycle endpoints.
         await auth_proxy.proxy_delete(engine, name, request, OAuthSettings())
         return
+    if is_custom_mcp(engine) and is_connection_id(name):
+        # Deleting it drops its held settings, after which the app removes its
+        # keychain entries; only the app, which revokes the token first, may.
+        require_app_secret(request)
     _refuse_unchangeable(scope, engine, name)
     try:
         # revoke() makes a blocking provider HTTP call (up to its own 10s

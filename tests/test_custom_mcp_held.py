@@ -12,7 +12,8 @@ import hmac
 import json
 
 import pytest
-from anton.core.datasources.data_vault import LocalDataVault
+from anton.core.datasources.data_vault import LocalDataVault, withheld_fields
+from anton.utils.datasources import clear_ds_env, restore_namespaced_env, scrub_credentials
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
@@ -96,6 +97,7 @@ EXPECTED_RECORD_FIELDS = {
     "_label": "Acme Tracker",
     "_access_mode": "write",
 }
+HELD_FIELDS = {**EXPECTED_RECORD_FIELDS, "access_token": "AT-held", "expires_at": "2030-01-01T00:00:00Z"}
 
 
 class TestTurnsReadOnlyHeldSettings:
@@ -103,19 +105,22 @@ class TestTurnsReadOnlyHeldSettings:
         _write_file(AGENT_WRITTEN)
         _hold()
         vault = _turn_vault()
-        assert vault.read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == EXPECTED_RECORD_FIELDS
-        assert vault.load(CUSTOM_MCP_ENGINE, CONN) == {
-            **EXPECTED_RECORD_FIELDS,
-            "access_token": "AT-held",
-            "expires_at": "2030-01-01T00:00:00Z",
-        }
+        assert vault.read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == HELD_FIELDS
+        assert vault.load(CUSTOM_MCP_ENGINE, CONN) == HELD_FIELDS
 
-    def test_the_record_carries_no_token_and_only_underscore_keys(self, protected):
+    def test_a_tool_result_that_echoes_the_held_token_is_scrubbed(self, protected):
         _write_file(AGENT_WRITTEN)
         _hold()
-        fields = _turn_vault().read_record(CUSTOM_MCP_ENGINE, CONN)["fields"]
-        assert "access_token" not in fields
-        assert all(key.startswith("_") for key in fields)
+        vault = _turn_vault()
+        try:
+            restore_namespaced_env(vault)
+            scrubbed = scrub_credentials("401 from the server: invalid bearer AT-held")
+        finally:
+            clear_ds_env()
+        assert "AT-held" not in scrubbed
+        # Withheld from the environment and the agent's listing all the same.
+        assert withheld_fields(vault.read_record(CUSTOM_MCP_ENGINE, CONN)) == ["access_token"]
+        assert "AT-held" not in (vault.env_for(CUSTOM_MCP_ENGINE, CONN) or {}).values()
 
     def test_with_nothing_held_the_connection_carries_its_method_only(self, protected):
         _write_file(AGENT_WRITTEN)
@@ -138,7 +143,7 @@ class TestTurnsReadOnlyHeldSettings:
         _hold()
         for path, content in saved.items():
             path.write_bytes(content)
-        assert _turn_vault().read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == EXPECTED_RECORD_FIELDS
+        assert _turn_vault().read_record(CUSTOM_MCP_ENGINE, CONN)["fields"] == HELD_FIELDS
 
     def test_deleting_through_the_turn_vault_drops_the_held_entry(self, protected):
         _write_file({"_method": "mcp"})
@@ -148,10 +153,18 @@ class TestTurnsReadOnlyHeldSettings:
         _write_file(AGENT_WRITTEN)
         assert _turn_vault().load(CUSTOM_MCP_ENGINE, CONN) == {"_method": "mcp"}
 
-    def test_the_generic_delete_route_drops_the_held_entry(self, protected):
+    def test_the_generic_delete_route_needs_the_app_secret(self, protected):
         _write_file({"_method": "mcp"})
         _hold()
         response = _client().delete(f"{BASE}/{CUSTOM_MCP_ENGINE}/{CONN}")
+        assert response.status_code == 403
+        assert app_held.held_custom(own_vault_root(LOCAL_SCOPE), CONN) == HELD
+        assert own_vault_for_scope(LOCAL_SCOPE).read_record(CUSTOM_MCP_ENGINE, CONN) is not None
+
+    def test_the_generic_delete_route_drops_the_held_entry(self, protected):
+        _write_file({"_method": "mcp"})
+        _hold()
+        response = _client().delete(f"{BASE}/{CUSTOM_MCP_ENGINE}/{CONN}", headers=HEADERS)
         assert response.status_code in (200, 204)
         assert app_held.held_custom(own_vault_root(LOCAL_SCOPE), CONN) == {}
         _write_file(AGENT_WRITTEN)

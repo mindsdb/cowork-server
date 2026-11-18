@@ -179,7 +179,8 @@ async def list_tools(name: str, scope: ScopeDep) -> dict[str, list[dict[str, Any
         # error's type is logged, since its text can carry the server's URL.
         _log.warning("listing tools of a custom MCP connection failed: %s", type(exc).__name__)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail={"error": "unreachable"}) from exc
-    allowed = set(entry.get("allowed_tools") or [])
+    # Read again after the listing: a switch made while it ran must show as made.
+    allowed = set(app_held.held_custom(own_vault_root(scope), name).get("allowed_tools") or [])
     return {
         "tools": [
             {"name": tool.name, "description": tool.description, "read_only": tool.read_only, "allowed": tool.name in allowed}

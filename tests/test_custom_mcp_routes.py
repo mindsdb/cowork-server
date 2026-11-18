@@ -12,6 +12,7 @@ import json
 import pytest
 from anton.core.mcp import wiring as anton_wiring
 from anton.core.mcp.errors import McpEgressBlocked, McpHostUnresolved, McpTokenRejected
+from anton.utils.datasources import clear_ds_env, restore_namespaced_env, scrub_credentials
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -193,6 +194,17 @@ class TestHeldAndTools:
         assert response.status_code == 200
         assert _turn_fields()["access_token"] == "AT-2"
 
+    def test_a_created_connection_s_token_is_scrubbed_from_tool_output(self, protected):
+        _create()
+        source = turn_vault_for_scope(LOCAL_SCOPE)
+        vault = app_held.turn_vault(source, source_vault=source, root=own_vault_root(LOCAL_SCOPE))
+        try:
+            restore_namespaced_env(vault)
+            scrubbed = scrub_credentials("the server said: bad token AT-1")
+        finally:
+            clear_ds_env()
+        assert "AT-1" not in scrubbed
+
     def test_a_new_server_url_drops_the_token(self, protected):
         _create()
         _client().put(f"{ROUTES}/{CONN}/held", json={"server_url": "https://other.example.com/mcp"}, headers=HEADERS)
@@ -289,6 +301,21 @@ class TestHeldAndTools:
             ]
         }
         assert calls == [("https://mcp.example.com/mcp", "AT-1", CONN)]
+
+    def test_a_switch_made_while_the_tools_are_listed_shows_as_made(self, protected, monkeypatch):
+        _create(allowed_tools=["create_issue"])
+
+        async def slow_list(url, token, *, connection_name):
+            response = _client().put(f"{ROUTES}/{CONN}/allowed-tools", json={"tools": ["search_issues"]}, headers=HEADERS)
+            assert response.status_code == 200
+            return [
+                anton_wiring.ServerTool(name="search_issues", description="Search", read_only=True),
+                anton_wiring.ServerTool(name="create_issue", description="Create", read_only=False),
+            ]
+
+        monkeypatch.setattr(anton_wiring, "list_custom_server_tools", slow_list)
+        tools = _client().get(f"{ROUTES}/{CONN}/tools", headers=HEADERS).json()["tools"]
+        assert {tool["name"]: tool["allowed"] for tool in tools} == {"search_issues": True, "create_issue": False}
 
     @pytest.mark.parametrize(
         ("error", "status_code", "code"),

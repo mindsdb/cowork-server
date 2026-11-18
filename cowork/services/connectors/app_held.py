@@ -138,12 +138,13 @@ def overlay(root: Path, engine: str, name: str, fields: dict, keys: tuple[str, .
 class AppHeldVault(FilteredDataVault):
     """A vault whose MCP connections read their app-held values.
 
-    ``load`` carries the token, its expiry and the access mode (anton's MCP
-    wiring reads the token from it); ``read_record`` carries only the access
-    mode (the wiring reads the mode from it), so the agent's connection listing,
-    which reads records, never names a DS_* token variable its environment
-    doesn't have. ``env_for``/``inject_env`` read the file alone: the token
-    must never reach a Scratchpad's environment.
+    ``load`` and ``read_record`` carry the token, its expiry and the access
+    mode. The record marks the token secret, so anton adds it to the turn's
+    scrub map: a server that echoes its token in a tool result or an error
+    gets it redacted. anton withholds an MCP connection's secrets from the
+    environment and from the agent's connection listing.
+    ``env_for``/``inject_env`` read the file alone: the token must never reach
+    a Scratchpad's environment.
 
     The access mode is the held one, else "read", never the file's: agent code
     can write the file, or delete the connection and save it again, while only
@@ -170,7 +171,7 @@ class AppHeldVault(FilteredDataVault):
             return fields
         return {**fields, "_access_mode": held(self._root, engine, name).get("access_mode") or "read"}
 
-    def _custom_fields(self, name: str, *, with_token: bool) -> dict[str, str]:
+    def _custom_fields(self, name: str) -> dict[str, str]:
         """A custom connection's fields, from the held entry only."""
         fields = {"_method": MCP_METHOD}
         if not active() or not self._is_own(CUSTOM_MCP_ENGINE, name):
@@ -188,36 +189,45 @@ class AppHeldVault(FilteredDataVault):
                 "_access_mode": "write",
             }
         )
-        if with_token and entry.get("access_token"):
+        if entry.get("access_token"):
             fields["access_token"] = entry["access_token"]
             if entry.get("expires_at"):
                 fields["expires_at"] = entry["expires_at"]
         return fields
 
-    def _custom_or_labels(self, name: str, source_fields: dict, *, with_token: bool) -> dict[str, str]:
+    def _custom_or_labels(self, name: str, source_fields: dict) -> dict[str, str]:
         """The held fields of a custom connection, or the source's label fields
         when the source turned it off: a connecting view lists a turned-off
         connection by its labels alone, and memory must not refill it. The
         file's own fields never decide which."""
         if self.hides(CUSTOM_MCP_ENGINE, name):
             return {key: value for key, value in source_fields.items() if key in LABEL_FIELDS}
-        return self._custom_fields(name, with_token=with_token)
+        return self._custom_fields(name)
+
+    def _held_fields(self, engine: str, name: str, fields: dict) -> dict:
+        """The fields a turn reads: the held ones for a custom connection, the
+        file's with the held token and mode laid over for any other."""
+        if is_custom_mcp(engine):
+            return self._custom_or_labels(name, fields)
+        return self._held_mode(engine, name, overlay(self._root, engine, name, fields))
 
     def load(self, engine: str, name: str) -> dict[str, str] | None:
         fields = super().load(engine, name)
         if fields is None:
             return None
-        if is_custom_mcp(engine):
-            return self._custom_or_labels(name, fields, with_token=True)
-        return self._held_mode(engine, name, overlay(self._root, engine, name, fields))
+        return self._held_fields(engine, name, fields)
 
     def read_record(self, engine: str, name: str) -> dict[str, Any] | None:
         record = super().read_record(engine, name)
         if record is None:
             return None
-        if is_custom_mcp(engine):
-            return {**record, "fields": self._custom_or_labels(name, record.get("fields") or {}, with_token=False)}
-        return {**record, "fields": self._held_mode(engine, name, record.get("fields") or {})}
+        fields = self._held_fields(engine, name, record.get("fields") or {})
+        secure_keys = record.get("secure_keys")
+        # An explicit list is authoritative to anton; a held token it doesn't
+        # name would be neither scrubbed nor withheld.
+        if "access_token" in fields and isinstance(secure_keys, list) and "access_token" not in secure_keys:
+            secure_keys = [*secure_keys, "access_token"]
+        return {**record, "fields": fields, "secure_keys": secure_keys}
 
     def for_connecting(self) -> AppHeldVault:
         """The connecting view anton's connect_new_datasource matches against,
