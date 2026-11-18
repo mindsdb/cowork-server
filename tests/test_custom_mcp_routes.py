@@ -136,7 +136,9 @@ class TestCreate:
     def test_creates_a_record_with_nothing_of_use_in_the_file(self, protected):
         _create(server_url="https://MCP.example.com/mcp")
         record = own_vault_for_scope(LOCAL_SCOPE).read_record(CUSTOM_MCP_ENGINE, CONN)
-        assert record["fields"] == {"_method": "mcp"}
+        # Bookkeeping only: nothing that says where a token goes or what runs.
+        assert set(record["fields"]) <= {"_method", "_connector_id", "_created_by"}
+        assert record["fields"]["_method"] == "mcp"
         assert _held()["server_url"] == "https://mcp.example.com/mcp"
         assert _held()["allowed_tools"] == []
         assert _turn_fields()["access_token"] == "AT-1"
@@ -199,8 +201,35 @@ class TestHeldAndTools:
             "server_url": "https://mcp.example.com/mcp",
         }
 
+    def test_create_starts_from_an_empty_held_entry(self, protected):
+        app_held.hold_custom(own_vault_root(LOCAL_SCOPE), CONN, {"access_token": "AT-old", "client_id": "old-client"})
+        _create(access_token=None, client_id=None)
+        assert "access_token" not in _held()
+        assert "client_id" not in _held()
+
+    def test_a_missing_connection_drops_what_is_still_held(self, protected):
+        app_held.hold_custom(own_vault_root(LOCAL_SCOPE), OTHER, {"access_token": "AT-leftover"})
+        response = _client().get(f"{ROUTES}/{OTHER}/held-summary", headers=HEADERS)
+        assert response.status_code == 404
+        assert app_held.held_custom(own_vault_root(LOCAL_SCOPE), OTHER) == {}
+
+    def test_the_list_and_detail_show_the_held_label_not_the_file(self, protected):
+        _create()
+        # The label tool writes the file through the turn vault, as agent code can.
+        own_vault_for_scope(LOCAL_SCOPE).save(
+            CUSTOM_MCP_ENGINE,
+            CONN,
+            {"_method": "mcp", "_user_label": "GitHub (official)", "_label": "GitHub", "_server_url": "https://attacker.example/"},
+        )
+        listing = _client().get("/api/v1/connectors/connections/").json()
+        [card] = [entry for entry in listing if entry["engine"] == CUSTOM_MCP_ENGINE]
+        assert card["user_label"] == "Acme Tracker"
+        detail = _client().get(f"/api/v1/connectors/connections/{CUSTOM_MCP_ENGINE}/{CONN}").json()
+        assert detail["user_label"] == "Acme Tracker"
+        assert detail["fields"] == {}
+
     def test_lists_tools_with_the_held_url_and_token(self, protected, monkeypatch):
-        _create(allowed_tools=["search_issues"])
+        _create(allowed_tools=["create_issue"])
         calls = []
 
         async def fake_list(url, token, *, connection_name):
@@ -215,8 +244,8 @@ class TestHeldAndTools:
         assert response.status_code == 200
         assert response.json() == {
             "tools": [
-                {"name": "search_issues", "description": "Search", "read_only": True, "allowed": True},
-                {"name": "create_issue", "description": "Create", "read_only": False, "allowed": False},
+                {"name": "search_issues", "description": "Search", "read_only": True, "allowed": False},
+                {"name": "create_issue", "description": "Create", "read_only": False, "allowed": True},
             ]
         }
         assert calls == [("https://mcp.example.com/mcp", "AT-1", CONN)]

@@ -23,7 +23,12 @@ from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.custom_mcp import AllowedToolsRequest, CheckUrlRequest, CreateCustomMcpRequest, CustomMcpSettings
 from cowork.services.connectors import app_held
 from cowork.services.connectors.custom_mcp import CUSTOM_MCP_ENGINE, is_connection_id
-from cowork.services.connectors.persist import own_vault_for_scope, own_vault_root
+from cowork.services.connectors.persist import (
+    ConnectionExistsError,
+    own_vault_for_scope,
+    own_vault_root,
+    persist_connection,
+)
 
 _log = logging.getLogger("cowork.connectors.custom_mcp")
 
@@ -54,15 +59,23 @@ def canonical_server_url(url: str) -> str:
 
 
 def _record_exists(scope: TenantScope, name: str) -> bool:
+    """Whether the scope's own vault holds a custom MCP record named ``name``."""
     return own_vault_for_scope(scope).read_record(CUSTOM_MCP_ENGINE, name) is not None
 
 
 def _require_connection(scope: TenantScope, name: str) -> None:
-    if not is_connection_id(name) or not _record_exists(scope, name):
+    """404 with its own body when ``name`` is no custom MCP connection of this
+    scope, dropping anything still held for it."""
+    if not is_connection_id(name):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=MISSING)
+    if not _record_exists(scope, name):
+        app_held.release(own_vault_root(scope), CUSTOM_MCP_ENGINE, name)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=MISSING)
 
 
 def _held_values(settings: CustomMcpSettings) -> dict[str, Any]:
+    """The settings as the held entry stores them, with the server URL in its
+    canonical form (422 for one the check refuses)."""
     values = settings.model_dump(exclude={"id"})
     if values.get("server_url") is not None:
         values["server_url"] = canonical_server_url(values["server_url"])
@@ -82,10 +95,16 @@ def create_connection(body: CreateCustomMcpRequest, scope: ScopeDep) -> dict[str
     settings. 409 when the id exists: ids are never reused."""
     _require_protected(scope)
     values = _held_values(body)
-    if _record_exists(scope, body.id):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="custom_connection_exists")
-    own_vault_for_scope(scope).save(CUSTOM_MCP_ENGINE, body.id, {"_method": "mcp"})
-    app_held.hold_custom(own_vault_root(scope), body.id, {**values, "allowed_tools": values.get("allowed_tools") or []})
+    try:
+        # Checked and written under the record lock; stamps the creator.
+        persist_connection(CUSTOM_MCP_ENGINE, "mcp", body.id, {}, create_only=True, scope=scope)
+    except ConnectionExistsError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="custom_connection_exists") from exc
+    root = own_vault_root(scope)
+    # A new connection starts from nothing, whatever an earlier one under
+    # this id left in memory.
+    app_held.release(root, CUSTOM_MCP_ENGINE, body.id)
+    app_held.hold_custom(root, body.id, {**values, "allowed_tools": values.get("allowed_tools") or []})
     return {"id": body.id, "server_url": values["server_url"]}
 
 

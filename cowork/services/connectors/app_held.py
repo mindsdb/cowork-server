@@ -116,6 +116,7 @@ def held_custom(root: Path, name: str) -> dict[str, Any]:
 
 
 def _copy(entry: dict[str, Any]) -> dict[str, Any]:
+    """A copy of a held entry that a caller cannot change it through."""
     return {key: list(value) if isinstance(value, list) else value for key, value in entry.items()}
 
 
@@ -209,7 +210,14 @@ class AppHeldVault(FilteredDataVault):
             return {**record, "fields": self._custom_fields(name, with_token=False)}
         return {**record, "fields": self._held_mode(engine, name, record.get("fields") or {})}
 
+    def for_connecting(self) -> AppHeldVault:
+        """The connecting view anton's connect_new_datasource matches against,
+        still read through this vault, so a custom MCP record there reads
+        from memory and a save of one is refused, as everywhere else."""
+        return AppHeldVault(source=super().for_connecting(), root=self._root, is_own=self._is_own)
+
     def delete(self, engine: str, name: str) -> bool:
+        """Delete the record, and for a custom MCP connection its held entry."""
         deleted = super().delete(engine, name)
         if is_custom_mcp(engine):
             release(self._root, engine, name)

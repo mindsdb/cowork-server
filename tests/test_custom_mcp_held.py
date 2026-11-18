@@ -27,7 +27,7 @@ from cowork.services.connectors import app_held
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError
 from cowork.services.connectors.custom_mcp import CUSTOM_MCP_ENGINE, ReservedEngineError, is_connection_id
-from cowork.services.connectors.layered_vault import LayeredDataVault
+from cowork.services.connectors.layered_vault import FilteredDataVault, LayeredDataVault
 from cowork.services.connectors.persist import own_vault_for_scope, own_vault_root, turn_vault_for_scope
 
 SECRET = "ab" * 32
@@ -165,6 +165,23 @@ class TestTurnsReadOnlyHeldSettings:
         vault = app_held.turn_vault(layered, source_vault=layered, root=own_vault_root(LOCAL_SCOPE))
         assert layered.answers_from_own(CUSTOM_MCP_ENGINE, CONN) is False
         assert vault.load(CUSTOM_MCP_ENGINE, CONN) == {"_method": "mcp"}
+
+    def test_the_connecting_view_still_reads_from_memory_and_refuses_saves(self, protected):
+        _write_file(AGENT_WRITTEN)
+        _hold()
+        connecting = _turn_vault().for_connecting()
+        assert connecting.load(CUSTOM_MCP_ENGINE, CONN)["_server_url"] == "https://mcp.example.com/mcp"
+        with pytest.raises(ReservedEngineError):
+            connecting.save(CUSTOM_MCP_ENGINE, CONN, dict(AGENT_WRITTEN))
+
+    def test_a_turned_off_connection_reads_as_its_label_alone_in_the_protected_connecting_view(self, protected):
+        own_vault_for_scope(LOCAL_SCOPE).save("postgres", "erp", {"host": "db.example", "password": "pw", "_label": "ERP"})
+        source = turn_vault_for_scope(LOCAL_SCOPE)
+        filtered = FilteredDataVault(source=source, hidden=frozenset({("postgres", "erp")}))
+        vault = app_held.turn_vault(filtered, source_vault=source, root=own_vault_root(LOCAL_SCOPE))
+        assert vault.load("postgres", "erp") is None
+        loaded = vault.for_connecting().load("postgres", "erp")
+        assert loaded is not None and "password" not in loaded and "host" not in loaded
 
     def test_without_the_app_secret_every_custom_connection_is_hidden(self, stores):
         _write_file(AGENT_WRITTEN)
