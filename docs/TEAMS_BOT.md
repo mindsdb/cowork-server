@@ -1,15 +1,16 @@
-# Teams bot on a self-hosted Cowork
+# Teams connector on a self-hosted Cowork
 
 On self-hosted, a Teams question reaches Cowork from the recording proxy as a normal turn, run as
 the person who asked. Cowork adds two internal routes for the outgoing side: posting the reply in
 the Teams thread, and looking up a person. Only the recording proxy may call them.
 
-The code is in `cowork/channels/teams.py`; it uses the [Teams client](TEAMS_CLIENT.md).
+The settings, signature and client are in `cowork/services/connectors/teams/`, and the routes in
+`cowork/api/v1/endpoints/connectors/teams.py`; it uses the [Teams client](TEAMS_CLIENT.md).
 
 ## Settings
 
-The operator sets the bot in `.env`, and compose passes it to Cowork under these names. This is
-the Teams equivalent of `python -m cowork.ops.channels`: one install has one bot, set once.
+The operator sets the bot in `.env`, and compose passes it to Cowork under these names: one install
+has one bot, set once.
 
 | Variable | Value |
 |---|---|
@@ -27,8 +28,8 @@ log says why. Cowork starts either way.
 
 | Route | Does |
 |---|---|
-| `POST /api/v1/channels/teams/deliver` | JSON `service_url`, `conversation_id`, `reply_to_id`, `text`. Posts `text` as a reply in that thread; answers `{"id": <new message id>}`. |
-| `GET /api/v1/channels/teams/member` | Query `service_url`, `conversation_id`, `member_id`. Answers the person's `id`, `name`, `email`, `user_principal_name`, `aad_object_id` and `tenant_id`. |
+| `POST /api/v1/connectors/teams/deliver` | JSON `service_url`, `conversation_id`, `reply_to_id`, `text`. Posts `text` as a reply in that thread; answers `{"id": <new message id>}`. |
+| `GET /api/v1/connectors/teams/member` | Query `service_url`, `conversation_id`, `member_id`. Answers the person's `id`, `name`, `email`, `user_principal_name`, `aad_object_id` and `tenant_id`. |
 
 Both answer:
 
@@ -81,7 +82,7 @@ Two limits:
 After setup, inside the Cowork container:
 
 ```
-python -m cowork.channels.teams check
+python -m cowork.services.connectors.teams check
 ```
 
 It asks Microsoft for the bot's token and prints whether Microsoft accepted the credentials. It

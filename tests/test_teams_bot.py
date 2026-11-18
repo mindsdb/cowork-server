@@ -1,4 +1,5 @@
-"""The Teams bot's internal routes and credentials check (cowork/channels/teams.py).
+"""The Teams connector's internal routes and the bot's credentials check
+(cowork/api/v1/endpoints/connectors/teams.py, cowork/services/connectors/teams/bot.py).
 
 A stand-in TeamsClient takes the place of Microsoft, so these run on every
 platform; TeamsClient itself is tested against stand-in Microsoft endpoints in
@@ -18,22 +19,23 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from cowork.channels import teams
-from cowork.channels.teams import (
+from cowork.api.v1.endpoints.connectors import teams as routes
+from cowork.api.v1.endpoints.connectors.teams import install_teams_routes
+from cowork.services.connectors.teams import bot as teams
+from cowork.services.connectors.teams.bot import (
     SIGNATURE_HEADER,
     TIMESTAMP_HEADER,
     TeamsBot,
     TeamsSettings,
-    install_teams_routes,
     sign,
 )
-from cowork.channels.teams_client import TeamsAuthError
+from cowork.services.connectors.teams.client import TeamsAuthError
 
 KEY = "internal-key-value"
 SECRET = "bot-secret-value"
 SERVICE_URL = "https://smba.trafficmanager.net/amer/tenant-1/"
-DELIVER = "/api/v1/channels/teams/deliver"
-MEMBER = "/api/v1/channels/teams/member"
+DELIVER = "/api/v1/connectors/teams/deliver"
+MEMBER = "/api/v1/connectors/teams/member"
 
 
 def _settings(**overrides) -> TeamsSettings:
@@ -310,7 +312,7 @@ def test_teams_stays_off_and_says_what_is_missing(teams_on, caplog):
 
 
 def test_teams_stays_off_without_the_teams_packages(monkeypatch, caplog):
-    monkeypatch.setattr(teams, "teams_available", lambda: False)
+    monkeypatch.setattr(routes, "teams_available", lambda: False)
     app, exempt = FastAPI(), set()
     with caplog.at_level(logging.WARNING):
         assert not install_teams_routes(app, exempt, _settings())
@@ -379,10 +381,10 @@ def test_the_server_log_names_the_missing_settings(teams_on):
     handler = logging.Handler()
     handler.setFormatter(make_formatter())
     handler.emit = lambda record: lines.append(handler.format(record))
-    logging.getLogger("cowork.channels.teams").addHandler(handler)
+    logging.getLogger("cowork.api.v1.endpoints.connectors.teams").addHandler(handler)
     try:
         install_teams_routes(FastAPI(), set(), _settings(internal_key=""))
     finally:
-        logging.getLogger("cowork.channels.teams").removeHandler(handler)
+        logging.getLogger("cowork.api.v1.endpoints.connectors.teams").removeHandler(handler)
     [line] = lines
     assert json.loads(line)["reason"] == "COWORK_TEAMS_INTERNAL_KEY not set"

@@ -1184,6 +1184,12 @@ def create_app() -> FastAPI:
 
     _install_channels(app, channel_webhook_paths)
 
+    # The Teams connector's internal routes, called only by the recording proxy and signed by it, so
+    # they join the paths the bearer and identity layers skip.
+    from cowork.api.v1.endpoints.connectors.teams import install_teams_routes
+
+    install_teams_routes(app, channel_webhook_paths)
+
     # ENG-2094: every route must declare a Permission (require(...)) so a
     # walker can tell "open on purpose" from "someone forgot the line" — see
     # route_walker.py and its docstring. Boot-time, not just CI, so a gap
@@ -1298,10 +1304,6 @@ def _install_channels(app: FastAPI, webhook_paths: set[str]) -> None:
     app.state.channel_runtime = runtime
     app.state.channel_ingress = IngressManager(sink=runtime.handle)
     app.state.channel_webhook_paths = webhook_paths
-
-    from cowork.channels.teams import install_teams_routes
-
-    install_teams_routes(app, webhook_paths)
 
 
 # Create the application instance
