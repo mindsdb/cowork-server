@@ -432,11 +432,18 @@ class ScheduleRunService:
             .limit(1)
         ).first()
 
-    def renew_lease(self, run_id: UUID, lease_seconds: float) -> bool:
+    def renew_lease(self, run_id: UUID, lease_seconds: float) -> bool | None:
         """Extend a running run's lease. False once the run has finished or
-        another replica reaped it, so its process no longer holds the claim."""
+        another replica reaped it, and None once the run is gone because its
+        schedule was deleted; either way its process no longer holds the claim.
+
+        One read decides both answers. A caller that checked for the row on its
+        own first could see it, lose the deletion race to this read, and report
+        a deleted task as a finished run."""
         run = self.session.get(ScheduleRun, run_id)
-        if run is None or run.status != RunStatus.running:
+        if run is None:
+            return None
+        if run.status != RunStatus.running:
             return False
         run.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
         self.session.add(run)
