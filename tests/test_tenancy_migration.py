@@ -342,10 +342,7 @@ def test_postgres_channel_archive_keeps_rows_drops_bot_passwords_and_unpins_conv
     engine = create_engine(POSTGRES_URI)
 
     def conversation_key() -> bool:
-        return any(
-            fk["referred_table"] == "conversations"
-            for fk in inspect(create_engine(POSTGRES_URI)).get_foreign_keys("channel_bindings")
-        )
+        return any(fk["referred_table"] == "conversations" for fk in inspect(engine).get_foreign_keys("channel_bindings"))
 
     try:
         command.upgrade(cfg, "f6a2c4e8b1d3")
@@ -396,5 +393,6 @@ def test_postgres_channel_archive_keeps_rows_drops_bot_passwords_and_unpins_conv
         with engine.begin() as connection:
             for table in ("channel_bindings", "settings", "conversations", "projects"):
                 connection.execute(text(f"delete from {table}"))
+        engine.dispose()
         command.downgrade(cfg, "base")
         get_app_settings.cache_clear()
