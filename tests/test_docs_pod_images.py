@@ -93,3 +93,27 @@ def test_an_image_over_the_size_cap_is_refused(tmp_path, size, ok):
         with pytest.raises(OSError):
             read(POD_PATH)
 
+
+
+@pytest.mark.parametrize("path", ["/workspace/a\x00.png", "/workspace/a\x00/b.png", "/project-artifacts/r\x00/c.png"])
+def test_a_nul_byte_in_the_path_is_a_refusal(tmp_path, path):
+    _project, _conv, files = _pod(tmp_path)
+    assert files.pod_project_parts(path) is None
+    with pytest.raises(OSError):
+        pod_image_reader(files)(path)
+    with pytest.raises(DocError):
+        localize_images(f"![x]({path})", lambda p: True, reader=pod_image_reader(files))
+
+
+def test_an_artifact_image_is_read_by_its_mount_path(tmp_path):
+    project, _conv, files = _pod(tmp_path)
+    image = project / ".anton" / "artifacts" / "report" / "chart.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(PNG)
+    assert pod_image_reader(files)("/project-artifacts/report/chart.png") == PNG
+
+
+def test_the_artifacts_mount_is_refused_when_the_projects_path_is_unknown(tmp_path):
+    project = tmp_path / "projects" / "proj"
+    files = AgentFiles.in_cloud_pod(project, conversation_id=uuid4(), workspace_rel_path=None)
+    assert files.pod_project_parts("/project-artifacts/report/chart.png") is None

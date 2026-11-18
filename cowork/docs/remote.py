@@ -32,14 +32,18 @@ def pod_image_reader(files: AgentFiles | None) -> Callable[[str], bytes]:
         if not parts:
             raise OSError("not a path in this turn's project")
         *dirs, name = parts
-        with opened_subdir_nofollow(files.project_root, *dirs) as pinned:
-            fd = dir_open(pinned, name, os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
-            try:
-                found = os.fstat(fd)
-                if not stat.S_ISREG(found.st_mode) or found.st_size > MAX_IMAGE_BYTES:
-                    raise OSError("not an image file within the size limit")
-                return b"".join(read_bounded(fd, found.st_size))
-            finally:
-                os.close(fd)
+        try:
+            with opened_subdir_nofollow(files.project_root, *dirs) as pinned:
+                fd = dir_open(pinned, name, os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+                try:
+                    found = os.fstat(fd)
+                    if not stat.S_ISREG(found.st_mode) or found.st_size > MAX_IMAGE_BYTES:
+                        raise OSError("not an image file within the size limit")
+                    return b"".join(read_bounded(fd, found.st_size))
+                finally:
+                    os.close(fd)
+        except ValueError as exc:
+            # An embedded NUL or similar: the path is unreadable, not a bug.
+            raise OSError(str(exc)) from exc
 
     return read
