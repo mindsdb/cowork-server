@@ -88,6 +88,7 @@ class RuntimeManager:
                 network_access=session.network_access,
                 web_search=session.web_search,
                 additional_dirs=tuple(session.additional_dirs),
+                writes_allowed=session.writes_allowed,
                 developer_instructions=session.developer_instructions,
                 skill_roots=tuple(session.skill_roots),
                 environment=tuple(session.environment.items()),

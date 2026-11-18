@@ -116,7 +116,7 @@ def test_malformed_body_is_rejected_before_queueing(client, turn, pod, body, exp
     (QID, ["continue"], False),
 ])
 def test_keep_going_at_a_limit_extends_the_turns_key_first(
-    client, turn, pod, monkeypatch, question_id, values, extended,
+    client, turn, pod, monkeypatch, question_id, values, extended, empty_decisions_proxy_records,
 ):
     """The key is extended before the answer reaches the pod, so the pod
     never runs on past a key that won't last."""

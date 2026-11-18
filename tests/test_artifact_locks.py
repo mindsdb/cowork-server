@@ -44,6 +44,23 @@ def test_release_of_absent_lock_is_silent(tmp_path):
     locks.release(tmp_path, "never-held")  # must not raise
 
 
+def test_refresh_restarts_the_ttl(tmp_path):
+    locks.acquire(tmp_path, "dash", ttl_s=60)
+    lock_file = tmp_path / locks.LOCKS_DIRNAME / "dash.lock"
+    # Old enough to be stolen until the refresh.
+    old = time.time() - 3600
+    os.utime(lock_file, (old, old))
+
+    locks.refresh(tmp_path, "dash")
+
+    assert locks.acquire(tmp_path, "dash", ttl_s=60) is False
+
+
+def test_refresh_of_absent_lock_is_silent(tmp_path):
+    locks.refresh(tmp_path, "never-held")  # must not raise
+    assert not (tmp_path / locks.LOCKS_DIRNAME / "never-held.lock").exists()
+
+
 def test_lock_does_not_leak_into_artifact_content(tmp_path):
     folder = tmp_path / "dash"
     folder.mkdir()

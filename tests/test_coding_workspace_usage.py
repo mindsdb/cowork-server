@@ -7,12 +7,13 @@ import threading
 from datetime import timedelta
 from pathlib import Path
 
-from coding_service_fakes import CREDS, FakeEngine, git, repository, service_with, wait_for_status
+from tests.support.coding.service_fakes import CREDS, FakeEngine, copy_folders_without_git, git, repository, service_with, wait_for_status
 
-from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind
+from cowork.coding.contracts import SessionCreateRequest, SessionStatus, WorkspaceKind, WorkspaceMode
 from cowork.coding.project_models import ProjectCreateRequest, ProjectFolder
 from cowork.coding.workspace import UsageRoots
 from cowork.coding.workspace_usage import WorkspaceUsage, tree_bytes
+
 
 
 def write(path: Path, size: int) -> None:
@@ -181,12 +182,13 @@ def test_preparing_a_task_invalidates_the_last_measurement(tmp_path: Path) -> No
     folder = tmp_path / "notes"
     write(folder / "big.bin", 300_000)
     service = service_with(tmp_path, FakeEngine())
+    copy_folders_without_git(service.workspaces)
     service.workspace_usage.measure()
 
     wait_for_status(
         service,
         service.create_session(
-            SessionCreateRequest(path=str(folder), prompt="Go", allow_direct_folder=True), CREDS, "fake", "fake-model",
+            SessionCreateRequest(path=str(folder), prompt="Go", workspace_mode=WorkspaceMode.worktree), CREDS, "fake", "fake-model",
         ).id,
         SessionStatus.completed,
     )
@@ -225,7 +227,7 @@ def test_a_request_once_the_path_is_visible_measures_again_while_setup_runs(tmp_
 
     factory._prepare_local_session = paused_prepare
     factory._run_setup = paused_setup
-    session_id = service.create_session(SessionCreateRequest(project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model").id
+    session_id = service.create_session(SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model").id
     try:
         assert preparing.wait(timeout=10)
         usage = service.workspace_usage
@@ -252,7 +254,7 @@ def test_the_service_reports_a_worktree_task_and_the_total(tmp_path: Path) -> No
     service = service_with(tmp_path, FakeEngine())
     session = wait_for_status(
         service,
-        service.create_session(SessionCreateRequest(path=str(repo), prompt="Go"), CREDS, "fake", "fake-model").id,
+        service.create_session(SessionCreateRequest(path=str(repo), workspace_mode=WorkspaceMode.worktree, prompt="Go"), CREDS, "fake", "fake-model").id,
         SessionStatus.completed,
     )
 
@@ -263,14 +265,17 @@ def test_the_service_reports_a_worktree_task_and_the_total(tmp_path: Path) -> No
     assert page.total_bytes >= sizes[session.id]
 
 
-def test_a_deleted_folder_copy_keeps_counting_its_recovery_copy(tmp_path: Path) -> None:
+def test_deleting_a_folder_copy_frees_its_storage(tmp_path: Path) -> None:
     folder = tmp_path / "notes"
     write(folder / "big.bin", 300_000)
     service = service_with(tmp_path, FakeEngine())
+    copy_folders_without_git(service.workspaces)
+    # Left by a task deleted before deletes cleared recovery data.
+    write(service.workspaces.snapshots_root / "deleted-earlier" / "local-copy" / "old.bin", 50_000)
     session = wait_for_status(
         service,
         service.create_session(
-            SessionCreateRequest(path=str(folder), prompt="Go", allow_direct_folder=True), CREDS, "fake", "fake-model",
+            SessionCreateRequest(path=str(folder), prompt="Go", workspace_mode=WorkspaceMode.worktree), CREDS, "fake", "fake-model",
         ).id,
         SessionStatus.completed,
     )
@@ -278,11 +283,12 @@ def test_a_deleted_folder_copy_keeps_counting_its_recovery_copy(tmp_path: Path) 
     (Path(session.workspace_path) / "edit.txt").write_text("unsaved work\n", encoding="utf-8")
 
     service.delete_session(session.id)
+    assert service.workspaces.pending_removals.wait(30)
     page = service.workspace_usage.measure()
 
-    # The task is gone, but the copy saved for recovery still takes space.
     assert session.id not in {item.session_id for item in page.items}
-    assert page.removed_task_bytes >= 300_000
+    # Only the earlier leftover still counts; the task just deleted kept nothing.
+    assert 50_000 <= page.removed_task_bytes < 300_000
 
 
 def test_a_project_task_is_measured_across_its_folders(tmp_path: Path) -> None:
@@ -302,7 +308,7 @@ def test_a_project_task_is_measured_across_its_folders(tmp_path: Path) -> None:
     ))
     session = wait_for_status(
         service,
-        service.create_session(SessionCreateRequest(project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model").id,
+        service.create_session(SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Go"), CREDS, "fake", "fake-model").id,
         SessionStatus.completed,
     )
 

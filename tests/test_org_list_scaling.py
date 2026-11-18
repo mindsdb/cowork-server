@@ -602,11 +602,24 @@ def test_a_held_row_never_shows_a_co_members_workspace_or_another_organizations_
 
 
 def _artifacts_at(org: str, project_path: Path, owner: str, times: dict[str, float]) -> None:
-    """One project-root artifact per name in ``times``, its metadata.json
-    modified at that time."""
-    for slug, at in times.items():
-        _project_root_artifact(org, project_path, owner, slug)
-        os.utime(project_path / ".anton" / "artifacts" / slug / "metadata.json", (at, at))
+    """Write project-root artifacts at the given times and commit their ownership together."""
+    if not times:
+        return
+    project_id = _project_id(org, project_path)
+    with Session(_engine()) as raw:
+        for slug, at in times.items():
+            _write_artifact(project_path / ".anton" / "artifacts", slug)
+            os.utime(project_path / ".anton" / "artifacts" / slug / "metadata.json", (at, at))
+            raw.add(
+                SharedResourceAttribution(
+                    org_id=org,
+                    resource_kind=ARTIFACT,
+                    resource_key=artifact_resource_key(project_id, slug),
+                    created_by_id=owner,
+                    updated_by_id=owner,
+                )
+            )
+        raw.commit()
 
 
 @pytest.mark.parametrize("unfiltered", [False, True], ids=["one-project", "every-project"])

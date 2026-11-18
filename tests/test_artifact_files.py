@@ -13,11 +13,12 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from draft_host_support import reviewed_and_read
 from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
 
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.common.paths import PinnedDir, pinned_dir
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.schemas.artifact_export import OmittedReason
 from cowork.services import artifact_files
 from cowork.services.artifact_files import (
@@ -26,9 +27,9 @@ from cowork.services.artifact_files import (
     read_artifact_file,
     read_artifact_file_entry,
 )
+from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
-from cowork.db.scoped import LOCAL_SCOPE
-from draft_host_support import reviewed_and_read
+from tests.support.pinned_responses import served_body
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_files"
 
@@ -108,13 +109,33 @@ _FILE_CALLS = (
 )
 
 
+def _refused_unless_coverage(original):
+    """Refuse a file call, except one made by coverage's tracer.
+
+    Coverage resolves the real path of each file the first time it traces it,
+    which can happen inside the patched window. Whether it does depends on
+    which tests ran earlier in the same worker, so allowing only those calls
+    keeps the check as strict without failing on test order.
+    """
+
+    def call(*args, **kwargs):
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_globals.get("__name__", "").startswith("coverage"):
+                return original(*args, **kwargs)
+            frame = frame.f_back
+        return _unexpected_file_call(*args, **kwargs)
+
+    return call
+
+
 def _refusal_without_file_calls(
     *, folder: Path, parts: tuple[str, ...], monkeypatch
 ) -> OmittedReason:
     with pinned_dir(folder) as pinned:
         with monkeypatch.context() as patch:
             for module, name in _FILE_CALLS:
-                patch.setattr(module, name, _unexpected_file_call)
+                patch.setattr(module, name, _refused_unless_coverage(getattr(module, name)))
             with pytest.raises(ArtifactFileRefused) as refused:
                 read_artifact_file_entry(folder=pinned, parts=parts, max_bytes=1024)
     return refused.value.reason
@@ -743,7 +764,7 @@ async def _serve_draft(*, monkeypatch, source, folder, rel_path):
     monkeypatch.setattr(
         workspace_ep,
         "review_artifact_and_read",
-        reviewed_and_read(lambda *_args: (source, folder, {"type": "html-app"}, True)),
+        reviewed_and_read(lambda *_args: (source, folder, ArtifactMetadata.model_validate({"type": "html-app"}), True)),
     )
     return await workspace_ep.serve_private_draft(
         "local",
@@ -753,13 +774,6 @@ async def _serve_draft(*, monkeypatch, source, folder, rel_path):
         LOCAL_SCOPE,
         download=False,
     )
-
-
-async def _body(*, response: StreamingResponse) -> bytes:
-    chunks = []
-    async for chunk in response.body_iterator:
-        chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
-    return b"".join(chunks)
 
 
 @pytest.mark.parametrize(
@@ -782,7 +796,7 @@ async def test_the_drafts_route_hides_a_housekeeping_name_at_any_depth(
     served = await _serve_draft(
         monkeypatch=monkeypatch, source=source, folder=folder, rel_path=beside
     )
-    assert await _body(response=served) == b"content"
+    assert await served_body(served) == b"content"
 
     with pytest.raises(HTTPException) as error:
         await _serve_draft(
@@ -811,7 +825,7 @@ async def test_a_top_level_housekeeping_name_inside_a_subfolder_is_content(
             folder=pinned, parts=tuple(rel_path.split("/")), max_bytes=1024
         )
 
-    assert await _body(response=served) == b"content"
+    assert await served_body(served) == b"content"
     assert read == b"content"
 
 
@@ -842,7 +856,7 @@ async def test_the_drafts_route_serves_a_path_deeper_than_the_export_cap(
         monkeypatch=monkeypatch, source=source, folder=folder, rel_path=rel_path
     )
 
-    assert await _body(response=served) == b"deep"
+    assert await served_body(served) == b"deep"
     with pinned_dir(folder) as pinned, pytest.raises(ArtifactFileRefused) as refused:
         read_artifact_file_entry(folder=pinned, parts=(*folders, "notes.txt"), max_bytes=1024)
     assert refused.value.reason is OmittedReason.BUDGET
@@ -863,7 +877,7 @@ async def test_the_drafts_route_reads_every_entry_past_the_export_scan_cap(
         served = await _serve_draft(
             monkeypatch=monkeypatch, source=source, folder=folder, rel_path=f"tiles/{name}"
         )
-        assert await _body(response=served) == PNG
+        assert await served_body(served) == PNG
     refusals = []
     with pinned_dir(folder) as pinned:
         for name in names:

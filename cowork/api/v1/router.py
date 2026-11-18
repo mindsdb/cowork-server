@@ -44,11 +44,14 @@ from cowork.api.v1.endpoints import (
     settings,
     skill_sharing,
     skills,
+    voice,
 )
 from cowork.api.v1.endpoints.connectors import (
     connections,
     custom,
+    custom_connections,
     datasources,
+    notion,
     oauth,
     posthog,
     sharepoint,
@@ -69,13 +72,18 @@ api_router = APIRouter(prefix="/api/v1")
 # ── Canonical routes ─────────────────────────────────────────────────
 api_router.include_router(health.router, prefix="/health", tags=["health"])
 api_router.include_router(browse.router, prefix="/browse", tags=["browser"])
+api_router.include_router(voice.router, prefix="/voice", tags=["voice"])
 api_router.include_router(
     capabilities.router, prefix="/capabilities", tags=["capabilities"]
 )
 api_router.include_router(specs.router, prefix="/connectors/specs", tags=["connectors"])
 api_router.include_router(custom.router, prefix="/connectors/custom", tags=["connectors"])
+api_router.include_router(
+    custom_connections.router, prefix="/connectors/custom-connections", tags=["connectors"]
+)
 api_router.include_router(submissions.router, prefix="/connectors/submissions", tags=["connectors"])
 api_router.include_router(posthog.router, prefix="/connectors/posthog", tags=["connectors"])
+api_router.include_router(notion.router, prefix="/connectors/notion", tags=["connectors"])
 api_router.include_router(sharepoint.router, prefix="/connectors/sharepoint", tags=["connectors"])
 api_router.include_router(connections.router, prefix="/connectors/connections", tags=["connectors"])
 api_router.include_router(datasources.router, prefix="/connectors/datasources", tags=["connectors"])
