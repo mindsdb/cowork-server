@@ -116,7 +116,8 @@ def desktop_db(tmp_path, monkeypatch):
 
 def test_upgrade_adds_nullable_columns_and_keeps_rows(desktop_db):
     cfg, db_path = desktop_db
-    command.upgrade(cfg, "head")
+    # This migration, not head: f73ba3db8974 erases the channel rows on purpose.
+    command.upgrade(cfg, "a3f9c2e8b1d4")
 
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     for table, column in EXPECTED:

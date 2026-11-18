@@ -49,7 +49,7 @@ class Conversation(BaseSQLModel, table=True):
     channel_type: str | None = Field(
         default=None,
         max_length=64,
-        description="Channel the runtime created this conversation for (discord, slack, ...); NULL otherwise",
+        description="Chat app whose channel started this conversation (discord, slack, ...), from the removed channel feature; NULL otherwise",
     )
 
     project: "Project" = Relationship()

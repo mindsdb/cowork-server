@@ -104,9 +104,10 @@ class ChannelBinding(BaseSQLModel, table=True):
         ),
         description="Project context this channel routes into",
     )
+    # No foreign key since f73ba3db8974, so a binding never blocks a
+    # conversation delete; the table is dropped once nothing writes it.
     anton_conversation_id: UUID | None = Field(
         default=None,
-        foreign_key="conversations.id",
         description="Conversation this binding is pinned to, when one external chat == one conversation",
     )
 

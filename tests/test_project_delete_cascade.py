@@ -203,6 +203,28 @@ def test_delete_project_releases_a_channel_binding_without_deleting_it(
     assert survivor.external_group_id == "C123"
 
 
+def test_delete_project_whose_conversation_a_binding_still_points_at(tmp_path, monkeypatch):
+    """During a rolling deploy the previous release still writes channel
+    bindings, and nothing unpins them any more. A binding pinned to one of the
+    project's conversations must not fail the project delete."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
+    session = _fk_enforced_session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    project = _project(session, tmp_path, name="pinned")
+    conversation = Conversation(project_id=project.id, topic="telegram: group")
+    session.add(conversation)
+    session.commit()
+    session.refresh(conversation)
+    binding = ChannelBinding(channel_type="telegram", external_group_id="-100123", anton_conversation_id=conversation.id)
+    session.add(binding)
+    session.commit()
+
+    assert ProjectService(scoped).delete_project(project.id) is True
+
+    assert session.get(Project, project.id) is None
+    assert session.get(Conversation, conversation.id) is None
+
+
 def _assert_delete_drops_objects_a_moved_task_left_behind(session: Session, tmp_path) -> None:
     scoped = ScopedSession(session, SYSTEM_SCOPE)
     project = _project(session, tmp_path, name="source")

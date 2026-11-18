@@ -544,6 +544,7 @@ from sqlalchemy import event  # noqa: E402
 from sqlalchemy.pool import StaticPool  # noqa: E402
 from sqlmodel import SQLModel, create_engine  # noqa: E402
 
+from cowork.models.channel import ChannelBinding  # noqa: E402
 from cowork.models.schedule import Schedule, ScheduleRun  # noqa: E402
 from cowork.schemas.schedules import RunStatus  # noqa: E402
 from cowork.scheduler import _apply_success_write_back  # noqa: E402
@@ -715,6 +716,32 @@ def test_delete_conversation_does_not_violate_a_foreign_key(tmp_path):
         assert s.get(Conversation, conv.id) is None
         assert s.get(ScheduleRun, run.id).conversation_id is None
         assert s.get(Schedule, schedule.id).last_result_conversation_id is None
+
+
+def test_a_binding_left_pointing_at_a_conversation_does_not_block_its_delete(tmp_path):
+    """During a rolling deploy the previous release still writes channel
+    bindings, and nothing unpins them any more. With foreign keys enforced, a
+    binding row pointing at the conversation must not fail the delete, or the
+    conversation's project delete."""
+    engine = _fk_enforcing_engine()
+    with Session(engine, autoflush=False, expire_on_commit=False) as s:
+        project = Project(name="fk-binding-project", path=str(tmp_path / "fk-binding-project"))
+        s.add(project)
+        s.commit()
+        scoped = ScopedSession(s, LOCAL_SCOPE)
+        conv = ConversationService(scoped).create_conversation("chat", project_id=project.id)
+        binding = ChannelBinding(
+            channel_type="telegram", external_group_id="-100123", external_thread_key="__default__",
+            anton_conversation_id=conv.id, anton_project_id=project.id,
+        )
+        s.add(binding)
+        s.commit()
+
+        assert ConversationService(scoped).delete_conversation(conv.id) is True
+
+        s.expire_all()
+        assert s.get(Conversation, conv.id) is None
+        assert s.get(ChannelBinding, binding.id) is not None
 
 
 def test_finishing_a_run_whose_conversation_was_deleted_mid_flight(tmp_path):
