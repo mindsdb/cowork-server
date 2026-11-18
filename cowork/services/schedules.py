@@ -437,18 +437,23 @@ class ScheduleRunService:
         another replica reaped it, and None once the run is gone because its
         schedule was deleted; either way its process no longer holds the claim.
 
-        One read decides both answers. A caller that checked for the row on its
-        own first could see it, lose the deletion race to this read, and report
-        a deleted task as a finished run."""
-        run = self.session.get(ScheduleRun, run_id)
-        if run is None:
-            return None
-        if run.status != RunStatus.running:
-            return False
-        run.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
-        self.session.add(run)
-        self.session.commit()
-        return True
+        One conditional UPDATE renews, so a reap or a delete that commits
+        while it runs makes it match no row instead of being overwritten or
+        failing the flush. Only then is the row read, to tell the two apart.
+        Core statements, for the reason still_exists gives."""
+        raw = unsafe_unscoped_session(self.session)
+        renewed = raw.execute(
+            sa.update(ScheduleRun)
+            .where(ScheduleRun.id == run_id)
+            .where(ScheduleRun.status == RunStatus.running)
+            .values(lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=lease_seconds))
+            .execution_options(synchronize_session=False)
+        ).rowcount
+        if renewed:
+            self.session.commit()
+            return True
+        status = raw.execute(sa.select(ScheduleRun.status).where(ScheduleRun.id == run_id)).scalar()
+        return None if status is None else False
 
     def still_running(self, run_id: UUID) -> bool:
         """Whether the run is still `running`, i.e. no replica has reaped it.
