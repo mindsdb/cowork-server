@@ -328,8 +328,8 @@ class MindsModelListing(NamedTuple):
     # Why a model the ``enabled`` map (or ``image_models``) marks false is
     # unavailable, in the gateway's own reason words: "model_restricted" (an
     # admin in the org restricted it), "wallet_empty",
-    # "included_allowance_exhausted" or "budget_exceeded" (an org budget is
-    # spent). Keyed only by ids one of those marks false, so the maps cannot
+    # "included_allowance_exhausted" or "budget_exceeded" (a spending budget
+    # is spent). Keyed only by ids one of those marks false, so the maps cannot
     # disagree. Empty whenever the gateway publishes no reasons, which includes
     # every MindsHub that predates the field and every plain OpenAI-compatible
     # endpoint. Required for the same reason as ``role_defaults``.
@@ -469,6 +469,32 @@ def _is_embedding_row(row: dict, model_id: str) -> bool:
         return bool(row.get("embedding"))
     lowered = model_id.lower()
     return any(hint in lowered for hint in _EMBEDDING_ID_HINTS)
+
+
+def cached_minds_model_label(model_id: str) -> str | None:
+    """The catalog label for ``model_id`` from a cached MindsHub ``/v1/models`` listing, or None.
+
+    Labels are catalog-wide, so any MindsHub caller's listing answers. Only entries fetched from the
+    operator's MindsHub URL count, so a user's custom endpoint can never rename a MindsHub model.
+    """
+    try:
+        trusted_base = minds_chat_base_url(_org_catalog_url())
+        entries = list(_minds_models_cache.items())
+    except Exception:
+        return None
+    for key, entry in reversed(entries):
+        if getattr(key, "chat_only", True) or getattr(key, "base_url", None) != trusted_base:
+            continue
+        listing = entry[1] if len(entry) > 1 else None
+        label = getattr(listing, "labels", {}).get(model_id) if listing is not None else None
+        if label:
+            return label
+    return None
+
+
+def budget_model_label(model: str) -> str:
+    """The catalog label for a budget's model alias, or the alias when the catalog has none."""
+    return cached_minds_model_label(model) or model
 
 
 def cached_minds_models(

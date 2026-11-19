@@ -56,6 +56,7 @@ __all__ = [
     "record_quick_edit_in_conversation",
     "record_undo_in_conversation",
     "resolve_backend",
+    "with_request_images",
 ]
 
 #: The ``harness`` the conversation note's messages are saved under, as a
@@ -452,6 +453,106 @@ async def _minted_backend(
     except BaseException:
         await backend.close()
         raise
+
+
+class RequestImagesLLM:
+    """The editor's LLM, with the bar's images beside the request (ENG-4410).
+
+    anton's editor takes the request as text only. Every call it makes goes
+    through ``plan_stream`` / ``code_stream``, so the images are added there,
+    to a copy of the user message that holds the request, as the editor adds
+    its own screenshots. Anything else is the wrapped client's.
+
+    A model that takes no images refuses the first call that carries them:
+    that call is made again without them, and so is every call after it, so
+    the edit still runs on the text.
+    """
+
+    def __init__(self, llm: Any, *, request: str, images: list[tuple[str, str]]) -> None:
+        self._llm = llm
+        self._request = request.strip()
+        self._images = list(images)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._llm, name)
+
+    def _blocks(self) -> list[dict]:
+        return [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
+            for data, media_type in self._images
+        ]
+
+    def _with_images(self, messages: list[dict]) -> list[dict]:
+        out = list(messages)
+        for i, message in enumerate(out):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
+            if not isinstance(blocks, list):
+                continue
+            at = next((
+                j for j, block in enumerate(blocks)
+                if isinstance(block, dict) and block.get("type") == "text"
+                and self._request in str(block.get("text") or "")
+            ), None)
+            if at is None:
+                continue
+            out[i] = {**message, "content": [*blocks[: at + 1], *self._blocks(), *blocks[at + 1:]]}
+            return out
+        # The request was not found as written: the first user message carries them.
+        for i, message in enumerate(out):
+            if isinstance(message, dict) and message.get("role") == "user":
+                content = message.get("content")
+                blocks = [{"type": "text", "text": content}] if isinstance(content, str) else list(content or [])
+                out[i] = {**message, "content": [*blocks, *self._blocks()]}
+                break
+        return out
+
+    async def _stream(self, name: str, messages: list[dict], kwargs: dict):
+        from anton.core.llm.provider import is_image_refusal
+
+        stream_fn = getattr(self._llm, name)
+        if not self._images:
+            stream = stream_fn(messages=messages, **kwargs)
+        else:
+            stream = stream_fn(messages=self._with_images(messages), **kwargs)
+        sent = False
+        try:
+            try:
+                async for event in stream:
+                    sent = True
+                    yield event
+                return
+            except Exception as exc:
+                if sent or not self._images or not is_image_refusal(exc):
+                    raise
+                logger.info("The quick edit's model takes no images; editing on the text alone")
+                self._images = []
+            await _close(stream)
+            stream = stream_fn(messages=messages, **kwargs)
+            async for event in stream:
+                yield event
+        finally:
+            await _close(stream)
+
+    def plan_stream(self, *, messages: list[dict], **kwargs: Any):
+        return self._stream("plan_stream", messages, kwargs)
+
+    def code_stream(self, *, messages: list[dict], **kwargs: Any):
+        return self._stream("code_stream", messages, kwargs)
+
+
+async def _close(stream: Any) -> None:
+    closer = getattr(stream, "aclose", None)
+    if closer is not None:
+        await closer()
+
+
+def with_request_images(llm: Any, *, request: str, images: list[tuple[str, str]]) -> Any:
+    """``llm``, sending ``images`` (``(base64, media type)`` pairs) with the
+    request; ``llm`` itself when there are none."""
+    return RequestImagesLLM(llm, request=request, images=images) if images else llm
 
 
 # ── the conversation's record of quick edits ──────────────────────────────

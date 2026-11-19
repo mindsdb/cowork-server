@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from cowork.coding.contracts import DiffFile, GitState, TaskWorkspace, WorkspaceKind
+from cowork.coding.contracts import DiffFile, GitState, TaskWorkspace, WorkspaceKind, WorkspaceReasonCode
 from cowork.coding.control_models import ExecutionWorkspace, WorkspaceStatus
 from cowork.coding.git_transport import validate_git_source
 from cowork.coding.project_models import (
@@ -198,7 +198,10 @@ class ProjectWorkspaceManager:
         self.repository_credentials = repository_credentials
         self._lock = threading.RLock()
 
-    def prepare(self, session_id: str, project: CodeProject, setup: TaskRepositorySetup | None = None) -> PreparedProjectWorkspace:
+    def prepare(
+        self, session_id: str, project: CodeProject, setup: TaskRepositorySetup | None = None,
+        *, deleted: Callable[[], bool] = lambda: False,
+    ) -> PreparedProjectWorkspace:
         with self._lock:
             prepared: list[TaskWorkspace] = []
             try:
@@ -222,19 +225,20 @@ class ProjectWorkspaceManager:
                         raise WorkspaceError(f"{folder.name}: {exc}") from exc
                     prepared.append(self._task_workspace(
                         session_id, project.name, folder, item, task_branch=setup.branch if setup else None,
+                        deleted=deleted,
                     ))
                 ports = self.ports.allocate(session_id, project.environment.port_names)
                 return PreparedProjectWorkspace(primary=prepared[0], workspaces=tuple(prepared), ports=ports)
             except Exception:
                 for workspace in reversed(prepared):
-                    self._cleanup_one(session_id, workspace)
+                    self._cleanup_one(session_id, workspace, keep_recovery=not deleted())
                     if setup and setup.branch and workspace.task_branch == setup.branch:
                         # Only branches successfully created by this preparation.
                         self.rollback_task_branch(workspace)
                 self.ports.release(session_id)
                 raise
 
-    def worktree_problem(self, project: CodeProject) -> str | None:
+    def worktree_problem(self, project: CodeProject) -> WorkspaceError | None:
         """Why a worktree task cannot use this project's folders, if it cannot.
 
         A worktree needs each local folder to be a Git repository with a
@@ -247,7 +251,7 @@ class ProjectWorkspaceManager:
             try:
                 self.workspaces.check_source(folder.path)
             except WorkspaceError as exc:
-                return f"{folder.name}: {exc}"
+                return WorkspaceError.in_folder(folder.name, exc)
         return None
 
     def in_place_roots(self, project: CodeProject) -> list[tuple[ProjectFolder, Path]]:
@@ -262,16 +266,21 @@ class ProjectWorkspaceManager:
                 resource.local_path and Path(resource.local_path).expanduser().is_dir()
             ):
                 raise WorkspaceError(
-                    f"{resource.name} has no checkout on this computer to work in; choose Worktree"
+                    f"{resource.name} has no checkout on this computer to work in; choose Worktree",
+                    reason=WorkspaceReasonCode.no_local_checkout,
+                    folder=resource.name,
                 )
             folder = resource_folder(resource)
             try:
                 root = self.workspaces.in_place_root(folder.path)
             except WorkspaceError as exc:
-                raise WorkspaceError(f"{folder.name}: {exc}") from exc
+                raise WorkspaceError.in_folder(folder.name, exc) from exc
             roots.append((folder, root))
         if len({root for _, root in roots}) != len(roots):
-            raise WorkspaceError("Two project folders are in the same repository, so they cannot both work in place; choose Worktree")
+            raise WorkspaceError(
+                "Two project folders are in the same repository, so they cannot both work in place; choose Worktree",
+                reason=WorkspaceReasonCode.shared_repository,
+            )
         return roots
 
     def prepare_in_place(self, session_id: str, project: CodeProject) -> PreparedProjectWorkspace:
@@ -676,6 +685,7 @@ class ProjectWorkspaceManager:
         prepared: PreparedWorkspace,
         base_branch: str | None = None,
         task_branch: str | None = None,
+        *, deleted: Callable[[], bool] = lambda: False,
     ) -> TaskWorkspace:
         branch = None
         branch_created = False
@@ -706,6 +716,7 @@ class ProjectWorkspaceManager:
                 str(prepared.workspace_path),
                 prepared.kind,
                 prepared.base_revision,
+                keep_recovery=not deleted(),
             )
             if task_branch and branch_created and prepared.base_revision:
                 self.workspaces.git.run(

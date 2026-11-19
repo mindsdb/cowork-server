@@ -215,12 +215,14 @@ class CodingSessionFactory:
         default_model: str,
         code_skills: CodeSkillService | None = None,
         model_levels: ModelLevels | None = None,
+        folder_busy: Callable[[set[Path]], bool] | None = None,
     ) -> CodingSession | PendingLocalSession:
         """Validate a new task and record it before any slow workspace work.
 
         A connected-computer task is complete here and returns its session. A
         local task returns a PendingLocalSession whose placeholder session is
-        already visible; ``complete`` prepares its workspace.
+        already visible; ``complete`` prepares its workspace. ``folder_busy``
+        says whether another task holds any of the given folders.
         """
         project = self.projects.get(request.project_id) if request.project_id else None
         if request.repository_setup is not None and project is not None:
@@ -262,15 +264,18 @@ class CodingSessionFactory:
             standalone_computer_id=self.control.local_computer.id if project is None else None,
         )
         runs_locally = control_snapshot.computer.id == self.control.local_computer.id
+        explicit_mode = request.explicit_workspace_mode
+        moved_from_busy_folder = False
         try:
             workspace_mode = resolve_workspace_mode(
-                request.workspace_mode,
-                project.default_workspace_mode if project else None,
+                explicit_mode,
+                (request.workspace_mode if request.workspace_mode_is_default else None)
+                or (project.default_workspace_mode if project else None),
                 runs_locally=runs_locally,
                 org_mode=_org_mode(),
             )
             if workspace_mode == WorkspaceMode.in_place and request.repository_setup is not None:
-                if request.workspace_mode is not None:
+                if explicit_mode is not None:
                     raise ValueError("Branch choices start an isolated worktree; choose Worktree")
                 # The project default is a preference; branch choices need a worktree.
                 workspace_mode = WorkspaceMode.worktree
@@ -296,13 +301,26 @@ class CodingSessionFactory:
             # refuse now, while the composer can still show the error.
             if workspace_mode == WorkspaceMode.in_place:
                 try:
-                    self.in_place_roots(project, request.resource_ids, request.path)
+                    roots = self.in_place_roots(project, request.resource_ids, request.path)
                 except (WorkspaceError, ValueError):
-                    if request.workspace_mode is not None:
+                    if explicit_mode is not None:
                         raise
                     # A project default of working in place is a preference:
                     # folders that cannot be worked in directly are isolated.
                     workspace_mode = WorkspaceMode.worktree
+                else:
+                    # A default of working in place gives way to a worktree
+                    # when another task already holds the folder, rather than
+                    # refusing the task. An explicit Local choice is refused
+                    # later, under the lock that serialises in-place starts.
+                    if (
+                        explicit_mode is None
+                        and folder_busy is not None
+                        and folder_busy(roots)
+                        and self._worktree_problem(project, request) is None
+                    ):
+                        workspace_mode = WorkspaceMode.worktree
+                        moved_from_busy_folder = True
             if workspace_mode != WorkspaceMode.in_place and project is None:
                 self.workspaces.check_source(request.path or "")
             elif workspace_mode != WorkspaceMode.in_place and project is not None:
@@ -313,8 +331,8 @@ class CodingSessionFactory:
                     # Like the options endpoint, treat an unusable project
                     # default as a preference. An explicit mode or branch
                     # choice must never silently change where the task works.
-                    if request.workspace_mode is not None or request.repository_setup is not None:
-                        raise WorkspaceError(problem)
+                    if explicit_mode is not None or request.repository_setup is not None:
+                        raise problem
                     try:
                         workspace_mode = resolve_workspace_mode(
                             WorkspaceMode.in_place, None,
@@ -322,7 +340,7 @@ class CodingSessionFactory:
                         )
                         self.in_place_roots(project, request.resource_ids, request.path)
                     except (ValueError, WorkspaceError) as exc:
-                        raise WorkspaceError(problem) from exc
+                        raise problem from exc
             validate_directories(request.additional_dirs)
         except Exception:
             with suppress(KeyError, ValueError):
@@ -358,6 +376,17 @@ class CodingSessionFactory:
                     data=message_attachments(request.attachments),
                 ),
             )
+            if moved_from_busy_folder:
+                self.store.append_event(
+                    session_id,
+                    CodingEvent(
+                        type=EventType.session,
+                        title="Working in a worktree",
+                        text="Another task is working in this folder, so this one works in a worktree.",
+                        phase="completed",
+                        data={"reason": "folder_busy"},
+                    ),
+                )
             self.store.append_event(
                 session_id,
                 CodingEvent(
@@ -388,17 +417,22 @@ class CodingSessionFactory:
         selected = self._selected_project(project, resource_ids)
         return {root for _, root in self.project_workspaces.in_place_roots(selected)}
 
-    def complete(self, pending: PendingLocalSession, cancelled: Callable[[], bool]) -> CodingSession:
+    def complete(
+        self, pending: PendingLocalSession, cancelled: Callable[[], bool], *, deleted: Callable[[], bool],
+    ) -> CodingSession:
         """Prepare a pending task's workspace and run its setup commands.
 
         On failure the workspace is released and the Run fails, but the task
-        record stays so the user can see why it did not start.
+        record stays so the user can see why it did not start. A task deleted
+        during preparation instead rolls back without saving recovery data.
         """
         session_id = pending.session_id
         request = pending.request
         preparation: LocalSessionPreparation | None = None
         try:
-            preparation = self._prepare_local_session(session_id, request, pending.project, pending.workspace_mode)
+            preparation = self._prepare_local_session(
+                session_id, request, pending.project, pending.workspace_mode, deleted=deleted,
+            )
             contexts = list(request.source_contexts)
             skill_resolution = self.skills.resolve(session_id, preparation.project, pending.code_skills)
             session = self._build_local_session(
@@ -436,7 +470,7 @@ class CodingSessionFactory:
         except Exception:
             self.skills.cleanup(session_id)
             if preparation is not None:
-                self._release_workspaces(session_id, preparation)
+                self._release_workspaces(session_id, preparation, keep_recovery=not deleted())
                 if request.repository_setup and request.repository_setup.branch:
                     for workspace in preparation.task_workspaces:
                         self.project_workspaces.rollback_task_branch(workspace)
@@ -512,9 +546,11 @@ class CodingSessionFactory:
             )
         self.skills.cleanup(session.id)
 
-    def _release_workspaces(self, session_id: str, preparation: LocalSessionPreparation) -> None:
+    def _release_workspaces(
+        self, session_id: str, preparation: LocalSessionPreparation, *, keep_recovery: bool = True,
+    ) -> None:
         if preparation.task_workspaces:
-            self.project_workspaces.cleanup(session_id, list(preparation.task_workspaces))
+            self.project_workspaces.cleanup(session_id, list(preparation.task_workspaces), keep_recovery=keep_recovery)
             return
         workspace = preparation.fallback_workspace
         if workspace and workspace.workspace_kind in {WorkspaceKind.git_worktree, WorkspaceKind.local_copy}:
@@ -524,6 +560,7 @@ class CodingSessionFactory:
                 workspace.workspace_path,
                 workspace.workspace_kind,
                 workspace.base_revision,
+                keep_recovery=keep_recovery,
             )
 
     @staticmethod
@@ -539,6 +576,8 @@ class CodingSessionFactory:
         request: SessionCreateRequest,
         project: CodeProject | None,
         workspace_mode: WorkspaceMode = WorkspaceMode.worktree,
+        *,
+        deleted: Callable[[], bool],
     ) -> LocalSessionPreparation:
         requested_dirs = validate_directories(request.additional_dirs)
         if project is None:
@@ -579,7 +618,7 @@ class CodingSessionFactory:
         prepared = (
             self.project_workspaces.prepare_in_place(session_id, selected_project)
             if workspace_mode == WorkspaceMode.in_place
-            else self.project_workspaces.prepare(session_id, selected_project, request.repository_setup)
+            else self.project_workspaces.prepare(session_id, selected_project, request.repository_setup, deleted=deleted)
         )
         permission_mode = (
             request.permission_mode
@@ -604,6 +643,16 @@ class CodingSessionFactory:
                 **{name: str(port) for name, port in prepared.ports.items()},
             },
         )
+
+    def _worktree_problem(self, project: CodeProject | None, request: SessionCreateRequest) -> WorkspaceError | None:
+        """Why a worktree cannot be made for this task's folders, if it cannot."""
+        if project is not None:
+            return self.project_workspaces.worktree_problem(self._selected_project(project, request.resource_ids))
+        try:
+            self.workspaces.check_source(request.path or "")
+        except WorkspaceError as exc:
+            return exc
+        return None
 
     @staticmethod
     def _selected_project(project: CodeProject, resource_ids: list[str] | None) -> CodeProject:

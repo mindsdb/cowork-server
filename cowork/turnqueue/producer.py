@@ -23,7 +23,11 @@ from redis.exceptions import RedisError
 
 from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metadata, surface
 from cowork.handlers.turn_errors import (
+    BUDGET_EXCEEDED_CODE,
     RESET_AT_CODES,
+    clean_budget_model,
+    clean_budget_period,
+    clean_budget_scope,
     WORKER_UNRESPONSIVE_TYPE_NAME,
     remote_error_label,
     remote_turn_error,
@@ -1335,18 +1339,20 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # them through a session of its own.
     turn_settings = await run_on_unit_threads(partial(get_user_settings, scope))
     jev_decisions = getattr(turn_settings, "jev_decisions_enabled", True) is not False
-    # Under ZDR MindsHub refuses Jev, so the pod's completion check never asks it.
-    if jev_decisions:
+    jev_classify = getattr(turn_settings, "jev_classify_enabled", True) is not False
+    # Under ZDR MindsHub refuses Jev, so the pod neither checks completion nor classifies with it.
+    if jev_decisions or jev_classify:
         if zdr_on is None:
             from cowork.services.mindshub_zdr import zdr_on_for
 
             try:
                 zdr_on = await zdr_on_for(scope=scope, settings=turn_settings, turn_key=llm_block.get("api_key", ""))
             except Exception:
-                # Unknown counts as on: the check only skips Jev, which MindsHub refuses under ZDR.
+                # Unknown counts as on: it only skips Jev, which MindsHub refuses under ZDR.
                 logger.warning("Could not read ZDR for the remote turn", exc_info=True)
                 zdr_on = True
-        jev_decisions = not zdr_on
+        jev_decisions = jev_decisions and not zdr_on
+        jev_classify = jev_classify and not zdr_on
     time_limit = settings.time_limit_seconds
     offer_connector_drafts = bool(
         connector_drafts and settings.connector_drafts_enabled and scope.org_mode and user_id
@@ -1370,6 +1376,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # completion check then never asks it. A controller that
               # predates the field drops it, and the pod keeps Jev on.
               "jev_decisions": jev_decisions,
+              # False when the organization turned off labelling texts with
+              # Jev: the pod's scratchpad then has no classify(). A controller
+              # that predates the field drops it, and the pod keeps it on.
+              "jev_classify": jev_classify,
               # The app's language (ENG-4149), read by anton's TurnRequestV1.
               # Absent without one. scratchpad-controller relays it to the pod
               # (mindsdb/scratchpad-controller#124, which merges first).
@@ -1585,11 +1595,21 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         # log must carry the same (code, message), and the same
                         # reset_at. An older worker sends no reset_at, and its
                         # frame stays as it was.
-                        code, message = remote_turn_error(data.get("error"))
+                        # A newer worker names a spent budget's scope and period; kept for that code only.
+                        budget_scope = clean_budget_scope(data.pop("budget_scope", None))
+                        budget_period = clean_budget_period(data.pop("budget_period", None))
+                        budget_model = clean_budget_model(data.pop("budget_model", None))
+                        code, message = remote_turn_error(data.get("error"), budget_scope, budget_period, budget_model)
                         data = {**data, "code": code, "message": message}
                         reset_at = _remote_reset_at(code=code, value=data.pop("reset_at", None))
                         if reset_at is not None:
                             data["reset_at"] = reset_at
+                        if code == BUDGET_EXCEEDED_CODE and budget_scope is not None:
+                            data["budget_scope"] = budget_scope
+                        if code == BUDGET_EXCEEDED_CODE and budget_period is not None:
+                            data["budget_period"] = budget_period
+                        if code == BUDGET_EXCEEDED_CODE and budget_model is not None:
+                            data["budget_model"] = budget_model
                         logger.warning(
                             "Remote turn failed conversation=%s correlation_id=%s error_type=%s error_code=%s",
                             conversation_id, corr, remote_error_label(error=data.get("error")), code,
