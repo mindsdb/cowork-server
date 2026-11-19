@@ -433,8 +433,12 @@ def _inside_project(base: Path, *, folder: Path) -> Path:
 settings = AntonHarnessSettings()
 
 
-def build_elicitor(conversation_id: str):
-    """The question strategy for this conversation, or None when disabled.
+def build_elicitor(conversation_id: str, *, interactive: bool = True):
+    """The question strategy for this conversation, or None when disabled or
+    when nobody watches the turn (``interactive`` False: a scheduled run).
+    Unattended, a question or a browser hand-over would only wait out its
+    timeout; without an elicitor the agent learns at once that nobody can
+    answer, as a pod turn without ``interactive`` does.
 
     Returning None is the kill switch: anton only registers `ask_user` when
     an elicitor supports "choice", so the model reverts to asking in plain
@@ -444,7 +448,7 @@ def build_elicitor(conversation_id: str):
     CLIElicitor (which does support "choice"), silently reopening the
     switch. See tests/test_ask_user_flag.py for the guard.
     """
-    if not get_app_settings().ask_user_enabled:
+    if not interactive or not get_app_settings().ask_user_enabled:
         return None
     from cowork.harnesses.anton_harness.elicitor import CoworkElicitor
     from cowork.streaming.answers import broker
@@ -1715,7 +1719,7 @@ class AntonHarness:
         _overlay_user_settings(anton_settings, user)
 
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
-        elicitor = build_elicitor(str(conversation.id))
+        elicitor = build_elicitor(str(conversation.id), interactive=interactive)
         # Asks the user's open preview whether an edited artifact runs. Only
         # where the cowork app tails the turn: a scheduled run or a channel
         # bot has no preview to answer, and would only wait out the timeout.
