@@ -1706,6 +1706,37 @@ async def test_produce_remote_failure_carries_the_workers_reset_at(
 
 
 @pytest.mark.asyncio
+async def test_produce_remote_failure_carries_the_budget_scope(monkeypatch):
+    # The hosted budget card names whose budget is spent, on the frame and on reload.
+    message = "This workspace's spending budget is used up. An administrator can raise it in Budgets."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "BudgetExceededError: spent", "code": "budget_exceeded", "message": message,
+        "budget_scope": "workspace",
+    })
+    expected = {
+        "type": "response.failed", "code": "budget_exceeded", "error": message,
+        "budget_scope": "workspace", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_carries_the_budget_period(monkeypatch):
+    message = "Your team's monthly spending budget is used up. An administrator can raise it in Budgets."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "BudgetExceededError: spent", "code": "budget_exceeded", "message": message,
+        "budget_scope": "team", "budget_period": "month",
+    })
+    expected = {
+        "type": "response.failed", "code": "budget_exceeded", "error": message,
+        "budget_scope": "team", "budget_period": "month", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_failure_without_reset_at_keeps_its_shape(monkeypatch):
     # An older worker sends none, so the frame stays exactly as before.
     frame, events = await _remote_failure_frames(monkeypatch, {
