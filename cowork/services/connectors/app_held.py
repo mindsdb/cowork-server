@@ -82,6 +82,17 @@ def overlay(root: Path, engine: str, name: str, fields: dict, keys: tuple[str, .
     return out
 
 
+ACCESS_MODES = ("read", "write", "none")
+
+
+def effective_access_mode(root: Path, engine: str, name: str, fields: dict) -> str:
+    """The access mode the agent runs an MCP connection with: while values are
+    app-held, the held mode (never the file's, see AppHeldVault); otherwise the
+    file's. A missing or unknown mode runs as "read"."""
+    mode = held(root, engine, name).get("access_mode") if active() else fields.get("_access_mode")
+    return mode if mode in ACCESS_MODES else "read"
+
+
 class AppHeldVault(FilteredDataVault):
     """A vault whose MCP connections read their app-held values.
 
@@ -106,7 +117,7 @@ class AppHeldVault(FilteredDataVault):
     def _held_mode(self, engine: str, name: str, fields: dict) -> dict:
         if not active() or fields.get("_method") != MCP_METHOD:
             return fields
-        return {**fields, "_access_mode": held(self._root, engine, name).get("access_mode") or "read"}
+        return {**fields, "_access_mode": effective_access_mode(self._root, engine, name, fields)}
 
     def load(self, engine: str, name: str) -> dict[str, str] | None:
         fields = super().load(engine, name)

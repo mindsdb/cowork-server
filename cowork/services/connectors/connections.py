@@ -16,13 +16,6 @@ from cowork.services.connectors.persist import own_vault_root, vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.vault_lock import discard_lock, lock_for
 
-_ACCESS_MODES = ("read", "write", "none")
-
-
-def _effective_access_mode(mode: object) -> str:
-    """The mode anton applies: a missing or unknown value runs as "read"."""
-    return mode if mode in _ACCESS_MODES else "read"
-
 
 class ConnectionsService:
     """Reads/writes the persisted connector vault (saved credentials).
@@ -113,8 +106,7 @@ class ConnectionsService:
             method = fields.get("_method")
             access_mode = None
             if method == app_held.MCP_METHOD:
-                held = app_held.overlay(own_vault_root(self.scope), engine, name, dict(fields), keys=("access_mode",))
-                access_mode = _effective_access_mode(held.get("_access_mode"))
+                access_mode = app_held.effective_access_mode(own_vault_root(self.scope), engine, name, fields)
             result.append(ConnectionSummaryResponse(
                 engine=engine,
                 name=name,

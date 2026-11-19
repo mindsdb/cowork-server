@@ -614,6 +614,18 @@ class TestConnectionList:
 
         assert self._row("hubspot", CONN)["access_mode"] == "write"
 
+    def test_a_mode_written_into_the_file_is_not_what_the_tile_shows(self, protected):
+        # While values are app-held the agent ignores the file's mode and runs
+        # with the held one, else read; the tile says the same.
+        _seed_mcp(mode="none")
+        app_held._entries.clear()
+        turn = app_held.AppHeldVault(source=turn_vault_for_scope(LOCAL_SCOPE), root=own_vault_root(LOCAL_SCOPE))
+        from anton.core.mcp.wiring import _access_mode_of
+
+        assert _file_fields()["_access_mode"] == "none"
+        assert _access_mode_of(turn, "hubspot", CONN) == "read"
+        assert self._row("hubspot", CONN)["access_mode"] == "read"
+
     def test_an_unknown_stored_mode_lists_as_read(self, stores):
         _seed_mcp(mode="admin")
         assert self._row("hubspot", CONN)["access_mode"] == "read"
