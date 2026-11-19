@@ -1,3 +1,14 @@
+# dev runs org mode like staging, so it gets the same ingress restriction (see
+# networkPolicy in values.yaml). Merging this does not roll dev: a PR labeled
+# deploy-to-dev does, when the label goes on and again on each push, reopen or
+# other label change while it stays, from that PR merged with its base. The
+# last such rollout wins. A labeled PR whose base lacks this line, such as one
+# into main before this change reaches main, rolls the policy away again. Watch
+# both replicas stay Ready through the rollout, then run the forged-header curl
+# from a pod in another namespace.
+networkPolicy:
+  enabled: true
+
 deployment:
   ingress:
     enabled: true

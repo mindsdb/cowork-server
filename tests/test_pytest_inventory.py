@@ -966,6 +966,58 @@ def test_shards_accept_flat_single_collection_download(shard_evidence, monkeypat
         latest_artifact(inputs, "test-inventory-broad-collection")
 
 
+def test_shard_aggregate_accepts_hosted_runner_differences(shard_evidence, monkeypatch, capsys):
+    """Host metadata stays in the reports without blocking complete evidence."""
+    root, _, inputs, _, _ = shard_evidence
+    collection_path = inputs / "test-inventory-broad-collection-1234-1/inventory.json"
+    shard_path = inputs / "test-inventory-broad-shard-0-1234-1/inventory.json"
+    collection = json.loads(collection_path.read_bytes())
+    collection["environment"]["ci"].update(ImageOS="ubuntu26", ImageVersion="collection-image", RUNNER_ARCH="X64")
+    collection_path.write_text(json.dumps(collection))
+    monkeypatch.setenv("ImageOS", "ubuntu26")
+    monkeypatch.setenv("ImageVersion", "collection-image")
+    monkeypatch.setenv("RUNNER_ARCH", "X64")
+    for index in range(4):
+        path = inputs / f"test-inventory-broad-shard-{index}-1234-1/inventory.json"
+        raw = json.loads(path.read_bytes())
+        raw["environment"]["ci"].update(ImageOS="ubuntu26", ImageVersion="collection-image", RUNNER_ARCH="X64")
+        path.write_text(json.dumps(raw))
+
+    shard = json.loads(shard_path.read_bytes())
+    original_shard = shard_path.read_bytes()
+    shard["environment"].update(release="different-kernel", logical_cpus=None)
+    if collection["environment"]["logical_cpus"] is None:
+        shard["environment"]["logical_cpus"] = 4
+    shard["environment"]["ci"].update(ImageOS="different-image-os", ImageVersion="shard-image")
+    shard_path.write_text(json.dumps(shard))
+    output = root.parent / "mixed-shard"
+    assert aggregate(inputs, output)["collected"] == 6
+    assert read_report(output / "shard-0/inventory.json").environment.model_dump() == shard["environment"]
+    diagnostic = capsys.readouterr().err
+    assert "broad-shard-0: hosted runner metadata differs from collection (ImageOS, ImageVersion, logical_cpus, release)" in diagnostic
+    assert "different-kernel" not in diagnostic and "shard-image" not in diagnostic
+    assert "aggregate:" not in diagnostic
+
+    shard_path.write_bytes(original_shard)
+    monkeypatch.setenv("ImageVersion", "consumer-image")
+    assert aggregate(inputs, root.parent / "mixed-consumer")["collected"] == 6
+    diagnostic = capsys.readouterr().err
+    assert "aggregate: hosted runner metadata differs from collection (ImageVersion)" in diagnostic
+    assert "broad-shard-0:" not in diagnostic
+
+    monkeypatch.delenv("ImageVersion")
+    shard["environment"]["ci"].pop("ImageVersion")
+    shard_path.write_text(json.dumps(shard))
+    assert aggregate(inputs, root.parent / "missing-image")["collected"] == 6
+    diagnostic = capsys.readouterr().err
+    assert "aggregate: hosted runner metadata differs from collection (ImageVersion)" in diagnostic
+    assert "broad-shard-0: hosted runner metadata differs from collection (ImageOS, ImageVersion, logical_cpus, release)" in diagnostic
+
+    monkeypatch.setenv("RUNNER_ARCH", "ARM64")
+    with pytest.raises(ValueError, match="Consumer runner/run metadata differs"):
+        aggregate(inputs, root.parent / "wrong-consumer-arch")
+
+
 def test_shard_aggregate_rejects_damaged_evidence(shard_evidence):
     """Missing inputs and altered source, runtime, coverage or membership cannot pass the join."""
     root, _, inputs, _, _ = shard_evidence
@@ -973,7 +1025,8 @@ def test_shard_aggregate_rejects_damaged_evidence(shard_evidence):
     report_path = shard / "inventory.json"
     original = report_path.read_bytes()
     changes = (
-        ("source", "Shard source"), ("runtime", "runtime"), ("marker", "cases/markers"),
+        ("source", "Shard source"), ("runtime", "runtime"), ("package", "runtime"),
+        ("runner-arch", "Runner/run metadata"), ("marker", "cases/markers"),
         ("selection", "selection"), ("coverage", "coverage"), ("worker", "worker"),
         ("run", "producer identity"),
         ("missing-integration", "selection"), ("missing-module", "selection"),
@@ -987,6 +1040,10 @@ def test_shard_aggregate_rejects_damaged_evidence(shard_evidence):
             raw["revision"]["tree_digest"] = raw["revision_end"]["tree_digest"] = "f" * 64
         elif fault == "runtime":
             raw["environment"]["python"] = "0.0.0"
+        elif fault == "package":
+            raw["environment"]["packages"]["pytest"] = "0.0.0"
+        elif fault == "runner-arch":
+            raw["environment"]["ci"]["RUNNER_ARCH"] = "different-arch"
         elif fault == "marker":
             raw["collection"]["items"][0]["markers"] = ["altered"]
             digest = hashlib.sha256(json.dumps(raw["collection"], sort_keys=True, ensure_ascii=True).encode()).hexdigest()

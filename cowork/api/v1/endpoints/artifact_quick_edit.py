@@ -21,6 +21,10 @@ The response is ``text/event-stream``:
   "editId", "undoable", "ms"}``
 * ``error``         ``{"message": str}``
 
+``images`` (at most 4 PNG, JPEG, GIF or WebP images of up to 5 MB, base64)
+go to the editor's model beside the request and are never stored; the router
+reads the text alone. Anything else there is a 422 before the stream starts.
+
 ``POST .../quick-edits/{edit_id}/undo`` puts back every file an applied
 edit changed and removes those it created, all or nothing
 (``services/artifact_quick_edits.py``); the tracked source's restore is
@@ -72,6 +76,7 @@ from cowork.services.artifact_revisions import (
     list_revisions,
     record_quick_edit,
 )
+from cowork.services.comment_images import MAX_REQUEST_IMAGES, ImageRefused, decode_request_image
 from cowork.services.product_permissions import require_product_permission
 from cowork.services.quick_edit import AntonQuickEdit, QuickEditBackend
 from cowork.streaming.preview_checks import PreviewCheckBroker, preview_checks
@@ -115,8 +120,18 @@ class _HistoryEntry(BaseModel):
     text: str = Field(max_length=4000)
 
 
+class _QuickEditImage(BaseModel):
+    """An image pasted into the bar, sent to the editor's model with the
+    request and never stored. Checked by its bytes (services/comment_images)."""
+
+    name: str | None = Field(default=None, max_length=200)
+    # Base64 of at most MAX_IMAGE_BYTES (5 MB), with room for its padding.
+    data: str = Field(min_length=1, max_length=7_000_000)
+
+
 class _QuickEditBody(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    images: list[_QuickEditImage] = Field(default_factory=list, max_length=MAX_REQUEST_IMAGES)
     # Earlier messages of the bar's thread, so "make it bigger" has a referent.
     history: list[_HistoryEntry] = Field(default_factory=list, max_length=20)
     expectedRevisionId: str | None = Field(default=None, min_length=1, max_length=80)
@@ -404,6 +419,9 @@ class QuickEditRun:
     started: float
     lock_key: str
     broker: PreviewCheckBroker = preview_checks
+    # The bar's images as ``(base64, media type)``, checked; sent to the
+    # editor's model with the request (quick_edit.with_request_images).
+    images: list[tuple[str, str]] = field(default_factory=list)
     # The bar's model pick and effort (``_model_choice``); None: the person's own.
     model: str | None = None
     reasoning_effort: str | None = None
@@ -581,7 +599,9 @@ class QuickEditRun:
                         self.folder,
                         self.body.message,
                         kind=self.kind,
-                        llm=backend.llm,
+                        llm=quick_edit_service.with_request_images(
+                            backend.llm, request=self.body.message, images=self.images,
+                        ),
                         checker=self._checker(emit),
                         history=[entry.model_dump() for entry in self.body.history],
                         on_progress=on_progress,
@@ -699,6 +719,10 @@ async def quick_edit_artifact(
             detail="Quick edits are not available on this server.",
         )
     started = time.monotonic()
+    try:
+        images = [decode_request_image(image.data) for image in body.images]
+    except ImageRefused as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     _source, folder, metadata, _capabilities = await _owner_workspace(scope, project_ref, artifact_id)
     model, reasoning_effort = await _model_choice(request, scope, body)
 
@@ -740,6 +764,7 @@ async def quick_edit_artifact(
 
     run = QuickEditRun(
         anton=anton,
+        images=images,
         model=model,
         reasoning_effort=reasoning_effort,
         scope=scope,

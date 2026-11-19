@@ -16,6 +16,7 @@ from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorSpecResponse
 from cowork.services.connectors.custom_connect import auth_summary, parse_stored
 from cowork.services.connectors.custom_connectors import scope_definitions, scope_is_one_persons
+from cowork.services.connectors.custom_mcp import is_custom_mcp
 from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,9 @@ class ConnectorCatalog(ConnectorSpecRegistry):
             merged = dict(self._base.get_connectors())
             own = scope_is_one_persons(self._session.scope)
             for row in self._custom_rows():
+                if is_custom_mcp(row.connector_id):
+                    logger.warning("a custom connector row uses the reserved id %r; it is not served", row.connector_id)
+                    continue
                 if row.connector_id in merged:
                     logger.warning(
                         "custom connector %r shares an id with a built-in connector; "
