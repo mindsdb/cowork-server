@@ -563,6 +563,22 @@ async def _rows(conversation_id):
     return await run_db(read, scope=LOCAL_SCOPE)
 
 
+async def _answer_events(conversation_id):
+    """The saved events of the conversation's answer, in order."""
+    from cowork.models.message_event import MessageEvent
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.units import run_db
+    from cowork.services.conversations import ConversationService
+
+    def read(session):
+        messages = ConversationService(session).get_ordered_messages(conversation_id, include_pending=True)
+        answer = next(m for m in messages if m.role == "assistant")
+        rows = session.exec(session.select(MessageEvent).where(MessageEvent.message_id == answer.id)).all()
+        return [r.event_data for r in sorted(rows, key=lambda r: r.sequence_number)]
+
+    return await run_db(read, scope=LOCAL_SCOPE)
+
+
 async def _answer(chunks, *, raise_after=None, delay=0.0):
     async def events():
         for i, chunk in enumerate(chunks):
@@ -724,6 +740,10 @@ async def test_produce_answer_saves_the_partial_answer_on_stop(monkeypatch):
     rows = await _rows(conversation_id)
     assert rows[0][2] is False  # the question rejoined history
     assert rows[1][0] == "assistant" and rows[1][1].startswith("Revenue was")
+    # The saved answer ends on the Stop, so a reload shows it as stopped (ENG-4345).
+    events = await _answer_events(conversation_id)
+    assert events[-1]["type"] == "response.cancelled"
+    assert isinstance(events[-1]["at_ms"], int)
 
 
 @pytest.mark.asyncio

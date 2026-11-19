@@ -1826,6 +1826,9 @@ async def test_produce_remote_treats_a_controller_cancel_as_a_real_cancel_not_a_
     assert buffer.frames[-1] == "CLOSE:cancelled"
     assert not any("response.failed" in f for f in buffer.frames)
     assert saved["assistant"] == "partial"
+    # The saved turn ends on the Stop, so a reload shows it as stopped (ENG-4345).
+    assert saved["events"][-1]["type"] == "response.cancelled"
+    assert isinstance(saved["events"][-1]["at_ms"], int)
 
 
 @pytest.mark.asyncio
