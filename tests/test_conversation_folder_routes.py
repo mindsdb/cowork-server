@@ -206,3 +206,16 @@ def test_a_folder_swapped_into_app_data_after_attaching_is_no_longer_served(loca
 
     assert [f["available"] for f in listed.json()["folders"]] == [False]
     assert files.status_code == 404, files.text
+
+
+def test_a_symlink_loop_in_a_folder_is_skipped_not_a_500(local_mode, tmp_path):
+    client = _client()
+    chat = _chat(client)
+    folder = _folder(tmp_path, "looped")
+    (folder / "loop").symlink_to("loop")
+    folder_id = _attach(client, chat, folder).json()["id"]
+
+    files = client.get(f"/api/v1/conversations/{chat}/folders/{folder_id}/files", headers=_LOOPBACK_HOST)
+
+    assert files.status_code == 200, files.text
+    assert [f["path"] for f in files.json()["files"]] == ["readme.md"]

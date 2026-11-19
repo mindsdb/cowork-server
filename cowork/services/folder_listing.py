@@ -71,11 +71,11 @@ def iter_folder_files(base: Path, budget: WalkBudget) -> Iterator[Path]:
 
 
 def file_meta(p: Path, base: Path) -> dict[str, Any] | None:
-    """Listing row for `p` relative to `base`, or None if it is gone or
-    resolves outside `base`."""
+    """Listing row for `p` relative to `base`, or None if it cannot be
+    stat'ed (gone, a symlink loop, unreadable) or resolves outside `base`."""
     try:
         st = p.stat()
-    except FileNotFoundError:
+    except OSError:
         return None
     try:
         resolved = p.resolve()
