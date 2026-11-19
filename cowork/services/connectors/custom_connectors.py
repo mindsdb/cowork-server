@@ -25,6 +25,7 @@ from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope, tenant_sc
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorForm, CustomConnectorUpdate
 from cowork.services.connectors.custom_connect import parse_stored
+from cowork.services.connectors.custom_mcp import is_custom_mcp
 from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
 from cowork.services.connectors.specs._registry import registry
 
@@ -597,6 +598,8 @@ class CustomConnectorService:
         Side effects:
             Commits the session.
         """
+        if is_custom_mcp(connector_id):
+            raise UnstorableFormError("that connector id is reserved for MCP servers the user adds in the app.")
         scope = self.session.scope
         if not scope_is_one_persons(scope):
             raise UnstorableFormError(

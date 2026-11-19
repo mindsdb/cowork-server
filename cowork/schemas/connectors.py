@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from cowork.services.connectors.custom_mcp import is_custom_mcp
+
 # Method ids are free-form per-connector strings (e.g. "personal-api-key",
 # "service-account", "browser_oauth_builtin") — over a hundred distinct
 # values across existing specs, not a fixed vocabulary, so this only
@@ -50,6 +52,10 @@ def validate_engine_id(value: Any) -> str:
         raise InvalidConnectorIdError(
             f"Invalid connector id {value!r}: that is a generated form id, not a "
             "connector. Set `engine` to the service's name (e.g. 'linkedin')."
+        )
+    if is_custom_mcp(value):
+        raise InvalidConnectorIdError(
+            f"Invalid connector id {value!r}: it is reserved for MCP servers the user adds in the app."
         )
     return value
 
