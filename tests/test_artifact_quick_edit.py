@@ -618,11 +618,11 @@ async def test_the_capability_follows_the_agent_permissions_and_support(monkeypa
     monkeypatch.setattr(workspace_ep, "has_product_permission", allowed)
     caps = {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}
     monkeypatch.setattr(workspace_ep, "quick_edit_available", lambda: True)
-    monkeypatch.setattr(workspace_ep, "direct_edit_available", awaitable(lambda scope: True))
+    monkeypatch.setattr(workspace_ep, "direct_edit_available", awaitable(lambda scope, **_: True))
     current = await workspace_ep._current_capabilities(LOCAL_SCOPE, caps)
     assert (current["canQuickEdit"], current["quickEditDirect"]) == (True, True)
     # No decisions model: the bar still shows, as a shortcut into the chat.
-    monkeypatch.setattr(workspace_ep, "direct_edit_available", awaitable(lambda scope: False))
+    monkeypatch.setattr(workspace_ep, "direct_edit_available", awaitable(lambda scope, **_: False))
     current = await workspace_ep._current_capabilities(LOCAL_SCOPE, caps)
     assert (current["canQuickEdit"], current["quickEditDirect"]) == (True, False)
     monkeypatch.setattr(workspace_ep, "quick_edit_available", lambda: False)
@@ -630,6 +630,44 @@ async def test_the_capability_follows_the_agent_permissions_and_support(monkeypa
     monkeypatch.setattr(workspace_ep, "quick_edit_available", lambda: True)
     reviewer = {"canEdit": False, "canAddressWithAgent": False, "canResolveComments": False}
     assert (await workspace_ep._current_capabilities(LOCAL_SCOPE, reviewer))["canQuickEdit"] is False
+
+
+@pytest.mark.parametrize(("blocked", "direct"), [(False, True), (True, False)])
+async def test_under_zdr_the_bar_does_not_offer_direct_edits(monkeypatch, blocked, direct):
+    """Under ZDR MindsHub refuses Jev, so the bar sends messages straight to the chat."""
+    monkeypatch.setattr(quick_edit_service, "anton_quick_edit", lambda: FakeAnton().api())
+    monkeypatch.setattr(
+        quick_edit_service, "decisions_for_scope",
+        awaitable(lambda anton, scope: ("the-user", Decisions(available=True, model="jev"))),
+    )
+    asked = []
+
+    async def zdr_blocks(decisions, **kwargs):
+        asked.append((kwargs["user"], kwargs["org_bearer"]))
+        return blocked
+
+    monkeypatch.setattr(quick_edit_service, "zdr_blocks", zdr_blocks)
+    assert await quick_edit_service.direct_edit_available(LOCAL_SCOPE, org_bearer="caller-token") is direct
+    assert asked == [("the-user", "caller-token")]
+
+
+async def test_the_capability_reads_zdr_as_the_caller(monkeypatch):
+    async def allowed(scope, permission):
+        return True
+
+    monkeypatch.setattr(workspace_ep, "has_product_permission", allowed)
+    monkeypatch.setattr(workspace_ep, "quick_edit_available", lambda: True)
+    asked = []
+
+    async def direct(scope, *, org_bearer=""):
+        asked.append(org_bearer)
+        return False
+
+    monkeypatch.setattr(workspace_ep, "direct_edit_available", direct)
+    caps = {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}
+    current = await workspace_ep._current_capabilities(LOCAL_SCOPE, caps, org_bearer="caller-token")
+    assert current["quickEditDirect"] is False
+    assert asked == ["caller-token"]
 
 
 async def test_permissions_are_checked_in_the_agent_repair_order(monkeypatch):

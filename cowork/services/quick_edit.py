@@ -356,15 +356,18 @@ async def zdr_blocks(decisions: Decisions, *, scope: TenantScope, user, org_bear
         return True
 
 
-async def direct_edit_available(scope: TenantScope) -> bool:
+async def direct_edit_available(scope: TenantScope, *, org_bearer: str = "") -> bool:
     """``quickEditDirect``: whether the bar can edit directly for the caller,
-    not only hand the message to the chat. Never raises."""
+    not only hand the message to the chat. False under ZDR when the decisions
+    model is Jev on MindsHub (``zdr_blocks``). Never raises."""
     try:
-        _user, decisions = await decisions_for_scope(anton_quick_edit(), scope)
+        user, decisions = await decisions_for_scope(anton_quick_edit(), scope)
     except Exception:
         logger.warning("Could not read whether quick edits can run directly", exc_info=True)
         return False
-    return decisions.available
+    if not decisions.available:
+        return False
+    return not await zdr_blocks(decisions, scope=scope, user=user, org_bearer=org_bearer)
 
 
 # ── the editor's LLM and the router's endpoint ───────────────────────────
