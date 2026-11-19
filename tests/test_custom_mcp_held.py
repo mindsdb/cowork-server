@@ -30,6 +30,7 @@ from cowork.services.connectors.custom_connectors import CustomConnectorService,
 from cowork.services.connectors.custom_mcp import CUSTOM_MCP_ENGINE, ReservedEngineError, is_connection_id
 from cowork.services.connectors.layered_vault import FilteredDataVault, LayeredDataVault
 from cowork.services.connectors.persist import own_vault_for_scope, own_vault_root, turn_vault_for_scope
+from tests._connector_test_request import with_test_request
 
 SECRET = "ab" * 32
 HEADERS = {app_secret.HEADER: SECRET}
@@ -347,13 +348,13 @@ class TestReservedEngine:
             CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form(CUSTOM_MCP_ENGINE, form)
 
     def test_a_planted_row_with_the_id_is_never_served(self, db):
-        form = {
+        form = with_test_request({
             "form_id": "fm_aaaaaaaaaa",
             "engine": "httpbin",
             "title": "Connect httpbin",
             "logo_color": "#3a7",
             "fields": [{"name": "token", "label": "Token", "type": "password", "secret": True}],
-        }
+        })
         with Session(db) as session:
             CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form("httpbin", form)
             row = session.exec(select(CustomConnector)).one()
