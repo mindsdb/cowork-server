@@ -2354,6 +2354,11 @@ async def _browser_config(
 
     if channel_context is not None or not browser_runs(user):
         return None
+    from cowork.handlers.jev_route import browser_needs_zdr
+
+    # Under ZDR MindsHub refuses Jev, so a browser whose steps it would pick doesn't run.
+    if browser_needs_zdr(user) and await _turn_zdr_on(user):
+        return None
     from cowork.common.settings.app_settings import TurnQueueSettings
     from cowork.handlers.jev_route import own_decision_target
 

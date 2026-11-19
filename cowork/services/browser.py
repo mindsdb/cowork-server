@@ -708,20 +708,22 @@ def llm_on_mindshub(user_settings: UserSettings) -> bool:
     return user_settings.resolved_planning_provider is Provider.MINDS_CLOUD
 
 
-def browser_runs(user_settings: UserSettings) -> bool:
+def browser_runs(user_settings: UserSettings, *, zdr_on: bool = False) -> bool:
     """Whether the person's switch is on and the browser can run with it: a
     decisions model picks its steps (``jev_route.decisions_available``), and
     on the web the LLM is MindsHub. Otherwise a turn gets no browser,
-    whatever the switch says."""
+    whatever the switch says. *zdr_on*: the org has ZDR on, so Jev on MindsHub
+    can't pick its steps."""
     from cowork.handlers.jev_route import decisions_available
 
-    if not user_settings.browser_enabled or not decisions_available(user_settings):
+    if not user_settings.browser_enabled or not decisions_available(user_settings, zdr_on=zdr_on):
         return False
     return llm_on_mindshub(user_settings) if on_web() else True
 
 
 async def browse_status(
     user_settings: UserSettings, *, bearer: str, org_id: str, user_id: str, can_set_decisions_model: bool = False,
+    zdr_on: bool = False,
 ) -> BrowseStatus:
     """``GET /browse/status`` for the caller.
 
@@ -737,7 +739,8 @@ async def browse_status(
     from cowork.handlers.jev_route import decisions_model
 
     status = partial(
-        BrowseStatus, enabled=browser_runs(user_settings), decisions_model=decisions_model(user_settings),
+        BrowseStatus, enabled=browser_runs(user_settings, zdr_on=zdr_on),
+        decisions_model=decisions_model(user_settings, zdr_on=zdr_on),
         can_set_decisions_model=can_set_decisions_model, own_decisions_unused=own_decisions_unused(user_settings),
     )
     if not on_web():
@@ -761,6 +764,7 @@ async def browse_status(
 
 def turn_block(
     user_settings: UserSettings, *, user_id: str | None, conversation_id: str, project_id: Any,
+    zdr_on: bool = False,
 ) -> BrowserConfig | None:
     """A web turn's browser: the router, the task's own session, and the
     project's saved-tabs key. No credential: anton reaches the router with the
@@ -781,7 +785,7 @@ def turn_block(
     MindsHub.
     """
     router = router_url()
-    if not router or not user_id or not browser_runs(user_settings):
+    if not router or not user_id or not browser_runs(user_settings, zdr_on=zdr_on):
         return None
     return BrowserConfig(
         base_url=router,

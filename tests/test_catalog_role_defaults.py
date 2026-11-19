@@ -731,6 +731,8 @@ def test_settings_are_told_when_zdr_keeps_jev_off(monkeypatch):
         payload = endpoint.call()
 
     assert payload["routing"]["zdr"] is True
+    # Nor can Jev pick the browser's steps, so the browser has no decisions model.
+    assert payload["routing"]["decisions"] is None
     # Asked with the stored settings, the same answer a turn gets.
     assert asked["settings"].minds_api_key is not None
 

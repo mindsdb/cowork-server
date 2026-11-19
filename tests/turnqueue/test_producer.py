@@ -2666,7 +2666,12 @@ def browser_router(monkeypatch, org_deployment):
     when it was made; ``refuse`` makes the next one fail."""
     from cowork.common.settings import user_settings
     from cowork.common.settings.app_settings import get_app_settings
-    from cowork.services import browser
+    from cowork.services import browser, mindshub_zdr
+
+    async def _zdr_off(**kwargs):
+        return False
+
+    monkeypatch.setattr(mindshub_zdr, "browser_zdr_on", _zdr_off)
 
     monkeypatch.setenv("COWORK_BROWSER_ROUTER_URL", ROUTER)
     get_app_settings.cache_clear()
@@ -2700,6 +2705,26 @@ async def _web_turn(*, user_id="u1", project_id="proj-1"):
         conversation_id="conv-1", org_id="o1", user_id=user_id, input_text="hi", model="mindshub_air",
         workspace=workspace,
     ))
+
+
+@pytest.mark.asyncio
+async def test_under_zdr_a_web_turn_gets_no_browser_jev_would_drive(browser_router, monkeypatch):
+    """MindsHub refuses Jev under ZDR: the key is still scoped, to no session, and the job has no browser."""
+    from cowork.services import mindshub_zdr
+
+    asked = []
+
+    async def _zdr_on(**kwargs):
+        asked.append(kwargs["turn_key"])
+        return True
+
+    monkeypatch.setattr(mindshub_zdr, "browser_zdr_on", _zdr_on)
+    await _web_turn()
+
+    [(turn_key, config, _queued)] = browser_router.scoped
+    assert (turn_key, config) == ("mdb_turnkey", None)
+    assert "browser" not in json.loads(browser_router.fake.added[0][1]["payload"])["params"]
+    assert asked == ["mdb_turnkey"]
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cowork.services import mindshub_teams
+from cowork.services import mindshub_teams, mindshub_zdr
 from cowork.services.mindshub_client import MindsHubAnswer, MindsHubReply
 from cowork.services.mindshub_zdr import zdr_on, zdr_on_for
 
@@ -105,3 +105,27 @@ def test_zdr_on_for_asks_with_the_callers_credential(mindshub, monkeypatch, org_
     scope = SimpleNamespace(org_mode=org_mode, org_id="o", user_id="u")
     asyncio.run(zdr_on_for(scope=scope, settings=None, org_bearer=org_bearer, turn_key=turn_key))
     assert mindshub.asked[-1][1] == expected
+
+
+@pytest.mark.parametrize(("needs", "read", "expected", "asked"), [
+    (False, True, False, False),
+    (True, True, True, True),
+    (True, False, False, True),
+    (True, RuntimeError("auth down"), True, True),
+])
+@pytest.mark.asyncio
+async def test_the_browser_asks_zdr_only_when_jev_would_pick_its_steps(monkeypatch, needs, read, expected, asked):
+    from cowork.handlers import jev_route
+
+    monkeypatch.setattr(jev_route, "browser_needs_zdr", lambda settings: needs)
+    calls = []
+
+    async def zdr_on_for(**kwargs):
+        calls.append(kwargs)
+        if isinstance(read, Exception):
+            raise read
+        return read
+
+    monkeypatch.setattr(mindshub_zdr, "zdr_on_for", zdr_on_for)
+    assert await mindshub_zdr.browser_zdr_on(scope=None, settings=None, org_bearer="tok") is expected
+    assert bool(calls) is asked

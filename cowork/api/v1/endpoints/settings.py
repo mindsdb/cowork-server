@@ -245,7 +245,9 @@ def _turns_on(updates: dict[str, Any], key: str) -> bool:
     return isinstance(value, str) and value.strip().lower() in ("true", "1", "yes", "on")
 
 
-async def _reject_browser_that_cant_run(scope: TenantScope, updates: dict[str, Any]) -> None:
+async def _reject_browser_that_cant_run(
+    scope: TenantScope, updates: dict[str, Any], request: Request | None = None,
+) -> None:
     """400 on turning the browser on where it can't run: with no decisions
     model to pick its steps (`jev_route.decisions_available`), or on the web
     with an LLM other than MindsHub, whose browser router takes only a
@@ -265,7 +267,17 @@ async def _reject_browser_that_cant_run(scope: TenantScope, updates: dict[str, A
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="The browser needs MindsHub as the model provider.",
         )
+    from cowork.services.mindshub_zdr import browser_zdr_on
+
     if decisions_available(settings):
+        if await browser_zdr_on(scope=scope, settings=settings, org_bearer=caller_bearer(request)):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "The browser can't use Jev on MindsHub while zero data retention is on. "
+                    "It needs a decision model of the organization's own."
+                ),
+            )
         return
     if browser.own_decisions_unused(settings):
         # Set up, but this deployment's browser can't ask it, as status
@@ -315,7 +327,7 @@ async def bulk_upsert_settings(
     _reject_malformed_role_defaults(body.values or {})
     _reject_decision_model_url_without_host(updates=body.values or {})
     await _reject_unservable_models(scope, body.values or {}, request)
-    await _reject_browser_that_cant_run(scope, body.values or {})
+    await _reject_browser_that_cant_run(scope, body.values or {}, request)
     try:
         updated = await run_db(
             lambda session: unit_setting_service(session).save_all(body.values), scope=scope
@@ -340,7 +352,7 @@ async def upsert_setting(
     _reject_malformed_role_defaults({key: body.value})
     _reject_decision_model_url_without_host(updates={key: body.value})
     await _reject_unservable_models(scope, {key: body.value}, request)
-    await _reject_browser_that_cant_run(scope, {key: body.value})
+    await _reject_browser_that_cant_run(scope, {key: body.value}, request)
     try:
         return await run_db(
             lambda session: unit_setting_service(session).upsert_setting(key, body.value),
@@ -1079,17 +1091,24 @@ async def recommended_models(
     # the caller may edit the organization's own decision model, as for the
     # provider and its keys (`_require_org_admin_for`): an organization admin,
     # or anyone on a local server, where the person is the admin.
+    from cowork.services.mindshub_zdr import zdr_on_for
+
+    mode = gate_mode(gate_settings)
+    # Read once when Jev on MindsHub would gate turns or pick the browser's steps.
+    zdr = (
+        await zdr_on_for(scope=scope, settings=gate_settings, org_bearer=caller_bearer(request))
+        if mode == "jev" or decisions_model(gate_settings) == "mindshub" else False
+    )
     routing = {
-        "mode": gate_mode(gate_settings), "routerProvider": gate["provider"],
-        "decisions": decisions_model(gate_settings),
+        "mode": mode, "routerProvider": gate["provider"],
+        # Under ZDR MindsHub refuses Jev, so the browser has no decisions model unless the org set its own.
+        "decisions": decisions_model(gate_settings, zdr_on=zdr),
         "canSetDecisionModel": not scope.org_mode or can_manage_org(principal),
     }
 
     # Under ZDR turns skip Jev whatever the switch says, so Settings shows it off and disabled.
-    if routing["mode"] == "jev":
-        from cowork.services.mindshub_zdr import zdr_on_for
-
-        routing["zdr"] = await zdr_on_for(scope=scope, settings=gate_settings, org_bearer=caller_bearer(request))
+    if mode == "jev":
+        routing["zdr"] = zdr
 
     # No image picker where Anton's images won't go to MindsHub: a pick there does nothing.
     if not gate_settings._images_go_to_mindshub():

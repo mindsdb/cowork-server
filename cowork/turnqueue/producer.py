@@ -1023,9 +1023,12 @@ _SLOW_SCOPE_MS = 1000
 
 
 async def _scoped_browser_block(
-    *, scope, conversation_id: str, turn_key: str, project_id: str | None,
+    *, scope, conversation_id: str, turn_key: str, project_id: str | None, zdr_on: bool | None = None,
 ) -> dict | None:
     """The job's browser block, or None when the turn gets no browser.
+
+    *zdr_on*: the handler's ZDR answer; None reads it with the turn key when the
+    browser would ask Jev on MindsHub, which ZDR rules out.
 
     Wherever the web has a router, every turn's key is scoped with it before
     the job is queued, since the router turns a key it hasn't scoped away and
@@ -1046,9 +1049,14 @@ async def _scoped_browser_block(
     router = browser.router_url()
     if not router or not turn_key:
         return None
+    from cowork.services.mindshub_zdr import browser_zdr_on
+
+    user_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+    if zdr_on is None:
+        zdr_on = await browser_zdr_on(scope=scope, settings=user_settings, turn_key=turn_key)
     config = browser.turn_block(
-        await run_on_unit_threads(partial(get_user_settings, scope)),
-        user_id=scope.user_id, conversation_id=conversation_id, project_id=project_id,
+        user_settings,
+        user_id=scope.user_id, conversation_id=conversation_id, project_id=project_id, zdr_on=zdr_on,
     )
     started = time.monotonic()
     try:
@@ -1307,7 +1315,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         connectors_block = await _with_custom_usage_notes(connectors_block, scope, custom_api_block)
     browser_block = await _scoped_browser_block(
         scope=scope, conversation_id=conversation_id, turn_key=llm_block.get("api_key", ""),
-        project_id=workspace.project_id if workspace is not None else None,
+        project_id=workspace.project_id if workspace is not None else None, zdr_on=zdr_on,
     )
     browser_block = await _admit_decisions_proxy(
         r, browser_block, turn_key=llm_block.get("api_key", ""), org_id=org_id, user_id=user_id,
