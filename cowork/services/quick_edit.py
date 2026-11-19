@@ -48,6 +48,7 @@ __all__ = [
     "decisions_for",
     "decisions_for_scope",
     "direct_edit_available",
+    "zdr_blocks",
     "quick_edit_available",
     "quick_edit_locks",
     "QUICK_EDIT_GROUP_EVENT",
@@ -331,6 +332,28 @@ async def decisions_for_scope(anton: AntonQuickEdit | None, scope: TenantScope) 
         return None, NO_DECISIONS
     user = await load_user_settings(scope)
     return user, decisions_for(anton, user)
+
+
+def _decisions_on_mindshub(decisions: Decisions) -> bool:
+    """Whether the decisions model is Jev on MindsHub: a minted key (no base yet) or a MindsHub host."""
+    from cowork.services.providers import is_minds_host
+
+    return decisions.base_url is None or is_minds_host(decisions.base_url)
+
+
+async def zdr_blocks(decisions: Decisions, *, scope: TenantScope, user, org_bearer: str = "") -> bool:
+    """Whether ZDR rules out asking *decisions*: Jev on MindsHub while the org has ZDR on.
+
+    An org's own decision model isn't on MindsHub, so it is never blocked. Unknown counts as on."""
+    if not decisions.available or not _decisions_on_mindshub(decisions):
+        return False
+    from cowork.services.mindshub_zdr import zdr_on_for
+
+    try:
+        return await zdr_on_for(scope=scope, settings=user, org_bearer=org_bearer)
+    except Exception:
+        logger.warning("Could not read ZDR for a quick edit; not asking Jev", exc_info=True)
+        return True
 
 
 async def direct_edit_available(scope: TenantScope) -> bool:

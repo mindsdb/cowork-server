@@ -68,6 +68,7 @@ QueuedReason = Literal[
     "busy",            # another message for the turn is still being decided
     # Jev.
     "jev_off",         # no decision model to ask
+    "zdr_on",          # Jev is on MindsHub and the org has ZDR on, which MindsHub refuses it under
     "jev_timeout",     # Jev did not answer in time
     "jev_error",       # Jev answered with an error or nothing usable
     "low_confidence",  # Jev leaned add, below COWORK_TURN_ADDON_MIN_P_ADD
@@ -292,7 +293,7 @@ async def _holding(lock: asyncio.Lock, deadline: float):
 
 async def route_addon(
     *, channel: AddonChannel, text: str, force: bool, scope: TenantScope, local_key: str | None = None,
-    deadline: float | None = None, queue_settings: TurnQueueSettings | None = None,
+    deadline: float | None = None, queue_settings: TurnQueueSettings | None = None, org_bearer: str = "",
 ) -> dict:
     """Add *text* to the turn *channel* belongs to, or say why it is queued,
     by *deadline* (budget_deadline() when not given). *queue_settings* is the
@@ -310,7 +311,7 @@ async def route_addon(
                 return added(addon_id, "user") if addon_id else queued("no_turn")
             return await _ask_jev(
                 channel=channel, text=text, scope=scope, local_key=local_key, deadline=deadline,
-                queue_settings=queue_settings,
+                queue_settings=queue_settings, org_bearer=org_bearer,
             )
     except _Busy:
         return queued("busy")
@@ -325,7 +326,7 @@ async def route_addon(
 
 async def _ask_jev(
     *, channel: AddonChannel, text: str, scope: TenantScope, local_key: str | None, deadline: float,
-    queue_settings: TurnQueueSettings,
+    queue_settings: TurnQueueSettings, org_bearer: str = "",
 ) -> dict:
     refusal = await _staged(deadline, "jev_timeout", partial(
         _jev_refusal,
@@ -337,6 +338,7 @@ async def _ask_jev(
         scope=scope,
         deadline=deadline,
         queue_settings=queue_settings,
+        org_bearer=org_bearer,
     ))
     if refusal is not None:
         return refusal
@@ -346,11 +348,12 @@ async def _ask_jev(
 
 async def _jev_refusal(
     *, conversation_id: str, task: str, progress: list[str], added: list[str], text: str, scope: TenantScope,
-    deadline: float | None = None, queue_settings: TurnQueueSettings | None = None,
+    deadline: float | None = None, queue_settings: TurnQueueSettings | None = None, org_bearer: str = "",
 ) -> dict | None:
     """Ask Jev whether *text* belongs to the running task. None when it does,
     else the queued response saying why not. *queue_settings* is the
-    request's; read here when not given."""
+    request's; read here when not given. *org_bearer*: the caller's own
+    credential on the web, for the ZDR read."""
     from cowork.db.units import run_on_unit_threads
 
     queue_settings = queue_settings or TurnQueueSettings()
@@ -364,6 +367,9 @@ async def _jev_refusal(
         return queued("internal")
     if found is None:
         return queued("jev_off")
+    on_mindshub = isinstance(found, _MintKey) or found[0].mindshub_gateway
+    if on_mindshub and await _zdr_on(scope, org_bearer):
+        return queued("zdr_on")
     # The correlation id of a key minted for this decision, set before the
     # mint: one that failed or was cancelled may still have issued a key, and
     # revoking by correlation id is a no-op when none was.
@@ -408,6 +414,20 @@ async def _jev_refusal(
             # cancellation included. Shielded, so a second cancel can't stop
             # the revoke; a failed one leaves the key to its short expiry.
             await asyncio.shield(producer.revoke_turn_key_quietly(minted_for))
+
+
+async def _zdr_on(scope: TenantScope, org_bearer: str) -> bool:
+    """Whether the caller's org has ZDR on; unknown counts as on, which only skips Jev."""
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.db.units import run_on_unit_threads
+    from cowork.services.mindshub_zdr import zdr_on_for
+
+    try:
+        settings = await run_on_unit_threads(partial(get_user_settings, scope))
+        return await zdr_on_for(scope=scope, settings=settings, org_bearer=org_bearer)
+    except Exception:
+        logger.warning("[addon] could not read ZDR; not asking Jev", exc_info=True)
+        return True
 
 
 def minted_key_ttl(settings: TurnQueueSettings) -> int:
@@ -561,7 +581,7 @@ _REMOTE_ADD_FAILURES: dict[RemoteAddonResult, QueuedReason] = {
 
 async def _remote_jev_refusal(
     *, conversation_id: str, correlation_id: str, text: str, scope: TenantScope, deadline: float,
-    queue_settings: TurnQueueSettings,
+    queue_settings: TurnQueueSettings, org_bearer: str = "",
 ) -> dict | None:
     task, progress, already = await _remote_jev_inputs(
         conversation_id=conversation_id, correlation_id=correlation_id, scope=scope,
@@ -569,13 +589,14 @@ async def _remote_jev_refusal(
     return await _jev_refusal(
         conversation_id=conversation_id, task=task, progress=progress,
         added=already, text=text, scope=scope, deadline=deadline, queue_settings=queue_settings,
+        org_bearer=org_bearer,
     )
 
 
 async def route_remote_addon(
     *, conversation_id: str, correlation_id: str, text: str, force: bool, scope: TenantScope,
     local_key: str | None = None, deadline: float | None = None,
-    queue_settings: TurnQueueSettings | None = None,
+    queue_settings: TurnQueueSettings | None = None, org_bearer: str = "",
 ) -> dict:
     """``route_addon`` for a turn that runs in a pod: decide with Jev here
     (``force`` skips it), then hand the message to the pod and return its
@@ -597,6 +618,7 @@ async def route_remote_addon(
                 refusal = await _staged(deadline, "jev_timeout", partial(
                     _remote_jev_refusal, conversation_id=conversation_id, correlation_id=correlation_id,
                     text=text, scope=scope, deadline=deadline, queue_settings=queue_settings,
+                    org_bearer=org_bearer,
                 ))
                 if refusal is not None:
                     return refusal

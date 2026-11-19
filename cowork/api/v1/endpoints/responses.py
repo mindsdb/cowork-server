@@ -632,7 +632,7 @@ class AddonRequest(BaseModel):
 
 
 @router.post("/addon", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
+async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep, request: Request):
     """A message sent while the conversation's turn runs: add it to that turn
     or tell the app to queue it as the next one (ENG-4194).
 
@@ -725,10 +725,11 @@ async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
             local_key=local_key,
             deadline=deadline,
             queue_settings=settings,
+            org_bearer=caller_bearer(request),
         )
     return await route_addon(
         channel=channel, text=text, force=req.force, scope=scope, local_key=local_key, deadline=deadline,
-        queue_settings=settings,
+        queue_settings=settings, org_bearer=caller_bearer(request),
     )
 
 
