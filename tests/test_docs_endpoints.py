@@ -1080,6 +1080,40 @@ def test_a_lagging_read_is_read_again_even_when_the_mtime_never_moves(monkeypatc
     assert name == "doc.updated" and f["rev"] == 2 and "clientId" not in f
 
 
+def test_a_doc_published_event_leaves_the_mtime_poll_to_send_a_write_nobody_announced(monkeypatch, tmp_path):
+    """doc.published carries no doc. If it moved last_mtime, a write whose own
+    event was lost would never reach the editor: the poll would see no change."""
+    import asyncio
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import DOC_PUBLISHED, DocHub, doc_topic
+    from cowork.docs.service import apply, create_doc
+
+    monkeypatch.setattr(docs, "_POLL_S", 0.2)
+    monkeypatch.setattr(docs, "hub", DocHub())
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    topic = doc_topic(made.folder)
+    lead = made.doc["tabs"][0]["blocks"][0]["id"]
+    seen = {"mtime": 1}
+    monkeypatch.setattr(docs, "_mtime", lambda folder: seen["mtime"])
+
+    async def scenario():
+        stream = docs._sse(_Open(), topic, initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+        await anext(stream)  # doc.ready, last_mtime 1
+        apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "Unannounced."}}], by="agent")
+        seen["mtime"] = 2
+        docs.hub.publish(topic, {"type": DOC_PUBLISHED, "rev": 0})
+        published = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+        polled = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+        await stream.aclose()
+        return published, polled
+
+    (p_name, _p), (u_name, u) = asyncio.run(scenario())
+    assert p_name == "doc.published"
+    assert u_name == "doc.updated" and u["doc"]["tabs"][0]["blocks"][0]["text"] == "Unannounced."
+
+
 def test_a_nudged_rev_the_file_never_reaches_stops_the_rereads_after_a_few_polls(monkeypatch, tmp_path):
     """The doc was recreated, or rewritten with a lower rev: the rev a nudge named
     never shows up. Each open stream must not go on reading and parsing the doc on

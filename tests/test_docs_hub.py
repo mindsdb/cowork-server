@@ -145,3 +145,27 @@ def test_a_message_with_malformed_fields_is_ignored(tmp_path):
         return [_drain(q) for q in queues]
 
     assert asyncio.run(scenario()) == [[], []]
+
+
+def test_another_replicas_doc_published_reaches_the_docs_streams_as_itself(tmp_path):
+    from cowork.docs.hub import DOC_PUBLISHED
+
+    async def scenario():
+        hub = DocHub()
+        topic = doc_topic(tmp_path)
+        queue = hub.subscribe(topic)
+        hub.deliver_remote({"type": DOC_PUBLISHED, "rev": 0, "clientId": None, "origin": "other", "topic": topic})
+        await asyncio.sleep(0)
+        return _drain(queue)
+
+    assert asyncio.run(scenario()) == [{"type": "doc.published", "rev": 0, "clientId": None}]
+
+
+def test_a_doc_published_event_goes_to_the_relay():
+    from cowork.docs.hub import DOC_PUBLISHED
+
+    hub = DocHub()
+    sent = []
+    hub.attach(sent.append)
+    hub.publish("doc:x", {"type": DOC_PUBLISHED, "rev": 0})
+    assert sent and sent[0]["type"] == "doc.published" and sent[0]["rev"] == 0
