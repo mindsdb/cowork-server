@@ -45,16 +45,21 @@ from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
     list_active_connections,
     list_custom_api_connections,
+    list_custom_mcp_connections,
     list_verified_datasource_connections,
     mint_turn_key,
     mint_turn_key_details,
     register_custom_api_grants,
+    register_custom_mcp_grants,
     register_datasource_grants,
     revoke_turn_key,
 )
+from cowork.services.connectors.custom_mcp import CUSTOM_MCP_ENGINE, is_connection_id
 from cowork.turnqueue.models import (
     CUSTOM_API_PROTOCOL_VERSION,
+    CUSTOM_MCP_PROTOCOL_VERSION,
     MAX_CUSTOM_API_CONNECTIONS,
+    MAX_CUSTOM_MCP_CONNECTIONS,
     MAX_DATASOURCE_CONNECTIONS,
     TurnJob,
     TurnJobHeader,
@@ -789,6 +794,188 @@ async def _mint_custom_api_block(*, scope: TenantScope, correlation_id: str, tur
         raise _refuse_custom_api("grants differ from the requested connections")
     return {"connections": [{**ref, "credential_version": versions[ref["connection_id"]]} for ref in refs]}
 
+
+#: The producer's backstop on a custom MCP block, in UTF-8 bytes of its definitions:
+#: auth's member ceiling keeps a real block far below it.
+_CUSTOM_MCP_BLOCK_BACKSTOP_BYTES = 1024 * 1024
+
+
+def _leave_out_custom_mcp(conversation_id: str, reason: str, *, exc_info: bool = False) -> None:
+    """Log the one event line of a turn whose custom MCP block was left out; ``reason`` is a fixed word."""
+    logger.warning(
+        "[producer] custom MCP servers left out of a turn: %s",
+        reason,
+        exc_info=exc_info,
+        extra={"event": "turn_custom_mcp_left_out", "conversation_id": conversation_id, "reason": reason},
+    )
+
+
+def _custom_mcp_connections(answer: dict, disabled: list[dict] | None) -> list[dict] | None:
+    """The listed custom MCP servers in the job's shape, minus the conversation's disabled ones.
+
+    Input: auth's whole listing answer. Output: one entry per server, by id,
+    each definition kept as the string auth served; never parsed here. None
+    when the answer breaks the listing contract anywhere: the caller then
+    leaves the whole block out, never one server. No side effects.
+    """
+    items = answer.get("items")
+    if not isinstance(items, list) or len(items) > MAX_CUSTOM_MCP_CONNECTIONS:
+        return None
+    disabled_names = {
+        entry.get("name") for entry in (disabled or [])
+        if isinstance(entry, dict) and entry.get("engine") == CUSTOM_MCP_ENGINE
+    }
+    connections: list[dict] = []
+    seen_ids: set[int] = set()
+    seen_names: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        connection_id, name, tools = item.get("id"), item.get("name"), item.get("tools")
+        if (
+            isinstance(connection_id, bool)
+            or not isinstance(connection_id, int)
+            or connection_id < 1
+            or connection_id in seen_ids
+            or not is_connection_id(name)
+            or name in seen_names
+            or not isinstance(item.get("label"), str)
+            or not isinstance(tools, list)
+            or not tools
+            or not all(isinstance(text, str) for text in tools)
+        ):
+            return None
+        seen_ids.add(connection_id)
+        seen_names.add(name)
+        if name in disabled_names:
+            continue
+        connections.append({"connection_id": connection_id, "name": name, "label": item["label"], "tools": tools})
+    connections.sort(key=lambda connection: connection["connection_id"])
+    return connections
+
+
+def _custom_mcp_block_bytes(connections: list[dict]) -> int:
+    """The UTF-8 bytes of every definition text, auth's own measure.
+
+    Raises ``ValueError`` (``UnicodeEncodeError``) for a text holding a lone surrogate.
+    """
+    return sum(len(text.encode("utf-8")) for connection in connections for text in connection["tools"])
+
+
+def _custom_mcp_grant_reason(exc: product_permissions.ProductPermissionUnavailable) -> str:
+    """The leave-out reason of a failed grant call, read from the status of auth's answer."""
+    cause = exc.__cause__
+    status = cause.response.status_code if isinstance(cause, httpx.HTTPStatusError) else None
+    if status == 429:
+        return "grant_quota"
+    if status == 409:
+        return "grant_conflict"
+    return "grant_refused"
+
+
+def _refuse_custom_mcp(reason: str) -> product_permissions.ProductPermissionUnavailable:
+    """Name the failed check for the operator; a fixed phrase, never a key, a row or a definition."""
+    logger.warning("[producer] custom MCP grants refused: %s", reason)
+    return product_permissions.ProductPermissionUnavailable()
+
+
+async def _mint_custom_mcp_block(*, scope: TenantScope, conversation_id: str, correlation_id: str,
+                                 turn_key_id: str | None, disabled: list[dict] | None,
+                                 settings: TurnQueueSettings) -> dict | None:
+    """The member's custom MCP servers for this turn, each with its switched-on definitions and a grant.
+
+    None when the turn cannot carry them: the setting off or outside a member's
+    org turn (no event), or, with one ``turn_custom_mcp_left_out`` line naming
+    the reason, no turn key prefix, no producer key, a listing that failed or
+    breaks the contract, a block over the backstop, or a grant call auth
+    refused. A member with no server, or every server disabled, gets None and
+    no event. The turn then runs without custom MCP tools.
+
+    Returns:
+        The whole ``custom_mcp`` block. Versions are the grants', not the listing's.
+
+    Raises:
+        ProductPermissionUnavailable: the grant answer names another member,
+            organization, key, correlation, scope or connection set.
+    """
+    org_id, user_id = scope.org_id, scope.user_id
+    if not settings.custom_mcp_enabled or not scope.org_mode or not org_id or not user_id:
+        return None
+    if not isinstance(turn_key_id, str) or not turn_key_id.strip():
+        _leave_out_custom_mcp(conversation_id, "no_turn_key_prefix")
+        return None
+    if not settings.datasource_producer_key_id or not settings.datasource_producer_key:
+        _leave_out_custom_mcp(conversation_id, "no_producer_key")
+        return None
+    try:
+        answer = await list_custom_mcp_connections(
+            org_id=org_id, user_id=user_id, turn_key_id=turn_key_id, settings=settings
+        )
+    except product_permissions.ProductPermissionUnavailable:
+        _leave_out_custom_mcp(conversation_id, "listing_failed", exc_info=True)
+        return None
+    connections = _custom_mcp_connections(answer, disabled)
+    if connections is None:
+        _leave_out_custom_mcp(conversation_id, "listing_malformed")
+        return None
+    if not connections:
+        return None
+    try:
+        size = _custom_mcp_block_bytes(connections)
+    except ValueError:
+        _leave_out_custom_mcp(conversation_id, "listing_malformed")
+        return None
+    if size > _CUSTOM_MCP_BLOCK_BACKSTOP_BYTES:
+        _leave_out_custom_mcp(conversation_id, "over_backstop")
+        return None
+    requested = [connection["connection_id"] for connection in connections]
+    try:
+        response = await register_custom_mcp_grants(
+            user_id=user_id, org_id=org_id, correlation_id=correlation_id, turn_key_id=turn_key_id,
+            connection_ids=requested, settings=settings,
+        )
+    except product_permissions.ProductPermissionUnavailable as exc:
+        _leave_out_custom_mcp(conversation_id, _custom_mcp_grant_reason(exc), exc_info=True)
+        return None
+    if (
+        not _same_identifier(response.get("user_id"), user_id)
+        or not _same_identifier(response.get("organization_id"), org_id)
+        or response.get("turn_key_id") != turn_key_id
+        or not _same_identifier(response.get("correlation_id"), correlation_id)
+        or response.get("audience") != "custom-mcp"
+        or response.get("purpose") != "call"
+    ):
+        raise _refuse_custom_mcp("grant response binding does not match this turn")
+    grants = response.get("grants")
+    if not isinstance(grants, list):
+        raise _refuse_custom_mcp("grant response carries no grant list")
+    versions: dict[int, int] = {}
+    for grant in grants:
+        connection_id = grant.get("connection_id") if isinstance(grant, dict) else None
+        version = grant.get("credential_version") if isinstance(grant, dict) else None
+        if (
+            isinstance(connection_id, bool) or not isinstance(connection_id, int)
+            or isinstance(version, bool) or not isinstance(version, int) or version < 1
+            or connection_id in versions
+        ):
+            raise _refuse_custom_mcp("grant response carries a malformed grant")
+        versions[connection_id] = version
+    if set(versions) != set(requested):
+        raise _refuse_custom_mcp("grants differ from the requested connections")
+    return {
+        "protocol_version": CUSTOM_MCP_PROTOCOL_VERSION,
+        "connections": [
+            {
+                "connection_id": connection["connection_id"],
+                "name": connection["name"],
+                "label": connection["label"],
+                "credential_version": versions[connection["connection_id"]],
+                "tools": connection["tools"],
+            }
+            for connection in connections
+        ],
+    }
+
 # What the reply loop reports when the worker stops answering. Shaped like the
 # pod's own scrubbed "ExceptionType: message" errors so remote_turn_error can
 # classify it, and built from the type name that function branches on so the two
@@ -1232,8 +1419,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
             else:
                 llm_block = llm_result
         # Independent auth round trips, run together so custom connections add
-        # no turn start time. Both run to the end; the datasource failure wins.
-        datasource_result, custom_api_result = await asyncio.gather(
+        # no turn start time. All run to the end; the datasource failure wins.
+        datasource_result, custom_api_result, custom_mcp_result = await asyncio.gather(
             _mint_datasource_block(
                 org_id=org_id,
                 user_id=user_id,
@@ -1245,12 +1432,17 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
             _mint_custom_api_block(
                 scope=scope, correlation_id=corr, turn_key_id=turn_key_id, disabled=disabled, settings=settings,
             ),
+            _mint_custom_mcp_block(
+                scope=scope, conversation_id=conversation_id, correlation_id=corr, turn_key_id=turn_key_id,
+                disabled=disabled, settings=settings,
+            ),
             return_exceptions=True,
         )
-        for result in (datasource_result, custom_api_result):
+        for result in (datasource_result, custom_api_result, custom_mcp_result):
             if isinstance(result, BaseException):
                 raise result
         datasource_block, custom_api_connections = datasource_result, custom_api_result
+        custom_mcp_block = custom_mcp_result
     except product_permissions.ProductPermissionUnavailable:
         logger.warning(
             "[producer] turn setup unavailable conversation=%s correlation_id=%s", conversation_id, corr,
@@ -1372,6 +1564,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # The member's own verified custom API connections, by id, with
               # grants bound to this turn's key; never a field value.
               **({"custom_api": custom_api_block} if custom_api_block else {}),
+              # The member's custom MCP servers with grants bound to this turn's
+              # key and each switched-on definition as auth stored it; never a token.
+              **({"custom_mcp": custom_mcp_block} if custom_mcp_block else {}),
               # Conversation creation time, ISO 8601. The pod is fresh every
               # turn and would otherwise stamp today's date into the system
               # prompt, changing the cached prefix at midnight.

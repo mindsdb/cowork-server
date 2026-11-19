@@ -268,3 +268,69 @@ async def test_removing_a_drive_file_in_org_mode_does_not_call_auth(monkeypatch)
     result = await connections_endpoints.delete_picked_file("google_drive", "work", "f1", "alpha", ORG_SCOPE, FakeRequest())
 
     assert result == {"ok": True, "files": []}
+
+
+_CUSTOM_MCP_NAME = "cm-" + "0123456789abcdef" * 2
+
+
+def _catalogue_with_one_drive(monkeypatch) -> None:
+    async def fake_proxy_catalogue(request, settings):
+        return {"items": [{"id": "google_drive", "connections": [{"engine": "google_drive", "name": "work"}]}]}
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_catalogue", fake_proxy_catalogue)
+
+
+@pytest.mark.asyncio
+async def test_list_connections_asks_auth_for_no_custom_mcp_server_while_the_switch_is_off(monkeypatch):
+    monkeypatch.delenv("COWORK_TURN_CUSTOM_MCP_ENABLED", raising=False)
+    _catalogue_with_one_drive(monkeypatch)
+
+    async def refuse(*args, **kwargs):
+        raise AssertionError("asked auth for custom MCP servers with the switch off")
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_custom_mcp", refuse)
+
+    result = await connections_endpoints.list_connections(ORG_SCOPE, FakeRequest())
+
+    assert [c.name for c in result] == ["work"]
+
+
+@pytest.mark.asyncio
+async def test_list_connections_adds_the_members_custom_mcp_servers(monkeypatch):
+    monkeypatch.setenv("COWORK_TURN_CUSTOM_MCP_ENABLED", "true")
+    _catalogue_with_one_drive(monkeypatch)
+    seen = []
+
+    async def fake_custom_mcp(method, path, request, settings, **kwargs):
+        seen.append((method, path))
+        return {"items": [
+            {"id": 7, "name": _CUSTOM_MCP_NAME, "label": "Issues", "server_url": "https://mcp.example.com/mcp",
+             "status": "needs_reconnect", "tools_revision": 2, "tools_on": 1},
+        ]}
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_custom_mcp", fake_custom_mcp)
+
+    result = await connections_endpoints.list_connections(ORG_SCOPE, FakeRequest())
+
+    assert seen == [("GET", "/connections")]
+    assert result == [
+        ConnectionSummaryResponse(engine="google_drive", name="work"),
+        ConnectionSummaryResponse(engine="custom_mcp", name=_CUSTOM_MCP_NAME, label="Issues", user_label="Issues",
+                                  server_url="https://mcp.example.com/mcp", status="needs_reconnect"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [404, 500])
+async def test_list_connections_keeps_the_catalogue_when_auths_custom_mcp_list_fails(monkeypatch, status_code):
+    monkeypatch.setenv("COWORK_TURN_CUSTOM_MCP_ENABLED", "true")
+    _catalogue_with_one_drive(monkeypatch)
+
+    async def failing(*args, **kwargs):
+        raise HTTPException(status_code=status_code, detail="Not found.")
+
+    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_custom_mcp", failing)
+
+    result = await connections_endpoints.list_connections(ORG_SCOPE, FakeRequest())
+
+    assert result == [ConnectionSummaryResponse(engine="google_drive", name="work")]

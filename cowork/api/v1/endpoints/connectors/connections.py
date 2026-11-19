@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from cowork import app_secret
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackDesktopOnly, require
-from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
+from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, TurnQueueSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_db, run_efs, unit_session
 from cowork.schemas.connectors import (
@@ -24,7 +24,7 @@ from cowork.schemas.connectors import (
 from cowork.services.connectors import app_held
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
-from cowork.services.connectors.custom_mcp import is_connection_id, is_custom_mcp
+from cowork.services.connectors.custom_mcp import CUSTOM_MCP_ENGINE, is_connection_id, is_custom_mcp
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
     DeveloperProviderUnavailable,
@@ -86,7 +86,7 @@ async def list_connections(scope: ScopeDep, request: Request):
         # The card reads a missing status as healthy, like the local vault's
         # list, so only the one actionable state is passed on; auth's
         # "active" would otherwise render as an unknown status.
-        return [
+        built_in = [
             ConnectionSummaryResponse(
                 engine=c["engine"],
                 name=c["name"],
@@ -96,8 +96,43 @@ async def list_connections(scope: ScopeDep, request: Request):
             for item in catalogue.get("items", [])
             for c in item.get("connections", [])
         ]
+        return built_in + await _org_custom_mcp_connections(request)
     specs = await run_db(lambda session: ConnectorCatalog(session).get_connectors(), scope=scope)
     return ConnectionsService(scope).list(specs)
+
+
+async def _org_custom_mcp_connections(request: Request) -> list[ConnectionSummaryResponse]:
+    """The member's own custom MCP servers from auth, as connection rows, when the setting is on.
+
+    Empty, with a warning, when auth cannot list them (its setting off answers
+    404): the built-in connectors must list whatever happens here.
+    """
+    if not TurnQueueSettings().custom_mcp_enabled:
+        return []
+    try:
+        answer = await auth_proxy.proxy_custom_mcp("GET", "/connections", request, OAuthSettings())
+    except HTTPException as exc:
+        _log.warning("custom MCP servers left out of the connection list: auth answered %s", exc.status_code)
+        return []
+    items = answer.get("items")
+    if not isinstance(items, list):
+        _log.warning("custom MCP servers left out of the connection list: auth's answer has no list")
+        return []
+    rows = []
+    for item in items:
+        if not isinstance(item, dict) or not is_connection_id(item.get("name")):
+            continue
+        label = item.get("label") if isinstance(item.get("label"), str) else None
+        server_url = item.get("server_url") if isinstance(item.get("server_url"), str) else None
+        rows.append(ConnectionSummaryResponse(
+            engine=CUSTOM_MCP_ENGINE,
+            name=item["name"],
+            label=label,
+            user_label=label,
+            server_url=server_url,
+            status="needs_reconnect" if item.get("status") == "needs_reconnect" else None,
+        ))
+    return rows
 
 
 # Non-secret fields surfaced from auth's connection-detail response —

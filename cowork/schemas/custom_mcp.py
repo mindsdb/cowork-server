@@ -1,4 +1,4 @@
-"""Request bodies of the custom MCP connection routes (desktop app only)."""
+"""Request bodies of the custom MCP connection routes: the desktop app's, then the web's."""
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -73,3 +73,59 @@ class AllowedToolsRequest(BaseModel):
         if any(not name or len(name) > _MAX_TOOL_NAME for name in value):
             raise ValueError(f"tool names must be 1 to {_MAX_TOOL_NAME} characters")
         return value
+
+
+#: auth's own bounds on the web routes' fields, so a body auth would refuse never leaves.
+_MAX_LOGIN_HOSTS = 4
+_MAX_LOGIN_HOST = 260
+
+
+class CloudReconnectRequest(BaseModel):
+    """A sign-in again with the stored client, after the member confirmed its login hosts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirmed_login_hosts: list[str] = Field(default_factory=list, max_length=_MAX_LOGIN_HOSTS)
+
+    @field_validator("confirmed_login_hosts")
+    @classmethod
+    def _hosts(cls, value: list[str]) -> list[str]:
+        if any(not host or len(host) > _MAX_LOGIN_HOST for host in value):
+            raise ValueError(f"login hosts must be 1 to {_MAX_LOGIN_HOST} characters")
+        return value
+
+
+class CloudConnectRequest(CloudReconnectRequest):
+    """A server a member adds on web; auth checks the URL and runs the sign-in.
+
+    ``client_secret`` is relayed to auth once and never logged, kept or returned.
+    """
+
+    server_url: str = Field(min_length=1, max_length=2048)
+    label: str = Field(min_length=1, max_length=128)
+    client_id: str = Field(default="", max_length=512)
+    client_secret: str = Field(default="", max_length=512, repr=False)
+
+
+class CloudSwitchesRequest(BaseModel):
+    """The stored tools to switch on, by name, and the snapshot revision they were chosen from."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tools: list[str]
+    tools_revision: int = Field(ge=0)
+
+    @field_validator("tools")
+    @classmethod
+    def _tool_names(cls, value: list[str]) -> list[str]:
+        if any(not name or len(name) > _MAX_TOOL_NAME for name in value):
+            raise ValueError(f"tool names must be 1 to {_MAX_TOOL_NAME} characters")
+        return value
+
+
+class CloudFinishRequest(BaseModel):
+    """The one-time completion id auth put in the finish page's address fragment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    completion: str = Field(min_length=1, max_length=64)
