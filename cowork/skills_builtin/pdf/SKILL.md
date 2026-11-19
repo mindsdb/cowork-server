@@ -164,7 +164,10 @@ Use this to look at a page, check a layout, or read a scanned page.
 import pypdfium2 as pdfium
 
 pdf = pdfium.PdfDocument("document.pdf")
-image = pdf[0].render(scale=2).to_pil()  # first page, as a PIL image
+page = pdf[0]  # first page
+# Long side about 1600 px whatever the page size: a fixed scale can render a
+# poster-size page to gigabytes and stop the scratchpad.
+image = page.render(scale=1600 / max(page.get_width(), page.get_height())).to_pil()
 image.save("page_1.png")
 ```
 
