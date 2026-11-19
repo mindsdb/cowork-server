@@ -149,9 +149,8 @@ class TurnContext:
     """Synthetic pre-turn event: what the formatter needs to know about the
     turn that its other events don't carry. Never emitted as SSE. Every
     producer of a turn's stream yields it first: AntonHarness.stream_response
-    for a turn in this process (from the web UI or a channel),
-    ResponsesHandler._run_remote_turn for a web turn on the remote worker,
-    and remote_turn_events for a channel turn there.
+    for a turn in this process, and ResponsesHandler._run_remote_turn for a
+    web turn on the remote worker.
 
     ``question`` is the text the turn was sent with. The formatter counts as
     the question only the part the user typed (_typed_text), so that a figure

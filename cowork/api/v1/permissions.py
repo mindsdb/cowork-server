@@ -13,10 +13,8 @@ than "open" and "closed":
 ``DesktopOnly``              refused in org mode (``require_local_tenancy``)
 ``LoopbackDesktopOnly``      the caller's network position (``require_local``),
                              and refused in org mode
-``PlatformSignature``        the calling platform's HMAC over the body
 ``Authenticated``            a verified ``Principal``
 ``AuthenticatedInOrgMode``   a verified ``Principal``, in org mode only
-``AuthenticatedOrgAdmin``    ... and org-admin standing
 ``TurnKey``                  a live web turn's key this server recorded
 ===========================  =====================================================
 
@@ -62,7 +60,7 @@ from fastapi import Depends, HTTPException, Request, status
 
 from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.principal import Principal, can_manage_org, get_principal
+from cowork.principal import Principal, get_principal
 
 
 class Permission(Protocol):
@@ -80,8 +78,8 @@ class OpenByDesign:
 
     The odd name in this file, on purpose. Every other class here is named
     after the credential the route takes: ``LoopbackDesktopOnly`` is a
-    network position, and desktop only; ``PlatformSignature`` is an HMAC;
-    ``Authenticated`` is a ``Principal``. The absence of a credential has
+    network position, and desktop only; ``Authenticated`` is a
+    ``Principal``. The absence of a credential has
     no name, so this one is named after the assertion instead: that the
     route is open because someone decided it, not because a line went
     missing. That is also the whole job: this class checks nothing and
@@ -113,9 +111,8 @@ class OpenByDesign:
     apart from "open because someone forgot the line"; both look identical at
     runtime without it.
 
-    If the answer is "loopback", "desktop-only" or "the platform signed it",
-    the class for that is ``LoopbackDesktopOnly`` / ``DesktopOnly`` /
-    ``PlatformSignature``, not this. This one means no credential at all, and
+    If the answer is "loopback" or "desktop-only", the class for that is
+    ``LoopbackDesktopOnly`` / ``DesktopOnly``, not this. This one means no credential at all, and
     every route that carries it is pinned with its reason in
     tests/test_open_by_design_pin.py — declare it here and the build stays red
     until the reason is written down.
@@ -186,27 +183,6 @@ class LoopbackDesktopOnly:
         return None
 
 
-class PlatformSignature:
-    """The credential is the calling platform's own signature over the body.
-
-    Slack, Discord, Telegram and WhatsApp sign their webhooks with a secret
-    this deployment stored when the channel was configured, and
-    ``bridge.verify_signature`` (cowork/channels/webhooks.py) rejects an
-    unsigned or mis-signed request with 401. There is no Cowork principal in
-    the flow by construction: the caller is a platform, not a person.
-
-    A marker, not a check — the verification is in the handler, because it
-    needs the raw body and the org the payload routes to, neither of which a
-    dependency has. What the name buys over ``OpenByDesign`` is the reader
-    knowing a credential exists at all, which is the distinction Envoy draws
-    between an empty ``requires`` and ``allow_missing``, and the one
-    mindshub_inference draws with ``SignedTokenIdentity``.
-    """
-
-    async def check(self, request: Request) -> None:
-        return None
-
-
 class Authenticated:
     """A verified ``Principal`` is required; no further check.
 
@@ -271,36 +247,6 @@ class AuthenticatedInOrgMode(Authenticated):
         if get_app_settings().tenancy_mode != "org":
             return None
         return await super().check(request, principal=principal)
-
-
-class AuthenticatedOrgAdmin(AuthenticatedInOrgMode):
-    """``AuthenticatedInOrgMode``, plus org-admin standing in org mode.
-
-    Configuring a shared resource on behalf of the whole org (channels,
-    org-scoped settings) is admin-owned; a no-op in local mode, same split as
-    ``AuthenticatedInOrgMode``.
-
-    Reads the forwarded roles, and that is the thing to fix next.
-    ``can_manage_org`` asks whether ``"manage-organization"`` is in
-    ``principal.roles``, which ``TrustedHeaderMiddleware`` parsed out of the
-    ``X-User-Roles`` header. ENG-2094's AC3 names that header as the source a
-    declared capability must never be checked against; auth's resolved answer
-    (``org_role`` and ``permissions[]`` from ``GET /v1/entitlements/me/``) is.
-    So this is a floor in the same sense ``AuthenticatedInOrgMode`` is, not a
-    capability check. It is written this way because it replaces
-    ``channels.py``'s own ``_require_org_admin``, which asked the same
-    question of the same header on the same six routes — moving that into the
-    vocabulary changes nothing about who is admitted, and swapping the source
-    is its own slice.
-    """
-
-    async def check(
-        self, request: Request, principal: Principal | None = Depends(get_principal)
-    ) -> Principal | None:
-        principal = await super().check(request, principal=principal)
-        if get_app_settings().tenancy_mode == "org" and not can_manage_org(principal):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="requires an org admin")
-        return principal
 
 
 class TurnKey:

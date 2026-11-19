@@ -28,7 +28,6 @@ from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.models.task_object import TaskObject
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
 from cowork.services.schedules import ScheduleRunService
-from tests.test_channel_binding_delete import postgres_engine  # noqa: F401  (fixture)
 
 
 def _fk_enforced_session() -> Session:
@@ -171,14 +170,13 @@ def test_delete_project_releases_a_channel_binding_without_deleting_it(
     """The fourth foreign key into projects, found in review.
 
     `channel_bindings.anton_project_id` is nullable and had no `ondelete`, so a
-    project that a Slack/Telegram route pointed at could not be deleted at all.
+    project that a channel route pointed at could not be deleted at all. The
+    table stays until a later release drops it, and an older release still
+    writes it during a rollout.
 
-    SET NULL rather than CASCADE is the point of this test: deleting a project
-    must NOT delete someone's channel route. The runtime reads the column as
-    optional (`binding.anton_project_id or self._resolve_default_project_id(...)`
-    at runtime.py:357 and :417), so a released binding keeps serving on the
-    default project. Asserting only "the delete stopped throwing" would pass
-    just as happily with CASCADE, which would silently destroy the route.
+    SET NULL rather than CASCADE is the point of this test: the key releases
+    the row and keeps it. Asserting only "the delete stopped throwing" would
+    pass just as happily with CASCADE.
     """
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
     session = _fk_enforced_session()
@@ -202,6 +200,28 @@ def test_delete_project_releases_a_channel_binding_without_deleting_it(
     session.refresh(survivor)
     assert survivor.anton_project_id is None
     assert survivor.external_group_id == "C123"
+
+
+def test_delete_project_whose_conversation_a_binding_still_points_at(tmp_path, monkeypatch):
+    """During a rolling deploy the previous release still writes channel
+    bindings, and nothing unpins them any more. A binding pinned to one of the
+    project's conversations must not fail the project delete."""
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
+    session = _fk_enforced_session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    project = _project(session, tmp_path, name="pinned")
+    conversation = Conversation(project_id=project.id, topic="telegram: group")
+    session.add(conversation)
+    session.commit()
+    session.refresh(conversation)
+    binding = ChannelBinding(channel_type="telegram", external_group_id="-100123", anton_conversation_id=conversation.id)
+    session.add(binding)
+    session.commit()
+
+    assert ProjectService(scoped).delete_project(project.id) is True
+
+    assert session.get(Project, project.id) is None
+    assert session.get(Conversation, conversation.id) is None
 
 
 def _assert_delete_drops_objects_a_moved_task_left_behind(session: Session, tmp_path) -> None:

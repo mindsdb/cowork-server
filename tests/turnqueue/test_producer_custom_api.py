@@ -119,7 +119,7 @@ async def test_a_routed_turn_binds_to_the_key_the_gate_minted(turn, monkeypatch)
 
 
 async def test_a_turn_that_arrives_with_a_key_but_no_prefix_runs_without_them(turn):
-    """A channel turn hands the producer a minted key and no prefix to bind grants to."""
+    """A turn that hands the producer a minted key and no prefix to bind grants to."""
     block = {"provider": "minds-cloud", "api_key": "mdb_x.secret", "base_url": "https://minds.internal/v1"}
 
     params, _ = await _run(turn, llm=block)

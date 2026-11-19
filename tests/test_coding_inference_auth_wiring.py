@@ -53,3 +53,20 @@ def test_valid_inference_credential_still_cannot_be_used_by_a_remote_peer(app):
     result = client.post('/api/v1/coding/inference/responses', headers={'Authorization': f'Bearer {LOCAL_PROXY_TOKEN}'}, json={})
     assert result.status_code == 403
     assert calls == []
+
+
+def test_a_path_added_to_the_apps_exempt_set_skips_the_bearer_layer(app):
+    """A connector registers its self-checked routes by adding them to
+    app.state.channel_webhook_paths after the middlewares are configured, so
+    that attribute must be the set the auth layer reads, not a copy."""
+    application, _calls, _token = app
+    path = '/api/v1/self-checked-probe'
+
+    @application.post(path)
+    async def self_checked():
+        return {'ok': True}
+
+    client = TestClient(application, client=('127.0.0.1', 50123))
+    assert client.post(path).status_code == 401
+    application.state.channel_webhook_paths.add(path)
+    assert client.post(path).status_code == 200

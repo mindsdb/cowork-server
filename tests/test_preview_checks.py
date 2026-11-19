@@ -256,7 +256,7 @@ def test_the_session_builder_passes_it_through_the_guard():
     source = inspect.getsource(harness.AntonHarness._build_turn_session)
     assert "**preview_checker_kwargs(ChatSessionConfig, preview_checker)" in source
     # Only a turn the app tails can be answered.
-    assert "if interactive and channel_context is None" in source
+    assert "build_preview_checker(str(conversation.id))\n            if interactive\n" in source
 
 
 def test_turn_end_closes_the_conversations_open_checks(monkeypatch):

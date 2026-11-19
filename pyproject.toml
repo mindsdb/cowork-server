@@ -15,9 +15,6 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    # Discord Gateway and Slack Socket Mode ingress import it at runtime, and
-    # the server image installs no extras, so it cannot live only in `channels`.
-    "aiohttp>=3.14",
     "alembic>=1.17.0",
     # First release that re-sends the previous password hash
     # (`previous_access`) and raises `ArtifactOwnedByOtherUserError`.
@@ -103,9 +100,8 @@ dependencies = [
     # three against 48.0.1 and correctly drops 537c.
     #
     # Reachability from THIS package is low for all three. Our own use of
-    # cryptography is Fernet (common/encryption.py, services/settings.py) and
-    # Ed25519 signature verification (channels/plugins/discord.py); we never
-    # decrypt PKCS#7 EnvelopedData and never drive the X.509 path builder.
+    # cryptography is Fernet (common/encryption.py, services/settings.py); we
+    # never decrypt PKCS#7 EnvelopedData and never drive the X.509 path builder.
     # Not audited: transitive use. pyhanko is the notable cryptography consumer
     # here and the X.509 pair is the half with any bearing on it, so that is
     # where to look first if this is ever revisited.
@@ -153,14 +149,6 @@ dependencies = [
     # the driver has to be present or `db-migrate` dies on import.
     "psycopg2-binary>=2.9",
     "redis>=5.3.1,<6",
-    # Org-controlled channel-binding trigger patterns (channel_bindings.py)
-    # are matched against every inbound message at runtime (channels/runtime.py).
-    # stdlib `re` has no backtracking bound, so a syntactically-valid but
-    # pathological pattern (e.g. "(a+)+$") plus an adversarial message is a
-    # ReDoS. re2 uses a linear-time automaton instead of backtracking, so no
-    # pattern can hang a match — no timeout needed, unlike `re`/`regex`. Not
-    # syntax-compatible with `re`: no backreferences, no lookahead/lookbehind.
-    "google-re2>=1.1",
     "python-multipart>=0.0.28",
     "sqlmodel>=0.0.38",
     "tzlocal>=5.0",
@@ -212,13 +200,6 @@ Issues = "https://github.com/mindsdb/cowork-server/issues"
 cowork-server = "cowork.cli:main"
 cowork-dev-setup = "cowork.cli:dev_setup_main"
 cowork-code-runtime = "cowork.coding.runtime_worker:main"
-
-[project.optional-dependencies]
-channels = [
-    "slack-sdk>=3.27.0",
-    "aiohttp>=3.9.0",
-    "discord.py>=2.3.0",
-]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

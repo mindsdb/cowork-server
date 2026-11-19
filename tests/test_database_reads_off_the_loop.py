@@ -1,5 +1,5 @@
-"""Search, settings, the MindsHub workspaces and the channel ingress reconcile
-read and write the database in worker threads.
+"""Search, settings and the MindsHub workspaces read and write the database in
+worker threads.
 
 With the pool's only connection held elsewhere, each one waits for it without
 stopping the event loop: a heartbeat on the test's loop keeps ticking and
@@ -21,7 +21,6 @@ import httpx
 import pytest
 
 import cowork.api.v1.endpoints.mindshub_workspaces as mindshub_workspaces_ep
-from cowork.channels import ingress
 from cowork.db.units import DatabaseBusy
 from cowork.server import create_app
 from cowork.services.mindshub_workspaces import MindsHubWorkspaceListing
@@ -150,23 +149,6 @@ async def test_a_read_that_finds_the_pool_held_waits_off_the_loop(held_pool, cli
     assert response.status_code == 503, response.text[:300]
     assert response.json()["code"] == "server_busy"
     assert response.headers["retry-after"] == str(WAIT)
-    _assert_the_loop_kept_serving(measured)
-
-
-async def test_the_ingress_reconcile_waits_off_the_loop(held_pool, client):
-    """The reconcile runs every 30 s on every replica. Its read of every org's
-    installations waits for the pool in a worker thread, and the pass is
-    refused at POOL_TIMEOUT; the loop's caller logs it and tries again."""
-
-    class _Manager:
-        def running_keys(self):
-            return []
-
-    measured = await _while_others_are_served(
-        client, lambda: ingress.reconcile_once(_Manager(), adapters=None)
-    )
-
-    assert isinstance(measured.outcome, DatabaseBusy)
     _assert_the_loop_kept_serving(measured)
 
 

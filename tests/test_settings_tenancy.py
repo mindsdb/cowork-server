@@ -70,10 +70,6 @@ def test_ui_and_model_choice_are_user_scoped():
         assert setting_is_org_scoped(key) is False
 
 
-def test_channel_credential_keys_are_org_scoped():
-    assert setting_is_org_scoped("channel.telegram.bot_token") is True
-
-
 # org-class keys: shared within an org, isolated across orgs
 
 def test_org_key_isolated_across_orgs(engine):

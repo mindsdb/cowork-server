@@ -431,11 +431,6 @@ def _known_harness_or_anton(value: str, field: str) -> str:
     return "anton"
 
 
-def _channels_harness_default() -> str:
-    value = get_app_settings().channels_harness or "anton"
-    return _known_harness_or_anton(value, "channels_harness")
-
-
 def _coding_engine_options() -> list[str]:
     # Imported lazily so normal Cowork settings startup does not import or
     # launch a coding runtime. The registry only reports functional adapters;
@@ -683,11 +678,6 @@ class UserSettings(Settings):
         default="anton",
         title="Harness",
         description="The AI harness used to generate responses.",
-    )
-    channels_harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
-        default_factory=_channels_harness_default,
-        title="Channel Agent",
-        description="The AI harness that serves messaging-channel conversations.",
     )
 
     # ── UI preferences ──
@@ -1163,7 +1153,7 @@ class UserSettings(Settings):
     # Same, for `minds_role_defaults` (see `_minds_role_default_map`).
     _role_default_cache: dict[str, str] | None = PrivateAttr(default=None)
 
-    @field_validator("harness", "channels_harness")
+    @field_validator("harness")
     @classmethod
     def validate_harness(cls, v: str, info: ValidationInfo) -> str:
         # Reads tolerate an unknown id: a stored row at any scope, ~/.cowork/.env
@@ -1636,12 +1626,9 @@ class UserSettings(Settings):
 
 
 def setting_is_org_scoped(key: str) -> bool:
-    """True for org-level config, False for a personal preference. channel.*
-    keys and SecretStr credentials are org structurally; other fields are org
-    iff tagged with the ORG marker. Only decides where a write lands, not read
-    fallback."""
-    if key.startswith("channel."):
-        return True
+    """True for org-level config, False for a personal preference. SecretStr
+    credentials are org structurally; other fields are org iff tagged with the
+    ORG marker. Only decides where a write lands, not read fallback."""
     field = UserSettings.model_fields.get(key)
     if field is None:
         return False

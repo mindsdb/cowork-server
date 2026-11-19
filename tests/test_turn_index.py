@@ -309,7 +309,7 @@ def test_only_a_run_that_saved_its_question_makes_a_start_at_or_below_its_number
 
     assert [entry.makes_stale(turn_id=n, now=1.0) for n in (2, 3, 4)] == [True, True, False]
     assert entry.model_copy(update={"saved_question": False}).makes_stale(turn_id=3, now=1.0) is False
-    # A channel turn's entry names no run.
+    # An entry an older release wrote for a channel turn names no run.
     assert entry.model_copy(update={"run_id": None}).makes_stale(turn_id=3, now=1.0) is False
 
 

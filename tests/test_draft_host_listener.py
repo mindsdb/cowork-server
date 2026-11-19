@@ -383,15 +383,12 @@ async def test_a_listener_that_fails_to_start_still_runs_the_shutdown(fresh_sett
     monkeypatch.setattr(server, "consume_pending_credential_clear", lambda *args: None)
     monkeypatch.setattr(server, "_warm_agent_runtime", lambda: None)
     monkeypatch.setattr(server, "_warm_model_map_on_boot", nothing)
-    monkeypatch.setattr(server, "_start_channels", nothing)
     monkeypatch.setattr(server, "start_scheduler", lambda: None)
     monkeypatch.setattr("cowork.db.session.get_open_session", boot_database_is_off)
     monkeypatch.setattr(server, "start_draft_listener", refuse)
     monkeypatch.setattr(server, "stop_draft_listener", stopped)
     monkeypatch.setattr(http_client, "close_proxy_client", closed)
     app = FastAPI()
-    app.state.channel_ingress = SimpleNamespace(stop_all=nothing)
-    app.state.channel_adapters = SimpleNamespace(shutdown=nothing)
 
     with pytest.raises(RuntimeError, match="the draft listener could not start"):
         async with server.lifespan(app):

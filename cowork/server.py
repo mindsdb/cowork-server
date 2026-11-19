@@ -166,25 +166,6 @@ class _StartupClock:
         )
 
 
-async def _start_channels(app: FastAPI) -> None:
-    """Build live adapters from stored credentials and start ingress.
-
-    Local mode only: adapters/ingress are boot-time and singleton, built from
-    the one deployment-global installation. Org mode resolves adapters
-    per-request instead (LiveAdapterRegistry.resolve_org_bridge), since
-    credentials are per-org and there is no single set to preload at boot."""
-    if get_app_settings().tenancy_mode == "org":
-        return
-    await app.state.channel_adapters.refresh_all()
-    from cowork.channels.ingress import sync_channel_ingress
-    from cowork.channels.registry import get_registry
-
-    for plugin in get_registry().all():
-        await sync_channel_ingress(
-            app.state.channel_ingress, app.state.channel_adapters, plugin.channel_type
-        )
-
-
 # Hard ceiling on the boot-time model-map warm. This runs during lifespan
 # startup, i.e. BEFORE uvicorn binds the port, so an unbounded fetch against a
 # degraded MindsHub would make the desktop app unreachable — and past the
@@ -697,20 +678,13 @@ async def lifespan(app: FastAPI):
     # is closed before the first turn. Bounded and fail-open; see the helper.
     if await _warm_model_map_on_boot():
         logger.info("warmed MindsHub model-availability map on boot")
-    clock.begin("scheduler_and_channels")
+    clock.begin("scheduler")
     start_scheduler()
-    await _start_channels(app)
     clock.begin("draft_listener")
-    app.state.channel_ingress_reconciler = None
     app.state.artifact_owner_backfill = None
     app.state.artifact_location_backfill = None
     app.state.artifact_location_backfill_stop = threading.Event()
     if get_app_settings().tenancy_mode == "org":
-        from cowork.channels.ingress import start_reconciler
-
-        app.state.channel_ingress_reconciler = start_reconciler(
-            app.state.channel_ingress, app.state.channel_adapters
-        )
         # Background so the port binds without waiting for an EFS walk.
         app.state.artifact_owner_backfill = asyncio.create_task(
             _run_artifact_owner_backfill()
@@ -749,7 +723,6 @@ async def lifespan(app: FastAPI):
         # First, so no draft request is still reading files or the database
         # while the steps below close them.
         await stop_draft_listener(draft_listener)
-        from cowork.channels.webhooks import drain_background_tasks
         from cowork.services.push.dispatch import drain_background_tasks as drain_push_notifications
         from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
@@ -769,7 +742,6 @@ async def lifespan(app: FastAPI):
         else:
             _log_cancelled_turns(await registry.shutdown())
 
-        await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
         await _stop_location_backfill(
             task=getattr(app.state, "artifact_location_backfill", None),
@@ -777,8 +749,6 @@ async def lifespan(app: FastAPI):
         )
         await _cancel_and_wait(getattr(app.state, "router_startup_probe", None))
 
-        await app.state.channel_ingress.stop_all()
-        await drain_background_tasks()
         # After the turn drains above, whose endings may each have started a
         # push, and the scheduled runs, which push when they finish.
         await drain_push_notifications()
@@ -786,7 +756,6 @@ async def lifespan(app: FastAPI):
         # close of its scratchpad processes, and those must finish before the
         # event loop stops.
         await drain_scratchpad_closes()
-        await app.state.channel_adapters.shutdown()
         get_coding_service().close_all()
         shutdown_launched_backends()
         await close_scratchpads()
@@ -1049,10 +1018,11 @@ def create_app() -> FastAPI:
     # flows back through CORS and carries Access-Control-Allow-Origin, so the
     # browser sees the 401 rather than an opaque CORS failure.
     #
-    # External channel webhooks carry their own signature, not the bearer
-    # token; _install_channels fills this set with their paths so the auth
-    # layer lets them through.
+    # Routes that check their own caller rather than the bearer token or the
+    # identity headers; both auth layers let these paths through. The Teams
+    # connector adds its routes to this same set through app.state.
     channel_webhook_paths: set[str] = set()
+    app.state.channel_webhook_paths = channel_webhook_paths
 
     # Trusted identity headers name a person in local tenancy. Only a request
     # that already passed the bearer token may name one, and each person's
@@ -1276,8 +1246,6 @@ def create_app() -> FastAPI:
     # Include v1 API routes
     app.include_router(v1_router)
 
-    _install_channels(app, channel_webhook_paths)
-
     # ENG-2094: every route must declare a Permission (require(...)) so a
     # walker can tell "open on purpose" from "someone forgot the line" — see
     # route_walker.py and its docstring. Boot-time, not just CI, so a gap
@@ -1342,56 +1310,6 @@ def _warn_if_the_front_door_outranks_the_identity_layer(app: FastAPI) -> None:
         settings.identity_enforce,
         still_enforcing,
     )
-
-
-def _install_channels(app: FastAPI, webhook_paths: set[str]) -> None:
-    """Discover channel plugins, mount their webhook routes, and build the
-    Anton-only channel runtime + live-adapter registry.
-
-    The registry/runtime are stashed on ``app.state`` so the lifespan can build
-    adapters from stored credentials at startup and tear them down on shutdown.
-    Webhook routes resolve the live adapter synchronously through the registry's
-    cache, which the lifespan populates — so routes are mounted here but only
-    serve once a channel is configured (otherwise the route ACK-ignores: 204).
-
-    Every mounted webhook path is recorded in ``webhook_paths`` so the bearer
-    auth layer exempts it — these endpoints are called by external platforms
-    that authenticate with their own signature, not the Cowork token.
-
-    Mounted in both local and org mode: org mode resolves the org per-request
-    from the payload (LiveAdapterRegistry.resolve_org_bridge) rather than
-    from one boot-time adapter, so there's no global set of credentials to
-    preload here the way local mode's lifespan startup does (_start_channels).
-    """
-    from cowork.channels.ingress import IngressManager
-    from cowork.channels.registry import get_registry, load_first_party_plugins
-    from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
-    from cowork.channels.webhooks import build_channel_webhook_router
-
-    load_first_party_plugins()
-    adapters = LiveAdapterRegistry()
-    runtime = AntonChannelRuntime(adapters)
-
-    for plugin in get_registry().all():
-        if not plugin.webhooks:
-            continue
-        app.include_router(
-            build_channel_webhook_router(
-                plugin, resolver=adapters.get, sink=runtime.handle,
-                org_resolver=adapters.resolve_org_bridge,
-            ),
-            prefix="/api/v1/channels",
-        )
-        # Mirrors the route path built in webhooks._add_webhook_route:
-        # f"/{channel_type}{webhook.path}" under the /api/v1/channels prefix.
-        webhook_paths.update(
-            f"/api/v1/channels/{plugin.channel_type}{webhook.path}"
-            for webhook in plugin.webhooks
-        )
-    app.state.channel_adapters = adapters
-    app.state.channel_runtime = runtime
-    app.state.channel_ingress = IngressManager(sink=runtime.handle)
-    app.state.channel_webhook_paths = webhook_paths
 
 
 # Create the application instance

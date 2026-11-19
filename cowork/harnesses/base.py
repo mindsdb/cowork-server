@@ -1,5 +1,4 @@
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, Literal, Protocol
 from typing_extensions import TypedDict
 
@@ -24,21 +23,6 @@ def prompt_text(blocks: Iterable[Mapping[str, Any]]) -> str:
     """The text of a turn's input blocks: what the user sent, with any
     context the client appended to it."""
     return " ".join(block["text"] for block in blocks if block.get("type") == "text")
-
-
-@dataclass(frozen=True)
-class ChannelContext:
-    """Origin of a turn that arrived via a chat channel (Telegram, Slack, ...).
-
-    None on the harness call means the turn came from the desktop UI. Harnesses
-    use it to swap desktop-oriented prompt guidance for chat/support-mode
-    guidance; harnesses without channel-aware prompts accept and ignore it.
-    """
-
-    channel_type: str
-    is_group: bool = False
-    display_name: str | None = None
-    instructions: str | None = None
 
 
 class HarnessProvider(Protocol):
@@ -74,10 +58,9 @@ class HarnessProvider(Protocol):
         # data without changing the harness contract.
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
-        channel_context: ChannelContext | None = None,
         # True only for a client that renders a tool's message to the user
-        # as an agent message (the cowork UI). A channel bot or the
-        # non-streaming API gets only the answer text.
+        # as an agent message (the cowork UI). The non-streaming API gets only
+        # the answer text.
         tool_messages: bool = False,
         # Liveness hook for silent model calls (cowork/streaming/liveness.py).
         # A harness with an anton session attaches it so the producer can keep

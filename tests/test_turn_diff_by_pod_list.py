@@ -662,40 +662,6 @@ async def test_a_turn_end_that_could_not_open_the_artifacts_keeps_the_rows(monke
     assert _queued_slugs(conv_id) == {"fixme"}
 
 
-async def test_a_channel_turn_end_rules_only_on_the_repair_folders_it_read(monkeypatch, tmp_path):
-    """The channel producer's record step rules on what the browser one does:
-    the repair folders its diff read, and not one whose open failed. It drops
-    no row itself: remote_turn_events drops the ruled ones once the turn's
-    cards are out."""
-    from cowork.handlers.responses import _RemoteArtifactsDir
-    from cowork.services import artifact_identity
-    from cowork.turnqueue.remote_turn import _record_turn_artifacts
-
-    base = tmp_path / "proj" / ".anton" / "artifacts"
-    _artifact(base, "readable")
-    _artifact(base, "flaky")
-    before, before_mtimes = snapshot_artifact_state(base)
-    conv_id = uuid4()
-    _record_queued(conversation_id=conv_id, slugs=["readable", "flaky"])
-    real_open_child = artifact_identity.open_pinned_child
-
-    def flaky_open(parent, name, *args, **kwargs):
-        if name == "flaky":
-            raise OSError(errno.EIO, "Input/output error")
-        return real_open_child(parent, name, *args, **kwargs)
-
-    monkeypatch.setattr(artifact_identity, "open_pinned_child", flaky_open)
-
-    changes = await _record_turn_artifacts(
-        _RemoteArtifactsDir(base=base, project_id=None, project_name="Project", creator=None),
-        conv_id=conv_id, scope=ORG_SCOPE, before_slugs=before, before_mtimes=before_mtimes,
-        completed_cleanly=True, touched=set(), repairs=_queued(conversation_id=conv_id),
-    )
-
-    assert changes.checked_repairs == {"readable"}
-    assert _queued_slugs(conv_id) == {"readable", "flaky"}
-
-
 def test_the_diff_rules_on_a_repair_folder_only_when_it_could_read_it(tmp_path, monkeypatch):
     """A folder that is gone holds no repair, so its row can go, and so does
     one swapped for a link after its probe, which no reader follows; one
@@ -816,28 +782,6 @@ def test_a_repair_folder_whose_repairs_cannot_be_read_is_not_ruled_on(tmp_path, 
 
     assert injected, "the read of the folder's repairs journal never reached the injected failure"
     assert changes.checked_repairs == set()
-
-
-async def test_a_channel_turn_end_keeps_the_row_of_a_repair_it_could_not_finish(monkeypatch, tmp_path):
-    from cowork.handlers.responses import _RemoteArtifactsDir
-    from cowork.turnqueue.remote_turn import _record_turn_artifacts
-
-    base = tmp_path / "proj" / ".anton" / "artifacts"
-    folder = _artifact(base, "fixme")
-    conv_id = uuid4()
-    _queue_repair(folder=folder, conversation_id=conv_id)
-    _record_queued(conversation_id=conv_id, slugs=["fixme"])
-    before, before_mtimes = snapshot_artifact_state(base)
-    _hold_artifact_lock(monkeypatch=monkeypatch, folder=folder)
-
-    changes = await _record_turn_artifacts(
-        _RemoteArtifactsDir(base=base, project_id=None, project_name="Project", creator=None),
-        conv_id=conv_id, scope=ORG_SCOPE, before_slugs=before, before_mtimes=before_mtimes,
-        completed_cleanly=True, touched=set(), repairs=_queued(conversation_id=conv_id),
-    )
-
-    assert changes.checked_repairs == set()
-    assert _queued_slugs(conv_id) == {"fixme"}
 
 
 async def test_a_web_turn_end_keeps_the_row_of_a_repair_it_could_not_finish(monkeypatch, tmp_path):

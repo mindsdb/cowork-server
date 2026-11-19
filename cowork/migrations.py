@@ -183,7 +183,7 @@ def normalize_retired_harness_rows(session: Session) -> bool:
 
     known = set(available_harness_ids())
     rows = session.exec(
-        select(Setting).where(Setting.key.in_(("harness", "channels_harness")))
+        select(Setting).where(Setting.key == "harness")
     ).all()
     changed = 0
     for row in rows:

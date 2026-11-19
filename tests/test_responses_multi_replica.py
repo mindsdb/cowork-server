@@ -729,32 +729,6 @@ async def test_a_stale_local_handle_defers_to_the_entry_another_replicas_run_wro
         await asyncio.wait_for(admitted.task, timeout=2)
 
 
-@pytest.mark.asyncio
-async def test_a_channel_turn_does_not_replace_a_claimed_turns_index_entry(fake_redis):
-    """Cancel and answer resolve a turn through its index entry. A channel
-    turn on the same conversation used to replace it, so they reached the
-    channel turn instead of the web turn holding the claim."""
-    runs = RunRegistry()
-    started, release = asyncio.Event(), asyncio.Event()
-    handle = await runs.start(
-        conversation_id="chan", turn_id=1, open_buffer=_opens("chan", 1), produce=_waiting(started, release),
-    )
-    await asyncio.wait_for(started.wait(), timeout=2)
-
-    wrote = await turn_index.record_channel_turn(
-        conversation_id="chan", turn_id=0, correlation_id="corr-channel", org_id=None, user_id=None,
-    )
-
-    assert wrote is False
-    assert (await turn_index.get_turn("chan")).run_id == handle.run_id
-    release.set()
-    await asyncio.wait_for(handle.task, timeout=2)
-    assert await turn_index.record_channel_turn(
-        conversation_id="chan", turn_id=0, correlation_id="corr-channel", org_id=None, user_id=None,
-    ) is True
-    assert (await turn_index.get_turn("chan")).correlation_id == "corr-channel"
-
-
 # ── the stale-number rule across replicas ────────────────────────────
 #
 # Two questions that read the history at the same moment compute the same

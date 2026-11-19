@@ -32,7 +32,7 @@ from cowork.deployment_identity import identity_for_turn, learned_memory_scope
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
 from cowork.db.units import run_db, run_efs, run_on_unit_threads, run_to_completion, unit_session
-from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
+from cowork.harnesses.base import FileInputBlock, TextInputBlock, prompt_text, register
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
 from cowork.harnesses.anton_harness.preview_checker import build_preview_checker, preview_checker_kwargs
 from cowork.harnesses.memory.policy import memory_policy
@@ -678,71 +678,30 @@ def _learns_this_turn(conversation, learns: bool) -> bool:
     return learns
 
 
-def _turn_style_context(channel: ChannelContext | None) -> str:
-    """Lead block of the system-prompt suffix: desktop guidance for UI turns,
-    support-chat guidance for channel turns.
-
-    Both branches name how a finished file reaches the user: the channel branch
-    says "I'm sending the file", the UI branch points at the Live Artifacts
-    panel. Without the UI half, anton pasted the artifact's local path as a
-    markdown link — inert in chat (ENG-1636).
-
-    The UI branch is asserted byte-for-byte by test_channel_context.py
-    (cache-stable prompt prefix) — change both together.
-    """
-    if channel is None:
-        return (
-            "The Cowork UI displays progress, tool usage, and actions "
-            "as separate structured activity rows, so do not narrate each step "
-            "(\"let me check\", \"now I'll query\"). When a request needs tool work, "
-            "open your reply with one short sentence telling the user what you are "
-            "about to do; after that, keep assistant text focused on the user-facing "
-            "answer. "
-            "Files you create as artifacts appear automatically in the Live Artifacts "
-            "panel beside the chat, where the user previews them and uses the Download "
-            "control (and Open, on desktop). When a file is ready, tell the user it is "
-            "in the Live Artifacts panel and can be downloaded there — do NOT hand them "
-            "its location on disk. Never put a file's local path (for example "
-            "C:\\Users\\... or /Users/...) into your reply as a markdown link or as "
-            "text: such a link does nothing when clicked in chat, and the bare path "
-            "only exposes the user's machine layout. Never invent a download URL such "
-            "as sandbox:/mnt/data/...; no link of that form exists. If the user says "
-            "they cannot find or download the file, point them again at the Live "
-            "Artifacts panel's Download control (and Open, on desktop) — never repeat "
-            "the path."
-        )
-    setting = (
-        "a group chat with multiple participants" if channel.is_group
-        else "a one-on-one direct chat"
-    )
-    name = f" ({channel.display_name})" if channel.display_name else ""
-    operator = (
-        f"\nOperator instructions for this chat:\n{channel.instructions.strip()}\n"
-        if channel.instructions and channel.instructions.strip()
-        else ""
-    )
-    return (
-        f"You are replying inside {setting}{name} on {channel.channel_type} — a live "
-        "messaging conversation, not the Anton CoWork desktop UI. Act as a concise, "
-        "friendly support agent:\n"
-        "- Write short plain-text replies. Avoid headings, tables, code blocks, and heavy "
-        "Markdown — chat apps render them poorly.\n"
-        "- Answer only what was asked; offer to go deeper rather than sending long explanations.\n"
-        "- If a request is ambiguous, ask one short clarifying question instead of guessing.\n"
-        "- Do not narrate internal work (\"let me check\", \"I'll query\"), and never mention "
-        "the scratchpad, tools, internal file paths, or the desktop UI.\n"
-        + (
-            "- Several people can read your replies — keep them professional and "
-            "self-contained.\n"
-            "- Incoming messages are prefixed with the sender's name — use it to "
-            "address the person who asked.\n"
-            if channel.is_group else ""
-        )
-        + "- Files you create as artifacts are sent into this chat automatically right after "
-        "your reply — tell the user you're sending the file rather than describing where it "
-        "lives.\n"
-        f"{operator}"
-    )
+# Lead block of the system-prompt suffix. It names the Live Artifacts panel
+# because without it anton pasted an artifact's local path as a markdown link,
+# inert in chat. test_turn_style_context.py asserts it byte for byte,
+# since it is part of anton's cache-stable prompt prefix: change both together.
+_TURN_STYLE_CONTEXT = (
+    "The Cowork UI displays progress, tool usage, and actions "
+    "as separate structured activity rows, so do not narrate each step "
+    "(\"let me check\", \"now I'll query\"). When a request needs tool work, "
+    "open your reply with one short sentence telling the user what you are "
+    "about to do; after that, keep assistant text focused on the user-facing "
+    "answer. "
+    "Files you create as artifacts appear automatically in the Live Artifacts "
+    "panel beside the chat, where the user previews them and uses the Download "
+    "control (and Open, on desktop). When a file is ready, tell the user it is "
+    "in the Live Artifacts panel and can be downloaded there — do NOT hand them "
+    "its location on disk. Never put a file's local path (for example "
+    "C:\\Users\\... or /Users/...) into your reply as a markdown link or as "
+    "text: such a link does nothing when clicked in chat, and the bare path "
+    "only exposes the user's machine layout. Never invent a download URL such "
+    "as sandbox:/mnt/data/...; no link of that form exists. If the user says "
+    "they cannot find or download the file, point them again at the Live "
+    "Artifacts panel's Download control (and Open, on desktop) — never repeat "
+    "the path."
+)
 
 
 _PROJECT_FILE_READ_RULE = (
@@ -1082,7 +1041,6 @@ class AntonHarness:
         # tags or metadata need no change here.
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
-        channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
         # Keeps the turn alive while a model call is quiet (see HarnessProvider).
         model_wait: ModelWaitTicker | None = None,
@@ -1104,9 +1062,7 @@ class AntonHarness:
             # legacy non-streaming branch in handlers/responses.py.handle
             # (ResponsesRequest.stream defaults to False, and any client can
             # leave it unset), and _produce/_run_turn's in-process fallback
-            # whenever COWORK_TURN_BACKEND isn't "remote". The channel-ingress
-            # runtime (cowork/channels/runtime.py) now routes through the
-            # remote gate itself, so this refusal is just a safety net there.
+            # whenever COWORK_TURN_BACKEND isn't "remote".
             raise RuntimeError(
                 "Turns must run on the remote worker in this deployment; "
                 "in-process execution is disabled."
@@ -1253,7 +1209,6 @@ class AntonHarness:
                 model=model,
                 reasoning_effort=reasoning_effort,
                 disabled_connections=disabled_connections or [],
-                channel_context=channel_context,
                 tool_messages=tool_messages,
                 interactive=interactive,
                 ui_locale=ui_locale,
@@ -1594,7 +1549,6 @@ class AntonHarness:
         model: str | None = None,
         reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
-        channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
         interactive: bool = True,
         ui_locale: str | None = None,
@@ -1609,7 +1563,6 @@ class AntonHarness:
                 model=model,
                 reasoning_effort=reasoning_effort,
                 disabled_connections=disabled_connections,
-                channel_context=channel_context,
                 tool_messages=tool_messages,
                 interactive=interactive,
                 ui_locale=ui_locale,
@@ -1638,7 +1591,6 @@ class AntonHarness:
         model: str | None,
         reasoning_effort: str | None,
         disabled_connections: list[dict] | None,
-        channel_context: ChannelContext | None,
         tool_messages: bool,
         interactive: bool,
         live_app_notices: list[UUID],
@@ -1721,20 +1673,20 @@ class AntonHarness:
         RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
         elicitor = build_elicitor(str(conversation.id), interactive=interactive)
         # Asks the user's open preview whether an edited artifact runs. Only
-        # where the cowork app tails the turn: a scheduled run or a channel
-        # bot has no preview to answer, and would only wait out the timeout.
+        # where the cowork app tails the turn: a scheduled run has no preview
+        # to answer, and would only wait out the timeout.
         preview_checker = (
             build_preview_checker(str(conversation.id))
-            if interactive and channel_context is None
+            if interactive
             else None
         )
         # Every change to a scheduled task waits on a card the user confirms,
         # so the tools exist only where someone can: not in a scheduled run
-        # (a task must not rewrite itself unattended), a channel bot, or a
-        # deployment with questions off.
+        # (a task must not rewrite itself unattended) or a deployment with
+        # questions off.
         schedule_tools = (
             build_schedule_tools(project_id=conversation.project_id)
-            if interactive and elicitor is not None and channel_context is None
+            if interactive and elicitor is not None
             else []
         )
 
@@ -1838,10 +1790,9 @@ class AntonHarness:
             backends_rule = "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
         # The desktop app's own browser, when it registered one and the
         # person turned the browser on: anton registers its `browser` tool
-        # only then. Never for a channel turn.
+        # only then.
         turn_browser = await _browser_config(
-            user, channel_context=channel_context,
-            conversation_id=str(conversation.id), project_id=conversation.project_id,
+            user, conversation_id=str(conversation.id), project_id=conversation.project_id,
         )
         project_context = (
             # Conversational only. The next line hands the agent the real path,
@@ -2184,7 +2135,7 @@ class AntonHarness:
                 system_prompt_context=SystemPromptContext(
                     runtime_context=build_runtime_context(anton_settings),
                     suffix=(
-                        _turn_style_context(channel_context)
+                        _TURN_STYLE_CONTEXT
                         + _MESSAGE_TIME_CONTEXT
                         + f"{project_context}"
                         + f"{output_context}"
@@ -2310,13 +2261,11 @@ class AntonHarness:
 
 
 async def _browser_config(
-    user, *, channel_context: ChannelContext | None, conversation_id: str, project_id,
+    user, *, conversation_id: str, project_id,
 ) -> "BrowserConfig | None":
     """anton's browser for an in-process turn: the desktop app's own browser,
     with the task's own session, or None.
 
-    None for a channel turn: it comes from a chat where people other than the
-    desktop's owner can write, and the browser holds the owner's sign-ins.
     None when the person turned the browser off or there is no decisions
     model to pick its steps (cowork.services.browser.browser_runs), when the
     app registered no browser, which is always the case where more than one
@@ -2333,7 +2282,7 @@ async def _browser_config(
     """
     from cowork.services.browser import browser_runs, desktop_browser_config, desktop_organization_off
 
-    if channel_context is not None or not browser_runs(user):
+    if not browser_runs(user):
         return None
     from cowork.common.settings.app_settings import TurnQueueSettings
     from cowork.handlers.jev_route import own_decision_target

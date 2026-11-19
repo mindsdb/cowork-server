@@ -70,8 +70,7 @@ def test_every_turn_originator_stamps_the_build():
     assert not offenders, (
         "These stream_response call sites start a turn without a build stamp, so their "
         "traces can't be attributed to a release (ENG-1279). Pass "
-        "trace_metadata=build_trace_metadata(...) — see cowork/handlers/responses.py "
-        f"and cowork/channels/runtime.py: {offenders}"
+        f"trace_metadata=build_trace_metadata(...) — see cowork/handlers/responses.py: {offenders}"
     )
 
 
@@ -79,12 +78,11 @@ def test_the_guard_actually_sees_the_known_call_sites():
     """Guard against the guard passing vacuously.
 
     An AST rule that matches nothing is worse than no rule — it reports green
-    forever. Pin the two seams we know exist, so a refactor that renames or
-    relocates them fails here rather than silently disabling the check above.
+    forever. Pin the seam we know exists, so a refactor that renames or
+    relocates it fails here rather than silently disabling the check above.
     """
     found = {str(path.relative_to(COWORK_ROOT.parent)) for path, _ in _call_sites()}
     assert "cowork/handlers/responses.py" in found
-    assert "cowork/channels/runtime.py" in found
 
 
 # ---------------------------------------------------------------------------

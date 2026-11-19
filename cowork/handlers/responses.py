@@ -608,8 +608,7 @@ class _RemoteTurnInputs:
     # (_remote_seed_history); None when compaction is off.
     seed_info: dict | None
     artifacts: _RemoteArtifactsDir | None
-    # The project's memory slots (_remote_memory); None for a channel turn,
-    # which has never sent them.
+    # The project's memory slots (_remote_memory).
     memory: dict | None
     # The project the turn runs in, or None when it could not be resolved
     # (_remote_workspace).
@@ -626,8 +625,8 @@ def remote_turn_skills(
     """The skills block for a cloud turn's request: every skill the pod's
     agent may recall in it, and the always-on ones flagged and first
     (cowork.services.skills.build_turn_skills). In MindsHub mode only the
-    skills ``viewer`` sees; without one (a scheduled or channel turn, or one
-    whose teams couldn't be read) the fail-closed viewer's.
+    skills ``viewer`` sees; without one (a scheduled turn, or one whose
+    teams couldn't be read) the fail-closed viewer's.
 
     Never None: the pod's anton recalls only what a block names, and falls
     back to whatever org skills tree its pod mounts for a request without
@@ -2671,10 +2670,9 @@ class ResponsesHandler:
         live and who created the conversation, the project's memory when
         ``with_memory``, its workspace, and when the conversation started. A
         browser turn reads memory, which lives on the file store, so it reads
-        this on the file store's threads (run_efs_unit); a channel turn never
-        sends memory, and reads only rows here. Its skills block reads skill
-        folders, so each turn reads it in a unit of its own on the file
-        store's threads (_produce_remote, remote_turn_events)."""
+        this on the file store's threads (run_efs_unit). Its skills block
+        reads skill folders, so each turn reads it in a unit of its own on the
+        file store's threads (_produce_remote)."""
         history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
         workspace = ResponsesHandler._remote_workspace(session, conv_id)
         return _RemoteTurnInputs(
@@ -2784,8 +2782,7 @@ class ResponsesHandler:
                 conv_id, summary, message_ids[idx],
             )
         except Exception:
-            # Rolled back so the session stays usable: the unit still commits,
-            # and a channel turn goes on in the same session.
+            # Rolled back so the session stays usable: the unit still commits.
             session.rollback()
             logger.exception(
                 "[responses] failed to persist history compaction",
@@ -3293,8 +3290,7 @@ class ResponsesHandler:
                 preview_checks=self.interactive and self.schedule_id is None,
                 # This handler serves the cowork UI (scheduled turns show
                 # there too), which renders a tool's message whether or
-                # not it can answer questions. Channel turns build their
-                # own request in turnqueue/remote_turn.py and leave it off.
+                # not it can answer questions.
                 tool_messages=True,
                 # A member's turn in the cowork UI, where the card is saved.
                 connector_drafts=True,

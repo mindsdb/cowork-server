@@ -32,7 +32,6 @@ from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
 from redis.exceptions import WatchError
 
-from cowork.streaming.turn_claim import claim_key
 from cowork.turnqueue.redis_client import get_redis, get_sync_redis
 
 logger = logging.getLogger(__name__)
@@ -77,8 +76,8 @@ class TurnOwner(BaseModel):
 
 
 class TurnIndexEntry(BaseModel):
-    """A conversation's turn index entry, every field its hash holds. A
-    channel turn's entry has no ``run_id``: no registry handle covers it."""
+    """A conversation's turn index entry, every field its hash holds. An
+    entry an older release wrote for a channel turn has no ``run_id``."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -118,8 +117,8 @@ class TurnIndexEntry(BaseModel):
         entry's run saved its question: the run saved it at this entry's
         number, and the start names that number or an earlier one. Only
         until STALE_START_WINDOW_SECONDS after the run released its claim,
-        with ``now`` the caller's Unix time. A channel turn's entry names no
-        run, so it never does."""
+        with ``now`` the caller's Unix time. An entry that names no run
+        never does."""
         return (
             self.run_id is not None and self.saved_question and turn_id <= self.turn_id
             and (self.released_at is None or now < self.released_at + STALE_START_WINDOW_SECONDS)
@@ -166,8 +165,7 @@ async def record_turn(
 ) -> None:
     """Note this turn as the conversation's current one, replacing any previous.
 
-    For a run that holds the conversation's turn claim (RunRegistry.start). A
-    turn no registry handle covers uses record_channel_turn.
+    For a run that holds the conversation's turn claim (RunRegistry.start).
 
     ``client`` lets a caller that already holds a Redis client reuse it, rather
     than this module reaching for a second one.
@@ -179,40 +177,6 @@ async def record_turn(
             org_id=org_id, user_id=user_id, run_id=run_id,
         )
         await pipe.execute()
-
-
-async def record_channel_turn(
-    *,
-    conversation_id: str,
-    turn_id: int,
-    correlation_id: str,
-    org_id: str | None,
-    user_id: str | None,
-    client=None,
-) -> bool:
-    """record_turn for a turn no registry handle covers (a channel turn),
-    unless a run holds the conversation's turn claim. That run's entry is
-    what cancel and answer resolve through, so it is left as it is. True when
-    it wrote the entry."""
-    r = client or get_redis()
-    key = turn_key(conversation_id)
-    claim = claim_key(conversation_id)
-    for _attempt in range(3):
-        try:
-            async with r.pipeline(transaction=True) as pipe:
-                await pipe.watch(claim, key)
-                if await pipe.exists(claim):
-                    return False
-                pipe.multi()
-                _queue_record(
-                    pipe=pipe, conversation_id=conversation_id, turn_id=turn_id, correlation_id=correlation_id,
-                    org_id=org_id, user_id=user_id, run_id=None,
-                )
-                await pipe.execute()
-                return True
-        except WatchError:
-            continue
-    raise WatchError(f"the turn index entry of {conversation_id} kept changing while it was recorded")
 
 
 async def stamp_question(*, conversation_id: str, run_id: str, released: bool, client=None) -> bool:

@@ -477,9 +477,9 @@ def _efs_share(scope: TenantScope) -> anyio.CapacityLimiter | None:
     deployment (the desktop, the operator view) and there is nobody to keep
     apart. A share lives while someone waits for it or holds it.
 
-    Work in a partitioned scope with no person, such as a channel turn
-    (scope_for_org), shares as one person keyed ``org:<org_id>``, so one
-    organization's channel bookkeeping cannot take every slot. That key
+    Work in a partitioned scope with no person (scope_for_org) shares as
+    one person keyed ``org:<org_id>``, so one organization's bookkeeping
+    cannot take every slot. That key
     never matches a person's: ``TrustedHeaderMiddleware.dispatch``
     (cowork/principal.py) parses X-User-Id as a UUID, so no person's key
     starts with ``org:``.

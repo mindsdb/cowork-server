@@ -175,9 +175,8 @@ async def _reject_unservable_models(
     Scope limit, stated because the inventory above reads broader than it is:
     this is an HTTP-layer check. ``SettingService.upsert_setting`` / ``save_all``
     / ``bulk_upsert`` called IN-PROCESS bypass it. No in-process caller writes a
-    model key today (``channels.py`` writes ``channels_harness``,
-    ``recommended_models`` writes ``minds_model_enabled`` and, in org mode,
-    ``minds_model_restricted``); moving the check down
+    model key today (``recommended_models`` writes ``minds_model_enabled`` and,
+    in org mode, ``minds_model_restricted``); moving the check down
     would need those sync methods to become async.
 
     Resolution uses ``load_pending`` — the state the write PRODUCES, not the one

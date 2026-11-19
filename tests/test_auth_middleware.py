@@ -24,7 +24,7 @@ from cowork.auth_middleware import (
 
 TOKEN = "test-token-abc123"
 ORIGIN = "http://localhost:1234"
-WEBHOOK = "/api/v1/channels/slack/events"
+EXEMPT = "/api/v1/live-apps/slot/check"
 
 
 def _client() -> TestClient:
@@ -38,13 +38,13 @@ def _client() -> TestClient:
     def projects():
         return {"projects": []}
 
-    @app.post(WEBHOOK)
-    async def slack_webhook():
+    @app.post(EXEMPT)
+    async def self_checked():
         return {"ack": True}
 
     # Mirror create_app's ordering: bearer added first (inner), CORS last
     # (outer) so a 401 still flows back out through CORS.
-    app.add_middleware(BearerTokenMiddleware, token=TOKEN, exempt_paths={WEBHOOK})
+    app.add_middleware(BearerTokenMiddleware, token=TOKEN, exempt_paths={EXEMPT})
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[ORIGIN],
@@ -73,8 +73,8 @@ def test_health_is_exempt_without_token():
     assert _client().get("/api/v1/health").status_code == 200
 
 
-def test_channel_webhook_is_exempt_without_token():
-    assert _client().post(WEBHOOK).status_code == 200
+def test_an_exempt_path_is_exempt_without_token():
+    assert _client().post(EXEMPT).status_code == 200
 
 
 def test_401_carries_cors_headers():

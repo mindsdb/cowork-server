@@ -304,13 +304,6 @@ ALLOWLIST = (
         "child process, against a folder it creates, and only with "
         "COWORK_CODE_SANDBOX=landlock",
     ),
-    (
-        "channels/registry.py",
-        "load_first_party_plugins",
-        "importlib.import_module",
-        "imports packaged cowork.channels.plugins modules discovered via "
-        "pkgutil.iter_modules, never an attacker-supplied name",
-    ),
 )
 
 

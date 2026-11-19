@@ -40,7 +40,7 @@ async def register_vault_secrets(scope: TenantScope | None) -> None:
     cannot read does not fail the turn: scrubbing falls back to the
     shape-based regex. A file store with no slot free within POOL_TIMEOUT
     does: ``FilesystemBusy`` propagates, so a web turn answers 503 with
-    Retry-After and a channel turn fails, rather than replay a saved secret,
+    Retry-After rather than replay a saved secret,
     such as a DSN password, unredacted.
     """
     # The scope opens here, in the request's context, and the vault reads and

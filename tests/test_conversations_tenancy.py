@@ -89,15 +89,6 @@ def test_creation_defaults_harness_and_model_to_none(db):
     assert conv.model is None
 
 
-def test_creation_persists_the_channel_it_came_from(db):
-    runtime_scope = TenantScope(org_mode=True, org_id=ORG_A, user_id=None)
-    conv = _svc(db, runtime_scope).create_conversation(
-        topic="discord: 123", project_id=_project_id(db, "a-proj"), channel_type="discord"
-    )
-    with Session(db) as s:
-        assert s.get(Conversation, conv.id).channel_type == "discord"
-
-
 def test_creation_defaults_channel_type_to_none(db):
     conv = _svc(db, _scope(ORG_A, "alice")).create_conversation(
         topic="hello", project_id=_project_id(db, "a-proj")

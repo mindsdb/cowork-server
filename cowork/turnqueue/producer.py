@@ -66,7 +66,6 @@ from cowork.turnqueue.models import (
 )
 from cowork.streaming.cancellation import stop_controller_turn
 from cowork.streaming.liveness import WORKER_ALIVE_PHASE
-from cowork.streaming.turn_index import record_channel_turn
 from cowork.turnqueue.redis_client import (
     REDIS_BLOCK_MS,
     cancel_cause_key,
@@ -721,7 +720,7 @@ async def _mint_custom_api_block(*, scope: TenantScope, correlation_id: str, tur
     """The member's custom API connections for this turn, with grants bound to its turn key.
 
     None, logged, when the turn cannot carry them: outside org mode, the
-    setting off, no turn key prefix (a channel turn), no producer key, a
+    setting off, no turn key prefix, no producer key, a
     listing that failed or contradicts itself, or a grant call auth refused.
     The turn then runs without custom connections. Only a grant answer that
     contradicts this turn fails it.
@@ -984,7 +983,7 @@ def step_stream_events(data: dict) -> list:
     # `addon` steps (ENG-4194) are relayed only after a check this sync
     # mapping can't make: that the addon is one this server accepted for the
     # turn (turnqueue.addons.relay_addon_step, which the web turn's relay
-    # calls). A channel turn takes no mid-task messages, so it renders none.
+    # calls).
     # `ask_user_answer_rejected` is the pod's verdict on one answer; only
     # /answer reads it (turnqueue/answers.py), nothing renders it.
     return []
@@ -1140,17 +1139,16 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     same (code, message) the caller streams and persists; synthesized locally
     when the worker goes quiet past the idle timeout).
     `correlation_id`/`llm` reuse a turn key the routing gate already minted.
-    `interactive` tells the pod it may ask `ask_user` questions (web UI turns;
-    channel turns never).
+    `interactive` tells the pod it may ask `ask_user` questions (web UI turns).
     `tool_messages` tells the pod the client renders a tool's message to the
-    user (the cowork UI does; channel turns never).
+    user (the cowork UI does).
     `connector_drafts` asks for the pod's connector template tool. It reaches
     the job only with the deployment setting on, in org mode, for a turn with
     a user; the caller passes it only where a member sees and saves the card.
     `preview_checks` lets the pod's artifact editor ask the app's open
     preview whether an edit runs (ENG-4227, turnqueue/preview_checks.py).
     Only with `interactive`: the answer reaches the pod on the stdin an
-    interactive turn keeps open. Channel turns never.
+    interactive turn keeps open.
     `ui_locale` is the app's language (cowork.common.ui_locale), which the
     pod's anton replies in when the user's message does not say; None for a
     turn with no request behind it.
@@ -1321,9 +1319,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     from cowork.db.units import run_on_unit_threads
 
     # The organization's Jev opt-out and per-task limits, read here so every
-    # remote turn carries them: web UI, scheduled and channel turns alike. Off
-    # the loop: a turn with no settings snapshot, such as a channel turn, reads
-    # them through a session of its own.
+    # remote turn carries them: web UI and scheduled turns alike. Off the
+    # loop: a turn with no settings snapshot reads them through a session of
+    # its own.
     turn_settings = await run_on_unit_threads(partial(get_user_settings, scope))
     jev_decisions = getattr(turn_settings, "jev_decisions_enabled", True) is not False
     time_limit = settings.time_limit_seconds
@@ -1437,17 +1435,6 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # new stream has no consumer group, so the script never retires it, and
     # the controller creates the group when it next reads.
     await r.sadd(registry_key, conversation_id)
-    # Any replica can now find this turn: its turn_id to open the buffer, its
-    # correlation_id to cancel it, its org to authorize the caller. Recorded
-    # here rather than after the first buffer record, because this generator
-    # does not own the buffer; _shared_turn covers the gap between the two.
-    # A turn with a run id was recorded by RunRegistry.start, which holds the
-    # conversation's claim; one without is skipped while such a run holds it.
-    if run_id is None:
-        await record_channel_turn(
-            conversation_id=conversation_id, turn_id=turn_id, correlation_id=corr,
-            org_id=org_id, user_id=user_id, client=r,
-        )
 
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds

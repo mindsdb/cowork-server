@@ -19,8 +19,7 @@ that has stopped protecting anything, and a route with no entry is the case
 this exists for.
 
 Only ``OpenByDesign`` is pinned. The other non-identity declarations
-(``DesktopOnly``, ``LoopbackDesktopOnly``, ``PlatformSignature``) each carry
-a check that refuses, so a route inheriting one of those from a router
+(``DesktopOnly``, ``LoopbackDesktopOnly``) each carry a check that refuses, so a route inheriting one of those from a router
 inherits a closed door. ``OpenByDesign`` is the
 only declaration where inheriting it is the hazard.
 """

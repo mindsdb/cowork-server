@@ -1759,3 +1759,83 @@ def test_the_custom_connector_auth_column_upgrades_and_downgrades(tmp_path, monk
         check = connection.execute(text("select connection_check from custom_connectors")).scalar()
     assert "connection_auth" not in columns
     assert json.loads(check) == {"path": "/v1/me"}
+
+
+def _conversation_fk_on_bindings(connection) -> bool:
+    return any(
+        row[2] == "conversations" and row[3] == "anton_conversation_id"
+        for row in connection.execute(text("pragma foreign_key_list(channel_bindings)"))
+    )
+
+
+def test_the_channel_archive_keeps_rows_drops_bot_passwords_and_unpins_conversations(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db = tmp_path / "channel_erase.db"
+    uri = _sqlite_uri(db)
+    engine = create_engine(uri)
+    _upgrade_to(engine, uri, "f6a2c4e8b1d3")
+    project_id, conversation_id, binding_id = uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO projects (id, name, path, is_active) VALUES (:id, 'chat', '', 0)"), {"id": project_id}
+        )
+        connection.execute(
+            text("INSERT INTO conversations (id, topic, project_id, channel_type) VALUES (:id, 'group', :p, 'telegram')"),
+            {"id": conversation_id, "p": project_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO channel_installations (id, channel_type, display_name, enabled, status) "
+                "VALUES (:id, 'telegram', 'Telegram', 1, 'active')"
+            ),
+            {"id": uuid.uuid4().hex},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO channel_bindings (id, channel_type, external_group_id, external_thread_key, "
+                "trigger_rule, anton_conversation_id) VALUES (:id, 'telegram', 'g-1', '__default__', 'always', :c)"
+            ),
+            {"id": binding_id, "c": conversation_id},
+        )
+        connection.execute(
+            text("INSERT INTO channel_sessions (id, binding_id, external_session_key) VALUES (:id, :b, 'g-1')"),
+            {"id": uuid.uuid4().hex, "b": binding_id},
+        )
+        connection.execute(
+            text("INSERT INTO channel_events (id, channel_type, direction, status) VALUES (:id, 'telegram', 'inbound', 'routed')"),
+            {"id": uuid.uuid4().hex},
+        )
+        _insert_setting(connection, key="channel.telegram.bot_token", value="not-a-real-token")
+        _insert_setting(connection, key="channel.slack.signing_secret", value="not-a-real-secret")
+        # A field no plugin of the last release declared is erased too.
+        _insert_setting(connection, key="channel.slack.client_secret", value="not-a-real-secret")
+        _insert_setting(connection, key="channel.telegram.bot_username", value="a_bot")
+        _insert_setting(connection, key="channel.whatsapp.verify_token", value="not-a-real-token")
+        _insert_setting(connection, key="Channel.Slack.bot_token", value="not-a-real-token")
+        _insert_setting(connection, key="channels_harness", value="anton")
+        _insert_setting(connection, key="greeting", value="hello there")
+
+    _upgrade_to(engine, uri, "head")
+
+    with engine.begin() as connection:
+        for table in ("channel_events", "channel_sessions", "channel_bindings", "channel_installations"):
+            assert connection.execute(text(f"select count(*) from {table}")).scalar() == 1, table
+        assert [row[0] for row in connection.execute(text("select key from settings order by key"))] == [
+            "channel.telegram.bot_username", "channels_harness", "greeting",
+        ]
+        assert connection.execute(
+            text("select channel_type from conversations where id = :id"), {"id": conversation_id}
+        ).scalar() == "telegram"
+        assert not _conversation_fk_on_bindings(connection)
+        # With the key gone, the conversation goes and its binding stays, pointing at nothing.
+        connection.execute(text("delete from conversations where id = :id"), {"id": conversation_id})
+
+    _downgrade_to(engine, uri, "f6a2c4e8b1d3")
+
+    with engine.begin() as connection:
+        assert _conversation_fk_on_bindings(connection)
+        assert connection.execute(
+            text("select anton_conversation_id from channel_bindings where id = :id"), {"id": binding_id}
+        ).one() == (None,)

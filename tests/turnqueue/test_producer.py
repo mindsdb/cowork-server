@@ -160,10 +160,8 @@ async def test_job_goes_to_the_conversations_own_stream(monkeypatch):
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None,
                                             user_id=None, input_text="hi", model="m"))
     assert fake.added[0][0] == "scratchpad:requests:conv-1"
-    # Registered in the controller's queue registry, and in cowork's own turn
-    # index so another replica can find this turn.
+    # Registered in the controller's queue registry.
     assert ("scratchpad:requests:queues", "conv-1") in fake.registered
-    assert ("cowork:turns", "conv-1") in fake.registered
 
 
 @pytest.mark.asyncio
@@ -2323,8 +2321,8 @@ async def test_tool_messages_reaches_the_job_params(monkeypatch, tool_messages):
 
 @pytest.mark.asyncio
 async def test_tool_messages_defaults_to_false(monkeypatch):
-    """Channel turns (turnqueue/remote_turn.py) never pass it: a bot cannot
-    render a tool's message, so the tool hands the content to the agent."""
+    """A caller that does not pass it gets the default: the tool hands the
+    content to the agent."""
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
@@ -2798,7 +2796,7 @@ async def test_an_unexpected_scope_error_still_queues_the_turn_without_a_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["no person", "browser off", "no decisions model", "not on MindsHub"])
 async def test_a_turn_without_a_browser_scopes_its_key_to_nothing(browser_router, case):
-    """A channel turn has no person behind it, a person can turn the browser
+    """A turn can have no person behind it, a person can turn the browser
     off, and with Jev turned off and no decision model of the organization's
     own, or an LLM other than MindsHub, it can't run: none carries a block,
     and each still binds its key to no session first, so code in the turn
@@ -2979,42 +2977,6 @@ async def test_a_second_run_that_fails_the_turn_revokes_its_key(monkeypatch, rev
     ]))
     assert (items[-1][0], items[-1][1]["error"]) == ("turn_failed", prod.SECOND_RUN_ERROR)
     assert revokes == ["r"]
-
-
-async def test_a_channel_turn_leaves_the_index_entry_of_a_claimed_turn_alone(monkeypatch):
-    """A channel turn has no registry handle, so the producer records its
-    index entry itself. While a run holds the conversation's turn claim,
-    that run's entry stays: cancel and answer resolve through it."""
-    import fakeredis.aioredis
-
-    from cowork.streaming import turn_index
-    from cowork.streaming.turn_claim import claim_key
-
-    r = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    monkeypatch.setattr(prod, "get_redis", lambda: r)
-    monkeypatch.setattr(turn_index, "get_redis", lambda: r)
-    await turn_index.record_turn(
-        "conv-1", turn_id=4, correlation_id="corr-web", run_id="run-web", org_id=None, user_id=None,
-    )
-    await r.set(claim_key("conv-1"), "held")
-
-    replies = asyncio.create_task(_drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
-        correlation_id="r",
-    )))
-    for _ in range(500):
-        if await r.exists("scratchpad:requests:conv-1"):
-            break
-        await asyncio.sleep(0.01)
-    for kind, data in (
-        ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}),
-        ("turn_completed", {}),
-    ):
-        await r.xadd("scratchpad:reply:conv-1", _reply(kind, data))
-    await asyncio.wait_for(replies, timeout=10)
-
-    entry = await turn_index.get_turn("conv-1")
-    assert (entry.run_id, entry.correlation_id) == ("run-web", "corr-web")
 
 
 @pytest.mark.asyncio

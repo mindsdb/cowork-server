@@ -364,7 +364,7 @@ def test_the_lifespan_drains_closes_after_turns_unwind_and_before_backends_are_r
     source = inspect.getsource(server.lifespan)
     calls = [
         "await registry.shutdown()",
-        "await drain_background_tasks()",
+        "await drain_push_notifications()",
         "await drain_scratchpad_closes()",
         "shutdown_launched_backends()",
     ]

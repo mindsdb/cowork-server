@@ -24,28 +24,26 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 from sqlmodel import Session
 
-import cowork.turnqueue.remote_turn as remote_turn_mod
+import cowork.handlers.responses as responses_mod
 from cowork.db import units
 from cowork.db.scoped import ScopedSession, TenantScope
-from cowork.handlers.responses import ResponsesHandler
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.task_object import TaskObject
 from cowork.services import artifact_autopublish as ap
 from cowork.services import artifact_ownership as ownership
-from cowork.services import comparisons, held_artifact_roots, task_objects
+from cowork.services import comparisons, held_artifact_roots
 from cowork.services.artifact_identity import ListedIds
 from cowork.services.artifact_locations import Location, LocationRow, find_location, record_checked_folders
 from cowork.services.comparisons import ComparisonService, SideSpec
 from cowork.services.held_artifact_roots import HeldRoot
 from cowork.services.task_objects import ListedLocationsUnchecked, record_new_artifacts
-from cowork.turnqueue.remote_turn import remote_turn_events
 from test_artifact_ownership import _engine, make_conversation, make_project, project_root, scoped, write_artifact
 from test_artifact_relocation_ownership import _index, _relocate
 from test_org_list_scaling import (  # noqa: F401  (fixtures)
@@ -58,7 +56,7 @@ from test_org_list_scaling import (  # noqa: F401  (fixtures)
     org,
 )
 from test_project_files_artifact_roots import _held_root_inserts_fail, _slugs, _sort_times
-from test_remote_turn import _drain, _fake_handler
+from test_artifact_sort_time_writers import _PRODUCERS, _responses_turn
 from tests._artifact_rows import held_roots_of, no_self_heals_left  # noqa: F401  (no_self_heals_left is a fixture)
 
 pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
@@ -69,32 +67,6 @@ def _refuse_holds(monkeypatch) -> None:
         raise RuntimeError("the row could not be written")
 
     monkeypatch.setattr(held_artifact_roots, "hold_root", refused)
-
-
-def _turn_end_on_the_test_database(monkeypatch, *, during_turn) -> None:
-    """A remote turn whose inputs are read and whose end is recorded in real
-    units on the test database. ``during_turn`` runs once the turn's
-    snapshot is taken, before the pod's ``turn_completed``, which carries no
-    list of the artifacts its tools touched, so the turn end lists the
-    project's whole shared root."""
-    _fake_handler(monkeypatch, remote_artifacts_context=ResponsesHandler._remote_artifacts_context)
-    monkeypatch.setattr(remote_turn_mod, "run_db", units.run_db)
-    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
-
-    async def replies(**kwargs):
-        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
-        during_turn()
-        yield "turn_completed", {}
-
-    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
-
-
-async def _run_turn(*, scope: TenantScope, conversation_id) -> None:
-    _, failure = await _drain(remote_turn_events(
-        scope=scope, conv_id=conversation_id, org_id=scope.org_id, user_id=scope.user_id,
-        input_text="hi", model="anton", turn_rows=[],
-    ))
-    assert failure is None
 
 
 def test_a_failed_hold_raises_once_the_turns_rows_are_written(tmp_path, monkeypatch):
@@ -144,24 +116,24 @@ async def test_a_turn_end_whose_hold_fails_asks_for_the_projects_self_heal(tmp_p
     project = make_project(tmp_path, org_id)
     conversation_id = make_conversation(project, creator)
     source = project_root(project)
-    _turn_end_on_the_test_database(
-        monkeypatch, during_turn=lambda: write_artifact(source.base, "report", conversation=conversation_id),
-    )
     _refuse_holds(monkeypatch)
     scope = TenantScope(org_mode=True, org_id=org_id, user_id=creator)
 
-    with caplog.at_level(logging.ERROR, logger=remote_turn_mod.logger.name):
-        await _run_turn(scope=scope, conversation_id=conversation_id)
+    with caplog.at_level(logging.ERROR, logger=responses_mod.logger.name):
+        await _responses_turn(
+            monkeypatch, project=project, scope=scope, conversation_id=conversation_id,
+            during_turn=lambda: write_artifact(source.base, "report", conversation=conversation_id), touched=None,
+        )
 
     heal = ap.SelfHeal(artifacts_base=source.base, scope=scope, project_id=str(project.id))
     assert ap._self_heals_requested == {heal}
-    [record] = [record for record in caplog.records if record.name == remote_turn_mod.logger.name]
+    [record] = [
+        record for record in caplog.records
+        if record.name == responses_mod.logger.name and record.levelno == logging.ERROR
+    ]
     assert isinstance(record.exc_info[1], ListedLocationsUnchecked)
     # The turn created a folder, but only the hold failed, which its line names.
-    assert record.getMessage() == (
-        "Could not check the locations of the artifacts a channel turn found, or record the folder that holds them"
-        " or their sort times"
-    )
+    assert record.getMessage() == _PRODUCERS["responses"].listed_lost
     # The turn's own rows are written all the same.
     with units.unit_session(scope=scope) as session:
         assert session.exec(
@@ -212,10 +184,12 @@ async def test_a_turn_end_whose_listing_reads_no_folder_holds_its_root_and_asks_
             raise OSError(errno.EIO, "the file server did not answer")
         return real_stat(path, *args, **kwargs)
 
-    _turn_end_on_the_test_database(monkeypatch, during_turn=lambda: monkeypatch.setattr(os, "stat", stat))
     scope = TenantScope(org_mode=True, org_id=org_id, user_id=creator)
 
-    await _run_turn(scope=scope, conversation_id=conversation_id)
+    await _responses_turn(
+        monkeypatch, project=project, scope=scope, conversation_id=conversation_id,
+        during_turn=lambda: monkeypatch.setattr(os, "stat", stat), touched=None,
+    )
     heal = ap.SelfHeal(artifacts_base=source.base, scope=scope, project_id=str(project.id))
     assert ap._self_heals_requested == {heal}
     assert ap._self_heal_publishes_requested == set()

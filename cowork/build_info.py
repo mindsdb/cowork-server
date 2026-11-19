@@ -156,8 +156,8 @@ def surface_kwarg(config_cls) -> dict[str, str]:
     """``{"surface": ...}`` for ``ChatSessionConfig``, or ``{}`` — never raises.
 
     Lives here rather than in one harness because every path that ORIGINATES a
-    turn needs it, and there is more than one: the anton harness serves the UI
-    and the channel bots, and the connector probe runs its own turn (the
+    turn needs it, and there is more than one: the anton harness serves the
+    UI, and the connector probe runs its own turn (the
     datasource-connection path, which is one of the things ENG-1459 wants
     measured per surface). ``tests/test_trace_stamp_seams.py`` enforces that
     every such call site passes it.
@@ -358,8 +358,8 @@ def build_trace_metadata(base: dict[str, str] | None = None) -> dict[str, str]:
     that change — the exact delivery lag this ticket exists for.
     """
     merged = dict(base or {})
-    # Belt for the hot path: this runs on every turn (API, channel bot,
-    # scheduled run) purely for observability. Nothing inside is expected to
+    # Belt for the hot path: this runs on every turn (API, scheduled run)
+    # purely for observability. Nothing inside is expected to
     # raise — the pieces have their own handlers — but an unattributable turn
     # is a far better failure than a failed turn, so a surprise here degrades
     # to "no build stamp" instead of 500-ing a user's message.

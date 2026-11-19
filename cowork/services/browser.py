@@ -769,8 +769,7 @@ def turn_block(
 
     None when this deployment has no router, when the person turned the
     browser off or it can't run (``browser_runs``), and for a turn with no
-    person behind it: an organization's channel turn, which comes from a chat
-    anyone in it can write to, while the browser holds one person's sign-ins.
+    person behind it, while the browser holds one person's sign-ins.
 
     When the organization set up a decision model of its own, the block also
     names this server's decisions proxy (``decisions_proxy``: its URL and the

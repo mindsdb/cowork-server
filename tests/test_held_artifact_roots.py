@@ -883,8 +883,7 @@ def test_a_delete_by_old_folder_name_finds_what_the_list_shows(tmp_path, org_dep
 def test_held_root_rows_never_returns_a_co_members_legacy_row(tmp_path, org_deployment, backfill_pending):
     """The query reads every shared root's row, and a legacy root's only for
     a conversation the caller owns, by the plan's owner rule: a scope with no
-    user, such as a channel turn's, owns the conversations no member
-    created."""
+    user owns the conversations no member created."""
     org_id = str(uuid4())
     project = make_project(tmp_path, org_id)
     owners, co_members, nobodys = (make_conversation(project, user) for user in (OWNER, CO_MEMBER, None))

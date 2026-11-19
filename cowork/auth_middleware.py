@@ -51,10 +51,10 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
     def __init__(self, app: ASGIApp, token: str, exempt_paths: Collection[str] = ()) -> None:
         super().__init__(app)
         self._token = token
-        # Routes reachable without a bearer token in addition to /health — e.g.
-        # external channel webhooks, which carry their own signature. create_app
-        # passes a set it keeps filling while mounting routes; it finishes
-        # before the first request, so a reference is enough.
+        # Routes reachable without a bearer token in addition to /health, ones
+        # that check their own caller. create_app passes a set it keeps filling
+        # while mounting routes; it finishes before the first request, so a
+        # reference is enough.
         self._exempt_paths = exempt_paths
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):

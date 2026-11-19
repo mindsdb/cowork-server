@@ -64,7 +64,7 @@ HEADER_USER_ROLES = "X-User-Roles"
 HEADER_EXPECTED_ORG_ID = "X-Cowork-Expected-Organization-Id"
 HEADER_ORG_RELOAD = "X-Cowork-Organization-Reload"
 
-# Always reachable without identity; channel webhooks are added by create_app().
+# Always reachable without identity; create_app() adds the routes that check their own caller.
 _EXEMPT_PATHS = frozenset({
     "/api/v1/health", "/api/v1/health/",
     "/api/v1/health/live",

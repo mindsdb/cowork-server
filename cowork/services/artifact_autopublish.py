@@ -720,8 +720,7 @@ async def autopublish_project_artifacts(
 # start_due_self_heals on every replica), and that request stays on the
 # replica that listed. So a folder that stays unreadable costs one listing of
 # the project per interval on each replica that has listed it, for each
-# member and project, and for each project's channel turns, until the folder
-# reads again or the replica restarts.
+# member and project, until the folder reads again or the replica restarts.
 SELF_HEAL_INTERVAL_S = 15 * 60.0
 
 
@@ -730,8 +729,7 @@ class SelfHeal:
     """One member's project for a scheduled self-heal: the location of every
     artifact below `artifacts_base`, then, when the publish was asked for
     too (request_self_heal), the publish of those the scope's user owns. A
-    channel turn's scope names no user, so its self-heal checks the
-    locations only."""
+    scope that names no user checks the locations only."""
 
     artifacts_base: Path
     scope: TenantScope
@@ -806,8 +804,8 @@ def request_turn_end_self_heal(*, artifacts_base: Path, scope: TenantScope | Non
     only the turn's own folders and lists nothing, so the self-heal's
     location check is what finds a copy no turn end claims, such as one a
     shell `cp -r` makes. Each producer asks for it as its turn end's record
-    starts, before the diff (handlers.responses `record_artifacts`,
-    turnqueue.remote_turn `remote_turn_events`), so a turn end whose diff
+    starts, before the diff (handlers.responses `record_artifacts`), so a
+    turn end whose diff
     fails, or that a Stop cuts, still asks. A turn end whose pod sent no
     list lists the project and checks every id itself, so it asks only when
     its diff or the record of what the diff listed fails. Asked for wherever
@@ -1129,9 +1127,9 @@ async def _record_listed_locations(heal: SelfHeal) -> None:
 async def _run_self_heal(heal: SelfHeal) -> None:
     """The location check, which reads no autopublish setting, then, for a
     scope that names a user, the publish, which returns at once when the
-    organization's autopublish is off. A channel turn's scope names no user,
-    and the reconciler would only record that refusal, so its self-heal
-    checks the locations alone."""
+    organization's autopublish is off. For a scope that names no user the
+    reconciler would only record that refusal, so its self-heal checks the
+    locations alone."""
     await _record_listed_locations(heal)
     if heal.scope.user_id is None:
         return
