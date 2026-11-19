@@ -26,7 +26,6 @@ from cowork.api.v1.endpoints.guards import require_local_in_desktop_mode
 from cowork.api.v1.permissions import (
     AuthenticatedInOrgMode,
     LoopbackDesktopOnly,
-    LoopbackOnly,
     OpenByDesign,
     require,
 )
@@ -448,9 +447,11 @@ def install_status():
     return {"antonInstalled": True, "serverDepsReady": True}
 
 
-# LoopbackOnly: returns an unmasked provider secret, so the credential is the
-# caller being on this machine, not who they are (ENG-457).
-@router.get("/reveal-key/{name}", dependencies=[Depends(require(LoopbackOnly))])
+# LoopbackDesktopOnly: returns an unmasked provider secret, so the credential
+# is the caller being on this machine, not who they are. Only the desktop app
+# calls it. An org deployment refuses it outright: loopback inside a hosted pod
+# says nothing about which member is calling, and no hosted caller needs it.
+@router.get("/reveal-key/{name}", dependencies=[Depends(require(LoopbackDesktopOnly))])
 def reveal_key(name: str, session: SessionDep, scope: ScopeDep):
     name_map = {
         "anthropic": Provider.ANTHROPIC,
@@ -836,8 +837,8 @@ async def recommended_models(
     # `modelDisabledReasons` maps a model id that `modelEnabled` marks false to
     # the gateway's reason for it: "model_restricted" (an admin in the org
     # restricted it, so credits cannot unlock it), "wallet_empty",
-    # "included_allowance_exhausted" or "budget_exceeded" (an org budget is
-    # spent, which credits cannot lift either). Filled from the MindsHub listing only,
+    # "included_allowance_exhausted" or "budget_exceeded" (a spending budget
+    # is spent, which credits cannot lift either). Filled from the MindsHub listing only,
     # never from a custom endpoint: a BYO base URL must not be able to label a
     # model "restricted by your admin". A model absent from this map keeps
     # today's locked, add-credits treatment.

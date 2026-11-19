@@ -4,7 +4,7 @@ address and launch key of the app's own browser.
 Write-only for the values themselves. The desktop app is the only caller and it
 already holds what it is sending, so no route reads them back. ``GET
 /settings/reveal-key/minds`` stays the one place a local caller can read the
-resolved credential, under the same loopback guard it always had. The one read
+resolved credential, under ``LoopbackDesktopOnly`` like this router. The one read
 here, ``GET /minds/organization``, answers which organization the held
 credential acts in, never the credential.
 """

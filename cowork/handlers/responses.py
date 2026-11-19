@@ -18,6 +18,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
+from cowork.common.event_clock import event_at_ms
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import log_context
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings, get_app_settings
@@ -111,6 +112,7 @@ from cowork.handlers._turn_history import (
 )
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
+    BUDGET_EXCEEDED_CODE,
     CONTENT_REPAIR_CODES,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
@@ -128,6 +130,9 @@ from cowork.handlers.turn_errors import (
     TURN_LOST_MESSAGE,
     auth_error_detail,
     friendly_turn_error,
+    gate_budget_model,
+    gate_budget_period,
+    gate_budget_scope,
     gate_reset_at,
     model_unavailable_info,
     provider_overloaded_info,
@@ -243,6 +248,25 @@ def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
             "text": "",
         })
     return synthesized
+
+
+#: The terminal a Stop saves with the turn's events. The live stream ends a
+#: stopped turn with this frame too, but the stream is not saved, so without it
+#: a reload could not tell a stopped turn from one still running (ENG-4345).
+STOPPED_EVENT = "response.cancelled"
+
+
+def stopped_turn_events(events: list[dict]) -> list[dict]:
+    """What a Stop adds to the turn's saved *events*: a retirement for each
+    question it left open, then the ``response.cancelled`` terminal. Its
+    ``at_ms`` is when the turn stopped, so a reload ends the turn's time there.
+
+    Nothing when the turn produced no events: a Stop that came before any
+    output saves no answer row, and the terminal alone must not create one.
+    """
+    if not events:
+        return []
+    return [*cancelled_ask_user_retirements(events), {"type": STOPPED_EVENT, "at_ms": event_at_ms()}]
 
 
 async def _remote_cancel_confirmed(error: str | None, correlation_id: str) -> bool:
@@ -1731,7 +1755,7 @@ class ResponsesHandler:
         queue_settings = TurnQueueSettings()
         turn_key_id = None
         workspace_id = getattr(settings, "hub_workspace_id", "") or None
-        if queue_settings.datasource_enabled:
+        if queue_settings.needs_turn_key_id:
             block, turn_key_id = await _mint_llm_block_with_turn_key_id(
                 org_id=self.scope.org_id,
                 user_id=self.scope.user_id,
@@ -2141,6 +2165,8 @@ class ResponsesHandler:
             reaches the open stream before Uvicorn's request drain cuts it."""
             # A turn stopped before its answer started saves no answer row.
             events = [text_delta("".join(parts), sequence_number=2), _DIRECT_MEMORY_READ.payload()] if parts else []
+            if reason == "cancelled":
+                events.extend(stopped_turn_events(events))
             if lifecycle.shutdown_frame_deadline is None:
                 saved = await persist(events)
             else:
@@ -3491,10 +3517,15 @@ class ResponsesHandler:
             # an offset-aware instant (`_remote_reset_at` in producer.py), so
             # it rides both the frame and the persisted event as sent.
             reset_at = failure.get("reset_at")
+            # Kept by the producer for budget_exceeded only, already validated.
+            budget_scope = failure.get("budget_scope")
+            budget_period = failure.get("budget_period")
+            budget_model = failure.get("budget_model")
             # The pod never got to retire a question it was blocked on.
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
             collected_events.append(response_failed_payload(
-                message, code, reset_at=reset_at, request_id=corr))
+                message, code, reset_at=reset_at, budget_scope=budget_scope, budget_period=budget_period,
+                budget_model=budget_model, request_id=corr))
 
             async def fail() -> None:
                 if code in CONTENT_REPAIR_CODES:
@@ -3526,8 +3557,8 @@ class ResponsesHandler:
                             "validation error", extra=log_context(conversation_id=conv_id),
                         )
                 await end_turn("error", lambda message_id: response_failed_sse(
-                    message, code, reset_at=reset_at, request_id=corr,
-                    assistant_message_id=message_id,
+                    message, code, reset_at=reset_at, budget_scope=budget_scope, budget_period=budget_period,
+                    budget_model=budget_model, request_id=corr, assistant_message_id=message_id,
                 ))
 
             await run_to_completion(fail())
@@ -3558,8 +3589,8 @@ class ResponsesHandler:
                 )))
                 return
             # Partial text generated before cancellation is persisted, with
-            # every question the Stop left open retired.
-            collected_events.extend(cancelled_ask_user_retirements(collected_events))
+            # every question the Stop left open retired, and the Stop itself.
+            collected_events.extend(stopped_turn_events(collected_events))
             await run_to_completion(end_turn("cancelled"))
         except Exception as exc:
             if isinstance(exc, PoolTimeoutError):
@@ -3853,13 +3884,13 @@ class ResponsesHandler:
                     message, code, request_id=corr, assistant_message_id=message_id,
                 )))
                 return
-            # Nothing special is emitted on cancellation.
             # The partial text and events generated before cancellation are persisted.
             # A question that was on screen when Stop was pressed never got its
             # `response.ask_user_answered` (see cancelled_ask_user_retirements),
             # so retire it here — otherwise the persisted log holds a published
-            # question that nothing in it ever closes.
-            collected_events.extend(cancelled_ask_user_retirements(collected_events))
+            # question that nothing in it ever closes. The Stop's own terminal
+            # follows, so a reload shows the turn as stopped.
+            collected_events.extend(stopped_turn_events(collected_events))
             await run_to_completion(end_turn("cancelled"))
             return
         except Exception as exc:
@@ -3931,6 +3962,14 @@ class ResponsesHandler:
                 _reset = gate_reset_at(exc)
                 if _reset is not None:
                     extra = {"reset_at": _reset}
+            elif code == BUDGET_EXCEEDED_CODE:
+                # Whose budget is spent and its period, so the card can name them.
+                _budget = {
+                    "budget_scope": gate_budget_scope(exc),
+                    "budget_period": gate_budget_period(exc),
+                    "budget_model": gate_budget_model(exc),
+                }
+                extra = {key: value for key, value in _budget.items() if value is not None}
             elif code == RATE_LIMITED_CODE:
                 # Pass the server's own wait interval so the card can time-gate
                 # its Retry (ENG-1537). An ungated Retry re-sends a large
@@ -4211,7 +4250,12 @@ class ResponsesHandler:
                 # it here. Same wire shape the streaming twin emits.
                 raise HTTPException(
                     status_code=400,
-                    detail=response_failed_payload(message, code, request_id=corr),
+                    detail=response_failed_payload(
+                        message, code, request_id=corr,
+                        budget_scope=gate_budget_scope(exc) if code == BUDGET_EXCEEDED_CODE else None,
+                        budget_period=gate_budget_period(exc) if code == BUDGET_EXCEEDED_CODE else None,
+                        budget_model=gate_budget_model(exc) if code == BUDGET_EXCEEDED_CODE else None,
+                    ),
                 )
             logger.exception(
                 "[responses] turn failed",

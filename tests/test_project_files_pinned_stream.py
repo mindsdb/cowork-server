@@ -11,12 +11,12 @@ from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
 
 from cowork.api.v1.endpoints import project_files as project_files_ep
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.db.units import unit_session
 from cowork.models.project import Project
+from tests.support.pinned_responses import served_body
 
 CSV_CRLF = b"id,name\r\n1,alpha\r\n2,beta\r\n"
 BINARY_WITH_EOF_MARK = b"PK\x03\x04\x1a\r\n\x00\x1a\n\xff"
@@ -38,13 +38,6 @@ def _stream(target, base):
     )
 
 
-async def _body(response: StreamingResponse) -> bytes:
-    chunks = []
-    async for chunk in response.body_iterator:
-        chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
-    return b"".join(chunks)
-
-
 @pytest.mark.parametrize("payload", (CSV_CRLF, BINARY_WITH_EOF_MARK))
 async def test_body_is_the_file_bytes(tmp_path, payload):
     base = _project(tmp_path)
@@ -53,7 +46,7 @@ async def test_body_is_the_file_bytes(tmp_path, payload):
 
     response = _stream(target, base)
 
-    assert await _body(response) == payload
+    assert await served_body(response) == payload
     assert response.headers["cache-control"] == "private, max-age=300"
 
 
@@ -69,7 +62,7 @@ async def test_stops_at_the_authorized_size_when_the_file_grows(tmp_path):
         handle.write(b"3,4\n")
 
     assert "content-length" not in response.headers
-    assert await _body(response) == b"a,b\n1,2\n"
+    assert await served_body(response) == b"a,b\n1,2\n"
 
 
 async def test_declares_no_length_when_the_file_is_rewritten_shorter(tmp_path):
@@ -83,7 +76,7 @@ async def test_declares_no_length_when_the_file_is_rewritten_shorter(tmp_path):
         handle.write(b"a,b\n")
 
     assert "content-length" not in response.headers
-    assert await _body(response) == b"a,b\n"
+    assert await served_body(response) == b"a,b\n"
 
 
 async def test_keeps_the_old_bytes_when_the_file_is_replaced(tmp_path):
@@ -97,7 +90,7 @@ async def test_keeps_the_old_bytes_when_the_file_is_replaced(tmp_path):
     os.replace(replacement, target)
 
     assert "content-length" not in response.headers
-    assert await _body(response) == b"a,b\n1,2\n"
+    assert await served_body(response) == b"a,b\n1,2\n"
 
 
 #: Seconds a pinned open of a FIFO may take. An open that waits for a writer

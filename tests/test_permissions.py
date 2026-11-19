@@ -194,7 +194,6 @@ def test_require_resolves_annotations_against_the_permissions_own_module():
 @pytest.mark.parametrize(
     "permission_cls,guard_names",
     [
-        ("LoopbackOnly", ["require_local"]),
         ("DesktopOnly", ["require_local_tenancy"]),
         ("LoopbackDesktopOnly", ["require_local", "require_local_tenancy"]),
     ],
@@ -204,7 +203,7 @@ def test_the_absorbed_guards_stay_reachable_through_dependency_overrides(
 ):
     """Absorbing a guard into a Permission must not hide it from FastAPI.
 
-    ``LoopbackOnly`` and friends declare ``Depends(require_local)`` rather than
+    ``LoopbackDesktopOnly`` and friends declare ``Depends(require_local)`` rather than
     calling it, for the same reason ``Authenticated`` declares
     ``get_principal``. Calling it directly works at runtime and silently breaks
     every test that stubs the guard out — which is how
@@ -231,11 +230,11 @@ def test_the_absorbed_guards_stay_reachable_through_dependency_overrides(
 
 def test_a_loopback_permission_still_refuses_a_remote_caller():
     """The other half: overriding is a test affordance, not a hole."""
-    from cowork.api.v1.permissions import LoopbackOnly
+    from cowork.api.v1.permissions import LoopbackDesktopOnly
 
     app = FastAPI()
 
-    @app.get("/guarded", dependencies=[Depends(require(LoopbackOnly))])
+    @app.get("/guarded", dependencies=[Depends(require(LoopbackDesktopOnly))])
     def guarded_route():
         return {"ok": True}
 

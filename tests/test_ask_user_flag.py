@@ -56,6 +56,27 @@ def test_harness_injects_a_choice_elicitor_when_the_flag_is_on(monkeypatch):
     assert elicitor.timeout_s == 300
 
 
+def test_an_unattended_turn_gets_no_elicitor(monkeypatch):
+    """A scheduled run has nobody to answer: a question or a browser hand-over
+    would only wait out its timeout before the agent moved on (ENG-4340)."""
+    from cowork.harnesses.anton_harness.harness import build_elicitor
+
+    monkeypatch.setattr(
+        "cowork.harnesses.anton_harness.harness.get_app_settings",
+        lambda: type("S", (), {"ask_user_enabled": True})(),
+    )
+    assert build_elicitor("conv-1", interactive=False) is None
+
+
+def test_the_harness_builds_its_elicitor_for_the_turn_it_serves():
+    import inspect
+
+    from cowork.harnesses.anton_harness.harness import AntonHarness
+
+    source = inspect.getsource(AntonHarness._build_turn_session)
+    assert "build_elicitor(str(conversation.id), interactive=interactive)" in source
+
+
 def _mock_llm():
     """Minimal LLM stand-in. ChatSession.__init__ reads
     coding_provider.export_connection_info() and
