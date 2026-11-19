@@ -90,7 +90,12 @@ def source_digest() -> str:
     lines = []
     for path in sorted(DIR.rglob("*"), key=lambda p: p.relative_to(DIR).as_posix()):
         rel = path.relative_to(DIR)
-        if path.is_file() and rel.parts[0] != PDFJS_DIR.name and "__pycache__" not in rel.parts:
+        # pdfjs/ and the folders fetch_pdfjs.py unpacks into (left behind by
+        # an interrupted run) are not committed.
+        top = rel.parts[0]
+        if top == PDFJS_DIR.name or top.startswith(".pdfjs-") or "__pycache__" in rel.parts:
+            continue
+        if path.is_file():
             lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {rel.as_posix()}\n")
     return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
 
@@ -116,7 +121,11 @@ def asset(name: str) -> tuple[bytes, str] | None:
     content_type = _CONTENT_TYPES.get(PurePosixPath(name).suffix)
     if content_type is None:
         return None
-    return path.read_bytes(), content_type
+    try:
+        return path.read_bytes(), content_type
+    except OSError:
+        # pdfjs/ was fetched again after this process imported the list.
+        return None
 
 
 def viewer_page(rel_path: str, *, draft: bool) -> str:

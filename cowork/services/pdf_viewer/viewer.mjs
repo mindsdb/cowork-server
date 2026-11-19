@@ -392,6 +392,8 @@ async function main() {
     await render(library, worker, data, ui);
   } catch (error) {
     worker.destroy();
+    // The Download button's blob holds a whole copy of the PDF.
+    if (ui.download?.href.startsWith('blob:')) URL.revokeObjectURL(ui.download.href);
     throw error;
   }
 }

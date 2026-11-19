@@ -33,6 +33,8 @@ URL = f"https://registry.npmjs.org/pdfjs-dist/-/pdfjs-dist-{VERSION}.tgz"
 SHA512 = "sha512-AVl138zALtfaAPvADulE0PZThbYzCBS79nL4pOSL/6Sm/4AH5A21BD9VHt97OlCuzJuCpmeZtAtkinisF4Vb1g=="
 
 DEST = Path(__file__).resolve().parent / "pdfjs"
+# Prefix of the folder a run unpacks into before it replaces DEST.
+STAGING_PREFIX = ".pdfjs-"
 # Written last into the folder; its text says which tarball the folder holds.
 STAMP = ".pdfjs-dist"
 _MAX_TARBALL = 64 * 1024 * 1024
@@ -121,13 +123,18 @@ def fetch(dest: Path = DEST) -> bool:
         return False
     data = _tarball()
     dest.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".pdfjs-", dir=dest.parent))
+    staging = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=dest.parent))
     try:
         _unpack(data, staging)
         (staging / STAMP).write_text(_stamp_text(), encoding="utf-8")
-        if dest.exists():
-            shutil.rmtree(dest)
+        shutil.rmtree(dest, ignore_errors=True)
         staging.rename(dest)
+    except OSError:
+        # Another build on the same tree may have put the same files in place
+        # first (a layer build and `make test/unit`, `uv sync` and `uv build`).
+        if is_current(dest):
+            return False
+        raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return True

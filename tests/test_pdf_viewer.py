@@ -15,7 +15,7 @@ from cowork.services.pdf_viewer import fetch_pdfjs
 
 ROOT = Path(__file__).resolve().parents[1]
 FOLDER = ROOT / "cowork" / "services" / "pdf_viewer"
-SOURCE_SHA256 = "b5f9b95add1d45fff240fcf078dab4fd87dc54b7ccaa589140c6d82ed58d9015"
+SOURCE_SHA256 = "36fc2cce5759d29c4ca1e6ca666456bdb3972c59642788a63058527665ba302b"
 
 
 def test_the_source_is_the_one_pinned_in_both_repositories():
@@ -36,6 +36,12 @@ def test_pdfjs_is_not_committed_but_goes_into_the_wheel():
     assert "cowork/services/pdf_viewer/pdfjs/" in wheel["artifacts"]
     assert "custom" in wheel["hooks"]
     assert (ROOT / "hatch_build.py").is_file()
+
+
+def test_a_new_pdfjs_pin_reinstalls_the_editable_project():
+    uv = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["uv"]
+    assert {"file": "cowork/services/pdf_viewer/fetch_pdfjs.py"} in uv["cache-keys"]
+    assert {"file": "pyproject.toml"} in uv["cache-keys"]
 
 
 def test_the_folder_is_kept_byte_for_byte_by_git():
