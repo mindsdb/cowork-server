@@ -193,6 +193,18 @@ def validate_and_save_developer_connection(body: DirectSaveRequest, scope: Scope
     return _persist_direct_connection(body, scope, values)
 
 
+def _refuse_new_slack_mcp(body: DirectSaveRequest, scope: TenantScope) -> None:
+    """While Slack's `mcp` method is switched off, refuse a new connection with
+    it; a reconnect of an existing one still saves."""
+    if body.connector_id != "slack" or body.method != "mcp" or OAuthSettings().slack_connector_enabled:
+        return
+    name = body.name.strip()
+    existing = ConnectionsService(scope).runtime_fields("slack", name) if body.replace_existing and name else None
+    if existing is not None and existing.get("_method") == "mcp":
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Slack sign-in is not available in this build yet.")
+
+
 def _refuse_sharepoint(connector_id: str, scope: TenantScope) -> None:
     """Refuse SharePoint here: only its own routes save it, after checking the key with Microsoft."""
     if connector_id == SHAREPOINT:
@@ -205,6 +217,7 @@ def _persist_direct_connection(
     values: dict,
 ) -> dict[str, object]:
     _refuse_sharepoint(body.connector_id, scope)
+    _refuse_new_slack_mcp(body, scope)
     with unit_session(scope=scope) as session:
         known = ConnectorCatalog(session).get_connector(body.connector_id)
     if known is None:

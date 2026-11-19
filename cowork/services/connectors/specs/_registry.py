@@ -4,6 +4,8 @@ import json
 import re
 from collections.abc import Iterable
 from pathlib import Path
+
+from cowork.common.settings.app_settings import OAuthSettings
 from cowork.schemas.connectors import (
     ConnectorMetadataResponse,
     ConnectorSpecResponse,
@@ -50,6 +52,19 @@ def connector_metadata(c: dict) -> ConnectorMetadataResponse:
         custom=c.get("custom", False),
         api_key=_takes_api_key(c),
     )
+
+
+def _without_slack_mcp(form: dict) -> dict:
+    """Slack's form while its `mcp` method is switched off: that method is
+    hidden, as the bot token was the default before it."""
+    methods = []
+    for method in form.get("methods") or []:
+        if isinstance(method, dict) and method.get("id") == "mcp":
+            method = {**method, "hidden": True, "recommended": False}
+        elif isinstance(method, dict) and method.get("id") == "bot-token":
+            method = {**method, "recommended": True}
+        methods.append(method)
+    return {**form, "methods": methods}
 
 
 class ConnectorSpecRegistry:
@@ -113,6 +128,9 @@ class ConnectorSpecRegistry:
         return items
 
     def _to_connector_spec_response(self, c: dict) -> ConnectorSpecResponse:
+        form = c.get("form", {})
+        if c.get("id") == "slack" and not OAuthSettings().slack_connector_enabled:
+            form = _without_slack_mcp(form)
         return ConnectorSpecResponse(
             id=c.get("id"),
             label=c.get("label", c.get("id", "")),
@@ -127,7 +145,7 @@ class ConnectorSpecRegistry:
             custom=c.get("custom", False),
             api_key=_takes_api_key(c),
             keywords=c.get("keywords", []),
-            form=c.get("form", {}),
+            form=form,
             check=c.get("check"),
             auth_summary=c.get("auth_summary"),
         )

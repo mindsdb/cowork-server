@@ -40,6 +40,7 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str | None]] = {
     "posthog":          ("posthog_client_id",           None),
     "hubspot":          ("hubspot_client_id",           "hubspot_client_secret"),
     "notion":           ("notion_client_id",            None),
+    "slack":            ("slack_client_id",             "slack_client_secret"),
 }
 
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
@@ -246,6 +247,31 @@ def _fetch_userinfo_supabase(access_token: str) -> dict[str, Any]:
     return {"email": f"org:{slug}" if slug else "", "name": name}
 
 
+def _slack_api(method: str, access_token: str, params: dict[str, str] | None = None) -> dict[str, Any]:
+    """A Slack Web API call. Slack reports failures as HTTP 200 with
+    `{"ok": false, "error": ...}`, so a body without `ok: true` is an error."""
+    url = f"https://slack.com/api/{method}"
+    if params:
+        url += "?" + urlencode(params)
+    result = _json_request(url, headers={"Authorization": f"Bearer {access_token}"})
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=f"Slack {method} failed: {result.get('error') or 'unknown error'}")
+    return result
+
+
+def _fetch_userinfo_slack(access_token: str) -> dict[str, Any]:
+    """Identity is `<email>:<team_id>`, so each workspace gets its own
+    connection; the name is the workspace. The user id stands in for an
+    email the profile doesn't carry."""
+    who = _slack_api("auth.test", access_token)
+    user_id = str(who.get("user_id") or "").strip()
+    team_id = str(who.get("team_id") or "").strip()
+    team_name = str(who.get("team") or "").strip()
+    profile = (_slack_api("users.info", access_token, {"user": user_id}).get("user") or {}).get("profile") or {}
+    person = str(profile.get("email") or "").strip() or user_id
+    return {"email": f"{person}:{team_id}" if team_id else person, "name": team_name or person}
+
+
 # engine → identity-fetch function. The one piece of connector onboarding
 # that can't be pure spec-JSON data — response shape (REST vs GraphQL) is
 # genuinely provider-specific code, not configuration. New OAuth-builtin
@@ -260,6 +286,7 @@ _USERINFO_FETCHERS: dict[str, Callable[[str], dict[str, Any]]] = {
     "github": _fetch_userinfo_github,
     "supabase": _fetch_userinfo_supabase,
     "posthog": _fetch_userinfo_posthog,
+    "slack": _fetch_userinfo_slack,
 }
 
 
@@ -338,6 +365,12 @@ def _revoke_notion(token: str, client_id: str, client_secret: str) -> None:
         pass
 
 
+def _revoke_slack(token: str, client_id: str, client_secret: str) -> None:
+    """auth.revoke takes the access token itself as the bearer. It revokes
+    that token only; the app stays installed in the workspace."""
+    _slack_api("auth.revoke", token)
+
+
 # engine → custom revoke function, for providers whose revoke call doesn't
 # fit the generic revoke_url/POST/form-body shape (see OAuthConfig.revoke_url).
 # Checked before the generic path in revoke() below.
@@ -345,6 +378,7 @@ _REVOKE_HANDLERS: dict[str, Callable[[str, str, str], None]] = {
     "github": _revoke_github,
     "notion": _revoke_notion,
     "posthog": _revoke_posthog,
+    "slack": _revoke_slack,
     "supabase": _revoke_supabase,
 }
 
@@ -647,7 +681,14 @@ class OAuthService:
             # MCP sign-in's token belongs to mcp.notion.com's revoke endpoint.
             _log.debug("Not revoking %s/%s remotely: not an MCP sign-in", engine, name)
             return
+        if engine == "slack" and fields.get("_method") != "mcp":
+            # The hidden `oauth` method signs in with the user's own Slack app,
+            # whose token may be shared with other integrations.
+            _log.debug("Not revoking %s/%s remotely: not an MCP sign-in", engine, name)
+            return
         token = fields.get("refresh_token", "").strip() or fields.get("access_token", "").strip()
+        if engine == "slack":
+            token = fields.get("access_token", "").strip()
         if not token:
             return
         if engine == "supabase" and not fields.get("refresh_token", "").strip():
