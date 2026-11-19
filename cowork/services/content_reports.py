@@ -10,7 +10,7 @@ from cowork.models.content_report import ContentReport
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.schemas.responses import Role
-from cowork.services.conversations import ConversationService
+from cowork.services.conversations import ConversationService, _is_tool_row
 
 
 # Persist only fields shown on cards or needed to identify them. In particular,
@@ -81,7 +81,16 @@ def submit_report(session: ScopedSession, *, conversation_id: UUID, message_id: 
     except ValueError:
         raise HTTPException(404, "Content not found.") from None
     message = session.get(Message, message_id)
-    if message is None or message.conversation_id != conversation_id or message.role != "assistant":
+    # Messages carry no org of their own, so the match against the caller's
+    # conversation is what keeps another tenant's message out of reach. Tool
+    # rows are saved as assistant too, but are replay history the reader never
+    # saw, and hold raw tool arguments.
+    if (
+        message is None
+        or message.conversation_id != conversation_id
+        or message.role != "assistant"
+        or _is_tool_row(message.content)
+    ):
         raise HTTPException(404, "Content not found.")
     content = message.content.model_dump() if hasattr(message.content, "model_dump") else message.content
     if content:

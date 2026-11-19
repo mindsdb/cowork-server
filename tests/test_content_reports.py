@@ -126,6 +126,75 @@ def test_cannot_substitute_evidence_or_target(setup):
     assert client.post('/reports/', json={**body, 'conversation_id': str(uuid4())}).status_code == 404
 
 
+def _reports_by(engine, caller) -> list:
+    with Session(engine) as db:
+        return db.exec(select(ContentReport).where(ContentReport.user_id == caller[0].user_id)).all()
+
+
+def _add_message(engine, conversation_id, **fields) -> str:
+    with Session(engine) as db:
+        message = Message(conversation_id=conversation_id, **fields)
+        db.add(message)
+        db.commit()
+        return str(message.id)
+
+
+def test_cannot_pair_own_task_with_a_message_from_another(setup):
+    client, caller, engine, body = setup
+    with Session(engine) as db:
+        # Another organization's task: messages carry no org to filter on.
+        org, user = str(uuid4()), str(uuid4())
+        project = Project(name=str(uuid4()), path='/unused', org_id=org, created_by=user)
+        db.add(project)
+        db.flush()
+        other = Conversation(topic='Other', project_id=project.id, org_id=org, created_by=user)
+        db.add(other)
+        db.commit()
+        other_id = other.id
+    foreign = _add_message(engine, other_id, role='assistant', content='Someone else\'s reply')
+    assert client.post('/reports/', json={**body, 'message_id': foreign}).status_code == 404
+    assert _reports_by(engine, caller) == []
+
+
+@pytest.mark.parametrize('fields', [
+    {'role': 'user', 'content': 'My own question'},
+    # Hidden replay rows are saved as assistant and hold raw tool arguments.
+    {'role': 'assistant', 'content': [{'type': 'tool_use', 'id': 't1', 'name': 'run', 'input': {'token': 'secret'}}]},
+    {'role': 'assistant', 'content': [{'type': 'text', 'text': 'Checking.'},
+                                      {'type': 'tool_use', 'id': 't2', 'name': 'run', 'input': {}}]},
+])
+def test_only_a_visible_assistant_reply_can_be_reported(setup, fields):
+    client, caller, engine, body = setup
+    message_id = _add_message(engine, UUID(body['conversation_id']), **fields)
+    assert client.post('/reports/', json={**body, 'message_id': message_id}).status_code == 404
+    assert _reports_by(engine, caller) == []
+
+
+@pytest.mark.parametrize('route', ['/reports/', '/reports/artifact'])
+def test_report_racing_its_own_retry_returns_the_first_receipt(setup, monkeypatch, route):
+    from sqlalchemy.exc import IntegrityError
+    client, _, _, body = setup
+    receipt = {'id': str(uuid4()), 'status': 'received'}
+    calls = []
+
+    async def run_db(operation, *, scope):
+        calls.append(operation)
+        if len(calls) == 1:
+            raise IntegrityError('insert', {}, Exception('uq_content_report_target'))
+        return receipt
+
+    async def reviewed(*args, **kwargs):
+        return None, ('generation', '{}')
+
+    monkeypatch.setattr(endpoint, 'run_db', run_db)
+    monkeypatch.setattr(endpoint, 'review_artifact_and_read', reviewed)
+    if route.endswith('artifact'):
+        body = {'project_id': str(uuid4()), 'artifact_id': str(uuid4())}
+    result = client.post(route, json=body)
+    assert (result.status_code, result.json()) == (201, receipt)
+    assert len(calls) == 2
+
+
 def test_anonymous_cannot_report(setup):
     client, caller, _, body = setup
     caller[0] = None
