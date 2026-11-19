@@ -5,8 +5,8 @@ import io
 import json
 import logging
 import os
-import re
 import shutil
+import stat
 import tempfile
 import zipfile
 from collections.abc import Callable
@@ -28,10 +28,15 @@ from anton.core.tools.skill_format import (
 
 from cowork import shared_skills
 from cowork.common.paths import (
+    O_NOFOLLOW,
+    dir_atomic_write,
+    dir_open,
     dir_rename,
     dir_replace,
     dir_rmtree,
+    dir_scandir,
     dir_unlink,
+    opened_subdir_nofollow,
     pinned_dir,
     safe_join,
 )
@@ -190,6 +195,11 @@ def builtin_fingerprint(skill_dir: Path) -> str | None:
                 return None
             files[path.relative_to(skill_dir).as_posix()] = path.read_bytes()
     return fingerprint_skill_files(files)
+
+
+def _is_skill_write_temp(name: str) -> bool:
+    """A temp file a skill write leaves beside SKILL.md if it is interrupted."""
+    return name.startswith(f".{SKILL_FILE}.") and name.endswith((".tmp", ".restore"))
 
 
 @lru_cache(maxsize=1)
@@ -2261,74 +2271,46 @@ class SkillService:
 
     # ── builtin seeding ──────────────────────────────────────────────────────
     def _refresh_builtin_skill(self, src: Path) -> bool:
-        """Replace an existing copy of a packaged builtin with the packaged one,
-        only when that copy is exactly a version we shipped before.
+        """Replace a store's copy of a packaged builtin with the packaged one,
+        only when that copy is exactly a version we shipped.
 
-        A copy someone edited, a copy that holds a link, and a slug that is not
-        a real directory are all left alone. The usage sidecar is carried over.
+        Every builtin is one SKILL.md, so the update is one atomic file
+        replace: the new text is written to a temp file beside SKILL.md and
+        renamed over it, and the skill is never missing or half written. The
+        folder is opened without following links and the rename replaces the
+        name itself, so a link anywhere in the copy is never written through.
+        A copy someone edited, one holding anything but SKILL.md and the usage
+        sidecar, and one holding a link are all left alone.
         """
         slug = src.name
         shipped = shipped_builtin_fingerprints(slug)
+        packaged = [p for p in src.rglob("*") if not p.is_dir()]
+        if not shipped or [p.name for p in packaged] != [SKILL_FILE] or packaged[0].is_symlink():
+            return False
         entry = self._skill_entry(slug)
-        if not shipped or entry.is_symlink() or not entry.is_dir():
+        if entry.is_symlink() or not entry.is_dir():
             return False
-        current = builtin_fingerprint(entry)
-        if current is None or current not in shipped or current == builtin_fingerprint(src):
-            return False
-        # Staged in a folder of its own with no SKILL.md, as `.delete-staging`
-        # is, so a copy left behind by a crash is never listed as a skill.
-        staging = Path(os.path.abspath(self.root / ".builtin-staging"))
-        staging.mkdir(parents=True, exist_ok=True)
-        token = uuid4().hex[:12]
-        staged_name, old_name = f"new-{slug}-{token}", f"old-{slug}-{token}"
-        staged = staging / staged_name
-        try:
-            for child in sorted(p for p in src.rglob("*") if p.is_file()):
-                target = safe_join(staged, *child.relative_to(src).parts)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(child, target)
-            sidecar = entry / BUILTIN_RUNTIME_SIDECAR
-            if sidecar.is_file() and not sidecar.is_symlink():
-                shutil.copy2(sidecar, safe_join(staged, BUILTIN_RUNTIME_SIDECAR))
-            self._rename_direct_child(self.root, entry.name, staging, old_name)
-        except Exception:
-            self._rmtree_direct_child(staging, staged_name, ignore_errors=True)
-            raise
-        try:
-            self._rename_direct_child(staging, staged_name, self.root, entry.name)
-        except BaseException:
-            # BaseException too: an interrupt here would otherwise leave the
-            # skill only in staging. If this restore also fails,
-            # _recover_stranded_builtin brings it back on the next pass.
-            self._rename_direct_child(staging, old_name, self.root, entry.name)
-            self._rmtree_direct_child(staging, staged_name, ignore_errors=True)
-            raise
-        self._rmtree_direct_child(staging, old_name, ignore_errors=True)
-        return True
-
-    def _recover_stranded_builtin(self, slug: str) -> bool:
-        """Put back a builtin a failed swap left only in `.builtin-staging`.
-
-        `_refresh_builtin_skill` moves the live copy to `old-<slug>-<token>`
-        before moving the new one in. If the process dies, or both that move
-        and the restore fail, the slug is missing and would be taken for one
-        someone deleted. Returns True when a copy was moved back. Nothing
-        behind a link is followed.
-        """
-        staging = self.root / ".builtin-staging"
-        if staging.is_symlink() or not staging.is_dir():
-            return False
-        pattern = re.compile(rf"old-{re.escape(slug)}-[0-9a-f]{{12}}")
-        stranded = [
-            p for p in staging.iterdir()
-            if pattern.fullmatch(p.name) and not p.is_symlink() and p.is_dir()
-            and (p / SKILL_FILE).is_file()
-        ]
-        if not stranded:
-            return False
-        newest = max(stranded, key=lambda p: p.stat().st_mtime)
-        self._rename_direct_child(staging, newest.name, self.root, slug)
-        logger.warning("Recovered builtin %r from an interrupted update in %s", slug, self.root)
+        new_body = packaged[0].read_bytes()
+        with opened_subdir_nofollow(self.root, entry.name) as skill_dir:
+            names = set()
+            for child in dir_scandir(skill_dir):
+                if _is_skill_write_temp(child.name):
+                    continue  # left by an interrupted write; not part of the skill
+                if child.is_symlink() or not child.is_file(follow_symlinks=False):
+                    return False
+                names.add(child.name)
+            if names - {BUILTIN_RUNTIME_SIDECAR} != {SKILL_FILE}:
+                return False
+            fd = dir_open(skill_dir, SKILL_FILE, os.O_RDONLY | O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as handle:
+                current = handle.read()
+            current_print = fingerprint_skill_files({SKILL_FILE: current})
+            if current_print not in shipped or current == new_body:
+                return False
+            dir_atomic_write(
+                skill_dir, SKILL_FILE, content=new_body,
+                mode=stat.S_IMODE(packaged[0].stat().st_mode),
+            )
         return True
 
     def _copy_builtin_skill(self, src: Path) -> bool:
@@ -2368,7 +2350,7 @@ class SkillService:
                 continue
             slug = src.name
             try:
-                if os.path.lexists(self._skill_entry(slug)) or self._recover_stranded_builtin(slug):
+                if os.path.lexists(self._skill_entry(slug)):
                     if not self._refresh_builtin_skill(src):
                         continue  # current already, or edited: leave it
                 elif seeded_version and builtin_introduced_in(slug) <= seeded_version:
@@ -2376,18 +2358,23 @@ class SkillService:
                 elif not self._copy_builtin_skill(src):
                     continue
             except ValueError:
-                # Either the slug resolves outside the store, or safe_join rejected a
-                # destination. The agent writes into its own org's tree on shared
-                # storage, so it can plant a symlink under `dest` between the exists()
-                # check above and the write. Skip this builtin: propagating would 500
-                # every skills read and every turn for the org, which a tenant must
-                # not be able to do to itself.
+                # The slug resolves outside the store, or safe_join rejected a
+                # destination. Turn pods don't mount the skill store, so only
+                # this server writes here; the checks stay so a planted link is
+                # refused rather than followed. Skip this builtin: propagating
+                # would fail every skills read and every turn for the org.
                 logger.warning(
                     "Skipping builtin %r: it does not resolve inside %s",
                     src.name,
                     self.root,
                     exc_info=True,
                 )
+                continue
+            except OSError as exc:
+                # A locked or unreadable file (Windows antivirus, say) costs
+                # this one builtin, never the boot or the request. Its old copy
+                # is still a shipped version, so the next version bump retries.
+                logger.warning("Could not update builtin %r: %s", slug, type(exc).__name__)
                 continue
             copied += 1
         return copied

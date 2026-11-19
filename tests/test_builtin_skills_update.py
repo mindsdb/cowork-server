@@ -1,7 +1,8 @@
 """Updating a store's copy of a packaged builtin when a new version ships.
 
-A copy is replaced only when it is exactly a version we shipped; one someone
-edited, one holding a link, and one someone deleted are left as they are.
+A copy is replaced only when it is exactly a version we shipped, in one atomic
+replace of its SKILL.md; one someone edited, one holding a link, and one someone
+deleted are left as they are.
 """
 from __future__ import annotations
 
@@ -237,43 +238,89 @@ def test_a_change_is_compared_with_the_stores_last_version_not_the_skills():
     assert script.entry_for("pdf", "pdf-edited", 5, released, store_last=4)["version"] == 5
 
 
-def _rename_failing_on(calls_to_fail: set[int], error: BaseException, monkeypatch):
-    real = SkillService._rename_direct_child
-    calls = {"n": 0}
-
-    def flaky(*args):
-        calls["n"] += 1
-        if calls["n"] in calls_to_fail:
-            raise error
-        return real(*args)
-
-    monkeypatch.setattr(SkillService, "_rename_direct_child", staticmethod(flaky))
-    return real
+def test_every_packaged_builtin_is_a_single_skill_file():
+    """The update replaces SKILL.md in one atomic step; a builtin with more
+    files would never be updated in place, so adding one needs a new design."""
+    for src in sorted(p for p in BUILTIN_SKILLS_DIR.iterdir() if p.is_dir()):
+        assert [p.name for p in src.rglob("*")] == ["SKILL.md"], src.name
 
 
-def test_a_swap_that_fails_partway_does_not_lose_the_builtin(skills_root, monkeypatch):
-    # The old copy is moved into .builtin-staging, then both the move of the new
-    # copy into place and the restore of the old one fail (a Windows lock, say).
-    _seed_at_previous_version_with(OLD_BODY, shipped=True, monkeypatch=monkeypatch)
-    real = _rename_failing_on({2, 3}, PermissionError(13, "locked"), monkeypatch)
+def test_a_locked_file_on_desktop_does_not_stop_boot(skills_root, monkeypatch):
+    """A Windows lock or antivirus scan makes the replace fail with an OSError.
+    Boot carries on, the copy stays usable, and a later start retries it."""
+    from cowork.db.session import get_open_session
+    from cowork.migrations import BUILTIN_SKILLS_SENTINEL, Setting, seed_builtin_skills
+    from cowork.services.settings import SettingService
 
-    assert SkillService(_org()).ensure_builtin_skills() is False
-    assert not (_store() / SLUG).exists()
+    store = SkillService(LOCAL_SCOPE)
+    store._copy_builtin_skills()
+    (store.root / SLUG / "SKILL.md").write_text(OLD_BODY)
+    old = builtin_fingerprint(store.root / SLUG)
+    real = skills_mod.shipped_builtin_fingerprints
+    monkeypatch.setattr(skills_mod, "shipped_builtin_fingerprints",
+                        lambda slug: real(slug) | {old} if slug == SLUG else real(slug))
 
-    monkeypatch.setattr(SkillService, "_rename_direct_child", staticmethod(real))
+    def locked(*_args, **_kwargs):
+        raise PermissionError(13, "The process cannot access the file")
+
+    monkeypatch.setattr(os, "replace", locked)
+    monkeypatch.setattr(os, "rename", locked)
+
+    session = get_open_session()
+    try:
+        row = SettingService(session)._fetch_row(BUILTIN_SKILLS_SENTINEL)
+        if row is None:
+            row = Setting(key=BUILTIN_SKILLS_SENTINEL, value="")
+        row.value = str(BUILTIN_SKILLS_VERSION - 1)
+        session.add(row)
+        session.commit()
+        seed_builtin_skills(session)  # must not raise
+    finally:
+        row = SettingService(session)._fetch_row(BUILTIN_SKILLS_SENTINEL)
+        if row is not None:
+            session.delete(row)
+            session.commit()
+        session.close()
+
+    assert (store.root / SLUG / "SKILL.md").read_text() == OLD_BODY
+    assert not [p.name for p in (store.root / SLUG).iterdir() if p.name.endswith(".tmp")]
+
+
+def test_a_deleted_builtin_does_not_come_back_from_a_leftover_copy(skills_root):
+    """A folder an earlier update could leave beside the store is never used to
+    put back a builtin the person deleted."""
+    SkillService(_org()).ensure_builtin_skills()
+    leftover = _store() / ".builtin-staging" / f"old-{SLUG}-0123456789ab"
+    leftover.mkdir(parents=True)
+    (leftover / "SKILL.md").write_text(OLD_BODY)
+    shutil.rmtree(_store() / SLUG)
+    (_store() / BUILTIN_SKILLS_MARKER).write_text(f"{BUILTIN_SKILLS_VERSION - 1}\n")
+
     SkillService(_org()).ensure_builtin_skills()
 
-    # The stranded copy is recovered and then updated, not taken for a deletion.
-    assert (_store() / SLUG / "SKILL.md").read_bytes() == (BUILTIN_SKILLS_DIR / SLUG / "SKILL.md").read_bytes()
-    assert (_store() / SLUG / "stats.json").read_text() == '{"total_recalls": 3}'
-    assert SLUG in {s.name for s in SkillService(_org()).list_skills()}
+    assert not (_store() / SLUG).exists()
 
 
-def test_an_interrupt_during_the_swap_puts_the_old_copy_back(skills_root, monkeypatch):
-    _seed_at_previous_version_with(OLD_BODY, shipped=True, monkeypatch=monkeypatch)
-    _rename_failing_on({2}, KeyboardInterrupt(), monkeypatch)
+def test_a_skill_file_planted_as_a_link_is_not_written_through(skills_root, monkeypatch, tmp_path):
+    copy = _seed_at_previous_version_with(OLD_BODY, shipped=False, monkeypatch=monkeypatch)
+    outside = tmp_path / "outside.md"
+    outside.write_text(OLD_BODY)
+    (copy / "SKILL.md").unlink()
+    (copy / "SKILL.md").symlink_to(outside)
+    # Even if what the link points at is a shipped version.
+    shipped = skills_mod.fingerprint_skill_files({"SKILL.md": OLD_BODY.encode()})
+    monkeypatch.setattr(skills_mod, "shipped_builtin_fingerprints", lambda slug: frozenset({shipped}))
 
-    with pytest.raises(KeyboardInterrupt):
-        SkillService(_org()).ensure_builtin_skills()
+    SkillService(_org()).ensure_builtin_skills()
 
-    assert (_store() / SLUG / "SKILL.md").read_text() == OLD_BODY
+    assert outside.read_text() == OLD_BODY
+    assert os.path.islink(copy / "SKILL.md")
+
+
+def test_a_temp_file_left_by_an_interrupted_write_does_not_block_the_update(skills_root, monkeypatch):
+    copy = _seed_at_previous_version_with(OLD_BODY, shipped=True, monkeypatch=monkeypatch)
+    (copy / ".SKILL.md.0123abcd.tmp").write_text("half")
+
+    SkillService(_org()).ensure_builtin_skills()
+
+    assert (copy / "SKILL.md").read_bytes() == (BUILTIN_SKILLS_DIR / SLUG / "SKILL.md").read_bytes()
