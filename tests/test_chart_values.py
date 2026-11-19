@@ -236,10 +236,13 @@ def test_custom_api_turns_are_off_in_the_code_and_the_base_and_on_only_where_lis
 
 
 def test_custom_mcp_turns_are_off_in_the_code_the_base_and_every_environment(base, monkeypatch):
-    """Merging turns nothing on: each environment's own change, after auth's and the gateway's, sets it."""
+    """Merging turns nothing on: each environment's own change, after auth's and the gateway's, sets it.
+
+    Test enablement, integration branch only, never merged: the base carries it on for the PR environment.
+    """
     monkeypatch.delenv(CUSTOM_MCP_FLAG, raising=False)
     assert TurnQueueSettings().custom_mcp_enabled is False
-    assert _deployment(BASE)["customMcpTurnsEnabled"] == "false"
+    assert _deployment(BASE)["customMcpTurnsEnabled"] == "true"
     assert _entry(base, CUSTOM_MCP_FLAG).value == "{{ $.Values.customMcpTurnsEnabled }}"
     for env_values in ENVIRONMENTS:
         assert _deployment(env_values).get("customMcpTurnsEnabled") in (None, "false"), (

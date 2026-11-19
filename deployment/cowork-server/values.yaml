@@ -159,7 +159,10 @@ deployment:
   # servers they added, and opens the web routes that add them
   # (COWORK_TURN_CUSTOM_MCP_ENABLED). Off in the base and in every environment;
   # it is the last of the three custom MCP switches, after auth's and the gateway's.
-  customMcpTurnsEnabled: "false"
+  # TEST ENABLEMENT, integration branch only, never merged or cherry-picked.
+  # A pull request environment composes base values alone, so this is the only
+  # place that can switch custom MCP turns on there.
+  customMcpTurnsEnabled: "true"
 
   # The draft-preview host name and the one page allowed to frame a draft. The
   # draft Ingress and the COWORK_DRAFT_* variables below are templated from
