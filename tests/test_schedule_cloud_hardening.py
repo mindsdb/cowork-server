@@ -625,6 +625,23 @@ async def test_deleting_task_stops_its_turn_and_logs_deletion(schedules, turns, 
         ConversationService(ScopedSession(session, SYSTEM_SCOPE)).delete_conversation(UUID(stopped[0]))
 
 
+def test_lease_renewal_tells_a_deleted_run_from_a_finished_one(schedules):
+    """_renew_lease logs a deletion only for None, so a run deleted with its
+    task must not come back as False, the answer for a finished run."""
+    running, finished = schedules(), schedules()
+    running_id, finished_id = _running(running).id, _running(finished).id
+    with get_open_session() as session:
+        scoped = ScopedSession(session, SYSTEM_SCOPE)
+        ScheduleRunService(scoped).finish_run(finished_id, status=RunStatus.success)
+        before = _runs(running)[0].lease_expires_at
+        assert scheduler._renew_run_lease(scoped, run_id=running_id) is True
+        assert _runs(running)[0].lease_expires_at != before
+        assert scheduler._renew_run_lease(scoped, run_id=finished_id) is False
+        assert _runs(finished)[0].lease_expires_at is None
+        ScheduleService(scoped).delete_schedule(running)
+        assert scheduler._renew_run_lease(scoped, run_id=running_id) is None
+
+
 def test_poll_reserves_only_available_org_capacity_before_process_admission(schedules, monkeypatch):
     monkeypatch.setattr(scheduler, "_org_run_limit", lambda: 2)
     _running(schedules(org_id="a"))

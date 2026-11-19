@@ -6,9 +6,10 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
-from coding_service_fakes import (
+from tests.support.coding.service_fakes import (
     CREDS,
     FakeEngine,
     repository,
@@ -22,11 +23,13 @@ from cowork.coding.contracts import (
     InputReference,
     SessionCreateRequest,
     SessionStatus,
+    WorkspaceMode,
 )
 from cowork.coding.control_models import RunStatus
 from cowork.coding.project_models import (
     ProjectCommand,
     ProjectCreateRequest,
+    ProjectEnvironment,
     ProjectFolder,
 )
 from cowork.coding.repository_setup_models import TaskRepositorySetup
@@ -135,6 +138,7 @@ def test_a_task_whose_workspace_cannot_be_prepared_stays_visible_as_failed(
         raise RuntimeError("disk is full")
 
     monkeypatch.setattr(service.session_factory.workspaces, "prepare", fail)
+    monkeypatch.setattr(service.session_factory.workspaces, "prepare_in_place", fail)
     started, release = hold_preparation(monkeypatch, service)
 
     created = create(service, repo)
@@ -202,20 +206,21 @@ def test_invalid_attachments_are_rejected_before_the_task_is_created(tmp_path: P
 
 
 @pytest.mark.parametrize(
-    ("folder", "allow_direct_folder", "message"),
+    ("folder", "mode", "message"),
     [
-        ("missing", True, "Choose an existing local folder"),
-        ("plain", False, "Local folder isolation was not enabled"),
+        ("missing", None, "Choose an existing local folder"),
+        ("missing", WorkspaceMode.worktree, "Choose an existing local folder"),
+        ("plain", WorkspaceMode.worktree, "Initialize Git to use a Worktree"),
     ],
 )
 def test_a_folder_preparation_would_refuse_is_rejected_before_the_task_is_created(
-    folder: str, allow_direct_folder: bool, message: str, tmp_path: Path
+    folder: str, mode: WorkspaceMode | None, message: str, tmp_path: Path
 ) -> None:
     (tmp_path / "plain").mkdir()
     service = service_with(tmp_path, FakeEngine())
     with pytest.raises(WorkspaceError, match=message):
         service.create_session(
-            SessionCreateRequest(path=str(tmp_path / folder), prompt="Go", allow_direct_folder=allow_direct_folder),
+            SessionCreateRequest(path=str(tmp_path / folder), prompt="Go", workspace_mode=mode),
             CREDS,
             "fake",
             "fake-model",
@@ -315,7 +320,7 @@ def test_setup_commands_report_progress_while_they_run(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(project_workspaces.ProjectCommandRunner, "_run_one", staticmethod(slow))
     created = service.create_session(
-        SessionCreateRequest(project_id=project.id, prompt="Build it"), CREDS, "fake", "fake-model"
+        SessionCreateRequest(workspace_mode=WorkspaceMode.worktree, project_id=project.id, prompt="Build it"), CREDS, "fake", "fake-model"
     )
     assert running.wait(timeout=3)
 
@@ -335,7 +340,10 @@ def test_deleting_a_task_while_it_prepares_removes_it_and_its_workspace(
     engine = FakeEngine()
     service = service_with(tmp_path, engine)
     started, release = hold_preparation(monkeypatch, service)
-    created = create(service, repo)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Build it", workspace_mode=WorkspaceMode.worktree),
+        CREDS, "fake", "fake-model",
+    )
     assert started.wait(timeout=3)
     thread = service._running[created.id].thread
 
@@ -350,6 +358,8 @@ def test_deleting_a_task_while_it_prepares_removes_it_and_its_workspace(
     assert engine.prompts == []
     # The worktree preparation made after the delete was released again.
     assert git_output(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+    assert not (service.workspaces.snapshots_root / created.id).exists()
 
 
 def test_runtime_settings_wait_for_the_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -393,6 +403,7 @@ def test_deleting_a_task_before_its_first_turn_rolls_back_its_new_branch(
     monkeypatch.setattr(service.session_factory, "complete", held)
     created = service.create_session(
         SessionCreateRequest(
+            workspace_mode=WorkspaceMode.worktree,
             project_id=project.id,
             prompt="Build it",
             repository_setup=TaskRepositorySetup(branch="feat/aborted"),
@@ -403,8 +414,12 @@ def test_deleting_a_task_before_its_first_turn_rolls_back_its_new_branch(
     )
     assert prepared.wait(timeout=3)
     assert "feat/aborted" in git_output(repo, "branch", "--list")
+    recovery = service.workspaces.snapshots_root / created.id
+    recovery.mkdir(parents=True, exist_ok=True)
+    (recovery / "prepared.patch").write_text("saved during preparation\n", encoding="utf-8")
     thread = service._running[created.id].thread
 
+    measure_before_discard(monkeypatch, service)
     service.delete_session(created.id)
     handoff.set()
     thread.join(timeout=5)
@@ -414,6 +429,127 @@ def test_deleting_a_task_before_its_first_turn_rolls_back_its_new_branch(
     assert "feat/aborted" not in git_output(repo, "branch", "--list")
     assert git_output(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
 
+    assert not recovery.exists()
+    assert_usage_refreshes_after_cleanup(service)
+
 
 def git_output(cwd: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout
+
+
+@pytest.mark.parametrize("delete_task, setup_fails", [(True, False), (True, True), (False, True)])
+def test_preparation_rollback_keeps_recovery_only_for_tasks_that_still_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delete_task: bool, setup_fails: bool,
+) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="App", folders=[ProjectFolder(id="app", name="App", path=str(repo))],
+        default_engine_id="fake", default_model="fake-model", environment=ProjectEnvironment(port_names=[]),
+    ))
+    started, resume = threading.Event(), threading.Event()
+
+    def setup(session, project, cancelled):
+        (Path(session.workspace_path) / "setup-output.txt").write_text("setup generated this\n")
+        started.set()
+        assert resume.wait(5)
+        if setup_fails:
+            raise WorkspaceError("Setup failed")
+
+    monkeypatch.setattr(service.session_factory, "_run_setup", setup)
+    created = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Go", workspace_mode=WorkspaceMode.worktree),
+        CREDS, "fake", "fake-model",
+    )
+    assert started.wait(3)
+    snapshots = []
+    snapshot_changes = service.workspaces._snapshot_changes
+
+    def track_snapshot(*args, **kwargs):
+        snapshots.append(args)
+        return snapshot_changes(*args, **kwargs)
+
+    monkeypatch.setattr(service.workspaces, "_snapshot_changes", track_snapshot)
+    thread = service._running[created.id].thread
+    try:
+        if delete_task:
+            measure_before_discard(monkeypatch, service)
+            service.delete_session(created.id)
+    finally:
+        resume.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    recovery = service.workspaces.snapshots_root / created.id
+    if delete_task:
+        assert service.list_sessions(True).items == []
+        assert not recovery.exists()
+        assert_usage_refreshes_after_cleanup(service)
+        assert snapshots == []
+        assert not (service.workspaces.worktrees_root / created.id).exists()
+    else:
+        assert service.get_session(created.id).status == SessionStatus.failed
+        assert "setup generated this" in (recovery / "app" / "cleanup.patch").read_text()
+    assert not (repo / "setup-output.txt").exists()
+
+
+@pytest.mark.parametrize("failure_step", ["create_branch", "allocate"])
+def test_partial_project_rollback_skips_snapshots_after_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_step: str,
+) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="App", folders=[ProjectFolder(id="app", name="App", path=str(repo))],
+        default_engine_id="fake", default_model="fake-model",
+    ))
+    started, resume = threading.Event(), threading.Event()
+
+    def fail(*args):
+        started.set()
+        assert resume.wait(5)
+        raise WorkspaceError("Preparation failed")
+
+    target = service.workspaces if failure_step == "create_branch" else service.project_workspaces.ports
+    monkeypatch.setattr(target, failure_step, fail)
+    created = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Go", workspace_mode=WorkspaceMode.worktree),
+        CREDS, "fake", "fake-model",
+    )
+    assert started.wait(3)
+    thread = service._running[created.id].thread
+    snapshot = Mock(wraps=service.workspaces._snapshot_changes)
+    monkeypatch.setattr(service.workspaces, "_snapshot_changes", snapshot)
+    try:
+        workspace = service.workspaces.worktrees_root / created.id / "app"
+        (workspace / "generated.txt").write_text("generated during preparation\n")
+        service.delete_session(created.id)
+    finally:
+        resume.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert not workspace.exists()
+    snapshot.assert_not_called()
+
+
+def measure_before_discard(monkeypatch: pytest.MonkeyPatch, service: CodingService) -> None:
+    discard = service.workspaces.discard_recovery
+
+    def measure_then_discard(session_id: str) -> None:
+        recovery = service.workspaces.snapshots_root / session_id
+        recovery.mkdir(parents=True, exist_ok=True)
+        (recovery / "earlier.patch").write_bytes(b"x" * 8192)
+        assert service.workspace_usage.measure().removed_task_bytes > 0
+        discard(session_id)
+
+    monkeypatch.setattr(service.workspaces, "discard_recovery", measure_then_discard)
+
+
+def assert_usage_refreshes_after_cleanup(service: CodingService) -> None:
+    page = service.workspace_usage_page()
+    assert page.measuring
+    deadline = time.monotonic() + 5
+    while page.measuring and time.monotonic() < deadline:
+        time.sleep(0.01)
+        page = service.workspace_usage_page()
+    assert not page.measuring
+    assert page.removed_task_bytes == 0

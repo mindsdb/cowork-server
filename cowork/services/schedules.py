@@ -432,16 +432,28 @@ class ScheduleRunService:
             .limit(1)
         ).first()
 
-    def renew_lease(self, run_id: UUID, lease_seconds: float) -> bool:
+    def renew_lease(self, run_id: UUID, lease_seconds: float) -> bool | None:
         """Extend a running run's lease. False once the run has finished or
-        another replica reaped it, so its process no longer holds the claim."""
-        run = self.session.get(ScheduleRun, run_id)
-        if run is None or run.status != RunStatus.running:
-            return False
-        run.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
-        self.session.add(run)
-        self.session.commit()
-        return True
+        another replica reaped it, and None once the run is gone because its
+        schedule was deleted; either way its process no longer holds the claim.
+
+        One conditional UPDATE renews, so a reap or a delete that commits
+        while it runs makes it match no row instead of being overwritten or
+        failing the flush. Only then is the row read, to tell the two apart.
+        Core statements, for the reason still_exists gives."""
+        raw = unsafe_unscoped_session(self.session)
+        renewed = raw.execute(
+            sa.update(ScheduleRun)
+            .where(ScheduleRun.id == run_id)
+            .where(ScheduleRun.status == RunStatus.running)
+            .values(lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=lease_seconds))
+            .execution_options(synchronize_session=False)
+        ).rowcount
+        if renewed:
+            self.session.commit()
+            return True
+        status = raw.execute(sa.select(ScheduleRun.status).where(ScheduleRun.id == run_id)).scalar()
+        return None if status is None else False
 
     def still_running(self, run_id: UUID) -> bool:
         """Whether the run is still `running`, i.e. no replica has reaped it.

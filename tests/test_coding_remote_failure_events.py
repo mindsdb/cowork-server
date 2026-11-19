@@ -42,3 +42,54 @@ def test_an_unclassified_remote_failure_keeps_the_legacy_detail_shape() -> None:
     assert event.text == "adapter stream disconnected"
     assert "code" not in event.data and "model" not in event.data
     assert event.data["detail"] == "adapter stream disconnected"
+
+
+def test_a_remote_budget_stop_keeps_its_scope_for_the_app() -> None:
+    _, event = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "message": "This workspace's spending budget is used up.",
+        "code": "budget_exceeded",
+        "budget_scope": "workspace",
+    }))
+
+    assert event.data["code"] == "budget_exceeded"
+    assert event.data["budget_scope"] == "workspace"
+
+
+def test_a_remote_failure_drops_a_malformed_or_misplaced_scope() -> None:
+    _, bad = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "code": "budget_exceeded", "budget_scope": "Bad Scope",
+    }))
+    _, other = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "code": "insufficient_credits", "budget_scope": "workspace",
+    }))
+
+    assert "budget_scope" not in bad.data
+    assert "budget_scope" not in other.data
+
+
+def test_a_remote_budget_stop_keeps_its_period_for_the_app() -> None:
+    _, event = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "code": "budget_exceeded", "budget_scope": "team", "budget_period": "month",
+    }))
+    _, bad = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "code": "budget_exceeded", "budget_period": "week",
+    }))
+
+    assert event.data["budget_period"] == "month"
+    assert "budget_period" not in bad.data
+
+
+def test_a_remote_budget_stop_keeps_its_model_for_the_app() -> None:
+    _, event = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "code": "budget_exceeded", "budget_scope": "team", "budget_model": "haiku-4-5",
+    }))
+    _, bad = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "code": "budget_exceeded", "budget_model": "bad model",
+    }))
+    _, other = RemoteExecutionCoordinator._coding_event(_failed_run(), _error_event({
+        "code": "insufficient_credits", "budget_model": "haiku-4-5",
+    }))
+
+    assert event.data["budget_model"] == "haiku-4-5"
+    assert "budget_model" not in bad.data
+    assert "budget_model" not in other.data

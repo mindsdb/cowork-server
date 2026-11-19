@@ -151,6 +151,24 @@ async def test_status_is_off_where_inference_does_not_serve_it(inference):
     assert (await _call("GET", "/status")).json()["available"] is False
 
 
+async def test_an_off_is_asked_again_sooner_than_an_on(monkeypatch, inference):
+    now = [1000.0]
+    monkeypatch.setattr(voice.time, "monotonic", lambda: now[0])
+    inference.answer = httpx.Response(404, json={"error": {"code": "live_not_enabled"}})
+    assert (await _call("GET", "/status")).json()["available"] is False
+
+    inference.answer = httpx.Response(400, json={"error": {"code": "invalid_request"}})
+    now[0] += voice._STATUS_OFF_TTL_S - 1
+    assert (await _call("GET", "/status")).json()["available"] is False
+    now[0] += 1
+    assert (await _call("GET", "/status")).json()["available"] is True
+
+    inference.answer = httpx.Response(404, json={"error": {"code": "live_not_enabled"}})
+    now[0] += voice._STATUS_OFF_TTL_S
+    assert (await _call("GET", "/status")).json()["available"] is True
+    assert len(inference.seen) == 2
+
+
 async def test_a_caller_inference_refuses_is_not_cached_for_everyone(inference):
     inference.answer = httpx.Response(401, json={"error": {"code": "unauthorized"}})
     assert (await _call("GET", "/status")).json()["available"] is False

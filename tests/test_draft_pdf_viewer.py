@@ -15,6 +15,7 @@ from cowork.draft_host import app as draft_app_module
 from cowork.draft_host.app import create_draft_app
 from cowork.services import pdf_viewer
 from cowork.services.preview_html import prepare_preview_html
+from tests.support.pinned_responses import served_body
 
 from draft_host_support import (
     DOC,
@@ -97,14 +98,6 @@ def desktop(monkeypatch):
     get_app_settings.cache_clear()
 
 
-async def _drain(response):
-    """Read a streamed body to its end, which closes the pinned descriptor."""
-    chunks = []
-    async for chunk in response.body_iterator:
-        chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
-    return b"".join(chunks)
-
-
 def _serve_the_artifact(monkeypatch, tmp_path):
     """The /drafts lookup finds the test artifact and lets the caller read it."""
     source, folder, metadata = make_artifact(tmp_path, files=FILES)
@@ -133,7 +126,7 @@ async def test_desktop_pdf_bytes_answer_any_origin(desktop, tmp_path, monkeypatc
     response = await _drafts(monkeypatch, tmp_path, "docs/report.pdf", "empty")
     assert response.headers["access-control-allow-origin"] == "*"
     assert response.headers["vary"] == "Sec-Fetch-Dest"
-    assert await _drain(response) == PDF.encode()
+    assert await served_body(response) == PDF.encode()
 
 
 async def test_desktop_frame_navigation_gets_the_viewer_page(desktop, tmp_path, monkeypatch):
@@ -152,7 +145,7 @@ async def test_desktop_documents_give_the_shim_the_route_address(desktop, tmp_pa
 async def test_a_download_still_gets_the_bytes(desktop, tmp_path, monkeypatch):
     response = await _drafts(monkeypatch, tmp_path, "docs/report.pdf", "iframe", download=True)
     assert response.headers["content-disposition"].startswith("attachment")
-    assert await _drain(response) == PDF.encode()
+    assert await served_body(response) == PDF.encode()
 
 
 # The org-mode side of the /drafts route is tested in

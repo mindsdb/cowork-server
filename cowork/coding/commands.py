@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cowork.coding.context import goal_directive, goal_status_text, slash_command
-from cowork.coding.contracts import CodingEvent, CodingSession, EventType
+from cowork.coding.contracts import PERMISSION_LABELS, CodingEvent, CodingSession, EventType
 from cowork.coding.engines.base import EngineCredentials, EngineSession
 from cowork.coding.engines.registry import CodingEngineRegistry
 from cowork.coding.runtime import RuntimeManager
@@ -198,7 +198,7 @@ class CodingCommandHandler:
                 f"Model: {session.model}",
                 f"Reasoning: {session.reasoning_effort or 'model default'}",
                 f"Fast: {'on' if session.service_tier == 'priority' else 'off'}",
-                f"Permissions: {session.permission_mode.value}",
+                f"Permissions: {PERMISSION_LABELS[session.permission_mode]}",
                 f"Network: {'on' if session.network_access else 'off'} · Web search: {'on' if session.web_search else 'off'}",
                 f"Folder: {session.workspace_path}",
                 f"Additional folders: {len(session.additional_dirs)}",
