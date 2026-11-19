@@ -16,6 +16,7 @@ from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError
 from cowork.harnesses.anton_harness.tools import _cowork_request_credentials
 from cowork.schemas.connectors import SubmitFormRequest
 from cowork.services.connectors.persist import ConnectionNotFoundError, persist_connection
+from tests._connector_test_request import bearer_test_request
 
 APP_CREDENTIALS = {
     "client_id": "86nwdt9sl34cuy",
@@ -139,7 +140,10 @@ class TestRequestCredentialsExtends:
     async def test_extends_connection_is_stamped_for_the_renderer_and_server(self, saved_linkedin):
         result = await _cowork_request_credentials(
             session=None,
-            tc_input={"engine": "linkedin", "title": "Finish", "extends_connection": "linkedin-1a2b3c4d"},
+            tc_input={
+                "engine": "linkedin", "title": "Finish", "extends_connection": "linkedin-1a2b3c4d",
+                "test_request": bearer_test_request("access_token"),
+            },
         )
         assert '"_extends_connection": "linkedin-1a2b3c4d"' in result
         assert '"_existing_name": "linkedin-1a2b3c4d"' in result
@@ -162,7 +166,10 @@ class TestRequestCredentialsExtends:
         monkeypatch.setattr("cowork.harnesses.anton_harness.tools.vault_for_scope", no_scope)
         result = await _cowork_request_credentials(
             session=None,
-            tc_input={"engine": "linkedin", "title": "Finish", "extends_connection": "linkedin-1a2b3c4d"},
+            tc_input={
+                "engine": "linkedin", "title": "Finish", "extends_connection": "linkedin-1a2b3c4d",
+                "test_request": bearer_test_request("access_token"),
+            },
         )
         assert "data-vault-form" in result
 

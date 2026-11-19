@@ -140,6 +140,9 @@ def health_probe(request: Request, nonce: str | None = None) -> dict:
     secret_proof = app_secret.proof(request.headers.get(app_secret.CHALLENGE_HEADER))
     if secret_proof is not None:
         body["app_secret_proof"] = secret_proof
+        # Beside the proof, so the app believes it only from the server that
+        # holds its secret: only that server keeps custom MCP settings in memory.
+        body["custom_mcp"] = 1
     return body
 
 

@@ -1088,7 +1088,10 @@ class ConversationService:
                 self.session.select(MessageEvent)
                 .where(MessageEvent.message_id == reply.id)
             ).all()
-            if any(e.event_data.get("type") in {"response.completed", "response.failed"} for e in events):
+            if any(
+                e.event_data.get("type") in {"response.completed", "response.failed", "response.cancelled"}
+                for e in events
+            ):
                 return False
             self.session.add(MessageEvent(
                 message_id=reply.id,

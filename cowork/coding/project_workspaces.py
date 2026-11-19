@@ -198,7 +198,10 @@ class ProjectWorkspaceManager:
         self.repository_credentials = repository_credentials
         self._lock = threading.RLock()
 
-    def prepare(self, session_id: str, project: CodeProject, setup: TaskRepositorySetup | None = None) -> PreparedProjectWorkspace:
+    def prepare(
+        self, session_id: str, project: CodeProject, setup: TaskRepositorySetup | None = None,
+        *, deleted: Callable[[], bool] = lambda: False,
+    ) -> PreparedProjectWorkspace:
         with self._lock:
             prepared: list[TaskWorkspace] = []
             try:
@@ -222,12 +225,13 @@ class ProjectWorkspaceManager:
                         raise WorkspaceError(f"{folder.name}: {exc}") from exc
                     prepared.append(self._task_workspace(
                         session_id, project.name, folder, item, task_branch=setup.branch if setup else None,
+                        deleted=deleted,
                     ))
                 ports = self.ports.allocate(session_id, project.environment.port_names)
                 return PreparedProjectWorkspace(primary=prepared[0], workspaces=tuple(prepared), ports=ports)
             except Exception:
                 for workspace in reversed(prepared):
-                    self._cleanup_one(session_id, workspace)
+                    self._cleanup_one(session_id, workspace, keep_recovery=not deleted())
                     if setup and setup.branch and workspace.task_branch == setup.branch:
                         # Only branches successfully created by this preparation.
                         self.rollback_task_branch(workspace)
@@ -681,6 +685,7 @@ class ProjectWorkspaceManager:
         prepared: PreparedWorkspace,
         base_branch: str | None = None,
         task_branch: str | None = None,
+        *, deleted: Callable[[], bool] = lambda: False,
     ) -> TaskWorkspace:
         branch = None
         branch_created = False
@@ -711,6 +716,7 @@ class ProjectWorkspaceManager:
                 str(prepared.workspace_path),
                 prepared.kind,
                 prepared.base_revision,
+                keep_recovery=not deleted(),
             )
             if task_branch and branch_created and prepared.base_revision:
                 self.workspaces.git.run(

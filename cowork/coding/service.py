@@ -463,7 +463,7 @@ class CodingService(
                 # Deleting stops preparation. The preparation thread releases
                 # any workspace it has already made once its current step ends.
                 preparing.cancel_requested = True
-                preparing.delete_requested = True
+                preparing.delete_requested.set()
             else:
                 preparing = None
         if preparing is not None:
@@ -483,13 +483,18 @@ class CodingService(
             return
         self.lifecycle.delete_session(session_id)
         self.retention.discard(session)
-        try:
-            self.workspaces.discard_recovery(session.id)
-        except (OSError, WorkspaceError) as exc:
-            # The task is already gone; leftover recovery files must not fail the delete.
-            logger.warning("Could not remove recovery data for deleted coding task %s: %s", session.id, exc)
+        self._discard_deleted_recovery(session.id)
         if session.run_id:
             self.control.delete_task(session.run_id)
+
+    def _discard_deleted_recovery(self, session_id: str) -> None:
+        try:
+            self.workspaces.discard_recovery(session_id)
+        except (OSError, WorkspaceError) as exc:
+            # The task is already gone; leftover recovery files must not fail the delete.
+            logger.warning("Could not remove recovery data for deleted coding task %s: %s", session_id, exc)
+        finally:
+            self.workspace_usage.invalidate()
 
     def rename_session(self, session_id: str, title: str) -> CodingSession:
         return self.lifecycle.rename_session(session_id, title)
