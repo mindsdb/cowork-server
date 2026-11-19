@@ -50,6 +50,7 @@ def connector_metadata(c: dict) -> ConnectorMetadataResponse:
         featured=c.get("featured", False),
         notice=c.get("notice"),
         custom=c.get("custom", False),
+        needs_rebuild=c.get("needs_rebuild", False),
         api_key=_takes_api_key(c),
     )
 
@@ -146,6 +147,7 @@ class ConnectorSpecRegistry:
             featured=c.get("featured", False),
             notice=c.get("notice"),
             custom=c.get("custom", False),
+            needs_rebuild=c.get("needs_rebuild", False),
             api_key=_takes_api_key(c),
             keywords=c.get("keywords", []),
             form=form,

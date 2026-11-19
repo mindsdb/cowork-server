@@ -214,6 +214,68 @@ async def test_proxy_keeps_a_spent_budget_apart_from_an_empty_wallet(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream", "scope"),
+    [
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_scope": "workspace"}}}, "workspace"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded"}}, "headers": {"x-mindshub-budget-scope": "api_key"}}, "api_key"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_scope": "Bad Scope"}}}, None),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded"}}}, None),
+        (
+            {
+                "json": {"error": {"message": "x", "code": "budget_exceeded", "budget_scope": "Bad Scope"}},
+                "headers": {"x-mindshub-budget-scope": "org"},
+            },
+            "org",
+        ),
+    ],
+    ids=["body", "header", "malformed", "absent", "malformed-body-good-header"],
+)
+async def test_proxy_passes_a_spent_budgets_scope_to_codex(monkeypatch: pytest.MonkeyPatch, upstream, scope) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, **upstream)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inference_proxy_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    request = _request([(b"content-type", b"application/json")], b'{"model": "gpt", "input": "hi"}')
+
+    response = await proxy_inference(request, "responses", EngineCredentials(minds_url="https://api.example", minds_api_key="mdb_key"))
+
+    assert json.loads(response.body)["error"].get("budget_scope") == scope
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream", "period"),
+    [
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_period": "month"}}}, "month"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded"}}, "headers": {"x-mindshub-budget-period": "day"}}, "day"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_period": "week"}}}, None),
+    ],
+    ids=["body", "header", "unknown"],
+)
+async def test_proxy_passes_a_spent_budgets_period_to_codex(monkeypatch: pytest.MonkeyPatch, upstream, period) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, **upstream)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inference_proxy_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    request = _request([(b"content-type", b"application/json")], b'{"model": "gpt", "input": "hi"}')
+
+    response = await proxy_inference(request, "responses", EngineCredentials(minds_url="https://api.example", minds_api_key="mdb_key"))
+
+    assert json.loads(response.body)["error"].get("budget_period") == period
+
+
+@pytest.mark.asyncio
 async def test_proxy_streams_successful_and_retryable_responses_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, content=b"busy", headers={"retry-after": "2"})
@@ -408,3 +470,30 @@ async def test_proxy_returns_the_upstream_connection_however_the_stream_ends(
     await asyncio.wait_for(response(scope, receive, send), timeout=5)
 
     assert stream.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream", "model"),
+    [
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_model": "haiku-4-5"}}}, "haiku-4-5"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded"}}, "headers": {"x-mindshub-budget-model": "gpt-nano"}}, "gpt-nano"),
+        ({"json": {"error": {"message": "x", "code": "budget_exceeded", "budget_model": "bad model"}}}, None),
+    ],
+    ids=["body", "header", "unknown"],
+)
+async def test_proxy_passes_a_spent_budgets_model_to_codex(monkeypatch: pytest.MonkeyPatch, upstream, model) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, **upstream)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inference_proxy_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    request = _request([(b"content-type", b"application/json")], b'{"model": "gpt", "input": "hi"}')
+
+    response = await proxy_inference(request, "responses", EngineCredentials(minds_url="https://api.example", minds_api_key="mdb_key"))
+
+    assert json.loads(response.body)["error"].get("budget_model") == model

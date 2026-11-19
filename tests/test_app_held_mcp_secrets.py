@@ -17,6 +17,8 @@ import sys
 from urllib.parse import parse_qs
 
 import pytest
+from anton.core.datasources.data_vault import withheld_fields
+from anton.utils.datasources import clear_ds_env, restore_namespaced_env, scrub_credentials
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -506,9 +508,15 @@ class TestReadersSeeMemory:
 
         assert turn.load("hubspot", CONN)["access_token"] == "mem-token"
         assert _access_mode_of(turn, "hubspot", CONN) == "write"
-        # Never into a Scratchpad's environment, nor named in the agent's listing.
+        # Never into a Scratchpad's environment, nor named in the agent's listing,
+        # but known to the scrub, so a tool result that echoes it is redacted.
         assert "mem-token" not in (turn.env_for("hubspot", CONN) or {}).values()
-        assert "access_token" not in turn.read_record("hubspot", CONN)["fields"]
+        assert withheld_fields(turn.read_record("hubspot", CONN)) == ["access_token"]
+        try:
+            restore_namespaced_env(turn)
+            assert "mem-token" not in scrub_credentials("rejected token mem-token")
+        finally:
+            clear_ds_env()
         assert ConnectionsService(LOCAL_SCOPE).mcp_access_token("hubspot", CONN) == "mem-token"
         assert ConnectionsService(LOCAL_SCOPE).get("hubspot", CONN).fields["_access_mode"] == "write"
 

@@ -7,6 +7,7 @@ from anton.core.datasources.data_vault import is_secret_key
 from cowork.db.scoped import TenantScope
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse
 from cowork.services.connectors import app_held
+from cowork.services.connectors.custom_mcp import is_custom_mcp
 from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL as _SENTINEL,
     connection_display_name,
@@ -102,6 +103,8 @@ class ConnectionsService:
             record = self._read_record(vault, engine, name)
             fields = (record or {}).get("fields") if record else {}
             fields = fields or {}
+            if is_custom_mcp(engine):
+                fields = self._held_custom_fields(name)
             user_label = str(fields.get("_user_label", "")).strip() or str(fields.get("_label", "")).strip() or None
             method = fields.get("_method")
             access_mode = None
@@ -125,6 +128,16 @@ class ConnectionsService:
             ))
         return result
 
+    def _held_custom_fields(self, name: str) -> dict[str, str]:
+        """A custom MCP connection's fields as the list and detail show them:
+        its method and the label held in memory, nothing from the vault file,
+        which agent code can write."""
+        fields = {"_method": "mcp"}
+        label = app_held.held_custom(own_vault_root(self.scope), name).get("label")
+        if label:
+            fields["_label"] = label
+        return fields
+
     def mcp_access_token(self, engine: str, name: str) -> str | None:
         """The stored access token of an MCP-method connection, for a server-side
         tool call on the user's behalf; None for any other connection."""
@@ -141,9 +154,12 @@ class ConnectionsService:
         if record is None:
             return None
 
-        fields: dict = app_held.overlay(
-            own_vault_root(self.scope), engine, name, dict(record.get("fields") or {}), keys=("access_mode",)
-        )
+        if is_custom_mcp(engine):
+            fields: dict = self._held_custom_fields(name)
+        else:
+            fields = app_held.overlay(
+                own_vault_root(self.scope), engine, name, dict(record.get("fields") or {}), keys=("access_mode",)
+            )
         # Mask secrets. Prefer the record's explicit secure_keys; fall back to the
         # name heuristic so records saved before secure_keys was persisted don't
         # leak their secret values through this endpoint.

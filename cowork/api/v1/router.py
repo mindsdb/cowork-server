@@ -9,6 +9,7 @@ from fastapi import APIRouter
 
 from cowork.api.v1.endpoints import (
     artifact_checks,
+    artifact_comment_images,
     artifact_quick_edit,
     artifacts,
     artifact_workspace,
@@ -23,6 +24,7 @@ from cowork.api.v1.endpoints import (
     conversations,
     files,
     health,
+    mindshub_account_deletion,
     mindshub_org_icons,
     mindshub_people,
     mindshub_teams,
@@ -50,6 +52,7 @@ from cowork.api.v1.endpoints.connectors import (
     connections,
     custom,
     custom_connections,
+    custom_mcp,
     datasources,
     notion,
     oauth,
@@ -85,6 +88,9 @@ api_router.include_router(submissions.router, prefix="/connectors/submissions", 
 api_router.include_router(posthog.router, prefix="/connectors/posthog", tags=["connectors"])
 api_router.include_router(notion.router, prefix="/connectors/notion", tags=["connectors"])
 api_router.include_router(sharepoint.router, prefix="/connectors/sharepoint", tags=["connectors"])
+# Before the generic connection routes, whose /{engine}/{name}/... paths
+# would otherwise be tried first for /custom_mcp/...
+api_router.include_router(custom_mcp.router, prefix="/connectors/connections/custom_mcp", tags=["connectors"])
 api_router.include_router(connections.router, prefix="/connectors/connections", tags=["connectors"])
 api_router.include_router(datasources.router, prefix="/connectors/datasources", tags=["connectors"])
 api_router.include_router(oauth.router, prefix="/connectors/oauth", tags=["connectors"])
@@ -113,6 +119,7 @@ api_router.include_router(artifacts.live_app_router, prefix="/artifacts", tags=[
 api_router.include_router(artifact_workspace.router, prefix="/artifacts", tags=["artifact-workspace"])
 api_router.include_router(artifact_checks.router, prefix="/artifacts", tags=["artifact-checks"])
 api_router.include_router(artifact_quick_edit.router, prefix="/artifacts", tags=["artifact-workspace"])
+api_router.include_router(artifact_comment_images.router, prefix="/artifacts", tags=["artifact-workspace"])
 api_router.include_router(comments.router, prefix="/artifact-comments", tags=["artifact-comments"])
 api_router.include_router(live_apps.router, prefix="/live-apps", tags=["live-apps"])
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])
@@ -129,6 +136,9 @@ api_router.include_router(mindshub_usage.router, prefix="/hub/usage", tags=["min
 api_router.include_router(mindshub_teams.router, prefix="/hub/teams", tags=["mindshub-teams"])
 api_router.include_router(mindshub_people.router, prefix="/hub/people", tags=["mindshub-people"])
 api_router.include_router(mindshub_org_icons.router, prefix="/hub/org-icons", tags=["mindshub-org-icons"])
+api_router.include_router(
+    mindshub_account_deletion.router, prefix="/hub/deletion-request", tags=["mindshub-account-deletion"]
+)
 api_router.include_router(org_branding.router, prefix="/org-branding", tags=["org-branding"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────

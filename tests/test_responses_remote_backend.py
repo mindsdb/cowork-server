@@ -1706,6 +1706,37 @@ async def test_produce_remote_failure_carries_the_workers_reset_at(
 
 
 @pytest.mark.asyncio
+async def test_produce_remote_failure_carries_the_budget_scope(monkeypatch):
+    # The hosted budget card names whose budget is spent, on the frame and on reload.
+    message = "This workspace's spending budget is used up. An administrator can raise it in Budgets."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "BudgetExceededError: spent", "code": "budget_exceeded", "message": message,
+        "budget_scope": "workspace",
+    })
+    expected = {
+        "type": "response.failed", "code": "budget_exceeded", "error": message,
+        "budget_scope": "workspace", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_carries_the_budget_period(monkeypatch):
+    message = "Your team's monthly spending budget is used up. An administrator can raise it in Budgets."
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "BudgetExceededError: spent", "code": "budget_exceeded", "message": message,
+        "budget_scope": "team", "budget_period": "month",
+    })
+    expected = {
+        "type": "response.failed", "code": "budget_exceeded", "error": message,
+        "budget_scope": "team", "budget_period": "month", "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_failure_without_reset_at_keeps_its_shape(monkeypatch):
     # An older worker sends none, so the frame stays exactly as before.
     frame, events = await _remote_failure_frames(monkeypatch, {
@@ -1826,6 +1857,9 @@ async def test_produce_remote_treats_a_controller_cancel_as_a_real_cancel_not_a_
     assert buffer.frames[-1] == "CLOSE:cancelled"
     assert not any("response.failed" in f for f in buffer.frames)
     assert saved["assistant"] == "partial"
+    # The saved turn ends on the Stop, so a reload shows it as stopped (ENG-4345).
+    assert saved["events"][-1]["type"] == "response.cancelled"
+    assert isinstance(saved["events"][-1]["at_ms"], int)
 
 
 @pytest.mark.asyncio
