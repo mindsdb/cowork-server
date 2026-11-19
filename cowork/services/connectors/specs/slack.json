@@ -18,14 +18,14 @@
     "integration",
     "communication"
   ],
-  "description": "Read, search and send Slack messages, channels and canvases in your workspace.",
+  "description": "Read and send messages in Slack channels and DMs.",
   "category": "communication",
   "logo": "chats",
   "logo_color": "#4A154B",
   "form": {
     "form_id": "slack-connector",
     "title": "Connect Slack",
-    "subtitle": "Authorize Anton to read your Slack workspace. Posting and editing stay off until you allow them.",
+    "subtitle": "Authorize Anton to read and post messages in your Slack workspace.",
     "logo": "chats",
     "logo_color": "#4A154B",
     "methods": [
