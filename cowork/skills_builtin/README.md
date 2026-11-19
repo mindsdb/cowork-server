@@ -4,7 +4,8 @@ Skills shipped with cowork and seeded into the canonical skills store. Desktop
 uses `COWORK_SKILLS_DIR` (default `~/.cowork/skills`); org mode lazily seeds each
 organization's `<shared>/<org_id>/skills` store on its first read or turn.
 
-Layout — one folder per skill, each holding a `SKILL.md`:
+Layout — one folder per skill, each holding only a `SKILL.md` (a test enforces
+it: an update replaces that one file atomically):
 
     skills_builtin/
       my-skill/
@@ -21,7 +22,11 @@ Seeding is versioned by `BUILTIN_SKILLS_VERSION`:
   version, so a builtin someone deleted stays deleted.
 - A builtin the store has is replaced only when its files are exactly a version
   we shipped (`shipped.json`; anton's `stats.json` sidecar is ignored and kept).
-  A copy someone edited, or one holding a link, is left as it is.
+  A copy someone edited, or one holding a link, is left as it is. The update
+  writes the new text beside `SKILL.md` and renames it over the old one, so a
+  copy is never missing or half written. A file that can't be replaced (a
+  Windows lock, say) is logged and skipped, and retried at the next version
+  bump; it never stops Desktop from starting.
 - To ship a new or changed builtin, in this order:
   1. Bump `BUILTIN_SKILLS_VERSION` (`CODE_BUILTIN_SKILLS_VERSION` for a Code
      skill). A store already at the old version would never see the change.
@@ -30,7 +35,8 @@ Seeding is versioned by `BUILTIN_SKILLS_VERSION`:
      git history). It refuses a new or changed builtin until the version is
      bumped, and records a new one as introduced in the bumped version.
   `test_every_packaged_builtin_is_in_the_shipped_list` fails if a builtin was
-  edited without running the script.
+  edited without running the script, and CI runs the script's `--check`: a
+  pull request against its base branch, a push against the commit before it.
 
 On desktop, seeded copies remain ordinary editable/deletable file-backed skills.
 In org mode, packaged slugs are reserved and immutable for members, admins, and
