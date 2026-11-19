@@ -1556,6 +1556,11 @@ class AppSettings(Settings):
         parsed = _bare_origin(self.web_origin)
         return parsed[0] if parsed else ""
 
+    def remote_docs_available(self) -> bool:
+        """Whether remote turns get the doc tools. Doc tools answer the pod on
+        the stdin only an interactive turn keeps open, so ask_user must be on."""
+        return bool(self.remote_docs and self.ask_user_enabled)
+
     def draft_links_enabled(self) -> bool:
         """Whether this server issues and serves signed draft links."""
         link_origin = _bare_origin(self.draft_origin)

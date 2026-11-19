@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from cowork.common.logger import log_context
 from cowork.common.paths import O_NOFOLLOW, O_NONBLOCK, dir_open, opened_subdir_nofollow, read_bounded
@@ -168,6 +168,7 @@ class RemoteDocWrites:
         self._turn_index = turn_index
         self._lock = threading.Lock()
         self._slugs: set[str] = set()
+        self._provenance_recorded: set[str] = set()
         self._by_call: dict[str, str] = {}
 
     def written(self, call_id: str, slug: str, tool: str) -> None:
@@ -180,13 +181,19 @@ class RemoteDocWrites:
             except Exception:
                 logger.warning("could not record the owner of a doc a remote turn created", exc_info=True,
                                extra=log_context(conversation_id=self._conversation_id, artifact_slug=slug))
-        try:
-            record_turn_provenance(self._artifacts_base / slug, conversation_id=self._conversation_id,
-                                   turn_index=self._turn_index,
-                                   summary="Created doc" if created else "Edited doc")
-        except Exception:
-            logger.warning("could not record a remote turn's provenance on a doc", exc_info=True,
-                           extra=log_context(conversation_id=self._conversation_id, artifact_slug=slug))
+        with self._lock:
+            provenance_done = slug in self._provenance_recorded
+        if not provenance_done:
+            try:
+                record_turn_provenance(self._artifacts_base / slug, conversation_id=self._conversation_id,
+                                       turn_index=self._turn_index,
+                                       summary="Created doc" if created else "Edited doc")
+            except Exception:
+                logger.warning("could not record a remote turn's provenance on a doc", exc_info=True,
+                               extra=log_context(conversation_id=self._conversation_id, artifact_slug=slug))
+            else:
+                with self._lock:
+                    self._provenance_recorded.add(slug)
         with self._lock:
             self._slugs.add(slug)
             self._by_call[call_id] = slug
@@ -239,6 +246,7 @@ class RemoteDocTools:
     runner: HostToolRunner
     writes: RemoteDocWrites
     context: DocToolContext
+    specs: list[dict[str, Any]]
 
 
 def start_remote_doc_tools(
@@ -266,11 +274,12 @@ def start_remote_doc_tools(
                                         on_written=partial(writes.written, call.call_id))
         return HostToolOutcome(result.text, ok=result.ok)
 
+    specs = remote_doc_tool_specs()
     runner = HostToolRunner(
         correlation_id=correlation_id,
-        timeouts={spec["name"]: spec["timeout_s"] for spec in remote_doc_tool_specs()},
+        timeouts={spec["name"]: spec["timeout_s"] for spec in specs},
         execute=execute,
         too_big_text=TOO_BIG_TEXT,
         r=r,
     )
-    return RemoteDocTools(runner=runner, writes=writes, context=context)
+    return RemoteDocTools(runner=runner, writes=writes, context=context, specs=specs)

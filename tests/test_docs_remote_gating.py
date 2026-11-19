@@ -40,7 +40,7 @@ def _handler(*, interactive=True, schedule_id=None):
 async def test_remote_docs_needs_every_condition(monkeypatch, case, expected):
     monkeypatch.setenv("COWORK_TURN_BACKEND", "inprocess" if case == "in_process" else "remote")
     monkeypatch.setattr(responses_mod, "get_app_settings", lambda: SimpleNamespace(
-        remote_docs=case != "flag_off", ask_user_enabled=case != "ask_user_off"))
+        remote_docs_available=lambda: case not in ("flag_off", "ask_user_off")))
 
     async def may_manage(scope, permission):
         assert permission == "artifact.manage"

@@ -23,6 +23,7 @@ def _app_settings(**overrides):
     fields = {"owner": "", "tenancy_mode": "local", "draft_links_enabled": lambda: False,
               "remote_docs": False, "ask_user_enabled": True}
     fields.update(overrides)
+    fields["remote_docs_available"] = lambda: bool(fields["remote_docs"] and fields["ask_user_enabled"])
     return SimpleNamespace(**fields)
 
 

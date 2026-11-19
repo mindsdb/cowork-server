@@ -68,10 +68,6 @@ OnWritten = Callable[[str, str], None]
 RunInThread = Callable[[Callable[[], T]], Awaitable[T]]
 
 
-async def _to_thread(fn: Callable[[], T]) -> T:
-    return await asyncio.to_thread(fn)
-
-
 @dataclass(frozen=True)
 class DocToolResult:
     """What one call answers the agent; ``touched_slug`` names the doc it wrote."""
@@ -100,7 +96,7 @@ class DocToolContext:
     ) -> None:
         self.artifacts_base = Path(artifacts_base)
         # Where every blocking step of a call runs, owner check and on_written included.
-        self.run_in_thread: RunInThread = run_in_thread or _to_thread
+        self.run_in_thread: RunInThread = run_in_thread or asyncio.to_thread
         self.conversation_id = conversation_id
         self.project_id = project_id
         self.project_name = project_name
@@ -232,15 +228,10 @@ def _repeated(doc: dict[str, Any], result: dict[str, Any]) -> list[str]:
     return out[:5]
 
 
-def _quote(text: str, n: int = 60) -> str:
-    text = " ".join(str(text or "").split())
-    return text if len(text) <= n else text[: n - 1] + "…"
-
-
 def edit_label(ops: Any, title: str) -> str:
     """What one edit_doc call is doing, in the words the chat shows."""
     if not isinstance(ops, list) or not ops:
-        return f"Editing “{_quote(title)}”"
+        return f"Editing “{render.clip(title)}”"
     headings = []
     for op in ops:
         if not isinstance(op, dict):
@@ -252,10 +243,10 @@ def edit_label(ops: Any, title: str) -> str:
         elif op.get("op") == "add_tab":
             headings.append(str(op.get("title") or "new tab"))
     if headings:
-        return "Writing " + ", ".join(f"“{_quote(h, 40)}”" for h in headings[:3]) + (
+        return "Writing " + ", ".join(f"“{render.clip(h, 40)}”" for h in headings[:3]) + (
             f" +{len(headings) - 3}" if len(headings) > 3 else "")
     n = len(ops)
-    return f"Editing “{_quote(title)}” · {n} change{'s' if n != 1 else ''}"
+    return f"Editing “{render.clip(title)}” · {n} change{'s' if n != 1 else ''}"
 
 
 def _if_rev(value: Any) -> int | None:
@@ -287,11 +278,11 @@ def _edit_report(before: Doc, doc: Doc, result: dict[str, Any], ops: list[Any]) 
         lines.append(f"Removed {removed} block(s).")
     taken_out = _taken_out(before, doc, result, ops, pending_before)
     if taken_out:
-        lines.append("Words this edit took out: " + "; ".join(f"“{_quote(s, 160)}”" for s in taken_out)
+        lines.append("Words this edit took out: " + "; ".join(f"“{render.clip(s, 160)}”" for s in taken_out)
                      + ". Put them back unless the person asked to cut or change them.")
     repeated = _repeated(doc, result)
     if repeated:
-        lines.append("Now in the doc twice: " + "; ".join(f"“{_quote(s, 120)}”" for s in repeated)
+        lines.append("Now in the doc twice: " + "; ".join(f"“{render.clip(s, 120)}”" for s in repeated)
                      + ". Unless the person asked for a copy, delete the extra one.")
     return "\n".join(lines) + _pending_note(doc)
 
@@ -304,7 +295,7 @@ def _open_doc(artifacts_dir: Path, ref: str) -> tuple[Path, Doc]:
 
 async def _create(ctx: DocToolContext, tc_input: dict, emit_step: EmitStep, *, artifacts_dir: Path,
                   on_written: OnWritten | None) -> DocToolResult:
-    await emit_step(f"Creating doc “{_quote(tc_input.get('title') or 'Untitled')}”")
+    await emit_step(f"Creating doc “{render.clip(tc_input.get('title') or 'Untitled')}”")
 
     def create() -> tuple[NewDoc, dict[str, Any] | None, str]:
         content, images = localize_images({"markdown": tc_input.get("markdown"), "tabs": tc_input.get("tabs")},
@@ -345,7 +336,7 @@ async def _read(ctx: DocToolContext, tc_input: dict, emit_step: EmitStep, *, art
     except DocError as err:
         await emit_step("Reading a doc")
         return _refusal(err)
-    await emit_step(f"Reading “{_quote(doc['title'])}”")
+    await emit_step(f"Reading “{render.clip(doc['title'])}”")
     view = tc_input.get("view") or "full"
     tab, ids = tc_input.get("tab"), tc_input.get("ids")
 

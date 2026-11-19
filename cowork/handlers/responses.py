@@ -98,8 +98,9 @@ from cowork.turnqueue.redis_client import (
     get_redis,
 )
 from cowork.docs.prompt import CONTEXT_PREFIXES, DOC_OUTPUT_NOTE, doc_context_block
+from anton.core.artifacts.models import ARTIFACT_ID_SLUG_PREFIX_LEN
 from cowork.docs.remote import RemoteDocTools, start_remote_doc_tools
-from cowork.docs.tools import DOC_WRITE_TOOL_NAMES, remote_doc_tool_specs
+from cowork.docs.tools import DOC_WRITE_TOOL_NAMES
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -207,7 +208,8 @@ def _title_text(blocks: list[dict]) -> str:
 
 
 _DOC_REF_FOR_LOG = re.compile(
-    r"[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{8}",
+    r"[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    rf"|[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{{{ARTIFACT_ID_SLUG_PREFIX_LEN}}}",
     re.IGNORECASE,
 )
 
@@ -916,13 +918,12 @@ class ResponsesHandler:
         pod's input, the gate and the host tools never disagree."""
         settings = get_app_settings()
         if not (
-            settings.remote_docs
+            settings.remote_docs_available()
             and _runs_remotely(request)
             and _client_shows_docs(request)
             # A doc tool's answer reaches the pod on the stdin only an
             # interactive turn keeps open.
             and self.interactive
-            and settings.ask_user_enabled
             and self.schedule_id is None
         ):
             return False
@@ -3441,7 +3442,7 @@ class ResponsesHandler:
                 # interactive, whose stdin the answer comes back on.
                 preview_checks=self.interactive and self.schedule_id is None,
                 # The doc tools this server runs for the pod (cowork/docs/remote.py).
-                host_tools=remote_doc_tool_specs() if doc_tools is not None else None,
+                host_tools=doc_tools.specs if doc_tools is not None else None,
                 # This handler serves the cowork UI (scheduled turns show
                 # there too), which renders a tool's message whether or
                 # not it can answer questions. Channel turns build their

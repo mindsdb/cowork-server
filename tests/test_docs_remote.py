@@ -329,3 +329,28 @@ async def test_two_edits_in_one_turn_leave_one_turn_entry(tmp_path):
     # anton's own model still loads what the server wrote.
     (entry,) = ArtifactStore(source.base).read_metadata(made.touched_slug).provenance
     assert entry.conversation == str(conversation_id) and len(entry.turns) == 1
+
+
+def test_provenance_is_recorded_once_per_doc_and_a_failed_record_is_retried(tmp_path, monkeypatch):
+    calls = []
+    outcomes = [DatabaseBusy("busy"), None, None]
+
+    def fake_record(folder, **kwargs):
+        calls.append(folder.name)
+        outcome = outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+
+    monkeypatch.setattr(remote_mod, "record_turn_provenance", fake_record)
+    writes = remote_mod.RemoteDocWrites(
+        scope=object(),
+        conversation_id="conv", project_id=None, creator=None, artifacts_base=tmp_path, turn_index=1,
+    )
+
+    writes.written("c1", "doc-a", "edit_doc")
+    writes.written("c2", "doc-a", "edit_doc")
+    writes.written("c3", "doc-a", "edit_doc")
+    writes.written("c4", "doc-b", "edit_doc")
+
+    assert calls == ["doc-a", "doc-a", "doc-b"]
+    assert writes.slugs() == {"doc-a", "doc-b"}
