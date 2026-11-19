@@ -22,7 +22,9 @@ import tokenize
 import pytest
 
 from cowork.channels import runtime as rt
+from cowork.handlers import _turn_history
 from cowork.handlers import responses as r
+from cowork.turnqueue import remote_turn
 
 
 def _norm(obj) -> str:
@@ -130,6 +132,9 @@ def test_the_in_process_guard_is_not_the_pod_sanitizer():
 
 
 def test_remote_path_sanitizes_before_persisting():
-    """The pod is semi-trusted; unvalidated rows must not reach the DB."""
-    src = _norm(r.ResponsesHandler._run_remote_turn)
-    assert "sanitize_turn_history_rows(" in src
+    """The pod is semi-trusted; unvalidated rows must not reach the DB. Both
+    remote reply loops take the pod's frame through remote_turn_history,
+    which sanitizes the rows a turn stores."""
+    assert "remote_turn_history(" in _norm(r.ResponsesHandler._run_remote_turn)
+    assert "remote_turn_history(" in _norm(remote_turn.remote_turn_events)
+    assert "sanitize_turn_history_rows(" in _norm(_turn_history.remote_turn_history)

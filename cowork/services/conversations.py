@@ -5,28 +5,34 @@ import json
 import logging
 import os
 import stat
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
+from pydantic import ValidationError
 from sqlalchemy import Text, case, cast, func, or_, tuple_
 from sqlalchemy import select as sa_select
+from sqlalchemy.orm import Bundle, selectinload
 
+from cowork.common.logger import log_context
 from cowork.common.paths import (
     dir_lstat,
     dir_rmtree,
     dir_unlink,
     opened_subdir_nofollow,
 )
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope
+from cowork.db.units import run_db
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.conversations import ConversationItemsPage
-from cowork.schemas.responses import Role
+from cowork.schemas.figure_sources import EarlierAnswer
+from cowork.schemas.responses import Role, TurnPick
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
@@ -51,6 +57,10 @@ _SCAN_CAP_MULTIPLIER = 10
 # trip on the unbounded get_messages branch a 1,000+ message conversation
 # can reach.
 _EVENTS_IN_CHUNK_SIZE = 500
+# The most recent answers whose figures a turn checks its own figures
+# against, to mark one an earlier answer gave as repeated
+# (read_earlier_answers).
+MAX_EARLIER_ANSWERS = 20
 # Upper bound for a decoded cursor's `seq`. Not the column's limit (`seq` is
 # INTEGER, so 2**31-1 on Postgres) — this is what the drivers tolerate. sqlite3
 # raises OverflowError rather than bind an int wider than 64 bits, and that
@@ -85,6 +95,18 @@ _MESSAGE_ORDER = (
 # The exact reverse of _MESSAGE_ORDER, for reads that walk back from the newest
 # row: id is unique, so every row has one place in either direction.
 _MESSAGE_ORDER_NEWEST_FIRST = tuple(column.desc() for column in _MESSAGE_ORDER)
+
+
+def _last_message_at():
+    """Each conversation's newest message time, as a subquery correlated to
+    the Conversation row. Without a GROUP BY, Postgres and SQLite answer each
+    row with one seek on `ix_messages_conversation_created`."""
+    return (
+        sa_select(func.max(Message.created_at))
+        .where(Message.conversation_id == Conversation.id)
+        .correlate(Conversation)
+        .scalar_subquery()
+    )
 
 
 def _message_cursor_key(message: Message) -> tuple[int, int, UUID]:
@@ -145,14 +167,15 @@ class ConversationDeleteStage:
 
 
 def _is_tool_row(content) -> bool:
-    """True for a history-only tool block-row (all blocks are tool_use /
-    tool_result). These carry prior tool calls for LLM-history replay and are
-    hidden from the UI, which renders tool activity from message events."""
+    """True for a history-only tool block-row: tool_use / tool_result blocks,
+    plus the text the assistant wrote beside its tool calls. These carry prior
+    tool calls for LLM-history replay and are hidden from the UI, which renders
+    tool activity from message events."""
     return (
         isinstance(content, list)
-        and len(content) > 0
+        and any(isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result") for block in content)
         and all(
-            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result")
+            isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result", "text")
             for block in content
         )
     )
@@ -448,13 +471,7 @@ class ConversationService:
         clean Conversation rows. Empty conversations coalesce to their own
         `created_at` so a NULL max can't sort them to the end.
         """
-        last_activity = func.coalesce(
-            sa_select(func.max(Message.created_at))
-            .where(Message.conversation_id == Conversation.id)
-            .correlate(Conversation)
-            .scalar_subquery(),
-            Conversation.created_at,
-        )
+        last_activity = func.coalesce(_last_message_at(), Conversation.created_at)
         stmt = self.session.select(Conversation)
         # Conversations are personal: the scoped session enforces the org, but
         # user_id has no automatic scoping (see PinService), so without this
@@ -465,11 +482,28 @@ class ConversationService:
             stmt = stmt.where(
                 Conversation.project_id == (project_id or self._default_project_id())
             )
+        else:
+            # A cross-project list is what a person browses, so it leaves out
+            # the model-comparison sides; their own project's list still has
+            # them. autoescape: `_` is a LIKE wildcard, and the prefix starts
+            # with one.
+            from cowork.services.projects import COMPARISON_SANDBOX_PREFIX
+
+            stmt = stmt.where(
+                Conversation.project_id.not_in(
+                    sa_select(Project.id).where(
+                        Project.name.startswith(COMPARISON_SANDBOX_PREFIX, autoescape=True)
+                    )
+                )
+            )
         # created_at then id break ties deterministically so equal-activity rows
         # (e.g. two empty conversations) keep a stable order across polls.
         stmt = stmt.order_by(
             last_activity.desc(), Conversation.created_at.desc(), Conversation.id
         ).limit(limit)
+        # Every caller shows each row's project: loaded in one query for the
+        # page, not one lazy load per row.
+        stmt = stmt.options(selectinload(Conversation.project))
         return list(self.session.exec(stmt).all())
 
     def list_conversations_with_activity(
@@ -479,16 +513,37 @@ class ConversationService:
         all_projects: bool = False,
     ) -> list[tuple[Conversation, datetime]]:
         """`list_conversations` paired with each row's last-activity timestamp
-        for serialization. The value reuses `last_message_at` (an index seek on
-        the ENG-961 composite index); callers that don't need the value (e.g.
-        search indexing) use `list_conversations` and skip the per-row lookup.
+        for serialization: `last_message_at` for the whole page in one query
+        (`last_messages_at`). Callers that don't need the value (e.g. search
+        indexing) use `list_conversations` and skip it.
         """
         convs = self.list_conversations(
             project_id=project_id, limit=limit, all_projects=all_projects
         )
-        return [
-            (conv, self.last_message_at(conv.id) or conv.created_at) for conv in convs
-        ]
+        last = self.last_messages_at([conv.id for conv in convs])
+        return [(conv, last.get(conv.id) or conv.created_at) for conv in convs]
+
+    def last_messages_at(self, conversation_ids: list[UUID]) -> dict[UUID, datetime]:
+        """`last_message_at` for many conversations in one query; a
+        conversation with no message has no entry.
+
+        One row per conversation, from the same correlated MAX that
+        `list_conversations` orders by. A join back to `messages` on the max
+        `created_at` would return every row of a turn's commit, since a
+        turn's tool rows and answer share one `created_at`
+        (`save_assistant_turn`). The Bundle keeps both columns through the
+        scoped select, which runs as scalars.
+        """
+        if not conversation_ids:
+            return {}
+        rows = self.session.exec(
+            self.session.select(Conversation)
+            .with_only_columns(
+                Bundle("last", Conversation.id, _last_message_at().label("created_at"))
+            )
+            .where(Conversation.id.in_(conversation_ids))
+        ).all()
+        return {row.id: row.created_at for row in rows if row.created_at is not None}
 
     def _owned(self, conversation_id: UUID) -> Conversation | None:
         """Fetch a conversation only if it belongs to the caller.
@@ -507,20 +562,28 @@ class ConversationService:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
         return self.session.exec(stmt).first()
 
-    def owned_ids(self, conversation_ids: Iterable[UUID]) -> set[UUID]:
-        """The subset of `conversation_ids` the caller owns, in one query.
+    def owned_ids(self) -> set[UUID]:
+        """Every conversation the caller owns, in one query that reads only
+        the ids.
 
-        Same rule as `_owned`, batched. The artifact roots resolver walks one
-        directory per conversation and holds every id at once, so without this
-        a plain list request would issue a SELECT per directory.
+        Same rule as `_owned`, batched. The artifact roots resolver reads it
+        once per request, before it walks the file store, so a listing over
+        every project runs one query, not one per project. The query can name
+        neither the directories it will find nor their project: a task moved
+        to another project keeps its workspace directory under the old one.
         """
-        ids = list(conversation_ids)
-        if not ids:
-            return set()
-        stmt = self.session.select(Conversation).where(Conversation.id.in_(ids))
+        return set(self.session.exec(self.owned_ids_query()).all())
+
+    def owned_ids_query(self) -> ScopedSelect:
+        """The query `owned_ids` runs, for a query that filters by the
+        caller's conversations in the database
+        (held_artifact_roots.held_root_rows). Same rule as `_owned`: in org mode
+        the conversations the scope's user created, and for a scope with no
+        user the ones no member created."""
+        stmt = self.session.select(Conversation).with_only_columns(Conversation.id)
         if self.session.scope.org_mode:
             stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
-        return {row.id for row in self.session.exec(stmt).all()}
+        return stmt
 
     def get_conversation(self, conversation_id: UUID) -> Conversation:
         conversation = self._owned(conversation_id)
@@ -536,10 +599,12 @@ class ConversationService:
         harness: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        channel_type: str | None = None,
     ) -> Conversation:
         """`conversation_id` lets the caller adopt a client-allocated id —
         the composer allocates one up front so attachments can be uploaded
-        against it before the first stream creates the conversation."""
+        against it before the first stream creates the conversation.
+        `channel_type` is set only by the channel runtime, never from a request."""
         # Anchor the parent: the target project must be visible in scope —
         # otherwise org A could link a conversation to org B's project and
         # leak its name/path through serialization.
@@ -552,6 +617,7 @@ class ConversationService:
             harness=harness,
             model=model,
             reasoning_effort=reasoning_effort,
+            channel_type=channel_type,
         )
         if conversation_id is not None:
             conversation.id = conversation_id
@@ -589,6 +655,36 @@ class ConversationService:
         self.session.commit()
         self.session.refresh(conversation)
         return conversation
+
+    def record_turn_picks(
+        self,
+        *,
+        conversation: Conversation,
+        model: str | None,
+        reasoning_effort: str | None,
+        reset: Collection[TurnPick] = (),
+    ) -> None:
+        """Save a turn's model and reasoning-effort picks as the conversation's
+        own, so a reopened chat comes back on the latest ones.
+
+        A pick the turn leaves out keeps the saved value. Cowork's renderer
+        sends no model for a pinned model its picker no longer offers
+        (`offeredModelId`, e.g. one the wallet locks), and that turn must not
+        wipe the pin a top-up brings back. A pick named in `reset` that the
+        turn leaves out is cleared instead: the user went back to Model Router
+        or the default effort. A pick the turn sends wins over its reset.
+        Commits only on a change.
+        """
+        picks = (
+            model or (None if "model" in reset else conversation.model),
+            reasoning_effort or (None if "reasoning_effort" in reset else conversation.reasoning_effort),
+        )
+        if picks == (conversation.model, conversation.reasoning_effort):
+            return
+        conversation.model, conversation.reasoning_effort = picks
+        self.session.add(conversation)
+        self.session.commit()
+        self.session.refresh(conversation)
 
     def update_history_compaction(
         self,
@@ -636,13 +732,18 @@ class ConversationService:
                 return archived
         return []
 
-    def delete_conversation(self, conversation_id: UUID) -> bool:
+    def delete_conversation(self, conversation_id: UUID, *, cleanup_project_files: bool = True) -> bool:
         """Owner-scoped delete for the request path: a member can only delete
-        their own conversation."""
+        their own conversation.
+
+        ``cleanup_project_files=False`` deletes the rows and the attachments'
+        files but leaves the conversation's folders in its project alone, for
+        a caller that knows none were made and runs off the file store's
+        threads, such as the scheduler's discard of a run that never started."""
         conversation = self._owned(conversation_id)
         if conversation is None:
             return False
-        return self._delete_conversation(conversation)
+        return self._delete_conversation(conversation, cleanup_project_files=cleanup_project_files)
 
     def stage_delete_conversation_row(
         self,
@@ -749,7 +850,7 @@ class ConversationService:
                 stage.conversation_id,
             )
 
-    def _delete_conversation(self, conversation: Conversation) -> bool:
+    def _delete_conversation(self, conversation: Conversation, *, cleanup_project_files: bool = True) -> bool:
         try:
             # A direct delete is the actor's own: never reach past their file
             # rows into a peer's attachment on the same conversation.
@@ -761,7 +862,7 @@ class ConversationService:
         except Exception:
             self.session.rollback()
             raise
-        self.finalize_staged_conversation_delete(stage)
+        self.finalize_staged_conversation_delete(stage, cleanup_project_files=cleanup_project_files)
         return True
 
     def delete_turn(self, conversation_id: UUID, message_id: UUID) -> int:
@@ -1103,6 +1204,66 @@ class ConversationService:
         ]
         return ReplayHistory(messages=messages, events=events)
 
+    def get_earlier_answers(self, conversation_id: UUID, *, answers: int) -> list[EarlierAnswer]:
+        """The figures the conversation's last ``answers`` answers list in
+        their saved response.figure_sources events, newest answer first.
+
+        An answer is a visible assistant message that is not pending; one
+        without the event (no figures, or a turn that stopped or failed)
+        still takes one of the places. An event whose figures do not read is
+        skipped with a warning. Raises ValueError, as get_conversation does,
+        for a conversation the caller does not own."""
+        # Anchor the parent: Message has no org_id, so tenancy comes from
+        # resolving the conversation through the scoped session.
+        self.get_conversation(conversation_id)
+        earlier = []
+        for row in self.session.exec(self._earlier_answer_events(conversation_id, answers=answers)).all():
+            # The SQL filter finds the type, quotes and all, anywhere in an
+            # event's text, so a text delta whose whole text is the type
+            # matches too, and would read as an event with no figures.
+            if not (isinstance(row.event_data, dict) and row.event_data.get("type") == "response.figure_sources"):
+                continue
+            # EarlierAnswer reads only the figures and ignores the steps, so a
+            # step whose kind this build lacks does not skip the answer.
+            try:
+                answer = EarlierAnswer.model_validate(row.event_data)
+            except ValidationError:
+                logger.warning(
+                    "Skipped an earlier answer's figure_sources event that does not read as one",
+                    extra=log_context(conversation_id=conversation_id),
+                )
+                continue
+            earlier.append(answer)
+        return earlier
+
+    def _earlier_answer_events(self, conversation_id: UUID, *, answers: int) -> ScopedSelect:
+        # The last `answers` answers, read on the messages index: assistant
+        # rows that are not pending and carry an event. A hidden tool row
+        # carries none, so it takes no place. A plain select, since a scoped
+        # one can't be passed to in_; the conversation was resolved through
+        # the scoped session before this runs.
+        last_answers = (
+            sa_select(Message.id)
+            .where(Message.conversation_id == conversation_id)
+            .where(Message.role == Role.assistant)
+            .where(Message.pending == False)  # noqa: E712 (a SQL boolean column, not Python identity)
+            .where(sa_select(MessageEvent.message_id).where(MessageEvent.message_id == Message.id).exists())
+            .order_by(*_MESSAGE_ORDER_NEWEST_FIRST)
+            .limit(answers)
+        )
+        # The type is found in each event's stored text, for the reason
+        # _replay_events gives: no JSON is parsed in SQL. autoescape keeps the
+        # _ in it from matching any character.
+        stored_text = cast(MessageEvent.event_data, Text)
+        return (
+            self.session.select(MessageEvent)
+            .join(Message, Message.id == MessageEvent.message_id)
+            .where(Message.conversation_id == conversation_id)
+            .where(MessageEvent.message_id.in_(last_answers))
+            .where(stored_text.contains('"response.figure_sources"', autoescape=True))
+            .order_by(*_MESSAGE_ORDER_NEWEST_FIRST, MessageEvent.sequence_number)
+        )
+
     def _replay_events(self, conversation_id: UUID, *, event_roles: tuple[str, ...]):
         # The relationship orders each message's events by sequence_number, so
         # history order then sequence_number is the order a per-message read
@@ -1256,3 +1417,25 @@ class ConversationService:
 
         items = self._hydrate_message_items(list(reversed(visible)))
         return ConversationItemsPage(items=items, has_more=has_more, next_before=next_before)
+
+
+def _earlier_answers(session: ScopedSession, *, conversation_id: UUID) -> list[EarlierAnswer]:
+    return ConversationService(session).get_earlier_answers(conversation_id, answers=MAX_EARLIER_ANSWERS)
+
+
+async def read_earlier_answers(*, conversation_id: UUID, scope: TenantScope) -> tuple[EarlierAnswer, ...]:
+    """The conversation's last MAX_EARLIER_ANSWERS answers' figures
+    (ConversationService.get_earlier_answers), read in a database unit of
+    its own, so a failed read can't abort another unit's transaction. A
+    failed read (a database error, no connection in time, or a conversation
+    the caller does not own) is logged and finds none, so the turn runs on
+    and marks no figure as repeated."""
+    try:
+        return tuple(await run_db(partial(_earlier_answers, conversation_id=conversation_id), scope=scope))
+    except Exception:
+        logger.warning(
+            "Could not read the earlier answers; no figure is marked as repeated",
+            exc_info=True,
+            extra=log_context(conversation_id=conversation_id),
+        )
+        return ()

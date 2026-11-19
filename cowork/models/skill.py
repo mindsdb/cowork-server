@@ -14,6 +14,17 @@ META_CREATED_AT = "created_at"
 META_UPDATED_AT = "updated_at"
 META_ENABLED = "enabled"
 META_PROJECTS = "projects"
+# Who created the skill: their sub, recorded on a deployment that trusts
+# identity headers (cowork.creators). Built-ins, the operator's managed skills
+# and the operator view's own carry none.
+META_CREATED_BY = "created_by"
+# What generated a skill nobody wrote by hand: only the org's Brand
+# guidelines skill (cowork.services.org_branding) carries one, so a local
+# store can tell it from a person's own skill of the same name.
+META_MANAGED_BY = "managed_by"
+# In MindsHub mode it is also the scope's person, and tells a skill made
+# since sharing from one that predates it when the skill has no skill_access
+# row. Who a skill is shared with is that row's (cowork.models.skill_access).
 
 
 class Skill(AgentSkill):
@@ -44,6 +55,11 @@ class Skill(AgentSkill):
         """Project ids the skill is distributed to (empty = none)."""
         raw = self.metadata.get(META_PROJECTS, "")
         return [p for p in (s.strip() for s in raw.split(",")) if p]
+
+    @property
+    def created_by(self) -> str | None:
+        """The sub of the person who created it, or None when nobody is recorded."""
+        return self.metadata.get(META_CREATED_BY) or None
 
     @property
     def created_at(self) -> datetime | None:

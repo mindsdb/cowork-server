@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session
 
+from cowork.api.v1.endpoints.guards import refuse_code_mode_in_sandbox
 from cowork.api.v1.permissions import LoopbackDesktopOnly, require
 from cowork.coding.connector_capabilities import (
     ConnectorCapability,
@@ -44,6 +45,7 @@ from cowork.coding.contracts import (
     TurnRequest,
     GitIdentity,
     GitIdentityRequest,
+    WorkspaceUsagePage,
 )
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
 from cowork.coding.contracts import ModeTurnRequest
@@ -86,7 +88,7 @@ from cowork.coding.project_models import (
     WorkItemSearchRequest,
     canonical_model_id,
 )
-from cowork.coding.reasoning import check_reasoning_effort
+from cowork.coding.reasoning import advertised_levels, check_reasoning_effort
 from cowork.coding.repository_setup import RepositorySetupService
 from cowork.coding.redaction import redact_text
 from cowork.coding.runtime_protocol import (
@@ -121,8 +123,11 @@ from cowork.services.skills import CodeSkillService
 # whole credential this surface has. Declared on the router rather than per
 # route because it REFUSES — the 106 routes below inherit a check, so a new
 # one added here is closed until someone opens it, which is the opposite of
-# what inheriting OpenByDesign did.
-router = APIRouter(dependencies=[Depends(require(LoopbackDesktopOnly))])
+# what inheriting OpenByDesign did. Under the code sandbox the whole surface
+# answers 403 (refuse_code_mode_in_sandbox).
+router = APIRouter(
+    dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(refuse_code_mode_in_sandbox)]
+)
 logger = logging.getLogger(__name__)
 
 
@@ -227,6 +232,15 @@ def _require_inference_client(request: Request) -> None:
 @router.get("/engines")
 def engines():
     return _service().capabilities()
+
+
+@router.get("/workspace-usage", response_model=WorkspaceUsagePage)
+def workspace_usage(session_id: str | None = Query(default=None, min_length=1, max_length=128)):
+    """Approximate storage Cowork manages for each task; measured in the background.
+
+    Passing the task being looked at measures again if the last measurement predates it.
+    """
+    return _service().workspace_usage_page(session_id)
 
 
 @router.get("/models")
@@ -622,10 +636,16 @@ def setup_windows_sandbox(session_id: str, session: SessionDep, scope: ScopeDep)
 
 @router.patch("/sessions/{session_id}")
 def update_session(session_id: str, body: SessionUpdateRequest, session: SessionDep, scope: ScopeDep):
-    if body.reasoning_effort is not None:
+    if body.model or body.reasoning_effort is not None:
         current = _call(_service().get_session, session_id)
         model = canonical_model_id(body.model) if body.model else current.model
-        _call(check_reasoning_effort, model, body.reasoning_effort, _model_levels(_settings(session, scope)))
+        levels = _model_levels(_settings(session, scope))
+        _call(check_reasoning_effort, model, body.reasoning_effort, levels)
+        if body.reasoning_effort is None and current.reasoning_effort:
+            offered = advertised_levels(model, levels)
+            if offered is not None and current.reasoning_effort not in offered:
+                # The previous model's level would reach Codex on the next turn and fail it there.
+                body = body.model_copy(update={"reasoning_effort": None})
     return _call(_service().update_session_config, session_id, body)
 
 

@@ -1,0 +1,16 @@
+# Each `unit` repeats `count` times inside one paragraph, with {text} standing
+# for 400 characters of text. Inlining it must stay well under the test's
+# time bound, which a walk that rebuilds the parent once per element exceeds
+# many times over.
+
+- id: unwrapped-siblings
+  unit: '<font>{text}</font>'
+  count: 10000
+
+- id: dropped-siblings-with-tails
+  unit: '<noscript></noscript>{text}'
+  count: 10000
+
+- id: unwrapped-empty-siblings
+  unit: '<font>a</font>'
+  count: 40000

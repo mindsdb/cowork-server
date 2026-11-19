@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import difflib
+import json
+import logging
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -23,6 +26,14 @@ from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
 from cowork.coding.workspace_key import managed_key
 from cowork.common.paths import O_NOFOLLOW, open_fd
 from cowork.common.settings.app_settings import get_app_settings
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class UsageRoots:
+    workspace: tuple[Path, ...]
+    recovery: tuple[Path, ...]
 
 
 class WorkspaceError(RuntimeError):
@@ -59,6 +70,21 @@ SNAPSHOT_TRUNCATED_MARKER = (
     "Snapshot truncated because this task has a large combined patch. Open the worktree to recover the rest.\n"
 )
 _TASK_ROOT_METADATA = (".DS_Store", "Thumbs.db", "desktop.ini")
+_RELEASE_METADATA = "release.json"
+# Ignored folders a worktree release may drop because tools recreate them on
+# their own. Anything else ignored (dependencies, .env, build output) keeps
+# the workspace in place.
+_SELF_REBUILDING_CACHES = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
+
+
+class ReleaseRefused(WorkspaceError):
+    """A workspace cannot be released without losing something."""
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def _org_mode() -> bool:
@@ -197,6 +223,7 @@ class WorkspaceManager:
         self.git = git or GitRunner()
         self.local_copies = LocalCopyManager(root, self.worktrees_root)
         self._mutation_lock = threading.RLock()
+        self._refusals: dict[str, str] = {}
         self.worktrees_root.mkdir(parents=True, exist_ok=True)
         self.snapshots_root.mkdir(parents=True, exist_ok=True)
 
@@ -752,6 +779,253 @@ class WorkspaceManager:
                     shutil.rmtree(actual)
             if source.is_dir():
                 self.git.run(source, "worktree", "prune")
+
+    def usage_roots(self) -> UsageRoots:
+        """Folders holding a ``<task>`` directory of each task's managed storage.
+
+        These are what storage reporting measures, which is wider than what
+        task cleanup prunes: recovery data outlives a task's workspace.
+        """
+        return UsageRoots(
+            workspace=(
+                self.worktrees_root,
+                self.legacy_worktrees_root,
+                self.local_copies.legacy_copies_root,
+                self.local_copies.baselines_root,
+            ),
+            recovery=(self.snapshots_root,),
+        )
+
+    def release(
+        self,
+        key: str,
+        source_path: str,
+        workspace_path: str,
+        kind: WorkspaceKind,
+    ) -> bool:
+        """Remove a task workspace to reclaim disk, keeping what restores it.
+
+        Returns False, leaving the workspace untouched, when it cannot be
+        released safely; ``release_refusal`` then says why. Only worktrees
+        are released. Their commits, staged state and working files (untracked
+        included) are kept as commits pinned by a ref in the source
+        repository, with the branch.
+        """
+        with self._mutation_lock:
+            self._refusals.pop(key, None)
+            try:
+                if kind != WorkspaceKind.git_worktree:
+                    raise ReleaseRefused("only worktrees can be released")
+                return self._release_worktree(key, Path(source_path), workspace_path)
+            except ReleaseRefused as refusal:
+                self._refusals[key] = str(refusal)
+                logger.info("Keeping the workspace %s: %s", key, refusal)
+                return False
+
+    def release_refusal(self, key: str) -> str | None:
+        """Why the last release of ``key`` was refused, if it was."""
+        return self._refusals.get(key)
+
+    def _release_worktree(self, key: str, source: Path, workspace_path: str) -> bool:
+        actual = self._managed_worktree(key, workspace_path)
+        if not actual.exists():
+            raise ReleaseRefused("the workspace folder is missing")
+        if not source.is_dir():
+            raise ReleaseRefused("the source repository is unavailable")
+        head = self._head_revision(actual)
+        if head is None:
+            raise ReleaseRefused("the workspace has no commit to restore from")
+        if self._has_nested_repository(actual):
+            raise ReleaseRefused("a repository inside the workspace has history that cannot be saved")
+        if self.git.run(actual, "ls-files", "--unmerged").stdout:
+            raise ReleaseRefused("the workspace has unresolved merge conflicts")
+        unsaved = self._unsaved_ignored(actual)
+        if unsaved:
+            raise ReleaseRefused(
+                "ignored files would be lost (" + ", ".join(unsaved[:3]) + ("…" if len(unsaved) > 3 else "") + ")"
+            )
+        branch_result = self.git.run(actual, "symbolic-ref", "-q", "--short", "HEAD", check=False)
+        branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+        index_commit, files_commit = self._save_worktree_state(actual, head)
+        release_dir = self.snapshots_root / managed_key(key)
+        release_dir.mkdir(parents=True, exist_ok=True)
+        self.git.run(source, "update-ref", self._release_ref(key), files_commit)
+        metadata = {
+            "format": 2,
+            "kind": WorkspaceKind.git_worktree.value,
+            "head": head,
+            "branch": branch,
+            "index": index_commit,
+            "files": files_commit,
+        }
+        try:
+            _write_atomically(release_dir / _RELEASE_METADATA, json.dumps(metadata))
+        except OSError as exc:
+            self.git.run(source, "update-ref", "-d", self._release_ref(key), check=False)
+            raise ReleaseRefused(f"the saved state could not be written: {exc}") from exc
+        self.git.run(source, "worktree", "remove", "--force", str(actual))
+        self.git.run(source, "worktree", "prune", check=False)
+        return True
+
+    def _unsaved_ignored(self, worktree: Path) -> list[str]:
+        """Ignored entries a release would lose; caches that rebuild themselves are fine."""
+        listed = self.git.run(
+            worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
+        ).stdout
+        return [
+            path for path in filter(None, listed.split("\0"))
+            if not any(part in _SELF_REBUILDING_CACHES for part in PurePosixPath(path.rstrip("/")).parts)
+        ]
+
+    def _save_worktree_state(self, worktree: Path, head: str) -> tuple[str, str]:
+        """Commit the staged state and the working files without touching the task's index.
+
+        Returns ``(index, files)``: a commit of the index whose parent is HEAD,
+        and a commit of every working file Git would see, untracked included,
+        whose parent is the index commit.
+        """
+        identity = {
+            "GIT_AUTHOR_NAME": "Cowork", "GIT_AUTHOR_EMAIL": "cowork@localhost",
+            "GIT_COMMITTER_NAME": "Cowork", "GIT_COMMITTER_EMAIL": "cowork@localhost",
+        }
+        index_path = Path(self.git.run(worktree, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout.strip())
+        with tempfile.TemporaryDirectory(prefix="cowork-release-") as temporary:
+            private = Path(temporary) / "index"
+            if index_path.is_file():
+                shutil.copy2(index_path, private)
+            environment = {"GIT_INDEX_FILE": str(private), "GIT_OPTIONAL_LOCKS": "0", **identity}
+            index_tree = self.git.run(worktree, "write-tree", environment=environment).stdout.strip()
+            index_commit = self.git.run(
+                worktree, "commit-tree", index_tree, "-p", head, "-m", "Cowork: staged changes", environment=environment,
+            ).stdout.strip()
+            self.git.run(worktree, "add", "--all", "--", ".", environment=environment)
+            files_tree = self.git.run(worktree, "write-tree", environment=environment).stdout.strip()
+            files_commit = self.git.run(
+                worktree, "commit-tree", files_tree, "-p", index_commit, "-m", "Cowork: working files",
+                environment=environment,
+            ).stdout.strip()
+        return index_commit, files_commit
+
+    def restore(
+        self,
+        key: str,
+        source_path: str,
+        workspace_path: str,
+        kind: WorkspaceKind,
+    ) -> None:
+        """Recreate a released workspace at its original path with its changes.
+
+        Raises, keeping the saved state, when it cannot be rebuilt exactly.
+        """
+        with self._mutation_lock:
+            if kind != WorkspaceKind.git_worktree:
+                return
+            actual = self._managed_worktree(key, workspace_path)
+            release_dir = self.snapshots_root / managed_key(key)
+            metadata_path = release_dir / _RELEASE_METADATA
+            if not metadata_path.is_file():
+                raise WorkspaceError("This task's workspace was removed and has no saved copy to restore")
+            source = Path(source_path)
+            if not source.is_dir():
+                raise WorkspaceError(
+                    f"The task's repository at {source} is unavailable. Put it back to reopen this task's workspace"
+                )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata.get("format") != 2:
+                raise WorkspaceError("This task's saved workspace is in a format this version cannot restore")
+            branch = metadata.get("branch")
+            if branch:
+                self._check_branch_free(source, branch, metadata["head"])
+            # An interrupted release can leave part of the folder behind. The
+            # saved state is complete, so the leftover is replaced.
+            if actual.exists():
+                self.git.run(source, "worktree", "remove", "--force", str(actual), check=False)
+                shutil.rmtree(actual, ignore_errors=True)
+            if actual.exists():
+                raise WorkspaceError("Part of this task's old workspace is still in use. Close programs using it and try again")
+            self.git.run(source, "worktree", "prune", check=False)
+            actual.parent.mkdir(parents=True, exist_ok=True)
+            if branch and self.git.run(source, "rev-parse", "--verify", "-q", f"refs/heads/{branch}", check=False).returncode:
+                # The branch was deleted while the task was released; nothing
+                # else uses the name, so it is recreated where the task left it.
+                self.git.run(source, "branch", branch, metadata["head"])
+            target = branch or metadata["head"]
+            self.git.run(source, "worktree", "add", *(() if branch else ("--detach",)), str(actual), target)
+            try:
+                # Files first, then the index on its own, so staged and
+                # unstaged versions of a file both come back.
+                self.git.run(actual, "read-tree", "-u", "--reset", f"{metadata['files']}^{{tree}}")
+                self.git.run(actual, "read-tree", f"{metadata['index']}^{{tree}}")
+            except Exception:
+                self.git.run(source, "worktree", "remove", "--force", str(actual), check=False)
+                self.git.run(source, "worktree", "prune", check=False)
+                raise
+            self.git.run(source, "update-ref", "-d", self._release_ref(key), check=False)
+            metadata_path.unlink()
+
+    def _check_branch_free(self, source: Path, branch: str, head: str) -> None:
+        """Refuse to restore onto a branch that moved or that another checkout holds."""
+        current = self.git.run(source, "rev-parse", "--verify", "-q", f"refs/heads/{branch}", check=False)
+        if current.returncode == 0 and current.stdout.strip() != head:
+            raise WorkspaceError(
+                f"The task's branch {branch} has moved since its workspace was put away. "
+                f"Move {branch} back to {head[:12]}, or rename it, to reopen this task"
+            )
+        for line in self.git.run(source, "worktree", "list", "--porcelain").stdout.splitlines():
+            if line == f"branch refs/heads/{branch}":
+                raise WorkspaceError(
+                    f"The task's branch {branch} is checked out in another folder. "
+                    "Switch that folder to another branch to reopen this task"
+                )
+
+    def is_released(self, key: str, kind: WorkspaceKind) -> bool:
+        """Whether saved state exists to rebuild this workspace from."""
+        if kind != WorkspaceKind.git_worktree:
+            return False
+        return (self.snapshots_root / managed_key(key) / _RELEASE_METADATA).is_file()
+
+    def discard_release(self, key: str, source_path: str) -> None:
+        """Forget a released workspace's saved state once its task is deleted."""
+        with self._mutation_lock:
+            release_dir = self.snapshots_root / managed_key(key)
+            (release_dir / _RELEASE_METADATA).unlink(missing_ok=True)
+            source = Path(source_path)
+            if source.is_dir() and self._git_root(source) is not None:
+                self.git.run(source, "update-ref", "-d", self._release_ref(key), check=False)
+
+    def _has_nested_repository(self, worktree: Path) -> bool:
+        """Whether a repository inside the worktree holds history a patch cannot carry.
+
+        A nested repository's files and commits would be lost when the worktree
+        is removed. One can sit anywhere, including in a tracked directory the
+        parent still sees as clean, so every path Git lists and its parents are
+        checked. A staged or committed nested repository is listed as a single
+        gitlink path. Ignored directories are not checked, as their contents
+        are never saved.
+        """
+        untracked = [path for status, path in self._status_entries(worktree) if status == "??"]
+        tracked = [path for path in self.git.run(worktree, "ls-files", "-z").stdout.split("\0") if path]
+        directories: set[PurePosixPath] = set()
+        for path in (*untracked, *tracked):
+            directories.add(PurePosixPath(path))
+            directories.update(PurePosixPath(path).parents)
+        directories.discard(PurePosixPath("."))
+        return any((worktree / directory / ".git").exists() for directory in directories)
+
+    def _managed_worktree(self, key: str, workspace_path: str) -> Path:
+        relative = managed_key(key)
+        expected = {
+            (self.worktrees_root / relative).resolve(),
+            (self.legacy_worktrees_root / relative).resolve(),
+        }
+        actual = Path(workspace_path).resolve()
+        if actual not in expected:
+            raise WorkspaceError("Refusing to change an unmanaged worktree path")
+        return actual
+
+    @staticmethod
+    def _release_ref(key: str) -> str:
+        return "refs/cowork/released/" + managed_key(key).as_posix()
 
     def prune_task_root(self, session_id: str) -> None:
         """Remove an empty project-task parent without discarding task files."""

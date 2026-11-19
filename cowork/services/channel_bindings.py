@@ -97,7 +97,7 @@ class ChannelBindingService:
         eff_conversation = (
             req.anton_conversation_id if "anton_conversation_id" in provided else binding.anton_conversation_id
         )
-        self._validate_links(eff_project, eff_conversation)
+        self._validate_links(eff_project, eff_conversation, pinning="anton_conversation_id" in provided)
 
         if "display_name" in provided:
             binding.display_name = req.display_name
@@ -198,6 +198,9 @@ class ChannelBindingService:
             return False
 
         self._drop_sessions(binding_id)
+        # No relationship() orders these, so one flush would delete the binding
+        # before its sessions and trip their foreign key.
+        self.session.flush()
         self.session.delete(binding)
         self.session.commit()
         return True
@@ -232,10 +235,19 @@ class ChannelBindingService:
             except re2.error as exc:
                 raise ValueError(f"invalid trigger_pattern regex: {exc}")
 
-    def _validate_links(self, project_id: UUID | None, conversation_id: UUID | None) -> None:
+    def _validate_links(
+        self, project_id: UUID | None, conversation_id: UUID | None, *, pinning: bool = True
+    ) -> None:
+        """Refuse links the caller may not make. `pinning` is False when the
+        conversation is the binding's existing one, not newly asked for."""
         # Scoped get: another org's project/conversation reads as nonexistent.
         if project_id is not None and self.session.get(Project, project_id) is None:
             raise ValueError(f"project not found: {project_id}")
+        # In org mode a route is never pinned to a conversation: the runtime
+        # keeps each route's conversation itself, so nobody can steer a DM into
+        # a conversation they or an admin can read.
+        if pinning and conversation_id is not None and self.session.scope.org_mode:
+            raise ValueError("a route cannot be pinned to a conversation in org mode")
         if conversation_id is not None:
             conversation = self.session.get(Conversation, conversation_id)
             if conversation is None or not self._conversation_readable(conversation):

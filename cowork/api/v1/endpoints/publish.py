@@ -4,18 +4,23 @@ Ported from cowork/server/routes/utilities.py (publish section).
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, StrictBool
 
 from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.schemas.artifact_access import ArtifactAccessRequest
 
+from cowork.services import artifact_stats as _stats
 from cowork.services.publish import (
     PublisherUnavailable,
+    ShareOrgRequired,
     activate_version as _activate_version,
     desktop_publish_context as _desktop_context,
+    desktop_publish_credential as _desktop_credential,
     list_publishable,
     list_versions as _list_versions,
     publish_artifact as _publish,
@@ -25,8 +30,11 @@ from cowork.services.publish import (
 
 # The whole publish surface is desktop-only: it addresses artifacts by absolute
 # server path and resolves the credential from stored provider settings, neither of
-# which exists in an org deployment. Auto-publish is the org path instead.
+# which exists in an org deployment. Auto-publish is the org path instead. Every
+# route resolves paths, and reads publish history, only inside the caller's own
+# scope: a person's partition where projects are personal.
 router = APIRouter(dependencies=[Depends(require(DesktopOnly))])
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 class _AccessBody(BaseModel):
@@ -63,28 +71,36 @@ class _ActivateBody(BaseModel):
     md5: str
 
 
+class _StatsTrackingBody(BaseModel):
+    path: str
+    enabled: StrictBool
+
+
 @router.get("/")
-async def list_publishable_endpoint():
-    return list_publishable()
+async def list_publishable_endpoint(scope: ScopeDep):
+    return list_publishable(scope=scope)
 
 
+# Plain `def`: publishing renders a Markdown page in the conversion process
+# and uploads the bundle, both blocking, so FastAPI runs it in its threadpool,
+# off the event loop. A typed refusal (an HTTPException) answers with its own
+# status: 413, 429 or 500 for a Markdown page, 413 for a bundle too large.
 @router.post("/")
-async def publish_artifact(req: _PublishBody, scope: TenantScope = Depends(get_tenant_scope)):
+def publish_artifact(req: _PublishBody, scope: ScopeDep):
     try:
-        artifact, artifacts_base, api_key, publish_url = _desktop_context(req.path)
+        artifact, artifacts_base, api_key, publish_url = _desktop_context(req.path, scope=scope)
         # The publisher resolves datasource secrets from the connector vault,
-        # which is org-keyed; without the scope it would look in the shared root.
-        # This router is local-only (see `require_local_tenancy` above), so the
-        # scope is always a local one here and `vault_for_scope` returns the
-        # unkeyed vault — threading it anyway keeps one resolution path for
-        # every publish call site rather than a desktop-only exception.
+        # which is keyed by the scope wherever connections are partitioned;
+        # without it the publisher would look in the shared root. This router
+        # is local-only, so the scope is LOCAL_SCOPE (the unkeyed vault) or a
+        # person's own partition.
         return _publish(
             artifact,
             artifacts_base=artifacts_base,
             api_key=api_key,
             publish_url=publish_url,
             password=req.password,
-            access=req.access.model_dump() if req.access else None,
+            access=ArtifactAccessRequest.of_publisher(req.access.model_dump()) if req.access else None,
             scope=scope,
         )
     except FileNotFoundError as e:
@@ -93,31 +109,42 @@ async def publish_artifact(req: _PublishBody, scope: TenantScope = Depends(get_t
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except PublisherUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except ShareOrgRequired as e:
+        # MindsHub refused the share with everyone and nothing was published.
+        return JSONResponse(e.refusal().model_dump(), status_code=e.status_code)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.post("/update")
-async def update_artifact(req: _UpdateBody):
+def update_artifact(req: _UpdateBody, scope: ScopeDep):
     try:
-        return _update(req.path)
+        return _update(req.path, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except PublisherUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except ShareOrgRequired as e:
+        # MindsHub refused the share with everyone and nothing was published.
+        return JSONResponse(e.refusal().model_dump(), status_code=e.status_code)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
 
+# Plain `def`: it waits for the folder's publish lock, which a publish
+# running in the threadpool may hold.
 @router.delete("/")
-async def unpublish_artifact(path: str = Query(..., description="Absolute path to the published HTML artifact")):
+def unpublish_artifact(
+    scope: ScopeDep,
+    path: str = Query(..., description="Absolute path to the published HTML artifact"),
+):
     try:
-        artifact, artifacts_base, api_key, publish_url = _desktop_context(path)
+        artifact, artifacts_base, api_key, publish_url = _desktop_context(path, scope=scope)
         return _unpublish(
             artifact, artifacts_base=artifacts_base,
-            api_key=api_key, publish_url=publish_url,
+            api_key=api_key, publish_url=publish_url, scope=scope,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -131,10 +158,11 @@ async def unpublish_artifact(path: str = Query(..., description="Absolute path t
 
 @router.get("/versions")
 async def list_versions_endpoint(
+    scope: ScopeDep,
     path: str = Query(..., description="Absolute path to the published artifact"),
 ):
     try:
-        return _list_versions(path)
+        return _list_versions(path, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -145,10 +173,12 @@ async def list_versions_endpoint(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+# A plain `def`: the rollback waits for its folder's publish lock and calls
+# the publishing service, both off the event loop.
 @router.post("/activate")
-async def activate_version_endpoint(req: _ActivateBody):
+def activate_version_endpoint(req: _ActivateBody, scope: ScopeDep):
     try:
-        return _activate_version(req.path, req.md5)
+        return _activate_version(req.path, req.md5, scope=scope)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
@@ -157,3 +187,46 @@ async def activate_version_endpoint(req: _ActivateBody):
         raise HTTPException(status_code=503, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+def _stats_credential() -> tuple[str, str]:
+    """(api_key, publish_url), or the code the stats panel shows as "Reconnect".
+
+    Only the credential lookup's ValueError gets the code; a ValueError from
+    path resolution stays an ordinary 400.
+    """
+    try:
+        return _desktop_credential()
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": _stats.PUBLISH_CREDENTIAL_MISSING_CODE, "message": str(e)},
+        ) from e
+
+
+# Plain `def` routes: FastAPI runs them in its threadpool, so the call to the
+# publishing service does not block the event loop.
+@router.get("/stats")
+def artifact_stats_endpoint(
+    scope: ScopeDep,
+    path: str = Query(..., description="Absolute path to the published artifact"),
+):
+    api_key, publish_url = _stats_credential()
+    try:
+        report_id = _stats.report_id_for_path(path, scope=scope)
+        return _stats.fetch_stats(publish_url=publish_url, key=api_key, report_id=report_id)
+    except _stats.STATS_ROUTE_ERRORS as e:
+        raise _stats.stats_http_exception(e, desktop=True) from e
+
+
+@router.put("/stats/tracking")
+def set_stats_tracking_endpoint(req: _StatsTrackingBody, scope: ScopeDep):
+    api_key, publish_url = _stats_credential()
+    try:
+        report_id = _stats.report_id_for_path(req.path, scope=scope)
+        tracking = _stats.set_tracking(
+            publish_url=publish_url, key=api_key, report_id=report_id, enabled=req.enabled,
+        )
+    except _stats.STATS_ROUTE_ERRORS as e:
+        raise _stats.stats_http_exception(e, desktop=True) from e
+    return {"tracking": tracking}

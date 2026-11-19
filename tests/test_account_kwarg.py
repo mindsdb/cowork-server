@@ -65,7 +65,7 @@ class _NewAnton:
 
 @dataclasses.dataclass
 class _OldAnton:
-    """The pinned anton, from before ENG-2121."""
+    """An anton from before ENG-2121."""
 
     surface: str | None = None
 
@@ -112,8 +112,8 @@ class TestDesktopAccount:
 
 class TestAccountKwargs:
     def test_an_old_anton_gets_no_kwargs_at_all(self, held):
-        # The pinned anton has no such fields; passing them would raise
-        # TypeError on every turn.
+        # An anton older than ENG-2121 has no such fields; passing them would
+        # raise TypeError on every turn.
         held(_jwt(_PAYLOAD))
         assert account_kwargs(_OldAnton) == {}
 

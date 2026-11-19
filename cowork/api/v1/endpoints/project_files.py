@@ -5,35 +5,49 @@ This is not necessarily final state — it was migrated to eliminate
 compat stubs and may be refactored later.
 """
 
+import errno
 import logging
 import mimetypes
 import ntpath
 import os
 import secrets
 import stat
+import threading
 import time
+import unicodedata
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NamedTuple
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.content_disposition import attachment_disposition
+from cowork.api.v1.endpoints.connectors.sharepoint import (
+    _KEY_NO_LONGER_WORKS,
+    _granted_site,
+    _stored_connection,
+)
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, require
+from cowork.api.v1.pinned_response import PinnedStreamingResponse
 
+from cowork.common.logger import log_context
 from cowork.common.paths import (
     O_NOFOLLOW,
+    O_NONBLOCK,
     PinnedDir,
     dir_lstat,
     dir_mkdir,
     dir_open,
     dir_replace,
+    dir_rmdir,
     dir_rmtree,
     dir_scandir,
     dir_unlink,
@@ -43,24 +57,48 @@ from cowork.common.paths import (
     read_bounded,
     safe_join,
 )
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     ScopedSession,
     ScopedSessionDep,
     TenantScope,
     get_tenant_scope,
 )
+from cowork.db.units import run_efs, run_efs_unit
 from cowork.models.project import Project
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.principal import Principal, get_principal
 from cowork.schemas.project_files import (
+    CANONICAL_PROJECT_MEMORY_PATHS,
     ProjectFileDeleteResponse,
     ProjectFileListResponse,
     ProjectFileReadResponse,
     ProjectFileWriteResponse,
     ProjectInstructionsResponse,
+    ProjectUploadResponse,
+    ProjectUploadResult,
 )
 from cowork.schemas.shared_resources import MutableResourceCapabilities
-from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
+from cowork.schemas.sharepoint import (
+    SharePointImportedFile,
+    SharePointImportResponse,
+    SharePointSkippedItem,
+)
+from cowork.services.artifact_roots import (
+    _ARTIFACTS_SUBPATH,
+    CONVERSATIONS_DIRNAME,
+    SERVER_PROJECT_FOLDERS,
+    ProjectRow,
+    recorded_source,
+    workspace_conversation_id,
+)
+from cowork.services.artifacts import _is_the_projects_secrets
+from cowork.services.connectors.sharepoint import (
+    DownloadBudget,
+    SharePointClient,
+    SharePointError,
+    SharePointErrorKind,
+)
 from cowork.services.projects import ProjectService
 from cowork.services.product_permissions import require_product_permission
 from cowork.services.shared_resources import (
@@ -82,14 +120,10 @@ logger = logging.getLogger(__name__)
 # a bypass, so it needs nothing of its own here.)
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
+ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
+
 ANTON_INSTRUCTIONS_FILENAME = "anton.md"
 TEXT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
-_CANONICAL_PROJECT_MEMORY_PATHS = frozenset(
-    {
-        (".anton", "memory", "rules.md"),
-        (".anton", "memory", "lessons.md"),
-    }
-)
 
 #: How long a preview token stays usable. Long enough that a preview left open
 #: keeps loading its sub-assets, short enough that a token which escapes the
@@ -101,6 +135,19 @@ PREVIEW_TOKEN_TTL_SECONDS = 30 * 60
 #: tens; the cap is here because nothing but the TTL evicts, and the container
 #: limit is 256Mi.
 PREVIEW_MOUNT_LIMIT = 2048
+
+
+def _workspaces_private(scope: TenantScope) -> bool:
+    """Whether `conversations/<id>/` is a per-conversation PRIVATE workspace
+    under `scope`: org mode, or a trusted-identity deployment that shares a
+    project while keeping conversations per person. Elsewhere (desktop, the
+    operator view, a partition's own projects) every workspace is the one
+    reader's, so nothing is kept apart."""
+    return scope.org_mode or (
+        scope.personal
+        and scope.partitioned_for(PersonalResource.CONVERSATIONS)
+        and not scope.partitioned_for(PersonalResource.PROJECTS)
+    )
 
 
 @dataclass(frozen=True)
@@ -126,13 +173,25 @@ class _PreviewMount:
     workspace: str | None
     org_id: str | None
     user_id: str | None
+    # Whether conversation workspaces are private under the scope that minted
+    # this token (org mode, or a shared project with per-person conversations).
+    # The token stores it so the session-free asset route keeps the decision
+    # without re-reading the scope.
+    workspaces_private: bool
     expires_at: float
 
     def readable_by(self, scope: TenantScope) -> bool:
-        """Desktop has one user and no organization, so nothing to compare."""
-        if not scope.org_mode:
-            return True
-        return self.org_id == scope.org_id and self.user_id == scope.user_id
+        """Where projects are partitioned (org mode, or a person's partition)
+        the reader must be the minter. Where projects are shared but
+        conversations are private, a workspace mount must also be the minter's,
+        so a teammate's token doesn't open another person's workspace. A shared
+        project's root mount stays shareable (desktop has one user, the operator
+        view reads everyone's)."""
+        if scope.partitioned_for(PersonalResource.PROJECTS) or (
+            self.workspaces_private and self.workspace is not None
+        ):
+            return self.org_id == scope.org_id and self.user_id == scope.user_id
+        return True
 
     def serves(self, target: Path) -> bool:
         """Whether this mount may hand out `target`.
@@ -143,10 +202,10 @@ class _PreviewMount:
         mounted file itself lived in is reachable, and a mount taken on a shared
         file reaches no workspace at all.
         """
-        if self.org_id is None:
-            # Desktop: one user, nothing to keep apart. An org-mode mount always
-            # carries an org, because minting reads the project through a scoped
-            # session and that raises without one.
+        if not self.workspaces_private:
+            # Nowhere keeps workspaces apart (desktop, the operator view, a
+            # partition's own projects, or a deployment that shares
+            # conversations too), so every path the mount contains is served.
             return True
         try:
             rel = target.relative_to(self.project_base).as_posix()
@@ -198,6 +257,9 @@ def _register_preview_mount(target: Path, base: Path, scope: TenantScope) -> str
         )
         _PROJECT_PREVIEW_MOUNTS.pop(oldest, None)
     token = secrets.token_urlsafe(32)
+    # Always the minter's real partition and sub, so a token minted where
+    # projects are shared but conversations are private still names the one
+    # person who may open a workspace mount through it.
     # `target` is already fully resolved by `_safe_relpath`, so its parent is too.
     # Resolving again would be a no-op, and it reads as a containment check that
     # has in fact already happened one frame up.
@@ -207,6 +269,7 @@ def _register_preview_mount(target: Path, base: Path, scope: TenantScope) -> str
         workspace=_mount_workspace(target, base),
         org_id=scope.org_id,
         user_id=scope.user_id,
+        workspaces_private=_workspaces_private(scope),
         expires_at=now + PREVIEW_TOKEN_TTL_SECONDS,
     )
     return token
@@ -279,8 +342,14 @@ def _validated_project_path(path: str) -> _ValidatedProjectPath:
     return _ValidatedProjectPath(tuple(parts))
 
 
+async def _project_mutation_path(path: str) -> _ValidatedProjectPath:
+    """The validation as a coroutine, so a request needs no default thread
+    for it."""
+    return _validated_project_path(path)
+
+
 ProjectMutationPathDep = Annotated[
-    _ValidatedProjectPath, Depends(_validated_project_path)
+    _ValidatedProjectPath, Depends(_project_mutation_path)
 ]
 
 
@@ -433,10 +502,10 @@ def _reject_generic_project_memory_mutation(
         return
     parts = _resolved_project_parts(base, path) if base is not None else path.parts
     instructions = (".anton", ANTON_INSTRUCTIONS_FILENAME)
-    protected = (*_CANONICAL_PROJECT_MEMORY_PATHS, instructions)
+    protected = (*CANONICAL_PROJECT_MEMORY_PATHS, instructions)
     if parts == instructions:
         return
-    if parts in _CANONICAL_PROJECT_MEMORY_PATHS:
+    if parts in CANONICAL_PROJECT_MEMORY_PATHS:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
@@ -668,10 +737,14 @@ def _conversation_workspace_ok(
     rel_posix: str, scoped: ScopedSession, cache: dict | None = None
 ) -> bool:
     """`conversations/<id>/…` is a per-conversation PRIVATE workspace even
-    though the project directory is org-shared, so only that conversation's
-    owner may list/read/write/delete inside it. Anything else is a shared
-    project file. Local mode has one user, so nothing is gated."""
-    if not scoped.scope.org_mode:
+    though the project directory is shared, so only that conversation's owner
+    may list/read/write/delete inside it: in org mode, and in a project a
+    trusted-identity deployment shares while it keeps conversations per person.
+    Anything else is a shared project file. Elsewhere nothing is gated: the
+    desktop has one user, the operator view reads everyone's, and a personal
+    partition's own projects hold only that person's conversations."""
+    scope = scoped.scope
+    if not _workspaces_private(scope):
         return True
     parts = rel_posix.split("/", 2)
     if len(parts) < 2 or parts[0] != CONVERSATIONS_DIRNAME:
@@ -709,7 +782,7 @@ def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -
 
 
 async def _authorize_artifact_file_mutation(
-    path: ProjectMutationPathDep, scoped: ScopedSessionDep,
+    path: ProjectMutationPathDep, scope: ScopeDep,
 ) -> None:
     """Protect artifact bytes reached through the generic file adapter.
 
@@ -720,19 +793,19 @@ async def _authorize_artifact_file_mutation(
     parts = tuple(part.casefold() for part in path.parts)
     if parts[0] == CONVERSATIONS_DIRNAME:
         if len(parts) == 1:
-            await require_product_permission(scoped.scope, "artifact.manage")
+            await require_product_permission(scope, "artifact.manage")
             return
         if len(parts) == 2:
             try:
                 UUID(parts[1])
             except ValueError:
                 return
-            await require_product_permission(scoped.scope, "artifact.manage")
+            await require_product_permission(scope, "artifact.manage")
             return
         parts = parts[2:]
     artifact_root = (".anton", "artifacts")
     if parts[:2] == artifact_root or parts == artifact_root[:1]:
-        await require_product_permission(scoped.scope, "artifact.manage")
+        await require_product_permission(scope, "artifact.manage")
 
 
 def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:
@@ -742,6 +815,34 @@ def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) 
     conversation id is the only workspace the operation can reach.
     """
     if not _conversation_workspace_ok(path.value, scoped):
+        raise HTTPException(status_code=404, detail="File not found")
+
+
+def _require_canonical_workspace(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:
+    """404, the answer a co-member's workspace gets, before a PUT writes into
+    a conversation workspace named by another spelling of its id.
+
+    In org mode the artifacts list and the held rows' backfill read a
+    workspace only under its canonical name, str(conversation_id)
+    (artifact_roots.workspace_conversation_id), so an artifact folder written
+    below another spelling would never be listed. An uppercase spelling is
+    another folder on a case-sensitive store and the same folder on a
+    case-insensitive one. A spelling without hyphens or with braces is another
+    folder on both. Only the PUT calls this, since it is the one route that
+    writes below a workspace: the owner still lists, reads, previews and
+    deletes what such a folder already holds (_conversation_workspace_ok).
+    Elsewhere no artifacts list reads a workspace, so nothing is refused.
+    """
+    if not scoped.scope.org_mode:
+        return
+    parts = path.parts
+    if len(parts) < 2 or parts[0] != CONVERSATIONS_DIRNAME:
+        return
+    try:
+        UUID(parts[1])
+    except ValueError:
+        return  # not a conversation workspace: a shared project folder
+    if workspace_conversation_id(parts[1]) is None:
         raise HTTPException(status_code=404, detail="File not found")
 
 
@@ -760,11 +861,16 @@ def _pinned_fd(target: Path, base: Path, flags: int) -> Iterator[int]:
 
     A planted link raises `OSError` (ELOOP), which callers map to the same 404 a
     genuine miss returns rather than letting it surface as a 500.
+
+    The open never waits: `O_NONBLOCK` returns at once on a FIFO a pod made at
+    the path, which no writer on this node would ever open, so the caller's
+    file type check refuses it rather than the open holding its thread for
+    good. A regular file ignores the flag.
     """
     rel = target.relative_to(base.resolve())
     *dirs, name = rel.parts
     with opened_subdir_nofollow(base, *dirs) as pinned:
-        fd = dir_open(pinned, name, flags | O_NOFOLLOW)
+        fd = dir_open(pinned, name, flags | O_NOFOLLOW | O_NONBLOCK)
         try:
             yield fd
         finally:
@@ -784,7 +890,7 @@ def _pinned_regular_file(target: Path, base: Path, flags: int = os.O_RDONLY):
     except OSError:
         cm.__exit__(None, None, None)
         raise HTTPException(status_code=404, detail="File not found")
-    if not stat.S_ISREG(st.st_mode):
+    if not stat.S_ISREG(st.st_mode) or _is_the_projects_secrets(st, anton_dir=base / ".anton"):
         cm.__exit__(None, None, None)
         raise HTTPException(status_code=404, detail="File not found")
     return cm, fd, st
@@ -836,17 +942,23 @@ def _opened_existing_project_entry(
 
 @contextmanager
 def _opened_pinned_descendant(
-    root: PinnedDir, names: tuple[str, ...], *, create: bool
+    root: PinnedDir,
+    names: tuple[str, ...],
+    *,
+    create: bool,
+    created: list[tuple[str, ...]] | None = None,
 ) -> Iterator[PinnedDir]:
     """Descend from an already-pinned project root without rebuilding its Path.
 
     Every component is reduced to a basename again beside the descriptor-based
     operation. POSIX resolves it with ``dir_fd`` and ``O_NOFOLLOW``; the local
-    Windows fallback receives the same single-component guarantee.
+    Windows fallback receives the same single-component guarantee. With
+    ``create``, each folder this call made is appended to ``created`` as its
+    path below ``root``, so a caller can remove what it added.
     """
     with ExitStack() as descendants:
         current = root
-        for raw_name in names:
+        for depth, raw_name in enumerate(names, start=1):
             name = os.path.basename(raw_name)
             if not name or name != raw_name or name in {".", ".."}:
                 raise ValueError("invalid path component")
@@ -855,9 +967,33 @@ def _opened_pinned_descendant(
                     dir_mkdir(current, name)
                 except FileExistsError:
                     pass
+                else:
+                    if created is not None:
+                        created.append(names[:depth])
             current = open_pinned_child(current, name)
             descendants.callback(current.close)
         yield current
+
+
+def _create_project_temp(parent: PinnedDir, prefix: str, mode: int) -> tuple[str, int]:
+    """Create a new, empty temporary entry in ``parent`` and open it for writing.
+
+    Returns the entry's name and a descriptor the caller closes. ``O_EXCL``
+    and ``O_NOFOLLOW`` make it a fresh file, never an existing one or a link.
+    """
+    temporary = f"{prefix}{secrets.token_hex(12)}.tmp"
+    fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, mode)
+    return temporary, fd
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of ``data`` to ``fd``; a write that makes no progress is an error."""
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written == 0:
+            raise OSError("project file write made no progress")
+        remaining = remaining[written:]
 
 
 def _write_bytes_at_project_root(
@@ -881,19 +1017,13 @@ def _write_bytes_at_project_root(
                 raise HTTPException(status_code=400, detail="Path is a directory")
         # Replacing the entry detaches any pre-existing hardlink. Truncating
         # its inode could edit protected artifact bytes through an ordinary name.
-        temporary = f".cowork-file-{secrets.token_hex(12)}.tmp"
         mode = stat.S_IMODE(existing.st_mode) if existing is not None else 0o644
-        fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, mode)
+        temporary, fd = _create_project_temp(parent, ".cowork-file-", mode)
         try:
             try:
                 if existing is not None and hasattr(os, "fchmod"):
                     os.fchmod(fd, mode)
-                remaining = memoryview(data)
-                while remaining:
-                    written = os.write(fd, remaining)
-                    if written == 0:
-                        raise OSError("project file write made no progress")
-                    remaining = remaining[written:]
+                _write_all(fd, data)
                 result = os.fstat(fd)
             finally:
                 os.close(fd)
@@ -905,6 +1035,344 @@ def _write_bytes_at_project_root(
             except FileNotFoundError:
                 pass
 
+
+
+_IMPORT_PREFIX = ".cowork-import-"
+_IMPORT_MAX_DEPTH = 32
+_IMPORT_STALE_SECONDS = 60 * 60
+_IMPORT_TEMP_NAME_LENGTH = len(_IMPORT_PREFIX) + 24 + len(".tmp")
+_WINDOWS_MAX_PATH = 259
+_WINDOWS_MAX_FOLDER = 247
+_MOVE_TRIES = 3
+_MOVE_RETRY_SECONDS = 0.35
+
+
+class _ImportWriteError(Exception):
+    """An import could not change the project; ``path`` is relative to the project root."""
+
+    def __init__(self, message: str, path: str) -> None:
+        """Keep a user-safe message and the project-relative path it is about."""
+        super().__init__(message)
+        self.path = path
+
+
+class _ImportConflict(_ImportWriteError):
+    """A target can't be written as asked; found before any byte is written."""
+
+
+class _ImportFileInUse(_ImportWriteError):
+    """Windows refused to replace a file another program holds open."""
+
+
+class _ImportDiskError(_ImportWriteError):
+    """The project folder refused a write, a move or a folder."""
+
+
+class _ImportRestoreFailed(_ImportWriteError):
+    """A failed import could not put a file back; ``kept`` is where its old copy still is."""
+
+    def __init__(self, message: str, path: str, kept: str | None) -> None:
+        """Name the file that could not be restored and the old copy kept beside it."""
+        super().__init__(message, path)
+        self.kept = kept
+
+
+@dataclass
+class _ImportTarget:
+    parts: tuple[str, ...]
+    old_mode: int | None = None
+    temporary: str | None = None
+    backup: str | None = None
+    state: str = "untouched"
+
+    @property
+    def path(self) -> str:
+        """The target as a project-relative path."""
+        return "/".join(self.parts)
+
+    @property
+    def folder(self) -> str:
+        """The target's folder as a project-relative path, ``""`` for the root."""
+        return "/".join(self.parts[:-1])
+
+
+def _folded(name: str) -> str:
+    """A name as a case-insensitive, Unicode-normalising filesystem compares it."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _utf16_length(path: str) -> int:
+    """A path's length as Windows counts it."""
+    return len(path.encode("utf-16-le")) // 2
+
+
+class _ProjectImport:
+    """Write a set of files into a project so that all of them land or none do.
+
+    ``check`` refuses every conflict before a byte is written. ``stage`` writes
+    one file's bytes to a temporary entry beside its target. ``commit`` moves
+    each old copy to a backup and each temporary onto its target, and only
+    after all of them moved removes the backups. Leaving the ``with`` block
+    with an exception undoes everything: files walked back in reverse, every
+    temporary removed, folders this import created removed if empty. A backup
+    is kept whenever its file could not be put back.
+
+    An old copy is only ever an entry with exactly the target's name: a name
+    the filesystem matches by folding case or Unicode form is a conflict, so
+    no file is touched that the import was not asked to replace.
+    """
+
+    def __init__(
+        self,
+        root: PinnedDir,
+        targets: list[tuple[str, ...]],
+        *,
+        windows: bool = os.name == "nt",
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """Hold the pinned project root and each target's path below it."""
+        self._root = root
+        self._targets = [_ImportTarget(tuple(parts)) for parts in targets]
+        self._windows = windows
+        self._clock = clock
+        self._sleep = sleep
+        self._created: list[tuple[str, ...]] = []
+        self._swept: set[tuple[str, ...]] = set()
+
+    def __enter__(self) -> "_ProjectImport":
+        """Start an import; leaving with an exception rolls it back."""
+        return self
+
+    def __exit__(self, exc_type: object, exc: BaseException | None, _tb: object) -> bool:
+        """On an exception, undo everything; a file that could not be put back replaces the error."""
+        if exc is None:
+            return False
+        failure = self._roll_back()
+        if failure is not None:
+            raise failure
+        return False
+
+    def check(self) -> None:
+        """Refuse any target that can't be written as asked, before anything is written."""
+        files: set[tuple[str, ...]] = set()
+        folders: dict[tuple[str, ...], tuple[str, ...]] = {}
+        for target in self._targets:
+            if not target.parts or len(target.parts) > _IMPORT_MAX_DEPTH:
+                raise _ImportConflict(f"{target.path} is more than {_IMPORT_MAX_DEPTH} folders deep.", target.path)
+            key = tuple(_folded(part) for part in target.parts)
+            if key in files:
+                raise _ImportConflict(f"Two picked files would both be saved as {target.path}.", target.path)
+            files.add(key)
+            for depth in range(1, len(key)):
+                spelled = folders.setdefault(key[:depth], target.parts[:depth])
+                if spelled != target.parts[:depth]:
+                    raise _ImportConflict(
+                        f"{'/'.join(target.parts[:depth])} and {'/'.join(spelled)} would be one folder "
+                        "on some computers. Rename one of them.",
+                        target.path,
+                    )
+        for target in self._targets:
+            if tuple(_folded(part) for part in target.parts) in folders:
+                raise _ImportConflict(f"{target.path} would be both a file and a folder.", target.path)
+        if self._windows:
+            self._check_windows_lengths()
+        for target in self._targets:
+            try:
+                self._check_on_disk(target)
+            except OSError as exc:
+                raise _ImportDiskError(f"Couldn't read {target.path} in the project folder.", target.path) from exc
+
+    def stage(self, index: int, feed: Callable[[Callable[[bytes], None]], object]) -> None:
+        """Write one target's bytes to a new temporary entry beside it.
+
+        ``feed`` is called with a sink and pushes the file's bytes into it.
+        An ``OSError`` or ``ValueError``, from the disk or from ``feed``,
+        becomes a disk error; any other error from ``feed`` propagates.
+        """
+        target = self._targets[index]
+        try:
+            with _opened_pinned_descendant(
+                self._root, target.parts[:-1], create=True, created=self._created
+            ) as parent:
+                self._sweep(parent, target.parts[:-1])
+                mode = target.old_mode if target.old_mode is not None else 0o644
+                temporary, fd = _create_project_temp(parent, _IMPORT_PREFIX, mode)
+                target.temporary = temporary
+                try:
+                    if target.old_mode is not None and hasattr(os, "fchmod"):
+                        os.fchmod(fd, mode)
+                    feed(lambda chunk: _write_all(fd, chunk))
+                finally:
+                    os.close(fd)
+        except (OSError, ValueError) as exc:
+            raise _ImportDiskError(f"Couldn't write {target.path} to the project folder.", target.path) from exc
+
+    def commit(self) -> None:
+        """Move every staged file into place, then drop the backups of the files it replaced."""
+        for target in self._targets:
+            try:
+                with _opened_pinned_descendant(self._root, target.parts[:-1], create=False) as parent:
+                    name = target.parts[-1]
+                    if target.old_mode is not None:
+                        backup = f"{_IMPORT_PREFIX}{secrets.token_hex(12)}.bak"
+                        # A held old copy means the user has it open, so it is not retried.
+                        dir_replace(parent, name, backup)
+                        target.backup = backup
+                        target.state = "backed_up"
+                    self._retrying(lambda: dir_replace(parent, target.temporary, name))
+                    target.temporary = None
+                    target.state = "replaced"
+            except (OSError, ValueError) as exc:
+                if self._windows and isinstance(exc, PermissionError):
+                    raise _ImportFileInUse(
+                        f"{target.path} is open in another program. Close it and import again.", target.path
+                    ) from exc
+                raise _ImportDiskError(f"Couldn't move {target.path} into place.", target.path) from exc
+        for target in self._targets:
+            if target.backup is not None:
+                self._discard(target, target.backup)
+                target.backup = None
+
+    def _check_windows_lengths(self) -> None:
+        """Refuse a target whose path, temporary entry or new folder would pass Windows' limits."""
+        base = str(self._root.path)
+        for target in self._targets:
+            folder = os.path.join(base, *target.parts[:-1])
+            if (
+                _utf16_length(os.path.join(base, *target.parts)) > _WINDOWS_MAX_PATH
+                or _utf16_length(folder) + 1 + _IMPORT_TEMP_NAME_LENGTH > _WINDOWS_MAX_PATH
+                or any(
+                    _utf16_length(os.path.join(base, *target.parts[:depth])) > _WINDOWS_MAX_FOLDER
+                    for depth in range(1, len(target.parts))
+                )
+            ):
+                raise _ImportConflict(f"{target.path} would be too long a path for Windows.", target.path)
+
+    def _check_on_disk(self, target: _ImportTarget) -> None:
+        """Refuse links, folders and case or Unicode variants in the way; note an old copy's mode."""
+        with ExitStack() as opened:
+            current = self._root
+            for depth, name in enumerate(target.parts, start=1):
+                shown = "/".join(target.parts[:depth])
+                if not name or os.path.basename(name) != name or name in {".", ".."}:
+                    raise _ImportConflict(f"{shown} isn't a valid name.", target.path)
+                try:
+                    found = dir_lstat(current, name)
+                except FileNotFoundError:
+                    return
+                if stat.S_ISLNK(found.st_mode):
+                    raise _ImportConflict(f"{shown} is a link, so the import won't write through it.", target.path)
+                try:
+                    _existing_entry_name(current, name)
+                except FileNotFoundError:
+                    raise _ImportConflict(
+                        f"{shown} matches an existing name that differs only in case or accents. Rename one of them.",
+                        target.path,
+                    ) from None
+                if depth < len(target.parts):
+                    if not stat.S_ISDIR(found.st_mode):
+                        raise _ImportConflict(f"{shown} is a file, but the import needs a folder there.", target.path)
+                    current = open_pinned_child(current, name)
+                    opened.callback(current.close)
+                elif stat.S_ISDIR(found.st_mode):
+                    raise _ImportConflict(f"{shown} is a folder, so the file can't be saved there.", target.path)
+                elif not stat.S_ISREG(found.st_mode):
+                    raise _ImportConflict(f"{shown} isn't a regular file.", target.path)
+                else:
+                    target.old_mode = stat.S_IMODE(found.st_mode)
+
+    def _sweep(self, parent: PinnedDir, folder: tuple[str, ...]) -> None:
+        """Remove import temporaries a killed import left in this folder over an hour ago."""
+        if folder in self._swept:
+            return
+        self._swept.add(folder)
+        cutoff = self._clock() - _IMPORT_STALE_SECONDS
+        with dir_scandir(parent) as entries:
+            names = [e.name for e in entries if e.name.startswith(_IMPORT_PREFIX) and e.name.endswith(".tmp")]
+        for name in names:
+            try:
+                found = dir_lstat(parent, name)
+                if stat.S_ISREG(found.st_mode) and found.st_mtime < cutoff:
+                    dir_unlink(parent, name)
+            except OSError as exc:
+                logger.warning("Could not remove a stale import temporary in %r: %s", "/".join(folder), exc)
+
+    def _retrying(self, action: Callable[[], None]) -> None:
+        """Run a move or removal, retrying briefly on Windows where a scanner may hold the file."""
+        tries = _MOVE_TRIES if self._windows else 1
+        for attempt in range(tries):
+            try:
+                action()
+                return
+            except PermissionError:
+                if attempt == tries - 1:
+                    raise
+                self._sleep(_MOVE_RETRY_SECONDS)
+
+    def _discard(self, target: _ImportTarget, name: str) -> None:
+        """Remove a temporary or backup beside ``target``; a failure is logged, not raised."""
+        try:
+            with _opened_pinned_descendant(self._root, target.parts[:-1], create=False) as parent:
+                self._retrying(lambda: dir_unlink(parent, name))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            logger.warning("Import could not remove %r beside %r: %s", name, target.path, exc)
+
+    def _roll_back(self) -> _ImportRestoreFailed | None:
+        """Undo every target in reverse, then remove the folders this import made; return the first restore failure."""
+        failure: _ImportRestoreFailed | None = None
+        for target in reversed(self._targets):
+            failed = self._undo(target)
+            if failure is None:
+                failure = failed
+        for parts in sorted(self._created, key=len, reverse=True):
+            try:
+                with _opened_pinned_descendant(self._root, parts[:-1], create=False) as parent:
+                    dir_rmdir(parent, parts[-1])
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                    logger.warning("Import could not remove the folder %r it created: %s", "/".join(parts), exc)
+        return failure
+
+    def _undo(self, target: _ImportTarget) -> _ImportRestoreFailed | None:
+        """Put one target back as it was and remove its temporary; report a file that stays changed."""
+        name = target.parts[-1]
+        try:
+            if target.state != "untouched":
+                with _opened_pinned_descendant(self._root, target.parts[:-1], create=False) as parent:
+                    if target.backup is not None:
+                        backup = target.backup
+                        self._retrying(lambda: dir_replace(parent, backup, name))
+                        target.backup = None
+                    else:
+                        self._retrying(lambda: dir_unlink(parent, name))
+                    target.state = "untouched"
+        except (OSError, ValueError) as exc:
+            if target.backup is not None:
+                kept = "/".join((*target.parts[:-1], target.backup))
+                failure = _ImportRestoreFailed(
+                    f"The import failed and {target.path} couldn't be put back. "
+                    f"Its old copy was kept as {kept}.",
+                    target.path,
+                    kept,
+                )
+            else:
+                failure = _ImportRestoreFailed(
+                    f"The import failed and couldn't remove {target.path}, which it had added.",
+                    target.path,
+                    None,
+                )
+            failure.__cause__ = exc
+            return failure
+        finally:
+            if target.temporary is not None:
+                self._discard(target, target.temporary)
+                target.temporary = None
+        return None
 
 
 def _write_project_bytes(
@@ -1011,7 +1479,7 @@ def _close_instruction_context(
 
 
 def _pinned_stream(
-    target: Path, base: Path, *, media_type: str, headers: dict
+    target: Path, base: Path, *, media_type: str, headers: dict, scope: TenantScope
 ) -> StreamingResponse:
     """Serve `target` from a pinned descriptor.
 
@@ -1025,14 +1493,20 @@ def _pinned_stream(
     file that keeps growing cannot keep the response open.
     """
     cm, fd, st = _pinned_regular_file(target, base)
-
-    def _chunks():
-        try:
-            yield from read_bounded(fd, st.st_size)
-        finally:
-            cm.__exit__(None, None, None)
-
-    return StreamingResponse(_chunks(), media_type=media_type, headers=headers)
+    resources = ExitStack()
+    resources.push(cm)
+    try:
+        return PinnedStreamingResponse(
+            read_bounded(fd, st.st_size),
+            resources=resources,
+            scope=scope,
+            media_type=media_type,
+            headers=headers,
+        )
+    except BaseException:
+        # No response exists to close the descriptor.
+        resources.close()
+        raise
 
 
 @router.get(
@@ -1040,10 +1514,21 @@ def _pinned_stream(
     response_model=ProjectInstructionsResponse,
     response_model_exclude_unset=True,
 )
-def get_project_instructions(
+async def get_project_instructions(
     project_name: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(
+        partial(_get_project_instructions, project_name=project_name, principal=principal), scope=scope
+    )
+
+
+def _get_project_instructions(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    principal: Principal | None,
 ):
     project = _project_for_name(project_name, scoped)
     base = _project_dir(project_name, scoped)
@@ -1094,10 +1579,19 @@ def get_project_instructions(
     response_model=ProjectFileListResponse,
     response_model_exclude_unset=True,
 )
-def list_project_files(
+async def list_project_files(
     project_name: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(partial(_list_project_files, project_name=project_name, principal=principal), scope=scope)
+
+
+def _list_project_files(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    principal: Principal | None,
 ):
     project = _project_for_name(project_name, scoped)
     base = _project_dir(project_name, scoped)
@@ -1165,11 +1659,23 @@ def list_project_files(
     response_model=ProjectFileReadResponse,
     response_model_exclude_unset=True,
 )
-def read_project_file(
+async def read_project_file(
     project_name: str,
     path: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(
+        partial(_read_project_file, project_name=project_name, path=path, principal=principal), scope=scope
+    )
+
+
+def _read_project_file(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: str,
+    principal: Principal | None,
 ):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
@@ -1231,20 +1737,260 @@ def read_project_file(
     return response
 
 
+class _ArtifactFolder(NamedTuple):
+    """An artifact folder a project files path lies in: the conversation
+    whose legacy root holds it, None for the project's shared root, and the
+    folder's name."""
+
+    conversation_id: UUID | None
+    slug: str
+
+
+class _ArtifactFolderPath(NamedTuple):
+    """A project files path below an artifact folder (_artifact_folder_path)."""
+
+    folder: _ArtifactFolder
+    #: The path's parts below the folder.
+    below: tuple[str, ...]
+
+
+def _artifact_folder_path(path: _ValidatedProjectPath) -> _ArtifactFolderPath | None:
+    """The artifact folder `path` lies in, when it lies in one: below a
+    project's shared root (`.anton/artifacts/<slug>/...`), or below a
+    conversation's legacy root (`conversations/<id>/.anton/artifacts/<slug>/
+    ...`), whose workspace name only counts in its canonical spelling
+    (artifact_roots.workspace_conversation_id). A file directly in a root is
+    no folder, and a folder whose name starts with a dot is none the list
+    opens (held_artifact_roots.listable_folders). Compared by parts,
+    case-sensitive, as the organization's file store is; the PUT and the
+    DELETE refuse a link in every component, so these parts are where they
+    wrote or deleted."""
+    parts = path.parts
+    conversation_id = None
+    if parts[0] == CONVERSATIONS_DIRNAME and len(parts) > 2:
+        conversation_id = workspace_conversation_id(parts[1])
+        if conversation_id is None:
+            return None
+        parts = parts[2:]
+    if len(parts) < 4 or parts[:2] != _ARTIFACTS_SUBPATH or parts[2].startswith("."):
+        return None
+    return _ArtifactFolderPath(
+        folder=_ArtifactFolder(conversation_id=conversation_id, slug=parts[2]), below=parts[3:]
+    )
+
+
+def _artifact_folder_written(path: _ValidatedProjectPath) -> _ArtifactFolder | None:
+    """The artifact folder a PUT of `path` wrote into, when it wrote into one
+    (_artifact_folder_path)."""
+    found = _artifact_folder_path(path)
+    return found.folder if found is not None else None
+
+
+def _artifact_folder_unlisted(path: _ValidatedProjectPath) -> _ArtifactFolder | None:
+    """The artifact folder whose card a DELETE of `path` removed: the
+    folder's own `metadata.json`, without which the artifacts list shows no
+    card for it. A DELETE never removes a folder (_delete_project_entry
+    refuses one), and any other file leaves the folder's card as it was."""
+    found = _artifact_folder_path(path)
+    return found.folder if found is not None and found.below == ("metadata.json",) else None
+
+
+def _record_artifact_folder_write(scoped: ScopedSession, *, project_name: str, path: _ValidatedProjectPath) -> None:
+    """After a PUT wrote into an artifact folder (_artifact_folder_written),
+    record two rows in the PUT's own unit, so the artifacts list shows the
+    folder: that the folder's root holds one (held_artifact_roots.hold_root),
+    so the list opens that root, and the folder's sort time
+    (artifact_sort_times.record_sort_times), so the list counts the folder
+    among the newest. The root is the project's shared root, or the caller's
+    own conversation's legacy root, which after the backfills only this PUT
+    and a comparison side's carry (ComparisonService._hold_carried_workspace)
+    record. Only org tenancy keeps these rows.
+
+    The time is the modification time of the folder's `metadata.json`
+    (_record_folder_time). A folder whose `metadata.json` is not written yet
+    gets no time; the PUT that writes it records one, and a later PUT into
+    the folder only moves the row to a newer time (record_sort_times).
+
+    Best-effort: the file is written already, so a failure is logged at
+    ERROR and the PUT still succeeds. Each row has its own try, so a failed
+    hold still records the time. For a shared root a failed hold asks for
+    the project's location check
+    (_ask_for_location_check), whose listing holds the root and records the
+    time of every folder it reads. A legacy root has no self-heal: its rows
+    wait for the next PUT into the folder."""
+    from cowork.services.artifact_locations import keeps_locations
+    from cowork.services.held_artifact_roots import hold_root
+
+    folder = _artifact_folder_written(path)
+    if folder is None or not keeps_locations(scoped.scope):
+        return
+    project = None
+    try:
+        project = _artifact_folder_project(scoped, project_name)
+        hold_root(scoped, project_id=project.id, conversation_id=folder.conversation_id)
+    except Exception:
+        scoped.rollback()
+        logger.error(
+            "Could not record that a project files write put an artifact folder in its root",
+            exc_info=True,
+            extra={"event": "held_artifact_root_not_recorded", **_folder_write_context(project, folder)},
+        )
+        _ask_for_location_check(scoped, project=project, folder=folder)
+    if project is None:
+        return
+    _record_folder_time(scoped, project=project, folder=folder)
+
+
+def _artifact_folder_project(scoped: ScopedSession, project_name: str) -> ProjectRow:
+    """`project_name`'s row as plain values, which stay readable after a
+    failed commit expires every loaded row. An org project's folder is never
+    one the user chose (ProjectService.directory_is_external)."""
+    found = _project_for_name(project_name, scoped)
+    return ProjectRow(id=found.id, name=found.name, path=found.path, external=False)
+
+
+def _record_folder_time(scoped: ScopedSession, *, project: ProjectRow, folder: _ArtifactFolder) -> None:
+    """Record `folder`'s sort time in `project` (artifact_sort_times.
+    record_sort_times): the modification time of its `metadata.json`, read
+    here (id_holder_times), since the project files units run on the file
+    store's threads (run_efs_unit). A folder with no `metadata.json`, or one
+    that holds no id, gets no time, and a row only moves to a newer time.
+
+    Best-effort: a failed write is rolled back and logged at ERROR. A
+    `metadata.json` the read could not reach, such as on EIO, is logged at
+    WARNING and leaves the folder's row as it was. For a shared root either
+    one asks for the project's location check (_ask_for_location_check),
+    whose listing records the time of every folder it reads."""
+    from cowork.services.artifact_sort_times import id_holder_times, record_sort_times
+
+    try:
+        read = id_holder_times(base=recorded_source(project, folder.conversation_id).base, slugs=[folder.slug])
+        record_sort_times(scoped, project_id=project.id, times=read.times, conversation_id=folder.conversation_id)
+    except Exception:
+        scoped.rollback()
+        logger.error(
+            "Could not record the sort time of an artifact folder a project files request changed",
+            exc_info=True,
+            extra={"event": "artifact_sort_time_not_recorded", **_folder_write_context(project, folder)},
+        )
+        _ask_for_location_check(scoped, project=project, folder=folder)
+        return
+    if read.unreadable:
+        # The event and level a turn end's or the self-heal's read logs for
+        # folders whose time it could not read.
+        logger.warning(
+            "Could not read the metadata.json of an artifact folder a project files request changed, so its sort "
+            "time was not updated",
+            extra={
+                "event": "artifact_sort_times_unreadable",
+                **_folder_write_context(project, folder),
+                "count": len(read.unreadable),
+            },
+        )
+        _ask_for_location_check(scoped, project=project, folder=folder)
+
+
+def _folder_write_context(
+    project: ProjectRow | None, folder: _ArtifactFolder
+) -> dict[str, str | tuple[str, ...]]:
+    """The log fields of a folder a PUT or a DELETE changed: its project,
+    when the request found its row, its conversation for a legacy root, and
+    its name."""
+    return log_context(
+        project_id=project.id if project is not None else None,
+        conversation_id=folder.conversation_id,
+        artifact_slug=folder.slug,
+    )
+
+
+def _ask_for_location_check(
+    scoped: ScopedSession, *, project: ProjectRow | None, folder: _ArtifactFolder
+) -> None:
+    """After a PUT or a DELETE could not record a row of `folder` in
+    `project`'s shared root (_record_artifact_folder_write,
+    _record_folder_time), ask for the project's location check
+    (artifact_autopublish.request_project_location_check). Its listing of
+    the shared root holds the root and records the time of every folder it
+    reads (artifact_autopublish._record_listing). Nothing is asked for a
+    legacy root, which has no self-heal, or when the request found no
+    project row."""
+    from cowork.services.artifact_autopublish import request_project_location_check
+
+    if project is None or folder.conversation_id is not None:
+        return
+    request_project_location_check(
+        artifacts_base=recorded_source(project, None).base, scope=scoped.scope, project_id=str(project.id)
+    )
+
+
+def _forget_artifact_folder_delete(scoped: ScopedSession, *, project_name: str, path: _ValidatedProjectPath) -> None:
+    """After a DELETE removed an artifact folder's `metadata.json`
+    (_artifact_folder_unlisted), drop that folder's sort-time row
+    (artifact_sort_times.forget_sort_time), in the project's shared root or
+    in the caller's own conversation's legacy root, in the DELETE's own
+    unit. Without its `metadata.json` the folder shows no card, so its row
+    would only cost the list a failed open among its newest rows, and no
+    self-heal lists a legacy root to drop it there. Only org tenancy keeps
+    these rows.
+
+    A PUT of the same `metadata.json` may write it again and record its row
+    between the unlink and the drop. So after the drop the DELETE reads the
+    folder's time again and records it (_record_folder_time): the row comes
+    back when the file is back, and none is written when it is still gone.
+
+    Best-effort: the file is deleted already, so a failed drop is rolled
+    back and logged at WARNING, and the DELETE still succeeds."""
+    from cowork.services.artifact_locations import Location, keeps_locations
+    from cowork.services.artifact_sort_times import forget_sort_time
+
+    folder = _artifact_folder_unlisted(path)
+    if folder is None or not keeps_locations(scoped.scope):
+        return
+    project = None
+    try:
+        project = _artifact_folder_project(scoped, project_name)
+        forget_sort_time(
+            scoped, location=Location(project_id=project.id, conversation_id=folder.conversation_id, slug=folder.slug)
+        )
+    except Exception:
+        scoped.rollback()
+        logger.warning(
+            "Could not drop the sort time of an artifact folder whose metadata.json a project files delete removed",
+            exc_info=True,
+            extra={"event": "artifact_sort_time_not_dropped", **_folder_write_context(project, folder)},
+        )
+        return
+    _record_folder_time(scoped, project=project, folder=folder)
+
+
 @router.put(
     "/{project_name}/files/{path:path}",
     response_model=ProjectFileWriteResponse,
     dependencies=[Depends(_authorize_artifact_file_mutation)],
     response_model_exclude_unset=True,
 )
-def write_project_file(
+async def write_project_file(
     project_name: str,
     path: ProjectMutationPathDep,
     req: _FileWriteRequest,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
 ):
+    return await run_efs_unit(
+        partial(_write_project_file, project_name=project_name, path=path, req=req, principal=principal), scope=scope
+    )
+
+
+def _write_project_file(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: ProjectMutationPathDep,
+    req: _FileWriteRequest,
+    principal: Principal | None,
+):
     _require_workspace_path(path, scoped)
+    _require_canonical_workspace(path, scoped)
     classification_base = (
         _project_dir(project_name, scoped) if scoped.scope.org_mode else None
     )
@@ -1355,6 +2101,7 @@ def write_project_file(
             )
         raise
     response = {"path": path.value, "size": st.st_size, "modified": st.st_mtime}
+    _record_artifact_folder_write(scoped, project_name=project_name, path=path)
     if instructions_context is not None:
         project = instructions_context.project
         access = instructions_context.access
@@ -1404,13 +2151,23 @@ def write_project_file(
     return response
 
 
-@router.post("/{project_name}/files/upload")
+# Unset fields stay out of each result: a written file has no error, a refused
+# one no size.
+@router.post("/{project_name}/files/upload", response_model=ProjectUploadResponse, response_model_exclude_unset=True)
 async def upload_project_files(
     project_name: str,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     files: list[UploadFile] = File(...),
 ):
-    results: list[dict[str, Any]] = []
+    # The project lookup and the writes run together on the file store's
+    # threads. Each upload is read there from its own spool, one at a time and
+    # only once the project is found, so a request holds at most one file's
+    # bytes in memory.
+    return await run_efs_unit(partial(_write_uploads, project_name=project_name, uploads=files), scope=scope)
+
+
+def _write_uploads(scoped: ScopedSession, *, project_name: str, uploads: list[UploadFile]) -> ProjectUploadResponse:
+    results: list[ProjectUploadResult] = []
     with _opened_project_directory_inventory(scoped) as inventory:
         selected_project_name = os.path.basename(project_name)
         if (
@@ -1432,28 +2189,195 @@ async def upload_project_files(
         if directory is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
-        for f in files:
-            if not f.filename:
-                results.append({"name": "", "ok": False, "error": "filename missing"})
+        for upload in uploads:
+            if not upload.filename:
+                results.append(ProjectUploadResult(name="", ok=False, error="filename missing"))
                 continue
-            safe_name = os.path.basename(f.filename).strip()
+            safe_name = os.path.basename(upload.filename).strip()
             if not safe_name or safe_name.startswith("."):
-                results.append(
-                    {"name": f.filename, "ok": False, "error": "invalid filename"}
-                )
+                results.append(ProjectUploadResult(name=upload.filename, ok=False, error="invalid filename"))
                 continue
             try:
-                data = await f.read()
+                data = upload.file.read()
                 _write_bytes_at_project_root(
                     directory, _ValidatedProjectPath((safe_name,)), data
                 )
-                results.append({"name": safe_name, "ok": True, "size": len(data)})
+                results.append(ProjectUploadResult(name=safe_name, ok=True, size=len(data)))
             except Exception as exc:
                 logger.error("Failed to write file %s: %s", safe_name, exc)
-                results.append(
-                    {"name": safe_name, "ok": False, "error": "File write failed"}
-                )
-    return {"results": results}
+                results.append(ProjectUploadResult(name=safe_name, ok=False, error="File write failed"))
+    return ProjectUploadResponse(results=results)
+
+
+_SHAREPOINT_IMPORT_FIELDS = frozenset({"connection", "site", "drive_id", "folder", "item_ids"})
+_IMPORTS_RUNNING: set[UUID] = set()
+_IMPORTS_LOCK = threading.Lock()
+_SHAREPOINT_IMPORT_STATUS = {
+    SharePointErrorKind.INVALID: status.HTTP_400_BAD_REQUEST,
+    SharePointErrorKind.TENANT_NOT_FOUND: status.HTTP_409_CONFLICT,
+    SharePointErrorKind.APP_NOT_FOUND: status.HTTP_409_CONFLICT,
+    SharePointErrorKind.KEY_REJECTED: status.HTTP_409_CONFLICT,
+    SharePointErrorKind.SITE_NOT_GRANTED: status.HTTP_404_NOT_FOUND,
+    SharePointErrorKind.ITEM_NOT_FOUND: status.HTTP_404_NOT_FOUND,
+    SharePointErrorKind.THROTTLED: status.HTTP_429_TOO_MANY_REQUESTS,
+    SharePointErrorKind.UNREACHABLE: status.HTTP_502_BAD_GATEWAY,
+    SharePointErrorKind.TOO_MANY_FILES: status.HTTP_413_CONTENT_TOO_LARGE,
+    SharePointErrorKind.TOO_LARGE: status.HTTP_413_CONTENT_TOO_LARGE,
+    SharePointErrorKind.BAD_NAME: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    SharePointErrorKind.PLAN_TOO_SLOW: status.HTTP_504_GATEWAY_TIMEOUT,
+    SharePointErrorKind.IMPORT_TOO_SLOW: status.HTTP_504_GATEWAY_TIMEOUT,
+}
+_IMPORT_WRITE_STATUS: dict[type[_ImportWriteError], int] = {
+    _ImportConflict: status.HTTP_409_CONFLICT,
+    _ImportFileInUse: status.HTTP_409_CONFLICT,
+    _ImportDiskError: status.HTTP_507_INSUFFICIENT_STORAGE,
+    _ImportRestoreFailed: status.HTTP_500_INTERNAL_SERVER_ERROR,
+}
+
+
+@dataclass(frozen=True)
+class _SharePointImportRequest:
+    connection: str
+    site: str
+    drive_id: str
+    folder: str
+    item_ids: list[str]
+
+
+def _sharepoint_import_request(body: Any) -> _SharePointImportRequest:
+    """Validate the import body: exactly its fields, strings, and 1 to 100 distinct item ids.
+
+    Every refusal is a fixed message, never an echo of the body.
+    """
+    invalid = HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail="Send connection, site, drive_id, folder and item_ids (a list of 1 to 100 ids).",
+    )
+    if not isinstance(body, dict) or set(body) != _SHAREPOINT_IMPORT_FIELDS:
+        raise invalid
+    text = {name: body[name] for name in ("connection", "site", "drive_id", "folder")}
+    item_ids = body["item_ids"]
+    if not all(isinstance(value, str) for value in text.values()):
+        raise invalid
+    if not isinstance(item_ids, list) or not all(isinstance(value, str) for value in item_ids):
+        raise invalid
+    distinct = list(dict.fromkeys(item_ids))
+    if not 1 <= len(distinct) <= 100:
+        raise invalid
+    return _SharePointImportRequest(item_ids=distinct, **text)
+
+
+def _reserved_import_folder(name: str) -> bool:
+    """Whether a top-level project folder is Cowork's own and closed to imports."""
+    return name.casefold() in SERVER_PROJECT_FOLDERS
+
+
+def _import_folder_parts(folder: str, scoped: ScopedSession) -> tuple[str, ...]:
+    """The destination folder as path parts; ``""`` is the project root."""
+    if folder == "":
+        return ()
+    path = _validated_project_path(folder)
+    if any(part.startswith(".") for part in path.parts):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid path")
+    if _reserved_import_folder(path.parts[0]):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This folder is reserved for Cowork.")
+    _require_workspace_path(path, scoped)
+    return path.parts
+
+
+def _detached_root(directory: PinnedDir) -> PinnedDir:
+    """A second handle on a pinned project root that outlives the inventory that opened it."""
+    if directory.fd is None:
+        return PinnedDir(None, directory.path)
+    return PinnedDir(os.dup(directory.fd), directory.path)
+
+
+def _sharepoint_import_error(exc: SharePointError) -> HTTPException:
+    """The import response for a SharePoint failure; a stored key that stopped working is one message."""
+    detail = str(exc)
+    if exc.kind in {
+        SharePointErrorKind.TENANT_NOT_FOUND,
+        SharePointErrorKind.APP_NOT_FOUND,
+        SharePointErrorKind.KEY_REJECTED,
+    }:
+        detail = _KEY_NO_LONGER_WORKS
+    return HTTPException(status_code=_SHAREPOINT_IMPORT_STATUS[exc.kind], detail=detail)
+
+
+@contextmanager
+def _project_import_lock(project_id: UUID) -> Iterator[None]:
+    """Let one import at a time run into a project; a second one is refused, not queued."""
+    with _IMPORTS_LOCK:
+        if project_id in _IMPORTS_RUNNING:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Another import into this project is still running.",
+            )
+        _IMPORTS_RUNNING.add(project_id)
+    try:
+        yield
+    finally:
+        with _IMPORTS_LOCK:
+            _IMPORTS_RUNNING.discard(project_id)
+
+
+@router.post(
+    "/{project_name}/files/import/sharepoint",
+    dependencies=[Depends(require(DesktopOnly))],
+    response_model=SharePointImportResponse,
+)
+def import_sharepoint_files(
+    project_name: str,
+    body: Annotated[Any, Body()],
+    scoped: ScopedSessionDep,
+) -> SharePointImportResponse:
+    """Copy picked files and folders from a SharePoint site into a project.
+
+    Every check that needs the database runs first, then the session is
+    closed: the walk and the downloads can take minutes. Files land together
+    or not at all (``_ProjectImport``). Desktop only.
+    """
+    request = _sharepoint_import_request(body)
+    key, sites = _stored_connection(scoped.scope, request.connection)
+    site_url = _granted_site(request.site, sites)
+    folder = _import_folder_parts(request.folder, scoped)
+    project = _project_for_name(project_name, scoped)
+    with _project_import_lock(project.id), ExitStack() as held:
+        with _opened_selected_project_directory(project_name, scoped) as directory:
+            root = _detached_root(directory)
+        held.callback(root.close)
+        scoped.close()
+        try:
+            with SharePointClient(key) as client:
+                deadline = client.import_deadline()
+                plan = client.plan_import(site_url, request.drive_id, request.item_ids)
+                if not folder and any(_reserved_import_folder(f.parts[0]) for f in plan.files):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST, detail="This folder is reserved for Cowork."
+                    )
+                budget = DownloadBudget()
+                sizes: list[int] = []
+                with _ProjectImport(root, [(*folder, *f.parts) for f in plan.files]) as writer:
+                    writer.check()
+                    for index, planned in enumerate(plan.files):
+                        writer.stage(
+                            index,
+                            lambda sink, item_id=planned.item_id: sizes.append(
+                                client.download(plan.site, plan.drive_id, item_id, sink, budget, deadline)
+                            ),
+                        )
+                    writer.commit()
+        except SharePointError as exc:
+            raise _sharepoint_import_error(exc) from exc
+        except _ImportWriteError as exc:
+            raise HTTPException(status_code=_IMPORT_WRITE_STATUS[type(exc)], detail=str(exc)) from exc
+    return SharePointImportResponse(
+        imported=[
+            SharePointImportedFile(path="/".join((*folder, *planned.parts)), size=size)
+            for planned, size in zip(plan.files, sizes, strict=True)
+        ],
+        skipped=[SharePointSkippedItem(path=item.path, reason=item.reason) for item in plan.skipped],
+    )
 
 
 @router.delete(
@@ -1461,11 +2385,23 @@ async def upload_project_files(
     response_model=ProjectFileDeleteResponse,
     dependencies=[Depends(_authorize_artifact_file_mutation)],
 )
-def delete_project_file(
+async def delete_project_file(
     project_name: str,
     path: ProjectMutationPathDep,
-    scoped: ScopedSessionDep,
+    scope: ScopeDep,
     principal: Principal | None = Depends(get_principal),
+):
+    return await run_efs_unit(
+        partial(_delete_project_file, project_name=project_name, path=path, principal=principal), scope=scope
+    )
+
+
+def _delete_project_file(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: ProjectMutationPathDep,
+    principal: Principal | None,
 ):
     _require_workspace_path(path, scoped)
     classification_base = (
@@ -1573,19 +2509,33 @@ def delete_project_file(
             _close_instruction_context(instructions_context)
             raise
         _close_instruction_context(instructions_context)
+    _forget_artifact_folder_delete(scoped, project_name=project_name, path=path)
     return {"status": "deleted", "path": path.value}
 
 
 @router.delete(
     "/{project_name}/skill_drafts/{slug}", status_code=status.HTTP_204_NO_CONTENT
 )
-def delete_skill_draft(project_name: str, slug: str, scoped: ScopedSessionDep):
+async def delete_skill_draft(
+    project_name: str,
+    slug: str,
+    scope: ScopeDep,
+):
     """Remove a staged skill draft once it is Saved (or dismissed).
 
     Idempotent: a missing draft is a no-op — Save may race the sweep, and a
     lingering draft is the safe default we're clearing, not a hard error. The
     slug is confined to a direct child of the drafts dir (no traversal).
     """
+    return await run_efs_unit(partial(_delete_skill_draft, project_name=project_name, slug=slug), scope=scope)
+
+
+def _delete_skill_draft(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    slug: str,
+):
     safe_slug = os.path.basename(slug)
     if (
         safe_slug != slug
@@ -1615,13 +2565,24 @@ def delete_skill_draft(project_name: str, slug: str, scoped: ScopedSessionDep):
 
 
 @router.post("/preview-mount-file")
-def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
+async def preview_mount_file(
+    req: _PreviewMountRequest,
+    scope: ScopeDep,
+):
+    return await run_efs_unit(partial(_preview_mount_file, req=req), scope=scope)
+
+
+def _preview_mount_file(
+    scoped: ScopedSession,
+    *,
+    req: _PreviewMountRequest,
+):
     base = _project_dir(req.name, scoped)
     target = _safe_relpath(req.path, base)
     _require_workspace_access(target, base, scoped)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-    if target.suffix.lower() != ".html":
+    if target.suffix.lower() not in (".html", ".htm"):
         raise HTTPException(
             status_code=415, detail="Preview mount is only available for HTML files"
         )
@@ -1634,9 +2595,13 @@ def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
 
 
 @router.get("/preview-asset/{token}/{rel_path:path}")
-def preview_asset(
+async def preview_asset(
     token: str, rel_path: str, scope: TenantScope = Depends(get_tenant_scope)
 ):
+    return await run_efs(partial(_preview_asset, token=token, rel_path=rel_path, scope=scope), scope=scope)
+
+
+def _preview_asset(*, token: str, rel_path: str, scope: TenantScope):
     # An unknown token, an expired one and another member's one all answer the
     # same 404: which of the three it was is itself information about somebody
     # else's files.
@@ -1668,11 +2633,25 @@ def preview_asset(
         mount.project_base,
         media_type=media_type,
         headers={"Cache-Control": "private, max-age=300"},
+        scope=scope,
     )
 
 
 @router.get("/{project_name}/files-raw/{path:path}")
-def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep):
+async def download_project_file(
+    project_name: str,
+    path: str,
+    scope: ScopeDep,
+):
+    return await run_efs_unit(partial(_download_project_file, project_name=project_name, path=path), scope=scope)
+
+
+def _download_project_file(
+    scoped: ScopedSession,
+    *,
+    project_name: str,
+    path: str,
+):
     base = _project_dir(project_name, scoped)
     target = _safe_relpath(path, base)
     _require_workspace_access(target, base, scoped)
@@ -1683,5 +2662,6 @@ def download_project_file(project_name: str, path: str, scoped: ScopedSessionDep
         target,
         base,
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{target.name}"'},
+        headers={"Content-Disposition": attachment_disposition(target.name)},
+        scope=scoped.scope,
     )

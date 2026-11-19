@@ -427,6 +427,13 @@ class CodingSession(BaseModel):
     terminal_tabs: list[TerminalTab] = Field(default_factory=list, max_length=12)
     pinned: bool = False
     archived: bool = False
+    # Set while the task's workspace is removed to reclaim disk. Paths above
+    # stay as they were; the workspace is rebuilt there when next needed.
+    workspace_released_at: datetime | None = None
+    # Why the last release kept the workspace, and why the last rebuild of a
+    # released one failed; both clear when the next attempt succeeds.
+    workspace_kept_reason: str | None = None
+    workspace_restore_error: str | None = None
     last_error: str | None = None
     event_count: int = 0
     created_at: datetime = Field(default_factory=utc_now)
@@ -590,6 +597,33 @@ class CommitRequest(BaseModel):
 
 class RenameSessionRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
+
+
+class WorkspaceUsageItem(BaseModel):
+    session_id: str
+    bytes: int
+    # Part of ``bytes`` kept to recover the task's work: snapshots, saved
+    # copies and released-workspace state.
+    recovery_bytes: int = 0
+
+
+class WorkspaceUsagePage(BaseModel):
+    """Approximate storage Cowork manages for each task.
+
+    Counts the task's workspaces, comparison baselines and recovery data in
+    Cowork's own folders. The user's original checkout and the repository
+    object stores that worktrees share are not counted. Sizes are allocated
+    blocks; on macOS a folder copy shares blocks with its source, so the space
+    deleting a task frees can be much lower than shown. ``measured_at`` is
+    ``None`` until the first measurement finishes.
+    """
+
+    items: list[WorkspaceUsageItem]
+    # Storage still held for tasks that no longer exist, such as their recovery copies.
+    removed_task_bytes: int = 0
+    total_bytes: int
+    measured_at: datetime | None = None
+    measuring: bool = False
 
 
 class SessionPage(BaseModel):

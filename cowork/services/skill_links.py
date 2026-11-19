@@ -3,6 +3,11 @@
 Each enabled skill is symlinked from the canonical store
 (``COWORK_SKILLS_DIR/<slug>``) into ``<projects_root>/<project>/skills/<slug>``.
 
+That fan-out runs only where skills and projects stay unpartitioned
+(``links_apply_to``). Where they are partitioned, nothing fans links out:
+each in-process turn links its own skills folder from the asker's store
+instead (``sync_turn_skill_links``).
+
 Scoping rules:
   - ``enabled=false`` → no links anywhere.
   - ``metadata.projects`` is empty → link to **all** discovered projects (global skill).
@@ -30,6 +35,9 @@ from pathlib import Path
 
 from cowork.common.paths import dir_rmdir, dir_unlink, pinned_dir, safe_join_lexical
 from cowork.common.settings import get_app_settings
+from cowork.db.personal_resources import PersonalResource
+from cowork.db.scoped import TenantScope, tenant_scope_required
+from cowork.managed import managed_folder
 from cowork.models.skill import Skill
 
 logger = logging.getLogger(__name__)
@@ -38,6 +46,44 @@ _IS_WINDOWS = os.name == "nt"
 
 if _IS_WINDOWS:
     import _winapi  # Windows-only stdlib; provides CreateJunction.
+
+
+def skill_partitions_enabled() -> bool:
+    """Whether this deployment keeps skills per org or per person.
+
+    True in org tenancy, and on a deployment that trusts identity headers and
+    lists skills in COWORK_PERSONAL_RESOURCES. There the unkeyed store belongs
+    to the operator view alone, so nothing fans its skills out into projects,
+    not even at boot.
+    """
+    settings = get_app_settings()
+    return settings.tenancy_mode == "org" or (
+        settings.trust_identity_headers
+        and PersonalResource.SKILLS in settings.personal_resources
+    )
+
+
+def links_apply_to(scope: TenantScope | None) -> bool:
+    """Whether a skill or project change under ``scope`` redistributes links.
+
+    Every link points from the unkeyed skills root into a project folder found
+    under the unkeyed projects root, so distribution belongs only to a scope
+    that keeps both skills and projects unpartitioned, on a deployment that
+    keeps skills unpartitioned: the desktop, and a trusted-identity deployment
+    that leaves skills shared (its operator view, and a person whose projects
+    are shared too). Anywhere else a link would name another person's or org's
+    skill, or land in a project that is not the caller's; those turns link
+    their own skills instead (sync_turn_skill_links). ``None`` is an unscoped
+    boot or migration path.
+    """
+    if skill_partitions_enabled():
+        return False
+    if scope is None:
+        return True
+    return not (
+        scope.partitioned_for(PersonalResource.SKILLS)
+        or scope.partitioned_for(PersonalResource.PROJECTS)
+    )
 
 
 def _canon_root() -> Path:
@@ -70,10 +116,10 @@ def _external_project_dirs() -> dict[str, Path]:
     A failure degrades to the scan alone, which is the behaviour before
     adopted folders existed, so it is logged rather than raised.
     """
-    if get_app_settings().tenancy_mode == "org":
-        # LOCAL_SCOPE below disables org filtering, so this query would read
-        # every tenant's rows. A folder can only be adopted on a local
-        # deployment, so there is nothing here to find.
+    if tenant_scope_required():
+        # LOCAL_SCOPE below disables partition filtering, so this query would
+        # read every org's or person's rows. A folder can only be adopted on an
+        # unpartitioned deployment, so there is nothing here to find.
         return {}
     try:
         from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
@@ -93,8 +139,18 @@ def _external_project_dirs() -> dict[str, Path]:
 
 
 def _all_projects() -> list[_ProjectDir]:
-    """Every project skills can be distributed into, scanned and adopted."""
-    projects = [_ProjectDir(name=path.name, path=path) for path in _project_dirs()]
+    """Every project skills can be distributed into, scanned and adopted.
+
+    Never a model-comparison sandbox: a link there would let a side's code
+    write into the person's own skills (comparisons copy them instead).
+    """
+    from cowork.services.projects import is_comparison_sandbox
+
+    projects = [
+        _ProjectDir(name=path.name, path=path)
+        for path in _project_dirs()
+        if not is_comparison_sandbox(path.name)
+    ]
     seen = {project.name for project in projects}
     for name, path in _external_project_dirs().items():
         if name not in seen:
@@ -216,7 +272,13 @@ def reconcile_skill_links(skill: Skill) -> None:
     """Make each project's ``skills/<slug>`` link match the skill's metadata."""
     canon = safe_join_lexical(_canon_root(), skill.name)
     all_projects = _all_projects()
-    if not skill.enabled:
+    managed = managed_folder()
+    if not skill.enabled or (managed is not None and skill.name in managed.skill_slugs()):
+        # A slug the operator's managed folder holds is loaded from that folder,
+        # so a same-named store skill must link into no project, or the agent
+        # would recall the store copy over the managed one. Treated like a
+        # disabled skill, which also removes a link left from before the
+        # managed copy on the next fan-out.
         desired: set[str] = set()
     elif skill.projects:
         desired = set(skill.projects)
@@ -263,11 +325,26 @@ def reconcile_project(
     selected_project = _select_project(project_dir, project_name)
     if selected_project is None:
         return
+    for name, canon in project_skill_dirs(skills, project_name=selected_project.name):
+        _ensure_symlink(safe_join_lexical(selected_project.path / "skills", name), canon)
+
+
+def project_skill_dirs(skills: list[Skill], *, project_name: str) -> list[tuple[str, Path]]:
+    """The skills a new project named ``project_name`` works with, as
+    (slug, store directory) pairs: enabled, not held by the managed folder,
+    and not restricted to other projects."""
     canon_root = _canon_root()
+    managed = managed_folder()
+    managed_slugs = frozenset() if managed is None else managed.skill_slugs()
+    found: list[tuple[str, Path]] = []
     for skill in skills:
         if not skill.enabled:
             continue
-        if skill.projects and selected_project.name not in skill.projects:
+        # A slug the managed folder holds is loaded from there; a same-named
+        # store skill must never link into the new project.
+        if skill.name in managed_slugs:
+            continue
+        if skill.projects and project_name not in skill.projects:
             continue
         safe_skill_name = os.path.basename(skill.name)
         if (
@@ -279,10 +356,44 @@ def reconcile_project(
             raise ValueError("Skill link target must be a direct-child name")
         canon = safe_join_lexical(canon_root, safe_skill_name)
         if canon.exists():
-            _ensure_symlink(
-                safe_join_lexical(selected_project.path / "skills", safe_skill_name),
-                canon,
-            )
+            found.append((safe_skill_name, canon))
+    return found
+
+
+def sync_turn_skill_links(*, skills_dir: Path, wanted: dict[str, Path]) -> None:
+    """Make ``skills_dir`` hold exactly one link per wanted skill, for one turn.
+
+    ``wanted`` maps each skill's slug to its directory: in the asker's own
+    store (select_turn_skills), or, for the folder of skills others share with
+    the asker, in each creator's own store (shared_turn_skills). Every other
+    link is removed, including one
+    that points into another store under a wanted slug, and links left by an
+    earlier fan-out from the unkeyed store; a link already pointing at its
+    wanted directory is kept. A real directory is left alone, so a skill the
+    agent wrote there is still relocated into a draft after the turn
+    (task_objects.finalize_turn_skill_drafts) rather than deleted. One link
+    that cannot be made or removed is logged and skipped, so the turn still
+    starts with the rest.
+    """
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    for entry in sorted(skills_dir.iterdir()):
+        if not _is_dir_link(entry):
+            continue
+        target = wanted.get(entry.name)
+        try:
+            if target is not None and entry.resolve() == target.resolve():
+                continue
+        except OSError:
+            pass  # dangling: removed below, relinked if wanted
+        try:
+            _remove_link(entry)
+        except Exception:
+            logger.warning("Could not remove stale skill link %r", entry.name, exc_info=True)
+    for slug, target in sorted(wanted.items()):
+        try:
+            _ensure_symlink(safe_join_lexical(skills_dir, slug), target)
+        except Exception:
+            logger.warning("Could not link skill %r for this turn", slug, exc_info=True)
 
 
 def reconcile_all(skills: list[Skill]) -> None:

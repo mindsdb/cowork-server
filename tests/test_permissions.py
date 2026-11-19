@@ -194,7 +194,6 @@ def test_require_resolves_annotations_against_the_permissions_own_module():
 @pytest.mark.parametrize(
     "permission_cls,guard_names",
     [
-        ("LoopbackOnly", ["require_local"]),
         ("DesktopOnly", ["require_local_tenancy"]),
         ("LoopbackDesktopOnly", ["require_local", "require_local_tenancy"]),
     ],
@@ -204,7 +203,7 @@ def test_the_absorbed_guards_stay_reachable_through_dependency_overrides(
 ):
     """Absorbing a guard into a Permission must not hide it from FastAPI.
 
-    ``LoopbackOnly`` and friends declare ``Depends(require_local)`` rather than
+    ``LoopbackDesktopOnly`` and friends declare ``Depends(require_local)`` rather than
     calling it, for the same reason ``Authenticated`` declares
     ``get_principal``. Calling it directly works at runtime and silently breaks
     every test that stubs the guard out — which is how
@@ -231,12 +230,51 @@ def test_the_absorbed_guards_stay_reachable_through_dependency_overrides(
 
 def test_a_loopback_permission_still_refuses_a_remote_caller():
     """The other half: overriding is a test affordance, not a hole."""
-    from cowork.api.v1.permissions import LoopbackOnly
+    from cowork.api.v1.permissions import LoopbackDesktopOnly
 
     app = FastAPI()
 
-    @app.get("/guarded", dependencies=[Depends(require(LoopbackOnly))])
+    @app.get("/guarded", dependencies=[Depends(require(LoopbackDesktopOnly))])
     def guarded_route():
         return {"ok": True}
 
     assert TestClient(app).get("/guarded").status_code == 403
+
+
+# ── the skill sharing route ──────────────────────────────────────────
+
+
+def test_the_skill_sharing_route_declares_authenticated_and_401s_with_no_principal():
+    """A person shares their own skill, so the route declares Authenticated
+    beside the sharing router's AuthenticatedInOrgMode: a caller with no
+    principal, the desktop or the operator view, gets a 401 in either mode,
+    before anything is read or written."""
+    from cowork.api.v1.endpoints import skill_sharing
+    from cowork.api.v1.route_walker import declared_permissions, route_key
+    from cowork.api.v1.router import api_router
+
+    (route,) = [
+        route
+        for route in api_router.routes
+        if route_key(route) == ("/api/v1/skills/{skill_id}/sharing", ("PUT",))
+    ]
+    assert declared_permissions(route) == [AuthenticatedInOrgMode, Authenticated]
+
+    app = FastAPI()
+    app.include_router(skill_sharing.router, prefix="/skills")
+    response = TestClient(app).put("/skills/my-notes/sharing", json={"shared": True})
+    assert (response.status_code, response.json()) == (401, {"detail": "Unauthorized"})
+
+
+def test_the_sharing_capabilities_route_is_never_read_as_a_skills_id():
+    """The sharing router is mounted ahead of the skills router, so GET
+    /skills/sharing-capabilities reaches the capabilities route, never GET
+    /skills/{skill_id} with "sharing-capabilities" as the id."""
+    from starlette.routing import Match
+
+    from cowork.api.v1.endpoints import skill_sharing
+    from cowork.api.v1.router import api_router
+
+    scope = {"type": "http", "path": "/api/v1/skills/sharing-capabilities", "method": "GET", "root_path": ""}
+    first = next(route for route in api_router.routes if route.matches(scope)[0] is Match.FULL)
+    assert first.endpoint is skill_sharing.skill_sharing_capabilities

@@ -18,19 +18,11 @@ from cowork.services import artifact_ownership as ownership
 from cowork.services import artifact_autopublish as ap
 from test_artifact_ownership import make_project, project_root, write_artifact
 
-pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
+pytestmark = pytest.mark.usefixtures("org_deployment", "cleanup_tmp_projects")
 
 
 def _engine():
     return get_engine(get_app_settings().database.uri)
-
-
-@pytest.fixture(autouse=True)
-def org_deployment(monkeypatch):
-    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
-    get_app_settings.cache_clear()
-    yield
-    get_app_settings.cache_clear()
 
 
 async def test_owned_slugs_splits_mine_theirs_and_unknown(tmp_path):
@@ -115,7 +107,7 @@ def published(monkeypatch) -> list[str]:
     slugs: list[str] = []
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url, password=None,
-                     access=None, scope=None, project_id=None):
+                     access=None, scope=None, project_id=None, background=False):
         slugs.append(artifact.name)
         (artifact / ".published.json").write_text(json.dumps({
             "index.html": {"report_id": "rid", "url": "u", "published": True,

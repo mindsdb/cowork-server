@@ -3,10 +3,15 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import uuid
 from pathlib import Path
 
 import pytest
 
+from cowork import code_sandbox
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services import artifact_identity, artifact_roots, artifacts
 from cowork.services.artifact_identity import ensure_full_id, resolve_artifact_folder
 from cowork.services.artifacts import ProjectArtifacts, list_artifacts
@@ -41,9 +46,9 @@ def test_desktop_scan_drops_a_symlinked_artifacts_root(tmp_path, monkeypatch):
     outside.mkdir()
     linked = project / ".anton" / "artifacts"
     linked.symlink_to(outside, target_is_directory=True)
-    monkeypatch.setattr(artifact_roots, "_scan_artifact_dirs", lambda: [linked])
+    monkeypatch.setattr(artifact_roots, "_scan_artifact_dirs", lambda *, scope: [linked])
 
-    assert artifact_roots.artifacts_sources_for_scan() == []
+    assert artifact_roots.artifacts_sources_for_scan(scope=LOCAL_SCOPE) == []
 
 
 @pytest.mark.skipif(os.name == "nt", reason="directory-link threat is POSIX org storage")
@@ -61,9 +66,16 @@ def test_org_discovery_drops_a_symlinked_conversation_root(tmp_path, monkeypatch
     # ENG-2056: the project-level base is always a candidate root regardless of
     # any conversation's safety — only the symlinked conversation entry itself
     # is dropped.
-    assert artifact_roots._project_artifact_bases(
-        str(project), object(), include_other_members=True
-    ) == [artifact_roots._artifacts_base(str(project))]
+    row = artifact_roots.ProjectRow(
+        id=uuid.UUID("11111111-1111-4111-8111-111111111111"),
+        name="project",
+        path=str(project),
+        external=False,
+    )
+    found = artifact_roots.discover_roots(artifact_roots.RootsPlan(projects=(row,)))
+    assert [source.base for source in found.unfiltered()] == [
+        artifact_roots._artifacts_base(str(project))
+    ]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="directory-link threat is POSIX org storage")
@@ -212,7 +224,7 @@ def test_root_swapped_after_index_build_is_refused(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="directory-link threat is POSIX org storage")
-def test_delete_refuses_a_folder_swap_before_removal(tmp_path, monkeypatch):
+async def test_delete_refuses_a_folder_swap_before_removal(tmp_path, monkeypatch):
     project = tmp_path / "project"
     folder = project / ".anton" / "artifacts" / "draft"
     _write_metadata(folder)
@@ -225,15 +237,16 @@ def test_delete_refuses_a_folder_swap_before_removal(tmp_path, monkeypatch):
         folder.rename(parked)
         folder.symlink_to(outside, target_is_directory=True)
 
-    monkeypatch.setattr(artifacts, "_unpublish_pinned_folder", swap_during_unpublish)
+    monkeypatch.setattr(artifacts, "_take_down_pages", swap_during_unpublish)
 
     with pytest.raises(FileNotFoundError, match="changed before deletion"):
-        artifacts.delete_artifact_from_source(
-            _source(project),
-            "draft",
+        await artifacts.delete_artifact_from_source(
+            source=_source(project),
+            folder_name="draft",
             expected_artifact_id=FULL_ID,
             api_key="key",
             publish_url="https://publish.example",
+            scope=LOCAL_SCOPE,
         )
 
     assert (outside / "keep.txt").read_text(encoding="utf-8") == "private"
@@ -241,7 +254,7 @@ def test_delete_refuses_a_folder_swap_before_removal(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="file-link threat is POSIX org storage")
-def test_delete_does_not_read_or_write_a_symlinked_publish_record(tmp_path):
+async def test_delete_does_not_read_or_write_a_symlinked_publish_record(tmp_path):
     project = tmp_path / "project"
     folder = project / ".anton" / "artifacts" / "draft"
     _write_metadata(folder)
@@ -253,19 +266,20 @@ def test_delete_does_not_read_or_write_a_symlinked_publish_record(tmp_path):
     outside.write_text(outside_payload, encoding="utf-8")
     (folder / ".published.json").symlink_to(outside)
 
-    artifacts.delete_artifact_from_source(
-        _source(project),
-        "draft",
+    await artifacts.delete_artifact_from_source(
+        source=_source(project),
+        folder_name="draft",
         expected_artifact_id=FULL_ID,
         api_key="key",
         publish_url="https://publish.example",
+        scope=LOCAL_SCOPE,
     )
 
     assert not folder.exists()
     assert outside.read_text(encoding="utf-8") == outside_payload
 
 
-def test_pinned_delete_unpublishes_before_removing_the_folder(tmp_path, monkeypatch):
+async def test_pinned_delete_unpublishes_before_removing_the_folder(tmp_path, monkeypatch):
     project = tmp_path / "project"
     folder = project / ".anton" / "artifacts" / "draft"
     _write_metadata(folder)
@@ -289,19 +303,20 @@ def test_pinned_delete_unpublishes_before_removing_the_folder(tmp_path, monkeypa
         lambda identifier, _entry, **_kwargs: revoked.append(identifier),
     )
 
-    artifacts.delete_artifact_from_source(
-        _source(project),
-        "draft",
+    await artifacts.delete_artifact_from_source(
+        source=_source(project),
+        folder_name="draft",
         expected_artifact_id=FULL_ID,
         api_key="key",
         publish_url="https://publish.example",
+        scope=LOCAL_SCOPE,
     )
 
     assert revoked == ["remote-id"]
     assert not folder.exists()
 
 
-def test_pinned_delete_keeps_the_folder_when_unpublish_fails(tmp_path, monkeypatch):
+async def test_pinned_delete_keeps_the_folder_when_unpublish_fails(tmp_path, monkeypatch):
     project = tmp_path / "project"
     folder = project / ".anton" / "artifacts" / "draft"
     _write_metadata(folder)
@@ -319,12 +334,99 @@ def test_pinned_delete_keeps_the_folder_when_unpublish_fails(tmp_path, monkeypat
     monkeypatch.setattr(artifacts, "_unpublish_identifier", fail)
 
     with pytest.raises(RuntimeError, match="remote unavailable"):
-        artifacts.delete_artifact_from_source(
-            _source(project),
-            "draft",
+        await artifacts.delete_artifact_from_source(
+            source=_source(project),
+            folder_name="draft",
             expected_artifact_id=FULL_ID,
             api_key="key",
             publish_url="https://publish.example",
+            scope=LOCAL_SCOPE,
         )
 
     assert folder.is_dir()
+
+
+ORG = "33333333-3333-4333-8333-333333333333"
+CONVERSATION = "22222222-2222-4222-8222-222222222222"
+LEGACY_ID = "44444444444444448444444444444444"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory-link threat is POSIX org storage")
+def test_org_storage_opens_every_folder_below_the_shared_root(tmp_path, monkeypatch, org_deployment):
+    """Hosted keeps each org's projects in the shared root, so an artifacts
+    folder there opens from that root with no folder below it followed: the
+    project's base and a legacy conversation root list for their owner, and a
+    link at the conversation or at the org folder reaches nothing."""
+    import shutil
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("COWORK_HOME", str(home))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(home))
+    get_app_settings.cache_clear()
+    project = home / ORG / "projects" / "forecast"
+    conversation = project / "conversations" / CONVERSATION
+    _write_metadata(project / ".anton" / "artifacts" / "shared-report")
+    _write_metadata(conversation / ".anton" / "artifacts" / "legacy-report", LEGACY_ID)
+    legacy = ProjectArtifacts(
+        base=conversation / ".anton" / "artifacts",
+        project_id="project-1",
+        project_name=project.name,
+        trusted_anchor=project,
+        root_parts=("conversations", CONVERSATION, ".anton", "artifacts"),
+    )
+    sources = [_source(project), legacy]
+    artifact_identity._clear_identity_indexes()
+
+    assert code_sandbox.anchored_below_a_trusted_root(project).names == (ORG, "projects", "forecast")
+    assert sorted(card["slug"] for card in list_artifacts(sources)) == ["legacy-report", "shared-report"]
+    assert resolve_artifact_folder(sources, LEGACY_ID)[1].name == "legacy-report"
+
+    elsewhere = tmp_path / "elsewhere"
+    shutil.move(conversation, elsewhere)
+    conversation.symlink_to(elsewhere, target_is_directory=True)
+    artifact_identity._clear_identity_indexes()
+    assert [card["slug"] for card in list_artifacts(sources)] == ["shared-report"]
+    with pytest.raises(FileNotFoundError, match="Artifact not found"):
+        resolve_artifact_folder(sources, LEGACY_ID)
+
+    another_org = tmp_path / "another-org"
+    shutil.move(home / ORG, another_org)
+    (home / ORG).symlink_to(another_org, target_is_directory=True)
+    artifact_identity._clear_identity_indexes()
+    assert list_artifacts(sources) == []
+    with pytest.raises(FileNotFoundError, match="Artifact not found"):
+        resolve_artifact_folder(sources, FULL_ID)
+
+
+@pytest.mark.parametrize("o_path", [True, False], ids=["o_path", "no-o_path"])
+def test_the_lists_sort_read_never_follows_a_link_in_place_of_a_folder(tmp_path, monkeypatch, o_path):
+    """The list reads each folder's metadata.json time through one open of
+    the folder that refuses a link: with O_PATH on Linux, and by opening the
+    folder no-follow elsewhere."""
+    from cowork.common import paths
+
+    if o_path and not getattr(os, "O_PATH", 0):
+        pytest.skip("O_PATH is Linux only")
+    if not o_path:
+        monkeypatch.setattr(paths, "O_PATH", 0)
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "metadata.json").write_text("{}")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "metadata.json").write_text("{}")
+    (tmp_path / "link").symlink_to(outside)
+    (tmp_path / "empty").mkdir()
+
+    with paths.pinned_dir(tmp_path) as root:
+        assert paths.dir_child_stat(root, "real", "metadata.json").st_ino == (real / "metadata.json").stat().st_ino
+        with pytest.raises(OSError):
+            paths.dir_child_stat(root, "link", "metadata.json")
+        with pytest.raises(FileNotFoundError):
+            paths.dir_child_stat(root, "empty", "metadata.json")
+        # A link in place of the child is followed by default, and stat'ed
+        # as the link itself without following.
+        (real / "metadata.json").unlink()
+        (real / "metadata.json").symlink_to(outside / "metadata.json")
+        assert stat.S_ISREG(paths.dir_child_stat(root, "real", "metadata.json").st_mode)
+        assert stat.S_ISLNK(paths.dir_child_stat(root, "real", "metadata.json", follow_symlinks=False).st_mode)

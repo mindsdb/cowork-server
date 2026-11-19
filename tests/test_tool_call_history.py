@@ -12,6 +12,7 @@ from anton.cloud_turn.history_rows import (
     split_turn_into_rows as _split_turn_into_rows,
 )
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+from cowork.harnesses.anton_harness.harness import _without_repeated_narration
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.project import Project
@@ -63,13 +64,13 @@ def _turn_slice():
 
 # --- pure helpers -----------------------------------------------------------
 
-def test_split_strips_text_and_keeps_tool_blocks():
+def test_split_keeps_tool_blocks():
     rows = _split_turn_into_rows(_turn_slice())
     assert len(rows) == 2
-    # tool_use row: text block dropped, tool_use kept verbatim
+    # tool_use row: tool_use kept verbatim, with or without the text beside it
     assert rows[0]["role"] == "assistant"
-    assert [b["type"] for b in rows[0]["content"]] == ["tool_use"]
-    assert rows[0]["content"][0]["input"] == {"name": "pdf"}
+    tool_uses = [b for b in rows[0]["content"] if b["type"] == "tool_use"]
+    assert [b["input"] for b in tool_uses] == [{"name": "pdf"}]
     # tool_result row
     assert rows[1]["role"] == "user"
     assert rows[1]["content"][0]["type"] == "tool_result"
@@ -79,10 +80,8 @@ def test_split_strips_text_and_keeps_tool_blocks():
 def test_split_skips_pure_text_message():
     # The final "final answer" message carries no tool block -> no row for it.
     rows = _split_turn_into_rows(_turn_slice())
-    assert all(
-        b["type"] in ("tool_use", "tool_result")
-        for row in rows for b in row["content"]
-    )
+    assert all(_is_tool_row(row["content"]) for row in rows)
+    assert {"type": "text", "text": "final answer"} not in [b for row in rows for b in row["content"]]
 
 
 def test_sanitize_replaces_image_with_replay_marker():
@@ -177,6 +176,8 @@ def test_history_round_trip_is_valid_tool_sequence(session, conversation):
 def test_is_tool_row_discriminates():
     assert _is_tool_row([{"type": "tool_use", "id": "x"}])
     assert _is_tool_row([{"type": "tool_result", "tool_use_id": "x"}])
+    assert _is_tool_row([{"type": "text", "text": "let me look"}, {"type": "tool_use", "id": "x"}])
+    assert not _is_tool_row([{"type": "text", "text": "let me look"}])
     assert not _is_tool_row("plain text")
     assert not _is_tool_row([{"type": "input_text", "text": "hi"}])
     assert not _is_tool_row([])
@@ -250,3 +251,51 @@ def test_delete_first_turn_clears_all(session, conversation):
     svc.delete_turn(conversation.id, _assistant_message_id(session, conversation, "a1"))
 
     assert svc.get_ordered_messages(conversation.id) == []
+
+
+# --- replay matches the live history -----------------------------------------
+
+def _narrated_turn(answer):
+    return [
+        {"role": "user", "content": "[2026-11-10 17:50] write the scene"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "I'll read the notes first."},
+            {"type": "tool_use", "id": "t1", "name": "read_text_file", "input": {"path": "a.md"}},
+        ]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "NOTES"}]},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Writing it now."},
+            {"type": "tool_use", "id": "t2", "name": "scratchpad", "input": {"code": "1"}},
+        ]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "ok"}]},
+        {"role": "assistant", "content": answer},
+    ]
+
+
+def test_replay_keeps_the_text_beside_tool_calls_and_only_the_final_reply():
+    history = _narrated_turn("I'll read the notes first.\n\nWriting it now.\n\nSaved Marsh Light.md.")
+    replayed = _without_repeated_narration(history)
+    assert replayed[1:5] == history[1:5]
+    assert replayed[-1] == {"role": "assistant", "content": "Saved Marsh Light.md."}
+
+
+def test_a_turn_without_a_final_reply_replays_as_before():
+    history = _narrated_turn("I'll read the notes first.\n\nWriting it now.")
+    replayed = _without_repeated_narration(history)
+    assert replayed[-1] == history[-1]
+    assert [b["type"] for b in replayed[1]["content"]] == ["tool_use"]
+
+
+def test_an_answer_that_does_not_repeat_the_rounds_replays_as_before():
+    history = _narrated_turn("A different answer.")
+    replayed = _without_repeated_narration(history)
+    assert replayed[-1] == history[-1]
+    assert [b["type"] for b in replayed[1]["content"]] == ["tool_use"]
+    assert [b["type"] for b in replayed[3]["content"]] == ["tool_use"]
+
+
+def test_rows_saved_without_text_replay_unchanged():
+    history = _narrated_turn("I'll read the notes first.\n\nWriting it now.\n\nDone.")
+    for i in (1, 3):
+        history[i] = {**history[i], "content": [b for b in history[i]["content"] if b["type"] != "text"]}
+    assert _without_repeated_narration(history) == history

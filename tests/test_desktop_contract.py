@@ -15,7 +15,10 @@ while making every packaged desktop install health-check a port the server
 never bound.
 """
 
+import hashlib
+import hmac
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -52,7 +55,7 @@ _PASSTHROUGH_ENV = (
 
 
 def _spawn_like_desktop(
-    tmp_path, port: int, owner: str | None, port_var: str
+    tmp_path, port: int, owner: str | None, port_var: str, proof_key: str | None = None,
 ) -> tuple[subprocess.Popen, "os.PathLike[str]"]:
     # Mirror the env block the desktop app builds before spawning the
     # sidecar. DATABASE_URI is pinned to a fresh SQLite file so the spawned
@@ -70,6 +73,8 @@ def _spawn_like_desktop(
     # Desktop builds before 2026-07-05 pass no owner.
     if owner is not None:
         env["COWORK_SERVER_OWNER"] = owner
+    if proof_key is not None:
+        env["COWORK_SERVER_HEALTH_PROOF_KEY"] = proof_key
     # Server output goes to a file, not a PIPE: nobody drains a pipe while
     # we poll /health, so chatty startup logging could fill the pipe buffer
     # and block the child. The file doubles as failure diagnostics.
@@ -160,5 +165,24 @@ def test_desktop_spawn_auth_without_token(tmp_path, owner, expected_status):
         _wait_for_health(proc, port, log_path)
         response = httpx.get(f"http://127.0.0.1:{port}/api/v1/settings/", timeout=5.0)
         assert response.status_code == expected_status
+    finally:
+        _stop(proc)
+
+
+def test_desktop_spawn_health_proof_names_the_port_the_server_bound(tmp_path):
+    """The app passes a proof key at spawn and a nonce on /health; the server
+    answers the HMAC of the nonce and the port it is listening on, which a
+    listener of another OS user on that port can't compute."""
+    port = _free_port()
+    key = secrets.token_hex(32)
+    proc, log_path = _spawn_like_desktop(tmp_path, port, "owner-token", "COWORK_SERVER_PORT", proof_key=key)
+    try:
+        _wait_for_health(proc, port, log_path)
+        nonce = secrets.token_hex(16)
+        payload = httpx.get(f"http://127.0.0.1:{port}/api/v1/health/", params={"nonce": nonce}, timeout=5.0).json()
+
+        expected = hmac.new(key.encode(), f"cowork-health-proof:{port}:{nonce}".encode(), hashlib.sha256).hexdigest()
+        assert payload["proof"] == expected
+        assert key not in repr(payload)
     finally:
         _stop(proc)

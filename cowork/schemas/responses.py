@@ -1,12 +1,13 @@
 import time
-from typing import Any
+from typing import Any, Literal
 import uuid
 from enum import Enum
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_serializer
+from pydantic import BaseModel, Field, StrictBool, model_serializer, model_validator
 
 from cowork.schemas.connectors import DisabledConnection
+from cowork.schemas.figure_sources import FigureSources
 
 
 class Role(str, Enum):
@@ -77,6 +78,26 @@ class ResponseStatus(str, Enum):
     created = "created"
     in_progress = "in_progress"
     completed = "completed"
+    # Answered, but the turn stopped early (a limit or another hand-back).
+    incomplete = "incomplete"
+
+
+class IncompleteDetails(BaseModel):
+    # A str, not a Literal: a new hand-back in anton must not break the final frame.
+    reason: str = Field(
+        description=(
+            "Why the turn stopped before it finished (anton's `ended_by`): "
+            "`spend_ceiling` (the token budget), `round_cap` (the step limit), "
+            "`handback_budget` (automatic continuations ran out), "
+            "`handback_verifier_failure` (the completion check returned no verdict), "
+            "`handback_stuck` (the completion check judged the task stuck), "
+            "`time_limit` (the task's time limit, after Stop here or no answer), "
+            "`retry_exhausted` (repeated errors), `content_filter` (the model "
+            "provider's content filter blocked a reply) or `question_unanswered` "
+            "(an `ask_user` question timed out or was skipped). Treat any other "
+            "value as a stop for an unlisted reason."
+        ),
+    )
 
 
 class ResponseOutput(BaseModel):
@@ -85,6 +106,10 @@ class ResponseOutput(BaseModel):
     status: ResponseStatus
     role: str = Role.assistant.value
     content: list[ResponseOutputContent]
+    # The figures in the answer and the steps they came from, on a
+    # non-streaming response. A stream carries them as its
+    # response.figure_sources event instead. Left out when None.
+    figure_sources: FigureSources | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class Response(BaseModel):
@@ -95,6 +120,8 @@ class Response(BaseModel):
     created_at: int = Field(default_factory=lambda: int(time.time()))
     status: ResponseStatus
     error: str | None = None
+    # Always present, null unless status is incomplete — as in OpenAI's schema.
+    incomplete_details: IncompleteDetails | None = None
     model: str | None = None  # The model can be set to None here because of the reasons mentioned in the request schema.
     output: list[ResponseOutput] = Field(default_factory=list)
     # TODO: There are some other that have not been included here. Are they needed?
@@ -119,6 +146,10 @@ class StreamingResponse(BaseModel):
     response: Response | ResponseDelta
 
 
+# A per-conversation pick a turn can save or reset (ResponsesRequest.reset_picks).
+TurnPick = Literal["model", "reasoning_effort"]
+
+
 class ResponsesRequest(BaseModel):
     input: str | list[Message] | None = Field(
         default=None, description="Input for the responses request, either a string or a list of messages"
@@ -139,9 +170,11 @@ class ResponsesRequest(BaseModel):
     # In OpenAI's Responses API, the model is required; here it is optional.
     # When set (the composer's per-conversation model pick), it overrides the
     # account-wide planning/coding/router model settings for this turn only
-    # (see AntonHarness._apply_model_override) and is persisted onto the new
-    # conversation's Conversation.model so a reopened task remembers the pick.
-    # When omitted, the account-wide user settings govern as before.
+    # (see AntonHarness._apply_model_override). The turn also saves it as the
+    # conversation's Conversation.model (ConversationService.record_turn_picks),
+    # so a reopened task comes back on the latest pick. When omitted, the
+    # account-wide user settings govern as before, and the saved pick stays
+    # unless `reset_picks` names it.
     model: str | None = Field(
         default=None,
         description="Model name for the chat completion request"
@@ -149,15 +182,27 @@ class ResponsesRequest(BaseModel):
     # The composer's per-task reasoning-effort pick — mirrors `model` above.
     # Overrides the account-wide planning/coding reasoning-effort settings for
     # THIS turn only (see providers.build_llm_client's effort_override param).
-    # When set on the turn that creates a new conversation, it is persisted
-    # onto Conversation.reasoning_effort so a reopened task remembers the pick,
-    # same as `model`. Not validated against the model's advertised effort
+    # When set, the turn saves it as Conversation.reasoning_effort, and when
+    # omitted the saved pick stays unless `reset_picks` names it, same as
+    # `model`. Not validated against the model's advertised effort
     # levels here — the client only offers levels the picked model supports
     # (settings.modelEfforts), and an invalid pair is rejected reactively by
     # the provider/gateway, same as an invalid model name.
     reasoning_effort: str | None = Field(
         default=None,
         description="Reasoning effort level for the chat completion request",
+    )
+    # The picks this turn sends back to the default: "model" for Model Router
+    # or the operator's default model, "reasoning_effort" for the default
+    # effort. An omitted pick keeps the conversation's saved one, since Cowork
+    # also sends no model for a pinned model its picker no longer offers, such
+    # as one the wallet locks, and that pin must come back after a top-up. A
+    # reset clears the saved pick instead (record_turn_picks), so a reopened
+    # task comes back on the default the user went back to. A model or effort
+    # the turn sends wins over its own reset, since the turn runs on it.
+    reset_picks: list[TurnPick] = Field(
+        default_factory=list,
+        description="Picks this turn returns to the default, clearing the conversation's saved model or reasoning effort",
     )
     # The composer's per-task harness pick (Coding Mode). Overrides the
     # account-wide `harness` setting for THIS conversation only — mirrors
@@ -175,6 +220,42 @@ class ResponsesRequest(BaseModel):
         default=False,
         description="Whether the chat completion request is streaming or not",
     )
+    cancel_on_disconnect: StrictBool = Field(
+        default=False,
+        description="Cancel this streaming turn if its originating HTTP client disconnects. Reconnected tails do not own the turn.",
+    )
+
+    # A scripted caller's opt-out, such as a scored evaluation run: "off" runs
+    # this question as MEMORY_ENABLED=false runs every turn, so it reads no
+    # learned memory and learns nothing, while other questions keep memory.
+    # ResponsesHandler.handle refuses it where memory off still reads stored
+    # memory.
+    memory: Literal["on", "off"] = Field(
+        default="on",
+        description=(
+            '"off" keeps this question from reading learned memory or learning any; '
+            "the operator's managed rules still apply. "
+            '"on", the default, follows the deployment\'s memory setting and never turns memory on.'
+        ),
+    )
+
+    # One task's opt-out of the agent's browser: the composer's Browser
+    # switch. "off" runs this turn as browser_enabled=false does: no browser
+    # tool, and on the web no scope call that would start the browser.
+    browser: Literal["on", "off"] = Field(
+        default="on",
+        description=(
+            '"off" runs this turn without the shared browser. '
+            '"on", the default, follows the user\'s browser setting and never turns the browser on.'
+        ),
+    )
+
+    @model_validator(mode="after")
+    def disconnect_requires_streaming(self) -> "ResponsesRequest":
+        if self.cancel_on_disconnect and self.stream is not True:
+            raise ValueError("cancel_on_disconnect requires stream=true")
+        return self
+
     # TODO(migration): Per MIGRATION.md, attachment_ids should be removed.
     # The client should instead send input_file content blocks in the input
     # field (the handler already supports this path). This field is a compat

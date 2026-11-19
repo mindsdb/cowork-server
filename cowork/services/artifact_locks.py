@@ -12,11 +12,16 @@ rely on the absent `metadata.json` to hide this directory: an enumerator that
 opens a folder before checking still finds it, which is what happened when the
 symlink hardening replaced the old `metadata.json` pre-check.
 
-The lock is released only after a SUCCESSFUL publish, or after a publish that
-failed synchronously. It is deliberately NOT released when a publish wait times
-out: `asyncio.to_thread` is not cancellable, so that upload is still running, and
-releasing would let a second publisher into the same slug. A TTL is what prevents
-a permanently stuck lock in that case.
+The reconciler releases the lock on every way out of a publish attempt but two,
+including a failure or a cancel before the upload is handed to its thread. It
+deliberately does NOT release it when a publish wait times out, or when a
+cancel (a Stop, a shutdown) lands once the upload is handed to
+`asyncio.to_thread`. In both cases the upload may be running or still queued
+for a thread. A running upload cannot be cancelled and may still write
+`.published.json`, so releasing would let a second publisher into the same
+slug; a queued one never runs, but the reconciler cannot tell the two apart
+and keeps the lock either way. A TTL is what prevents a permanently stuck lock
+in those cases.
 
 A file lock rather than an asyncio.Lock because contention is genuinely
 cross-process: `deployment/cowork-server/values.yaml` now runs `replicaCount: 2`
@@ -96,8 +101,11 @@ def acquire(artifacts_base: Path, slug: str, *, ttl_s: float) -> bool:
 
 
 def release(artifacts_base: Path, slug: str) -> None:
-    """Drop the lock. Call this after a publish succeeded or failed outright —
-    never in a timeout path (see the module docstring). Silent when already gone.
+    """Drop the lock. Call this on a way out where the upload was never handed
+    to its thread, or has returned or raised. Never call it after a publish
+    timeout, or after a cancel once the upload is handed to its thread, whether
+    it runs or is still queued (see the module docstring). Silent when already
+    gone.
     """
     try:
         _lock_path(artifacts_base, slug).unlink(missing_ok=True)

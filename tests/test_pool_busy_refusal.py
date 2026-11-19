@@ -20,10 +20,12 @@ import pytest
 import cowork.db.session as db_session
 import cowork.handlers.responses as responses_mod
 from cowork.common.settings.app_settings import DatabaseSettings
-from cowork.handlers.response_routing import DELEGATED_AGENTIC, RouteDecision
+from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, RouteDecision
 from cowork.db.scoped import LOCAL_SCOPE
-from cowork.db.units import run_db
+from cowork.db.units import DatabaseBusy, run_db
 from cowork.server import create_app
+from cowork.services.conversations import ConversationService
+from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.streaming import registry
 
 from _fakes import PausedHarness
@@ -48,9 +50,10 @@ class _Measured:
     live_answers: int
 
 
-async def _ask_while_others_are_served() -> _Measured:
+async def _ask_while_others_are_served(*, project_id: str | None = None) -> _Measured:
     """POST a question while a heartbeat ticks every 10 ms and
-    /api/v1/health/live is asked every 50 ms."""
+    /api/v1/health/live is asked every 50 ms. ``project_id`` names the new
+    conversation's project."""
     ticks = 0
     live_answers = 0
 
@@ -76,7 +79,7 @@ async def _ask_while_others_are_served() -> _Measured:
         started = loop.time()
         try:
             response = await asyncio.wait_for(
-                client.post("/api/v1/responses/", json={"input": "hi", "stream": True}),
+                client.post("/api/v1/responses/", json={"input": "hi", "stream": True, "project_id": project_id}),
                 timeout=WAIT * 5,
             )
             elapsed = loop.time() - started
@@ -146,7 +149,10 @@ async def test_a_question_that_finds_every_unit_slot_taken_is_refused_while_the_
 ):
     """Units queue for a slot, one per connection the pool can lend (one on
     SQLite), before they ask the pool. That wait is bounded by POOL_TIMEOUT
-    too, and ends in the same refusal."""
+    too, and ends in the same refusal. The question names its project by id,
+    so its first unit is a database unit: one that names none may start in
+    the general project and reads on the file store's threads, which on
+    SQLite take no unit slot."""
     monkeypatch.setattr(db_session.settings.database, "pool_timeout", WAIT)
     entered = threading.Event()
     release = threading.Event()
@@ -159,7 +165,7 @@ async def test_a_question_that_finds_every_unit_slot_taken_is_refused_while_the_
     try:
         while not entered.is_set():
             await asyncio.sleep(0.01)
-        measured = await _ask_while_others_are_served()
+        measured = await _ask_while_others_are_served(project_id=str(GENERAL_PROJECT_ID))
     finally:
         release.set()
         await holder
@@ -187,3 +193,28 @@ def test_a_postgres_pool_waits_five_seconds_unless_pool_timeout_says_otherwise(m
 
     monkeypatch.setenv("POOL_TIMEOUT", "7")
     assert pool_wait() == 7
+
+
+async def test_a_direct_answer_whose_save_finds_no_connection_is_refused_as_busy(monkeypatch):
+    """The non-streaming direct answer catches its save's failures to quote a
+    Reference, but a database with no free connection is still the 503 every
+    other request gets, with its Retry-After, not a generic 500."""
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", WAIT)
+
+    async def decide(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi.")
+
+    def no_connection(*_args, **_kwargs):
+        raise DatabaseBusy("no connection freed in time")
+
+    monkeypatch.setattr(responses_mod, "decide_route", decide)
+    monkeypatch.setattr(ConversationService, "save_assistant_turn", no_connection)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(), raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/api/v1/responses/", json={"input": "hi", "stream": False})
+
+    assert response.status_code == 503, response.text[:300]
+    assert response.json() == BUSY
+    assert response.headers["retry-after"] == str(WAIT)

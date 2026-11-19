@@ -22,6 +22,7 @@ from uuid import uuid4
 
 import fakeredis.aioredis
 import pytest
+from anton.core.llm import liveness as anton_liveness
 from anton.core.llm.provider import StreamTextDelta
 
 import cowork.handlers.responses as responses_mod
@@ -107,6 +108,8 @@ class _Harness:
         self, *, conversation, input, model=None, reasoning_effort=None,
         disabled_connections=None, trace_tags=None, trace_metadata=None,
         channel_context=None, tool_messages=False, model_wait=None,
+        interactive=True,
+        ui_locale=None, schedule_id=None,
     ):
         if model_wait is not None:
             model_wait.attach(session=self.session)
@@ -132,6 +135,7 @@ class _Harness:
 
 def _handler(monkeypatch, saved: dict, harness: _Harness):
     handler = object.__new__(responses_mod.ResponsesHandler)
+    handler.schedule_id = None
     handler.principal = object()
 
     class FakeConversationService:
@@ -367,7 +371,6 @@ async def test_the_anton_harness_attaches_its_session_for_the_turn_only(monkeypa
     from cowork.harnesses.anton_harness import harness as harness_mod
 
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_a, **_k: (set(), {}))
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", lambda *_a, **_k: ([], set(), None))
     monkeypatch.setattr(task_objects, "cards_for_slugs", lambda *_a, **_k: [])
 
     async def _no_autopublish(*_a, **_k):
@@ -398,7 +401,7 @@ async def test_the_anton_harness_attaches_its_session_for_the_turn_only(monkeypa
     session = _Session()
 
     async def _fake_build(self, conversation, **kwargs):
-        return session, None, None
+        return harness_mod.BuiltChatSession(session=session, turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(harness_mod.AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(
@@ -427,20 +430,11 @@ async def test_the_anton_harness_attaches_its_session_for_the_turn_only(monkeypa
 # ── The contract with the real anton ─────────────────────────────────
 # Everything above uses stand-ins, and cowork-server reads anton's tracker and
 # error by attribute and by class name. These run against the installed
-# anton, so they skip until uv.lock moves to an anton release that has the
-# tracker, then catch a rename the stand-ins would hide.
-
-
-def _real_anton_liveness():
-    liveness_mod = pytest.importorskip("anton.core.llm.liveness")
-    if getattr(liveness_mod, "ModelCallTracker", None) is None:
-        pytest.skip("installed anton predates the model-call tracker (ENG-3281)")
-    return liveness_mod
+# anton and catch a rename the stand-ins would hide.
 
 
 async def test_a_real_anton_tracker_drives_the_ticker():
-    real = _real_anton_liveness()
-    tracker = real.ModelCallTracker()
+    tracker = anton_liveness.ModelCallTracker()
     tracker.open(role="planning", idle_timeout_s=600.0).awaiting = True
     buffer = _Buffer()
     ticker = liveness.ModelWaitTicker()
@@ -456,7 +450,6 @@ async def test_a_real_anton_tracker_drives_the_ticker():
 
 
 def test_a_real_anton_deadline_maps_to_model_timeout_in_process_and_remote():
-    _real_anton_liveness()
     from anton.core.llm.provider import ModelCallTimeoutError
 
     from cowork.handlers.turn_errors import MODEL_TIMEOUT_CODE, friendly_turn_error, remote_turn_error
@@ -607,3 +600,17 @@ def test_the_frame_omits_a_sequence_number_it_does_not_have():
     assert payload["content"] == "Still working: Waiting for the model (20s)"
     assert payload["eta_seconds"] == 20.0
     assert isinstance(payload["at_ms"], int)
+
+
+def test_a_frame_whose_message_is_the_label_does_not_repeat_it():
+    """The web turn's relay frame carries the label as its message; a client
+    that renders the generic "Label: message" content must not read
+    "Still working: Still working"."""
+    import json
+
+    from cowork.streaming.liveness import MODEL_WAIT_LABEL, model_wait_sse
+
+    frame = model_wait_sse(message=MODEL_WAIT_LABEL, waited_s=None)
+    payload = json.loads(frame.split("data: ", 1)[1])
+    assert payload["content"] == "Still working"
+    assert payload["message"] == "Still working"

@@ -50,6 +50,21 @@ def wait_for_status(service: CodingService, session_id: str, status: SessionStat
     return session
 
 
+def wait_for_run_to_follow(service: CodingService, session_id: str) -> CodingSession:
+    """Wait for a local task's run status to match its session status, and
+    return the task as it is then.
+
+    The run follows the session in a separate save, so a read between the two
+    sees them disagree. A remote runtime owns its run's status; not for those.
+    """
+    deadline = time.monotonic() + 3
+    session = service.get_session(session_id)
+    while time.monotonic() < deadline and session.run_status != session.status.value:
+        time.sleep(0.01)
+        session = service.get_session(session_id)
+    return session
+
+
 def wait_for_turn_thread(session_id: str) -> None:
     """Wait for a task's turn thread to exit.
 
@@ -75,6 +90,22 @@ def wait_for_workspace(service: CodingService, session_id: str) -> CodingSession
     session = service.get_session(session_id)
     assert session.workspace_path, "the task workspace was not prepared"
     return session
+
+
+def wait_for_steerable_turn(service: CodingService, session_id: str) -> None:
+    """Wait until the running turn routes a steer straight to its engine.
+
+    ``FakeEngine.started`` fires inside ``start_turn``, before the turn records
+    its id. A steer sent in that gap is held for the turn instead of reaching
+    the engine, so a test that needs the engine's answer waits here first.
+    """
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        running = service._running.get(session_id)
+        if running is not None and running.engine is not None and running.turn_id:
+            return
+        time.sleep(0.01)
+    raise AssertionError("the turn did not become ready for steering")
 
 
 def wait_for_steers(engine: FakeEngine) -> None:

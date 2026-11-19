@@ -64,3 +64,15 @@ class TestClassifyCellStatusFallback:
 
     def test_plain_text_error_bracket(self):
         assert classify_cell_status("[error]\nNameError") == "error"
+
+    def test_a_cell_anton_never_ran_is_error(self):
+        # anton's result for a write the user didn't approve. Cowork marks
+        # only timeout and error, so "ok" would show it as a clean run.
+        refused = (
+            "Not run: this step would change data in a connected source. That needs the "
+            "user's approval, and they declined it. Nothing in this cell ran."
+        )
+        assert classify_cell_status(refused) == "error"
+
+    def test_a_cell_that_printed_not_run_is_still_ok(self):
+        assert classify_cell_status(_cell(error=None, stdout="Not run: 3 rows skipped")) == "ok"

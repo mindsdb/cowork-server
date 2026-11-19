@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
 import time
 from collections import OrderedDict
@@ -15,10 +16,12 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import SecretStr
 
+from cowork.build_info import supported_kwargs, surface
+from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
 from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
-from cowork.services.hub_workspaces import sweep_cache
+from cowork.services.mindshub_client import sweep_cache
 
 if TYPE_CHECKING:
     from cowork.common.settings.app_settings import OpenAICompatibleAPI
@@ -38,12 +41,30 @@ MINDS_PROBE_MODEL = "mindshub_air"
 
 # Marks a request as our own background call on the user's key, not activity
 # they asked for, so the customer's Traces list hides it by default: the
-# connectivity/health-check pings below and the Jev shadow probe
-# (cowork/handlers/jev_shadow.py). Read by mindshub_inference; it is
+# connectivity/health-check pings below. Read by mindshub_inference; it is
 # our own header and means nothing to a non-Minds endpoint, so it is only ever
 # sent to a Minds host.
 MINDS_REQUEST_KIND_HEADER = "X-Minds-Request-Kind"
 MINDS_REQUEST_KIND_PROBE = "probe"
+
+# Langfuse tag on every MindsHub connectivity probe. The gateway files a call
+# with no Langfuse headers as direct-API use, so without it a user who only
+# opened Settings is counted as an API user. Tags alone make the gateway treat
+# the call as first-party; no `harness` is claimed because no agent runs here,
+# and no session or turn because a ping belongs to no conversation.
+PROBE_TRACE_TAG = "provider-ping"
+
+
+def _minds_probe_headers() -> dict[str, str]:
+    """The probe marker plus the probe's Langfuse identity, for a MindsHub host only."""
+    resolved_surface = surface()
+    tags = [PROBE_TRACE_TAG]
+    headers = {MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE}
+    if resolved_surface:
+        tags.append(f"{SURFACE_TAG_PREFIX}{resolved_surface}")
+        headers["Langfuse-Metadata"] = json.dumps({"surface": resolved_surface}, separators=(",", ":"))
+    headers["Langfuse-Tags"] = ",".join(tags)
+    return headers
 
 
 def minds_chat_base_url(minds_url: str) -> str:
@@ -102,10 +123,26 @@ def is_minds_host(url: str | None) -> bool:
     return host in ("mindshub.ai", "mdb.ai") or host.endswith((".mindshub.ai", ".mdb.ai"))
 
 
-# Working prod publish host. Prod's api host (api.mindshub.ai) does NOT serve the
-# publish API — it lives on the legacy 4nton.ai host — so prod, plus anything we
-# can't map to a non-prod MindsHub env, falls back here.
-PUBLISH_FAILSAFE_URL = "https://4nton.ai"
+# Prod publish host. The view host serves the publishing API (/upload, /list,
+# /delete/{id}, /versions, /activate); prod's api host (api.mindshub.ai) does
+# not. So prod, plus anything we can't map to a non-prod MindsHub env, falls
+# back here.
+PUBLISH_FAILSAFE_URL = "https://view.mindshub.ai"
+
+# The former prod publish host. It serves the same API but is being retired
+# for publishing, while saved settings may still name it.
+LEGACY_PUBLISH_HOST = "4nton.ai"
+
+
+def normalize_publish_url(publish_url: str | None) -> str | None:
+    """`publish_url` with the retired 4nton.ai host replaced by the prod
+    publish host; any other URL is returned unchanged."""
+    try:
+        host = (urlparse(publish_url or "").hostname or "").lower().rstrip(".")
+    except ValueError:
+        # `.hostname` raises on an unbalanced bracket; see `is_minds_host`.
+        return publish_url
+    return PUBLISH_FAILSAFE_URL if host == LEGACY_PUBLISH_HOST else publish_url
 
 
 def publish_url_for_endpoint(endpoint_url: str | None) -> str:
@@ -115,9 +152,9 @@ def publish_url_for_endpoint(endpoint_url: str | None) -> str:
     served on the *non-prod* MindsHub api hosts, so a provider pointed at
     ``api.<env>.mindshub.ai`` (dev/staging) publishes to that same host. Prod
     (``api.mindshub.ai``) has no publish routes, and anything unrecognised
-    (mdb.ai, a custom endpoint, empty) falls back to the legacy ``4nton.ai``
-    host. anton appends the route path; an explicit `publish_url` /
-    `ANTON_PUBLISH_URL` overrides this.
+    (mdb.ai, a custom endpoint, empty) falls back to the prod publish host,
+    ``view.mindshub.ai``. anton appends the route path; an explicit
+    `publish_url` / `ANTON_PUBLISH_URL` overrides this.
     """
     host = (urlparse(endpoint_url or "").hostname or "").lower()
     if host.startswith("api.") and host.endswith(".mindshub.ai") and host != "api.mindshub.ai":
@@ -131,17 +168,11 @@ def is_mindshub_publish_url(publish_url: str | None) -> bool:
     Only MindsHub's service can run a full-stack artifact. A service an operator
     points `ANTON_PUBLISH_URL` or the `publish_url` setting at, such as one a
     customer built from the publishing specification, stores static bundles
-    only. Matches the hosts `publish_url_for_endpoint` can return: the MindsHub
-    api hosts (via `is_minds_host`) and the legacy `4nton.ai` host.
+    only. Matches the hosts `publish_url_for_endpoint` can return (MindsHub
+    hosts, via `is_minds_host`); a retired `4nton.ai` URL counts as the prod
+    publish host it maps to.
     """
-    if is_minds_host(publish_url):
-        return True
-    try:
-        host = (urlparse(publish_url or "").hostname or "").lower()
-    except ValueError:
-        # `.hostname` raises on an unbalanced bracket; see `is_minds_host`.
-        return False
-    return host == urlparse(PUBLISH_FAILSAFE_URL).hostname
+    return is_minds_host(normalize_publish_url(publish_url))
 
 
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
@@ -224,20 +255,23 @@ def provider_base_url(
 # so this live list is the only source of minds-cloud model names. The
 # deprecated MindsHub sentinel aliases are hidden from this route by design.
 #
-# Cached so a rapid sequence of Settings opens doesn't re-hit the
-# network. Failures are cached too — with a shorter TTL — so a route
-# that isn't deployed yet doesn't add a round-trip to every load.
-_MINDS_MODELS_TTL = 300.0       # successful fetch
+# Short-lived so a top-up (or running out) reaches the picker within seconds.
+# Failures are cached too, so an undeployed route doesn't cost every load a fetch.
+_MINDS_MODELS_TTL = 15.0        # successful MindsHub fetch (``mindshub=True``)
+_CUSTOM_MODELS_TTL = 300.0      # successful fetch from a BYO custom endpoint
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
-# Expired entries are dropped on every write, and past this many the least
-# recently used goes too. Org mode holds one listing per org member, so without
-# a bound the cache grows with every member a pod has ever served. Meant to sit
-# well above the members one pod serves within one TTL, since only their entries
-# are still fresh, so eviction normally takes an entry nobody is about to read.
+# For MindsHub, force_refresh retries a cached failure once it is this old, so a
+# picker open during an outage can wait up to the fetch budget (_MINDS_MODELS_TIMEOUT_S).
+_MINDS_MODELS_FORCED_RETRY_S = 5.0
+# How long an expired success stays readable through `cached_minds_models`.
+_MINDS_MODELS_RETAIN_S = 300.0
+# Past this many entries the least recently used goes (org mode holds one per
+# member). Sized well above the members one pod serves in the retain window.
 _MINDS_MODELS_CACHE_MAX = 512
-# Derived from the TTLs rather than restated, so raising one cannot start
-# dropping entries that are still fresh.
-_MINDS_MODELS_MAX_TTL_S = max(_MINDS_MODELS_TTL, _MINDS_MODELS_FAIL_TTL)
+# Derived rather than restated, so raising a TTL cannot start dropping fresh entries.
+_MINDS_MODELS_MAX_TTL_S = max(
+    _MINDS_MODELS_TTL, _CUSTOM_MODELS_TTL, _MINDS_MODELS_FAIL_TTL, _MINDS_MODELS_RETAIN_S
+)
 # Hard TOTAL budget for one /v1/models fetch. httpx.Timeout is per-operation, so
 # `follow_redirects` chains and trickled responses (each chunk under the per-op
 # read timeout) can otherwise run far past it — minutes, unbounded. This fetch
@@ -289,7 +323,8 @@ class MindsModelListing(NamedTuple):
     role_defaults: dict[str, str]
     # Why a model the ``enabled`` map marks false is unavailable, in the
     # gateway's own reason words: "model_restricted" (an admin in the org
-    # restricted it), "wallet_empty" or "included_allowance_exhausted". Keyed
+    # restricted it), "wallet_empty", "included_allowance_exhausted" or
+    # "budget_exceeded" (an org budget is spent). Keyed
     # only by ids that ``enabled`` marks false, so the two maps cannot
     # disagree. Empty whenever the gateway publishes no reasons, which includes
     # every MindsHub that predates the field and every plain OpenAI-compatible
@@ -348,19 +383,46 @@ def _listing_cache_key(
     return _ListingCacheKey(base_url, tenant_key, user_id, credential)
 
 
-# Least recently used first, so the cap in `_store_listing` evicts from the front.
-_minds_models_cache: OrderedDict[_ListingCacheKey, tuple[float, MindsModelListing]] = OrderedDict()
+# LRU order; entries are (stored_at, listing), (failed_at, empty), or after a failure
+# that kept the last success, (stored_at, last_success, failed_at).
+_minds_models_cache: OrderedDict[_ListingCacheKey, tuple] = OrderedDict()
+
+
+def _failed_at(entry: tuple) -> float | None:
+    """When this entry's latest fetch failed, or None if it succeeded."""
+    if len(entry) > 2:
+        return entry[2]
+    return None if entry[1].ids else entry[0]
 
 
 def _store_listing(key: _ListingCacheKey, listing: MindsModelListing) -> None:
     """Cache ``listing`` under ``key``: expired entries go first, then any past the cap.
 
-    Swept on write, the one place the cache grows, with the hub workspace
-    caches' ``sweep_cache``. A departed caller's entry is never read or
+    Swept on write, the one place the cache grows, with the MindsHub client's
+    ``sweep_cache``. A departed caller's entry is never read or
     overwritten again, so nothing else would drop it.
     """
-    sweep_cache(_minds_models_cache, max_ttl_s=_MINDS_MODELS_MAX_TTL_S)
-    _minds_models_cache[key] = (time.monotonic(), listing)
+    _store_entry(key, (time.monotonic(), listing))
+
+
+def _latest_stamp(entry: tuple) -> float:
+    """An entry's most recent write, so a late failure isn't swept with its old success."""
+    return max(entry[0], entry[2]) if len(entry) > 2 else entry[0]
+
+
+def _store_failure(key: _ListingCacheKey) -> None:
+    """Record a failed fetch, keeping a retained success readable by ``cached_minds_models``."""
+    now = time.monotonic()
+    prior = _minds_models_cache.get(key)
+    if prior and prior[1].ids and now - prior[0] < _MINDS_MODELS_RETAIN_S:
+        _store_entry(key, (prior[0], prior[1], now))
+    else:
+        _store_entry(key, (now, _empty_listing()))
+
+
+def _store_entry(key: _ListingCacheKey, entry: tuple) -> None:
+    sweep_cache(_minds_models_cache, max_ttl_s=_MINDS_MODELS_MAX_TTL_S, stamp=_latest_stamp)
+    _minds_models_cache[key] = entry
     _minds_models_cache.move_to_end(key)
     while len(_minds_models_cache) > _MINDS_MODELS_CACHE_MAX:
         _minds_models_cache.popitem(last=False)
@@ -401,9 +463,9 @@ def cached_minds_models(
     A synchronous read for callers that cannot await the fetch (the coding
     endpoints run in a threadpool) and need only what the gateway advertises per
     model, which changes on the gateway's release cadence rather than the cache
-    TTL's. None until something has fetched the listing since the process
-    started, and None for a negatively cached failure. An expired entry is read
-    until the next write drops it (``_store_listing``). ``tenant_key``,
+    TTL's. None until a fetch has succeeded; a later failure keeps the last success
+    readable (``_store_failure``). An expired entry is read
+    until a sweep drops it, so it may be older than the retain window. ``tenant_key``,
     ``user_id`` and ``api_key`` pick the entry the same way they do in
     ``fetch_minds_models``: with no ``tenant_key``, the entry is the one fetched
     with this ``api_key``.
@@ -431,6 +493,7 @@ async def fetch_minds_models(
     api_key: str,
     *,
     force_refresh: bool = False,
+    mindshub: bool = False,
     tenant_key: str | None = None,
     user_id: str | None = None,
 ) -> MindsModelListing:
@@ -455,15 +518,8 @@ async def fetch_minds_models(
     id-derived label. Embedding and decision models are dropped entirely — they
     share this listing but cannot serve planning/coding roles.
 
-    ``force_refresh`` skips the cache *read* for a cached success (a fresh
-    result is still cached for subsequent calls) — used when the caller knows
-    the cached answer may be stale, e.g. the Settings picker re-checking on
-    dropdown open after the user tops up credits in an external tab.
-
-    A cached *failure* is still honored under ``force_refresh``: the negative
-    TTL exists so an unreachable MindsHub isn't re-probed on every call, and
-    the picker opens on demand, so bypassing it would make every open pay the
-    fetch budget for as long as the outage lasts.
+    ``force_refresh`` skips a cached success. ``mindshub`` (MindsHub callers only) uses the
+    short success TTL and lets force_refresh retry a failure older than 5s.
 
     ``tenant_key`` and ``user_id`` scope the cache entry (see
     ``_ListingCacheKey``): pass the org id for an org-scoped catalog, and the
@@ -484,16 +540,24 @@ async def fetch_minds_models(
     now = time.monotonic()
     cached = _minds_models_cache.get(cache_key)
     if cached:
-        ts, val = cached
-        ttl = _MINDS_MODELS_TTL if val.ids else _MINDS_MODELS_FAIL_TTL
-        # force_refresh only overrides the success TTL — see the negative-cache
-        # note above.
-        if (now - ts) < ttl and not (force_refresh and val.ids):
+        failed_at = _failed_at(cached)
+        if failed_at is not None:
+            retry = force_refresh and mindshub
+            window = _MINDS_MODELS_FORCED_RETRY_S if retry else _MINDS_MODELS_FAIL_TTL
+            if now - failed_at < window:
+                _minds_models_cache.move_to_end(cache_key)
+                return _empty_listing()
+        elif not force_refresh and now - cached[0] < (
+            _MINDS_MODELS_TTL if mindshub else _CUSTOM_MODELS_TTL
+        ):
             _minds_models_cache.move_to_end(cache_key)
-            return val
+            return cached[1]
 
     def _remember(val: MindsModelListing) -> MindsModelListing:
-        _store_listing(cache_key, val)
+        if val.ids:
+            _store_listing(cache_key, val)
+        else:
+            _store_failure(cache_key)
         return val
 
     async def _fetch() -> httpx.Response:
@@ -632,6 +696,20 @@ async def fetch_minds_models(
     )
 
 
+def _org_catalog_url() -> str:
+    """The operator endpoint the org catalog is fetched from and cached under."""
+    from cowork.common.settings.app_settings import (
+        TurnQueueSettings,
+        default_turn_minds_api_host,
+    )
+    return TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
+
+
+def cached_org_model_catalog(*, org_id: str, user_id: str) -> MindsModelListing | None:
+    """The org catalog ``fetch_org_model_catalog`` last cached for this member, or None."""
+    return cached_minds_models(_org_catalog_url(), tenant_key=org_id, user_id=user_id)
+
+
 async def fetch_org_model_catalog(
     *, org_id: str, user_id: str, bearer_token: str, refresh: bool = False
 ) -> MindsModelListing:
@@ -648,13 +726,9 @@ async def fetch_org_model_catalog(
         raise ValueError("org catalog requires an organization id")
     if not user_id:
         raise ValueError("org catalog requires the caller's user id")
-    from cowork.common.settings.app_settings import (
-        TurnQueueSettings,
-        default_turn_minds_api_host,
-    )
-    url = TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
     return await fetch_minds_models(
-        url, bearer_token, force_refresh=refresh, tenant_key=org_id, user_id=user_id
+        _org_catalog_url(), bearer_token, force_refresh=refresh, mindshub=True,
+        tenant_key=org_id, user_id=user_id,
     )
 
 
@@ -804,7 +878,7 @@ async def model_value_rejection(
                 org_id=org_id, user_id=user_id, bearer_token=bearer_token
             )
         elif api_key and settings.minds_url:
-            listing = await fetch_minds_models(settings.minds_url, api_key)
+            listing = await fetch_minds_models(settings.minds_url, api_key, mindshub=True)
         else:
             return None
     except Exception:
@@ -1051,7 +1125,7 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
     minds_key = inference_api_key_str(s, Provider.MINDS_CLOUD)
     if not minds_key or not s.minds_url:
         return False
-    listing = await fetch_minds_models(s.minds_url, minds_key)
+    listing = await fetch_minds_models(s.minds_url, minds_key, mindshub=True)
     return persist_enabled_model_map(
         session, scope, s.minds_model_enabled, listing.enabled, listing.ids
     )
@@ -1218,6 +1292,8 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
         `max_tokens` is kept at a small-but-safe 20 rather than 1 — some
         models reject a 1-token budget (or can't emit even a stop token),
         which would fail the probe for a perfectly valid key."""
+        from cowork.db.units import run_on_unit_threads
+
         payload = {"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "ping"}]}
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(url, headers=headers, json=payload)
@@ -1235,7 +1311,8 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
         return ProviderPing(
             status="fail",
             detail=f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}",
-            denial=_probe_denial(response=r),
+            # Off the loop: the gateway check reads settings.
+            denial=await run_on_unit_threads(lambda: _probe_denial(response=r)),
         )
 
     try:
@@ -1282,7 +1359,7 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
                 {
                     "Authorization": f"Bearer {key}",
                     "Content-Type": "application/json",
-                    MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                    **_minds_probe_headers(),
                 },
                 MINDS_PROBE_MODEL,
             )
@@ -1353,7 +1430,7 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
-                    MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                    **_minds_probe_headers(),
                 },
                 json={"model": MINDS_PROBE_MODEL, "max_tokens": 20,
                       "messages": [{"role": "user", "content": "ping"}]},
@@ -1401,7 +1478,7 @@ async def validate_openai_compatible(api_key: str, base_url: str = "https://api.
         # meaningless to an arbitrary endpoint, and only MindsHub reads it to hide
         # the probe from the Traces list.
         if is_minds_host(normalized):
-            headers[MINDS_REQUEST_KIND_HEADER] = MINDS_REQUEST_KIND_PROBE
+            headers.update(_minds_probe_headers())
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(chat_url, headers=headers, json=payload)
             if r.status_code in (200, 201):
@@ -1459,7 +1536,7 @@ _warned_responses_transport_missing = False
 
 
 def openai_compatible_agent_api() -> OpenAICompatibleAPI:
-    """The API the planning and coding roles call on an openai_compatible provider.
+    """The API all agent roles call on an openai_compatible provider.
 
     COWORK_OPENAI_COMPATIBLE_API asks for it. The Responses API is used only
     when the installed anton reports its Responses path ready, because before
@@ -1480,7 +1557,7 @@ def openai_compatible_agent_api() -> OpenAICompatibleAPI:
         _warned_responses_transport_missing = True
         logger.warning(
             "Installed anton does not report RESPONSES_TRANSPORT_READY; "
-            "openai_compatible planning and coding stay on chat completions "
+            "openai_compatible planning, coding and router stay on chat completions "
             "although COWORK_OPENAI_COMPATIBLE_API=responses"
         )
     return "chat_completions"
@@ -1492,6 +1569,18 @@ class WebToolKwargs(TypedDict, total=False):
 
     web_search_enabled: bool
     web_fetch_enabled: bool
+    # False: the agent answers from the connected data only (no web tools, no
+    # scratchpad web_search(), no internet guidance in its prompt).
+    internet_research_enabled: bool
+
+
+# anton's own setting names, so the CLI and a cowork-server read the same variables.
+_WEB_TOOL_ENV = {
+    "web_search_enabled": "ANTON_WEB_SEARCH_ENABLED",
+    "web_fetch_enabled": "ANTON_WEB_FETCH_ENABLED",
+    "internet_research_enabled": "ANTON_INTERNET_RESEARCH_ENABLED",
+}
+_OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
@@ -1504,15 +1593,37 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
     onto that flavor runs with both off. Every other session keeps anton's
     defaults: MindsHub keeps its native web tools, and direct OpenAI keeps
     what its flavor provides.
+
+    ``ANTON_WEB_SEARCH_ENABLED`` / ``ANTON_WEB_FETCH_ENABLED`` set to a false
+    value in the server's env turn that tool off for every session this server
+    runs, and ``ANTON_INTERNET_RESEARCH_ENABLED`` turns internet research off;
+    they never turn anything on. Org turns run in a pod through
+    ``anton.cloud_turn``, which doesn't read this env. A field the installed
+    anton's ChatSessionConfig lacks is dropped (``supported_kwargs``): passing
+    it would fail every turn.
     """
+    from anton.core.session import ChatSessionConfig
+
+    return WebToolKwargs(**supported_kwargs(ChatSessionConfig, **web_tool_switches(planning_provider)))
+
+
+def web_tool_switches(planning_provider: Provider) -> WebToolKwargs:
+    """The web tools this server turns off for a session on `planning_provider`,
+    before `web_tool_kwargs_for` drops the fields the installed anton lacks.
+    For callers that apply them themselves, such as the direct answer."""
     from cowork.common.settings.user_settings import Provider
 
     if (
         planning_provider is Provider.OPENAI_COMPATIBLE
         and openai_compatible_agent_api() == "responses"
     ):
-        return WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
-    return WebToolKwargs()
+        kwargs = WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
+    else:
+        kwargs = WebToolKwargs()
+    for field, env_name in _WEB_TOOL_ENV.items():
+        if os.environ.get(env_name, "").strip().lower() in _OFF_VALUES:
+            kwargs[field] = False
+    return kwargs
 
 
 def build_llm_client(
@@ -1579,11 +1690,13 @@ def build_llm_client(
         else settings.resolved_router_model
     )
 
-    # The published package still permits Anton releases from before ENG-2116.
-    # Inspect the constructor once per client build so those versions keep
-    # working without pretending they can refresh a credential per request.
-    # A signature we cannot inspect is treated as unsupported: omitting a new
-    # kwarg is safer than raising TypeError on every MindsHub turn.
+    # Inspect OpenAIProvider's constructor once per client build for
+    # api_key_provider (ENG-2116). Every anton this server can start with has
+    # it: it predates the anton.core.artifacts.internal_files constants the
+    # server imports at startup. So the check serves only an anton too old to
+    # start this server. A signature we cannot inspect is treated as
+    # unsupported: omitting a new kwarg is safer than raising TypeError on
+    # every MindsHub turn.
     try:
         openai_provider_params = inspect.signature(OpenAIProvider).parameters
     except (TypeError, ValueError):
@@ -1591,10 +1704,9 @@ def build_llm_client(
     supports_api_key_provider = "api_key_provider" in openai_provider_params
     warned_about_static_runtime_credential = False
 
-    # Passed to the planning and coding builds only. The router stays on chat
-    # completions: the gate's first-event budget is sized for a model that
-    # doesn't reason, and a router model that reasons by default is held to
-    # that with router_reasoning_effort "none".
+    # The router shares this transport with planning and coding: its delegate
+    # function needs Responses on models that reject tools on chat completions.
+    # Its effort remains the operator's choice and its gate budgets still apply.
     agent_api = openai_compatible_agent_api()
 
     def _make_provider(
@@ -1636,10 +1748,11 @@ def build_llm_client(
             # this callback unset and keep their existing lifetime.
             #
             # The live supplier is available only when Anton advertises the
-            # constructor kwarg. Older versions allowed by the package metadata
-            # keep the construction-time credential and log that they cannot
-            # adopt desktop refreshes; passing the unsupported kwarg would
-            # TypeError on every signed-in MindsHub turn.
+            # constructor kwarg. An anton without it (none can start this
+            # server; see supports_api_key_provider above) keeps the
+            # construction-time credential and logs that it cannot adopt
+            # desktop refreshes; passing the unsupported kwarg would TypeError
+            # on every signed-in MindsHub turn.
             #
             # This refreshes the MAIN-PROCESS provider only. anton snapshots
             # export_connection_info().api_key once per ChatSession and hands
@@ -1775,7 +1888,7 @@ def build_llm_client(
         if "router_provider" in _params:
             router_kw = {
                 "router_provider": _make_provider(
-                    settings.resolved_router_provider, router_effort
+                    settings.resolved_router_provider, router_effort, api=agent_api
                 ),
                 "router_model": router_model,
             }

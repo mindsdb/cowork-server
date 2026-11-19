@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import json
 import logging
 import mimetypes
@@ -22,16 +23,21 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Iterable
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, NamedTuple
 
 from urllib.parse import quote
 
+from cowork.code_sandbox import backends_off_message, build_cell_sandbox, code_sandbox_on
+from cowork.common.minds_tls import minds_ssl_verify
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
+    dir_child_stat,
     dir_open,
     dir_rmtree,
     dir_scandir,
@@ -39,10 +45,18 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
-from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
+from cowork.db.personal_resources import PersonalResource
+from cowork.models.artifact_owner_choice import AccessMode
+from cowork.schemas.artifact_access import ArtifactAccessView, ArtifactStatusView
+from anton.core.artifacts.internal_files import (
+    NON_CONTENT_NAMES,
+    REVISIONS_DIRNAME,
+    is_bytecode_name,
+)
+from anton.core.artifacts.store import iter_content_files
 
 if TYPE_CHECKING:
-    from cowork.db.scoped import ScopedSession
+    from cowork.db.scoped import ScopedSession, TenantScope
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +109,21 @@ _NO_EXEC_DETAIL = (
 )
 
 
+_SHARED_PROJECT_BACKEND_DETAIL = (
+    "Live previews of apps with a backend are off on this deployment: projects "
+    "are shared while each person's connections are their own, and one shared "
+    "preview can't keep two people's connections apart."
+)
+
+
+class BackendPreviewRefused(RuntimeError):
+    """Raised by `mount_preview` instead of previewing an artifact's live
+    backend where one backend would serve several people's connections
+    (`_backends_cross_people`), and under the code sandbox, which runs no
+    backend (`code_sandbox_on`). The /artifacts/preview-mount route answers
+    it with 409 and its message."""
+
+
 class ExecutionRefused(RuntimeError):
     """Raised instead of running something, because `_org_mode()` is true.
 
@@ -113,15 +142,49 @@ class ExecutionRefused(RuntimeError):
 # `kind` field on the preview-mount response payload discriminates.
 _PREVIEW_MOUNTS: dict[str, Path] = {}
 
-# Launched-by-cowork-server backend tracking, keyed by artifact slug.
-# Shape matches anton's launcher: {"proc", "port", "pid", "log_path"}.
-# Used to avoid double-launching and to reap on shutdown.
-_LAUNCHED_BACKENDS: dict[str, dict] = {}
+# Launched-by-cowork-server backend tracking, keyed by project root, then by
+# artifact slug inside it: anton's launcher keys the dict it is handed by slug
+# and reaps the previous entry under the same slug, so one dict per project
+# root keeps two partitions' same-slug artifacts from replacing each other.
+# Entry shape matches anton's launcher: {"proc", "port", "pid", "log_path"},
+# read here as a LaunchedBackend. Used to avoid double-launching, to check
+# the proxy's port and to reap on shutdown.
+_LAUNCHED_BACKENDS: dict[str, dict[str, dict]] = {}
 
-# Per-slug mutex so two parallel `preview-mount` requests (React
-# StrictMode double-effects, a double-click) can't both decide the port
+# Per-(project root, slug) mutex so two parallel `preview-mount` requests
+# (React StrictMode double-effects, a double-click) can't both decide the port
 # is dead and spawn two backends side by side.
-_BACKEND_LAUNCH_LOCKS: dict[str, asyncio.Lock] = {}
+_BACKEND_LAUNCH_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+@dataclass(frozen=True)
+class LaunchedBackend:
+    """One `_LAUNCHED_BACKENDS` entry, as this module reads it. anton's
+    launcher writes the entry, a dict, so the registry keeps dicts."""
+
+    proc: asyncio.subprocess.Process | None
+    port: int | None
+
+    @classmethod
+    def from_entry(cls, entry: dict) -> LaunchedBackend:
+        return cls(proc=entry.get("proc"), port=entry.get("port"))
+
+    @property
+    def live(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None
+
+
+class BackendStatus(NamedTuple):
+    """What `_ensure_backend_running` reports for an artifact's backend."""
+
+    # Whether the backend answers.
+    running: bool
+    # "already_running" or "launched" when it runs; otherwise why it doesn't.
+    detail: str
+    # The port it answers on, which a fresh launch can change; 0 when it
+    # doesn't run.
+    port: int
+
 
 # ─── Type / kind mapping ──────────────────────────────────────────
 
@@ -158,6 +221,8 @@ TEXT_EXTENSIONS = {
     ".ts", ".tsx", ".css", ".log",
 }
 
+PREVIEW_TEXT_MAX = 200_000
+
 
 # ─── Helpers ──────────────────────────────────────────────────────
 
@@ -179,15 +244,22 @@ def _human_mtime(ts: float) -> str:
     return f"updated {int(secs // 86400)}d ago"
 
 
-def _projects_root() -> Path:
-    # Unkeyed: in org mode this dir is empty (projects live org-first under the
-    # shared root), so the in-app artifact API sees nothing there. Tracked in
-    # next.md §1 (artifacts org-scoping).
-    return Path(get_app_settings().project.root_dir)
+def _projects_root(*, scope: TenantScope | None) -> Path:
+    """The projects root the filesystem scan reads for ``scope``.
+
+    The canonical ProjectService helper, so a person whose projects are
+    personal scans their partition's projects and nobody else's, and
+    LOCAL_SCOPE scans the unkeyed root as the desktop always has. It keys the
+    path by the projects resource and refuses ``scope=None`` on a partitioned
+    deployment.
+    """
+    from cowork.services.projects import projects_root
+
+    return projects_root(scope=scope)
 
 
-def _registered_project_dirs() -> list[Path]:
-    """All project directories under the projects root, **resolved**.
+def _registered_project_dirs(*, scope: TenantScope | None) -> list[Path]:
+    """All project directories under ``scope``'s projects root, **resolved**.
 
     The resolution is part of the contract, not an implementation detail.
     ``_artifact_root_for_project`` matches these against a resolved candidate
@@ -199,7 +271,19 @@ def _registered_project_dirs() -> list[Path]:
     ``/private/var/folders/...``; a stub returning the raw temp path passes on
     Linux and fails on a Mac, which is how that state went unnoticed.
     """
-    root = _projects_root().resolve(strict=False)
+    raw_root = _projects_root(scope=scope)
+    if scope is not None and scope.partitioned_for(PersonalResource.PROJECTS):
+        # Reject a link planted at the projects level (<shared>/<org_id>/projects)
+        # or the partition level (<shared>/<org_id>): resolving the root blindly
+        # would follow it into another person's projects and hand the caller
+        # their artifacts. Each level must be a real directory, not a symlink.
+        for level in (raw_root, raw_root.parent):
+            try:
+                if not stat.S_ISDIR(os.lstat(level).st_mode):
+                    return []
+            except OSError:
+                return []
+    root = raw_root.resolve(strict=False)
     if not root.is_dir():
         return []
     out: list[Path] = []
@@ -218,45 +302,20 @@ def _registered_project_dirs() -> list[Path]:
     return out
 
 
-def _scan_artifact_dirs() -> list[Path]:
-    """Every project's `.anton/artifacts/` dir that exists."""
+def _scan_artifact_dirs(*, scope: TenantScope | None) -> list[Path]:
+    """Every `.anton/artifacts/` dir that exists under ``scope``'s projects.
+
+    A project whose `.anton` or `.anton/artifacts` is a link is skipped, as
+    artifacts_sources_for_scan skips it: every path route checks containment
+    against these dirs, so a link to another person's folder would make it
+    the caller's.
+    """
     dirs: dict[str, Path] = {}
-    for project_dir in _registered_project_dirs():
-        candidate = project_dir / ".anton" / "artifacts"
-        if candidate.is_dir():
+    for project_dir in _registered_project_dirs(scope=scope):
+        candidate = _real_artifacts_dir(project_dir)
+        if candidate is not None:
             dirs[str(candidate.resolve())] = candidate
     return list(dirs.values())
-
-
-def _iter_artifact_folders(project_path: str | None = None) -> Iterator[Path]:
-    """Yield artifact folders containing readable metadata.json."""
-    roots: list[Path]
-    if project_path is not None:
-        if not project_path or "\x00" in project_path:
-            return
-        try:
-            requested = Path(project_path).expanduser().resolve(strict=False)
-        except (OSError, ValueError, RuntimeError):
-            return
-        registered = set(_registered_project_dirs())
-        if requested not in registered:
-            return
-        candidate = requested / ".anton" / "artifacts"
-        if not candidate.is_dir():
-            return
-        roots = [candidate]
-    else:
-        roots = _scan_artifact_dirs()
-    for root in roots:
-        try:
-            for child in sorted(root.iterdir()):
-                if not child.is_dir():
-                    continue
-                if not (child / "metadata.json").is_file():
-                    continue
-                yield child
-        except OSError:
-            continue
 
 
 def _load_metadata(folder: Path) -> dict | None:
@@ -291,42 +350,10 @@ def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
     """All non-housekeeping files inside an artifact folder, paired with their
     mtime in nanoseconds, sorted by mtime desc.
 
-    One `os.scandir` pass: `DirEntry.is_file(follow_symlinks=False)` and
-    `DirEntry.stat(follow_symlinks=False)` are served from the entry the
-    kernel already returned, so each file is stat'd once instead of the
-    two-to-four times separate `rglob`/`is_file`/`is_symlink`/`stat` calls cost.
+    anton's `iter_content_files` decides what is content, so the card and
+    anton's own view of the artifact cannot disagree.
     """
-    out: list[tuple[Path, int]] = []
-
-    def _walk(start: Path, start_top: str | None) -> None:
-        # Explicit stack, not recursion: a folder deep enough to exhaust the
-        # call stack raises RecursionError, which is not an OSError and would
-        # otherwise escape every handler in the card builder above this.
-        stack: list[tuple[Path, str | None]] = [(start, start_top)]
-        while stack:
-            dir_path, top = stack.pop()
-            try:
-                with os.scandir(dir_path) as it:
-                    entries = list(it)
-            except OSError:
-                continue
-            for entry in entries:
-                entry_top = top if top is not None else entry.name
-                # First path component only: `static/prd.md` is content.
-                if entry_top in NON_CONTENT_NAMES:
-                    continue
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append((Path(entry.path), entry_top))
-                        continue
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
-                    mtime_ns = entry.stat(follow_symlinks=False).st_mtime_ns
-                except OSError:
-                    continue
-                out.append((Path(entry.path), mtime_ns))
-
-    _walk(folder, None)
+    out = [(path, st.st_mtime_ns) for path, st in iter_content_files(folder)]
     out.sort(key=lambda item: item[1], reverse=True)
     return out
 
@@ -344,7 +371,15 @@ def _pick_primary(
     preserve_folder_path: bool = False,
 ) -> Path | None:
     """The "open this" file for an artifact card."""
-    if primary_hint:
+    # The hint is agent-written. Two leading separators make it a UNC or
+    # device path, which replaces the folder in the join below, and on Windows
+    # even resolving one can send the user's credentials to another host. So
+    # such a hint is passed over before any file call.
+    if (
+        isinstance(primary_hint, str)
+        and primary_hint
+        and not primary_hint.replace("\\", "/").startswith("//")
+    ):
         try:
             candidate = folder / primary_hint
             target = candidate.resolve()
@@ -354,7 +389,8 @@ def _pick_primary(
                 # Keep that stable descriptor path rather than returning the
                 # resolved, swappable storage name after the containment check.
                 return candidate if preserve_folder_path else target
-        except (ValueError, OSError):
+        # Python 3.12's resolve() raises RuntimeError for a symlink loop.
+        except (ValueError, OSError, RuntimeError):
             pass
     if not files:
         return None
@@ -492,6 +528,23 @@ def _published_url_for(
     return ""
 
 
+def _report_id_for(
+    folder: Path,
+    primary: Path | None,
+    *,
+    published_map: dict | None = None,
+) -> str:
+    """The publish service's id for the artifact's live page, "" when it has
+    none. Read beside the URL and under the same rule, so a soft-deleted record
+    that keeps its report_id for a later re-publish reports none. The id is
+    already in the page's URL; the client sends it with its sharing analytics."""
+    pmap = published_map if published_map is not None else _load_published_map(folder)
+    if primary is None or not _published_url_for(folder, primary, published_map=pmap):
+        return ""
+    report_id = pmap[primary.name].get("report_id")
+    return report_id if isinstance(report_id, str) else ""
+
+
 def _modified_state(
     folder: Path,
     primary: Path | None,
@@ -526,14 +579,17 @@ def _modified_state(
 
     # Local import: publish imports this module, so import lazily to avoid a
     # circular import (mirrors _unpublish_folder below).
-    from cowork.services.publish import compute_publish_md5
+    from cowork.services.publish import MarkdownRenderBusy, compute_publish_md5
 
     # `folder.parent` IS the artifacts root: artifacts always live at
     # `<base>/<slug>/`. Passing it explicitly is what makes the badge work in org
     # mode, where the module-level FS scan finds no roots at all.
-    current_md5 = compute_publish_md5(
-        folder, artifacts_base=artifacts_base or folder.parent
-    )
+    try:
+        current_md5 = compute_publish_md5(
+            folder, artifacts_base=artifacts_base or folder.parent
+        )
+    except MarkdownRenderBusy:
+        return False, False  # another conversion runs: can't tell yet
     if current_md5 is None:
         return False, False  # can't tell — don't raise a false "modified"
     if current_md5 != entry.get("last_md5"):
@@ -598,67 +654,92 @@ def _is_modified(
     return False
 
 
-def _published_access_for(
+def published_access_view(
     folder: Path,
     primary: Path | None,
     *,
     published_map: dict | None = None,
-) -> dict:
+) -> ArtifactAccessView:
     """Owner-side access state for the primary file, from `.published.json`.
 
-    Returns ``accessMode`` (public|password|restricted) plus the mode-specific
-    state needed to pre-fill the publish dialog on re-publish:
-    ``accessProtected``/``accessPassword`` (password) and
-    ``accessEmails``/``orgAllowed``/``ownerOnly`` (restricted). The plaintext password and
-    the email list are owner-only — `.published.json` never enters the
-    published bundle — so callers must only return this to the artifact's owner
-    (the local/authenticated session).
+    The mode (public|password|restricted) plus the mode-specific state needed
+    to pre-fill the publish dialog on re-publish: the password (password) and
+    who a restricted artifact is shared with. The plaintext password and the
+    email list are owner-only (`.published.json` never enters the published
+    bundle), so callers must only return this to the artifact's owner (the
+    local/authenticated session).
+
+    In MindsHub mode the entry doesn't say who a restricted artifact is
+    shared with: MindsHub's rule is the one record of it, which GET /access
+    reads (cowork.services.publish.stored_artifact_rule). So the audience
+    reads as unknown here (ArtifactAccessView.audience_unknown), even for an
+    entry written before that: a card never shows a copy that could have
+    gone stale or been planted, nor an empty audience it doesn't know. An
+    entry whose mode is none of the three reads as public, the mode anton's
+    publisher republishes it in.
     """
-    out = {
-        "accessMode": "public",
-        "accessProtected": False,
-        "accessPassword": "",
-        "accessEmails": [],
-        "orgAllowed": False,
-        "ownerOnly": False,
-        # Composite comments scope {user_dir}/{report_id} (Plan 5); "" when
-        # unpublished or published before the key was persisted.
-        "artifactKey": "",
-    }
     if primary is None:
-        return out
+        return ArtifactAccessView()
     try:
         pmap = published_map if published_map is not None else _load_published_map(folder)
         entry = pmap.get(primary.name)
         # A soft-deleted record (published=False) is no longer live, so it must
         # not report a password/restricted mode — that would draw a lock icon on
         # an artifact whose publishedUrl is empty. Legacy entries have no flag.
-        if isinstance(entry, dict) and entry.get("published", True):
-            # `mode` is authoritative; fall back to the legacy requires_password
-            # flag for artifacts published before the mode field existed.
-            mode = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
-            out["accessMode"] = mode
-            out["artifactKey"] = entry.get("artifact_key", "") or ""
-            if mode == "password":
-                out["accessProtected"] = True
-                out["accessPassword"] = entry.get("access_password", "") or ""
-            elif mode == "restricted":
-                out["accessEmails"] = entry.get("emails", []) or []
-                out["orgAllowed"] = bool(entry.get("org_allowed"))
-                out["ownerOnly"] = bool(entry.get("owner_only"))
+        if not (isinstance(entry, dict) and entry.get("published", True)):
+            return ArtifactAccessView()
+        # `mode` is authoritative; fall back to the legacy requires_password
+        # flag for artifacts published before the mode field existed.
+        recorded = entry.get("mode") or ("password" if entry.get("requires_password") else "public")
+        mode = AccessMode(recorded) if recorded in set(AccessMode) else AccessMode.PUBLIC
+        artifact_key = entry.get("artifact_key", "") or ""
+        report_id = _report_id_for(folder, primary, published_map=pmap)
+        if mode is AccessMode.PASSWORD:
+            return ArtifactAccessView(
+                access_mode=mode,
+                artifact_key=artifact_key,
+                report_id=report_id,
+                access_protected=True,
+                access_password=entry.get("access_password", "") or "",
+            )
+        if mode is AccessMode.RESTRICTED and _org_mode():
+            return ArtifactAccessView.audience_unknown(artifact_key=artifact_key, report_id=report_id)
+        if mode is AccessMode.RESTRICTED:
+            return ArtifactAccessView(
+                access_mode=mode,
+                artifact_key=artifact_key,
+                report_id=report_id,
+                access_emails=entry.get("emails", []) or [],
+                org_allowed=bool(entry.get("org_allowed")),
+                owner_only=bool(entry.get("owner_only")),
+            )
+        return ArtifactAccessView(access_mode=mode, artifact_key=artifact_key, report_id=report_id)
     except Exception:
-        pass
-    return out
+        return ArtifactAccessView()
 
 
-def _external_project_artifacts_base(
+def _published_access_for(
+    folder: Path,
+    primary: Path | None,
+    *,
+    published_map: dict | None = None,
+) -> dict:
+    """published_access_view, under the app's names, for the artifact card's
+    access fields."""
+    return published_access_view(folder, primary, published_map=published_map).model_dump(
+        by_alias=True, mode="json"
+    )
+
+
+def _external_project_dir(
     project_name: str, session: ScopedSession
 ) -> Path | None:
-    """The artifacts dir of an adopted-folder project, addressed by row name.
+    """The folder of an adopted-folder project, addressed by row name.
 
     Scoped read, so it cannot reach another tenant's project. Returns None for
-    every project the filesystem scan already resolves, leaving that path
-    untouched.
+    every project the filesystem scan resolves, and for a row whose folder is
+    gone: a row created before the projects root moved still looks adopted,
+    and its folder now lives under the new root, where the scan finds it.
     """
     from cowork.services.projects import ProjectService
 
@@ -666,53 +747,136 @@ def _external_project_artifacts_base(
     project = service.get_project_by_name_or_none(project_name)
     if project is None or not service.directory_is_external(project):
         return None
-    base = Path(project.path) / ".anton" / "artifacts"
-    return base if base.is_dir() else None
+    folder = Path(project.path)
+    # lstat, not is_dir: a dangling link at the folder's path is not a stale
+    # row, and neither is a folder lstat can't reach. Only a missing path
+    # hands the name to a folder in the projects root.
+    try:
+        folder.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        pass
+    return folder
+
+
+def _real_artifacts_dir(project_dir: Path) -> Path | None:
+    """``project_dir``'s `.anton/artifacts`, or None when it's missing or
+    either folder is a link: the scan skips such a project too
+    (_scan_artifact_dirs), since a link to another person's folder would serve
+    their files as this project's."""
+    from cowork.services.artifact_roots import _storage_components_are_safe
+
+    if not _storage_components_are_safe(project_dir, may_be_absent=False):
+        return None
+    return project_dir / ".anton" / "artifacts"
+
+
+def _served_artifacts_dir(
+    project_dir: Path, *, project_name: str, session: ScopedSession
+) -> Path | None:
+    """_real_artifacts_dir for /serve, with one warning when a link in
+    `.anton` or `.anton/artifacts` is why it refuses: the route answers 404
+    then, as for a missing folder, and only this line tells the two apart."""
+    from cowork.services.artifact_roots import _ARTIFACTS_SUBPATH
+    from cowork.services.projects import ProjectService
+
+    base = _real_artifacts_dir(project_dir)
+    # os.path.islink, not Path.is_symlink: it answers False when lstat
+    # fails, where is_symlink raises on EACCES.
+    if base is None and (
+        os.path.islink(project_dir / _ARTIFACTS_SUBPATH[0])
+        or os.path.islink(project_dir.joinpath(*_ARTIFACTS_SUBPATH))
+    ):
+        # The JSON log keeps only its listed fields, so the project goes in
+        # by id; a name in `extra` would never reach it.
+        project = ProjectService(session).get_project_by_name_or_none(project_name)
+        logger.warning(
+            "Refused a linked artifacts folder",
+            extra={
+                "event": "artifact_folder_refused",
+                "reason": "linked_folder",
+                "project_id": str(project.id) if project is not None else None,
+            },
+        )
+    return base
+
+
+def _is_single_named_file(path: Path) -> bool:
+    """A regular file, not a link, with no second name. A hard link in an
+    artifacts folder to a file outside it, such as the project's
+    `.anton/.env`, resolves inside the folder and passes every path check,
+    and the code sandbox lets a cell make one. A route that hands out a
+    file's content checks this; the drafts route refuses such a file the same
+    way (artifact_files._open_regular_file)."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+
+
+def _is_the_projects_secrets(found: os.stat_result, *, anton_dir: Path) -> bool:
+    """Whether ``found`` is the project's `.anton/.env` under a second name: a
+    hard link a cell can make anywhere in its project, past the proxy's
+    refusal of `.anton/`. Matched by device and inode, so the project's other
+    hard-linked files, such as a package store's or a backup tool's, still
+    open."""
+    if found.st_nlink == 1:
+        return False
+    try:
+        saved = (anton_dir / ".env").lstat()
+    except OSError:
+        return False
+    return (found.st_dev, found.st_ino) == (saved.st_dev, saved.st_ino)
 
 
 def _project_artifacts_base(
-    project_name: str, session: ScopedSession | None = None
+    project_name: str, session: ScopedSession
 ) -> Path | None:
     """Resolve a project name to its `.anton/artifacts` dir, only when it
-    maps to a registered project. Returns None for unknown projects or
-    path-traversal attempts.
+    maps to a registered project of the session's scope and neither `.anton`
+    nor `.anton/artifacts` is a link. Returns None for unknown projects,
+    path-traversal attempts and linked folders.
 
     The scan below derives the directory as `<root>/<name>`, which is only true
     for a project the scan can see. A project pointed at a folder the user
-    chose is resolved from its row instead, when a session is available.
+    chose is resolved from its row instead. A row whose folder is gone, such
+    as one created before the projects root moved, is resolved by the scan.
     """
     if (not project_name or "\x00" in project_name
             or "/" in project_name or "\\" in project_name
             or project_name in (".", "..")):
         return None
-    if session is not None:
-        base = _external_project_artifacts_base(project_name, session)
-        if base is not None:
-            return base
+    external = _external_project_dir(project_name, session)
+    if external is not None:
+        # Final: the scan lists every folder in the projects root, so falling
+        # through would serve a same-named folder there instead.
+        return _served_artifacts_dir(external, project_name=project_name, session=session)
     # Compare canonical paths on both sides. On macOS, temporary and user
     # paths commonly cross aliases such as /var -> /private/var; comparing a
     # resolved candidate with raw registry entries incorrectly rejects a
     # genuinely registered project in that case.
     registered: set[Path] = set()
-    for project_dir in _registered_project_dirs():
+    for project_dir in _registered_project_dirs(scope=session.scope):
         try:
             registered.add(project_dir.resolve(strict=False))
         except (OSError, ValueError):
             continue
-    root = _projects_root().resolve(strict=False)
+    root = _projects_root(scope=session.scope).resolve(strict=False)
     try:
         candidate = (root / project_name).resolve(strict=False)
     except (OSError, ValueError):
         return None
     if candidate not in registered:
         return None
-    base = candidate / ".anton" / "artifacts"
-    return base if base.is_dir() else None
+    return _served_artifacts_dir(candidate, project_name=project_name, session=session)
 
 
 def serve_url_for(
     path: str | Path,
     *,
+    scope: TenantScope | None,
     artifacts_base: Path | None = None,
     project_name: str | None = None,
 ) -> str:
@@ -725,9 +889,9 @@ def serve_url_for(
     check — so there is no local URL to build.
 
     A caller that already knows the artifacts root and the project's name says
-    so. The scan below can only find projects inside the projects root, so for
-    an adopted folder it is both wrong about the URL segment (it would use the
-    folder's basename) and unable to find the tree at all.
+    so. The scan below can only find projects inside ``scope``'s projects root,
+    so for an adopted folder it is both wrong about the URL segment (it would
+    use the folder's basename) and unable to find the tree at all.
     """
     if _org_mode():
         return ""
@@ -744,8 +908,12 @@ def serve_url_for(
             return ""
         rel_str = "/".join(quote(part) for part in rel.parts)
         return f"/api/v1/artifacts/serve/{quote(project_name)}/{rel_str}"
-    for project_dir in _registered_project_dirs():
-        base = project_dir / ".anton" / "artifacts"
+    for project_dir in _registered_project_dirs(scope=scope):
+        # The route's own rule (_project_artifacts_base): a URL for a linked
+        # folder would get only a 404.
+        base = _real_artifacts_dir(project_dir)
+        if base is None:
+            continue
         try:
             rel = p.relative_to(base.resolve())
         except (ValueError, OSError):
@@ -757,7 +925,7 @@ def serve_url_for(
     return ""
 
 
-def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
+def _candidate_relative_artifacts(raw_path: str, artifact_dirs: list[Path]) -> list[Path]:
     text = (raw_path or "").strip().replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
@@ -767,7 +935,7 @@ def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
     if text.startswith("artifacts/"):
         text = text[len("artifacts/"):]
     matches: dict[str, Path] = {}
-    for art_root in _scan_artifact_dirs():
+    for art_root in artifact_dirs:
         try:
             target = (art_root / text).resolve()
             target.relative_to(art_root.resolve())
@@ -778,11 +946,17 @@ def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
     return list(matches.values())
 
 
-def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | None:
+def resolve_artifact_path(
+    raw_path: str, *, scope: TenantScope | None, allow_dir: bool = False
+) -> Path | None:
     """Turn an artifact request path into an absolute path on disk.
 
     Returns None if invalid, or the resolved Path if found.
     Raises ValueError with a message for 400/404 cases.
+
+    Only the artifacts roots of ``scope``'s projects count, so a path into
+    another person's partition, or into the unkeyed root from a partition,
+    is "not in a known artifacts directory".
 
     When `allow_dir` is set, an absolute path that resolves to an artifact
     *root directory* (one carrying `metadata.json`) is also accepted — used
@@ -801,7 +975,7 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
 
     if target.is_absolute():
         resolved = target.resolve()
-        for art_root in _scan_artifact_dirs():
+        for art_root in _scan_artifact_dirs(scope=scope):
             try:
                 resolved.relative_to(art_root.resolve())
             except ValueError:
@@ -812,7 +986,7 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
                 return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
-    matches = _candidate_relative_artifacts(raw_path)
+    matches = _candidate_relative_artifacts(raw_path, _scan_artifact_dirs(scope=scope))
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -820,7 +994,7 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
-def _artifact_root_for(path: Path) -> Path:
+def _artifact_root_for(path: Path, *, scope: TenantScope | None) -> Path:
     """Climb from an artifact file to the folder that holds its
     `metadata.json` — the artifact root.
 
@@ -834,7 +1008,7 @@ def _artifact_root_for(path: Path) -> Path:
     (`<base>/.anton/artifacts/`) so a metadata-less tree can't send us
     climbing into the rest of the disk. Falls back to `path.parent`.
     """
-    containers = {str(d.resolve()) for d in _scan_artifact_dirs()}
+    containers = {str(d.resolve()) for d in _scan_artifact_dirs(scope=scope)}
     current = path.parent.resolve()
     while True:
         if (current / "metadata.json").is_file():
@@ -859,14 +1033,28 @@ def _fullstack_types() -> frozenset[str]:
         return frozenset()
 
 
+def is_publish_record_name(name: object) -> bool:
+    """A `.published.json` key names a file directly in the record's folder."""
+    return (
+        isinstance(name, str)
+        and name not in {"", ".", ".."}
+        and Path(name).name == name
+        and "/" not in name
+        and "\\" not in name
+        and "\x00" not in name
+    )
+
+
 def _unpublish_folder(
-    folder: Path, *, artifacts_base: Path, api_key: str, publish_url: str
+    folder: Path, *, artifacts_base: Path, api_key: str, publish_url: str,
+    scope: TenantScope | None = None,
 ) -> None:
     """Unpublish every published file in an artifact folder.
 
     Reads `.published.json` and unpublishes each recorded file from the
     remote. Raises if any unpublish fails so the caller can abort the
-    delete and leave the artifact intact.
+    delete and leave the artifact intact. On a protected publisher,
+    `unpublish_artifact` checks each page's owner with ``scope``.
     """
     published_map = _load_published_map(folder)
     if not published_map:
@@ -887,6 +1075,14 @@ def _unpublish_folder(
             continue
         if not (entry.get("report_id") or entry.get("last_md5")):
             continue
+        if not is_publish_record_name(name):
+            # A key like ../other/index.html would reach another folder's page.
+            logger.warning(
+                "orphaned_publish identifier=%s url=%s reason=primary_invalid",
+                entry.get("report_id") or entry.get("last_md5"),
+                entry.get("url", ""),
+            )
+            continue
         if not (folder / name).is_file():
             # The path-based unpublish needs the file present, so this record
             # cannot be cleared upstream — and once the folder is gone there is
@@ -900,7 +1096,7 @@ def _unpublish_folder(
             continue
         unpublish_artifact(
             folder / name, artifacts_base=artifacts_base,
-            api_key=api_key, publish_url=publish_url,
+            api_key=api_key, publish_url=publish_url, scope=scope,
         )
 
 
@@ -917,7 +1113,7 @@ def _unpublish_identifier(
 
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
-    ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+    ssl_verify = minds_ssl_verify()
     try:
         unpublish(
             identifier,
@@ -926,9 +1122,9 @@ def _unpublish_identifier(
             ssl_verify=ssl_verify,
         )
     except Exception as exc:
-        from cowork.services.publish import raise_publish_permission_error
+        from cowork.services.publish import classify_upload_error
 
-        raise_publish_permission_error(exc)
+        classify_upload_error(exc)
         message = str(exc) or "Unpublishing failed."
         if "404" in message or "not found" in message.lower():
             logger.warning(
@@ -941,25 +1137,26 @@ def _unpublish_identifier(
         raise RuntimeError(f"Unpublishing failed: {message}") from exc
 
 
-def _unpublish_pinned_folder(
-    folder: PinnedDir, *, api_key: str, publish_url: str
-) -> None:
-    """Unpublish records read and updated through one pinned artifact folder."""
-    published_map = _load_published_map_pinned(folder)
+class _PageToTakeDown(NamedTuple):
+    """A live page of an artifact's publish record that its delete takes down."""
+
+    name: str
+    identifier: str
+    entry: dict
+
+
+def _pages_to_take_down(*, folder: PinnedDir, published_map: dict) -> list[_PageToTakeDown]:
+    """The pages ``published_map`` records as live whose primary is still a
+    regular file in ``folder``. A page whose primary name is invalid or whose
+    primary is gone is logged as an orphaned publish and left up."""
+    pages: list[_PageToTakeDown] = []
     for name, entry in published_map.items():
         if not isinstance(entry, dict) or entry.get("published") is False:
             continue
         identifier = entry.get("report_id") or entry.get("last_md5")
         if not identifier:
             continue
-        if (
-            not name
-            or name in {".", ".."}
-            or Path(name).name != name
-            or "/" in name
-            or "\\" in name
-            or "\x00" in name
-        ):
+        if not is_publish_record_name(name):
             logger.warning(
                 "orphaned_publish identifier=%s url=%s reason=primary_invalid",
                 identifier,
@@ -977,19 +1174,64 @@ def _unpublish_pinned_folder(
                 entry.get("url", ""),
             )
             continue
+        pages.append(_PageToTakeDown(name, str(identifier), entry))
+    return pages
 
-        _unpublish_identifier(
-            str(identifier), entry, api_key=api_key, publish_url=publish_url
-        )
-        entry["published"] = False
-        published_map[name] = entry
+
+def _unpublish_protected_pages(
+    *, folder: PinnedDir, api_key: str, publish_url: str, scope: TenantScope | None,
+) -> None:
+    """Take down a pinned folder's pages on a protected publisher
+    (``protects_publisher``), updating its publish record as each comes down.
+
+    Each page goes through the same owner check as `unpublish_artifact`, which
+    holds the publish record's lock across the take-down: another tester's
+    page refuses the delete, and an id this artifact has no record for is
+    dropped locally without a request.
+    """
+    from cowork.services.published_page_ownership import publication_owner
+
+    published_map = _load_published_map_pinned(folder)
+    for page in _pages_to_take_down(folder=folder, published_map=published_map):
+        with publication_owner(
+            folder.path / page.name, published_dir=folder.path,
+            publish_url=publish_url, scope=scope,
+        ) as ownership:
+            identifier = ownership.checked_report_id(
+                page.entry.get("report_id"), url=page.entry.get("url", ""),
+            )
+            if identifier is None:
+                published_map.pop(page.name, None)
+                _write_published_map_pinned(folder, published_map)
+                continue
+            _unpublish_identifier(
+                identifier, page.entry, api_key=api_key, publish_url=publish_url
+            )
+        page.entry["published"] = False
+        published_map[page.name] = page.entry
         # Match the historical partial-progress behavior: if a later remote
         # revoke fails, earlier successful records remain marked unpublished.
         _write_published_map_pinned(folder, published_map)
 
 
+def _record_taken_down(*, folder: PinnedDir, names: list[str]) -> None:
+    """Mark each of ``names`` unpublished in a pinned folder's publish record.
+    The record is read again here: a publish may have written it while the
+    pages came down."""
+    published_map = _load_published_map_pinned(folder)
+    marked = False
+    for name in names:
+        entry = published_map.get(name)
+        if isinstance(entry, dict):
+            entry["published"] = False
+            marked = True
+    if marked:
+        _write_published_map_pinned(folder, published_map)
+
+
 def delete_artifact(
-    artifact: Path, *, artifacts_base: Path, api_key: str, publish_url: str
+    artifact: Path, *, artifacts_base: Path, api_key: str, publish_url: str,
+    scope: TenantScope | None = None,
 ) -> None:
     """Permanently delete an artifact folder from disk.
 
@@ -1014,6 +1256,7 @@ def delete_artifact(
     # Unpublish before deleting; if this raises, the artifact stays.
     _unpublish_folder(
         folder, artifacts_base=artifacts_base, api_key=api_key, publish_url=publish_url,
+        scope=scope,
     )
     shutil.rmtree(folder)
 
@@ -1035,13 +1278,142 @@ def artifact_id_for_folder(source: ProjectArtifacts, folder_name: str) -> str:
         return artifact_id
 
 
-def delete_artifact_from_source(
+@dataclass
+class _PinnedDelete:
+    """An artifact folder a delete has pinned and checked, and the pages it
+    takes down before it removes the folder.
+
+    ``descriptors`` keeps the root's and the folder's descriptors open from
+    the check to the removal, so the folder's inode can't be reused, and a
+    folder replaced by another one or a link in between is refused rather
+    than removed. ``folder_descriptor`` closes the folder's alone, before the
+    removal. ``taken_down`` names each page the delete has taken down.
+    """
+
+    root: PinnedDir
+    folder: PinnedDir
+    folder_name: str
+    pages: list[_PageToTakeDown]
+    descriptors: ExitStack
+    folder_descriptor: ExitStack
+    taken_down: list[str] = field(default_factory=list)
+
+
+def _pin_for_delete(
+    *,
     source: ProjectArtifacts,
     folder_name: str,
-    *,
     expected_artifact_id: str | None,
     api_key: str,
     publish_url: str,
+    scope: TenantScope | None,
+) -> _PinnedDelete:
+    """The delete's first file store step: pin the root and the folder, check
+    the folder is the artifact asked for, and list the pages to take down.
+
+    A protected publisher's pages come down here, in this step, since each
+    one's owner check holds the publish record's lock across its take-down
+    (`_unpublish_protected_pages`); the delete then lists none.
+    """
+    from cowork.services.artifact_identity import (
+        _opened_child_directory,
+        canonical_artifact_id,
+        ensure_full_id,
+        opened_artifact_root,
+    )
+    from cowork.services.published_page_ownership import protects_publisher
+
+    expected = (
+        canonical_artifact_id(expected_artifact_id)
+        if expected_artifact_id is not None
+        else None
+    )
+    descriptors = ExitStack()
+    try:
+        root = descriptors.enter_context(opened_artifact_root(source))
+        folder_descriptor = descriptors.enter_context(ExitStack())
+        folder = folder_descriptor.enter_context(_opened_child_directory(root, folder_name))
+        try:
+            metadata_stat = dir_stat(folder, "metadata.json", follow_symlinks=False)
+        except OSError as exc:
+            raise FileNotFoundError("Artifact not found") from exc
+        if not stat.S_ISREG(metadata_stat.st_mode):
+            raise FileNotFoundError("Artifact metadata is not a regular file")
+
+        if expected is not None:
+            found, _metadata = ensure_full_id(folder.path, _pinned=folder)
+            if found != expected:
+                raise FileNotFoundError("Artifact identity changed before deletion")
+
+        if protects_publisher(publish_url):
+            _unpublish_protected_pages(folder=folder, api_key=api_key, publish_url=publish_url, scope=scope)
+            pages: list[_PageToTakeDown] = []
+        else:
+            pages = _pages_to_take_down(folder=folder, published_map=_load_published_map_pinned(folder))
+    except BaseException:
+        descriptors.close()
+        raise
+    return _PinnedDelete(
+        root=root,
+        folder=folder,
+        folder_name=folder_name,
+        pages=pages,
+        descriptors=descriptors,
+        folder_descriptor=folder_descriptor,
+    )
+
+
+def _take_down_pages(*, pinned: _PinnedDelete, api_key: str, publish_url: str) -> None:
+    """The delete's network step: take down each page ``pinned`` lists, with no
+    file store call, so a slow publish service holds no file store slot. Each
+    page is added to ``pinned.taken_down`` once it is down, so a failure
+    part-way still records the pages already down."""
+    for page in pinned.pages:
+        _unpublish_identifier(page.identifier, page.entry, api_key=api_key, publish_url=publish_url)
+        pinned.taken_down.append(page.name)
+
+
+def _finish_delete(*, pinned: _PinnedDelete, remove: bool) -> None:
+    """The delete's last file store step: record the pages taken down in the
+    publish record, then, with ``remove``, check that the folder is still the
+    one pinned and remove it. Closes the descriptors either way."""
+    with pinned.descriptors:
+        if pinned.taken_down:
+            _record_taken_down(folder=pinned.folder, names=pinned.taken_down)
+        if not remove:
+            return
+        folder = pinned.folder
+        opened_stat = (
+            os.fstat(folder.fd)
+            if folder.fd is not None
+            else folder.path.stat(follow_symlinks=False)
+        )
+        try:
+            current_stat = dir_stat(pinned.root, pinned.folder_name, follow_symlinks=False)
+        except OSError as exc:
+            raise FileNotFoundError("Artifact changed before deletion") from exc
+        if (
+            not stat.S_ISDIR(current_stat.st_mode)
+            or (current_stat.st_dev, current_stat.st_ino)
+            != (opened_stat.st_dev, opened_stat.st_ino)
+        ):
+            raise FileNotFoundError("Artifact changed before deletion")
+        pinned.folder_descriptor.close()
+        # POSIX ``shutil.rmtree(..., dir_fd=...)`` performs its own fd/stat
+        # symlink-attack checks while walking. The root descriptor also keeps
+        # this operation in the authorized container if its lexical path moves.
+        dir_rmtree(pinned.root, pinned.folder_name)
+
+
+async def delete_artifact_from_source(
+    *,
+    source: ProjectArtifacts,
+    folder_name: str,
+    expected_artifact_id: str | None,
+    api_key: str,
+    publish_url: str,
+    scope: TenantScope,
+    deadline: bool = True,
 ) -> None:
     """Delete one direct artifact child through pinned directory descriptors.
 
@@ -1051,63 +1423,46 @@ def delete_artifact_from_source(
     validated legacy name. Keeping the root and folder descriptors open across
     validation and unpublishing prevents a writable root/folder symlink swap
     from redirecting the eventual removal to another tenant's storage.
+
+    It runs in three steps, so a slow publish service holds no file store
+    slot. A file store call pins and checks the folder and lists its live
+    pages (``run_efs``; ``deadline`` as there). The pages come down on
+    asyncio's default executor, as the publish uploads go up. A second file
+    store call then records them in the publish record and removes the
+    folder. That call waits for a slot as long as it takes: the pages are
+    already down. A failed take-down leaves the folder in place and
+    propagates, with the pages already down recorded.
     """
-    from cowork.services.artifact_identity import (
-        _opened_child_directory,
-        canonical_artifact_id,
-        ensure_full_id,
-        opened_artifact_root,
-    )
+    from cowork.db.units import run_efs, run_to_completion
 
-    expected = (
-        canonical_artifact_id(expected_artifact_id)
-        if expected_artifact_id is not None
-        else None
-    )
-    with opened_artifact_root(source) as root:
-        with _opened_child_directory(root, folder_name) as folder:
-            try:
-                metadata_stat = dir_stat(
-                    folder, "metadata.json", follow_symlinks=False
-                )
-            except OSError as exc:
-                raise FileNotFoundError("Artifact not found") from exc
-            if not stat.S_ISREG(metadata_stat.st_mode):
-                raise FileNotFoundError("Artifact metadata is not a regular file")
+    # Filled once the pin step returns, so a caller canceled while that step
+    # ran still closes what it pinned.
+    pinned: list[_PinnedDelete] = []
 
-            if expected is not None:
-                found, _metadata = ensure_full_id(folder.path, _pinned=folder)
-                if found != expected:
-                    raise FileNotFoundError("Artifact identity changed before deletion")
+    def pin() -> None:
+        pinned.append(_pin_for_delete(
+            source=source,
+            folder_name=folder_name,
+            expected_artifact_id=expected_artifact_id,
+            api_key=api_key,
+            publish_url=publish_url,
+            scope=scope,
+        ))
 
-            # Unpublish before deletion. A remote failure propagates while the
-            # exact folder remains present, preserving the established contract.
-            _unpublish_pinned_folder(
-                folder,
-                api_key=api_key,
-                publish_url=publish_url,
+    taken_down = False
+    try:
+        await run_efs(pin, scope=scope, deadline=deadline)
+        # Waits for the take-down even when canceled: its pages must be
+        # recorded, and the descriptors stay open until it ends.
+        await run_to_completion(asyncio.to_thread(
+            _take_down_pages, pinned=pinned[0], api_key=api_key, publish_url=publish_url,
+        ))
+        taken_down = True
+    finally:
+        if pinned:
+            await run_efs(
+                partial(_finish_delete, pinned=pinned[0], remove=taken_down), scope=scope, deadline=False,
             )
-
-            opened_stat = (
-                os.fstat(folder.fd)
-                if folder.fd is not None
-                else folder.path.stat(follow_symlinks=False)
-            )
-            try:
-                current_stat = dir_stat(root, folder_name, follow_symlinks=False)
-            except OSError as exc:
-                raise FileNotFoundError("Artifact changed before deletion") from exc
-            if (
-                not stat.S_ISDIR(current_stat.st_mode)
-                or (current_stat.st_dev, current_stat.st_ino)
-                != (opened_stat.st_dev, opened_stat.st_ino)
-            ):
-                raise FileNotFoundError("Artifact changed before deletion")
-
-        # POSIX ``shutil.rmtree(..., dir_fd=...)`` performs its own fd/stat
-        # symlink-attack checks while walking. The root descriptor also keeps
-        # this operation in the authorized container if its lexical path moves.
-        dir_rmtree(root, folder_name)
 
 
 def reveal_in_file_manager(path: Path) -> None:
@@ -1124,6 +1479,19 @@ def reveal_in_file_manager(path: Path) -> None:
 
 
 # ─── Public API ───────────────────────────────────────────────────
+
+
+def draft_url_for(*, project_id: str | None, artifact_id: str, rel_path: str) -> str:
+    """The authenticated draft URL of one file inside an artifact folder.
+
+    The project segment is ``project_id``, or ``local`` for a root no project
+    row names. ``rel_path`` is "/"-separated and relative to the artifact folder.
+    """
+    project_ref = project_id or "local"
+    return (
+        f"/api/v1/artifacts/drafts/{quote(str(project_ref))}/"
+        f"{quote(artifact_id)}/{quote(rel_path, safe='/')}"
+    )
 
 
 @dataclass(frozen=True)
@@ -1148,10 +1516,15 @@ def _prepare_artifact_card(
     project_name: str,
     pinned_folder: PinnedDir | None,
     pinned_root: PinnedDir | None,
+    scope: TenantScope | None,
     artifacts_base: Path | None = None,
     project_label: str = "",
 ) -> _PreparedArtifactCard | None:
-    """Assemble the shared card shape without any filesystem mutation."""
+    """Assemble the shared card shape without any filesystem mutation.
+
+    ``scope`` only finds the serve URL's project by scanning, when the caller
+    names no ``artifacts_base`` and ``project_name`` (see serve_url_for).
+    """
     logical_folder = folder
     io_folder = _pinned_directory_path(pinned_folder) if pinned_folder else folder
     io_root = _pinned_directory_path(pinned_root) if pinned_root else None
@@ -1235,7 +1608,10 @@ def _prepare_artifact_card(
             io_folder, primary, published_map=published_map
         ),
         "serveUrl": serve_url_for(
-            primary_path, artifacts_base=artifacts_base, project_name=project_name
+            primary_path,
+            scope=scope,
+            artifacts_base=artifacts_base,
+            project_name=project_name,
         ),
     }
     from cowork.services.artifact_identity import artifact_key
@@ -1245,7 +1621,6 @@ def _prepare_artifact_card(
     # fork when an artifact is re-published under a different report URL.
     card["artifactKey"] = artifact_key(artifact_id)
     if primary is not None:
-        project_ref = project_id or "local"
         # macOS commonly exposes the same temporary directory through both
         # ``/var`` and ``/private/var``. Canonicalize both sides before deriving
         # the URL path so an absolute primary hint cannot fail on that alias.
@@ -1261,17 +1636,16 @@ def _prepare_artifact_card(
         except ValueError:
             logger.warning("Artifact primary resolves outside its folder: %s", folder)
         else:
-            card["draftUrl"] = (
-                f"/api/v1/artifacts/drafts/{quote(str(project_ref))}/"
-                f"{quote(artifact_id)}/{quote(rel, safe='/')}"
+            card["draftUrl"] = draft_url_for(
+                project_id=project_id, artifact_id=artifact_id, rel_path=rel
             )
     if _org_mode():
         # Dropped at the single card builder so inline chat cards are covered
         # too: they call this function as well, and a filter applied only at the
         # list endpoint would still hand the plaintext password to the chat.
-        # Access in org mode is always restricted-to-org, so neither field has a
-        # consumer there. `accessMode` stays — ArtifactStatus draws its badge
-        # from it.
+        # In org mode the owner reads the password and the emails from GET
+        # .../access, which can tell owner from co-member, so the card carries
+        # neither. `accessMode` stays: ArtifactStatus draws its badge from it.
         card.pop("accessPassword", None)
         card.pop("accessEmails", None)
     return _PreparedArtifactCard(
@@ -1287,6 +1661,7 @@ def card_for_folder(
     folder: Path,
     idx: int = 0,
     *,
+    scope: TenantScope | None,
     project_id: str | None = None,
     project_name: str = "",
     project_label: str = "",
@@ -1329,6 +1704,7 @@ def card_for_folder(
         project_name=project_name,
         pinned_folder=_pinned_folder,
         pinned_root=_pinned_root,
+        scope=scope,
         artifacts_base=artifacts_base,
         project_label=project_label,
     )
@@ -1353,9 +1729,13 @@ def _listed_card_for_pinned_folder(
     project_name: str,
     pinned_folder: PinnedDir,
     pinned_root: PinnedDir,
-    artifacts_base: Path | None = None,
+    artifacts_base: Path,
 ) -> dict | None:
-    """Build one list card through a call graph containing no artifact writes."""
+    """Build one list card through a call graph containing no artifact writes.
+
+    The caller names the card's artifacts root, so its serve URL is built from
+    that root and the project name, never by scanning for whose project it is.
+    """
     from cowork.services.artifact_identity import read_full_id
 
     try:
@@ -1378,6 +1758,8 @@ def _listed_card_for_pinned_folder(
         project_name=project_name,
         pinned_folder=pinned_folder,
         pinned_root=pinned_root,
+        # No scan: artifacts_base and project_name name the card's project.
+        scope=None,
         artifacts_base=artifacts_base,
     )
     if prepared is None:
@@ -1411,16 +1793,7 @@ def _pinned_directory_path(directory: PinnedDir | None) -> Path | None:
         return None
 
 
-def _blank_artifact_status() -> dict:
-    """The stable response for an unknown or no-longer-readable artifact."""
-    return {
-        "publishedUrl": "", "modified": False, "accessMode": "public",
-        "accessProtected": False, "accessEmails": [], "orgAllowed": False,
-        "ownerOnly": False,
-    }
-
-
-def artifact_status_for_resolved(artifact: Path) -> dict:
+def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -> ArtifactStatusView:
     """Fresh owner-side status for an already resolved artifact path.
 
     The HTTP boundary resolves an untrusted request through
@@ -1433,15 +1806,14 @@ def artifact_status_for_resolved(artifact: Path) -> dict:
     subset only — the cheap read the viewer polls on window focus to light up
     the "Update" button when the artifact changes underneath an open preview.
     """
-    blank = _blank_artifact_status()
     if not isinstance(artifact, Path) or not artifact.is_absolute():
-        return dict(blank)
+        return ArtifactStatusView()
     # Fullstack artifacts keep their primary file in a `static/` subdir, so a
     # naive `artifact.parent` would land there instead of the artifact root
     # (where metadata.json + .published.json actually live) — climb via
-    # `_artifact_root_for` like `mount_preview`/`html_artifacts` do.
-    folder = artifact if artifact.is_dir() else _artifact_root_for(artifact)
-    card = card_for_folder(folder)
+    # `_artifact_root_for` like `mount_preview` does.
+    folder = artifact if artifact.is_dir() else _artifact_root_for(artifact, scope=scope)
+    card = card_for_folder(folder, scope=scope)
     if card is None:
         # Loose / legacy file (no metadata.json anywhere up to the artifacts
         # container root).
@@ -1453,50 +1825,83 @@ def artifact_status_for_resolved(artifact: Path) -> dict:
     # One response shape for BOTH branches: explicitly the published /
     # modified / access subset, and NEVER `accessPassword` — that owner-only
     # plaintext (which `_published_access_for` and the card both carry) must
-    # not leave this endpoint.
-    return {
-        "publishedUrl": card.get("publishedUrl", ""),
-        "modified": bool(card.get("modified")),
-        "accessMode": card.get("accessMode", "public"),
-        "accessProtected": bool(card.get("accessProtected")),
-        "accessEmails": card.get("accessEmails", []),
-        "orgAllowed": bool(card.get("orgAllowed")),
-        "ownerOnly": bool(card.get("ownerOnly")),
-        "artifactKey": card.get("artifactKey", ""),
-    }
+    # not leave this endpoint. ArtifactStatusView has no field for it.
+    return ArtifactStatusView.of_card(card)
 
 
-def artifact_status(raw_path: str) -> dict:
+def artifact_status(raw_path: str, *, scope: TenantScope | None) -> ArtifactStatusView:
     """Compatibility wrapper accepting the historical raw path string."""
     try:
-        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+        artifact = resolve_artifact_path(raw_path, scope=scope, allow_dir=True)
     except Exception:
-        return _blank_artifact_status()
+        return ArtifactStatusView()
     if artifact is None:
-        return _blank_artifact_status()
-    return artifact_status_for_resolved(artifact)
+        return ArtifactStatusView()
+    return artifact_status_for_resolved(artifact, scope=scope)
+
+
+#: The cards a list shows, newest first.
+LIST_CARDS = 80
+
+
+class ListCandidate(NamedTuple):
+    """One folder a list may show: the time it sorts by, its root's place in
+    the list's roots (which breaks a tie), its name, and its root."""
+
+    sort_time: float
+    source_index: int
+    name: str
+    source: ProjectArtifacts
+
+
+class ListedCards(NamedTuple):
+    """What cards_for_candidates built: the cards, newest first, and the
+    candidates whose folder opened and built no card. A folder lands in
+    `no_card` when the read of its id raises any OSError or ValueError
+    (artifact_identity.read_full_id): it holds no metadata.json, one that
+    is a link or not a regular file, one with no valid id, or one whose
+    read fails, as on EIO or ESTALE. It lands there too when the card
+    builder finds no procfs path for the open folder or its root
+    (_pinned_directory_path), on a Linux host without procfs. A folder
+    that fails to open, or whose card build raises, is skipped and is in
+    neither field."""
+
+    cards: list[dict]
+    no_card: tuple[ListCandidate, ...]
 
 
 def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
-    """Every artifact under the given roots, newest first, capped at 80.
+    """Every artifact under the given roots, newest first, capped at
+    LIST_CARDS.
 
     Roots come from the caller (see services.artifact_roots) — this function
     never discovers them, because a filesystem scan cannot tell which tenant is
-    asking. The 80-item cap is pre-existing but matters more in org mode, where
+    asking. The cap is pre-existing but matters more in org mode, where
     `sources` spans every project of the organization instead of one tree.
 
     Two passes so the cap is applied before card work, not after: a collect
-    pass opens each artifact once and reads only its `metadata.json` mtime (no
-    card built), then a build pass walks the sorted candidates and stops once
-    80 cards have been produced.
+    pass (list_candidates) opens each artifact once and reads only its
+    `metadata.json` mtime (no card built), then a build pass
+    (cards_for_candidates) walks the sorted candidates and stops once
+    LIST_CARDS cards have been produced. In org mode, once the sort times are
+    recorded, the list runs the collect pass only over the roots of the
+    projects whose rows it cannot trust, and passes the newest rows as the
+    other candidates (cowork.services.artifact_sort_times).
     """
-    from cowork.services.artifact_identity import (
-        _opened_child_directory,
-        opened_artifact_root,
-    )
+    return cards_for_candidates(list_candidates(sources, indexes=range(len(sources)))).cards
 
-    candidates: list[tuple[float, int, str, ProjectArtifacts]] = []
-    for source_idx, source in enumerate(sources):
+
+def list_candidates(sources: list[ProjectArtifacts], *, indexes: Iterable[int]) -> list[ListCandidate]:
+    """The collect pass of list_artifacts over the roots of `sources` at
+    `indexes`: one candidate for each folder of those roots, with its root's
+    index in `sources`, so candidates from separate calls over the same
+    `sources` sort together as one walk's (cards_for_candidates). A root that
+    fails to open or list gives none."""
+    from cowork.services.artifact_identity import opened_artifact_root
+
+    candidates: list[ListCandidate] = []
+    for source_idx in indexes:
+        source = sources[source_idx]
         try:
             with opened_artifact_root(source) as root:
                 with dir_scandir(root) as entries:
@@ -1520,21 +1925,35 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                         except OSError:
                             continue
                 for child_name in sorted(child_names):
+                    # One no-follow open of the folder and one stat of its
+                    # metadata.json (dir_child_stat), the least a sort by that
+                    # time can cost on the file store. A folder that would not
+                    # open, or holds no metadata.json, sorts last at 0; the
+                    # build pass opens it no-follow again and skips it.
                     try:
-                        with _opened_child_directory(root, child_name) as pinned_folder:
-                            try:
-                                mtime = dir_stat(pinned_folder, "metadata.json").st_mtime
-                            except OSError:
-                                mtime = 0.0
-                            candidates.append((mtime, source_idx, child_name, source))
-                    except (OSError, ValueError):
-                        continue
+                        mtime = dir_child_stat(root, child_name, "metadata.json").st_mtime
+                    except OSError:
+                        mtime = 0.0
+                    candidates.append(ListCandidate(mtime, source_idx, child_name, source))
         except (OSError, ValueError):
             continue
+    return candidates
 
-    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
 
+def cards_for_candidates(candidates: Iterable[ListCandidate]) -> ListedCards:
+    """The cards of `candidates`, newest first, then by root and name, capped
+    at LIST_CARDS: each folder opened without following a link, and one
+    that fails to open or builds no card skipped. Each candidate whose
+    folder opened and built no card comes back in ListedCards.no_card,
+    which says when that happens."""
+    from cowork.services.artifact_identity import (
+        _opened_child_directory,
+        opened_artifact_root,
+    )
+
+    ordered = sorted(candidates, key=lambda item: (-item.sort_time, item.source_index, item.name))
     cards: list[dict] = []
+    no_card: list[ListCandidate] = []
     # One root open per source, not per surviving candidate: opening a root
     # costs an openat+stat per path component, so re-opening it per card
     # would undo what capping the candidates before this pass just saved.
@@ -1551,9 +1970,10 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                     opened_roots[source_idx] = None
             return opened_roots[source_idx]
 
-        for _mtime, source_idx, child_name, source in candidates:
-            if len(cards) >= 80:
+        for candidate in ordered:
+            if len(cards) >= LIST_CARDS:
                 break
+            _mtime, source_idx, child_name, source = candidate
             root = _root_for(source_idx, source)
             if root is None:
                 continue
@@ -1567,15 +1987,68 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                         project_name=source.project_name,
                         pinned_folder=pinned_folder,
                         pinned_root=root,
-                        artifacts_base=(source.base if source.external else None),
+                        artifacts_base=source.base,
                     )
-                    if card is None:
-                        continue
-                    cards.append(card)
             except (OSError, ValueError):
                 continue
+            if card is None:
+                no_card.append(candidate)
+                continue
+            cards.append(card)
 
-    return cards
+    return ListedCards(cards=cards, no_card=tuple(no_card))
+
+
+def _line_breaks(text: str, start: int, end: int, has_cr: bool) -> int:
+    # `\r\n` is one break; a bare `\n` or `\r` is one each.
+    breaks = text.count("\n", start, end)
+    if has_cr:
+        breaks += text.count("\r", start, end) - text.count("\r\n", start, end)
+    return breaks
+
+
+def count_csv_rows(text: str) -> int:
+    """Count CSV records, header included, by the rules of the renderer's countCsvRows.
+
+    The preview footer sits under a table the renderer parses, so both sides must
+    agree on every input, including a quote that opens a field only at its start
+    and a last record counted by the final character alone. The scan jumps from
+    quote to quote and counts line breaks with str.count, so the Python loop runs
+    once per quote rather than once per character.
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    end = len(text)
+    # read_text already turns `\r\n` and `\r` into `\n`, so this usually saves
+    # two counts per segment.
+    has_cr = "\r" in text
+    rows = 0
+    pos = 0
+    while pos < end:
+        quote = text.find('"', pos)
+        if quote < 0:
+            rows += _line_breaks(text, pos, end, has_cr)
+            break
+        rows += _line_breaks(text, pos, quote, has_cr)
+        if quote and text[quote - 1] not in ",\n\r":
+            # A quote inside a field is literal.
+            pos = quote + 1
+            continue
+        # Skip the quoted field; `""` inside it is an escaped quote.
+        close = quote + 1
+        while True:
+            close = text.find('"', close)
+            if close < 0:
+                close = end
+                break
+            if text.startswith('"', close + 1):
+                close += 2
+                continue
+            break
+        pos = close + 1
+    if text and text[-1] not in "\n\r":
+        rows += 1
+    return rows
 
 
 def preview_artifact(path: Path) -> dict:
@@ -1583,18 +2056,26 @@ def preview_artifact(path: Path) -> dict:
     if suffix not in TEXT_EXTENSIONS:
         raise ValueError("Preview is available for text, Markdown, code, JSON, CSV, and HTML files")
     text = path.read_text(encoding="utf-8", errors="replace")
-    return {
+    preview = {
         "path": str(path),
         "title": path.name,
         "kind": KIND_BY_EXT.get(suffix, "File"),
         "mime": mimetypes.guess_type(str(path))[0] or "text/plain",
-        "content": text[:200_000],
-        "truncated": len(text) > 200_000,
+        "content": text[:PREVIEW_TEXT_MAX],
+        "truncated": len(text) > PREVIEW_TEXT_MAX,
     }
+    if suffix == ".csv" and preview["truncated"]:
+        # The client only sees the cut content, so the total has to come from here.
+        preview["total_rows"] = max(0, count_csv_rows(text) - 1)
+    return preview
 
 
-async def mount_preview(path: Path) -> dict:
+async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
     """Register an artifact for iframe preview.
+
+    ``path`` is already resolved inside ``scope``'s artifacts roots; ``scope``
+    bounds the climb to its artifact root and keys a live backend's
+    connections and launch.
 
     Two payload shapes share a `kind` discriminator:
       - `kind: "static"` (HTML asset bundles) — token + relUrl that
@@ -1608,7 +2089,7 @@ async def mount_preview(path: Path) -> dict:
     # primary file's parent — fullstack apps keep their frontend in a
     # `static/` subdir. Resolve it explicitly for all backend lookups so
     # we read the `port` from the root, not from `static/`.
-    root = _artifact_root_for(path)
+    root = _artifact_root_for(path, scope=scope)
 
     # Backend+frontend artifacts: detect them by a `port` field in the
     # root's metadata.json. The iframe will load through our proxy
@@ -1637,6 +2118,13 @@ async def mount_preview(path: Path) -> dict:
         # pod and use the mount as an SSRF pivot, backend running or not.
         if _org_mode():
             raise ValueError(_NO_EXEC_DETAIL)
+        # Under the code sandbox no backend can run, so no proxy token is
+        # minted either: the proxy would forward to whatever loopback port
+        # the agent writes into metadata.json.
+        if code_sandbox_on():
+            raise BackendPreviewRefused(backends_off_message())
+        if _backends_cross_people():
+            raise BackendPreviewRefused(_SHARED_PROJECT_BACKEND_DETAIL)
         # Register the artifact root (where metadata.json and the live port
         # live) so the proxy endpoint reads a current port by token, then
         # auto-launch the backend if dead. Returns without `proxyUrl`; the
@@ -1645,16 +2133,14 @@ async def mount_preview(path: Path) -> dict:
         # reach us.
         root_token = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
         _PREVIEW_MOUNTS[root_token] = root
-        running, launch_detail, current_port = await _ensure_backend_running(
-            root, backend_port
-        )
+        backend = await _ensure_backend_running(root, backend_port, scope=scope)
         return {
             "kind": "proxy",
             "token": root_token,
             "artifactDir": str(root),
-            "port": current_port if running else backend_port,
-            "backendRunning": running,
-            "launchError": "" if running else launch_detail,
+            "port": backend.port if backend.running else backend_port,
+            "backendRunning": backend.running,
+            "launchError": "" if backend.running else backend.detail,
             # Fullstack apps publish from the artifact root, `.published.json`
             # keyed by the primary file name — surface the published state so
             # the viewer shows the "Published" pill for backend artifacts too.
@@ -1674,7 +2160,7 @@ async def mount_preview(path: Path) -> dict:
         "token": token,
         "entry": path.name,
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
-        "serveUrl": serve_url_for(path),
+        "serveUrl": serve_url_for(path, scope=scope),
         # Route through _published_url_for so a soft-deleted (published=False)
         # record reports an empty URL — matching the artifact grid and the
         # fullstack branch, instead of surfacing a dead 4nton.ai link.
@@ -1683,61 +2169,157 @@ async def mount_preview(path: Path) -> dict:
     }
 
 
-def get_preview_mount(token: str) -> Path | None:
-    return _PREVIEW_MOUNTS.get(token)
+def preview_mount_for(token: str, *, scope: TenantScope | None) -> Path | None:
+    """The directory ``token`` mounts, only when it lies inside one of
+    ``scope``'s artifacts roots; None otherwise, the same answer as an unknown
+    token.
+
+    A token is a hash of the mounted path, the registry is process-wide, and
+    the asset route has no other owner to check, so a token minted for another
+    person's artifact must not serve its files to whoever presents it.
+    """
+    mounted = _PREVIEW_MOUNTS.get(token)
+    if mounted is None:
+        return None
+    # Desktop has one user and org mode has no mounts, so the per-asset scan
+    # guards nobody there; skipping it keeps a 30-asset preview from rescanning
+    # and resolving every project folder on each sub-asset request and stalling
+    # the event loop. The scan runs only where identity headers are trusted.
+    if not get_app_settings().trust_identity_headers:
+        return mounted
+    try:
+        resolved = mounted.resolve(strict=False)
+    except OSError:
+        return None
+    for container in _scan_artifact_dirs(scope=scope):
+        try:
+            resolved.relative_to(container.resolve())
+        except (ValueError, OSError):
+            continue
+        return mounted
+    return None
 
 
-def html_artifacts() -> list[dict]:
-    """List every publishable file (HTML + Markdown) under every project's
-    artifacts tree.
+# Static artifact extensions a user can publish to a MindsHub web page.
+# `.html` is served as-is; `.md` is rendered to a styled HTML page first
+# (see `publish._render_markdown_to_html`). Fullstack artifacts bypass this —
+# they publish their directory regardless of the primary file's suffix.
+PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
+_PUBLISHABLE_LIST_LIMIT = 40
+
+
+def is_non_content_path(path: Path, container: Path) -> bool:
+    """True when `path` is not artifact content: its first component inside the
+    artifact folder is in anton's `NON_CONTENT_NAMES` (`static/prd.md` is
+    content), it lies in a revision journal at any depth, or it is Python
+    bytecode at any depth inside the artifact folder.
+
+    `container` is an artifacts dir whose direct children are artifact folders.
+    A path outside it is not judged here and returns False.
+    """
+    try:
+        parts = path.resolve().relative_to(container.resolve()).parts
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return (
+        REVISIONS_DIRNAME in parts
+        or (len(parts) > 1 and parts[1] in NON_CONTENT_NAMES)
+        or any(is_bytecode_name(part) for part in parts[1:])
+    )
+
+
+class _PublishableCandidate(NamedTuple):
+    mtime_ns: int
+    path: Path
+    size: int
+    published_dir: Path
+    title: str
+
+
+def _humanize(name: str) -> str:
+    return name.replace("_", " ").replace("-", " ").title()
+
+
+def _publishable_in_folder(
+    folder: Path, container: Path, fullstack_types: frozenset[str]
+) -> list[_PublishableCandidate]:
+    """Publishable candidates of one artifact folder: one per static page, or a
+    single entry for a fullstack app."""
+    # `iter_content_files` already drops top-level non-content names; only a
+    # nested revision journal is left to skip.
+    pages = [
+        (path, st)
+        for path, st in iter_content_files(folder)
+        if path.suffix.lower() in PUBLISHABLE_STATIC_SUFFIXES
+        and REVISIONS_DIRNAME not in path.relative_to(folder).parts
+    ]
+    meta = _load_metadata(folder) if (folder / "metadata.json").is_file() else None
+    if (meta or {}).get("type") not in fullstack_types:
+        return [
+            _PublishableCandidate(st.st_mtime_ns, path, st.st_size, path.parent, _humanize(path.stem))
+            for path, st in pages
+        ]
+
+    # Fullstack apps are found by their metadata, not by having a page, so an
+    # app whose primary is not HTML/Markdown is still listed.
+    newest = max(pages, key=lambda page: page[1].st_mtime_ns, default=None)
+    primary = meta.get("primary")
+    entry_path = folder / primary if primary else None
+    if entry_path is None or not entry_path.is_file() or is_non_content_path(entry_path, container):
+        entry_path = newest[0] if newest else None
+    if entry_path is None:
+        return []
+    try:
+        st = entry_path.stat()
+    except OSError:
+        return []
+    mtime_ns = newest[1].st_mtime_ns if newest else st.st_mtime_ns
+    title = meta.get("name") or _humanize(folder.name)
+    return [_PublishableCandidate(mtime_ns, entry_path, st.st_size, folder, title)]
+
+
+def html_artifacts(*, scope: TenantScope | None) -> list[dict]:
+    """List the most recently changed publishable files (HTML + Markdown)
+    across the artifacts tree of every project of ``scope``.
 
     `.md` files publish as rendered HTML pages (see `publish.py`), so they
     belong in this list alongside `.html`. Fullstack apps keep their pages
     inside `static/`; they're surfaced as a single entry per artifact root
-    (titled by the root's metadata), not one row per page.
+    (titled by the root's metadata), not one row per page. Non-content files
+    (README, generation inputs, revision copies) and symlinks are not listed.
     """
-    out = []
-    seen: set[str] = set()
-    seen_roots: set[str] = set()
     fullstack_types = _fullstack_types()
-    for art_root in _scan_artifact_dirs():
-        if not art_root.exists():
+    candidates: list[_PublishableCandidate] = []
+    for container in _scan_artifact_dirs(scope=scope):
+        try:
+            with os.scandir(container) as it:
+                entries = list(it)
+        except OSError:
             continue
-        candidates = [p for ext in ("*.html", "*.md") for p in art_root.rglob(ext)]
-        for path in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
-            key = str(path.resolve())
-            if key in seen:
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    candidates.extend(_publishable_in_folder(path, container, fullstack_types))
+                elif entry.is_file(follow_symlinks=False) and path.suffix.lower() in PUBLISHABLE_STATIC_SUFFIXES:
+                    # Legacy loose file directly in the container.
+                    st = entry.stat(follow_symlinks=False)
+                    candidates.append(
+                        _PublishableCandidate(st.st_mtime_ns, path, st.st_size, container, _humanize(path.stem))
+                    )
+            except OSError:
                 continue
-
-            # Group fullstack apps by their artifact root — one entry per app.
-            artifact_root = _artifact_root_for(path)
-            meta = _load_metadata(artifact_root) if (artifact_root / "metadata.json").is_file() else None
-            if (meta or {}).get("type") in fullstack_types:
-                root_key = str(artifact_root.resolve())
-                if root_key in seen_roots:
-                    continue
-                seen_roots.add(root_key)
-                primary_hint = meta.get("primary") or ""
-                entry_path = (artifact_root / primary_hint) if primary_hint else path
-                if not entry_path.is_file():
-                    entry_path = path
-                seen.add(str(entry_path.resolve()))
-                out.append({
-                    "title": meta.get("name") or artifact_root.name.replace("_", " ").replace("-", " ").title(),
-                    "path": str(entry_path),
-                    "bytes": entry_path.stat().st_size if entry_path.is_file() else 0,
-                    "publishedUrl": _published_url_for(artifact_root, entry_path),
-                })
-                continue
-
-            seen.add(key)
-            out.append({
-                "title": path.stem.replace("_", " ").replace("-", " ").title(),
-                "path": str(path),
-                "bytes": path.stat().st_size,
-                "publishedUrl": _published_url_for(path.parent, path),
-            })
-    return out[:40]
+    newest = heapq.nlargest(_PUBLISHABLE_LIST_LIMIT, candidates, key=lambda c: c.mtime_ns)
+    return [
+        {
+            "title": c.title,
+            "path": str(c.path),
+            "bytes": c.size,
+            "publishedUrl": _published_url_for(c.published_dir, c.path),
+            "reportId": _report_id_for(c.published_dir, c.path),
+        }
+        for c in newest
+    ]
 
 
 # ─── Backend-artifact auto-launch ─────────────────────────────────
@@ -1753,7 +2335,8 @@ def html_artifacts() -> list[dict]:
 # match Anton's own `launch_backend` tool exactly. The new port is
 # persisted back to metadata.json so the proxy and future opens see it.
 
-def _launch_lock(key: str) -> asyncio.Lock:
+def _launch_lock(*, project_root: Path, slug: str) -> asyncio.Lock:
+    key = (str(project_root), slug)
     lock = _BACKEND_LAUNCH_LOCKS.get(key)
     if lock is None:
         lock = asyncio.Lock()
@@ -1770,76 +2353,160 @@ def _probe_port(port: int, *, timeout: float = 0.3) -> bool:
         return False
 
 
-def _resolve_project_root(artifact_dir: Path) -> Path | None:
-    """The registered project root that owns this artifact dir, if any.
+def _launched_live_on(*, project_root: Path, slug: str, port: int) -> bool:
+    """Whether a backend this server launched for ``project_root`` and
+    ``slug`` is still running, on ``port``."""
+    entry = _LAUNCHED_BACKENDS.get(str(project_root), {}).get(slug)
+    if entry is None:
+        return False
+    backend = LaunchedBackend.from_entry(entry)
+    return backend.port == port and backend.live
+
+
+def _backend_answers(
+    *, project_root: Path, slug: str, port: int, scope: TenantScope | None
+) -> bool:
+    """Whether the artifact's own backend already listens on ``port``.
+
+    On the desktop a listener on the port is enough: the agent's own
+    `launch_backend` tool starts backends this server never tracks. Where
+    projects are partitioned it is not, because ports are reused: by the time
+    a person previews, the port in their metadata.json can belong to another
+    person's backend, which runs with that person's connection secrets. There
+    only a live backend this server launched for that project root and slug,
+    on that port, counts; any other listener gets a backend of the caller's
+    own started beside it.
+    """
+    if not _probe_port(port):
+        return False
+    if scope is None or not scope.partitioned_for(PersonalResource.PROJECTS):
+        return True
+    return _launched_live_on(project_root=project_root, slug=slug, port=port)
+
+
+def backend_port_is_the_callers(
+    artifact_dir: Path, *, port: int, scope: TenantScope | None
+) -> bool:
+    """Whether the preview proxy may forward ``scope``'s request for the
+    artifact at ``artifact_dir`` to ``port``, the one its metadata.json names.
+
+    Where projects are partitioned, only to a live backend this server
+    launched for that artifact's project root and slug, on that port, as
+    `_backend_answers` counts at mount: once the caller's backend exits,
+    another person's next launch can take its port while the caller's token
+    still resolves. Anywhere else, any port, as `_backend_answers` counts any
+    listener there.
+    """
+    if scope is None or not scope.partitioned_for(PersonalResource.PROJECTS):
+        return True
+    project_root = _resolve_project_root(artifact_dir, scope=scope)
+    return project_root is not None and _launched_live_on(
+        project_root=project_root, slug=artifact_dir.name, port=port
+    )
+
+
+def _backends_cross_people() -> bool:
+    """Whether one live backend would serve several people's connections: on
+    a deployment that trusts identity headers, with projects shared and
+    connections personal. Everyone reads the one artifact folder, so they
+    share its preview token and the port its metadata.json names, which the
+    proxy follows on every request, while the backend runs with the secrets
+    of whoever launched it. A backend per person doesn't help: each launch
+    rewrites that one port."""
+    settings = get_app_settings()
+    return (
+        settings.trust_identity_headers
+        and PersonalResource.CONNECTIONS in settings.personal_resources
+        and PersonalResource.PROJECTS not in settings.personal_resources
+    )
+
+
+def _resolve_project_root(artifact_dir: Path, *, scope: TenantScope | None) -> Path | None:
+    """The registered project root of ``scope`` that owns this artifact dir.
 
     `artifact_dir` is the parent of the primary file (e.g.
     `<project>/.anton/artifacts/<slug>/`). We walk back to the registered
-    project root by checking ancestors against `_registered_project_dirs()`.
-    Returns None when the dir isn't under any registered project — in
+    project root by checking ancestors against `_registered_project_dirs`.
+    Returns None when the dir isn't under any of the scope's projects — in
     which case auto-launch is a non-starter anyway.
     """
     try:
         artifact_resolved = artifact_dir.resolve()
     except OSError:
         return None
-    registered = _registered_project_dirs()
+    registered = _registered_project_dirs(scope=scope)
     for parent in (artifact_resolved, *artifact_resolved.parents):
         if parent in registered:
-            return parent
+            # The registered entry, equal to the ancestor: the caller hands it
+            # to the code sandbox, so it is a path this module listed rather
+            # than one built from the request's artifact path.
+            return next(root for root in registered if root == parent)
     return None
 
 
 async def _ensure_backend_running(
-    artifact_dir: Path, port: int
-) -> tuple[bool, str, int]:
+    artifact_dir: Path, port: int, *, scope: TenantScope | None
+) -> BackendStatus:
     """Bring up the artifact's backend if it isn't already listening.
 
-    Returns `(running, detail, port)`:
-      - `running=True`  → port is alive; `detail` is a short label
-        ("already_running" or "launched"); `port` may differ from the
-        input when the helper had to allocate a fresh free port.
-      - `running=False` → backend is down and we couldn't start it;
-        `detail` carries the reason; `port` echoes the input port.
+    Running, `detail` is "already_running" or "launched", and the port may
+    differ from ``port`` when the helper had to allocate a fresh free one.
+    Down and not startable, `detail` carries the reason.
 
-    In org mode this always refuses; see `_org_mode`.
+    In org mode this always refuses; see `_org_mode`. The no-exec check is
+    deployment-wide, so a personal partition launches like the desktop does.
+    Under the code sandbox it refuses too, before the scratchpad pool is
+    touched: the pool's venv check and install would run the venv's Python.
     """
     if _org_mode():
-        return False, _NO_EXEC_DETAIL, 0
+        return BackendStatus(running=False, detail=_NO_EXEC_DETAIL, port=0)
+    if code_sandbox_on():
+        return BackendStatus(running=False, detail=backends_off_message(), port=0)
 
     slug = artifact_dir.name
-    if _probe_port(port):
-        return True, "already_running", port
+    # The project root first, so nothing about the port is reported for an
+    # artifact outside the caller's own projects.
+    project_root = _resolve_project_root(artifact_dir, scope=scope)
+    if project_root is None:
+        return BackendStatus(running=False, detail="Artifact is not in a registered project.", port=0)
+    if _backend_answers(project_root=project_root, slug=slug, port=port, scope=scope):
+        return BackendStatus(running=True, detail="already_running", port=port)
 
-    # Serialize launches per-slug. Whichever request wins the lock does
-    # the actual work; the rest just re-probe after it releases.
-    async with _launch_lock(slug):
-        if _probe_port(port):
-            return True, "already_running", port
-        return await _launch_backend_locked(artifact_dir, slug)
+    # Serialize launches per project root and slug: two partitions can each
+    # hold an artifact with the same slug. Whichever request wins the lock
+    # does the actual work; the rest just re-probe after it releases.
+    async with _launch_lock(project_root=project_root, slug=slug):
+        if _backend_answers(project_root=project_root, slug=slug, port=port, scope=scope):
+            return BackendStatus(running=True, detail="already_running", port=port)
+        return await _launch_backend_locked(
+            artifact_dir, project_root=project_root, scope=scope
+        )
 
 
 async def _launch_backend_locked(
-    artifact_dir: Path, slug: str
-) -> tuple[bool, str, int]:
+    artifact_dir: Path, *, project_root: Path, scope: TenantScope | None
+) -> BackendStatus:
     """Spawn the artifact's backend via anton's shared launcher.
 
     The slug-keyed scratchpad venv (provisioned by Anton when the agent
-    built the artifact) is the python interpreter; `requirements.txt`
-    in the artifact folder is installed before spawn; the launcher
-    picks a free port and passes `--port <port>` to the script. New
-    port is persisted into `metadata.json` so the proxy reads a current
-    value on its next request.
+    built the artifact, inside `project_root`'s workspace) is the python
+    interpreter; `requirements.txt` in the artifact folder is installed
+    before spawn; the launcher picks a free port and passes `--port <port>`
+    to the script. New port is persisted into `metadata.json` so the proxy
+    reads a current value on its next request. The datasource secrets come
+    from `scope`'s own connections.
     """
     from anton.core.artifacts.backend_launcher import launch_artifact_backend
 
     from cowork.services.scratchpad_runtime import WorkspaceScopedPool
 
-    project_root = _resolve_project_root(artifact_dir)
-    if project_root is None:
-        return False, "Artifact is not in a registered project.", 0
-
-    pool = WorkspaceScopedPool(str(project_root))
+    slug = artifact_dir.name
+    # anton refuses a backend whose pool carries a policy, so a launch that
+    # got past the refusal in _ensure_backend_running still runs nothing.
+    pool = WorkspaceScopedPool(
+        str(project_root),
+        cell_sandbox=build_cell_sandbox(scope=scope, project_dir=project_root),
+    )
 
     # Inject the secrets of datasources the artifact declared in metadata.json
     # into the backend subprocess only — NOT the cowork server's global
@@ -1850,13 +2517,27 @@ async def _launch_backend_locked(
         meta = _load_metadata(artifact_dir) or {}
         datasources = meta.get("datasources") or []
         if datasources:
-            from anton.core.datasources.data_vault import LocalDataVault
+            from cowork.services.connectors.persist import turn_vault_for_scope
 
-            vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+            vault = turn_vault_for_scope(scope)
+            # The agent writes metadata.json, so a comparison side could name a
+            # connection its turn is kept from: its backend gets none of those.
+            from cowork.services.projects import path_in_comparison_sandbox
+
+            comparison_side = path_in_comparison_sandbox(project_root)
             for ds in datasources:
                 engine, name = ds.get("engine"), ds.get("name")
                 if not engine or not name:
                     continue
+                if comparison_side:
+                    from cowork.services.comparisons import _blocked
+
+                    if _blocked(engine):
+                        logger.info(
+                            "Comparison side's backend %s declared blocked connector %s; not passed",
+                            slug, engine,
+                        )
+                        continue
                 env = vault.env_for(engine, name)
                 if env is None:
                     logger.warning(
@@ -1890,7 +2571,7 @@ async def _launch_backend_locked(
         slug=slug,
         artifact_folder=artifact_dir,
         scratchpad_pool=pool,
-        tracked_backends=_LAUNCHED_BACKENDS,
+        tracked_backends=_LAUNCHED_BACKENDS.setdefault(str(project_root), {}),
         **env_kwargs,
         health_timeout=45.0,
     )
@@ -1898,7 +2579,7 @@ async def _launch_backend_locked(
         # Helper returned an error string. Strip the redundant "Error: "
         # prefix so the message reads naturally in the preview pane.
         detail = result[len("Error: "):] if result.startswith("Error: ") else result
-        return False, detail, 0
+        return BackendStatus(running=False, detail=detail, port=0)
 
     new_port = int(result["port"])
     # Persist the new port directly to metadata.json. The proxy reads
@@ -1924,7 +2605,20 @@ async def _launch_backend_locked(
         "Auto-launched artifact backend via anton helper: slug=%s port=%d pid=%s",
         slug, new_port, result.get("pid"),
     )
-    return True, "launched", new_port
+    return BackendStatus(running=True, detail="launched", port=new_port)
+
+
+def stop_project_backends(project_root: str | Path) -> None:
+    """Stop the backends launched for one project, for a project going away."""
+    root = Path(project_root)
+    for key in {str(root), str(root.resolve())}:
+        for entry in list(_LAUNCHED_BACKENDS.pop(key, {}).values()):
+            backend = LaunchedBackend.from_entry(entry)
+            if backend.live:
+                try:
+                    backend.proc.terminate()
+                except (OSError, ProcessLookupError):
+                    pass
 
 
 def shutdown_launched_backends() -> None:
@@ -1936,11 +2630,12 @@ def shutdown_launched_backends() -> None:
     the kernel SIGTERM the backends when we go. macOS relies on the
     explicit `terminate()` call.
     """
-    for slug, entry in list(_LAUNCHED_BACKENDS.items()):
-        proc = entry.get("proc")
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.terminate()
-            except (OSError, ProcessLookupError):
-                pass
-        _LAUNCHED_BACKENDS.pop(slug, None)
+    for project_root, backends in list(_LAUNCHED_BACKENDS.items()):
+        for entry in list(backends.values()):
+            backend = LaunchedBackend.from_entry(entry)
+            if backend.live:
+                try:
+                    backend.proc.terminate()
+                except (OSError, ProcessLookupError):
+                    pass
+        _LAUNCHED_BACKENDS.pop(project_root, None)

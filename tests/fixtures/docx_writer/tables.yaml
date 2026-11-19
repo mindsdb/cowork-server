@@ -1,0 +1,67 @@
+# Table layouts. rows and columns: the Word table's grid. merged: pairs of
+# grid positions that must be one cell. present and absent: text that must
+# and must not appear anywhere in the document. {digits} in html stands for
+# 5000 nines, more than Python converts to an int.
+- name: colspan_past_the_column_limit
+  html: '<table><tr><td colspan="1000">wide</td><td>dropped</td></tr><tr><td>a</td></tr></table>'
+  rows: 2
+  columns: 63
+  merged: [[[0, 0], [0, 62]]]
+  present: [wide, a]
+  absent: [dropped]
+- name: rowspan_past_the_last_row
+  html: '<table><tr><td rowspan="65534">tall</td><td>b</td></tr><tr><td>c</td></tr></table>'
+  rows: 2
+  columns: 2
+  merged: [[[0, 0], [1, 0]]]
+  present: [tall, b, c]
+  absent: []
+- name: rowspan_zero_spans_to_the_end
+  html: '<table><tr><td rowspan="0">all</td><td>1</td></tr><tr><td>2</td></tr><tr><td>3</td></tr></table>'
+  rows: 3
+  columns: 2
+  merged: [[[0, 0], [2, 0]]]
+  present: [all, "1", "2", "3"]
+  absent: []
+- name: colspan_stops_at_a_covered_column
+  html: '<table><tr><td>a</td><td rowspan="2">b</td></tr><tr><td colspan="3">c</td></tr></table>'
+  rows: 2
+  columns: 2
+  merged: [[[0, 1], [1, 1]]]
+  present: [a, b, c]
+  absent: []
+- name: unparsable_spans_count_as_one
+  html: '<table><tr><td colspan="abc">a</td><td rowspan="-3">b</td><td colspan="2px">c</td></tr></table>'
+  rows: 1
+  columns: 4
+  merged: [[[0, 2], [0, 3]]]
+  present: [a, b, c]
+  absent: []
+- name: header_cells_and_row_groups
+  html: '<table><thead><tr><th>Head</th></tr></thead><tbody><tr><td>body</td></tr></tbody><tfoot><tr><td>foot</td></tr></tfoot></table>'
+  rows: 3
+  columns: 1
+  merged: []
+  present: [Head, body, foot]
+  absent: []
+- name: colspan_past_the_column_limit_after_a_cell
+  html: '<table><tr><td>a</td><td colspan="1000">wide</td></tr></table>'
+  rows: 1
+  columns: 63
+  merged: [[[0, 1], [0, 62]]]
+  present: [a, wide]
+  absent: []
+- name: colspan_with_more_digits_than_python_converts
+  html: '<table><tr><td colspan="{digits}">wide</td><td>dropped</td></tr><tr><td>a</td></tr></table>'
+  rows: 2
+  columns: 63
+  merged: [[[0, 0], [0, 62]]]
+  present: [wide, a]
+  absent: [dropped]
+- name: rowspan_with_more_digits_than_python_converts
+  html: '<table><tr><td rowspan="{digits}">tall</td><td>b</td></tr><tr><td>c</td></tr></table>'
+  rows: 2
+  columns: 2
+  merged: [[[0, 0], [1, 0]]]
+  present: [tall, b, c]
+  absent: []

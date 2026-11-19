@@ -8,35 +8,50 @@ that can be included in the main FastAPI application.
 from fastapi import APIRouter
 
 from cowork.api.v1.endpoints import (
+    artifact_checks,
+    artifact_quick_edit,
     artifacts,
     artifact_workspace,
+    browse,
     capabilities,
     channels,
     comments,
+    comparisons,
     coding,
     coding_personal_skills,
     coding_runtime,
     conversations,
     files,
     health,
-    hub_usage,
-    hub_workspaces,
+    mindshub_org_icons,
+    mindshub_people,
+    mindshub_teams,
+    mindshub_usage,
+    mindshub_workspaces,
+    live_apps,
     memory,
+    org_branding,
     pins,
     project_files,
     projects,
     publish,
+    push,
     responses,
     runtime_credential,
     schedules,
+    shared_projects,
     search,
     settings,
+    skill_sharing,
     skills,
 )
 from cowork.api.v1.endpoints.connectors import (
     connections,
+    custom,
+    datasources,
     oauth,
     posthog,
+    sharepoint,
     specs,
     submissions,
 )
@@ -44,7 +59,6 @@ from cowork.api.v1.endpoints.connectors import (
 # "Compat routes" section below when the client is updated.
 from cowork.api.v1.endpoints.compat.stubs import (
     attachments_router,
-    browse_router,
     integrations_router,
     scratchpad_router,
 )
@@ -54,16 +68,21 @@ api_router = APIRouter(prefix="/api/v1")
 
 # ── Canonical routes ─────────────────────────────────────────────────
 api_router.include_router(health.router, prefix="/health", tags=["health"])
+api_router.include_router(browse.router, prefix="/browse", tags=["browser"])
 api_router.include_router(
     capabilities.router, prefix="/capabilities", tags=["capabilities"]
 )
 api_router.include_router(specs.router, prefix="/connectors/specs", tags=["connectors"])
+api_router.include_router(custom.router, prefix="/connectors/custom", tags=["connectors"])
 api_router.include_router(submissions.router, prefix="/connectors/submissions", tags=["connectors"])
 api_router.include_router(posthog.router, prefix="/connectors/posthog", tags=["connectors"])
+api_router.include_router(sharepoint.router, prefix="/connectors/sharepoint", tags=["connectors"])
 api_router.include_router(connections.router, prefix="/connectors/connections", tags=["connectors"])
+api_router.include_router(datasources.router, prefix="/connectors/datasources", tags=["connectors"])
 api_router.include_router(oauth.router, prefix="/connectors/oauth", tags=["connectors"])
 api_router.include_router(projects.router, prefix="/projects", tags=["projects"])
 api_router.include_router(project_files.router, prefix="/projects", tags=["project-files"])
+api_router.include_router(shared_projects.router, prefix="/shared-projects", tags=["shared-projects"])
 api_router.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
 # `/tasks` is a branding alias for `/conversations` (ENG-2069) — same router,
 # same request/response schemas, mounted under a second prefix so it can
@@ -73,12 +92,21 @@ api_router.include_router(responses.router, prefix="/responses", tags=["response
 api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(schedules.router, prefix="/schedules", tags=["schedules"])
 api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
+api_router.include_router(push.router, prefix="/push", tags=["push"])
+# The sharing routes first: GET /skills/sharing-capabilities must match before
+# the skills router's GET /skills/{skill_id} reads it as a skill's id.
+api_router.include_router(skill_sharing.router, prefix="/skills", tags=["skills"])
+api_router.include_router(comparisons.router, prefix="/comparisons", tags=["comparisons"])
 api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])
 api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
+api_router.include_router(artifacts.live_app_router, prefix="/artifacts", tags=["artifacts", "live-apps"])
 api_router.include_router(artifact_workspace.router, prefix="/artifacts", tags=["artifact-workspace"])
+api_router.include_router(artifact_checks.router, prefix="/artifacts", tags=["artifact-checks"])
+api_router.include_router(artifact_quick_edit.router, prefix="/artifacts", tags=["artifact-workspace"])
 api_router.include_router(comments.router, prefix="/artifact-comments", tags=["artifact-comments"])
+api_router.include_router(live_apps.router, prefix="/live-apps", tags=["live-apps"])
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
 api_router.include_router(
@@ -88,11 +116,14 @@ api_router.include_router(search.router, prefix="/search", tags=["search"])
 api_router.include_router(coding.router, prefix="/coding", tags=["coding"])
 api_router.include_router(coding_personal_skills.router, prefix="/coding/skills/personal", tags=["coding"])
 api_router.include_router(coding_runtime.router, prefix="/coding/runtime", tags=["coding-runtime"])
-api_router.include_router(hub_workspaces.router, prefix="/hub/workspaces", tags=["hub-workspaces"])
-api_router.include_router(hub_usage.router, prefix="/hub/usage", tags=["hub-usage"])
+api_router.include_router(mindshub_workspaces.router, prefix="/hub/workspaces", tags=["mindshub-workspaces"])
+api_router.include_router(mindshub_usage.router, prefix="/hub/usage", tags=["mindshub-usage"])
+api_router.include_router(mindshub_teams.router, prefix="/hub/teams", tags=["mindshub-teams"])
+api_router.include_router(mindshub_people.router, prefix="/hub/people", tags=["mindshub-people"])
+api_router.include_router(mindshub_org_icons.router, prefix="/hub/org-icons", tags=["mindshub-org-icons"])
+api_router.include_router(org_branding.router, prefix="/org-branding", tags=["org-branding"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────
 api_router.include_router(integrations_router, prefix="/integrations", tags=["compat"])
 api_router.include_router(attachments_router, prefix="/attachments", tags=["compat"])
 api_router.include_router(scratchpad_router, prefix="/scratchpad", tags=["compat"])
-api_router.include_router(browse_router, prefix="/browse", tags=["compat"])

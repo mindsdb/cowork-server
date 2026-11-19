@@ -8,9 +8,10 @@ package exists.
 """
 from __future__ import annotations
 
-from typing import Any, Literal
+import re
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictStr, field_validator, model_validator
 
 
 #: Ceiling for ``TurnJob.deadline_ms``. 24h is far past any real turn and far
@@ -19,6 +20,31 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 MAX_DEADLINE_MS = 24 * 60 * 60 * 1000
 DATASOURCE_PROTOCOL_VERSION = 1
 MAX_DATASOURCE_CONNECTIONS = 100
+_REQUIRED_REF_KEYS = frozenset({"connection_id", "credential_version"})
+#: Names for the prompt only. anton's `anton/cloud_turn/contract.py` allows the
+#: same two, cleans each value for the prompt and drops what it cannot use, so
+#: this check enforces shape alone; the producer sends only values that pass it.
+_OPTIONAL_REF_KEYS = frozenset({"label", "engine"})
+#: Auth's cap on a connection's name.
+_MAX_CONNECTION_LABEL_CHARS = 128
+_CONNECTION_ENGINE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,31}")
+
+#: The ``turn_completed`` key that names the artifact folders the turn's tools
+#: touched. anton holds the same name as ``ARTIFACTS_TOUCHED_KEY`` in
+#: ``anton/cloud_turn/contract.py``, and scratchpad-controller as
+#: ``ARTIFACTS_TOUCHED_KEY`` in ``src/scratchpad_controller/anton_turn.py``.
+ARTIFACTS_TOUCHED_KEY = "artifacts_touched"
+#: The most names that list carries. anton's ``_stream_turn`` leaves out a
+#: longer list and scratchpad-controller relays none, each against its own
+#: ``MAX_ARTIFACTS_TOUCHED`` in the files above; this server reads one as
+#: absent (``TurnCompleted``).
+MAX_ARTIFACTS_TOUCHED = 1000
+#: The longest name that list may hold, this server's own bound: no folder
+#: name is longer on the file systems artifacts live on. A list holding a
+#: longer name reads as absent (``TurnCompleted``), and the shutdown line
+#: that names a turn's artifacts leaves one out
+#: (``cowork.db.units.drain_turn_end_records``).
+MAX_ARTIFACT_NAME_CHARS = 255
 
 
 def _validate_datasource_block(value: object) -> None:
@@ -40,7 +66,14 @@ def _validate_datasource_block(value: object) -> None:
         raise ValueError("datasource connections are invalid")
     seen: set[int] = set()
     for connection in connections:
-        if not isinstance(connection, dict) or set(connection) != {"connection_id", "credential_version"}:
+        if (
+            not isinstance(connection, dict)
+            or not _REQUIRED_REF_KEYS <= set(connection) <= _REQUIRED_REF_KEYS | _OPTIONAL_REF_KEYS
+        ):
+            raise ValueError("datasource connection reference is invalid")
+        if "label" in connection and not is_connection_label(connection["label"]):
+            raise ValueError("datasource connection reference is invalid")
+        if "engine" in connection and not is_connection_engine(connection["engine"]):
             raise ValueError("datasource connection reference is invalid")
         connection_id = connection.get("connection_id")
         version = connection.get("credential_version")
@@ -57,11 +90,21 @@ def _validate_datasource_block(value: object) -> None:
         seen.add(connection_id)
 
 
+def is_connection_label(value: object) -> bool:
+    """Whether ``value`` has the shape of a connection name the producer sends: a non-empty string within auth's cap."""
+    return isinstance(value, str) and 0 < len(value) <= _MAX_CONNECTION_LABEL_CHARS
+
+
+def is_connection_engine(value: object) -> bool:
+    """Whether ``value`` has the shape of auth's connector id; ``fullmatch``, so a trailing newline fails."""
+    return isinstance(value, str) and _CONNECTION_ENGINE_PATTERN.fullmatch(value) is not None
+
+
 class TurnJob(BaseModel):
     """Mirror of scratchpad-controller ScratchpadJobPayload (job the controller consumes).
 
     ``params`` carries an ``llm`` block minted per turn by
-    ``cowork.turnqueue.producer._mint_llm_block``:
+    ``cowork.turnqueue.producer.mint_llm_block``:
     ``{"provider": "minds-cloud", "api_key": <short-TTL mdb_ turn key>,
     "base_url": <MindsHub chat base URL>}``. MVP is MindsHub-inference-only, so
     this is the only provider/credential shape carried here. The key is scoped
@@ -128,3 +171,29 @@ class TurnReply(BaseModel):
                   "turn_memory", "turn_skill", "turn_history", "turn_compaction",
                   "turn_completed", "turn_failed"]
     data: dict[str, Any] = Field(default_factory=dict)
+    # The reply's number within its turn, counting up by one. The controller
+    # resends a reply whose XADD reply it lost, and the relay drops a reply
+    # whose number repeats the last one it applied (producer.py). A
+    # controller that numbers nothing sends none, and every reply is applied.
+    n: int | None = None
+
+
+class TurnJobHeader(BaseModel):
+    """The field of a queued job the producer reads back after a job XADD
+    whose reply it lost: the turn it queues."""
+
+    correlation_id: str
+
+
+class TurnCompleted(BaseModel):
+    """The ``data`` of a ``turn_completed`` reply, as far as this server reads
+    it. Written by anton's ``_stream_turn`` (``anton/cloud_turn/__main__.py``,
+    documented in ``anton/cloud_turn/contract.py``) and relayed by
+    scratchpad-controller's ``src/scratchpad_controller/anton_turn.py``.
+    Untrusted: the pod writes it."""
+
+    # The folder names of the artifacts the turn's tools touched; None for a
+    # pod that sends no list.
+    artifacts_touched: list[Annotated[StrictStr, Field(max_length=MAX_ARTIFACT_NAME_CHARS)]] | None = Field(
+        default=None, alias=ARTIFACTS_TOUCHED_KEY, max_length=MAX_ARTIFACTS_TOUCHED,
+    )

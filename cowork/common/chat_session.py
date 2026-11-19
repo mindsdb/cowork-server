@@ -33,6 +33,7 @@ import asyncio
 import functools
 import logging
 
+from cowork.code_sandbox import refuse_a_missing_policy
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,8 @@ def in_process_agent_allowed() -> bool:
 
 
 def build_chat_session(config):
-    """Construct an anton ChatSession, or refuse in org mode.
+    """Construct an anton ChatSession, or refuse in org mode, and under the
+    code sandbox when `config` carries no policy (refuse_a_missing_policy).
 
     `config` is an `anton.core.session.ChatSessionConfig`. It is not annotated
     because anton is imported lazily below: importing `anton.core.session` at
@@ -60,6 +62,7 @@ def build_chat_session(config):
     """
     if not in_process_agent_allowed():
         raise RuntimeError(NO_IN_PROCESS_TURN_DETAIL)
+    refuse_a_missing_policy(getattr(config, "cell_sandbox", None), site="a chat session")
     from anton.core.session import ChatSession
 
     return ChatSession(config)

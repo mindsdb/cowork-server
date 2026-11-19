@@ -1,12 +1,14 @@
 """Which build is running, for trace attribution (ENG-1279).
 
-Delivery in this stack is four hops with different latencies per channel (a
-git-channel desktop picks up anton in minutes, a PyPI-channel desktop only
-gets it when a cowork-server wheel ships, a hosted install waits for a
-snapshot bake), so "which build produced this trace?" cannot be answered from
-release dates. These values ride on every turn's Langfuse trace metadata, and
-the router lifts ``anton_version`` onto the trace's native ``version`` field —
-the only form the Langfuse metrics API can group by.
+Delivery in this stack is four hops, and each channel takes anton differently:
+a git-channel desktop and a stable cowork-server wheel resolve ``anton-agent``
+from PyPI within the range in ``pyproject.toml``, a staging rc wheel pins it
+to its newest rc when that is PyPI's newest ``anton-agent`` upload, and a
+hosted install waits for a snapshot bake. So "which build produced this
+trace?" cannot be answered from release dates. These values ride on every
+turn's Langfuse trace metadata, and the router lifts ``anton_version`` onto
+the trace's native ``version`` field — the only form the Langfuse metrics API
+can group by.
 
 Everything here is a process-lifetime constant: a version change means the
 package on disk was replaced, and the sidecar is restarted as part of that, so
@@ -100,9 +102,11 @@ def surface() -> str | None:
     baseline web is measured against) and the enterprise container.
     """
     try:
-        # anton owns the canonical vocabulary. Guarded because cowork-server
-        # pins anton to a branch: a lock predating anton's half of ENG-1459 has
-        # no such name, and telemetry must not raise on the way past.
+        # anton owns the canonical vocabulary. VALID_SURFACES (anton's half of
+        # ENG-1459) predates the anton.core.artifacts.internal_files constants
+        # the server imports at startup, so every anton this server can start
+        # with has it, and the fallback serves only an anton too old to start
+        # this server.
         try:
             from anton.core.llm.tracing import VALID_SURFACES
         except ImportError:
@@ -130,10 +134,10 @@ def surface() -> str | None:
 def supported_kwargs(config_cls, **candidates) -> dict:
     """Only those `candidates` the installed dataclass actually declares.
 
-    Same hazard as `surface_kwarg`: this server pins anton to a rev, so a
-    field it knows about can be absent from the installed copy, and passing an
-    unexpected keyword raises on **every turn**. A dropped field degrades that
-    feature; raising takes the whole turn down.
+    Same hazard as `surface_kwarg`: the installed anton can predate a field
+    this server knows about, and passing an unexpected keyword raises on
+    **every turn**. A dropped field degrades that feature; raising takes the
+    whole turn down.
     """
     import dataclasses
 
@@ -158,10 +162,12 @@ def surface_kwarg(config_cls) -> dict[str, str]:
     measured per surface). ``tests/test_trace_stamp_seams.py`` enforces that
     every such call site passes it.
 
-    cowork-server pins anton to a *branch*, so the installed copy can predate
-    anton's half of ENG-1459. Passing an unexpected keyword would then raise on
-    **every turn**, which a telemetry field must never be able to do — so the
-    kwarg is only produced when the installed dataclass actually declares it.
+    Passing an unexpected keyword raises on **every turn**, which a telemetry
+    field must never be able to do — so the kwarg is only produced when the
+    installed dataclass actually declares it. Every anton this server can
+    start with declares ``surface``: anton's half of ENG-1459 predates the
+    ``anton.core.artifacts.internal_files`` constants the server imports at
+    startup. So the check serves only an anton too old to start this server.
 
     Returns ``{}`` when the surface is unresolvable, so an unknown surface stays
     absent rather than being sent as a guess.
@@ -250,10 +256,13 @@ def desktop_account() -> dict[str, str]:
 def account_kwargs(config_cls) -> dict[str, str]:
     """``{"user_id", "organization_id"}`` for ``ChatSessionConfig``, or ``{}``.
 
-    Same version-skew guard as ``surface_kwarg``: the pinned anton may predate
-    ENG-2121, and an unexpected keyword would raise on every turn. Absent
-    rather than empty when there is no account, so the event falls back to the
-    install fingerprint exactly as before. Never raises.
+    Same version-skew guard as ``surface_kwarg``: an unexpected keyword would
+    raise on every turn. Every anton this server can start with declares both
+    fields (ENG-2121 predates the ``anton.core.artifacts.internal_files``
+    constants the server imports at startup), so the guard serves only an
+    anton too old to start this server. Absent rather than empty when there is
+    no account, so the event falls back to the install fingerprint exactly as
+    before. Never raises.
     """
     try:
         return supported_kwargs(config_cls, **desktop_account())
@@ -267,9 +276,10 @@ def install_channel() -> str:
     """How this server was installed: hosted / git / pypi / local / unknown.
 
     Two users on the same version via different channels are not equivalent
-    for delivery questions — the PyPI channel pins anton inside the wheel
-    while the git channel tracks a branch — so the channel is recorded
-    alongside the versions rather than inferred from them.
+    for delivery questions — a staging rc wheel can pin ``anton-agent`` to one
+    rc, while a stable wheel and a git install resolve it from PyPI within the
+    range in ``pyproject.toml`` — so the channel is recorded alongside the
+    versions rather than inferred from them.
 
     An explicit ``COWORK_INSTALL_CHANNEL`` wins over everything: a deployer
     declaring the channel knows more than any inference from inside the

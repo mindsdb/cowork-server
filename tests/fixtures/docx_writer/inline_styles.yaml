@@ -1,0 +1,20 @@
+# One inline element per case. The run whose text is "styled" must carry
+# exactly the listed formatting; every other property stays unset.
+- {name: b, html: "<b>styled</b>", expect: {bold: true}}
+- {name: strong, html: "<strong>styled</strong>", expect: {bold: true}}
+- {name: i, html: "<i>styled</i>", expect: {italic: true}}
+- {name: em, html: "<em>styled</em>", expect: {italic: true}}
+- {name: u, html: "<u>styled</u>", expect: {underline: true}}
+- {name: ins, html: "<ins>styled</ins>", expect: {underline: true}}
+- {name: s, html: "<s>styled</s>", expect: {strike: true}}
+- {name: strike, html: "<strike>styled</strike>", expect: {strike: true}}
+- {name: del, html: "<del>styled</del>", expect: {strike: true}}
+- {name: code, html: "<code>styled</code>", expect: {font_name: Courier New}}
+- {name: kbd, html: "<kbd>styled</kbd>", expect: {font_name: Courier New}}
+- {name: samp, html: "<samp>styled</samp>", expect: {font_name: Courier New}}
+- {name: sub, html: "<sub>styled</sub>", expect: {subscript: true}}
+- {name: sup, html: "<sup>styled</sup>", expect: {superscript: true}}
+- {name: mark, html: "<mark>styled</mark>", expect: {highlight: YELLOW}}
+- {name: small, html: "<small>styled</small>", expect: {size_pt: 9}}
+- {name: span, html: "<span>styled</span>", expect: {}}
+- {name: nested, html: "<b><i><u>styled</u></i></b>", expect: {bold: true, italic: true, underline: true}}

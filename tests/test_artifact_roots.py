@@ -8,21 +8,28 @@ whichever project happens to sort first.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from pathlib import Path
 
 import pytest
-from sqlmodel import Session
+from fastapi import HTTPException
+from sqlmodel import Session, select
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
+from cowork.services import artifact_identity
+from cowork.services.artifact_draft_review import disable_draft_review, enable_draft_review
 from cowork.services.artifact_roots import (
     artifacts_sources_for_project,
     artifacts_sources_for_scope,
     conversation_artifacts_base,
+    owned_conversation_ids,
+    plan_project_roots,
+    plan_scope_roots,
     project_artifacts_base,
 )
 
@@ -31,6 +38,7 @@ ORG_B = "22222222-2222-2222-2222-222222222222"
 USER_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 # A second member of ORG_A: same tenant, different person.
 USER_A2 = "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2"
+USER_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 
 @pytest.fixture
@@ -153,6 +161,44 @@ def test_a_directory_naming_no_owned_conversation_is_skipped(session, tmp_path, 
     }
 
 
+def test_a_moved_tasks_legacy_root_stays_with_its_owner(session, tmp_path, org_mode):
+    """Moving a task to another project changes its row's project and leaves
+    its workspace directory where it was. The owner filter reads which
+    conversations the caller owns before it walks the file store, so that
+    read must not be narrowed to the project being walked."""
+    source = _project(session, tmp_path, name="moved-from", org_id=ORG_A)
+    destination = _project(session, tmp_path, name="moved-to", org_id=ORG_A)
+    moved = _conversation(session, source, owner=USER_A)
+    row = session.get(Conversation, moved)
+    row.project_id = destination.id
+    session.add(row)
+    session.commit()
+    scoped = ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A))
+
+    assert _base_for(source, moved) in {s.base for s in artifacts_sources_for_project(scoped, source.id)}
+
+
+def test_the_owner_filter_reads_only_the_callers_own_conversations_in_their_organization(
+    session, tmp_path, org_mode
+):
+    mine = _conversation(session, _project(session, tmp_path, name="own", org_id=ORG_A), owner=USER_A)
+    _conversation(session, _project(session, tmp_path, name="co-member", org_id=ORG_A), owner=USER_A2)
+    # The same person's id in another organization is still another tenant.
+    _conversation(session, _project(session, tmp_path, name="elsewhere", org_id=ORG_B), owner=USER_A)
+    scoped = ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A))
+
+    owned = owned_conversation_ids(scoped)
+
+    assert mine in owned
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        others = raw.exec(
+            select(Conversation.id).where(
+                (Conversation.created_by != USER_A) | (Conversation.org_id != ORG_A)
+            )
+        ).all()
+    assert owned.isdisjoint(others)
+
+
 def test_sources_for_project_is_just_the_project_base_before_any_conversation_wrote(
     session, tmp_path, org_mode
 ):
@@ -215,11 +261,11 @@ def test_sources_for_scope_falls_back_to_the_scan_in_desktop_mode(session, monke
     called = []
     monkeypatch.setattr(
         "cowork.services.artifact_roots.artifacts_sources_for_scan",
-        lambda: called.append(1) or [],
+        lambda *, scope: called.append(scope) or [],
     )
 
     assert artifacts_sources_for_scope(ScopedSession(session, LOCAL_SCOPE)) == []
-    assert called == [1]
+    assert called == [LOCAL_SCOPE]
 
 
 # ─── the turn-end root ─────────────────────────────────────────────────────
@@ -310,47 +356,322 @@ def test_the_unfiltered_scan_yields_nothing_for_an_org_project(session, tmp_path
     """A tripwire, not a behaviour test.
 
     `artifacts_sources_for_scan` is this module's third public resolver and the
-    only one taking no session, so it applies no org filter and no owner filter.
-    `/api/v1/search` calls it unconditionally, in every tenancy mode.
+    only one taking no session, so it applies no owner filter. It walks
+    `_projects_root(scope=...)`, the scope's own projects root: an org's is
+    `<shared_root>/<org_id>/projects`, so the org filter is the root itself.
+    `/api/v1/search` skips the scan in org mode explicitly.
 
-    Nothing leaks today, for two reasons and neither of them is a check. It
-    walks `_projects_root()`, which is deliberately unkeyed and so empty in org
-    mode because org projects live at `<shared_root>/<org_id>/projects`
-    (services/artifacts.py carries its own TODO to org-scope it). And
-    `_scan_artifact_dirs` looks only for `<project>/.anton/artifacts`, the
-    desktop layout, while an org project's LEGACY artifacts sit one level
-    deeper under `conversations/<id>/`.
+    The owner filter is not a check either. `_scan_artifact_dirs` looks only
+    for `<project>/.anton/artifacts`, the desktop layout, while an org
+    project's LEGACY artifacts sit one level deeper under `conversations/<id>/`.
+    Since ENG-2056 new org artifacts land at `<project>/.anton/artifacts`,
+    project-wide by decision, so there is no cross-MEMBER read to reopen there.
 
-    Since ENG-2056 new org artifacts land at `<project>/.anton/artifacts` —
-    the same shape the scan looks for — so for THEM only the first reason (the
-    unkeyed, empty root) stands between the scan and another org's tree. That
-    is a smaller loss than it sounds: artifacts are project-wide by decision
-    now, so within one org there is no cross-MEMBER read left to reopen — the
-    remaining stake is cross-ORG, held by the empty root.
-
-    So this points the scan straight at an org project's real tree, defeating
-    the first reason, and asserts the second still holds for the legacy layout.
-    Whoever org-scopes the root or teaches the scan the conversation layout
-    changes that calculus, and this fails when they do.
+    So this points the scan straight at an org project's real tree and asserts
+    the legacy layout is still skipped. Whoever teaches the scan the
+    conversation layout changes that calculus, and this fails when they do.
     """
     from cowork.services import artifacts as artifacts_service
     from cowork.services.artifact_roots import artifacts_sources_for_scan
 
+    org_scope = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
     project = _project(session, tmp_path, name="scanned", org_id=ORG_A)
     _conversation(session, project, owner=USER_A2)
     monkeypatch.setattr(
-        artifacts_service, "_projects_root", lambda: Path(project.path).parent
+        artifacts_service, "_projects_root", lambda *, scope: Path(project.path).parent
     )
 
-    assert artifacts_sources_for_scan() == [], (
-        "the scan reached an org project's conversation workspaces; /api/v1/search "
-        "would now surface a co-member's artifacts"
+    assert artifacts_sources_for_scan(scope=org_scope) == [], (
+        "the scan reached an org project's conversation workspaces; a co-member's "
+        "legacy artifacts would surface wherever the scan is used"
     )
 
     # Not vacuous: the same scan, same root, does find a desktop-layout tree, so
     # the empty result above is the org layout being skipped rather than the
     # scan being broken or the root being wrong.
     (Path(project.path) / ".anton" / "artifacts").mkdir(parents=True)
-    assert [s.base for s in artifacts_sources_for_scan()] == [
+    assert [s.base for s in artifacts_sources_for_scan(scope=org_scope)] == [
         Path(project.path).resolve() / ".anton" / "artifacts"
     ]
+
+
+# ─── personal partitions ───────────────────────────────────────────────────
+
+PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
+PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
+
+
+def _personal(*, partition: str, user: str, resources=None) -> TenantScope:
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+
+    return TenantScope(
+        personal=True,
+        org_id=partition,
+        user_id=user,
+        personal_resources=ALL_PERSONAL_RESOURCES if resources is None else resources,
+    )
+
+
+def test_sources_for_scope_lists_only_the_persons_own_projects(session, tmp_path, monkeypatch):
+    """A person's list reads their project rows, as org mode does, so each
+    card carries its project id; the scan of their partition's projects root
+    would leave cards path-addressed. Another person's project is not among
+    them."""
+    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
+    monkeypatch.setattr(
+        "cowork.services.artifact_roots.artifacts_sources_for_scan",
+        lambda *, scope: pytest.fail("a personal partition must not fall back to the scan"),
+    )
+    mine = _project(session, tmp_path, name="alice-notes", org_id=PARTITION_A)
+    _project(session, tmp_path, name="bob-notes", org_id=PARTITION_B)
+
+    sources = artifacts_sources_for_scope(ScopedSession(session, _personal(partition=PARTITION_A, user=USER_A)))
+
+    assert [s.project_name for s in sources] == ["alice-notes"]
+    # The in-process layout: one project-wide root, no conversation segment.
+    assert [s.base for s in sources] == [_project_base(mine)]
+    assert sources[0].project_id == str(mine.id)
+
+
+def test_sources_for_scope_scans_when_projects_are_shared(session, monkeypatch):
+    """Projects left off the personal list stay in the unkeyed root, so the
+    person's list is the desktop scan, as on today's shared stack."""
+    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
+    called = []
+    monkeypatch.setattr(
+        "cowork.services.artifact_roots.artifacts_sources_for_scan",
+        lambda *, scope: called.append("scan") or [],
+    )
+    # Earlier tests leave project rows behind in the shared database; the
+    # adopted-folder half of the desktop path is not what this pins.
+    monkeypatch.setattr(
+        "cowork.services.artifact_roots._adopted_root",
+        lambda _project: called.append("adopted") or None,
+    )
+
+    scope = _personal(partition=PARTITION_A, user=USER_A, resources=frozenset())
+    plan = plan_scope_roots(ScopedSession(session, scope))
+    assert plan.scan and plan.scan_scope == scope and plan.projects == ()
+    assert artifacts_sources_for_scope(ScopedSession(session, scope)) == []
+    assert called[0] == "scan"
+
+
+# ─── the review resolver ───────────────────────────────────────────────────
+#
+# `artifact_scope.review_artifact_for_request` is the one lookup that searches
+# a co-member's legacy conversation root, and only the owner's draft-review
+# grant makes a hit there visible. The route tests stub it, so these drive it
+# for real: org tenancy, database rows, and folders on disk.
+
+REVIEWED = "0f9e8d7c6b5a49388271605f4e3d2c1b"
+
+
+@pytest.fixture
+def owners_legacy_artifact(session, tmp_path, org_deployment, cleanup_tmp_projects):
+    """USER_A's artifact in their own legacy conversation root of an ORG_A
+    project. Returns (project, folder)."""
+    row = _project(session, tmp_path, name="reviewed", org_id=ORG_A)
+    folder = _base_for(row, _conversation(session, row, owner=USER_A)) / "brief"
+    folder.mkdir()
+    (folder / "metadata.json").write_text(
+        json.dumps({"id": REVIEWED, "type": "html-app", "primary": "index.html"})
+    )
+    (folder / "index.html").write_text("<p>brief</p>")
+    artifact_identity._clear_identity_indexes()
+    yield row, folder
+    artifact_identity._clear_identity_indexes()
+
+
+async def _review(project, *, org_id: str, user_id: str, artifact_id: str = REVIEWED):
+    from cowork.api.v1.artifact_scope import review_artifact_for_request
+
+    return await review_artifact_for_request(
+        TenantScope(org_mode=True, org_id=org_id, user_id=user_id), project.id.hex, artifact_id
+    )
+
+
+async def _refusal(project, **who) -> tuple[int, str]:
+    with pytest.raises(HTTPException) as refused:
+        await _review(project, **who)
+    return refused.value.status_code, refused.value.detail
+
+
+async def test_the_owner_reviews_their_legacy_artifact_as_their_own(owners_legacy_artifact):
+    row, folder = owners_legacy_artifact
+
+    resolved = await _review(row, org_id=ORG_A, user_id=USER_A)
+
+    assert resolved.is_own is True
+    assert resolved.folder.name == folder.name
+    assert resolved.source.base == folder.parent
+
+
+async def test_a_co_member_with_the_owners_grant_reviews_it_as_a_reviewer(owners_legacy_artifact):
+    row, folder = owners_legacy_artifact
+    enable_draft_review(folder, org_id=ORG_A, enabled_by=USER_A)
+
+    resolved = await _review(row, org_id=ORG_A, user_id=USER_A2)
+
+    assert resolved.is_own is False
+    assert resolved.folder.name == folder.name
+
+
+async def test_a_co_member_without_a_grant_gets_the_same_404_as_a_missing_artifact(
+    owners_legacy_artifact,
+):
+    row, _folder = owners_legacy_artifact
+
+    hidden = await _refusal(row, org_id=ORG_A, user_id=USER_A2)
+    missing = await _refusal(row, org_id=ORG_A, user_id=USER_A2, artifact_id=uuid.uuid4().hex)
+
+    assert hidden == missing == (404, "Artifact not found")
+
+
+async def test_a_grant_never_reaches_another_organization(owners_legacy_artifact):
+    row, folder = owners_legacy_artifact
+    enable_draft_review(folder, org_id=ORG_A, enabled_by=USER_A)
+
+    status_code, _detail = await _refusal(row, org_id=ORG_B, user_id=USER_B)
+
+    assert status_code == 404
+    # A grant that names another organization, as one left behind when the
+    # project row moved, opens nothing to the members of this one.
+    disable_draft_review(folder)
+    enable_draft_review(folder, org_id=ORG_B, enabled_by=USER_A)
+    assert await _refusal(row, org_id=ORG_A, user_id=USER_A2) == (404, "Artifact not found")
+
+
+def _count_hops(monkeypatch, *modules) -> list[str]:
+    """Record each run_db and run_efs call the named modules make, in order.
+    The database unit that records what a lookup's scan found
+    (record_checked_folders) appears as "record"."""
+    from cowork.api.v1 import artifact_scope
+    from cowork.db import units
+
+    hops: list[str] = []
+
+    async def run_db(fn, *, scope):
+        recording = getattr(fn, "func", None) is artifact_scope.record_checked_folders
+        hops.append("record" if recording else "run_db")
+        return await units.run_db(fn, scope=scope)
+
+    async def run_efs(fn, *, scope, deadline=True):
+        hops.append("run_efs")
+        return await units.run_efs(fn, scope=scope, deadline=deadline)
+
+    for module in modules:
+        monkeypatch.setattr(module, "run_db", run_db)
+        monkeypatch.setattr(module, "run_efs", run_efs)
+    return hops
+
+
+async def test_a_review_lookup_waits_for_the_database_once_and_the_file_store_once(
+    owners_legacy_artifact, monkeypatch, caplog,
+):
+    """The project row, the conversations the caller owns and the location
+    row in one database unit, then the row's folder or the roots, the owner
+    filter, the folder and a reviewer's grant in one file store call. Each
+    wait for a slot can refuse the request, so a lookup that waited again
+    after its file store work could be refused with that work done. A lookup
+    that scanned records what it found in one more unit, and a refusal there
+    is only logged."""
+    from cowork.api.v1 import artifact_scope
+    from cowork.db.units import DatabaseBusy
+
+    row, folder = owners_legacy_artifact
+    enable_draft_review(folder, org_id=ORG_A, enabled_by=USER_A)
+    hops = _count_hops(monkeypatch, artifact_scope)
+    counted_run_db = artifact_scope.run_db
+
+    async def busy_record(fn, *, scope):
+        if fn.func is artifact_scope.record_checked_folders:
+            hops.append("record")
+            raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+        return await counted_run_db(fn, scope=scope)
+
+    with monkeypatch.context() as busy, caplog.at_level(logging.WARNING, logger=artifact_scope.logger.name):
+        busy.setattr(artifact_scope, "run_db", busy_record)
+        assert (await _review(row, org_id=ORG_A, user_id=USER_A)).is_own is True
+    assert hops == ["run_db", "run_efs", "record"]
+    [logged] = [
+        record for record in caplog.records
+        if record.name == artifact_scope.logger.name and record.levelno == logging.WARNING
+    ]
+    assert logged.error_type == "DatabaseBusy"
+
+    for user_id, is_own, waits in (
+        # No row yet: the scan, then the unit that records its folder.
+        (USER_A, True, ["run_db", "run_efs", "record"]),
+        # The row that lookup recorded: its folder alone.
+        (USER_A2, False, ["run_db", "run_efs"]),
+    ):
+        hops.clear()
+        assert (await _review(row, org_id=ORG_A, user_id=user_id)).is_own is is_own
+        assert hops == waits, user_id
+
+
+async def test_a_lookup_whose_scan_changes_no_row_records_nothing(owners_legacy_artifact, monkeypatch):
+    """A miss finds no folder and no row to drop, and a co-member without a
+    grant finds only the folder the owner's row names: neither lookup waits
+    for the database again."""
+    from cowork.api.v1 import artifact_scope
+
+    row, _folder = owners_legacy_artifact
+    hops = _count_hops(monkeypatch, artifact_scope)
+
+    assert await _refusal(row, org_id=ORG_A, user_id=USER_A, artifact_id=uuid.uuid4().hex) == (
+        404, "Artifact not found",
+    )
+    assert hops == ["run_db", "run_efs"]
+
+    await _review(row, org_id=ORG_A, user_id=USER_A)  # records the owner's row
+    hops.clear()
+    assert await _refusal(row, org_id=ORG_A, user_id=USER_A2) == (404, "Artifact not found")
+    assert hops == ["run_db", "run_efs"]
+
+
+async def test_a_project_list_reads_its_roots_and_cards_in_one_file_store_call(
+    owners_legacy_artifact, monkeypatch,
+):
+    from cowork.api.v1 import artifact_scope
+    from cowork.api.v1.endpoints import artifacts
+
+    row, _folder = owners_legacy_artifact
+    hops = _count_hops(monkeypatch, artifact_scope, artifacts)
+    caller = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
+
+    cards = await artifacts.list_artifacts(caller, project_id=row.id, project_path=None)
+
+    # The owner's legacy root is still listed: the owner filter kept it.
+    assert [card["slug"] for card in cards] == ["brief"]
+    assert hops == ["run_db", "run_efs", "run_db"]
+
+
+async def test_a_plan_leaves_out_a_project_in_another_partition_with_no_file_store_call(session, org_deployment):
+    """A row naming a folder in another partition of the shared root, as agent
+    code from before the code sandbox could leave, is left out of the plan the
+    database unit builds, so no reader of RootsPlan.projects reaches it. The
+    unit compares the path against the shared root resolved at startup, so the
+    blocking guard sees no file store call in it."""
+    from cowork.db.units import run_db
+    from cowork.services.projects import resolve_shared_root
+
+    shared = resolve_shared_root()  # as the lifespan does before the port binds
+    suffix = uuid.uuid4().hex[:8]
+    mine = Project(name=f"mine-{suffix}", path=str(shared / ORG_A / "projects" / "mine"), org_id=ORG_A)
+    planted = Project(name=f"planted-{suffix}", path=str(shared / ORG_B / "projects" / "theirs"), org_id=ORG_A)
+    session.add_all([mine, planted])
+    session.commit()
+    scope = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
+    try:
+        listed = await run_db(plan_scope_roots, scope=scope)
+        by_id = await run_db(lambda scoped: plan_project_roots(scoped, planted.id), scope=scope)
+    finally:
+        session.delete(mine)
+        session.delete(planted)
+        session.commit()
+
+    names = {row.name for row in listed.projects}
+    assert mine.name in names
+    assert planted.name not in names
+    assert by_id.projects == ()

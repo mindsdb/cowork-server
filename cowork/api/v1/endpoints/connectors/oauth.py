@@ -8,9 +8,10 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, OpenByDesign, require
-from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackDesktopOnly, OpenByDesign, require
+from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.units import run_efs
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.config import OAUTH_SERVICES
@@ -63,13 +64,30 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
             service, request, OAuthSettings(),
             {"client_id": body.client_id, "client_secret": body.client_secret, "extra_fields": body.extra_fields},
         )
+    if get_app_settings().trust_identity_headers:
+        # The provider redirects the browser back to the callback as a
+        # top-level navigation with no identity: the recording proxy refuses
+        # it, and reaching cowork-server directly it is the operator view, so
+        # the connection would be saved with no creator rather than the
+        # person's. OAuthStateStore also keeps one pending start per service
+        # for the whole deployment, which two people's sign-ins would clobber.
+        # Refused up front wherever identity headers are trusted, whether
+        # connections are personal or left shared; connect the service with
+        # its credentials instead.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Signing in to a service from here is not available on this deployment. "
+                "Connect it with its credentials instead."
+            ),
+        )
     return oauth_service.start(service, OAuthSettings(), client_id=body.client_id, client_secret=body.client_secret, extra_fields=body.extra_fields)
 
 
-# LoopbackOnly: returns a raw client_secret, so the credential is the caller
-# being on this machine — same restriction as settings reveal-key and /raw
-# (ENG-868).
-@router.get("/{engine}/credentials", dependencies=[Depends(require(LoopbackOnly))])
+# LoopbackDesktopOnly: returns a raw client_secret, so the credential is the
+# caller being on this machine, the same restriction as settings reveal-key.
+# Only Electron main calls it, so an org deployment refuses it outright.
+@router.get("/{engine}/credentials", dependencies=[Depends(require(LoopbackDesktopOnly))])
 def get_oauth_credentials(engine: str):
     """Return client_id and client_secret for a builtin-OAuth engine.
     Called by Electron main process only — never exposed to the renderer."""
@@ -147,14 +165,14 @@ def _parse_mcp_identity(user_details: Any, org_details: Any) -> tuple[str, str]:
     return email, name
 
 
-# LoopbackOnly: same restriction as /credentials above — this hands back
+# LoopbackDesktopOnly: same restriction as /credentials above. This hands back
 # account identity derived from the caller-supplied access token, so the
 # credential is the caller being on this machine. Called by Electron's
 # oauth-identity.ts (fetchHubspotIdentity) — Electron can't speak MCP
 # itself (it's TypeScript, the client is Python), so it hands the
 # freshly-obtained access token here instead of calling the provider
 # directly, unlike every other FETCHERS entry.
-@router.post("/{engine}/mcp/identity", dependencies=[Depends(require(LoopbackOnly))])
+@router.post("/{engine}/mcp/identity", dependencies=[Depends(require(LoopbackDesktopOnly))])
 async def get_mcp_identity(engine: str, body: McpIdentityRequest):
     """Resolve {account_email, account_name} for an MCP-based connector by
     calling its `get_user_details`/`get_organization_details` tools directly
@@ -163,11 +181,12 @@ async def get_mcp_identity(engine: str, body: McpIdentityRequest):
     table rather than a second MCP implementation here)."""
     if engine not in _MCP_IDENTITY_ENGINES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No MCP identity resolution for {engine!r}.")
-    # Capability-gated like the harness's own discovery call: this repo's
-    # published anton floor still resolves builds without anton.core.mcp
-    # (ENG-1816 reaches anton's main on its own cadence). A bare ImportError
-    # here would surface to Electron as an opaque 500; 501 says what is
-    # actually true — this build cannot do MCP identity resolution at all.
+    # Capability-gated like the harness's own discovery call. Every anton this
+    # server can start with has anton.core.mcp (ENG-1816): it predates the
+    # anton.core.artifacts.internal_files constants the server imports at
+    # startup. So the 501 serves only an anton too old to start this server,
+    # and says what is true there: this build cannot do MCP identity
+    # resolution at all.
     try:
         from anton.core.mcp.wiring import call_mcp_tool
     except ImportError as exc:
@@ -230,10 +249,18 @@ async def oauth_status(request: Request, scope: ScopeDep, state: str = Query(...
 # — there is no principal to check by construction, same as auth's own
 # OAuthCallbackView.
 @router.get("/{service}/callback", response_class=HTMLResponse, dependencies=[Depends(require(OpenByDesign))])
-def oauth_callback(service: str, code: str = "", state: str = "", error: str = ""):
+async def oauth_callback(service: str, scope: ScopeDep, code: str = "", state: str = "", error: str = ""):
     if service not in OAUTH_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth service: {service!r}")
-    html = oauth_service.callback(service, code, state, error, OAuthSettings())
+    # A sign-in completes here only on the desktop: start_oauth refuses one
+    # wherever identity headers are trusted, and in org mode auth runs the
+    # handshake and its own callback. Any caller still reaches this route,
+    # and it reads and clears the pending sign-in and records its outcome in
+    # COWORK_HOME, the shared file store where hosted, so the callback runs on
+    # the file store's threads.
+    html = await run_efs(
+        lambda: oauth_service.callback(service, code, state, error, OAuthSettings(), scope=scope), scope=scope
+    )
     return HTMLResponse(content=html)
 
 

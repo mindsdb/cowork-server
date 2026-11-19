@@ -31,6 +31,23 @@ from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 from urllib.parse import urlparse
 
+from anton.core.llm.provider import (
+    AllowanceExhaustedError,
+    FreeServingPausedError,
+    WalletEmptyError,
+)
+
+try:
+    from anton.core.llm.provider import BudgetExceededError
+except ImportError:  # TODO(ENG-1585): import it above once uv.lock pins an anton that has it.
+
+    class BudgetExceededError(Exception):  # type: ignore[no-redef]
+        """Stand-in for an anton without the type, with anton's signature; anton never raises it."""
+
+        def __init__(self, message: str, *, reason: str = "", status_code: int | None = None, **_: object):
+            super().__init__(message)
+            self.reason = reason
+            self.status_code = status_code
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.settings.app_settings import default_minds_url
@@ -87,9 +104,8 @@ CONTENT_REPAIR_CODES: frozenset[str] = frozenset(
     {CONTENT_RECOVERY_CODE, CONTENT_TOO_LARGE_CODE}
 )
 
-# Curated copy for the out-of-credits case. In the wallet billing model this
-# fires when either the org's wallet is empty (gateway 402 `wallet_empty`) or
-# the free allowance is spent (gateway 429 `included_allowance_exhausted`).
+# Curated copy for an empty wallet or a legacy TokenLimitExceeded failure.
+# Known allowance and free-serving-pause refusals have their own codes below.
 # Without this the turn would die mid-stream
 # with no completion event and no error frame — the SSE connection just closes
 # and the renderer's spinner stops, which reads as "Anton is dead" rather than
@@ -105,11 +121,9 @@ CONTENT_REPAIR_CODES: frozenset[str] = frozenset(
 # pay-as-you-go. So editing this message alone changes nothing a desktop user
 # sees; the client must change too. It still reaches non-desktop consumers and
 # is the fallback for a client that doesn't hardcode.
-# This copy is now the EMPTY-WALLET half only. The spent-free-allowance case was
-# split off into ALLOWANCE_EXHAUSTED_CODE below (ENG-1537 step 8, in scope from
-# the start) — an earlier revision of this comment argued for deferring it and
-# is superseded. Because the split introduces a code an older renderer has no
-# branch for, the delivery order matters: the cowork card must reach users
+# A spent free allowance has its own ALLOWANCE_EXHAUSTED_CODE below. Because
+# that code is one an older renderer has no branch for, the delivery order
+# matters: the cowork card must reach users
 # BEFORE this server change, or a user who has just spent their free grant
 # falls through to a buttonless alert at the paid-conversion moment. That is a
 # release-ordering constraint, not a merge-ordering one.
@@ -118,23 +132,23 @@ TOKEN_LIMIT_USER_MESSAGE = (
 )
 
 # Wire-level code for the out-of-credits case. Named `token_limit` for wire
-# back-compat with clients already branching on it; it now covers both the
-# empty-wallet and spent-allowance reasons above.
+# back-compat with clients already branching on it. It covers an empty wallet,
+# a gateway 402 with no reason, and a plain anton `TokenLimitExceeded`.
 TOKEN_LIMIT_CODE = "token_limit"
 
 # Curated copy + wire code for a spent or absent FREE allowance (gateway 429
-# `included_allowance_exhausted`). Split from `token_limit`: both denials used
-# to share the out-of-credits card, but they are different situations.
-# `access.py` in auth decides it, and the logic is exact. This reason fires
+# `included_allowance_exhausted`). Kept apart from `token_limit` and its
+# out-of-credits card: they are different situations.
+# MindsHub decides it, and the logic is exact. This reason fires
 # ONLY for a free-bucket model on an org that has NEVER topped up ("a non-free
 # model always needs the wallet"). So the person seeing this card has not spent
 # money. Credits genuinely unlock the rest of the catalogue for them, because
 # non-free models need a wallet they do not have.
-# The same reason also fires for an org with NO free grant at all: auth zeroes
+# The same reason also fires for an org with NO free grant at all: MindsHub zeroes
 # the allowance of an org that is not `free_grant_eligible`, so its first
 # free-bucket request lands here and nothing ever refills. The denial does not
-# say which case it is. The card learns that from the hub usage read instead:
-# `cowork/services/hub_usage.py` relays auth's `free_grant_eligible: false` as
+# say which case it is. The card learns that from the MindsHub usage read instead:
+# `cowork/services/mindshub_usage.py` relays MindsHub's `free_grant_eligible: false` as
 # `freeTokens.limit` 0, and the card says there is no grant when it reads that.
 # The failure frame's `reset_at` only supplies the refill time. This string is
 # the fallback for consumers that don't render the card, including the channel
@@ -162,6 +176,17 @@ FREE_SERVING_PAUSED_USER_MESSAGE = (
     "Add credits to keep working now."
 )
 
+# Curated copy + wire code for a spent organization budget (gateway 402
+# `budget_exceeded`). An admin set a hard spending cap and paid requests hit it,
+# so credits do not lift it: the card sends the user to the console's Budgets
+# tab. MindsHub Air keeps working while its free allowance lasts. The gate sends
+# no reset instant, so this code is not in RESET_AT_CODES.
+BUDGET_EXCEEDED_CODE = "budget_exceeded"
+BUDGET_EXCEEDED_USER_MESSAGE = (
+    "Your organization's spending budget is used up. "
+    "An owner or admin can raise it in Budgets."
+)
+
 # Codes whose failure frame carries the gate's `X-MindsHub-Reset-At` instant as
 # `reset_at`, so the card can say when the free way forward comes back.
 # responses.py branches on this set for an in-process turn, and
@@ -174,12 +199,13 @@ RESET_AT_CODES: frozenset[str] = frozenset(
 
 # Curated copy + wire code for a VELOCITY rate-limit (gateway 429
 # `rate_limited`) — the org exceeded requests/tokens per minute, NOT its credit
-# balance. ENG-1537: this was the fifth and only unmapped gateway reason, so it
-# fell through to the bare-status 429 rule below and rendered as out-of-credits
-# — telling the user to buy something that cannot raise a per-minute ceiling.
-# The gateway is explicit that the two are different (`rate_limited()` in
-# minds/inference/errors.py: "the caller should slow down and retry after
-# retry_after seconds, not wait for an allowance reset or add credits").
+# balance. A 429's status cannot tell it apart from an allowance stop, so only
+# the reason header or the body code selects it. It must never render as
+# out-of-credits, which tells the user to buy something that cannot raise a
+# per-minute ceiling. The gateway is explicit that the two are different
+# (`rate_limited()` in minds/inference/errors.py: "the caller should slow down
+# and retry after retry_after seconds, not wait for an allowance reset or add
+# credits").
 # Copy names the remedy (wait) and rules out the one the user would otherwise
 # assume, because they have just been shown a credits card for this.
 RATE_LIMITED_CODE = "rate_limited"
@@ -309,12 +335,13 @@ MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
 # billing decision precisely. Preferred over status/message heuristics.
 #
 # mindshub_inference (`denial_error()` and `credential_rejected()` in
-# minds/inference/errors.py) emits eight reasons today: unknown_model,
+# minds/inference/errors.py) emits nine reasons today: unknown_model,
 # rate_limited, wallet_empty, included_allowance_exhausted,
-# free_air_daily_spend_fuse_exceeded, policy_unavailable, permission_denied and
-# invalid_credentials. Any other gate reason fails closed to policy_unavailable.
+# free_air_daily_spend_fuse_exceeded, budget_exceeded, policy_unavailable,
+# permission_denied and invalid_credentials. Any other gate reason fails closed
+# to policy_unavailable.
 #
-# This module maps the first six, below. permission_denied (403) and
+# This module maps the first seven, below. permission_denied (403) and
 # invalid_credentials (401) are credential rejections with no reason mapping
 # here: they fall through to the rest of `friendly_turn_error`'s ladder, where
 # `is_auth_error` picks up anton's typed ProviderAuthError for a 401 and a 403
@@ -323,6 +350,7 @@ MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
 _REASON_WALLET_EMPTY = "wallet_empty"
 _REASON_ALLOWANCE_EXHAUSTED = "included_allowance_exhausted"
 _REASON_FREE_AIR_FUSE = "free_air_daily_spend_fuse_exceeded"
+_REASON_BUDGET_EXCEEDED = "budget_exceeded"
 _REASON_POLICY_UNAVAILABLE = "policy_unavailable"
 _REASON_UNKNOWN_MODEL = "unknown_model"
 _REASON_RATE_LIMITED = "rate_limited"
@@ -355,10 +383,23 @@ GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
 # clients (which may branch on it) keep working after the migration.
 GENERIC_TURN_ERROR_CODE = "anton_error"
 
-# Message for a turn cut off by boot recovery or shutdown, not by the model,
-# provider, or user Stop. Paired with GENERIC_TURN_ERROR_CODE, not a code of
-# its own — same as TurnInterrupted below.
+# Message for a turn the watchdog ended after it made no progress
+# (TurnLifecycle.timed_out), not the model, provider, or user Stop. Paired
+# with GENERIC_TURN_ERROR_CODE, not a code of its own — same as
+# TurnInterrupted below.
 INTERRUPTED_TURN_MESSAGE = "The response was interrupted before it finished. Please try again."
+
+# The server stopped while the turn ran: a shutdown, or a crash that boot
+# recovery finds afterwards. A code of its own because the next step differs
+# from anton_error: nothing about the request or the agent failed, the answer
+# streamed so far is kept, and sending the question again works once the
+# server is back. A proxy that outlives the server can send the same frame to
+# a client whose stream the crash cut.
+TURN_LOST_CODE = "turn_lost"
+TURN_LOST_MESSAGE = (
+    "The server stopped before this answer finished. The answer ends where it "
+    "was cut off. Please send your question again."
+)
 
 # anton ended a model call that sent no output within its deadline. Its own
 # message names the deadline, so it passes through; this is the fallback for
@@ -382,6 +423,9 @@ STALLED_TURN_MESSAGE = "The response stalled and was ended. Please try sending a
 POD_STREAM_ENDED_PREFIX = "pod stream ended without a terminal event"
 POD_STREAM_ENDED_USER_MESSAGE = "The turn ended unexpectedly. Please try again."
 TURN_ABORTED_TIMEOUT_PREFIX = "turn aborted: hard turn timeout"
+# The controller's other turn ceiling, which also counts time a question waited
+# on the user. Same outcome for the user, so the same copy.
+TURN_ABORTED_WALL_CLOCK_PREFIX = "turn aborted: wall-clock limit"
 TURN_ABORTED_TIMEOUT_USER_MESSAGE = (
     "This turn took too long and was stopped. Try again with a smaller request."
 )
@@ -440,11 +484,15 @@ REMOTE_CANCEL_LITERAL = "cancelled"
 # per-stream-line cancel check needs stream lines to run and none exist
 # before the pod is Running.
 #
-# Ambiguous on its own: a replica taking SIGTERM during a rolling deploy
-# unwinds through the same handler, and reading that as a cancel would end
-# the turn with partial text, no error frame and no lookup id — the one
-# failure class that would come out of this change LESS visible. Callers
-# confirm it against the cancel flag before treating it as a Stop.
+# Ambiguous on its own: a controller replica without a shutdown drain also
+# sends it when its whole process is cancelled, as SIGINT in a local run
+# cancels every job task (a draining controller ends those turns with
+# "TurnInterrupted" instead). A hosted SIGTERM never gets there: as PID 1
+# such a controller ignores it until the kubelet kills it, and a peer later
+# reports the turn as lost. Reading this string as a cancel would end the
+# turn with partial text, no error frame and no lookup id: the one failure
+# class that would come out of this change LESS visible. Callers confirm it
+# against the cancel flag before treating it as a Stop.
 REMOTE_CANCEL_VIA_FAIL_JOB = "RuntimeError: cancelled"
 
 # live_pod.py raises a bare RuntimeError from two places when the pod never
@@ -527,14 +575,12 @@ def is_image_format_error(exc: Exception) -> bool:
 
 
 # ENG-2689's discriminator, deliberately NOT an isinstance check against
-# `anton.core.llm.provider.ContentTooLargeError`. cowork-server pins anton from
-# a git branch, so importing a type this repo can be deployed ahead of would
-# turn a version skew into an ImportError on the error path — the worst place
-# to have one. The class NAME is also the only thing that survives the remote
-# hop (`anton.cloud_turn.__main__._scrub` emits "<Type>: <message>"), so keying
-# on it here keeps both transports on one rule. `code` is checked too because
-# it is the attribute anton actually declares, and a future rename of the class
-# should not silently downgrade this to the wrong card.
+# `anton.core.llm.provider.ContentTooLargeError`. The class NAME is the only
+# thing that survives the remote hop (`anton.cloud_turn.__main__._scrub` emits
+# "<Type>: <message>"), so keying on it here keeps both transports on one rule.
+# `code` is checked too because it is the attribute anton actually declares,
+# and a future rename of the class should not silently downgrade this to the
+# wrong card.
 CONTENT_TOO_LARGE_TYPE_NAME = "ContentTooLargeError"
 
 
@@ -644,11 +690,12 @@ def is_content_validation_error(exc: Exception) -> bool:
 
 
 def is_token_limit_error(exc: Exception) -> bool:
-    """Detect a spent allowance — anton's ``TokenLimitExceeded`` (429 token
-    limit) OR an exhausted credit balance (the gateway may instead report a
-    402 / "insufficient credits"). Both mean "out of credits", so we map them
-    to the same ``token_limit`` code and let the client show the curated
-    out-of-credits card instead of a generic crash.
+    """Detect an out-of-credits failure: anton's ``TokenLimitExceeded`` or an
+    exhausted credit balance (a 402 / "insufficient credits" message). Both map
+    to the ``token_limit`` code so the client shows the curated out-of-credits
+    card instead of a generic crash. ``friendly_turn_error`` maps anton's
+    allowance and free-serving-pause subclasses to their own codes before
+    this runs.
     """
     try:
         from anton.core.llm.provider import TokenLimitExceeded
@@ -762,12 +809,10 @@ def is_auth_error(exc: Exception) -> bool:
     Anton's typed exception proves the failed credential belongs to the active
     LLM provider and may select the reconnect/update-key card.
 
-    Imported lazily like every other anton type in this module
-    (``ContentValidationError``, ``TokenLimitExceeded``, ``ModelUnavailableError``,
-    ``ProviderOverloadedError``). A module-scope import would turn an anton
-    without this symbol — staging and main today, and the ``branch = "main"``
-    pin this repo's pyproject documents — into a failed app import rather than
-    one missing error card.
+    Imported lazily, so an anton without this symbol loses one error card rather
+    than failing the app import. The billing subclasses at the top of this
+    module import eagerly because the anton-agent floor in pyproject.toml ships
+    them.
     """
     try:
         from anton.core.llm.provider import ProviderAuthError
@@ -857,9 +902,9 @@ def _http_error_context(
     matching. When the header is found, the status and host are taken from that
     SAME exception so the trio always describes one response; otherwise they
     come from the first exception in the chain with a ``status_code``. The host
-    lets callers tell a gateway billing status from a BYOK provider's own
-    402/429/503. Returns ``(None, None, None)`` for a plain exception with no
-    HTTP context.
+    lets callers tell a gateway billing decision from a BYOK provider's own
+    status. Returns ``(None, None, None)`` for a plain exception with no HTTP
+    context.
 
     anton's typed billing stops and its ``TransientProviderError`` carry a
     ``status_code`` but no response, so for them the host is None. The
@@ -931,11 +976,14 @@ def _configured_minds_host() -> str | None:
 def _from_minds_gateway(host: str | None) -> bool:
     """Whether the failing request went to the configured MindsHub gateway.
 
-    Gates the bare-status billing fallbacks: only the gateway's 402/429/503
-    are billing decisions. The same statuses from a BYOK provider mean
-    something else entirely (an OpenAI rate limit, an Anthropic overload) and
-    must not surface billing copy. An unknown origin (no URL on the failure)
-    is treated as not-the-gateway, so ambiguous failures stay generic.
+    Gates body-code reads, the body deny detail, the bare-status 402/503
+    billing fallbacks and, through ``_origin_is_known_third_party``, the reason
+    header. A self-hosted ``minds_url`` that never resolves makes this False
+    for the real gateway; the typed billing rung in ``friendly_turn_error``
+    covers that case. The same statuses from a BYOK provider mean something
+    else entirely and must not surface billing copy. An unknown origin (no URL
+    on the failure) is treated as not-the-gateway, so ambiguous failures stay
+    generic.
     """
     if not host:
         return False
@@ -980,6 +1028,7 @@ def _gateway_body_denial(*, exc: BaseException) -> _BodyDenial | None:
         _REASON_WALLET_EMPTY,
         _REASON_ALLOWANCE_EXHAUSTED,
         _REASON_FREE_AIR_FUSE,
+        _REASON_BUDGET_EXCEEDED,
         _REASON_POLICY_UNAVAILABLE,
         _REASON_UNKNOWN_MODEL,
         _REASON_RATE_LIMITED,
@@ -1236,14 +1285,14 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     NOT, because that user has never paid, so it has its own code and copy.
     The free-Air spend fuse is neither: free serving is paused for
     every org whose wallet cannot pay, not just this one, so it has its own code
-    and copy too. A policy outage is transient. An unknown model can't be fixed
+    and copy too. A spent budget is not out of credits either: an admin
+    raises it. A policy outage is transient. An unknown model can't be fixed
     with credits.
 
     A velocity ``rate_limited`` is NOT out of credits and must never share that
     card: the ceiling is per-minute tokens, so buying credits cannot lift it and
-    the remedy is to wait (ENG-1537). It is listed here rather than left to the
-    bare-status 429 rule below precisely because that rule cannot tell the two
-    429s apart — and the gateway already did.
+    the remedy is to wait. The gateway's explicit reason distinguishes it from
+    other 429s; the status alone cannot.
     """
     if reason == _REASON_RATE_LIMITED:
         return RATE_LIMITED_CODE, RATE_LIMITED_USER_MESSAGE
@@ -1251,6 +1300,8 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
         return ALLOWANCE_EXHAUSTED_CODE, ALLOWANCE_EXHAUSTED_USER_MESSAGE
     if reason == _REASON_FREE_AIR_FUSE:
         return FREE_SERVING_PAUSED_CODE, FREE_SERVING_PAUSED_USER_MESSAGE
+    if reason == _REASON_BUDGET_EXCEEDED:
+        return BUDGET_EXCEEDED_CODE, BUDGET_EXCEEDED_USER_MESSAGE
     if reason == _REASON_WALLET_EMPTY:
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
     if reason == _REASON_POLICY_UNAVAILABLE:
@@ -1280,6 +1331,7 @@ PROBE_DENIAL_REASONS: frozenset[str] = frozenset(
         _REASON_WALLET_EMPTY,
         _REASON_ALLOWANCE_EXHAUSTED,
         _REASON_FREE_AIR_FUSE,
+        _REASON_BUDGET_EXCEEDED,
         _REASON_RATE_LIMITED,
         _REASON_POLICY_UNAVAILABLE,
     }
@@ -1359,8 +1411,7 @@ def friendly_turn_error(
             # model 'deepseek-v4-flash' isn't available: …"), while the header
             # only says *that* a model was rejected. Returning the header copy
             # here threw the model id away and left the user with nothing to act
-            # on — ENG-1358. The billing reasons have no such typed counterpart,
-            # so they still short-circuit.
+            # on. Billing types use the same curated copy as the header.
             if mapped[0] == MODEL_NOT_FOUND_CODE:
                 if model_info is _UNSET:
                     model_info = model_unavailable_info(exc)
@@ -1371,9 +1422,8 @@ def friendly_turn_error(
     # Same decision from the body's `code` when the header didn't survive the
     # trip (ENG-1363's Anthropic lane strips it). The gateway sets both fields
     # to the same value, so this is the identical decision from a second
-    # carrier — NOT a heuristic. It must stay above the bare-status rule below:
-    # that rule cannot tell the velocity 429 from the allowance 429, and
-    # guessing "out of credits" for a rate limit is the ENG-1537 defect.
+    # carrier, not a heuristic. It must stay above the legacy token-limit
+    # detector so a recognized reason keeps its specific classification.
     body_denial = _gateway_body_denial(exc=exc)
     # NOTE: strict here (provably-gateway), unlike the header above. The header
     # needs the looser three-valued check because an existing test requires an
@@ -1400,18 +1450,13 @@ def friendly_turn_error(
             return MODEL_RESTRICTED_CODE, str(exc)
         return MODEL_RESTRICTED_CODE, MODEL_RESTRICTED_USER_MESSAGE
 
-    # anton exhausted its rate-limit wait budget and re-raised with the code
-    # (ENG-1537). Checked here, above the bare-status rule, because that
-    # exception still carries the original 429 in its cause chain — so without
-    # this the honest "waiting didn't clear it" failure is relabelled
-    # out-of-credits, which is exactly what the wait was added to stop.
+    # Anton exhausted its rate-limit wait budget and re-raised with the code;
+    # keep that verdict.
     # Read the code attribute DIRECTLY rather than via provider_overloaded_info:
     # that helper's version-skew duck-type only accepts
     # ``code == provider_overloaded``, so under the exact skew its own docstring
     # exists for (anton's type not importable), an exhausted rate-limit wait
-    # would fall through to the bare-status rule and be relabelled
-    # out-of-credits — the outcome this hoist exists to prevent (ENG-1537
-    # review).
+    # would otherwise lose its specific verdict.
     # `not hasattr(exc, "response")` is load-bearing, not defensive noise.
     # `openai.APIStatusError` populates `.code` FROM THE RESPONSE BODY, and on a
     # BYOK OPENAI_COMPATIBLE provider that body is third-party-controlled — so
@@ -1428,6 +1473,25 @@ def friendly_turn_error(
     if getattr(exc, "code", None) == RATE_LIMITED_CODE and not hasattr(exc, "response"):
         return RATE_LIMITED_CODE, str(exc) or RATE_LIMITED_USER_MESSAGE
 
+    # Anton's mindshub_billing_stop builds these types only for a response that
+    # is not provably from a third party, so the type is the verdict.
+    # Self-hosted sets minds_url to a nonresolving host while model calls go to
+    # MindsHub, so this module's _origin_is_known_third_party and
+    # _from_minds_gateway treat the real gateway as foreign and skip its header
+    # and body code. Checked before is_token_limit_error, which matches every
+    # TokenLimitExceeded. Only the imported types count: a reason attribute or a
+    # class with the same name does not. The wallet line returns what
+    # is_token_limit_error would; it mirrors _REMOTE_TYPE_MAPPINGS and holds if
+    # anton ever reparents the type.
+    if isinstance(exc, WalletEmptyError):
+        return _map_gateway_reason(_REASON_WALLET_EMPTY)
+    if isinstance(exc, AllowanceExhaustedError):
+        return _map_gateway_reason(_REASON_ALLOWANCE_EXHAUSTED)
+    if isinstance(exc, FreeServingPausedError):
+        return _map_gateway_reason(_REASON_FREE_AIR_FUSE)
+    if isinstance(exc, BudgetExceededError):
+        return _map_gateway_reason(_REASON_BUDGET_EXCEEDED)
+
     # Precedence per ENG-673: token_limit / the billing-status fallback /
     # provider_auth / the ENG-598 model gate all WIN over provider_overloaded
     # (ranked below, after auth). These exception types are disjoint in practice
@@ -1443,12 +1507,11 @@ def friendly_turn_error(
 
     # Bare-status fallback for a gateway that omits the reason header (older
     # versions). Gated on the failing request having gone to the configured
-    # MindsHub gateway: a BYOK provider's own 402/429/503 (an OpenAI rate
-    # limit, an Anthropic overload) is not a billing decision, so it falls
-    # through — usually to the generic redacted message. 402/429 both mean
-    # out-of-credits; 503 is a transient policy outage, retryable and never
-    # the out-of-credits card.
-    if status in (402, 429, 503) and _from_minds_gateway(host):
+    # MindsHub gateway: a BYOK provider's own 402/503 is not a billing decision,
+    # so it falls through, usually to the generic redacted message. A gateway
+    # 429 alone does not identify which limit fired and must stay unclassified.
+    # 402 means out-of-credits; 503 is a transient policy outage.
+    if status in (402, 503) and _from_minds_gateway(host):
         if status == 503:
             return POLICY_UNAVAILABLE_CODE, POLICY_UNAVAILABLE_USER_MESSAGE
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
@@ -1506,7 +1569,7 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
     WORKER_UNRESPONSIVE_TYPE_NAME: _RemoteTypeMapping(
         WORKER_UNRESPONSIVE_CODE, WORKER_UNRESPONSIVE_MESSAGE
     ),
-    # The three MindsHub billing stops, each named by its own anton type so the
+    # The MindsHub billing stops, each named by its own anton type so the
     # hosted card matches the desktop one. The reset instant does not ride the
     # error string: the worker sends it as `reset_at` beside `error`, and
     # `turnqueue/producer.py` keeps it for the RESET_AT_CODES only.
@@ -1516,6 +1579,9 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
     ),
     "FreeServingPausedError": _RemoteTypeMapping(
         FREE_SERVING_PAUSED_CODE, FREE_SERVING_PAUSED_USER_MESSAGE
+    ),
+    "BudgetExceededError": _RemoteTypeMapping(
+        BUDGET_EXCEEDED_CODE, BUDGET_EXCEEDED_USER_MESSAGE
     ),
     # Older worker images raise the parent type for every billing stop, and so
     # does any plain raise of it. Both keep the out-of-credits card.
@@ -1603,7 +1669,7 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
     # returned rather than any part of the wire text.
     if text.startswith(POD_STREAM_ENDED_PREFIX):
         return GENERIC_TURN_ERROR_CODE, POD_STREAM_ENDED_USER_MESSAGE
-    if text.startswith(TURN_ABORTED_TIMEOUT_PREFIX):
+    if text.startswith((TURN_ABORTED_TIMEOUT_PREFIX, TURN_ABORTED_WALL_CLOCK_PREFIX)):
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_TIMEOUT_USER_MESSAGE
     if text.startswith(TURN_ABORTED_STALL_PREFIX):
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_STALL_USER_MESSAGE
@@ -1647,7 +1713,7 @@ def remote_error_label(*, error: str | None) -> str:
         return text.partition(":")[0]
     if text.startswith(POD_STREAM_ENDED_PREFIX):
         return "pod_stream_ended"
-    if text.startswith(TURN_ABORTED_TIMEOUT_PREFIX):
+    if text.startswith((TURN_ABORTED_TIMEOUT_PREFIX, TURN_ABORTED_WALL_CLOCK_PREFIX)):
         return "turn_aborted_timeout"
     if text.startswith(TURN_ABORTED_STALL_PREFIX):
         return "turn_aborted_stall"
@@ -1694,7 +1760,8 @@ def response_failed_payload(
     every remote-backend and in-process failure regardless of code, including
     the fully generic ``anton_error`` bucket, so a user report of "An
     unexpected error occurred" can still be pinned to this turn's server-side
-    logs. The direct and channel producers have none to offer and omit it.
+    logs. Every producer that builds this payload sets one. Boot recovery,
+    which seals a turn a restart killed, has none to offer and omits it.
 
     ``assistant_message_id`` is the persisted assistant Message's
     id when the failed turn still produced one (e.g. partial text before an

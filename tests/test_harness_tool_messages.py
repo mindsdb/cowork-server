@@ -20,7 +20,6 @@ class _FakeSession:
 
 def test_stream_response_forwards_the_flag_and_defaults_it_off(monkeypatch):
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_a, **_k: (set(), {}))
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", lambda *_a, **_k: ([], set(), None))
     monkeypatch.setattr(task_objects, "cards_for_slugs", lambda *_a, **_k: [])
 
     async def _no_autopublish(*_a, **_k):
@@ -31,7 +30,7 @@ def test_stream_response_forwards_the_flag_and_defaults_it_off(monkeypatch):
 
     async def _fake_build(self, conversation, **kwargs):
         received.append(kwargs["tool_messages"])
-        return _FakeSession(), None, None
+        return harness.BuiltChatSession(session=_FakeSession(), turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(harness.AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(
@@ -57,5 +56,5 @@ def test_only_the_ui_turn_opts_in():
 
 
 def test_the_session_builder_degrades_on_an_older_anton():
-    source = inspect.getsource(harness.AntonHarness._build_chat_session)
+    source = inspect.getsource(harness.AntonHarness._build_turn_session)
     assert "**supported_kwargs(ChatSessionConfig, tool_messages=tool_messages)" in source

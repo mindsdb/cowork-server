@@ -1,0 +1,126 @@
+# One reference each, run as an <img src> and as a CSS url("...").
+# `reason` is the OmittedReason the reference gets, or null when it inlines.
+# `recorded` is the reference as `omitted` records it, when cleaning changed it.
+# `img_only` skips the CSS run, where a `#fragment` names this document.
+# `{outside}` is a 127.0.0.1 recording server that must see no request.
+
+- id: plain-name
+  reference: chart.png
+  reason: null
+- id: dot-segment
+  reference: ./chart.png
+  reason: null
+- id: query-and-fragment-cut
+  reference: chart.png?v=2#top
+  reason: null
+- id: percent-decoded-once
+  reference: "%63hart.png"
+  reason: null
+- id: control-characters-stripped
+  reference: "ch\tar\nt.p\rng"
+  reason: null
+- id: nested-folder
+  reference: sub/inner.png
+  reason: null
+- id: backslash-separator
+  reference: 'sub\inner.png'
+  reason: null
+
+- id: metadata-address
+  reference: http://169.254.169.254/latest/meta-data/
+  reason: scheme
+- id: outside-url
+  reference: "{outside}/pixel.png"
+  reason: scheme
+- id: uppercase-scheme
+  reference: HTTPS://example.com/x.png
+  reason: scheme
+- id: file-url
+  reference: file:///etc/passwd
+  reason: scheme
+- id: javascript-url
+  reference: "java\tscript:alert(1)"
+  reason: scheme
+  recorded: javascript:alert(1)
+- id: drive-letter-reads-as-scheme
+  reference: C:/Windows/win.ini
+  reason: scheme
+
+- id: leading-slash
+  reference: /etc/passwd
+  reason: absolute
+- id: protocol-relative
+  reference: //example.com/x.png
+  reason: absolute
+- id: leading-backslash-unc
+  reference: '\\server\share\x.png'
+  reason: absolute
+
+- id: parent-segment
+  reference: ../other/secret.png
+  reason: traversal
+- id: encoded-parent-segment
+  reference: "%2e%2e/other/secret.png"
+  reason: traversal
+- id: encoded-separator
+  reference: "sub/..%2f..%2fother/secret.png"
+  reason: traversal
+- id: backslash-parent
+  reference: '..\other\secret.png'
+  reason: traversal
+- id: encoded-drive
+  reference: "C%3A/Windows/win.ini"
+  reason: traversal
+- id: encoded-nul
+  reference: "chart.png%00.txt"
+  reason: traversal
+- id: empty-segment
+  reference: sub//inner.png
+  reason: traversal
+- id: colon-in-segment
+  reference: sub/inner.png:stream
+  reason: traversal
+- id: reserved-device-name
+  reference: NUL.png
+  reason: traversal
+- id: trailing-dot
+  reference: chart.png.
+  reason: traversal
+
+- id: encoded-unc
+  reference: "%2F%2Fserver%2Fshare%2Fx.png"
+  reason: unc_path
+- id: encoded-backslash-unc
+  reference: "%5C%5Cserver%5Cshare%5Cx.png"
+  reason: unc_path
+
+- id: housekeeping-name
+  reference: metadata.json
+  reason: housekeeping
+- id: casefolded-housekeeping-name
+  reference: sub/Metadata.JSON
+  reason: housekeeping
+- id: revisions-folder
+  reference: .revisions/old.png
+  reason: housekeeping
+- id: casefolded-revisions-folder
+  reference: .REVISIONS/old.png
+  reason: housekeeping
+
+- id: absent-file
+  reference: absent.png
+  reason: missing
+- id: fragment-only
+  reference: "#top"
+  reason: missing
+  img_only: true
+- id: not-utf8-after-decoding
+  reference: "%ff.png"
+  reason: missing
+
+- id: text-file
+  reference: notes.txt
+  reason: unsupported_type
+- id: svg-file
+  reference: vector.svg
+  reason: unsupported_type

@@ -95,6 +95,17 @@ def test_options_preflight_is_allowed_without_token():
     assert res.headers.get("access-control-allow-origin") == ORIGIN
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"Access-Control-Request-Method": "GET"}, {"Origin": ORIGIN}],
+)
+def test_options_that_is_no_preflight_needs_the_token(headers):
+    """Only Origin and Access-Control-Request-Method together make a
+    preflight, which CORS answers before this layer; any other OPTIONS is an
+    ordinary request."""
+    assert _client().options("/api/v1/projects/", headers=headers).status_code == 401
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes only")
 def test_generated_token_file_is_private(tmp_path):
     env = tmp_path / ".env"

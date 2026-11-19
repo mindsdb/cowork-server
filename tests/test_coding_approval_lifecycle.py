@@ -6,7 +6,7 @@ import pytest
 
 from coding_service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
 from cowork.coding.approvals import ApprovalBroker
-from cowork.coding.contracts import ApprovalDecision, PermissionMode, SessionCreateRequest, SessionStatus, SessionUpdateRequest
+from cowork.coding.contracts import ApprovalDecision, EventType, PermissionMode, SessionCreateRequest, SessionStatus, SessionUpdateRequest
 from cowork.coding.store import CodingStore
 from test_coding_command_approvals import METHOD, request
 
@@ -15,6 +15,7 @@ class ApprovalEngine(FakeEngine):
     """Exercise the real turn -> approval -> store -> resume lifecycle."""
 
     next_request: dict | None = None
+    next_method: str = METHOD
 
     def __init__(self):
         super().__init__()
@@ -27,18 +28,21 @@ class ApprovalEngine(FakeEngine):
         def events(turn_id):
             params, self.next_request = self.next_request, None
             if params:
-                self.decisions.append(kwargs["approval_handler"](METHOD, params))
+                self.decisions.append(kwargs["approval_handler"](self.next_method, params))
             yield from original(turn_id)
 
         runtime.events = events
         return runtime
 
 
-def make_task(tmp_path: Path):
+def make_task(tmp_path: Path, permission_mode: PermissionMode = PermissionMode.supervised):
     repo = repository(tmp_path)
     engine = ApprovalEngine()
     service = service_with(tmp_path, engine)
-    task = service.create_session(SessionCreateRequest(path=str(repo), prompt="Approval test"), CREDS, "fake", "fake-model")
+    task = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Approval test", permission_mode=permission_mode),
+        CREDS, "fake", "fake-model",
+    )
     wait_for_status(service, task.id, SessionStatus.completed)
     return service, engine, task
 
@@ -91,7 +95,7 @@ def test_forks_do_not_inherit_grants_even_if_the_command_is_identical(tmp_path):
 
 
 @pytest.mark.parametrize("change", [
-    {"permission_mode": PermissionMode.read_only}, {"network_access": True}, {"additional_dirs": []},
+    {"permission_mode": PermissionMode.workspace}, {"network_access": True}, {"additional_dirs": []},
 ])
 def test_permission_changes_revoke_grants_but_model_changes_do_not(tmp_path, change):
     service, engine, task = make_task(tmp_path)
@@ -126,3 +130,40 @@ def test_failed_grant_save_does_not_authorize_or_remember_command(tmp_path, monk
     wait_for_status(service, task.id, SessionStatus.completed)
     assert engine.decisions == [{"decision": "decline"}]
     assert service.get_session(task.id).command_approval_grants == []
+
+
+@pytest.mark.parametrize("method, params", [
+    (METHOD, request()),
+    ("item/fileChange/requestApproval", {"reason": "Append hello to README.md"}),
+])
+def test_read_only_task_declines_every_request_without_a_card(tmp_path, method, params):
+    service, engine, task = make_task(tmp_path, PermissionMode.read_only)
+    engine.next_method, engine.next_request = method, params
+    service.submit_turn(task.id, "Add the line hello to the end of README.md", CREDS)
+    wait_for_status(service, task.id, SessionStatus.completed)
+
+    assert engine.decisions == [{"decision": "decline"}]
+    events = service.events(task.id).items
+    assert not [event for event in events if event.type == EventType.approval]
+    refusal = next(event for event in events if event.type == EventType.command_result)
+    assert refusal.phase == "failed"
+    assert refusal.title == "Declined: this task is Read only"
+    assert "Switch the task to Ask first" in refusal.text
+    assert service.get_session(task.id).command_approval_grants == []
+
+
+def test_read_only_task_ignores_a_remembered_always_allow(tmp_path):
+    service, engine, task = make_task(tmp_path)
+    approve(service, engine, task.id, ApprovalDecision.approve_session)
+    grants = service.get_session(task.id).command_approval_grants
+    assert grants
+    # Reach Read only with the grant still stored, as no supported path can,
+    # so the refusal does not depend on a mode change clearing it first.
+    service.store.update_session(task.id, lambda current: setattr(current, "permission_mode", PermissionMode.read_only))
+    assert service.get_session(task.id).command_approval_grants == grants
+
+    for script in ("npm test", "npm test -- --reporter=verbose"):
+        engine.next_request = request(script)
+        service.submit_turn(task.id, "Run the command again", CREDS)
+        wait_for_status(service, task.id, SessionStatus.completed)
+    assert engine.decisions[1:] == [{"decision": "decline"}, {"decision": "decline"}]

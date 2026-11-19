@@ -3,8 +3,8 @@
 Builds a real SQLite database at the PREVIOUS migration head, seeds rows in
 every touched table (simulating an existing desktop install), then exercises
 upgrade / downgrade / re-upgrade. A PostgreSQL variant runs when
-COWORK_TEST_POSTGRES_URI points at a disposable database (no Postgres in CI
-yet — the variant is the contract for when it lands).
+COWORK_TEST_POSTGRES_URI points at a disposable database, which
+`.github/workflows/tests-services.yml` provides on every pull request.
 """
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from cowork.models.pin import Pin
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule
 from cowork.models.setting import Setting
+from tests.integration.prereq import missing_prerequisite
 
 PREVIOUS_HEAD = "f7d2b9e4a1c6"
 
@@ -254,10 +255,15 @@ def test_migrated_schema_matches_fresh_models(desktop_db, tmp_path):
 POSTGRES_URI = os.environ.get("COWORK_TEST_POSTGRES_URI", "")
 
 
-@pytest.mark.skipif(not POSTGRES_URI, reason="set COWORK_TEST_POSTGRES_URI to a disposable database")
+@pytest.mark.postgres_service
 def test_postgres_upgrade_downgrade_cycle(monkeypatch):
     # Same contract on Postgres: full upgrade, columns + indexes, downgrade,
-    # re-upgrade. Runs once CI (or a developer) provides a disposable DB.
+    # re-upgrade, then every downgrade back to base.
+    if not POSTGRES_URI:
+        missing_prerequisite(
+            "set COWORK_TEST_POSTGRES_URI to a disposable database",
+            required_by="COWORK_REQUIRE_SERVICES",
+        )
     monkeypatch.setenv("DATABASE_URI", POSTGRES_URI)
     get_app_settings.cache_clear()
     cfg = Config("alembic.ini")

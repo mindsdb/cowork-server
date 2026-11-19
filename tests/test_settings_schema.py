@@ -40,6 +40,12 @@ def test_show_dots_default_is_true():
     assert UserSettings.model_fields["show_dots"].get_default() is True
 
 
+def test_show_figure_sources_defaults_to_true():
+    # The server always sends an answer's figure sources; this only lets a
+    # user hide the marks, so they show until someone turns them off.
+    assert UserSettings.model_fields["show_figure_sources"].get_default() is True
+
+
 def test_favicon_defaults_to_empty_and_is_not_sensitive():
     assert UserSettings.model_fields["favicon"].get_default() == ""
     assert UserSettings.field_is_sensitive("favicon") is False
@@ -141,3 +147,9 @@ def test_autopublish_description_names_the_override_that_works(monkeypatch):
     # Naming the alias is fine — saying it is the override is not. The
     # description must mark it as NOT the bypass.
     assert "NOT that" in text or "not that" in text
+
+
+def test_keeping_the_desktop_awake_for_scheduled_tasks_defaults_on():
+    # On unless the user turns it off: a task that comes due while the
+    # laptop idle-sleeps does not run.
+    assert UserSettings.model_fields["schedule_keep_awake"].get_default() is True

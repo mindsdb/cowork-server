@@ -34,7 +34,7 @@ import cowork.services.connectors.probe as probe_module
 import cowork.services.task_objects as task_objects
 from cowork.harnesses.anton_harness import harness as harness_module
 from cowork.common.chat_session import close_session_scratchpads, drain_scratchpad_closes
-from cowork.harnesses.anton_harness.harness import AntonHarness
+from cowork.harnesses.anton_harness.harness import AntonHarness, BuiltChatSession
 
 #: How long a turn's pad may outlive the turn. Generous so a loaded CI runner
 #: does not flake; a leaked pad never exits, so the bound only has to be finite.
@@ -173,17 +173,17 @@ async def turns(monkeypatch, tmp_path):
     async def _fake_build(self, conversation, **_kwargs):
         session = _Session(pads, bodies.pop(0), tmp_path)
         sessions.append(session)
-        return session, None, None
+        return BuiltChatSession(session=session, turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(
         id="conv-1", project_id="proj-1", project=SimpleNamespace(path=str(tmp_path), name="p")
     )
 
-    def run(body):
+    def run(body, **kwargs):
         bodies.append(body)
         return AntonHarness().stream_response(
-            conversation=conversation, input=[{"type": "text", "text": "hi"}]
+            conversation=conversation, input=[{"type": "text", "text": "hi"}], **kwargs
         )
 
     yield SimpleNamespace(run=run, pads=pads, sessions=sessions)
@@ -535,7 +535,7 @@ async def test_real_pad_exits_its_descriptors_close_and_the_next_turn_restores_i
             yield
 
     async def _fake_build(self, conversation, **_kwargs):
-        return _RealPadSession(), None, None
+        return BuiltChatSession(session=_RealPadSession(), turn_scratch_dir=None, seed_info=None, learns=True)
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
     conversation = SimpleNamespace(

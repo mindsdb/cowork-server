@@ -4,6 +4,8 @@ Isolates the app onto a throwaway SQLite DB + master key BEFORE any cowork
 module is imported (settings/engine are read at import time), then builds the
 schema directly and seeds the ``general`` project the runtime depends on.
 """
+import copy
+import gc
 import importlib
 import io
 import logging
@@ -14,10 +16,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-TMP = Path(tempfile.mkdtemp(prefix="cowork-chan-test-"))
+# Resolved: macOS links /var to /private/var, and a COWORK_HOME under that
+# link takes branches a Linux run doesn't, so the blocking guard
+# (tests/_blocking_guard.py) would find different sites on each.
+TMP = Path(tempfile.mkdtemp(prefix="cowork-chan-test-")).resolve()
 # Force isolation (assignment, not setdefault, never touch a real DB).
 os.environ["DATABASE_URI"] = f"sqlite:///{TMP / 'test.db'}"
-os.environ["MASTER_KEY_PATH"] = str(TMP / "master.key")
+# Outside COWORK_HOME: the blocking guard (tests/_blocking_guard.py) counts
+# file work under COWORK_HOME, and the key's first read would be blamed on
+# whichever test decrypts first after get_fernet's cache clears. Hosted pods
+# take the key from COWORK_MASTER_KEY and read no file.
+os.environ["MASTER_KEY_PATH"] = str(Path(tempfile.mkdtemp(prefix="cowork-test-key-")) / "master.key")
+# Org mode's pod-local stores (publish state.json, probe env files, the
+# harness's temporary vault) default to <system temp>/cowork, which every test
+# process shares; per process, and outside COWORK_HOME for the same reason as the key.
+os.environ["COWORK_POD_SCRATCH_DIR"] = str(Path(tempfile.mkdtemp(prefix="cowork-test-pod-scratch-")).resolve())
 os.environ["COWORK_PUBLIC_BASE_URL"] = "https://hooks.example.com"
 os.environ["COWORK_CONVERSATION_LINK_TEMPLATE"] = "https://app.example.com/c/{conversation_id}"
 # Org mode roots every filesystem store at cowork_home() (see
@@ -40,6 +53,22 @@ os.environ["COWORK_REQUIRE_AUTH"] = "false"
 
 import pytest
 from sqlmodel import Session, SQLModel
+
+# Lists every skipped test in CI and fails a run that requires every
+# prerequisite when one is left out without a reason (tests/skip_guard.py).
+from tests.skip_guard import pytest_addoption, pytest_configure  # noqa: E402,F401
+
+# The blocking guard (tests/_blocking_guard.py) wraps its calls before
+# collection imports the test modules and the rest of cowork, so a module
+# loaded after this that binds one by name, as ``from asyncio import
+# to_thread`` or ``from os import scandir`` does, holds the wrapper. The
+# modules the guard imports itself load before it wraps anything:
+# cowork.common.paths, cowork.db.units, the settings and their imports. Those
+# must call os, io and asyncio by attribute, or they keep the real function.
+# The wrappers pass straight through while no watch is open.
+import _blocking_guard  # noqa: E402
+
+_blocking_guard.install()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -102,6 +131,25 @@ def keep_seeded_general_path():
 
 
 @pytest.fixture(autouse=True)
+def app_settings_rebuilt_after_a_test_replaced_them():
+    """Clear the cached app settings when a test left a different object there.
+
+    A fixture that sets an env var and clears ``get_app_settings`` leaves the
+    env to monkeypatch, which restores it last; a teardown in between that
+    reads settings caches the test's env for the next test. Autouse fixtures
+    set up before ``monkeypatch``, so this tears down after it, and the next
+    read uses the restored env. A test that never replaced the cached object
+    costs no rebuild.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    before = get_app_settings()
+    yield
+    if get_app_settings.cache_info().currsize and get_app_settings() is not before:
+        get_app_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
 def close_coding_services():
     yield
     from coding_service_fakes import close_services
@@ -120,10 +168,52 @@ def trust_test_client_host():
     guards._TRUSTED_LOOPBACK_HOSTS = production
 
 
+@pytest.fixture(scope="session", autouse=True)
+def shared_root_resolved_at_startup():
+    """The lifespan's step before the port binds (cowork.server.lifespan),
+    which tests that drive the app without it skip: resolve the shared root,
+    so a database unit's partition check reads that answer and makes no file
+    store call (cowork.services.projects.resolved_shared_root). A test that
+    points COWORK_SHARED_DIR under COWORK_HOME elsewhere resolves it again."""
+    from cowork.services.projects import resolve_shared_root
+
+    resolve_shared_root()
+
+
+@pytest.fixture(scope="session")
+def child_runs_this_checkout():
+    """Fail at once when a conversion process would import another checkout's cowork.
+
+    The process starts with ``-I``, which drops ``PYTHONPATH`` and the current
+    folder, so it imports cowork from the interpreter's own site-packages. A
+    venv whose editable install points at another checkout would test that
+    checkout's conversion.
+    """
+    import subprocess
+
+    import cowork
+    from cowork.schemas.export_child import ChildLimits
+    from cowork.services import export_runner
+
+    command = export_runner.child_command(limits=ChildLimits(wall_seconds=30.0, memory_bytes=1))
+    interpreter = command.argv[: command.argv.index("-m")]
+    finished = subprocess.run(
+        [*interpreter, "-c", "import cowork; print(cowork.__file__)"],
+        env=command.environment, capture_output=True, text=True, timeout=60,
+    )
+    found = finished.stdout.strip()
+    if finished.returncode != 0 or Path(found).resolve() != Path(cowork.__file__).resolve():
+        pytest.fail(
+            f"a conversion process imports cowork from {found or finished.stderr!r}, "
+            f"not {cowork.__file__}: reinstall this checkout into the venv (uv sync)"
+        )
+
+
 @pytest.fixture
 def cleanup_tmp_projects(tmp_path):
     """Delete Project rows created under this test's `tmp_path`, plus their
-    dependent TaskObject, Conversation, and SharedResourceAttribution rows.
+    dependent TaskObject, ArtifactLocation, Conversation, and
+    SharedResourceAttribution rows.
 
     Several artifact-ownership test modules create real Project rows against
     the session-scoped test DB; a leaked row (especially one with a real
@@ -136,6 +226,7 @@ def cleanup_tmp_projects(tmp_path):
 
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.db.session import get_engine
+    from cowork.models.artifact_location import ArtifactLocation
     from cowork.models.conversation import Conversation
     from cowork.models.project import Project
     from cowork.models.shared_resource import SharedResourceAttribution
@@ -153,6 +244,7 @@ def cleanup_tmp_projects(tmp_path):
         if not leaked_ids:
             return
         session.exec(delete(TaskObject).where(TaskObject.project_id.in_(leaked_ids)))
+        session.exec(delete(ArtifactLocation).where(ArtifactLocation.project_id.in_(leaked_ids)))
         session.exec(delete(Conversation).where(Conversation.project_id.in_(leaked_ids)))
         # `artifact_resource_key` always starts with "<project_id>/".
         session.exec(
@@ -167,6 +259,150 @@ def cleanup_tmp_projects(tmp_path):
         )
         session.exec(delete(Project).where(Project.id.in_(leaked_ids)))
         session.commit()
+
+
+@pytest.fixture
+def org_deployment(monkeypatch):
+    """Hosted org tenancy for one test, through the real AppSettings."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+def stub_landlock_kernel(monkeypatch, *, abi: int = 6) -> None:
+    """Answer the code sandbox's kernel checks without a kernel: the ABI probe
+    reports ``abi`` and the launcher's self-test passes. The one seam
+    cowork.code_sandbox leaves for tests, since neither macOS nor every CI
+    kernel has Landlock."""
+    from cowork import code_sandbox
+
+    monkeypatch.setattr(code_sandbox, "_probe_abi", lambda: abi)
+    monkeypatch.setattr(code_sandbox, "_run_self_test", lambda: None)
+
+
+@pytest.fixture
+def landlock_kernel(monkeypatch):
+    """stub_landlock_kernel for one test: a kernel at Landlock ABI 6 whose
+    self-test passes."""
+    stub_landlock_kernel(monkeypatch)
+
+
+@pytest.fixture
+def personal_deployment(monkeypatch):
+    """A local deployment that trusts identity headers, for one test.
+
+    Local tenancy with COWORK_TRUST_IDENTITY_HEADERS and COWORK_REQUIRE_AUTH
+    on, every resource personal (the setting's default), and
+    COWORK_CODE_SANDBOX=landlock, which identity headers require, with its
+    kernel checks stubbed (stub_landlock_kernel). COWORK_AUTH_TOKEN is set,
+    since identity headers take the token from the environment alone. A test
+    that leaves a resource shared sets COWORK_PERSONAL_RESOURCES and clears
+    the settings cache itself.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", "personal-deployment-test-token")
+    monkeypatch.setenv("COWORK_CODE_SANDBOX", "landlock")
+    monkeypatch.delenv("COWORK_PERSONAL_RESOURCES", raising=False)
+    stub_landlock_kernel(monkeypatch)
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def self_hosted_minds_url(monkeypatch):
+    """User settings whose minds_url is self-hosted's https://minds.invalid.
+
+    The stack sets MINDS_URL to a host that never resolves while its model
+    calls go to MindsHub. Returns the settings object, so a test can point
+    minds_url elsewhere.
+    """
+    from types import SimpleNamespace
+
+    from cowork.common.settings import user_settings
+
+    settings = SimpleNamespace(minds_url="https://minds.invalid")
+    monkeypatch.setattr(user_settings, "get_user_settings", lambda: settings)
+    return settings
+
+
+@pytest.fixture
+def managed_dir(monkeypatch, tmp_path):
+    """An operator's managed folder (COWORK_MANAGED_DIR) for one test.
+
+    ``memory/`` holds one rule and one lesson and an empty profile, as the
+    image bakes them; ``skills/`` and ``data-vault/`` start empty. Turns read
+    it through the installed anton's Cortex and its read-only ``managed_hc``
+    layer. Yields the cowork.managed.ManagedFolder.
+    """
+    from anton.core.memory.hippocampus import Hippocampus
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.managed import ManagedFolder
+    from tests._fakes import MANAGED_LESSON, MANAGED_RULE
+
+    folder = ManagedFolder.at(tmp_path / "managed")
+    for path in (folder.memory_dir, folder.skills_dir, folder.vault_dir):
+        path.mkdir(parents=True)
+    managed_hc = Hippocampus(folder.memory_dir)
+    managed_hc.encode_rule(MANAGED_RULE, kind="always", confidence="high", source="user")
+    managed_hc.encode_lesson(MANAGED_LESSON, topic="data", source="user")
+    (folder.memory_dir / "profile.md").write_text("", encoding="utf-8")
+
+    monkeypatch.setenv("COWORK_MANAGED_DIR", str(folder.root))
+    get_app_settings.cache_clear()
+    yield folder
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def sharepoint_stores(monkeypatch, tmp_path):
+    """Fresh home, shared, vault, skills and memory folders and an empty SharePoint token cache, for one test.
+
+    Yields ``tmp_path``, the folders' root.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.services.connectors import sharepoint as sharepoint_service
+
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "home" / "data-vault"))
+    monkeypatch.setenv("COWORK_SKILLS_DIR", str(tmp_path / "home" / "skills"))
+    monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "home" / "memory"))
+    get_app_settings.cache_clear()
+    sharepoint_service._TOKENS.clear()
+    yield tmp_path
+    sharepoint_service._TOKENS.clear()
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def stored_memory_enabled():
+    """Store ``memory_enabled`` for one test as the operator's Settings write
+    does (SettingService), and remove the row afterwards.
+
+    The key is operator-pinned, so the row is the deployment's global one,
+    which every scope resolves ahead of MEMORY_ENABLED. Call the yielded
+    function with ``"true"`` or ``"false"``.
+    """
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.session import get_open_session
+    from cowork.services.settings import SettingService
+
+    def store(value: str) -> None:
+        with get_open_session() as db:
+            SettingService(db, LOCAL_SCOPE).upsert_setting("memory_enabled", value)
+
+    yield store
+    with get_open_session() as db:
+        SettingService(db, LOCAL_SCOPE).delete_setting("memory_enabled")
 
 
 @pytest.fixture
@@ -185,6 +421,86 @@ def granted_product_permissions(monkeypatch):
 
     monkeypatch.setattr(product_permissions, "has_product_permission", allowed)
     monkeypatch.setattr(artifact_workspace, "has_product_permission", allowed)
+
+
+def _set_datasource_adapter_flag(available: bool):
+    """Set `cloud.available` on the database and managed service specs, restoring it afterwards.
+
+    Mutates the registry's cached spec data, because that is what a release
+    flipping the flag looks like from the policy's side.
+    """
+    from cowork.services.connectors.specs._registry import registry
+
+    raw = registry.get_connectors()
+    restore: list[tuple[dict, bool]] = []
+    for connector_id, spec in raw.items():
+        for method in spec.get("form", {}).get("methods", []):
+            cloud = method.get("cloud")
+            if cloud is None:
+                continue
+            # The engines, and every managed service that runs as one of them.
+            if connector_id in ("postgres", "mysql") or cloud.get("engine"):
+                restore.append((cloud, cloud.get("available", False)))
+                cloud["available"] = available
+    yield
+    for cloud, previous in restore:
+        cloud["available"] = previous
+
+
+@pytest.fixture
+def adapter_verified_datasources():
+    """The database methods report that the hosted path can execute them.
+
+    The capability policy's first gate; a test about the deployment's own
+    enable list has to lift it.
+    """
+    yield from _set_datasource_adapter_flag(True)
+
+
+@pytest.fixture
+def adapter_unverified_datasources():
+    """The database methods report that the hosted path cannot execute them.
+
+    Set rather than assumed, so a test of that gate keeps its meaning on a
+    branch that ships the flag the other way round.
+    """
+    yield from _set_datasource_adapter_flag(False)
+
+
+@pytest.fixture
+def managed_postgres_service():
+    """A managed service spec, ``managed_pg``, that runs as postgres:host-port.
+
+    Its one cloud method copies postgres's cloud fields and is adapter-verified.
+    Added to the registry's cached spec data and removed afterwards.
+    """
+    from cowork.services.connectors.specs._registry import registry
+
+    raw = registry.get_connectors()
+    postgres_cloud = next(
+        m["cloud"] for m in raw["postgres"]["form"]["methods"] if m.get("cloud") is not None
+    )
+    raw["managed_pg"] = {
+        "id": "managed_pg",
+        "label": "Managed PostgreSQL",
+        "category": "database",
+        "form": {
+            "form_id": "managed-pg-connector",
+            "title": "Connect Managed PostgreSQL",
+            "methods": [{
+                "id": "direct",
+                "label": "Direct",
+                "fields": [{"name": "host", "label": "Host", "type": "text"}],
+                "cloud": {
+                    **copy.deepcopy(postgres_cloud),
+                    "available": True,
+                    "engine": "postgres:host-port",
+                },
+            }],
+        },
+    }
+    yield "managed_pg", "direct"
+    raw.pop("managed_pg", None)
 
 
 @pytest.fixture
@@ -315,3 +631,47 @@ def owned_logger(monkeypatch, caplog, tmp_path):
         logger.setLevel(level)
     for handler in handlers:
         handler.close()
+
+
+# ── Blocking work where it stops other requests (tests/_blocking_guard.py) ──
+
+_GUARD_REACHED: set[_blocking_guard.Site] = set()
+
+
+@pytest.fixture(autouse=True)
+def blocking_work_guard():
+    """Fail a test that reaches a blocking site the guard's allowlist lacks."""
+    with _blocking_guard.watching() as found:
+        yield
+    _GUARD_REACHED.update(found)
+    unlisted = _blocking_guard.unlisted(found)
+    if unlisted:
+        lines = "\n".join(_blocking_guard.site_line(site) for site in unlisted)
+        pytest.fail(
+            "blocking work where it stops other requests, not on "
+            f"tests/_blocking_guard.py's ALLOWLIST:\n{lines}",
+            pytrace=False,
+        )
+
+
+def pytest_sessionstart(session):
+    session.config.pluginmanager.register(
+        _blocking_guard.StaleEntryCheck(tests_dir=Path(__file__).parent, reached=_GUARD_REACHED),
+        "cowork-blocking-guard-stale-entries",
+    )
+
+
+@pytest.fixture
+def without_gc_pauses():
+    """Collect now, then hold the cyclic garbage collector off for the test.
+
+    Late in a full run the heap is large, and one full collection stops the
+    event loop for over a second on a CI runner. A test that times the loop
+    would then blame the code under test for the collector's pause.
+    """
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()

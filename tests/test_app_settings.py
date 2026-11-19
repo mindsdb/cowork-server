@@ -22,6 +22,20 @@ def test_app_settings_reads_cowork_listen_port(monkeypatch):
     assert settings.port == 9999
 
 
+def test_app_settings_reads_cowork_publish_token(monkeypatch):
+    monkeypatch.setenv("COWORK_PUBLISH_TOKEN", "mdb_publish_token")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.publish_token.get_secret_value() == "mdb_publish_token"
+
+
+def test_app_settings_publish_token_defaults_to_unset(monkeypatch):
+    monkeypatch.delenv("COWORK_PUBLISH_TOKEN", raising=False)
+
+    assert AppSettings(_env_file=None).publish_token is None
+
+
 def test_app_settings_rejects_invalid_cowork_listen_port(monkeypatch):
     monkeypatch.setenv("COWORK_LISTEN_PORT", "invalid")
     with pytest.raises(ValidationError):
@@ -281,12 +295,20 @@ def test_turn_queue_settings_is_remote(monkeypatch):
     assert TurnQueueSettings().is_remote is False  # default is "inprocess"
 
 
-def test_turn_queue_settings_jev_shadow_is_off_unless_the_env_turns_it_on(monkeypatch):
-    monkeypatch.delenv("COWORK_TURN_JEV_SHADOW_ENABLED", raising=False)
-    assert TurnQueueSettings(_env_file=None).jev_shadow_enabled is False
+def test_turn_queue_settings_jev_route_defaults_and_env_overrides(monkeypatch):
+    """The defaults are the ones scripts/eval_jev_route measured."""
+    for name in ("MODEL", "TIMEOUT_SECONDS", "MIN_P_DIRECT"):
+        monkeypatch.delenv(f"COWORK_TURN_JEV_ROUTE_{name}", raising=False)
+    settings = TurnQueueSettings(_env_file=None)
+    assert (settings.jev_route_model, settings.jev_route_timeout_seconds, settings.jev_route_min_p_direct) == (
+        "jev", 3.0, 0.5,
+    )
 
-    monkeypatch.setenv("COWORK_TURN_JEV_SHADOW_ENABLED", "true")
-    assert TurnQueueSettings(_env_file=None).jev_shadow_enabled is True
+    monkeypatch.setenv("COWORK_TURN_JEV_ROUTE_MIN_P_DIRECT", "0.8")
+    assert TurnQueueSettings(_env_file=None).jev_route_min_p_direct == 0.8
+    monkeypatch.setenv("COWORK_TURN_JEV_ROUTE_MIN_P_DIRECT", "1.5")
+    with pytest.raises(ValueError):
+        TurnQueueSettings(_env_file=None)
 
 
 def test_stale_organization_boundary_mode_env_var_is_inert(monkeypatch):
@@ -377,3 +399,14 @@ def test_openai_compatible_api_rejects_any_other_value(monkeypatch, value):
 
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1", True), (" ON ", True), ("", False), ("0", False), ("enabled", False)],
+)
+def test_usage_log_reads_its_variable_as_anton_does(monkeypatch, value, expected):
+    # A blank line in a desktop .env must not stop the server from starting.
+    monkeypatch.setenv("ANTON_USAGE_LOG", value)
+
+    assert AppSettings(_env_file=None).usage_log is expected

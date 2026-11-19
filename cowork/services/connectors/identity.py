@@ -101,19 +101,30 @@ def derive_connection_name(
     return slug or None
 
 
-def spec_secret_fields(connector_id: str, method: str | None) -> list[str]:
-    """Field names the connector spec marks ``secret: true`` (for the method)."""
-    raw = registry.get_connectors().get(connector_id) or {}
-    form = raw.get("form") or {}
+def spec_secret_fields(connector_id: str, method: str | None, form: dict | None = None) -> list[str]:
+    """Field names the connector spec marks ``secret: true`` (for the method).
+
+    ``form`` is the connection form to read when the connector is not in the
+    static registry (a custom or handcrafted one); otherwise the registry's.
+    A model-written form can forget the flag, so there a ``password`` field
+    counts as secret too.
+    """
+    model_written = form is not None
+    if form is None:
+        form = (registry.get_connectors().get(connector_id) or {}).get("form") or {}
+
+    def is_secret(field: dict) -> bool:
+        return bool(field.get("secret")) or (model_written and field.get("type") == "password")
+
     secret: set[str] = set()
     for m in form.get("methods", []) or []:
         if method and m.get("id") != method:
             continue
         for f in m.get("fields", []) or []:
-            if f.get("secret") and f.get("name"):
+            if is_secret(f) and f.get("name"):
                 secret.add(f["name"])
     for f in form.get("fields", []) or []:
-        if f.get("secret") and f.get("name"):
+        if is_secret(f) and f.get("name"):
             secret.add(f["name"])
     return sorted(secret)
 
@@ -138,6 +149,12 @@ def connection_display_name(fields: dict, engine: str = "") -> str | None:
     (see ``ConnectionSummaryResponse.user_label``); this function is the
     *subtitle* source only. Returns None when there's nothing meaningful —
     the caller then falls back to the slug.
+
+    The ``user_label`` contract for connections saved through
+    ``persist_connection``: ``_user_label`` holds only a name a person gave the
+    connection, or an OAuth account name captured at connect time, never the
+    engine id. anton's ``connect_datasource`` tool still defaults it to the
+    engine id, so a stored ``_user_label`` can repeat the title.
 
     ``account_name`` is checked first only for ``SYNTHETIC_ACCOUNT_EMAIL_ENGINES``
     (supabase/linear/posthog): their ``account_email`` is a synthetic
@@ -216,7 +233,7 @@ _KNOWN_NONSECRET_FIELDS = frozenset({"token_url", "auth_type", "token_type"})
 _VOLATILE_IDENTITY_FIELDS = frozenset({"expires_at", "scope"})
 
 
-def secure_keys_for(connector_id: str, method: str | None, fields: dict) -> list[str]:
+def secure_keys_for(connector_id: str, method: str | None, fields: dict, form: dict | None = None) -> list[str]:
     """The ``secure_keys`` to persist: spec-marked secrets ∪ name-heuristic.
 
     Union so we never *under*-mask: an explicit spec flag classifies a field
@@ -225,7 +242,7 @@ def secure_keys_for(connector_id: str, method: str | None, fields: dict) -> list
     subtracted from the heuristic side only, so a spec can still force one of
     those names secret explicitly if a future connector needs to.
     """
-    spec_secrets = set(spec_secret_fields(connector_id, method))
+    spec_secrets = set(spec_secret_fields(connector_id, method, form))
     return sorted(
         {
             k for k in fields

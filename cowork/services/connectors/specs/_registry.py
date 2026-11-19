@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from cowork.schemas.connectors import (
     ConnectorMetadataResponse,
@@ -9,6 +10,23 @@ from cowork.schemas.connectors import (
     MatchCandidate,
     MatchResponse,
 )
+
+
+def connector_metadata(c: dict) -> ConnectorMetadataResponse:
+    """Return a raw connector spec's directory entry, defaults filled in."""
+    return ConnectorMetadataResponse(
+        id=c.get("id"),
+        label=c.get("label", c.get("id", "")),
+        description=c.get("description", ""),
+        category=c.get("category", "other"),
+        logo=c.get("logo"),
+        logo_url=c.get("logo_url"),
+        logo_color=c.get("logo_color"),
+        aliases=c.get("aliases", []),
+        featured=c.get("featured", False),
+        notice=c.get("notice"),
+        custom=c.get("custom", False),
+    )
 
 
 class ConnectorSpecRegistry:
@@ -43,22 +61,20 @@ class ConnectorSpecRegistry:
             return None
         return self._to_connector_spec_response(c)
 
+    def usage_notes_for(self, engines: Iterable[str]) -> dict[str, str]:
+        """engine -> `usage_notes` for those of `engines` whose spec declares
+        non-blank notes. Reads the raw spec dicts: the notes are deliberately
+        left out of ConnectorSpecResponse built by get_connector()."""
+        specs = self.get_connectors()
+        notes: dict[str, str] = {}
+        for engine in engines:
+            text = (specs.get(engine) or {}).get("usage_notes")
+            if isinstance(text, str) and text.strip():
+                notes[engine] = text
+        return notes
+
     def list_connectors(self) -> list[ConnectorMetadataResponse]:
-        items = [
-            ConnectorMetadataResponse(
-                id=c.get("id"),
-                label=c.get("label", c.get("id", "")),
-                description=c.get("description", ""),
-                category=c.get("category", "other"),
-                logo=c.get("logo"),
-                logo_url=c.get("logo_url"),
-                logo_color=c.get("logo_color"),
-                aliases=c.get("aliases", []),
-                featured=c.get("featured", False),
-                notice=c.get("notice"),
-            )
-            for c in self.get_connectors().values()
-        ]
+        items = [connector_metadata(c) for c in self.get_connectors().values()]
         items.sort(key=lambda x: (x.label or "").lower())
         return items
 
@@ -74,6 +90,7 @@ class ConnectorSpecRegistry:
             aliases=c.get("aliases", []),
             featured=c.get("featured", False),
             notice=c.get("notice"),
+            custom=c.get("custom", False),
             keywords=c.get("keywords", []),
             form=c.get("form", {}),
         )

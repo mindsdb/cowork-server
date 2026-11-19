@@ -7,7 +7,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from cowork.coding.context import validate_directories
+from cowork.coding.context import message_attachments, validate_directories
 from cowork.coding.contracts import (
     CodingEvent,
     CodingSession,
@@ -173,6 +173,7 @@ class CodingSessionFactory:
         project_workspaces: ProjectWorkspaceManager,
         emit: EventEmitter,
         control: ControlPlaneService,
+        on_workspace_ready: Callable[[], None] = lambda: None,
     ) -> None:
         self.registry = registry
         self.store = store
@@ -183,6 +184,8 @@ class CodingSessionFactory:
         self.project_workspaces = project_workspaces
         self.emit = emit
         self.control = control
+        # Called once a task's workspace exists, before its path is visible.
+        self.on_workspace_ready = on_workspace_ready
 
     def begin(
         self,
@@ -281,7 +284,13 @@ class CodingSessionFactory:
             # which stays ``preparing`` until the workspace exists.
             self.store.append_event(
                 session_id,
-                CodingEvent(type=EventType.user_message, title="You", text=request.prompt, phase="completed"),
+                CodingEvent(
+                    type=EventType.user_message,
+                    title="You",
+                    text=request.prompt,
+                    phase="completed",
+                    data=message_attachments(request.attachments),
+                ),
             )
             self.store.append_event(
                 session_id,
@@ -325,6 +334,10 @@ class CodingSessionFactory:
             # The placeholder has been visible and editable since ``begin``:
             # queued follow-ups, title, pin and config changes stay, and only
             # what preparation produced is merged in.
+            # Anything measured while the workspace was being made is out of
+            # date. Say so before publishing the path, which clients react to,
+            # and before setup commands, which can take a while.
+            self.on_workspace_ready()
             session = self.store.update_session(session_id, lambda current: _adopt_preparation(current, session))
             self.control.attach_prepared_workspaces(
                 pending.control_snapshot.run.id,

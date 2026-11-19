@@ -14,8 +14,7 @@ Rejection is always all-or-nothing. tool_use/tool_result pairing is a property
 of the SET, not of a single row, so dropping one bad row would leave an orphan
 block and make every subsequent turn fail with a 400 from the provider. Dropping
 the whole set costs that one turn its tool detail and nothing else: it replays
-text-only, exactly the degradation the in-process harness already applies after
-a mid-turn compaction.
+text-only, as a turn that compacted its context mid-way does on either path.
 
 The one exception is an oversized tool_result, where the payload is replaced by
 a placeholder instead of the row being dropped — the call stays visible and
@@ -36,6 +35,8 @@ import json
 import logging
 from collections import Counter
 
+from cowork.harnesses.anton_harness.stream_formatter import TurnHistory
+
 logger = logging.getLogger(__name__)
 
 #: Per-tool_result payload budget. Sized for "the gist of the call" rather than
@@ -48,6 +49,12 @@ _MAX_TURN_BYTES = 256 * 1024
 #: sign the payload did not come from it.
 _BLOCK_FOR_ROLE = {"assistant": "tool_use", "user": "tool_result"}
 _ID_FIELD = {"tool_use": "id", "tool_result": "tool_use_id"}
+
+
+def _is_narration(role: str, block: dict) -> bool:
+    """An assistant text block saved beside its tool calls, so the replayed
+    history matches what the model saw and the prompt cache holds across turns."""
+    return role == "assistant" and block.get("type") == "text" and isinstance(block.get("text"), str)
 
 
 def _wire_size(obj) -> int:
@@ -104,8 +111,8 @@ def reject_unreplayable_tool_rows(rows: object) -> list[dict]:
     All-or-nothing, for the same reason ENG-1808 gives: tool_use/tool_result
     pairing is a property of the SET, so dropping one bad row would leave an
     orphan and make every later turn fail — the outcome being prevented. An
-    empty result replays text-only, which is a degradation the in-process
-    harness already applies after a mid-turn compaction.
+    empty result replays text-only, as a turn that compacted its context
+    mid-way does.
 
     `rows: object`, like its sibling: both call sites feed it
     `data.get("rows") or []` off an untyped dict, and the first statement here
@@ -124,6 +131,8 @@ def reject_unreplayable_tool_rows(rows: object) -> list[dict]:
         content = row.get("content")
         if not isinstance(content, list):
             continue
+        if not any(isinstance(b, dict) and b.get("type") == want for b in content):
+            return _reject("in-process %s row carries no %s block", row.get("role"), want)
         for block in content:
             if not isinstance(block, dict) or block.get("type") != want:
                 continue
@@ -169,6 +178,9 @@ def sanitize_turn_history_rows(rows: object) -> list[dict]:
         for block in content:
             if not isinstance(block, dict):
                 return _reject("role %s carries a %s block", role, type(block).__name__)
+            if _is_narration(role, block):
+                blocks.append(block)
+                continue
             if block.get("type") != want:
                 return _reject("role %s carries a %r block, expected %r",
                                role, block.get("type"), want)
@@ -183,6 +195,8 @@ def sanitize_turn_history_rows(rows: object) -> list[dict]:
                 return _reject("%s block carries %s as its %s, expected a non-empty string",
                                want, type(block_id).__name__, _ID_FIELD[want])
             blocks.append(_cap_tool_result(block) if want == "tool_result" else block)
+        if not any(b.get("type") == want for b in blocks):
+            return _reject("role %s carries no %s block", role, want)
         clean.append({"role": role, "content": blocks})
 
     if not clean:
@@ -191,7 +205,7 @@ def sanitize_turn_history_rows(rows: object) -> list[dict]:
     # Counter, not set: two tool_use blocks sharing an id against one
     # tool_result would pass a set comparison and still replay invalidly.
     uses = Counter(
-        b["id"] for r in clean if r["role"] == "assistant" for b in r["content"]
+        b["id"] for r in clean if r["role"] == "assistant" for b in r["content"] if b["type"] == "tool_use"
     )
     results = Counter(
         b["tool_use_id"] for r in clean if r["role"] == "user" for b in r["content"]
@@ -205,3 +219,24 @@ def sanitize_turn_history_rows(rows: object) -> list[dict]:
         return _reject("rows are %d bytes, over the %d-byte turn cap",
                        total, _MAX_TURN_BYTES)
     return clean
+
+
+def remote_turn_history(*, pod_rows: object, compacted: bool) -> TurnHistory | None:
+    """A pod's history frame as the formatter takes it: `rows` are what the
+    turn stores, `read` the rows as the pod sent them, which the formatter
+    finds the answer's figures in before the replay caps trimmed them. None
+    when there is nothing to pass on.
+
+    A turn that did not compact stores its rows sanitized
+    (`sanitize_turn_history_rows`). A turn that compacted or hard-truncated
+    its context, which the pod reports before this frame, ran near or over
+    the model's context window, so it stores no rows and the next turn
+    replays it as text only, as an in-process turn that compacted does. Its
+    frame whose rows are not a list carries none, so it gives None and the
+    formatter treats the turn as one no rows arrived for, as from a pod that
+    sends no frame.
+    """
+    read = pod_rows if isinstance(pod_rows, list) else None
+    if compacted:
+        return None if read is None else TurnHistory(rows=[], read=read)
+    return TurnHistory(rows=sanitize_turn_history_rows(pod_rows), read=read)

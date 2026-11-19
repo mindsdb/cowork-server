@@ -25,8 +25,9 @@ import datetime as dt
 import logging
 from pathlib import Path
 
-from cowork.common.settings.app_settings import default_minds_api_host
+from cowork.common.settings.app_settings import default_minds_api_host, get_app_settings
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 from pydantic import ValidationError
 
@@ -34,10 +35,13 @@ from anton.core.tools.skill_format import normalize_name, DESC_MAX
 from cowork.common.paths import cowork_home
 from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.user_settings import (
+    BUDGET_SETTING_KEYS,
+    is_chosen_budget,
     ENV_ALIAS_TO_SETTING,
     UserSettings,
     normalize_provider_value,
 )
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
@@ -198,6 +202,51 @@ def normalize_retired_harness_rows(session: Session) -> bool:
     return bool(changed)
 
 
+def enable_limits_for_saved_budgets(session: Session) -> bool:
+    """Turn ``limits_enabled`` on wherever a budget was saved without it.
+
+    Only a user's Save in Settings (or a direct settings API call) stores a
+    budget row, so one means the user chose a limit, unless it holds the old
+    default: a renderer that predates the switch stores that when a field is
+    cleared, to reset it (``is_chosen_budget``). For each scope (global, org,
+    or user row) that holds a chosen budget and no ``limits_enabled`` row, this
+    writes ``limits_enabled=True`` at that scope, as a Save would. A scope
+    that already has the switch, on or off, is left alone, so turning it off
+    sticks. Idempotent and sentinel-free: it also catches a budget saved later
+    by a renderer that predates the switch. Returns True if any row was written.
+
+    In org tenancy, global (unscoped) rows are skipped: they predate the
+    per-org scopes, so they are no org's choice, and a global switch would
+    reach every org without its own. A local install's rows are global, and
+    are its own choice.
+    """
+    rows = session.exec(
+        select(Setting).where(Setting.key.in_((*BUDGET_SETTING_KEYS, "limits_enabled")))
+    ).all()
+    if get_app_settings().tenancy_mode == "org":
+        rows = [r for r in rows if r.scope is not None]
+    has_switch = {(r.scope, r.org_id, r.user_id) for r in rows if r.key == "limits_enabled"}
+    pending = {
+        (r.scope, r.org_id, r.user_id)
+        for r in rows
+        if r.key != "limits_enabled" and is_chosen_budget(r.key, r.value)
+    } - has_switch
+    written = 0
+    for scope, org_id, user_id in sorted(pending, key=lambda k: tuple(v or "" for v in k)):
+        # Each insert on its own: replicas booting together race on the same
+        # scope, and the unique index turns the loser's insert into a no-op.
+        try:
+            session.add(Setting(key="limits_enabled", value="True", scope=scope, org_id=org_id, user_id=user_id))
+            session.commit()
+            written += 1
+        except IntegrityError:
+            session.rollback()
+    if written:
+        invalidate_user_settings_cache()
+        logger.info("settings: turned limits_enabled on for %d scope(s) with a saved budget", written)
+    return bool(written)
+
+
 def backfill_minds_url(session: Session) -> bool:
     """Rewrite the legacy MindsHub host (mdb.ai) to the env-appropriate host.
 
@@ -255,7 +304,9 @@ def seed_builtin_skills(session: Session) -> bool:
     if current >= BUILTIN_SKILLS_VERSION:
         return False
 
-    store = SkillService()
+    # The base store, named explicitly: a deployment that trusts identity
+    # headers refuses a store with no scope.
+    store = SkillService(LOCAL_SCOPE)
     copied = store._copy_builtin_skills()
 
     if copied:
@@ -284,7 +335,8 @@ def migrate_skills_to_files(session: Session) -> bool:
     if svc._fetch_row(SKILL_MIGRATION_SENTINEL) is not None:
         return False
 
-    store = SkillService()
+    # The base store, named explicitly, as in seed_builtin_skills.
+    store = SkillService(LOCAL_SCOPE)
     rows = list(session.exec(select(SkillLegacy)).all())
 
     def _unique_slug(svc: SkillService, base: str, taken: set[str]) -> str:
