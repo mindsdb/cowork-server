@@ -307,7 +307,13 @@ def seed_builtin_skills(session: Session) -> bool:
     # The base store, named explicitly: a deployment that trusts identity
     # headers refuses a store with no scope.
     store = SkillService(LOCAL_SCOPE)
-    copied = store._copy_builtin_skills()
+    try:
+        copied = store._copy_builtin_skills(current)
+    except OSError as exc:
+        # The store itself can't be read or created. Boot carries on without
+        # builtins and tries again next start; the version is not advanced.
+        logger.warning("Could not seed builtin skills: %s", type(exc).__name__)
+        return False
 
     if copied:
         logger.info("Seeded %d builtin skill(s) into %s", copied, store.root)
