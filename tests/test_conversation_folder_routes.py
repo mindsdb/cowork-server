@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.server import create_app
+from cowork.services import folder_listing
 from cowork.services.conversation_folders import MAX_FOLDERS_PER_CONVERSATION
 
 _LOOPBACK_HOST = {"Host": "localhost"}
@@ -206,6 +207,25 @@ def test_a_folder_swapped_into_app_data_after_attaching_is_no_longer_served(loca
 
     assert [f["available"] for f in listed.json()["folders"]] == [False]
     assert files.status_code == 404, files.text
+
+
+def test_hidden_entries_do_not_use_up_the_listing_cap(local_mode, tmp_path, monkeypatch):
+    monkeypatch.setattr(folder_listing, "MAX_LISTED_FILES", 2)
+    client = _client()
+    chat = _chat(client)
+    folder = _folder(tmp_path, "repo")
+    (folder / "notes.md").write_text("x")
+    (folder / ".git").mkdir()
+    for name in ("a", "b", "c"):
+        (folder / ".git" / name).write_text("x")
+    (folder / ".env").write_text("x")
+    folder_id = _attach(client, chat, folder).json()["id"]
+
+    files = client.get(f"/api/v1/conversations/{chat}/folders/{folder_id}/files", headers=_LOOPBACK_HOST)
+
+    assert files.status_code == 200, files.text
+    assert [f["path"] for f in files.json()["files"]] == ["notes.md", "readme.md"]
+    assert "truncated" not in files.json()
 
 
 def test_a_symlink_loop_in_a_folder_is_skipped_not_a_500(local_mode, tmp_path):

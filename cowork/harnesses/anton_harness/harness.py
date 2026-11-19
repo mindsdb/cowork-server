@@ -1059,6 +1059,11 @@ def _stored_folder_paths(session: ScopedSession, *, conversation_id: UUID) -> li
     return [row.path for row in rows]
 
 
+def _usable_folder_paths(paths: list[str], project_path: str | None) -> list[str]:
+    """The stored folder paths that still pass the working-folder rules. Touches the filesystem."""
+    return [path for path in paths if folder_refusal(path, project_path) is None]
+
+
 async def _working_folder_paths(conversation, channel_context: ChannelContext | None) -> list[str]:
     """The chat's working folders the agent may use this turn, as absolute paths.
 
@@ -1079,7 +1084,8 @@ async def _working_folder_paths(conversation, channel_context: ChannelContext | 
             partial(_stored_folder_paths, conversation_id=conversation.id), scope=scope,
         )
         project_path = conversation.project.path if conversation.project else None
-        return [path for path in paths if folder_refusal(path, project_path) is None]
+        # Each check stats the folder, which can hang on a network share that stopped answering.
+        return await asyncio.to_thread(_usable_folder_paths, paths, project_path)
     except PoolTimeoutError:
         raise
     except Exception:
@@ -1119,8 +1125,8 @@ def _working_folders_context(paths: list[str]) -> str:
         " Before you change, move or delete any file in a working folder, ask the user for permission first."
         " Keep creating artifacts in the project as usual."
         " Leave any .anton/ directory inside a working folder alone."
-        " To find a file in a working folder, list or search the folder in the scratchpad;"
-        " do not use select_path for it, because select_path only sees the project."
+        " To find or read a file in a working folder, list, search and read it in the scratchpad;"
+        " do not use read_text_file or select_path for it, because they cannot open working-folder files."
         " When the user names a file without saying which folder, search the project and every working folder"
         " before saying it is missing. If it is not found, say so and ask; never answer about a different file instead."
     )

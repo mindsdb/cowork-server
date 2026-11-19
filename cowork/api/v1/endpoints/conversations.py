@@ -285,6 +285,11 @@ def _project_path(conversation: Conversation) -> str | None:
     return conversation.project.path if conversation.project else None
 
 
+def _is_hidden(relative_path: str) -> bool:
+    """True when any segment of the slash-separated `relative_path` starts with a dot."""
+    return any(segment.startswith(".") for segment in relative_path.split("/"))
+
+
 def _serialize_folder(folder: ConversationFolder, *, available: bool) -> dict[str, Any]:
     """One folder as the desktop app reads it; `available` is decided by the caller."""
     return {
@@ -369,7 +374,8 @@ def list_conversation_folder_files(
     truncated = False
     for p in folder_listing.iter_folder_files(base, budget):
         meta = folder_listing.file_meta(p, base)
-        if meta is None:
+        # The card never shows hidden paths, so they must not use up the cap.
+        if meta is None or _is_hidden(meta["path"]):
             continue
         if len(files) >= folder_listing.MAX_LISTED_FILES:
             truncated = True

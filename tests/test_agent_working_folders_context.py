@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
@@ -85,7 +86,7 @@ def test_with_folders_the_rules_allow_them_and_the_context_lists_them():
     assert "outside the project is strictly forbidden" not in rules
     assert "  - /Users/x/docs\n  - /Users/x/reports" in context
     assert "ask the user for permission first" in context
-    assert "do not use select_path" in context
+    assert "do not use read_text_file or select_path" in context
 
 
 async def _as_the_harness_gets_it(tmp_path: Path, name: str, folders: list[Path]) -> Conversation:
@@ -124,6 +125,25 @@ async def test_a_folder_that_is_gone_is_left_out(local_mode, tmp_path):
     conversation = await _as_the_harness_gets_it(tmp_path, "ctx-gone", [docs, gone])
 
     assert await _working_folder_paths(conversation, None) == [str(docs)]
+
+
+@pytest.mark.asyncio
+async def test_folders_are_checked_off_the_event_loop(local_mode, tmp_path, monkeypatch):
+    """A folder on a share that stopped answering must not stall every request."""
+    docs = _folder(tmp_path, "docs")
+    conversation = await _as_the_harness_gets_it(tmp_path, "ctx-thread", [docs])
+    loop_thread = threading.get_ident()
+    checked_on = []
+    real_refusal = harness.folder_refusal
+
+    def recording_refusal(path, project_path):
+        checked_on.append(threading.get_ident())
+        return real_refusal(path, project_path)
+
+    monkeypatch.setattr(harness, "folder_refusal", recording_refusal)
+
+    assert await _working_folder_paths(conversation, None) == [str(docs)]
+    assert checked_on and loop_thread not in checked_on
 
 
 async def _suffix(monkeypatch, conversation_id, channel_context=None) -> str:
@@ -168,7 +188,7 @@ async def test_the_built_prompt_grants_each_folder(local_mode, monkeypatch, tmp_
     suffix = await _suffix(monkeypatch, chat)
 
     assert f"  - {docs}\n  - {reports}" in suffix
-    assert "do not use select_path" in suffix
+    assert "do not use read_text_file or select_path" in suffix
     # A file named without its folder was searched for in one folder only, and
     # the agent then answered about a different file.
     assert "search the project and every working folder" in suffix
