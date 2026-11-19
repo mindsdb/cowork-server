@@ -1,5 +1,5 @@
 """The cowork-server chart's values: datasource switches, the draft-preview
-host and the pod's shutdown.
+host, the pod's shutdown and who may reach the pod.
 
 Cloud datasource grants for hosted turns sit behind ``COWORK_TURN_DATASOURCE_ENABLED``
 and ``COWORK_DATASOURCE_CAPABILITIES``. Three facts about the values files hold
@@ -49,6 +49,11 @@ neither of which touches the database, the file store or settings, and the
 liveness delay leaves the boot room to finish. The ``deployment`` subchart
 that renders them is pinned to one version, so a new release of it can't
 change them unreviewed.
+
+The NetworkPolicy decides who may reach the pod. dev, staging and prod each
+turn it on and set nothing else in it, the base keeps it off, and every
+rendering admits only the labeled ingress controller pods in
+``infrastructure``.
 """
 
 from __future__ import annotations
@@ -80,6 +85,9 @@ ENABLED_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
 LABELS_FLAG = "COWORK_TURN_DATASOURCE_LABELS_ENABLED"
 DRAFTS_FLAG = "COWORK_TURN_CONNECTOR_DRAFTS_ENABLED"
 CUSTOM_API_FLAG = "COWORK_TURN_CUSTOM_API_ENABLED"
+# Environments where auth, the inference gateway and the pod's anton serve custom
+# API connections; the change that turns one on adds it here and to its values file.
+CUSTOM_API_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
 # The exact methods each enabled environment offers.
 OFFERED_METHODS: dict[str, frozenset[str]] = {"staging": frozenset({"mysql:host-password", "postgres:host-port"})}
 # The draft host of each environment. cowork's web build frames exactly these
@@ -110,9 +118,14 @@ class _Env:
     optional: bool = False
 
 
+def _block(path: Path, key: str) -> dict:
+    """One top-level block of a values file, such as ``deployment:``."""
+    return (yaml.safe_load(path.read_text()) or {}).get(key) or {}
+
+
 def _deployment(path: Path) -> dict:
     """The ``deployment:`` block of a values file, the subchart's own values."""
-    return (yaml.safe_load(path.read_text()) or {}).get("deployment") or {}
+    return _block(path, "deployment")
 
 
 def _env(path: Path) -> list[_Env]:
@@ -205,13 +218,20 @@ def test_connector_drafts_are_on_in_the_base_and_an_environment_may_only_opt_out
         )
 
 
-def test_custom_api_turns_are_off_in_the_code_and_no_values_file_turns_them_on(monkeypatch):
-    """Turns carry custom connections only once auth, the gateway and the pod's anton
-    serve them; turning them on in an environment is its own change to this test."""
+def test_custom_api_turns_are_off_in_the_code_and_the_base_and_on_only_where_listed(base, monkeypatch):
+    """Turns carry custom connections only where auth, the gateway and the pod's anton
+    serve them; a PR environment, which renders the base alone, stays off."""
     monkeypatch.delenv(CUSTOM_API_FLAG, raising=False)
     assert TurnQueueSettings().custom_api_enabled is False
-    for path in (BASE, *ENVIRONMENTS):
-        assert not [e for e in _env(path) if e.name == CUSTOM_API_FLAG], f"{path.name} declares {CUSTOM_API_FLAG}"
+    assert _deployment(BASE)["customApiTurnsEnabled"] == "false"
+    assert _entry(base, CUSTOM_API_FLAG).value == "{{ $.Values.customApiTurnsEnabled }}"
+    for env_values in ENVIRONMENTS:
+        environment = env_values.stem.removeprefix("values-")
+        expected = "true" if environment in CUSTOM_API_ENVIRONMENTS else None
+        assert _deployment(env_values).get("customApiTurnsEnabled") == expected, f"{env_values.name} flips custom API turns"
+        assert not [e for e in _env(env_values) if e.name == CUSTOM_API_FLAG], (
+            f"{env_values.name} declares {CUSTOM_API_FLAG}; set deployment.customApiTurnsEnabled instead"
+        )
 
 
 def test_datasource_methods_are_offered_exactly_where_the_gate_passed(base):
@@ -353,9 +373,9 @@ def _merged(base: dict, overlay: dict) -> dict:
     return merged
 
 
-def _rendered(path: Path) -> dict:
-    """The ``deployment:`` values an environment renders with."""
-    return _deployment(BASE) if path == BASE else _merged(_deployment(BASE), _deployment(path))
+def _rendered(path: Path, key: str = "deployment") -> dict:
+    """The values an environment renders a top-level block with, ``deployment:`` by default."""
+    return _block(BASE, key) if path == BASE else _merged(_block(BASE, key), _block(path, key))
 
 
 def _prestop_seconds(deployment: dict) -> int:
@@ -544,3 +564,28 @@ def test_the_scope_key_file_is_the_routers_secret_mounted_where_the_server_reads
     assert mount.get("readOnly") is True
     [item] = [i for i in volume["secret"]["items"] if i["key"] == "scope_key"]
     assert path == Path(mount["mountPath"]) / item["path"]
+
+
+def test_every_named_environment_admits_only_the_ingress_controllers():
+    """dev, staging and prod run org mode, where the pod trusts the identity
+    headers of whoever reaches it, so each renders the policy. A PR
+    environment renders the base, which keeps it off, and its deploy turns it
+    on with a parameter of its own. Every rendering admits the same peer, the
+    labeled controller pods in ``infrastructure``, and nothing wider. An
+    environment sets ``enabled`` and nothing else, so the port and the pod
+    labels, which fail silently when they drift, stay the base's."""
+    assert _rendered(BASE, "networkPolicy")["enabled"] is False
+    assert {path.stem.removeprefix("values-") for path in ENVIRONMENTS} == {"dev", "staging", "prod"}
+    for path in ENVIRONMENTS:
+        assert set(_block(path, "networkPolicy")) == {"enabled"}, path.name
+    for path in RENDERED:
+        policy = _rendered(path, "networkPolicy")
+        assert policy["enabled"] is (path != BASE), path.name
+        assert policy["ingressController"] == {
+            "enabled": True,
+            "namespaceSelector": {"kubernetes.io/metadata.name": "infrastructure"},
+            "podSelector": {"nginx-ingress-controller": "true"},
+        }, path.name
+        assert policy["nodeCidrs"] == [], path.name
+        assert (policy["port"], policy["podSelectorLabels"]) == ("", {}), path.name
+        assert policy["extraIngress"] == [], path.name
