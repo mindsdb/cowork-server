@@ -228,6 +228,25 @@ def test_hidden_entries_do_not_use_up_the_listing_cap(local_mode, tmp_path, monk
     assert "truncated" not in files.json()
 
 
+def test_a_large_hidden_tree_does_not_stop_the_walk_before_visible_files(local_mode, tmp_path, monkeypatch):
+    monkeypatch.setattr(folder_listing, "MAX_EXAMINED_ENTRIES", 12)
+    client = _client()
+    chat = _chat(client)
+    folder = _folder(tmp_path, "repo")
+    objects = folder / ".git" / "objects"
+    objects.mkdir(parents=True)
+    for i in range(20):
+        (objects / f"o{i}").write_text("x")
+    (folder / "src" / "deep").mkdir(parents=True)
+    (folder / "src" / "deep" / "x.md").write_text("x")
+    folder_id = _attach(client, chat, folder).json()["id"]
+
+    files = client.get(f"/api/v1/conversations/{chat}/folders/{folder_id}/files", headers=_LOOPBACK_HOST)
+
+    assert [f["path"] for f in files.json()["files"]] == ["readme.md", "src/deep/x.md"]
+    assert "truncated" not in files.json()
+
+
 def test_a_symlink_loop_in_a_folder_is_skipped_not_a_500(local_mode, tmp_path):
     client = _client()
     chat = _chat(client)

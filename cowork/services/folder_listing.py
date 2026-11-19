@@ -32,7 +32,7 @@ class WalkBudget:
     exhausted: bool = False
 
 
-def iter_folder_files(base: Path, budget: WalkBudget) -> Iterator[Path]:
+def iter_folder_files(base: Path, budget: WalkBudget, *, skip_hidden: bool = False) -> Iterator[Path]:
     """Candidate files under `base`, breadth-first, bounded by entries seen.
 
     Breadth-first so a truncated listing shows the user's own top-level files
@@ -45,6 +45,10 @@ def iter_folder_files(base: Path, budget: WalkBudget) -> Iterator[Path]:
     from `reconcile_project`, so descending would spend the budget on trees
     whose entries `file_meta` then discards for resolving outside `base`.
 
+    With `skip_hidden`, entries whose name starts with a dot are neither
+    yielded, descended into nor counted, so a large `.git` cannot spend the
+    budget before the user's own files are reached.
+
     Sets `budget.exhausted` when it stops at `MAX_EXAMINED_ENTRIES`.
     """
     queue: deque[Path] = deque([base])
@@ -55,6 +59,8 @@ def iter_folder_files(base: Path, budget: WalkBudget) -> Iterator[Path]:
         except OSError:
             continue
         for entry in entries:
+            if skip_hidden and entry.name.startswith("."):
+                continue
             examined += 1
             if examined > MAX_EXAMINED_ENTRIES:
                 budget.exhausted = True

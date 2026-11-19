@@ -372,9 +372,10 @@ def list_conversation_folder_files(
     budget = folder_listing.WalkBudget()
     files: list[dict[str, Any]] = []
     truncated = False
-    for p in folder_listing.iter_folder_files(base, budget):
+    # The card never shows hidden paths, so they must not use up either budget.
+    for p in folder_listing.iter_folder_files(base, budget, skip_hidden=True):
         meta = folder_listing.file_meta(p, base)
-        # The card never shows hidden paths, so they must not use up the cap.
+        # A visible link can still resolve to a hidden target.
         if meta is None or _is_hidden(meta["path"]):
             continue
         if len(files) >= folder_listing.MAX_LISTED_FILES:

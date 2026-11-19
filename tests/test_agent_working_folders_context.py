@@ -146,6 +146,24 @@ async def test_folders_are_checked_off_the_event_loop(local_mode, tmp_path, monk
     assert checked_on and loop_thread not in checked_on
 
 
+@pytest.mark.asyncio
+async def test_a_folder_check_that_hangs_offers_no_folders(local_mode, tmp_path, monkeypatch):
+    docs = _folder(tmp_path, "docs")
+    conversation = await _as_the_harness_gets_it(tmp_path, "ctx-hang", [docs])
+    release = threading.Event()
+
+    def hanging_refusal(path, project_path):
+        release.wait(5)
+        return None
+
+    monkeypatch.setattr(harness, "folder_refusal", hanging_refusal)
+    monkeypatch.setattr(harness, "_FOLDER_CHECK_TIMEOUT_S", 0.1)
+    try:
+        assert await _working_folder_paths(conversation, None) == []
+    finally:
+        release.set()
+
+
 async def _suffix(monkeypatch, conversation_id, channel_context=None) -> str:
     """The system prompt suffix one turn of this chat is built with, by the real harness."""
     settings = UserSettings(

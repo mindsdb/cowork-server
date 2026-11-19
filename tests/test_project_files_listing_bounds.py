@@ -12,6 +12,7 @@ actually see, or a subtree they may not spends the whole listing.
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -265,8 +266,11 @@ def test_an_entry_turned_into_a_loop_after_its_stat_is_skipped(tmp_path, monkeyp
     row = listing.file_meta(racy, tmp_path)
 
     assert swapped
-    # 3.12 raises on the loop and the entry is skipped; 3.13 resolves it in place.
-    assert row is None or row["path"] == "racy.md"
+    # 3.12's resolve raises on the loop, so the entry is skipped; 3.13 resolves it in place.
+    if sys.version_info < (3, 13):
+        assert row is None
+    else:
+        assert row is not None and row["path"] == "racy.md"
 
 
 def test_an_entry_whose_parent_closes_after_resolve_still_lists(tmp_path, monkeypatch):

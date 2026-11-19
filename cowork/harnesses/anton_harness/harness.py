@@ -1059,6 +1059,9 @@ def _stored_folder_paths(session: ScopedSession, *, conversation_id: UUID) -> li
     return [row.path for row in rows]
 
 
+_FOLDER_CHECK_TIMEOUT_S = 5.0
+
+
 def _usable_folder_paths(paths: list[str], project_path: str | None) -> list[str]:
     """The stored folder paths that still pass the working-folder rules. Touches the filesystem."""
     return [path for path in paths if folder_refusal(path, project_path) is None]
@@ -1084,8 +1087,12 @@ async def _working_folder_paths(conversation, channel_context: ChannelContext | 
             partial(_stored_folder_paths, conversation_id=conversation.id), scope=scope,
         )
         project_path = conversation.project.path if conversation.project else None
-        # Each check stats the folder, which can hang on a network share that stopped answering.
-        return await asyncio.to_thread(_usable_folder_paths, paths, project_path)
+        # Each check stats the folder, which can hang on a network share that stopped
+        # answering; a timeout offers no folders, through the handler below.
+        return await asyncio.wait_for(
+            asyncio.to_thread(_usable_folder_paths, paths, project_path),
+            timeout=_FOLDER_CHECK_TIMEOUT_S,
+        )
     except PoolTimeoutError:
         raise
     except Exception:
