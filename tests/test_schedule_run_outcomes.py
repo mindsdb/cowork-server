@@ -204,7 +204,7 @@ async def test_a_turn_that_handed_its_browser_over_is_not_a_success(schedule_id,
     await _run(first)
 
     (run,) = _runs(schedule_id)
-    assert (run.status, run.outcome) == (RunStatus.failed, AttemptOutcome.needed_person)
+    assert (run.status, run.outcome) == (RunStatus.failed, AttemptOutcome.failed_during_execution)
     assert "Sign in to Gmail to read the newest email." in run.error
     schedule = _schedule(schedule_id)
     assert schedule.last_error == run.error
@@ -658,7 +658,7 @@ def test_a_turn_says_when_it_handed_its_browser_over(tmp_path, monkeypatch, fram
 
 def test_a_hand_over_outranks_a_finished_turn_but_not_a_failure():
     handed = scheduler._classify(scheduler._TurnEvidence(reason="completed", acted=True, handed_over="Sign in."))
-    assert handed.outcome == AttemptOutcome.needed_person
+    assert handed.outcome == AttemptOutcome.failed_during_execution
     failed = scheduler._classify(scheduler._TurnEvidence(reason="error", acted=True, handed_over="Sign in."))
     assert failed.outcome == AttemptOutcome.failed_during_execution
 

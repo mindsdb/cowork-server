@@ -463,7 +463,7 @@ def _classify(evidence: _TurnEvidence) -> _AttemptEnd:
         if evidence.handed_over is not None:
             # The agent ends its turn once nobody takes the browser, so the
             # turn reads as finished though its work stopped at that step.
-            return _AttemptEnd(outcome=AttemptOutcome.needed_person, error=_hand_over_error(evidence.handed_over))
+            return _AttemptEnd(outcome=AttemptOutcome.failed_during_execution, error=_hand_over_error(evidence.handed_over))
         limit_error = _LIMIT_ERRORS.get(evidence.stopped_by or "")
         if limit_error:
             return _AttemptEnd(outcome=AttemptOutcome.stopped_at_limit, error=limit_error)
@@ -1150,7 +1150,6 @@ async def _execute_schedule(
                             AttemptOutcome.failed_during_execution,
                             AttemptOutcome.interrupted,
                             AttemptOutcome.stopped_at_limit,
-                            AttemptOutcome.needed_person,
                         }
                         and not shutdown_interrupted
                     ),
