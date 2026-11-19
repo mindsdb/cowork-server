@@ -587,3 +587,40 @@ class TestStartup:
         lines = result.stdout.strip().splitlines()
         assert lines[-2] == repr(expected)
         assert lines[-1] == "False"
+
+
+class TestConnectionList:
+    def _row(self, engine: str, name: str) -> dict:
+        rows = _client().get(f"{BASE}/").json()
+        return next(r for r in rows if r["engine"] == engine and r["name"] == name)
+
+    def test_lists_an_mcp_connection_with_its_access_mode(self, stores):
+        _seed_mcp(mode="read")
+        assert self._row("hubspot", CONN)["method"] == "mcp"
+        assert self._row("hubspot", CONN)["access_mode"] == "read"
+
+        _client().patch(f"{CONN_URL}/access-mode", json={"access_mode": "none"})
+
+        assert self._row("hubspot", CONN)["access_mode"] == "none"
+
+    def test_lists_the_held_mode_once_the_file_is_stripped(self, protected):
+        _seed_mcp(mode="read")
+        _client().put(
+            f"{CONN_URL}/app-held",
+            json={"access_token": "mem-token", "expires_at": "2027-01-01T00:00:00Z", "access_mode": "write"},
+            headers=HEADERS,
+        )
+        assert "_access_mode" not in _file_fields()
+
+        assert self._row("hubspot", CONN)["access_mode"] == "write"
+
+    def test_an_unknown_stored_mode_lists_as_read(self, stores):
+        _seed_mcp(mode="admin")
+        assert self._row("hubspot", CONN)["access_mode"] == "read"
+
+    def test_a_non_mcp_connection_lists_no_access_mode(self, stores):
+        persist_connection("linear", "browser_oauth_builtin", "lin", {"access_token": "a"}, scope=LOCAL_SCOPE)
+        row = self._row("linear", "lin")
+        assert row["method"] == "browser_oauth_builtin"
+        assert row["access_mode"] is None
+        assert "a" not in row.values()
