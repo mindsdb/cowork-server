@@ -95,20 +95,22 @@ class TestSpec:
 
 class TestSwitchedOff:
     """SLACK_CONNECTOR_ENABLED off, as in prod for now: the spec served to
-    clients looks as it did before the `mcp` method, and new sign-ins are refused."""
+    clients shows the same methods as before the `mcp` method, and new
+    In-Browser Connect sign-ins are refused."""
 
     def test_the_mcp_method_is_hidden_and_the_bot_token_is_the_default(self, slack_off):
         methods = _methods()
         assert methods["mcp"].hidden is True
         assert methods["mcp"].recommended is False
         assert methods["bot-token"].recommended is True
-        assert methods["oauth"].hidden is True
+        assert methods["oauth"].hidden is False
 
     def test_switching_on_shows_the_mcp_method(self, slack_on):
         methods = _methods()
         assert methods["mcp"].hidden is False
         assert methods["mcp"].recommended is True
         assert methods["bot-token"].recommended is False
+        assert methods["oauth"].hidden is True
 
     @staticmethod
     def _client() -> TestClient:

@@ -55,14 +55,17 @@ def connector_metadata(c: dict) -> ConnectorMetadataResponse:
 
 
 def _without_slack_mcp(form: dict) -> dict:
-    """Slack's form while its `mcp` method is switched off: that method is
-    hidden, as the bot token was the default before it."""
+    """Slack's form while its `mcp` method is switched off, as it was before
+    that method: `mcp` hidden, the bot token the default, and the
+    bring-your-own-app `oauth` method visible again."""
     methods = []
     for method in form.get("methods") or []:
         if isinstance(method, dict) and method.get("id") == "mcp":
             method = {**method, "hidden": True, "recommended": False}
         elif isinstance(method, dict) and method.get("id") == "bot-token":
             method = {**method, "recommended": True}
+        elif isinstance(method, dict) and method.get("id") == "oauth":
+            method = {**method, "hidden": False}
         methods.append(method)
     return {**form, "methods": methods}
 
