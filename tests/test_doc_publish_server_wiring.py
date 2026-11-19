@@ -1,5 +1,5 @@
 """The server starts the doc publish worker with the doc relay and stops it
-after the turn drains, before the relay and Redis close."""
+after the turn drains, alongside the scratchpad closes."""
 import inspect
 
 from cowork import server

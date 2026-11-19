@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -133,11 +134,14 @@ def _doc_folder(job: DocPublishJob) -> tuple[Path | None, str | None]:
 
 async def _owner_of(job: DocPublishJob, scope: TenantScope) -> str | None:
     """The doc's recorded owner; None when unknown or when the base is not the project's root."""
-    resolutions = await run_db(
-        partial(_artifact_owners, artifacts_base=Path(job.artifacts_base), project_id=job.project_id,
-                slugs=[job.slug]),
-        scope=scope,
-    )
+    try:
+        resolutions = await run_db(
+            partial(_artifact_owners, artifacts_base=Path(job.artifacts_base), project_id=job.project_id,
+                    slugs=[job.slug]),
+            scope=scope,
+        )
+    except ValueError:  # a deleted project or a project id that is not a UUID
+        return None
     if resolutions is None:
         return None
     resolution = resolutions[job.slug]
@@ -195,8 +199,19 @@ async def _let_go_then(base: Path, slug: str, scope: TenantScope, key: PublishKe
         on_done()
 
 
-def _after_thread(base: Path, slug: str, scope: TenantScope, key: PublishKey, on_done: Callable[[], None]):
-    def done(_future: asyncio.Future) -> None:
+def _after_thread(base: Path, slug: str, scope: TenantScope, key: PublishKey, on_done: Callable[[], None],
+                  folder: Path, timed_out: threading.Event):
+    def done(future: asyncio.Future) -> None:
+        # Runs when the thread ends, so a page that went out after the wait timed
+        # out still reaches the editors.
+        if not future.cancelled():
+            error = future.exception()
+            if error is None:
+                hub.publish(doc_topic(folder), {"type": DOC_PUBLISHED, "rev": 0})
+            elif timed_out.is_set():
+                logger.warning("doc_publish", extra={
+                    "event": "doc_publish", "outcome": "late_failure", "artifact_slug": slug,
+                    "error_type": type(error).__name__})
         task = asyncio.get_running_loop().create_task(_let_go_then(base, slug, scope, key, on_done))
         _cleanups.add(task)
         task.add_done_callback(_cleanups.discard)
@@ -251,11 +266,15 @@ async def publish_doc_page(job: DocPublishJob, *, on_done: Callable[[], None]) -
         context = contextvars.copy_context()
         future = asyncio.get_running_loop().run_in_executor(None, context.run, upload)
         handed_off = True
-        future.add_done_callback(_after_thread(base, job.slug, scope, key, on_done))
+        timed_out = threading.Event()
+        future.add_done_callback(_after_thread(base, job.slug, scope, key, on_done, folder, timed_out))
         # shield: a timeout must not cancel the future, or its callback would
         # fire while the upload thread still runs.
-        await asyncio.wait_for(asyncio.shield(future), timeout=PUBLISH_TIMEOUT_S)
-        hub.publish(doc_topic(folder), {"type": DOC_PUBLISHED, "rev": 0})
+        try:
+            await asyncio.wait_for(asyncio.shield(future), timeout=PUBLISH_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            timed_out.set()
+            raise
         return PublishResult(Outcome.PUBLISHED)
     finally:
         if not handed_off:

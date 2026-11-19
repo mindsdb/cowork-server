@@ -149,7 +149,9 @@ async def create_blank_doc(body: _CreateBody, scope: TenantScope = Depends(get_t
         scope=scope,
     )
     # After the owner is recorded: the publish resolves the owner to key it.
-    republish.schedule(made.folder, scope=scope, project_id=str(source.project_id), artifact_id=made.artifact_id)
+    republish.schedule(made.folder, scope=scope,
+                      project_id=str(source.project_id) if source.project_id else None,
+                      artifact_id=made.artifact_id)
     card = await run_efs(partial(_card, scope, source, made.folder), scope=scope)
     return {"artifactId": made.artifact_id, "slug": made.slug, "doc": made.doc, "card": card}
 

@@ -16,6 +16,9 @@ from cowork.services import live_publish as lp
 from cowork.services.artifact_autopublish import AUTOPUBLISH_ACCESS
 
 
+_REAL_OWNER_OF = lp._owner_of
+
+
 class FakeKey:
     minted: list["FakeKey"] = []
 
@@ -269,3 +272,84 @@ def test_other_errors_are_permanent_or_not_by_type():
     assert not lp.is_permanent(asyncio.TimeoutError())
     assert lp.is_permanent(ProductPermissionDenied.__new__(ProductPermissionDenied))
     assert not lp.is_permanent(ProductPermissionUnavailable.__new__(ProductPermissionUnavailable))
+
+
+def _real_owner(job, monkeypatch, owners):
+    async def inline_db(fn, *, scope):
+        return fn(object())
+
+    monkeypatch.setattr(lp, "run_db", inline_db)
+    monkeypatch.setattr(lp, "_artifact_owners", owners)
+    return asyncio.run(_REAL_OWNER_OF(job, lp.TenantScope(org_mode=True, org_id="org-1")))
+
+
+def test_owner_of_is_none_when_the_project_is_unknown(doc, monkeypatch):
+    def unknown(*a, **k):
+        raise ValueError("Unknown project")
+
+    assert _real_owner(_job(doc), monkeypatch, unknown) is None
+
+
+def test_owner_of_is_none_when_the_base_is_not_the_project_root(doc, monkeypatch):
+    assert _real_owner(_job(doc), monkeypatch, lambda *a, **k: None) is None
+
+
+def test_owner_of_is_none_when_the_resolution_is_unknown(doc, monkeypatch):
+    job = _job(doc)
+    resolution = SimpleNamespace(unknown=True, owner_user_id=None)
+    assert _real_owner(job, monkeypatch, lambda *a, **k: {job.slug: resolution}) is None
+
+
+def test_owner_of_is_the_known_owner_as_a_string(doc, monkeypatch):
+    job = _job(doc)
+    resolution = SimpleNamespace(unknown=False, owner_user_id=42)
+    assert _real_owner(job, monkeypatch, lambda *a, **k: {job.slug: resolution}) == "42"
+
+
+def test_an_upload_finishing_after_the_timeout_still_tells_the_editors(doc, monkeypatch):
+    gate = threading.Event()
+    monkeypatch.setattr(lp, "PUBLISH_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(lp, "publish_artifact", lambda *a, **k: gate.wait(5) or {"url": "u"})
+
+    async def scenario():
+        with pytest.raises(asyncio.TimeoutError):
+            await lp.publish_doc_page(_job(doc), on_done=lambda: None)
+        before = list(doc.events)
+        gate.set()
+        for _ in range(100):
+            if doc.events:
+                break
+            await asyncio.sleep(0.02)
+        await lp.drain_cleanup(timeout=2.0)
+        return before
+
+    before = asyncio.run(scenario())
+    assert before == [] and doc.events == [{"type": "doc.published", "rev": 0}]
+
+
+def test_an_upload_failing_after_the_timeout_logs_and_publishes_nothing(doc, monkeypatch, caplog):
+    gate = threading.Event()
+
+    def fail_late(*a, **k):
+        gate.wait(5)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(lp, "PUBLISH_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(lp, "publish_artifact", fail_late)
+
+    async def scenario():
+        with pytest.raises(asyncio.TimeoutError):
+            await lp.publish_doc_page(_job(doc), on_done=lambda: None)
+        gate.set()
+        for _ in range(100):
+            if any(getattr(r, "outcome", None) == "late_failure" for r in caplog.records):
+                break
+            await asyncio.sleep(0.02)
+        await lp.drain_cleanup(timeout=2.0)
+
+    with caplog.at_level("WARNING", logger=lp.logger.name):
+        asyncio.run(scenario())
+    late = [r for r in caplog.records if getattr(r, "outcome", None) == "late_failure"]
+    assert len(late) == 1 and late[0].levelname == "WARNING"
+    assert late[0].error_type == "RuntimeError" and late[0].artifact_slug == doc.folder.name
+    assert doc.events == []
