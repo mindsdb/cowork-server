@@ -122,7 +122,7 @@ def _scoped(engine, scope) -> ScopedSession:
 
 
 @pytest.fixture()
-def engine():
+def engine(org_deployment):
     """One database holding the builder's templates: one per auth type, and one without a check."""
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(eng)

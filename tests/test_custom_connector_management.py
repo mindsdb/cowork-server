@@ -36,17 +36,18 @@ from cowork.services.connectors.custom_connectors import (
     CustomConnectorService,
     UnstorableFormError,
 )
+from tests._connector_test_request import with_test_request
 from tests._fakes import FakeRequest
 
 ORG_A = TenantScope(org_mode=True, org_id="org-a", user_id="builder-a")
 ORG_A_OTHER = TenantScope(org_mode=True, org_id="org-a", user_id="member-a2")
 ORG_B = TenantScope(org_mode=True, org_id="org-b", user_id="member-b")
 
-FORM = {
+FORM = with_test_request({
     "form_id": "httpbin-connector",
     "title": "Connect httpbin",
     "fields": [{"name": "token", "label": "Bearer token", "type": "password", "secret": True}],
-}
+})
 
 
 @pytest.fixture()
@@ -133,7 +134,10 @@ def test_a_field_sent_on_its_own_wins_over_the_connector_block(engine):
 
 
 def test_replace_the_form(engine):
-    new_form = {**FORM, "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}]}
+    new_form = with_test_request(
+        {**FORM, "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}]},
+        field="api_key",
+    )
 
     update_custom_connector("httpbin", CustomConnectorUpdate(spec=new_form), _scoped(engine))
 
@@ -463,7 +467,7 @@ class TestSaveConnectorDraft:
 
         assert TestClient(app).post("/custom", json=_anton_draft()).status_code == 404
 
-    def test_a_save_racing_the_same_members_save_updates_their_row(self, engine, monkeypatch):
+    def test_a_save_racing_the_same_members_save_updates_their_row(self, engine, org_tenancy, monkeypatch):
         """The insert loses to the other save's row, so it updates that row instead."""
         service = CustomConnectorService(_scoped(engine, ORG_A))
         service.save_member_draft(parse_connector_draft(_anton_draft()))
@@ -484,7 +488,7 @@ class TestSaveConnectorDraft:
 
     @pytest.mark.parametrize("scope", [LOCAL_SCOPE, TenantScope(org_mode=True, org_id="org-a")],
                              ids=["local", "org scope with no user"])
-    def test_the_service_saves_drafts_only_for_an_org_member(self, engine, scope):
+    def test_the_service_saves_drafts_only_for_an_org_member(self, engine, org_tenancy, scope):
         with pytest.raises(UnstorableFormError):
             CustomConnectorService(_scoped(engine, scope)).save_member_draft(parse_connector_draft(_anton_draft()))
         assert _org_rows(engine) == []

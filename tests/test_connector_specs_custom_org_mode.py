@@ -27,7 +27,7 @@ DRAFT = {
 
 
 @pytest.fixture()
-def engine():
+def engine(org_deployment):
     """The builder's one template, plus a stored row that takes a built-in id."""
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(eng)
