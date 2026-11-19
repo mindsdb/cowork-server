@@ -1933,10 +1933,9 @@ class AntonHarness:
                 )
             else:
                 data_vault = source_vault
-            if app_held.active():
-                data_vault = app_held.AppHeldVault(
-                    source=data_vault, root=own_vault_root(current_settings_scope())
-                )
+            data_vault = app_held.turn_vault(
+                data_vault, source_vault=source_vault, root=own_vault_root(current_settings_scope())
+            )
             # Registers this turn's DS_* names and values for scrubbing, and
             # touches no process state, so a concurrent turn's are left alone.
             from anton.utils.datasources import restore_namespaced_env
