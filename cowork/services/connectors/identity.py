@@ -133,7 +133,8 @@ def spec_secret_fields(connector_id: str, method: str | None, form: dict | None 
 # `account_email` as a synthetic composite placeholder — `org:<slug>` (see
 # `_fetch_userinfo_supabase`) or `<email>:<workspace_id>`/
 # `<email>:<organization_id>` (see `_fetch_userinfo_linear`/
-# `_fetch_userinfo_posthog`/`_fetch_userinfo_slack`, and Notion's MCP identity bridge) — rather than a
+# `_fetch_userinfo_posthog`, Notion's MCP identity bridge, and Slack's identity
+# from the desktop app and auth) — rather than a
 # real, displayable email. Shared so any caller falling back from
 # `account_name` to `account_email` can skip that fallback for exactly these
 # engines instead of leaking the composite string.
