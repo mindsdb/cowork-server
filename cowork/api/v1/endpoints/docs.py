@@ -42,6 +42,7 @@ from cowork.docs.hub import DOC_PUBLISHED, NUDGE, conv_topic, doc_topic, hub
 from cowork.docs.images import MAX_IMAGE_BYTES, store_image
 from cowork.docs.model import DocError
 from cowork.docs.ops import MAX_OPS
+from cowork.docs import republish
 from cowork.docs.service import apply, create_doc
 from cowork.docs.store import doc_file, is_doc_folder, load_doc
 from cowork.docs.sync import after_write
@@ -147,6 +148,8 @@ async def create_blank_doc(body: _CreateBody, scope: TenantScope = Depends(get_t
         lambda unit: record_artifact_owner(unit, source.project_id, made.slug, scope.user_id, action="create"),
         scope=scope,
     )
+    # After the owner is recorded: the publish resolves the owner to key it.
+    republish.schedule(made.folder, scope=scope, project_id=str(source.project_id), artifact_id=made.artifact_id)
     card = await run_efs(partial(_card, scope, source, made.folder), scope=scope)
     return {"artifactId": made.artifact_id, "slug": made.slug, "doc": made.doc, "card": card}
 
@@ -238,14 +241,15 @@ async def edit_doc(
     project_ref: str, artifact_id: ArtifactIdDep, body: _OpsBody, scope: TenantScope = Depends(get_tenant_scope)
 ):
     await require_product_permission(scope, "artifact.manage")
-    _source, folder, _metadata, _is_own = await _resolve(scope, project_ref, artifact_id, write=True)
+    source, folder, _metadata, _is_own = await _resolve(scope, project_ref, artifact_id, write=True)
     try:
         doc, result = await run_efs(
             lambda: apply(folder, body.ops, tab=body.tab, by="user", if_rev=body.ifRev), scope=scope
         )
     except DocError as err:
         raise _doc_error(err) from err
-    after_write(folder, doc, result, by="user", scope=scope, client_id=body.clientId)
+    after_write(folder, doc, result, by="user", scope=scope, client_id=body.clientId,
+                project_id=str(source.project_id) if source.project_id else None)
     return {"doc": doc, **result}
 
 
@@ -407,12 +411,13 @@ async def restore_version(
 ):
     """Bring version ``rev`` back. ``replacedRev`` is the version restoring undoes this."""
     await require_product_permission(scope, "artifact.manage")
-    _source, folder, _metadata, _is_own = await _resolve(scope, project_ref, artifact_id, write=True)
+    source, folder, _metadata, _is_own = await _resolve(scope, project_ref, artifact_id, write=True)
     try:
         doc, replaced = await run_efs(partial(restore, folder, rev), scope=scope)
     except DocError as err:
         raise _doc_error(err) from err
-    after_write(folder, doc, None, by="user", scope=scope, client_id=body.clientId if body else None)
+    after_write(folder, doc, None, by="user", scope=scope, client_id=body.clientId if body else None,
+                project_id=str(source.project_id) if source.project_id else None)
     return {"doc": doc, "replacedRev": replaced}
 
 

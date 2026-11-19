@@ -26,7 +26,7 @@ from typing import Any, TypeVar
 
 from cowork.common.settings.user_settings import current_settings_scope
 from cowork.db.scoped import LOCAL_SCOPE
-from cowork.docs import render
+from cowork.docs import render, republish
 from cowork.docs.images import localize_images, within, write_images
 from cowork.docs.model import TEXT_TYPES, Doc, DocError, block_text_for_search, find_tab
 from cowork.docs.prompt import (
@@ -326,6 +326,9 @@ async def _create(ctx: DocToolContext, tc_input: dict, emit_step: EmitStep, *, a
         return _refusal(err)
     announce(made.artifact_id, made.doc, None, folder=made.folder, by="agent",
              conversation_id=ctx.conversation_id, created=True, card=card)
+    # Not after_write: the announce above already told the editors.
+    republish.schedule(made.folder, scope=current_settings_scope() or LOCAL_SCOPE,
+                       project_id=ctx.project_id, artifact_id=made.artifact_id)
     return DocToolResult(text, touched_slug=made.slug)
 
 
@@ -385,7 +388,7 @@ async def _edit(ctx: DocToolContext, tc_input: dict, emit_step: EmitStep, *, art
                 logger.debug("could not reread %s for a stale refusal", folder, exc_info=True)
         return _refusal(err, current)
     after_write(folder, doc, result, by="agent", scope=current_settings_scope() or LOCAL_SCOPE,
-                conversation_id=ctx.conversation_id)
+                conversation_id=ctx.conversation_id, project_id=ctx.project_id)
     return DocToolResult(text, touched_slug=folder.name)
 
 

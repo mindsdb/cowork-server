@@ -165,3 +165,42 @@ def test_two_runs_of_one_key_never_overlap():
     while len(runs) < 2 and time.monotonic() < end:
         time.sleep(0.01)
     assert runs == [1, 2] and most[0] == 1
+
+
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope
+
+ORG = TenantScope(org_mode=True, org_id="org-1", user_id="u1")
+
+
+def _deployment(monkeypatch, *, mode="org", trust_headers=False):
+    monkeypatch.setattr(republish, "get_app_settings",
+                        lambda: SimpleNamespace(tenancy_mode=mode, trust_identity_headers=trust_headers))
+    queued = []
+    monkeypatch.setattr(republish, "schedule_enqueue", lambda job: queued.append(job) or True)
+    return queued
+
+
+def test_an_org_deployment_queues_the_page_in_redis(folder, monkeypatch):
+    queued = _deployment(monkeypatch)
+    assert republish.schedule(folder, scope=ORG, project_id="p1", artifact_id="a1")
+    job = queued[0]
+    assert (job.artifact_id, job.project_id, job.slug, job.org_id) == ("a1", "p1", folder.name, "org-1")
+    assert job.artifacts_base == str(folder.parent)
+
+
+def test_an_org_deployment_queues_nothing_without_an_org_scope_a_project_or_a_doc_id(folder, monkeypatch):
+    queued = _deployment(monkeypatch)
+    assert not republish.schedule(folder, scope=LOCAL_SCOPE, project_id="p1", artifact_id="a1")
+    assert not republish.schedule(folder, scope=ORG, project_id=None, artifact_id="a1")
+    assert not republish.schedule(folder, scope=ORG, project_id="p1", artifact_id=None)
+    assert queued == []
+
+
+def test_a_local_deployment_that_trusts_identity_headers_keeps_the_desktop_republish(folder, monkeypatch):
+    queued = _deployment(monkeypatch, mode="local", trust_headers=True)
+    monkeypatch.setattr(republish, "is_shared", lambda f: True)
+    debounced = []
+    monkeypatch.setattr(republish._republishes, "schedule", lambda key, fn: debounced.append(key))
+    personal = TenantScope(personal=True, org_id="me", user_id="me")
+    assert republish.schedule(folder, scope=personal, project_id="p1", artifact_id="a1")
+    assert debounced == [str(folder / "doc.html")] and queued == []

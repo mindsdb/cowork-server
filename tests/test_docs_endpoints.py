@@ -348,9 +348,35 @@ def test_a_doc_created_over_http_is_its_creators(monkeypatch, tmp_path, inline_u
     monkeypatch.setattr(docs, "readable_sources", lambda plan: [source])
     monkeypatch.setattr(docs, "record_artifact_owner", lambda *a, **kw: recorded.append((a, kw)))
     monkeypatch.setattr(docs, "_card", lambda *a: None)
+    monkeypatch.setattr(docs.republish, "schedule", lambda folder, **kw: False)
     scope = SimpleNamespace(user_id="alice")
     made = asyncio.run(docs.create_blank_doc(docs._CreateBody(projectId=uuid4(), title="Plan"), scope))
     assert recorded == [(("unit", "p-1", made["slug"], "alice"), {"action": "create"})]
+
+
+def test_a_doc_created_in_the_app_asks_for_its_page_after_its_owner_is_recorded(monkeypatch, tmp_path, inline_units):
+    import asyncio
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from cowork.api.v1.endpoints import docs
+
+    order = []
+
+    async def allowed(scope, permission):
+        return None
+
+    source = SimpleNamespace(base=str(tmp_path / "artifacts"), project_id="p-1", project_name="P", external=False)
+    monkeypatch.setattr(docs, "require_product_permission", allowed)
+    monkeypatch.setattr(docs, "_project_plan", lambda session, **kw: None)
+    monkeypatch.setattr(docs, "readable_sources", lambda plan: [source])
+    monkeypatch.setattr(docs, "record_artifact_owner", lambda *a, **kw: order.append("owner"))
+    monkeypatch.setattr(docs, "_card", lambda *a: None)
+    monkeypatch.setattr(docs.republish, "schedule",
+                        lambda folder, **kw: order.append(("schedule", kw["project_id"], kw["artifact_id"])) or True)
+    scope = SimpleNamespace(user_id="alice")
+    made = asyncio.run(docs.create_blank_doc(docs._CreateBody(projectId=uuid4(), title="Plan"), scope))
+    assert order == ["owner", ("schedule", "p-1", made["artifactId"])]
 
 
 def test_a_reviewer_reads_the_doc_without_the_owners_card(monkeypatch, tmp_path, inline_units):
