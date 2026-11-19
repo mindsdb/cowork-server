@@ -99,7 +99,7 @@ from cowork.turnqueue.redis_client import (
 )
 from cowork.docs.prompt import CONTEXT_PREFIXES, DOC_OUTPUT_NOTE, doc_context_block
 from cowork.docs.remote import RemoteDocTools, start_remote_doc_tools
-from cowork.docs.tools import remote_doc_tool_specs
+from cowork.docs.tools import DOC_WRITE_TOOL_NAMES, remote_doc_tool_specs
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -187,6 +187,16 @@ def _typed_text(blocks: list[dict]) -> str:
     typed nothing ("Edit with agent")."""
     own = [b for b in blocks if b.get("type") == "text" and not str(b.get("text", "")).startswith(CONTEXT_PREFIXES)]
     return prompt_text(own)
+
+
+def _pod_input_text(blocks: list[dict]) -> str:
+    """A remote turn's input for the pod. With the doc blocks ahead of the
+    typed text, each text block is its own paragraph, as the in-process
+    harness sees them; otherwise the same text prompt_text gives."""
+    texts = [b for b in blocks if b.get("type") == "text"]
+    if any(str(b.get("text", "")).startswith(CONTEXT_PREFIXES) for b in texts):
+        return "\n\n".join(b["text"] for b in texts)
+    return prompt_text(blocks)
 
 
 def _title_text(blocks: list[dict]) -> str:
@@ -2455,7 +2465,7 @@ class ResponsesHandler:
             return self._produce_remote(
                 lifecycle=lifecycle,
                 conv_id=conv_id,
-                input_text=prompt_text(harness_input),
+                input_text=_pod_input_text(harness_input),
                 original_content=original_content,
                 model=model,
                 reasoning_effort=reasoning_effort,
@@ -3484,11 +3494,12 @@ class ResponsesHandler:
                         if doc_tools is not None:
                             # The turn end records nothing for a workspace that is not
                             # persistent, so a write would go unclaimed: refuse it at once
-                            # rather than let the pod wait out its timeout.
+                            # rather than let the pod wait out its timeout. Reads still run.
                             may_write = turn_artifacts is not None and turn_artifacts.writes_allowed
+                            refused = data.get("tool") in DOC_WRITE_TOOL_NAMES and not may_write
                             doc_tools.runner.start(
                                 data,
-                                refusal=None if may_write else "Refused (not_allowed): this turn cannot change files.",
+                                refusal="Refused (not_allowed): this turn cannot change files." if refused else None,
                             )
                         continue
                     if step == ADDON_STEP:

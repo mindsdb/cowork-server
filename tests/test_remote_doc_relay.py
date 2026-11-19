@@ -250,14 +250,19 @@ async def test_the_turn_end_waits_for_a_late_call_names_its_doc_and_sends_nothin
     assert "host_tool_result" not in kinds
 
 
-async def test_a_call_in_a_workspace_that_keeps_nothing_is_refused_at_once(monkeypatch, tmp_path, redis):
+@pytest.mark.parametrize("call", [
+    ("create_doc", {"title": "Plan", "markdown": "Lead."}),
+    ("edit_doc", {"doc": "Plan", "ops": [{"op": "append", "markdown": "More."}]}),
+])
+async def test_a_write_in_a_workspace_that_keeps_nothing_is_refused_at_once(monkeypatch, tmp_path, redis, call):
     handler, base = _doc_turn(monkeypatch, tmp_path)
     sent: dict = {}
+    tool, tc_input = call
 
     async def pod(**kwargs):
         # Persistent was asked for; the controller authorizes ephemeral.
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "ephemeral"}
-        yield _call("create_doc", title="Plan", markdown="Lead.")
+        yield _call(tool, **tc_input)
         sent["entries"] = await _answered(redis, kwargs["correlation_id"])
         yield "turn_completed", {"artifacts_touched": []}
 
@@ -267,6 +272,36 @@ async def test_a_call_in_a_workspace_that_keeps_nothing_is_refused_at_once(monke
     assert result["ok"] is False and result["last"] is True
     assert result["text"] == "Refused (not_allowed): this turn cannot change files."
     assert list(base.iterdir()) == []
+
+
+@pytest.mark.parametrize("tool,tc_input", [("list_docs", {}), ("read_doc", {"doc": "Plan"})])
+async def test_a_read_in_a_workspace_that_keeps_nothing_still_runs(monkeypatch, tmp_path, redis, tool, tc_input):
+    """The pod's input may hold the open doc even when no write is allowed:
+    the agent can still read it from the turn's own artifacts folder."""
+    handler, base = _doc_turn(monkeypatch, tmp_path)
+    folder = base / "plan-0123abcd"
+    folder.mkdir()
+    sent: dict = {}
+    seen: list = []
+    real = doc_tools.run_doc_tool
+
+    async def spy(context, name, tool_input, emit_step, **kwargs):
+        seen.append((name, context.artifacts_base))
+        return await real(context, name, tool_input, emit_step, **kwargs)
+
+    monkeypatch.setattr(remote_mod, "run_doc_tool", spy)
+
+    async def pod(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "ephemeral"}
+        yield _call(tool, **tc_input)
+        sent["entries"] = await _answered(redis, kwargs["correlation_id"])
+        yield "turn_completed", {"artifacts_touched": []}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", pod)
+    await _produce(handler, uuid4())
+    (result,) = [e for e in sent["entries"] if e["kind"] == "host_tool_result"]
+    assert "not_allowed" not in result["text"]
+    assert seen == [(tool, base)]
 
 
 async def test_a_failing_artifacts_re_read_leaves_the_turn_running_without_doc_tools(

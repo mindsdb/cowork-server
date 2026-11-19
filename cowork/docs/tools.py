@@ -55,6 +55,7 @@ DOC_TOOL_SPECS: tuple[tuple[str, str, dict[str, Any]], ...] = (
     ("list_docs", LIST_DOCS_DESCRIPTION, LIST_DOCS_SCHEMA),
 )
 DOC_TOOL_NAMES = tuple(name for name, _description, _schema in DOC_TOOL_SPECS)
+DOC_WRITE_TOOL_NAMES = ("create_doc", "edit_doc")
 DOC_TOOL_TIMEOUT_S = 60
 TOO_BIG_TEXT = (
     "Refused (too_big): this answer would be over 1 MiB. Read the doc in parts: pass `tab` for one tab, "
@@ -448,6 +449,6 @@ def remote_doc_tool_specs(*, timeout_s: int = DOC_TOOL_TIMEOUT_S) -> list[dict[s
 
 
 __all__ = [
-    "DOC_TOOL_NAMES", "DOC_TOOL_SPECS", "DOC_TOOL_TIMEOUT_S", "TOO_BIG_TEXT", "DocToolContext", "DocToolResult",
+    "DOC_TOOL_NAMES", "DOC_TOOL_SPECS", "DOC_WRITE_TOOL_NAMES", "DOC_TOOL_TIMEOUT_S", "TOO_BIG_TEXT", "DocToolContext", "DocToolResult",
     "EmitStep", "OnWritten", "RunInThread", "edit_label", "remote_doc_tool_specs", "run_doc_tool",
 ]

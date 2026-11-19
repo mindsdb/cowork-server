@@ -55,6 +55,7 @@ MAX_PROGRESS_CHARS = 500
 TURN_END_WAIT_S = 20.0
 _TOO_BIG_TEXT = "The answer is over 1 MiB, more than the host sends for one call."
 _HOST_ERROR_TEXT = "Refused (host_error): the host could not send this answer."
+_BUSY_TEXT = "Refused (busy): nothing was changed."
 
 
 @dataclass(frozen=True)
@@ -83,9 +84,14 @@ def _line(payload: dict[str, Any]) -> str:
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
+def _encodable(text: str) -> str:
+    # Doc text can hold a lone surrogate (agent code in the pod may write one);
+    # unreplaced, it fails the size check and the push in Redis.
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
 def progress_entry(call_id: str, n: int, text: str) -> str:
-    # A step label quotes a doc's title: a lone surrogate there would fail the whole push in Redis.
-    text = text.encode("utf-8", "replace").decode("utf-8")
+    text = _encodable(text)
     if len(text) > MAX_PROGRESS_CHARS:
         text = text[: MAX_PROGRESS_CHARS - 1] + "…"
     return _line({"kind": "host_tool_progress", "call_id": call_id, "entry_id": f"{call_id}:{n}", "text": text})
@@ -198,6 +204,10 @@ class HostToolRunner:
         except RedisError:
             logger.warning("host tool call not run: Redis failed correlation_id=%s call_id=%s",
                            self._corr, call.call_id, exc_info=True)
+            # Best effort: the push may go through where SET timed out, and spares
+            # the pod a wait that ends in "may have been applied".
+            if not self._closed:
+                await self._push(r, call, [_result_line(call.call_id, 0, last=True, ok=False, text=_BUSY_TEXT)])
             return
         if not first:
             logger.info("host tool call already run correlation_id=%s call_id=%s", self._corr, call.call_id)
@@ -223,7 +233,7 @@ class HostToolRunner:
         await self._push(r, call, entries)
 
     def _answer(self, call_id: str, outcome: HostToolOutcome) -> list[str]:
-        outcome = capped(outcome, self._too_big_text)
+        outcome = capped(HostToolOutcome(_encodable(outcome.text), ok=outcome.ok), self._too_big_text)
         return result_entries(call_id, ok=outcome.ok, text=outcome.text)
 
     async def _outcome(self, call: HostCall, r: aioredis.Redis) -> HostToolOutcome:

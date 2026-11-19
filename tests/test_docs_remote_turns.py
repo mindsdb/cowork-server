@@ -91,6 +91,21 @@ async def test_the_pods_input_carries_the_open_doc_only_when_the_turn_gets_the_d
     assert sent["input_text"].endswith("Tighten the intro")
 
 
+async def test_the_pods_input_keeps_the_doc_blocks_and_the_typed_text_in_separate_paragraphs(monkeypatch):
+    """The in-process harness hands these as separate blocks; joined with a
+    space, the typed message would read as the end of the Output: Doc note."""
+    from cowork.docs.prompt import doc_context_block
+
+    sent = await _remote_turn(monkeypatch, flag=True, may_manage=True, doc_context=DOC_CONTEXT, output="doc")
+    assert sent["input_text"] == "\n\n".join([doc_context_block(DOC_CONTEXT), DOC_OUTPUT_NOTE, "Tighten the intro"])
+
+
+@pytest.mark.parametrize("flag", [True, False])
+async def test_without_doc_blocks_the_pods_input_is_the_typed_text_unchanged(monkeypatch, flag):
+    sent = await _remote_turn(monkeypatch, flag=flag, may_manage=True)
+    assert sent["input_text"] == "Tighten the intro"
+
+
 @pytest.mark.parametrize("flag,may_manage,expected", [(True, True, True), (True, False, False), (False, True, False)])
 async def test_the_pod_is_offered_the_doc_tools_exactly_when_its_input_carries_the_doc(
     monkeypatch, flag, may_manage, expected,

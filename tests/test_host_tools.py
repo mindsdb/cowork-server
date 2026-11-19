@@ -141,6 +141,46 @@ async def test_nothing_runs_when_redis_cannot_hold_the_once_only_key():
     await _settle(runner)
 
 
+class _SetFails(fakeredis.aioredis.FakeRedis):
+    async def set(self, *args, **kwargs):
+        raise RedisError("timeout")
+
+
+async def test_a_call_redis_cannot_hold_the_key_for_is_answered_busy_so_the_pod_does_not_wait():
+    """RPUSH may go through where SET timed out: tell the pod nothing started
+    rather than leave it to time out and read "may have been applied"."""
+    redis = _SetFails(decode_responses=True)
+
+    async def execute(call, emit):
+        raise AssertionError("ran without the once-only key")
+
+    runner = _runner(redis, execute)
+    runner.start(STEP)
+    await _settle(runner)
+    assert await _queued(redis) == [
+        {"kind": "host_tool_result", "call_id": CALL, "entry_id": f"{CALL}:0", "seq": 0, "last": True,
+         "ok": False, "text": "Refused (busy): nothing was changed."},
+    ]
+
+
+async def test_when_the_busy_answer_cannot_be_queued_either_it_is_logged_by_call_id(caplog):
+    class Down:
+        async def set(self, *args, **kwargs):
+            raise RedisError("down")
+
+        def pipeline(self, **kwargs):
+            raise RedisError("down")
+
+    async def execute(call, emit):
+        raise AssertionError("ran without the once-only key")
+
+    runner = HostToolRunner(correlation_id=CORR, timeouts={"read_doc": 30}, execute=execute, r=Down())
+    with caplog.at_level(logging.WARNING, logger=host_tools.logger.name):
+        runner.start(STEP)
+        await _settle(runner)
+    assert any(CALL in record.getMessage() and "not queued" in record.getMessage() for record in caplog.records)
+
+
 def test_a_long_answer_is_cut_into_lines_that_each_fit_the_pods_stdin():
     text = 'quote " backslash \\ tab \t nul \x00 emoji 😀 ελληνικά 日本語 ' * 4000
     raw = result_entries(CALL, ok=True, text=text)
@@ -178,10 +218,27 @@ async def test_an_answer_over_one_mib_is_refused_whatever_the_tool_checked(redis
     assert result["ok"] is False and result["last"] is True and result["text"] == "read it by tab"
 
 
-async def test_an_answer_that_cannot_be_encoded_is_refused_and_logged(redis, caplog):
+async def test_an_answer_with_a_lone_surrogate_is_sent_with_it_replaced(redis):
+    """Agent code in the pod can write a doc holding one; reading it must still work."""
     async def execute(call, emit):
         return HostToolOutcome("broken \ud800 text")
 
+    runner = _runner(redis, execute)
+    runner.start(STEP)
+    await _settle(runner)
+    (result,) = await _queued(redis)
+    assert result["ok"] is True and result["last"] is True
+    assert result["text"] == "broken ? text"
+
+
+async def test_an_answer_that_cannot_be_built_is_refused_and_logged(redis, caplog, monkeypatch):
+    async def execute(call, emit):
+        return HostToolOutcome("broken text")
+
+    def fail(*args, **kwargs):
+        raise ValueError("cannot cut")
+
+    monkeypatch.setattr(host_tools, "result_entries", fail)
     runner = _runner(redis, execute)
     with caplog.at_level(logging.ERROR, logger=host_tools.logger.name):
         runner.start(STEP)

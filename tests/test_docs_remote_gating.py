@@ -90,6 +90,18 @@ def test_the_remote_producer_gets_the_typed_question_apart_from_the_doc_blocks(m
     assert called["remote_docs"] is True
 
 
+def test_the_pod_input_separates_blocks_only_when_a_doc_block_is_present():
+    from cowork.handlers.responses import _pod_input_text
+
+    plain = [{"type": "text", "text": "one"}, {"type": "file", "path": "/x", "filename": "x"},
+             {"type": "text", "text": "two"}]
+    # Same join as before the doc blocks existed, so a turn without them is unchanged.
+    assert _pod_input_text(plain) == "one two"
+    with_doc = [{"type": "text", "text": doc_context_block(DOC_CONTEXT)}, {"type": "text", "text": DOC_OUTPUT_NOTE},
+                {"type": "text", "text": "Tighten the intro"}]
+    assert _pod_input_text(with_doc) == "\n\n".join(b["text"] for b in with_doc)
+
+
 def test_with_nothing_typed_the_question_is_empty_not_the_doc_block(monkeypatch):
     """"Edit with agent" sends the doc block and no text of the person's."""
     monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")

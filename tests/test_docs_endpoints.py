@@ -1080,6 +1080,51 @@ def test_a_lagging_read_is_read_again_even_when_the_mtime_never_moves(monkeypatc
     assert name == "doc.updated" and f["rev"] == 2 and "clientId" not in f
 
 
+def test_a_nudged_rev_the_file_never_reaches_stops_the_rereads_after_a_few_polls(monkeypatch, tmp_path):
+    """The doc was recreated, or rewritten with a lower rev: the rev a nudge named
+    never shows up. Each open stream must not go on reading and parsing the doc on
+    every poll until it closes."""
+    import asyncio
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import DocHub, doc_topic
+    from cowork.docs.service import create_doc
+    from cowork.docs.store import load_doc
+
+    monkeypatch.setattr(docs, "_POLL_S", 0.05)
+    monkeypatch.setattr(docs, "hub", DocHub())
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    topic = doc_topic(made.folder)
+    loads: list[int] = []
+
+    def counting_load(folder):
+        loads.append(1)
+        return load_doc(folder)
+
+    monkeypatch.setattr(docs, "_mtime", lambda folder: 1)
+    monkeypatch.setattr(docs, "load_doc", counting_load)
+
+    async def scenario():
+        stream = docs._sse(_Open(), topic, initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+        await anext(stream)  # doc.ready at rev 1
+        docs.hub.deliver_remote({"type": "doc.updated", "rev": made.doc["rev"] + 5, "clientId": None,
+                                 "origin": "other", "topic": topic})
+        # One pending read throughout: cancelling it would end the stream.
+        following = asyncio.ensure_future(anext(stream))
+        await asyncio.sleep(1.0)
+        settled = len(loads)
+        await asyncio.sleep(0.5)
+        assert not following.done(), "a frame was sent"
+        following.cancel()
+        return settled
+
+    settled = asyncio.run(scenario())
+    # doc.ready, the nudge, then a bounded number of rereads; none after that.
+    assert len(loads) == settled
+    assert settled <= 2 + docs._PENDING_REREADS
+
+
 def test_two_nudges_for_the_same_rev_send_one_frame(monkeypatch, tmp_path):
     import asyncio
 
