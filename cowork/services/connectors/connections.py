@@ -206,7 +206,10 @@ class ConnectionsService:
         record = self._read_record(self._vault(), engine, name)
         if record is None:
             return None
-        return dict(record.get("fields") or {})
+        # An MCP connection's token may be held in memory only, not in the file.
+        return app_held.overlay(
+            own_vault_root(self.scope), engine, name, dict(record.get("fields") or {}), keys=("access_token",)
+        )
 
     def patch_token(self, engine: str, name: str, updates: dict) -> bool:
         """Merge ``updates`` into an existing vault entry's fields.

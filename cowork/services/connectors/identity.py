@@ -133,15 +133,16 @@ def spec_secret_fields(connector_id: str, method: str | None, form: dict | None 
 # `account_email` as a synthetic composite placeholder — `org:<slug>` (see
 # `_fetch_userinfo_supabase`) or `<email>:<workspace_id>`/
 # `<email>:<organization_id>` (see `_fetch_userinfo_linear`/
-# `_fetch_userinfo_posthog`, and Notion's MCP identity bridge) — rather than a
+# `_fetch_userinfo_posthog`, Notion's MCP identity bridge, and Slack's identity
+# from the desktop app and auth) — rather than a
 # real, displayable email. Shared so any caller falling back from
 # `account_name` to `account_email` can skip that fallback for exactly these
 # engines instead of leaking the composite string.
-SYNTHETIC_ACCOUNT_EMAIL_ENGINES = frozenset({"supabase", "linear", "posthog", "notion"})
+SYNTHETIC_ACCOUNT_EMAIL_ENGINES = frozenset({"supabase", "linear", "posthog", "notion", "slack"})
 
 # Of those, the engines whose composite starts with the person's real email
 # (`<email>:<workspace_id>`) and whose subtitle shows that email.
-EMAIL_SUBTITLE_ENGINES = frozenset({"notion"})
+EMAIL_SUBTITLE_ENGINES = frozenset({"notion", "slack"})
 
 
 def connection_display_name(fields: dict, engine: str = "") -> str | None:
