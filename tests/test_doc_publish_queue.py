@@ -258,3 +258,146 @@ def test_a_doc_its_owner_unpublished_logs_quietly(caplog):
     pq._record(PublishResult(Outcome.SKIPPED, "unpublished"), JOB)
     pq._record(PublishResult(Outcome.UNCHANGED), JOB)
     assert [r.levelno for r in caplog.records[-2:]] == [logging.DEBUG, logging.DEBUG]
+
+
+def _held_hgetall(client, entered: asyncio.Event, release: asyncio.Event):
+    real = client.hgetall
+
+    async def held(key):
+        entered.set()
+        await release.wait()
+        return await real(key)
+
+    client.hgetall = held
+    return client
+
+
+def test_a_tick_stopped_mid_claim_puts_the_entry_back(server):
+    async def scenario():
+        r = _client(server)
+        await pq.enqueue(JOB, client=r, now=0.0)
+        entered = asyncio.Event()
+        client = _held_hgetall(_client(server), entered, asyncio.Event())
+        rec = Recorder()
+        w = pq.DocPublishWorker(client, publish=rec, clock=lambda: 10.0)
+        tick = asyncio.create_task(w.tick())
+        await entered.wait()
+        claimed = await r.zscore(pq.DUE_KEY, "a1")
+        tick.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tick
+        return claimed, await r.zscore(pq.DUE_KEY, "a1"), rec.jobs, w.free_slots
+
+    assert asyncio.run(scenario()) == (None, 10.0, [], pq.SLOTS)
+
+
+def test_a_failed_put_back_keeps_the_original_error(server, caplog):
+    class Broken:
+        def __init__(self, client):
+            self._client = client
+
+        def __getattr__(self, name):
+            return getattr(self._client, name)
+
+        async def hgetall(self, key):
+            raise RuntimeError("read failed")
+
+        async def zadd(self, *a, **k):
+            raise ConnectionError("down")
+
+    async def scenario():
+        r = _client(server)
+        await pq.enqueue(JOB, client=r, now=0.0)
+        w = pq.DocPublishWorker(Broken(_client(server)), publish=Recorder(), clock=lambda: 10.0)
+        with pytest.raises(RuntimeError, match="read failed"):
+            await w.tick()
+
+    with caplog.at_level(logging.WARNING, logger=pq.logger.name):
+        asyncio.run(scenario())
+    assert [r.outcome for r in caplog.records if getattr(r, "outcome", None)] == ["requeue_failed"]
+
+
+def test_a_doc_still_publishing_is_not_claimed_again(server):
+    async def scenario():
+        r = _client(server)
+        await pq.enqueue(JOB, client=r, now=0.0)
+        hold = asyncio.Event()
+        rec = Recorder(hold=hold)
+        w = pq.DocPublishWorker(_client(server), publish=rec, clock=lambda: 10.0)
+        await w.tick()
+        await asyncio.sleep(0)
+        await pq.enqueue(JOB, client=r, now=10.0)  # due 14
+        w._clock = lambda: 20.0
+        await w.tick()
+        await asyncio.sleep(0)
+        held = len(rec.jobs), await r.zscore(pq.DUE_KEY, "a1")
+        hold.set()
+        await _settle(w)
+        return held
+
+    assert asyncio.run(scenario()) == (1, 14.0)
+
+
+def test_a_busy_lock_retries_without_spending_an_attempt(server):
+    async def scenario():
+        r = _client(server)
+        await pq.enqueue(JOB, client=r, now=0.0)
+        await r.hset(pq.doc_key("a1"), "attempts", 2)
+        rec = Recorder(*([PublishResult(Outcome.RETRY, "lock_busy")] * pq.MAX_ATTEMPTS))
+        now = {"t": 10.0}
+        w = pq.DocPublishWorker(_client(server), publish=rec, clock=lambda: now["t"])
+        dues = []
+        for _ in range(pq.MAX_ATTEMPTS):
+            await w.tick()
+            await _settle(w)
+            due = await r.zscore(pq.DUE_KEY, "a1")
+            dues.append(None if due is None else round(due - now["t"], 6))
+            now["t"] = (due or now["t"]) + 0.1
+        return dues, len(rec.jobs), await r.hget(pq.doc_key("a1"), "attempts")
+
+    assert asyncio.run(scenario()) == ([pq.DEBOUNCE_S] * pq.MAX_ATTEMPTS, pq.MAX_ATTEMPTS, "2")
+
+
+def test_a_busy_lock_logs_quietly():
+    assert pq._level(PublishResult(Outcome.RETRY, "lock_busy")) == logging.DEBUG
+    assert pq._level(PublishResult(Outcome.RETRY, "no_key")) == logging.WARNING
+
+
+def test_a_paused_worker_claims_nothing_more_and_lets_running_publishes_finish(server):
+    async def scenario():
+        r = _client(server)
+        await pq.enqueue(JOB, client=r, now=0.0)
+        hold = asyncio.Event()
+        rec = Recorder(hold=hold)
+        w = pq.DocPublishWorker(_client(server), publish=rec, tick_s=0.01, clock=lambda: 10.0)
+        w.start()
+        for _ in range(100):
+            if rec.jobs:
+                break
+            await asyncio.sleep(0.01)
+        await pq.pause_doc_publish_worker(w)
+        await pq.enqueue(DocPublishJob("b1", "p1", "/base", "other", "org-1"), client=r, now=0.0)
+        await asyncio.sleep(0.1)
+        left = await r.zscore(pq.DUE_KEY, "b1")
+        hold.set()
+        await _settle(w)
+        finished = len(rec.jobs), w.free_slots, await r.zscore(pq.DUE_KEY, "a1")
+        await w.stop(timeout=1.0)
+        await pq.pause_doc_publish_worker(None)
+        return left, finished
+
+    assert asyncio.run(scenario()) == (4.0, (1, pq.SLOTS, None))
+
+
+def test_a_corrupted_attempts_count_still_publishes_once(server):
+    async def scenario():
+        r = _client(server)
+        await pq.enqueue(JOB, client=r, now=0.0)
+        await r.hset(pq.doc_key("a1"), "attempts", "x")
+        rec = Recorder()
+        w = pq.DocPublishWorker(_client(server), publish=rec, clock=lambda: 10.0)
+        await w.tick()
+        await _settle(w)
+        return len(rec.jobs), await r.zscore(pq.DUE_KEY, "a1")
+
+    assert asyncio.run(scenario()) == (1, None)

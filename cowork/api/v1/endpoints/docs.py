@@ -38,7 +38,7 @@ from cowork.services.artifact_export import ExportRefusal, ExportRefused, export
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.services.render_pdf_client import RenderPdfFailed
 from cowork.docs.history import LIST_LIMIT, LIST_MAX, list_versions, read_version, restore
-from cowork.docs.hub import DOC_PUBLISHED, NUDGE, conv_topic, doc_topic, hub
+from cowork.docs.hub import NUDGE, conv_topic, doc_topic, hub
 from cowork.docs.images import MAX_IMAGE_BYTES, store_image
 from cowork.docs.model import DocError
 from cowork.docs.ops import MAX_OPS
@@ -598,8 +598,9 @@ def _sse(
                                 yield frame
                     else:
                         idle = 0.0
-                        # doc.published carries no doc: the marks stay with the last doc sent.
-                        if initial is not None and event.get("type") != DOC_PUBLISHED:
+                        # Only an event that carries a doc moves the marks (doc.published
+                        # does not): else the poll would miss a write nobody announced.
+                        if initial is not None and event.get("doc") is not None:
                             last_rev = max(last_rev, int(event.get("rev") or 0))
                             last_mtime = await poll_mtime(last_mtime)
                         yield _frame(event.get("type", "message"), event)

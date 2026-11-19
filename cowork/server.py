@@ -706,7 +706,11 @@ async def lifespan(app: FastAPI):
 
     shared_docs.start()
     from cowork.docs.relay import start_doc_relay, stop_doc_relay
-    from cowork.docs.publish_queue import start_doc_publish_worker, stop_doc_publish_worker
+    from cowork.docs.publish_queue import (
+        pause_doc_publish_worker,
+        start_doc_publish_worker,
+        stop_doc_publish_worker,
+    )
 
     clock.begin("draft_listener")
     app.state.doc_relay = None
@@ -758,9 +762,12 @@ async def lifespan(app: FastAPI):
         watchdog.start()
         yield
     finally:
+        # Turns still draining queue their pages for the other replicas; this
+        # replica stops taking new uploads it would have to abandon.
+        await pause_doc_publish_worker(getattr(app.state, "doc_publish_worker", None))
         if watchdog is not None:
             watchdog.stop()
-        # First, so no draft request is still reading files or the database
+        # Early, so no draft request is still reading files or the database
         # while the steps below close them.
         await stop_draft_listener(draft_listener)
         from cowork.channels.webhooks import drain_background_tasks

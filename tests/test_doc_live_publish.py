@@ -353,3 +353,93 @@ def test_an_upload_failing_after_the_timeout_logs_and_publishes_nothing(doc, mon
     assert len(late) == 1 and late[0].levelname == "WARNING"
     assert late[0].error_type == "RuntimeError" and late[0].artifact_slug == doc.folder.name
     assert doc.events == []
+
+
+def test_a_failing_announcement_still_lets_go_of_the_slot_and_lock(doc, monkeypatch):
+    released = []
+    monkeypatch.setattr(lp, "release", lambda base, slug: released.append(slug))
+    monkeypatch.setattr(lp, "publish_artifact", lambda *a, **k: {"url": "u"})
+
+    def broken(topic, event, **kw):
+        raise RuntimeError("hub down")
+
+    monkeypatch.setattr(lp.hub, "publish", broken)
+
+    async def scenario():
+        done = []
+        await lp.publish_doc_page(_job(doc), on_done=lambda: done.append(1))
+        for _ in range(100):
+            if done:
+                break
+            await asyncio.sleep(0.02)
+        await lp.drain_cleanup(timeout=2.0)
+        return done
+
+    assert asyncio.run(scenario()) == [1] and released == [doc.folder.name]
+
+
+def test_an_upload_failing_after_the_caller_was_cancelled_logs_and_publishes_nothing(doc, monkeypatch, caplog):
+    entered = threading.Event()
+    gate = threading.Event()
+
+    def fail_late(*a, **k):
+        entered.set()
+        gate.wait(5)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(lp, "publish_artifact", fail_late)
+
+    async def scenario():
+        caller = asyncio.create_task(lp.publish_doc_page(_job(doc), on_done=lambda: None))
+        for _ in range(250):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.02)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        gate.set()
+        for _ in range(100):
+            if any(getattr(r, "outcome", None) == "late_failure" for r in caplog.records):
+                break
+            await asyncio.sleep(0.02)
+        await lp.drain_cleanup(timeout=2.0)
+
+    with caplog.at_level("WARNING", logger=lp.logger.name):
+        asyncio.run(scenario())
+    late = [r for r in caplog.records if getattr(r, "outcome", None) == "late_failure"]
+    assert len(late) == 1 and late[0].levelname == "WARNING"
+    assert doc.events == []
+
+
+def test_a_busy_file_store_while_taking_the_lock_answers_lock_busy(doc, monkeypatch):
+    from cowork.db.units import FilesystemBusy
+
+    async def efs(fn, *, scope, deadline=True):
+        if getattr(fn, "func", None) is lp.acquire:
+            raise FilesystemBusy(limiter="run_efs")
+        return fn()
+
+    monkeypatch.setattr(lp, "run_efs", efs)
+    monkeypatch.setattr(lp, "LOCK_WAIT_S", 0.2)
+    result, done = asyncio.run(_run(_job(doc)))
+    assert result == lp.PublishResult(lp.Outcome.RETRY, "lock_busy") and done == [1] and FakeKey.minted == []
+
+
+def test_the_project_root_is_checked_before_any_file_is_read(doc, monkeypatch):
+    async def nobody(job, scope):
+        return None
+
+    monkeypatch.setattr(lp, "_owner_of", nobody)
+    monkeypatch.setattr(lp, "_doc_folder", lambda job: pytest.fail("read the doc folder"))
+    result, done = asyncio.run(_run(_job(doc)))
+    assert result == lp.PublishResult(lp.Outcome.SKIPPED, "owner_unknown") and done == [1]
+
+
+def test_a_bad_slug_is_refused_before_the_owner_lookup(doc, monkeypatch):
+    async def no_lookup(job, scope):
+        pytest.fail("looked up the owner")
+
+    monkeypatch.setattr(lp, "_owner_of", no_lookup)
+    result, done = asyncio.run(_run(_job(doc, slug="../other")))
+    assert result == lp.PublishResult(lp.Outcome.SKIPPED, "bad_slug") and done == [1]

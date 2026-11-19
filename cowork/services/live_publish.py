@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
-import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from cowork.db.scoped import TenantScope
-from cowork.db.units import run_db, run_efs, run_efs_cleanup, run_on_unit_threads
+from cowork.db.units import FilesystemBusy, run_db, run_efs, run_efs_cleanup, run_on_unit_threads
 from cowork.docs.hub import DOC_PUBLISHED, doc_topic, hub
 from cowork.docs.store import DOC_HTML, is_doc_folder, load_doc
 from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAudienceRejected
@@ -121,7 +120,8 @@ def _same_id(a: str, b: str) -> bool:
 
 
 def _doc_folder(job: DocPublishJob) -> tuple[Path | None, str | None]:
-    """The doc folder the record names, or (None, why not)."""
+    """The doc folder the record names, or (None, why not). Read only once
+    _owner_of has confirmed the base is the project's root."""
     if not _valid_slug(job.slug):
         return None, "bad_slug"
     folder = Path(job.artifacts_base) / job.slug
@@ -173,8 +173,11 @@ def _early(state: _PageState) -> PublishResult | None:
 async def _take_lock(base: Path, slug: str, scope: TenantScope) -> bool:
     deadline = time.monotonic() + LOCK_WAIT_S
     while True:
-        if await run_efs(partial(acquire, base, slug, ttl_s=LOCK_TTL_S), scope=scope):
-            return True
+        try:
+            if await run_efs(partial(acquire, base, slug, ttl_s=LOCK_TTL_S), scope=scope):
+                return True
+        except FilesystemBusy:
+            pass  # a busy file store is a lock not taken this round
         if time.monotonic() >= deadline:
             return False
         await asyncio.sleep(_LOCK_POLL_S)
@@ -200,21 +203,23 @@ async def _let_go_then(base: Path, slug: str, scope: TenantScope, key: PublishKe
 
 
 def _after_thread(base: Path, slug: str, scope: TenantScope, key: PublishKey, on_done: Callable[[], None],
-                  folder: Path, timed_out: threading.Event):
+                  folder: Path, abandoned: list[bool]):
     def done(future: asyncio.Future) -> None:
         # Runs when the thread ends, so a page that went out after the wait timed
         # out still reaches the editors.
-        if not future.cancelled():
-            error = future.exception()
-            if error is None:
-                hub.publish(doc_topic(folder), {"type": DOC_PUBLISHED, "rev": 0})
-            elif timed_out.is_set():
-                logger.warning("doc_publish", extra={
-                    "event": "doc_publish", "outcome": "late_failure", "artifact_slug": slug,
-                    "error_type": type(error).__name__})
-        task = asyncio.get_running_loop().create_task(_let_go_then(base, slug, scope, key, on_done))
-        _cleanups.add(task)
-        task.add_done_callback(_cleanups.discard)
+        try:
+            if not future.cancelled():
+                error = future.exception()
+                if error is None:
+                    hub.publish(doc_topic(folder), {"type": DOC_PUBLISHED, "rev": 0})
+                elif abandoned[0]:
+                    logger.warning("doc_publish", extra={
+                        "event": "doc_publish", "outcome": "late_failure", "artifact_slug": slug,
+                        "error_type": type(error).__name__})
+        finally:
+            task = asyncio.get_running_loop().create_task(_let_go_then(base, slug, scope, key, on_done))
+            _cleanups.add(task)
+            task.add_done_callback(_cleanups.discard)
 
     return done
 
@@ -232,12 +237,15 @@ async def publish_doc_page(job: DocPublishJob, *, on_done: Callable[[], None]) -
     key: PublishKey | None = None
     handed_off = False
     try:
-        folder, why_not = await run_efs(partial(_doc_folder, job), scope=scope)
-        if folder is None:
-            return PublishResult(Outcome.SKIPPED, why_not)
+        if not _valid_slug(job.slug):
+            return PublishResult(Outcome.SKIPPED, "bad_slug")
+        # The base comes from Redis: no file under it is read before it proves to be the project's root.
         owner = await _owner_of(job, scope)
         if owner is None:
             return PublishResult(Outcome.SKIPPED, "owner_unknown")
+        folder, why_not = await run_efs(partial(_doc_folder, job), scope=scope)
+        if folder is None:
+            return PublishResult(Outcome.SKIPPED, why_not)
         scope = TenantScope(org_mode=True, org_id=job.org_id, user_id=owner)
         state = await run_efs(partial(_page_state, folder), scope=scope)
         if (early := _early(state)) is not None:
@@ -266,14 +274,15 @@ async def publish_doc_page(job: DocPublishJob, *, on_done: Callable[[], None]) -
         context = contextvars.copy_context()
         future = asyncio.get_running_loop().run_in_executor(None, context.run, upload)
         handed_off = True
-        timed_out = threading.Event()
-        future.add_done_callback(_after_thread(base, job.slug, scope, key, on_done, folder, timed_out))
-        # shield: a timeout must not cancel the future, or its callback would
-        # fire while the upload thread still runs.
+        # Set once nobody awaits the upload any more; read and written on the loop thread only.
+        abandoned = [False]
+        future.add_done_callback(_after_thread(base, job.slug, scope, key, on_done, folder, abandoned))
+        # shield: a timeout or a cancel must not cancel the future, or its
+        # callback would fire while the upload thread still runs.
         try:
             await asyncio.wait_for(asyncio.shield(future), timeout=PUBLISH_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            timed_out.set()
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            abandoned[0] = True
             raise
         return PublishResult(Outcome.PUBLISHED)
     finally:

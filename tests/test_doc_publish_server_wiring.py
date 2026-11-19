@@ -26,3 +26,11 @@ def test_the_worker_stop_fits_in_the_scratchpad_closes_wait():
 
     timeout = inspect.signature(drain_scratchpad_closes).parameters["timeout"].default
     assert STOP_BUDGET_S <= timeout
+
+
+def test_the_worker_stops_claiming_before_the_teardown_starts():
+    source = inspect.getsource(server.lifespan)
+    teardown = source.index("finally:", source.index("start_doc_publish_worker()"))
+    pause = source.index("pause_doc_publish_worker(", teardown)
+    assert pause < source.index("stop_draft_listener(", teardown)
+    assert pause < source.index("stop_doc_publish_worker(", teardown)

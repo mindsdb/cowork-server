@@ -55,9 +55,18 @@ def doc_key(artifact_id: str) -> str:
     return _DOC_PREFIX + artifact_id
 
 
+def _attempts(value: str | None) -> int:
+    # A corrupted count must not stop the publish, or the claim would re-queue every tick.
+    try:
+        return int(value or 0)
+    except ValueError:
+        return 0
+
+
 def _level(result: PublishResult) -> int:
     quiet = result.outcome is Outcome.UNCHANGED or (
-        result.outcome is Outcome.SKIPPED and result.reason == "unpublished")
+        result.outcome is Outcome.SKIPPED and result.reason == "unpublished") or (
+        result.outcome is Outcome.RETRY and result.reason == "lock_busy")
     return logging.DEBUG if quiet else logging.WARNING
 
 
@@ -129,6 +138,8 @@ class DocPublishWorker:
         self._clock = clock
         self._loop_task: asyncio.Task | None = None
         self._tasks: set[asyncio.Task] = set()
+        # artifact_ids whose _run is still going: a member due again meanwhile waits in the set.
+        self._publishing: set[str] = set()
 
     @property
     def free_slots(self) -> int:
@@ -151,28 +162,51 @@ class DocPublishWorker:
         if self._free <= 0:
             return
         r = self._client
-        members = await r.zrangebyscore(DUE_KEY, "-inf", self._clock(), start=0, num=self._free)
+        # Enough to fill the free slots even when every doc still publishing is among them.
+        members = await r.zrangebyscore(DUE_KEY, "-inf", self._clock(), start=0,
+                                        num=self._free + len(self._publishing))
         for artifact_id in members:
             if self._free <= 0:
                 return
+            if artifact_id in self._publishing:
+                continue
             if not await r.zrem(DUE_KEY, artifact_id):
                 continue  # another replica took it
-            key = doc_key(artifact_id)
-            fields = await r.hgetall(key)
-            if not all(fields.get(name) for name in _FIELDS):
-                # Expired, or recreated by a retry's HSET after it expired.
-                await r.delete(key)
-                logger.debug("doc_publish", extra={"event": "doc_publish", "outcome": "skipped", "reason": "no_fields"})
-                continue
-            # A write from here on starts a new burst.
-            await r.hdel(key, "first")
-            job = DocPublishJob(artifact_id=artifact_id, project_id=fields["project_id"],
-                                artifacts_base=fields["artifacts_base"], slug=fields["slug"],
-                                org_id=fields["org_id"])
-            self._free -= 1
-            task = asyncio.get_running_loop().create_task(self._run(job, int(fields.get("attempts") or 0)))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            try:
+                await self._claim(artifact_id)
+            except BaseException:
+                # Claimed but not started (a stop, a Redis error): nobody else would publish it.
+                await self._requeue(artifact_id)
+                raise
+
+    async def _claim(self, artifact_id: str) -> None:
+        r = self._client
+        key = doc_key(artifact_id)
+        fields = await r.hgetall(key)
+        if not all(fields.get(name) for name in _FIELDS):
+            # Expired, or recreated by a retry's HSET after it expired.
+            await r.delete(key)
+            logger.debug("doc_publish", extra={"event": "doc_publish", "outcome": "skipped", "reason": "no_fields"})
+            return
+        # A write from here on starts a new burst.
+        await r.hdel(key, "first")
+        job = DocPublishJob(artifact_id=artifact_id, project_id=fields["project_id"],
+                            artifacts_base=fields["artifacts_base"], slug=fields["slug"],
+                            org_id=fields["org_id"])
+        attempts = _attempts(fields.get("attempts"))
+        task = asyncio.get_running_loop().create_task(self._run(job, attempts))
+        self._free -= 1
+        self._publishing.add(artifact_id)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(lambda _task: self._publishing.discard(artifact_id))
+
+    async def _requeue(self, artifact_id: str) -> None:
+        try:
+            await self._client.zadd(DUE_KEY, {artifact_id: self._clock()}, nx=True)
+        except Exception:  # noqa: BLE001 - the caller re-raises its own error
+            logger.warning("doc_publish", exc_info=True, extra={
+                "event": "doc_publish", "outcome": "requeue_failed"})
 
     async def _run(self, job: DocPublishJob, attempts: int) -> None:
         freed = False
@@ -195,7 +229,10 @@ class DocPublishWorker:
             error_type = type(exc).__name__
         key = doc_key(job.artifact_id)
         try:
-            if result.outcome is Outcome.RETRY:
+            if result.outcome is Outcome.RETRY and result.reason == "lock_busy":
+                # Another publish of this page is still running: not an attempt of ours.
+                await self._client.zadd(DUE_KEY, {job.artifact_id: self._clock() + DEBOUNCE_S}, nx=True)
+            elif result.outcome is Outcome.RETRY:
                 attempts += 1
                 if attempts >= MAX_ATTEMPTS:
                     await self._client.hdel(key, "attempts")
@@ -215,10 +252,15 @@ class DocPublishWorker:
             logger.warning("doc_publish", exc_info=True, extra={
                 "event": "doc_publish", "outcome": "record_failed", "artifact_slug": job.slug})
 
+    async def pause(self) -> None:
+        """Stop claiming; publishes already running go on."""
+        task, self._loop_task = self._loop_task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def stop(self, *, timeout: float) -> None:
-        if self._loop_task is not None:
-            self._loop_task.cancel()
-            await asyncio.gather(self._loop_task, return_exceptions=True)
+        await self.pause()
         tasks = list(self._tasks)
         for task in tasks:
             task.cancel()
@@ -240,6 +282,12 @@ def start_doc_publish_worker() -> DocPublishWorker | None:
     worker = DocPublishWorker(get_redis())
     worker.start()
     return worker
+
+
+async def pause_doc_publish_worker(worker: DocPublishWorker | None) -> None:
+    """Stop claiming at the start of shutdown; what is already publishing goes on."""
+    if worker is not None:
+        await worker.pause()
 
 
 async def stop_doc_publish_worker(worker: DocPublishWorker | None, *, budget_s: float = STOP_BUDGET_S) -> None:

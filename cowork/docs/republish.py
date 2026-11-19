@@ -15,10 +15,8 @@ from pathlib import Path
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import TenantScope
-from cowork.docs.publish_queue import schedule_enqueue
 from cowork.services.artifacts import load_published_map
 from cowork.services.publish import compute_publish_md5, desktop_publish_credential, update_artifact
-from cowork.services.live_publish import DocPublishJob
 from cowork.services.published_page_ownership import publication_owner
 
 from .debounce import Debouncer
@@ -71,6 +69,10 @@ def _schedule_org(folder: Path, *, scope: TenantScope | None, project_id: str | 
             "event": "doc_publish", "outcome": "not_queued", "reason": "no_scope_project_or_id",
             "artifact_slug": folder.name, "project_id": project_id})
         return False
+    # Org only: a desktop never loads the queue, its Redis client or the autopublish.
+    from cowork.docs.publish_queue import schedule_enqueue
+    from cowork.services.live_publish import DocPublishJob
+
     return schedule_enqueue(DocPublishJob(
         artifact_id=str(artifact_id), project_id=str(project_id), artifacts_base=str(folder.parent),
         slug=folder.name, org_id=str(scope.org_id),

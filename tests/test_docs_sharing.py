@@ -176,7 +176,7 @@ def _deployment(monkeypatch, *, mode="org", trust_headers=False):
     monkeypatch.setattr(republish, "get_app_settings",
                         lambda: SimpleNamespace(tenancy_mode=mode, trust_identity_headers=trust_headers))
     queued = []
-    monkeypatch.setattr(republish, "schedule_enqueue", lambda job: queued.append(job) or True)
+    monkeypatch.setattr("cowork.docs.publish_queue.schedule_enqueue", lambda job: queued.append(job) or True)
     return queued
 
 
@@ -204,3 +204,16 @@ def test_a_local_deployment_that_trusts_identity_headers_keeps_the_desktop_repub
     personal = TenantScope(personal=True, org_id="me", user_id="me")
     assert republish.schedule(folder, scope=personal, project_id="p1", artifact_id="a1")
     assert debounced == [str(folder / "doc.html")] and queued == []
+
+
+def test_importing_the_republish_module_leaves_the_org_queue_unloaded():
+    import subprocess
+    import sys
+
+    org_only = ("cowork.docs.publish_queue", "cowork.turnqueue.redis_client",
+                "cowork.services.live_publish", "cowork.services.artifact_autopublish")
+    code = ("import sys, cowork.docs.republish; "
+            f"print(sorted(m for m in {org_only!r} if m in sys.modules))")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
+                         cwd=Path(__file__).resolve().parents[1], timeout=120)
+    assert out.stdout.strip() == "[]"
