@@ -2221,21 +2221,20 @@ class ResponsesHandler:
 
             if first_take is not None:
                 first_take.cancel()
-            from cowork.services.content_safety import ContentSafetySettings, check_content
+            from cowork.services.content_safety import ContentSafetySettings, MAX_CONTENT_CHARS, check_content
+            first_text = answer.first_text
+            remaining_text = answer.rest()
             if ContentSafetySettings().required:
-                held = [answer.first_text]
-                async for chunk in answer.rest():
-                    held.append(chunk)
-                    if sum(map(len, held)) > 100_000:
+                held = [first_text]
+                size = len(first_text)
+                async for chunk in remaining_text:
+                    size += len(chunk)
+                    if size > MAX_CONTENT_CHARS:
                         raise HTTPException(413, "This content is too large for a safety check.")
-                checked_text = "".join(held)
-                await check_content(checked_text, purpose="output", scope=scope)
-                async def checked_rest():
-                    if False:
-                        yield ""
-                from types import SimpleNamespace
-                answer = SimpleNamespace(first_text=checked_text, rest=checked_rest)
-            parts.append(answer.first_text)
+                    held.append(chunk)
+                first_text = "".join(held)
+                await check_content(first_text, purpose="output", scope=scope)
+            parts.append(first_text)
             response = Response(status=ResponseStatus.created, model=binding.model)
             await buffer.append("sse", {"sse": sse_frame("response.created", {
                 "type": "response.created",
@@ -2246,8 +2245,8 @@ class ResponsesHandler:
                 "user_message_id": str(question_id),
                 "response": response.model_dump(),
             })})
-            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(answer.first_text))})
-            async for text in answer.rest():
+            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(first_text))})
+            async for text in remaining_text:
                 parts.append(text)
                 await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(text))})
 

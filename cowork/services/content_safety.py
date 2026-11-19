@@ -12,16 +12,17 @@ from typing import Literal
 from urllib.parse import urlsplit
 import httpx
 from fastapi import HTTPException
-from pydantic import Field, SecretStr
+from pydantic import SecretStr
+from pydantic_settings import SettingsConfigDict
 from cowork.common.settings.app_settings import Settings, MINDS_FREE_MODEL
 from cowork.db.scoped import TenantScope
 
 class ContentSafetySettings(Settings):
-    model_config = {**Settings.model_config, "populate_by_name": True}
-    required: bool = Field(default=False, validation_alias="COWORK_CONTENT_SAFETY_REQUIRED")
-    model: str = Field(default=MINDS_FREE_MODEL, validation_alias="COWORK_CONTENT_SAFETY_MODEL")
-    endpoint: str = Field(default="", validation_alias="COWORK_CONTENT_SAFETY_ENDPOINT")
-    api_key: SecretStr | None = Field(default=None, validation_alias="COWORK_CONTENT_SAFETY_API_KEY")
+    model_config = SettingsConfigDict(env_prefix="COWORK_CONTENT_SAFETY_")
+    required: bool = False
+    model: str = MINDS_FREE_MODEL
+    endpoint: str = ""
+    api_key: SecretStr | None = None
 
 MAX_CONTENT_CHARS = 100_000
 MAX_FILE_BYTES = 100_000

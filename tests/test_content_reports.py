@@ -1,5 +1,6 @@
-from uuid import uuid4
-from datetime import datetime, timezone
+import json
+from uuid import UUID, uuid4
+from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -52,6 +53,65 @@ def test_durable_report_and_retry_return_same_receipt(setup):
     assert 'evidence' not in first.json()
     assert client.get('/reports/').status_code == 405
 
+def test_event_only_report_keeps_visible_card_after_message_deletion(setup):
+    from cowork.models.message_event import MessageEvent
+
+    client, _, engine, body = setup
+    with Session(engine) as db:
+        message = db.get(Message, UUID(body["message_id"]))
+        message.content = ""
+        for sequence, data in enumerate([
+            {"type": "response.turn_history", "rows": ["private history"]},
+            {"type": "response.quick_edit_group", "edits": [
+                {"summary": "Updated heading", "request": "private original request"},
+            ]},
+            {"type": "response.artifact_created", "artifact": {
+                "id": "abc", "title": "Quarterly results", "type": "document",
+                "accessPassword": "secret", "path": "/private/path",
+            }},
+        ]):
+            db.add(MessageEvent(message_id=message.id, sequence_number=sequence, event_data=data))
+        db.commit()
+    receipt = client.post("/reports/", json=body)
+    assert receipt.status_code == 201, receipt.text
+    with Session(engine) as db:
+        message = db.get(Message, UUID(body["message_id"]))
+        for event in message.message_events:
+            db.delete(event)
+        db.delete(message)
+        db.commit()
+        evidence = json.loads(db.get(ContentReport, UUID(receipt.json()["id"])).evidence)
+        assert evidence == {"cards": [{"event": "response.quick_edit_group", "summary": "Updated heading"}, {
+            "event": "response.artifact_created", "id": "abc", "title": "Quarterly results", "type": "document",
+        }]}
+
+
+def test_event_report_caps_large_unicode_cards_as_valid_json(setup):
+    from cowork.models.message_event import MessageEvent
+
+    client, _, engine, body = setup
+    with Session(engine) as db:
+        message = db.get(Message, UUID(body["message_id"]))
+        message.content = ""
+        text = "🌱" * 2048
+        for sequence in range(20):
+            db.add(MessageEvent(
+                message_id=message.id, sequence_number=sequence, event_data={
+                    "type": "response.artifact_created",
+                    "artifact": dict.fromkeys(("id", "slug", "projectId", "title", "description", "type"), text),
+                },
+            ))
+        db.commit()
+    receipt = client.post("/reports/", json=body)
+    assert receipt.status_code == 201
+    with Session(engine) as db:
+        evidence = db.get(ContentReport, UUID(receipt.json()["id"])).evidence
+        assert len(evidence) <= 65536
+        cards = json.loads(evidence)["cards"]
+        assert 0 < len(cards) < 20
+        assert cards[0]["title"] == text[:512]
+
+
 @pytest.mark.parametrize('other_org', [False, True])
 def test_cannot_report_another_persons_task(setup, other_org):
     client, caller, _, body = setup
@@ -75,23 +135,39 @@ def test_anonymous_cannot_report(setup):
 def test_daily_report_limit(setup):
     client, caller, engine, body = setup
     with Session(engine) as db:
-        for _ in range(100):
+        now = datetime.now(timezone.utc)
+        # The extra report models two requests admitted concurrently. Capacity
+        # returns when the 100th newest report expires, after about two hours.
+        times = [now - timedelta(hours=23), now - timedelta(hours=22)] + [now] * 99
+        for created_at in times:
             db.add(ContentReport(org_id=caller[0].org_id, user_id=caller[0].user_id,
-                target_key=str(uuid4()), conversation_id=uuid4(), message_id=uuid4(), evidence='test', created_at=datetime.now(timezone.utc)))
+                target_key=str(uuid4()), conversation_id=uuid4(), message_id=uuid4(), evidence='test', created_at=created_at))
         db.commit()
-    assert client.post('/reports/', json=body).status_code == 429
+    result = client.post('/reports/', json=body)
+    assert result.status_code == 429
+    assert 7195 <= int(result.headers['Retry-After']) <= 7200
 
 @pytest.mark.parametrize('allowed', [False, True])
-def test_artifact_report_uses_viewers_access_check(setup, monkeypatch, allowed):
+def test_artifact_report_uses_viewers_access_check(setup, monkeypatch, tmp_path, allowed):
     from unittest.mock import AsyncMock
     from fastapi import HTTPException
-    from cowork.api.v1 import artifact_scope
+    from cowork.api.v1.artifact_scope import ResolvedArtifact
+    from cowork.services.artifact_metadata import ArtifactMetadata
     client, caller, engine, _ = setup
     project_id, artifact_id = uuid4(), uuid4()
-    resolver = AsyncMock(return_value=(None, None, {'title': 'Reported artifact'}, False))
+    source = tmp_path / "index.html"
+    source.write_text("First version")
+    extra = tmp_path / "style.css"
+    extra.write_text("p {color: red}")
+    found = ResolvedArtifact(None, tmp_path, ArtifactMetadata.model_validate({
+        "title": "Reported artifact", "primary": "index.html",
+    }), False)
+    async def read_authorized(scope, project_id, artifact_id, *, read):
+        return found, read(found)
+    resolver = AsyncMock(side_effect=read_authorized)
     if not allowed:
         resolver.side_effect = HTTPException(404, 'Artifact not found')
-    monkeypatch.setattr(artifact_scope, 'review_artifact_for_request', resolver)
+    monkeypatch.setattr(endpoint, 'review_artifact_and_read', resolver)
     body = {'project_id': str(project_id), 'artifact_id': str(artifact_id)}
     response = client.post('/reports/artifact', json=body)
     assert response.status_code == (201 if allowed else 404), response.text
@@ -105,6 +181,27 @@ def test_artifact_report_uses_viewers_access_check(setup, monkeypatch, allowed):
             assert rows[0].message_id is None
     if allowed:
         assert client.post('/reports/artifact',json=body).json() == response.json()
+        with Session(engine) as db:
+            original = db.get(ContentReport, UUID(response.json()["id"]))
+            original.status = "resolved"
+            generation = json.loads(original.evidence)["generation"]
+            assert generation
+            db.commit()
+        assert client.post('/reports/artifact',json=body).json() == response.json()
+        source.write_text("Second version")
+        changed = client.post('/reports/artifact', json=body)
+        assert changed.status_code == 201
+        assert changed.json()["id"] != response.json()["id"]
+        with Session(engine) as db:
+            updated = db.get(ContentReport, UUID(changed.json()["id"]))
+            assert updated.status == "pending"
+            assert json.loads(updated.evidence)["generation"] != generation
+        extra.write_text("p {color: black}")
+        supporting_asset_changed = client.post('/reports/artifact', json=body)
+        assert supporting_asset_changed.status_code == 201
+        assert supporting_asset_changed.json() != changed.json()
+        assert client.post('/reports/artifact', json=body).json() == supporting_asset_changed.json()
+        assert set(tmp_path.iterdir()) == {source, extra}
 
 
 def test_report_migration_preserves_other_tables_and_round_trips():

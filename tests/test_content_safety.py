@@ -12,6 +12,31 @@ def config(**kwargs):
 def transport(body, status=200):
     return httpx.MockTransport(lambda request: httpx.Response(status, json=body))
 
+def test_moderation_settings_read_only_their_own_environment(monkeypatch):
+    prefix = "COWORK_CONTENT_SAFETY_"
+    for name, value in {
+        "REQUIRED": "true", "ENDPOINT": "https://other.example", "MODEL": "other", "API_KEY": "unrelated-key",
+    }.items():
+        monkeypatch.delenv(prefix + name, raising=False)
+        monkeypatch.setenv(name, value)
+
+    defaults = safety.ContentSafetySettings(_env_file=None)
+    assert defaults.required is False
+    assert defaults.endpoint == ""
+    assert defaults.model == safety.MINDS_FREE_MODEL
+    assert defaults.api_key is None
+
+    monkeypatch.setenv(prefix + "REQUIRED", "true")
+    monkeypatch.setenv(prefix + "ENDPOINT", "https://moderation.example")
+    monkeypatch.setenv(prefix + "MODEL", "classifier")
+    monkeypatch.setenv(prefix + "API_KEY", "moderation-key")
+    settings = safety.ContentSafetySettings(_env_file=None)
+    assert settings.required is True
+    assert settings.endpoint == "https://moderation.example"
+    assert settings.model == "classifier"
+    assert settings.api_key.get_secret_value() == "moderation-key"
+
+
 @pytest.mark.parametrize('body,status,expected', [
     ({'decision':'block'},200,422), ({'decision':'unknown'},200,503),
     ({},200,503), ([],200,503), ({'decision':'allow'},500,503),
