@@ -3394,6 +3394,9 @@ class ResponsesHandler:
                     creator=artifacts.creator,
                     files=seed.files,
                 )
+            # A pod left without its doc tools gets what a turn without docs gets:
+            # the typed text, without the doc blocks that tell it to call them.
+            pod_input = question if remote_docs and doc_tools is None and question else input_text
             # Set only on turn_completed: any other exit (Stop, cancel, failure)
             # may have cut anton off between writing an artifact's metadata and
             # appending its provenance, see `turn_created_slugs`.
@@ -3416,7 +3419,7 @@ class ResponsesHandler:
                 conversation_id=str(conv_id),
                 org_id=self.scope.org_id,
                 user_id=self.scope.user_id,
-                input_text=input_text,
+                input_text=pod_input,
                 model=model,
                 reasoning_effort=reasoning_effort,
                 turn_id=turn_id,

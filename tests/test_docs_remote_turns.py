@@ -118,3 +118,13 @@ async def test_the_pod_is_offered_the_doc_tools_exactly_when_its_input_carries_t
         assert [spec["name"] for spec in sent.get("host_tools") or []] == list(DOC_TOOL_NAMES)
     else:
         assert sent.get("host_tools") is None
+
+
+async def test_a_pod_left_without_the_doc_tools_gets_the_typed_text_alone(monkeypatch):
+    """No artifacts folder to run the doc tools on: the doc blocks would tell the
+    pod to call tools it is not offered, so they are dropped as for any turn without docs."""
+    monkeypatch.setattr(responses_mod.ResponsesHandler, "_remote_artifacts_context",
+                        staticmethod(lambda session, conv_id: None))
+    sent = await _remote_turn(monkeypatch, flag=True, may_manage=True, doc_context=DOC_CONTEXT, output="doc")
+    assert sent["input_text"] == "Tighten the intro"
+    assert sent.get("host_tools") is None

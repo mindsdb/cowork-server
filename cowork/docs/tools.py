@@ -377,7 +377,13 @@ async def _edit(ctx: DocToolContext, tc_input: dict, emit_step: EmitStep, *, art
     try:
         doc, result, text = await ctx.run_in_thread(edit)
     except DocError as err:
-        return _refusal(err, await ctx.run_in_thread(partial(load_doc, folder)) if err.code == "stale" else None)
+        current = None
+        if err.code == "stale":
+            try:
+                current = await ctx.run_in_thread(partial(load_doc, folder))
+            except Exception:  # noqa: BLE001 - nothing was written; the refusal stands without the block's text
+                logger.debug("could not reread %s for a stale refusal", folder, exc_info=True)
+        return _refusal(err, current)
     after_write(folder, doc, result, by="agent", scope=current_settings_scope() or LOCAL_SCOPE,
                 conversation_id=ctx.conversation_id)
     return DocToolResult(text, touched_slug=folder.name)

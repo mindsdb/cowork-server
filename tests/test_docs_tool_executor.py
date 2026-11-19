@@ -116,3 +116,24 @@ def test_the_remote_specs_are_the_doc_tools_with_the_retry_rule_only_in_their_pr
     }
     assert "did not answer" in REMOTE_RETRY_RULE and "did not answer" not in DOC_PROMPT
     assert {t.name: t.prompt for t in build_doc_tools(ctx)}["create_doc"] == DOC_PROMPT
+
+
+async def test_a_stale_edit_is_refused_even_when_the_doc_cannot_be_read_again(ctx, monkeypatch):
+    await _run(ctx, "create_doc", title="Board memo", markdown="Intro text here.")
+    real_load = doc_tools.load_doc
+    calls = []
+
+    def load(folder):
+        calls.append(folder)
+        if len(calls) > 1:  # the reread for the refusal: the doc went away meanwhile
+            raise DocError("not_found", "gone")
+        return real_load(folder)
+
+    def stale(*_args, **_kwargs):
+        raise DocError("stale", "the doc changed", ids=[])
+
+    monkeypatch.setattr(doc_tools, "load_doc", load)
+    monkeypatch.setattr(doc_tools, "apply", stale)
+    _steps, result = await _run(ctx, "edit_doc", doc="Board memo", ops=[
+        {"op": "replace", "target": {"find": "Intro"}, "markdown": "New intro."}])
+    assert not result.ok and result.text.startswith("Refused (stale): the doc changed")
