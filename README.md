@@ -581,13 +581,17 @@ Two properties follow. **Nothing survives a restart**, so the desktop app re-pus
 The session token bills whatever organization Keycloak has active, which a
 switch in the browser changes. So when the hand-over carries `organization_id`
 (the organization the desktop started this process on), the hand-over mints a
-30-minute turn key for that organization and the desktop's workspace pick from
-auth's `POST /v1/turn-keys/` (`cowork/services/inference_key.py`). Every LLM call
-and model listing uses it; publishing and comments keep the session token. It is
-re-minted on a hand-over once it has under 20 minutes left, and at once when the
-organization or the workspace pick changes. Old keys are left to expire because
-the scratchpad may still hold one. With no live key, LLM calls fail rather than
-fall back to the session token, and the mint is retried every minute.
+60-minute turn key for that organization and the desktop's workspace pick from
+auth's `POST /v1/turn-keys/` (`cowork/services/inference_key.py`). Every LLM call,
+Jev decision and model listing uses it; publishing and comments keep the session
+token. A hand-over with no organization keeps the pin; sign-out or a hand-entered
+`mdb_` key clears it. It is re-minted on a hand-over once it has under 45 minutes
+left, and at once when the organization or the workspace pick changes. Old keys
+are left to expire because the scratchpad may still hold one; sign-out revokes
+every live key the process installed, and a mint that lands after the 6s budget
+is revoked as soon as it answers. With no live key, LLM calls fail rather than
+fall back to the session token. A failed mint is retried after a minute, backing
+off to ten; a refusal (400, 403 or 409) waits for the next hand-over.
 
 `build_llm_client` capability-gates the kwarg on `inspect.signature`, so an
 older Anton keeps the static key and logs the degradation rather than failing

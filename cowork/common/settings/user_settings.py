@@ -119,9 +119,9 @@ def provider_api_key_str(settings: "UserSettings", provider: "Provider") -> str:
 
 
 def inference_api_key_str(settings: "UserSettings", provider: "Provider") -> str:
-    """The key an LLM call sends: on a desktop, the turn key pinned to its organization.
+    """The key an LLM call or model listing sends: on a desktop, the turn key pinned to its organization.
 
-    Publishing, comments and model listing keep ``provider_api_key_str`` (the session token).
+    Publishing and comments keep ``provider_api_key_str`` (the session token).
     """
     from cowork.common.settings import runtime_credential
 

@@ -25,7 +25,7 @@ from cowork.common.settings.runtime_credential import (
     set_browser_host,
     set_minds_credential,
 )
-from cowork.services.inference_key import refresh_inference_key, revoke_inference_key
+from cowork.services.inference_key import refresh_inference_key, revoke_all_inference_keys
 from cowork.schemas.base import CamelResponse
 
 # Both guards sit on the router rather than on the route, so a second route
@@ -48,23 +48,26 @@ class MindsCredentialBody(BaseModel):
     # The organization the desktop has mounted. When sent, LLM calls bill a
     # turn key pinned to it rather than the session token.
     organization_id: str | None = None
+    # Sign-out only: a live token to revoke turn keys with, since the held one may have expired.
+    revoke_token: str | None = None
 
 
 @router.put("/minds")
 def put_minds_credential(body: MindsCredentialBody) -> dict[str, bool]:
     if not body.value:
-        key, token = (
-            runtime_credential.get_inference_key(),
-            runtime_credential.get_minds_credential(),
-        )
+        token = body.revoke_token or runtime_credential.get_minds_credential()
         clear_minds_credential()
-        if key and token:
-            revoke_inference_key(token, key)
+        if token:
+            # Earlier keys may still sit in a scratchpad, so revoke them all, not just the held one.
+            revoke_all_inference_keys(token)
         return {"ok": True}
 
     set_minds_credential(body.value)
     # A hand-entered mdb_ key already names its organization, and auth won't mint with one.
-    organization_id = None if body.value.startswith("mdb_") else body.organization_id
+    # A token with no organization keeps the pin; only sign-out or an mdb_ key clears it.
+    organization_id = (
+        None if body.value.startswith("mdb_") else body.organization_id or runtime_credential.get_organization()
+    )
     runtime_credential.set_organization(organization_id)
     if organization_id:
         refresh_inference_key(body.value, organization_id)

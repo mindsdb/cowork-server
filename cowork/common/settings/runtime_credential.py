@@ -124,6 +124,13 @@ def get_inference_credential() -> str | None:
     return None
 
 
+def missing_minds_key_message() -> str:
+    """Why a MindsHub call has no key: signed out, or a pinned desktop whose turn key couldn't be minted."""
+    if get_organization() and get_minds_credential():
+        return "The MindsHub credential for this organization is not available. Reconnect and try again."
+    return "MindsHub is not connected. Sign in or configure a MindsHub API key first."
+
+
 def get_minds_credential() -> str | None:
     """The held credential, or ``None`` when nothing has been handed over."""
     if _org_mode():
