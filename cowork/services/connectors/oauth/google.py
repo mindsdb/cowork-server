@@ -247,29 +247,13 @@ def _fetch_userinfo_supabase(access_token: str) -> dict[str, Any]:
     return {"email": f"org:{slug}" if slug else "", "name": name}
 
 
-def _slack_api(method: str, access_token: str, params: dict[str, str] | None = None) -> dict[str, Any]:
+def _slack_api(method: str, access_token: str) -> dict[str, Any]:
     """A Slack Web API call. Slack reports failures as HTTP 200 with
     `{"ok": false, "error": ...}`, so a body without `ok: true` is an error."""
-    url = f"https://slack.com/api/{method}"
-    if params:
-        url += "?" + urlencode(params)
-    result = _json_request(url, headers={"Authorization": f"Bearer {access_token}"})
+    result = _json_request(f"https://slack.com/api/{method}", headers={"Authorization": f"Bearer {access_token}"})
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=f"Slack {method} failed: {result.get('error') or 'unknown error'}")
     return result
-
-
-def _fetch_userinfo_slack(access_token: str) -> dict[str, Any]:
-    """Identity is `<email>:<team_id>`, so each workspace gets its own
-    connection; the name is the workspace. The user id stands in for an
-    email the profile doesn't carry."""
-    who = _slack_api("auth.test", access_token)
-    user_id = str(who.get("user_id") or "").strip()
-    team_id = str(who.get("team_id") or "").strip()
-    team_name = str(who.get("team") or "").strip()
-    profile = (_slack_api("users.info", access_token, {"user": user_id}).get("user") or {}).get("profile") or {}
-    person = str(profile.get("email") or "").strip() or user_id
-    return {"email": f"{person}:{team_id}" if team_id else person, "name": team_name or person}
 
 
 # engine → identity-fetch function. The one piece of connector onboarding
@@ -286,7 +270,6 @@ _USERINFO_FETCHERS: dict[str, Callable[[str], dict[str, Any]]] = {
     "github": _fetch_userinfo_github,
     "supabase": _fetch_userinfo_supabase,
     "posthog": _fetch_userinfo_posthog,
-    "slack": _fetch_userinfo_slack,
 }
 
 
@@ -686,9 +669,9 @@ class OAuthService:
             # whose token may be shared with other integrations.
             _log.debug("Not revoking %s/%s remotely: not an MCP sign-in", engine, name)
             return
-        token = fields.get("refresh_token", "").strip() or fields.get("access_token", "").strip()
-        if engine == "slack":
-            token = fields.get("access_token", "").strip()
+        refresh, access = fields.get("refresh_token", "").strip(), fields.get("access_token", "").strip()
+        # Slack's auth.revoke authenticates with the access token itself.
+        token = access if engine == "slack" else (refresh or access)
         if not token:
             return
         if engine == "supabase" and not fields.get("refresh_token", "").strip():

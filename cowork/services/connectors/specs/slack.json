@@ -32,7 +32,7 @@
       {
         "id": "mcp",
         "label": "In-Browser Connect",
-        "description": "Opens Slack sign-in in your browser through Slack MCP, the same mechanism Claude's own Slack connector uses. No credentials required, just click Connect. Anton acts as you and can reach whatever you can reach in the workspace you pick. Anton can read; posting and editing stay off until you allow them in Tool access.",
+        "description": "Opens Slack sign-in in your browser through Slack MCP, the same mechanism Claude's own Slack connector uses. No credentials required, just click Connect. Anton acts as you and can reach whatever you can reach in the workspace you pick. Anton can read; it posts or edits only when you allow it in Tool access. Code Projects posts an update only after you confirm it.",
         "recommended": true,
         "hidden": false,
         "fields": [],

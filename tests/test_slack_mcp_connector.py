@@ -95,20 +95,22 @@ class TestSpec:
 
 class TestSwitchedOff:
     """SLACK_CONNECTOR_ENABLED off, as in prod for now: the spec served to
-    clients looks as it did before the `mcp` method, and new sign-ins are refused."""
+    clients shows the same methods as before the `mcp` method, and new
+    In-Browser Connect sign-ins are refused."""
 
     def test_the_mcp_method_is_hidden_and_the_bot_token_is_the_default(self, slack_off):
         methods = _methods()
         assert methods["mcp"].hidden is True
         assert methods["mcp"].recommended is False
         assert methods["bot-token"].recommended is True
-        assert methods["oauth"].hidden is True
+        assert methods["oauth"].hidden is False
 
     def test_switching_on_shows_the_mcp_method(self, slack_on):
         methods = _methods()
         assert methods["mcp"].hidden is False
         assert methods["mcp"].recommended is True
         assert methods["bot-token"].recommended is False
+        assert methods["oauth"].hidden is True
 
     @staticmethod
     def _client() -> TestClient:
@@ -177,52 +179,7 @@ def test_credentials_need_both_id_and_secret(monkeypatch):
     assert get_oauth_credentials("slack") == {"client_id": "123.456", "client_secret": "s3cret"}
 
 
-def _slack_responses(monkeypatch, responses: dict[str, dict], calls: list | None = None):
-    def fake_json_request(url, *, headers=None, **_kwargs):
-        if calls is not None:
-            calls.append((url, headers))
-        method = url.split("https://slack.com/api/", 1)[1].split("?", 1)[0]
-        return responses[method]
-
-    monkeypatch.setattr(google_module, "_json_request", fake_json_request)
-
-
-AUTH_TEST = {"ok": True, "user_id": "U1", "team_id": "T1", "team": "Acme"}
-
-
 class TestIdentity:
-    def test_identity_is_email_and_team_named_after_the_workspace(self, monkeypatch):
-        calls = []
-        _slack_responses(monkeypatch, {
-            "auth.test": AUTH_TEST,
-            "users.info": {"ok": True, "user": {"profile": {"email": "ann@acme.com"}}},
-        }, calls)
-
-        assert google_module._fetch_userinfo_slack("xoxp-1") == {"email": "ann@acme.com:T1", "name": "Acme"}
-        assert calls[1][0] == "https://slack.com/api/users.info?user=U1"
-        assert all(headers == {"Authorization": "Bearer xoxp-1"} for _, headers in calls)
-
-    def test_a_profile_without_an_email_falls_back_to_the_user_id(self, monkeypatch):
-        _slack_responses(monkeypatch, {
-            "auth.test": AUTH_TEST,
-            "users.info": {"ok": True, "user": {"profile": {}}},
-        })
-        assert google_module._fetch_userinfo_slack("xoxp-1") == {"email": "U1:T1", "name": "Acme"}
-
-    @pytest.mark.parametrize("failing", ["auth.test", "users.info"])
-    def test_an_ok_false_body_is_an_error(self, monkeypatch, failing):
-        responses = {
-            "auth.test": AUTH_TEST,
-            "users.info": {"ok": True, "user": {"profile": {"email": "ann@acme.com"}}},
-        }
-        responses[failing] = {"ok": False, "error": "invalid_auth"}
-        _slack_responses(monkeypatch, responses)
-
-        with pytest.raises(HTTPException) as exc:
-            google_module._fetch_userinfo_slack("xoxp-1")
-        assert exc.value.status_code == 502
-        assert exc.value.detail == f"Slack {failing} failed: invalid_auth"
-
     def test_tile_subtitle_is_the_email_never_the_composite_identity(self):
         assert connection_display_name({"account_email": "ann@acme.com:T1", "account_name": "Acme"}, "slack") == "ann@acme.com"
         assert connection_display_name({"account_email": "U1:T1", "account_name": "Acme"}, "slack") == "Acme"
