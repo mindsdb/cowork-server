@@ -230,6 +230,10 @@ fallback-version = "0.0.0-dev"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cowork"]
+# pdf.js, put there by hatch_build.py and ignored by git.
+artifacts = ["cowork/services/pdf_viewer/pdfjs/"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
 
 [dependency-groups]
 dev = [

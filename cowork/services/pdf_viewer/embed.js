@@ -22,8 +22,8 @@
  *
  * Spliced as source text into the frame runtime (mindshub_services) and the
  * preview shim (cowork-server); the folder is copied byte for byte between the
- * two repositories (manifest.txt). Keep it free of a closing script tag, of
- * placeholder-like names and of timers.
+ * two repositories (source_digest() in __init__.py). Keep it free of a closing
+ * script tag, of placeholder-like names and of timers.
  */
 function installPdfEmbeds(w, options) {
   'use strict';

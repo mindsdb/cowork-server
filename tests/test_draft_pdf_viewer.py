@@ -58,7 +58,7 @@ def test_the_draft_host_serves_the_viewer_files(host):
     assert response.headers["access-control-allow-origin"] == "*"
 
 
-@pytest.mark.parametrize("name", ["LICENSE", "manifest.txt", "__init__.py", "missing.mjs"])
+@pytest.mark.parametrize("name", ["LICENSE", "fetch_pdfjs.py", "__init__.py", "missing.mjs"])
 def test_the_draft_host_serves_nothing_else_from_the_viewer_folder(host, name):
     _token, response = _host_get(host, f"_anton_pdf/{name}", "script")
     assert response.status_code == 404
