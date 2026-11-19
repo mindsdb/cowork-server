@@ -543,3 +543,39 @@ def test_the_probe_vocabulary_matches_the_wire_contract():
     from typing import get_args
 
     assert set(get_args(ProbeDenialCode)) == te.PROBE_DENIAL_REASONS
+
+
+# ── Zero data retention ───────────────────────────────────────────────
+#
+# Under ZDR MindsHub refuses the free probe model with 403 zdr_restricted. The
+# key was accepted, so the probes pass it; a model the person picked still fails.
+
+_ZDR_BODY = {"error": {"message": "Not available under zero data retention.", "deny_detail": "zdr_restricted"}}
+
+
+@pytest.mark.parametrize("carrier", ["header", "body"])
+def test_a_zdr_refusal_of_the_probe_model_passes_the_key(monkeypatch, carrier):
+    headers = {"X-MindsHub-Deny-Detail": "zdr_restricted"} if carrier == "header" else {}
+    body = None if carrier == "header" else _ZDR_BODY
+    _serve_gateway(monkeypatch, 403, headers, body=body)
+
+    ping = asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": "mdb_x", "mindsUrl": _gateway_base()}))
+    assert ping.status == "ok"
+    assert asyncio.run(validate_minds("mdb_x", _gateway_base())) == {"ok": True}
+    assert asyncio.run(validate_provider("openai-compatible", "mdb_x", _gateway_base(), None)) == {"ok": True}
+
+
+def test_a_zdr_refusal_of_a_picked_model_fails_with_its_own_message(monkeypatch):
+    _serve_gateway(monkeypatch, 403, {"X-MindsHub-Deny-Detail": "zdr_restricted"}, body=_ZDR_BODY)
+
+    result = asyncio.run(validate_provider("openai-compatible", "mdb_x", _gateway_base(), "sonnet"))
+    assert result == {"ok": False, "error": "Not available under zero data retention."}
+
+
+@pytest.mark.parametrize("detail", [None, "model_restricted"])
+def test_any_other_403_is_still_a_rejected_key(monkeypatch, detail):
+    _serve_gateway(monkeypatch, 403, {"X-MindsHub-Deny-Detail": detail} if detail else {})
+
+    assert asyncio.run(validate_minds("mdb_x", _gateway_base())) == {"ok": False, "error": "Invalid API key"}
+    ping = asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": "mdb_x", "mindsUrl": _gateway_base()}))
+    assert ping.status == "fail"

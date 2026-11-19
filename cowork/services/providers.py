@@ -1305,6 +1305,25 @@ def _provider_error_message(resp: httpx.Response) -> Optional[str]:
     return msg.strip() if isinstance(msg, str) and msg.strip() else None
 
 
+_ZDR_RESTRICTED = "zdr_restricted"
+
+
+def _zdr_restricted(resp: httpx.Response) -> bool:
+    """Whether MindsHub refused the model only because the org's ZDR rules out its provider.
+
+    The key itself was accepted. Read from the deny-detail header or the body's ``deny_detail``."""
+    if resp.status_code != 403:
+        return False
+    if resp.headers.get("X-MindsHub-Deny-Detail") == _ZDR_RESTRICTED:
+        return True
+    try:
+        data = resp.json()
+    except Exception:
+        return False
+    err = data.get("error") if isinstance(data, dict) else None
+    return isinstance(err, dict) and err.get("deny_detail") == _ZDR_RESTRICTED
+
+
 # Auth-SHAPED provider messages: only the genuinely "your key is bad" phrasings.
 # A bare "api key" substring also appears in permission ("The API key does not
 # have permission to use this model") and quota ("Quota exceeded for this API
@@ -1431,6 +1450,9 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
             r = await client.post(url, headers=headers, json=payload)
         if r.status_code < 400:
             return ProviderPing(status="ok", detail=f"HTTP {r.status_code}")
+        # Under ZDR the free probe model is refused, but the key was accepted.
+        if _zdr_restricted(r):
+            return ProviderPing(status="ok", detail="HTTP 403: key accepted; the probe model is not available under ZDR")
         # Same as _check: surface the gateway's own message so minds-cloud's
         # Settings dot carries the actionable reason (wallet/allowance/model)
         # instead of a bare "HTTP 502"/"HTTP 429". _chat_probe exercises real
@@ -1567,6 +1589,9 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
                 json={"model": MINDS_PROBE_MODEL, "max_tokens": 20,
                       "messages": [{"role": "user", "content": "ping"}]},
             )
+        # Under ZDR the free probe model is refused, but the key was accepted.
+        if _zdr_restricted(r):
+            return {"ok": True}
         if r.status_code in (401, 403):
             return {"ok": False, "error": "Invalid API key"}
         if 200 <= r.status_code < 300:
@@ -1578,8 +1603,12 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
 
 async def validate_openai_compatible(api_key: str, base_url: str = "https://api.openai.com/v1",
                                      model: str | None = None,
-                                     max_tokens: int | None = None) -> dict[str, Any]:
+                                     max_tokens: int | None = None,
+                                     probe: bool = False) -> dict[str, Any]:
     """Probe an openai-compatible chat endpoint.
+
+    `probe`: `model` is MindsHub's free probe model rather than one the person
+    picked, so a ZDR refusal of it still passes the key.
 
     `max_tokens` is opt-in, and deliberately not sent by default. It belongs on a
     probe we know the shape of: MindsHub bills per model, so an uncapped probe
@@ -1616,6 +1645,9 @@ async def validate_openai_compatible(api_key: str, base_url: str = "https://api.
             if r.status_code in (200, 201):
                 return {"ok": True}
             msg = _provider_error_message(r)
+            # A ZDR refusal accepted the key: a pass for the probe model, else the model's own failure.
+            if is_minds_host(normalized) and _zdr_restricted(r):
+                return {"ok": True} if probe else {"ok": False, "error": msg or "Not available under zero data retention"}
             # Gemini (and some others) return 400 — not 401/403 — for a bad key,
             # so key on an auth-shaped message too, or a bad key reads as an
             # opaque "HTTP 400" the user can't act on. Tight match: a permission
@@ -1657,7 +1689,7 @@ async def validate_provider(provider: str, api_key: str,
             # the reason _chat_probe documents. Only here, because max_tokens is
             # not safe to send to an arbitrary endpoint (see
             # validate_openai_compatible).
-            return await validate_openai_compatible(api_key, resolved_base, model, max_tokens=20)
+            return await validate_openai_compatible(api_key, resolved_base, model, max_tokens=20, probe=True)
         return await validate_openai_compatible(api_key, resolved_base, model)
     return {"ok": False, "error": "Unknown provider"}
 
