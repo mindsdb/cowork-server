@@ -262,5 +262,32 @@ def test_an_entry_turned_into_a_loop_after_its_stat_is_skipped(tmp_path, monkeyp
 
     monkeypatch.setattr(Path, "stat", stat_then_swap)
 
-    assert listing.file_meta(racy, tmp_path) is None
+    row = listing.file_meta(racy, tmp_path)
+
     assert swapped
+    # 3.12 raises on the loop and the entry is skipped; 3.13 resolves it in place.
+    assert row is None or row["path"] == "racy.md"
+
+
+def test_an_entry_whose_parent_closes_after_resolve_still_lists(tmp_path, monkeypatch):
+    """The directory flag comes from the stat already taken, not a second call."""
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    entry = sub / "x"
+    entry.write_text("y")
+    real_resolve = Path.resolve
+
+    def resolve_then_close(self, *args, **kwargs):
+        result = real_resolve(self, *args, **kwargs)
+        if self == entry:
+            sub.chmod(0o444)
+        return result
+
+    monkeypatch.setattr(Path, "resolve", resolve_then_close)
+    try:
+        row = listing.file_meta(entry, tmp_path)
+    finally:
+        sub.chmod(0o755)
+
+    assert row is not None
+    assert (row["path"], row["is_dir"]) == ("sub/x", False)
