@@ -396,6 +396,47 @@ async def test_turn_failed_never_carries_reset_at_outside_the_reset_codes(monkey
     assert "reset_at" not in data
 
 
+# ENG-4186's plan stops, under the type names the worker will send them as.
+_WINDOW_STOP = "WindowAllowanceExhaustedError: You have used your plan's 5-hour allowance for 'x'."
+_TIER_STOP = "ModelNotInTierError: Your plan's included allowance does not cover the model 'x'."
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_keeps_a_spent_windows_reset_at_and_window(monkeypatch):
+    data = await _failed_turn(monkeypatch, {"error": _WINDOW_STOP, "reset_at": _RESET_AT, "window": "5h"})
+    assert data["code"] == te.WINDOW_ALLOWANCE_EXHAUSTED_CODE
+    assert data["message"] == te.WINDOW_ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    assert data["reset_at"] == _RESET_AT
+    assert data["window"] == "5h"
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_keeps_a_model_outside_the_tiers_required_tier(monkeypatch):
+    data = await _failed_turn(monkeypatch, {"error": _TIER_STOP, "required_tier": "pro", "reset_at": _RESET_AT})
+    assert data["code"] == te.MODEL_NOT_IN_TIER_CODE
+    assert data["required_tier"] == "pro"
+    # No wait lifts it, so no reset instant rides it.
+    assert "reset_at" not in data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "field", "value"),
+    [
+        (_WINDOW_STOP, "window", "1d"),
+        (_WINDOW_STOP, "window", 5),
+        (_ALLOWANCE_STOP, "window", "5h"),
+        (_TIER_STOP, "required_tier", "enterprise"),
+        (_TIER_STOP, "required_tier", "free"),
+        (_WALLET_STOP, "required_tier", "pro"),
+    ],
+)
+async def test_turn_failed_drops_a_plan_field_it_cannot_use(monkeypatch, error, field, value):
+    # A malformed value, and a value on another code.
+    data = await _failed_turn(monkeypatch, {"error": error, field: value})
+    assert field not in data
+
+
 @pytest.mark.asyncio
 async def test_turn_failed_from_an_older_worker_is_unchanged(monkeypatch):
     # An older worker sends no reset_at, and the reply keeps exactly the shape

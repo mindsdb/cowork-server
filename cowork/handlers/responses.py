@@ -117,6 +117,7 @@ from cowork.handlers.turn_errors import (
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
     INTERRUPTED_TURN_MESSAGE,
+    MODEL_NOT_IN_TIER_CODE,
     MODEL_UNAVAILABLE_CODES,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
@@ -128,12 +129,15 @@ from cowork.handlers.turn_errors import (
     STALLED_TURN_MESSAGE,
     TURN_LOST_CODE,
     TURN_LOST_MESSAGE,
+    WINDOW_ALLOWANCE_EXHAUSTED_CODE,
     auth_error_detail,
     friendly_turn_error,
     gate_budget_model,
     gate_budget_period,
     gate_budget_scope,
+    gate_required_tier,
     gate_reset_at,
+    gate_window,
     model_unavailable_info,
     provider_overloaded_info,
     remote_error_label,
@@ -3521,11 +3525,14 @@ class ResponsesHandler:
             budget_scope = failure.get("budget_scope")
             budget_period = failure.get("budget_period")
             budget_model = failure.get("budget_model")
+            # Kept by the producer for their own ENG-4186 codes only, already validated.
+            window = failure.get("window")
+            required_tier = failure.get("required_tier")
             # The pod never got to retire a question it was blocked on.
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
             collected_events.append(response_failed_payload(
                 message, code, reset_at=reset_at, budget_scope=budget_scope, budget_period=budget_period,
-                budget_model=budget_model, request_id=corr))
+                budget_model=budget_model, window=window, required_tier=required_tier, request_id=corr))
 
             async def fail() -> None:
                 if code in CONTENT_REPAIR_CODES:
@@ -3558,7 +3565,8 @@ class ResponsesHandler:
                         )
                 await end_turn("error", lambda message_id: response_failed_sse(
                     message, code, reset_at=reset_at, budget_scope=budget_scope, budget_period=budget_period,
-                    budget_model=budget_model, request_id=corr, assistant_message_id=message_id,
+                    budget_model=budget_model, window=window, required_tier=required_tier, request_id=corr,
+                    assistant_message_id=message_id,
                 ))
 
             await run_to_completion(fail())
@@ -3962,6 +3970,21 @@ class ResponsesHandler:
                 _reset = gate_reset_at(exc)
                 if _reset is not None:
                     extra = {"reset_at": _reset}
+                # A spent plan window also says which one (ENG-4186), so the
+                # card can tell a five-hour pause from a weekly one.
+                if code == WINDOW_ALLOWANCE_EXHAUSTED_CODE:
+                    _window = gate_window(exc)
+                    if _window is not None:
+                        extra["window"] = _window
+            elif code == MODEL_NOT_IN_TIER_CODE:
+                # The tier that covers the model, so the card can offer that
+                # upgrade beside adding credits (ENG-4186). The model too when
+                # anton's typed error named it, so the card can name it.
+                _tier = gate_required_tier(exc)
+                if _tier is not None:
+                    extra["required_tier"] = _tier
+                if model_info and model_info[1]:
+                    extra["model"] = model_info[1]
             elif code == BUDGET_EXCEEDED_CODE:
                 # Whose budget is spent and its period, so the card can name them.
                 _budget = {

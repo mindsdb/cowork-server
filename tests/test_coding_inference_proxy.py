@@ -331,7 +331,9 @@ async def _proxy(body: bytes = b"{}"):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("code", ["included_allowance_exhausted", "free_air_daily_spend_fuse_exceeded"])
+@pytest.mark.parametrize(
+    "code", ["included_allowance_exhausted", "window_allowance_exhausted", "free_air_daily_spend_fuse_exceeded"]
+)
 async def test_proxy_fails_a_reset_bound_429_terminally_without_waiting(monkeypatch: pytest.MonkeyPatch, code: str) -> None:
     upstream = httpx.Response(
         429,
@@ -348,6 +350,38 @@ async def test_proxy_fails_a_reset_bound_429_terminally_without_waiting(monkeypa
     assert response.headers["x-mindshub-upstream-status"] == "429"
     assert response.headers["x-mindshub-reset-at"] == "2026-09-26T19:00:00Z"
     assert json.loads(response.body)["error"]["code"] == code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "upstream",
+    [
+        {"json": {"error": {"message": "Not in your plan.", "code": "model_not_in_tier"}, "required_tier": "pro"}},
+        {"json": {"error": {"message": "Not in your plan."}}, "headers": {"x-mindshub-reason": "model_not_in_tier"}},
+    ],
+    ids=["body-code", "reason-header"],
+)
+async def test_proxy_keeps_a_model_outside_the_tier_apart_from_a_rejected_credential(
+    monkeypatch: pytest.MonkeyPatch, upstream
+) -> None:
+    """Both are 403s, but the credential is fine (ENG-4186), so Codex does not tell the user to sign in again."""
+    _mock_upstream(monkeypatch, [httpx.Response(403, **upstream)])
+
+    response = await _proxy()
+
+    assert response.status_code == 400
+    assert response.headers["x-mindshub-error-code"] == "model_not_in_tier"
+    assert response.headers["x-mindshub-upstream-status"] == "403"
+    assert json.loads(response.body)["error"]["code"] == "model_not_in_tier"
+
+
+@pytest.mark.asyncio
+async def test_proxy_keeps_reading_an_unexplained_403_as_a_rejected_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_upstream(monkeypatch, [httpx.Response(403, json={"error": {"message": "Forbidden", "code": "budget_exceeded"}})])
+
+    response = await _proxy()
+
+    assert response.headers["x-mindshub-error-code"] == "model_authentication_failed"
 
 
 @pytest.mark.asyncio

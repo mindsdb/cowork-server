@@ -1,7 +1,7 @@
 """MindsHub usage, read on behalf of the caller.
 
 Three MindsHub reads behind one route: ``GET /v1/entitlements/me/`` for the free
-Air allowance, ``GET /v1/wallet/`` for the paid balance and auto top up, and
+Air allowance and the subscription plan, ``GET /v1/wallet/`` for the paid balance and auto top up, and
 ``GET /v1/usage/summary/`` for what the period's credit spend adds up to (the
 same figure the console's "Credit spend this period" shows).
 The desktop shows them above the composer and in Settings so a person sees
@@ -30,6 +30,8 @@ from cowork.schemas.mindshub_usage import (
     MindsHubBalance,
     MindsHubCreditSpend,
     MindsHubFreeTokens,
+    MindsHubPlan,
+    MindsHubPlanWindow,
     MindsHubUsageView,
 )
 from cowork.services.mindshub_client import (
@@ -130,6 +132,100 @@ def _parse_free_tokens(payload: Any) -> Optional[MindsHubFreeTokens]:
     )
 
 
+_PLAN_TIERS = frozenset({"free", "plus", "pro"})
+_PLAN_STATUSES = frozenset({"active", "past_due", "canceled"})
+_PLAN_WINDOWS = frozenset({"5h", "7d"})
+
+
+def _optional_str(value: Any) -> tuple[bool, Optional[str]]:
+    """``(ok, value)`` for a field that must be a string or null."""
+    if value is None or isinstance(value, str):
+        return True, value
+    return False, None
+
+
+def _percent_used(value: Any) -> Optional[int]:
+    """A window's ``percent_used`` as an int clamped to 0-100, or None when it is not a real number.
+
+    Same rules as the free allowance's percentage: a bool, NaN, an infinity or
+    an integer too large for a float would otherwise slip through as a full or
+    an empty window.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(round(max(0.0, min(100.0, number))))
+
+
+def _parse_plan(payload: Any) -> Optional[MindsHubPlan]:
+    """Read entitlements/me's ``plan`` block (ENG-4186), failing closed.
+
+    Absent means an auth that predates subscriptions, or one whose
+    subscriptions gate is off, and the clients then render no plan surface.
+    Anything malformed reports no plan rather than a guessed one, as
+    ``_parse_free_tokens`` does: a percentage misread as 0 would draw an empty
+    meter for a window that is spent, and an unknown tier or status would make
+    the client claim a plan the person does not have.
+
+    A window name this server does not know is skipped rather than failing the
+    whole block, so a newer auth adding a window does not hide the two known
+    ones. A known window that does not parse fails the block.
+    """
+    if not isinstance(payload, dict):
+        return None
+    plan = payload.get("plan")
+    if not isinstance(plan, dict):
+        return None
+
+    tier = plan.get("tier")
+    status = plan.get("status")
+    if tier not in _PLAN_TIERS or status not in _PLAN_STATUSES:
+        return None
+    ok, renews_at = _optional_str(plan.get("renews_at"))
+    if not ok:
+        return None
+    cancel_at_period_end = plan.get("cancel_at_period_end", False)
+    if not isinstance(cancel_at_period_end, bool):
+        return None
+
+    raw_windows = plan.get("windows")
+    if raw_windows is None:
+        raw_windows = []
+    if not isinstance(raw_windows, list):
+        return None
+    windows: list[MindsHubPlanWindow] = []
+    seen: set[str] = set()
+    for raw in raw_windows:
+        if not isinstance(raw, dict):
+            return None
+        name = raw.get("window")
+        if name not in _PLAN_WINDOWS:
+            continue
+        if name in seen:
+            return None
+        seen.add(name)
+        percent = _percent_used(raw.get("percent_used"))
+        if percent is None:
+            return None
+        ok, resets_at = _optional_str(raw.get("resets_at"))
+        if not ok:
+            return None
+        windows.append(MindsHubPlanWindow(window=name, percent_used=percent, resets_at=resets_at))
+
+    return MindsHubPlan(
+        tier=tier,
+        status=status,
+        renews_at=renews_at,
+        cancel_at_period_end=cancel_at_period_end,
+        windows=windows,
+    )
+
+
 def _parse_balance(payload: Any) -> Optional[MindsHubBalance]:
     if not isinstance(payload, dict):
         return None
@@ -221,6 +317,7 @@ def parse_usage(entitlements: Any, wallet: Any, summary: Any = None) -> MindsHub
         reachable=True,
         is_billing_owner=bool(entitlements.get("is_billing_owner")) if isinstance(entitlements, dict) else False,
         free_tokens=_parse_free_tokens(entitlements),
+        plan=_parse_plan(entitlements),
         balance=_parse_balance(wallet),
         auto_top_up=_parse_auto_top_up(wallet),
         credit_spend=_parse_credit_spend(summary, wallet),
