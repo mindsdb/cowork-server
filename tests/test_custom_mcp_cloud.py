@@ -271,6 +271,51 @@ def test_a_failed_first_listing_leaves_the_server_connected_with_no_tools(hosts)
         "success", 0, True)
 
 
+@pytest.mark.parametrize(("method", "path", "body", "auth_path", "status_word"), [
+    ("GET", f"{ROUTES}/status?state=s1", None, "/v1/oauth/status", "success"),
+    ("POST", f"{ROUTES}/connect", {"server_url": "https://mcp.example.com/mcp", "label": "x"},
+     "/v1/custom-mcp/start", "connected"),
+], ids=["sign-in finished", "no-login server connected"])
+def test_a_connected_server_whose_list_cannot_be_read_still_answers_connected(
+        hosts, method, path, body, auth_path, status_word):
+    hosts["answers"][(method, auth_path)] = (200, {"status": status_word, "name": NAME})
+    hosts["answers"][("GET", "/v1/custom-mcp/connections")] = httpx.ConnectError("down")
+
+    response = _client().request(method, path, json=body)
+
+    assert response.status_code == 200
+    assert response.json() == {"status": status_word, "name": NAME, "tools_on": 0, "tools_unavailable": True}
+    assert _sent(hosts, GATEWAY) == []
+
+
+@pytest.mark.parametrize("body", [{"label": ["This field may not be blank."]}, ["not", "a", "dict"],
+                                  {"error": "", "detail": "blank code"}],
+                         ids=["field errors", "a list", "an empty code"])
+def test_a_codeless_400_from_auth_answers_a_fixed_refusal(hosts, body):
+    hosts["answers"][("POST", "/v1/custom-mcp/start")] = (400, body)
+
+    response = _client().post(f"{ROUTES}/connect", json={"server_url": "https://mcp.example.com/mcp", "label": "x"})
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_request", "detail": "The request was refused."}
+
+
+@pytest.mark.parametrize(("body", "relayed"), [
+    ({"tools": [f"t{i}" for i in range(12_684)], "tools_revision": 3}, True),
+    ({"tools": [f"t{i}" for i in range(12_685)], "tools_revision": 3}, False),
+    ({"tools": ["search", "search"], "tools_revision": 3}, False),
+    ({"tools": ["search"], "tools_revision": True}, False),
+    ({"tools": ["search"], "tools_revision": 1.0}, False),
+], ids=["as many as a member can switch on", "one more", "a name twice", "a bool revision", "a float revision"])
+def test_a_switch_save_auth_would_refuse_never_leaves(hosts, body, relayed):
+    hosts["answers"][("PUT", f"/v1/custom-mcp/connections/{NAME}/tools")] = (200, SNAPSHOT)
+
+    response = _client().put(f"{ROUTES}/connections/{NAME}/tools", json=body)
+
+    assert response.status_code == (200 if relayed else 422)
+    assert len(hosts["sent"]) == (1 if relayed else 0)
+
+
 def test_the_tools_screen_lists_live_and_says_it_is_fresh(hosts):
     hosts["answers"][("POST", "/v1/datasources/custom-mcp/member-tools")] = (200, SNAPSHOT)
 

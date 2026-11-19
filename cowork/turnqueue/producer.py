@@ -800,9 +800,14 @@ async def _mint_custom_api_block(*, scope: TenantScope, correlation_id: str, tur
 _CUSTOM_MCP_BLOCK_BACKSTOP_BYTES = 1024 * 1024
 
 
-def _leave_out_custom_mcp(conversation_id: str, reason: str, *, exc_info: bool = False) -> None:
-    """Log the one event line of a turn whose custom MCP block was left out; ``reason`` is a fixed word."""
-    logger.warning(
+def _leave_out_custom_mcp(conversation_id: str, reason: str, *, exc_info: bool = False,
+                          expected: bool = False) -> None:
+    """Log the one event line of a turn whose custom MCP block was left out; ``reason`` is a fixed word.
+
+    ``expected`` logs at info a leave-out that every turn of its kind has, as the custom API twin does.
+    """
+    log = logger.info if expected else logger.warning
+    log(
         "[producer] custom MCP servers left out of a turn: %s",
         reason,
         exc_info=exc_info,
@@ -902,7 +907,7 @@ async def _mint_custom_mcp_block(*, scope: TenantScope, conversation_id: str, co
     if not settings.custom_mcp_enabled or not scope.org_mode or not org_id or not user_id:
         return None
     if not isinstance(turn_key_id, str) or not turn_key_id.strip():
-        _leave_out_custom_mcp(conversation_id, "no_turn_key_prefix")
+        _leave_out_custom_mcp(conversation_id, "no_turn_key_prefix", expected=True)
         return None
     if not settings.datasource_producer_key_id or not settings.datasource_producer_key:
         _leave_out_custom_mcp(conversation_id, "no_producer_key")

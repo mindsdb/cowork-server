@@ -41,6 +41,8 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 _GATEWAY_TIMEOUT_SECONDS = 32.0
 _MEMBER_TOOLS_PATH = "/v1/datasources/custom-mcp/member-tools"
 _MEMBER_TOOLS_PROTOCOL_VERSION = 1
+#: auth's own code for a body it could not read.
+_INVALID_REQUEST = "invalid_request"
 
 
 async def _require_org(scope: ScopeDep) -> None:
@@ -99,7 +101,8 @@ async def _auth(method: str, path: str, request: Request, *, params: dict | None
     """Relay one call to auth's custom MCP routes on the member's credential.
 
     Returns auth's answer. Raises ``_Refused`` when auth refused with a code,
-    and auth's own ``HTTPException`` otherwise (unreachable, unauthenticated).
+    or with a 400 that carries none (``invalid_request``, a fixed message);
+    auth's own ``HTTPException`` otherwise (unreachable, unauthenticated).
     """
     try:
         return await auth_proxy.proxy_custom_mcp(
@@ -108,6 +111,9 @@ async def _auth(method: str, path: str, request: Request, *, params: dict | None
     except HTTPException as exc:
         if isinstance(exc.detail, dict) and isinstance(exc.detail.get("code"), str):
             raise _Refused(exc.status_code, exc.detail["code"], str(exc.detail.get("message", ""))) from exc
+        # A codeless 400 holds auth's raw body, field errors included; the web shows a fixed message instead.
+        if exc.status_code == status.HTTP_400_BAD_REQUEST:
+            raise _Refused(exc.status_code, _INVALID_REQUEST, "The request was refused.") from exc
         raise
 
 
@@ -165,12 +171,19 @@ async def _server_details(name: str, request: Request) -> dict[str, Any] | None:
 
     Reads the member's servers from auth for the id, label, URL and
     ``tools_revision``, and lists through the gateway only at revision 0, so a
-    second poll and a reconnect never list again. A failed listing leaves the
-    server connected with no tools and ``tools_unavailable`` true. Returns
-    ``{name, id, label, server_url, tools_on, tools_unavailable}``, or None
-    when the server is not in the member's list.
+    second poll and a reconnect never list again. A failed listing, or a
+    failed read of the member's servers, leaves the server connected with no
+    tools and ``tools_unavailable`` true; the failed read answers only the
+    name. Returns ``{name, id, label, server_url, tools_on, tools_unavailable}``,
+    or None when the server is not in the member's list.
     """
-    items = (await _auth("GET", "/connections", request)).get("items")
+    try:
+        items = (await _auth("GET", "/connections", request)).get("items")
+    except (_Refused, HTTPException) as exc:
+        # auth already connected the server; a failure here must not read as a failed sign-in.
+        _log.warning("a custom MCP sign-in finished but the member's servers could not be read: status %s",
+                     exc.status_code)
+        return {"name": name, "tools_on": 0, "tools_unavailable": True}
     row = next(
         (item for item in items if isinstance(item, dict) and item.get("name") == name), None,
     ) if isinstance(items, list) else None

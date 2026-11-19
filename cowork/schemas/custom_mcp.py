@@ -78,6 +78,9 @@ class AllowedToolsRequest(BaseModel):
 #: auth's own bounds on the web routes' fields, so a body auth would refuse never leaves.
 _MAX_LOGIN_HOSTS = 4
 _MAX_LOGIN_HOST = 260
+#: auth sets no list bound, but its largest member ceiling (768 KiB) holds at most this many
+#: of its smallest stored definitions (62 bytes), so a longer list can never save.
+_MAX_CLOUD_SWITCHES = 768 * 1024 // 62
 
 
 class CloudReconnectRequest(BaseModel):
@@ -112,14 +115,17 @@ class CloudSwitchesRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    tools: list[str]
-    tools_revision: int = Field(ge=0)
+    tools: list[str] = Field(max_length=_MAX_CLOUD_SWITCHES)
+    tools_revision: int = Field(ge=0, strict=True)
 
     @field_validator("tools")
     @classmethod
     def _tool_names(cls, value: list[str]) -> list[str]:
+        """Each name 1 to 128 characters and named once, as auth's switch save requires."""
         if any(not name or len(name) > _MAX_TOOL_NAME for name in value):
             raise ValueError(f"tool names must be 1 to {_MAX_TOOL_NAME} characters")
+        if len(set(value)) != len(value):
+            raise ValueError("a tool is named more than once")
         return value
 
 

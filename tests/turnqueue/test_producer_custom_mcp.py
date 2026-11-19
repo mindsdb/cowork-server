@@ -136,10 +136,10 @@ async def _run(state, **kwargs):
     return json.loads(state["redis"].added[0][1]["payload"])["params"], items
 
 
-def _events(state) -> list[dict]:
-    """The ``extra`` of every leave-out event the producer logged."""
+def _events(state, *, level: str = "warning") -> list[dict]:
+    """The ``extra`` of every leave-out event the producer logged at ``level``."""
     return [
-        call.kwargs["extra"] for call in state["log"].warning.call_args_list
+        call.kwargs["extra"] for call in getattr(state["log"], level).call_args_list
         if call.kwargs.get("extra", {}).get("event") == "turn_custom_mcp_left_out"
     ]
 
@@ -235,6 +235,7 @@ async def test_a_member_with_no_server_gets_no_block_and_no_event(auth):
     params, _ = await _run(auth)
 
     assert "custom_mcp" not in params
+    assert _paths(auth).count(_LISTING_PATH) == 1
     assert _GRANT_PATH not in _paths(auth)
     assert _events(auth) == []
 
@@ -347,15 +348,16 @@ async def test_without_the_producer_key_the_block_is_left_out(auth, monkeypatch)
     assert [e["reason"] for e in _events(auth)] == ["no_producer_key"]
 
 
-async def test_a_turn_with_a_key_but_no_prefix_logs_it(auth):
-    """A channel turn hands the producer a minted key and no prefix to bind grants to."""
+async def test_a_turn_with_a_key_but_no_prefix_logs_it_at_info(auth):
+    """A channel turn hands the producer a minted key and no prefix: every such turn has it, so not a warning."""
     block = {"provider": "minds-cloud", "api_key": "mdb_x.secret", "base_url": "https://minds.internal/v1"}
 
     params, _ = await _run(auth, llm=block)
 
     assert "custom_mcp" not in params
     assert auth["calls"] == []
-    assert [e["reason"] for e in _events(auth)] == ["no_turn_key_prefix"]
+    assert [e["reason"] for e in _events(auth, level="info")] == ["no_turn_key_prefix"]
+    assert _events(auth) == []
 
 
 @pytest.mark.parametrize("trusted", [False, True], ids=["local tenancy", "personal partition"])
