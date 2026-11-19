@@ -98,9 +98,10 @@ STATS_ROUTE_ERRORS = (StatsError, FileNotFoundError, ValueError, RuntimeError)
 
 
 def _stats_url(publish_url: str, report_id: str) -> str:
-    # Under the artifact's own path, the publishing service's home for owner
-    # endpoints about one artifact (ENG-4455); it still answers /stats/{id}.
-    return f"{publish_url.rstrip('/')}/artifacts/{quote(report_id, safe='')}/stats"
+    # Under the artifact's own route, which every host already sends to the
+    # publishing service, so stats need no routing of their own (ENG-4455).
+    # The service still answers /stats/{id}.
+    return f"{publish_url.rstrip('/')}/a/{quote(report_id, safe='')}/_stats"
 
 
 def _json_body(raw: bytes) -> Any:

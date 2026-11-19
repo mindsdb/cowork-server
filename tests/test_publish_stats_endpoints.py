@@ -74,7 +74,7 @@ def test_get_returns_the_service_json_unchanged(monkeypatch, credential, publish
     assert res.status_code == 200, res.text
     assert res.json() == STATS_BODY
     assert published == ["/art/rep/report.html"]
-    assert upstream.calls[0].url == "https://view.example/artifacts/rid-1/stats"
+    assert upstream.calls[0].url == "https://view.example/a/rid-1/_stats"
     assert upstream.calls[0].api_key == "desk-key"
 
 
@@ -87,7 +87,7 @@ def test_put_sets_tracking_and_returns_the_flag(monkeypatch, credential, publish
     assert res.json() == {"tracking": False, "require_email": False}
     assert published == ["/art/rep/report.html"]
     assert upstream.calls[0].method == "PUT"
-    assert upstream.calls[0].url == "https://view.example/artifacts/rid-1/stats/tracking"
+    assert upstream.calls[0].url == "https://view.example/a/rid-1/_stats/tracking"
     assert json.loads(upstream.calls[0].payload) == {"tracking": False, "enabled": False}
 
 
@@ -248,7 +248,7 @@ def test_viewer_route_returns_the_service_json(monkeypatch, credential, publishe
 
     assert res.status_code == 200, res.text
     assert res.json() == body
-    assert upstream.calls[0].url == "https://view.example/artifacts/rid-1/stats/viewers/v_1"
+    assert upstream.calls[0].url == "https://view.example/a/rid-1/_stats/viewers/v_1"
     assert published == ["/art/rep/report.html"]
 
 
@@ -269,4 +269,4 @@ def test_delete_purges_the_analytics(monkeypatch, credential, published):
     assert res.status_code == 204
     assert res.content == b""
     assert upstream.calls[0].method == "DELETE"
-    assert upstream.calls[0].url == "https://view.example/artifacts/rid-1/stats"
+    assert upstream.calls[0].url == "https://view.example/a/rid-1/_stats"

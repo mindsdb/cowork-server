@@ -46,7 +46,7 @@ def test_fetch_sends_the_publish_credential_and_returns_the_body_unchanged(monke
     (call,) = upstream.calls
     assert out == STATS_BODY
     assert call.method == "GET"
-    assert call.url == "https://view.example/artifacts/rid-1/stats"
+    assert call.url == "https://view.example/a/rid-1/_stats"
     assert call.api_key == "k-1"
     assert call.payload is None
     assert call.timeout == 15
@@ -61,7 +61,7 @@ def test_set_tracking_puts_the_flag_and_returns_the_stored_settings(monkeypatch)
     # A service that predates the email gate answers without require_email.
     assert out == {"tracking": False, "require_email": False}
     assert call.method == "PUT"
-    assert call.url == "https://view.example/artifacts/rid-1/stats/tracking"
+    assert call.url == "https://view.example/a/rid-1/_stats/tracking"
     assert call.api_key == "k-1"
     assert isinstance(call.payload, bytes)
     assert json.loads(call.payload) == {"tracking": False, "enabled": False}
@@ -91,13 +91,13 @@ def test_fetch_viewer_gets_one_viewer_unchanged(monkeypatch):
 
     assert out == body
     assert upstream.calls[0].method == "GET"
-    assert upstream.calls[0].url == "https://view.example/artifacts/rid-1/stats/viewers/v_1"
+    assert upstream.calls[0].url == "https://view.example/a/rid-1/_stats/viewers/v_1"
 
 
 def test_viewer_id_is_escaped_into_one_path_segment(monkeypatch):
     upstream = StatsUpstream(200, {"viewer": {}, "visits": []}).install(monkeypatch)
     stats.fetch_viewer(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1", viewer_id="a/b?c")
-    assert upstream.calls[0].url == "https://view.example/artifacts/rid-1/stats/viewers/a%2Fb%3Fc"
+    assert upstream.calls[0].url == "https://view.example/a/rid-1/_stats/viewers/a%2Fb%3Fc"
 
 
 @pytest.mark.parametrize("viewer_id", ["", ".", "..", "x" * 129])
@@ -121,7 +121,7 @@ def test_delete_stats_sends_a_delete_and_accepts_an_empty_204(monkeypatch):
     assert stats.delete_stats(publish_url=PUBLISH_URL, key="k-1", report_id="rid-1") is None
 
     assert upstream.calls[0].method == "DELETE"
-    assert upstream.calls[0].url == "https://view.example/artifacts/rid-1/stats"
+    assert upstream.calls[0].url == "https://view.example/a/rid-1/_stats"
     assert upstream.calls[0].payload is None
 
 
@@ -149,7 +149,7 @@ def test_report_id_is_escaped_into_one_path_segment(monkeypatch):
 
     stats.fetch_stats(publish_url=PUBLISH_URL, key="k-1", report_id="a/b")
 
-    assert upstream.calls[0].url == "https://view.example/artifacts/a%2Fb/stats"
+    assert upstream.calls[0].url == "https://view.example/a/a%2Fb/_stats"
 
 
 def test_requests_pass_the_tls_setting_to_the_transport(monkeypatch):
