@@ -6,6 +6,7 @@ the caps through this module, so a test that lowers one affects every caller.
 
 from __future__ import annotations
 
+import stat
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -72,7 +73,8 @@ def iter_folder_files(base: Path, budget: WalkBudget) -> Iterator[Path]:
 
 def file_meta(p: Path, base: Path) -> dict[str, Any] | None:
     """Listing row for `p` relative to `base`, or None if it cannot be
-    stat'ed (gone, a symlink loop, unreadable) or resolves outside `base`."""
+    stat'ed or resolved (gone, a symlink loop, inaccessible) or resolves
+    outside `base`. The entry can change between calls, so each one may fail."""
     try:
         st = p.stat()
     except OSError:
@@ -80,12 +82,12 @@ def file_meta(p: Path, base: Path) -> dict[str, Any] | None:
     try:
         resolved = p.resolve()
         rel = resolved.relative_to(base.resolve())
-    except ValueError:
+    except (OSError, RuntimeError, ValueError):
         return None
     return {
         "path": str(rel).replace("\\", "/"),
         "name": p.name,
         "size": st.st_size,
         "modified": st.st_mtime,
-        "is_dir": p.is_dir(),
+        "is_dir": stat.S_ISDIR(st.st_mode),
     }

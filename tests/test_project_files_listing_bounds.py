@@ -231,3 +231,36 @@ def test_a_truncated_response_says_so(engine, projects_root):
     # The synthetic instructions row is inserted after the walk, so it is not
     # one of the capped entries.
     assert len(response["files"]) == MAX_LISTED_FILES + 1
+
+
+def test_a_looped_entry_in_a_project_is_skipped(engine, projects_root):
+    svc = ProjectService(ScopedSession(Session(engine), LOCAL_SCOPE))
+    project = svc.create_project("notes")
+    (Path(project.path) / "a.md").write_text("x")
+    (Path(project.path) / "loop").symlink_to("loop")
+
+    paths = {f["path"] for f in _list_files(engine, project.name)["files"]}
+
+    assert "a.md" in paths
+    assert "loop" not in paths
+
+
+def test_an_entry_turned_into_a_loop_after_its_stat_is_skipped(tmp_path, monkeypatch):
+    """The agent can rewrite a folder while it is listed."""
+    racy = tmp_path / "racy.md"
+    racy.write_text("y")
+    real_stat = Path.stat
+    swapped = []
+
+    def stat_then_swap(self, *args, **kwargs):
+        result = real_stat(self, *args, **kwargs)
+        if self == racy and not swapped:
+            swapped.append(True)
+            racy.unlink()
+            racy.symlink_to("racy.md")
+        return result
+
+    monkeypatch.setattr(Path, "stat", stat_then_swap)
+
+    assert listing.file_meta(racy, tmp_path) is None
+    assert swapped
