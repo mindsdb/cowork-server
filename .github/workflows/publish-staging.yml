@@ -72,6 +72,7 @@ jobs:
     # a broken image. Both land in this one run tree, and `notify` covers both.
     permissions:
       contents: read
+      id-token: write # the build's ECR role, assumed over OIDC
     uses: ./.github/workflows/build-deploy.yml
     with:
       build-environment: staging
