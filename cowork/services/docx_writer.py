@@ -445,8 +445,10 @@ class _Writer:
             # Past the depth limit, tags lose their meaning and only text flows.
             inner = outer
         elif tag == "br":
-            if not _ends_paragraph(br=element):
-                self._line_break(context=outer)
+            if _ends_paragraph(br=element):
+                # Its tail, if any, is space a browser drops at a line end.
+                return
+            self._line_break(context=outer)
             self._write_tail(visit=visit)
             return
         elif tag == "img":
