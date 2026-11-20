@@ -5,13 +5,10 @@ import json
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
-from cowork.common.settings.app_settings import get_app_settings
 from cowork.docs import history, store
 from cowork.docs.service import apply, create_doc
 from cowork.docs.store import find_doc_folder, list_history, load_doc
-from cowork.services.projects import GENERAL_PROJECT_ID
 
 
 @pytest.fixture
@@ -25,6 +22,11 @@ def _meta(folder: Path) -> dict:
 
 def _rename(folder: Path, title: str, **kw):
     return apply(folder, [{"op": "rename_doc", "title": title}], **kw)
+
+
+def _type_in_body(folder: Path):
+    lead = load_doc(folder)["tabs"][0]["blocks"][0]
+    apply(folder, [{"op": "update", "id": lead["id"], "set": {"text": "Typed."}}], by="user")
 
 
 @pytest.mark.parametrize("who", [{"by": "user"}, {"by": "agent", "turn": "reply-2"}])
@@ -56,20 +58,18 @@ def test_restoring_a_version_with_another_title_brings_that_title_to_the_card(ma
 def test_a_doc_renamed_before_the_card_followed_catches_up_on_its_next_write(made):
     meta = _meta(made.folder)
     (made.folder / "metadata.json").write_text(json.dumps({**meta, "name": "Old name"}))
-    lead = load_doc(made.folder)["tabs"][0]["blocks"][0]
-    apply(made.folder, [{"op": "update", "id": lead["id"], "set": {"text": "Typed."}}], by="user")
+    _type_in_body(made.folder)
     assert _meta(made.folder)["name"] == "Plan"
 
 
 def test_an_edit_that_keeps_the_title_leaves_metadata_untouched(made):
     path = made.folder / "metadata.json"
     stamp = path.stat().st_mtime_ns
-    lead = load_doc(made.folder)["tabs"][0]["blocks"][0]
-    apply(made.folder, [{"op": "update", "id": lead["id"], "set": {"text": "Typed."}}], by="user")
+    _type_in_body(made.folder)
     assert path.stat().st_mtime_ns == stamp
 
 
-def test_a_metadata_file_that_is_a_link_is_not_written_through(made, tmp_path):
+def test_a_metadata_file_that_is_a_link_is_not_written_through(made, tmp_path, caplog):
     """The agent's code can write the doc's folder: a link planted at metadata.json must
     not let a rename write another artifact's metadata."""
     other = create_doc(tmp_path / "other", title="Other", markdown="x", by="agent")
@@ -81,15 +81,8 @@ def test_a_metadata_file_that_is_a_link_is_not_written_through(made, tmp_path):
     assert doc["title"] == "Hiring plan"  # the edit still lands
     assert target.read_text() == original
     assert (made.folder / "metadata.json").is_symlink()
-
-
-def test_a_card_that_cannot_be_renamed_is_one_line_in_the_log_not_a_traceback(made, caplog, tmp_path):
-    other = create_doc(tmp_path / "other", title="Other", markdown="x", by="agent")
-    (made.folder / "metadata.json").unlink()
-    (made.folder / "metadata.json").symlink_to(other.folder / "metadata.json")
-    _rename(made.folder, "Hiring plan", by="user")
     (record,) = [r for r in caplog.records if "card title" in r.getMessage()]
-    assert record.exc_info is None
+    assert record.exc_info is None  # one line, not a traceback per write
 
 
 def test_a_doc_without_metadata_is_still_edited_and_logs_nothing(made, caplog):
@@ -97,22 +90,3 @@ def test_a_doc_without_metadata_is_still_edited_and_logs_nothing(made, caplog):
     doc, _ = _rename(made.folder, "Hiring plan", by="user")
     assert doc["title"] == "Hiring plan"
     assert not [r for r in caplog.records if "card title" in r.getMessage()]
-
-
-@pytest.fixture
-def client(monkeypatch, granted_product_permissions):
-    from cowork.server import create_app
-
-    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
-    get_app_settings.cache_clear()
-    yield TestClient(create_app())
-    get_app_settings.cache_clear()
-
-
-def test_the_card_the_api_returns_carries_the_new_title(client):
-    res = client.post("/api/v1/docs/", json={"projectId": str(GENERAL_PROJECT_ID), "title": "Plan", "markdown": "x"})
-    assert res.status_code == 200, res.text
-    url = f"/api/v1/docs/{GENERAL_PROJECT_ID}/{res.json()['artifactId']}"
-    res = client.post(f"{url}/ops", json={"ops": [{"op": "rename_doc", "title": "Hiring plan"}]})
-    assert res.status_code == 200, res.text
-    assert client.get(url).json()["card"]["title"] == "Hiring plan"

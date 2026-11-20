@@ -92,8 +92,7 @@ SESSION_PAUSE_S = 5 * 60
 SESSION_MAX_S = 30 * 60
 MAX_DOC_BYTES = 8 * 1024 * 1024
 _MAX_DOC_MB = MAX_DOC_BYTES // (1024 * 1024)
-# The most of an artifact's metadata.json read.
-MAX_METADATA_BYTES = 1024 * 1024
+_MAX_METADATA_BYTES = 1024 * 1024
 
 _locks: dict[str, _DocLock] = {}
 _locks_guard = threading.Lock()
@@ -264,10 +263,16 @@ def remove_child(folder: Path, name: str) -> None:
 def _meta_in(d: PinnedDir) -> dict[str, Any]:
     """The ``metadata.json`` in the artifact's opened folder; {} when it is missing or unreadable."""
     try:
-        meta = json.loads(read_child(d, "metadata.json", max_bytes=MAX_METADATA_BYTES))
+        meta = json.loads(read_child(d, "metadata.json", max_bytes=_MAX_METADATA_BYTES))
     except (OSError, ValueError, DocError):
         return {}
     return meta if isinstance(meta, dict) else {}
+
+
+def read_metadata(d: PinnedDir) -> ArtifactMetadata:
+    """The ``metadata.json`` in the artifact's opened folder, not following a link
+    (read_child). Raises what read_child raises, and ValueError when it won't parse."""
+    return ArtifactMetadata.parse(read_child(d, "metadata.json", max_bytes=_MAX_METADATA_BYTES).decode("utf-8"))
 
 
 def _read_meta(folder: Path) -> dict[str, Any]:
@@ -488,18 +493,13 @@ def write_html(folder: Path, doc: Doc) -> None:
 
 
 def _sync_card_title(folder: Path, title: str) -> None:
-    """Set ``name`` in the doc's ``metadata.json`` to the doc's title: the artifact
-    card and a lookup by title read it there. Only ``name`` changes. The file is
-    opened without following a link and replaced, never written through; a link or
-    a second name at ``metadata.json`` is left as it is. Best-effort: the doc file
-    is the truth, and the next write tries again."""
+    """Best-effort: set ``name`` in ``metadata.json``, which the card and a lookup by
+    title read, to the doc's title. A link at ``metadata.json`` is left as it is."""
     try:
         with doc_subfolder(folder) as d:
-            raw = read_child(d, "metadata.json", max_bytes=MAX_METADATA_BYTES)
-            metadata = ArtifactMetadata.parse(raw.decode("utf-8"))
-            if metadata.to_document().get("name") == title:
+            if _meta_in(d).get("name") == title:
                 return
-            _write_metadata(d, metadata.with_value("name", title))
+            _write_metadata(d, read_metadata(d).with_value("name", title))
     except FileNotFoundError:
         return  # no metadata, no card to rename
     except (OSError, ValueError, DocError) as exc:
@@ -560,8 +560,8 @@ def mutate_doc(
             # History is a safety net; never fail the edit over it.
             logger.warning("could not keep a version of %s", folder, exc_info=True)
         write_child(folder, path.name, payload)
-        # Checked against the metadata, not the previous doc, so a doc renamed
-        # before this sync existed catches up on its next write.
+        # Against the metadata, not the previous doc: a doc renamed before this
+        # sync existed catches up on its next write.
         _sync_card_title(folder, new_doc["title"])
         if after is not None:
             after(new_doc)

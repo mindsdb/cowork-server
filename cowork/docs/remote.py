@@ -26,10 +26,9 @@ from cowork.common.settings.user_settings import use_settings_scope
 from cowork.db.units import DatabaseBusy, run_efs, unit_session
 from cowork.docs.images import MAX_IMAGE_BYTES
 from cowork.docs.model import DocError
-from cowork.docs.store import MAX_METADATA_BYTES, doc_lock, doc_subfolder, read_child
+from cowork.docs.store import doc_lock, doc_subfolder, read_metadata
 from cowork.docs.tools import TOO_BIG_TEXT, DocToolContext, remote_doc_tool_specs, run_doc_tool
 from cowork.services.artifact_identity import _write_metadata
-from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifact_ownership import artifact_root_for_base, record_artifact_owner
 from cowork.services.artifact_permissions import artifact_capabilities
 from cowork.turnqueue.host_tools import MAX_RESULT_BYTES, EmitStep, HostCall, HostToolOutcome, HostToolRunner
@@ -119,8 +118,7 @@ def record_turn_provenance(folder: Path, *, conversation_id: str, turn_index: in
     metadata can't be read or written.
     """
     with doc_lock(folder), doc_subfolder(folder) as pinned:
-        raw = read_child(pinned, "metadata.json", max_bytes=MAX_METADATA_BYTES)
-        metadata = ArtifactMetadata.parse(raw.decode("utf-8"))
+        metadata = read_metadata(pinned)
         document = metadata.to_document()
         provenance = document.get("provenance")
         provenance = copy.deepcopy(provenance) if isinstance(provenance, list) else []

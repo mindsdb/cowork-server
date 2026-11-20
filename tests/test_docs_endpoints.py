@@ -51,6 +51,12 @@ def test_read_and_edit(client, doc):
     assert res.json()["doc"]["tabs"][0]["blocks"][0]["by"] == "user"
 
 
+def test_a_rename_retitles_the_docs_card(client, doc):
+    res = client.post(_url(doc, "/ops"), json={"ops": [{"op": "rename_doc", "title": "Hiring plan 2027"}]})
+    assert res.status_code == 200, res.text
+    assert client.get(_url(doc)).json()["card"]["title"] == "Hiring plan 2027"
+
+
 def test_a_stale_write_is_a_409_naming_the_block(client, doc):
     lead = doc["doc"]["tabs"][0]["blocks"][0]
     client.post(_url(doc, "/ops"), json={"ops": [{"op": "update", "id": lead["id"], "set": {"text": "v2"}}]})
