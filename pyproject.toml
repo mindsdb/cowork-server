@@ -62,9 +62,11 @@ dependencies = [
     # custom MCP routes import.
     # 2.26.11.19.1rc3 is the first with Slack's MCP server and tool access
     # tiers (mindsdb/anton#820), which Slack's In-Browser Connect needs.
+    # 2.26.11.20.1rc3 tags the budget-refusal link with from=budget_denial
+    # (mindsdb/anton#819), so the console counts those visits.
     # Desktop installs the anton this lock names, so a production release
     # names a final anton, never a release candidate.
-    "anton-agent>=2.26.11.19.1rc3,<3",
+    "anton-agent>=2.26.11.20.1rc3,<3",
     # Floor for GHSA-8bx3-mgpq-m8m9 (IDNA 2003 vs IDNA 2009 host-name encoding
     # mismatch in TLSStream/connect_tcp() lets a hijacked connection to an
     # internationalized domain present a certificate that validates against
