@@ -7,9 +7,21 @@ overlays its live model list. fetch_minds_models is stubbed so no network is hit
 import asyncio
 import json
 
+import pytest
+
 from cowork.db.scoped import LOCAL_SCOPE
 from _fakes import FakeRequest
 
+
+
+@pytest.fixture(autouse=True)
+def zdr_off(monkeypatch):
+    """ZDR off: these tests read the catalog, not the org's ZDR mode."""
+
+    async def _off(**_kwargs):
+        return False
+
+    monkeypatch.setattr("cowork.services.mindshub_zdr.zdr_on_for", _off)
 
 def _listing(
     ids, efforts=None, enabled=None, labels=None, providers=None, families=None, role_defaults=None,

@@ -1094,10 +1094,16 @@ async def recommended_models(
     from cowork.services.mindshub_zdr import zdr_on_for
 
     mode = gate_mode(gate_settings)
-    # Read once when Jev on MindsHub would gate turns or pick the browser's steps.
+    # Read once wherever something ZDR turns off could run: Jev gating turns or picking
+    # the browser's steps, or a role on MindsHub (Jev classify, voice calls).
+    on_mindshub = (
+        mode == "jev"
+        or decisions_model(gate_settings) == "mindshub"
+        or Provider.MINDS_CLOUD in (gate_settings.resolved_planning_provider, gate_settings.resolved_coding_provider)
+    )
     zdr = (
         await zdr_on_for(scope=scope, settings=gate_settings, org_bearer=caller_bearer(request))
-        if mode == "jev" or decisions_model(gate_settings) == "mindshub" else False
+        if on_mindshub else False
     )
     routing = {
         "mode": mode, "routerProvider": gate["provider"],
@@ -1106,8 +1112,8 @@ async def recommended_models(
         "canSetDecisionModel": not scope.org_mode or can_manage_org(principal),
     }
 
-    # Under ZDR turns skip Jev whatever the switch says, so Settings shows it off and disabled.
-    if mode == "jev":
+    # Under ZDR Jev, classify and voice are off whatever their switches say, so Settings shows them off and disabled.
+    if on_mindshub:
         routing["zdr"] = zdr
 
     # No image picker where Anton's images won't go to MindsHub: a pick there does nothing.
