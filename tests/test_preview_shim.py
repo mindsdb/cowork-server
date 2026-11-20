@@ -740,3 +740,16 @@ def test_hash_and_scroll_are_restored():
     assert out["restored"] == ["ok"]
     probe = next(m for m in out["posted"] if m["type"] == "probe")
     assert probe == {"type": "probe", "hash": "#pricing", "y": 900, "top": 40}
+
+
+def test_the_shim_reports_the_page_height_and_whether_it_scrolls():
+    """The app fits a page taller than its frame that scrolls nowhere (a deck
+    sized from the frame's width, overflow hidden): the shim tells it the
+    page's full height and whether the root or body hide their overflow,
+    after load and on every resize, best effort."""
+    js = SHIM_JS
+    block = js[js.index("type: 'size'") - 600 : js.index("size reports are best effort")]
+    assert "content: Math.ceil(Math.max(root.scrollHeight" in block
+    assert "locked: hidesOverflow(root) || hidesOverflow(body)" in block
+    assert "window.addEventListener('load', scheduleSize)" in js
+    assert "window.addEventListener('resize', scheduleSize)" in js
