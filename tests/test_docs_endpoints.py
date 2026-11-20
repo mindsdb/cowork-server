@@ -134,6 +134,14 @@ def test_a_pdf_is_the_render_services_made_from_the_inlined_doc(client, doc, ren
     assert "<table>" in sent.html and "<h1>Hiring plan</h1>" in sent.html
 
 
+def test_a_pdf_keeps_the_pages_font_through_the_inliner(client, doc, render_service):
+    assert client.get(_url(doc, "/export?format=pdf")).status_code == 200
+    [sent] = render_service.requests
+    # "d09GMg" is base64 for the woff2 signature: the inliner kept the embedded Inter.
+    assert sent.html.count("@font-face") == 2 and "data:font/woff2;base64,d09GMg" in sent.html
+    assert "font-family:Inter," in sent.html
+
+
 def test_a_title_in_any_script_exports_under_its_own_name(client):
     from urllib.parse import quote
 
@@ -711,6 +719,8 @@ def test_word_and_pdf_convert_the_docs_page_in_the_conversion_process(client, do
     assert request.limits.max_total_bytes == (PDF_INLINE_BUDGET_BYTES if fmt == "pdf" else INLINE_BUDGET_BYTES)
     assert call["limits"].memory_bytes == CONVERSION_MEMORY_BYTES
     assert b"<h1>Hiring plan</h1>" in call["source"]
+    # Word ignores CSS, so only the PDF's source carries the page's font.
+    assert (b"@font-face" in call["source"]) == (fmt == "pdf")
     if fmt == "docx":
         assert res.content == _CONVERTED
     else:
