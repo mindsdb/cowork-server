@@ -69,6 +69,7 @@ def check_personal_resource_dependencies(resources: frozenset[PersonalResource])
 # Keyed by table name, not model class, so this module imports no models and
 # app settings can import the enum above without a cycle.
 MODEL_RESOURCE: dict[str, PersonalResource] = {
+    "content_reports": PersonalResource.CONVERSATIONS,
     "conversations": PersonalResource.CONVERSATIONS,
     # created_by only: a message's partition is its conversation's, and the
     # flush hook stamps its author only where conversations are personal.

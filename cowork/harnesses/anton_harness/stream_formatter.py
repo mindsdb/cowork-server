@@ -956,7 +956,8 @@ async def format_responses_stream(
     }
     yield _event("response.created", created_data)
 
-    async for event in event_stream:
+    from cowork.services.content_safety import guarded_events
+    async for event in guarded_events(event_stream):
         if isinstance(event, StreamTextDelta):
             if event.text.strip():
                 failure_reply = event.text.startswith(_ANTON_FAILURE_REPLY)
@@ -1474,6 +1475,8 @@ async def format_responses_stream(
     form = requested_form(tool_rows) if form_blocks and not failure_reply else None
     added = missing_form_text("".join(collected_text), form) if form is not None else ""
     if added:
+        from cowork.services.content_safety import check_content
+        await check_content(''.join(collected_text)[-8000:] + added, purpose='output')
         collected_text.append(added)
         seq += 1
         yield _event("response.output_text.delta", {
@@ -1504,6 +1507,8 @@ async def format_responses_stream(
         ) if compacted and not tool_rows_arrived else (),
     ))
     if sources.figures:
+        from cowork.services.content_safety import check_content
+        await check_content(json.dumps(sources.model_dump(mode='json'), ensure_ascii=False), purpose='output')
         seq += 1
         yield _event("response.figure_sources", {
             "type": "response.figure_sources",
