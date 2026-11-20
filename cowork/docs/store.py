@@ -57,6 +57,7 @@ from cowork.common.paths import (
     pinned_dir,
     read_bounded,
 )
+from cowork.services.artifact_identity import _write_metadata
 from cowork.services.artifact_journal import (
     read_journal_file,
     read_journal_json,
@@ -64,6 +65,7 @@ from cowork.services.artifact_journal import (
     write_journal_file,
 )
 from cowork.services.artifact_lock import artifact_lock
+from cowork.services.artifact_metadata import ArtifactMetadata
 
 from .model import Doc, DocError, normalize_doc
 from .render import doc_html
@@ -483,6 +485,22 @@ def write_html(folder: Path, doc: Doc) -> None:
         logger.warning("could not render %s", folder / DOC_HTML, exc_info=True)
 
 
+def _sync_card_title(folder: Path, title: str) -> None:
+    """Set ``name`` in the doc's ``metadata.json`` to the doc's title: the artifact
+    card and a lookup by title read it there. Only ``name`` changes. The file is
+    opened without following a link and replaced, never written through; a link or
+    a second name at ``metadata.json`` is left as it is. Best-effort: the doc file
+    is the truth, and the next write tries again."""
+    try:
+        with doc_subfolder(folder) as d:
+            metadata = ArtifactMetadata.parse(read_child(d, "metadata.json", max_bytes=1024 * 1024).decode("utf-8"))
+            if metadata.to_document().get("name") == title:
+                return
+            _write_metadata(d, metadata.with_value("name", title))
+    except (OSError, ValueError, DocError):
+        logger.warning("could not set the card title of %s", folder, exc_info=True)
+
+
 def doc_lock(folder: Path) -> _DocLock:
     """The lock every write to this doc holds, in this process and across processes.
 
@@ -536,6 +554,9 @@ def mutate_doc(
             # History is a safety net; never fail the edit over it.
             logger.warning("could not keep a version of %s", folder, exc_info=True)
         write_child(folder, path.name, payload)
+        # Checked against the metadata, not the previous doc, so a doc renamed
+        # before this sync existed catches up on its next write.
+        _sync_card_title(folder, new_doc["title"])
         if after is not None:
             after(new_doc)
         return new_doc, result
