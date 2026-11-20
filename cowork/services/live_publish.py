@@ -265,10 +265,8 @@ async def publish_doc_page(job: DocPublishJob, *, on_done: Callable[[], None]) -
         if (early := _early(state)) is not None:
             return early
         access = AUTOPUBLISH_ACCESS if state.entry is None else kept_access(state.entry, org_mode=True)
-        publish_url, workspace_id = await asyncio.gather(
-            run_on_unit_threads(partial(_publish_url, scope)),
-            run_on_unit_threads(partial(_active_workspace_id, scope)),
-        )
+        publish_url = await run_on_unit_threads(partial(_publish_url, scope))
+        workspace_id = await run_on_unit_threads(partial(_active_workspace_id, scope))
         key = PublishKey(owner, job.org_id, min_ttl_s=LOCK_TTL_S + 60.0, workspace_id=workspace_id)
         api_key = await key.get()
         if not api_key:

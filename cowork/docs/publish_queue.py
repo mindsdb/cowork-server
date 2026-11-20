@@ -217,7 +217,6 @@ class DocPublishWorker:
             result = PublishResult(Outcome.DROPPED if is_permanent(exc) else Outcome.RETRY)
             error_type = type(exc).__name__
         key = doc_key(job.artifact_id)
-        claimed = attempts
         try:
             if result.outcome is Outcome.RETRY and result.reason == "lock_busy":
                 # Another publish of this page is still running: not an attempt of ours.
@@ -235,7 +234,9 @@ class DocPublishWorker:
                     await pipe.execute()
                     delay = BACKOFF_S[min(attempts, len(BACKOFF_S)) - 1]
                     await self._client.zadd(DUE_KEY, {job.artifact_id: self._clock() + delay}, nx=True)
-            if claimed and result.outcome is not Outcome.RETRY:
+            # Always, not only when this claim carried attempts: another replica
+            # may have counted a failure while this publish ran.
+            if result.outcome is not Outcome.RETRY:
                 await self._client.hdel(key, "attempts")
             _record(result, job, attempts=attempts, error_type=error_type)
         except Exception:  # noqa: BLE001 - the next write queues the doc again
