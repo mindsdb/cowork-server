@@ -235,7 +235,9 @@ class TestEveryHostIsJudgedBeforeAnyRequest:
         assert api.requests == []
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("listed", ["172.30.9.10", "172.30.9.10/32", "auth.example.com,api.example.com"])
+    @pytest.mark.parametrize("listed", [
+        "172.30.9.10", "172.30.9.10/32", "172.30.9.10,auth.example.com,api.example.com",
+    ])
     async def test_a_shared_deployment_reaches_a_private_address_the_operator_listed(
         self, monkeypatch, personal_deployment, listed,
     ):
@@ -244,6 +246,34 @@ class TestEveryHostIsJudgedBeforeAnyRequest:
         outcome, api = await run(table={"auth.example.com": "172.30.9.10", "api.example.com": "172.30.9.10"})
         assert outcome.private_host is None and outcome.preview is not None
         assert [r.headers["host"] for r in api.requests] == ["auth.example.com", "api.example.com"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("listed", "url"), [
+        ("auth.example.com,api.example.com", "https://api.example.com/v1/data"),
+        ("172.30.9.10,auth.example.com", "https://api.example.com/v1/data"),
+        ("172.30.9.10,auth.example.com,api.example.com", "https://172.30.9.10/v1/data"),
+        ("172.30.9.10,auth.example.com,api.example.com", "https://other.example.com:5432/v1/data"),
+        ("172.30.9.0/24,auth.example.com,api.example.com", "https://api.example.com/v1/data"),
+    ], ids=["names only", "host not named", "address literal", "another host and port", "resolves outside the range"])
+    async def test_a_shared_deployment_needs_the_name_and_the_address_listed(
+        self, monkeypatch, personal_deployment, listed, url,
+    ):
+        """A listed name alone would be dialled wherever its DNS points, and a
+        listed address alone would open every host and port behind it."""
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset())
+        allow(monkeypatch, listed)
+        table = {
+            "auth.example.com": "172.30.9.10", "other.example.com": "172.30.9.10",
+            "api.example.com": "172.30.11.10" if "/24" in listed else "172.30.9.10",
+        }
+        api = await refused("operator has not allowed", with_url(url), table=table)
+        assert [r.headers["host"] for r in api.requests] in ([], ["auth.example.com"])
+
+    @pytest.mark.asyncio
+    async def test_a_single_user_install_takes_a_listed_name_or_a_listed_address(self, monkeypatch):
+        allow(monkeypatch, "auth.example.com,api.example.com")
+        outcome, _api = await run(table={"auth.example.com": "10.0.0.5", "api.example.com": "10.0.0.6"})
+        assert outcome.private_host is None and outcome.preview is not None
 
     @pytest.mark.asyncio
     async def test_a_single_user_install_still_offers_this_computer_on_another_port(self, monkeypatch):

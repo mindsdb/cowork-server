@@ -633,7 +633,10 @@ async def _judge_host(
     else:
         addresses = await _resolve(host, resolver)
         hosts, networks = private_allowlist()
-        allowed = host in hosts or all(any(_judged(a) in n or a in n for n in networks) for a in addresses)
+        in_ranges = all(any(_judged(a) in n or a in n for n in networks) for a in addresses)
+        # On a shared deployment a name alone would trust its DNS answer, so every
+        # address must be listed too; listed names then narrow which hosts may use them.
+        allowed = in_ranges and (not hosts or host in hosts) if shared else host in hosts or in_ranges
     # On a shared deployment "this computer" is the server, so nothing on it is
     # a person's own to test, on any port, listed by the operator or not.
     own = _own_addresses() if shared else None
