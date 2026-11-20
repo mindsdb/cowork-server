@@ -1,6 +1,7 @@
 from __future__ import annotations
 from tests._logging_assertions import assert_log_fields
 
+import logging
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -1130,6 +1131,26 @@ def test_auth_outage_before_the_turn_keeps_the_slot_due(monkeypatch):
     assert state["run_status"] == RunStatus.failed
     # The outage clears on its own; the next poll runs the occurrence.
     assert state["next_advanced"] is False
+
+
+def test_an_auth_outage_before_the_turn_logs_why_once(monkeypatch, caplog, owned_logger):
+    """The run's error is the answer, so the line saying why is logged with it."""
+    import cowork.services.product_permissions as permissions_mod
+
+    owned_logger("cowork.services.product_permissions", level=logging.WARNING)
+
+    async def _check(*_args, **_kwargs):
+        raise permissions_mod.permission_unavailable(route=permissions_mod.AUTHORIZE_ROUTE, cause="not_configured")
+
+    monkeypatch.setattr(permissions_mod, "require_product_permission", _check)
+    state = _execute_with_terminal(monkeypatch, None)
+
+    assert state["run_status"] == RunStatus.failed
+    [record] = [
+        r for r in caplog.records
+        if r.name == "cowork.services.product_permissions" and getattr(r, "event", None) == "permission_unavailable"
+    ]
+    assert (record.route, record.reason) == (permissions_mod.AUTHORIZE_ROUTE, "not_configured")
 
 
 def test_revoked_permission_consumes_the_slot(monkeypatch):

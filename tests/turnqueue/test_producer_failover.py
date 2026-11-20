@@ -17,6 +17,7 @@ from cowork.streaming import cancellation
 from cowork.turnqueue import producer as prod
 from cowork.turnqueue.redis_client import REDIS_BLOCK_MS, cancel_flag_key
 from tests._logging_assertions import assert_log_fields
+from tests.turnqueue.test_producer import turn_key_details_from
 
 from _fakes import QueuedPipeline
 
@@ -29,6 +30,7 @@ def _stub_turn_setup(monkeypatch):
         return "mdb_turnkey"
 
     monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(fake_mint))
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
 
 
