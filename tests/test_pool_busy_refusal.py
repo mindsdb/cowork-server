@@ -32,6 +32,7 @@ from _fakes import PausedHarness
 
 # POOL_TIMEOUT in these tests, in seconds; one_connection_pool uses the same.
 WAIT = 2
+PROBE_CLEANUP_TIMEOUT = WAIT * 5
 
 BUSY = {"detail": f"Cowork is busy. Try again in about {WAIT} seconds.", "code": "server_busy"}
 
@@ -84,10 +85,21 @@ async def _ask_while_others_are_served(*, project_id: str | None = None) -> _Mea
             )
             elapsed = loop.time() - started
         finally:
-            for task in (beat, prober):
-                task.cancel()
+            prober.cancel()
+            try:
+                completed, _ = await asyncio.wait({prober}, timeout=PROBE_CLEANUP_TIMEOUT)
+                if not completed:
+                    raise TimeoutError(
+                        f"/api/v1/health/live probe did not stop within {PROBE_CLEANUP_TIMEOUT:.2f}s"
+                    )
                 with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                    await prober
+            finally:
+                if not prober.done():
+                    prober.cancel()
+                beat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await beat
     return _Measured(response=response, elapsed=elapsed, ticks=ticks, live_answers=live_answers)
 
 
@@ -100,6 +112,70 @@ def _assert_refused_as_busy(measured: _Measured) -> None:
     # A free loop ticks about 100 times a second here; a blocked one once.
     assert measured.ticks >= 20, f"event loop stalled: {measured.ticks} ticks in {measured.elapsed:.2f}s"
     assert measured.live_answers >= 5, f"/api/v1/health/live answered {measured.live_answers} times"
+
+
+async def test_liveness_probe_cleanup_is_bounded(monkeypatch):
+    """A stalled probe fails cleanup without awaiting a cancellation-resistant client."""
+    class _CancellationResistantClient:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc_info):
+            return None
+
+        async def get(self, _path):
+            self.started.set()
+            try:
+                while not self.release.is_set():
+                    try:
+                        await self.release.wait()
+                    except asyncio.CancelledError:
+                        continue
+                return httpx.Response(200)
+            finally:
+                self.finished.set()
+
+        async def post(self, *_args, **_kwargs):
+            await asyncio.wait_for(self.started.wait(), timeout=1)
+            return httpx.Response(
+                503,
+                request=httpx.Request("POST", "http://test/api/v1/responses/"),
+            )
+
+    client = _CancellationResistantClient()
+    monkeypatch.setitem(globals(), "PROBE_CLEANUP_TIMEOUT", 0.02)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
+    tasks = []
+    create_task = asyncio.create_task
+
+    def track_task(coro):
+        task = create_task(coro)
+        tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", track_task)
+
+    try:
+        with pytest.raises(TimeoutError, match="probe did not stop"):
+            await _ask_while_others_are_served()
+        assert client.started.is_set()
+        assert len(tasks) == 2
+        assert tasks[0].done()
+        assert not tasks[1].done()
+    finally:
+        client.release.set()
+        if client.started.is_set():
+            await asyncio.wait_for(client.finished.wait(), timeout=1)
+        if len(tasks) == 2:
+            tasks[1].cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(tasks[1], timeout=1)
+            assert tasks[1].done()
 
 
 async def test_a_question_that_finds_the_pool_held_is_refused_while_the_loop_keeps_serving(

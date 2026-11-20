@@ -54,8 +54,8 @@ from cowork.services.artifact_inline import TRUNCATION_NOTE, folder_reader
 from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services.artifacts import ProjectArtifacts
 from scripts import measure_export_capacity as capacity
-from test_artifact_export_route import _snapshot
-from test_artifact_export_service import local_mode  # noqa: F401  (fixture)
+from tests.support.artifacts.files import _snapshot
+from tests.support.artifacts.fixtures import local_mode as local_mode
 from tests._no_fetch import recording_server
 
 ROOT = Path(__file__).resolve().parents[1]
