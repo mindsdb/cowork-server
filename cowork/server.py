@@ -63,7 +63,7 @@ from cowork.shared_skills import read_shared_skills, shared_skills_file
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.services.live_apps import live_app_slot_paths
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
-from cowork.services.connectors.connector_test_run import private_allowlist
+from cowork.services.connectors.connector_test_run import private_allowlist, started_ca_file
 from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import ServerShuttingDown, TurnInProgress, registry
 from cowork.streaming.registry import TURN_SHUTDOWN_GRACE_SECONDS
@@ -945,9 +945,10 @@ def create_app() -> FastAPI:
     # PDF export settings come from the process environment alone. An engine
     # other than "render", or "render" without an http(s) URL, stops the start.
     get_export_pdf_settings()
-    # The operator's private allowlist for connection tests, fixed as the
-    # server starts: code the agent runs can write the environment later.
+    # The operator's private allowlist and certificate file for connection
+    # tests, fixed as the server starts: agent code can write the environment later.
     private_allowlist()
+    started_ca_file()
 
     from cowork.deployment_identity import initialize_deployment_identity
 

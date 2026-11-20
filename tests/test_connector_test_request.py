@@ -22,6 +22,7 @@ import pytest
 from cowork.services.connectors import connector_test_run
 from cowork.services.connectors.connector_test_run import ConnectorTestError, run_test_request
 from tests._logging_assertions import assert_log_fields
+from tests._tls_origin import certificates
 
 SECRET = "s3cr3t-Value/with+chars@x"
 CLIENT_ID = "planner-client"
@@ -333,6 +334,77 @@ class TestEveryHostIsJudgedBeforeAnyRequest:
         request["data"]["method"] = "GET"
         outcome, _ = await run(request, table=table, approved=approved)
         assert outcome.private_host is not None
+
+
+async def _answer_rows(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Answer any request with one JSON row."""
+    await reader.readuntil(b"\r\n\r\n")
+    body = b'{"rows": [{"id": 1}]}'
+    writer.write(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+        + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
+    )
+    await writer.drain()
+    writer.close()
+
+
+class TestAnApiBehindTheOperatorsOwnCertificateAuthority:
+    """The real client and a real TLS handshake, at the step that sends: the
+    judging above it refuses loopback on a shared deployment."""
+
+    HOST = "erp.example.test"
+
+    @pytest.fixture(autouse=True)
+    def no_started_ca_file(self, monkeypatch):
+        monkeypatch.delenv(connector_test_run.CA_FILE_ENV, raising=False)
+        connector_test_run.started_ca_file.cache_clear()
+        yield
+        connector_test_run.started_ca_file.cache_clear()
+
+    @pytest.fixture
+    async def origin(self, tmp_path):
+        server_context, _client, ca_file = certificates(tmp_path, self.HOST)
+        server = await asyncio.start_server(_answer_rows, "127.0.0.1", 0, ssl=server_context)
+        yield server.sockets[0].getsockname()[1], ca_file
+        server.close()
+        await server.wait_closed()
+
+    async def _send(self, port: int):
+        step = connector_test_run._build_step("data", {"method": "GET", "url": f"https://{self.HOST}:{port}/rows"}, {})
+        return await connector_test_run._send_once(step, (ipaddress.ip_address("127.0.0.1"),), None)
+
+    @pytest.mark.asyncio
+    async def test_a_shared_deployment_trusts_the_file_the_server_started_with(self, monkeypatch, personal_deployment, origin):
+        port, ca_file = origin
+        monkeypatch.setenv(connector_test_run.CA_FILE_ENV, str(ca_file))
+
+        status, body, _over_cap, _content_type = await self._send(port)
+
+        assert (status, json.loads(body)) == (200, {"rows": [{"id": 1}]})
+        # The built-in authorities stay trusted beside the operator's one.
+        assert connector_test_run._tls_verify().cert_store_stats()["x509_ca"] > 1
+
+    @pytest.mark.asyncio
+    async def test_a_shared_deployment_without_the_file_does_not_trust_it(self, personal_deployment, origin):
+        port, _ca_file = origin
+        with pytest.raises(ConnectorTestError, match="could not connect"):
+            await self._send(port)
+
+    @pytest.mark.asyncio
+    async def test_a_single_user_install_keeps_the_built_in_authorities_alone(self, monkeypatch, origin):
+        port, ca_file = origin
+        monkeypatch.setenv(connector_test_run.CA_FILE_ENV, str(ca_file))
+
+        assert connector_test_run._tls_verify() is True
+        with pytest.raises(ConnectorTestError, match="could not connect"):
+            await self._send(port)
+
+    def test_the_file_is_the_one_the_server_started_with(self, monkeypatch, tmp_path, personal_deployment):
+        monkeypatch.setenv(connector_test_run.CA_FILE_ENV, "/started/ca.pem")
+        connector_test_run.started_ca_file()
+        monkeypatch.setenv(connector_test_run.CA_FILE_ENV, str(tmp_path / "written-later.pem"))
+
+        assert connector_test_run.started_ca_file() == "/started/ca.pem"
 
 
 class TestFillingIn:

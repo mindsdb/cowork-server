@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import datetime
 import ipaddress
 import logging
 import socket
@@ -19,13 +18,10 @@ from pathlib import Path
 import httpcore
 import httpx
 import pytest
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
 
 from cowork.services.connectors import egress
 from cowork.services.connectors.egress import LIBRARY_LOGGERS, EgressRefused, pinned_get
+from tests._tls_origin import certificates
 
 _HOST = "api.example.test"
 _KEY = "k3y+PLANTED/value="
@@ -184,47 +180,6 @@ def test_the_quiet_rule_covers_every_logger_httpx_and_httpcore_write_to():
     assert _library_logger_names() == set(LIBRARY_LOGGERS)
 
 
-def _certificates(tmp_path: Path) -> tuple[ssl.SSLContext, ssl.SSLContext]:
-    """A throwaway CA and a certificate for _HOST: the server's context and the client's."""
-    now = datetime.datetime.now(datetime.UTC)
-    ca_key = ec.generate_private_key(ec.SECP256R1())
-    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test CA")])
-    ca = (
-        x509.CertificateBuilder()
-        .subject_name(ca_name)
-        .issuer_name(ca_name)
-        .public_key(ca_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(minutes=1))
-        .not_valid_after(now + datetime.timedelta(hours=1))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .sign(ca_key, hashes.SHA256())
-    )
-    key = ec.generate_private_key(ec.SECP256R1())
-    leaf = (
-        x509.CertificateBuilder()
-        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, _HOST)]))
-        .issuer_name(ca_name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(minutes=1))
-        .not_valid_after(now + datetime.timedelta(hours=1))
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName(_HOST)]), critical=False)
-        .sign(ca_key, hashes.SHA256())
-    )
-    cert_file, key_file = tmp_path / "leaf.pem", tmp_path / "leaf.key"
-    cert_file.write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
-    key_file.write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
-        )
-    )
-    server = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    server.load_cert_chain(cert_file, key_file)
-    client = ssl.create_default_context(cadata=ca.public_bytes(serialization.Encoding.PEM).decode())
-    return server, client
-
-
 async def _echo_origin(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """Answer 301 with the request target in Location, a header and the body; logs nothing."""
     head = await reader.readuntil(b"\r\n\r\n")
@@ -242,7 +197,7 @@ async def _echo_origin(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 @pytest.fixture
 async def tls_origin(tmp_path, monkeypatch):
     """A local TLS origin for _HOST, reached through the real per-send transport."""
-    server_context, client_context = _certificates(tmp_path)
+    server_context, client_context, _ca_file = certificates(tmp_path, _HOST)
     server = await asyncio.start_server(_echo_origin, "127.0.0.1", 0, ssl=server_context)
     port = server.sockets[0].getsockname()[1]
     monkeypatch.setattr(egress, "_RESOLVER", _resolve_to("127.0.0.1", port))

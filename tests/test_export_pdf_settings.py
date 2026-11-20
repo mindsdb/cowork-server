@@ -24,7 +24,12 @@ from cowork.common.settings.app_settings import (
 )
 from cowork.schemas.artifact_export import ExportPdfSettings
 from cowork.server import create_app
-from cowork.services.connectors.connector_test_run import ALLOWLIST_ENV, private_allowlist
+from cowork.services.connectors.connector_test_run import (
+    ALLOWLIST_ENV,
+    CA_FILE_ENV,
+    private_allowlist,
+    started_ca_file,
+)
 
 
 class RenderUrlCases(BaseModel, frozen=True):
@@ -275,6 +280,36 @@ def test_the_server_reads_the_connection_test_allowlist_as_it_starts(monkeypatch
         assert [str(n) for n in private_allowlist()[1]] == ["10.9.0.0/16"]
     finally:
         private_allowlist.cache_clear()
+
+
+def test_the_connection_test_certificate_file_is_the_one_the_cli_started_with(monkeypatch, tmp_path):
+    """A line in <COWORK_HOME>/.env names no certificate authority for tests."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"{CA_FILE_ENV}={tmp_path / 'planted.pem'}\n", encoding="utf-8")
+    monkeypatch.delenv(CA_FILE_ENV, raising=False)
+    started_ca_file.cache_clear()
+    _cli_loads_dotenv(monkeypatch, env_path=env_path)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda app, **_: None)
+
+    try:
+        cli.main()
+
+        assert started_ca_file() is None
+    finally:
+        os.environ.pop(CA_FILE_ENV, None)
+        started_ca_file.cache_clear()
+
+
+def test_the_server_reads_the_connection_test_certificate_file_as_it_starts(monkeypatch):
+    monkeypatch.setenv(CA_FILE_ENV, "/started/ca.pem")
+    started_ca_file.cache_clear()
+    try:
+        create_app()
+        monkeypatch.setenv(CA_FILE_ENV, "/written/later.pem")
+
+        assert started_ca_file() == "/started/ca.pem"
+    finally:
+        started_ca_file.cache_clear()
 
 
 def _cli_loads_dotenv(monkeypatch: pytest.MonkeyPatch, *, env_path: Path) -> None:

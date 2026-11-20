@@ -24,6 +24,7 @@ import os
 import posixpath
 import re
 import socket
+import ssl
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -151,6 +152,34 @@ def private_allowlist() -> tuple[frozenset[str], tuple[ipaddress.IPv4Network | i
         except ValueError:
             hosts.add(_normal_host(entry))
     return frozenset(hosts), tuple(networks)
+
+
+CA_FILE_ENV = "SSL_CERT_FILE"
+
+
+@functools.cache
+def started_ca_file() -> str | None:
+    """The certificate file the server was started with, or None.
+
+    Read once as the server starts (``create_app``, and the CLI before it
+    loads ``<COWORK_HOME>/.env``), like ``private_allowlist``.
+    """
+    return os.environ.get(CA_FILE_ENV) or None
+
+
+def _tls_verify() -> ssl.SSLContext | bool:
+    """How a test verifies an API's certificate.
+
+    On a shared deployment the operator's own certificate file is trusted
+    beside the built-in authorities, since its APIs may sit behind a private
+    one. A single-user install keeps the built-in authorities alone.
+    """
+    ca_file = started_ca_file()
+    if ca_file is None or not tenant_scope_required():
+        return True
+    context = httpx.create_ssl_context(trust_env=False)
+    context.load_verify_locations(cafile=ca_file)
+    return context
 
 
 def approval_key(step: str, method: str, scheme: str, host: str, port: int) -> str:
@@ -611,7 +640,9 @@ async def _send_once(
         kwargs["json"] = step.json_body
     # trust_env stays off: an environment proxy would carry the request to a
     # host nobody vetted. No redirects, for the same reason.
-    async with httpx.AsyncClient(follow_redirects=False, trust_env=False, transport=transport) as client:
+    async with httpx.AsyncClient(
+        follow_redirects=False, trust_env=False, transport=transport, verify=_tls_verify(),
+    ) as client:
         attempts = connection_attempts(list(addresses), total_seconds=_REQUEST_SECONDS)
         for index, (address, connect_seconds) in enumerate(attempts):
             request = client.build_request(
