@@ -1,6 +1,7 @@
 """The current clock reaches both text and attachment turns, including resumes."""
 from copy import deepcopy
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
@@ -33,7 +34,7 @@ def test_resumed_attachment_turn_has_its_own_utc_clock(fixed_clock, attachment, 
     blocks = ([{"type": "text", "text": "Refresh this dashboard every hour"}] if with_text else [])
     blocks.append(attachment)
     original = deepcopy(blocks)
-    history = [{"role": "user", "content": "[2026-11-11 20:17 UTC] Make a dashboard"}]
+    history = [{"role": "user", "content": "[2026-11-11 20:17] Make a dashboard"}]
 
     # Exercise the installed Anton boundary too: block lists receive no stamp
     # there, so the harness must supply this turn's clock before handing off.
@@ -41,7 +42,7 @@ def test_resumed_attachment_turn_has_its_own_utc_clock(fixed_clock, attachment, 
     history.append({"role": "user", "content": incoming})
 
     assert history[-1]["content"][0] == {"type": "text", "text": "[2026-11-12 20:17 UTC]"}
-    assert history[0]["content"] == "[2026-11-11 20:17 UTC] Make a dashboard"
+    assert history[0]["content"] == "[2026-11-11 20:17] Make a dashboard"
     assert blocks == original
     if with_text:
         assert incoming[1] == original[0]
@@ -57,6 +58,20 @@ def test_plain_text_is_stamped_once_by_anton(fixed_clock):
     incoming = harness.AntonHarness._to_anton_input([{"type": "text", "text": "Refresh hourly"}])
     assert incoming == "Refresh hourly"
     assert _stamp_user_content(incoming, NOW) == "[2026-11-12 20:17] Refresh hourly"
+
+
+def test_replayed_message_matches_the_live_turn_byte_for_byte():
+    """A replayed user message must read exactly as anton sent it live, or the
+    prompt cache stops matching at the first user message on every turn."""
+    message = SimpleNamespace(
+        role="user",
+        created_at=NOW.replace(tzinfo=None),
+        to_openai_message=lambda: SimpleNamespace(
+            model_dump=lambda: {"role": "user", "content": "Refresh hourly"}
+        ),
+    )
+    replayed = harness.AntonHarness._stamp_message(message)["content"]
+    assert replayed == _stamp_user_content("Refresh hourly", NOW)
 
 
 def test_multiple_text_blocks_get_a_clock_without_losing_content(fixed_clock):
