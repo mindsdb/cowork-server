@@ -545,6 +545,22 @@ class TestASharedDeploymentDecidesInCode:
         assert done["response"]["status"] == "retry"
 
     @pytest.mark.asyncio
+    async def test_a_form_whose_data_request_a_write_approval_rule_holds_is_not_tested(
+        self, api, shared_deployment, monkeypatch,
+    ):
+        monkeypatch.setenv("ANTON_WRITE_APPROVAL", "true")
+        monkeypatch.setenv("ANTON_WRITE_APPROVAL_HTTP", "POST https://planner.example.com/integration/**")
+
+        events = await submit(PLANNER_FORM, PERSON, shared_deployment)
+
+        assert api.requests == []
+        assert shared_deployment.vault.list_connections() == []
+        assert ModelSaysYes.built == 0
+        assert of(events, "connector.test_preview") == []
+        [done] = of(events, "response.completed")
+        assert done["response"]["status"] == "retry"
+
+    @pytest.mark.asyncio
     @SHARED_DEPLOYMENT_SCOPES
     async def test_a_correct_test_request_saves_once_the_person_confirms(self, api, shared_deployment, scope):
         events = await submit(PLANNER_FORM, scope, shared_deployment)

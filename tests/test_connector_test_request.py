@@ -19,6 +19,8 @@ from urllib.parse import quote, quote_plus
 import httpx
 import pytest
 
+from anton.core.utils.write_check import http_write_rule_matches, parse_http_write_rules
+
 from cowork.services.connectors import connector_test_run
 from cowork.services.connectors.connector_test_run import ConnectorTestError, run_test_request
 from tests._logging_assertions import assert_log_fields
@@ -86,10 +88,18 @@ def resolver(table: dict[str, str | list[str]]):
 
 @pytest.fixture(autouse=True)
 def no_allowlist(monkeypatch):
+    monkeypatch.delenv("ANTON_WRITE_APPROVAL", raising=False)
+    monkeypatch.delenv("ANTON_WRITE_APPROVAL_HTTP", raising=False)
     monkeypatch.delenv(connector_test_run.ALLOWLIST_ENV, raising=False)
     connector_test_run.private_allowlist.cache_clear()
     yield
     connector_test_run.private_allowlist.cache_clear()
+
+
+def hold(monkeypatch, rules: str, *, approval: str = "true") -> None:
+    """Set the write-approval rules in the process environment, as anton reads them."""
+    monkeypatch.setenv("ANTON_WRITE_APPROVAL", approval)
+    monkeypatch.setenv("ANTON_WRITE_APPROVAL_HTTP", rules)
 
 
 def allow(monkeypatch, value: str) -> None:
@@ -477,6 +487,126 @@ class TestAnApiBehindTheOperatorsOwnCertificateAuthority:
 
         status, _body, _over_cap, _content_type = await self._send(port)
         assert status == 200
+
+
+class TestAWriteApprovalRuleHoldsATestStep:
+    """A test shows no approval card, so on a shared deployment it never sends
+    a request anton's own matcher would hold."""
+
+    DATA_URL = "https://api.example.com/integration/V1/query"
+    TOKEN_URL = "https://auth.example.com/oauth2/token"
+
+    @staticmethod
+    def _held(rule: str, method: str, url: str) -> bool:
+        [parsed] = parse_http_write_rules(rule)
+        return http_write_rule_matches(parsed, method=method, url=url)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rule", [
+        f"POST {DATA_URL}",
+        "POST https://api.example.com/integration/*/query",
+        "POST https://api.example.com/**",
+        "POST https://api.example.com:443/integration/V1/query",
+        "* https://api.example.com/**",
+        "POST HTTPS://API.EXAMPLE.COM/INTEGRATION/**",
+    ], ids=["exact", "star", "double star", "explicit port", "any method", "other case"])
+    async def test_a_held_data_step_is_refused_before_anything_is_sent(
+        self, monkeypatch, personal_deployment, rule,
+    ):
+        """Each rule is one anton's own matcher holds for some spelling of this URL."""
+        spellings = [self.DATA_URL, self.DATA_URL.replace(".com/", ".com:443/")]
+        assert any(self._held(rule, "POST", spelling) for spelling in spellings)
+        hold(monkeypatch, rule)
+        api = await refused("data step sends a request that needs an approval", api=Api())
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_rule_with_no_path_holds_a_data_step_with_no_path(self, monkeypatch, personal_deployment):
+        rule = "POST https://api.example.com"
+        assert self._held(rule, "POST", "https://api.example.com") is True
+        assert self._held(rule, "POST", self.DATA_URL) is False
+        hold(monkeypatch, rule)
+        api = await refused("data step sends a request that needs an approval", with_url("https://api.example.com"))
+        assert api.requests == []
+        outcome, _api = await run()
+        assert outcome.preview is not None
+
+    @pytest.mark.asyncio
+    async def test_the_trailing_dot_and_spelling_anton_does_not_match_are_still_held(
+        self, monkeypatch, personal_deployment,
+    ):
+        rule = f"POST {self.DATA_URL}"
+        spelled = "https://API.example.com./integration/V1/query"
+        assert self._held(rule, "POST", spelled) is False
+        hold(monkeypatch, rule)
+        api = await refused("data step sends a request that needs an approval", with_url(spelled))
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_rule_naming_the_other_port_holds_nothing_on_this_one(self, monkeypatch, personal_deployment):
+        rule = "POST https://api.example.com:8443/**"
+        assert self._held(rule, "POST", self.DATA_URL) is False
+        hold(monkeypatch, rule)
+        outcome, api = await run()
+        assert outcome.preview is not None and len(api.requests) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_held_token_step_refuses_with_no_request_sent(self, monkeypatch, personal_deployment):
+        hold(monkeypatch, f"POST {self.TOKEN_URL}")
+        api = await refused("token step sends a request that needs an approval")
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_held_data_step_refuses_before_the_token_request_is_sent(self, monkeypatch, personal_deployment):
+        hold(monkeypatch, f"POST {self.DATA_URL}")
+        api = await refused("data step sends a request that needs an approval")
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_says_it_cannot_be_connected_here_and_shows_no_url(self, monkeypatch, personal_deployment):
+        hold(monkeypatch, f"POST {self.DATA_URL}")
+        with pytest.raises(ConnectorTestError) as exc:
+            await run()
+        assert "cannot ask for one" in exc.value.reason and "cannot be connected here" in exc.value.reason
+        assert "example.com" not in exc.value.reason
+
+    @pytest.mark.asyncio
+    async def test_a_data_url_made_held_by_the_issued_token_is_refused_before_its_request(
+        self, monkeypatch, personal_deployment,
+    ):
+        hold(monkeypatch, f"POST {self.DATA_URL}/{ISSUED}")
+        api = await refused(
+            "data step sends a request that needs an approval",
+            with_url(f"{self.DATA_URL}/{{{{token}}}}"),
+        )
+        assert [r.url.path for r in api.requests] == ["/oauth2/token"]
+
+    @pytest.mark.asyncio
+    async def test_an_unheld_post_query_on_the_same_host_still_runs(self, monkeypatch, personal_deployment):
+        hold(monkeypatch, "POST https://api.example.com/integration/V1/orders/*\nPUT https://api.example.com/**")
+        outcome, api = await run()
+        assert outcome.preview is not None and outcome.preview.item_count == 2
+        assert len(api.requests) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_rule_set_after_the_app_started_applies_at_the_next_test(self, monkeypatch, personal_deployment):
+        outcome, _api = await run()
+        assert outcome.preview is not None
+        hold(monkeypatch, f"POST {self.DATA_URL}")
+        api = await refused("data step sends a request that needs an approval")
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_rules_do_nothing_while_write_approval_is_off(self, monkeypatch, personal_deployment):
+        hold(monkeypatch, f"POST {self.DATA_URL}", approval="false")
+        outcome, _api = await run()
+        assert outcome.preview is not None
+
+    @pytest.mark.asyncio
+    async def test_a_single_user_install_with_the_same_rule_still_runs_the_test(self, monkeypatch):
+        hold(monkeypatch, f"POST {self.DATA_URL}")
+        outcome, api = await run()
+        assert outcome.preview is not None and len(api.requests) == 2
 
 
 class TestFillingIn:

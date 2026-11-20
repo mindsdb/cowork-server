@@ -33,6 +33,8 @@ from urllib.parse import quote, quote_plus, unquote, urlsplit
 
 import httpx
 import psutil
+from anton.config.settings import AntonSettings
+from anton.core.utils.write_check import HttpWriteRule, http_write_rule_matches, parse_http_write_rules
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import tenant_scope_required
@@ -614,6 +616,56 @@ def _is_this_server(address: IPAddress, own: frozenset[IPAddress]) -> bool:
     return judged.is_loopback or judged.is_unspecified or judged in own or address in own
 
 
+def held_write_rules() -> tuple[HttpWriteRule, ...]:
+    """The write-approval rules a cell's check would apply on this deployment.
+
+    Read through anton's own settings at each call, as a turn builds them, so a
+    rule the server runs with applies at the next test. None while
+    ``ANTON_WRITE_APPROVAL`` is off, since nothing is held then. Only a shared
+    deployment reads them: a single-user install lets the person confirm.
+    """
+    if not tenant_scope_required():
+        return ()
+    settings = AntonSettings()
+    if settings.write_approval is not True:
+        return ()
+    return parse_http_write_rules(settings.write_approval_http)
+
+
+def _held_urls(url: httpx.URL) -> list[str]:
+    """The spellings of ``url`` a rule may be written against.
+
+    anton matches the text it is given, so a trailing dot on the host or an
+    explicit default port would slip past a rule written without it. httpx
+    drops a default port from its text, so the spellings are built by hand.
+    """
+    text = str(url)
+    start = len(f"{url.scheme}://")
+    end = next((i for i in range(start, len(text)) if text[i] in "/?#"), len(text))
+    ports = [url.port] if url.port is not None else [None, {"https": 443, "http": 80}.get(url.scheme)]
+    hosts = {url.host, url.host.rstrip(".")}
+    return [
+        f"{url.scheme}://{f'[{host}]' if ':' in host else host}{f':{port}' if port else ''}{text[end:]}"
+        for host in hosts
+        for port in ports
+    ]
+
+
+def refuse_held_step(step: _Step, rules: tuple[HttpWriteRule, ...]) -> None:
+    """Refuse a step a write-approval rule would hold: a connection test shows
+    no approval card, so it cannot send what needs one.
+
+    Raises:
+        ConnectorTestError: naming the step, never the URL.
+    """
+    for url in _held_urls(step.url):
+        if any(http_write_rule_matches(rule, method=step.method, url=url) for rule in rules):
+            raise ConnectorTestError(
+                f"The {step.name} step sends a request that needs an approval, and a connection test "
+                "cannot ask for one, so this connector cannot be connected here."
+            )
+
+
 async def _judge_host(
     step: _Step, approved: Mapping[str, tuple[str, ...]], resolver: Callable[..., list[tuple]],
 ) -> tuple[tuple[IPAddress, ...], PrivateHost | None]:
@@ -817,6 +869,9 @@ async def _run_test_request(
     data_probe = _build_step("data", data_spec, pending)
     outcome = ConnectorTestOutcome()
     dial: dict[str, tuple[IPAddress, ...]] = {}
+    rules = held_write_rules()
+    for step in [*steps, data_probe]:
+        refuse_held_step(step, rules)
     for step in [*steps, data_probe]:
         addresses, private = await _judge_host(step, approved, resolver)
         if private is not None:
@@ -846,6 +901,7 @@ async def _run_test_request(
         filled["token"] = token
         token_host = url_host(token_step.url)
     data_step = _build_step("data", data_spec, filled)
+    refuse_held_step(data_step, rules)
     if token_spec and _endpoint(data_step.url) == _endpoint(steps[0].url):
         raise ConnectorTestError("The data step asks the token URL again; it must fetch data.")
     status, body, over_cap, content_type = await _send(data_step, dial["data"], transport)
