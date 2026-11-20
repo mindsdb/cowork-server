@@ -21,7 +21,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, Field, StrictBool
+from pydantic import BaseModel, Field, StrictBool, model_validator
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
@@ -59,6 +59,7 @@ from cowork.schemas.artifact_export import ExportRequest, ExportResult
 from cowork.schemas.artifact_access import (
     ArtifactAccessRequest,
     ArtifactAccessView,
+    ArtifactSharedAudienceView,
     access_refusal,
 )
 from cowork.schemas.base import CamelResponse
@@ -1279,28 +1280,113 @@ async def artifact_access(
     file store with the access state, in one call on its threads (run_efs),
     and MindsHub is asked on one of anyio's default threads.
     """
+    source, folder, metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    return await _read_access_state(scope, folder, metadata, project_id=source.project_id)
+
+
+async def _read_access_state(
+    scope: TenantScope,
+    folder: Path,
+    metadata: ArtifactMetadata,
+    *,
+    project_id: str | None,
+    rule_scope: TenantScope | None = None,
+) -> ArtifactAccessView:
+    """The artifact's access state as GET .../access answers it (see there):
+    503 while MindsHub's rule can't be read, 409 when it refuses the read.
+
+    ``rule_scope`` is who the rule is read as, the caller's scope by default.
+    MindsHub binds an artifact's rule to its owner, so a read for anyone else
+    (GET .../audience) passes the owner's: the same organization, the owner's
+    user id."""
     from cowork.models.artifact_owner_choice import AccessMode
     from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAccessUnavailable
     from cowork.services.publish import held_rule_under, stored_rule_under
 
-    source, folder, metadata, _capabilities = await _owner_workspace(
-        scope, project_ref, artifact_id
-    )
+    rule_scope = scope if rule_scope is None else rule_scope
     try:
         state, keys = await run_efs(
-            partial(_access_read, folder, metadata, scope=scope, project_id=source.project_id), scope=scope
+            partial(_access_read, folder, metadata, scope=rule_scope, project_id=project_id), scope=scope
         )
         if not scope.org_mode:
             return state
         rule_under: Callable[[list[str], TenantScope], ArtifactRule | None] = (
             stored_rule_under if state.access_mode is AccessMode.RESTRICTED else held_rule_under
         )
-        rule = await run_in_threadpool(rule_under, keys, scope)
+        rule = await run_in_threadpool(rule_under, keys, rule_scope)
     except ArtifactAccessUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except ArtifactAccessRefused as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     return state if rule is None else state.restricted_to(rule)
+
+
+def _member_of_artifact_org(scope: TenantScope, principal: Principal | None) -> bool:
+    """True when the caller belongs to the organization the artifact lives in.
+
+    Outside org mode there is one person behind the scope (the desktop, or a
+    personal partition on a trusted-identity deployment), who is the owner.
+    In org mode an artifact is only ever resolved inside the scope's own
+    organization, and the scope is built from the request's principal
+    (cowork.db.scoped.scope_from_principal), so every caller who reaches this
+    is a member; the check is kept so a scope that doesn't come from the
+    request's own principal never sees names."""
+    if not scope.org_mode:
+        return True
+    return (
+        isinstance(principal, Principal)
+        and bool(scope.org_id)
+        and principal.org_id == scope.org_id
+        and principal.user_id == scope.user_id
+    )
+
+
+@router.get(
+    "/workspace/{project_ref}/{artifact_id}/audience",
+    response_model=ArtifactSharedAudienceView,
+)
+async def artifact_audience(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    scope: ScopeDep,
+    principal: Annotated[Principal | None, Depends(get_principal)],
+) -> ArtifactSharedAudienceView:
+    """Who the artifact is shared with, for anyone who may preview it: the
+    read-only "Shared with" panel a non-owner opens from the viewer.
+
+    Resolved the way the review route resolves it (a caller with no grant
+    gets 404), never through `_owner_workspace`, and read the way GET
+    .../access reads it (`_read_access_state`, 503 and 409 alike), so a
+    member sees the audience the owner sees. In org mode the rule is read as
+    the artifact's recorded owner, since MindsHub binds it to them; an owner
+    nobody is recorded as fails closed there with 503 once a rule must be
+    read. Never the password, nor the live page's ids. A caller outside the
+    artifact's organization gets how it is shared and no names
+    (`_member_of_artifact_org`).
+    """
+    from dataclasses import replace
+
+    from cowork.services.artifact_ownership import resolve_artifact_owner
+
+    source, folder, metadata, _is_own = await review_artifact_for_request(
+        scope, project_ref, artifact_id
+    )
+    rule_scope = scope
+    if scope.org_mode:
+        resolution = await run_db(
+            lambda unit: resolve_artifact_owner(unit, source, folder.name), scope=scope
+        )
+        owner_id = resolution.owner_user_id
+        if owner_id and not resolution.unknown and str(owner_id) != str(scope.user_id):
+            rule_scope = replace(scope, user_id=str(owner_id))
+    state = await _read_access_state(
+        scope, folder, metadata, project_id=source.project_id, rule_scope=rule_scope
+    )
+    return ArtifactSharedAudienceView.of_access(
+        state, names=_member_of_artifact_org(scope, principal)
+    )
 
 
 def _push_share(scope, principal: Principal | None, notices: list) -> None:
@@ -1519,7 +1605,16 @@ async def _call_stats_service(scope: TenantScope, folder: Path, call: Callable[.
 
 
 class _StatsTrackingBody(BaseModel):
-    enabled: StrictBool
+    """At least one setting; an omitted one stays as it is."""
+
+    enabled: StrictBool | None = None
+    require_email: StrictBool | None = None
+
+    @model_validator(mode="after")
+    def _one_setting(self):
+        if self.enabled is None and self.require_email is None:
+            raise ValueError("Send enabled, require_email or both")
+        return self
 
 
 @router.get("/workspace/{project_ref}/{artifact_id}/stats")
@@ -1549,7 +1644,8 @@ async def set_artifact_stats_tracking(
     body: _StatsTrackingBody,
     scope: ScopeDep,
 ):
-    """Turn view recording on or off for this published artifact. Owner-only.
+    """Turn viewer analytics, or the email gate, on or off for this published
+    artifact. Owner-only. Returns `{"tracking": bool, "require_email": bool}`.
 
     The publishing service rewrites the artifact's metadata file to store the
     flag, so the request holds the publish lock: a live sync or autopublish
@@ -1571,8 +1667,10 @@ async def set_artifact_stats_tracking(
             detail="Publishing is busy right now. Try again in a moment.",
         )
     try:
-        tracking = await _call_stats_service(
-            scope, folder, partial(stats.set_tracking, enabled=body.enabled),
+        settings = await _call_stats_service(
+            scope,
+            folder,
+            partial(stats.set_tracking, enabled=body.enabled, require_email=body.require_email),
         )
     finally:
         # Shielded for the same reason: an unreleased lock blocks publishing
@@ -1581,7 +1679,47 @@ async def set_artifact_stats_tracking(
             await run_efs(
                 partial(release, folder.parent, folder.name), scope=scope, deadline=False
             )
-    return {"tracking": tracking}
+    return settings
+
+
+@router.get("/workspace/{project_ref}/{artifact_id}/stats/viewers/{viewer_id}")
+async def read_artifact_stats_viewer(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    viewer_id: str,
+    scope: ScopeDep,
+):
+    """One viewer's visits and per-section times, as the publishing service
+    returns them. Owner-only, like the stats themselves."""
+    await require_product_permission(scope, "artifact.manage")
+    from cowork.services import artifact_stats as stats
+
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    return await _call_stats_service(
+        scope, folder, partial(stats.fetch_viewer, viewer_id=viewer_id)
+    )
+
+
+@router.delete(
+    "/workspace/{project_ref}/{artifact_id}/stats",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_artifact_stats(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    scope: ScopeDep,
+):
+    """Delete this artifact's viewer analytics (views, visits, viewers). Owner-only."""
+    await require_product_permission(scope, "artifact.manage")
+    from cowork.services import artifact_stats as stats
+
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    await _call_stats_service(scope, folder, stats.delete_stats)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 def _open_comments(

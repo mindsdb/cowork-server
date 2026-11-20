@@ -408,24 +408,45 @@ def test_delete_artifact_keeps_folder_when_unpublish_fails(source, monkeypatch):
     assert folder.exists()
 
 
-def test_delete_logs_orphan_when_primary_file_is_gone(source, monkeypatch, caplog):
+def test_delete_takes_down_a_page_whose_primary_file_is_gone(source, monkeypatch):
+    # ENG-4455: the page used to be only logged as orphaned and left up, with
+    # nothing left pointing at it once the folder went.
     folder = _make_artifact(source.base, "dash", files={"other.txt": "x"},
                             meta={"slug": "dash", "type": "document"})
     (folder / ".published.json").write_text(
         json.dumps({"index.html": {"report_id": "rid", "url": "https://view.example/r/1",
                                    "published": True}})
     )
-    called = []
+    by_path, by_id = [], []
     monkeypatch.setattr("cowork.services.publish.unpublish_artifact",
-                        lambda art, **kw: called.append(art))
+                        lambda art, **kw: by_path.append(art))
+    monkeypatch.setattr(a, "_unpublish_identifier",
+                        lambda identifier, entry, **kw: by_id.append((identifier, kw["api_key"])))
 
-    with caplog.at_level("WARNING"):
+    a.delete_artifact(folder, artifacts_base=source.base, api_key="k",
+                      publish_url="https://api.staging.mindshub.ai")
+
+    assert by_path == []
+    assert by_id == [("rid", "k")]
+    assert not folder.exists()
+
+
+def test_delete_keeps_folder_when_a_missing_primary_page_fails_to_come_down(source, monkeypatch):
+    folder = _make_artifact(source.base, "dash", files={"other.txt": "x"},
+                            meta={"slug": "dash", "type": "document"})
+    (folder / ".published.json").write_text(
+        json.dumps({"index.html": {"report_id": "rid", "published": True}})
+    )
+
+    def boom(identifier, entry, **kw):
+        raise RuntimeError("Unpublishing failed: HTTP Error 500")
+
+    monkeypatch.setattr(a, "_unpublish_identifier", boom)
+
+    with pytest.raises(RuntimeError):
         a.delete_artifact(folder, artifacts_base=source.base, api_key="k",
                           publish_url="https://api.staging.mindshub.ai")
-
-    assert called == []  # can't unpublish a record whose file is gone
-    assert "orphaned_publish" in caplog.text
-    assert not folder.exists()
+    assert folder.exists()
 
 
 def test_delete_artifact_rejects_folder_outside_the_given_root(source, tmp_path):

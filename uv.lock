@@ -141,7 +141,7 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.11.19.1rc3"
+version = "2.26.11.20.1rc3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
@@ -163,9 +163,9 @@ dependencies = [
     { name = "truststore" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/71/f1/e6775117af1c32bb2b3271cc629458995bfe41c83a62994d0e800e16c447/anton_agent-2.26.11.19.1rc3.tar.gz", hash = "sha256:343abc61f307eddb0ab3c982dfceac7f55642de6c68bcb517207613eb481d5cd", size = 7622140, upload-time = "2026-11-19T16:46:19.895Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/cf/d6c67457b3c03999e9d168758d796bfdf61affdeeb59c6888457072ebf0a/anton_agent-2.26.11.20.1rc3.tar.gz", hash = "sha256:98b559d549da224edf6ee0373a45381fec6a89cbd2f3713762a8ddf486e33d15", size = 7672062, upload-time = "2026-11-20T08:27:45.089Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0e/66/9d5d43f0ef528516c353c6ef1ae80f3a8f50f3ec6e257f75e8877fb5bb41/anton_agent-2.26.11.19.1rc3-py3-none-any.whl", hash = "sha256:938df42643887c714600a451d6e285d768717da05b85363dafaf227238a8dadd", size = 4530367, upload-time = "2026-11-19T16:46:17.74Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/21/435fdf6de39c5c4a820c309c7c75a62a540f36af1f175168db2fdd34a19e/anton_agent-2.26.11.20.1rc3-py3-none-any.whl", hash = "sha256:006893bf5de6d4945817efd8ea31d79a28deead54f54a41f69193c12bf1316dd", size = 4539682, upload-time = "2026-11-20T08:27:43.295Z" },
 ]
 
 [[package]]
@@ -459,7 +459,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14" },
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", specifier = ">=2.26.11.19.1rc3,<3" },
+    { name = "anton-agent", specifier = ">=2.26.11.20.1rc3,<3" },
     { name = "anyio", specifier = ">=4.14.2" },
     { name = "beautifulsoup4", specifier = "==4.15.0" },
     { name = "cryptography", specifier = ">=48.0.0,<51" },

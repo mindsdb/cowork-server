@@ -664,6 +664,36 @@ async def test_produce_answer_streams_then_saves_the_turn(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_moderated_direct_answer_finishes_and_releases_its_resources(monkeypatch):
+    from unittest.mock import AsyncMock
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.handlers import responses
+    from cowork.services import content_safety
+
+    monkeypatch.setenv("COWORK_CONTENT_SAFETY_REQUIRED", "true")
+    check = AsyncMock()
+    revoke = AsyncMock()
+    monkeypatch.setattr(content_safety, "check_content", check)
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
+    conversation_id = await _conversation()
+    answer = await _answer(["First ", "second."])
+    close = AsyncMock(wraps=answer.close)
+    monkeypatch.setattr(answer, "close", close)
+    _, buffer, produce = await _produce(
+        monkeypatch, conversation_id, answer, gate_key={"correlation_id": "corr-gate"},
+    )
+
+    await produce
+
+    check.assert_awaited_once_with("First second.", purpose="output", scope=LOCAL_SCOPE)
+    deltas = [_payload(f)["delta"] for f in buffer.frames if f.startswith("event: response.output_text.delta")]
+    assert deltas == ["First second."]
+    assert buffer.status == "completed"
+    close.assert_awaited_once_with()
+    revoke.assert_awaited_once_with("corr-gate")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delegates", [False, True, "fails"])
 async def test_produce_answer_revokes_the_gate_key_unless_the_agent_takes_the_turn(monkeypatch, delegates):
     """An answered turn runs no agent turn to revoke the gate's key; a

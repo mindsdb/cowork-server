@@ -763,6 +763,12 @@ LAYER_JS = r"""
     closePop();
     pop = document.createElement('div');
     pop.className = 'act-pop';
+    // Keys typed in the card stay in the card: a deck that moves on Space or
+    // the arrows (and swallows them) never hears them, so a comment can have
+    // spaces. Escape still reaches the layer, which closes the card with it.
+    ['keydown', 'keypress', 'keyup'].forEach(function(type){
+      pop.addEventListener(type, function(e){ if (e.key !== 'Escape') e.stopPropagation(); });
+    });
     // Doc bounds measured BEFORE appending (the popover itself would inflate them).
     var docW = document.documentElement.scrollWidth;
     pop.__docH = document.documentElement.scrollHeight;
