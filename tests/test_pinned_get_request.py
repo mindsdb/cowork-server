@@ -11,7 +11,6 @@ import asyncio
 import ipaddress
 import logging
 import socket
-import ssl
 import time
 from pathlib import Path
 

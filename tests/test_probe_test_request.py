@@ -23,6 +23,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.user_settings import use_settings_scope
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, ScopedSession, TenantScope
 from cowork.handlers import probe as probe_handler
@@ -451,6 +452,35 @@ class TestAnOldConnectorCanBeBuiltAgain:
     async def test_a_handcrafted_submission_may_replace_it(self, old_connector):
         await old_connector.submissions.submit_form(SubmitFormRequest(form_spec=PLANNER_FORM, values=VALUES), LOCAL_SCOPE)
         assert [s["form_id"] for s in old_connector.staged] == ["fm_aaaaaaaaaa"]
+
+    @pytest.fixture()
+    def old_connector_of_a_person(self, shared_deployment, monkeypatch):
+        """The same connector kept in a person's own scope, on a deployment that trusts identity headers."""
+        with Session(shared_deployment.engine) as session:
+            ScopedSession(session, PERSON).add(
+                CustomConnector(connector_id="planner", label="Planner", description="", spec=self.OLD)
+            )
+            session.commit()
+        monkeypatch.setattr(tools, "run_db", connector_test_flow.run_db)
+        staged = []
+        monkeypatch.setattr(submissions_endpoint.store, "stage", lambda **kwargs: staged.append(kwargs) or "sub_x")
+        return staged
+
+    @pytest.mark.asyncio
+    async def test_the_agent_of_a_shared_deployment_gets_the_rebuild_text(self, old_connector_of_a_person):
+        with use_settings_scope(PERSON):
+            result = await tools._cowork_request_credentials(None, {"_connector_id": "planner", **self.OLD})
+        assert "data-vault-form" not in result and "saved before connection tests existed" in result
+
+    @pytest.mark.asyncio
+    async def test_a_stamped_submission_of_it_on_a_shared_deployment_is_refused_before_it_is_staged(
+        self, old_connector_of_a_person
+    ):
+        req = SubmitFormRequest(form_spec={"_connector_id": "planner", "form_id": "planner-connector"}, values=VALUES)
+        with pytest.raises(HTTPException) as exc:
+            await submissions_endpoint.submit_form(req, PERSON)
+        assert exc.value.status_code == 422 and "saved before connection tests existed" in exc.value.detail
+        assert old_connector_of_a_person == []
 
     def test_the_catalog_marks_it_for_rebuilding_on_a_single_user_install_only(self, saved, monkeypatch):
         _stored(saved.engine, self.OLD)

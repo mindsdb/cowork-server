@@ -27,6 +27,7 @@ import socket
 import ssl
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, quote_plus, unquote, urlsplit
 
@@ -157,29 +158,76 @@ def private_allowlist() -> tuple[frozenset[str], tuple[ipaddress.IPv4Network | i
 CA_FILE_ENV = "SSL_CERT_FILE"
 
 
-@functools.cache
-def started_ca_file() -> str | None:
-    """The certificate file the server was started with, or None.
+@dataclass(frozen=True)
+class StartedCertificates:
+    """The certificate file named when the server started: its path and its
+    text, or None for the text when it could not be read."""
 
-    Read once as the server starts (``create_app``, and the CLI before it
-    loads ``<COWORK_HOME>/.env``), like ``private_allowlist``.
+    path: str
+    pem: str | None
+
+
+@functools.cache
+def started_certificates() -> StartedCertificates | None:
+    """The operator's certificate file as it was when the server started, or
+    None when no file is named.
+
+    Read once, with its text (``create_app``, and the CLI before it loads
+    ``<COWORK_HOME>/.env``), like ``private_allowlist``. An unreadable file
+    is kept as a path with no text, so a single-user install, which never
+    uses the file, still starts.
     """
-    return os.environ.get(CA_FILE_ENV) or None
+    path = os.environ.get(CA_FILE_ENV)
+    if not path:
+        return None
+    try:
+        return StartedCertificates(path, Path(path).read_text(encoding="ascii"))
+    except (OSError, UnicodeDecodeError):
+        return StartedCertificates(path, None)
+
+
+def _trust_context(certificates: StartedCertificates) -> ssl.SSLContext:
+    """The built-in authorities plus the started file's certificates.
+
+    Raises ValueError when the file could not be read or holds no certificate.
+    """
+    if certificates.pem is None:
+        raise ValueError(f"{CA_FILE_ENV} names a file that cannot be read: {certificates.path}")
+    context = httpx.create_ssl_context(trust_env=False)
+    try:
+        context.load_verify_locations(cadata=certificates.pem)
+    except ssl.SSLError as error:
+        raise ValueError(f"{CA_FILE_ENV} names a file with no certificate in it: {certificates.path}") from error
+    return context
+
+
+def check_started_certificates() -> None:
+    """Stop the start of a shared deployment whose ``SSL_CERT_FILE`` cannot
+    be used, rather than fail later inside a test. A single-user install
+    never uses the file and is not checked."""
+    certificates = started_certificates()
+    if certificates is not None and tenant_scope_required():
+        _trust_context(certificates)
+
+
+@functools.cache
+def _shared_tls_context() -> ssl.SSLContext | None:
+    """The shared deployment's context, built once from the started text."""
+    certificates = started_certificates()
+    return None if certificates is None else _trust_context(certificates)
 
 
 def _tls_verify() -> ssl.SSLContext | bool:
     """How a test verifies an API's certificate.
 
-    On a shared deployment the operator's own certificate file is trusted
-    beside the built-in authorities, since its APIs may sit behind a private
-    one. A single-user install keeps the built-in authorities alone.
+    On a shared deployment the operator's own certificate file, as it was at
+    the start, is trusted beside the built-in authorities, since its APIs may
+    sit behind a private one. A single-user install keeps the built-in
+    authorities alone.
     """
-    ca_file = started_ca_file()
-    if ca_file is None or not tenant_scope_required():
+    if not tenant_scope_required():
         return True
-    context = httpx.create_ssl_context(trust_env=False)
-    context.load_verify_locations(cafile=ca_file)
-    return context
+    return _shared_tls_context() or True
 
 
 def approval_key(step: str, method: str, scheme: str, host: str, port: int) -> str:

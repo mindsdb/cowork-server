@@ -355,11 +355,20 @@ class TestAnApiBehindTheOperatorsOwnCertificateAuthority:
     HOST = "erp.example.test"
 
     @pytest.fixture(autouse=True)
-    def no_started_ca_file(self, monkeypatch):
+    def no_started_certificates(self, monkeypatch):
         monkeypatch.delenv(connector_test_run.CA_FILE_ENV, raising=False)
-        connector_test_run.started_ca_file.cache_clear()
+        self._forget_the_start()
         yield
-        connector_test_run.started_ca_file.cache_clear()
+        self._forget_the_start()
+
+    @staticmethod
+    def _forget_the_start():
+        connector_test_run.started_certificates.cache_clear()
+        connector_test_run._shared_tls_context.cache_clear()
+
+    def _start_with(self, monkeypatch, path):
+        monkeypatch.setenv(connector_test_run.CA_FILE_ENV, str(path))
+        connector_test_run.started_certificates()
 
     @pytest.fixture
     async def origin(self, tmp_path):
@@ -376,7 +385,7 @@ class TestAnApiBehindTheOperatorsOwnCertificateAuthority:
     @pytest.mark.asyncio
     async def test_a_shared_deployment_trusts_the_file_the_server_started_with(self, monkeypatch, personal_deployment, origin):
         port, ca_file = origin
-        monkeypatch.setenv(connector_test_run.CA_FILE_ENV, str(ca_file))
+        self._start_with(monkeypatch, ca_file)
 
         status, body, _over_cap, _content_type = await self._send(port)
 
@@ -393,18 +402,51 @@ class TestAnApiBehindTheOperatorsOwnCertificateAuthority:
     @pytest.mark.asyncio
     async def test_a_single_user_install_keeps_the_built_in_authorities_alone(self, monkeypatch, origin):
         port, ca_file = origin
-        monkeypatch.setenv(connector_test_run.CA_FILE_ENV, str(ca_file))
+        self._start_with(monkeypatch, ca_file)
 
         assert connector_test_run._tls_verify() is True
         with pytest.raises(ConnectorTestError, match="could not connect"):
             await self._send(port)
 
     def test_the_file_is_the_one_the_server_started_with(self, monkeypatch, tmp_path, personal_deployment):
-        monkeypatch.setenv(connector_test_run.CA_FILE_ENV, "/started/ca.pem")
-        connector_test_run.started_ca_file()
+        started = tmp_path / "started.pem"
+        started.write_text("started", encoding="ascii")
+        self._start_with(monkeypatch, started)
         monkeypatch.setenv(connector_test_run.CA_FILE_ENV, str(tmp_path / "written-later.pem"))
 
-        assert connector_test_run.started_ca_file() == "/started/ca.pem"
+        assert connector_test_run.started_certificates() == connector_test_run.StartedCertificates(
+            str(started), "started"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_file_overwritten_after_the_start_is_not_trusted(
+        self, monkeypatch, tmp_path, personal_deployment, origin
+    ):
+        port, origin_ca = origin
+        bundle = tmp_path / "bundle.pem"
+        (tmp_path / "other").mkdir()
+        _server, _client, other_ca = certificates(tmp_path / "other", self.HOST)
+        bundle.write_bytes(other_ca.read_bytes())
+        self._start_with(monkeypatch, bundle)
+
+        bundle.write_bytes(origin_ca.read_bytes())
+
+        with pytest.raises(ConnectorTestError, match="could not connect"):
+            await self._send(port)
+
+    @pytest.mark.asyncio
+    async def test_a_file_removed_after_the_start_is_still_trusted(
+        self, monkeypatch, tmp_path, personal_deployment, origin
+    ):
+        port, origin_ca = origin
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_bytes(origin_ca.read_bytes())
+        self._start_with(monkeypatch, bundle)
+
+        bundle.unlink()
+
+        status, _body, _over_cap, _content_type = await self._send(port)
+        assert status == 200
 
 
 class TestFillingIn:

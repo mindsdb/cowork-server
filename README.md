@@ -1038,7 +1038,7 @@ Where a test may go:
 - On a single-user install, a private or loopback address is reached only after the person allows that host for that test (`.../allow-private`). Plain `http` is accepted only to that computer.
 - On a deployment that trusts identity headers, nobody is asked. The request leaves from inside the operator's network, so a private address is reached only when the operator listed it in `COWORK_CONNECTOR_TEST_PRIVATE_ALLOWLIST`, and `.../allow-private` answers 403. Loopback and every address of the server's own network interfaces are refused even when listed, on any port, and so is plain `http`. An API reached through a private egress path (a forward proxy or gateway at a private address) therefore needs that address on the list; `cowork-self-hosted` writes its egress gateway there. The test trusts the built-in certificate authorities and, on such a deployment, the file `SSL_CERT_FILE` named when the server started.
 
-Both values are read once as the server starts. A line for either in `<COWORK_HOME>/.env`, which code the agent runs can write, changes nothing.
+Both values are read once as the server starts, the certificate file as its text, so a file changed afterwards is not trusted. A line for either in `<COWORK_HOME>/.env`, which code the agent runs can write, changes nothing. A deployment that trusts identity headers does not start when `SSL_CERT_FILE` is set to a file that cannot be read or holds no certificate.
 
 
 ### Sharing selected projects

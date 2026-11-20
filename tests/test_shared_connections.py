@@ -440,7 +440,8 @@ async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharin
         [event async for event in ProbeHandler(scope=BOB).run(submission_id, "acme_crm", None, "acme", None)]
     )
     answer = await _confirm(probed, BOB)
-    assert "saved_slug" not in answer and answer["patch"]["form_error"]
+    assert "saved_slug" not in answer
+    assert answer["patch"]["form_error"] == "Cowork could not save the connection. Submit the form again."
     staged: list = []
     monkeypatch.setattr(submissions_ep.store, "stage", lambda **kwargs: staged.append(kwargs))
 

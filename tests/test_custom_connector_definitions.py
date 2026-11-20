@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
@@ -102,12 +103,12 @@ def vault(tmp_path, monkeypatch):
     return vault
 
 
-async def _probe(form_spec: dict, values: dict, *, scope=LOCAL_SCOPE, method=None) -> str:
+async def _probe(form_spec: dict, values: dict, *, scope=LOCAL_SCOPE, method=None, conversation_id=None) -> str:
     submission_id = store.stage(
-        form_id=form_spec["form_id"], connector_id="httpbin", conversation_id=None,
+        form_id=form_spec["form_id"], connector_id="httpbin", conversation_id=conversation_id,
         values=values, form_spec=form_spec, checked_against_stored_spec=False,
     )
-    events = [e async for e in probe_handler.ProbeHandler(scope=scope).run(submission_id, "httpbin", method, "", None)]
+    events = [e async for e in probe_handler.ProbeHandler(scope=scope).run(submission_id, "httpbin", method, "", conversation_id)]
     return "".join(events)
 
 
@@ -205,13 +206,25 @@ class TestProbeStream:
         assert "account_code" in record["secure_keys"]
 
     @pytest.mark.asyncio
-    async def test_a_scope_shared_by_several_people_saves_the_connection_but_no_definition(self, engine, vault, api):
-        stream = await _probe(HTTPBIN_FORM, {"token": "a-bearer-token"}, scope=SHARED_CONNECTIONS)
+    async def test_a_scope_shared_by_several_people_saves_the_connection_but_no_definition(
+        self, engine, vault, api, monkeypatch, tmp_path
+    ):
+        outcomes: list[str] = []
+        conversation = probe_handler._ProbeConversation(id=uuid4(), workspace_path=Path(tmp_path))
+        monkeypatch.setattr(probe_handler, "_read_conversation", lambda session, conversation_id: conversation)
+        monkeypatch.setattr(probe_handler, "_save_probe_turn", lambda session, conversation_id, text, events: uuid4())
+        monkeypatch.setattr(connector_test_flow, "_save_outcome", lambda session, conversation_id, text: outcomes.append(text))
+        stream = await _probe(
+            HTTPBIN_FORM, {"token": "a-bearer-token"}, scope=SHARED_CONNECTIONS, conversation_id=str(conversation.id),
+        )
 
         await _confirm(stream, SHARED_CONNECTIONS)
 
         assert len(vault.list_connections()) == 1
         assert _rows(engine) == []
+        [outcome] = outcomes
+        assert outcome.startswith("Saved as `")
+        assert "not added to your connectors list" in outcome
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(("connector_id", "defines_pass"), [("roam_research", True), ("airtable", False)])
