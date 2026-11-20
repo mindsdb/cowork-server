@@ -14,7 +14,7 @@ import asyncio
 import contextvars
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -22,19 +22,20 @@ from pathlib import Path
 from typing import Any
 
 from cowork.db.scoped import TenantScope
-from cowork.db.units import FilesystemBusy, run_db, run_efs, run_efs_cleanup, run_on_unit_threads
+from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.docs.hub import DOC_PUBLISHED, doc_topic, hub
-from cowork.docs.store import DOC_HTML, is_doc_folder, load_doc
+from cowork.docs.store import DOC_HTML, _has_id, is_doc_folder, load_doc
 from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAudienceRejected
 from cowork.services.artifact_autopublish import (
     AUTOPUBLISH_ACCESS,
     _active_workspace_id,
     _artifact_owners,
     _publish_url,
+    _release,
     job_budget_for,
     lock_ttl_for,
 )
-from cowork.services.artifact_locks import acquire, refresh, release
+from cowork.services.artifact_locks import acquire, refresh
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.artifacts import load_published_map
 from cowork.services.product_permissions import ProductPermissionDenied
@@ -115,19 +116,31 @@ def _valid_slug(slug: str) -> bool:
     return bool(slug) and not slug.startswith(".") and "/" not in slug and "\\" not in slug
 
 
-def _same_id(a: str, b: str) -> bool:
-    return str(a).replace("-", "").lower() == str(b).replace("-", "").lower()
+def track(task: asyncio.Task, registry: set[asyncio.Task]) -> asyncio.Task:
+    """Keep ``task`` in ``registry`` until it ends, so a shutdown can wait for it."""
+    registry.add(task)
+    task.add_done_callback(registry.discard)
+    return task
+
+
+async def drain(tasks: Iterable[asyncio.Task], *, timeout: float, outcome: str) -> None:
+    """Wait up to ``timeout`` for ``tasks``; log ``outcome`` with how many there were when it runs out."""
+    tasks = list(tasks)
+    if not tasks or timeout <= 0:
+        return
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning("doc_publish", extra={"event": "doc_publish", "outcome": outcome, "count": len(tasks)})
 
 
 def _doc_folder(job: DocPublishJob) -> tuple[Path | None, str | None]:
     """The doc folder the record names, or (None, why not). Read only once
-    _owner_of has confirmed the base is the project's root."""
-    if not _valid_slug(job.slug):
-        return None, "bad_slug"
+    the slug is valid and _owner_of has confirmed the base is the project's root."""
     folder = Path(job.artifacts_base) / job.slug
     if not folder.is_dir() or not is_doc_folder(folder):
         return None, "not_a_doc"
-    if not _same_id(load_doc(folder).get("id", ""), job.artifact_id):
+    if not _has_id(load_doc(folder), job.artifact_id.replace("-", "").lower()):
         return None, "id_mismatch"
     return folder, None
 
@@ -170,11 +183,30 @@ def _early(state: _PageState) -> PublishResult | None:
     return None
 
 
+async def _try_lock(base: Path, slug: str, scope: TenantScope) -> bool:
+    """One take of the publish lock. A cancel that lands once the take ran
+    frees a lock it took, as artifact_autopublish._acquire does: the caller
+    never sees that True."""
+    taken = False
+
+    def take() -> bool:
+        nonlocal taken
+        taken = acquire(base, slug, ttl_s=LOCK_TTL_S)
+        return taken
+
+    try:
+        return await run_efs(take, scope=scope)
+    except asyncio.CancelledError:
+        if taken:
+            await _release(base, slug, scope=scope)
+        raise
+
+
 async def _take_lock(base: Path, slug: str, scope: TenantScope) -> bool:
     deadline = time.monotonic() + LOCK_WAIT_S
     while True:
         try:
-            if await run_efs(partial(acquire, base, slug, ttl_s=LOCK_TTL_S), scope=scope):
+            if await _try_lock(base, slug, scope):
                 return True
         except FilesystemBusy:
             pass  # a busy file store is a lock not taken this round
@@ -183,45 +215,20 @@ async def _take_lock(base: Path, slug: str, scope: TenantScope) -> bool:
         await asyncio.sleep(_LOCK_POLL_S)
 
 
-async def _let_go(base: Path, slug: str, scope: TenantScope, *, lock: bool, key: PublishKey | None) -> None:
-    if lock:
-        try:
-            await run_efs_cleanup(partial(release, base, slug), scope=scope)
-        except Exception:  # noqa: BLE001 - the lock expires by its TTL
-            logger.warning("doc_publish", exc_info=True, extra={
-                "event": "doc_publish", "outcome": "lock_release_failed", "artifact_slug": slug})
-    if key is not None:
-        await key.revoke()
-
-
-async def _let_go_then(base: Path, slug: str, scope: TenantScope, key: PublishKey,
-                       on_done: Callable[[], None]) -> None:
+async def _let_go(base: Path, slug: str, scope: TenantScope, *, lock: bool, key: PublishKey | None,
+                  on_done: Callable[[], None] | None = None) -> None:
     try:
-        await _let_go(base, slug, scope, lock=True, key=key)
+        if lock:
+            try:
+                await _release(base, slug, scope=scope)
+            except Exception:  # noqa: BLE001 - the lock expires by its TTL
+                logger.warning("doc_publish", exc_info=True, extra={
+                    "event": "doc_publish", "outcome": "lock_release_failed", "artifact_slug": slug})
+        if key is not None:
+            await key.revoke()
     finally:
-        on_done()
-
-
-def _after_thread(base: Path, slug: str, scope: TenantScope, key: PublishKey, on_done: Callable[[], None],
-                  folder: Path, abandoned: list[bool]):
-    def done(future: asyncio.Future) -> None:
-        # Runs when the thread ends, so a page that went out after the wait timed
-        # out still reaches the editors.
-        try:
-            if not future.cancelled():
-                error = future.exception()
-                if error is None:
-                    hub.publish(doc_topic(folder), {"type": DOC_PUBLISHED, "rev": 0})
-                elif abandoned[0]:
-                    logger.warning("doc_publish", extra={
-                        "event": "doc_publish", "outcome": "late_failure", "artifact_slug": slug,
-                        "error_type": type(error).__name__})
-        finally:
-            task = asyncio.get_running_loop().create_task(_let_go_then(base, slug, scope, key, on_done))
-            _cleanups.add(task)
-            task.add_done_callback(_cleanups.discard)
-
-    return done
+        if on_done is not None:
+            on_done()
 
 
 async def publish_doc_page(job: DocPublishJob, *, on_done: Callable[[], None]) -> PublishResult:
@@ -258,8 +265,10 @@ async def publish_doc_page(job: DocPublishJob, *, on_done: Callable[[], None]) -
         if (early := _early(state)) is not None:
             return early
         access = AUTOPUBLISH_ACCESS if state.entry is None else kept_access(state.entry, org_mode=True)
-        publish_url = await run_on_unit_threads(partial(_publish_url, scope))
-        workspace_id = await run_on_unit_threads(partial(_active_workspace_id, scope))
+        publish_url, workspace_id = await asyncio.gather(
+            run_on_unit_threads(partial(_publish_url, scope)),
+            run_on_unit_threads(partial(_active_workspace_id, scope)),
+        )
         key = PublishKey(owner, job.org_id, min_ttl_s=LOCK_TTL_S + 60.0, workspace_id=workspace_id)
         api_key = await key.get()
         if not api_key:
@@ -275,31 +284,38 @@ async def publish_doc_page(job: DocPublishJob, *, on_done: Callable[[], None]) -
         future = asyncio.get_running_loop().run_in_executor(None, context.run, upload)
         handed_off = True
         # Set once nobody awaits the upload any more; read and written on the loop thread only.
-        abandoned = [False]
-        future.add_done_callback(_after_thread(base, job.slug, scope, key, on_done, folder, abandoned))
+        abandoned = False
+
+        def done(finished: asyncio.Future) -> None:
+            # Runs when the thread ends, so a page that went out after the wait
+            # timed out still reaches the editors.
+            try:
+                if not finished.cancelled():
+                    error = finished.exception()
+                    if error is None:
+                        hub.publish(doc_topic(folder), {"type": DOC_PUBLISHED, "rev": 0})
+                    elif abandoned:
+                        logger.warning("doc_publish", extra={
+                            "event": "doc_publish", "outcome": "late_failure", "artifact_slug": job.slug,
+                            "error_type": type(error).__name__})
+            finally:
+                track(asyncio.get_running_loop().create_task(
+                    _let_go(base, job.slug, scope, lock=True, key=key, on_done=on_done)), _cleanups)
+
+        future.add_done_callback(done)
         # shield: a timeout or a cancel must not cancel the future, or its
         # callback would fire while the upload thread still runs.
         try:
             await asyncio.wait_for(asyncio.shield(future), timeout=PUBLISH_TIMEOUT_S)
         except (asyncio.TimeoutError, asyncio.CancelledError):
-            abandoned[0] = True
+            abandoned = True
             raise
         return PublishResult(Outcome.PUBLISHED)
     finally:
         if not handed_off:
-            try:
-                await _let_go(base, job.slug, scope, lock=lock, key=key)
-            finally:
-                on_done()
+            await _let_go(base, job.slug, scope, lock=lock, key=key, on_done=on_done)
 
 
 async def drain_cleanup(*, timeout: float) -> None:
     """Wait for the lock releases and key revokes finished uploads asked for (shutdown)."""
-    tasks = list(_cleanups)
-    if not tasks or timeout <= 0:
-        return
-    try:
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning("doc_publish", extra={
-            "event": "doc_publish", "outcome": "cleanup_unfinished", "count": len(tasks)})
+    await drain(_cleanups, timeout=timeout, outcome="cleanup_unfinished")

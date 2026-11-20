@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.docs import republish, sharing, sync
 from cowork.docs.debounce import Debouncer
 from cowork.docs.service import create_doc
@@ -167,14 +168,11 @@ def test_two_runs_of_one_key_never_overlap():
     assert runs == [1, 2] and most[0] == 1
 
 
-from cowork.db.scoped import LOCAL_SCOPE, TenantScope
-
 ORG = TenantScope(org_mode=True, org_id="org-1", user_id="u1")
 
 
-def _deployment(monkeypatch, *, mode="org", trust_headers=False):
-    monkeypatch.setattr(republish, "get_app_settings",
-                        lambda: SimpleNamespace(tenancy_mode=mode, trust_identity_headers=trust_headers))
+def _deployment(monkeypatch, *, mode="org"):
+    monkeypatch.setattr(republish, "get_app_settings", lambda: SimpleNamespace(tenancy_mode=mode))
     queued = []
     monkeypatch.setattr("cowork.docs.publish_queue.schedule_enqueue", lambda job: queued.append(job) or True)
     return queued
@@ -197,7 +195,7 @@ def test_an_org_deployment_queues_nothing_without_an_org_scope_a_project_or_a_do
 
 
 def test_a_local_deployment_that_trusts_identity_headers_keeps_the_desktop_republish(folder, monkeypatch):
-    queued = _deployment(monkeypatch, mode="local", trust_headers=True)
+    queued = _deployment(monkeypatch, mode="local")
     monkeypatch.setattr(republish, "is_shared", lambda f: True)
     debounced = []
     monkeypatch.setattr(republish._republishes, "schedule", lambda key, fn: debounced.append(key))

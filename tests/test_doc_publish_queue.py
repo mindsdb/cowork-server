@@ -74,9 +74,31 @@ class Recorder:
 
 async def _settle(worker):
     for _ in range(50):
-        if not worker._tasks:
+        if not worker._running:
             return
         await asyncio.sleep(0.01)
+
+
+async def _run_once(server, rec, *, now=10.0):
+    """Queue JOB, claim it with one tick of a fresh worker and wait for its publish; returns (redis, worker)."""
+    r = _client(server)
+    await pq.enqueue(JOB, client=r, now=0.0)
+    w = pq.DocPublishWorker(_client(server), publish=rec, clock=lambda: now)
+    await w.tick()
+    await _settle(w)
+    return r, w
+
+
+async def _dues(r, w, now, ticks):
+    """Tick ``ticks`` times, each time moving the clock just past the due time; the delays seen (None: gone)."""
+    dues = []
+    for _ in range(ticks):
+        await w.tick()
+        await _settle(w)
+        due = await r.zscore(pq.DUE_KEY, "a1")
+        dues.append(None if due is None else round(due - now["t"], 6))
+        now["t"] = (due or now["t"]) + 0.1
+    return dues
 
 
 def test_of_two_replicas_one_publishes(server):
@@ -137,13 +159,7 @@ def test_retries_back_off_and_stop_after_the_last_attempt(server):
         rec = Recorder(*([Outcome.RETRY] * pq.MAX_ATTEMPTS))
         now = {"t": 10.0}
         w = pq.DocPublishWorker(_client(server), publish=rec, clock=lambda: now["t"])
-        dues = []
-        for _ in range(pq.MAX_ATTEMPTS):
-            await w.tick()
-            await _settle(w)
-            due = await r.zscore(pq.DUE_KEY, "a1")
-            dues.append(None if due is None else round(due - now["t"], 6))
-            now["t"] = (due or now["t"]) + 0.1
+        dues = await _dues(r, w, now, pq.MAX_ATTEMPTS)
         return dues, await r.hget(pq.doc_key("a1"), "attempts")
 
     dues, attempts = asyncio.run(scenario())
@@ -154,12 +170,8 @@ def test_a_permanent_error_drops_the_entry_and_a_temporary_one_retries(server):
     from cowork.services.publish import PublishRejected, PublishTooLarge
 
     async def scenario(error):
-        r = _client(server)
-        await r.flushall()
-        await pq.enqueue(JOB, client=r, now=0.0)
-        w = pq.DocPublishWorker(_client(server), publish=Recorder(error), clock=lambda: 10.0)
-        await w.tick()
-        await _settle(w)
+        await _client(server).flushall()
+        r, w = await _run_once(server, Recorder(error))
         return await r.zscore(pq.DUE_KEY, "a1"), w.free_slots
 
     too_large = PublishTooLarge.__new__(PublishTooLarge)
@@ -185,11 +197,7 @@ def test_an_entry_without_its_fields_is_skipped(server, fields):
 
 def test_a_retry_keeps_the_entry_expiring(server):
     async def scenario():
-        r = _client(server)
-        await pq.enqueue(JOB, client=r, now=0.0)
-        w = pq.DocPublishWorker(_client(server), publish=Recorder(Outcome.RETRY), clock=lambda: 10.0)
-        await w.tick()
-        await _settle(w)
+        r, _ = await _run_once(server, Recorder(Outcome.RETRY))
         return await r.ttl(pq.doc_key("a1"))
 
     assert 0 < asyncio.run(scenario()) <= pq.HASH_TTL_S
@@ -253,22 +261,31 @@ def test_the_log_fields_survive_the_json_formatter(caplog):
     assert record.levelno == logging.WARNING
 
 
-def test_a_doc_its_owner_unpublished_logs_quietly(caplog):
-    caplog.set_level(logging.DEBUG, logger=pq.logger.name)
-    pq._record(PublishResult(Outcome.SKIPPED, "unpublished"), JOB)
-    pq._record(PublishResult(Outcome.UNCHANGED), JOB)
-    assert [r.levelno for r in caplog.records[-2:]] == [logging.DEBUG, logging.DEBUG]
+@pytest.mark.parametrize("result, level", [
+    (PublishResult(Outcome.SKIPPED, "unpublished"), logging.DEBUG),
+    (PublishResult(Outcome.UNCHANGED), logging.DEBUG),
+    (PublishResult(Outcome.RETRY, "lock_busy"), logging.DEBUG),
+    (PublishResult(Outcome.RETRY, "no_key"), logging.WARNING),
+], ids=["unpublished", "unchanged", "lock_busy", "no_key"])
+def test_what_is_logged_quietly(result, level):
+    assert pq._level(result) == level
 
 
-def _held_hgetall(client, entered: asyncio.Event, release: asyncio.Event):
-    real = client.hgetall
+def _held_claim(client, entered: asyncio.Event):
+    """``client`` whose pipelines never answer: a claim waits in its read until cancelled."""
+    real = client.pipeline
 
-    async def held(key):
-        entered.set()
-        await release.wait()
-        return await real(key)
+    def pipeline(**kw):
+        pipe = real(**kw)
 
-    client.hgetall = held
+        async def held():
+            entered.set()
+            await asyncio.Event().wait()
+
+        pipe.execute = held
+        return pipe
+
+    client.pipeline = pipeline
     return client
 
 
@@ -277,7 +294,7 @@ def test_a_tick_stopped_mid_claim_puts_the_entry_back(server):
         r = _client(server)
         await pq.enqueue(JOB, client=r, now=0.0)
         entered = asyncio.Event()
-        client = _held_hgetall(_client(server), entered, asyncio.Event())
+        client = _held_claim(_client(server), entered)
         rec = Recorder()
         w = pq.DocPublishWorker(client, publish=rec, clock=lambda: 10.0)
         tick = asyncio.create_task(w.tick())
@@ -299,8 +316,14 @@ def test_a_failed_put_back_keeps_the_original_error(server, caplog):
         def __getattr__(self, name):
             return getattr(self._client, name)
 
-        async def hgetall(self, key):
-            raise RuntimeError("read failed")
+        def pipeline(self, **kw):
+            pipe = self._client.pipeline(**kw)
+
+            async def fail():
+                raise RuntimeError("read failed")
+
+            pipe.execute = fail
+            return pipe
 
         async def zadd(self, *a, **k):
             raise ConnectionError("down")
@@ -346,21 +369,10 @@ def test_a_busy_lock_retries_without_spending_an_attempt(server):
         rec = Recorder(*([PublishResult(Outcome.RETRY, "lock_busy")] * pq.MAX_ATTEMPTS))
         now = {"t": 10.0}
         w = pq.DocPublishWorker(_client(server), publish=rec, clock=lambda: now["t"])
-        dues = []
-        for _ in range(pq.MAX_ATTEMPTS):
-            await w.tick()
-            await _settle(w)
-            due = await r.zscore(pq.DUE_KEY, "a1")
-            dues.append(None if due is None else round(due - now["t"], 6))
-            now["t"] = (due or now["t"]) + 0.1
+        dues = await _dues(r, w, now, pq.MAX_ATTEMPTS)
         return dues, len(rec.jobs), await r.hget(pq.doc_key("a1"), "attempts")
 
     assert asyncio.run(scenario()) == ([pq.DEBOUNCE_S] * pq.MAX_ATTEMPTS, pq.MAX_ATTEMPTS, "2")
-
-
-def test_a_busy_lock_logs_quietly():
-    assert pq._level(PublishResult(Outcome.RETRY, "lock_busy")) == logging.DEBUG
-    assert pq._level(PublishResult(Outcome.RETRY, "no_key")) == logging.WARNING
 
 
 def test_a_paused_worker_claims_nothing_more_and_lets_running_publishes_finish(server):
@@ -391,13 +403,9 @@ def test_a_paused_worker_claims_nothing_more_and_lets_running_publishes_finish(s
 
 def test_a_corrupted_attempts_count_still_publishes_once(server):
     async def scenario():
-        r = _client(server)
-        await pq.enqueue(JOB, client=r, now=0.0)
-        await r.hset(pq.doc_key("a1"), "attempts", "x")
+        await _client(server).hset(pq.doc_key("a1"), "attempts", "x")
         rec = Recorder()
-        w = pq.DocPublishWorker(_client(server), publish=rec, clock=lambda: 10.0)
-        await w.tick()
-        await _settle(w)
+        r, _ = await _run_once(server, rec)
         return len(rec.jobs), await r.zscore(pq.DUE_KEY, "a1")
 
     assert asyncio.run(scenario()) == (1, None)

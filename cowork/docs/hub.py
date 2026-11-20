@@ -57,9 +57,11 @@ _DOC_PREFIX = "doc:"
 _CONV_PREFIX = "conv:"
 # Keys a relay message adds around the event; no event uses them.
 _ENVELOPE = ("origin", "topic")
+# Doc event types that mean the file changed: this replica's streams reread it.
+_NUDGED = frozenset({"doc.created", "doc.updated"})
 # What another replica's message may carry. The type becomes an SSE event name,
 # and a doc stream does arithmetic on the rev.
-_REMOTE_TYPES = frozenset({"doc.created", "doc.updated", DOC_PUBLISHED})
+_REMOTE_TYPES = _NUDGED | {DOC_PUBLISHED}
 _CLIENT_ID_MAX = 100
 
 
@@ -123,11 +125,8 @@ class DocHub:
         if not isinstance(topic, str) or not _well_formed(message):
             return
         if topic.startswith(_DOC_PREFIX):
-            if message.get("type") == DOC_PUBLISHED:
-                # It carries no doc, so there is nothing to reread: pass it on as it is.
-                self._fan_out(topic, {"type": DOC_PUBLISHED, "rev": message.get("rev"), "clientId": None})
-            else:
-                self._fan_out(topic, {"type": NUDGE, "rev": message.get("rev"), "clientId": message.get("clientId")})
+            kind = NUDGE if message.get("type") in _NUDGED else message.get("type")
+            self._fan_out(topic, {"type": kind, "rev": message.get("rev"), "clientId": message.get("clientId")})
         elif topic.startswith(_CONV_PREFIX):
             self._fan_out(topic, {k: v for k, v in message.items() if k not in _ENVELOPE}, keep=True)
 

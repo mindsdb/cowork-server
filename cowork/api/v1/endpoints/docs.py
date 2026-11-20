@@ -33,6 +33,7 @@ from cowork.api.v1.endpoints.artifact_workspace import ArtifactIdDep
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.units import FilesystemBusy, run_db, run_efs
+from cowork.docs import republish
 from cowork.docs.export import CONVERTED_FORMATS, MEDIA_TYPES, export_bytes, export_filename, offered_formats
 from cowork.services.artifact_export import ExportRefusal, ExportRefused, export_slot, org_export_refused
 from cowork.services.artifact_identity import opened_artifact_folder
@@ -42,7 +43,6 @@ from cowork.docs.hub import NUDGE, conv_topic, doc_topic, hub
 from cowork.docs.images import MAX_IMAGE_BYTES, store_image
 from cowork.docs.model import DocError
 from cowork.docs.ops import MAX_OPS
-from cowork.docs import republish
 from cowork.docs.service import apply, create_doc
 from cowork.docs.store import doc_file, is_doc_folder, load_doc
 from cowork.docs.sync import after_write
@@ -93,6 +93,10 @@ async def _resolve(scope: TenantScope, project_ref: str, artifact_id: str, *, wr
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the doc's owner can edit it")
         await run_db(lambda unit: require_artifact_owner(unit, source, folder.name), scope=scope)
     return source, folder, metadata, is_own
+
+
+def _project_id(source) -> str | None:
+    return str(source.project_id) if source.project_id else None
 
 
 def _card(scope: TenantScope, source, folder: Path) -> dict[str, Any] | None:
@@ -150,7 +154,7 @@ async def create_blank_doc(body: _CreateBody, scope: TenantScope = Depends(get_t
     )
     # After the owner is recorded: the publish resolves the owner to key it.
     republish.schedule(made.folder, scope=scope,
-                      project_id=str(source.project_id) if source.project_id else None,
+                      project_id=_project_id(source),
                       artifact_id=made.artifact_id)
     card = await run_efs(partial(_card, scope, source, made.folder), scope=scope)
     return {"artifactId": made.artifact_id, "slug": made.slug, "doc": made.doc, "card": card}
@@ -251,7 +255,7 @@ async def edit_doc(
     except DocError as err:
         raise _doc_error(err) from err
     after_write(folder, doc, result, by="user", scope=scope, client_id=body.clientId,
-                project_id=str(source.project_id) if source.project_id else None)
+                project_id=_project_id(source))
     return {"doc": doc, **result}
 
 
@@ -419,7 +423,7 @@ async def restore_version(
     except DocError as err:
         raise _doc_error(err) from err
     after_write(folder, doc, None, by="user", scope=scope, client_id=body.clientId if body else None,
-                project_id=str(source.project_id) if source.project_id else None)
+                project_id=_project_id(source))
     return {"doc": doc, "replacedRev": replaced}
 
 

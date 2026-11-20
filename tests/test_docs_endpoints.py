@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.docs.hub import DOC_PUBLISHED
 from cowork.services.projects import GENERAL_PROJECT_ID
 
 
@@ -337,30 +338,6 @@ def test_a_doc_created_over_http_is_its_creators(monkeypatch, tmp_path, inline_u
 
     from cowork.api.v1.endpoints import docs
 
-    recorded = []
-
-    async def allowed(scope, permission):
-        return None
-
-    source = SimpleNamespace(base=str(tmp_path / "artifacts"), project_id="p-1", project_name="P", external=False)
-    monkeypatch.setattr(docs, "require_product_permission", allowed)
-    monkeypatch.setattr(docs, "_project_plan", lambda session, **kw: None)
-    monkeypatch.setattr(docs, "readable_sources", lambda plan: [source])
-    monkeypatch.setattr(docs, "record_artifact_owner", lambda *a, **kw: recorded.append((a, kw)))
-    monkeypatch.setattr(docs, "_card", lambda *a: None)
-    monkeypatch.setattr(docs.republish, "schedule", lambda folder, **kw: False)
-    scope = SimpleNamespace(user_id="alice")
-    made = asyncio.run(docs.create_blank_doc(docs._CreateBody(projectId=uuid4(), title="Plan"), scope))
-    assert recorded == [(("unit", "p-1", made["slug"], "alice"), {"action": "create"})]
-
-
-def test_a_doc_created_in_the_app_asks_for_its_page_after_its_owner_is_recorded(monkeypatch, tmp_path, inline_units):
-    import asyncio
-    from types import SimpleNamespace
-    from uuid import uuid4
-
-    from cowork.api.v1.endpoints import docs
-
     order = []
 
     async def allowed(scope, permission):
@@ -370,13 +347,17 @@ def test_a_doc_created_in_the_app_asks_for_its_page_after_its_owner_is_recorded(
     monkeypatch.setattr(docs, "require_product_permission", allowed)
     monkeypatch.setattr(docs, "_project_plan", lambda session, **kw: None)
     monkeypatch.setattr(docs, "readable_sources", lambda plan: [source])
-    monkeypatch.setattr(docs, "record_artifact_owner", lambda *a, **kw: order.append("owner"))
+    monkeypatch.setattr(docs, "record_artifact_owner", lambda *a, **kw: order.append(("owner", a, kw)))
     monkeypatch.setattr(docs, "_card", lambda *a: None)
+    # The page is asked for after the owner is recorded: the publish resolves the owner to key it.
     monkeypatch.setattr(docs.republish, "schedule",
                         lambda folder, **kw: order.append(("schedule", kw["project_id"], kw["artifact_id"])) or True)
     scope = SimpleNamespace(user_id="alice")
     made = asyncio.run(docs.create_blank_doc(docs._CreateBody(projectId=uuid4(), title="Plan"), scope))
-    assert order == ["owner", ("schedule", "p-1", made["artifactId"])]
+    assert order == [
+        ("owner", ("unit", "p-1", made["slug"], "alice"), {"action": "create"}),
+        ("schedule", "p-1", made["artifactId"]),
+    ]
 
 
 def test_a_reviewer_reads_the_doc_without_the_owners_card(monkeypatch, tmp_path, inline_units):
@@ -1106,42 +1087,12 @@ def test_a_lagging_read_is_read_again_even_when_the_mtime_never_moves(monkeypatc
     assert name == "doc.updated" and f["rev"] == 2 and "clientId" not in f
 
 
-def test_a_doc_published_event_leaves_the_mtime_poll_to_send_a_write_nobody_announced(monkeypatch, tmp_path):
-    """doc.published carries no doc. If it moved last_mtime, a write whose own
-    event was lost would never reach the editor: the poll would see no change."""
-    import asyncio
-
-    from cowork.api.v1.endpoints import docs
-    from cowork.db.scoped import LOCAL_SCOPE
-    from cowork.docs.hub import DOC_PUBLISHED, DocHub, doc_topic
-    from cowork.docs.service import apply, create_doc
-
-    monkeypatch.setattr(docs, "_POLL_S", 0.2)
-    monkeypatch.setattr(docs, "hub", DocHub())
-    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
-    topic = doc_topic(made.folder)
-    lead = made.doc["tabs"][0]["blocks"][0]["id"]
-    seen = {"mtime": 1}
-    monkeypatch.setattr(docs, "_mtime", lambda folder: seen["mtime"])
-
-    async def scenario():
-        stream = docs._sse(_Open(), topic, initial=made.folder, scope=LOCAL_SCOPE).body_iterator
-        await anext(stream)  # doc.ready, last_mtime 1
-        apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "Unannounced."}}], by="agent")
-        seen["mtime"] = 2
-        docs.hub.publish(topic, {"type": DOC_PUBLISHED, "rev": 0})
-        published = _sse_frame(await asyncio.wait_for(anext(stream), 3))
-        polled = _sse_frame(await asyncio.wait_for(anext(stream), 3))
-        await stream.aclose()
-        return published, polled
-
-    (p_name, _p), (u_name, u) = asyncio.run(scenario())
-    assert p_name == "doc.published"
-    assert u_name == "doc.updated" and u["doc"]["tabs"][0]["blocks"][0]["text"] == "Unannounced."
-
-
-def test_an_event_without_a_doc_leaves_the_mtime_poll_to_send_a_write_nobody_announced(monkeypatch, tmp_path):
-    """Only an event that carries a doc moves the marks, whatever its type."""
+@pytest.mark.parametrize("event_type, rev", [(DOC_PUBLISHED, 0), ("doc.something", 99)])
+def test_an_event_without_a_doc_leaves_the_mtime_poll_to_send_a_write_nobody_announced(
+        monkeypatch, tmp_path, event_type, rev):
+    """Only an event that carries a doc moves the marks, whatever its type. If
+    doc.published moved last_mtime, a write whose own event was lost would never
+    reach the editor: the poll would see no change."""
     import asyncio
 
     from cowork.api.v1.endpoints import docs
@@ -1162,14 +1113,14 @@ def test_an_event_without_a_doc_leaves_the_mtime_poll_to_send_a_write_nobody_ann
         await anext(stream)  # doc.ready, last_mtime 1
         apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "Unannounced."}}], by="agent")
         seen["mtime"] = 2
-        docs.hub.publish(topic, {"type": "doc.something", "rev": 99})
-        other = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+        docs.hub.publish(topic, {"type": event_type, "rev": rev})
+        passed_on = _sse_frame(await asyncio.wait_for(anext(stream), 3))
         polled = _sse_frame(await asyncio.wait_for(anext(stream), 3))
         await stream.aclose()
-        return other, polled
+        return passed_on, polled
 
-    (o_name, _o), (u_name, u) = asyncio.run(scenario())
-    assert o_name == "doc.something"
+    (name, _), (u_name, u) = asyncio.run(scenario())
+    assert name == event_type
     assert u_name == "doc.updated" and u["doc"]["tabs"][0]["blocks"][0]["text"] == "Unannounced."
 
 

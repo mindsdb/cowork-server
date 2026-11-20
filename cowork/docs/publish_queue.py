@@ -22,9 +22,11 @@ from cowork.services.live_publish import (
     DocPublishJob,
     Outcome,
     PublishResult,
+    drain,
     drain_cleanup,
     is_permanent,
     publish_doc_page,
+    track,
 )
 from cowork.streaming.backend import get_backend
 from cowork.turnqueue.redis_client import get_redis
@@ -86,8 +88,7 @@ async def enqueue(job: DocPublishJob, *, client: Redis | None = None, now: float
     try:
         r = client if client is not None else get_redis()
         pipe = r.pipeline(transaction=True)
-        pipe.hset(key, mapping={"project_id": job.project_id, "artifacts_base": job.artifacts_base,
-                                "slug": job.slug, "org_id": job.org_id})
+        pipe.hset(key, mapping={f: getattr(job, f) for f in _FIELDS})
         pipe.hsetnx(key, "first", now)
         pipe.expire(key, HASH_TTL_S)
         pipe.hget(key, "first")
@@ -105,25 +106,17 @@ def schedule_enqueue(job: DocPublishJob) -> bool:
     if get_backend() != "redis":
         return False
     try:
-        task = asyncio.get_running_loop().create_task(enqueue(job))
+        loop = asyncio.get_running_loop()
     except RuntimeError:
         logger.warning("doc_publish", extra={
             "event": "doc_publish", "outcome": "not_queued", "reason": "no_loop", "artifact_slug": job.slug})
         return False
-    _enqueues.add(task)
-    task.add_done_callback(_enqueues.discard)
+    track(loop.create_task(enqueue(job)), _enqueues)
     return True
 
 
 async def drain_enqueues(*, timeout: float) -> None:
-    tasks = list(_enqueues)
-    if not tasks or timeout <= 0:
-        return
-    try:
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning("doc_publish", extra={
-            "event": "doc_publish", "outcome": "enqueue_unfinished", "count": len(tasks)})
+    await drain(_enqueues, timeout=timeout, outcome="enqueue_unfinished")
 
 
 class DocPublishWorker:
@@ -137,9 +130,8 @@ class DocPublishWorker:
         self._publish = publish
         self._clock = clock
         self._loop_task: asyncio.Task | None = None
-        self._tasks: set[asyncio.Task] = set()
-        # artifact_ids whose _run is still going: a member due again meanwhile waits in the set.
-        self._publishing: set[str] = set()
+        # artifact_id -> its _run while it goes on: a member due again meanwhile stays in DUE_KEY.
+        self._running: dict[str, asyncio.Task] = {}
 
     @property
     def free_slots(self) -> int:
@@ -164,11 +156,11 @@ class DocPublishWorker:
         r = self._client
         # Enough to fill the free slots even when every doc still publishing is among them.
         members = await r.zrangebyscore(DUE_KEY, "-inf", self._clock(), start=0,
-                                        num=self._free + len(self._publishing))
+                                        num=self._free + len(self._running))
         for artifact_id in members:
             if self._free <= 0:
                 return
-            if artifact_id in self._publishing:
+            if artifact_id in self._running:
                 continue
             if not await r.zrem(DUE_KEY, artifact_id):
                 continue  # another replica took it
@@ -182,24 +174,21 @@ class DocPublishWorker:
     async def _claim(self, artifact_id: str) -> None:
         r = self._client
         key = doc_key(artifact_id)
-        fields = await r.hgetall(key)
+        # A write from here on starts a new burst.
+        pipe = r.pipeline(transaction=False)
+        pipe.hgetall(key)
+        pipe.hdel(key, "first")
+        fields, _ = await pipe.execute()
         if not all(fields.get(name) for name in _FIELDS):
             # Expired, or recreated by a retry's HSET after it expired.
             await r.delete(key)
             logger.debug("doc_publish", extra={"event": "doc_publish", "outcome": "skipped", "reason": "no_fields"})
             return
-        # A write from here on starts a new burst.
-        await r.hdel(key, "first")
-        job = DocPublishJob(artifact_id=artifact_id, project_id=fields["project_id"],
-                            artifacts_base=fields["artifacts_base"], slug=fields["slug"],
-                            org_id=fields["org_id"])
-        attempts = _attempts(fields.get("attempts"))
-        task = asyncio.get_running_loop().create_task(self._run(job, attempts))
+        job = DocPublishJob(artifact_id=artifact_id, **{f: fields[f] for f in _FIELDS})
+        task = asyncio.get_running_loop().create_task(self._run(job, _attempts(fields.get("attempts"))))
         self._free -= 1
-        self._publishing.add(artifact_id)
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-        task.add_done_callback(lambda _task: self._publishing.discard(artifact_id))
+        self._running[artifact_id] = task
+        task.add_done_callback(lambda _task: self._running.pop(artifact_id, None))
 
     async def _requeue(self, artifact_id: str) -> None:
         try:
@@ -228,24 +217,25 @@ class DocPublishWorker:
             result = PublishResult(Outcome.DROPPED if is_permanent(exc) else Outcome.RETRY)
             error_type = type(exc).__name__
         key = doc_key(job.artifact_id)
+        claimed = attempts
         try:
             if result.outcome is Outcome.RETRY and result.reason == "lock_busy":
                 # Another publish of this page is still running: not an attempt of ours.
                 await self._client.zadd(DUE_KEY, {job.artifact_id: self._clock() + DEBOUNCE_S}, nx=True)
-            elif result.outcome is Outcome.RETRY:
+                _record(result, job, attempts=attempts, error_type=error_type)
+                return
+            if result.outcome is Outcome.RETRY:
                 attempts += 1
                 if attempts >= MAX_ATTEMPTS:
-                    await self._client.hdel(key, "attempts")
-                    _record(PublishResult(Outcome.DROPPED, result.reason), job, attempts=attempts,
-                            error_type=error_type)
-                    return
-                pipe = self._client.pipeline(transaction=True)
-                pipe.hset(key, "attempts", attempts)
-                pipe.expire(key, HASH_TTL_S)
-                await pipe.execute()
-                delay = BACKOFF_S[min(attempts, len(BACKOFF_S)) - 1]
-                await self._client.zadd(DUE_KEY, {job.artifact_id: self._clock() + delay}, nx=True)
-            else:
+                    result = PublishResult(Outcome.DROPPED, result.reason)
+                else:
+                    pipe = self._client.pipeline(transaction=True)
+                    pipe.hset(key, "attempts", attempts)
+                    pipe.expire(key, HASH_TTL_S)
+                    await pipe.execute()
+                    delay = BACKOFF_S[min(attempts, len(BACKOFF_S)) - 1]
+                    await self._client.zadd(DUE_KEY, {job.artifact_id: self._clock() + delay}, nx=True)
+            if claimed and result.outcome is not Outcome.RETRY:
                 await self._client.hdel(key, "attempts")
             _record(result, job, attempts=attempts, error_type=error_type)
         except Exception:  # noqa: BLE001 - the next write queues the doc again
@@ -261,15 +251,10 @@ class DocPublishWorker:
 
     async def stop(self, *, timeout: float) -> None:
         await self.pause()
-        tasks = list(self._tasks)
+        tasks = list(self._running.values())
         for task in tasks:
             task.cancel()
-        if tasks and timeout > 0:
-            try:
-                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning("doc_publish", extra={
-                    "event": "doc_publish", "outcome": "stop_unfinished", "count": len(tasks)})
+        await drain(tasks, timeout=timeout, outcome="stop_unfinished")
 
 
 def start_doc_publish_worker() -> DocPublishWorker | None:
