@@ -7,6 +7,7 @@ saved if anything still trusts the model.
 """
 from __future__ import annotations
 
+import base64
 import copy
 import json
 from pathlib import Path
@@ -18,12 +19,12 @@ import pytest
 from fastapi import HTTPException
 from anton.core.datasources.data_vault import LocalDataVault
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
+from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, ScopedSession, TenantScope
 from cowork.handlers import probe as probe_handler
 from cowork.harnesses.anton_harness import tools
 from cowork.models.custom_connector import CustomConnector
@@ -183,6 +184,17 @@ class TestTheModelNoLongerDecides:
         assert done["response"]["status"] == "failed"
 
     @pytest.mark.asyncio
+    async def test_in_org_mode_a_custom_connector_is_refused_and_no_model_starts(self, api, saved, monkeypatch):
+        monkeypatch.setattr(probe_handler, "custom_test_is_code_checked", lambda: False)
+
+        events = await connect(PLANNER_FORM, VALUES, saved)
+
+        assert saved.vault.list_connections() == [] and ModelSaysYes.built == 0 and api.requests == []
+        [done] = of(events, "response.completed")
+        assert done["response"]["status"] == "failed"
+        assert "cannot be connected in an organization" in json.dumps(events)
+
+    @pytest.mark.asyncio
     async def test_a_built_in_connector_still_runs_the_model_probe(self, api, saved):
         await connect({"form_id": "github-connector", "_connector_id": "github"}, {"token": "x"}, saved,
                       connector_id="github", custom_spec=None)
@@ -336,18 +348,69 @@ class TestStoredCustomConnectors:
         assert done["response"]["status"] == "retry"
 
 
-class TestSelfHostedKeepsTheModelProbe:
+def _follow_up(slug: str) -> dict:
+    return {
+        "form_id": "fm_bbbbbbbbbb", "engine": "planner", "title": "Finish",
+        "fields": [{"name": "client_secret", "label": "Client secret", "type": "password", "secret": True}],
+        "_extends_connection": slug, "test_request": copy.deepcopy(PLANNER_FORM["test_request"]),
+    }
+
+
+def _confirm_id(events) -> str:
+    [preview] = of(events, "connector.test_preview")
+    return preview["confirm_id"]
+
+
+class TestAFollowUpStepKeepsOneConnection:
     @pytest.mark.asyncio
-    @pytest.mark.usefixtures("self_hosted_probe")
-    async def test_a_stamped_stored_custom_connector_still_runs_the_model_probe(self, api, saved):
-        old = {k: v for k, v in PLANNER_FORM.items() if k not in ("test_request", "engine", "connector")}
-        custom_spec = {"id": "planner", "label": "Planner", "description": "", "category": "other",
-                       "custom": True, "form": old}
+    async def test_a_resubmitted_field_is_tested_with_its_new_value(self, api, saved):
+        saved.vault.save("planner", "planner-1", {"client_id": "planner-client", "client_secret": SECRET}, secure_keys=["client_secret"])
+        _stored(saved.engine, {k: v for k, v in PLANNER_FORM.items() if k not in ("engine", "connector")})
 
-        await connect(old, VALUES, saved, custom_spec=custom_spec)
+        await connect(_follow_up("planner-1"), {"client_secret": "rotated-secret"}, saved)
 
-        assert ModelSaysYes.built == 1 and api.requests == []
-        assert len(saved.vault.list_connections()) == 1
+        sent = base64.b64decode(api.requests[0].headers["authorization"].removeprefix("Basic ")).decode()
+        assert sent == "planner-client:rotated-secret"
+
+    @pytest.mark.asyncio
+    async def test_extending_a_missing_connection_fails_before_any_test(self, api, saved):
+        events = await connect(_follow_up("planner-gone"), {"client_secret": SECRET}, saved)
+
+        assert api.requests == [] and ModelSaysYes.built == 0
+        assert saved.vault.list_connections() == []
+        [done] = of(events, "response.completed")
+        assert done["response"]["status"] == "failed"
+        assert "No planner connection named 'planner-gone'" in json.dumps(events)
+
+    @pytest.mark.asyncio
+    async def test_a_connection_that_cannot_be_read_fails_on_the_form(self, api, saved, monkeypatch):
+        def no_scope(scope):
+            raise MissingTenantScopeError("no organization in scope")
+
+        monkeypatch.setattr(probe_handler, "vault_for_scope", no_scope)
+
+        events = await connect(_follow_up("planner-1"), {"client_secret": SECRET}, saved)
+
+        assert api.requests == []
+        [done] = of(events, "response.completed")
+        assert done["response"]["status"] == "failed"
+        assert "Could not read `planner-1`" in json.dumps(events)
+
+    @pytest.mark.asyncio
+    async def test_only_the_first_step_saves_the_connector_definition(self, api, saved):
+        first = await connect(PLANNER_FORM, VALUES, saved)
+        slug = (await submissions_endpoint.confirm_route(ConnectorTestAnswer(confirm_id=_confirm_id(first)), LOCAL_SCOPE))["saved_slug"]
+        with Session(saved.engine) as session:
+            [row] = session.exec(select(CustomConnector)).all()
+            definition = copy.deepcopy(row.spec)
+
+        second = await connect(_follow_up(slug), {"client_secret": "rotated-secret"}, saved)
+        await submissions_endpoint.confirm_route(ConnectorTestAnswer(confirm_id=_confirm_id(second)), LOCAL_SCOPE)
+
+        assert [c["name"] for c in saved.vault.list_connections()] == [slug]
+        with Session(saved.engine) as session:
+            [row] = session.exec(select(CustomConnector)).all()
+        assert row.spec == definition
 
 
 class TestAnOldConnectorCanBeBuiltAgain:
