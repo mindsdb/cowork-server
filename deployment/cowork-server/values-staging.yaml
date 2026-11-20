@@ -80,7 +80,7 @@ deployment:
     # Shows the organization picker. The expected-organization boundary refuses
     # a mismatched tab whatever this says; see README.md.
     - name: COWORK_ORGANIZATION_SWITCH_ENABLED
-      value: "true"
+      value: "false"
 
     # Offers Slack's In-Browser Connect. Unset (prod), Slack shows only the
     # bot-token method: the Slack app is internal to one workspace for now.
