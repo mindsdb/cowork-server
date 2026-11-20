@@ -158,6 +158,7 @@ def private_allowlist() -> tuple[frozenset[str], tuple[ipaddress.IPv4Network | i
 
 
 CA_FILE_ENV = "SSL_CERT_FILE"
+_CERTIFICATE_BLOCK = re.compile(rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -179,9 +180,10 @@ def started_certificates() -> StartedCertificates | None:
     is kept as a path with no text, so a single-user install, which never
     uses the file, still starts.
 
-    The file is read as bytes and its non-ASCII characters dropped, since
-    OpenSSL skips a comment line or a byte-order mark that ``cadata`` as text
-    would refuse, and PEM itself is ASCII.
+    The file is read as bytes and only its certificate blocks are kept, since
+    OpenSSL skips a comment line or a byte-order mark around them that
+    ``cadata`` as text would refuse. A block that is not ASCII is kept as it
+    is, so a damaged certificate fails to load here as it does in OpenSSL.
     """
     path = os.environ.get(CA_FILE_ENV)
     if not path:
@@ -190,7 +192,8 @@ def started_certificates() -> StartedCertificates | None:
         data = Path(path).read_bytes()
     except OSError:
         return StartedCertificates(path, None)
-    return StartedCertificates(path, data.decode("utf-8", errors="ignore").encode("ascii", errors="ignore").decode("ascii"))
+    blocks = _CERTIFICATE_BLOCK.findall(data)
+    return StartedCertificates(path, "\n".join(block.decode("latin-1") for block in blocks))
 
 
 def _trust_context(certificates: StartedCertificates) -> ssl.SSLContext:
@@ -203,8 +206,9 @@ def _trust_context(certificates: StartedCertificates) -> ssl.SSLContext:
     context = httpx.create_ssl_context(trust_env=False)
     try:
         context.load_verify_locations(cadata=certificates.pem)
-    except ssl.SSLError as error:
-        raise ValueError(f"{CA_FILE_ENV} names a file with no certificate in it: {certificates.path}") from error
+    except (ssl.SSLError, TypeError, ValueError) as error:
+        # No block at all, a damaged one, or bytes inside one that are not PEM.
+        raise ValueError(f"{CA_FILE_ENV} names a file with no usable certificate in it: {certificates.path}") from error
     return context
 
 
@@ -680,39 +684,59 @@ def _is_plain_path(path: str) -> bool:
     return all(segments[:-1]) and all(unquote(part) not in (".", "..") for part in segments)
 
 
+def _authorities(url: httpx.URL) -> list[str]:
+    """The spellings of ``url``'s scheme, host and port a rule may be written
+    against: no userinfo, with and without the default port and a trailing dot
+    on the host, the host as Unicode and in the ASCII form the request is sent to."""
+    ports = [url.port] if url.port is not None else [None, {"https": 443, "http": 80}.get(url.scheme)]
+    hosts = {url.host, url.host.rstrip("."), url_host(url), url_host(url) + "."}
+    return [
+        f"{url.scheme}://{f'[{host}]' if ':' in host else host}{f':{port}' if port else ''}"
+        for host in hosts
+        for port in ports
+    ]
+
+
 def _held_urls(url: httpx.URL) -> list[str]:
     """The spellings of ``url`` a rule may be written against.
 
     anton matches the text it is given and says a service passes it decoded
     and normalized, without the query or fragment. So the path is tried
-    decoded and as written, with and without a trailing slash, and the
-    authority without userinfo, with and without its default port and a
-    trailing dot on the host.
+    decoded and as written, with and without a trailing slash, under every
+    spelling of the authority (``_authorities``).
     """
     written = _written_path(url)
     paths = {written, unquote(written)}
-    if len(written) > 1:
-        paths |= {path.rstrip("/") if path.endswith("/") else path + "/" for path in paths}
-    ports = [url.port] if url.port is not None else [None, {"https": 443, "http": 80}.get(url.scheme)]
-    hosts = {url.host, url.host.rstrip(".")}
-    return [
-        f"{url.scheme}://{f'[{host}]' if ':' in host else host}{f':{port}' if port else ''}{path}"
-        for host in hosts
-        for port in ports
-        for path in paths
-    ]
+    paths |= {path.rstrip("/") if path.endswith("/") else path + "/" for path in paths}
+    return [authority + path for authority in _authorities(url) for path in paths]
+
+
+def _concerns(rule: HttpWriteRule, step: _Step) -> bool:
+    """Whether ``rule`` could hold some request of ``step``'s method to its
+    scheme, host and port, whatever the path. A rule whose authority cannot
+    be read apart from its path counts as concerning every step."""
+    if rule.method not in ("*", step.method.upper()):
+        return False
+    scheme, separator, rest = rule.url_glob.partition("://")
+    authority_glob = scheme + separator + rest.split("/", 1)[0]
+    if not separator or "**" in authority_glob:
+        return True
+    host_rule = HttpWriteRule(method="*", url_glob=authority_glob)
+    return any(http_write_rule_matches(host_rule, method=step.method, url=a) for a in _authorities(step.url))
 
 
 def refuse_held_step(step: _Step, rules: tuple[HttpWriteRule, ...]) -> None:
     """Refuse a step a write-approval rule would hold: a connection test shows
     no approval card, so it cannot send what needs one.
 
-    With no rule there is nothing to slip past, so an address is judged only
-    when rules exist.
+    An address must be written plainly only where a rule could hold a request
+    of this method to this host: elsewhere there is nothing to slip past, and
+    an API may want an escaped ``/`` in its path.
 
     Raises:
         ConnectorTestError: naming the step, never the URL.
     """
+    rules = tuple(rule for rule in rules if _concerns(rule, step))
     if not rules:
         return
     if not _is_plain_path(_written_path(step.url)):

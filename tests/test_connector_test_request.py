@@ -457,13 +457,20 @@ class TestAnApiBehindTheOperatorsOwnCertificateAuthority:
         with pytest.raises(ValueError, match="SSL_CERT_FILE names a file that cannot be read"):
             connector_test_run.check_started_certificates()
 
-    def test_a_shared_deployment_does_not_start_with_a_file_holding_no_certificate(
-        self, monkeypatch, tmp_path, personal_deployment,
+    @pytest.mark.parametrize("content", [
+        b"not a certificate\n",
+        b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        b"-----BEGIN CERTIFICATE-----\nMIIB\xe9AAAA\n-----END CERTIFICATE-----\n",
+    ], ids=["no block", "damaged block", "a stray byte inside a block"])
+    def test_a_shared_deployment_does_not_start_with_a_file_holding_no_usable_certificate(
+        self, monkeypatch, tmp_path, personal_deployment, content,
     ):
-        empty = tmp_path / "empty.pem"
-        empty.write_text("not a certificate\n", encoding="ascii")
-        self._start_with(monkeypatch, empty)
-        with pytest.raises(ValueError, match="SSL_CERT_FILE names a file with no certificate in it"):
+        """Bytes around a certificate are skipped as OpenSSL skips them; bytes
+        inside one are not dropped to make it load."""
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_bytes(content)
+        self._start_with(monkeypatch, bundle)
+        with pytest.raises(ValueError, match="SSL_CERT_FILE names a file with no usable certificate in it"):
             connector_test_run.check_started_certificates()
 
     @pytest.mark.parametrize("bad", ["missing", "empty"])
@@ -496,14 +503,13 @@ class TestAnApiBehindTheOperatorsOwnCertificateAuthority:
             await self._send(port)
 
     def test_the_file_is_the_one_the_server_started_with(self, monkeypatch, tmp_path, personal_deployment):
+        block = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----"
         started = tmp_path / "started.pem"
-        started.write_text("started", encoding="ascii")
+        started.write_text(f"# the operator's own\n{block}\n", encoding="ascii")
         self._start_with(monkeypatch, started)
         monkeypatch.setenv(connector_test_run.CA_FILE_ENV, str(tmp_path / "written-later.pem"))
 
-        assert connector_test_run.started_certificates() == connector_test_run.StartedCertificates(
-            str(started), "started"
-        )
+        assert connector_test_run.started_certificates() == connector_test_run.StartedCertificates(str(started), block)
 
     @pytest.mark.asyncio
     async def test_a_file_overwritten_after_the_start_is_not_trusted(
@@ -640,6 +646,55 @@ class TestAWriteApprovalRuleHoldsATestStep:
     async def test_a_held_path_is_refused_however_it_is_spelled(self, monkeypatch, personal_deployment, rule, path):
         hold(monkeypatch, rule)
         api = await refused("data step", with_url(f"https://api.example.com{path}"))
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rule", [
+        "POST https://xn--bcher-kva.example/**", "POST https://xn--bcher-kva.example/v1/orders",
+        "POST https://b\u00fccher.example/**",
+    ], ids=["ascii glob", "ascii exact", "unicode glob"])
+    @pytest.mark.parametrize("host", ["xn--bcher-kva.example", "b\u00fccher.example"], ids=["ascii url", "unicode url"])
+    async def test_a_held_host_with_a_non_ascii_name_is_refused_in_either_spelling(
+        self, monkeypatch, personal_deployment, rule, host,
+    ):
+        """A rule names the host in ASCII or in Unicode, and so may the form."""
+        hold(monkeypatch, rule)
+        table = {**PUBLIC, "xn--bcher-kva.example": "93.184.216.21"}
+        api = await refused("needs an approval", with_url(f"https://{host}/v1/orders"), table=table)
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rule", [
+        "POST https://other.example.com/**", "GET https://api.example.com/**", "POST http://api.example.com/**",
+        "POST https://api.example.com:8443/**",
+    ], ids=["another host", "another method", "another scheme", "another port"])
+    async def test_a_rule_that_cannot_hold_this_step_does_not_judge_how_its_path_is_written(
+        self, monkeypatch, personal_deployment, rule,
+    ):
+        """An API may want an escaped slash in its path; only a rule that could
+        hold a request to this host makes the spelling matter."""
+        hold(monkeypatch, rule)
+        outcome, api = await run(with_url("https://api.example.com/v1/projects/group%2Fproject/items"))
+        assert outcome.preview is not None and api.requests[-1].url.raw_path.endswith(b"group%2Fproject/items")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rule", ["POST https://api.example.com/v2/**", "POST https://*.example.com/v2/**", "POST **orders**"])
+    async def test_a_rule_that_could_hold_this_host_makes_the_spelling_matter(self, monkeypatch, personal_deployment, rule):
+        hold(monkeypatch, rule)
+        api = await refused(
+            "written in a way a connection test does not accept",
+            with_url("https://api.example.com/v1/projects/group%2Fproject/items"),
+        )
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("rule", "url"), [
+        ("POST https://api.example.com", "https://api.example.com/"),
+        ("POST https://api.example.com/", "https://api.example.com"),
+    ])
+    async def test_a_rule_on_the_root_holds_it_with_and_without_its_slash(self, monkeypatch, personal_deployment, rule, url):
+        hold(monkeypatch, rule)
+        api = await refused("needs an approval", with_url(url))
         assert api.requests == []
 
     @pytest.mark.asyncio
