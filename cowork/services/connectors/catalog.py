@@ -34,6 +34,8 @@ def _field_lines(form: dict[str, Any] | None) -> str:
         A short section naming each field by the end of the environment
         variable the agent sees (anton writes ``<prefix>__<FIELD>``) with its
         description, cut to _FIELD_DESCRIPTION_MAX; "" when no field has one.
+        A name used by several methods keeps the first description found,
+        whichever method the saved connection used.
     """
     form = form or {}
     fields = list(form.get("fields") or [])
