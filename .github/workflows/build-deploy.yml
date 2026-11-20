@@ -37,7 +37,7 @@ on:
         type: string
         required: true
       build-runner:
-        description: "Runner label for deploy and integration; build stays on mdb-dev"
+        description: "Runner label for deploy and integration; the build runs on ubuntu-latest"
         type: string
         default: mdb-dev
       pr-environment:
@@ -69,8 +69,11 @@ defaults:
 jobs:
 
   build:
-    # Always build on dev runner because thats where buildkit is
-    runs-on: mdb-dev
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The OIDC token configure-aws-credentials exchanges for the ECR role.
+      id-token: write
     outputs:
       image: ${{ steps.build.outputs.image }}
     env:
@@ -106,11 +109,17 @@ jobs:
           # the Dockerfile COPYs the build context into the builder stage. It
           # deletes .git after the sync so the runtime image does not carry it.
           fetch-depth: 0
-      - uses: mindsdb/github-actions/setup-env@main
-      - id: build
-        uses: mindsdb/github-actions/build-push-ecr@main
+      - name: Assume the ECR push role
+        # github-ecr-push from terraform's github-oidc stack, which every
+        # mindsdb repository may assume.
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
         with:
-          module-name: ${{ env.CI_REPOSITORY_SLUG }}
+          role-to-assume: ${{ vars.ECR_PUSH_ROLE_ARN }}
+          aws-region: us-east-1
+      - id: build
+        uses: mindsdb/github-actions/build-image@main
+        with:
+          module-name: mindsdb-cowork-server
           build-for-environment: ${{ inputs.build-environment }}
 
   scan:
@@ -187,7 +196,7 @@ jobs:
         with:
           environment-slug: dev
           k8s-namespace: dev
-          # The tag build-push-ecr gave this run's image, as in `deploy` below.
+          # The tag build-image gave this run's image, as in `deploy` below.
           image-tag: ${{ inputs.build-environment }}-${{ env.SLUG }}
           timeout: 600s
 
@@ -230,7 +239,7 @@ jobs:
         with:
           environment-slug: ${{ env.DEPLOY_ENV }}
           k8s-namespace: ${{ env.DEPLOY_ENV }}
-          # build-push-ecr tags the image `<build-for-environment>-<sha>`, so this
+          # build-image tags the image `<build-for-environment>-<sha>`, so this
           # is the image flavour, not DEPLOY_ENV.
           image-tag: ${{ inputs.build-environment }}-${{ env.SLUG }}
           timeout: 600s
