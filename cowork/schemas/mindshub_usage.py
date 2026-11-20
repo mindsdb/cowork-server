@@ -1,6 +1,6 @@
 """Wire shape for the desktop's usage read: free tokens, plan, balance, auto top up."""
 
-from typing import Literal, Optional, get_args
+from typing import Literal, Optional, TypeGuard, get_args
 
 from cowork.schemas.base import CamelResponse
 
@@ -18,6 +18,17 @@ PLAN_TIERS: frozenset[str] = frozenset(get_args(PlanTier))
 PAID_PLAN_TIERS: frozenset[str] = frozenset(get_args(PaidPlanTier))
 PLAN_STATUSES: frozenset[str] = frozenset(get_args(PlanStatus))
 PLAN_WINDOWS: frozenset[str] = frozenset(get_args(PlanWindowName))
+
+
+def is_one_of(value: object, allowed: frozenset[str]) -> TypeGuard[str]:
+    """True when ``value`` is a string in ``allowed``.
+
+    The type is checked first. These values come from untrusted JSON, and a
+    list or an object raises ``TypeError`` (unhashable) in a bare ``in`` test.
+    Every check against the sets above goes through here, so no caller can
+    leave the type check out.
+    """
+    return isinstance(value, str) and value in allowed
 
 
 class MindsHubFreeTokens(CamelResponse):

@@ -21,7 +21,7 @@ from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import CATALOG_ROLE_NAMES, IMAGE_ROLE, default_minds_api_host
 from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
-from cowork.schemas.mindshub_usage import PLAN_TIERS
+from cowork.schemas.mindshub_usage import PLAN_TIERS, is_one_of
 from cowork.services.mindshub_client import sweep_cache
 
 if TYPE_CHECKING:
@@ -737,9 +737,10 @@ async def fetch_minds_models(
             disabled_reasons[model_id] = reason
         # The tier whose allowance covers the model, whether or not
         # it is locked: the picker shows it on covered rows and offers it as
-        # the upgrade on locked ones. Type first: a custom endpoint's row may
-        # send a list or an object here, and `in` raises on an unhashable value.
-        if isinstance(tier := row.get("covered_by_tier"), str) and tier in PLAN_TIERS:
+        # the upgrade on locked ones. `is_one_of` checks the type first: a custom
+        # endpoint's row may send a list or an object here, and `in` raises on
+        # an unhashable value.
+        if is_one_of(tier := row.get("covered_by_tier"), PLAN_TIERS):
             covered_by_tier[model_id] = tier
         levels = row.get("reasoning_efforts")
         if isinstance(levels, list) and levels:

@@ -36,6 +36,7 @@ from cowork.schemas.mindshub_usage import (
     MindsHubPlan,
     MindsHubPlanWindow,
     MindsHubUsageView,
+    is_one_of,
 )
 from cowork.services.mindshub_client import (
     ENTITLEMENTS_PATH,
@@ -135,15 +136,6 @@ def _parse_free_tokens(payload: Any) -> Optional[MindsHubFreeTokens]:
     )
 
 
-def _is_one_of(value: Any, allowed: frozenset[str]) -> bool:
-    """True when ``value`` is a string in ``allowed``.
-
-    Checked for type first: the response body is untrusted JSON, and a list or
-    an object in a field raises ``TypeError`` (unhashable) in a bare ``in`` test.
-    """
-    return isinstance(value, str) and value in allowed
-
-
 def _optional_str(value: Any) -> tuple[bool, Optional[str]]:
     """``(ok, value)`` for a field that must be a string or null."""
     if value is None or isinstance(value, str):
@@ -191,7 +183,7 @@ def _parse_plan(payload: Any) -> Optional[MindsHubPlan]:
 
     tier = plan.get("tier")
     status = plan.get("status")
-    if not _is_one_of(tier, PLAN_TIERS) or not _is_one_of(status, PLAN_STATUSES):
+    if not is_one_of(tier, PLAN_TIERS) or not is_one_of(status, PLAN_STATUSES):
         return None
     ok, renews_at = _optional_str(plan.get("renews_at"))
     if not ok:
@@ -211,7 +203,7 @@ def _parse_plan(payload: Any) -> Optional[MindsHubPlan]:
         if not isinstance(raw, dict):
             return None
         name = raw.get("window")
-        if not _is_one_of(name, PLAN_WINDOWS):
+        if not is_one_of(name, PLAN_WINDOWS):
             continue
         if name in seen:
             return None

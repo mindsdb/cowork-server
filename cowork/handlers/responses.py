@@ -4285,11 +4285,16 @@ class ResponsesHandler:
                             extra=log_context(request_id=corr, conversation_id=conversation_id),
                         )
                 # The ladder already produced a code; carry it instead of dropping
-                # it here. Same wire shape the streaming twin emits.
+                # it here. Same wire shape the streaming twin emits. The reset
+                # instant, the plan fields and the budget fields ride along for
+                # their own codes, as they do there.
                 raise HTTPException(
                     status_code=400,
                     detail=response_failed_payload(
                         message, code, request_id=corr,
+                        reset_at=gate_reset_at(exc) if code in RESET_AT_CODES else None,
+                        window=gate_window(exc) if code == WINDOW_ALLOWANCE_EXHAUSTED_CODE else None,
+                        required_tier=gate_required_tier(exc) if code == MODEL_NOT_IN_TIER_CODE else None,
                         budget_scope=gate_budget_scope(exc) if code == BUDGET_EXCEEDED_CODE else None,
                         budget_period=gate_budget_period(exc) if code == BUDGET_EXCEEDED_CODE else None,
                         budget_model=gate_budget_model(exc) if code == BUDGET_EXCEEDED_CODE else None,
