@@ -91,8 +91,18 @@ async def _relay(
             detail = {"code": body[code_key], "message": detail}
         raise HTTPException(status_code=resp.status_code, detail=detail)
     # Every route but disconnect returns a JSON object; disconnect's 204 has
-    # no body at all, so decoding it unconditionally would raise.
-    return resp.json() if resp.text else {}
+    # no body at all. Anything else is a broken answer, never a 500 here.
+    if not resp.text:
+        return {}
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="auth answered something other than a JSON object",
+        )
+    return body
 
 
 async def proxy_start(service: str, request: Request, settings: OAuthSettings, body: dict) -> dict:

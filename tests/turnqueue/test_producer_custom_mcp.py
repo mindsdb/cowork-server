@@ -240,23 +240,47 @@ async def test_a_member_with_no_server_gets_no_block_and_no_event(auth):
     assert _events(auth) == []
 
 
-async def test_the_backstop_measures_unescaped_utf8(auth):
-    """48 definitions of 16 KiB of non-Latin text: 768 KiB by auth's measure, about twice that escaped."""
-    def definition(index: int) -> str:
-        head = json.dumps({"description": "", "input_schema": {"type": "object"}, "name": f"t{index}"},
-                          separators=(",", ":"), sort_keys=True, ensure_ascii=False)
-        room = 16 * 1024 - len(head.encode("utf-8"))
-        return head.replace('"description":""', '"description":"' + "文" * (room // 3) + '"')
+def _definition(index: int, size: int) -> str:
+    """A definition of exactly ``size`` UTF-8 bytes, padded mostly with three-byte characters."""
+    head = json.dumps({"description": "", "input_schema": {"type": "object"}, "name": f"t{index}"},
+                      separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+    room = size - len(head.encode("utf-8"))
+    padding = "文" * (room // 3) + "x" * (room % 3)
+    return head.replace('"description":""', '"description":"' + padding + '"')
 
-    tools = [definition(i) for i in range(48)]
+
+def _sixteen_kib_tools(extra_bytes: int = 0) -> list[str]:
+    """16 definitions of 16 KiB: anton's block total exactly, plus ``extra_bytes`` on the last."""
+    tools = [_definition(i, 16 * 1024) for i in range(16)]
+    tools[-1] = _definition(15, 16 * 1024 + extra_bytes)
+    return tools
+
+
+async def test_a_block_at_antons_byte_total_is_sent_measured_unescaped(auth):
+    tools = _sixteen_kib_tools()
     auth["listing"] = [httpx.Response(200, json={"items": [{**_listing()["items"][0], "tools": tools}]})]
 
     params, _ = await _run(auth)
 
     assert params["custom_mcp"]["connections"][0]["tools"] == tools
-    assert 700 * 1024 < sum(len(t.encode("utf-8")) for t in tools) <= 768 * 1024
-    assert len(json.dumps(tools).encode("utf-8")) > 1024 * 1024
+    assert sum(len(t.encode("utf-8")) for t in tools) == 262144
+    assert len(json.dumps(tools).encode("utf-8")) > 262144
     assert _events(auth) == []
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [_sixteen_kib_tools(extra_bytes=1), [_definition(i, 100) for i in range(101)]],
+    ids=["one byte past the total", "101 tools"],
+)
+async def test_a_block_past_either_anton_total_is_left_out(auth, tools):
+    auth["listing"] = [httpx.Response(200, json={"items": [{**_listing()["items"][0], "tools": tools}]})]
+
+    params, _ = await _run(auth)
+
+    assert "custom_mcp" not in params
+    assert _GRANT_PATH not in _paths(auth)
+    assert [event["reason"] for event in _events(auth)] == ["over_backstop"]
 
 
 # ── a grant answer that contradicts the turn ─────────────────────────────────

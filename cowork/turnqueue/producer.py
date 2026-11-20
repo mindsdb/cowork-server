@@ -59,7 +59,9 @@ from cowork.turnqueue.models import (
     CUSTOM_API_PROTOCOL_VERSION,
     CUSTOM_MCP_PROTOCOL_VERSION,
     MAX_CUSTOM_API_CONNECTIONS,
+    MAX_CUSTOM_MCP_BLOCK_BYTES,
     MAX_CUSTOM_MCP_CONNECTIONS,
+    MAX_CUSTOM_MCP_TOOLS,
     MAX_DATASOURCE_CONNECTIONS,
     TurnJob,
     TurnJobHeader,
@@ -795,11 +797,6 @@ async def _mint_custom_api_block(*, scope: TenantScope, correlation_id: str, tur
     return {"connections": [{**ref, "credential_version": versions[ref["connection_id"]]} for ref in refs]}
 
 
-#: The producer's backstop on a custom MCP block, in UTF-8 bytes of its definitions:
-#: auth's member ceiling keeps a real block far below it.
-_CUSTOM_MCP_BLOCK_BACKSTOP_BYTES = 1024 * 1024
-
-
 def _leave_out_custom_mcp(conversation_id: str, reason: str, *, exc_info: bool = False,
                           expected: bool = False) -> None:
     """Log the one event line of a turn whose custom MCP block was left out; ``reason`` is a fixed word.
@@ -930,7 +927,9 @@ async def _mint_custom_mcp_block(*, scope: TenantScope, conversation_id: str, co
     except ValueError:
         _leave_out_custom_mcp(conversation_id, "listing_malformed")
         return None
-    if size > _CUSTOM_MCP_BLOCK_BACKSTOP_BYTES:
+    # auth's member ceiling keeps a real block inside both; past either, anton would drop it.
+    tool_count = sum(len(connection["tools"]) for connection in connections)
+    if size > MAX_CUSTOM_MCP_BLOCK_BYTES or tool_count > MAX_CUSTOM_MCP_TOOLS:
         _leave_out_custom_mcp(conversation_id, "over_backstop")
         return None
     requested = [connection["connection_id"] for connection in connections]

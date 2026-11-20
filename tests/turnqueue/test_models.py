@@ -279,4 +279,6 @@ def test_turn_job_refuses_a_malformed_custom_mcp_block_before_it_is_queued(custo
 def test_the_custom_mcp_block_rules_match_the_pods():
     assert models.CUSTOM_MCP_PROTOCOL_VERSION == contract.CUSTOM_MCP_PROTOCOL_VERSION
     assert models.MAX_CUSTOM_MCP_CONNECTIONS == contract.MAX_CUSTOM_MCP_CONNECTIONS
+    assert models.MAX_CUSTOM_MCP_TOOLS == contract.CUSTOM_MCP_MAX_SWITCHED_ON_TOOLS
+    assert models.MAX_CUSTOM_MCP_BLOCK_BYTES == contract.CUSTOM_MCP_MAX_MEMBER_CEILING_BYTES
     assert models._CUSTOM_MCP_CONNECTION_KEYS == contract._CUSTOM_MCP_CONNECTION_KEYS

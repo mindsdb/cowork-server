@@ -26,10 +26,12 @@ MAX_DATASOURCE_CONNECTIONS = 100
 MAX_CUSTOM_API_CONNECTIONS = 25
 #: The `custom_api` block's wire version; anton drops a block carrying any other.
 CUSTOM_API_PROTOCOL_VERSION = 1
-#: The `custom_mcp` block's wire version and connection cap; anton holds the same
-#: two and drops the whole block when either is broken. A test pins them to anton's.
+#: The `custom_mcp` block's wire version, connection cap and totals; anton holds the
+#: same and drops the whole block when any is broken. A test pins them to anton's.
 CUSTOM_MCP_PROTOCOL_VERSION = 1
 MAX_CUSTOM_MCP_CONNECTIONS = 25
+MAX_CUSTOM_MCP_TOOLS = 100
+MAX_CUSTOM_MCP_BLOCK_BYTES = 262144
 _CUSTOM_MCP_CONNECTION_KEYS = frozenset({"connection_id", "name", "label", "credential_version", "tools"})
 _REQUIRED_REF_KEYS = frozenset({"connection_id", "credential_version"})
 #: Names for the prompt only. anton's `anton/cloud_turn/contract.py` allows the

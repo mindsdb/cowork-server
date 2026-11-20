@@ -6,11 +6,13 @@ test_oauth_picker_token.py).
 """
 from __future__ import annotations
 
+import httpx
 import pytest
 from fastapi import HTTPException
 
 from cowork.api.v1.endpoints.connectors import connections as connections_endpoints
 from cowork.db.scoped import TenantScope
+from cowork.services.connectors.oauth import auth_proxy as auth_proxy_module
 from cowork.schemas.connectors import ConnectionSummaryResponse
 from tests._fakes import FakeRequest
 
@@ -304,7 +306,7 @@ async def test_list_connections_adds_the_members_custom_mcp_servers(monkeypatch)
     async def fake_custom_mcp(method, path, request, settings, **kwargs):
         seen.append((method, path))
         return {"items": [
-            {"id": 7, "name": _CUSTOM_MCP_NAME, "label": "Issues", "server_url": "https://mcp.example.com/mcp",
+            {"id": 7, "name": _CUSTOM_MCP_NAME, "label": "Issues", "server_url": "https://mcp.example.com/***",
              "status": "needs_reconnect", "tools_revision": 2, "tools_on": 1},
         ]}
 
@@ -316,20 +318,22 @@ async def test_list_connections_adds_the_members_custom_mcp_servers(monkeypatch)
     assert result == [
         ConnectionSummaryResponse(engine="google_drive", name="work"),
         ConnectionSummaryResponse(engine="custom_mcp", name=_CUSTOM_MCP_NAME, label="Issues", user_label="Issues",
-                                  server_url="https://mcp.example.com/mcp", status="needs_reconnect"),
+                                  server_url="https://mcp.example.com/***", status="needs_reconnect"),
     ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [404, 500])
-async def test_list_connections_keeps_the_catalogue_when_auths_custom_mcp_list_fails(monkeypatch, status_code):
+@pytest.mark.parametrize("answer", [
+    httpx.Response(404, json={"detail": "Not found."}), httpx.Response(500, text="boom"),
+    httpx.Response(200, text="<html>proxy</html>"), httpx.Response(200, json=[]),
+], ids=["404", "500", "an HTML 200", "a list 200"])
+async def test_list_connections_keeps_the_catalogue_when_auths_custom_mcp_list_fails(monkeypatch, answer):
     monkeypatch.setenv("COWORK_TURN_CUSTOM_MCP_ENABLED", "true")
+    monkeypatch.setenv("AUTH_SERVICE_BASE_URL", "https://auth.internal")
     _catalogue_with_one_drive(monkeypatch)
-
-    async def failing(*args, **kwargs):
-        raise HTTPException(status_code=status_code, detail="Not found.")
-
-    monkeypatch.setattr(connections_endpoints.auth_proxy, "proxy_custom_mcp", failing)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(auth_proxy_module.httpx, "AsyncClient", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(lambda request: answer), **kwargs))
 
     result = await connections_endpoints.list_connections(ORG_SCOPE, FakeRequest())
 
