@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from sqlalchemy import false
 from sqlalchemy.exc import IntegrityError
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSelect, ScopedSession, TenantScope, tenant_scope_required
 from cowork.models.custom_connector import CustomConnector
@@ -60,11 +61,11 @@ def custom_test_is_code_checked() -> bool:
     """Whether a custom connector's connection test is decided by code, from
     what its test request returned, and not by the model probe.
 
-    True on a single-user install. False in org mode, which refuses custom
-    forms, and on a deployment that trusts identity headers, which keeps the
-    model probe.
+    True on every local-tenancy deployment, in every scope: a single-user
+    install and one that trusts identity headers alike. False in org mode,
+    which refuses custom forms before anything is tested.
     """
-    return not tenant_scope_required()
+    return get_app_settings().tenancy_mode != "org"
 
 
 def handcrafted_form_allowed(

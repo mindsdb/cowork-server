@@ -11,7 +11,6 @@ import time
 
 import pytest
 
-from cowork.services.connectors import custom_connectors
 from cowork.services.connectors.custom_connectors import UnstorableFormError, check_handcrafted_form, stored_form
 from tests._connector_test_request import bearer_test_request
 
@@ -106,8 +105,12 @@ class TestEveryMethodNeedsOne:
         method = {**OAUTH_METHOD, "test_request": bearer_test_request("access_token")}
         check_handcrafted_form({"form_id": "fm_dddddddddd", "title": "Acme", "methods": [method]})
 
-    def test_self_hosted_and_org_mode_keep_todays_rule(self, monkeypatch):
-        monkeypatch.setattr(custom_connectors, "tenant_scope_required", lambda: True)
+    def test_a_shared_deployment_needs_one_too(self, personal_deployment):
+        _refused({k: v for k, v in FORM.items() if k != "test_request"}, "needs a test_request")
+
+    def test_org_mode_keeps_todays_rule(self, org_deployment):
+        """Org mode refuses a handcrafted form before this check; a member's
+        draft there carries a connection check of its own."""
         check_handcrafted_form({k: v for k, v in FORM.items() if k != "test_request"})
 
     def test_a_stored_definition_keeps_its_request(self):

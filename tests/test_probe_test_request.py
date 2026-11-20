@@ -22,14 +22,15 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from cowork.api.v1.endpoints.connectors import submissions as submissions_endpoint
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.handlers import probe as probe_handler
 from cowork.harnesses.anton_harness import tools
 from cowork.models.custom_connector import CustomConnector
 from cowork.services.connectors import catalog as catalog_module
 from cowork.services.connectors import connector_test_flow, connector_test_run
 from cowork.services.connectors.catalog import ConnectorCatalog
-from cowork.schemas.connectors import SubmitFormRequest
+from cowork.schemas.connectors import ConnectorTestAnswer, SubmitFormRequest
 from cowork.services.connectors.probe import ProbeOutcome
 from cowork.services.connectors.submissions import store
 
@@ -396,24 +397,132 @@ class TestAnOldConnectorCanBeBuiltAgain:
             assert ConnectorCatalog(ScopedSession(session, LOCAL_SCOPE)).get_connector("planner").needs_rebuild is False
 
 
-class TestSelfHostedWithTheRealSetting:
-    """The same path as a self-hosted deployment takes it: identity headers
-    trusted, so a handcrafted form needs no test request and the model probe runs."""
+PARTITION, SUB, OTHER_SUB = "p-11111111", "sub-alice", "sub-bob"
+PERSON = TenantScope(personal=True, org_id=PARTITION, user_id=SUB, personal_resources=ALL_PERSONAL_RESOURCES)
+OTHER_PERSON = TenantScope(personal=True, org_id="p-22222222", user_id=OTHER_SUB, personal_resources=ALL_PERSONAL_RESOURCES)
+PERSON_SHARING_CONNECTIONS = TenantScope(
+    personal=True, org_id=PARTITION, user_id=SUB,
+    personal_resources=ALL_PERSONAL_RESOURCES - {PersonalResource.CONNECTIONS},
+)
+SHARED_DEPLOYMENT_SCOPES = pytest.mark.parametrize(
+    "scope", [PERSON, PERSON_SHARING_CONNECTIONS, LOCAL_SCOPE],
+    ids=["personal connections", "shared connections", "operator view"],
+)
+
+
+@pytest.fixture()
+def shared_deployment(personal_deployment, monkeypatch, saved):
+    """A local deployment that trusts identity headers, through the real
+    settings, in audit mode so a call without identity is the operator view."""
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    get_app_settings.cache_clear()
+    monkeypatch.setattr(submissions_endpoint, "run_db", connector_test_flow.run_db)
+    monkeypatch.setattr(submissions_endpoint, "vault_for_scope", lambda scope: saved.vault)
+    yield saved
+    get_app_settings.cache_clear()
+
+
+async def submit(form: dict, scope: TenantScope, saved) -> list[tuple[str, dict]]:
+    """Submit ``form`` through the route's own checks; the stream's events."""
+    response = await submissions_endpoint.submit_form(
+        SubmitFormRequest(form_spec=form, values=VALUES, conversation_id=saved.conversation_id), scope,
+    )
+    events = []
+    async for frame in response.body_iterator:
+        kind, data = frame.split("\n", 1)
+        events.append((kind.removeprefix("event: "), json.loads(data.removeprefix("data: ").strip())))
+    return events
+
+
+class TestASharedDeploymentDecidesInCode:
+    """The deployment the ticket names: local tenancy that trusts identity
+    headers, read from the real settings, in each scope a request can have."""
 
     @pytest.mark.asyncio
-    async def test_a_handcrafted_form_without_a_test_request_still_goes_to_the_model_probe(self, api, saved, monkeypatch):
-        monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
-        get_app_settings.cache_clear()
-        monkeypatch.setattr(submissions_endpoint, "run_db", connector_test_flow.run_db)
-        try:
-            form = {k: v for k, v in PLANNER_FORM.items() if k != "test_request"}
-            response = await submissions_endpoint.submit_form(
-                SubmitFormRequest(form_spec=form, values=VALUES, conversation_id=saved.conversation_id), LOCAL_SCOPE,
-            )
-            _ = [chunk async for chunk in response.body_iterator]
-        finally:
-            monkeypatch.delenv("COWORK_TRUST_IDENTITY_HEADERS")
-            get_app_settings.cache_clear()
+    @SHARED_DEPLOYMENT_SCOPES
+    async def test_a_form_whose_text_calls_a_token_data_saves_nothing(self, api, shared_deployment, scope):
+        api.rows = {"access_token": ISSUED, "token_type": "bearer"}
 
-        assert ModelSaysYes.built == 1 and api.requests == []
-        assert len(saved.vault.list_connections()) == 1
+        events = await submit(PLANNER_FORM, scope, shared_deployment)
+
+        assert shared_deployment.vault.list_connections() == []
+        assert ModelSaysYes.built == 0
+        assert of(events, "connector.test_preview") == []
+        [done] = of(events, "response.completed")
+        assert done["response"]["status"] == "retry"
+
+    @pytest.mark.asyncio
+    @SHARED_DEPLOYMENT_SCOPES
+    async def test_a_correct_test_request_saves_once_the_person_confirms(self, api, shared_deployment, scope):
+        events = await submit(PLANNER_FORM, scope, shared_deployment)
+
+        assert shared_deployment.vault.list_connections() == [] and ModelSaysYes.built == 0
+        [preview] = of(events, "connector.test_preview")
+        assert preview["preview"]["item_count"] == 2
+        answer = await submissions_endpoint.confirm_route(ConnectorTestAnswer(confirm_id=preview["confirm_id"]), scope)
+
+        assert answer["saved_slug"]
+        [connection] = shared_deployment.vault.list_connections()
+        assert connection["engine"] == "planner"
+
+    @pytest.mark.asyncio
+    @SHARED_DEPLOYMENT_SCOPES
+    async def test_a_form_without_a_test_request_is_refused_before_anything_is_staged(
+        self, api, shared_deployment, scope, monkeypatch,
+    ):
+        staged: list = []
+        monkeypatch.setattr(submissions_endpoint.store, "stage", lambda **kwargs: staged.append(kwargs))
+        form = {k: v for k, v in PLANNER_FORM.items() if k != "test_request"}
+
+        with pytest.raises(HTTPException) as exc:
+            await submit(form, scope, shared_deployment)
+
+        assert exc.value.status_code == 422 and "test_request" in exc.value.detail
+        assert staged == [] and ModelSaysYes.built == 0 and api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("asker", [OTHER_PERSON, LOCAL_SCOPE], ids=["another person", "operator view"])
+    async def test_only_the_person_who_ran_the_test_confirms_it(self, api, shared_deployment, asker):
+        events = await submit(PLANNER_FORM, PERSON, shared_deployment)
+        [preview] = of(events, "connector.test_preview")
+        answer = ConnectorTestAnswer(confirm_id=preview["confirm_id"])
+
+        with pytest.raises(HTTPException) as exc:
+            await submissions_endpoint.confirm_route(answer, asker)
+
+        assert exc.value.status_code == 404
+        assert shared_deployment.vault.list_connections() == []
+        assert (await submissions_endpoint.confirm_route(answer, PERSON))["saved_slug"]
+
+    @pytest.mark.asyncio
+    async def test_a_private_api_is_tested_only_when_the_operator_listed_it(self, api, shared_deployment, monkeypatch):
+        """The self-hosted stack's egress gateway is a private address; the
+        operator's list names it, and no person is asked."""
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset())
+        monkeypatch.setattr(
+            connector_test_run, "_RESOLVER", lambda host, port, type=None: [(None, None, None, "", ("172.30.9.10", 443))],
+        )
+        monkeypatch.delenv(connector_test_run.ALLOWLIST_ENV, raising=False)
+        connector_test_run.private_allowlist.cache_clear()
+        try:
+            refused = await submit(PLANNER_FORM, PERSON, shared_deployment)
+            assert of(refused, "connector.private_host_request") == [] and api.requests == []
+            [done] = of(refused, "response.completed")
+            assert done["response"]["status"] == "retry"
+
+            monkeypatch.setenv(connector_test_run.ALLOWLIST_ENV, "172.30.9.10")
+            connector_test_run.private_allowlist.cache_clear()
+            allowed = await submit(PLANNER_FORM, PERSON, shared_deployment)
+            assert len(of(allowed, "connector.test_preview")) == 1
+        finally:
+            connector_test_run.private_allowlist.cache_clear()
+
+    def test_an_old_custom_connector_is_marked_for_rebuilding(self, shared_deployment):
+        old = {k: v for k, v in PLANNER_FORM.items() if k not in ("test_request", "engine", "connector")}
+        with Session(shared_deployment.engine) as session:
+            session.add(CustomConnector(
+                connector_id="planner", label="Planner", description="", spec=old,
+                org_id=PERSON.org_id, created_by=PERSON.user_id,
+            ))
+            session.commit()
+            assert ConnectorCatalog(ScopedSession(session, PERSON)).get_connector("planner").needs_rebuild is True
