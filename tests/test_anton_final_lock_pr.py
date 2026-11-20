@@ -14,6 +14,7 @@ SPEC = importlib.util.spec_from_file_location(
 pr = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pr)
 TITLE = "fix(deps): lock anton-agent's final 1.0 instead of 1.0rc1 (ENG-4355)"
+FLOOR = '[project]\ndependencies = ["anton-agent>={},<3"]\n'
 
 
 @pytest.fixture
@@ -24,6 +25,7 @@ def repo(tmp_path, monkeypatch):
     pr.run("git", "config", "user.email", "test@example.com")
     (tmp_path / "cowork").mkdir()
     write_lock("1.0rc1", "1")
+    Path("pyproject.toml").write_text(FLOOR.format("1.0rc1"))
     pr.run("git", "add", ".")
     pr.run("git", "commit", "-qm", "base")
     return pr.run("git", "rev-parse", "HEAD")
@@ -249,6 +251,7 @@ def test_retry_uses_fresh_staging_lock_and_replaces_old_decision(repo, tmp_path,
         assert pr.remote_head("bot/anton-final-lock") == pr.run("git", "rev-parse", "HEAD")
         assert pr.run("git", "rev-parse", "HEAD^") == fresh
         assert "other==2" in pr.run("git", "show", "HEAD:uv.lock")
+        assert pr.run("git", "show", "HEAD:pyproject.toml") == FLOOR.format("1.1").strip()
         assert (sys.executable, "scripts/release_contract.py") in calls
         assert (sys.executable, "scripts/release_contract.py", "--check") in calls
     else:
@@ -268,6 +271,28 @@ def test_repeated_staging_changes_stop_after_three_attempts(monkeypatch):
         pr.retry_staging()
     assert len(calls) == 3
     assert len(refreshes) == 2
+
+
+def test_relock_raises_a_candidate_floor_before_locking(repo, monkeypatch):
+    calls = []
+    def run(*args):
+        calls.append(args)
+        if args[0] == "uv":
+            assert Path("pyproject.toml").read_text() == FLOOR.format("1.0")
+        return ""
+    monkeypatch.setattr(pr, "run", run)
+    pr.relock("1.0")
+    assert calls == [
+        ("uv", "lock", "--upgrade-package", "anton-agent==1.0"),
+        (sys.executable, "scripts/release_contract.py"),
+        (sys.executable, "scripts/release_contract.py", "--check"),
+    ]
+
+
+def test_the_raised_floor_is_committed(repo):
+    Path("pyproject.toml").write_text(FLOOR.format("1.0"))
+    assert pr.prepare_commit(repo, "", "floor")
+    assert pr.run("git", "show", "HEAD:pyproject.toml") == FLOOR.format("1.0").strip()
 
 
 def test_retry_does_not_reset_checkout_for_non_staging_failure(monkeypatch):

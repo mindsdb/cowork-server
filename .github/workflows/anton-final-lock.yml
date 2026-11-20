@@ -11,7 +11,8 @@ name: Lock anton's final release on staging
 # the notice.
 #
 # When staging locks a candidate and a newer final exists, it relocks staging
-# to that final and opens (or updates) one PR into staging. CI runs on it because
+# to that final, raises a candidate anton-agent floor in pyproject.toml to it,
+# and opens (or updates) one PR into staging. CI runs on it because
 # the release-train App opens it, not GITHUB_TOKEN. A person still reviews and
 # merges it: a newer version number does not prove the final carries the
 # candidate's code, so the PR's CI is that check.
@@ -72,9 +73,7 @@ jobs:
           VERSION: ${{ steps.final.outputs.version }}
         run: |
           set -euo pipefail
-          uv lock --upgrade-package "anton-agent==${VERSION}"
-          python scripts/release_contract.py
-          python scripts/release_contract.py --check
+          uv run --no-project --with packaging==26.3 python scripts/anton_final_lock_pr.py --relock "${VERSION}"
           git diff --stat
 
       - name: Find the existing bump PR

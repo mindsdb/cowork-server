@@ -1356,8 +1356,12 @@ or leave it unread, without logging its private path.
 ### Production dependency gate
 
 Production accepts only final dependency versions. `scripts/release_contract.py
---check --require-final` checks the lock export before tagging, publishing, or
-building the production image. Staging may still lock release candidates.
+--check --require-final` checks the lock export and the version bounds in
+`pyproject.toml` before tagging, publishing, or building the production image.
+A pre-release in a bound such as `anton-agent>=2.0rc1` lets pip and uv install
+newer pre-releases from PyPI, so it is refused like a pre-release pin. Staging
+may still lock and require release candidates, and the anton relock raises a
+candidate floor to the final it locks.
 
 A repository administrator must also require the `final-release-lock` GitHub
 Actions status check on `main`. This is a branch-rule setting, not something

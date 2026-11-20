@@ -6,11 +6,13 @@ import re
 import subprocess
 import sys
 import tarfile
+import tomllib
 import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "cowork" / "release-requirements.txt"
+PYPROJECT = ROOT / "pyproject.toml"
 
 # One `name==version` pin per requirement line of the uv export; hash and
 # marker continuations follow on indented lines.
@@ -20,6 +22,8 @@ PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;\\]+)")
 VERSION = re.compile(
     r"^(?:\d+!)?\d+(?:\.\d+)*(?P<pre>(?:a|b|rc)\d+)?(?:\.post\d+)?(?P<dev>\.dev\d+)?(?:\+[a-z0-9.]+)?$"
 )
+# Each version a declared requirement names, such as the `2.0rc1` in `>=2.0rc1,<3`.
+SPECIFIER = re.compile(r"(?:===|~=|==|!=|<=|>=|<|>)\s*([^\s,;]+)")
 
 
 def unreleased_pins(export: str) -> list[str]:
@@ -38,6 +42,31 @@ def unreleased_pins(export: str) -> list[str]:
         parsed = VERSION.match(version)
         if parsed is None or parsed["pre"] or parsed["dev"]:
             refused.append(f"{name}=={version}")
+    return refused
+
+
+def unreleased_requirements(pyproject: str) -> list[str]:
+    """Return every declared requirement that names a pre-release or dev build.
+
+    The wheel's metadata carries these requirements, and a pre-release in one
+    lets pip and uv pick newer pre-releases for anyone who installs from PyPI
+    without the lock. A version this cannot parse is refused too.
+    """
+    project = tomllib.loads(pyproject)["project"]
+    requirements = list(project.get("dependencies", []))
+    for extra in project.get("optional-dependencies", {}).values():
+        requirements.extend(extra)
+    refused = []
+    for requirement in requirements:
+        versions = requirement.split(";", 1)[0]
+        if "@" in versions:
+            # A direct reference names a URL, not a version.
+            continue
+        for version in SPECIFIER.findall(versions):
+            parsed = VERSION.match(version.removesuffix(".*"))
+            if parsed is None or parsed["pre"] or parsed["dev"]:
+                refused.append(requirement)
+                break
     return refused
 
 
@@ -91,6 +120,16 @@ def main() -> int:
                 " python scripts/release_contract.py.",
                 file=sys.stderr,
             )
+        declared = unreleased_requirements(PYPROJECT.read_text())
+        if declared:
+            print(
+                "A production release must declare final releases only. pyproject.toml requires:\n  "
+                + "\n  ".join(declared)
+                + "\nRaise each bound to the final release the lock names, then run uv lock and"
+                " python scripts/release_contract.py.",
+                file=sys.stderr,
+            )
+        if refused or declared:
             return 1
     if args.dist_dir:
         try:
