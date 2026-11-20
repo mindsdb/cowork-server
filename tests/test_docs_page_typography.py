@@ -19,7 +19,7 @@ from cowork.docs.render import FONT_CSS, PAGE_CSS, PDF_CSS, doc_html
 
 _RULES_BYTES = (Path(__file__).parent / "fixtures" / "docs_typography" / "rules.json").read_bytes()
 # The same digest is pinned in cowork's docTypography.test.js.
-_RULES_SHA256 = "6591c429ba06e88e8d6b0a3582a22ab56b59f9254e1df2b365b0298fb45092fc"
+_RULES_SHA256 = "621c3295182af196d7977c5c911ccc3e2fc9fc2fa51f7dfb49d5f3adb42be10d"
 _RULES = json.loads(_RULES_BYTES)
 _SIDES = ("top", "right", "bottom", "left")
 
@@ -153,3 +153,47 @@ def test_a_callout_shows_its_icon_and_its_title_on_a_line_of_its_own():
     page = _page({"type": "callout", "tone": "warning", "title": "Heads up", "text": "Body."})
     assert "<div class='callout callout-warning'><span class='callout-icon'><svg width='16'" in page
     assert "<div class='callout-body'><div class='callout-title'>Heads up</div><p>Body.</p></div></div>" in page
+
+
+def _tabbed_page() -> str:
+    tabs = [{"id": f"t_{n}", "title": title, "blocks": [{"type": "paragraph", "text": f"{title} body"}]}
+            for n, title in enumerate(["Overview", "Risks <b>"], 1)]
+    return doc_html(normalize_doc({"schema": SCHEMA, "title": "T", "rev": 1, "tabs": tabs}))
+
+
+def test_a_doc_of_several_tabs_lists_them_on_the_left_and_above_the_page_on_a_narrow_screen():
+    page = _tabbed_page()
+    links = ("<a class='doc-tab is-active' href='#tab-1' aria-current=true><span class='doc-tab__title'>Overview</span></a>"
+             "<a class='doc-tab' href='#tab-2'><span class='doc-tab__title'>Risks &lt;b&gt;</span></a>")
+    assert f"<div class='doc-tabs__list'>{links}</div></nav>" in page
+    assert f"<nav class='doc-tabstrip' aria-label='Tabs'>{links}</nav>" in page
+    assert "<body class='tabbed'><nav class='doc-tabs' aria-label='Tabs'>" in page
+    assert "class='doc-tabs__hide' aria-label='Hide tabs'" in page and "class='doc-tabs__show' aria-label='Show tabs'" in page
+    # The first tab is shown before the script runs; without it every tab stays on the page.
+    assert "<section class='tab is-active' id='tab-1'>" in page and "<section class='tab' id='tab-2'>" in page
+    assert ".js section.tab:not(.is-active),.js .tab-title{display:none}" in PAGE_CSS
+
+
+def test_the_rails_folded_state_is_read_and_kept_only_where_storage_may_throw():
+    page = _tabbed_page()
+    uses = [m.start() for m in re.finditer(r"localStorage", page)]
+    assert len(uses) == 2
+    assert all(re.search(r"try\{(if\()?$", page[:at]) for at in uses)
+    assert page.count("cowork:doc-tabs-hidden:v1") == 2
+
+
+def test_a_doc_of_one_tab_has_no_tabs_and_no_script():
+    page = _page({"type": "paragraph", "text": "Only"})
+    assert "doc-tabs" not in page and "<script" not in doc_html(normalize_doc(
+        {"schema": SCHEMA, "title": "T", "rev": 1, "tabs": [{"id": "t_1", "title": "T", "blocks": []}]}))
+
+
+def test_the_word_and_pdf_markup_keeps_its_tab_headings_and_no_tab_ui():
+    from cowork.docs.export import _document
+
+    tabs = [{"id": f"t_{n}", "title": title, "blocks": []} for n, title in enumerate(["Overview", "Risks"], 1)]
+    doc = normalize_doc({"schema": SCHEMA, "title": "T", "rev": 1, "tabs": tabs})
+    for fmt in ("docx", "pdf"):
+        source = _document(doc, fmt).decode("utf-8")
+        assert "<h1>Overview</h1>" in source and "<h1 class=tab>Risks</h1>" in source
+        assert "doc-tab" not in source and "<script" not in source and "<nav" not in source

@@ -752,12 +752,16 @@ _CALLOUT_ICONS = {
 }
 
 
+def _icon(shapes: str) -> str:
+    """A lucide glyph as the editor draws it: 16px, a 1px line."""
+    return ("<svg width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='currentColor' "
+            f"stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' aria-hidden='true'>{shapes}</svg>")
+
+
 def _callout_html(tab: Tab, b: Block, rich: bool) -> str:
     if rich:
         tone = b["tone"] if b["tone"] in _CALLOUT_ICONS else "info"
-        icon = ("<svg width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='currentColor' "
-                "stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' aria-hidden='true'>"
-                f"{_CALLOUT_ICONS[tone]}</svg>")
+        icon = _icon(_CALLOUT_ICONS[tone])
         head = f"<div class='callout-title'>{inline_html(b['title'])}</div>" if b.get("title") else ""
         return (f"<div class='callout callout-{tone}'><span class='callout-icon'>{icon}</span>"
                 f"<div class='callout-body'>{head}<p>{inline_html(b['text'])}</p></div></div>")
@@ -879,18 +883,23 @@ FONT_CSS = _font_face("normal", "inter.woff2") + _font_face("italic", "inter-ita
 PDF_CSS = FONT_CSS + f"body{{font-family:{FONT_STACK}}}"
 
 # The page a doc opens as in a browser and is shared as: the editor's look,
-# standalone (no scripts, no external assets), light and dark, and printable.
+# standalone (no external assets; a small script only for tabs), light and dark,
+# and printable.
 # The editor (cowork, components/doc/doc.css) is the reference: the numbers
 # both share are pinned in tests/fixtures/docs_typography/rules.json.
 PAGE_CSS = FONT_CSS + """
 :root{color-scheme:light dark;--bg:#fafafa;--surface:#fff;--surface-2:#f4f4f4;--line:#e4e4e1;--ink:#0e0f10;--ink-2:#3a3d40;
 --ink-3:#6b6f73;--accent:#1f9cb0;--accent-ink:#115562;
 --gray-bg:#eeeff0;--gray:#4a4f55;--blue-bg:#e3eefb;--blue:#1c5296;--green-bg:#e1f3e6;--green:#1c6236;
---yellow-bg:#fbf0d5;--yellow:#6e5010;--red-bg:#fbe5e2;--red:#922b20;--purple-bg:#eee7fa;--purple:#553789}
+--yellow-bg:#fbf0d5;--yellow:#6e5010;--red-bg:#fbe5e2;--red:#922b20;--purple-bg:#eee7fa;--purple:#553789;
+--ink-4:#9b9fa3;--accent-glow:rgba(31,156,176,.3);--hover:color-mix(in srgb,var(--ink) 7%,transparent);
+--press:color-mix(in srgb,var(--ink) 11%,transparent);--ease:cubic-bezier(.22,1,.36,1)}
 @media (prefers-color-scheme:dark){:root{--bg:#0f1113;--surface:#16191c;--surface-2:#1d2125;--line:#2a2f34;--ink:#f2f4f5;
 --ink-2:#c9cdd2;--ink-3:#8f969d;--accent:#22d3ee;--accent-ink:#7fe3f3;
 --gray-bg:#2c2f33;--gray:#c9cdd2;--blue-bg:#18304d;--blue:#a9cbf5;--green-bg:#173826;--green:#9fdcb2;
---yellow-bg:#3b3014;--yellow:#f0d08a;--red-bg:#45201c;--red:#f4ada4;--purple-bg:#2e2346;--purple:#cdb8f3}}
+--yellow-bg:#3b3014;--yellow:#f0d08a;--red-bg:#45201c;--red:#f4ada4;--purple-bg:#2e2346;--purple:#cdb8f3;
+--ink-4:#6f777f;--accent-glow:rgba(34,211,238,.45);--hover:color-mix(in srgb,var(--ink) 8%,transparent);
+--press:color-mix(in srgb,var(--ink) 12%,transparent)}}
 *{box-sizing:border-box}
 html{background:var(--bg)}
 body{margin:0;color:var(--ink-2);font:15px/1.65 """ + FONT_STACK + """;font-optical-sizing:auto;
@@ -899,10 +908,35 @@ p,h1,h2,h3,blockquote,figure,pre,ul,ol{margin:0}
 .page{--doc-gutter:56px;max-width:760px;margin:0 auto;padding:36px var(--doc-gutter) 96px;font-size:15px;line-height:1.65}
 .page-title{font-size:30px;line-height:1.2;font-weight:650;letter-spacing:-.02em;color:var(--ink);margin:0 0 6px}
 .meta{font-size:12.5px;color:var(--ink-3);margin:0 0 22px}
-nav.tabs{display:flex;flex-wrap:wrap;gap:4px;margin:0 0 22px;padding-bottom:14px;border-bottom:1px solid var(--line)}
-nav.tabs a{font-size:12.5px;border-radius:6px;color:var(--ink-2);text-decoration:none;padding:5px 8px;background:var(--surface-2)}
-nav.tabs a:hover{color:var(--ink)}
 section.tab+section.tab{margin-top:48px;padding-top:28px;border-top:1px solid var(--line)}
+body.tabbed{display:flex;align-items:flex-start}
+.doc-content{flex:1;min-width:0}
+.doc-tabs{position:sticky;top:0;height:100vh;width:196px;flex-shrink:0;border-right:1px solid var(--line);padding:14px 8px;
+overflow-x:hidden;overflow-y:auto;display:flex;flex-direction:column;gap:2px;transform-origin:left center;
+transition:width .2s var(--ease),padding .2s var(--ease),opacity .2s var(--ease),transform .2s var(--ease),
+filter .2s var(--ease),border-color .2s var(--ease)}
+.doc-tabs>*{min-width:180px}
+.tabs-hidden .doc-tabs{width:0;padding-inline:0;border-right-color:transparent;opacity:0;transform:translateX(-12px) scale(.985);
+filter:blur(6px);pointer-events:none}
+.doc-tabs__head{display:flex;align-items:center;justify-content:space-between;padding:0 0 6px 8px}
+.doc-tabs__label{font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-4)}
+.doc-tabs__list{display:flex;flex-direction:column;gap:2px}
+.doc-tabs__hide,.doc-tabs__show{display:none;place-items:center;border:0;padding:0;background:none;color:var(--ink-4);
+border-radius:6px;cursor:pointer;font:inherit}
+.doc-tabs__hide{width:26px;height:26px;margin:-6px 0}
+.doc-tabs__show{position:fixed;top:12px;left:12px;width:30px;height:30px;color:var(--ink-3)}
+.js .doc-tabs__hide,.js.tabs-hidden .doc-tabs__show{display:inline-grid}
+:is(.doc-tabs__hide,.doc-tabs__show):hover{background:var(--hover);color:var(--ink)}
+:is(.doc-tabs__hide,.doc-tabs__show,.doc-tab):focus-visible{outline:0;box-shadow:0 0 0 2px var(--accent-glow)}
+.doc-tab{display:flex;align-items:center;gap:6px;min-height:30px;padding:5px 6px 5px 8px;border-radius:6px;font-size:12.5px;
+color:var(--ink-2);text-decoration:none}
+.doc-tab:hover{background:var(--hover)}
+.js .doc-tab.is-active{background:var(--press);color:var(--ink);font-weight:600}
+.doc-tab__title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.doc-tabstrip{display:none;align-items:center;gap:4px;padding:10px 16px 0;overflow-x:auto}
+.doc-tabstrip .doc-tab{flex:0 0 auto}
+.js section.tab:not(.is-active),.js .tab-title{display:none}
+.js section.tab+section.tab{margin-top:0;padding-top:0;border-top:0}
 .tab>p{padding:3px 0}
 .tab>h1,.tab>h2,.tab>h3{color:var(--ink);font-weight:650;letter-spacing:-.01em}
 .tab>h1{font-size:24px;line-height:1.3;margin-top:30px;padding:3px 0}
@@ -963,9 +997,48 @@ figure.chart .legend i{display:inline-block;width:10px;height:10px;border-radius
 .m-value{font-size:24px;font-weight:650;letter-spacing:-.01em;color:var(--ink);line-height:1.25;margin-top:2px}
 .m-delta{font-size:11px;color:var(--ink-3);margin-top:2px}.m-good{color:var(--green)}.m-bad{color:var(--red)}
 footer{margin-top:56px;font-size:12px;color:var(--ink-3)}
-@media print{html{background:#fff}.page{padding:0}nav.tabs{display:none}.table-wrap{overflow:visible}}
-@media (max-width:619.98px){.page{--doc-gutter:48px;padding-top:24px}}
+@media (prefers-reduced-motion:reduce){.doc-tabs{transition:none}}
+@media (max-width:619.98px){.page{--doc-gutter:48px;padding-top:24px}
+body.tabbed{display:block}.doc-tabs,.js.tabs-hidden .doc-tabs__show{display:none}.doc-tabstrip{display:flex}}
+@media print{html{background:#fff}body.tabbed{display:block}.page{padding:0}.table-wrap{overflow:visible}
+.doc-tabs,.doc-tabstrip,.js.tabs-hidden .doc-tabs__show{display:none}
+.js section.tab:not(.is-active),.js .tab-title{display:block}
+.js section.tab+section.tab{margin-top:48px;padding-top:28px;border-top:1px solid var(--line)}}
 """
+
+# The tabs as the editor shows them, one at a time. Without the script every
+# tab stays on the page and the links scroll to it. The rail's folded state is
+# kept per browser, under the editor's own key.
+_TABS_EARLY_JS = ("<script>(function(){var r=document.documentElement;r.classList.add('js');"
+                  "try{if(localStorage.getItem('cowork:doc-tabs-hidden:v1')==='1')r.classList.add('tabs-hidden')}"
+                  "catch(e){}})()</script>")
+_TABS_JS = r"""<script>(function(){
+var d=document,root=d.documentElement,KEY='cowork:doc-tabs-hidden:v1';
+var sections=d.querySelectorAll('section.tab'),rail=d.querySelector('.doc-tabs');
+function open(n){
+for(var i=0;i<sections.length;i++)sections[i].classList.toggle('is-active',i+1===n);
+var links=d.querySelectorAll('.doc-tab');
+for(var j=0;j<links.length;j++){var on=links[j].getAttribute('href')==='#tab-'+n;
+links[j].classList.toggle('is-active',on);if(on)links[j].setAttribute('aria-current','true');else links[j].removeAttribute('aria-current')}}
+function fromHash(){var m=/^#tab-(\d+)$/.exec(location.hash),n=m?+m[1]:1;open(n>=1&&n<=sections.length?n:1)}
+window.addEventListener('hashchange',function(){fromHash();window.scrollTo(0,0)});
+fromHash();
+function fold(hidden){root.classList.toggle('tabs-hidden',hidden);rail.inert=hidden;
+try{localStorage.setItem(KEY,hidden?'1':'0')}catch(e){}}
+rail.inert=root.classList.contains('tabs-hidden');
+d.querySelector('.doc-tabs__hide').addEventListener('click',function(){fold(true);d.querySelector('.doc-tabs__show').focus()});
+d.querySelector('.doc-tabs__show').addEventListener('click',function(){fold(false);var a=rail.querySelector('.is-active');if(a)a.focus()});
+})()</script>"""
+_PANEL_LEFT = "<rect width='18' height='18' x='3' y='3' rx='2'/><path d='M9 3v18'/>"
+_PANEL_LEFT_CLOSE = _PANEL_LEFT + "<path d='m16 15-3-3 3-3'/>"
+_PANEL_LEFT_OPEN = _PANEL_LEFT + "<path d='m14 9 3 3-3 3'/>"
+
+
+def _tab_links(doc: Doc) -> str:
+    return "".join(
+        f"<a class='doc-tab{' is-active' if n == 0 else ''}' href='#tab-{n + 1}'{' aria-current=true' if n == 0 else ''}>"
+        f"<span class='doc-tab__title'>{html.escape(t['title'])}</span></a>"
+        for n, t in enumerate(doc["tabs"]))
 
 
 def export_body_html(doc: Doc) -> str:
@@ -987,18 +1060,23 @@ def doc_html(doc: Doc) -> str:
     sections = []
     for n, tab in enumerate(doc["tabs"]):
         head = f"<h2 class='tab-title'>{html.escape(tab['title'])}</h2>" if multi else ""
-        sections.append(f"<section class='tab' id='tab-{n + 1}'>{head}{tab_html(tab)}</section>")
-    nav = ""
-    if multi:
-        nav = "<nav class='tabs'>" + "".join(
-            f"<a href='#tab-{n + 1}'>{html.escape(t['title'])}</a>" for n, t in enumerate(doc["tabs"])) + "</nav>"
+        active = " is-active" if multi and n == 0 else ""
+        sections.append(f"<section class='tab{active}' id='tab-{n + 1}'>{head}{tab_html(tab)}</section>")
     updated = (doc.get("updated_at") or "")[:10]
     meta = f"<p class='meta'>Updated {html.escape(_date_label(updated))}</p>" if updated else ""
-    return (
-        "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        f"<title>{html.escape(doc['title'])}</title><style>{PAGE_CSS}</style></head><body>"
-        f"<main class='page'><h1 class='page-title'>{html.escape(doc['title'])}</h1>{meta}{nav}"
-        + "".join(sections)
-        + "<footer>Made with MindsHub Cowork</footer></main></body></html>"
-    )
+    main = (f"<main class='page'><h1 class='page-title'>{html.escape(doc['title'])}</h1>{meta}"
+            + "".join(sections) + "<footer>Made with MindsHub Cowork</footer></main>")
+    head = ("<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            f"<title>{html.escape(doc['title'])}</title><style>{PAGE_CSS}</style>")
+    if not multi:
+        return head + f"</head><body>{main}</body></html>"
+    links = _tab_links(doc)
+    rail = ("<nav class='doc-tabs' aria-label='Tabs'><div class='doc-tabs__head'><div class='doc-tabs__label'>Tabs</div>"
+            "<button type='button' class='doc-tabs__hide' aria-label='Hide tabs' title='Hide tabs'>"
+            f"{_icon(_PANEL_LEFT_CLOSE)}</button></div><div class='doc-tabs__list'>{links}</div></nav>")
+    show = (f"<button type='button' class='doc-tabs__show' aria-label='Show tabs' title='Show tabs'>"
+            f"{_icon(_PANEL_LEFT_OPEN)}</button>")
+    strip = f"<nav class='doc-tabstrip' aria-label='Tabs'>{links}</nav>"
+    return (head + _TABS_EARLY_JS + "</head><body class='tabbed'>" + rail
+            + f"<div class='doc-content'>{show}{strip}{main}</div>" + _TABS_JS + "</body></html>")
