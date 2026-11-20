@@ -2,7 +2,7 @@ import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cowork.services.connectors.custom_mcp import is_custom_mcp
 
@@ -73,6 +73,15 @@ class ConnectorField(BaseModel):
     #: A checkbox reads as a sentence beside the box, which is longer than the
     #: label the field is listed under. Only a boolean field uses it.
     checkbox_label: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _help_as_description(cls, data: Any) -> Any:
+        """Keep a field's ``help`` (what the probe writes for a field it asks
+        for) as its ``description`` when it has none, so it outlives storage."""
+        if isinstance(data, dict) and not data.get("description") and isinstance(data.get("help"), str):
+            return {**data, "description": data["help"]}
+        return data
 
 
 class OAuthConfig(BaseModel):

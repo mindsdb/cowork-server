@@ -118,6 +118,25 @@ class TestEveryMethodNeedsOne:
     def test_an_unknown_key_is_refused(self):
         _refused(_with(FORM, ("test_request", "data", "json"), {"q": 1}), "not valid")
 
+    def test_a_field_the_probe_asked_for_keeps_its_help_as_its_description(self):
+        asked = {"name": "resource_endpoint", "label": "Resource endpoint", "type": "text",
+                 "help": "For the connection check only, not where data is queried."}
+        form = {**CLIENT_FORM, "fields": [*CLIENT_FORM["fields"], asked]}
+
+        stored = stored_form("acme", form)
+
+        field = next(f for f in stored["fields"] if f["name"] == "resource_endpoint")
+        assert field["description"] == asked["help"]
+
+    def test_a_description_is_kept_over_help(self):
+        both = {"name": "region", "label": "Region", "type": "text",
+                "description": "The account's region.", "help": "Shown under the box."}
+        form = {**CLIENT_FORM, "fields": [*CLIENT_FORM["fields"], both]}
+
+        stored = stored_form("acme", form)
+
+        assert next(f for f in stored["fields"] if f["name"] == "region")["description"] == "The account's region."
+
 
 class TestPlaceholdersCannotMoveTheHost:
     @pytest.mark.parametrize("url", [
