@@ -83,6 +83,22 @@ def test_a_metadata_file_that_is_a_link_is_not_written_through(made, tmp_path):
     assert (made.folder / "metadata.json").is_symlink()
 
 
+def test_a_card_that_cannot_be_renamed_is_one_line_in_the_log_not_a_traceback(made, caplog, tmp_path):
+    other = create_doc(tmp_path / "other", title="Other", markdown="x", by="agent")
+    (made.folder / "metadata.json").unlink()
+    (made.folder / "metadata.json").symlink_to(other.folder / "metadata.json")
+    _rename(made.folder, "Hiring plan", by="user")
+    (record,) = [r for r in caplog.records if "card title" in r.getMessage()]
+    assert record.exc_info is None
+
+
+def test_a_doc_without_metadata_is_still_edited_and_logs_nothing(made, caplog):
+    (made.folder / "metadata.json").unlink()
+    doc, _ = _rename(made.folder, "Hiring plan", by="user")
+    assert doc["title"] == "Hiring plan"
+    assert not [r for r in caplog.records if "card title" in r.getMessage()]
+
+
 @pytest.fixture
 def client(monkeypatch, granted_product_permissions):
     from cowork.server import create_app

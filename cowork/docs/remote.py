@@ -26,7 +26,7 @@ from cowork.common.settings.user_settings import use_settings_scope
 from cowork.db.units import DatabaseBusy, run_efs, unit_session
 from cowork.docs.images import MAX_IMAGE_BYTES
 from cowork.docs.model import DocError
-from cowork.docs.store import doc_lock, doc_subfolder, read_child
+from cowork.docs.store import MAX_METADATA_BYTES, doc_lock, doc_subfolder, read_child
 from cowork.docs.tools import TOO_BIG_TEXT, DocToolContext, remote_doc_tool_specs, run_doc_tool
 from cowork.services.artifact_identity import _write_metadata
 from cowork.services.artifact_metadata import ArtifactMetadata
@@ -105,9 +105,6 @@ def owner_check(*, scope: TenantScope, project_id: str | None, artifacts_base: P
     return check
 
 
-_MAX_METADATA_BYTES = 1024 * 1024
-
-
 def record_turn_provenance(folder: Path, *, conversation_id: str, turn_index: int, summary: str) -> None:
     """Append this turn to the doc's ``provenance``, in the shape anton's
     ArtifactStore.record_turn writes, once per turn: a later call of the same
@@ -122,7 +119,7 @@ def record_turn_provenance(folder: Path, *, conversation_id: str, turn_index: in
     metadata can't be read or written.
     """
     with doc_lock(folder), doc_subfolder(folder) as pinned:
-        raw = read_child(pinned, "metadata.json", max_bytes=_MAX_METADATA_BYTES)
+        raw = read_child(pinned, "metadata.json", max_bytes=MAX_METADATA_BYTES)
         metadata = ArtifactMetadata.parse(raw.decode("utf-8"))
         document = metadata.to_document()
         provenance = document.get("provenance")

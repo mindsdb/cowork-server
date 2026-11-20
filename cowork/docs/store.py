@@ -92,6 +92,8 @@ SESSION_PAUSE_S = 5 * 60
 SESSION_MAX_S = 30 * 60
 MAX_DOC_BYTES = 8 * 1024 * 1024
 _MAX_DOC_MB = MAX_DOC_BYTES // (1024 * 1024)
+# The most of an artifact's metadata.json read.
+MAX_METADATA_BYTES = 1024 * 1024
 
 _locks: dict[str, _DocLock] = {}
 _locks_guard = threading.Lock()
@@ -262,7 +264,7 @@ def remove_child(folder: Path, name: str) -> None:
 def _meta_in(d: PinnedDir) -> dict[str, Any]:
     """The ``metadata.json`` in the artifact's opened folder; {} when it is missing or unreadable."""
     try:
-        meta = json.loads(read_child(d, "metadata.json", max_bytes=1024 * 1024))
+        meta = json.loads(read_child(d, "metadata.json", max_bytes=MAX_METADATA_BYTES))
     except (OSError, ValueError, DocError):
         return {}
     return meta if isinstance(meta, dict) else {}
@@ -493,12 +495,16 @@ def _sync_card_title(folder: Path, title: str) -> None:
     is the truth, and the next write tries again."""
     try:
         with doc_subfolder(folder) as d:
-            metadata = ArtifactMetadata.parse(read_child(d, "metadata.json", max_bytes=1024 * 1024).decode("utf-8"))
+            raw = read_child(d, "metadata.json", max_bytes=MAX_METADATA_BYTES)
+            metadata = ArtifactMetadata.parse(raw.decode("utf-8"))
             if metadata.to_document().get("name") == title:
                 return
             _write_metadata(d, metadata.with_value("name", title))
-    except (OSError, ValueError, DocError):
-        logger.warning("could not set the card title of %s", folder, exc_info=True)
+    except FileNotFoundError:
+        return  # no metadata, no card to rename
+    except (OSError, ValueError, DocError) as exc:
+        # No stack: it runs on every write of such a doc.
+        logger.warning("could not set the card title of %s (%s)", folder, exc)
 
 
 def doc_lock(folder: Path) -> _DocLock:
