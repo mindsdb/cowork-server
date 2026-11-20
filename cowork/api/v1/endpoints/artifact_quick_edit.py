@@ -3,13 +3,18 @@
 The artifact viewer's chat bar sends a change here. Jev routes it (anton's
 ``route_request``): a change that needs only the artifact's own files runs
 anton's artifact editor right here, with no chat turn, checks the open
-preview, and saves ONE new draft revision; anything else is handed back to
-the app (``done`` with status ``agent``), which sends the message to the
-artifact's chat as a normal turn.
+preview, and saves ONE new draft revision; a greeting or a question the
+artifact itself answers, when the installed anton can reply, is answered
+right here by a quick LLM (``done`` with status ``reply``), with no change,
+no revision and no chat turn; anything else is handed back to the app
+(``done`` with status ``agent``), which sends the message to the artifact's
+chat as a normal turn.
 
 The response is ``text/event-stream``:
 
-* ``route``         ``{"route": "edit"|"agent", "confidence": float, "ms": int, "reason": str}``;
+* ``route``         ``{"route": "edit"|"agent"|"reply", "confidence": float, "ms": int, "reason": str}``;
+  ``reply`` only when the installed anton's router takes ``allow_reply`` and
+  it has ``answer_request``;
   with no decisions model for the caller's provider, at once
   ``{"route": "agent", "confidence": 1, "ms": 0, "reason": "no_decisions_model"}``
   and neither Jev nor the editor runs
@@ -18,7 +23,8 @@ The response is ``text/event-stream``:
   answered with the existing ``POST /api/v1/artifacts/checks/{check_id}``
   (same broker as a turn's checks, authorized against this request's owner)
 * ``done``          ``{"status", "summary", "revisionId", "previousRevisionId", "changed", "check",
-  "editId", "undoable", "ms"}``
+  "editId", "undoable", "ms"}``; status ``reply`` carries the answer as its
+  ``summary``, and a reply that comes back empty or fails ends ``agent``
 * ``error``         ``{"message": str}``
 
 ``images`` (at most 4 PNG, JPEG, GIF or WebP images of up to 5 MB, base64)
@@ -46,6 +52,7 @@ away cancels the edit, and anton's editor restores every file it touched.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
@@ -108,6 +115,10 @@ _MAX_STAGE = 40
 #: What the app is told when the edit could not run; the reason is logged.
 _ERROR_MESSAGE = "Couldn't run the quick edit. Try again, or ask the agent."
 _TIMEOUT_SUMMARY = "The edit took too long, so nothing was changed."
+#: A quick reply past this goes to the agent instead: anton's own limit when
+#: its answer_request takes ``timeout_s``, and ours a little later.
+REPLY_TIMEOUT_S = 30.0
+_REPLY_GRACE_S = 5.0
 
 #: The route event's reason when no decisions model serves the caller.
 NO_DECISIONS_REASON = "no_decisions_model"
@@ -430,6 +441,8 @@ class QuickEditRun:
     # None reads EDIT_TIMEOUT_S at call time.
     edit_timeout_s: float | None = None
     _released: bool = field(default=False, init=False)
+    # The context the router got, for a quick reply to read too.
+    _route_context: dict = field(default_factory=dict, init=False)
 
     @property
     def kind(self) -> str:
@@ -467,6 +480,9 @@ class QuickEditRun:
                 )
             except Exception:
                 logger.warning("Could not read the conversation for the quick edit router", exc_info=True)
+        self._route_context = {key: extra[key] for key in quick_edit_service.REPLY_CONTEXT if key in extra}
+        if self.anton.can_reply:
+            extra["allow_reply"] = True
         refusals: list[dict] = []
         http = _jev_client(refusals)
         try:
@@ -483,7 +499,7 @@ class QuickEditRun:
             if http is not None:
                 await http.aclose()
         route = getattr(decision, "route", "agent")
-        if route not in ("edit", "agent"):
+        if route not in ("edit", "agent", "reply") or (route == "reply" and not self.anton.can_reply):
             route = "agent"
         try:
             confidence = float(getattr(decision, "confidence", 0.0) or 0.0)
@@ -502,6 +518,36 @@ class QuickEditRun:
                        "jev_error_code": refusal["code"], "artifact_id": self.artifact_id},
             )
         return route, confidence, reason
+
+    async def _reply(self, backend: QuickEditBackend) -> str:
+        """anton's quick answer to a message routed ``reply``, from the
+        context the router got; "" (the agent takes it) when it has none,
+        fails or takes too long. Touches no file.
+
+        No ``role``: the editor here runs on anton's default role, and so
+        does its reply."""
+        try:
+            params = set(inspect.signature(self.anton.answer_request).parameters)
+        except (TypeError, ValueError):
+            params = set()
+        try:
+            answer = await asyncio.wait_for(
+                self.anton.answer_request(
+                    self.body.message,
+                    llm=quick_edit_service.with_request_images(
+                        backend.llm, request=self.body.message, images=self.images,
+                    ),
+                    **self._route_context,
+                    **({"timeout_s": REPLY_TIMEOUT_S} if "timeout_s" in params else {}),
+                ),
+                timeout=REPLY_TIMEOUT_S + _REPLY_GRACE_S,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Quick reply on %s failed; the message goes to the agent", self.artifact_id, exc_info=True)
+            return ""
+        return answer.strip() if isinstance(answer, str) else ""
 
     def _checker(self, emit: Callable[[str], None]):
         """The editor's checker chain, ending in the viewer's preview, asked
@@ -581,6 +627,12 @@ class QuickEditRun:
             route_started = time.monotonic()
             route, confidence, reason = await self._route(backend, decisions)
             emit(sse_frame("route", {"route": route, "confidence": confidence, "ms": _ms(route_started), "reason": reason}))
+            if route == "reply":
+                # A reply changes nothing: the artifact is free for an edit now.
+                self.release()
+                answer = await self._reply(backend)
+                emit(_done(status_="reply" if answer else "agent", summary=answer, started=self.started))
+                return
             if route == "agent":
                 emit(_done(status_="agent", started=self.started))
                 return
@@ -654,7 +706,9 @@ class QuickEditRun:
             logger.exception("Quick edit on %s failed", self.artifact_id)
             emit(sse_frame("error", {"message": _ERROR_MESSAGE}))
         finally:
-            self.broker.close_conversation(_broker_key(self.artifact_id))
+            if not self._released:
+                # Released early (a reply), the key may be a newer edit's now.
+                self.broker.close_conversation(_broker_key(self.artifact_id))
             if backend is not None:
                 await asyncio.shield(backend.close())
 
