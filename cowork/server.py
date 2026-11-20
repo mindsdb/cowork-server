@@ -20,6 +20,7 @@ from types import FrameType
 
 import psutil
 from fastapi import FastAPI
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
@@ -62,6 +63,7 @@ from cowork.managed import (
 from cowork.shared_skills import read_shared_skills, shared_skills_file
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.services.live_apps import live_app_slot_paths
+from cowork.services.product_permissions import ProductPermissionUnavailable, report_permission_unavailable
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import ServerShuttingDown, TurnInProgress, registry
@@ -1005,6 +1007,15 @@ def create_app() -> FastAPI:
             },
         )
         return _server_busy(retry_after=busy_retry_seconds(), status_code=FilesystemBusy.status_code)
+
+    # A permission auth could not verify, answered 503 as any HTTPException
+    # is. The line saying why is logged here, where a person gets the answer,
+    # not where it was raised: a turn that goes on without what auth couldn't
+    # confirm logs its own line instead.
+    @app.exception_handler(ProductPermissionUnavailable)
+    async def _permission_unavailable(request, exc):
+        report_permission_unavailable(exc)
+        return await http_exception_handler(request, exc)
 
     # A question that reached a replica already ending its turns for a
     # shutdown (RunRegistry.close). Refused as a busy server is: the client

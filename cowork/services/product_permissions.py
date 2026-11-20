@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Literal
 
 import httpx
@@ -39,8 +40,32 @@ class ProductPermissionDenied(HTTPException):
         )
 
 
+@dataclass(frozen=True)
+class UnavailableCause:
+    """Why an auth call left a permission unverified.
+
+    ``route`` is auth's route, then auth's HTTP ``status_code`` with its error
+    code or detail as ``reason``, the exception class as ``error_type``, or a
+    fixed ``reason`` for a check this server made. Never a header, a request
+    body or a mint answer, which holds the key.
+    """
+
+    route: str
+    status_code: int | None = None
+    reason: str | None = None
+    error_type: str | None = None
+
+    def log_fields(self) -> dict[str, str | int]:
+        fields: dict[str, str | int] = {"event": "permission_unavailable", "route": self.route}
+        for name, value in (("status_code", self.status_code), ("reason", self.reason),
+                            ("error_type", self.error_type)):
+            if value is not None:
+                fields[name] = value
+        return fields
+
+
 class ProductPermissionUnavailable(HTTPException):
-    def __init__(self) -> None:
+    def __init__(self, auth_cause: UnavailableCause | None = None) -> None:
         super().__init__(
             503,
             detail={
@@ -48,6 +73,10 @@ class ProductPermissionUnavailable(HTTPException):
                 "message": "Your current permissions could not be verified. Try again.",
             },
         )
+        #: Why auth left the permission unverified; None for another service's answer.
+        self.auth_cause = auth_cause
+        #: Set once report_permission_unavailable has logged it.
+        self.reported = False
 
 
 def auth_refusal_reason(*, response: httpx.Response) -> str | None:
@@ -69,26 +98,36 @@ def auth_refusal_reason(*, response: httpx.Response) -> str | None:
 
 
 def permission_unavailable(*, route: str, cause: BaseException | str) -> ProductPermissionUnavailable:
-    """Log why an auth call left a permission unverified, and return the 503 for the caller to raise.
+    """The 503 for the caller to raise, carrying why auth left a permission unverified.
 
     ``cause`` is what the call raised, or a fixed phrase for a check this
-    server made, such as ``not_configured``. The WARNING line names auth's
-    route and the HTTP status (with auth's error code or detail) or the
-    exception class. It never carries a header, a request body or a mint
-    answer, which holds the key.
+    server made, such as ``not_configured``. Nothing is logged here: a caller
+    may catch it and go on without what auth couldn't confirm. The place that
+    answers it logs it (report_permission_unavailable).
     """
-    fields: dict[str, str | int] = {"event": "permission_unavailable", "route": route}
     if isinstance(cause, str):
-        fields["reason"] = cause
-    elif isinstance(cause, httpx.HTTPStatusError):
-        fields["status_code"] = cause.response.status_code
-        reason = auth_refusal_reason(response=cause.response)
-        if reason:
-            fields["reason"] = reason
-    else:
-        fields["error_type"] = type(cause).__name__
-    logger.warning("auth could not verify a permission", extra=fields)
-    return ProductPermissionUnavailable()
+        return ProductPermissionUnavailable(UnavailableCause(route=route, reason=cause))
+    if isinstance(cause, httpx.HTTPStatusError):
+        return ProductPermissionUnavailable(UnavailableCause(
+            route=route, status_code=cause.response.status_code,
+            reason=auth_refusal_reason(response=cause.response),
+        ))
+    return ProductPermissionUnavailable(UnavailableCause(route=route, error_type=type(cause).__name__))
+
+
+def report_permission_unavailable(exc: ProductPermissionUnavailable) -> None:
+    """Log one WARNING for a permission_unavailable that reaches a person.
+
+    Called where it is answered: the HTTP 503 (cowork.server), a turn's
+    turn_failed or its admission check (cowork.turnqueue.producer), and a
+    scheduled run's error (cowork.scheduler). Once per exception, however
+    many of those it passes. An exception from another service's answer has
+    no auth cause and logs nothing here.
+    """
+    if exc.reported or exc.auth_cause is None:
+        return
+    exc.reported = True
+    logger.warning("auth could not verify a permission", extra=exc.auth_cause.log_fields())
 
 
 async def has_product_permission(

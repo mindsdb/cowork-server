@@ -2056,6 +2056,34 @@ def _echo(refs, **overrides):
 
 
 @pytest.mark.asyncio
+async def test_a_datasource_listing_auth_cannot_answer_logs_no_permission_unavailable(monkeypatch, caplog, owned_logger):
+    """The turn runs without its databases, and no permission_unavailable is
+    logged for an answer nobody got: the producer's own line says what was left out."""
+    from cowork.services.product_permissions import permission_unavailable
+
+    owned_logger("cowork.services.product_permissions", level=logging.WARNING)
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(prod, "mint_turn_key_details", AsyncMock(
+        return_value=MintedTurnKey(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)))
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(
+        side_effect=permission_unavailable(route=DATASOURCE_CONNECTIONS_ROUTE, cause=httpx.ReadTimeout("slow"))))
+
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    assert [kind for kind, _ in items] == ["turn_completed"]
+    assert "datasource" not in json.loads(fake.added[0][1]["payload"])["params"]
+    assert not [
+        r for r in caplog.records
+        if r.name == "cowork.services.product_permissions" and getattr(r, "event", None) == "permission_unavailable"
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("listing", "grants", "route", "reason"),
     [
@@ -2273,28 +2301,23 @@ def test_the_connection_cap_applies_to_the_grant_set_not_the_listing():
 
 @pytest.mark.asyncio
 async def test_a_refused_grant_names_the_failed_check_and_never_a_secret(monkeypatch):
-    """Recorded at the module logger rather than through caplog: another test's
-    logging setup must not decide whether this assertion sees the record."""
+    """Carried on the exception for the place that answers it to log
+    (product_permissions.report_permission_unavailable)."""
     from cowork.common.settings.app_settings import TurnQueueSettings
     from cowork.services.product_permissions import ProductPermissionUnavailable
 
-    warnings: list[dict] = []
-    monkeypatch.setattr(
-        prod.product_permissions.logger, "warning",
-        lambda msg, *args, **kw: warnings.append({"message": msg % args, **kw.get("extra", {})}),
-    )
     monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[_verified(7)]))
     monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(return_value=_echo([(7, 3)], turn_key_id="mdb_other")))
     settings = TurnQueueSettings(
         datasource_enabled=True, datasource_producer_key_id="producer-v1", datasource_producer_key="producer-secret"
     )
-    with pytest.raises(ProductPermissionUnavailable):
+    with pytest.raises(ProductPermissionUnavailable) as raised:
         await prod._mint_datasource_block(
             org_id="o1", user_id="u1", correlation_id="r", turn_key_id="mdb_prefix", disabled=None, settings=settings
         )
-    [warning] = warnings
-    assert "binding" in warning["reason"] and warning["route"] == DATASOURCE_GRANTS_ROUTE
-    assert "producer-secret" not in repr(warning) and "mdb_" not in repr(warning)
+    cause = raised.value.auth_cause
+    assert "binding" in cause.reason and cause.route == DATASOURCE_GRANTS_ROUTE
+    assert "producer-secret" not in repr(cause) and "mdb_" not in repr(cause)
 
 
 @pytest.mark.asyncio

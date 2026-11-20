@@ -548,8 +548,9 @@ _CAUSES = [
 async def test_each_permission_unavailable_logs_its_route_and_cause_and_no_secret(
     monkeypatch, caplog, owned_logger, call, answer, overrides, fields
 ):
-    """Through each real raise: the line the console prints names the route and
-    the status or exception class, and holds neither internal secret nor the key."""
+    """Through each real raise: nothing is logged where it is raised. Where it
+    is answered, the line the console prints names the route and the status or
+    exception class, once, and holds neither internal secret nor the key."""
     settings = _Settings(**overrides)
     monkeypatch.setattr(product_permissions, "TurnQueueSettings", lambda: settings)
 
@@ -559,9 +560,13 @@ async def test_each_permission_unavailable_logs_its_route_and_cause_and_no_secre
     _serve(monkeypatch, _answering(answer) if answer is not None else unexpected)
     logged = owned_logger("cowork.services.product_permissions", level=logging.WARNING)
 
-    with pytest.raises(ProductPermissionUnavailable):
+    with pytest.raises(ProductPermissionUnavailable) as raised:
         await call(settings)
 
+    assert _records(caplog, "cowork.services.product_permissions", "permission_unavailable") == []
+    # Answered: the HTTP handler, then a caller that passes it on, report it.
+    product_permissions.report_permission_unavailable(raised.value)
+    product_permissions.report_permission_unavailable(raised.value)
     [record] = _records(caplog, "cowork.services.product_permissions", "permission_unavailable")
     for name, value in fields.items():
         assert getattr(record, name) == value, name
@@ -573,6 +578,85 @@ async def test_each_permission_unavailable_logs_its_route_and_cause_and_no_secre
     for secret in (SECRET, PRODUCER_SECRET, KEY):
         assert secret not in logged.output()
         assert not any(secret in repr(value) for value in vars(record).values())
+        assert secret not in repr(raised.value.auth_cause)
+
+
+# ── Where it is answered ────────────────────────────────────────────────────
+
+
+def test_an_http_answer_logs_why_once(monkeypatch, caplog, owned_logger):
+    """The app's own handler: a route that raises it answers 503 with the same
+    body as before, and the line is logged there."""
+    from fastapi.testclient import TestClient
+
+    from cowork.server import create_app
+
+    logged = owned_logger("cowork.services.product_permissions", level=logging.WARNING)
+    app = create_app()
+
+    async def refused():
+        raise product_permissions.permission_unavailable(route=product_permissions.AUTHORIZE_ROUTE,
+                                                         cause=httpx.ReadTimeout("slow"))
+
+    app.add_api_route("/test-permission-unavailable", refused)
+    response = TestClient(app).get("/test-permission-unavailable")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": ProductPermissionUnavailable().detail}
+    [record] = _records(caplog, "cowork.services.product_permissions", "permission_unavailable")
+    assert (record.route, record.error_type) == (product_permissions.AUTHORIZE_ROUTE, "ReadTimeout")
+    assert json.loads(logged.output().strip())["event"] == "permission_unavailable"
+
+
+async def test_a_turns_admission_check_logs_why_once(monkeypatch, caplog, owned_logger):
+    """Raised on to every caller of the producer; logged once, before any of them answers it."""
+    owned_logger("cowork.services.product_permissions", level=logging.WARNING)
+    monkeypatch.setattr(prod, "get_redis", AsyncMock(side_effect=AssertionError("queued")))
+
+    async def unverified(scope, permission):
+        raise product_permissions.permission_unavailable(route=product_permissions.AUTHORIZE_ROUTE,
+                                                         cause="not_configured")
+
+    monkeypatch.setattr(prod, "require_product_permission", unverified)
+
+    with pytest.raises(ProductPermissionUnavailable) as raised:
+        await _drain(prod.stream_remote_replies(
+            conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        ))
+
+    [record] = _records(caplog, "cowork.services.product_permissions", "permission_unavailable")
+    assert (record.route, record.reason) == (product_permissions.AUTHORIZE_ROUTE, "not_configured")
+    # The caller that answers it, the HTTP handler or the scheduler, logs nothing more.
+    product_permissions.report_permission_unavailable(raised.value)
+    assert len(_records(caplog, "cowork.services.product_permissions", "permission_unavailable")) == 1
+
+
+async def test_a_turn_that_goes_on_without_its_connector_key_logs_no_permission_unavailable(
+    time_limit, monkeypatch, caplog, owned_logger
+):
+    """The turn runs without its MCP connections; the producer's own line says
+    so, and no permission_unavailable is logged for an answer nobody got."""
+    owned_logger("cowork.services.product_permissions", level=logging.WARNING)
+
+    def auth(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content)["purpose"] == "connector_token":
+            return httpx.Response(500, json={"detail": "boom"})
+        return httpx.Response(201, json={"key": KEY, "prefix": "mdb_pfx"})
+
+    _serve(monkeypatch, auth)
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "revoke_turn_key", AsyncMock())
+    monkeypatch.setattr(prod, "list_active_connections", AsyncMock(return_value=[{"engine": "notion", "name": "acme"}]))
+
+    events = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    assert [kind for kind, _ in events] == ["turn_completed"]
+    assert "oauth" not in _job(fake)
+    assert _records(caplog, "cowork.services.product_permissions", "permission_unavailable") == []
 
 
 def test_auths_detail_is_cut_to_two_hundred_characters():

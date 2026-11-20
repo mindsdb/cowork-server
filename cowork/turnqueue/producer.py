@@ -1203,10 +1203,17 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     pod's configured default."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
-    await require_product_permission(scope, "product.execute")
-    workspace_mode = (
-        "persistent" if await product_permissions.has_product_permission(scope, "artifact.manage") else "ephemeral"
-    )
+    try:
+        await require_product_permission(scope, "product.execute")
+        workspace_mode = (
+            "persistent" if await product_permissions.has_product_permission(scope, "artifact.manage")
+            else "ephemeral"
+        )
+    except product_permissions.ProductPermissionUnavailable as exc:
+        # Raised to every caller, a channel turn and a scheduled run among
+        # them, so it is logged here, before any of them answers it.
+        product_permissions.report_permission_unavailable(exc)
+        raise
     r = get_redis()
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line,
@@ -1284,7 +1291,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
             if isinstance(result, BaseException):
                 raise result
         datasource_block, custom_api_connections = datasource_result, custom_api_result
-    except product_permissions.ProductPermissionUnavailable:
+    except product_permissions.ProductPermissionUnavailable as exc:
+        product_permissions.report_permission_unavailable(exc)
         logger.warning(
             "[producer] turn setup unavailable conversation=%s correlation_id=%s", conversation_id, corr,
             exc_info=True,
