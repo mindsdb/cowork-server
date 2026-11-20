@@ -21,6 +21,39 @@ from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, re
 
 logger = logging.getLogger(__name__)
 
+_FIELD_DESCRIPTION_MAX = 200
+
+
+def _field_lines(form: dict[str, Any] | None) -> str:
+    """Return one line per described field of a stored custom form.
+
+    Args:
+        form: The connector's stored form, fields at the top or per method.
+
+    Returns:
+        A short section naming each field by the end of the environment
+        variable the agent sees (anton writes ``<prefix>__<FIELD>``) with its
+        description, cut to _FIELD_DESCRIPTION_MAX; "" when no field has one.
+    """
+    form = form or {}
+    fields = list(form.get("fields") or [])
+    for method in form.get("methods") or []:
+        if isinstance(method, dict):
+            fields += method.get("fields") or []
+    lines: list[str] = []
+    seen: set[str] = set()
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        name, text = field.get("name"), field.get("description")
+        if not isinstance(name, str) or name in seen or not isinstance(text, str) or not text.strip():
+            continue
+        seen.add(name)
+        lines.append(f"- `__{name.upper()}`: {' '.join(text.split())[:_FIELD_DESCRIPTION_MAX]}")
+    if not lines:
+        return ""
+    return "What each field holds, by the end of its environment variable name:\n" + "\n".join(lines)
+
 
 def custom_connector_spec(row: CustomConnector) -> dict[str, Any]:
     """Return a stored custom connector in the registry's raw spec shape.
@@ -101,6 +134,32 @@ class ConnectorCatalog(ConnectorSpecRegistry):
             return notes
         for engine, text in super().usage_notes_for(wanted).items():
             notes.setdefault(engine, scrub_output(text))
+        return notes
+
+    def turn_notes_for(self, engines: Iterable[str]) -> dict[str, str]:
+        """Return engine -> usage notes for an agent turn: usage_notes_for,
+        plus, for a custom connector in one person's scope, what each
+        described field holds.
+
+        The probe keeps reading usage_notes_for, so a stored connector without
+        notes still lets a resubmitted form's own notes stand in there.
+        The field lines are model-written like the notes and pass the same
+        scrubber; the stored notes come first and are never cut.
+        """
+        wanted = list(engines)
+        notes = self.usage_notes_for(wanted)
+        if not scope_is_one_persons(self._session.scope):
+            return notes
+        specs = self.get_connectors()
+        for engine in wanted:
+            spec = specs.get(engine) or {}
+            if not spec.get("custom"):
+                continue
+            fields = _field_lines(spec.get("form"))
+            if not fields:
+                continue
+            text = notes.get(engine)
+            notes[engine] = f"{text}\n\n{scrub_output(fields)}" if text else scrub_output(fields)
         return notes
 
     def get_connectors(self) -> dict[str, dict]:
