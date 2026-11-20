@@ -285,3 +285,12 @@ def test_a_stored_custom_connector_submission_ignores_notes_in_its_submitted_for
     )
 
     assert kwargs["usage_notes"] is None
+
+
+def test_a_field_asked_for_only_to_check_the_connection_is_described_as_such():
+    prompt = _prompt()
+
+    rule = prompt[prompt.index("——— RULES ———"):]
+    assert "only so the check has something to read" in rule
+    assert "for the connection check only, not where data is queried" in rule
+    assert "relative to the base address" in rule

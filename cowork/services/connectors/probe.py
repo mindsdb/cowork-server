@@ -468,6 +468,9 @@ class CredentialProbe:
             f"• NEVER print credential values. NEVER include them in tool inputs.\n"
             f"• You MUST call exactly one verdict tool before stopping.\n"
             f"• Don't ask follow-up questions in prose — use `request_extra_field`.\n"
+            f"• A field you ask for only so the check has something to read: its `help` "
+            f"says it is for the connection check only, not where data is queried, and, "
+            f"when its value is a path, that it is relative to the base address.\n"
             f"{quirks_rule}"
         )
 
