@@ -1196,6 +1196,7 @@ async def _execute_schedule(
                 _active_run_ids.discard(run_id)
             if push_succeeded is not None and not lease_lost.is_set() and trigger != RunTrigger.trial:
                 _push_run_ending(scheduled, conversation_id=conversation_id, succeeded=push_succeeded)
+                await _post_run_notice(run_id)
 
 
 def _push_run_ending(
@@ -1236,6 +1237,34 @@ def _push_reaped_run(push: ReapedRunPush) -> None:
         )
     except Exception:
         logger.warning("Could not push a reaped run's ending", exc_info=True, extra={"event": "push_schedule_failed"})
+
+
+async def _post_run_notice(run_id: UUID) -> None:
+    """Put the run's ending in its owner's inbox, if they asked to hear
+    about it. Never holds up or fails a run.
+
+    Same callers as _push_run_ending, but on every deployment: the inbox is
+    how the desktop and self-hosted hear about a run, where there is no push.
+    """
+    try:
+        from cowork.services.notices import post_scheduled_run_notice
+
+        await run_db(partial(post_scheduled_run_notice, run_id=run_id), scope=SYSTEM_SCOPE)
+    except Exception:
+        logger.warning("Could not post a scheduled run's notice", exc_info=True, extra={"event": "schedule_notice_failed"})
+
+
+def post_reaped_run_notices(session: ScopedSession, run_ids: list[UUID]) -> None:
+    """Post the notices for runs a reaper failed, inside its database unit.
+    One run's failure to post never stops the others, or the reap."""
+    from cowork.services.notices import post_scheduled_run_notice
+
+    for run_id in run_ids:
+        try:
+            post_scheduled_run_notice(session, run_id=run_id)
+        except Exception:
+            session.rollback()
+            logger.warning("Could not post a reaped run's notice", exc_info=True, extra={"event": "schedule_notice_failed"})
 
 
 class _LeaseLost(Exception):
@@ -1756,6 +1785,7 @@ def _reap_lapsed_runs(
                 conversation_id=str(run.conversation_id) if run.conversation_id else None,
             ))
     session.commit()
+    post_reaped_run_notices(session, [run.id for run in executed if not run.trial])
     if abandoned is not None:
         abandoned.extend(committed_abandoned)
     if pushes is not None:
