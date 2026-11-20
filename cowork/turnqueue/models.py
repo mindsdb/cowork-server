@@ -13,6 +13,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, StrictStr, field_validator, model_validator
 
+from cowork.services.connectors.custom_mcp import is_connection_id
+
 
 #: Ceiling for ``TurnJob.deadline_ms``. 24h is far past any real turn and far
 #: below any epoch value, so an epoch fails validation instead of silently
@@ -24,6 +26,11 @@ MAX_DATASOURCE_CONNECTIONS = 100
 MAX_CUSTOM_API_CONNECTIONS = 25
 #: The `custom_api` block's wire version; anton drops a block carrying any other.
 CUSTOM_API_PROTOCOL_VERSION = 1
+#: The `custom_mcp` block's wire version and connection cap; anton holds the same
+#: two and drops the whole block when either is broken. A test pins them to anton's.
+CUSTOM_MCP_PROTOCOL_VERSION = 1
+MAX_CUSTOM_MCP_CONNECTIONS = 25
+_CUSTOM_MCP_CONNECTION_KEYS = frozenset({"connection_id", "name", "label", "credential_version", "tools"})
 _REQUIRED_REF_KEYS = frozenset({"connection_id", "credential_version"})
 #: Names for the prompt only. anton's `anton/cloud_turn/contract.py` allows the
 #: same two, cleans each value for the prompt and drops what it cannot use, so
@@ -128,6 +135,42 @@ def _validate_custom_api_block(value: object) -> None:
         seen.add(connection_id)
 
 
+def _validate_custom_mcp_block(value: object) -> None:
+    """Refuse a ``custom_mcp`` block that is not the shape the producer builds.
+
+    Checks the keys, version, cap, ids, names and that each server's tools are
+    strings; the definitions themselves are anton's to parse. Raises ``ValueError``.
+    """
+    if not isinstance(value, dict) or set(value) != {"protocol_version", "connections"}:
+        raise ValueError("custom_mcp must carry exactly protocol_version and connections")
+    version = value["protocol_version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != CUSTOM_MCP_PROTOCOL_VERSION:
+        raise ValueError("custom_mcp protocol version is unsupported")
+    connections = value["connections"]
+    if not isinstance(connections, list) or not connections or len(connections) > MAX_CUSTOM_MCP_CONNECTIONS:
+        raise ValueError("custom_mcp connections are invalid")
+    seen_ids: set[int] = set()
+    seen_names: set[str] = set()
+    for connection in connections:
+        if not isinstance(connection, dict) or set(connection) != _CUSTOM_MCP_CONNECTION_KEYS:
+            raise ValueError("custom_mcp connection is invalid")
+        connection_id, name, tools = connection["connection_id"], connection["name"], connection["tools"]
+        if (
+            not _is_positive_int(connection_id)
+            or not _is_positive_int(connection["credential_version"])
+            or not is_connection_id(name)
+            or not isinstance(connection["label"], str)
+            or not isinstance(tools, list)
+            or not tools
+            or not all(isinstance(text, str) for text in tools)
+            or connection_id in seen_ids
+            or name in seen_names
+        ):
+            raise ValueError("custom_mcp connection is invalid")
+        seen_ids.add(connection_id)
+        seen_names.add(name)
+
+
 def is_connection_label(value: object) -> bool:
     """Whether ``value`` has the shape of a connection name the producer sends: a non-empty string within auth's cap."""
     return isinstance(value, str) and 0 < len(value) <= _MAX_CONNECTION_LABEL_CHARS
@@ -181,6 +224,8 @@ class TurnJob(BaseModel):
             _validate_datasource_block(self.params["datasource"])
         if "custom_api" in self.params:
             _validate_custom_api_block(self.params["custom_api"])
+        if "custom_mcp" in self.params:
+            _validate_custom_mcp_block(self.params["custom_mcp"])
         return self
 
     @field_validator("deadline_ms")

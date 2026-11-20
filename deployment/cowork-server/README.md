@@ -153,6 +153,19 @@ custom API block is deployed, and the producer key bundle
 line from the environment's values file and the environment from
 `CUSTOM_API_ENVIRONMENTS` in the same change.
 
+`deployment.customMcpTurnsEnabled`, rendered as `COWORK_TURN_CUSTOM_MCP_ENABLED`,
+gives a member's org-mode turns the switched-on tools of the custom MCP servers
+they added and opens the web routes under `/api/v1/connectors/custom-mcp`. It
+is `"false"` in `values.yaml` and in every environment;
+`tests/test_chart_values.py` pins that. Turn it on per environment only after
+auth's custom MCP switch and the inference gateway's are on there, a
+scratchpad image whose anton reads the version 1 `custom_mcp` block is
+deployed, the producer key bundle (`datasource-service-keys`) exists, and
+every model cloud turns offer was checked against a large custom tool set. With it on, the producer mints the
+turn key prefix even when datasource and custom API turns are off. Rollback
+sets it back to `"false"`; a member can still remove a stored server through
+`DELETE /api/v1/connectors/custom-mcp/connections/{name}`.
+
 ## Required cluster permissions
 
 In `dev`, `staging` and `prod` this chart renders a NetworkPolicy (`networkPolicy.enabled`
