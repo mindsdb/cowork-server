@@ -134,7 +134,7 @@
               "required": true,
               "secret": true,
               "placeholder": "••••••••",
-              "description": "Password for the above user. Stored encrypted and never shown again."
+              "description": "Password for the above user. Never shown again."
             },
             {
               "name": "tls_mode",
