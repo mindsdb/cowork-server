@@ -265,6 +265,11 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     if getattr(user, "jev_decisions_enabled", True) is False and hasattr(anton_settings, "verifier_jev"):
         anton_settings.verifier_jev = "off"
         applied.append("verifier_jev")
+    # The same pattern for classify(): only ever turns it off. An anton that
+    # predates the setting has no classify() to turn off.
+    if getattr(user, "jev_classify_enabled", True) is False and hasattr(anton_settings, "classify_jev"):
+        anton_settings.classify_jev = "off"
+        applied.append("classify_jev")
     return applied
 
 
@@ -1933,10 +1938,9 @@ class AntonHarness:
                 )
             else:
                 data_vault = source_vault
-            if app_held.active():
-                data_vault = app_held.AppHeldVault(
-                    source=data_vault, root=own_vault_root(current_settings_scope())
-                )
+            data_vault = app_held.turn_vault(
+                data_vault, source_vault=source_vault, root=own_vault_root(current_settings_scope())
+            )
             # Registers this turn's DS_* names and values for scrubbing, and
             # touches no process state, so a concurrent turn's are left alone.
             from anton.utils.datasources import restore_namespaced_env

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -15,6 +16,7 @@ from anton.core.llm.provider import (
     WalletEmptyError,
     mindshub_billing_stop,
 )
+from fastapi import HTTPException
 from openai import APIStatusError
 
 from cowork.db.scoped import LOCAL_SCOPE
@@ -254,7 +256,9 @@ def test_an_unknown_plan_window_is_left_off_the_frame(monkeypatch, mindshub_mind
     assert "window" not in failed
 
 
-@pytest.mark.parametrize(("tier", "expected"), [("plus", "plus"), ("pro", "pro"), ("enterprise", None)])
+@pytest.mark.parametrize(
+    ("tier", "expected"), [("plus", "plus"), ("pro", "pro"), ("free", None), ("enterprise", None)],
+)
 def test_a_model_outside_the_tier_keeps_its_card_and_tier_on_reload(
     monkeypatch, mindshub_minds_url, conversation_id, tier, expected,
 ):
@@ -277,4 +281,66 @@ def test_a_third_party_cannot_persist_a_plan_card(monkeypatch, mindshub_minds_ur
     failed = _saved_and_streamed_failure(monkeypatch, conversation_id, error)
 
     assert failed["code"] == turn_errors.GENERIC_TURN_ERROR_CODE
+    assert "window" not in failed
+
+
+# ── The non-streaming 400 carries the same fields ────────────────────────
+# `POST /responses` with `stream=false` raises the failure frame as the 400's
+# detail. These pin that the detail keeps the reset instant and the plan fields
+# for their own codes, as the streaming frame above does, and drops them for
+# any other code even when the inference service sent them.
+
+
+def _collected_failure(error: Exception) -> dict:
+    handler = _handler_with_raising_formatter(error)
+    with pytest.raises(HTTPException) as raised:
+        asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
+    assert raised.value.status_code == 400
+    assert raised.value.detail["type"] == "response.failed"
+    return raised.value.detail
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "code", "has_reset"),
+    [
+        pytest.param(402, "wallet_empty", turn_errors.TOKEN_LIMIT_CODE, False, id="wallet"),
+        pytest.param(429, "included_allowance_exhausted", turn_errors.ALLOWANCE_EXHAUSTED_CODE, True, id="allowance"),
+        pytest.param(
+            429, "free_air_daily_spend_fuse_exceeded", turn_errors.FREE_SERVING_PAUSED_CODE, True, id="fuse",
+        ),
+    ],
+)
+def test_the_non_streaming_400_carries_the_reset_instant_for_its_codes(
+    self_hosted_minds_url, status, reason, code, has_reset,
+):
+    # Every row's response from the inference service carries a reset instant.
+    # Only the codes that offer waiting may pass it on.
+    failed = _collected_failure(_billing_stop(status=status, reason=reason))
+
+    assert failed["code"] == code
+    assert failed.get("reset_at") == (RESET_AT if has_reset else None)
+    assert "window" not in failed
+    assert "required_tier" not in failed
+
+
+def test_the_non_streaming_400_names_the_spent_plan_window(mindshub_minds_url):
+    error = _plan_stop(status=429, reason="window_allowance_exhausted", window="7d", required_tier="pro")
+
+    failed = _collected_failure(error)
+
+    assert failed["code"] == turn_errors.WINDOW_ALLOWANCE_EXHAUSTED_CODE
+    assert failed["reset_at"] == RESET_AT
+    assert failed["window"] == "7d"
+    assert "required_tier" not in failed
+
+
+def test_the_non_streaming_400_names_the_tier_that_covers_the_model(mindshub_minds_url):
+    error = _plan_stop(status=403, reason="model_not_in_tier", required_tier="pro", window="7d")
+    error.response.headers["X-MindsHub-Reset-At"] = RESET_AT
+
+    failed = _collected_failure(error)
+
+    assert failed["code"] == turn_errors.MODEL_NOT_IN_TIER_CODE
+    assert failed["required_tier"] == "pro"
+    assert "reset_at" not in failed
     assert "window" not in failed

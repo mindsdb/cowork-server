@@ -716,7 +716,11 @@ def _plan_with_window(**changes):
         pytest.param("plus", id="not_an_object"),
         pytest.param(_plan_with(tier="enterprise"), id="unknown_tier"),
         pytest.param(_plan_with(tier=None), id="no_tier"),
+        pytest.param(_plan_with(tier=["plus"]), id="tier_a_list"),
+        pytest.param(_plan_with(tier={"name": "plus"}), id="tier_an_object"),
         pytest.param(_plan_with(status="trialing"), id="unknown_status"),
+        pytest.param(_plan_with(status=["active"]), id="status_a_list"),
+        pytest.param(_plan_with(status={"state": "active"}), id="status_an_object"),
         pytest.param(_plan_with(renews_at=1790380800), id="renews_at_not_a_string"),
         pytest.param(_plan_with(cancel_at_period_end="no"), id="cancel_flag_not_a_bool"),
         pytest.param(_plan_with(windows={"5h": 42}), id="windows_not_a_list"),
@@ -748,6 +752,15 @@ def test_a_malformed_plan_fails_closed(calls, plan):
 def test_an_unknown_window_is_skipped_rather_than_hiding_the_known_ones(calls):
     plan = copy.deepcopy(PLAN_ENTITLEMENTS["plan"])
     plan["windows"].append({"window": "30d", "percent_used": 3, "resets_at": None})
+    calls.answers[svc.ENTITLEMENTS_PATH] = _with_plan(plan)
+
+    assert [w.window for w in _fetch().plan.windows] == ["5h", "7d"]
+
+
+@pytest.mark.parametrize("name", [["5h"], {"name": "5h"}, 5, None])
+def test_a_window_name_that_is_not_a_string_is_skipped_not_raised(calls, name):
+    plan = copy.deepcopy(PLAN_ENTITLEMENTS["plan"])
+    plan["windows"].append({"window": name, "percent_used": 3, "resets_at": None})
     calls.answers[svc.ENTITLEMENTS_PATH] = _with_plan(plan)
 
     assert [w.window for w in _fetch().plan.windows] == ["5h", "7d"]

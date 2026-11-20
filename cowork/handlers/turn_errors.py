@@ -53,6 +53,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from cowork.coding.context import BUDGET_MODEL_PATTERN, BUDGET_PERIOD_ADJECTIVES, BUDGET_SCOPE_PATTERN
 from cowork.common.settings.app_settings import default_minds_url
 from cowork.db.units import busy_retry_seconds
+from cowork.schemas.mindshub_usage import PAID_PLAN_TIERS, PLAN_WINDOWS, is_one_of
 
 # Curated copy for the unsupported-image case. Surfaced verbatim.
 IMAGE_FORMAT_USER_MESSAGE = (
@@ -189,10 +190,6 @@ MODEL_NOT_IN_TIER_USER_MESSAGE = (
     "Your plan doesn't include this model. "
     "Upgrade your plan or add credits to use it."
 )
-
-# The values the two ENG-4186 frame fields may carry; anything else is left off.
-PLAN_WINDOWS = frozenset({"5h", "7d"})
-PLAN_REQUIRED_TIERS = frozenset({"plus", "pro"})
 
 # Curated copy + wire code for the fleet-wide free-Air spend fuse (gateway 429
 # `free_air_daily_spend_fuse_exceeded`). The gate trips it when the day's
@@ -379,8 +376,8 @@ MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
 # The X-MindsHub-Reason header values the inference gateway sets to name the
 # billing decision precisely. Preferred over status/message heuristics.
 #
-# mindshub_inference (`denial_error()` and `credential_rejected()` in
-# minds/inference/errors.py) emits eleven reasons today: unknown_model,
+# The inference service (its `denial_error()` and `credential_rejected()`)
+# emits eleven reasons today: unknown_model,
 # rate_limited, wallet_empty, included_allowance_exhausted,
 # window_allowance_exhausted, model_not_in_tier,
 # free_air_daily_spend_fuse_exceeded, budget_exceeded, policy_unavailable,
@@ -1900,12 +1897,12 @@ def _gate_budget_field(exc: BaseException, name: str, clean) -> str | None:
 
 def clean_plan_window(value: object) -> str | None:
     """``value`` when it names a plan window (``5h`` or ``7d``), else None."""
-    return value if isinstance(value, str) and value in PLAN_WINDOWS else None
+    return value if is_one_of(value, PLAN_WINDOWS) else None
 
 
 def clean_required_tier(value: object) -> str | None:
     """``value`` when it names a tier a model can require (``plus`` or ``pro``), else None."""
-    return value if isinstance(value, str) and value in PLAN_REQUIRED_TIERS else None
+    return value if is_one_of(value, PAID_PLAN_TIERS) else None
 
 
 def _gate_body_field(exc: BaseException, name: str, clean) -> str | None:

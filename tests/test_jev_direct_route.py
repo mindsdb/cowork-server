@@ -664,6 +664,36 @@ async def test_produce_answer_streams_then_saves_the_turn(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_moderated_direct_answer_finishes_and_releases_its_resources(monkeypatch):
+    from unittest.mock import AsyncMock
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.handlers import responses
+    from cowork.services import content_safety
+
+    monkeypatch.setenv("COWORK_CONTENT_SAFETY_REQUIRED", "true")
+    check = AsyncMock()
+    revoke = AsyncMock()
+    monkeypatch.setattr(content_safety, "check_content", check)
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
+    conversation_id = await _conversation()
+    answer = await _answer(["First ", "second."])
+    close = AsyncMock(wraps=answer.close)
+    monkeypatch.setattr(answer, "close", close)
+    _, buffer, produce = await _produce(
+        monkeypatch, conversation_id, answer, gate_key={"correlation_id": "corr-gate"},
+    )
+
+    await produce
+
+    check.assert_awaited_once_with("First second.", purpose="output", scope=LOCAL_SCOPE)
+    deltas = [_payload(f)["delta"] for f in buffer.frames if f.startswith("event: response.output_text.delta")]
+    assert deltas == ["First second."]
+    assert buffer.status == "completed"
+    close.assert_awaited_once_with()
+    revoke.assert_awaited_once_with("corr-gate")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delegates", [False, True, "fails"])
 async def test_produce_answer_revokes_the_gate_key_unless_the_agent_takes_the_turn(monkeypatch, delegates):
     """An answered turn runs no agent turn to revoke the gate's key; a
@@ -778,6 +808,36 @@ def test_jev_opt_out_turns_off_antons_completion_check(enabled, verifier_jev):
 
     assert anton.verifier_jev == verifier_jev
     assert ("verifier_jev" in applied) is (not enabled)
+
+
+@pytest.mark.parametrize(("enabled", "classify_jev"), [(False, "off"), (True, "on")])
+def test_jev_classify_opt_out_reaches_anton(enabled, classify_jev):
+    """A settings object with the field stands in for an anton that has it;
+    the pinned anton may predate it."""
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = SimpleNamespace(classify_jev="on", verifier_jev="on")
+    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_classify_enabled": enabled}))
+
+    assert anton.classify_jev == classify_jev
+    assert ("classify_jev" in applied) is (not enabled)
+    assert anton.verifier_jev == "on"
+
+
+def test_an_anton_without_classify_is_left_alone():
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = SimpleNamespace(verifier_jev="on")
+    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_classify_enabled": False}))
+
+    assert not hasattr(anton, "classify_jev")
+    assert "classify_jev" not in applied
 
 
 def test_route_state_puts_the_latest_message_apart():

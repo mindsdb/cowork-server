@@ -769,7 +769,8 @@ def _start_first_take(
     Its trace is its own (tag ``cowork-first-take``), joined to the gate's by
     the correlation id, so its cost is countable apart from the gate's.
     """
-    if not _first_take_enabled():
+    from cowork.services.content_safety import ContentSafetySettings
+    if ContentSafetySettings().required or not _first_take_enabled():
         return None
     binding = _first_take_binding(minted, binding_factory=binding_factory)
     if binding is None:
@@ -872,6 +873,8 @@ class ResponsesHandler:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
 
         await require_product_permission(self.scope, "product.execute")
+        from cowork.services.content_safety import check_request
+        await check_request(request, scope=self.scope)
 
         # "memory": "off" runs the turn as MEMORY_ENABLED=false would. On a
         # deployment where that still reads stored memory (memory_policy: the
@@ -1811,6 +1814,8 @@ class ResponsesHandler:
         # which registry.start records in the turn index on the Redis backend,
         # so there the Reference a user reports resolves in the index too; the
         # non-streaming half leaves only the log line.
+        from cowork.services.content_safety import check_content
+        await check_content(route.text, purpose="output", scope=self.scope)
         corr = f"direct-{uuid4()}"
         if not request.stream:
             text = route.text
@@ -2220,7 +2225,20 @@ class ResponsesHandler:
 
             if first_take is not None:
                 first_take.cancel()
-            parts.append(answer.first_text)
+            from cowork.services.content_safety import ContentSafetySettings, MAX_CONTENT_CHARS, check_content
+            first_text = answer.first_text
+            remaining_text = answer.rest()
+            if ContentSafetySettings().required:
+                held = [first_text]
+                size = len(first_text)
+                async for chunk in remaining_text:
+                    size += len(chunk)
+                    if size > MAX_CONTENT_CHARS:
+                        raise HTTPException(413, "This content is too large for a safety check.")
+                    held.append(chunk)
+                first_text = "".join(held)
+                await check_content(first_text, purpose="output", scope=scope)
+            parts.append(first_text)
             response = Response(status=ResponseStatus.created, model=binding.model)
             await buffer.append("sse", {"sse": sse_frame("response.created", {
                 "type": "response.created",
@@ -2231,8 +2249,8 @@ class ResponsesHandler:
                 "user_message_id": str(question_id),
                 "response": response.model_dump(),
             })})
-            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(answer.first_text))})
-            async for text in answer.rest():
+            await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(first_text))})
+            async for text in remaining_text:
                 parts.append(text)
                 await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", text_delta(text))})
 
@@ -3978,13 +3996,10 @@ class ResponsesHandler:
                         extra["window"] = _window
             elif code == MODEL_NOT_IN_TIER_CODE:
                 # The tier that covers the model, so the card can offer that
-                # upgrade beside adding credits (ENG-4186). The model too when
-                # anton's typed error named it, so the card can name it.
+                # upgrade beside adding credits.
                 _tier = gate_required_tier(exc)
                 if _tier is not None:
                     extra["required_tier"] = _tier
-                if model_info and model_info[1]:
-                    extra["model"] = model_info[1]
             elif code == BUDGET_EXCEEDED_CODE:
                 # Whose budget is spent and its period, so the card can name them.
                 _budget = {
@@ -4270,11 +4285,16 @@ class ResponsesHandler:
                             extra=log_context(request_id=corr, conversation_id=conversation_id),
                         )
                 # The ladder already produced a code; carry it instead of dropping
-                # it here. Same wire shape the streaming twin emits.
+                # it here. Same wire shape the streaming twin emits. The reset
+                # instant, the plan fields and the budget fields ride along for
+                # their own codes, as they do there.
                 raise HTTPException(
                     status_code=400,
                     detail=response_failed_payload(
                         message, code, request_id=corr,
+                        reset_at=gate_reset_at(exc) if code in RESET_AT_CODES else None,
+                        window=gate_window(exc) if code == WINDOW_ALLOWANCE_EXHAUSTED_CODE else None,
+                        required_tier=gate_required_tier(exc) if code == MODEL_NOT_IN_TIER_CODE else None,
                         budget_scope=gate_budget_scope(exc) if code == BUDGET_EXCEEDED_CODE else None,
                         budget_period=gate_budget_period(exc) if code == BUDGET_EXCEEDED_CODE else None,
                         budget_model=gate_budget_model(exc) if code == BUDGET_EXCEEDED_CODE else None,

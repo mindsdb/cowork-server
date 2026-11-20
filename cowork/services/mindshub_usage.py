@@ -26,6 +26,9 @@ import math
 from typing import Any, Optional
 
 from cowork.schemas.mindshub_usage import (
+    PLAN_STATUSES,
+    PLAN_TIERS,
+    PLAN_WINDOWS,
     MindsHubAutoTopUp,
     MindsHubBalance,
     MindsHubCreditSpend,
@@ -33,6 +36,7 @@ from cowork.schemas.mindshub_usage import (
     MindsHubPlan,
     MindsHubPlanWindow,
     MindsHubUsageView,
+    is_one_of,
 )
 from cowork.services.mindshub_client import (
     ENTITLEMENTS_PATH,
@@ -132,11 +136,6 @@ def _parse_free_tokens(payload: Any) -> Optional[MindsHubFreeTokens]:
     )
 
 
-_PLAN_TIERS = frozenset({"free", "plus", "pro"})
-_PLAN_STATUSES = frozenset({"active", "past_due", "canceled"})
-_PLAN_WINDOWS = frozenset({"5h", "7d"})
-
-
 def _optional_str(value: Any) -> tuple[bool, Optional[str]]:
     """``(ok, value)`` for a field that must be a string or null."""
     if value is None or isinstance(value, str):
@@ -184,7 +183,7 @@ def _parse_plan(payload: Any) -> Optional[MindsHubPlan]:
 
     tier = plan.get("tier")
     status = plan.get("status")
-    if tier not in _PLAN_TIERS or status not in _PLAN_STATUSES:
+    if not is_one_of(tier, PLAN_TIERS) or not is_one_of(status, PLAN_STATUSES):
         return None
     ok, renews_at = _optional_str(plan.get("renews_at"))
     if not ok:
@@ -204,7 +203,7 @@ def _parse_plan(payload: Any) -> Optional[MindsHubPlan]:
         if not isinstance(raw, dict):
             return None
         name = raw.get("window")
-        if name not in _PLAN_WINDOWS:
+        if not is_one_of(name, PLAN_WINDOWS):
             continue
         if name in seen:
             return None

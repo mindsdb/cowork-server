@@ -351,6 +351,21 @@ def test_each_rows_covering_tier_is_recorded_locked_or_not(monkeypatch):
     assert listing.disabled_reasons == {"opus": "model_not_in_tier"}
 
 
+@pytest.mark.parametrize("junk", [[], {}, ["plus"], {"tier": "plus"}, True])
+def test_an_unhashable_or_non_string_covering_tier_is_dropped_not_raised(monkeypatch, junk):
+    # A custom endpoint's rows run through the same loop. A list or an object
+    # is unhashable, so a bare `in` test on it would raise out of the listing.
+    _serve(
+        monkeypatch,
+        {"data": [_row("odd", covered_by_tier=junk), _row("kimi-k3", covered_by_tier="plus")]},
+    )
+
+    listing = asyncio.run(fetch_minds_models(_URL, _KEY))
+
+    assert listing.covered_by_tier == {"kimi-k3": "plus"}
+    assert listing.ids == ["odd", "kimi-k3"]
+
+
 @pytest.mark.parametrize("junk", [None, 42, "", "   ", ["model_restricted"]])
 def test_a_junk_reason_is_treated_as_absent(monkeypatch, junk):
     _serve(monkeypatch, {"data": [_row("opus", enabled=False, disabled_reason=junk)]})
