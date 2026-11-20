@@ -90,7 +90,7 @@ class StandInTeams:
 @pytest.fixture
 def sdk():
     pytest.importorskip("microsoft_teams.api", reason="Teams packages are Linux-only")
-    from cowork.channels import teams_client
+    from cowork.services.connectors.teams import client as teams_client
 
     return teams_client
 
@@ -194,7 +194,7 @@ def test_imports_without_the_teams_packages():
         "import sys\n"
         "sys.modules['msal'] = None\n"
         "sys.modules['microsoft_teams'] = None\n"
-        "from cowork.channels import teams_client as t\n"
+        "from cowork.services.connectors.teams import client as t\n"
         "assert not t.teams_available()\n"
         "try:\n"
         "    t.TeamsClient('a', 's', 't')\n"
