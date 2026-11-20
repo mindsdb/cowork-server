@@ -48,6 +48,7 @@ __all__ = [
     "decisions_for",
     "decisions_for_scope",
     "direct_edit_available",
+    "zdr_blocks",
     "quick_edit_available",
     "quick_edit_locks",
     "QUICK_EDIT_GROUP_EVENT",
@@ -360,15 +361,40 @@ async def decisions_for_scope(anton: AntonQuickEdit | None, scope: TenantScope) 
     return user, decisions_for(anton, user)
 
 
-async def direct_edit_available(scope: TenantScope) -> bool:
-    """``quickEditDirect``: whether the bar can edit directly for the caller,
-    not only hand the message to the chat. Never raises."""
+def _decisions_on_mindshub(decisions: Decisions) -> bool:
+    """Whether the decisions model is Jev on MindsHub: a minted key (no base yet) or a MindsHub host."""
+    from cowork.services.providers import is_minds_host
+
+    return decisions.base_url is None or is_minds_host(decisions.base_url)
+
+
+async def zdr_blocks(decisions: Decisions, *, scope: TenantScope, user, org_bearer: str = "") -> bool:
+    """Whether ZDR rules out asking *decisions*: Jev on MindsHub while the org has ZDR on.
+
+    An org's own decision model isn't on MindsHub, so it is never blocked. Unknown counts as on."""
+    if not decisions.available or not _decisions_on_mindshub(decisions):
+        return False
+    from cowork.services.mindshub_zdr import zdr_on_for
+
     try:
-        _user, decisions = await decisions_for_scope(anton_quick_edit(), scope)
+        return await zdr_on_for(scope=scope, settings=user, org_bearer=org_bearer)
+    except Exception:
+        logger.warning("Could not read ZDR for a quick edit; not asking Jev", exc_info=True)
+        return True
+
+
+async def direct_edit_available(scope: TenantScope, *, org_bearer: str = "") -> bool:
+    """``quickEditDirect``: whether the bar can edit directly for the caller,
+    not only hand the message to the chat. False under ZDR when the decisions
+    model is Jev on MindsHub (``zdr_blocks``). Never raises."""
+    try:
+        user, decisions = await decisions_for_scope(anton_quick_edit(), scope)
     except Exception:
         logger.warning("Could not read whether quick edits can run directly", exc_info=True)
         return False
-    return decisions.available
+    if not decisions.available:
+        return False
+    return not await zdr_blocks(decisions, scope=scope, user=user, org_bearer=org_bearer)
 
 
 # ── the editor's LLM and the router's endpoint ───────────────────────────

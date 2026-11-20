@@ -42,7 +42,7 @@ from cowork.common.settings.app_settings import default_draft_env_label, get_app
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.draft_host.token import DRAFT_TTL_SECONDS, issue_draft_token
-from cowork.principal import Principal, get_principal
+from cowork.principal import Principal, caller_bearer, get_principal
 from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
@@ -636,7 +636,7 @@ async def _acquire_live_publish_lock(
         await asyncio.sleep(0.1)
 
 
-async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
+async def _current_capabilities(scope: TenantScope, capabilities: dict, *, org_bearer: str = "") -> dict:
     """*capabilities* narrowed by the caller's current product permissions.
 
     ``canQuickEdit`` (ENG-4227): the viewer's chat bar is offered. It needs
@@ -659,7 +659,7 @@ async def _current_capabilities(scope: TenantScope, capabilities: dict) -> dict:
     }
     can_quick_edit = bool(can_address and quick_edit_available())
     current["canQuickEdit"] = can_quick_edit
-    current["quickEditDirect"] = can_quick_edit and await direct_edit_available(scope)
+    current["quickEditDirect"] = can_quick_edit and await direct_edit_available(scope, org_bearer=org_bearer)
     # The export route needs `artifact.manage` too, so it offers nothing here.
     if not can_edit and "exportFormats" in capabilities:
         current["exportFormats"] = []
@@ -743,6 +743,7 @@ async def artifact_source(
     # scope (and the artifact roots it discovers) as an HTTP parameter.
     scope: TenantScope = Depends(get_tenant_scope),
     path: str | None = Query(default=None, max_length=1000),
+    request: Request = None,
 ):
     """Authenticated source + revision token for Desktop and Cowork SaaS.
 
@@ -764,7 +765,8 @@ async def artifact_source(
             scope=scope,
         )
         capabilities = await _current_capabilities(
-            scope, with_export_formats(scope, owner_capabilities, export_source)
+            scope, with_export_formats(scope, owner_capabilities, export_source),
+            org_bearer=caller_bearer(request),
         )
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
@@ -925,6 +927,7 @@ async def artifact_review_entry(
     # Spell out the dependency so SAST does not treat the server-derived
     # scope (and the artifact roots it discovers) as an HTTP parameter.
     scope: TenantScope = Depends(get_tenant_scope),
+    request: Request = None,
 ):
     """What a reviewer needs to comment, and nothing that reveals the source.
 
@@ -950,6 +953,7 @@ async def artifact_review_entry(
             lambda unit: artifact_capabilities(unit, artifact.source, artifact.folder.name),
             scope=scope,
         ),
+        org_bearer=caller_bearer(request),
     )
     return {
         "artifactKey": artifact_key(artifact_id),
@@ -1746,6 +1750,7 @@ async def enable_artifact_comments(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     scope: ScopeDep,
+    request: Request = None,
 ) -> CommentsAccessResponse:
     """Turn on draft comments for the artifact's owner.
 
@@ -1778,7 +1783,7 @@ async def enable_artifact_comments(
             status_code=status.HTTP_409_CONFLICT,
             detail="Sharing is off while models are being compared. Continue with this side to share it.",
         )
-    capabilities = await _current_capabilities(scope, capabilities)
+    capabilities = await _current_capabilities(scope, capabilities, org_bearer=caller_bearer(request))
     review_scope = None
     if scope.org_mode:
         # `_owner_workspace` already refused anyone but the owner, so the owner is

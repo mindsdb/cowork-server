@@ -321,6 +321,22 @@ _OWN = {"decision_model_url": "https://api.typesafe.ai/v1/systemone", "decision_
 
 
 @pytest.mark.parametrize(("fields", "model"), [
+    # MindsHub refuses Jev under ZDR, so it can't pick the browser's steps.
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k"}, None),
+    # The organization's own model isn't on MindsHub, so it still does.
+    ({"planning_provider": "minds_cloud", "minds_api_key": "k", **_OWN}, "own"),
+])
+def test_under_zdr_only_the_organizations_own_model_picks_the_browsers_steps(fields, model, monkeypatch):
+    from cowork.services import browser
+
+    monkeypatch.setattr(browser, "own_model_reaches_browser", lambda: True)
+    settings = _user(**fields)
+    assert jev_route.decisions_model(settings, zdr_on=True) == model
+    assert jev_route.decisions_available(settings, zdr_on=True) is (model is not None)
+    assert jev_route.browser_needs_zdr(settings) is (model is None)
+
+
+@pytest.mark.parametrize(("fields", "model"), [
     # What the settings otherwise allow: Jev on MindsHub for an LLM on it...
     ({"planning_provider": "minds_cloud", "minds_api_key": "k", **_OWN}, "mindshub"),
     # ...and nothing when Jev is off or the LLM is elsewhere.

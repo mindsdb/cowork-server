@@ -244,9 +244,20 @@ def _new_correlation_id() -> str:
     return str(uuid.uuid4())
 
 
+def turn_coding_model(user_settings) -> str | None:
+    """The caller's resolved coding model when it runs on MindsHub, else None.
+    Resolved like the desktop's, so a model the org can't use is swapped for one it can."""
+    from cowork.common.settings.user_settings import Provider
+
+    if getattr(user_settings, "resolved_coding_provider", None) is not Provider.MINDS_CLOUD:
+        return None
+    return user_settings.resolved_coding_model
+
+
 async def mint_llm_block(*, org_id: str | None, user_id: str | None,
                          correlation_id: str, settings: TurnQueueSettings,
-                         workspace_id: str | None = None, ttl_seconds: int | None = None) -> dict:
+                         workspace_id: str | None = None, ttl_seconds: int | None = None,
+                         coding_model: str | None = None) -> dict:
     """Mint a short-TTL MindsHub turn key and build the job's `llm` block.
 
     The mint call is authenticated with the internal shared secret
@@ -265,16 +276,16 @@ async def mint_llm_block(*, org_id: str | None, user_id: str | None,
         ttl_seconds=ttl_seconds or settings.turn_key_lifetime_seconds, settings=settings,
         workspace_id=workspace_id,
     )
-    return _build_llm_block(api_key, settings)
+    return _build_llm_block(api_key, settings, coding_model)
 
 
-def _build_llm_block(api_key: str, settings: TurnQueueSettings) -> dict:
+def _build_llm_block(api_key: str, settings: TurnQueueSettings, user_coding_model: str | None = None) -> dict:
     base_url = settings.minds_base_url or minds_chat_base_url(default_turn_minds_api_host())
     block = {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
-    # Must be a MINDS alias (the pod runs on minds-cloud). Default to the
-    # free-bucket model: a fresh org has no wallet balance, so premium 402s.
+    # Must be a MINDS alias (the pod runs on minds-cloud). The deployment override wins, then the
+    # caller's resolved coding model, then the free-bucket model. Anton also summarizes on it.
     from cowork.common.settings.app_settings import MINDS_FREE_MODEL
-    coding_model = settings.minds_coding_model or MINDS_FREE_MODEL
+    coding_model = settings.minds_coding_model or user_coding_model or MINDS_FREE_MODEL
     if coding_model:
         block["coding_model"] = coding_model
     return block
@@ -282,7 +293,7 @@ def _build_llm_block(api_key: str, settings: TurnQueueSettings) -> dict:
 
 async def _mint_llm_block_with_turn_key_id(
     *, org_id: str | None, user_id: str | None, correlation_id: str, settings: TurnQueueSettings,
-    workspace_id: str | None = None,
+    workspace_id: str | None = None, coding_model: str | None = None,
 ) -> tuple[dict, str]:
     """As mint_llm_block, also returning the key's public prefix the datasource grants bind to."""
     minted = await mint_turn_key_details(
@@ -293,7 +304,7 @@ async def _mint_llm_block_with_turn_key_id(
         settings=settings,
         workspace_id=workspace_id,
     )
-    return _build_llm_block(minted.key, settings), minted.prefix
+    return _build_llm_block(minted.key, settings, coding_model), minted.prefix
 
 
 async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
@@ -1016,9 +1027,12 @@ _SLOW_SCOPE_MS = 1000
 
 
 async def _scoped_browser_block(
-    *, scope, conversation_id: str, turn_key: str, project_id: str | None,
+    *, scope, conversation_id: str, turn_key: str, project_id: str | None, zdr_on: bool | None = None,
 ) -> dict | None:
     """The job's browser block, or None when the turn gets no browser.
+
+    *zdr_on*: the handler's ZDR answer; None reads it with the turn key when the
+    browser would ask Jev on MindsHub, which ZDR rules out.
 
     Wherever the web has a router, every turn's key is scoped with it before
     the job is queued, since the router turns a key it hasn't scoped away and
@@ -1039,9 +1053,14 @@ async def _scoped_browser_block(
     router = browser.router_url()
     if not router or not turn_key:
         return None
+    from cowork.services.mindshub_zdr import browser_zdr_on
+
+    user_settings = await run_on_unit_threads(partial(get_user_settings, scope))
+    if zdr_on is None:
+        zdr_on = await browser_zdr_on(scope=scope, settings=user_settings, turn_key=turn_key)
     config = browser.turn_block(
-        await run_on_unit_threads(partial(get_user_settings, scope)),
-        user_id=scope.user_id, conversation_id=conversation_id, project_id=project_id,
+        user_settings,
+        user_id=scope.user_id, conversation_id=conversation_id, project_id=project_id, zdr_on=zdr_on,
     )
     started = time.monotonic()
     try:
@@ -1136,7 +1155,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 connector_drafts: bool = False,
                                 preview_checks: bool = False,
                                 ui_locale: str | None = None,
-                                reasoning_effort: str | None = None):
+                                reasoning_effort: str | None = None,
+                                zdr_on: bool | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -1167,7 +1187,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     one would let it fall back to a mounted org skills tree
     (cowork.handlers.responses.remote_turn_skills).
     `reasoning_effort` is the composer's pick for this turn; None leaves the
-    pod's configured default."""
+    pod's configured default.
+    `zdr_on` is the caller's ZDR answer when the handler already has it; None reads it here."""
     settings = TurnQueueSettings()
     scope = scope_for_identity(org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
@@ -1220,7 +1241,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
             # turn-key mint is known here and revoked rather than left live.
             llm_result, oauth_result = await asyncio.gather(
                 mint_llm(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
-                         workspace_id=workspace_id),
+                         workspace_id=workspace_id, coding_model=turn_coding_model(user_settings)),
                 oauth_connections_coro,
                 return_exceptions=True,
             )
@@ -1298,7 +1319,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         connectors_block = await _with_custom_usage_notes(connectors_block, scope, custom_api_block)
     browser_block = await _scoped_browser_block(
         scope=scope, conversation_id=conversation_id, turn_key=llm_block.get("api_key", ""),
-        project_id=workspace.project_id if workspace is not None else None,
+        project_id=workspace.project_id if workspace is not None else None, zdr_on=zdr_on,
     )
     browser_block = await _admit_decisions_proxy(
         r, browser_block, turn_key=llm_block.get("api_key", ""), org_id=org_id, user_id=user_id,
@@ -1331,6 +1352,19 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     turn_settings = await run_on_unit_threads(partial(get_user_settings, scope))
     jev_decisions = getattr(turn_settings, "jev_decisions_enabled", True) is not False
     jev_classify = getattr(turn_settings, "jev_classify_enabled", True) is not False
+    # Under ZDR MindsHub refuses Jev, so the pod neither checks completion nor classifies with it.
+    if jev_decisions or jev_classify:
+        if zdr_on is None:
+            from cowork.services.mindshub_zdr import zdr_on_for
+
+            try:
+                zdr_on = await zdr_on_for(scope=scope, settings=turn_settings, turn_key=llm_block.get("api_key", ""))
+            except Exception:
+                # Unknown counts as on: it only skips Jev, which MindsHub refuses under ZDR.
+                logger.warning("Could not read ZDR for the remote turn", exc_info=True)
+                zdr_on = True
+        jev_decisions = jev_decisions and not zdr_on
+        jev_classify = jev_classify and not zdr_on
     time_limit = settings.time_limit_seconds
     offer_connector_drafts = bool(
         connector_drafts and settings.connector_drafts_enabled and scope.org_mode and user_id

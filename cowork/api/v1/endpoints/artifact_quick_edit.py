@@ -72,6 +72,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import TenantScope
 from cowork.db.units import run_db, run_efs, run_to_completion
 from cowork.harnesses.anton_harness.preview_checker import ask_preview
+from cowork.principal import caller_bearer
 from cowork.services import artifact_quick_edits
 from cowork.services.artifact_metadata import ArtifactMetadata
 from cowork.services import quick_edit as quick_edit_service
@@ -122,6 +123,8 @@ _REPLY_GRACE_S = 5.0
 
 #: The route event's reason when no decisions model serves the caller.
 NO_DECISIONS_REASON = "no_decisions_model"
+#: The route event's reason when the decisions model is Jev on MindsHub and the org has ZDR on.
+ZDR_ON_REASON = "zdr_on"
 
 QUICK_EDIT_STATUSES = frozenset({"applied", "escalate", "failed", "noop"})
 
@@ -443,6 +446,8 @@ class QuickEditRun:
     resolve_backend: Callable[[TenantScope], Any] | None = None
     # None reads EDIT_TIMEOUT_S at call time.
     edit_timeout_s: float | None = None
+    # The caller's own credential on the web, for the ZDR read.
+    org_bearer: str = ""
     _released: bool = field(default=False, init=False)
     # The context the router got, for a quick reply to read too.
     _route_context: dict = field(default_factory=dict, init=False)
@@ -624,6 +629,11 @@ class QuickEditRun:
                 # runs, not even when the app forces the edit, and the app
                 # sends the message to the chat.
                 emit(sse_frame("route", {"route": "agent", "confidence": 1.0, "ms": 0, "reason": NO_DECISIONS_REASON}))
+                emit(_done(status_="agent", started=self.started))
+                return
+            # Under ZDR MindsHub refuses Jev, so the message goes to the chat without asking it.
+            if await quick_edit_service.zdr_blocks(decisions, scope=self.scope, user=user, org_bearer=self.org_bearer):
+                emit(sse_frame("route", {"route": "agent", "confidence": 1.0, "ms": 0, "reason": ZDR_ON_REASON}))
                 emit(_done(status_="agent", started=self.started))
                 return
             backend = await (self.resolve_backend or quick_edit_service.resolve_backend)(
@@ -835,6 +845,7 @@ async def quick_edit_artifact(
         base_revision_id=begun["revision"]["id"],
         started=started,
         lock_key=lock_key,
+        org_bearer=caller_bearer(request),
     )
     try:
         return StreamingResponse(

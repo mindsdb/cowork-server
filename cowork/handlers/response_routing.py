@@ -867,6 +867,7 @@ async def decide_route(
     binding: RouterBinding | None = None,
     binding_factory: Callable[[], RouterBinding | None] | None = None,
     jev: Callable[[list[dict]], Awaitable[JevRoute]] | None = None,
+    jev_may_fall_back: Callable[[], Awaitable[bool]] | None = None,
     ui_locale: str | None = None,
 ) -> RouteDecision:
     """Choose a direct answer or safe delegation.
@@ -891,6 +892,8 @@ async def decide_route(
     `binding` lets the caller supply a pre-built gate target (org mode mints a
     per-turn key); when None the binding comes from stored settings or the
     request's lazy `binding_factory`. Resolve only after the eligibility checks.
+    `jev_may_fall_back`, asked only when Jev fails, says whether the LLM gate
+    may decide instead (None: it may).
     Gate/provider failures intentionally fail open to Anton.  This boundary must
     never make a chat turn unavailable because the optional fast path is down.
     A database pool that freed no connection in time is not a gate failure: it
@@ -941,9 +944,11 @@ async def decide_route(
                 p_direct=result.p_direct,
                 needs_search=result.needs_search,
             )
-        if not result.falls_back_to_llm_gate:
-            # Jev ran out the gate's time: asking the LLM gate now would only
-            # make the agent start later.
+        if not result.falls_back_to_llm_gate or (
+            jev_may_fall_back is not None and not await jev_may_fall_back()
+        ):
+            # Jev ran out the gate's time, or the LLM gate would run on a model
+            # ZDR refuses: the turn goes straight to the agent.
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason=f"jev_{result.error}", provider="jev",
                 model=result.model or None, fallback=True,

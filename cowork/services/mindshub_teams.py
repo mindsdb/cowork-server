@@ -92,6 +92,10 @@ class MindsHubTeamListing(BaseModel):
         return next((team.id for team in self.teams if team.is_default), "")
 
 
+# entitlements/me's ``zdr_mode`` when ZDR is off; auth builds without the field mean off.
+ZDR_OFF = "off"
+
+
 class MindsHubPermissions(BaseModel):
     """The caller's resolved permissions in the active organization.
 
@@ -107,6 +111,8 @@ class MindsHubPermissions(BaseModel):
     #: MindsHub refused the credential itself (401): the caller signs in again,
     #: which says nothing about their browser access.
     signed_out: bool = False
+    #: The organization's ZDR mode (``off``, ``standard``, ``strict``); None when unknown.
+    zdr_mode: str | None = None
     #: The organization the answer is for, from the browser block: the active
     #: organization for a Keycloak token, the key's own organization for an API
     #: key. None when the answer carried none.
@@ -116,6 +122,11 @@ class MindsHubPermissions(BaseModel):
         """Auth's own answer when it couldn't read membership: no permissions
         and no browser block. Kept only as long as a failure."""
         return self.reachable and self.browser is None and not self.permissions
+
+    @property
+    def zdr_on(self) -> bool:
+        """Whether ZDR is on; an unknown mode, or auth's outage answer, counts as on."""
+        return self.zdr_mode != ZDR_OFF or self.is_outage_answer()
 
 
 def _refused_permissions(status_code: int | None) -> MindsHubPermissions:
@@ -167,12 +178,14 @@ def _parse_permissions(payload: Any) -> MindsHubPermissions:
         browser = BrowserEntitlement.model_validate(payload.get(BROWSER_ENTITLEMENT_KEY))
     except ValidationError:
         browser = None
+    zdr_mode = payload.get("zdr_mode", ZDR_OFF)
     block = payload.get(BROWSER_ENTITLEMENT_KEY)
     organization_id = block.get("organization_id") if isinstance(block, dict) else None
     return MindsHubPermissions(
         permissions=frozenset(str(p) for p in payload["permissions"] if isinstance(p, str)),
         reachable=True,
         browser=browser,
+        zdr_mode=zdr_mode if isinstance(zdr_mode, str) else None,
         organization_id=organization_id if isinstance(organization_id, str) and organization_id else None,
     )
 

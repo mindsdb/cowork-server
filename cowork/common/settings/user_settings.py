@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 import json
+from collections.abc import Collection
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
@@ -140,7 +141,7 @@ def _defaults_with_declared(
 
 
 def minds_role_start_models(
-    *, declared: dict[str, str], enabled_map: dict[str, bool]
+    *, declared: dict[str, str], enabled_map: dict[str, bool], blocked: Collection[str] = frozenset()
 ) -> list[str]:
     """The model each minds-cloud role starts on, in ``AGENT_ROLE_ORDER``.
 
@@ -166,24 +167,39 @@ def minds_role_start_models(
             Provider.MINDS_CLOUD.value,
             _defaults_with_declared(role, compiled, declared),
             enabled_map,
+            blocked,
         )
         or ""
         for role, compiled in ROLE_MODEL_DEFAULTS.items()
     ]
 
-def _first_available_model(enabled_map: dict[str, bool]) -> str | None:
+def _id_set(stored: str | None) -> frozenset[str]:
+    """A stored JSON list of model ids; anything unreadable reads as empty."""
+    try:
+        raw = json.loads(stored or "[]")
+    except (ValueError, TypeError):
+        return frozenset()
+    if not isinstance(raw, list):
+        return frozenset()
+    return frozenset(v for v in raw if isinstance(v, str) and v)
+
+
+def _first_available_model(
+    enabled_map: dict[str, bool], blocked: Collection[str] = frozenset()
+) -> str | None:
     """First enabled model in map order, else the first served one, else None.
 
     The map lists the full ``/v1/models`` catalogue in the gateway's ranking, so
     its first enabled entry is the affordable baseline; when nothing is enabled the
     first key is still a served (locked) model — recoverable via top-up, unlike a
-    retired id that 404s every turn. Empty map → None.
+    retired id that 404s every turn. Empty map → None. A ``blocked`` id (zero
+    data retention) is never unlocked by a top-up, so a locked pick skips it.
     """
     if not enabled_map:
         return None
     return next(
         (m for m, en in enabled_map.items() if en),
-        next(iter(enabled_map)),
+        next((m for m in enabled_map if m not in blocked), next(iter(enabled_map))),
     )
 
 
@@ -191,6 +207,7 @@ def _enabled_aware_default(
     provider_value: str,
     defaults: dict[str, str],
     enabled_map: dict[str, bool],
+    blocked: Collection[str] = frozenset(),
 ) -> str | None:
     """The provider's canonical default model, adjusted for availability.
 
@@ -208,7 +225,9 @@ def _enabled_aware_default(
     minds-cloud: direct (BYOK) providers have no such availability map.
 
     Org mode requires the same positive evidence, but falls back to
-    MINDS_FREE_MODEL instead, so a credit-less org isn't charged.
+    MINDS_FREE_MODEL instead, so a credit-less org isn't charged. When the map
+    marks the free model itself disabled (e.g. zero data retention blocks it),
+    org mode takes the first enabled model instead.
     """
     default = defaults.get(provider_value)
     if provider_value != Provider.MINDS_CLOUD.value:
@@ -216,17 +235,24 @@ def _enabled_aware_default(
     if get_app_settings().tenancy_mode == "org":
         if default is not None and enabled_map.get(default) is True:
             return default
-        # Free model, unless a known catalogue no longer serves it — then it's
-        # retired and would 404 every turn, so hand out a served model.
-        if enabled_map and MINDS_FREE_MODEL not in enabled_map:
-            served = _first_available_model(enabled_map)
+        # A disabled free model would be refused every call (ZDR blocks it).
+        if enabled_map.get(MINDS_FREE_MODEL) is False:
+            enabled = next((m for m, en in enabled_map.items() if en), None)
+            if enabled is not None:
+                return enabled
+        # Free model, unless a known catalogue no longer serves it (retired, 404s
+        # every turn) or zero data retention refuses it: then hand out a served model.
+        if enabled_map and (MINDS_FREE_MODEL not in enabled_map or MINDS_FREE_MODEL in blocked):
+            served = _first_available_model(enabled_map, blocked)
             if served is not None:
                 return served
         return MINDS_FREE_MODEL
-    return _availability_adjusted(default, enabled_map)
+    return _availability_adjusted(default, enabled_map, blocked)
 
 
-def _availability_adjusted(default: str | None, enabled_map: dict[str, bool]) -> str | None:
+def _availability_adjusted(
+    default: str | None, enabled_map: dict[str, bool], blocked: Collection[str] = frozenset()
+) -> str | None:
     """``default``, moved off a model the availability map says cannot be used.
 
     The desktop half of ``_enabled_aware_default``, and the whole rule for the
@@ -243,9 +269,10 @@ def _availability_adjusted(default: str | None, enabled_map: dict[str, bool]) ->
             return model_id
     # Nothing affordable. A still-served (locked) default is kept — it 402s with a
     # top-up path. A default absent from this non-empty catalogue is retired and
-    # would 404 every turn, so fall back to a served model instead.
-    if default is not None and default not in enabled_map:
-        served = _first_available_model(enabled_map)
+    # would 404 every turn, and a blocked one is refused for good, so fall back
+    # to a served model instead.
+    if default is not None and (default not in enabled_map or default in blocked):
+        served = _first_available_model(enabled_map, blocked)
         if served is not None:
             return served
     return default
@@ -259,6 +286,7 @@ def _resolved_model(
     enabled_map: dict[str, bool] | None = None,
     *,
     wallet_aware: bool = False,
+    blocked: Collection[str] = frozenset(),
 ) -> str | None:
     """Resolve a role's model given the readiness resolver's provider switch.
 
@@ -338,14 +366,14 @@ def _resolved_model(
                 # Nothing affordable. A still-served (locked) pin is kept below. But
                 # an id absent from this non-empty catalogue is retired/foreign and
                 # 404s every turn with no recovery, so hand out a served model
-                # instead of a dead id.
-                if bare not in enabled:
-                    return next(iter(enabled))
+                # instead of a dead id. A blocked pin is refused for good too.
+                if bare not in enabled or bare in blocked:
+                    return _first_available_model(enabled, blocked)
         return user_model
     # No explicit choice (or provider switched): the resolved provider's default,
     # availability-adjusted. openai-compatible has no default -> None, so the
     # "select a model" gate still fires for it.
-    return _enabled_aware_default(resolved_provider.value, defaults, enabled_map or {})
+    return _enabled_aware_default(resolved_provider.value, defaults, enabled_map or {}, blocked)
 
 # Provider types as exposed to the UI (uses dashes, not underscores)
 UI_PROVIDER_TYPES = ("minds-cloud", "anthropic", "openai", "gemini", "openai-compatible")
@@ -1140,6 +1168,18 @@ class UserSettings(Settings):
         ),
     )
 
+    # Org-wide, as zero data retention is: the ids MindsHub refuses under it.
+    minds_model_zdr_blocked: Annotated[str, ORG, PINNED] = Field(
+        default="[]",
+        title="MindsHub Models Blocked By Zero Data Retention",
+        description=(
+            "JSON-encoded list of the MindsHub model ids zero data retention "
+            "rules out for your organization, cached from /v1/models whenever "
+            "recommended-models fetches it live. Credits cannot unlock them, so "
+            "a fallback never lands on one while another model is served."
+        ),
+    )
+
     minds_role_defaults: Annotated[str, ORG, PINNED] = Field(
         default="{}",
         title="MindsHub Role Defaults",
@@ -1267,13 +1307,11 @@ class UserSettings(Settings):
         empty: an unreadable restriction list must not lock models it never
         named.
         """
-        try:
-            raw = json.loads(self.minds_model_restricted or "[]")
-        except (ValueError, TypeError):
-            return frozenset()
-        if not isinstance(raw, list):
-            return frozenset()
-        return frozenset(v for v in raw if isinstance(v, str) and v)
+        return _id_set(self.minds_model_restricted)
+
+    def _minds_zdr_blocked_ids(self) -> frozenset[str]:
+        """The model ids zero data retention rules out, or an empty set."""
+        return _id_set(self.minds_model_zdr_blocked)
 
     def _minds_role_default_map(self) -> dict[str, str]:
         """The cached agent-role -> model-id map MindsHub's catalog declares, or {}.
@@ -1343,23 +1381,27 @@ class UserSettings(Settings):
         # the two. Tracked on ENG-1632 as a follow-up; changing it here would
         # alter resolution for existing split configs.
         enabled_map = self._minds_enabled_map()
+        blocked = self._minds_zdr_blocked_ids()
         if self.planning_model is None:
             self.planning_model = _enabled_aware_default(
                 self.planning_provider.value,
                 self._defaults_for_role("planning", PLANNING_MODEL_DEFAULTS),
                 enabled_map,
+                blocked,
             )
         if self.coding_model is None:
             self.coding_model = _enabled_aware_default(
                 self.coding_provider.value,
                 self._defaults_for_role("coding", CODING_MODEL_DEFAULTS),
                 enabled_map,
+                blocked,
             )
         if self.router_model is None:
             self.router_model = _enabled_aware_default(
                 self.coding_provider.value,
                 self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
                 enabled_map,
+                blocked,
             )
         if self.image_model is None:
             self.image_model = self._image_model_default()
@@ -1375,7 +1417,10 @@ class UserSettings(Settings):
         stays and is refused with a top-up path.
         """
         declared = self._minds_role_default_map().get(IMAGE_ROLE) or IMAGE_MODEL_DEFAULT
-        return _availability_adjusted(declared, self._minds_image_enabled_map()) or declared
+        return (
+            _availability_adjusted(declared, self._minds_image_enabled_map(), self._minds_zdr_blocked_ids())
+            or declared
+        )
 
     def _has_key(self, p: Provider) -> bool:
         # Org mode mints a per-turn key, so minds-cloud is usable with nothing
@@ -1454,6 +1499,7 @@ class UserSettings(Settings):
             self._defaults_for_role("planning", PLANNING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
             wallet_aware=True,
+            blocked=self._minds_zdr_blocked_ids(),
         )
 
     @property
@@ -1468,6 +1514,7 @@ class UserSettings(Settings):
             self._defaults_for_role("coding", CODING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
             wallet_aware=True,
+            blocked=self._minds_zdr_blocked_ids(),
         )
 
     @property
@@ -1486,6 +1533,7 @@ class UserSettings(Settings):
             self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
             self._minds_enabled_map(),
             wallet_aware=True,
+            blocked=self._minds_zdr_blocked_ids(),
         )
 
     @property
@@ -1508,6 +1556,7 @@ class UserSettings(Settings):
             {Provider.MINDS_CLOUD.value: default},
             self._minds_image_enabled_map(),
             wallet_aware=True,
+            blocked=self._minds_zdr_blocked_ids(),
         ) or default
 
     @property
@@ -1518,7 +1567,8 @@ class UserSettings(Settings):
         Anton's images go to MindsHub (``_images_go_to_mindshub``) and the cached
         catalog lists an image model this member is not restricted from. A pick
         follows the same rule: on another provider it would fail every image
-        call. A wallet-locked model is still handed over, since a top-up lifts it.
+        call. A wallet-locked model is still handed over, since a top-up lifts it;
+        one zero data retention blocks is not, since nothing lifts it.
         """
         if not self._images_go_to_mindshub():
             return None
@@ -1526,7 +1576,7 @@ class UserSettings(Settings):
         if not available:
             return None
         model = self.resolved_image_model
-        restricted = self._minds_restricted_ids()
+        restricted = self._minds_restricted_ids() | self._minds_zdr_blocked_ids()
         if model in restricted:
             # Only reached with nothing enabled: prefer a wallet-locked model, else none.
             return next((m for m in available if m not in restricted), None)
@@ -1575,6 +1625,7 @@ class UserSettings(Settings):
             provider.value,
             self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
             self._minds_enabled_map(),
+            self._minds_zdr_blocked_ids(),
         )
 
     @property
