@@ -28,12 +28,22 @@ TERMINAL_UPSTREAM_CODES = {
     404: "model_unavailable",
 }
 
-# MindsHub answers 429 for three different denials. An exhausted allowance or a
-# tripped free-serving fuse holds until a reset hours away, so retrying cannot
-# succeed and they fail terminally like the codes above. A velocity limit clears
-# within seconds, so the proxy waits out Retry-After itself: Codex's one
-# immediate retry would land inside the same window and fail the turn.
-TERMINAL_RATE_LIMIT_CODES = frozenset({"included_allowance_exhausted", "free_air_daily_spend_fuse_exceeded"})
+# MindsHub answers 429 for four different denials. An exhausted allowance, a
+# spent subscription window (ENG-4186) or a tripped free-serving fuse holds
+# until a reset hours away, so retrying cannot succeed and they fail terminally
+# like the codes above. A velocity limit clears within seconds, so the proxy
+# waits out Retry-After itself: Codex's one immediate retry would land inside
+# the same window and fail the turn.
+TERMINAL_RATE_LIMIT_CODES = frozenset(
+    {"included_allowance_exhausted", "window_allowance_exhausted", "free_air_daily_spend_fuse_exceeded"}
+)
+
+# Terminal statuses whose upstream code names a decision of its own rather than
+# the status's generic one, so the rewrite keeps it. A spent budget is a 402,
+# but credits do not lift it. A model outside the plan's tier (ENG-4186) is a
+# 403, but the credential is fine: read as the status's generic code it would
+# tell the user to sign in again.
+KEPT_UPSTREAM_CODES = {402: frozenset({"budget_exceeded"}), 403: frozenset({"model_not_in_tier"})}
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_DEFAULT_WAIT_SECONDS = 2.0
 # Codex holds the request open while the proxy waits, so the total wait stays
@@ -240,12 +250,12 @@ async def proxy_inference(request: Request, path: str, credentials: EngineCreden
             raw = await _read_bounded(upstream, MAX_REJECTION_BODY_BYTES)
         finally:
             await upstream.aclose()
-        # A spent budget is a 402 too, but credits do not lift it, so it keeps its own code.
-        budget = upstream.status_code == 402 and "budget_exceeded" in (
-            upstream_error_code(raw),
-            upstream.headers.get("x-mindshub-reason", ""),
+        kept = KEPT_UPSTREAM_CODES.get(upstream.status_code, frozenset())
+        code = next(
+            (c for c in (upstream_error_code(raw), upstream.headers.get("x-mindshub-reason", "")) if c in kept),
+            None,
         )
-        return _terminal_response(upstream, raw, "budget_exceeded" if budget else None)
+        return _terminal_response(upstream, raw, code)
     return _UpstreamStreamingResponse(upstream)
 
 
