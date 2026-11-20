@@ -13,8 +13,8 @@ chat as a normal turn.
 The response is ``text/event-stream``:
 
 * ``route``         ``{"route": "edit"|"agent"|"reply", "confidence": float, "ms": int, "reason": str}``;
-  ``reply`` only when the installed anton's router takes ``allow_reply`` and
-  it has ``answer_request``;
+  ``reply`` only when the app asks for it (``allowReply``) and the installed
+  anton's router takes ``allow_reply`` and it has ``answer_request``;
   with no decisions model for the caller's provider, at once
   ``{"route": "agent", "confidence": 1, "ms": 0, "reason": "no_decisions_model"}``
   and neither Jev nor the editor runs
@@ -148,6 +148,9 @@ class _QuickEditBody(BaseModel):
     expectedRevisionId: str | None = Field(default=None, min_length=1, max_length=80)
     conversationId: UUID | None = None
     forceRoute: Literal["edit", "agent"] | None = None
+    # The app shows an answer in the bar (``done`` status ``reply``). An app
+    # that does not send it never gets one: it would read it as a failure.
+    allowReply: bool = False
     # The bar's model picker. A model the composer offers this person (GET
     # /api/v1/settings/recommended-models), else 422; null is their default.
     model: str | None = Field(default=None, min_length=1, max_length=200)
@@ -481,7 +484,7 @@ class QuickEditRun:
             except Exception:
                 logger.warning("Could not read the conversation for the quick edit router", exc_info=True)
         self._route_context = {key: extra[key] for key in quick_edit_service.REPLY_CONTEXT if key in extra}
-        if self.anton.can_reply:
+        if self.anton.can_reply and body.allowReply:
             extra["allow_reply"] = True
         refusals: list[dict] = []
         http = _jev_client(refusals)
@@ -499,7 +502,9 @@ class QuickEditRun:
             if http is not None:
                 await http.aclose()
         route = getattr(decision, "route", "agent")
-        if route not in ("edit", "agent", "reply") or (route == "reply" and not self.anton.can_reply):
+        if route not in ("edit", "agent", "reply") or (
+            route == "reply" and not (self.anton.can_reply and body.allowReply)
+        ):
             route = "agent"
         try:
             confidence = float(getattr(decision, "confidence", 0.0) or 0.0)

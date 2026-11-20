@@ -1525,7 +1525,7 @@ def test_a_reply_route_answers_in_the_bar_and_changes_nothing(client, fake_anton
     fake_anton.answer = answer
     history = [{"role": "user", "text": "hi"}, {"role": "assistant", "text": "Hello!"}]
 
-    events = events_of(post(client, artifact_id, message="What does this show?", history=history).text)
+    events = events_of(post(client, artifact_id, message="What does this show?", history=history, allowReply=True).text)
 
     assert [name for name, _ in events] == ["route", "done"]
     assert events[0][1]["route"] == "reply"
@@ -1548,6 +1548,20 @@ def test_a_reply_route_answers_in_the_bar_and_changes_nothing(client, fake_anton
     assert len(list_revisions(folder, rel_path="index.html")) <= 1
 
 
+def test_an_app_that_does_not_ask_for_replies_never_gets_one(client, fake_anton, artifact):
+    """An app without the bar's reply would read one as a failure: without
+    ``allowReply`` the router is not offered it, and a stray reply is the agent's."""
+    _folder, _metadata, artifact_id = artifact
+    fake_anton.route = RouteDecision("reply", 0.95)
+
+    events = events_of(post(client, artifact_id, message="hi").text)
+
+    assert fake_anton.route_calls[0]["allow_reply"] is False
+    assert events[0][1]["route"] == "agent"
+    assert events[-1][1]["status"] == "agent"
+    assert fake_anton.answer_calls == []
+
+
 @pytest.mark.parametrize("outcome", ["", "raise"])
 def test_a_reply_that_comes_back_empty_or_fails_goes_to_the_agent(client, fake_anton, artifact, outcome):
     _folder, _metadata, artifact_id = artifact
@@ -1560,7 +1574,7 @@ def test_a_reply_that_comes_back_empty_or_fails_goes_to_the_agent(client, fake_a
 
     fake_anton.answer = answer
 
-    events = events_of(post(client, artifact_id, message="How many regions?").text)
+    events = events_of(post(client, artifact_id, message="How many regions?", allowReply=True).text)
 
     assert [name for name, _ in events] == ["route", "done"]
     assert events[1][1]["status"] == "agent" and events[1][1]["summary"] == ""

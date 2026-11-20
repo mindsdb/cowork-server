@@ -220,3 +220,33 @@ def test_desktop_project_delete_takes_down_pages_and_aborts_on_failure(tmp_path,
     finally:
         client.close()
         get_app_settings.cache_clear()
+
+
+def test_desktop_delete_of_a_chosen_folder_leaves_its_pages_up(tmp_path, monkeypatch, upstream):
+    """A folder the user chose stays when its project is deleted, artifacts
+    and all, so their published pages stay up with them: nothing is taken
+    down and no credential is minted."""
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    from cowork.server import create_app
+
+    chosen = tmp_path / "Documents" / "reports"
+    chosen.mkdir(parents=True)
+    # Choosing a folder is a local-only request.
+    client = TestClient(create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321))
+    try:
+        res = client.post("/api/v1/projects/", json={"name": f"chosen-{uuid4().hex[:8]}", "path": str(chosen)})
+        assert res.status_code == 201, res.text
+        project = res.json()
+        folder = _artifact(Path(project["path"]) / ".anton" / "artifacts", "live", published={"report_id": "rid-kept"})
+
+        done = client.delete(f"/api/v1/projects/{project['id']}")
+
+        assert done.status_code == 204, done.text
+        assert upstream.taken_down == []
+        assert folder.exists()
+        assert json.loads((folder / ".published.json").read_text())["index.html"]["report_id"] == "rid-kept"
+    finally:
+        client.close()
+        get_app_settings.cache_clear()

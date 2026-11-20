@@ -689,7 +689,11 @@ def _take_down_plan(session: ScopedSession, *, project_id: UUID, principal: Prin
     once the caller may delete it: the checks `_delete_project` makes before
     it changes anything, so a refused delete takes no page down. Every
     member's legacy conversation roots are included, since the delete removes
-    them all."""
+    them all.
+
+    None when the delete leaves the project's folder in place (a folder the
+    user chose, or a stored path that is not the derived one): its artifacts
+    stay on disk, so their pages stay up too."""
     from cowork.services.artifact_roots import plan_project_roots
 
     service = ProjectService(session)
@@ -706,11 +710,27 @@ def _take_down_plan(session: ScopedSession, *, project_id: UUID, principal: Prin
                 detail="Only the project creator or an organization admin can delete this project",
             )
         service._refuse_while_others_use(project_id)
+        if not _delete_removes_folder(service, project):
+            return None
         return plan_project_roots(session, project_id, include_other_members=True)
     except ProjectNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except ProjectInUseError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+
+
+def _delete_removes_folder(service: ProjectService, project) -> bool:
+    """Whether `delete_project` removes this project's folder: only when its
+    stored path is the derived one (the same test the delete makes). A folder
+    the user chose, or one at a path that does not match, is left in place."""
+    path = Path(project.path)
+    if not path.exists():
+        return True
+    try:
+        safe = service._project_path(project.name)
+    except ValueError:
+        return False
+    return safe.resolve() == path.resolve()
 
 
 def _published_folders(plan) -> list[tuple[object, str]]:
@@ -751,6 +771,8 @@ async def _take_down_published_pages(
     plan = await run_efs_unit(
         partial(_take_down_plan, project_id=project_id, principal=principal), scope=scope
     )
+    if plan is None:
+        return
     try:
         folders = await run_efs(partial(_published_folders, plan), scope=scope)
     except OSError as e:
