@@ -22,6 +22,7 @@ from cowork.api.v1.endpoints import (
     coding_personal_skills,
     coding_runtime,
     conversations,
+    content_reports,
     files,
     health,
     mindshub_account_deletion,
@@ -52,6 +53,7 @@ from cowork.api.v1.endpoints.connectors import (
     connections,
     custom,
     custom_connections,
+    custom_mcp,
     datasources,
     notion,
     oauth,
@@ -87,6 +89,9 @@ api_router.include_router(submissions.router, prefix="/connectors/submissions", 
 api_router.include_router(posthog.router, prefix="/connectors/posthog", tags=["connectors"])
 api_router.include_router(notion.router, prefix="/connectors/notion", tags=["connectors"])
 api_router.include_router(sharepoint.router, prefix="/connectors/sharepoint", tags=["connectors"])
+# Before the generic connection routes, whose /{engine}/{name}/... paths
+# would otherwise be tried first for /custom_mcp/...
+api_router.include_router(custom_mcp.router, prefix="/connectors/connections/custom_mcp", tags=["connectors"])
 api_router.include_router(connections.router, prefix="/connectors/connections", tags=["connectors"])
 api_router.include_router(datasources.router, prefix="/connectors/datasources", tags=["connectors"])
 api_router.include_router(oauth.router, prefix="/connectors/oauth", tags=["connectors"])
@@ -102,6 +107,7 @@ api_router.include_router(responses.router, prefix="/responses", tags=["response
 api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(schedules.router, prefix="/schedules", tags=["schedules"])
 api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
+api_router.include_router(content_reports.router, prefix="/content-reports", tags=["content-reports"])
 api_router.include_router(push.router, prefix="/push", tags=["push"])
 # The sharing routes first: GET /skills/sharing-capabilities must match before
 # the skills router's GET /skills/{skill_id} reads it as a skill's id.

@@ -116,8 +116,33 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  builtin-skills-manifest:
+    # A changed or new builtin skill must bump its store's version, or stores
+    # already at that version never receive it. The script refuses that, but
+    # only if something runs it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The manifest lists every version of each builtin from history.
+          fetch-depth: 0
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.30"
+          python-version: "3.12"
+
+      - name: Check the builtin skills manifest
+        env:
+          # A pull request is compared with its base branch. A push is compared
+          # with the commit before it, so of two PRs that both bumped from the
+          # same version, the second to merge fails here.
+          BUILTIN_SKILLS_BASELINE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+        run: uv run --locked python scripts/builtin_skills_shipped.py --check
+
   unit-tests:
-    needs: [collect-tests, unit-test-shards]
+    needs: [collect-tests, unit-test-shards, builtin-skills-manifest]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -125,9 +150,11 @@ jobs:
         env:
           COLLECTION_RESULT: ${{ needs.collect-tests.result }}
           SHARDS_RESULT: ${{ needs.unit-test-shards.result }}
+          MANIFEST_RESULT: ${{ needs.builtin-skills-manifest.result }}
         run: |
           test "$COLLECTION_RESULT" = success
           test "$SHARDS_RESULT" = success
+          test "$MANIFEST_RESULT" = success
 
       - uses: actions/checkout@v5
 

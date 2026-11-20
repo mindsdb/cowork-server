@@ -254,7 +254,9 @@ def test_an_unknown_plan_window_is_left_off_the_frame(monkeypatch, mindshub_mind
     assert "window" not in failed
 
 
-@pytest.mark.parametrize(("tier", "expected"), [("plus", "plus"), ("pro", "pro"), ("enterprise", None)])
+@pytest.mark.parametrize(
+    ("tier", "expected"), [("plus", "plus"), ("pro", "pro"), ("free", None), ("enterprise", None)],
+)
 def test_a_model_outside_the_tier_keeps_its_card_and_tier_on_reload(
     monkeypatch, mindshub_minds_url, conversation_id, tier, expected,
 ):

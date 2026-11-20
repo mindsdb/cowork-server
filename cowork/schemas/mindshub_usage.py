@@ -1,8 +1,23 @@
 """Wire shape for the desktop's usage read: free tokens, plan, balance, auto top up."""
 
-from typing import Literal, Optional
+from typing import Literal, Optional, get_args
 
 from cowork.schemas.base import CamelResponse
+
+# The plan values, spelled once. Every other module that checks one imports the
+# set derived from it below, so a new tier or window is one edit here. Keep this
+# module free of heavy imports: the services and the turn-failure mapping all
+# import it, and a heavy one would make a cycle.
+PaidPlanTier = Literal["plus", "pro"]
+PlanTier = Literal["free", PaidPlanTier]
+PlanStatus = Literal["active", "past_due", "canceled"]
+PlanWindowName = Literal["5h", "7d"]
+
+PLAN_TIERS: frozenset[str] = frozenset(get_args(PlanTier))
+# The tiers a model can require: the ones above Free.
+PAID_PLAN_TIERS: frozenset[str] = frozenset(get_args(PaidPlanTier))
+PLAN_STATUSES: frozenset[str] = frozenset(get_args(PlanStatus))
+PLAN_WINDOWS: frozenset[str] = frozenset(get_args(PlanWindowName))
 
 
 class MindsHubFreeTokens(CamelResponse):
@@ -66,7 +81,7 @@ class MindsHubPlanWindow(CamelResponse):
     """
 
     # "5h" or "7d".
-    window: Literal["5h", "7d"]
+    window: PlanWindowName
     # An integer 0-100, as auth sends it.
     percent_used: int
     # When the window frees up, as auth's opaque ISO string. None when nothing
@@ -81,8 +96,8 @@ class MindsHubPlan(CamelResponse):
     ``freeTokens``.
     """
 
-    tier: Literal["free", "plus", "pro"]
-    status: Literal["active", "past_due", "canceled"]
+    tier: PlanTier
+    status: PlanStatus
     renews_at: Optional[str] = None
     cancel_at_period_end: bool = False
     windows: list[MindsHubPlanWindow] = []

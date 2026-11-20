@@ -559,6 +559,8 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     verdict (turnqueue/answers.py).
     """
     _require_streaming_scope(scope)
+    from cowork.services.content_safety import check_content
+    await check_content("\n".join([req.text or "", *(req.values or [])]), purpose="input", scope=scope)
     # Keyed off the backend setting rather than local-registry presence (the
     # way /cancel and /tail check first): on the replica that owns this turn a
     # registry handle exists, but the broker it would submit to never holds a
@@ -676,6 +678,8 @@ async def add_to_running_turn(req: AddonRequest, scope: TenantScopeDep):
     if not valid_text(req.text):
         return JSONResponse(status_code=400, content={"status": "invalid_text"})
     text = req.text.strip()
+    from cowork.services.content_safety import check_content
+    await check_content(text, purpose="input", scope=scope)
     if not text:
         return queued("empty")
     if not settings.addon_routing_enabled:
