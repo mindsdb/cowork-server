@@ -242,7 +242,7 @@ jobs:
   deploy-argocd:
     # The dev and staging deploy. Records the commit and its image tag in
     # mindsdb/argocd-state, which Argo CD in newdev watches and syncs, then
-    # waits for the argocd/<env> commit status Argo CD sets once the sync is
+    # waits for the argocd/<env>/cowork-server commit status Argo CD sets once the sync is
     # healthy, so the Slack message still follows the rollout. `dev` on a PR
     # labeled `deploy-to-dev` from a branch of this repository, on every push
     # while the label stays, as `deploy-dev` did; `staging` on a staging
@@ -258,7 +258,7 @@ jobs:
           || inputs.build-environment == 'staging')
     permissions:
       contents: read
-      # write-env-state sets argocd/<env> to pending on the commit; the wait
+      # write-env-state sets argocd/<env>/cowork-server to pending on the commit; the wait
       # below reads it.
       statuses: write
     concurrency:
@@ -324,14 +324,14 @@ jobs:
         run: |
           set -euo pipefail
           for _ in $(seq 1 45); do
-            state="$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEPLOY_SHA/status" --jq ".statuses[] | select(.context == \"argocd/$DEPLOY_ENV\") | .state")"
+            state="$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEPLOY_SHA/status" --jq ".statuses[] | select(.context == \"argocd/$DEPLOY_ENV/cowork-server\") | .state")"
             case "$state" in
               success) echo "Argo CD synced $DEPLOY_SHA to $DEPLOY_ENV"; exit 0 ;;
-              failure|error) echo "::error::Argo CD reported $state for $DEPLOY_SHA in $DEPLOY_ENV: see the argocd/$DEPLOY_ENV status on the commit"; exit 1 ;;
+              failure|error) echo "::error::Argo CD reported $state for $DEPLOY_SHA in $DEPLOY_ENV: see the argocd/$DEPLOY_ENV/cowork-server status on the commit"; exit 1 ;;
             esac
             sleep 20
           done
-          echo "::error::Argo CD has not reported on $DEPLOY_SHA in $DEPLOY_ENV: see the argocd/$DEPLOY_ENV status on the commit"
+          echo "::error::Argo CD has not reported on $DEPLOY_SHA in $DEPLOY_ENV: see the argocd/$DEPLOY_ENV/cowork-server status on the commit"
           exit 1
       - name: Notify of deployment finish
         uses: mindsdb/github-actions/slack-deploy-msg@main
