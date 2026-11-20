@@ -645,6 +645,8 @@ class TestAWriteApprovalRuleHoldsATestStep:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", [
         "/v1/or%64ers", "/v1/%2Forders", "/v1//orders", "/v1/orders//", "/v1/x/%2e%2e/orders", "/v1/or%zzders",
+        "/v1/orders;x=1/7", "/v1/orders%3Bx/7", "/v1/or%2564ers", "/v1/orders%00/7", "/v1/orders%0a/7",
+        "/v1/orders%7f/7", "/v1/orders%ff/7", "/v1/orders%c3/7",
     ])
     async def test_a_path_not_written_plainly_is_refused_as_such_when_a_rule_exists(
         self, monkeypatch, personal_deployment, path,

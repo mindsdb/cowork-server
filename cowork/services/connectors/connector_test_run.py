@@ -657,7 +657,9 @@ def _written_path(url: httpx.URL) -> str:
 
 def _is_plain_path(path: str) -> bool:
     """Whether ``path`` is written in one way only: no escape that decodes to
-    an unreserved character, ``/`` or a backslash, no empty or dot segment.
+    an unreserved character, ``/``, ``;``, ``%``, a backslash or a control
+    character, no escapes that are not UTF-8 text, no ``;`` path parameter,
+    and no empty or dot segment.
 
     A server may read those spellings as the same resource as the plain one,
     while anton matches the text it is given.
@@ -665,9 +667,14 @@ def _is_plain_path(path: str) -> bool:
     for escape in _ESCAPE.findall(path):
         if len(escape) < 2 or not all(c in "0123456789abcdefABCDEF" for c in escape):
             return False
-        if chr(int(escape, 16)) in _UNRESERVED | {"/", "\\"}:
+        decoded = chr(int(escape, 16))
+        if decoded in _UNRESERVED | {"/", "\\", ";", "%"} or decoded < " " or decoded == "\x7f":
             return False
-    if "\\" in path:
+    if "\\" in path or ";" in path:
+        return False
+    try:
+        unquote(path, errors="strict")
+    except UnicodeDecodeError:
         return False
     segments = path.split("/")[1:]
     return all(segments[:-1]) and all(unquote(part) not in (".", "..") for part in segments)
