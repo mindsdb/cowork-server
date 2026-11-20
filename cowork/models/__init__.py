@@ -29,3 +29,5 @@ from cowork.models.shared_resource import (  # noqa: F401
 from cowork.models.task_object import TaskObject  # noqa: F401
 
 from cowork.models.live_app_preview import LiveAppPreview  # noqa: F401
+
+from cowork.models.content_report import ContentReport  # noqa: F401
