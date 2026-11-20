@@ -183,6 +183,9 @@ jobs:
           uv pip check --python .smoke-venv
           VENV_PY="$(pwd)/.smoke-venv/bin/python"
           cd /tmp && "$VENV_PY" -c "import cowork.server"
+          # pdf.js is fetched by the wheel build hook, not committed: a wheel
+          # without it would ship a PDF viewer that has no files to serve.
+          "$VENV_PY" -c "import sys; from cowork.services import pdf_viewer; sys.exit(0 if pdf_viewer.PDFJS_FILES else 'no pdf.js in the wheel')"
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

@@ -868,7 +868,7 @@ async def _preview(route: str, project_id: str, artifact_id: str, caller):
         project_ref=project_id,
         artifact_id=artifact_id,
     )
-    request = SimpleNamespace(path_params={"rel_path": "index.html"}, query_params={})
+    request = SimpleNamespace(path_params={"rel_path": "index.html", "token": draft_token()}, query_params={}, headers={})
     return await draft_app._draft_response(request, grant)
 
 
@@ -1172,3 +1172,21 @@ async def test_lists_stuck_on_the_general_folder_leave_database_routes_answering
     assert [task.result().status_code for task in lists] == [200] * 5
     assert search.status_code == 200, search.text
     assert models.status_code == 200, models.text
+
+
+async def test_the_org_drafts_route_gives_the_shim_no_pdf_viewer_address(owned):
+    """In org mode /drafts serves only the legacy srcdoc path, where no PDF
+    embed is replaced."""
+    project_id, artifact_id = owned
+    response = await _preview("drafts", project_id, artifact_id, _caller(tenancy.USER_A))
+    assert response.status_code == 200
+    assert 'var PDF_ASSETS = "";' in response.body.decode()
+
+
+async def test_the_org_drafts_route_serves_the_pdf_viewer_files_without_cors(owned):
+    project_id, artifact_id = owned
+    response = await artifact_workspace.serve_private_draft(
+        project_id, artifact_id, "_anton_pdf/viewer.mjs", SimpleNamespace(query_params={}), _caller(tenancy.USER_A)
+    )
+    assert response.status_code == 200
+    assert "access-control-allow-origin" not in response.headers
