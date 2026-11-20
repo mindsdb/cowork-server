@@ -24,6 +24,8 @@ _COLLECTION = "test-inventory-broad-collection"
 _SHARD = "test-inventory-broad-shard-"
 _SHARD_COUNT = 4
 _VARIABLE_CI_FIELDS = {"GITHUB_JOB", "GITHUB_RUN_ATTEMPT"}
+_HOST_RUNTIME_FIELDS = {"release", "logical_cpus"}
+_HOST_IMAGE_FIELDS = {"ImageOS", "ImageVersion"}
 
 
 def _require(condition: bool, message: str) -> None:
@@ -199,15 +201,32 @@ def run_shard(inputs: Path, output: Path, index: int) -> int:
     return subprocess.run(command, env=environment, check=False).returncode
 
 
+def _runner_differences(cohort: str, fields: Iterable[str]) -> None:
+    """Report host differences without printing metadata values."""
+    changed = sorted(fields)
+    if changed:
+        print(f"{cohort}: hosted runner metadata differs from collection ({', '.join(changed)})", file=sys.stderr)
+
+
+def _runner_identity(report: Report) -> dict[str, str]:
+    """Return CI fields that identify the runner platform and workflow run."""
+    return {key: value for key, value in report.environment.ci.items()
+            if key not in _VARIABLE_CI_FIELDS | _HOST_IMAGE_FIELDS}
+
+
 def _compatible(collection: Report, shard: Report) -> None:
     """Require compatible source and runtime while allowing carried producer attempts."""
     _require(shard.revision == shard.revision_end == collection.revision, "Shard source/configuration differs")
     _require(shard.reporter_digest == collection.reporter_digest, "Reporter differs")
-    _require(shard.environment.model_dump(exclude={"ci"}) == collection.environment.model_dump(exclude={"ci"}),
+    excluded = {"ci"} | _HOST_RUNTIME_FIELDS
+    _require(shard.environment.model_dump(exclude=excluded) == collection.environment.model_dump(exclude=excluded),
              "Shard runtime differs; rerun collection and its dependent jobs")
-    ci = lambda report: {k: v for k, v in report.environment.ci.items() if k not in _VARIABLE_CI_FIELDS}
-    _require(ci(collection) == ci(shard), "Runner/run metadata differs; rerun collection and its dependent jobs")
-    _require(all(os.environ.get(k) == v for k, v in ci(collection).items()), "Consumer runner/run metadata differs")
+    _require(_runner_identity(collection) == _runner_identity(shard),
+             "Runner/run metadata differs; rerun collection and its dependent jobs")
+    _runner_differences(shard.cohort, [
+        *(key for key in _HOST_RUNTIME_FIELDS if getattr(shard.environment, key) != getattr(collection.environment, key)),
+        *(key for key in _HOST_IMAGE_FIELDS if shard.environment.ci.get(key) != collection.environment.ci.get(key)),
+    ])
 
 
 def _coverage_data(path: Path) -> CoverageData:
@@ -258,6 +277,10 @@ def aggregate(inputs: Path, output: Path) -> dict[str, object]:
         reports.append(report)
         paths.append(path)
         attempts.append(attempt)
+    _require(all(os.environ.get(k) == v for k, v in _runner_identity(collection).items()),
+             "Consumer runner/run metadata differs")
+    _runner_differences("aggregate", (key for key in _HOST_IMAGE_FIELDS
+                                      if os.environ.get(key) != collection.environment.ci.get(key)))
     _require(all(report.invocation.coverage == reports[0].invocation.coverage for report in reports),
              "Coverage configurations differ")
     items = [case for report in reports for case in report.collection.items]

@@ -26,6 +26,14 @@ import httpx
 FALLBACK_CONNECT_SECONDS = 3.0
 #: Addresses tried per request. A cloud host can answer with a dozen or more.
 MAX_CONNECTION_ATTEMPTS = 4
+#: IPv6 ranges that carry an IPv4 address in their last 32 bits: well-known
+#: NAT64, IPv4-compatible and SIIT. A translator dials that IPv4 address.
+_EMBEDDED_IPV4_NETWORKS = (
+    ipaddress.ip_network("64:ff9b::/96"),
+    ipaddress.ip_network("::/96"),
+    ipaddress.ip_network("::ffff:0:0:0/96"),
+)
+_NOT_EMBEDDED = frozenset({ipaddress.ip_address("::"), ipaddress.ip_address("::1")})
 
 
 class EgressHostUnresolved(RuntimeError):
@@ -54,17 +62,18 @@ _WELL_KNOWN_NAT64 = ipaddress.ip_network("64:ff9b::/96")
 def is_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """Whether a dial to ``address`` can only reach the public internet.
 
-    IPv4 is ``is_global``. IPv6 is global unicast that ``is_global`` accepts,
-    or well-known NAT64 whose embedded IPv4 is public, so an IPv4-only API
+    IPv4 is ``is_global`` and not multicast, which ``is_global`` admits. IPv6
+    is global unicast that ``is_global`` accepts, or well-known NAT64 whose
+    embedded IPv4 is public by the same rule, so an IPv4-only API
     behind DNS64 still works while NAT64 to a private or metadata address
     does not. ``is_global`` alone admits ``64:ff9b::a9fe:a9fe`` and
     ``::a9fe:a9fe``, which reach 169.254.169.254; it already refuses 6to4
     (``2002::/16``) and Teredo (``2001::/32``), which the tests pin.
     """
     if address.version == 4:
-        return address.is_global
+        return address.is_global and not address.is_multicast
     if address in _WELL_KNOWN_NAT64:
-        return ipaddress.IPv4Address(int(address) & 0xFFFFFFFF).is_global
+        return is_public_address(ipaddress.IPv4Address(int(address) & 0xFFFFFFFF))
     return address in _GLOBAL_UNICAST_V6 and address.is_global
 
 
@@ -76,7 +85,7 @@ def vetted_public_addresses(
 
     Accepts an address literal as itself. Raises ``EgressHostUnresolved``
     when resolution fails and ``EgressHostNotPublic`` when the answer holds
-    any address that is not globally routable: one private address in a
+    any address that is not public (``is_public_address``): one private address in a
     mixed answer refuses the whole host, because dialing the rest would
     still leave the private one reachable on a later attempt.
 
@@ -102,6 +111,19 @@ def vetted_public_addresses(
     if not addresses or any(not is_public_address(address) for address in addresses):
         raise EgressHostNotPublic(hostname)
     return addresses
+
+
+def embedded_ipv4(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | None:
+    """Return the IPv4 address a NAT64, IPv4-compatible or SIIT address
+    carries in its last 32 bits, or None for any other address."""
+    if address.version != 6 or not any(address in net for net in _EMBEDDED_IPV4_NETWORKS):
+        return None
+    # "::" and "::1" sit inside ::/96 but are IPv6's own unspecified and loopback.
+    if address in _NOT_EMBEDDED:
+        return None
+    return ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
 
 
 def connection_attempts(

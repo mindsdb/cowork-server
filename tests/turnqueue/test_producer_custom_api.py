@@ -303,7 +303,7 @@ async def test_a_grant_at_no_version_is_refused_by_the_producer_itself(turn):
 
 
 @pytest.fixture()
-def templates(monkeypatch):
+def templates(monkeypatch, org_deployment):
     """A database holding acme_crm templates for two members of o1 and one of o2, saved the real way."""
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)

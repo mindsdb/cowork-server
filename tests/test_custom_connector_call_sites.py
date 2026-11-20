@@ -26,15 +26,16 @@ from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import DirectSaveRequest, SubmitFormRequest
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.persist import persist_connection
+from tests._connector_test_request import bearer_test_request, with_test_request
 from tests._fakes import FakeRequest
 
-HTTPBIN_FORM = {
+HTTPBIN_FORM = with_test_request({
     "form_id": "httpbin-connector",
     "title": "Connect httpbin",
     "fields": [
         {"name": "token", "label": "Bearer token", "type": "password", "required": True, "secret": True},
     ],
-}
+})
 
 
 @pytest.fixture()
@@ -122,7 +123,10 @@ class TestAgentTools:
         monkeypatch.setattr(tools, "vault_for_scope", lambda scope: vault)
         result = await tools._cowork_request_credentials(
             None,
-            {"engine": "httpbin", "title": "Finish", "fields": [], "extends_connection": "httpbin-1a2b3c4d"},
+            {
+                "engine": "httpbin", "title": "Finish", "fields": [], "extends_connection": "httpbin-1a2b3c4d",
+                "test_request": bearer_test_request(),
+            },
         )
 
         assert '"_extends_connection": "httpbin-1a2b3c4d"' in result
@@ -143,7 +147,10 @@ class TestConnectorIdStamp:
     @pytest.mark.asyncio
     async def test_an_unknown_stamped_id_routes_by_engine(self, engine):
         result = await tools._cowork_request_credentials(
-            None, {"_connector_id": "acme", "title": "Connect Acme", "fields": []},
+            None, with_test_request({
+                "_connector_id": "acme", "title": "Connect Acme",
+                "fields": [{"name": "token", "label": "Token", "type": "password", "secret": True}],
+            }),
         )
 
         block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
@@ -168,26 +175,32 @@ def org_row(engine):
 
 
 class TestOrgDefinitionsAreTheBuilders:
+    """In an organization no custom form is submitted yet: the builder's own id,
+    their stamped form and another member's same id are all refused before
+    anything is checked or staged."""
+
     @pytest.mark.asyncio
-    async def test_the_builders_id_is_known_so_a_handcrafted_form_is_refused(self, org_row, staged):
+    async def test_the_builders_handcrafted_form_on_their_id_is_refused_unstaged(self, org_row, staged):
         req = SubmitFormRequest(form_spec={"form_id": "fm_aaaaaaaaaa", "engine": "acme_crm", "fields": []})
 
         with pytest.raises(HTTPException) as exc:
             await submissions_endpoints.submit_form(req, ORG_BUILDER)
-        assert exc.value.status_code == 422
+        assert exc.value.status_code == 403
         assert staged == []
 
     @pytest.mark.asyncio
-    async def test_the_builders_stamped_form_is_checked_against_their_row(self, org_row, staged):
-        req = SubmitFormRequest(form_spec={"_connector_id": "acme_crm", "form_id": "acme_crm-connector"}, values={})
+    async def test_the_builders_stamped_form_is_refused_unstaged(self, org_row, staged):
+        req = SubmitFormRequest(
+            form_spec={"_connector_id": "acme_crm", "form_id": "acme_crm-connector"}, values={"token": "any-token"},
+        )
 
         with pytest.raises(HTTPException) as exc:
             await submissions_endpoints.submit_form(req, ORG_BUILDER)
-        assert exc.value.status_code == 400
-        assert "token" in exc.value.detail
+        assert exc.value.status_code == 403
+        assert staged == []
 
     @pytest.mark.asyncio
-    async def test_another_member_submits_the_same_id_as_an_unknown_one(self, org_row, staged):
+    async def test_another_member_submitting_the_same_id_is_refused_unstaged(self, org_row, staged):
         req = SubmitFormRequest(
             form_spec={"form_id": "fm_aaaaaaaaaa", "engine": "acme_crm", "title": "Connect Acme", "fields": [
                 {"name": "key", "label": "Key", "type": "password", "secret": True},
@@ -195,11 +208,10 @@ class TestOrgDefinitionsAreTheBuilders:
             values={"key": "any-key"},
         )
 
-        await submissions_endpoints.submit_form(req, ORG_OTHER_MEMBER)
-
-        [call] = staged
-        assert call["connector_id"] == "acme_crm"
-        assert call.get("custom_spec") is None
+        with pytest.raises(HTTPException) as exc:
+            await submissions_endpoints.submit_form(req, ORG_OTHER_MEMBER)
+        assert exc.value.status_code == 403
+        assert staged == []
 
 
 class TestSubmitForm:
@@ -243,7 +255,7 @@ class TestSubmitForm:
         req = SubmitFormRequest(
             form_spec={
                 "form_id": "fm_bbbbbbbbbb", "engine": "httpbin", "title": "httpbin", "fields": [],
-                "_extends_connection": "httpbin-1a2b3c4d",
+                "_extends_connection": "httpbin-1a2b3c4d", "test_request": bearer_test_request(),
             },
             values={"refresh": "r"},
         )
@@ -417,11 +429,11 @@ class TestWithoutABoundScope:
 class TestBuildFlowPrompt:
     @pytest.mark.asyncio
     async def test_the_connector_block_reaches_the_form(self, engine):
-        result = await tools._cowork_request_credentials(None, {
+        result = await tools._cowork_request_credentials(None, with_test_request({
             "engine": "acme", "title": "Connect Acme",
             "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}],
             "connector": {"label": "Acme", "category": "erp", "usage_notes": "Base URL is per tenant."},
-        })
+        }, field="api_key"))
 
         block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
         assert block["connector"] == {"label": "Acme", "category": "erp", "usage_notes": "Base URL is per tenant."}
@@ -479,3 +491,52 @@ class TestHandcraftedFormsSayHowToFetchData:
         text = skill.read_text()
         assert "every handcrafted form" in text
         assert _DATA_SAMPLE in text
+
+
+class TestHandcraftedFormsCarryATestRequest:
+    """On a single-user install Cowork tests a handcrafted form only through
+    its test_request, so the agent is told to write one, and where."""
+
+    def test_both_no_match_answers_ask_for_a_test_request(self):
+        for text in (tools._BUILD_CUSTOM_CONNECTOR, tools._NO_CUSTOM_CONNECTOR):
+            assert tools._TEST_REQUEST_NOTE in text
+        note = tools._TEST_REQUEST_NOTE
+        assert "`test_request`" in note and "never in the host" in note and "ask the user for it first" in note
+        assert "signed requests or client certificates" in note
+
+    def test_the_schema_offers_it_on_the_form_and_on_each_method(self):
+        props = tools._REQUEST_CREDENTIALS_SCHEMA["properties"]
+        method_props = props["methods"]["items"]["properties"]
+
+        for schema in (props["test_request"], method_props["test_request"]):
+            assert set(schema["properties"]) == {"token", "data"} and schema["required"] == ["data"]
+            assert {"url", "headers", "basic_auth", "json_body", "token_field"} <= set(schema["properties"]["data"]["properties"])
+
+    @pytest.mark.asyncio
+    async def test_the_tool_no_longer_says_the_server_saves_on_its_own(self, engine):
+        form = with_test_request({
+            "engine": "acme", "title": "Connect Acme",
+            "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}],
+        }, field="api_key")
+
+        result = await tools._cowork_request_credentials(None, form)
+
+        assert "saves the credentials automatically" not in " ".join(result.split())
+        assert "once the user confirms its result" in " ".join(result.split())
+
+    @pytest.mark.asyncio
+    async def test_the_rendered_form_keeps_its_test_request(self, engine):
+        form = with_test_request({
+            "engine": "acme", "title": "Connect Acme",
+            "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}],
+        }, field="api_key")
+
+        result = await tools._cowork_request_credentials(None, form)
+
+        block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
+        assert block["test_request"] == form["test_request"]
+
+    def test_the_connect_skill_asks_for_a_test_request(self):
+        text = (Path(tools.__file__).parent / "skills" / "connect-datasource" / "SKILL.md").read_text()
+        assert "Give every handcrafted form a `test_request`" in text
+        assert "confirms what came back before anything is saved" in text

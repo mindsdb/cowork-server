@@ -52,12 +52,16 @@ Classify the job first:
 - FORM: inspect, fill, flatten, or verify PDF forms.
 - SECURITY: encrypt, decrypt with a user-provided password, or preserve permissions.
 - IMAGES: extract embedded images or convert pages to images.
-- OCR: process scanned PDFs and make them searchable when supported.
+- OCR: read scanned pages with the model (see Scanned PDFs and OCR).
 
 ## Common tool patterns
 
-Use whatever PDF tools the app provides. When code execution is available,
-these are reliable patterns:
+Use these Python libraries in the scratchpad, not command-line tools such as
+`pdftotext`, `qpdf` or `pdfimages`: Cowork on the web has none of them, and a
+person's computer often doesn't either. `pypdf`, `pdfplumber` and `pypdfium2`
+are installed on Cowork on the web. Put every library a cell imports in that
+cell's `packages` array: one already installed is skipped, and a missing one is
+installed before the cell runs.
 
 ### Read page count and text
 
@@ -152,7 +156,25 @@ with pdfplumber.open("document.pdf") as pdf:
                 print(row)
 ```
 
+### Render a page to an image
+
+Use this to look at a page, check a layout, or read a scanned page.
+
+```python
+import pypdfium2 as pdfium
+
+pdf = pdfium.PdfDocument("document.pdf")
+page = pdf[0]  # first page
+# Long side about 1600 px whatever the page size: a fixed scale can render a
+# poster-size page to gigabytes and stop the scratchpad.
+image = page.render(scale=1600 / max(page.get_width(), page.get_height())).to_pil()
+image.save("page_1.png")
+```
+
 ### Create a PDF
+
+Cowork on the web doesn't have `reportlab` installed: put `reportlab` in the
+cell's `packages` array (it is skipped where it is already installed).
 
 ```python
 from reportlab.lib.pagesizes import letter
@@ -218,8 +240,12 @@ the table carefully.
 For scanned PDFs:
 
 - Treat the PDF as image-based until text extraction proves otherwise.
-- Convert pages to images if OCR is needed and supported.
-- OCR each page separately so page numbers remain traceable.
+- There is no OCR engine such as tesseract. Read scanned pages with the model.
+  If `reading-files` is listed in your skills, recall it: it renders each page
+  with `pypdfium2`, sends it to `get_llm()` as an image, saves the text page by
+  page, and asks before reading more than 20 pages. Otherwise render each page
+  as above (list `pypdfium2` in `packages`) and send it to `get_llm()`.
+- Read each page separately so page numbers remain traceable.
 - Mention uncertainty when the scan is low-resolution, skewed, handwritten, or noisy.
 - After OCR, search for important terms and spot-check against the page image.
 
@@ -243,35 +269,6 @@ Examples:
 
 - use `H<sub>2</sub>O` instead of Unicode subscript 2 in rich paragraph tools
 - use `x<super>2</super>` instead of Unicode superscript 2 in rich paragraph tools
-
-## Command-line equivalents when available
-
-Useful operations:
-
-```bash
-# Extract text
-pdftotext input.pdf output.txt
-pdftotext -layout input.pdf output.txt
-pdftotext -f 1 -l 5 input.pdf output.txt
-
-# Merge
-qpdf --empty --pages file1.pdf file2.pdf -- merged.pdf
-
-# Split ranges
-qpdf input.pdf --pages . 1-5 -- pages1-5.pdf
-qpdf input.pdf --pages . 6-10 -- pages6-10.pdf
-
-# Rotate page 1
-qpdf input.pdf output.pdf --rotate=+90:1
-
-# Decrypt with a user-provided password
-qpdf --password=mypassword --decrypt encrypted.pdf decrypted.pdf
-
-# Extract images
-pdfimages -j input.pdf output_prefix
-```
-
-Use command-line tools only when available in the app environment.
 
 ## Editing and coordinates
 

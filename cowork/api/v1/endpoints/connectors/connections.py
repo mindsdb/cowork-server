@@ -24,6 +24,7 @@ from cowork.schemas.connectors import (
 from cowork.services.connectors import app_held
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.custom_mcp import is_connection_id, is_custom_mcp
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
     DeveloperProviderUnavailable,
@@ -33,7 +34,7 @@ from cowork.services.connectors.identity import oauth_default_label
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, SharedConnectionError
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
-from cowork.services.connectors.persist import own_vault_root, persist_connection, vault_for_scope
+from cowork.services.connectors.persist import own_vault_for_scope, own_vault_root, persist_connection, vault_for_scope
 from cowork.services.connectors.sharepoint import ENGINE as SHAREPOINT, generic_setup_refusal
 
 _log = logging.getLogger("cowork.connectors.connections")
@@ -181,6 +182,7 @@ def validate_and_save_developer_connection(body: DirectSaveRequest, scope: Scope
     using ``/save``.  This route is for the personal-token fallback shown when
     a desktop build has no hosted OAuth client configured.
     """
+    _refuse_custom_mcp(body.connector_id)
     _refuse_sharepoint(body.connector_id, scope)
     try:
         identity = validate_developer_connection(body.connector_id, body.method, body.values)
@@ -193,10 +195,43 @@ def validate_and_save_developer_connection(body: DirectSaveRequest, scope: Scope
     return _persist_direct_connection(body, scope, values)
 
 
+def _refuse_new_slack_mcp(body: DirectSaveRequest, scope: TenantScope) -> None:
+    """While Slack's `mcp` method is switched off, refuse a new connection with
+    it; a reconnect of an existing one still saves."""
+    if body.connector_id != "slack" or body.method != "mcp" or OAuthSettings().slack_connector_enabled:
+        return
+    name = body.name.strip()
+    existing = ConnectionsService(scope).runtime_fields("slack", name) if body.replace_existing and name else None
+    if existing is not None and existing.get("_method") == "mcp":
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Slack sign-in is not available in this build yet.")
+
+
 def _refuse_sharepoint(connector_id: str, scope: TenantScope) -> None:
     """Refuse SharePoint here: only its own routes save it, after checking the key with Microsoft."""
     if connector_id == SHAREPOINT:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=generic_setup_refusal(scope.org_mode))
+
+
+def _refuse_custom_mcp(engine: str) -> None:
+    """409 for ``custom_mcp``: its settings and token are written only through
+    its own app-secret routes, never through a generic connection writer."""
+    if is_custom_mcp(engine):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="custom_mcp_reserved")
+
+
+def _names_custom_connection(scope: TenantScope, engine: str, name: str) -> bool:
+    """Whether ``engine``/``name`` reach a custom MCP connection: by their own
+    form, or by the record the vault resolves them to, which other spellings
+    (case, punctuation the file name drops) reach on a case-insensitive disk."""
+    if is_custom_mcp(engine) and is_connection_id(name):
+        return True
+    try:
+        record = own_vault_for_scope(scope).read_record(engine, name)
+    except OSError:
+        # Unreadable here means unreadable to the delete too; ask for the secret.
+        return True
+    return bool(record) and is_custom_mcp(str(record.get("engine"))) and is_connection_id(str(record.get("name")))
 
 
 def _persist_direct_connection(
@@ -204,7 +239,9 @@ def _persist_direct_connection(
     scope: TenantScope,
     values: dict,
 ) -> dict[str, object]:
+    _refuse_custom_mcp(body.connector_id)
     _refuse_sharepoint(body.connector_id, scope)
+    _refuse_new_slack_mcp(body, scope)
     with unit_session(scope=scope) as session:
         known = ConnectorCatalog(session).get_connector(body.connector_id)
     if known is None:
@@ -270,6 +307,10 @@ async def delete_connection(engine: str, name: str, scope: ScopeDep, request: Re
         # credential proxy as the other OAuth Connector Lifecycle endpoints.
         await auth_proxy.proxy_delete(engine, name, request, OAuthSettings())
         return
+    if _names_custom_connection(scope, engine, name):
+        # Deleting it drops its held settings, after which the app removes its
+        # keychain entries; only the app, which revokes the token first, may.
+        require_app_secret(request)
     _refuse_unchangeable(scope, engine, name)
     try:
         # revoke() makes a blocking provider HTTP call (up to its own 10s
@@ -319,6 +360,7 @@ def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: 
     Guarded explicitly so a future org-mode caller added here by mistake fails
     loudly instead of silently writing to the wrong (non-durable) vault.
     """
+    _refuse_custom_mcp(engine)
     if scope.org_mode:
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
@@ -456,6 +498,7 @@ async def patch_access_mode(engine: str, name: str, body: PatchAccessModeBody, s
     (see the HubSpot blueprint tab, Stage 0). No PKCE, no reconnect, no
     provider round-trip — a purely local write, same shape as
     patch_picked_files above."""
+    _refuse_custom_mcp(engine)
     if body.access_mode not in _ACCESS_MODES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -492,6 +535,7 @@ def put_app_held(engine: str, name: str, body: AppHeldBody, scope: ScopeDep):
     (app_held). Once both are held, they are removed from the vault file; the
     app keeps the mode in the OS keychain and can push both again after a
     restart."""
+    _refuse_custom_mcp(engine)
     if scope.org_mode or not app_held.active():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="app_secret_protocol_off")
     _refuse_unchangeable(scope, engine, name)
