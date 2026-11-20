@@ -862,6 +862,51 @@
     return !isNaN(when) && when <= Date.now();
   }
 
+  /* The page's own height, for the app to fit a page that is taller than its
+     frame and scrolls nowhere: a deck sized from the frame's width with its
+     overflow hidden is cut off below, out of reach. `content` is the page's
+     full height, `locked` whether the root or body hide their overflow (so
+     nothing scrolls). Sent after load and whenever the page or frame resizes,
+     only when it changed. */
+  try {
+    var lastSize = '', sizeTimer = 0;
+    var hidesOverflow = function (el) {
+      if (!el) return false;
+      var value = window.getComputedStyle(el).overflowY;
+      return value === 'hidden' || value === 'clip';
+    };
+    var sendSize = function () {
+      var root = document.documentElement, body = document.body;
+      if (!root || !body) return;
+      var size = {
+        type: 'size',
+        width: Math.round(window.innerWidth || 0),
+        height: Math.round(window.innerHeight || 0),
+        content: Math.ceil(Math.max(root.scrollHeight || 0, body.scrollHeight || 0)),
+        locked: hidesOverflow(root) || hidesOverflow(body)
+      };
+      var text = JSON.stringify(size);
+      if (text === lastSize) return;
+      lastSize = text;
+      post(size);
+    };
+    var scheduleSize = function () {
+      clearTimeout(sizeTimer);
+      sizeTimer = setTimeout(function () {
+        try { sendSize(); } catch (inner) { /* never break the page */ }
+      }, 150);
+    };
+    window.addEventListener('load', scheduleSize);
+    window.addEventListener('resize', scheduleSize);
+    if (typeof ResizeObserver === 'function') {
+      var watchBody = function () {
+        if (document.body) new ResizeObserver(scheduleSize).observe(document.body);
+      };
+      if (document.body) watchBody();
+      else document.addEventListener('DOMContentLoaded', watchBody);
+    }
+  } catch (e) { /* size reports are best effort */ }
+
   try {
     Object.defineProperty(document, 'cookie', {
       configurable: true,
