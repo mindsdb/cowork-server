@@ -629,6 +629,68 @@ class TestAWriteApprovalRuleHoldsATestStep:
         assert [r.url.path for r in api.requests] == ["/oauth2/token"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("rule", [
+        "POST https://api.example.com/v1/orders/**", "POST https://api.example.com/v1/orders",
+    ], ids=["glob", "exact path"])
+    @pytest.mark.parametrize("path", [
+        "/v1/orders", "/v1/orders/", "/v1/or%64ers", "/v1/or%64ers/", "/v1/%6Frders", "/v1/or%64ers%2f",
+        "/v1/x/%2e%2e/orders", "/v1/%2Forders", "/v1//orders", "//v1/orders", "/v1/./orders", "/v1/a/../orders",
+        "/v1/orders//", "/v1\\orders", "/v1/orders%2F",
+    ])
+    async def test_a_held_path_is_refused_however_it_is_spelled(self, monkeypatch, personal_deployment, rule, path):
+        hold(monkeypatch, rule)
+        api = await refused("data step", with_url(f"https://api.example.com{path}"))
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", [
+        "/v1/or%64ers", "/v1/%2Forders", "/v1//orders", "/v1/orders//", "/v1/x/%2e%2e/orders", "/v1/or%zzders",
+    ])
+    async def test_a_path_not_written_plainly_is_refused_as_such_when_a_rule_exists(
+        self, monkeypatch, personal_deployment, path,
+    ):
+        hold(monkeypatch, "POST https://api.example.com/v1/orders/**")
+        api = await refused("written in a way a connection test does not accept", with_url(f"https://api.example.com{path}"))
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("url", [
+        "https://user:pw@api.example.com/v1/orders/7", "https://api.example.com:443/v1/orders/7",
+        "https://API.EXAMPLE.COM./V1/ORDERS/7?x=1#f", "https://api.example.com/v1/orders/",
+    ])
+    async def test_a_plain_held_url_is_refused_as_held(self, monkeypatch, personal_deployment, url):
+        hold(monkeypatch, "POST https://api.example.com/v1/orders/**\nPOST https://api.example.com/v1/orders")
+        api = await refused("needs an approval", with_url(url))
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_an_unheld_plain_url_on_the_same_host_runs(self, monkeypatch, personal_deployment):
+        hold(monkeypatch, "POST https://api.example.com/v1/orders/**")
+        outcome, api = await run(request=with_url("https://api.example.com/v1/query"))
+        assert outcome.preview is not None and len(api.requests) == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("value", "glob"), [("a b", "a?b"), ("caf\u00e9", "caf?")], ids=["space", "non-ascii"])
+    async def test_an_encoded_value_in_the_path_is_accepted_and_judged_decoded(
+        self, monkeypatch, personal_deployment, value, glob,
+    ):
+        request = with_url("https://api.example.com/v1/{{client_id}}/query")
+        values = {**VALUES, "client_id": value}
+        hold(monkeypatch, "POST https://api.example.com/v1/orders/**")
+        outcome, _api = await run(request, values)
+        assert outcome.preview is not None
+
+        hold(monkeypatch, f"POST https://api.example.com/v1/{glob}/query")
+        api = await refused("needs an approval", request, values)
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_single_user_install_does_not_judge_the_spelling(self, monkeypatch):
+        hold(monkeypatch, "POST https://api.example.com/v1/orders/**")
+        outcome, _api = await run(request=with_url("https://api.example.com/v1/or%64ers"))
+        assert outcome.preview is not None
+
+    @pytest.mark.asyncio
     async def test_an_unheld_post_query_on_the_same_host_still_runs(self, monkeypatch, personal_deployment):
         hold(monkeypatch, "POST https://api.example.com/integration/V1/orders/*\nPUT https://api.example.com/**")
         outcome, api = await run()

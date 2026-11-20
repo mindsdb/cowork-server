@@ -643,22 +643,56 @@ def held_write_rules() -> tuple[HttpWriteRule, ...]:
     return parse_http_write_rules(settings.write_approval_http)
 
 
-def _held_urls(url: httpx.URL) -> list[str]:
-    """The spellings of ``url`` a rule may be written against.
+_UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+_ESCAPE = re.compile(r"%(.{0,2})")
 
-    anton matches the text it is given, so a trailing dot on the host or an
-    explicit default port would slip past a rule written without it. httpx
-    drops a default port from its text, so the spellings are built by hand.
-    """
+
+def _written_path(url: httpx.URL) -> str:
+    """The path as the URL's text spells it: empty when it has none, with no query or fragment."""
     text = str(url)
     start = len(f"{url.scheme}://")
     end = next((i for i in range(start, len(text)) if text[i] in "/?#"), len(text))
+    return re.split(r"[?#]", text[end:], maxsplit=1)[0]
+
+
+def _is_plain_path(path: str) -> bool:
+    """Whether ``path`` is written in one way only: no escape that decodes to
+    an unreserved character, ``/`` or a backslash, no empty or dot segment.
+
+    A server may read those spellings as the same resource as the plain one,
+    while anton matches the text it is given.
+    """
+    for escape in _ESCAPE.findall(path):
+        if len(escape) < 2 or not all(c in "0123456789abcdefABCDEF" for c in escape):
+            return False
+        if chr(int(escape, 16)) in _UNRESERVED | {"/", "\\"}:
+            return False
+    if "\\" in path:
+        return False
+    segments = path.split("/")[1:]
+    return all(segments[:-1]) and all(unquote(part) not in (".", "..") for part in segments)
+
+
+def _held_urls(url: httpx.URL) -> list[str]:
+    """The spellings of ``url`` a rule may be written against.
+
+    anton matches the text it is given and says a service passes it decoded
+    and normalized, without the query or fragment. So the path is tried
+    decoded and as written, with and without a trailing slash, and the
+    authority without userinfo, with and without its default port and a
+    trailing dot on the host.
+    """
+    written = _written_path(url)
+    paths = {written, unquote(written)}
+    if len(written) > 1:
+        paths |= {path.rstrip("/") if path.endswith("/") else path + "/" for path in paths}
     ports = [url.port] if url.port is not None else [None, {"https": 443, "http": 80}.get(url.scheme)]
     hosts = {url.host, url.host.rstrip(".")}
     return [
-        f"{url.scheme}://{f'[{host}]' if ':' in host else host}{f':{port}' if port else ''}{text[end:]}"
+        f"{url.scheme}://{f'[{host}]' if ':' in host else host}{f':{port}' if port else ''}{path}"
         for host in hosts
         for port in ports
+        for path in paths
     ]
 
 
@@ -666,9 +700,18 @@ def refuse_held_step(step: _Step, rules: tuple[HttpWriteRule, ...]) -> None:
     """Refuse a step a write-approval rule would hold: a connection test shows
     no approval card, so it cannot send what needs one.
 
+    With no rule there is nothing to slip past, so an address is judged only
+    when rules exist.
+
     Raises:
         ConnectorTestError: naming the step, never the URL.
     """
+    if not rules:
+        return
+    if not _is_plain_path(_written_path(step.url)):
+        raise ConnectorTestError(
+            f"The {step.name} step's address is written in a way a connection test does not accept."
+        )
     for url in _held_urls(step.url):
         if any(http_write_rule_matches(rule, method=step.method, url=url) for rule in rules):
             raise ConnectorTestError(
