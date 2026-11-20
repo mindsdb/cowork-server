@@ -29,6 +29,7 @@ from cowork.services.connectors.connector_test_flow import (
 from cowork.services.connectors.connector_test_run import ConnectorTestError, placeholder_names, request_endpoints
 from cowork.services.connectors.custom_connectors import (
     NEEDS_REBUILD_FOR_MEMBER,
+    NO_CUSTOM_IN_ORG,
     custom_test_is_code_checked,
     test_request_for,
 )
@@ -124,10 +125,6 @@ def _is_oauth_grant(form_spec: dict, method: str | None, credentials: dict) -> b
 
 
 _NO_TEST_REQUEST = "This form has no test request, so its connection cannot be tested."
-_NO_CUSTOM_IN_ORG = (
-    "Custom connectors cannot be connected in an organization yet. "
-    "Use a connector from Connect Apps and Data."
-)
 
 
 def _method_fields(form_spec: dict, method: str | None) -> list:
@@ -416,7 +413,7 @@ class ProbeHandler:
                 # sends the saved value.
                 from_saved = set(probe_credentials) - set(credentials)
                 if not custom_test_is_code_checked():
-                    refusal = _NO_CUSTOM_IN_ORG
+                    refusal = NO_CUSTOM_IN_ORG
                 elif test_request is None:
                     refusal = NEEDS_REBUILD_FOR_MEMBER if spec is not None else _NO_TEST_REQUEST
                 else:

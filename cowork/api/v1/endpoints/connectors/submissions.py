@@ -21,6 +21,7 @@ from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
 from cowork.services.connectors.custom_connectors import (
     NEEDS_REBUILD_FOR_MEMBER,
+    NO_CUSTOM_IN_ORG,
     UnstorableFormError,
     check_handcrafted_form,
     custom_test_is_code_checked,
@@ -57,10 +58,6 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 _DATABASE_CATEGORY = "database"
 _GONE = "This test result is no longer waiting. Submit the form again."
-_NO_CUSTOM_IN_ORG = (
-    "Custom connectors cannot be connected in an organization yet. "
-    "Use a connector from Connect Apps and Data."
-)
 
 
 def _resolve_fields(spec, method_id: str | None) -> list:
@@ -261,7 +258,7 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScope) -> StreamingRe
     if scope.org_mode and (is_custom or (known is None and req.form_spec)):
         # Nothing tests a custom connector in an organization yet; refused
         # before anything is checked or staged, so no value is kept.
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_CUSTOM_IN_ORG)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=NO_CUSTOM_IN_ORG)
     if known is not None and stamped and extends_name is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

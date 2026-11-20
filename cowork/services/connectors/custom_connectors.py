@@ -57,6 +57,13 @@ class UnstorableFormError(ValueError):
     """A handcrafted form that cannot be kept as a custom connector."""
 
 
+#: What a custom connector's form is answered with in org mode, where nothing tests one.
+NO_CUSTOM_IN_ORG = (
+    "Custom connectors cannot be connected in an organization yet. "
+    "Use a connector from Connect Apps and Data."
+)
+
+
 def custom_test_is_code_checked() -> bool:
     """Whether a custom connector's connection test is decided by code, from
     what its test request returned, and not by the model probe.
