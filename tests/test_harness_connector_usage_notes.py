@@ -161,6 +161,40 @@ async def test_a_custom_connectors_notes_reach_the_session_config(monkeypatch, t
             db.commit()
 
 
+async def test_a_custom_connectors_described_fields_reach_the_agents_prompt(monkeypatch, tmp_path):
+    from anton.core.datasources.data_vault import LocalDataVault
+    from anton.utils.datasources import build_datasource_context
+    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+    from cowork.db.session import get_open_session
+    from cowork.models.custom_connector import CustomConnector
+
+    with get_open_session() as db:
+        row = ScopedSession(db, LOCAL_SCOPE).add(CustomConnector(
+            connector_id="probed_api", label="Probed API", spec={"form_id": "x", "fields": [
+                {"name": "base_url", "label": "Base URL", "type": "text"},
+                {"name": "resource_endpoint", "label": "Resource endpoint", "type": "text",
+                 "description": "For the connection check only, not where data is queried."},
+            ]},
+        ))
+        db.commit()
+        row_id = row.id
+    vault = LocalDataVault(tmp_path / "vault")
+    vault.save("probed_api", "main", {"base_url": "https://api.example.com", "resource_endpoint": "/v1/metadata"})
+
+    try:
+        async with _session_config(monkeypatch, vault) as config:
+            prompt = build_datasource_context(vault, usage_notes=config.connector_usage_notes)
+    finally:
+        with get_open_session() as db:
+            db.delete(db.get(CustomConnector, row_id))
+            db.commit()
+
+    notes_block = prompt[prompt.index("### Usage notes:"):]
+    assert "DS_PROBED_API_MAIN__RESOURCE_ENDPOINT" in prompt
+    assert "`__RESOURCE_ENDPOINT`: For the connection check only, not where data is queried." in notes_block
+    assert "/v1/metadata" not in prompt
+
+
 async def test_drive_notes_reach_the_session_config_without_picked_files(monkeypatch, tmp_path):
     async with _session_config(monkeypatch, _drive_vault(tmp_path)) as config:
         notes = config.connector_usage_notes["google_drive"]
