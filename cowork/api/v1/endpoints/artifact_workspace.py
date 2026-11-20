@@ -21,7 +21,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, Field, StrictBool
+from pydantic import BaseModel, Field, StrictBool, model_validator
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
@@ -1519,7 +1519,16 @@ async def _call_stats_service(scope: TenantScope, folder: Path, call: Callable[.
 
 
 class _StatsTrackingBody(BaseModel):
-    enabled: StrictBool
+    """At least one setting; an omitted one stays as it is."""
+
+    enabled: StrictBool | None = None
+    require_email: StrictBool | None = None
+
+    @model_validator(mode="after")
+    def _one_setting(self):
+        if self.enabled is None and self.require_email is None:
+            raise ValueError("Send enabled, require_email or both")
+        return self
 
 
 @router.get("/workspace/{project_ref}/{artifact_id}/stats")
@@ -1549,7 +1558,8 @@ async def set_artifact_stats_tracking(
     body: _StatsTrackingBody,
     scope: ScopeDep,
 ):
-    """Turn view recording on or off for this published artifact. Owner-only.
+    """Turn viewer analytics, or the email gate, on or off for this published
+    artifact. Owner-only. Returns `{"tracking": bool, "require_email": bool}`.
 
     The publishing service rewrites the artifact's metadata file to store the
     flag, so the request holds the publish lock: a live sync or autopublish
@@ -1571,8 +1581,10 @@ async def set_artifact_stats_tracking(
             detail="Publishing is busy right now. Try again in a moment.",
         )
     try:
-        tracking = await _call_stats_service(
-            scope, folder, partial(stats.set_tracking, enabled=body.enabled),
+        settings = await _call_stats_service(
+            scope,
+            folder,
+            partial(stats.set_tracking, enabled=body.enabled, require_email=body.require_email),
         )
     finally:
         # Shielded for the same reason: an unreleased lock blocks publishing
@@ -1581,7 +1593,47 @@ async def set_artifact_stats_tracking(
             await run_efs(
                 partial(release, folder.parent, folder.name), scope=scope, deadline=False
             )
-    return {"tracking": tracking}
+    return settings
+
+
+@router.get("/workspace/{project_ref}/{artifact_id}/stats/viewers/{viewer_id}")
+async def read_artifact_stats_viewer(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    viewer_id: str,
+    scope: ScopeDep,
+):
+    """One viewer's visits and per-section times, as the publishing service
+    returns them. Owner-only, like the stats themselves."""
+    await require_product_permission(scope, "artifact.manage")
+    from cowork.services import artifact_stats as stats
+
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    return await _call_stats_service(
+        scope, folder, partial(stats.fetch_viewer, viewer_id=viewer_id)
+    )
+
+
+@router.delete(
+    "/workspace/{project_ref}/{artifact_id}/stats",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_artifact_stats(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    scope: ScopeDep,
+):
+    """Delete this artifact's viewer analytics (views, visits, viewers). Owner-only."""
+    await require_product_permission(scope, "artifact.manage")
+    from cowork.services import artifact_stats as stats
+
+    _source, folder, _metadata, _capabilities = await _owner_workspace(
+        scope, project_ref, artifact_id
+    )
+    await _call_stats_service(scope, folder, stats.delete_stats)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 def _open_comments(
