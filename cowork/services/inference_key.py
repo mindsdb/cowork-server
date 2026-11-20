@@ -78,7 +78,11 @@ def refresh_inference_key(token: str, organization_id: str) -> None:
         _refresh(token, organization_id, deadline)
     except Exception as exc:
         # A failed settings read must not fail the hand-over or end the retries.
-        logger.warning("Could not refresh the turn key for organization %s: %s", organization_id, exc)
+        # Fields, not %s args: the structured logger drops positional values.
+        logger.warning(
+            "Could not refresh the turn key",
+            extra={"event": "turn_key_refresh_failed", "organization_id": organization_id, "error_type": type(exc).__name__},
+        )
         _schedule_retry()
     finally:
         _mint_lock.release()
@@ -116,7 +120,13 @@ def _refresh(token: str, organization_id: str, deadline: float) -> None:
         if response.status_code in _PERMANENT_REFUSALS and (response.status_code == 400 or _code(response)):
             # A retry a minute later gets the same answer; the next hand-over tries again.
             logger.warning(
-                "Auth refused a turn key for organization %s: %s", organization_id, _code(response)
+                "Auth refused a turn key",
+                extra={
+                    "event": "turn_key_refused",
+                    "organization_id": organization_id,
+                    "status_code": response.status_code,
+                    "reason": _code(response),
+                },
             )
             _drop_key_unless_for(organization_id)
             return
@@ -124,7 +134,13 @@ def _refresh(token: str, organization_id: str, deadline: float) -> None:
         key = response.json()["key"]
     except Exception as exc:
         logger.warning(
-            "Could not mint a turn key for organization %s: %s", organization_id, exc
+            "Could not mint a turn key",
+            extra={
+                "event": "turn_key_mint_failed",
+                "organization_id": organization_id,
+                "error_type": type(exc).__name__,
+                "status_code": getattr(getattr(exc, "response", None), "status_code", None),
+            },
         )
         _schedule_retry()
         _drop_key_unless_for(organization_id)
@@ -290,8 +306,14 @@ def _revoke_instance(token: str, instance_id: str) -> None:
             timeout=_REVOKE_TIMEOUT_S,
         )
     except Exception as exc:
-        logger.warning("Could not revoke turn key %s: %s", instance_id, exc)
+        logger.warning(
+            "Could not revoke a turn key",
+            extra={"event": "turn_key_revoke_failed", "instance_id": instance_id, "error_type": type(exc).__name__},
+        )
         return
     if not response.is_success:
         # It stays live until it expires; worth seeing, since a scratchpad may still hold it.
-        logger.warning("Auth refused to revoke turn key %s: HTTP %s", instance_id, response.status_code)
+        logger.warning(
+            "Auth refused to revoke a turn key",
+            extra={"event": "turn_key_revoke_refused", "instance_id": instance_id, "status_code": response.status_code},
+        )

@@ -1,5 +1,6 @@
 """The turn key that pins the desktop's LLM billing to its mounted organization."""
 
+import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.runtime_credential import InferenceKey
 from cowork.services import inference_key
+from tests._logging_assertions import assert_log_fields
 
 ORG_A = "org-a"
 ORG_B = "org-b"
@@ -251,13 +253,41 @@ class TestRefresh:
         assert revoked == {first.instance_id, runtime_credential.get_inference_key().instance_id}
         assert inference_key._installed == {}
 
-    def test_a_failed_revoke_is_logged(self, http, caplog):
+    def test_a_refused_revoke_logs_the_key_and_status(self, http, owned_logger):
+        logged = owned_logger(inference_key.logger.name, level=logging.WARNING)
         http.delete.return_value.is_success = False
         http.delete.return_value.status_code = 401
 
-        inference_key.revoke_inference_key("jwt", _key())
+        inference_key.revoke_inference_key("jwt", _key(instance_id="desktop-abc"))
 
-        assert "HTTP 401" in caplog.text
+        assert_log_fields(
+            logged.output(), event="turn_key_revoke_refused", instance_id="desktop-abc", status_code=401
+        )
+
+    def test_a_refused_mint_logs_the_org_and_code(self, http, owned_logger):
+        logged = owned_logger(inference_key.logger.name, level=logging.WARNING)
+        http.post.return_value.status_code = 403
+        http.post.return_value.json.return_value = {"code": "permission_denied"}
+
+        inference_key.refresh_inference_key("jwt", ORG_A)
+
+        assert_log_fields(
+            logged.output(),
+            event="turn_key_refused",
+            organization_id=ORG_A,
+            status_code=403,
+            reason="permission_denied",
+        )
+
+    def test_a_failed_mint_logs_the_org_and_error_type(self, http, owned_logger):
+        logged = owned_logger(inference_key.logger.name, level=logging.WARNING)
+        http.post.side_effect = RuntimeError("auth down")
+
+        inference_key.refresh_inference_key("jwt", ORG_A)
+
+        assert_log_fields(
+            logged.output(), event="turn_key_mint_failed", organization_id=ORG_A, error_type="RuntimeError"
+        )
 
     def test_sign_out_stops_the_retries_and_resets_the_backoff(self, http):
         with patch.object(inference_key.threading, "Timer") as timer:
