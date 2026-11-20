@@ -33,6 +33,7 @@ from cowork.api.v1.endpoints.artifact_workspace import ArtifactIdDep
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.units import FilesystemBusy, run_db, run_efs
+from cowork.docs import republish
 from cowork.docs.export import CONVERTED_FORMATS, MEDIA_TYPES, export_bytes, export_filename, offered_formats
 from cowork.services.artifact_export import ExportRefusal, ExportRefused, export_slot, org_export_refused
 from cowork.services.artifact_identity import opened_artifact_folder
@@ -94,6 +95,10 @@ async def _resolve(scope: TenantScope, project_ref: str, artifact_id: str, *, wr
     return source, folder, metadata, is_own
 
 
+def _project_id(source) -> str | None:
+    return str(source.project_id) if source.project_id else None
+
+
 def _card(scope: TenantScope, source, folder: Path) -> dict[str, Any] | None:
     """The doc's artifact card: its publish state, access and paths, as the library shows them (owner only)."""
     try:
@@ -147,6 +152,10 @@ async def create_blank_doc(body: _CreateBody, scope: TenantScope = Depends(get_t
         lambda unit: record_artifact_owner(unit, source.project_id, made.slug, scope.user_id, action="create"),
         scope=scope,
     )
+    # After the owner is recorded: the publish resolves the owner to key it.
+    republish.schedule(made.folder, scope=scope,
+                      project_id=_project_id(source),
+                      artifact_id=made.artifact_id)
     card = await run_efs(partial(_card, scope, source, made.folder), scope=scope)
     return {"artifactId": made.artifact_id, "slug": made.slug, "doc": made.doc, "card": card}
 
@@ -238,14 +247,15 @@ async def edit_doc(
     project_ref: str, artifact_id: ArtifactIdDep, body: _OpsBody, scope: TenantScope = Depends(get_tenant_scope)
 ):
     await require_product_permission(scope, "artifact.manage")
-    _source, folder, _metadata, _is_own = await _resolve(scope, project_ref, artifact_id, write=True)
+    source, folder, _metadata, _is_own = await _resolve(scope, project_ref, artifact_id, write=True)
     try:
         doc, result = await run_efs(
             lambda: apply(folder, body.ops, tab=body.tab, by="user", if_rev=body.ifRev), scope=scope
         )
     except DocError as err:
         raise _doc_error(err) from err
-    after_write(folder, doc, result, by="user", scope=scope, client_id=body.clientId)
+    after_write(folder, doc, result, by="user", scope=scope, client_id=body.clientId,
+                project_id=_project_id(source))
     return {"doc": doc, **result}
 
 
@@ -407,12 +417,13 @@ async def restore_version(
 ):
     """Bring version ``rev`` back. ``replacedRev`` is the version restoring undoes this."""
     await require_product_permission(scope, "artifact.manage")
-    _source, folder, _metadata, _is_own = await _resolve(scope, project_ref, artifact_id, write=True)
+    source, folder, _metadata, _is_own = await _resolve(scope, project_ref, artifact_id, write=True)
     try:
         doc, replaced = await run_efs(partial(restore, folder, rev), scope=scope)
     except DocError as err:
         raise _doc_error(err) from err
-    after_write(folder, doc, None, by="user", scope=scope, client_id=body.clientId if body else None)
+    after_write(folder, doc, None, by="user", scope=scope, client_id=body.clientId if body else None,
+                project_id=_project_id(source))
     return {"doc": doc, "replacedRev": replaced}
 
 
@@ -591,7 +602,9 @@ def _sse(
                                 yield frame
                     else:
                         idle = 0.0
-                        if initial is not None:
+                        # Only an event that carries a doc moves the marks (doc.published
+                        # does not): else the poll would miss a write nobody announced.
+                        if initial is not None and event.get("doc") is not None:
                             last_rev = max(last_rev, int(event.get("rev") or 0))
                             last_mtime = await poll_mtime(last_mtime)
                         yield _frame(event.get("type", "message"), event)

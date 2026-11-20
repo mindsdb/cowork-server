@@ -31,9 +31,10 @@ def after_write(
     scope: TenantScope | None,
     client_id: str | None = None,
     conversation_id: str | None = None,
+    project_id: str | None = None,
 ) -> None:
     announce(doc["id"], doc, result, folder=folder, by=by, client_id=client_id, conversation_id=conversation_id)
-    republish.schedule(folder, scope=scope)
+    republish.schedule(folder, scope=scope, project_id=project_id, artifact_id=doc["id"])
 
 
 def catch_up_shared_docs() -> None:

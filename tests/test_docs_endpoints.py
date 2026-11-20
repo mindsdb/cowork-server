@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.docs.hub import DOC_PUBLISHED
 from cowork.services.projects import GENERAL_PROJECT_ID
 
 
@@ -337,7 +338,7 @@ def test_a_doc_created_over_http_is_its_creators(monkeypatch, tmp_path, inline_u
 
     from cowork.api.v1.endpoints import docs
 
-    recorded = []
+    order = []
 
     async def allowed(scope, permission):
         return None
@@ -346,11 +347,17 @@ def test_a_doc_created_over_http_is_its_creators(monkeypatch, tmp_path, inline_u
     monkeypatch.setattr(docs, "require_product_permission", allowed)
     monkeypatch.setattr(docs, "_project_plan", lambda session, **kw: None)
     monkeypatch.setattr(docs, "readable_sources", lambda plan: [source])
-    monkeypatch.setattr(docs, "record_artifact_owner", lambda *a, **kw: recorded.append((a, kw)))
+    monkeypatch.setattr(docs, "record_artifact_owner", lambda *a, **kw: order.append(("owner", a, kw)))
     monkeypatch.setattr(docs, "_card", lambda *a: None)
+    # The page is asked for after the owner is recorded: the publish resolves the owner to key it.
+    monkeypatch.setattr(docs.republish, "schedule",
+                        lambda folder, **kw: order.append(("schedule", kw["project_id"], kw["artifact_id"])) or True)
     scope = SimpleNamespace(user_id="alice")
     made = asyncio.run(docs.create_blank_doc(docs._CreateBody(projectId=uuid4(), title="Plan"), scope))
-    assert recorded == [(("unit", "p-1", made["slug"], "alice"), {"action": "create"})]
+    assert order == [
+        ("owner", ("unit", "p-1", made["slug"], "alice"), {"action": "create"}),
+        ("schedule", "p-1", made["artifactId"]),
+    ]
 
 
 def test_a_reviewer_reads_the_doc_without_the_owners_card(monkeypatch, tmp_path, inline_units):
@@ -1078,6 +1085,43 @@ def test_a_lagging_read_is_read_again_even_when_the_mtime_never_moves(monkeypatc
 
     name, f = asyncio.run(scenario())
     assert name == "doc.updated" and f["rev"] == 2 and "clientId" not in f
+
+
+@pytest.mark.parametrize("event_type, rev", [(DOC_PUBLISHED, 0), ("doc.something", 99)])
+def test_an_event_without_a_doc_leaves_the_mtime_poll_to_send_a_write_nobody_announced(
+        monkeypatch, tmp_path, event_type, rev):
+    """Only an event that carries a doc moves the marks, whatever its type. If
+    doc.published moved last_mtime, a write whose own event was lost would never
+    reach the editor: the poll would see no change."""
+    import asyncio
+
+    from cowork.api.v1.endpoints import docs
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.docs.hub import DocHub, doc_topic
+    from cowork.docs.service import apply, create_doc
+
+    monkeypatch.setattr(docs, "_POLL_S", 0.2)
+    monkeypatch.setattr(docs, "hub", DocHub())
+    made = create_doc(tmp_path, title="Plan", markdown="Hi.", by="user")
+    topic = doc_topic(made.folder)
+    lead = made.doc["tabs"][0]["blocks"][0]["id"]
+    seen = {"mtime": 1}
+    monkeypatch.setattr(docs, "_mtime", lambda folder: seen["mtime"])
+
+    async def scenario():
+        stream = docs._sse(_Open(), topic, initial=made.folder, scope=LOCAL_SCOPE).body_iterator
+        await anext(stream)  # doc.ready, last_mtime 1
+        apply(made.folder, [{"op": "update", "id": lead, "set": {"text": "Unannounced."}}], by="agent")
+        seen["mtime"] = 2
+        docs.hub.publish(topic, {"type": event_type, "rev": rev})
+        passed_on = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+        polled = _sse_frame(await asyncio.wait_for(anext(stream), 3))
+        await stream.aclose()
+        return passed_on, polled
+
+    (name, _), (u_name, u) = asyncio.run(scenario())
+    assert name == event_type
+    assert u_name == "doc.updated" and u["doc"]["tabs"][0]["blocks"][0]["text"] == "Unannounced."
 
 
 def test_a_nudged_rev_the_file_never_reaches_stops_the_rereads_after_a_few_polls(monkeypatch, tmp_path):
