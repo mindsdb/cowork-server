@@ -300,8 +300,9 @@ async def test_a_gate_key_carries_its_lifetime_into_the_job(time_limit, monkeypa
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
-        correlation_id="r", llm={"provider": "minds-cloud", "api_key": "mdb_gate", "base_url": "http://gw/v1"},
-        turn_key_ttl_seconds=key_ttl,
+        correlation_id="r",
+        llm=prod.TurnLlm(block={"provider": "minds-cloud", "api_key": "mdb_gate", "base_url": "http://gw/v1"},
+                         turn_key_id=None, ttl_seconds=key_ttl),
     ))
 
     assert _job(fake)["limits"].get("max_turn_seconds") == time_limit_sent
@@ -387,19 +388,6 @@ async def test_everyday_turns_against_each_auth_cap(auth_env, monkeypatch, forgo
         assert _job(fake)["limits"].get("max_turn_seconds") == case.max_turn_seconds
 
 
-async def test_a_gate_key_without_its_lifetime_is_refused_before_anything_runs(monkeypatch):
-    redis = AsyncMock(side_effect=AssertionError("queued"))
-    monkeypatch.setattr(prod, "get_redis", redis)
-
-    with pytest.raises(ValueError):
-        await _drain(prod.stream_remote_replies(
-            conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
-            llm={"api_key": "mdb_gate"},
-        ))
-
-    redis.assert_not_called()
-
-
 async def test_the_decisions_proxy_knows_the_key_as_long_as_auth_does(time_limit, monkeypatch):
     """Under a time limit the turn's lifetime is 6,000 s; a record that long
     would outlive the 1,200 s key auth actually minted."""
@@ -436,8 +424,8 @@ async def test_the_routing_gate_hands_on_the_lifetime_auth_gave_its_key(time_lim
 
     _, turn_context = await handler._router_binding()
 
-    assert turn_context["llm"]["api_key"] == KEY
-    assert turn_context["turn_key_ttl_seconds"] == 1200
+    assert turn_context["llm"].block["api_key"] == KEY
+    assert turn_context["llm"].ttl_seconds == 1200
     assert len(auth.posts) == 2
 
 

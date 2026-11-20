@@ -30,8 +30,10 @@ CUSTOM_CONNECTIONS_ROUTE = "/internal/custom-connections/"
 CUSTOM_GRANTS_ROUTE = "/internal/custom-connections/turn-grants/"
 
 # auth's turn-key mint refuses an expiry past its cap with a 400 whose detail
-# starts with this text, and with no error code: the text is the only sign of
-# that refusal, so a test pins it.
+# starts with this text, and with no error code. The text is the only sign of
+# that refusal. The tests here pin this matcher to the text auth sends today;
+# nothing on auth's side pins it, so a reworded refusal ends the fallback, and
+# the turn answers permission_unavailable with auth's detail in its log line.
 TTL_REFUSAL_PREFIX = "expiry_date exceeds the max turn-key TTL"
 
 

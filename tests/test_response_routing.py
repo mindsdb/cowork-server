@@ -12,6 +12,7 @@ from cowork.handlers.response_routing import (
     decide_route,
 )
 from cowork.handlers.responses import ResponsesHandler
+from cowork.turnqueue.producer import TurnLlm
 from tests._logging_assertions import assert_log_fields
 
 
@@ -1096,7 +1097,8 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     # with an older dependency that never reads it when building headers.
     metadata = json.loads(requests[0].headers["Langfuse-Metadata"])
     assert metadata["role"] == "router"
-    assert turn_llm == {"correlation_id": minted["corr"], "llm": block, "turn_key_ttl_seconds": 1200}
+    assert turn_llm == {"correlation_id": minted["corr"],
+                        "llm": producer.TurnLlm(block=block, turn_key_id=None, ttl_seconds=1200)}
     # The routing gate's own pre-mint must carry the caller's picked workspace
     # too — this key is what a delegated remote turn ends up reusing as its
     # `llm` block, so skipping it here would silently exempt every hosted-org
@@ -1178,10 +1180,10 @@ async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_
 
     _, turn_llm = await handler._router_binding()
 
-    assert turn_llm["llm"] == block
-    assert turn_llm["turn_key_id"] == "mdb_gate"
+    assert turn_llm["llm"].block == block
+    assert turn_llm["llm"].turn_key_id == "mdb_gate"
     # The producer sizes the job's time limit to the key auth actually minted.
-    assert turn_llm["turn_key_ttl_seconds"] == 6000
+    assert turn_llm["llm"].ttl_seconds == 6000
     # The workspace a person picked binds the key whether or not datasources are on.
     assert minted["workspace_id"] == "ws-picked"
 
@@ -1212,7 +1214,7 @@ async def test_the_gate_mints_a_prefixed_key_when_either_setting_needs_one(monke
 
     _, turn_llm = await handler._router_binding()
 
-    assert turn_llm.get("turn_key_id") == ("mdb_gate" if prefixed else None)
+    assert turn_llm["llm"].turn_key_id == ("mdb_gate" if prefixed else None)
 
 
 @pytest.mark.asyncio
@@ -3052,7 +3054,8 @@ async def test_a_failed_gate_revokes_the_key_it_minted(monkeypatch):
     llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
 
     async def fake_binding():
-        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+        return None, {"correlation_id": "corr-gate",
+                      "llm": TurnLlm(block=llm_block, turn_key_id=None, ttl_seconds=1200)}
 
     handler._router_binding = fake_binding
 
@@ -3089,7 +3092,8 @@ async def test_a_failed_gate_cancels_the_first_take_before_revoking_its_key(monk
     llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
 
     async def fake_binding():
-        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+        return None, {"correlation_id": "corr-gate",
+                      "llm": TurnLlm(block=llm_block, turn_key_id=None, ttl_seconds=1200)}
 
     handler._router_binding = fake_binding
     events = []
@@ -3131,7 +3135,8 @@ async def test_a_gate_cancelled_after_its_mint_revokes_the_key(monkeypatch):
     llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
 
     async def fake_binding():
-        return None, {"correlation_id": "corr-gate", "llm": llm_block}
+        return None, {"correlation_id": "corr-gate",
+                      "llm": TurnLlm(block=llm_block, turn_key_id=None, ttl_seconds=1200)}
 
     handler._router_binding = fake_binding
 

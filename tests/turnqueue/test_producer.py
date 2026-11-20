@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ from cowork.turnqueue.redis_client import cancel_flag_key
 from cowork.handlers import turn_errors as te
 from cowork.services import providers as pv
 from cowork.turnqueue import producer as prod
-from cowork.turnqueue.auth_keys import MintedTurnKey
+from cowork.turnqueue.auth_keys import DATASOURCE_CONNECTIONS_ROUTE, DATASOURCE_GRANTS_ROUTE, MintedTurnKey
 
 from _fakes import QueuedPipeline
 
@@ -32,8 +33,7 @@ def _stub_llm_mint(monkeypatch):
         return MintedTurnKey(key="mdb_turnkey", prefix="turnkey", ttl_seconds=kw["ttl_seconds"])
 
     monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
-    monkeypatch.setattr(prod, "mint_turn_key_details", turn_key_details_from(_fake_mint))
-    # Minted when a turn key prefix is needed: the datasource or the custom connector setting.
+    # Every turn key mints here (mint_turn_llm); the connector key through mint_turn_key.
     monkeypatch.setattr(prod, "mint_turn_key_details", _fake_mint_details)
 
 
@@ -303,6 +303,67 @@ async def test_turn_failed_keeps_the_workers_reset_at_for_a_timed_stop(
     data = await _failed_turn(monkeypatch, {"error": error, "reset_at": _RESET_AT})
     assert data["code"] == expected_code
     assert data["reset_at"] == _RESET_AT
+
+
+_BUDGET_STOP = "BudgetExceededError: Server returned 402: budget used up."
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_keeps_the_workers_budget_scope_and_names_it(monkeypatch):
+    data = await _failed_turn(monkeypatch, {"error": _BUDGET_STOP, "budget_scope": "workspace"})
+    assert data["code"] == te.BUDGET_EXCEEDED_CODE
+    assert data["budget_scope"] == "workspace"
+    assert data["message"].startswith("This workspace's spending budget is used up.")
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_keeps_the_workers_budget_period_and_names_it(monkeypatch):
+    data = await _failed_turn(monkeypatch, {"error": _BUDGET_STOP, "budget_scope": "team", "budget_period": "month"})
+    assert data["budget_period"] == "month"
+    assert data["message"].startswith("Your team's monthly spending budget is used up.")
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_keeps_the_workers_budget_model_and_names_it(monkeypatch):
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: "Claude Haiku")
+    data = await _failed_turn(
+        monkeypatch,
+        {"error": _BUDGET_STOP, "budget_scope": "team", "budget_period": "day", "budget_model": "haiku-4-5"},
+    )
+    assert data["budget_model"] == "haiku-4-5"
+    assert data["message"].startswith("Your team's daily spending budget for Claude Haiku is used up.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("error", "model"), [(_BUDGET_STOP, "bad model"), (_WALLET_STOP, "haiku-4-5")])
+async def test_turn_failed_drops_a_budget_model_it_cannot_use(monkeypatch, error, model):
+    data = await _failed_turn(monkeypatch, {"error": error, "budget_model": model})
+    assert "budget_model" not in data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "period"),
+    [(_BUDGET_STOP, "week"), (_WALLET_STOP, "day"), (_BUDGET_STOP, None)],
+)
+async def test_turn_failed_drops_a_budget_period_it_cannot_use(monkeypatch, error, period):
+    reply = {"error": error} if period is None else {"error": error, "budget_period": period}
+    data = await _failed_turn(monkeypatch, reply)
+    assert "budget_period" not in data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "scope"),
+    [(_BUDGET_STOP, "Not A Scope!"), (_WALLET_STOP, "workspace"), (_BUDGET_STOP, None)],
+)
+async def test_turn_failed_drops_a_budget_scope_it_cannot_use(monkeypatch, error, scope):
+    # A malformed scope, a scope on another code, and an older worker that sends none.
+    reply = {"error": error} if scope is None else {"error": error, "budget_scope": scope}
+    data = await _failed_turn(monkeypatch, reply)
+    assert "budget_scope" not in data
 
 
 @pytest.mark.asyncio
@@ -1973,7 +2034,7 @@ async def test_artifact_authority_outage_stops_before_queue_side_effects(monkeyp
     with pytest.raises(prod.product_permissions.ProductPermissionUnavailable):
         await _drain(prod.stream_remote_replies(
             conversation_id="conv-1", org_id="org", user_id="user", input_text="run",
-            model="m", llm={"api_key": "already-minted-key"}, turn_key_ttl_seconds=1200,
+            model="m", llm=prod.TurnLlm(block={"api_key": "already-minted-key"}, turn_key_id=None, ttl_seconds=1200),
         ))
     assert permissions == ["product.execute", "artifact.manage"]
     redis.assert_not_called()
@@ -1992,6 +2053,45 @@ def _echo(refs, **overrides):
     }
     response.update(overrides)
     return response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("listing", "grants", "route", "reason"),
+    [
+        (["not an object"], None, DATASOURCE_CONNECTIONS_ROUTE, "listing carries a connection that is not an object"),
+        ([_verified(7)], _echo([(7, 3)], turn_key_id="other"), DATASOURCE_GRANTS_ROUTE,
+         "grant response binding does not match this turn"),
+    ],
+    ids=["listing", "grant-answer"],
+)
+async def test_a_refused_datasource_grant_logs_its_route_and_reason(
+    monkeypatch, caplog, owned_logger, listing, grants, route, reason
+):
+    """The line the console prints for a grant check that fails the turn, not only the 503."""
+    logged = owned_logger("cowork.services.product_permissions", level=logging.WARNING)
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(prod, "mint_turn_key_details", AsyncMock(
+        return_value=MintedTurnKey(key="mdb_prefix.secret", prefix="mdb_prefix", ttl_seconds=1200)))
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=listing))
+    monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(return_value=grants))
+
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    assert [(kind, data["code"]) for kind, data in items] == [("turn_failed", "permission_unavailable")]
+    [record] = [
+        r for r in caplog.records
+        if r.name == "cowork.services.product_permissions" and getattr(r, "event", None) == "permission_unavailable"
+    ]
+    assert (record.route, record.reason) == (route, reason)
+    line = json.loads(logged.output().strip())
+    assert (line["event"], line["route"], line["reason"]) == ("permission_unavailable", route, reason)
+    assert "mdb_prefix.secret" not in logged.output()
 
 
 @pytest.mark.asyncio
@@ -2014,7 +2114,7 @@ async def test_a_hosted_turn_registers_grants_against_the_gate_minted_key(monkey
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block, turn_key_id="mdb_gate", turn_key_ttl_seconds=1200,
+        correlation_id="r", llm=prod.TurnLlm(block=block, turn_key_id="mdb_gate", ttl_seconds=1200),
     ))
 
     assert register.await_args.kwargs["turn_key_id"] == "mdb_gate"
@@ -2047,7 +2147,7 @@ async def test_a_listing_auth_cannot_answer_costs_the_turn_its_databases_not_the
 
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block, turn_key_id="mdb_gate", turn_key_ttl_seconds=1200,
+        correlation_id="r", llm=prod.TurnLlm(block=block, turn_key_id="mdb_gate", ttl_seconds=1200),
     ))
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
@@ -2090,7 +2190,7 @@ async def _queued_datasource(monkeypatch, listing, *, labels: bool) -> dict | No
     block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "https://minds.internal/v1"}
     await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block, turn_key_id="mdb_gate", turn_key_ttl_seconds=1200,
+        correlation_id="r", llm=prod.TurnLlm(block=block, turn_key_id="mdb_gate", ttl_seconds=1200),
     ))
     return json.loads(fake.added[0][1]["payload"])["params"].get("datasource")
 
@@ -2178,8 +2278,11 @@ async def test_a_refused_grant_names_the_failed_check_and_never_a_secret(monkeyp
     from cowork.common.settings.app_settings import TurnQueueSettings
     from cowork.services.product_permissions import ProductPermissionUnavailable
 
-    warnings: list[str] = []
-    monkeypatch.setattr(prod.logger, "warning", lambda msg, *args, **kw: warnings.append(msg % args))
+    warnings: list[dict] = []
+    monkeypatch.setattr(
+        prod.product_permissions.logger, "warning",
+        lambda msg, *args, **kw: warnings.append({"message": msg % args, **kw.get("extra", {})}),
+    )
     monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[_verified(7)]))
     monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(return_value=_echo([(7, 3)], turn_key_id="mdb_other")))
     settings = TurnQueueSettings(
@@ -2189,8 +2292,9 @@ async def test_a_refused_grant_names_the_failed_check_and_never_a_secret(monkeyp
         await prod._mint_datasource_block(
             org_id="o1", user_id="u1", correlation_id="r", turn_key_id="mdb_prefix", disabled=None, settings=settings
         )
-    assert len(warnings) == 1 and "binding" in warnings[0]
-    assert "producer-secret" not in warnings[0] and "mdb_" not in warnings[0]
+    [warning] = warnings
+    assert "binding" in warning["reason"] and warning["route"] == DATASOURCE_GRANTS_ROUTE
+    assert "producer-secret" not in repr(warning) and "mdb_" not in repr(warning)
 
 
 @pytest.mark.asyncio
@@ -2557,7 +2661,7 @@ async def test_the_users_image_model_reaches_the_pod_and_an_upstream_pick_is_kep
     block = {"provider": "minds-cloud", "api_key": "k", "base_url": "https://minds.internal/v1", "image_model": "x"}
     await asyncio.wait_for(_drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        correlation_id="r", llm=block, turn_key_ttl_seconds=1200,
+        correlation_id="r", llm=prod.TurnLlm(block=block, turn_key_id=None, ttl_seconds=1200),
     )), timeout=5)
     assert json.loads(fake.added[0][1]["payload"])["params"]["llm"]["image_model"] == "x"
 
@@ -2815,6 +2919,26 @@ async def test_the_job_carries_the_organizations_jev_opt_out(monkeypatch, enable
     assert json.loads(fake.added[0][1]["payload"])["params"]["jev_decisions"] is enabled
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_the_job_carries_the_organizations_classify_switch(monkeypatch, enabled):
+    from cowork.common.settings import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(limits_enabled=False, resolved_planning_model="m", hub_workspace_id="",
+                                      jev_decisions_enabled=True, jev_classify_enabled=enabled),
+    )
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["jev_classify"] is enabled
+    assert params["jev_decisions"] is True
+
+
 @pytest.fixture
 def revokes(monkeypatch):
     """Internal auth configured, as in every hosted deployment; records each
@@ -2836,8 +2960,10 @@ def _turn_with_key(monkeypatch, replies):
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     return prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
-        llm={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
-        turn_key_ttl_seconds=1200,
+        llm=prod.TurnLlm(
+            block={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
+            turn_key_id=None, ttl_seconds=1200,
+        ),
     )
 
 
@@ -2888,8 +3014,10 @@ async def _cancel_mid_turn(monkeypatch, *, stopped: bool) -> None:
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
     task = asyncio.create_task(_drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
-        llm={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
-        turn_key_ttl_seconds=1200,
+        llm=prod.TurnLlm(
+            block={"provider": "minds-cloud", "api_key": "mdb_turnkey", "base_url": "https://gateway.example.test/v1"},
+            turn_key_id=None, ttl_seconds=1200,
+        ),
     )))
     await fake.waiting.wait()
     if stopped:

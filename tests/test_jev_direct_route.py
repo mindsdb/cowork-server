@@ -24,6 +24,12 @@ from cowork.handlers.response_routing import (
 )
 from cowork.handlers.responses import ResponsesHandler
 from cowork.streaming.registry import TurnLifecycle
+from cowork.turnqueue.producer import TurnLlm
+
+def _gate_minted(base_url: str) -> dict:
+    """The turn context the routing gate hands on: the key it minted, at ``base_url``."""
+    return {"llm": TurnLlm(block={"base_url": base_url, "api_key": "turn"}, turn_key_id=None, ttl_seconds=1200)}
+
 
 _TOOL_ROWS = [
     {"role": "user", "content": "Build me a dashboard of our 2025 sales."},
@@ -222,7 +228,7 @@ def test_jev_gate_leaves_other_providers_on_the_llm_gate(monkeypatch):
 def test_jev_gate_is_off_when_the_organization_opted_out(monkeypatch):
     handler = _gate(monkeypatch, _settings(enabled=False), stored_key="k")
 
-    assert handler._jev_gate({"llm": {"base_url": "https://x/v1", "api_key": "turn"}}) == "off"
+    assert handler._jev_gate(_gate_minted("https://x/v1")) == "off"
 
 
 def test_jev_gate_without_a_key_falls_back_to_the_llm_gate(monkeypatch):
@@ -234,7 +240,7 @@ def test_jev_gate_without_a_key_falls_back_to_the_llm_gate(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("turn_llm", "stored_key", "target"), [
     # A remote turn asks on the key the gate minted for it.
-    ({"llm": {"base_url": "https://minds.example/v1", "api_key": "turn"}}, "stored",
+    (_gate_minted("https://minds.example/v1"), "stored",
      jev_route.JevTarget(url="https://minds.example/v1/decisions", api_key="turn", mindshub_gateway=True)),
     # The desktop asks on the stored key, at the chat base URL.
     (None, "stored", jev_route.JevTarget(url="https://api.mindshub.ai/v1/decisions", api_key="stored", mindshub_gateway=True)),
@@ -485,7 +491,7 @@ def test_answer_binding_uses_the_composer_pick_on_the_minted_key(monkeypatch):
     handler = _gate(monkeypatch, _settings(model="sonnet-5-5"))
     binding = handler._answer_binding(
         model="opus-5-5", reasoning_effort="high",
-        turn_llm={"llm": {"base_url": "https://minds.example/v1", "api_key": "turn"}},
+        turn_llm=_gate_minted("https://minds.example/v1"),
     )
 
     assert binding.model == "opus-5-5"
@@ -559,6 +565,22 @@ async def _rows(conversation_id):
     def read(session):
         messages = ConversationService(session).get_ordered_messages(conversation_id, include_pending=True)
         return [(m.role, m.content, m.pending, m.harness) for m in messages]
+
+    return await run_db(read, scope=LOCAL_SCOPE)
+
+
+async def _answer_events(conversation_id):
+    """The saved events of the conversation's answer, in order."""
+    from cowork.models.message_event import MessageEvent
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.units import run_db
+    from cowork.services.conversations import ConversationService
+
+    def read(session):
+        messages = ConversationService(session).get_ordered_messages(conversation_id, include_pending=True)
+        answer = next(m for m in messages if m.role == "assistant")
+        rows = session.exec(session.select(MessageEvent).where(MessageEvent.message_id == answer.id)).all()
+        return [r.event_data for r in sorted(rows, key=lambda r: r.sequence_number)]
 
     return await run_db(read, scope=LOCAL_SCOPE)
 
@@ -648,6 +670,36 @@ async def test_produce_answer_streams_then_saves_the_turn(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_moderated_direct_answer_finishes_and_releases_its_resources(monkeypatch):
+    from unittest.mock import AsyncMock
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.handlers import responses
+    from cowork.services import content_safety
+
+    monkeypatch.setenv("COWORK_CONTENT_SAFETY_REQUIRED", "true")
+    check = AsyncMock()
+    revoke = AsyncMock()
+    monkeypatch.setattr(content_safety, "check_content", check)
+    monkeypatch.setattr(responses, "revoke_turn_key_quietly", revoke)
+    conversation_id = await _conversation()
+    answer = await _answer(["First ", "second."])
+    close = AsyncMock(wraps=answer.close)
+    monkeypatch.setattr(answer, "close", close)
+    _, buffer, produce = await _produce(
+        monkeypatch, conversation_id, answer, gate_key={"correlation_id": "corr-gate"},
+    )
+
+    await produce
+
+    check.assert_awaited_once_with("First second.", purpose="output", scope=LOCAL_SCOPE)
+    deltas = [_payload(f)["delta"] for f in buffer.frames if f.startswith("event: response.output_text.delta")]
+    assert deltas == ["First second."]
+    assert buffer.status == "completed"
+    close.assert_awaited_once_with()
+    revoke.assert_awaited_once_with("corr-gate")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delegates", [False, True, "fails"])
 async def test_produce_answer_revokes_the_gate_key_unless_the_agent_takes_the_turn(monkeypatch, delegates):
     """An answered turn runs no agent turn to revoke the gate's key; a
@@ -724,6 +776,10 @@ async def test_produce_answer_saves_the_partial_answer_on_stop(monkeypatch):
     rows = await _rows(conversation_id)
     assert rows[0][2] is False  # the question rejoined history
     assert rows[1][0] == "assistant" and rows[1][1].startswith("Revenue was")
+    # The saved answer ends on the Stop, so a reload shows it as stopped (ENG-4345).
+    events = await _answer_events(conversation_id)
+    assert events[-1]["type"] == "response.cancelled"
+    assert isinstance(events[-1]["at_ms"], int)
 
 
 @pytest.mark.asyncio
@@ -760,6 +816,36 @@ def test_jev_opt_out_turns_off_antons_completion_check(enabled, verifier_jev):
     assert ("verifier_jev" in applied) is (not enabled)
 
 
+@pytest.mark.parametrize(("enabled", "classify_jev"), [(False, "off"), (True, "on")])
+def test_jev_classify_opt_out_reaches_anton(enabled, classify_jev):
+    """A settings object with the field stands in for an anton that has it;
+    the pinned anton may predate it."""
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = SimpleNamespace(classify_jev="on", verifier_jev="on")
+    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_classify_enabled": enabled}))
+
+    assert anton.classify_jev == classify_jev
+    assert ("classify_jev" in applied) is (not enabled)
+    assert anton.verifier_jev == "on"
+
+
+def test_an_anton_without_classify_is_left_alone():
+    from types import SimpleNamespace
+
+    from cowork.common.settings.user_settings import UserSettings
+    from cowork.harnesses.anton_harness.harness import _overlay_user_settings
+
+    anton = SimpleNamespace(verifier_jev="on")
+    applied = _overlay_user_settings(anton, UserSettings.model_validate({"jev_classify_enabled": False}))
+
+    assert not hasattr(anton, "classify_jev")
+    assert "classify_jev" not in applied
+
+
 def test_route_state_puts_the_latest_message_apart():
     messages = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}]
 
@@ -791,7 +877,7 @@ async def test_an_own_decision_model_routes_any_provider(monkeypatch, planning, 
     own = {"url": " https://api.typesafe.ai/v1/systemone ", "key": "own-key", "model": "jev-latest"}
     handler = _gate(monkeypatch, _settings(planning=planning, enabled=enabled, own=own), stored_key="minds")
 
-    seen = await _asked(monkeypatch, handler, {"llm": {"base_url": "https://minds/v1", "api_key": "turn"}})
+    seen = await _asked(monkeypatch, handler, _gate_minted("https://minds/v1"))
 
     # Posted to as given: hosts serve the same body at different paths.
     assert seen["target"] == jev_route.JevTarget(url="https://api.typesafe.ai/v1/systemone", api_key="own-key")
@@ -815,7 +901,7 @@ def test_answer_binding_runs_on_the_users_own_provider(monkeypatch):
     monkeypatch.setattr(responses, "build_llm_client", lambda **_k: SimpleNamespace(planning_provider=planning))
 
     binding = handler._answer_binding(
-        model=None, turn_llm={"llm": {"base_url": "https://minds.example/v1", "api_key": "turn"}},
+        model=None, turn_llm=_gate_minted("https://minds.example/v1"),
     )
 
     assert (binding.provider, binding.model, binding.label) == (planning, "claude-opus-5-5", "anthropic")

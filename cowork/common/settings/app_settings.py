@@ -648,6 +648,12 @@ class OAuthSettings(Settings):
     hubspot_client_id: str = Field(default="", validation_alias=AliasChoices("HUBSPOT_CLIENT_ID"))
     hubspot_client_secret: str = Field(default="", validation_alias=AliasChoices("HUBSPOT_CLIENT_SECRET"))
 
+    slack_client_id: str = Field(default="", validation_alias=AliasChoices("SLACK_CLIENT_ID"))
+    slack_client_secret: str = Field(default="", validation_alias=AliasChoices("SLACK_CLIENT_SECRET"))
+    # Offers Slack's `mcp` method for new connections. Off hides it and refuses
+    # new sign-ins; existing connections of any method keep working.
+    slack_connector_enabled: bool = Field(default=False, validation_alias=AliasChoices("SLACK_CONNECTOR_ENABLED"))
+
     # Browser-side key for the Google Picker widget (drive.file scope only
     # grants access to files the user explicitly picks via this UI).
     google_picker_api_key: str = Field(default="", validation_alias=AliasChoices("GOOGLE_PICKER_API_KEY"))
@@ -860,8 +866,8 @@ class TurnQueueSettings(Settings):
             raise ValueError(
                 f"COWORK_TURN_TIME_LIMIT_SECONDS + COWORK_TURN_TIME_LIMIT_KEY_MARGIN_SECONDS "
                 f"({self.turn_key_lifetime_seconds}s) must leave {AUTH_TURN_KEY_SKEW_SECONDS}s "
-                f"under auth's turn-key cap ({AUTH_TURN_KEY_MAX_TTL_SECONDS}s), or every web "
-                f"turn's key mint is refused"
+                f"under auth's turn-key cap ({AUTH_TURN_KEY_MAX_TTL_SECONDS}s), or auth refuses "
+                f"every time-limited key and each web turn runs untimed"
             )
         return self
 

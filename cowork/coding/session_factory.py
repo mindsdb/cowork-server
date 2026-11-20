@@ -417,17 +417,22 @@ class CodingSessionFactory:
         selected = self._selected_project(project, resource_ids)
         return {root for _, root in self.project_workspaces.in_place_roots(selected)}
 
-    def complete(self, pending: PendingLocalSession, cancelled: Callable[[], bool]) -> CodingSession:
+    def complete(
+        self, pending: PendingLocalSession, cancelled: Callable[[], bool], *, deleted: Callable[[], bool],
+    ) -> CodingSession:
         """Prepare a pending task's workspace and run its setup commands.
 
         On failure the workspace is released and the Run fails, but the task
-        record stays so the user can see why it did not start.
+        record stays so the user can see why it did not start. A task deleted
+        during preparation instead rolls back without saving recovery data.
         """
         session_id = pending.session_id
         request = pending.request
         preparation: LocalSessionPreparation | None = None
         try:
-            preparation = self._prepare_local_session(session_id, request, pending.project, pending.workspace_mode)
+            preparation = self._prepare_local_session(
+                session_id, request, pending.project, pending.workspace_mode, deleted=deleted,
+            )
             contexts = list(request.source_contexts)
             skill_resolution = self.skills.resolve(session_id, preparation.project, pending.code_skills)
             session = self._build_local_session(
@@ -465,7 +470,7 @@ class CodingSessionFactory:
         except Exception:
             self.skills.cleanup(session_id)
             if preparation is not None:
-                self._release_workspaces(session_id, preparation)
+                self._release_workspaces(session_id, preparation, keep_recovery=not deleted())
                 if request.repository_setup and request.repository_setup.branch:
                     for workspace in preparation.task_workspaces:
                         self.project_workspaces.rollback_task_branch(workspace)
@@ -541,9 +546,11 @@ class CodingSessionFactory:
             )
         self.skills.cleanup(session.id)
 
-    def _release_workspaces(self, session_id: str, preparation: LocalSessionPreparation) -> None:
+    def _release_workspaces(
+        self, session_id: str, preparation: LocalSessionPreparation, *, keep_recovery: bool = True,
+    ) -> None:
         if preparation.task_workspaces:
-            self.project_workspaces.cleanup(session_id, list(preparation.task_workspaces))
+            self.project_workspaces.cleanup(session_id, list(preparation.task_workspaces), keep_recovery=keep_recovery)
             return
         workspace = preparation.fallback_workspace
         if workspace and workspace.workspace_kind in {WorkspaceKind.git_worktree, WorkspaceKind.local_copy}:
@@ -553,6 +560,7 @@ class CodingSessionFactory:
                 workspace.workspace_path,
                 workspace.workspace_kind,
                 workspace.base_revision,
+                keep_recovery=keep_recovery,
             )
 
     @staticmethod
@@ -568,6 +576,8 @@ class CodingSessionFactory:
         request: SessionCreateRequest,
         project: CodeProject | None,
         workspace_mode: WorkspaceMode = WorkspaceMode.worktree,
+        *,
+        deleted: Callable[[], bool],
     ) -> LocalSessionPreparation:
         requested_dirs = validate_directories(request.additional_dirs)
         if project is None:
@@ -608,7 +618,7 @@ class CodingSessionFactory:
         prepared = (
             self.project_workspaces.prepare_in_place(session_id, selected_project)
             if workspace_mode == WorkspaceMode.in_place
-            else self.project_workspaces.prepare(session_id, selected_project, request.repository_setup)
+            else self.project_workspaces.prepare(session_id, selected_project, request.repository_setup, deleted=deleted)
         )
         permission_mode = (
             request.permission_mode

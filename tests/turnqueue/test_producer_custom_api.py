@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -28,6 +29,7 @@ from cowork.services.connectors.custom_connectors import (
 )
 from cowork.services.product_permissions import ProductPermissionUnavailable
 from cowork.turnqueue import producer as prod
+from cowork.turnqueue.auth_keys import CUSTOM_GRANTS_ROUTE
 
 FakeRedis = base.FakeRedis
 _drain = base._drain
@@ -111,7 +113,9 @@ async def test_a_routed_turn_binds_to_the_key_the_gate_minted(turn, monkeypatch)
     block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "https://minds.internal/v1"}
     turn["grant"].return_value = _granted({3: 1, 5: 2}, turn_key_id="mdb_gate")
 
-    params, _ = await _run(turn, correlation_id="r", llm=block, turn_key_id="mdb_gate", turn_key_ttl_seconds=1200)
+    params, _ = await _run(
+        turn, correlation_id="r", llm=prod.TurnLlm(block=block, turn_key_id="mdb_gate", ttl_seconds=1200),
+    )
 
     assert turn["list"].await_args.kwargs["turn_key_id"] == "mdb_gate"
     assert "turn_key" not in params["custom_api"]
@@ -122,7 +126,7 @@ async def test_a_turn_that_arrives_with_a_key_but_no_prefix_runs_without_them(tu
     """A channel turn hands the producer a minted key and no prefix to bind grants to."""
     block = {"provider": "minds-cloud", "api_key": "mdb_x.secret", "base_url": "https://minds.internal/v1"}
 
-    params, _ = await _run(turn, llm=block, turn_key_ttl_seconds=1200)
+    params, _ = await _run(turn, llm=prod.TurnLlm(block=block, turn_key_id=None, ttl_seconds=1200))
 
     assert "custom_api" not in params
     turn["list"].assert_not_awaited()
@@ -200,6 +204,25 @@ async def test_a_grant_answer_bound_to_anything_else_fails_the_turn(turn, field)
 
     assert params is None
     assert items[-1][0] == "turn_failed"
+
+
+async def test_a_refused_grant_answer_logs_its_route_and_reason(turn, caplog, owned_logger):
+    """The line the console prints for a grant answer that fails the turn, not only the 503."""
+    logged = owned_logger("cowork.services.product_permissions", level=logging.WARNING)
+    turn["grant"].return_value = _granted({3: 1, 5: 2}, turn_key_id="other")
+
+    params, items = await _run(turn)
+
+    assert params is None and items[-1][0] == "turn_failed"
+    [record] = [
+        r for r in caplog.records
+        if r.name == "cowork.services.product_permissions" and getattr(r, "event", None) == "permission_unavailable"
+    ]
+    reason = "grant response binding does not match this turn"
+    assert (record.route, record.reason) == (CUSTOM_GRANTS_ROUTE, reason)
+    line = json.loads(logged.output().strip())
+    assert (line["event"], line["route"], line["reason"]) == ("permission_unavailable", CUSTOM_GRANTS_ROUTE, reason)
+    assert "producer-secret" not in logged.output()
 
 
 @pytest.mark.parametrize("grants", [
@@ -303,7 +326,7 @@ async def test_a_grant_at_no_version_is_refused_by_the_producer_itself(turn):
 
 
 @pytest.fixture()
-def templates(monkeypatch):
+def templates(monkeypatch, org_deployment):
     """A database holding acme_crm templates for two members of o1 and one of o2, saved the real way."""
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
