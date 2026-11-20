@@ -7,6 +7,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
+from cowork.common.settings import runtime_credential
 from cowork.coding.context import message_attachments, validate_directories
 from cowork.coding.contracts import (
     CodingEvent,
@@ -225,7 +226,7 @@ class CodingSessionFactory:
         if not capabilities.available:
             raise RuntimeError(capabilities.reason or f"{capabilities.label} is unavailable")
         if not credentials.minds_api_key:
-            raise RuntimeError("MindsHub is not connected. Sign in or configure a MindsHub API key first.")
+            raise RuntimeError(runtime_credential.missing_minds_key_message())
 
         session_id = str(uuid.uuid4())
         if request.task_mode == "plan" and request.computer_id not in {None, self.control.local_computer.id}:

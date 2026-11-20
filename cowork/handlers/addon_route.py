@@ -126,7 +126,7 @@ def _jev_target(
     None when none applies (the LLM gate's providers, Jev turned off, no
     MindsHub key to use or mint). Sync: it reads settings through a session of
     its own. *queue_settings* is the request's; read here when not given."""
-    from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key_str
+    from cowork.common.settings.user_settings import Provider, get_user_settings, inference_api_key_str
     from cowork.services.providers import minds_chat_base_url
 
     settings = get_user_settings(scope)
@@ -137,7 +137,8 @@ def _jev_target(
         return (target, settings.decision_model or queue_settings.jev_route_model) if target else None
     if mode != "jev":
         return None
-    key = provider_api_key_str(settings, Provider.MINDS_CLOUD)
+    # The key turns bill with, so a desktop's decision bills its pinned organization.
+    key = inference_api_key_str(settings, Provider.MINDS_CLOUD)
     if key:
         return jev_route.JevTarget.mindshub(minds_chat_base_url(settings.minds_url), key), queue_settings.jev_route_model
     if queue_settings.is_remote:

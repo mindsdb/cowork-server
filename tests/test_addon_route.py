@@ -690,3 +690,32 @@ def test_jev_target_mints_for_a_hosted_org_without_a_stored_key(monkeypatch, rem
         assert found == addon_route._MintKey(workspace_id="ws1", model="jev")
     else:
         assert found is None
+
+
+def test_a_pinned_desktops_addon_decision_bills_its_turn_key(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from cowork.common.settings import runtime_credential, user_settings
+    from cowork.common.settings.user_settings import UserSettings
+
+    monkeypatch.setattr(runtime_credential, "_minds_credential", "session-jwt")
+    monkeypatch.setattr(runtime_credential, "_organization_id", "org-a")
+    monkeypatch.setattr(
+        runtime_credential,
+        "_inference_key",
+        runtime_credential.InferenceKey(
+            value="mdb_turn_a",
+            organization_id="org-a",
+            instance_id="desktop-1",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        ),
+    )
+    settings = UserSettings.model_validate(
+        {"planning_provider": "minds_cloud", "minds_api_key": "session-jwt", "minds_url": "https://minds.example"}
+    )
+    monkeypatch.setattr(user_settings, "get_user_settings", lambda scope: settings)
+    monkeypatch.setattr(jev_route, "gate_mode", lambda s: "jev")
+
+    target, _model = addon_route._jev_target(None)
+
+    assert target.api_key == "mdb_turn_a"

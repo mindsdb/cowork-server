@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 import psutil
 
+from cowork.common.settings import runtime_credential
 from cowork.coding.contracts import (
     CodingEvent,
     EngineCapabilities,
@@ -204,7 +205,7 @@ class CodexEngineSession:
         from openai_codex.client import CodexClient, CodexConfig
 
         if not credentials.minds_api_key:
-            raise RuntimeError("MindsHub is not connected. Sign in or configure a MindsHub API key first.")
+            raise RuntimeError(runtime_credential.missing_minds_key_message())
         # Thread IDs stored in CodingSession are only resumable from the Codex
         # home that owns their rollout files. Keep that home under Cowork's
         # persistent data root instead of inheriting the launching shell's

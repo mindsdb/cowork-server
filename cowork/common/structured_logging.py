@@ -84,6 +84,9 @@ EVENT_FIELDS = frozenset(
         "share",
         "step",
         "steps",
+        # A desktop turn key's client-side id, desktop-<uuid>; not a secret
+        # (cowork.services.inference_key).
+        "instance_id",
     ]
 )
 HEALTH_PATHS = frozenset(
