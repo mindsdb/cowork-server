@@ -15,7 +15,8 @@ The modules depend in one direction, each on those above it:
 | `changes` | What changed between two versions, in one line |
 | `render` | The agent's outline and full views, the page (`doc.html`) and export markup |
 | `store` | The doc file in its artifact folder: the lock, atomic writes, one kept version per editing session |
-| `hub` | In-process fan-out of changes to the editors and chats watching |
+| `hub` | In-process fan-out of changes to the editors and chats watching, and the hand-off to `relay` |
+| `relay` | Hub events between replicas over Redis pub/sub (`cowork:docs:<topic>`), only on the `redis` stream backend |
 | `images` | Images on this computer, kept beside the doc |
 | `sharing` | Which docs are shared |
 | `service` | Create and apply (rendering the page under the doc's lock), and `announce` |
@@ -93,6 +94,8 @@ Both the agent and the editor apply the same ops through `cowork.docs.service.ap
 
 Then `cowork.docs.sync.after_write` announces the change on the in-process hub (`cowork.docs.hub`) to the editors and chats watching, and for a shared doc schedules its republish.
 
+Where replicas share Redis (`COWORK_STREAM_BACKEND=redis`), `cowork.docs.relay` also carries each event to the other replicas, without the doc. There an editor's stream reads the doc from the file and sends it as `doc.updated`, with the writer's `clientId`, only when the doc read is exactly that write's rev; a newer or older read is left to the nudge of that rev or to the mtime poll. A conversation's event reaches its chat and the replay as it is. A message lost to Redis costs latency only: a doc stream also polls the file's mtime every 2 s.
+
 Every write lands at once, like a Google Doc's: there is no save step and no versions to manage.
 
 ## HTTP API
@@ -105,7 +108,7 @@ Everything is under `/api/v1/docs` and addressed like the artifact workspace rou
 | GET | `/{project}/{artifact}` | `{doc, card, capabilities, originConversationId}`; the card (with the share's access) for the owner only |
 | POST | `/{project}/{artifact}/ops` | `{ops, tab?, ifRev?, clientId?}` → `{doc, rev, results, touched, removed, undo}`; 409 for `stale`. The editor's Cmd+Z sends `undo` back. |
 | POST | `/{project}/{artifact}/images` | An image's bytes (PNG, JPEG, GIF or WebP, 10 MB at most), kept beside the doc as `images/<hash>.<ext>` → `{src}`, for the editor's next insert |
-| GET | `/{project}/{artifact}/events` | SSE `doc.updated` with the doc. Also catches writes from other processes by watching the file. |
+| GET | `/{project}/{artifact}/events` | SSE `doc.updated` with the doc. Hears other replicas' writes through the relay, and catches writes no hub announced by watching the file. |
 | GET | `/{project}/{artifact}/export?format=md\|html\|docx\|pdf` | Download. Word and PDF are made as an artifact's export makes them (the fetch-free inliner, the Word writer, and for PDF the render service a deployment configures); the read's `capabilities.exportFormats` says which this deployment offers. They carry images beside the doc; a web image is left out, never fetched. |
 | GET | `/events?conversation_id=` | SSE `doc.created` / `doc.updated` for docs the agent touches in that conversation |
 
@@ -155,6 +158,8 @@ Tests, in `tests/`:
 - `test_docs_ops.py`: the edit operations and the stale guard.
 - `test_docs_undo.py`: undoing and redoing each kind of edit.
 - `test_docs_store.py`: the write path, editing sessions and their versions, and the hub.
+- `test_docs_hub.py`: what the hub hands the relay, and what it does with another replica's message.
+- `test_docs_relay.py`: the relay on fakeredis, and an editor on one replica hearing a write made on another.
 - `test_docs_endpoints.py`: the HTTP API.
 - `test_docs_images.py`: images kept beside the doc.
 - `test_docs_tools.py`: the agent's tools.

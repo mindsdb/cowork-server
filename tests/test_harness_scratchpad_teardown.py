@@ -365,7 +365,8 @@ def test_the_lifespan_drains_closes_after_turns_unwind_and_before_backends_are_r
     calls = [
         "await registry.shutdown()",
         "await drain_background_tasks()",
-        "await drain_scratchpad_closes()",
+        # Awaited in a gather with the doc publish worker's stop, which shares its wait.
+        "drain_scratchpad_closes()",
         "shutdown_launched_backends()",
     ]
     positions = [source.find(call) for call in calls]

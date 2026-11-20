@@ -1131,6 +1131,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 tool_messages: bool = False,
                                 connector_drafts: bool = False,
                                 preview_checks: bool = False,
+                                host_tools: list[dict] | None = None,
                                 ui_locale: str | None = None,
                                 reasoning_effort: str | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
@@ -1151,6 +1152,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     preview whether an edit runs (ENG-4227, turnqueue/preview_checks.py).
     Only with `interactive`: the answer reaches the pod on the stdin an
     interactive turn keeps open. Channel turns never.
+    `host_tools` are tools this server runs for the pod
+    (turnqueue/host_tools.py), sent only with `interactive`: their answers
+    reach the pod on the stdin an interactive turn keeps open, and only for
+    a persistent workspace: the doc tools write into the project's folder from
+    this server whatever the pod mounts, but without artifact.manage the
+    caller may not change artifacts, and the turn end records nothing for a
+    workspace that is not persistent. Channel turns never send them.
     `ui_locale` is the app's language (cowork.common.ui_locale), which the
     pod's anton replies in when the user's message does not say; None for a
     turn with no request behind it.
@@ -1346,6 +1354,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # stdin its answer comes back on (scratchpad-controller#134
               # relays it; an older controller drops it and the pod never asks).
               **({"preview_checks": True} if preview_checks and interactive else {}),
+              # Tools this server runs for the pod; their answers come back on stdin.
+              **({"host_tools": host_tools} if host_tools and interactive and workspace_mode == "persistent" else {}),
               # False when the organization opted out of Jev: the pod's
               # completion check then never asks it. A controller that
               # predates the field drops it, and the pod keeps Jev on.

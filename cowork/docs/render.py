@@ -33,8 +33,8 @@ _SHORT = {
 }
 
 
-def _clip(text: str, n: int = 90) -> str:
-    text = " ".join((text or "").split())
+def clip(text: str, n: int = 90) -> str:
+    text = " ".join(str(text or "").split())
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
@@ -46,7 +46,7 @@ def _block_line(b: dict[str, Any]) -> str:
     if t == "task":
         label += " [x]" if b.get("done") else " [ ]"
     if t in TEXT_TYPES:
-        detail = _clip(b.get("text", ""))
+        detail = clip(b.get("text", ""))
         if t == "callout":
             detail = f"({b.get('tone')}) " + (f"{b['title']}: " if b.get("title") else "") + detail
     elif t == "table":
@@ -617,7 +617,7 @@ def _chart_svg(b: dict[str, Any], labels: list[str], series: list[dict[str, Any]
         room = max(6, int(step * every / 7))
         for i, label in enumerate(labels):
             if i % every == 0:
-                parts.append(f'<text x="{pad_l + step * (i + 0.5):.1f}" y="{h - pad_b + 16}" font-size="10" text-anchor="middle" fill="#555">{html.escape(_clip(label, room))}</text>')
+                parts.append(f'<text x="{pad_l + step * (i + 0.5):.1f}" y="{h - pad_b + 16}" font-size="10" text-anchor="middle" fill="#555">{html.escape(clip(label, room))}</text>')
         parts.append("</svg>")
         svg = "".join(parts)
     if len(series) > 1:
@@ -652,7 +652,7 @@ def _hbar_svg(labels: list[str], series: list[dict[str, Any]], low: float, span:
             parts.append(f'<rect x="{x0:.1f}" y="{y0:.1f}" width="{max(1, x1 - x0):.1f}" height="{bh:.1f}" fill="{_color(si)}" rx="2"/>')
     room = max(6, int((pad_l - 12) / 6))
     for i, label in enumerate(labels):
-        parts.append(f'<text x="{pad_l - 6}" y="{pad_t + row * (i + 0.5) + 4:.1f}" font-size="10" text-anchor="end" fill="#555">{html.escape(_clip(label, room))}</text>')
+        parts.append(f'<text x="{pad_l - 6}" y="{pad_t + row * (i + 0.5) + 4:.1f}" font-size="10" text-anchor="end" fill="#555">{html.escape(clip(label, room))}</text>')
     parts.append("</svg>")
     return "".join(parts)
 

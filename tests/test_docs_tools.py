@@ -255,7 +255,7 @@ def test_the_conversation_hears_about_a_new_doc_as_it_is_made(tools):
 def test_a_card_that_fails_is_logged_as_a_warning_and_the_doc_still_opens(tools, monkeypatch, caplog):
     """The card is extra: the doc is already written. But a failure must be seen,
     not dropped at debug, where a bug left every doc.created without its card."""
-    from cowork.harnesses.anton_harness import doc_tools
+    from cowork.docs import tools as doc_tools
 
     defs, session, _ = tools
     conv = "c0ffee00-0000-4000-8000-000000000001"
@@ -420,3 +420,21 @@ def test_the_edit_tools_schema_takes_rows_in_both_forms_the_prompt_teaches():
 
     for rows in ([["Backend", "Open"]], [{"Role": "Backend", "Status": "Open"}], [0, "r_abc"]):
         jsonschema.validate({"doc": "Plan", "ops": [{"op": "add_rows", "table": "b_1", "rows": rows}]}, EDIT_DOC_SCHEMA)
+
+
+def test_an_agent_create_and_edit_ask_for_the_page_with_the_project(tmp_path, monkeypatch):
+    from cowork.docs import republish
+
+    artifacts = tmp_path / ".anton" / "artifacts"
+    ctx = DocToolContext(artifacts_base=artifacts, conversation_id="c0ffee00-0000-4000-8000-000000000001",
+                         project_id="p1")
+    defs = {t.name: t for t in build_doc_tools(ctx)}
+    session = SimpleNamespace(_workspace=SimpleNamespace(artifacts_dir=artifacts), _artifacts_touched=set(),
+                              _session_id="", _turn_count=0)
+    asked = []
+    monkeypatch.setattr(republish, "schedule",
+                        lambda folder, **kw: asked.append((folder.name, kw["project_id"], kw["artifact_id"])) or False)
+    assert _ok(_call(defs, session, "create_doc", title="Plan", markdown="Hi."))
+    assert _ok(_call(defs, session, "edit_doc", doc="Plan", ops=[{"op": "edit_text", "find": "Hi", "replace": "Hello"}]))
+    assert [a[1] for a in asked] == ["p1", "p1"]
+    assert asked[0][0] == asked[1][0] and asked[0][2] == asked[1][2] and asked[0][2]

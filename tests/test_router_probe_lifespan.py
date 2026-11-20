@@ -159,3 +159,28 @@ async def test_the_lifespan_resolves_the_shared_root_on_a_file_store_thread_befo
         configured = get_app_settings().storage.shared_root
         resolved = Path(os.path.realpath(configured))
         assert projects._RESOLVED_SHARED_ROOTS == {configured: resolved}
+
+
+@pytest.mark.parametrize("backend", ["file", "redis"])
+async def test_the_lifespan_runs_the_doc_relay_only_on_the_redis_backend(boot, monkeypatch, backend):
+    """Replicas that share Redis relay doc events to each other; every other
+    server keeps the doc hub in-process."""
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.docs import relay as relay_mod
+    from cowork.docs.hub import hub
+
+    app, _order, _probe = boot()
+    monkeypatch.setattr(relay_mod, "get_backend", lambda: backend)
+    monkeypatch.setattr(relay_mod, "get_redis", lambda: fakeaioredis.FakeRedis(decode_responses=True))
+    async with server.lifespan(app):
+        relay = app.state.doc_relay
+        if backend == "redis":
+            assert relay is not None and hub._relay == relay.offer
+            tasks = list(relay._tasks)
+            assert tasks and not any(task.done() for task in tasks)
+        else:
+            assert relay is None and hub._relay is None
+    assert hub._relay is None
+    if backend == "redis":
+        assert all(task.done() for task in tasks)
