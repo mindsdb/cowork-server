@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import ipaddress
 import json
 import logging
 import re
@@ -193,6 +194,35 @@ class TestEveryHostIsJudgedBeforeAnyRequest:
         url = f"https://cowork.local:{port}/api/v1/health"
         api = await refused("Cowork itself", with_url(url), table={**PUBLIC, "cowork.local": address})
         assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("address", [
+        "172.30.9.20", "::ffff:172.30.9.20", "64:ff9b::ac1e:914", "fd30::20", "127.0.0.1", "127.8.8.8", "::1", "0.0.0.0",
+    ])
+    @pytest.mark.parametrize("port", [8443, None])
+    @pytest.mark.parametrize("listed", ["cowork.internal", "172.30.0.0/16,fd30::/16,127.0.0.0/8,::1/128,64:ff9b::/96"])
+    async def test_a_shared_deployment_never_tests_its_own_machine(
+        self, monkeypatch, personal_deployment, address, port, listed,
+    ):
+        """At any port, by address or by a hostname the operator listed: the
+        server's interfaces and loopback are nobody's own to test there."""
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset({
+            ipaddress.ip_address("172.30.9.20"), ipaddress.ip_address("fd30::20"),
+        }))
+        allow(monkeypatch, listed)
+        url = f"https://cowork.internal{f':{port}' if port else ''}/v1/data"
+        api = await refused("Cowork itself", with_url(url), table={**PUBLIC, "cowork.internal": address})
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_single_user_install_still_offers_this_computer_on_another_port(self, monkeypatch):
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset({ipaddress.ip_address("10.0.0.5")}))
+        outcome, api = await run(with_url("http://localhost:9999/v1/data"), table={**PUBLIC, "localhost": "127.0.0.1"})
+        assert outcome.private_host is not None and api.requests == []
+
+    def test_the_interfaces_are_read_for_each_test_and_hold_this_machines_loopback(self):
+        assert ipaddress.ip_address("127.0.0.1") in connector_test_run._own_addresses()
+        assert not hasattr(connector_test_run._own_addresses, "cache_clear")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("address", ["10.0.0.5", "192.168.1.10", "172.16.0.9", "100.64.0.1", "fd12::5", "64:ff9b::a00:5"])

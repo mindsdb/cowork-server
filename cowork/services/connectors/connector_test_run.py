@@ -30,8 +30,10 @@ from typing import Any
 from urllib.parse import quote, quote_plus, unquote, urlsplit
 
 import httpx
+import psutil
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import tenant_scope_required
 from cowork.services.connectors.custom_connectors import PLACEHOLDER
 from cowork.services.connectors.egress import (
     connection_attempts,
@@ -513,6 +515,26 @@ def judge(
     )
 
 
+def _own_addresses() -> frozenset[IPAddress]:
+    """The addresses of this server's network interfaces, read at each call."""
+    own: set[IPAddress] = set()
+    for addresses in psutil.net_if_addrs().values():
+        for entry in addresses:
+            if entry.family not in (socket.AF_INET, socket.AF_INET6):
+                continue
+            # An IPv6 link-local address carries its interface as a "%" suffix.
+            own.add(ipaddress.ip_address(entry.address.split("%", 1)[0]))
+    return frozenset(own)
+
+
+def _is_this_server(address: IPAddress, own: frozenset[IPAddress]) -> bool:
+    """Whether ``address`` is the machine a shared deployment runs on, at any
+    port: loopback, the unspecified address, or one of its interfaces'."""
+    # An IPv4-mapped address is dialled as the IPv4 one, like a translated one.
+    judged = getattr(address, "ipv4_mapped", None) or _judged(address)
+    return judged.is_loopback or judged.is_unspecified or judged in own or address in own
+
+
 async def _judge_host(
     step: _Step, approved: Mapping[str, tuple[str, ...]], resolver: Callable[..., list[tuple]],
 ) -> tuple[tuple[IPAddress, ...], PrivateHost | None]:
@@ -531,8 +553,11 @@ async def _judge_host(
         addresses = await _resolve(host, resolver)
         hosts, networks = private_allowlist()
         allowed = host in hosts or all(any(_judged(a) in n or a in n for n in networks) for a in addresses)
+    # On a shared deployment "this computer" is the server, so nothing on it is
+    # a person's own to test, on any port, listed by the operator or not.
+    own = _own_addresses() if tenant_scope_required() else None
     for address in addresses:
-        if _reaches_this_server(address, port):
+        if _reaches_this_server(address, port) or (own is not None and _is_this_server(address, own)):
             raise ConnectorTestError(f"The {step.name} step points at Cowork itself.")
         if not is_public_address(address) and not _offerable(address):
             raise ConnectorTestError(f"The {step.name} step points at an address no test may reach ({address}).")
