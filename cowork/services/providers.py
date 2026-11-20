@@ -365,6 +365,8 @@ _IMAGE_KIND = "image"
 # for the caller. Unlike the billing reasons, it is true for the caller alone
 # (see ``persist_org_model_availability``).
 _MODEL_RESTRICTED_REASON = "model_restricted"
+# The reason for a model zero data retention rules out for the whole org.
+_ZDR_RESTRICTED_REASON = "zdr_restricted"
 
 
 class _ListingCacheKey(NamedTuple):
@@ -1147,6 +1149,32 @@ def persist_org_model_availability(
     return True
 
 
+def zdr_blocked_ids(listing: MindsModelListing) -> frozenset[str]:
+    """The listing's ids MindsHub refuses under zero data retention."""
+    return frozenset(mid for mid, reason in listing.disabled_reasons.items() if reason == _ZDR_RESTRICTED_REASON)
+
+
+def persist_zdr_blocked(session, scope, prior_json: str | None, listing: MindsModelListing) -> bool:
+    """Cache the ids MindsHub refuses under zero data retention (``minds_model_zdr_blocked``).
+
+    Same evidence rule as the restriction list: a listing with no ``enabled`` flags
+    says nothing, so the stored list stays. Written sorted, only on a change.
+    """
+    from cowork.services.settings import SettingService
+
+    if not (listing.enabled or listing.image_models):
+        return False
+    blocked = sorted(zdr_blocked_ids(listing))
+    try:
+        prior = json.loads(prior_json or "[]")
+    except (ValueError, TypeError):
+        prior = None
+    if prior == blocked:
+        return False
+    SettingService(session, scope).upsert_setting("minds_model_zdr_blocked", json.dumps(blocked))
+    return True
+
+
 def _parsed_map(stored: str | None) -> dict:
     try:
         parsed = json.loads(stored or "{}")
@@ -1260,7 +1288,8 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
     changed = persist_enabled_model_map(
         session, scope, s.minds_model_enabled, listing.enabled, listing.ids
     )
-    return persist_image_model_map(session, scope, s.minds_image_model_enabled, listing) or changed
+    changed = persist_image_model_map(session, scope, s.minds_image_model_enabled, listing) or changed
+    return persist_zdr_blocked(session, scope, s.minds_model_zdr_blocked, listing) or changed
 
 
 # ── Config readiness ─────────────────────────────────────────────────

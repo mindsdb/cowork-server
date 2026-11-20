@@ -55,10 +55,12 @@ from cowork.services.providers import (
     persist_image_model_map,
     persist_org_model_availability,
     persist_role_defaults_map,
+    persist_zdr_blocked,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
     warm_enabled_model_map,
+    zdr_blocked_ids,
 )
 from cowork.services.org_branding import remove_brand_skill
 from cowork.services.settings import SettingService, unit_setting_service
@@ -797,6 +799,7 @@ def _persist_catalog_maps(
                 raw, scope, prior.minds_model_enabled, listing.enabled, listing.ids
             )
             persist_image_model_map(raw, scope, prior.minds_image_model_enabled, listing)
+        persist_zdr_blocked(raw, scope, prior.minds_model_zdr_blocked, listing)
     persist_role_defaults_map(raw, scope, prior.minds_role_defaults, listing.role_defaults)
 
 
@@ -975,6 +978,7 @@ async def recommended_models(
             pair["minds-cloud"] = minds_role_start_models(
                 declared=declared_roles,
                 enabled_map=live_enabled or s._minds_enabled_map(),
+                blocked=zdr_blocked_ids(listing) if live_enabled else s._minds_zdr_blocked_ids(),
             )
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
