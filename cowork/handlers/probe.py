@@ -31,6 +31,7 @@ from cowork.services.connectors.connector_test_run import ConnectorTestError, pl
 from cowork.services.connectors.custom_connectors import (
     NEEDS_REBUILD_FOR_MEMBER,
     USAGE_NOTES_MAX,
+    custom_test_is_code_checked,
     test_request_for,
 )
 from cowork.services.connectors.identity import spec_secret_fields
@@ -43,7 +44,6 @@ from cowork.db.scoped import (
     LOCAL_SCOPE,
     ScopedSession,
     TenantScope,
-    tenant_scope_required,
     unsafe_unscoped_session,
 )
 from cowork.db.units import busy_retry_seconds, conversation_writes, run_db
@@ -428,9 +428,9 @@ class ProbeHandler:
                     unpatchable_names.update({saved_name.lower(), f"ds_{saved_name.lower()}"})
 
             # A custom connector is tested by its own test request, which the
-            # member confirms, never by the model probe. Self-hosted and org
-            # mode keep the model probe until their own milestone.
-            if registry.get_connector(connector_id) is None and not tenant_scope_required():
+            # member confirms, never by the model probe, where code decides
+            # the test (custom_test_is_code_checked).
+            if registry.get_connector(connector_id) is None and custom_test_is_code_checked():
                 # The staged copy goes now; the values wait only in the pending test.
                 store.consume(submission_id)
                 test_request = test_request_for(form_spec, method)

@@ -392,7 +392,7 @@ class TestAnOldConnectorCanBeBuiltAgain:
         _stored(saved.engine, self.OLD)
         with Session(saved.engine) as session:
             assert ConnectorCatalog(ScopedSession(session, LOCAL_SCOPE)).get_connector("planner").needs_rebuild is True
-            monkeypatch.setattr(catalog_module, "tenant_scope_required", lambda: True)
+            monkeypatch.setattr(catalog_module, "custom_test_is_code_checked", lambda: False)
             assert ConnectorCatalog(ScopedSession(session, LOCAL_SCOPE)).get_connector("planner").needs_rebuild is False
 
 

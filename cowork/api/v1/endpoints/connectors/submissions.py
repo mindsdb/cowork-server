@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, SingleUserOnly, require
-from cowork.db.scoped import TenantScope, get_tenant_scope, tenant_scope_required
+from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_db
 from cowork.handlers.datasource_relay import relay_cloud_submission
 from cowork.handlers.probe import ProbeHandler
@@ -23,6 +23,7 @@ from cowork.services.connectors.custom_connectors import (
     NEEDS_REBUILD_FOR_MEMBER,
     UnstorableFormError,
     check_handcrafted_form,
+    custom_test_is_code_checked,
     handcrafted_form_allowed,
     has_test_requests,
 )
@@ -271,7 +272,7 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScope) -> StreamingRe
         known=known is not None, custom=is_custom, extends=extends_name is not None,
         stored_test_request=stored_test_request,
     )
-    if stamped and stored_test_request is False and not tenant_scope_required():
+    if stamped and stored_test_request is False and custom_test_is_code_checked():
         # Saved before connection tests existed: it can never pass one.
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=NEEDS_REBUILD_FOR_MEMBER)
     if not stamped and not handcrafted:
