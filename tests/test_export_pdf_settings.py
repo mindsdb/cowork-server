@@ -24,6 +24,7 @@ from cowork.common.settings.app_settings import (
 )
 from cowork.schemas.artifact_export import ExportPdfSettings
 from cowork.server import create_app
+from cowork.services.connectors.connector_test_run import ALLOWLIST_ENV, private_allowlist
 
 
 class RenderUrlCases(BaseModel, frozen=True):
@@ -236,6 +237,44 @@ def test_pdf_settings_the_server_started_with_stay_in_the_environment(monkeypatc
         "http://127.0.0.1:9000",
     )
     assert str(get_export_pdf_settings().render_url) == "http://127.0.0.1:9000/"
+
+
+@pytest.mark.parametrize("started_with", ["10.9.0.0/16", None])
+def test_the_connection_test_allowlist_stays_as_the_server_started_with(monkeypatch, tmp_path, started_with):
+    """<COWORK_HOME>/.env is writable by agent code, so a line there neither
+    adds to the operator's list nor creates one."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"{ALLOWLIST_ENV}=10.0.0.0/8\n", encoding="utf-8")
+    if started_with is None:
+        monkeypatch.delenv(ALLOWLIST_ENV, raising=False)
+    else:
+        monkeypatch.setenv(ALLOWLIST_ENV, started_with)
+    private_allowlist.cache_clear()
+    _cli_loads_dotenv(monkeypatch, env_path=env_path)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda app, **_: None)
+
+    try:
+        cli.main()
+
+        assert os.environ.get(ALLOWLIST_ENV) == started_with
+        hosts, networks = private_allowlist()
+        assert (hosts, [str(n) for n in networks]) == (frozenset(), [started_with] if started_with else [])
+    finally:
+        os.environ.pop(ALLOWLIST_ENV, None)
+        private_allowlist.cache_clear()
+
+
+def test_the_server_reads_the_connection_test_allowlist_as_it_starts(monkeypatch):
+    """A value written to the environment after the start changes nothing."""
+    monkeypatch.setenv(ALLOWLIST_ENV, "10.9.0.0/16")
+    private_allowlist.cache_clear()
+    try:
+        create_app()
+        monkeypatch.setenv(ALLOWLIST_ENV, "10.0.0.0/8")
+
+        assert [str(n) for n in private_allowlist()[1]] == ["10.9.0.0/16"]
+    finally:
+        private_allowlist.cache_clear()
 
 
 def _cli_loads_dotenv(monkeypatch: pytest.MonkeyPatch, *, env_path: Path) -> None:

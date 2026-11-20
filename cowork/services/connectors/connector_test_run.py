@@ -136,7 +136,9 @@ def private_allowlist() -> tuple[frozenset[str], tuple[ipaddress.IPv4Network | i
     """The operator's private hosts and ranges, from the process environment.
 
     Read once and only from ``os.environ``: never from ``<COWORK_HOME>/.env``
-    or settings, which code the agent runs can write.
+    or settings, which code the agent runs can write. The server reads it as
+    it starts (``create_app``), so nothing written to the environment later
+    changes it.
     """
     hosts: set[str] = set()
     networks = []
@@ -546,7 +548,9 @@ async def _judge_host(
     host = url_host(step.url)
     port = step.url.port or (443 if step.url.scheme == "https" else 80)
     key = approval_key(step.name, step.method, step.url.scheme, host, port)
-    if key in approved:
+    shared = tenant_scope_required()
+    # A person's approval counts only on their own install.
+    if key in approved and not shared:
         addresses = tuple(ipaddress.ip_address(a) for a in approved[key])
         allowed = True
     else:
@@ -555,13 +559,20 @@ async def _judge_host(
         allowed = host in hosts or all(any(_judged(a) in n or a in n for n in networks) for a in addresses)
     # On a shared deployment "this computer" is the server, so nothing on it is
     # a person's own to test, on any port, listed by the operator or not.
-    own = _own_addresses() if tenant_scope_required() else None
+    own = _own_addresses() if shared else None
     for address in addresses:
         if _reaches_this_server(address, port) or (own is not None and _is_this_server(address, own)):
             raise ConnectorTestError(f"The {step.name} step points at Cowork itself.")
         if not is_public_address(address) and not _offerable(address):
             raise ConnectorTestError(f"The {step.name} step points at an address no test may reach ({address}).")
     private = [a for a in addresses if not is_public_address(a)]
+    if private and not allowed and shared:
+        # The request leaves from inside the operator's network, so only the
+        # operator's list opens a private address; nobody is asked.
+        raise ConnectorTestError(
+            f"The {step.name} step points at a private address ({host}) that the operator "
+            "has not allowed for connection tests."
+        )
     if private and not allowed:
         return addresses, PrivateHost(
             step.name, step.method, step.url.scheme, host, port, step.shown_path,

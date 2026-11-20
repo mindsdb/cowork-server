@@ -215,6 +215,36 @@ class TestEveryHostIsJudgedBeforeAnyRequest:
         assert api.requests == []
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("address", ["10.0.0.5", "192.168.1.10", "100.64.0.1", "fd12::5", "64:ff9b::a00:5"])
+    async def test_a_shared_deployment_refuses_a_private_host_the_operator_did_not_list(
+        self, monkeypatch, personal_deployment, address,
+    ):
+        """Nobody is asked there: the request leaves from the operator's network."""
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset())
+        api = await refused("operator has not allowed", table={**PUBLIC, "api.example.com": address})
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_shared_deployment_ignores_a_persons_approval(self, monkeypatch, personal_deployment):
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset())
+        key = connector_test_run.approval_key("data", "POST", "https", "api.example.com", 443)
+        api = await refused(
+            "operator has not allowed", table={**PUBLIC, "api.example.com": "10.0.0.5"}, approved={key: ("10.0.0.5",)},
+        )
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("listed", ["172.30.9.10", "172.30.9.10/32", "auth.example.com,api.example.com"])
+    async def test_a_shared_deployment_reaches_a_private_address_the_operator_listed(
+        self, monkeypatch, personal_deployment, listed,
+    ):
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset())
+        allow(monkeypatch, listed)
+        outcome, api = await run(table={"auth.example.com": "172.30.9.10", "api.example.com": "172.30.9.10"})
+        assert outcome.private_host is None and outcome.preview is not None
+        assert [r.headers["host"] for r in api.requests] == ["auth.example.com", "api.example.com"]
+
+    @pytest.mark.asyncio
     async def test_a_single_user_install_still_offers_this_computer_on_another_port(self, monkeypatch):
         monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset({ipaddress.ip_address("10.0.0.5")}))
         outcome, api = await run(with_url("http://localhost:9999/v1/data"), table={**PUBLIC, "localhost": "127.0.0.1"})
