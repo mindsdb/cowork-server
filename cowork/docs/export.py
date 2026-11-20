@@ -17,7 +17,7 @@ from cowork.services import artifact_export
 
 from .markdown import doc_to_markdown
 from .model import Doc
-from .render import doc_html, export_body_html
+from .render import PDF_CSS, doc_html, export_body_html
 
 MEDIA_TYPES = {
     "md": "text/markdown; charset=utf-8",
@@ -40,12 +40,16 @@ def offered_formats(*, org_mode: bool) -> list[str]:
             if fmt not in CONVERTED_FORMATS or (converted and (fmt != "pdf" or pdf_offered))]
 
 
-def _document(doc: Doc) -> bytes:
-    """The doc as one HTML document for the inliner, its title first when no tab heading carries it."""
+def _document(doc: Doc, fmt: str) -> bytes:
+    """The doc as one HTML document for the inliner, its title first when no tab heading carries it.
+
+    A PDF gets the page's font; Word ignores CSS, so its document carries none.
+    """
     title = html.escape(doc["title"])
     # A one-tab doc has no tab heading to carry its name; the export starts with it.
     title_html = f"<h1>{title}</h1>" if len(doc["tabs"]) == 1 else ""
-    return (f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>{title}</title></head>"
+    style = f"<style>{PDF_CSS}</style>" if fmt == "pdf" else ""
+    return (f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>{title}</title>{style}</head>"
             f"<body>{title_html}{export_body_html(doc)}</body></html>").encode("utf-8")
 
 
@@ -64,7 +68,7 @@ def export_bytes(doc: Doc, fmt: str, *, folder: PinnedDir | None = None, org_mod
     if folder is None:
         raise ValueError(f"a {fmt} export reads the doc's folder")
     return artifact_export.convert_document(
-        source=_document(doc),
+        source=_document(doc, fmt),
         parts=("doc.html",),
         title=doc["title"],
         folder=folder,
