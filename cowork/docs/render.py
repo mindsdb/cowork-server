@@ -718,6 +718,10 @@ def _heading_html(tab: Tab, b: Block, rich: bool) -> str:
 
 
 def _paragraph_html(tab: Tab, b: Block, rich: bool) -> str:
+    # An empty <p> has no height and its margins collapse into the neighbours',
+    # so a blank line the editor shows would vanish from the page.
+    if not b["text"].strip():
+        return "<p><br></p>"
     return f"<p>{inline_html(b['text'])}</p>"
 
 
