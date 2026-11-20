@@ -26,7 +26,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 
 import httpx
@@ -428,6 +430,11 @@ async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharin
     stays empty."""
     _share_alices_acme(sharing)
     before = _vault_files(ALICE)
+    save_failures: list[BaseException | None] = []
+    monkeypatch.setattr(
+        submissions_ep, "logger",
+        SimpleNamespace(exception=lambda *args, **kwargs: save_failures.append(sys.exc_info()[1])),
+    )
 
     submission_id = submissions_ep.store.stage(
         form_id="fm_acmegrant1",
@@ -442,6 +449,8 @@ async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharin
     answer = await _confirm(probed, BOB)
     assert "saved_slug" not in answer
     assert answer["patch"]["form_error"] == "Cowork could not save the connection. Submit the form again."
+    [failure] = save_failures
+    assert isinstance(failure, SharedConnectionError) and failure.detail == SHARED_CONNECTION_REFUSAL
     staged: list = []
     monkeypatch.setattr(submissions_ep.store, "stage", lambda **kwargs: staged.append(kwargs))
 

@@ -434,6 +434,53 @@ class TestAnApiBehindTheOperatorsOwnCertificateAuthority:
         assert connector_test_run._tls_verify().cert_store_stats()["x509_ca"] > 1
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("prefix", [
+        "# CA de l'équipe, Zürich — 2026\n".encode(), b"\xef\xbb\xbf", b"# caf\xe9\n", b"",
+    ], ids=["utf-8 comment", "byte-order mark", "latin-1 comment", "plain"])
+    async def test_a_bundle_with_a_comment_or_byte_order_mark_is_trusted(
+        self, monkeypatch, tmp_path, personal_deployment, origin, prefix,
+    ):
+        port, origin_ca = origin
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_bytes(prefix + origin_ca.read_bytes())
+        self._start_with(monkeypatch, bundle)
+
+        connector_test_run.check_started_certificates()
+        status, _body, _over_cap, _content_type = await self._send(port)
+
+        assert status == 200
+
+    def test_a_shared_deployment_does_not_start_with_a_file_it_cannot_read(
+        self, monkeypatch, tmp_path, personal_deployment,
+    ):
+        self._start_with(monkeypatch, tmp_path / "missing.pem")
+        with pytest.raises(ValueError, match="SSL_CERT_FILE names a file that cannot be read"):
+            connector_test_run.check_started_certificates()
+
+    def test_a_shared_deployment_does_not_start_with_a_file_holding_no_certificate(
+        self, monkeypatch, tmp_path, personal_deployment,
+    ):
+        empty = tmp_path / "empty.pem"
+        empty.write_text("not a certificate\n", encoding="ascii")
+        self._start_with(monkeypatch, empty)
+        with pytest.raises(ValueError, match="SSL_CERT_FILE names a file with no certificate in it"):
+            connector_test_run.check_started_certificates()
+
+    @pytest.mark.parametrize("bad", ["missing", "empty"])
+    def test_an_org_deployment_starts_with_a_file_it_never_uses(
+        self, monkeypatch, tmp_path, org_deployment, bad,
+    ):
+        path = tmp_path / "bad.pem"
+        if bad == "empty":
+            path.write_text("not a certificate\n", encoding="ascii")
+        self._start_with(monkeypatch, path)
+        connector_test_run.check_started_certificates()
+
+    def test_a_single_user_install_starts_with_a_file_it_cannot_read(self, monkeypatch, tmp_path):
+        self._start_with(monkeypatch, tmp_path / "missing.pem")
+        connector_test_run.check_started_certificates()
+
+    @pytest.mark.asyncio
     async def test_a_shared_deployment_without_the_file_does_not_trust_it(self, personal_deployment, origin):
         port, _ca_file = origin
         with pytest.raises(ConnectorTestError, match="could not connect"):

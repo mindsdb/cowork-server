@@ -163,7 +163,7 @@ CA_FILE_ENV = "SSL_CERT_FILE"
 @dataclass(frozen=True)
 class StartedCertificates:
     """The certificate file named when the server started: its path and its
-    text, or None for the text when it could not be read."""
+    PEM text, or None for the text when it could not be read."""
 
     path: str
     pem: str | None
@@ -178,14 +178,19 @@ def started_certificates() -> StartedCertificates | None:
     ``<COWORK_HOME>/.env``), like ``private_allowlist``. An unreadable file
     is kept as a path with no text, so a single-user install, which never
     uses the file, still starts.
+
+    The file is read as bytes and its non-ASCII characters dropped, since
+    OpenSSL skips a comment line or a byte-order mark that ``cadata`` as text
+    would refuse, and PEM itself is ASCII.
     """
     path = os.environ.get(CA_FILE_ENV)
     if not path:
         return None
     try:
-        return StartedCertificates(path, Path(path).read_text(encoding="ascii"))
-    except (OSError, UnicodeDecodeError):
+        data = Path(path).read_bytes()
+    except OSError:
         return StartedCertificates(path, None)
+    return StartedCertificates(path, data.decode("utf-8", errors="ignore").encode("ascii", errors="ignore").decode("ascii"))
 
 
 def _trust_context(certificates: StartedCertificates) -> ssl.SSLContext:
@@ -204,11 +209,17 @@ def _trust_context(certificates: StartedCertificates) -> ssl.SSLContext:
 
 
 def check_started_certificates() -> None:
-    """Stop the start of a shared deployment whose ``SSL_CERT_FILE`` cannot
-    be used, rather than fail later inside a test. A single-user install
-    never uses the file and is not checked."""
+    """Stop the start of a deployment that trusts identity headers when its
+    ``SSL_CERT_FILE`` cannot be used, rather than fail later inside a test.
+    A single-user install and org mode never use the file and are not checked.
+
+    Raises:
+        ValueError: naming ``SSL_CERT_FILE``, saying whether the file cannot
+            be read or holds no certificate.
+    """
+    settings = get_app_settings()
     certificates = started_certificates()
-    if certificates is not None and tenant_scope_required():
+    if certificates is not None and settings.tenancy_mode != "org" and settings.trust_identity_headers:
         _trust_context(certificates)
 
 
