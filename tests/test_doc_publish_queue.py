@@ -265,8 +265,9 @@ def test_the_log_fields_survive_the_json_formatter(caplog):
     (PublishResult(Outcome.SKIPPED, "unpublished"), logging.DEBUG),
     (PublishResult(Outcome.UNCHANGED), logging.DEBUG),
     (PublishResult(Outcome.RETRY, "lock_busy"), logging.DEBUG),
+    (PublishResult(Outcome.RETRY, "store_busy"), logging.WARNING),
     (PublishResult(Outcome.RETRY, "no_key"), logging.WARNING),
-], ids=["unpublished", "unchanged", "lock_busy", "no_key"])
+], ids=["unpublished", "unchanged", "lock_busy", "store_busy", "no_key"])
 def test_what_is_logged_quietly(result, level):
     assert pq._level(result) == level
 
@@ -361,12 +362,13 @@ def test_a_doc_still_publishing_is_not_claimed_again(server):
     assert asyncio.run(scenario()) == (1, 14.0)
 
 
-def test_a_busy_lock_retries_without_spending_an_attempt(server):
+@pytest.mark.parametrize("reason", ["lock_busy", "store_busy"])
+def test_a_busy_lock_retries_without_spending_an_attempt(server, reason):
     async def scenario():
         r = _client(server)
         await pq.enqueue(JOB, client=r, now=0.0)
         await r.hset(pq.doc_key("a1"), "attempts", 2)
-        rec = Recorder(*([PublishResult(Outcome.RETRY, "lock_busy")] * pq.MAX_ATTEMPTS))
+        rec = Recorder(*([PublishResult(Outcome.RETRY, reason)] * pq.MAX_ATTEMPTS))
         now = {"t": 10.0}
         w = pq.DocPublishWorker(_client(server), publish=rec, clock=lambda: now["t"])
         dues = await _dues(r, w, now, pq.MAX_ATTEMPTS)

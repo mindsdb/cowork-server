@@ -57,6 +57,11 @@ def doc_key(artifact_id: str) -> str:
     return _DOC_PREFIX + artifact_id
 
 
+# Retries that spend no attempt. store_busy still logs at WARNING: a file
+# store that stays saturated would otherwise loop here unseen.
+_BUSY = frozenset({"lock_busy", "store_busy"})
+
+
 def _attempts(value: str | None) -> int:
     # A corrupted count must not stop the publish, or the claim would re-queue every tick.
     try:
@@ -218,8 +223,8 @@ class DocPublishWorker:
             error_type = type(exc).__name__
         key = doc_key(job.artifact_id)
         try:
-            if result.outcome is Outcome.RETRY and result.reason == "lock_busy":
-                # Another publish of this page is still running: not an attempt of ours.
+            if result.outcome is Outcome.RETRY and result.reason in _BUSY:
+                # Another publish of this page, or a busy file store: not an attempt of ours.
                 await self._client.zadd(DUE_KEY, {job.artifact_id: self._clock() + DEBOUNCE_S}, nx=True)
                 _record(result, job, attempts=attempts, error_type=error_type)
                 return

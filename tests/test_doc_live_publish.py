@@ -409,7 +409,7 @@ def test_an_upload_failing_after_the_caller_was_cancelled_logs_and_publishes_not
     assert events == []
 
 
-def test_a_busy_file_store_while_taking_the_lock_answers_lock_busy(doc, monkeypatch):
+def test_a_busy_file_store_while_taking_the_lock_answers_store_busy(doc, monkeypatch):
     # The inline run_efs passes the busy store up the way the real one refuses a slot.
     def busy(base, slug, *, ttl_s):
         raise FilesystemBusy(limiter="run_efs")
@@ -417,7 +417,19 @@ def test_a_busy_file_store_while_taking_the_lock_answers_lock_busy(doc, monkeypa
     monkeypatch.setattr(lp, "acquire", busy)
     monkeypatch.setattr(lp, "LOCK_WAIT_S", 0.2)
     result, done = asyncio.run(_run(_job(doc)))
-    assert result == lp.PublishResult(lp.Outcome.RETRY, "lock_busy") and done == [1] and FakeKey.minted == []
+    assert result == lp.PublishResult(lp.Outcome.RETRY, "store_busy") and done == [1] and FakeKey.minted == []
+
+
+def test_an_unreadable_doc_is_skipped_not_retried(doc, monkeypatch):
+    from cowork.docs.model import DocError
+
+    def broken(folder):
+        raise DocError("bad", "doc.json does not parse")
+
+    monkeypatch.setattr(lp, "load_doc", broken)
+    monkeypatch.setattr(lp, "publish_artifact", lambda *a, **k: pytest.fail("uploaded"))
+    result, done = asyncio.run(_run(_job(doc)))
+    assert result == lp.PublishResult(lp.Outcome.SKIPPED, "unreadable") and done == [1] and FakeKey.minted == []
 
 
 def test_a_cancel_after_the_lock_was_taken_lets_it_go(doc, released, monkeypatch):

@@ -24,6 +24,7 @@ from typing import Any
 from cowork.db.scoped import TenantScope
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
 from cowork.docs.hub import DOC_PUBLISHED, doc_topic, hub
+from cowork.docs.model import DocError
 from cowork.docs.store import DOC_HTML, _has_id, is_doc_folder, load_doc
 from cowork.services.artifact_access import ArtifactAccessRefused, ArtifactAudienceRejected
 from cowork.services.artifact_autopublish import (
@@ -140,7 +141,11 @@ def _doc_folder(job: DocPublishJob) -> tuple[Path | None, str | None]:
     folder = Path(job.artifacts_base) / job.slug
     if not folder.is_dir() or not is_doc_folder(folder):
         return None, "not_a_doc"
-    if not _has_id(load_doc(folder), job.artifact_id.replace("-", "").lower()):
+    try:
+        doc = load_doc(folder)
+    except DocError:  # a doc.json that waiting will not make readable
+        return None, "unreadable"
+    if not _has_id(doc, job.artifact_id.replace("-", "").lower()):
         return None, "id_mismatch"
     return folder, None
 
@@ -202,16 +207,20 @@ async def _try_lock(base: Path, slug: str, scope: TenantScope) -> bool:
         raise
 
 
-async def _take_lock(base: Path, slug: str, scope: TenantScope) -> bool:
+async def _take_lock(base: Path, slug: str, scope: TenantScope) -> str | None:
+    """None once the lock is taken, else why not: "lock_busy" (another publish
+    holds it) or "store_busy" (the file store refused every try)."""
     deadline = time.monotonic() + LOCK_WAIT_S
+    held = False
     while True:
         try:
             if await _try_lock(base, slug, scope):
-                return True
+                return None
+            held = True
         except FilesystemBusy:
             pass  # a busy file store is a lock not taken this round
         if time.monotonic() >= deadline:
-            return False
+            return "lock_busy" if held else "store_busy"
         await asyncio.sleep(_LOCK_POLL_S)
 
 
@@ -257,8 +266,8 @@ async def publish_doc_page(job: DocPublishJob, *, on_done: Callable[[], None]) -
         state = await run_efs(partial(_page_state, folder), scope=scope)
         if (early := _early(state)) is not None:
             return early
-        if not await _take_lock(base, job.slug, scope):
-            return PublishResult(Outcome.RETRY, "lock_busy")
+        if (busy := await _take_lock(base, job.slug, scope)) is not None:
+            return PublishResult(Outcome.RETRY, busy)
         lock = True
         # Another publish may have sent this page while the lock was taken.
         state = await run_efs(partial(_page_state, folder), scope=scope)
