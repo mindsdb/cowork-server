@@ -1273,6 +1273,126 @@ def test_a_budget_stop_carries_no_reset_instant():
     assert te.BUDGET_EXCEEDED_CODE not in te.RESET_AT_CODES
 
 
+_SCOPED_BUDGET_MESSAGES = {
+    "org": "Your organization's spending budget is used up. An owner or admin can raise it in Budgets.",
+    "workspace": "This workspace's spending budget is used up. An administrator can raise it in Budgets.",
+    "api_key": "This API key's spending budget is used up. An administrator can raise it in Budgets.",
+}
+
+
+def _scoped_budget_via_header(scope):
+    exc = _gateway_failure(402, reason="budget_exceeded")
+    exc.__cause__.response.headers["X-MindsHub-Budget-Scope"] = scope
+    return exc
+
+
+def _scoped_budget_via_body(scope):
+    exc = _budget_via_body_code()
+    exc.__cause__.body["error"]["budget_scope"] = scope
+    return exc
+
+
+def _scoped_budget_via_type(scope):
+    stop = te.BudgetExceededError("Server returned 402: budget used up.", reason="budget_exceeded", status_code=402)
+    stop.budget_scope = scope
+    return stop
+
+
+@pytest.mark.parametrize("carrier", [_scoped_budget_via_header, _scoped_budget_via_body, _scoped_budget_via_type])
+@pytest.mark.parametrize("scope", sorted(_SCOPED_BUDGET_MESSAGES))
+def test_a_spent_budget_names_its_scope(carrier, scope):
+    failure = carrier(scope)
+    assert te.friendly_turn_error(failure) == (te.BUDGET_EXCEEDED_CODE, _SCOPED_BUDGET_MESSAGES[scope])
+    assert te.gate_budget_scope(failure) == scope
+
+
+@pytest.mark.parametrize(
+    ("scope", "lead"),
+    [
+        ("team", "Your team's spending budget is used up. An administrator"),
+        ("user", "Your spending budget is used up. An administrator"),
+        ("all_members", "Your spending budget is used up. An administrator"),
+    ],
+)
+def test_team_and_member_budgets_are_named(scope, lead):
+    code, message = te.friendly_turn_error(_scoped_budget_via_header(scope))
+    assert code == te.BUDGET_EXCEEDED_CODE
+    assert message.startswith(lead)
+
+
+@pytest.mark.parametrize(
+    ("scope", "period", "message"),
+    [
+        ("org", "month", "Your organization's monthly spending budget is used up. An owner or admin can raise it in Budgets."),
+        ("workspace", "day", "This workspace's daily spending budget is used up. An administrator can raise it in Budgets."),
+        ("user", "year", "Your yearly spending budget is used up. An administrator can raise it in Budgets."),
+        ("guild", "day", "A daily spending budget is used up. An administrator can raise it in Budgets."),
+        ("org", "week", "Your organization's spending budget is used up. An owner or admin can raise it in Budgets."),
+    ],
+)
+def test_a_spent_budget_names_its_period(scope, period, message):
+    exc = _scoped_budget_via_header(scope)
+    exc.__cause__.response.headers["X-MindsHub-Budget-Period"] = period
+    assert te.friendly_turn_error(exc) == (te.BUDGET_EXCEEDED_CODE, message)
+    assert te.gate_budget_period(exc) == (period if period != "week" else None)
+
+
+def test_the_period_is_read_from_the_body_and_the_typed_error():
+    exc = _scoped_budget_via_body("workspace")
+    exc.__cause__.body["error"]["budget_period"] = "month"
+    assert te.gate_budget_period(exc) == "month"
+    typed = _scoped_budget_via_type("org")
+    typed.budget_period = "year"
+    assert te.gate_budget_period(typed) == "year"
+
+
+def test_the_failed_payload_carries_the_budget_period_only_when_set():
+    assert te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE, budget_period="day")["budget_period"] == "day"
+    assert "budget_period" not in te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE)
+
+
+def test_a_remote_budget_stop_names_scope_and_period():
+    code, message = te.remote_turn_error("BudgetExceededError: x", "team", "month")
+    assert (code, message) == (
+        te.BUDGET_EXCEEDED_CODE,
+        "Your team's monthly spending budget is used up. An administrator can raise it in Budgets.",
+    )
+
+
+@pytest.mark.parametrize("scope", ["guild", "Not A Scope!", "x" * 33])
+def test_a_scope_the_copy_does_not_know_reads_as_neutral(scope):
+    code, message = te.friendly_turn_error(_scoped_budget_via_header(scope))
+    assert (code, message) == (te.BUDGET_EXCEEDED_CODE, te.BUDGET_EXCEEDED_USER_MESSAGE)
+    assert message.startswith("A spending budget is used up.")
+
+
+def test_only_a_well_formed_scope_is_forwarded():
+    assert te.gate_budget_scope(_scoped_budget_via_header("team")) == "team"
+    assert te.gate_budget_scope(_scoped_budget_via_header("Not A Scope!")) is None
+    assert te.gate_budget_scope(_gateway_failure(402, reason="budget_exceeded")) is None
+
+
+@pytest.mark.parametrize("name", ["X-MindsHub-Budget-Scope", "x-mindshub-budget-scope", "X-Mindshub-Budget-Scope"])
+def test_a_plain_dict_header_is_read_in_any_casing(name):
+    class Denied(Exception):
+        headers = {name: "team", name.replace("Scope", "Period").replace("scope", "period"): "day"}
+
+    assert te.gate_budget_scope(Denied()) == "team"
+    assert te.gate_budget_period(Denied()) == "day"
+
+
+def test_the_failed_payload_carries_the_budget_scope_only_when_set():
+    assert te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE, budget_scope="workspace")["budget_scope"] == "workspace"
+    assert "budget_scope" not in te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE)
+
+
+@pytest.mark.parametrize("scope", sorted(_SCOPED_BUDGET_MESSAGES))
+def test_a_remote_budget_stop_names_the_scope_the_worker_sent(scope):
+    error = "BudgetExceededError: Server returned 402: budget used up."
+    assert te.remote_turn_error(error, scope) == (te.BUDGET_EXCEEDED_CODE, _SCOPED_BUDGET_MESSAGES[scope])
+    assert te.remote_turn_error(error) == (te.BUDGET_EXCEEDED_CODE, te.BUDGET_EXCEEDED_USER_MESSAGE)
+
+
 def test_fuse_header_maps_to_free_serving_paused_not_out_of_credits():
     code, message = te.friendly_turn_error(_fuse_via_header())
     assert code == te.FREE_SERVING_PAUSED_CODE
@@ -3257,3 +3377,60 @@ def test_gateway_denial_reads_the_body_code_only_from_the_gateway_host():
 
 def test_gateway_denial_is_none_for_a_plain_exception():
     assert te.gateway_denial(exc=Exception("boom")) is None
+
+
+def test_a_per_model_budget_names_the_model_by_its_catalog_label(monkeypatch):
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: {"haiku-4-5": "Claude Haiku"}.get(m))
+    exc = _scoped_budget_via_header("workspace")
+    exc.__cause__.response.headers["X-MindsHub-Budget-Period"] = "day"
+    exc.__cause__.response.headers["X-MindsHub-Budget-Model"] = "haiku-4-5"
+    assert te.gate_budget_model(exc) == "haiku-4-5"
+    assert te.friendly_turn_error(exc) == (
+        te.BUDGET_EXCEEDED_CODE,
+        "This workspace's daily spending budget for Claude Haiku is used up. Other models still work. "
+        "An administrator can raise it in Budgets.",
+    )
+
+
+def test_a_model_the_catalog_does_not_know_falls_back_to_its_alias(monkeypatch):
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: None)
+    assert te.budget_exceeded_message("org", "month", "gpt-nano") == (
+        "Your organization's monthly spending budget for gpt-nano is used up. Other models still work. "
+        "An owner or admin can raise it in Budgets."
+    )
+
+
+@pytest.mark.parametrize("model", [None, "", "bad model", "x\r\ny", 7])
+def test_only_a_header_safe_model_is_kept(model):
+    assert te.clean_budget_model(model) is None
+
+
+def test_the_model_is_read_from_the_body_and_the_typed_error():
+    exc = _scoped_budget_via_body("team")
+    exc.__cause__.body["error"]["budget_model"] = "haiku-4-5"
+    assert te.gate_budget_model(exc) == "haiku-4-5"
+    typed = _scoped_budget_via_type("org")
+    typed.budget_model = "sonnet-4-5"
+    assert te.gate_budget_model(typed) == "sonnet-4-5"
+
+
+def test_the_failed_payload_carries_the_budget_model_only_when_set():
+    assert te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE, budget_model="haiku-4-5")["budget_model"] == (
+        "haiku-4-5"
+    )
+    assert "budget_model" not in te.response_failed_payload("m", te.BUDGET_EXCEEDED_CODE)
+
+
+def test_a_remote_per_model_budget_stop_names_the_model(monkeypatch):
+    import cowork.services.providers as providers
+
+    monkeypatch.setattr(providers, "cached_minds_model_label", lambda m: "Claude Haiku")
+    code, message = te.remote_turn_error("BudgetExceededError: x", "team", "month", "haiku-4-5")
+    assert message == (
+        "Your team's monthly spending budget for Claude Haiku is used up. Other models still work. "
+        "An administrator can raise it in Budgets."
+    )

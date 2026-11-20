@@ -46,7 +46,7 @@ class TestSpec:
         assert "editing stays off until you allow it in Tool access" in mcp
 
     def test_the_mcp_engines_are_the_specs_with_an_mcp_method(self):
-        assert ConnectorSpecRegistry().mcp_engines() == {"hubspot", "notion"}
+        assert ConnectorSpecRegistry().mcp_engines() == {"hubspot", "notion", "slack"}
 
     async def test_mcp_identity_is_offered_only_for_the_spec_mcp_engines(self, monkeypatch):
         from cowork.services.connectors.specs._registry import registry
