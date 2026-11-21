@@ -215,11 +215,12 @@ def test_without_a_hand_off_no_route_refuses_and_every_declared_route_reaches_it
 
 def test_no_other_code_gives_the_refusal():
     """The walk stops before every endpoint, so it can't see a handler that
-    gives this refusal itself. The source can: only WindowProof writes it."""
+    gives this refusal itself. The source can: only WindowProof writes it,
+    and the request log only lists it as a reason it may name."""
     root = Path(cowork.__file__).parent
     found = sorted(
         path.relative_to(root).as_posix()
         for path in root.rglob("*.py")
         if REFUSAL in path.read_text(encoding="utf-8")
     )
-    assert found == ["api/v1/permissions.py"]
+    assert found == ["api/v1/permissions.py", "common/request_logging.py"]
