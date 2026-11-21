@@ -92,6 +92,8 @@ async def list_connections(scope: ScopeDep, request: Request):
                 name=c["name"],
                 user_label=c.get("user_label"),
                 status="needs_reconnect" if c.get("status") == "needs_reconnect" else None,
+                method=c.get("method"),
+                access_mode=c.get("access_mode"),
             )
             for item in catalogue.get("items", [])
             for c in item.get("connections", [])
