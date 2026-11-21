@@ -609,6 +609,10 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/hub/usage` | The caller's free Air allowance (as a proportion), subscription plan, balance, auto top up and credit spend, for the desktop's usage warnings. An organization with no free grant reads `freeTokens.limit` 0 and `freeTokens.resetsAt` null, since nothing refills. `plan` is `{tier, status, renewsAt, cancelAtPeriodEnd, windows: [{window, percentUsed, resetsAt}]}` from entitlements/me's `plan` block (ENG-4186), or null when auth sends none or one that does not parse |
 | `/hub/deletion-request` | The caller's request to delete their MindsHub account: `GET` answers the open request or 404, `POST` opens one (202). MindsHub's support deletes the account. 404 outside MindsHub mode |
 
+### Request size limits
+
+In MindsHub mode, every request body has a cap: 500 MiB for the file uploads, 208 MiB for a skill upload, 5 MiB plus framing for a comment image, and 32 MiB for every other request. `BodyLimitMiddleware` (`cowork/api/body_limits.py`) answers 413 before the app reads a body over its route's cap, and the desktop app has no cap. Uploads are copied from Starlette's spool to storage in 1 MiB chunks, in every mode. The chart's [Request size limits](deployment/cowork-server/README.md#request-size-limits) section gives each route's cap, the ingress limit that matches it, and the skill archive's own limits.
+
 ### Declaring who may call a route
 
 Every route declares its permission at its own definition, and `create_app()` refuses to start if one does not. Adding a route means picking the class that names the credential the route actually takes:

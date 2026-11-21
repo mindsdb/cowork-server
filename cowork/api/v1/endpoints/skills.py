@@ -2,7 +2,7 @@ import logging
 from collections.abc import Mapping
 from contextlib import ExitStack, nullcontext
 from functools import partial
-from typing import Annotated, NamedTuple
+from typing import Annotated, BinaryIO, NamedTuple
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy.exc import IntegrityError
@@ -42,6 +42,7 @@ from cowork.services.skills import (
     SkillOrigin,
     SkillService,
     SkillSharingError,
+    SkillTooLargeError,
     VisibleSkill,
     builtin_skill_refusal,
     is_builtin_skill,
@@ -604,12 +605,12 @@ def _create_skill(
     ).model_dump(by_alias=True)
 
 
-def _upload_skill_bytes(
-    raw: bytes,
-    filename: str | None,
+def _upload_skill_file(
     scoped: ScopedSession,
-    principal: Principal | None,
     *,
+    source: BinaryIO,
+    filename: str | None,
+    principal: Principal | None,
     shared: bool = False,
     viewer: SkillViewer | None = None,
 ) -> dict:
@@ -629,8 +630,8 @@ def _upload_skill_bytes(
                 claim, claim_token = reserved.claim, reserved.token
 
             try:
-                skill = service.import_skill(
-                    raw,
+                skill = service.import_skill_file(
+                    source=source,
                     filename=filename,
                     before_persist=reserve_import if scoped.scope.org_mode else None,
                     shared=shared,
@@ -652,6 +653,13 @@ def _upload_skill_bytes(
             except (FileExistsError, SkillAlreadyExistsError) as e:
                 _release_new_skill_claim(access, claim, claim_token)
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+            # Before ValueError's 422, as it is one.
+            except SkillTooLargeError as e:
+                _release_new_skill_claim(access, claim, claim_token)
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail=str(e),
+                )
             except ValueError as e:
                 _release_new_skill_claim(access, claim, claim_token)
                 raise HTTPException(
@@ -686,9 +694,17 @@ async def upload_skill(
     shared: Annotated[bool, Form()] = False,
     viewer: SkillViewerDep = None,
 ):
-    raw = await file.read()
+    # The import reads Starlette's spool of the upload (on disk past 1 MiB) on
+    # the file store's thread, so the upload is never held in memory whole.
     return await run_efs_unit(
-        lambda session: _upload_skill_bytes(raw, file.filename, session, principal, shared=shared, viewer=viewer),
+        partial(
+            _upload_skill_file,
+            source=file.file,
+            filename=file.filename,
+            principal=principal,
+            shared=shared,
+            viewer=viewer,
+        ),
         scope=scope,
     )
 

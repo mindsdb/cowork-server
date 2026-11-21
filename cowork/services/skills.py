@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, BinaryIO, NamedTuple
 from uuid import uuid4
 
 from anton.core.tools.skill_format import (
@@ -113,6 +113,13 @@ class SkillSharingUnavailableError(SkillSharingError):
     (SkillService.sharing_available)."""
 
 
+class SkillTooLargeError(ValueError):
+    """An upload was refused for its size: a SKILL.md past SKILL_MD_MAX_BYTES,
+    or a zip whose central directory is past
+    SkillService._ZIP_MAX_DIRECTORY_BYTES. A ValueError, so a caller that
+    catches ValueError still refuses it."""
+
+
 # Every change to a skill its reader can't change: one someone else shares
 # with them, one of the operator's managed skills, and where skills are shared
 # across the deployment, one somebody else created (cowork.creators).
@@ -131,6 +138,16 @@ SKILL_SHARING_UNAVAILABLE = "Sharing one skill at a time isn't available here."
 # stops one bad skill from bloating the payload. The aggregate request size is
 # bounded downstream by the producer's _fit_request against the real stdin cap.
 _TURN_SKILL_FILE_MAX = 200_000
+
+# The largest SKILL.md an upload may hold, since anton's parse_skill_dir reads
+# it whole. 2 MiB is about 500,000 tokens, more than any model's context. A
+# SKILL.md over _TURN_SKILL_FILE_MAX and within this bound still uploads, and
+# a turn leaves it out (_skill_wire_files).
+SKILL_MD_MAX_BYTES = 2 * 1024 * 1024
+SKILL_MD_TOO_LARGE = (
+    f"This skill's SKILL.md is larger than the {SKILL_MD_MAX_BYTES // (1024 * 1024)} MB limit."
+)
+SKILL_ARCHIVE_TOO_MANY_FILES = "This skill archive holds too many files."
 
 # Packaged skills shipped with cowork. Bump BUILTIN_SKILLS_VERSION when the set
 # changes; seeding re-runs only when the stored version is lower, so a future
@@ -307,7 +324,14 @@ def _skill_wire_files(skill_dir: Path, root: Path) -> dict[str, str] | None:
         if rel == "stats.json" or any(p.startswith(".") for p in rel.split("/")):
             continue
         try:
-            text = child.read_text(encoding="utf-8")
+            # lstat, as the checks above skip a link rather than follow it.
+            # _wire_len never comes out below the size on disk: json.dumps
+            # writes each character in at least as many bytes as UTF-8 does
+            # (a CRLF that reads back as "\n" is two bytes either way), plus
+            # two quotes. So a file over the cap on disk is over it on the
+            # wire too, and is left unread.
+            size = child.lstat().st_size
+            text = child.read_text(encoding="utf-8") if size <= _TURN_SKILL_FILE_MAX else None
         except (OSError, UnicodeDecodeError):
             logger.warning(
                 "turn skills: skipping unreadable or non-text file %r in %r",
@@ -315,7 +339,7 @@ def _skill_wire_files(skill_dir: Path, root: Path) -> dict[str, str] | None:
                 skill_dir.name,
             )
             continue
-        if _wire_len(text) > _TURN_SKILL_FILE_MAX:
+        if text is None or _wire_len(text) > _TURN_SKILL_FILE_MAX:
             if rel == SKILL_FILE:
                 logger.warning(
                     "turn skills: dropping %r (SKILL.md over %d wire bytes)",
@@ -324,10 +348,10 @@ def _skill_wire_files(skill_dir: Path, root: Path) -> dict[str, str] | None:
                 )
                 return None
             logger.warning(
-                "turn skills: skipping oversized file %r in %r (%d wire bytes)",
+                "turn skills: skipping oversized file %r in %r (over %d wire bytes)",
                 rel,
                 skill_dir.name,
-                _wire_len(text),
+                _TURN_SKILL_FILE_MAX,
             )
             continue
         files[rel] = text
@@ -744,6 +768,35 @@ def _skill_from_dir(
         skill.name = skill_dir.name
 
     return skill
+
+
+def _refuse_oversized_skill_md(*, path: Path) -> None:
+    """Refuse a SKILL.md past SKILL_MD_MAX_BYTES before parse_skill_dir reads
+    it whole. A missing one is left to the parse, which reports it."""
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return
+    if size > SKILL_MD_MAX_BYTES:
+        raise SkillTooLargeError(SKILL_MD_TOO_LARGE)
+
+
+def _zip_directory_size(*, source: BinaryIO) -> int:
+    """The size in bytes of a zip's central directory, from its end record.
+
+    ZipFile builds a ZipInfo for every central directory entry as it opens an
+    archive, before its caller can check anything, so this reads the end
+    record first with zipfile._EndRecData, the reader ZipFile itself uses
+    (ZIP64 included). Raises BadZipFile where ZipFile would, an OSError from
+    that reader included.
+    """
+    try:
+        end_record = zipfile._EndRecData(source)
+    except OSError:
+        end_record = None
+    if end_record is None:
+        raise zipfile.BadZipFile("File is not a zip file")
+    return end_record[zipfile._ECD_SIZE]
 
 
 class SkillOrigin(StrEnum):
@@ -1851,26 +1904,54 @@ class SkillService:
         validate_skill: Callable[[Skill], None] | None = None,
         shared: bool = False,
     ) -> Skill:
+        """import_skill_file for a file already held in memory as ``data``."""
+        return self.import_skill_file(
+            source=io.BytesIO(data),
+            filename=filename,
+            before_persist=before_persist,
+            validate_skill=validate_skill,
+            shared=shared,
+        )
+
+    def import_skill_file(
+        self,
+        *,
+        source: BinaryIO,
+        filename: str | None,
+        before_persist: Callable[[str], None] | None = None,
+        validate_skill: Callable[[Skill], None] | None = None,
+        shared: bool = False,
+    ) -> Skill:
         """Import a skill from an uploaded file, shared with everyone,
         read-only, when ``shared`` (as create_skill shares one).
 
+        ``source`` is never read whole into memory. A zip is read in place,
+        so ``source`` must be seekable; a text file is read from its current
+        position, and only up to one byte past SKILL_MD_MAX_BYTES.
+
         Supported formats (by extension):
-          - ``.md`` / ``.skill`` — a text ``SKILL.md``.
-          - ``.zip`` — the contents of a skill folder, extracted as-is.
+          - ``.md`` / ``.skill``: a text ``SKILL.md``.
+          - ``.zip``: the contents of a skill folder, extracted as-is.
 
         Validation = "does its ``SKILL.md`` parse via skill_format". Raises
-        ``ValueError`` for an unparseable/unsafe file, ``FileExistsError`` on
-        slug collision.
+        ``SkillTooLargeError`` for a SKILL.md or a zip directory past its
+        bound, ``ValueError`` for an unparseable/unsafe file,
+        ``FileExistsError`` on slug collision.
         ``validate_skill`` can enforce a caller's edit constraints on the parsed
         skill before any files are persisted; other callers remain lenient.
         """
         if Path(filename or "").suffix.lower() == ".zip":
             return self._import_zip(
-                data,
+                source=source,
                 before_persist=before_persist,
                 validate_skill=validate_skill,
                 shared=shared,
             )
+        # One byte past the bound tells an oversized file apart, so a text
+        # upload of any size costs at most that much memory here.
+        data = source.read(SKILL_MD_MAX_BYTES + 1)
+        if len(data) > SKILL_MD_MAX_BYTES:
+            raise SkillTooLargeError(SKILL_MD_TOO_LARGE)
         try:
             content = data.decode("utf-8")
         except UnicodeDecodeError:
@@ -1890,8 +1971,8 @@ class SkillService:
 
     def _import_zip(
         self,
-        data: bytes,
         *,
+        source: BinaryIO,
         before_persist: Callable[[str], None] | None = None,
         validate_skill: Callable[[Skill], None] | None = None,
         shared: bool = False,
@@ -1899,7 +1980,7 @@ class SkillService:
         with tempfile.TemporaryDirectory() as tmp:
             extract_dir = Path(tmp) / "skill"
             extract_dir.mkdir(parents=True)
-            self._safe_extract_zip(data, extract_dir)
+            self._safe_extract_zip(source=source, dest=extract_dir)
             return self._persist_imported(
                 extract_dir,
                 copy_tree=True,
@@ -1925,6 +2006,10 @@ class SkillService:
         refused share reserves nothing, and shares the skill once written.
         """
         self._normalize_skill_dir(src_dir)
+        # Checked here, after the unwrap, rather than on a zip's entry names:
+        # the SKILL.md parsed below may come from a wrapping folder, or be a
+        # lone .md file under another name that _normalize_skill_dir renamed.
+        _refuse_oversized_skill_md(path=src_dir / SKILL_FILE)
         skill = _skill_from_dir(src_dir, canonicalize_name=False)
         if skill is None:
             raise ValueError("Could not find a parseable SKILL.md in the upload.")
@@ -1998,16 +2083,26 @@ class SkillService:
 
     # A small archive can expand to many times its size — bound the expansion.
     _ZIP_MAX_UNCOMPRESSED = 200 * 1024 * 1024  # 200 MB
+    # The largest central directory an archive may hold, about 40,000 files
+    # with ordinary names. It bounds the ZipInfo objects ZipFile builds as it
+    # opens the archive, one per entry.
+    _ZIP_MAX_DIRECTORY_BYTES = 4 * 1024 * 1024
 
     @staticmethod
-    def _safe_extract_zip(data: bytes, dest: Path) -> None:
-        """Extract a zip into ``dest``, rejecting escaping paths, symlinks, and
-        archives that would expand past the size bound."""
-        import stat
+    def _safe_extract_zip(*, source: BinaryIO, dest: Path) -> None:
+        """Extract the zip ``source`` into ``dest``, rejecting a central
+        directory past its bound, archives that would expand past the size
+        bound, symlinks, and escaping paths.
 
+        ``source`` is read in place, never whole into memory, and each entry
+        is extracted in chunks up to its declared size: ZipExtFile stops
+        reading there whatever the entry's data holds.
+        """
         dest_resolved = dest.resolve()
         try:
-            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            if _zip_directory_size(source=source) > SkillService._ZIP_MAX_DIRECTORY_BYTES:
+                raise SkillTooLargeError(SKILL_ARCHIVE_TOO_MANY_FILES)
+            with zipfile.ZipFile(source) as zf:
                 infos = zf.infolist()
                 if sum(i.file_size for i in infos) > SkillService._ZIP_MAX_UNCOMPRESSED:
                     raise ValueError("Archive would expand beyond the allowed size.")

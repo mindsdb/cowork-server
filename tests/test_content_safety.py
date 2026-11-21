@@ -273,13 +273,14 @@ async def test_project_upload_writes_only_approved_bytes(monkeypatch):
     assert written == [b'original']
 
 async def test_denied_upload_never_reaches_storage(monkeypatch):
+    from io import BytesIO
     from cowork.services import files
     from cowork.db.scoped import LOCAL_SCOPE
     monkeypatch.setenv('COWORK_CONTENT_SAFETY_REQUIRED', 'true')
     store = AsyncMock()
     monkeypatch.setattr(files, 'run_efs', store)
     with pytest.raises(HTTPException):
-        await files.store_file(scope=LOCAL_SCOPE, filename='image.png', content_type='image/png', data=b'PNG', purpose='test')
+        await files.store_file(scope=LOCAL_SCOPE, filename='image.png', content_type='image/png', source=BytesIO(b'PNG'), purpose='test')
     store.assert_not_called()
 
 async def test_project_text_read_is_checked_before_return(monkeypatch):

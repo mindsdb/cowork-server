@@ -154,11 +154,15 @@ def test_every_change_to_a_managed_slug_is_refused(managed_skill, scoped, own_co
         scope, body=SkillCreateRequest(label=MANAGED, instructions="x"), principal=None, viewer=None
     ))
     upload = f"---\nname: {MANAGED}\ndescription: mine\n---\nMine.\n".encode()
-    _refusal(lambda: skills_ep._upload_skill_bytes(upload, "SKILL.md", scope, None))
+    _refusal(lambda: skills_ep._upload_skill_file(
+        scope, source=io.BytesIO(upload), filename="SKILL.md", principal=None
+    ))
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as packed:
         packed.writestr(f"{MANAGED}/SKILL.md", upload.decode())
-    _refusal(lambda: skills_ep._upload_skill_bytes(archive.getvalue(), "skill.zip", scope, None))
+    _refusal(lambda: skills_ep._upload_skill_file(
+        scope, source=io.BytesIO(archive.getvalue()), filename="skill.zip", principal=None
+    ))
     _refusal(lambda: skills_ep._update_skill(
         scope, skill_id="my-notes", body=SkillUpdateRequest(label=MANAGED), principal=None, viewer=None
     ))
