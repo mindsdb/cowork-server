@@ -289,6 +289,17 @@ def test_relock_raises_a_candidate_floor_before_locking(repo, monkeypatch):
     ]
 
 
+def test_relock_drops_anton_agents_allowance_before_locking(repo, monkeypatch):
+    allowance = '\n[tool.cowork.release.allow-prerelease]\nanton-agent = "1.0rc1"\n'
+    Path("pyproject.toml").write_text(FLOOR.format("1.0rc1") + allowance)
+    def run(*args):
+        if args[0] == "uv":
+            assert Path("pyproject.toml").read_text() == FLOOR.format("1.0") + "\n[tool.cowork.release.allow-prerelease]\n"
+        return ""
+    monkeypatch.setattr(pr, "run", run)
+    pr.relock("1.0")
+
+
 def test_the_raised_floor_is_committed(repo):
     Path("pyproject.toml").write_text(FLOOR.format("1.0"))
     assert pr.prepare_commit(repo, "", "floor")
