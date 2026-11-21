@@ -189,7 +189,7 @@ dependencies = [
     # anton's prompt names BeautifulSoup. The PDF export client also counts a
     # render service's pages with pypdf. Declared directly so they stay
     # installed whatever another package's dependencies become.
-    "pypdf==6.21.1",
+    "pypdf==6.21.4",
     "reportlab==5.0.1",
     "beautifulsoup4==4.15.0",
     # Kept for agent code cells that render PDFs with it. cowork/ never
