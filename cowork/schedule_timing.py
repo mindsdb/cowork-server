@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import calendar
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tzlocal import get_localzone
@@ -44,7 +46,85 @@ def resolve_timezone(name: str | None) -> ZoneInfo:
         return ZoneInfo("UTC")
 
 
-def advance_occurrence(cadence: str, at: datetime, timezone_name: str) -> datetime:
+WEEKDAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _month_day(year: int, month: int, day: int) -> int:
+    """The day a monthly task runs: ``day``, or the month's last day when the
+    month is shorter, so "the 31st" runs on 30 April and 28 or 29 February."""
+    return min(day, calendar.monthrange(year, month)[1])
+
+
+def _nth_weekday(year: int, month: int, week: int, weekday: int) -> int:
+    """The day of the month that is its ``week``-th ``weekday`` (Monday 0);
+    week -1 is the last one."""
+    first_weekday, days = calendar.monthrange(year, month)
+    first = 1 + (weekday - first_weekday) % 7
+    if week == -1:
+        return first + 7 * ((days - first) // 7)
+    return first + 7 * (week - 1)
+
+
+def day_rule(cadence: str, recurrence: Mapping | None, anchor: date) -> Callable[[date], bool] | None:
+    """Which local dates a calendar cadence with a rule runs on, or None for a
+    cadence stepped without one.
+
+    Weekly runs on the rule's ``days``, monthly on its ``month_day`` or on its
+    ``week``-th ``weekday``. A weekly or monthly task saved without a rule
+    runs on ``anchor``'s weekday or day of the month, as weekly tasks always
+    have.
+    """
+    rule = recurrence or {}
+    if cadence == Cadence.weekly:
+        days = rule.get("days")
+        if not days:
+            return None
+        wanted = {WEEKDAY_NAMES.index(day) for day in days}
+        return lambda d: d.weekday() in wanted
+    if cadence == Cadence.monthly:
+        week, weekday = rule.get("week"), rule.get("weekday")
+        if week is not None and weekday is not None:
+            index = WEEKDAY_NAMES.index(weekday)
+            return lambda d: d.day == _nth_weekday(d.year, d.month, week, index)
+        day = rule.get("month_day") or anchor.day
+        return lambda d: d.day == _month_day(d.year, d.month, day)
+    return None
+
+
+# Long enough for any rule to match: a monthly rule matches every month.
+_RULE_SEARCH_DAYS = 62
+
+
+def _next_matching_date(after: date, matches: Callable[[date], bool], *, inclusive: bool = False) -> date:
+    candidate = after if inclusive else after + timedelta(days=1)
+    for _ in range(_RULE_SEARCH_DAYS):
+        if matches(candidate):
+            return candidate
+        candidate += timedelta(days=1)
+    raise ValueError("The schedule's days never come round")
+
+
+def align_to_rule(
+    cadence: str, at: datetime, timezone_name: str, recurrence: Mapping | None = None,
+) -> datetime:
+    """``at``, or the first day after it that the rule runs on, at the same
+    local time. A start the form or a caller set on a day the task does not
+    run moves to the first day it does."""
+    current = ensure_utc(at)
+    if current is None:
+        raise ValueError("at must be a datetime")
+    tz = resolve_timezone(timezone_name)
+    local = current.astimezone(tz)
+    matches = day_rule(cadence, recurrence, local.date())
+    if matches is None or matches(local.date()):
+        return current
+    next_date = _next_matching_date(local.date(), matches)
+    return datetime.combine(next_date, local.time(), tzinfo=tz).astimezone(timezone.utc)
+
+
+def advance_occurrence(
+    cadence: str, at: datetime, timezone_name: str, recurrence: Mapping | None = None,
+) -> datetime:
     """Return the next scheduled instant strictly after ``at``."""
     current = ensure_utc(at)
     if current is None:
@@ -56,7 +136,10 @@ def advance_occurrence(cadence: str, at: datetime, timezone_name: str) -> dateti
 
     tz = resolve_timezone(timezone_name)
     local = current.astimezone(tz)
-    if cadence == Cadence.daily:
+    matches = day_rule(cadence, recurrence, local.date())
+    if matches is not None:
+        next_date = _next_matching_date(local.date(), matches)
+    elif cadence == Cadence.daily:
         next_date = local.date() + timedelta(days=1)
     elif cadence == Cadence.weekdays:
         next_date = local.date() + timedelta(days=1)
@@ -77,6 +160,7 @@ def next_future_occurrence(
     timezone_name: str,
     *,
     now: datetime | None = None,
+    recurrence: Mapping | None = None,
 ) -> datetime:
     """Fast-forward ``next_run_at`` to the first occurrence after ``now``."""
     reference = ensure_utc(now or datetime.now(timezone.utc))
@@ -85,7 +169,7 @@ def next_future_occurrence(
         raise ValueError("next_run_at and now must be datetimes")
 
     while cursor <= reference:
-        cursor = advance_occurrence(cadence, cursor, timezone_name)
+        cursor = advance_occurrence(cadence, cursor, timezone_name, recurrence)
     return cursor
 
 
@@ -95,6 +179,7 @@ def count_missed_occurrences(
     timezone_name: str,
     *,
     now: datetime | None = None,
+    recurrence: Mapping | None = None,
 ) -> tuple[int, datetime]:
     """Count overdue occurrences and return the first future ``next_run_at``."""
     reference = ensure_utc(now or datetime.now(timezone.utc))
@@ -105,7 +190,7 @@ def count_missed_occurrences(
     missed = 0
     while cursor <= reference:
         missed += 1
-        cursor = advance_occurrence(cadence, cursor, timezone_name)
+        cursor = advance_occurrence(cadence, cursor, timezone_name, recurrence)
     return missed, cursor
 
 
@@ -129,6 +214,7 @@ def missed_slots(
     *,
     now: datetime,
     lookback: timedelta,
+    recurrence: Mapping | None = None,
 ) -> MissedSlots:
     """Which of the overdue slots runs: the latest one no older than
     ``lookback``, once. Every other overdue slot is passed over."""
@@ -150,7 +236,7 @@ def missed_slots(
     while cursor <= reference:
         count += 1
         latest = cursor
-        cursor = advance_occurrence(cadence, cursor, timezone_name)
+        cursor = advance_occurrence(cadence, cursor, timezone_name, recurrence)
     if latest is not None and latest >= floor:
         return MissedSlots(run=latest, skipped=count - 1, future=cursor)
     return MissedSlots(run=None, skipped=count, future=cursor)
@@ -162,6 +248,7 @@ def normalize_next_run(
     timezone_name: str,
     *,
     now: datetime | None = None,
+    recurrence: Mapping | None = None,
 ) -> datetime:
     """The first slot at or after ``next_run_at`` that is still ahead.
 
@@ -176,5 +263,5 @@ def normalize_next_run(
         return start
     reference = ensure_utc(now or datetime.now(timezone.utc))
     if start <= reference:
-        start = next_future_occurrence(cadence, start, timezone_name, now=reference)
+        start = next_future_occurrence(cadence, start, timezone_name, now=reference, recurrence=recurrence)
     return start
