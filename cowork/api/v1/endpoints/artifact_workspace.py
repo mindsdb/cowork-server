@@ -37,7 +37,7 @@ from cowork.api.v1.artifact_scope import (
     review_artifact_and_read,
     review_artifact_for_request,
 )
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, WindowProof, require
 from cowork.common.settings.app_settings import default_draft_env_label, get_app_settings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import FilesystemBusy, run_db, run_efs, run_on_unit_threads
@@ -2042,7 +2042,10 @@ async def cancel_queued_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/decision")
+@router.post(
+    "/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/decision",
+    dependencies=[Depends(require(WindowProof))],
+)
 async def decide_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,

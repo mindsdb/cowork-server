@@ -25,30 +25,13 @@ from cowork import app_secret
 from cowork.api.v1.router import api_router
 from cowork.auth_middleware import _read_token
 from cowork.common.settings.app_settings import get_app_settings
+from tests._launch_handoff import GOOD, PROOF, SECRET, TOKEN
 
-SECRET = "ab" * 32
-TOKEN = "cd" * 32
-PROOF = "ef" * 32
 OLD_ENV_TOKEN = "0123456789abcdef" * 2
-GOOD = {"app_secret": SECRET, "auth_token": TOKEN, "window_proof": PROOF}
 
 
 def _line(payload) -> str:
     return json.dumps(payload) + "\n"
-
-
-@pytest.fixture
-def nothing_held(monkeypatch):
-    monkeypatch.setattr(app_secret, "_secret", None)
-    monkeypatch.setattr(app_secret, "_handoff", None)
-
-
-@pytest.fixture
-def handoff_held(monkeypatch):
-    handoff = app_secret.LaunchHandoff.model_validate(GOOD)
-    monkeypatch.setattr(app_secret, "_handoff", handoff)
-    monkeypatch.setattr(app_secret, "_secret", handoff.app_secret)
-    return handoff
 
 
 class TestContract:

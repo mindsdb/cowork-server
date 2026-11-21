@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from cowork import app_secret
 from cowork.api.v1.endpoints.connectors.custom_mcp import _record_file_present
-from cowork.api.v1.permissions import LoopbackDesktopOnly
+from cowork.api.v1.permissions import LoopbackDesktopOnly, WindowProof
 from cowork.api.v1.route_walker import declared_permissions, route_key
 from cowork.api.v1.router import api_router
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope, get_tenant_scope
@@ -106,10 +106,13 @@ class TestCheckUrl:
 
 def test_every_custom_route_declares_loopback_desktop_only():
     """The router's guard is what refuses a non-loopback peer, a hostile Host
-    or Origin, and org mode, before the app secret is checked."""
+    or Origin, and org mode, before the app secret is checked. The three
+    writes also ask for the window proof (tests/test_window_proof_pin.py)."""
     routes = [route for route in api_router.routes if route_key(route)[0].startswith("/api/v1/connectors/connections/custom_mcp")]
     assert len(routes) == 6
-    assert all(declared_permissions(route) == [LoopbackDesktopOnly] for route in routes)
+    assert all(
+        declared_permissions(route) in ([LoopbackDesktopOnly], [LoopbackDesktopOnly, WindowProof]) for route in routes
+    )
 
 
 @pytest.mark.parametrize("name", ["../custom_mcp-x", "cm-" + "0" * 31, "cm-" + "0" * 32 + "/x", ""])

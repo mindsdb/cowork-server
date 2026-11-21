@@ -23,7 +23,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, status
 
 from anton.core.datasources.data_vault import LocalDataVault, _slug_env_prefix
 
-from cowork.api.v1.permissions import DesktopOnly, require
+from cowork.api.v1.permissions import DesktopOnly, WindowProof, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.sharepoint import (
     SharePointChildrenResponse,
@@ -151,7 +151,7 @@ def _saved(vault: LocalDataVault | LayeredDataVault, name: str) -> dict[str, Any
 
 # Bodies are parsed by hand, not by a Pydantic model: FastAPI's 422 echoes
 # the input, which would put the client secret in the reply.
-@router.post("/connections", status_code=status.HTTP_201_CREATED)
+@router.post("/connections", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require(WindowProof))])
 def create_connection(body: Annotated[Any, Body()], scope: ScopeDep) -> dict[str, Any]:
     """Create a SharePoint connection once its key opens every site; 409 if the name is taken."""
     fields = _body_fields(body, _CREATE_FIELDS, ("name", *_KEY_FIELDS))
@@ -188,7 +188,7 @@ def create_connection(body: Annotated[Any, Body()], scope: ScopeDep) -> dict[str
     return _saved(vault, name)
 
 
-@router.put("/connections/{name}")
+@router.put("/connections/{name}", dependencies=[Depends(require(WindowProof))])
 def edit_connection(name: str, body: Annotated[Any, Body()], scope: ScopeDep) -> dict[str, Any]:
     """Replace a SharePoint connection's key and sites once the new values pass the check.
 

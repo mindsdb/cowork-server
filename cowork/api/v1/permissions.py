@@ -20,6 +20,10 @@ than "open" and "closed":
 ``AuthenticatedInOrgMode``   a verified ``Principal``, in org mode only
 ``AuthenticatedOrgAdmin``    ... and org-admin standing
 ``TurnKey``                  a live web turn's key this server recorded
+``WindowProof``              the launch hand-off's window proof in
+                             ``X-Cowork-Window-Proof``, beside a route's own
+                             class; a no-op without a hand-off. Pinned route
+                             by route in tests/test_window_proof_pin.py.
 ===========================  =====================================================
 
 An earlier draft had one open marker covering all five non-identity cases, and
@@ -62,6 +66,7 @@ from typing import Protocol
 
 from fastapi import Depends, HTTPException, Request, status
 
+from cowork import app_secret
 from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy, require_single_user
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.principal import Principal, can_manage_org, get_principal
@@ -355,6 +360,55 @@ class TurnKey:
         if principal is not None and (principal.org_id, principal.user_id) != (holder.org_id, holder.user_id):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
         return holder
+
+
+class WindowProof:
+    """The credential is the launch hand-off's window proof, which the caller
+    sends in ``X-Cowork-Window-Proof`` (``app_secret.WINDOW_PROOF_HEADER``).
+
+    The desktop app hands the server it starts a new window proof on stdin at
+    every launch (``app_secret.read_handoff_from_stdin``). Two callers send
+    it: Cowork's main window, on its main-frame ``fetch`` requests, and the
+    desktop app's main process. The bearer token says a caller may use this
+    server; the proof says the caller is the app itself. A route that
+    approves an agent's action, reveals or writes a credential, or changes a
+    gate on what the agent may do declares this, so a caller that holds the
+    bearer token and nothing else, such as agent code on the same machine,
+    can't call it.
+
+    The check runs only while the server holds a launch hand-off
+    (``app_secret.held_handoff()``), which only ``cowork-server`` started with
+    ``COWORK_APP_SECRET_STDIN=2`` reads (``cowork.cli.main``). A server started
+    from a terminal, one an older desktop app started with ``1``, and one
+    ``uvicorn`` starts, as the MindsHub and self-hosted images do, hold none,
+    and ``create_app`` refuses to start org tenancy with one. There the check
+    is a no-op, and it has to be: the hosted web build sends no proof at all.
+
+    A missing, empty or wrong value answers 403 with ``window_proof_required``
+    as the body's ``detail`` and in the ``X-Cowork-Reason`` header, so a
+    client can tell this refusal from the route's own 403s.
+    ``app_secret.window_proof_matches`` compares the value in constant time.
+
+    Declare it at the route, with ``Depends(require(WindowProof))`` in the
+    route's ``dependencies``, after the class the route or its router
+    declares. That class keeps saying who the route admits where no hand-off
+    is held. WindowProof refuses, so a route that inherits it from a router
+    inherits a closed door, but that door is closed to every caller except
+    the app: a route added later for anyone else would stop working. Declare
+    it on a router only when every route on that router needs the proof.
+    Every route that declares it is pinned with its reason in
+    tests/test_window_proof_pin.py.
+    """
+
+    async def check(self, request: Request) -> None:
+        if app_secret.held_handoff() is None:
+            return None
+        if not app_secret.window_proof_matches(given=request.headers.get(app_secret.WINDOW_PROOF_HEADER)):
+            reason = "window_proof_required"
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail=reason, headers={"X-Cowork-Reason": reason}
+            )
+        return None
 
 
 @cache

@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin, WindowProof, require
 from cowork.db.scoped import ScopedSessionDep, TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.db.units import run_db
@@ -145,7 +145,7 @@ def get_config(channel_type: str, scoped: ScopedSessionDep) -> ChannelConfigResp
 @router.put(
     "/{channel_type}/config",
     response_model=ChannelConfigResponse,
-    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+    dependencies=[Depends(require(AuthenticatedOrgAdmin)), Depends(require(WindowProof))],
 )
 async def set_config(
     channel_type: str,
@@ -174,7 +174,7 @@ async def set_config(
 @router.delete(
     "/{channel_type}/config",
     status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+    dependencies=[Depends(require(AuthenticatedOrgAdmin)), Depends(require(WindowProof))],
 )
 async def delete_config(
     channel_type: str, request: Request, scope: ScopeDep
@@ -283,7 +283,7 @@ def _lifecycle_service(request: Request, scope: TenantScope) -> ChannelLifecycle
 @router.post(
     "/{channel_type}/setup",
     response_model=ChannelLifecycleResponse,
-    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+    dependencies=[Depends(require(AuthenticatedOrgAdmin)), Depends(require(WindowProof))],
 )
 async def setup_channel(
     channel_type: str, request: Request, scope: ScopeDep
@@ -308,7 +308,7 @@ async def setup_channel(
 @router.post(
     "/{channel_type}/teardown",
     response_model=ChannelLifecycleResponse,
-    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+    dependencies=[Depends(require(AuthenticatedOrgAdmin)), Depends(require(WindowProof))],
 )
 async def teardown_channel(
     channel_type: str, request: Request, scope: ScopeDep
