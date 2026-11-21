@@ -7,6 +7,8 @@ import pytest
 
 from cowork import cli
 
+pytestmark = pytest.mark.usefixtures("launch_environment_restored")
+
 
 def test_server_shutdown_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     # An open event stream must not keep a terminated sidecar alive forever.

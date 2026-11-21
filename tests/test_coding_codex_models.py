@@ -224,10 +224,12 @@ def test_session_loads_catalog_before_start_and_cleans_up(
     monkeypatch.setattr(codex.CodexEngineSession, "_route_global_notifications", lambda self: None)
     monkeypatch.setattr(codex.CodexEngineSession, "_app_server_pid", lambda self: None)
     monkeypatch.setattr(codex, "terminate_descendants", lambda pid: None)
+    # A local session's key is the inference capability token
+    # RuntimeManager.open_locked mints for it; a remote one's is the lease's.
     config = EngineSessionConfig(
         model="fable", permission_mode=PermissionMode.workspace,
         inference_base_url="https://gateway/inference" if remote else "",
-        inference_api_key="scoped-token" if remote else "",
+        inference_api_key="scoped-token" if remote else "session-inference-token",
     )
 
     def open_session():
@@ -248,7 +250,7 @@ def test_session_loads_catalog_before_start_and_cleans_up(
         session.close()
     assert calls[-1] == "close"
     assert not paths[0].exists()
-    token = "scoped-token" if remote else codex_config.LOCAL_PROXY_TOKEN
+    token = "scoped-token" if remote else "session-inference-token"
     assert requests[0].headers["Authorization"] == f"Bearer {token}"
     assert requests[0].url.host == ("gateway" if remote else "127.0.0.1")
 
@@ -295,7 +297,9 @@ def test_session_starts_on_fallback_metadata_for_unlisted_model(monkeypatch, tmp
     monkeypatch.setattr(codex, "terminate_descendants", lambda pid: None)
     session = codex.CodexEngineSession(
         cowork_root=tmp_path, workspace=tmp_path,
-        config=EngineSessionConfig(model="fable", permission_mode=PermissionMode.workspace),
+        config=EngineSessionConfig(
+            model="fable", permission_mode=PermissionMode.workspace, inference_api_key="session-inference-token",
+        ),
         credentials=EngineCredentials(minds_url="https://upstream", minds_api_key="real-secret"),
         existing_session_id=None, approval_handler=lambda *args: {},
     )

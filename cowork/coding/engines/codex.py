@@ -218,12 +218,14 @@ class CodexEngineSession:
         launch = codex_config.prepare_launch(config, workspace, endpoint)
         client_config = CodexConfig(
             cwd=str(workspace),
-            # Codex talks only to Cowork's loopback inference proxy. Keep the
-            # real credential in the server process, outside agent commands.
+            # Codex talks only to Cowork's loopback inference proxy, with the
+            # session's own credential (RuntimeManager.open_locked mints it).
+            # The real credential stays in the server process, outside agent
+            # commands.
             env=codex_config.client_environment(
                 codex_home,
                 config.environment,
-                config.inference_api_key or codex_config.LOCAL_PROXY_TOKEN,
+                inference_api_key=config.inference_api_key,
             ),
             config_overrides=launch.config_overrides,
             client_name="mindshub_cowork",
@@ -246,7 +248,7 @@ class CodexEngineSession:
         self._approval_policy = launch.approval_policy
         self._approvals_reviewer = launch.approvals_reviewer
         self._sandbox_policy = launch.sandbox_policy
-        self._secrets = tuple(value for value in (credentials.minds_api_key,) if value)
+        self._secrets = tuple(value for value in (credentials.minds_api_key, config.inference_api_key) if value)
         # The MCP servers Codex runs for this thread; they live under the
         # app-server next to the turn's commands and must outlive the turn.
         self._mcp_servers = tuple((server.command, tuple(server.args)) for server in (config.mcp_servers or ()))
@@ -263,7 +265,7 @@ class CodexEngineSession:
         try:
             catalog_path = self._catalog_resources.enter_context(model_catalog(
                 endpoint,
-                config.inference_api_key or codex_config.LOCAL_PROXY_TOKEN,
+                config.inference_api_key,
                 client_config.client_version,
                 config.model,
             ))

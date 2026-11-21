@@ -154,7 +154,10 @@ def health() -> dict:
     _org_mode = get_app_settings().tenancy_mode == "org"
     # Present only while this server holds the desktop app's secret: the app
     # then sends it on the routes that need it and pushes MCP tokens to memory.
-    protocol = {"app_secret_protocol": 1} if app_secret.get_app_secret() is not None else {}
+    # 2 while it holds the whole launch hand-off (cowork.app_secret), 1 for
+    # the app secret alone.
+    held = app_secret.held_protocol()
+    protocol = {"app_secret_protocol": held} if held is not None else {}
     return {
         "status": "ok",
         # Runtime feature handshake for desktop clients. A healthy HTTP server

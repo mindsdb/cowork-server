@@ -50,7 +50,8 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 def require_app_secret(request: Request) -> None:
     """While the server holds the desktop app's secret, refuse a caller that
     doesn't send it: these routes change what an MCP connection may do, and
-    COWORK_AUTH_TOKEN alone is readable by agent code on the same machine.
+    a COWORK_AUTH_TOKEN kept in cowork-home's .env, as a launch without the
+    launch hand-off keeps it, is readable by agent code on the same machine.
     A no-op otherwise."""
     if app_secret.get_app_secret() is None:
         return

@@ -19,8 +19,10 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic_settings import BaseSettings, EnvSettingsSource, NoDecode, SettingsConfigDict
+from pydantic_settings.sources.utils import parse_env_vars
 
+from cowork.common.launch_environment import captured_environment, launch_value
 from cowork.common.paths import cowork_home
 from cowork.common.settings.secret_files import SecretFileSettingsSource, require_process_secrets
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
@@ -376,7 +378,7 @@ def _dev_oauth_env_path() -> Path | None:
     pointer. Reject every other path rather than turning an environment
     variable into an arbitrary dotenv-file loader.
     """
-    raw = os.environ.get("COWORK_DEV_OAUTH_ENV_FILE", "").strip()
+    raw = (launch_value("COWORK_DEV_OAUTH_ENV_FILE") or "").strip()
     if not raw:
         return None
 
@@ -414,6 +416,18 @@ def _dev_oauth_settings_source() -> dict[str, str]:
     }
 
 
+class LaunchEnvironmentSource(EnvSettingsSource):
+    """The ``COWORK_*`` and ``MINDSHUB_*`` variables a local launch moved out of
+    the environment (cowork.common.launch_environment), read as the
+    environment is. Ranked just under the live environment, so a settings
+    object built after the scrub reads what it read before."""
+
+    def _load_env_vars(self) -> Mapping[str, str | None]:
+        return parse_env_vars(
+            captured_environment(), self.case_sensitive, self.env_ignore_empty, self.env_parse_none_str
+        )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=_env_file_chain(),
@@ -421,6 +435,18 @@ class Settings(BaseSettings):
         env_nested_delimiter="_",
         extra="ignore",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+    ):
+        return (
+            init_settings,
+            env_settings,
+            LaunchEnvironmentSource(settings_cls),
+            dotenv_settings,
+            file_secret_settings,
+        )
 
 
 class DatabaseSettings(Settings):
@@ -602,12 +628,14 @@ class OAuthSettings(Settings):
     def settings_customise_sources(
         cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
     ):
-        # Explicit values, process env, and the isolated COWORK_HOME dotenv all
-        # win. The fixed developer file is a narrow fallback and returns only
-        # the validation aliases for the two coding connectors.
+        # Explicit values, process env (live, then as captured at launch), and
+        # the isolated COWORK_HOME dotenv all win. The fixed developer file is
+        # a narrow fallback and returns only the validation aliases for the
+        # two coding connectors.
         return (
             init_settings,
             env_settings,
+            LaunchEnvironmentSource(settings_cls),
             dotenv_settings,
             _dev_oauth_settings_source,
             file_secret_settings,
@@ -1020,10 +1048,13 @@ class AppSettings(Settings):
     ):
         # A credential whose file the process environment names wins over the
         # environment and every .env (cowork.common.settings.secret_files).
+        # The values a local launch moved out of the environment rank just
+        # under it, as for every other settings class (Settings).
         return (
             init_settings,
             SecretFileSettingsSource(settings_cls),
             env_settings,
+            LaunchEnvironmentSource(settings_cls),
             dotenv_settings,
             file_secret_settings,
         )
