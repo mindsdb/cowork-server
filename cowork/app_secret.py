@@ -35,8 +35,10 @@ from typing import Annotated, TextIO
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
-# The names and numbers below are mirrored by the desktop app's
-# src/main/app-secret.ts (cowork repository); change both together.
+# The desktop app (cowork repository) mirrors the names and numbers below,
+# under the same names: STDIN_FLAG, HANDOFF_PROTOCOL and WINDOW_PROOF_HEADER in
+# src/shared/server-launch.ts, and HEADER and CHALLENGE_HEADER in
+# src/main/app-secret.ts. Change both sides together.
 STDIN_FLAG = "COWORK_APP_SECRET_STDIN"
 HEADER = "X-Cowork-App-Secret"
 CHALLENGE_HEADER = "X-Cowork-App-Challenge"
