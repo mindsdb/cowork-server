@@ -235,6 +235,14 @@ fallback-version = "0.0.0-dev"
 [tool.hatch.build.targets.wheel]
 packages = ["cowork"]
 
+[tool.cowork.release.allow-prerelease]
+# The exact pre-releases a production release may still name, in the lock and
+# in the bounds above. `scripts/release_contract.py --require-final` refuses
+# every other one, a newer candidate of the same project included. The anton
+# relock (`scripts/anton_final_lock_pr.py`) removes anton-agent's entry when it
+# locks anton's final.
+anton-agent = "2.26.11.20.1rc3"
+
 [dependency-groups]
 dev = [
     "alembic>=1.18.4",

@@ -34,9 +34,9 @@ def prepare_commit(base: str, previous: str, title: str) -> bool:
 
 
 def relock(version: str) -> None:
-    """Lock the final, raise a candidate floor to it, and refresh the reviewed export."""
+    """Lock the final, raise a candidate floor to it, drop the candidate's allowance, and refresh the export."""
     pyproject = Path("pyproject.toml")
-    pyproject.write_text(selection.raise_floor(pyproject.read_text(), version))
+    pyproject.write_text(selection.drop_allowance(selection.raise_floor(pyproject.read_text(), version)))
     run("uv", "lock", "--upgrade-package", f"anton-agent=={version}")
     run(sys.executable, "scripts/release_contract.py")
     run(sys.executable, "scripts/release_contract.py", "--check")
@@ -103,8 +103,9 @@ def main() -> None:
         run("git", "push", f"--force-with-lease=refs/heads/{branch}:{previous}",
             "origin", f"HEAD:refs/heads/{branch}")
     body = (
-        f"Staging locks `{locked}`. This proposes final `{version}` for ENG-4355, and raises "
-        "a release-candidate `anton-agent` floor in `pyproject.toml` to it.\n\n"
+        f"Staging locks `{locked}`. This proposes final `{version}` for ENG-4355, raises "
+        "a release-candidate `anton-agent` floor in `pyproject.toml` to it, and removes "
+        "anton-agent's production pre-release allowance.\n\n"
         "Before merging, check that the final contains the anton changes staging needs, "
         "and let CI finish. Merge it before the staging → main release PR, which stays red "
         "until staging locks a final. anton's final usually lands during the release freeze, "
