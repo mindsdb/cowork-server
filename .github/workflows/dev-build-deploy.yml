@@ -133,6 +133,55 @@ jobs:
       - name: Refuse a lock that pins a pre-release
         run: python scripts/release_contract.py --check --require-final
 
+  # A required check, so it has no `needs:` and no `if:`: GitHub counts a
+  # skipped job as passing. A PR that changes a migration or a builtin skill
+  # passes only when its head contains the live tip of its base branch, so the
+  # checks below run on the head itself, which is the tree the merge produces.
+  # The merge ref would hide a stale head by merging today's base into it.
+  # GitHub-hosted and secret-free, so it works on a fork PR.
+  migration-freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - id: scope
+        uses: mindsdb/github-actions/migration-freshness@5384950e85069e96be1bf38ece9ebb1883f0c51e
+        with:
+          mode: pr
+          protected-paths: |
+            cowork/db/alembic/versions/*
+            cowork/skills_builtin/*
+          constant-file: cowork/services/skills.py
+          constant-pattern: '^(CODE_)?BUILTIN_SKILLS_VERSION\s*='
+
+      - if: steps.scope.outputs.protected == 'true'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          # The manifest check lists every version of each builtin from history.
+          fetch-depth: 0
+
+      - name: Setup uv
+        if: steps.scope.outputs.protected == 'true'
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.11.30"
+          python-version: "3.12"
+
+      - name: Check that the migration graph has one head
+        if: steps.scope.outputs.protected == 'true'
+        run: uv run --locked pytest tests/test_schema_migrations.py::test_migration_graph_has_single_head
+
+      - name: Check the builtin skills manifest
+        if: steps.scope.outputs.protected == 'true'
+        env:
+          # The head contains the base tip, so the tip is the baseline.
+          BUILTIN_SKILLS_BASELINE_REF: ${{ steps.scope.outputs.tip }}
+        run: uv run --locked python scripts/builtin_skills_shipped.py --check
+
   build-deploy:
     needs: [gate]
     if: needs.gate.outputs.run == 'true'

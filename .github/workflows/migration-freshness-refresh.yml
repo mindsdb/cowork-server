@@ -1,0 +1,57 @@
+# run-tree-ok: a status writer, not a stage of the staging or main pipeline.
+# Folding it into publish-staging.yml or publish.yml would tie it to a release
+# that has nothing to do with stale pull requests, and a failed publish would
+# leave every stale PR unmarked.
+name: Migration freshness refresh
+
+# A push to staging or main leaves every open PR that changes a migration or a
+# builtin skill behind its base. GitHub does not re-run a PR's checks when its
+# base moves, so this marks each such PR's head with a failing
+# `migration-freshness` status until its author merges the base in. The check
+# itself is the `migration-freshness` job in dev-build-deploy.yml.
+
+on:
+  push:
+    branches: [staging, main]
+  # A pull request retargeted onto staging or main, such as a stacked one whose
+  # base branch merged, keeps the check it passed against its old base. This
+  # job checks out nothing and runs no pull request code, so the base
+  # repository's token is safe on this trigger.
+  pull_request_target:  # zizmor: ignore[dangerous-triggers]
+    types: [edited]
+    branches: [staging, main]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "refresh marks stale PRs; backfill also marks unprotected PRs as passing"
+        type: choice
+        options: [refresh, backfill]
+        default: backfill
+
+permissions: {}
+
+concurrency:
+  # Per event, so a skipped title-edit run never cancels a push refresh.
+  group: migration-freshness-refresh-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    # Of the edits, only a base change matters. This job is not the required
+    # check, so skipping it is harmless.
+    if: github.event_name != 'pull_request_target' || github.event.changes.base
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: mindsdb/github-actions/migration-freshness@5384950e85069e96be1bf38ece9ebb1883f0c51e
+        with:
+          mode: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'refresh' }}
+          protected-paths: |
+            cowork/db/alembic/versions/*
+            cowork/skills_builtin/*
+          constant-file: cowork/services/skills.py
+          constant-pattern: '^(CODE_)?BUILTIN_SKILLS_VERSION\s*='

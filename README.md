@@ -462,6 +462,7 @@ Data lives in two places: a **SQLite database** for structured records and the *
 - **Location**: `~/.cowork/cowork.db` (override with `DATABASE_URI`)
 - **ORM**: [SQLModel](https://sqlmodel.tiangolo.com/) (SQLAlchemy + Pydantic)
 - **Migrations**: Alembic (`cowork/db/alembic/versions/`). Startup runs `alembic upgrade head` (singular), so the graph must have exactly ONE head: if two branches each added a migration on the same parent, every fresh boot aborts with "Multiple head revisions". After merging or rebasing, check `alembic heads`; if it prints two revisions, add a no-op merge revision whose `down_revision` is the tuple of both heads (see `f4e2c1a9d3b7` for the pattern).
+- **Merging a migration**: a pull request that changes `cowork/db/alembic/versions/`, `cowork/skills_builtin/`, or the `BUILTIN_SKILLS_VERSION` or `CODE_BUILTIN_SKILLS_VERSION` line in `cowork/services/skills.py` must contain the current tip of its base branch before it merges. The required check `migration-freshness` fails otherwise. It also turns red when anything else merges into the base first, because [`migration-freshness-refresh.yml`](.github/workflows/migration-freshness-refresh.yml) marks every open one stale on each push to `staging` or `main`, and when a pull request is retargeted onto either. To fix it, merge the base branch into the pull request branch (or rebase onto it). If the migration graph check then reports two heads, add a merge revision as described above. Then push.
 
 Key tables:
 
