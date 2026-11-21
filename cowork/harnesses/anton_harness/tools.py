@@ -816,9 +816,10 @@ async def _scope_connectors() -> dict[str, dict]:
 
 async def scope_usage_notes(engines: Iterable[str]) -> dict[str, str]:
     """Return engine -> agent-facing usage notes for those of ``engines``
-    that declare some, custom connectors included, in this turn's scope."""
+    that declare some, custom connectors included with what each described
+    field holds, in this turn's scope."""
     wanted = list(engines)
-    return await _read_scope_catalog(lambda catalog: catalog.usage_notes_for(wanted))
+    return await _read_scope_catalog(lambda catalog: catalog.turn_notes_for(wanted))
 
 
 # Request Credentials Tool

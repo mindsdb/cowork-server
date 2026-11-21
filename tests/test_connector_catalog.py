@@ -241,3 +241,92 @@ class TestSpecsEndpoints:
         result = await specs_endpoints.match_connector_spec(MatchRequest(query="httpbin"), LOCAL_SCOPE)
 
         assert result.candidates[0].id == "httpbin"
+
+
+PROBED_FORM = with_test_request({
+    "form_id": "supply-connector",
+    "title": "Connect supply",
+    "fields": [
+        {"name": "base_url", "label": "Base URL", "type": "text"},
+        {"name": "client_secret", "label": "Client secret", "type": "password", "secret": True,
+         "description": "The OAuth client secret."},
+        {"name": "resource_endpoint", "label": "Resource endpoint", "type": "text",
+         "description": "For the connection check only, not where data is queried."},
+    ],
+})
+
+
+def _add_probed(engine, *, notes=None, org_id=None, created_by=None, form=PROBED_FORM):
+    """Store a supply definition whose form describes some of its fields."""
+    with Session(engine) as session:
+        session.add(CustomConnector(
+            connector_id="supply", label="supply", description="Supply API", category="developer",
+            spec=form, usage_notes=notes, org_id=org_id, created_by=created_by,
+        ))
+        session.commit()
+
+
+class TestTurnNotes:
+    def test_a_described_field_is_named_by_the_end_of_its_variable(self, engine):
+        _add_probed(engine)
+
+        text = _catalog(engine, LOCAL_SCOPE).turn_notes_for(["supply"])["supply"]
+
+        assert "`__RESOURCE_ENDPOINT`: For the connection check only, not where data is queried." in text
+        assert "`__CLIENT_SECRET`: The OAuth client secret." in text
+        assert "__BASE_URL" not in text
+
+    def test_field_lines_come_after_the_notes_which_stay_whole(self, engine):
+        notes = "POST the query to {{base_url}}/integration/V1/query. " * 30
+        _add_probed(engine, notes=notes)
+
+        text = _catalog(engine, LOCAL_SCOPE).turn_notes_for(["supply"])["supply"]
+
+        assert text.startswith(notes)
+        assert text.index("__RESOURCE_ENDPOINT") > len(notes)
+
+    def test_a_connector_with_no_notes_and_no_descriptions_gets_none(self, engine):
+        _add(engine, connector_id="supply")
+
+        assert _catalog(engine, LOCAL_SCOPE).turn_notes_for(["supply"]) == {}
+
+    def test_a_long_description_is_cut(self, engine):
+        form = {**PROBED_FORM, "fields": [{"name": "region", "label": "Region", "type": "text",
+                                           "description": "x" * 500}]}
+        _add_probed(engine, form=form)
+
+        line = _catalog(engine, LOCAL_SCOPE).turn_notes_for(["supply"])["supply"].splitlines()[-1]
+
+        assert line == "- `__REGION`: " + "x" * 200
+
+    def test_a_secret_looking_description_is_scrubbed(self, engine):
+        form = {**PROBED_FORM, "fields": [{"name": "key", "label": "Key", "type": "password",
+                                           "description": "Was sk-proj-abcdefghijklmnopqrstuvwx, rotated."}]}
+        _add_probed(engine, form=form)
+
+        text = _catalog(engine, LOCAL_SCOPE).turn_notes_for(["supply"])["supply"]
+
+        assert "sk-proj-abcdefghijklmnopqrstuvwx" not in text
+        assert text.endswith(", rotated.")
+
+    @pytest.mark.parametrize("scope, row_org, own", [
+        (PERSON_A, "partition-a", True),
+        (PERSON_SHARED, "partition-a", False),
+        (ORG_A, "org-a", False),
+    ], ids=["personal connections", "shared connections", "org mode"])
+    def test_field_lines_reach_an_agent_only_in_ones_own_scope(self, engine, scope, row_org, own):
+        _add_probed(engine, org_id=row_org, created_by=scope.user_id)
+
+        notes = _catalog(engine, scope).turn_notes_for(["supply"])
+
+        assert ("supply" in notes) is own
+
+    def test_the_probe_still_reads_only_the_stored_notes(self, engine):
+        _add_probed(engine)
+
+        assert _catalog(engine, LOCAL_SCOPE).usage_notes_for(["supply"]) == {}
+
+    def test_a_built_in_connector_keeps_its_own_notes(self, engine):
+        catalog = _catalog(engine, LOCAL_SCOPE)
+
+        assert catalog.turn_notes_for(["postgres"]) == catalog.usage_notes_for(["postgres"])
