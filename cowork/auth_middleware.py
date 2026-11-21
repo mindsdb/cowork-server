@@ -3,10 +3,15 @@
 When COWORK_REQUIRE_AUTH is true the server validates every request (except
 OPTIONS preflight and the /health endpoint) against a shared secret token
 stored in ~/.cowork/.env as COWORK_AUTH_TOKEN.  If no token is set, one is
-auto-generated at startup and written back to that file so the desktop app
-can read it. With COWORK_TRUST_IDENTITY_HEADERS on, the token comes from the
-environment alone, and create_app removes any copy from that file
-(remove_auth_token).
+auto-generated at startup and written back to that file so a client started
+from a terminal, or a desktop app that predates the launch hand-off, can read
+it. A desktop app that hands the server its launch hand-off
+(cowork.app_secret, ``COWORK_APP_SECRET_STDIN=2``) gives the token on stdin
+instead: it stays in memory for that launch, the check is on whatever the
+settings say, and create_app removes any copy from that file
+(remove_auth_token). With COWORK_TRUST_IDENTITY_HEADERS on, the token comes
+from the environment alone, and create_app removes any copy from that file
+too.
 
 Defaults on in local/desktop tenancy (see AppSettings.require_auth) and stays
 off in org mode, where it isn't supported at all — see create_app()'s
