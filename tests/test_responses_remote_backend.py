@@ -754,7 +754,7 @@ def memory_write_fakes(monkeypatch):
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
     monkeypatch.setattr(responses_mod, "apply_turn_memory", fake_apply)
     monkeypatch.setattr(shared_resources, "SharedResourceAccess", FakeAccess)
-    return SimpleNamespace(session=FakeSession(), written=written)
+    return SimpleNamespace(session=FakeSession(), written=written, project_id=project_id)
 
 
 @pytest.mark.parametrize(
@@ -803,6 +803,75 @@ def test_a_failed_settings_read_writes_nothing(monkeypatch, memory_write_fakes):
     ResponsesHandler._persist_turn_memory(memory_write_fakes.session, uuid4(), entries, object())
 
     assert memory_write_fakes.written == []
+
+
+def test_persist_turn_memory_reports_where_the_entries_went(monkeypatch, memory_write_fakes):
+    from cowork.services.memory import TurnMemoryWrite
+
+    monkeypatch.setattr(
+        responses_mod, "get_user_settings",
+        lambda scope=None: SimpleNamespace(memory_enabled=True, memory_mode="autopilot"),
+    )
+    entries = [
+        {"text": "Reply briefly", "kind": "always", "scope": "global"},
+        {"text": "Use the shared style", "kind": "always", "scope": "project"},
+        {"text": "not a memory"},
+    ]
+
+    written = ResponsesHandler._persist_turn_memory(memory_write_fakes.session, uuid4(), entries, object())
+
+    assert written == TurnMemoryWrite(project_id=memory_write_fakes.project_id, personal=1, project=1)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_a_saved_turn_memory_starts_compaction_only_when_switched_on(monkeypatch, enabled):
+    from cowork.services.memory import TurnMemoryWrite
+
+    monkeypatch.setenv("COWORK_TURN_MEMORY_COMPACTION_ENABLED", "true" if enabled else "false")
+    project_id = uuid4()
+
+    async def unit(fn, *, scope):
+        return TurnMemoryWrite(project_id, 2, 1)
+
+    monkeypatch.setattr(responses_mod, "run_efs_unit", unit)
+    started = []
+    monkeypatch.setattr(responses_mod, "start_compaction", lambda **kwargs: started.append(kwargs))
+    principal = object()
+
+    await responses_mod.save_turn_memory(
+        conv_id=uuid4(), entries=[{"text": "remember"}], principal=principal,
+        scope=_FakeScope(), request_id="turn-1",
+    )
+
+    if not enabled:
+        assert started == []
+        return
+    assert len(started) == 1
+    assert started[0]["principal"] is principal
+    assert started[0]["project_id"] == project_id
+    assert (started[0]["personal_entries"], started[0]["project_entries"]) == (2, 1)
+    assert started[0]["turn_correlation_id"] == "turn-1"
+
+
+@pytest.mark.parametrize("outcome", ["nothing-written", "raised"])
+async def test_a_failed_memory_save_starts_no_compaction(monkeypatch, outcome):
+    monkeypatch.setenv("COWORK_TURN_MEMORY_COMPACTION_ENABLED", "true")
+
+    async def unit(fn, *, scope):
+        if outcome == "raised":
+            raise RuntimeError("store down")
+        return None
+
+    monkeypatch.setattr(responses_mod, "run_efs_unit", unit)
+    started = []
+    monkeypatch.setattr(responses_mod, "start_compaction", lambda **kwargs: started.append(kwargs))
+
+    await responses_mod.save_turn_memory(
+        conv_id=uuid4(), entries=[{"text": "remember"}], principal=None,
+        scope=_FakeScope(), request_id="turn-1",
+    )
+
+    assert started == []
 
 
 def _units_on_the_test_database(monkeypatch, *, scope=None):

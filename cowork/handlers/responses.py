@@ -169,7 +169,8 @@ from cowork.services.live_apps import use_live_app_launcher
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
-from cowork.services.memory import apply_turn_memory, build_turn_memory
+from cowork.services.memory import TurnMemoryWrite, apply_turn_memory, build_turn_memory, turn_memory_write
+from cowork.services.memory_compaction import start_compaction
 from cowork.services.projects import ProjectNotFoundError, ProjectService, is_comparison_sandbox
 from cowork.services.queued_repairs import QueuedRepairs
 from cowork.services.settings import SettingService
@@ -2621,9 +2622,10 @@ class ResponsesHandler:
         conv_id: UUID,
         entries: list,
         principal: Principal | None,
-    ) -> None:
+    ) -> TurnMemoryWrite | None:
         """Apply what the pod asked to remember, re-anchoring the conversation
         first (like persist(): one deleted mid-turn must not write memory).
+        Returns where the entries went, None when nothing was written.
 
         Honours the user's memory settings the way the desktop harness does:
         memory disabled, or the mode "off", writes nothing. A settings read that
@@ -2632,7 +2634,7 @@ class ResponsesHandler:
         Never fails the turn — a lost memory is recoverable, a lost reply isn't.
         """
         if not entries:
-            return
+            return None
         try:
             settings = get_user_settings(session.scope)
             if not settings.memory_enabled or settings.memory_mode == "off":
@@ -2681,8 +2683,10 @@ class ResponsesHandler:
                 )
             logger.info("[responses] applied %d memory entr(ies) for conversation %s",
                         applied, conv_id)
+            return turn_memory_write(entries, project.id)
         except Exception:
             logger.exception("[responses] failed to apply memory", extra=log_context(conversation_id=conv_id))
+            return None
 
     @staticmethod
     def _read_remote_turn_inputs(
@@ -4509,7 +4513,8 @@ async def save_turn_memory(
     """Apply what a remote turn's pod asked to remember, in a unit on the
     file store's threads (run_efs_unit), as it arrives: the memory store
     lives on the file store. The browser and the channel producers both save
-    memory here.
+    memory here. A save that wrote starts compaction of the tiers it wrote to,
+    when COWORK_TURN_MEMORY_COMPACTION_ENABLED is on.
 
     Never fails the turn: a lost memory is recoverable, a lost reply isn't.
     A pool that frees no connection, or a file store that frees no slot,
@@ -4519,7 +4524,7 @@ async def save_turn_memory(
     if not entries:
         return
     try:
-        await run_efs_unit(
+        written = await run_efs_unit(
             partial(
                 ResponsesHandler._persist_turn_memory,
                 conv_id=conv_id, entries=entries, principal=principal,
@@ -4531,10 +4536,21 @@ async def save_turn_memory(
             "[responses] no database connection or file store slot freed in time to apply a turn's memory",
             extra=log_context(request_id=request_id, conversation_id=conv_id),
         )
+        return
     except Exception:
         logger.exception(
             "[responses] failed to apply memory",
             extra=log_context(request_id=request_id, conversation_id=conv_id),
+        )
+        return
+    if written is not None and TurnQueueSettings().memory_compaction_enabled:
+        start_compaction(
+            scope=scope,
+            principal=principal,
+            turn_correlation_id=request_id or str(uuid4()),
+            project_id=written.project_id,
+            personal_entries=written.personal,
+            project_entries=written.project,
         )
 
 

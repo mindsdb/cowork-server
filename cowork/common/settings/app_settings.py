@@ -891,6 +891,16 @@ class TurnQueueSettings(Settings):
             "per-PR / non-standard envs whose host the slug logic cannot derive. Empty = derive."
         ),
     )  # COWORK_TURN_MINDS_BASE_URL
+    memory_compaction_enabled: bool = Field(
+        default=False,
+        description=(
+            "Compact a person's or a project's memory on the server after a remote turn "
+            "saved to it, once it holds more than 20 rules and lessons and grew by 10 since "
+            "the last attempt (cowork.services.memory_compaction). One coding-model call on "
+            "a turn key minted for that person. Off by default while it rolls out: a "
+            "compaction deletes entries for good."
+        ),
+    )  # COWORK_TURN_MEMORY_COMPACTION_ENABLED
     jev_route_model: str = Field(
         default="jev",
         description="MindsHub catalog alias of the Jev model the route gate asks ('/v1/decisions').",

@@ -756,6 +756,7 @@ async def lifespan(app: FastAPI):
         from cowork.coding.inference_proxy import close_inference_client
         from cowork.handlers.jev_route import close_client as close_jev_client
         from cowork.services.artifacts import shutdown_launched_backends
+        from cowork.services.memory_compaction import cancel_compactions
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
 
@@ -779,6 +780,7 @@ async def lifespan(app: FastAPI):
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
+        await cancel_compactions()
         # After the turn drains above, whose endings may each have started a
         # push, and the scheduled runs, which push when they finish.
         await drain_push_notifications()
