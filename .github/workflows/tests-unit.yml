@@ -242,6 +242,8 @@ jobs:
           tests/test_export_child.py
           tests/test_publish_markdown.py
           -p scripts.pytest_inventory --test-cohort=desktop-export
+          -p scripts.pytest_liveness
+          --test-liveness-observations="$TEST_REPORT_DIR/liveness.json"
           --test-inventory="$TEST_REPORT_DIR/inventory.json"
           --junitxml="$TEST_REPORT_DIR/junit.xml"
 
@@ -259,5 +261,6 @@ jobs:
           path: |
             ${{ env.TEST_REPORT_DIR }}/inventory.json
             ${{ env.TEST_REPORT_DIR }}/junit.xml
+            ${{ env.TEST_REPORT_DIR }}/liveness.json
           if-no-files-found: error
           retention-days: 14
