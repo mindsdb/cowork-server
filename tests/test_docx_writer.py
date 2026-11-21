@@ -991,3 +991,20 @@ def test_past_the_depth_limit_text_still_flows(monkeypatch):
     assert not [p for p in package.document.paragraphs if p.style.name.startswith("Heading")]
     assert "deep heading" in package.text
     assert "deep cell" in package.text
+
+
+@pytest.mark.parametrize(
+    ("html", "paragraphs"),
+    [
+        ("<p>a</p><p><br></p><p>b</p>", ["a", "", "b"]),
+        ("<p>a<br></p>", ["a"]),
+        ("<p>a<br> </p>", ["a"]),
+        ("<p>a<br><br></p>", ["a\n"]),
+        ("<p>a<br>b</p>", ["a\nb"]),
+        ("<p><b>a<br></b>b</p>", ["a\nb"]),
+    ],
+    ids=["empty_paragraph", "trailing", "trailing_space", "two_trailing", "between", "inside_inline"],
+)
+def test_a_break_that_ends_its_paragraph_adds_no_line(html, paragraphs):
+    """A browser draws no line for a paragraph's last <br>; Word would add one."""
+    assert _write(html).paragraph_texts() == paragraphs

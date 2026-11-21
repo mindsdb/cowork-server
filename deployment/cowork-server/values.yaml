@@ -195,7 +195,8 @@ deployment:
   #           LOCATION_BACKFILL_SHUTDOWN_SECONDS in cowork/server.py),
   #           channel tasks (3 s, then up to 5 s more while each one
   #           cancelled writes its sandbox turn's cancel flag and records its
-  #           artifacts) and scratchpad closes (5 s).
+  #           artifacts) and scratchpad closes (5 s, and alongside them the doc
+  #           publish worker's stop (3 s)).
   #   up to 8 s  last, only while a turn's artifact diff or record is still
   #           running, as during a file store stall: the wait for those
   #           (TURN_END_RECORD_DRAIN_SECONDS, cowork/db/units.py).
@@ -474,6 +475,11 @@ deployment:
     # Route each agent turn to the scratchpad-controller over Redis instead of running it in-process.
     - name: COWORK_TURN_BACKEND
       value: "remote"
+
+    # TEMPORARY, for the PR environment test only. Revert before merge: this
+    # base list reaches every environment.
+    - name: COWORK_REMOTE_DOCS
+      value: "true"
 
     # Populated by the redis-auth ExternalSecret (terraform-custom-*-redis-auth).
     # Listed before the URL so Kubernetes can expand $(REDIS_PASSWORD) into it.
