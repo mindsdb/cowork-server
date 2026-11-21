@@ -11,7 +11,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, SingleUserOnly, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, SingleUserOnly, WindowProof, require
 from cowork.db.scoped import TenantScope, get_tenant_scope, tenant_scope_required
 from cowork.db.units import run_db
 from cowork.handlers.datasource_relay import relay_cloud_submission
@@ -139,7 +139,9 @@ async def submit_form_route(req: SubmitFormRequest, request: Request, scope: Ten
 
 
 @router.post(
-    "/allow-private", name="submission_allow_private", dependencies=[Depends(require(SingleUserOnly))],
+    "/allow-private",
+    name="submission_allow_private",
+    dependencies=[Depends(require(SingleUserOnly)), Depends(require(WindowProof))],
 )
 async def allow_private_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> dict:
     """Continue a custom connector's test after the member allows a private host.
@@ -161,7 +163,11 @@ async def allow_private_route(answer: ConnectorTestAnswer, scope: TenantScopeDep
         return {"patch": failed_patch(entry.form_id, exc.reason)}
 
 
-@router.post("/confirm", name="submission_confirm", dependencies=[Depends(require(SingleUserOnly))])
+@router.post(
+    "/confirm",
+    name="submission_confirm",
+    dependencies=[Depends(require(SingleUserOnly)), Depends(require(WindowProof))],
+)
 async def confirm_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> dict:
     """Save the connection whose test result the member confirmed.
 
@@ -185,7 +191,7 @@ async def confirm_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> d
 
 @router.post(
     "/cancel", name="submission_cancel", status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require(SingleUserOnly))],
+    dependencies=[Depends(require(SingleUserOnly)), Depends(require(WindowProof))],
 )
 async def cancel_route(answer: ConnectorTestAnswer, scope: TenantScopeDep, reason: str | None = None) -> None:
     """Drop a waiting test and the values it holds. Idempotent: an unknown id

@@ -27,6 +27,7 @@ from cowork.api.v1.permissions import (
     AuthenticatedInOrgMode,
     LoopbackDesktopOnly,
     OpenByDesign,
+    WindowProof,
     require,
 )
 from cowork.common.paths import cowork_home
@@ -293,7 +294,7 @@ async def _reject_browser_that_cant_run(scope: TenantScope, updates: dict[str, A
 # gating on org-scoped keys stays in _require_org_admin_for below — it's
 # conditional on which keys are in the request body, not a blanket per-route
 # check a declared dependency can express.
-@router.put("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.put("/", dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))])
 async def bulk_upsert_settings(
     body: SettingsBulkUpsertRequest,
     scope: ScopeDep,
@@ -327,7 +328,11 @@ async def bulk_upsert_settings(
 
 # AuthenticatedInOrgMode, declared explicitly: same _require_writable
 # fail-closed reasoning as bulk_upsert_settings above.
-@router.put("/{key}", response_model=SettingResponse, dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.put(
+    "/{key}",
+    response_model=SettingResponse,
+    dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))],
+)
 async def upsert_setting(
     key: str,
     body: SettingUpsertRequest,
@@ -352,7 +357,7 @@ async def upsert_setting(
 
 # AuthenticatedInOrgMode, declared explicitly: same _require_writable
 # fail-closed reasoning as bulk_upsert_settings above.
-@router.delete("/{key}", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.delete("/{key}", dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))])
 def delete_setting(key: str, session: SessionDep, scope: ScopeDep, principal: PrincipalDep):
     _require_org_admin_for([key], scope, principal)
     try:
@@ -451,7 +456,9 @@ def install_status():
 # is the caller being on this machine, not who they are. Only the desktop app
 # calls it. An org deployment refuses it outright: loopback inside a hosted pod
 # says nothing about which member is calling, and no hosted caller needs it.
-@router.get("/reveal-key/{name}", dependencies=[Depends(require(LoopbackDesktopOnly))])
+@router.get(
+    "/reveal-key/{name}", dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require(WindowProof))]
+)
 def reveal_key(name: str, session: SessionDep, scope: ScopeDep):
     name_map = {
         "anthropic": Provider.ANTHROPIC,
@@ -1151,7 +1158,7 @@ def _read_env_dict() -> dict[str, str]:
 # LoopbackDesktopOnly: /raw dumps the dotenv verbatim, every provider secret
 # in it. Loopback-only, and desktop-only because the dotenv is
 # deployment-global state no org boundary divides.
-@router.get("/raw", dependencies=[Depends(require(LoopbackDesktopOnly))])
+@router.get("/raw", dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require(WindowProof))])
 def read_raw_settings():
     # /raw dumps the dotenv verbatim (all provider secrets) — same loopback
     # restriction as reveal-key, and desktop-only (deployment-global state).
@@ -1163,7 +1170,7 @@ class _RawSettingsBody(BaseModel):
 
 
 # LoopbackDesktopOnly: same reasoning as GET /raw above, and this one writes.
-@router.post("/raw", dependencies=[Depends(require(LoopbackDesktopOnly))])
+@router.post("/raw", dependencies=[Depends(require(LoopbackDesktopOnly)), Depends(require(WindowProof))])
 async def write_raw_settings(body: _RawSettingsBody, session: SessionDep):
     """Merge dotenv content into ~/.cowork/.env and sync recognised keys to the DB.
 

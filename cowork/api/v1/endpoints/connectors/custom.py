@@ -6,7 +6,7 @@ from anton.core.tools.connector_draft import ConnectorDraftError, check_draft_te
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, WindowProof, require
 from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, TenantScope, get_tenant_scope
 from cowork.db.units import run_db
@@ -169,7 +169,12 @@ def _refusal(code: str, status_code: int, message: str) -> JSONResponse:
     return JSONResponse({"detail": {"code": code, "message": message}}, status_code=status_code)
 
 
-@router.post("/{connector_id}/connect", response_model=CustomConnectionResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/{connector_id}/connect",
+    response_model=CustomConnectionResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require(WindowProof))],
+)
 async def connect_custom_connector(
     connector_id: str,
     body: CustomConnectRequest,

@@ -14,7 +14,7 @@ from sqlmodel import Session
 
 from cowork import capability_tokens
 from cowork.api.v1.endpoints.guards import refuse_code_mode_in_sandbox
-from cowork.api.v1.permissions import LoopbackDesktopOnly, require
+from cowork.api.v1.permissions import LoopbackDesktopOnly, WindowProof, require
 from cowork.coding.connector_capabilities import (
     ConnectorCapability,
     ConnectorCapabilityIssueRequest,
@@ -313,12 +313,20 @@ def revoke_coding_computer(computer_id: str):
     _call(_service().control.revoke_computer, computer_id)
 
 
-@router.post("/runtime/registration-token", response_model=RegistrationTokenResponse)
+@router.post(
+    "/runtime/registration-token",
+    response_model=RegistrationTokenResponse,
+    dependencies=[Depends(require(WindowProof))],
+)
 def runtime_registration_token():
     return RegistrationTokenResponse(registration_token=_service().control.issue_registration_token())
 
 
-@router.post("/runs/{run_id}/connector-capabilities", response_model=ConnectorCapability)
+@router.post(
+    "/runs/{run_id}/connector-capabilities",
+    response_model=ConnectorCapability,
+    dependencies=[Depends(require(WindowProof))],
+)
 def issue_connector_capability(run_id: str, body: ConnectorCapabilityIssueRequest):
     grant, token = _call(
         _service().control.issue_connector_grant,
@@ -683,7 +691,7 @@ def setup_windows_sandbox(session_id: str, session: SessionDep, scope: ScopeDep)
     )
 
 
-@router.patch("/sessions/{session_id}")
+@router.patch("/sessions/{session_id}", dependencies=[Depends(require(WindowProof))])
 def update_session(session_id: str, body: SessionUpdateRequest, session: SessionDep, scope: ScopeDep):
     if body.model or body.reasoning_effort is not None:
         current = _call(_service().get_session, session_id)
@@ -789,7 +797,7 @@ def steer(session_id: str, body: TurnRequest):
     return _call(_service().steer, session_id, body.prompt, body.attachments)
 
 
-@router.post("/sessions/{session_id}/mode-turns")
+@router.post("/sessions/{session_id}/mode-turns", dependencies=[Depends(require(WindowProof))])
 def submit_mode_turn(session_id: str, body: ModeTurnRequest, session: SessionDep, scope: ScopeDep):
     return _call(_service().submit_mode_turn, session_id, body, _credentials(_settings(session, scope)))
 
@@ -829,7 +837,7 @@ def cancel(session_id: str):
     return _call(_service().cancel, session_id)
 
 
-@router.post("/sessions/{session_id}/questions/{question_id}")
+@router.post("/sessions/{session_id}/questions/{question_id}", dependencies=[Depends(require(WindowProof))])
 def answer_question(session_id: str, question_id: str, body: QuestionResponse):
     return _call(_service().answer_question, session_id, question_id, body)
 
@@ -1034,7 +1042,7 @@ def _terminal_stream_response(
     )
 
 
-@router.post("/sessions/{session_id}/approvals/{approval_id}")
+@router.post("/sessions/{session_id}/approvals/{approval_id}", dependencies=[Depends(require(WindowProof))])
 def approval(session_id: str, approval_id: str, body: ApprovalRequest):
     return _call(_service().resolve_approval, session_id, approval_id, body.decision)
 

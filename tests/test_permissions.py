@@ -1,4 +1,4 @@
-"""Behaviour of the ENG-2094 permission front door's four classes.
+"""Behaviour of the ENG-2094 permission front door's classes.
 
 Exercises ``require(...)`` on a tiny scratch app rather than ``create_app()``,
 so this doesn't depend on the settings singleton or
@@ -8,7 +8,9 @@ identity the middleware would have built.
 Every "allows" test overrides ``get_principal``, never
 ``require(<the class under test>)``. Overriding the latter replaces the check
 with the answer and proves nothing: the whole suite still passed with
-``Authenticated.check`` mutated to raise unconditionally.
+``Authenticated.check`` mutated to raise unconditionally. WindowProof's tests
+set what the server holds instead (the ``nothing_held`` and ``handoff_held``
+fixtures), for the same reason.
 """
 from __future__ import annotations
 
@@ -16,14 +18,17 @@ import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
+from cowork import app_secret
 from cowork.api.v1.permissions import (
     Authenticated,
     AuthenticatedInOrgMode,
     AuthenticatedOrgAdmin,
     OpenByDesign,
+    WindowProof,
     require,
 )
 from cowork.principal import ORG_MANAGE_ROLE, Principal, get_principal
+from tests._launch_handoff import PROOF, SECRET, TOKEN
 
 MEMBER = Principal(user_id="u1", org_id="o1")
 ADMIN = Principal(user_id="u2", org_id="o1", roles=frozenset({ORG_MANAGE_ROLE}))
@@ -145,6 +150,84 @@ def test_org_admin_is_a_no_op_in_local_mode():
     assert _client().get("/org-admin").status_code == 200
 
 
+# ── WindowProof ──────────────────────────────────────────────────────
+
+
+def _window_proof_client() -> TestClient:
+    app = FastAPI()
+
+    @app.post("/approve", dependencies=[Depends(require(WindowProof))])
+    def approve_route():
+        return {"ok": True}
+
+    return TestClient(app)
+
+
+def test_window_proof_is_a_no_op_without_a_hand_off(nothing_held):
+    """A server started from a terminal, as in MindsHub mode, where the
+    hosted web build sends no proof at all."""
+    response = _window_proof_client().post("/approve")
+    assert (response.status_code, response.json()) == (200, {"ok": True})
+
+
+def test_window_proof_is_a_no_op_with_the_app_secret_alone(nothing_held, monkeypatch):
+    """A server an older desktop app started with COWORK_APP_SECRET_STDIN=1."""
+    monkeypatch.setattr(app_secret, "_secret", SECRET)
+    response = _window_proof_client().post("/approve")
+    assert (response.status_code, response.json()) == (200, {"ok": True})
+
+
+@pytest.mark.parametrize(
+    "proof",
+    [None, "", "12" * 32, PROOF[:-2], PROOF.upper(), TOKEN, SECRET],
+    ids=["missing", "empty", "wrong", "truncated", "uppercase", "bearer-token", "app-secret"],
+)
+def test_window_proof_refuses_a_request_without_the_held_proof(handoff_held, proof):
+    headers = {} if proof is None else {app_secret.WINDOW_PROOF_HEADER: proof}
+    response = _window_proof_client().post("/approve", headers=headers)
+    assert response.status_code == 403
+    assert response.json() == {"detail": "window_proof_required"}
+    assert response.headers["X-Cowork-Reason"] == "window_proof_required"
+
+
+def test_the_request_log_names_each_desktop_secret_refusal(handoff_held, caplog):
+    """An operator counts these refusals by reason in the request log, the
+    one place a refused agent call shows up. Drives the real middleware."""
+    from cowork.api.v1.endpoints.connectors.connections import require_app_secret
+    from cowork.common.request_logging import RequestLoggingApp
+
+    app = RequestLoggingApp()
+
+    @app.post("/approve", dependencies=[Depends(require(WindowProof))])
+    def approve_route():
+        return {"ok": True}
+
+    @app.post("/held", dependencies=[Depends(require_app_secret)])
+    def held_route():
+        return {"ok": True}
+
+    client = TestClient(app)
+    with caplog.at_level("WARNING", logger="cowork.common.request_logging"):
+        assert client.post("/approve").status_code == 403
+        held = client.post("/held")
+        assert held.status_code == 403
+        assert held.headers["X-Cowork-Reason"] == "app_secret_required"
+        assert client.post("/approve", headers={app_secret.WINDOW_PROOF_HEADER: PROOF}).status_code == 200
+
+    refused = [
+        record.reason
+        for record in caplog.records
+        if record.name == "cowork.common.request_logging" and getattr(record, "event", None) == "request_refused"
+    ]
+    assert refused == ["window_proof_required", "app_secret_required"]
+
+
+def test_window_proof_admits_the_held_proof(handoff_held):
+    response = _window_proof_client().post("/approve", headers={app_secret.WINDOW_PROOF_HEADER: PROOF})
+    assert (response.status_code, response.json()) == (200, {"ok": True})
+    assert "X-Cowork-Reason" not in response.headers
+
+
 # ── require() itself ─────────────────────────────────────────────────
 
 
@@ -153,6 +236,7 @@ def test_require_stamps_permission_cls_for_the_ci_walker():
     assert require(Authenticated).permission_cls is Authenticated
     assert require(AuthenticatedInOrgMode).permission_cls is AuthenticatedInOrgMode
     assert require(AuthenticatedOrgAdmin).permission_cls is AuthenticatedOrgAdmin
+    assert require(WindowProof).permission_cls is WindowProof
 
 
 def test_require_is_cached_so_every_call_site_shares_one_dependency():
