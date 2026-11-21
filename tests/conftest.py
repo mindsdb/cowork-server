@@ -286,6 +286,27 @@ def stub_landlock_kernel(monkeypatch, *, abi: int = 6) -> None:
 
 
 @pytest.fixture
+def launch_environment_restored(monkeypatch):
+    """For a test that runs cowork.cli.main in this process. The launch moves
+    every COWORK_* and MINDSHUB_* variable out of os.environ into
+    cowork.common.launch_environment; afterwards this puts the variables and
+    the captured values back, so later tests in this worker see the
+    environment conftest built."""
+    from cowork.common import launch_environment
+
+    monkeypatch.setattr(launch_environment, "_captured", launch_environment._captured)
+    saved = {
+        name: value
+        for name, value in os.environ.items()
+        if name.startswith(launch_environment.SCRUBBED_PREFIXES)
+    }
+    yield
+    for name in [name for name in os.environ if name.startswith(launch_environment.SCRUBBED_PREFIXES)]:
+        del os.environ[name]
+    os.environ.update(saved)
+
+
+@pytest.fixture
 def landlock_kernel(monkeypatch):
     """stub_landlock_kernel for one test: a kernel at Landlock ABI 6 whose
     self-test passes."""

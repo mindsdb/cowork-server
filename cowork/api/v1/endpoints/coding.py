@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import logging
 from collections.abc import Callable
@@ -13,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session
 
+from cowork import capability_tokens
 from cowork.api.v1.endpoints.guards import refuse_code_mode_in_sandbox
 from cowork.api.v1.permissions import LoopbackDesktopOnly, require
 from cowork.coding.connector_capabilities import (
@@ -58,7 +58,6 @@ from cowork.coding.questions import QuestionResponse
 from cowork.coding.control_models import TaskResourceScope
 from cowork.coding.delivery_automation import DeliveryAutomationService
 from cowork.coding.engines.base import EngineCredentials
-from cowork.coding.engines.codex_config import LOCAL_PROXY_TOKEN
 from cowork.coding.inference_proxy import (
     inference_body as _inference_body,  # noqa: F401 - retained for endpoint-test compatibility.
 )
@@ -244,8 +243,12 @@ def _call[Result](operation: Callable[..., Result], *args, **kwargs) -> Result:
 
 
 def _require_inference_client(request: Request) -> None:
+    """Admit only a live Code mode engine session: the bearer must be an
+    ``inference`` capability token (cowork.capability_tokens) that
+    RuntimeManager.open_locked minted and has not revoked. The bearer
+    middleware exempts these routes, so this is their whole credential check."""
     scheme, _, credential = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not hmac.compare_digest(credential, LOCAL_PROXY_TOKEN):
+    if scheme.lower() != "bearer" or capability_tokens.verify(token=credential, purpose="inference") is None:
         raise HTTPException(status_code=401, detail="invalid inference client")
 
 

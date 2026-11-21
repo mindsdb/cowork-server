@@ -408,6 +408,28 @@ def test_identity_headers_never_copy_the_token(stack, tmp_path):
     assert not env.exists() or TOKEN not in env.read_text(encoding="utf-8")
 
 
+def test_identity_headers_take_the_token_a_local_launch_moved_out_of_the_environment(stack):
+    """cowork.cli.main moves COWORK_AUTH_TOKEN out of os.environ before
+    create_app runs (cowork.common.launch_environment); the value it captured
+    is the token the server checks."""
+    from types import MappingProxyType
+
+    from fastapi.testclient import TestClient
+
+    from cowork.common import launch_environment
+
+    stack.delenv("COWORK_AUTH_TOKEN")
+    stack.setattr(launch_environment, "_captured", MappingProxyType({"COWORK_AUTH_TOKEN": TOKEN}))
+    get_app_settings.cache_clear()
+    client = TestClient(cowork_server.create_app())
+    try:
+        assert client.get("/api/v1/conversations/").status_code == 401
+        authed = client.get("/api/v1/conversations/", headers={"Authorization": f"Bearer {TOKEN}"})
+        assert authed.status_code != 401
+    finally:
+        client.close()
+
+
 def test_identity_headers_need_the_token_in_the_environment(stack):
     stack.setenv("COWORK_AUTH_TOKEN", "")
     assert _refusal().startswith(

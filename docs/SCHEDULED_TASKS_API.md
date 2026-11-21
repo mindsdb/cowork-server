@@ -66,7 +66,8 @@ default. It then ends `failed` with outcome `interrupted`.
 | Deployment | Base URL | Credential |
 |---|---|---|
 | Hosted (MindsHub) | `https://cowork.mindshub.ai` (staging: `https://cowork.staging.mindshub.ai`) | An `mdb_` API key from your MindsHub account |
-| Desktop app | `http://127.0.0.1:26866` | The app's local token: `COWORK_AUTH_TOKEN` in `~/.cowork/.env` |
+| Desktop app | None a script can use | The hosted API with an `mdb_` key, or a `cowork-server` you start from a terminal |
+| `cowork-server` started from a terminal | `http://127.0.0.1:26866` | Its local token: `COWORK_AUTH_TOKEN` in `~/.cowork/.env` |
 | Self-hosted | Your deployment's address | A tester's Keycloak access token, as the runbook's scripted questions get it |
 
 Send it as `Authorization: Bearer <credential>`.
@@ -74,8 +75,14 @@ Send it as `Authorization: Bearer <credential>`.
 - **Hosted.** The gateway checks the key and tells cowork-server whose it is.
   Every call acts as the key's owner, in their organization. Identity headers a
   caller sends are replaced, so a key can't act as someone else.
-- **Desktop.** The app writes the token the first time it starts its server.
-  Only processes on your machine can reach the port.
+- **Desktop.** The desktop app hands the server it starts a new token for each
+  launch, on the server's stdin, and the token stays in the app's and the
+  server's memory. Nothing on disk holds it, so a script can't read it. Script
+  your tasks against the hosted API with an `mdb_` key, or start a server of
+  your own from a terminal.
+- **`cowork-server` from a terminal.** The server writes its token to
+  `~/.cowork/.env` the first time it starts, or takes `COWORK_AUTH_TOKEN` from
+  its environment. Only processes on your machine can reach the port.
 - **Self-hosted.** Sign in with `tests/e2e/keycloak_login.py` from the
   cowork-self-hosted repository: call `login()` once and `refresh_if_needed()`
   before each call, as its runbook's
@@ -119,8 +126,8 @@ curl -sS -X DELETE "$BASE/schedules/<task id>" -H "$AUTH"
 # → 204
 ```
 
-On the desktop, use `BASE=http://127.0.0.1:26866/api/v1` and read the token
-from `~/.cowork/.env`:
+Against a `cowork-server` you started from a terminal, use
+`BASE=http://127.0.0.1:26866/api/v1` and read the token from `~/.cowork/.env`:
 
 ```sh
 AUTH="Authorization: Bearer $(sed -n 's/^COWORK_AUTH_TOKEN=//p' ~/.cowork/.env)"
@@ -130,9 +137,9 @@ AUTH="Authorization: Bearer $(sed -n 's/^COWORK_AUTH_TOKEN=//p' ~/.cowork/.env)"
 
 The server describes every route in OpenAPI.
 
-- **Desktop:** `curl -H "$AUTH" http://127.0.0.1:26866/openapi.json`. The
-  interactive page at `/docs` needs the same token, so a browser can't open it
-  directly.
+- **`cowork-server` from a terminal:** `curl -H "$AUTH" http://127.0.0.1:26866/openapi.json`.
+  The interactive page at `/docs` needs the same token, so a browser can't open
+  it directly.
 - **Hosted:** not published. The hosted address serves only `/api` from
   cowork-server, and `/openapi.json` there is the web app's page.
 
