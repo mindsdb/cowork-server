@@ -155,6 +155,14 @@ deployment:
   # in its own values file once auth, the inference gateway and the pod's anton
   # there serve those connections. tests/test_chart_values.py pins which are on.
   customApiTurnsEnabled: "false"
+  # Gives a member's org-mode turns the switched-on tools of the custom MCP
+  # servers they added, and opens the web routes that add them
+  # (COWORK_TURN_CUSTOM_MCP_ENABLED). Off in the base and in every environment;
+  # it is the last of the three custom MCP switches, after auth's and the gateway's.
+  # TEST ENABLEMENT, integration branch only, never merged or cherry-picked.
+  # A pull request environment composes base values alone, so this is the only
+  # place that can switch custom MCP turns on there.
+  customMcpTurnsEnabled: "true"
 
   # The draft-preview host name and the one page allowed to frame a draft. The
   # draft Ingress and the COWORK_DRAFT_* variables below are templated from
@@ -528,6 +536,8 @@ deployment:
       value: '{{ $.Values.connectorDraftsEnabled }}'
     - name: COWORK_TURN_CUSTOM_API_ENABLED
       value: '{{ $.Values.customApiTurnsEnabled }}'
+    - name: COWORK_TURN_CUSTOM_MCP_ENABLED
+      value: '{{ $.Values.customMcpTurnsEnabled }}'
     - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
       valueFrom:
         secretKeyRef:
