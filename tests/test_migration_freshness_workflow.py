@@ -27,7 +27,9 @@ def _pr_job() -> dict:
 
 
 def _action_step(job: dict) -> dict:
-    return next(step for step in job["steps"] if str(step.get("uses", "")).startswith(ACTION))
+    return next(
+        step for step in job["steps"] if str(step.get("uses", "")).startswith(ACTION)
+    )
 
 
 def test_the_pr_job_always_runs_so_its_check_is_never_skipped():
@@ -44,7 +46,11 @@ def test_the_pr_job_always_runs_so_its_check_is_never_skipped():
 def test_the_pr_job_runs_the_action_in_pr_mode_and_checks_out_the_head():
     job = _pr_job()
     scope = _action_step(job)
-    checkout = next(step for step in job["steps"] if str(step.get("uses", "")).startswith("actions/checkout@"))
+    checkout = next(
+        step
+        for step in job["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
 
     assert job["steps"][0] is scope
     # A skipped or forgiven scope step leaves `protected` unset, which skips
@@ -56,7 +62,10 @@ def test_the_pr_job_runs_the_action_in_pr_mode_and_checks_out_the_head():
     assert scope["with"]["mode"] == "pr"
     assert checkout["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
     assert checkout["with"]["persist-credentials"] is False
-    assert all(step["if"] == "steps.scope.outputs.protected == 'true'" for step in job["steps"][1:])
+    assert all(
+        step["if"] == "steps.scope.outputs.protected == 'true'"
+        for step in job["steps"][1:]
+    )
 
 
 def test_the_refresher_writes_statuses_on_every_push_to_a_gated_base():
@@ -81,7 +90,9 @@ def test_the_refresher_rechecks_a_pull_request_retargeted_onto_a_gated_base():
     assert set(trigger["branches"]) == {"staging", "main"}
     for job in workflow["jobs"].values():
         assert "github.event.changes.base" in job["if"]
-        assert [step["uses"].split("@")[0] for step in job["steps"]] == [ACTION.rstrip("@")]
+        assert [step["uses"].split("@")[0] for step in job["steps"]] == [
+            ACTION.rstrip("@")
+        ]
 
 
 def test_both_workflows_protect_the_same_paths():
