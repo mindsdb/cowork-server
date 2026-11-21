@@ -47,7 +47,7 @@ jobs:
       pull-requests: read
       statuses: write
     steps:
-      - uses: mindsdb/github-actions/migration-freshness@5c4dcd6788847991ca76baffde758b4265410d3a
+      - uses: mindsdb/github-actions/migration-freshness@5384950e85069e96be1bf38ece9ebb1883f0c51e
         with:
           mode: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'refresh' }}
           protected-paths: |

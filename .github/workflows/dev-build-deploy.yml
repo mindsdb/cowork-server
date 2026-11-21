@@ -147,7 +147,7 @@ jobs:
       pull-requests: read
     steps:
       - id: scope
-        uses: mindsdb/github-actions/migration-freshness@5c4dcd6788847991ca76baffde758b4265410d3a
+        uses: mindsdb/github-actions/migration-freshness@5384950e85069e96be1bf38ece9ebb1883f0c51e
         with:
           mode: pr
           protected-paths: |
