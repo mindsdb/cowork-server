@@ -209,7 +209,9 @@ def test_the_request_log_names_each_desktop_secret_refusal(handoff_held, caplog)
     client = TestClient(app)
     with caplog.at_level("WARNING", logger="cowork.common.request_logging"):
         assert client.post("/approve").status_code == 403
-        assert client.post("/held").status_code == 403
+        held = client.post("/held")
+        assert held.status_code == 403
+        assert held.headers["X-Cowork-Reason"] == "app_secret_required"
         assert client.post("/approve", headers={app_secret.WINDOW_PROOF_HEADER: PROOF}).status_code == 200
 
     refused = [
