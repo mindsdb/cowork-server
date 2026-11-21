@@ -201,4 +201,3 @@ def test_a_local_launch_leaves_no_cowork_or_mindshub_variable_to_its_children(tm
     assert seen["anton_child"] is True
     assert seen["home"] == str(tmp_path / "home")
     assert seen["coding_dir"] == str(tmp_path / "org" / "coding")
-
