@@ -56,6 +56,8 @@ def require_app_secret(request: Request) -> None:
     if app_secret.get_app_secret() is None:
         return
     if not app_secret.matches(request.headers.get(app_secret.HEADER)):
+        # Names the refusal in the request log (cowork.common.request_logging).
+        request.state._request_log_reason = "app_secret_required"
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="app_secret_required")
 
 

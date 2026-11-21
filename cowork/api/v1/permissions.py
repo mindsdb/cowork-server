@@ -405,6 +405,8 @@ class WindowProof:
             return None
         if not app_secret.window_proof_matches(given=request.headers.get(app_secret.WINDOW_PROOF_HEADER)):
             reason = "window_proof_required"
+            # Names the refusal in the request log (cowork.common.request_logging).
+            request.state._request_log_reason = reason
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail=reason, headers={"X-Cowork-Reason": reason}
             )
