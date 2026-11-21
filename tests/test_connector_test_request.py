@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import ipaddress
 import json
 import logging
 import re
@@ -18,9 +19,12 @@ from urllib.parse import quote, quote_plus
 import httpx
 import pytest
 
+from anton.core.utils.write_check import http_write_rule_matches, parse_http_write_rules
+
 from cowork.services.connectors import connector_test_run
 from cowork.services.connectors.connector_test_run import ConnectorTestError, run_test_request
 from tests._logging_assertions import assert_log_fields
+from tests._tls_origin import certificates
 
 SECRET = "s3cr3t-Value/with+chars@x"
 CLIENT_ID = "planner-client"
@@ -84,10 +88,18 @@ def resolver(table: dict[str, str | list[str]]):
 
 @pytest.fixture(autouse=True)
 def no_allowlist(monkeypatch):
+    monkeypatch.delenv("ANTON_WRITE_APPROVAL", raising=False)
+    monkeypatch.delenv("ANTON_WRITE_APPROVAL_HTTP", raising=False)
     monkeypatch.delenv(connector_test_run.ALLOWLIST_ENV, raising=False)
     connector_test_run.private_allowlist.cache_clear()
     yield
     connector_test_run.private_allowlist.cache_clear()
+
+
+def hold(monkeypatch, rules: str, *, approval: str = "true") -> None:
+    """Set the write-approval rules in the process environment, as anton reads them."""
+    monkeypatch.setenv("ANTON_WRITE_APPROVAL", approval)
+    monkeypatch.setenv("ANTON_WRITE_APPROVAL_HTTP", rules)
 
 
 def allow(monkeypatch, value: str) -> None:
@@ -195,6 +207,95 @@ class TestEveryHostIsJudgedBeforeAnyRequest:
         assert api.requests == []
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("address", [
+        "172.30.9.20", "::ffff:172.30.9.20", "64:ff9b::ac1e:914", "fd30::20", "127.0.0.1", "127.8.8.8", "::1", "0.0.0.0",
+    ])
+    @pytest.mark.parametrize("port", [8443, None])
+    @pytest.mark.parametrize("listed", ["cowork.internal", "172.30.0.0/16,fd30::/16,127.0.0.0/8,::1/128,64:ff9b::/96"])
+    async def test_a_shared_deployment_never_tests_its_own_machine(
+        self, monkeypatch, personal_deployment, address, port, listed,
+    ):
+        """At any port, by address or by a hostname the operator listed: the
+        server's interfaces and loopback are nobody's own to test there."""
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset({
+            ipaddress.ip_address("172.30.9.20"), ipaddress.ip_address("fd30::20"),
+        }))
+        allow(monkeypatch, listed)
+        url = f"https://cowork.internal{f':{port}' if port else ''}/v1/data"
+        api = await refused("Cowork itself", with_url(url), table={**PUBLIC, "cowork.internal": address})
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("address", ["10.0.0.5", "192.168.1.10", "100.64.0.1", "fd12::5", "64:ff9b::a00:5"])
+    async def test_a_shared_deployment_refuses_a_private_host_the_operator_did_not_list(
+        self, monkeypatch, personal_deployment, address,
+    ):
+        """Nobody is asked there: the request leaves from the operator's network."""
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset())
+        api = await refused("operator has not allowed", table={**PUBLIC, "api.example.com": address})
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_shared_deployment_ignores_a_persons_approval(self, monkeypatch, personal_deployment):
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset())
+        key = connector_test_run.approval_key("data", "POST", "https", "api.example.com", 443)
+        api = await refused(
+            "operator has not allowed", table={**PUBLIC, "api.example.com": "10.0.0.5"}, approved={key: ("10.0.0.5",)},
+        )
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("listed", [
+        "172.30.9.10", "172.30.9.10/32", "172.30.9.10,auth.example.com,api.example.com",
+    ])
+    async def test_a_shared_deployment_reaches_a_private_address_the_operator_listed(
+        self, monkeypatch, personal_deployment, listed,
+    ):
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset())
+        allow(monkeypatch, listed)
+        outcome, api = await run(table={"auth.example.com": "172.30.9.10", "api.example.com": "172.30.9.10"})
+        assert outcome.private_host is None and outcome.preview is not None
+        assert [r.headers["host"] for r in api.requests] == ["auth.example.com", "api.example.com"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("listed", "url"), [
+        ("auth.example.com,api.example.com", "https://api.example.com/v1/data"),
+        ("172.30.9.10,auth.example.com", "https://api.example.com/v1/data"),
+        ("172.30.9.10,auth.example.com,api.example.com", "https://172.30.9.10/v1/data"),
+        ("172.30.9.10,auth.example.com,api.example.com", "https://other.example.com:5432/v1/data"),
+        ("172.30.9.0/24,auth.example.com,api.example.com", "https://api.example.com/v1/data"),
+    ], ids=["names only", "host not named", "address literal", "another host and port", "resolves outside the range"])
+    async def test_a_shared_deployment_needs_the_name_and_the_address_listed(
+        self, monkeypatch, personal_deployment, listed, url,
+    ):
+        """A listed name alone would be dialled wherever its DNS points, and a
+        listed address alone would open every host and port behind it."""
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset())
+        allow(monkeypatch, listed)
+        table = {
+            "auth.example.com": "172.30.9.10", "other.example.com": "172.30.9.10",
+            "api.example.com": "172.30.11.10" if "/24" in listed else "172.30.9.10",
+        }
+        api = await refused("operator has not allowed", with_url(url), table=table)
+        assert [r.headers["host"] for r in api.requests] in ([], ["auth.example.com"])
+
+    @pytest.mark.asyncio
+    async def test_a_single_user_install_takes_a_listed_name_or_a_listed_address(self, monkeypatch):
+        allow(monkeypatch, "auth.example.com,api.example.com")
+        outcome, _api = await run(table={"auth.example.com": "10.0.0.5", "api.example.com": "10.0.0.6"})
+        assert outcome.private_host is None and outcome.preview is not None
+
+    @pytest.mark.asyncio
+    async def test_a_single_user_install_still_offers_this_computer_on_another_port(self, monkeypatch):
+        monkeypatch.setattr(connector_test_run, "_own_addresses", lambda: frozenset({ipaddress.ip_address("10.0.0.5")}))
+        outcome, api = await run(with_url("http://localhost:9999/v1/data"), table={**PUBLIC, "localhost": "127.0.0.1"})
+        assert outcome.private_host is not None and api.requests == []
+
+    def test_the_interfaces_are_read_for_each_test_and_hold_this_machines_loopback(self):
+        assert ipaddress.ip_address("127.0.0.1") in connector_test_run._own_addresses()
+        assert not hasattr(connector_test_run._own_addresses, "cache_clear")
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("address", ["10.0.0.5", "192.168.1.10", "172.16.0.9", "100.64.0.1", "fd12::5", "64:ff9b::a00:5"])
     async def test_a_private_host_asks_before_anything_is_sent(self, address):
         outcome, api = await run(table={**PUBLIC, "api.example.com": address})
@@ -273,6 +374,405 @@ class TestEveryHostIsJudgedBeforeAnyRequest:
         request["data"]["method"] = "GET"
         outcome, _ = await run(request, table=table, approved=approved)
         assert outcome.private_host is not None
+
+
+async def _answer_rows(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Answer any request with one JSON row."""
+    await reader.readuntil(b"\r\n\r\n")
+    body = b'{"rows": [{"id": 1}]}'
+    writer.write(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+        + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
+    )
+    await writer.drain()
+    writer.close()
+
+
+class TestAnApiBehindTheOperatorsOwnCertificateAuthority:
+    """The real client and a real TLS handshake, at the step that sends: the
+    judging above it refuses loopback on a shared deployment."""
+
+    HOST = "erp.example.test"
+
+    @pytest.fixture(autouse=True)
+    def no_started_certificates(self, monkeypatch):
+        monkeypatch.delenv(connector_test_run.CA_FILE_ENV, raising=False)
+        self._forget_the_start()
+        yield
+        self._forget_the_start()
+
+    @staticmethod
+    def _forget_the_start():
+        connector_test_run.started_certificates.cache_clear()
+        connector_test_run._shared_tls_context.cache_clear()
+
+    def _start_with(self, monkeypatch, path):
+        monkeypatch.setenv(connector_test_run.CA_FILE_ENV, str(path))
+        connector_test_run.started_certificates()
+
+    @pytest.fixture
+    async def origin(self, tmp_path):
+        server_context, _client, ca_file = certificates(tmp_path, self.HOST)
+        server = await asyncio.start_server(_answer_rows, "127.0.0.1", 0, ssl=server_context)
+        yield server.sockets[0].getsockname()[1], ca_file
+        server.close()
+        await server.wait_closed()
+
+    async def _send(self, port: int):
+        step = connector_test_run._build_step("data", {"method": "GET", "url": f"https://{self.HOST}:{port}/rows"}, {})
+        return await connector_test_run._send_once(step, (ipaddress.ip_address("127.0.0.1"),), None)
+
+    @pytest.mark.asyncio
+    async def test_a_shared_deployment_trusts_the_file_the_server_started_with(self, monkeypatch, personal_deployment, origin):
+        port, ca_file = origin
+        self._start_with(monkeypatch, ca_file)
+
+        status, body, _over_cap, _content_type = await self._send(port)
+
+        assert (status, json.loads(body)) == (200, {"rows": [{"id": 1}]})
+        # The built-in authorities stay trusted beside the operator's one.
+        assert connector_test_run._tls_verify().cert_store_stats()["x509_ca"] > 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("prefix", [
+        "# CA de l'équipe, Zürich — 2026\n".encode(), b"\xef\xbb\xbf", b"# caf\xe9\n", b"",
+    ], ids=["utf-8 comment", "byte-order mark", "latin-1 comment", "plain"])
+    async def test_a_bundle_with_a_comment_or_byte_order_mark_is_trusted(
+        self, monkeypatch, tmp_path, personal_deployment, origin, prefix,
+    ):
+        port, origin_ca = origin
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_bytes(prefix + origin_ca.read_bytes())
+        self._start_with(monkeypatch, bundle)
+
+        connector_test_run.check_started_certificates()
+        status, _body, _over_cap, _content_type = await self._send(port)
+
+        assert status == 200
+
+    def test_a_shared_deployment_does_not_start_with_a_file_it_cannot_read(
+        self, monkeypatch, tmp_path, personal_deployment,
+    ):
+        self._start_with(monkeypatch, tmp_path / "missing.pem")
+        with pytest.raises(ValueError, match="SSL_CERT_FILE names a file that cannot be read"):
+            connector_test_run.check_started_certificates()
+
+    @pytest.mark.parametrize("content", [
+        b"not a certificate\n",
+        b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        b"-----BEGIN CERTIFICATE-----\nMIIB\xe9AAAA\n-----END CERTIFICATE-----\n",
+    ], ids=["no block", "damaged block", "a stray byte inside a block"])
+    def test_a_shared_deployment_does_not_start_with_a_file_holding_no_usable_certificate(
+        self, monkeypatch, tmp_path, personal_deployment, content,
+    ):
+        """Bytes around a certificate are skipped as OpenSSL skips them; bytes
+        inside one are not dropped to make it load."""
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_bytes(content)
+        self._start_with(monkeypatch, bundle)
+        with pytest.raises(ValueError, match="SSL_CERT_FILE names a file with no usable certificate in it"):
+            connector_test_run.check_started_certificates()
+
+    @pytest.mark.parametrize("bad", ["missing", "empty"])
+    def test_an_org_deployment_starts_with_a_file_it_never_uses(
+        self, monkeypatch, tmp_path, org_deployment, bad,
+    ):
+        path = tmp_path / "bad.pem"
+        if bad == "empty":
+            path.write_text("not a certificate\n", encoding="ascii")
+        self._start_with(monkeypatch, path)
+        connector_test_run.check_started_certificates()
+
+    def test_a_single_user_install_starts_with_a_file_it_cannot_read(self, monkeypatch, tmp_path):
+        self._start_with(monkeypatch, tmp_path / "missing.pem")
+        connector_test_run.check_started_certificates()
+
+    @pytest.mark.asyncio
+    async def test_a_shared_deployment_without_the_file_does_not_trust_it(self, personal_deployment, origin):
+        port, _ca_file = origin
+        with pytest.raises(ConnectorTestError, match="could not connect"):
+            await self._send(port)
+
+    @pytest.mark.asyncio
+    async def test_a_single_user_install_keeps_the_built_in_authorities_alone(self, monkeypatch, origin):
+        port, ca_file = origin
+        self._start_with(monkeypatch, ca_file)
+
+        assert connector_test_run._tls_verify() is True
+        with pytest.raises(ConnectorTestError, match="could not connect"):
+            await self._send(port)
+
+    def test_the_file_is_the_one_the_server_started_with(self, monkeypatch, tmp_path, personal_deployment):
+        block = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----"
+        started = tmp_path / "started.pem"
+        started.write_text(f"# the operator's own\n{block}\n", encoding="ascii")
+        self._start_with(monkeypatch, started)
+        monkeypatch.setenv(connector_test_run.CA_FILE_ENV, str(tmp_path / "written-later.pem"))
+
+        assert connector_test_run.started_certificates() == connector_test_run.StartedCertificates(str(started), block)
+
+    @pytest.mark.asyncio
+    async def test_a_file_overwritten_after_the_start_is_not_trusted(
+        self, monkeypatch, tmp_path, personal_deployment, origin
+    ):
+        port, origin_ca = origin
+        bundle = tmp_path / "bundle.pem"
+        (tmp_path / "other").mkdir()
+        _server, _client, other_ca = certificates(tmp_path / "other", self.HOST)
+        bundle.write_bytes(other_ca.read_bytes())
+        self._start_with(monkeypatch, bundle)
+
+        bundle.write_bytes(origin_ca.read_bytes())
+
+        with pytest.raises(ConnectorTestError, match="could not connect"):
+            await self._send(port)
+
+    @pytest.mark.asyncio
+    async def test_a_file_removed_after_the_start_is_still_trusted(
+        self, monkeypatch, tmp_path, personal_deployment, origin
+    ):
+        port, origin_ca = origin
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_bytes(origin_ca.read_bytes())
+        self._start_with(monkeypatch, bundle)
+
+        bundle.unlink()
+
+        status, _body, _over_cap, _content_type = await self._send(port)
+        assert status == 200
+
+
+class TestAWriteApprovalRuleHoldsATestStep:
+    """A test shows no approval card, so on a shared deployment it never sends
+    a request anton's own matcher would hold."""
+
+    DATA_URL = "https://api.example.com/integration/V1/query"
+    TOKEN_URL = "https://auth.example.com/oauth2/token"
+
+    @staticmethod
+    def _held(rule: str, method: str, url: str) -> bool:
+        [parsed] = parse_http_write_rules(rule)
+        return http_write_rule_matches(parsed, method=method, url=url)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rule", [
+        f"POST {DATA_URL}",
+        "POST https://api.example.com/integration/*/query",
+        "POST https://api.example.com/**",
+        "POST https://api.example.com:443/integration/V1/query",
+        "* https://api.example.com/**",
+        "POST HTTPS://API.EXAMPLE.COM/INTEGRATION/**",
+    ], ids=["exact", "star", "double star", "explicit port", "any method", "other case"])
+    async def test_a_held_data_step_is_refused_before_anything_is_sent(
+        self, monkeypatch, personal_deployment, rule,
+    ):
+        """Each rule is one anton's own matcher holds for some spelling of this URL."""
+        spellings = [self.DATA_URL, self.DATA_URL.replace(".com/", ".com:443/")]
+        assert any(self._held(rule, "POST", spelling) for spelling in spellings)
+        hold(monkeypatch, rule)
+        api = await refused("data step sends a request that needs an approval", api=Api())
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_rule_with_no_path_holds_a_data_step_with_no_path(self, monkeypatch, personal_deployment):
+        rule = "POST https://api.example.com"
+        assert self._held(rule, "POST", "https://api.example.com") is True
+        assert self._held(rule, "POST", self.DATA_URL) is False
+        hold(monkeypatch, rule)
+        api = await refused("data step sends a request that needs an approval", with_url("https://api.example.com"))
+        assert api.requests == []
+        outcome, _api = await run()
+        assert outcome.preview is not None
+
+    @pytest.mark.asyncio
+    async def test_the_trailing_dot_and_spelling_anton_does_not_match_are_still_held(
+        self, monkeypatch, personal_deployment,
+    ):
+        rule = f"POST {self.DATA_URL}"
+        spelled = "https://API.example.com./integration/V1/query"
+        assert self._held(rule, "POST", spelled) is False
+        hold(monkeypatch, rule)
+        api = await refused("data step sends a request that needs an approval", with_url(spelled))
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_rule_naming_the_other_port_holds_nothing_on_this_one(self, monkeypatch, personal_deployment):
+        rule = "POST https://api.example.com:8443/**"
+        assert self._held(rule, "POST", self.DATA_URL) is False
+        hold(monkeypatch, rule)
+        outcome, api = await run()
+        assert outcome.preview is not None and len(api.requests) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_held_token_step_refuses_with_no_request_sent(self, monkeypatch, personal_deployment):
+        hold(monkeypatch, f"POST {self.TOKEN_URL}")
+        api = await refused("token step sends a request that needs an approval")
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_held_data_step_refuses_before_the_token_request_is_sent(self, monkeypatch, personal_deployment):
+        hold(monkeypatch, f"POST {self.DATA_URL}")
+        api = await refused("data step sends a request that needs an approval")
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_says_it_cannot_be_connected_here_and_shows_no_url(self, monkeypatch, personal_deployment):
+        hold(monkeypatch, f"POST {self.DATA_URL}")
+        with pytest.raises(ConnectorTestError) as exc:
+            await run()
+        assert "cannot ask for one" in exc.value.reason and "cannot be connected here" in exc.value.reason
+        assert "example.com" not in exc.value.reason
+
+    @pytest.mark.asyncio
+    async def test_a_data_url_made_held_by_the_issued_token_is_refused_before_its_request(
+        self, monkeypatch, personal_deployment,
+    ):
+        hold(monkeypatch, f"POST {self.DATA_URL}/{ISSUED}")
+        api = await refused(
+            "data step sends a request that needs an approval",
+            with_url(f"{self.DATA_URL}/{{{{token}}}}"),
+        )
+        assert [r.url.path for r in api.requests] == ["/oauth2/token"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rule", [
+        "POST https://api.example.com/v1/orders/**", "POST https://api.example.com/v1/orders",
+    ], ids=["glob", "exact path"])
+    @pytest.mark.parametrize("path", [
+        "/v1/orders", "/v1/orders/", "/v1/or%64ers", "/v1/or%64ers/", "/v1/%6Frders", "/v1/or%64ers%2f",
+        "/v1/x/%2e%2e/orders", "/v1/%2Forders", "/v1//orders", "//v1/orders", "/v1/./orders", "/v1/a/../orders",
+        "/v1/orders//", "/v1\\orders", "/v1/orders%2F",
+    ])
+    async def test_a_held_path_is_refused_however_it_is_spelled(self, monkeypatch, personal_deployment, rule, path):
+        hold(monkeypatch, rule)
+        api = await refused("data step", with_url(f"https://api.example.com{path}"))
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rule", [
+        "POST https://xn--bcher-kva.example/**", "POST https://xn--bcher-kva.example/v1/orders",
+        "POST https://b\u00fccher.example/**",
+    ], ids=["ascii glob", "ascii exact", "unicode glob"])
+    @pytest.mark.parametrize("host", ["xn--bcher-kva.example", "b\u00fccher.example"], ids=["ascii url", "unicode url"])
+    async def test_a_held_host_with_a_non_ascii_name_is_refused_in_either_spelling(
+        self, monkeypatch, personal_deployment, rule, host,
+    ):
+        """A rule names the host in ASCII or in Unicode, and so may the form."""
+        hold(monkeypatch, rule)
+        table = {**PUBLIC, "xn--bcher-kva.example": "93.184.216.21"}
+        api = await refused("needs an approval", with_url(f"https://{host}/v1/orders"), table=table)
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rule", [
+        "POST https://other.example.com/**", "GET https://api.example.com/**", "POST http://api.example.com/**",
+        "POST https://api.example.com:8443/**",
+    ], ids=["another host", "another method", "another scheme", "another port"])
+    async def test_a_rule_that_cannot_hold_this_step_does_not_judge_how_its_path_is_written(
+        self, monkeypatch, personal_deployment, rule,
+    ):
+        """An API may want an escaped slash in its path; only a rule that could
+        hold a request to this host makes the spelling matter."""
+        hold(monkeypatch, rule)
+        outcome, api = await run(with_url("https://api.example.com/v1/projects/group%2Fproject/items"))
+        assert outcome.preview is not None and api.requests[-1].url.raw_path.endswith(b"group%2Fproject/items")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rule", ["POST https://api.example.com/v2/**", "POST https://*.example.com/v2/**", "POST **orders**"])
+    async def test_a_rule_that_could_hold_this_host_makes_the_spelling_matter(self, monkeypatch, personal_deployment, rule):
+        hold(monkeypatch, rule)
+        api = await refused(
+            "written in a way a connection test does not accept",
+            with_url("https://api.example.com/v1/projects/group%2Fproject/items"),
+        )
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("rule", "url"), [
+        ("POST https://api.example.com", "https://api.example.com/"),
+        ("POST https://api.example.com/", "https://api.example.com"),
+    ])
+    async def test_a_rule_on_the_root_holds_it_with_and_without_its_slash(self, monkeypatch, personal_deployment, rule, url):
+        hold(monkeypatch, rule)
+        api = await refused("needs an approval", with_url(url))
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", [
+        "/v1/or%64ers", "/v1/%2Forders", "/v1//orders", "/v1/orders//", "/v1/x/%2e%2e/orders", "/v1/or%zzders",
+        "/v1/orders;x=1/7", "/v1/orders%3Bx/7", "/v1/or%2564ers", "/v1/orders%00/7", "/v1/orders%0a/7",
+        "/v1/orders%7f/7", "/v1/orders%ff/7", "/v1/orders%c3/7",
+    ])
+    async def test_a_path_not_written_plainly_is_refused_as_such_when_a_rule_exists(
+        self, monkeypatch, personal_deployment, path,
+    ):
+        hold(monkeypatch, "POST https://api.example.com/v1/orders/**")
+        api = await refused("written in a way a connection test does not accept", with_url(f"https://api.example.com{path}"))
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("url", [
+        "https://user:pw@api.example.com/v1/orders/7", "https://api.example.com:443/v1/orders/7",
+        "https://API.EXAMPLE.COM./V1/ORDERS/7?x=1#f", "https://api.example.com/v1/orders/",
+    ])
+    async def test_a_plain_held_url_is_refused_as_held(self, monkeypatch, personal_deployment, url):
+        hold(monkeypatch, "POST https://api.example.com/v1/orders/**\nPOST https://api.example.com/v1/orders")
+        api = await refused("needs an approval", with_url(url))
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_an_unheld_plain_url_on_the_same_host_runs(self, monkeypatch, personal_deployment):
+        hold(monkeypatch, "POST https://api.example.com/v1/orders/**")
+        outcome, api = await run(request=with_url("https://api.example.com/v1/query"))
+        assert outcome.preview is not None and len(api.requests) == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("value", "glob"), [("a b", "a?b"), ("caf\u00e9", "caf?")], ids=["space", "non-ascii"])
+    async def test_an_encoded_value_in_the_path_is_accepted_and_judged_decoded(
+        self, monkeypatch, personal_deployment, value, glob,
+    ):
+        request = with_url("https://api.example.com/v1/{{client_id}}/query")
+        values = {**VALUES, "client_id": value}
+        hold(monkeypatch, "POST https://api.example.com/v1/orders/**")
+        outcome, _api = await run(request, values)
+        assert outcome.preview is not None
+
+        hold(monkeypatch, f"POST https://api.example.com/v1/{glob}/query")
+        api = await refused("needs an approval", request, values)
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_a_single_user_install_does_not_judge_the_spelling(self, monkeypatch):
+        hold(monkeypatch, "POST https://api.example.com/v1/orders/**")
+        outcome, _api = await run(request=with_url("https://api.example.com/v1/or%64ers"))
+        assert outcome.preview is not None
+
+    @pytest.mark.asyncio
+    async def test_an_unheld_post_query_on_the_same_host_still_runs(self, monkeypatch, personal_deployment):
+        hold(monkeypatch, "POST https://api.example.com/integration/V1/orders/*\nPUT https://api.example.com/**")
+        outcome, api = await run()
+        assert outcome.preview is not None and outcome.preview.item_count == 2
+        assert len(api.requests) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_rule_set_after_the_app_started_applies_at_the_next_test(self, monkeypatch, personal_deployment):
+        outcome, _api = await run()
+        assert outcome.preview is not None
+        hold(monkeypatch, f"POST {self.DATA_URL}")
+        api = await refused("data step sends a request that needs an approval")
+        assert api.requests == []
+
+    @pytest.mark.asyncio
+    async def test_rules_do_nothing_while_write_approval_is_off(self, monkeypatch, personal_deployment):
+        hold(monkeypatch, f"POST {self.DATA_URL}", approval="false")
+        outcome, _api = await run()
+        assert outcome.preview is not None
+
+    @pytest.mark.asyncio
+    async def test_a_single_user_install_with_the_same_rule_still_runs_the_test(self, monkeypatch):
+        hold(monkeypatch, f"POST {self.DATA_URL}")
+        outcome, api = await run()
+        assert outcome.preview is not None and len(api.requests) == 2
 
 
 class TestFillingIn:

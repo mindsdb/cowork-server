@@ -25,12 +25,12 @@ from cowork.services.connectors.connector_test_flow import (
     WAITING_FOR_APPROVAL,
     WAITING_FOR_CONFIRMATION,
     advance,
-    save_definition,
 )
 from cowork.services.connectors.connector_test_run import ConnectorTestError, placeholder_names, request_endpoints
 from cowork.services.connectors.custom_connectors import (
     NEEDS_REBUILD_FOR_MEMBER,
-    USAGE_NOTES_MAX,
+    NO_CUSTOM_IN_ORG,
+    custom_test_is_code_checked,
     test_request_for,
 )
 from cowork.services.connectors.identity import spec_secret_fields
@@ -43,7 +43,6 @@ from cowork.db.scoped import (
     LOCAL_SCOPE,
     ScopedSession,
     TenantScope,
-    tenant_scope_required,
     unsafe_unscoped_session,
 )
 from cowork.db.units import busy_retry_seconds, conversation_writes, run_db
@@ -135,20 +134,6 @@ def _method_fields(form_spec: dict, method: str | None) -> list:
         return list(form_spec.get("fields") or [])
     chosen = next((m for m in methods if m.get("id") == method), None)
     return list((chosen or {}).get("fields") or [])
-
-
-def _form_usage_notes(form_spec: dict) -> str | None:
-    """A handcrafted form's own ``connector.usage_notes``, for its probe.
-
-    Returns the stripped text, or None when the form has none or they exceed
-    USAGE_NOTES_MAX. The cap is checked again here rather than trusting that
-    every route staging a form ran check_handcrafted_form.
-    """
-    meta = form_spec.get("connector")
-    notes = meta.get("usage_notes") if isinstance(meta, dict) else None
-    if not isinstance(notes, str) or len(notes) > USAGE_NOTES_MAX:
-        return None
-    return notes.strip() or None
 
 
 _GRANT_UNLISTED = (
@@ -397,8 +382,6 @@ class ProbeHandler:
             # A follow-up step is probed with the fields of the connection it
             # extends too; the save below still merges them once, under the vault lock.
             probe_credentials = credentials
-            saved_only_fields: set[str] = set()
-            unpatchable_names: set[str] = set()
             if extends_name:
                 try:
                     target = vault_for_scope(self.scope).read_record(connector_id, extends_name)
@@ -417,20 +400,11 @@ class ProbeHandler:
                     return
                 stored = {k: v for k, v in target.get("fields", {}).items() if not k.startswith("_")}
                 probe_credentials = {**stored, **credentials}
-                step_field_names: set[str] = set()
-                field_lists = [form_spec.get("fields") or []]
-                field_lists += [m.get("fields") or [] for m in form_spec.get("methods") or [] if isinstance(m, dict)]
-                for fields in field_lists:
-                    step_field_names.update(f.get("name") for f in fields if isinstance(f, dict))
-                saved_only_fields = set(stored) - step_field_names
-                # The probe reads these as DS_<NAME> in its .env, so it may echo either form.
-                for saved_name in saved_only_fields:
-                    unpatchable_names.update({saved_name.lower(), f"ds_{saved_name.lower()}"})
 
             # A custom connector is tested by its own test request, which the
-            # member confirms, never by the model probe. Self-hosted and org
-            # mode keep the model probe until their own milestone.
-            if registry.get_connector(connector_id) is None and not tenant_scope_required():
+            # member confirms, never by the model probe; only a built-in
+            # connector reaches the probe below.
+            if registry.get_connector(connector_id) is None:
                 # The staged copy goes now; the values wait only in the pending test.
                 store.consume(submission_id)
                 test_request = test_request_for(form_spec, method)
@@ -438,11 +412,12 @@ class ProbeHandler:
                 # this step's form or not: a blank field of the same name still
                 # sends the saved value.
                 from_saved = set(probe_credentials) - set(credentials)
-                refusal = (
-                    (NEEDS_REBUILD_FOR_MEMBER if spec is not None else _NO_TEST_REQUEST)
-                    if test_request is None
-                    else await self._follow_up_refusal(connector_id, test_request, form_spec, method, from_saved)
-                )
+                if not custom_test_is_code_checked():
+                    refusal = NO_CUSTOM_IN_ORG
+                elif test_request is None:
+                    refusal = NEEDS_REBUILD_FOR_MEMBER if spec is not None else _NO_TEST_REQUEST
+                else:
+                    refusal = await self._follow_up_refusal(connector_id, test_request, form_spec, method, from_saved)
                 if refusal is not None:
                     yield _delta(refusal)
                     yield _patch_delta({"form_id": form_id, "_is_probing": False, "form_error": refusal})
@@ -542,14 +517,6 @@ class ProbeHandler:
                 logger.exception("Could not build LLM client for probe")
 
             # Workspace / LLM client availability
-            if (workspace is None or llm_client is None) and grant_slug:
-                yield _delta(_GRANT_UNLISTED.format(reason=init_error))
-                yield _patch_delta(_grant_saved_patch(form_id, grant_slug))
-                yield await _completed(
-                    None if settings_busy else db_conversation_id,
-                    {"status": "success", "user_label": grant_user_label},
-                )
-                return
             if workspace is None or llm_client is None:
                 yield _delta(init_error)
                 yield _patch_delta({"form_id": form_id, "form_error": init_error})
@@ -573,10 +540,6 @@ class ProbeHandler:
             pending_cell: dict = {}
 
             usage_notes, notes_define_pass = await self._usage_notes(connector_id)
-            if spec is None and not usage_notes:
-                # The submitter wrote this form and its probe uses only their own
-                # credentials, so its notes are hints in every scope, never the rule.
-                usage_notes, notes_define_pass = _form_usage_notes(form_spec), False
             probe = CredentialProbe(
                 engine=connector_id,
                 credentials=probe_credentials,
@@ -587,7 +550,6 @@ class ProbeHandler:
                 usage_notes=usage_notes,
                 notes_define_pass=notes_define_pass,
                 web_tool_kwargs=web_tools,
-                saved_fields=sorted(saved_only_fields),
                 cell_sandbox=cell_sandbox,
             )
             try:
@@ -602,15 +564,13 @@ class ProbeHandler:
                         })
                     elif kind == "field_status":
                         field_name = (payload or {}).get("name")
-                        # A patch for a field the form doesn't hold would add it,
-                        # untyped, so a saved secret typed there would show.
-                        if field_name and field_name.lower() not in unpatchable_names:
+                        if field_name:
                             status_val = (payload or {}).get("status")
                             mid = (payload or {}).get("method_id")
                             yield _patch_delta(_field_patch(form_id, mid, field_name, {"status": status_val}))
                     elif kind == "remove_field":
                         field_name = (payload or {}).get("name")
-                        if field_name and field_name.lower() not in unpatchable_names:
+                        if field_name:
                             mid = (payload or {}).get("method_id")
                             yield _patch_delta(_field_patch(form_id, mid, field_name, None))
                     elif kind == "switch_method":
@@ -668,25 +628,13 @@ class ProbeHandler:
             # Apply verdict
             saved_slug: str | None = None
             saved_user_label: str | None = None
-            if grant_slug and final_outcome.status != "success":
-                reason = final_outcome.error or final_outcome.follow_up or "its test did not pass"
-                yield _delta(_GRANT_UNLISTED.format(reason=reason))
-                yield _patch_delta(_grant_saved_patch(form_id, grant_slug))
-                yield await _completed(db_conversation_id, {"status": "success", "user_label": grant_user_label})
-                return
-            if grant_slug:
-                saved_slug, saved_user_label = grant_slug, grant_user_label
-            elif final_outcome.status == "success":
-                # A connector the static registry lacks has only this form to
-                # say which fields are secret.
-                builtin = registry.get_connector(connector_id) is not None
+            if final_outcome.status == "success":
                 try:
                     vault = vault_for_scope(self.scope)
                     slug = persist_connection(
-                        connector_id, method, extends_name or name, credentials,
+                        connector_id, method, name, credentials,
                         label=connection_label, user_label=connection_user_label,
-                        extends=bool(extends_name), spec_form=None if builtin else form_spec,
-                        vault=vault, scope=self.scope,
+                        extends=False, spec_form=None, vault=vault, scope=self.scope,
                     )
                     saved_slug = slug
                     saved_record = vault.read_record(connector_id, slug) or {}
@@ -699,10 +647,6 @@ class ProbeHandler:
             if final_outcome.status == "success":
                 summary = final_outcome.summary or "Connection works."
                 yield _delta(f"\n\n{summary}\n\nSaved as `{saved_slug}`.\n")
-                if spec is None and not extends_name:
-                    note = await self._save_definition(connector_id, form_spec)
-                    if note:
-                        yield _delta(note)
                 yield _patch_delta({
                     "form_id": form_id,
                     "title": f"Connected — {saved_slug}",
@@ -765,16 +709,6 @@ class ProbeHandler:
             if _temp_workspace_dir:
                 shutil.rmtree(_temp_workspace_dir, ignore_errors=True)
 
-    async def _save_definition(self, connector_id: str, form_spec: dict) -> str | None:
-        """Store a handcrafted form whose model probe passed as the scope's
-        custom connector (``connector_test_flow.save_definition``).
-
-        Returns:
-            None when saved or skipped, else a line telling the user the
-            connection is saved but the connector could not be.
-        """
-        return await save_definition(self.scope, connector_id, form_spec)
-
     async def _follow_up_refusal(
         self, connector_id: str, test_request: dict, form_spec: dict, method: str | None, saved_fields: set[str],
     ) -> str | None:
@@ -805,10 +739,9 @@ class ProbeHandler:
 
     async def _usage_notes(self, connector_id: str) -> tuple[str | None, bool]:
         """The connector's agent-facing notes from the catalog, or None when it
-        has none or they could not be read; a handcrafted form's own notes may
-        then stand in (``_form_usage_notes``). The flag is True
-        only for a built-in spec's notes, the ones reviewed like code, which
-        may tell the probe what counts as a pass."""
+        has none or they could not be read. The flag is True only for a
+        built-in spec's notes, the ones reviewed like code, which may tell the
+        probe what counts as a pass."""
         try:
             notes = await run_db(
                 lambda session: ConnectorCatalog(session).usage_notes_for([connector_id]), scope=self.scope,

@@ -13,6 +13,7 @@ from cowork.common.settings.app_settings import (
     get_export_pdf_settings,
 )
 from cowork.dev_setup import run_dev_setup
+from cowork.services.connectors.connector_test_run import ALLOWLIST_ENV, started_certificates
 
 # Long enough for in-flight requests to finish, short enough that a supervisor
 # never has to escalate to SIGKILL.
@@ -28,14 +29,18 @@ def main() -> None:
     # Taken from the spawn environment only, before the .env file below joins
     # it: that file is writable by agent code.
     secret_on_stdin = os.environ.get(app_secret.STDIN_FLAG) == "1"
-    started_with = {name: os.environ.get(name) for name in (EXPORT_PDF_ENGINE_VAR, EXPORT_RENDER_URL_VAR)}
+    started_certificates()
+    started_with = {
+        name: os.environ.get(name) for name in (EXPORT_PDF_ENGINE_VAR, EXPORT_RENDER_URL_VAR, ALLOWLIST_ENV)
+    }
     try:
         from dotenv import load_dotenv
         load_dotenv(override=False)
     except ImportError:
         pass
     # Whatever reads the environment from here on, in this process or one it
-    # starts, sees the PDF settings the server started with.
+    # starts, sees the PDF settings and the connection test's private
+    # allowlist the server started with.
     for name, value in started_with.items():
         if value is None:
             os.environ.pop(name, None)

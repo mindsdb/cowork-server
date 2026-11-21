@@ -24,14 +24,20 @@ import os
 import posixpath
 import re
 import socket
+import ssl
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, quote_plus, unquote, urlsplit
 
 import httpx
+import psutil
+from anton.config.settings import AntonSettings
+from anton.core.utils.write_check import HttpWriteRule, http_write_rule_matches, parse_http_write_rules
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import tenant_scope_required
 from cowork.services.connectors.custom_connectors import PLACEHOLDER
 from cowork.services.connectors.egress import (
     connection_attempts,
@@ -134,7 +140,9 @@ def private_allowlist() -> tuple[frozenset[str], tuple[ipaddress.IPv4Network | i
     """The operator's private hosts and ranges, from the process environment.
 
     Read once and only from ``os.environ``: never from ``<COWORK_HOME>/.env``
-    or settings, which code the agent runs can write.
+    or settings, which code the agent runs can write. The server reads it as
+    it starts (``create_app``), so nothing written to the environment later
+    changes it.
     """
     hosts: set[str] = set()
     networks = []
@@ -147,6 +155,96 @@ def private_allowlist() -> tuple[frozenset[str], tuple[ipaddress.IPv4Network | i
         except ValueError:
             hosts.add(_normal_host(entry))
     return frozenset(hosts), tuple(networks)
+
+
+CA_FILE_ENV = "SSL_CERT_FILE"
+_CERTIFICATE_BLOCK = re.compile(rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL)
+
+
+@dataclass(frozen=True)
+class StartedCertificates:
+    """The certificate file named when the server started: its path and its
+    PEM text, or None for the text when it could not be read."""
+
+    path: str
+    pem: str | None
+
+
+@functools.cache
+def started_certificates() -> StartedCertificates | None:
+    """The operator's certificate file as it was when the server started, or
+    None when no file is named.
+
+    Read once, with its text (``create_app``, and the CLI before it loads
+    ``<COWORK_HOME>/.env``), like ``private_allowlist``. An unreadable file
+    is kept as a path with no text, so a single-user install, which never
+    uses the file, still starts.
+
+    The file is read as bytes and only its certificate blocks are kept, since
+    OpenSSL skips a comment line or a byte-order mark around them that
+    ``cadata`` as text would refuse. A block that is not ASCII is kept as it
+    is, so a damaged certificate fails to load here as it does in OpenSSL.
+    """
+    path = os.environ.get(CA_FILE_ENV)
+    if not path:
+        return None
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return StartedCertificates(path, None)
+    blocks = _CERTIFICATE_BLOCK.findall(data)
+    return StartedCertificates(path, "\n".join(block.decode("latin-1") for block in blocks))
+
+
+def _trust_context(certificates: StartedCertificates) -> ssl.SSLContext:
+    """The built-in authorities plus the started file's certificates.
+
+    Raises ValueError when the file could not be read or holds no certificate.
+    """
+    if certificates.pem is None:
+        raise ValueError(f"{CA_FILE_ENV} names a file that cannot be read: {certificates.path}")
+    context = httpx.create_ssl_context(trust_env=False)
+    try:
+        context.load_verify_locations(cadata=certificates.pem)
+    except (ssl.SSLError, TypeError, ValueError) as error:
+        # No block at all, a damaged one, or bytes inside one that are not PEM.
+        raise ValueError(f"{CA_FILE_ENV} names a file with no usable certificate in it: {certificates.path}") from error
+    return context
+
+
+def check_started_certificates() -> None:
+    """Stop the start of a deployment that trusts identity headers when its
+    ``SSL_CERT_FILE`` cannot be used, rather than fail later inside a test.
+    A single-user install and org mode never use the file and are not checked.
+
+    Raises:
+        ValueError: naming ``SSL_CERT_FILE``, saying whether the file cannot
+            be read or holds no certificate.
+    """
+    settings = get_app_settings()
+    certificates = started_certificates()
+    if certificates is not None and settings.tenancy_mode != "org" and settings.trust_identity_headers:
+        _trust_context(certificates)
+
+
+@functools.cache
+def _shared_tls_context() -> ssl.SSLContext | None:
+    """The shared deployment's context, built once from the started text."""
+    certificates = started_certificates()
+    return None if certificates is None else _trust_context(certificates)
+
+
+def _tls_verify() -> ssl.SSLContext | bool:
+    """How a test verifies an API's certificate.
+
+    On a shared deployment the operator's own certificate file, as it was at
+    the start, is trusted beside the built-in authorities, since its APIs may
+    sit behind a private one. A single-user install keeps the built-in
+    authorities alone.
+    """
+    if not tenant_scope_required():
+        return True
+    return _shared_tls_context() or True
 
 
 def approval_key(step: str, method: str, scheme: str, host: str, port: int) -> str:
@@ -513,6 +611,146 @@ def judge(
     )
 
 
+def _own_addresses() -> frozenset[IPAddress]:
+    """The addresses of this server's network interfaces, read at each call."""
+    own: set[IPAddress] = set()
+    for addresses in psutil.net_if_addrs().values():
+        for entry in addresses:
+            if entry.family not in (socket.AF_INET, socket.AF_INET6):
+                continue
+            # An IPv6 link-local address carries its interface as a "%" suffix.
+            own.add(ipaddress.ip_address(entry.address.split("%", 1)[0]))
+    return frozenset(own)
+
+
+def _is_this_server(address: IPAddress, own: frozenset[IPAddress]) -> bool:
+    """Whether ``address`` is the machine a shared deployment runs on, at any
+    port: loopback, the unspecified address, or one of its interfaces'."""
+    # An IPv4-mapped address is dialled as the IPv4 one, like a translated one.
+    judged = getattr(address, "ipv4_mapped", None) or _judged(address)
+    return judged.is_loopback or judged.is_unspecified or judged in own or address in own
+
+
+def held_write_rules() -> tuple[HttpWriteRule, ...]:
+    """The write-approval rules a cell's check would apply on this deployment.
+
+    Read through anton's own settings at each call, as a turn builds them, so a
+    rule the server runs with applies at the next test. None while
+    ``ANTON_WRITE_APPROVAL`` is off, since nothing is held then. Only a shared
+    deployment reads them: a single-user install lets the person confirm.
+    """
+    if not tenant_scope_required():
+        return ()
+    settings = AntonSettings()
+    if settings.write_approval is not True:
+        return ()
+    return parse_http_write_rules(settings.write_approval_http)
+
+
+_UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+_ESCAPE = re.compile(r"%(.{0,2})")
+
+
+def _written_path(url: httpx.URL) -> str:
+    """The path as the URL's text spells it: empty when it has none, with no query or fragment."""
+    text = str(url)
+    start = len(f"{url.scheme}://")
+    end = next((i for i in range(start, len(text)) if text[i] in "/?#"), len(text))
+    return re.split(r"[?#]", text[end:], maxsplit=1)[0]
+
+
+def _is_plain_path(path: str) -> bool:
+    """Whether ``path`` is written in one way only: no escape that decodes to
+    an unreserved character, ``/``, ``;``, ``%``, a backslash or a control
+    character, no escapes that are not UTF-8 text, no ``;`` path parameter,
+    and no empty or dot segment.
+
+    A server may read those spellings as the same resource as the plain one,
+    while anton matches the text it is given.
+    """
+    for escape in _ESCAPE.findall(path):
+        if len(escape) < 2 or not all(c in "0123456789abcdefABCDEF" for c in escape):
+            return False
+        decoded = chr(int(escape, 16))
+        if decoded in _UNRESERVED | {"/", "\\", ";", "%"} or decoded < " " or decoded == "\x7f":
+            return False
+    if "\\" in path or ";" in path:
+        return False
+    try:
+        unquote(path, errors="strict")
+    except UnicodeDecodeError:
+        return False
+    segments = path.split("/")[1:]
+    return all(segments[:-1]) and all(unquote(part) not in (".", "..") for part in segments)
+
+
+def _authorities(url: httpx.URL) -> list[str]:
+    """The spellings of ``url``'s scheme, host and port a rule may be written
+    against: no userinfo, with and without the default port and a trailing dot
+    on the host, the host as Unicode and in the ASCII form the request is sent to."""
+    ports = [url.port] if url.port is not None else [None, {"https": 443, "http": 80}.get(url.scheme)]
+    hosts = {url.host, url.host.rstrip("."), url_host(url), url_host(url) + "."}
+    return [
+        f"{url.scheme}://{f'[{host}]' if ':' in host else host}{f':{port}' if port else ''}"
+        for host in hosts
+        for port in ports
+    ]
+
+
+def _held_urls(url: httpx.URL) -> list[str]:
+    """The spellings of ``url`` a rule may be written against.
+
+    anton matches the text it is given and says a service passes it decoded
+    and normalized, without the query or fragment. So the path is tried
+    decoded and as written, with and without a trailing slash, under every
+    spelling of the authority (``_authorities``).
+    """
+    written = _written_path(url)
+    paths = {written, unquote(written)}
+    paths |= {path.rstrip("/") if path.endswith("/") else path + "/" for path in paths}
+    return [authority + path for authority in _authorities(url) for path in paths]
+
+
+def _concerns(rule: HttpWriteRule, step: _Step) -> bool:
+    """Whether ``rule`` could hold some request of ``step``'s method to its
+    scheme, host and port, whatever the path. A rule whose authority cannot
+    be read apart from its path counts as concerning every step."""
+    if rule.method not in ("*", step.method.upper()):
+        return False
+    scheme, separator, rest = rule.url_glob.partition("://")
+    authority_glob = scheme + separator + rest.split("/", 1)[0]
+    if not separator or "**" in authority_glob:
+        return True
+    host_rule = HttpWriteRule(method="*", url_glob=authority_glob)
+    return any(http_write_rule_matches(host_rule, method=step.method, url=a) for a in _authorities(step.url))
+
+
+def refuse_held_step(step: _Step, rules: tuple[HttpWriteRule, ...]) -> None:
+    """Refuse a step a write-approval rule would hold: a connection test shows
+    no approval card, so it cannot send what needs one.
+
+    An address must be written plainly only where a rule could hold a request
+    of this method to this host: elsewhere there is nothing to slip past, and
+    an API may want an escaped ``/`` in its path.
+
+    Raises:
+        ConnectorTestError: naming the step, never the URL.
+    """
+    rules = tuple(rule for rule in rules if _concerns(rule, step))
+    if not rules:
+        return
+    if not _is_plain_path(_written_path(step.url)):
+        raise ConnectorTestError(
+            f"The {step.name} step's address is written in a way a connection test does not accept."
+        )
+    for url in _held_urls(step.url):
+        if any(http_write_rule_matches(rule, method=step.method, url=url) for rule in rules):
+            raise ConnectorTestError(
+                f"The {step.name} step sends a request that needs an approval, and a connection test "
+                "cannot ask for one, so this connector cannot be connected here."
+            )
+
+
 async def _judge_host(
     step: _Step, approved: Mapping[str, tuple[str, ...]], resolver: Callable[..., list[tuple]],
 ) -> tuple[tuple[IPAddress, ...], PrivateHost | None]:
@@ -524,19 +762,34 @@ async def _judge_host(
     host = url_host(step.url)
     port = step.url.port or (443 if step.url.scheme == "https" else 80)
     key = approval_key(step.name, step.method, step.url.scheme, host, port)
-    if key in approved:
+    shared = tenant_scope_required()
+    # A person's approval counts only on their own install.
+    if key in approved and not shared:
         addresses = tuple(ipaddress.ip_address(a) for a in approved[key])
         allowed = True
     else:
         addresses = await _resolve(host, resolver)
         hosts, networks = private_allowlist()
-        allowed = host in hosts or all(any(_judged(a) in n or a in n for n in networks) for a in addresses)
+        in_ranges = all(any(_judged(a) in n or a in n for n in networks) for a in addresses)
+        # On a shared deployment a name alone would trust its DNS answer, so every
+        # address must be listed too; listed names then narrow which hosts may use them.
+        allowed = in_ranges and (not hosts or host in hosts) if shared else host in hosts or in_ranges
+    # On a shared deployment "this computer" is the server, so nothing on it is
+    # a person's own to test, on any port, listed by the operator or not.
+    own = _own_addresses() if shared else None
     for address in addresses:
-        if _reaches_this_server(address, port):
+        if _reaches_this_server(address, port) or (own is not None and _is_this_server(address, own)):
             raise ConnectorTestError(f"The {step.name} step points at Cowork itself.")
         if not is_public_address(address) and not _offerable(address):
             raise ConnectorTestError(f"The {step.name} step points at an address no test may reach ({address}).")
     private = [a for a in addresses if not is_public_address(a)]
+    if private and not allowed and shared:
+        # The request leaves from inside the operator's network, so only the
+        # operator's list opens a private address; nobody is asked.
+        raise ConnectorTestError(
+            f"The {step.name} step points at a private address ({host}) that the operator "
+            "has not allowed for connection tests."
+        )
     if private and not allowed:
         return addresses, PrivateHost(
             step.name, step.method, step.url.scheme, host, port, step.shown_path,
@@ -575,7 +828,9 @@ async def _send_once(
         kwargs["json"] = step.json_body
     # trust_env stays off: an environment proxy would carry the request to a
     # host nobody vetted. No redirects, for the same reason.
-    async with httpx.AsyncClient(follow_redirects=False, trust_env=False, transport=transport) as client:
+    async with httpx.AsyncClient(
+        follow_redirects=False, trust_env=False, transport=transport, verify=_tls_verify(),
+    ) as client:
         attempts = connection_attempts(list(addresses), total_seconds=_REQUEST_SECONDS)
         for index, (address, connect_seconds) in enumerate(attempts):
             request = client.build_request(
@@ -699,6 +954,9 @@ async def _run_test_request(
     data_probe = _build_step("data", data_spec, pending)
     outcome = ConnectorTestOutcome()
     dial: dict[str, tuple[IPAddress, ...]] = {}
+    rules = held_write_rules()
+    for step in [*steps, data_probe]:
+        refuse_held_step(step, rules)
     for step in [*steps, data_probe]:
         addresses, private = await _judge_host(step, approved, resolver)
         if private is not None:
@@ -728,6 +986,7 @@ async def _run_test_request(
         filled["token"] = token
         token_host = url_host(token_step.url)
     data_step = _build_step("data", data_spec, filled)
+    refuse_held_step(data_step, rules)
     if token_spec and _endpoint(data_step.url) == _endpoint(steps[0].url):
         raise ConnectorTestError("The data step asks the token URL again; it must fetch data.")
     status, body, over_cap, content_type = await _send(data_step, dial["data"], transport)

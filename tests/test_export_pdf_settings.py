@@ -24,6 +24,13 @@ from cowork.common.settings.app_settings import (
 )
 from cowork.schemas.artifact_export import ExportPdfSettings
 from cowork.server import create_app
+from cowork.services.connectors import connector_test_run
+from cowork.services.connectors.connector_test_run import (
+    ALLOWLIST_ENV,
+    CA_FILE_ENV,
+    private_allowlist,
+    started_certificates,
+)
 
 
 class RenderUrlCases(BaseModel, frozen=True):
@@ -236,6 +243,108 @@ def test_pdf_settings_the_server_started_with_stay_in_the_environment(monkeypatc
         "http://127.0.0.1:9000",
     )
     assert str(get_export_pdf_settings().render_url) == "http://127.0.0.1:9000/"
+
+
+@pytest.mark.parametrize("started_with", ["10.9.0.0/16", None])
+def test_the_connection_test_allowlist_stays_as_the_server_started_with(monkeypatch, tmp_path, started_with):
+    """<COWORK_HOME>/.env is writable by agent code, so a line there neither
+    adds to the operator's list nor creates one."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"{ALLOWLIST_ENV}=10.0.0.0/8\n", encoding="utf-8")
+    if started_with is None:
+        monkeypatch.delenv(ALLOWLIST_ENV, raising=False)
+    else:
+        monkeypatch.setenv(ALLOWLIST_ENV, started_with)
+    private_allowlist.cache_clear()
+    _cli_loads_dotenv(monkeypatch, env_path=env_path)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda app, **_: None)
+
+    try:
+        cli.main()
+
+        assert os.environ.get(ALLOWLIST_ENV) == started_with
+        hosts, networks = private_allowlist()
+        assert (hosts, [str(n) for n in networks]) == (frozenset(), [started_with] if started_with else [])
+    finally:
+        os.environ.pop(ALLOWLIST_ENV, None)
+        private_allowlist.cache_clear()
+
+
+def test_the_server_reads_the_connection_test_allowlist_as_it_starts(monkeypatch):
+    """A value written to the environment after the start changes nothing."""
+    monkeypatch.setenv(ALLOWLIST_ENV, "10.9.0.0/16")
+    private_allowlist.cache_clear()
+    try:
+        create_app()
+        monkeypatch.setenv(ALLOWLIST_ENV, "10.0.0.0/8")
+
+        assert [str(n) for n in private_allowlist()[1]] == ["10.9.0.0/16"]
+    finally:
+        private_allowlist.cache_clear()
+
+
+def test_the_connection_test_certificate_file_is_the_one_the_cli_started_with(monkeypatch, tmp_path):
+    """A line in <COWORK_HOME>/.env names no certificate authority for tests."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"{CA_FILE_ENV}={tmp_path / 'planted.pem'}\n", encoding="utf-8")
+    monkeypatch.delenv(CA_FILE_ENV, raising=False)
+    started_certificates.cache_clear()
+    _cli_loads_dotenv(monkeypatch, env_path=env_path)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda app, **_: None)
+
+    try:
+        cli.main()
+
+        assert started_certificates() is None
+    finally:
+        os.environ.pop(CA_FILE_ENV, None)
+        started_certificates.cache_clear()
+
+
+def _forget_the_certificate_start():
+    started_certificates.cache_clear()
+    connector_test_run._shared_tls_context.cache_clear()
+
+
+def test_the_server_reads_the_connection_test_certificate_file_as_it_starts(monkeypatch, tmp_path):
+    started = tmp_path / "started.pem"
+    started.write_text("started", encoding="ascii")
+    monkeypatch.setenv(CA_FILE_ENV, str(started))
+    _forget_the_certificate_start()
+    try:
+        create_app()
+        monkeypatch.setenv(CA_FILE_ENV, str(tmp_path / "written-later.pem"))
+
+        assert started_certificates().path == str(started)
+    finally:
+        _forget_the_certificate_start()
+
+
+def test_a_single_user_install_starts_with_an_unreadable_certificate_file(monkeypatch, tmp_path):
+    monkeypatch.setenv(CA_FILE_ENV, str(tmp_path / "missing.pem"))
+    _forget_the_certificate_start()
+    try:
+        create_app()
+
+        assert connector_test_run._tls_verify() is True
+    finally:
+        _forget_the_certificate_start()
+
+
+@pytest.mark.parametrize("content", [None, "not a certificate"], ids=["unreadable", "no certificate"])
+def test_a_shared_deployment_does_not_start_on_a_certificate_file_it_cannot_use(
+    monkeypatch, tmp_path, personal_deployment, content
+):
+    bundle = tmp_path / "bundle.pem"
+    if content is not None:
+        bundle.write_text(content, encoding="ascii")
+    monkeypatch.setenv(CA_FILE_ENV, str(bundle))
+    _forget_the_certificate_start()
+    try:
+        with pytest.raises(ValueError, match=CA_FILE_ENV):
+            create_app()
+    finally:
+        _forget_the_certificate_start()
 
 
 def _cli_loads_dotenv(monkeypatch: pytest.MonkeyPatch, *, env_path: Path) -> None:

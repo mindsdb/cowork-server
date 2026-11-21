@@ -133,7 +133,9 @@ class OpenByDesign:
 
 
 class DesktopOnly:
-    """Refused outright in org mode; desktop is the only place it runs.
+    """Refused outright in org mode; it runs on local tenancy: desktop, and a
+    local deployment that trusts identity headers. On the latter a route
+    declaring this must scope its own answers to the person asking.
 
     ``require_local_tenancy`` 403s the route whenever
     ``tenancy_mode == "org"``, so there is no multi-tenant identity concept to

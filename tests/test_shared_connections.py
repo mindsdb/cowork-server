@@ -26,10 +26,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 
+import httpx
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
 from anton.utils.datasources import build_datasource_context
@@ -46,13 +48,13 @@ from cowork.common.settings.user_settings import use_settings_scope
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope, scope_from_principal, service_principal_for
 from cowork.db.session import get_open_session
-from cowork.handlers import probe as probe_handler
 from cowork.handlers.probe import ProbeHandler
 from cowork.harnesses.anton_harness.tools import _cowork_label_connection, _cowork_request_credentials
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.principal import personal_partition_id
-from cowork.schemas.connectors import DirectSaveRequest, PatchPickedFilesBody, SubmitFormRequest
+from cowork.schemas.connectors import ConnectorTestAnswer, DirectSaveRequest, PatchPickedFilesBody, SubmitFormRequest
+from cowork.services.connectors import connector_test_run
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.layered_vault import (
     CREATED_BY_FIELD,
@@ -69,7 +71,7 @@ from cowork.services.connectors.persist import (
     turn_vault_for_scope,
     vault_for_scope,
 )
-from cowork.services.connectors.probe import ProbeOutcome
+from tests._connector_test_request import bearer_test_request
 from tests._fakes import FakeRequest
 from tests._turns import built_turn, connect_in_chat
 
@@ -367,21 +369,21 @@ def _share_alices_acme(managed_dir) -> None:
     )
 
 
+ACME_ROWS = {"items": [{"id": 1, "name": "First"}]}
+
+
 @pytest.fixture
-def accepting_probe(monkeypatch):
-    """A handcrafted step is probed before it is saved; this probe accepts, so
-    the save and its sharing rules decide the outcome."""
-
-    class AcceptingProbe:
-        def __init__(self, **kwargs) -> None:
-            pass
-
-        async def run(self):
-            yield "verdict", ProbeOutcome(status="success", summary="Connection works.")
-
-    monkeypatch.setattr(probe_handler, "CredentialProbe", AcceptingProbe)
-    monkeypatch.setattr(ProbeHandler, "_build_llm_client", staticmethod(lambda settings=None: object()))
-    monkeypatch.setattr("anton.workspace.Workspace", lambda path: SimpleNamespace(path=path))
+def acme_api(monkeypatch):
+    """A handcrafted step's test request is sent before it is saved; this API
+    answers it with rows, so the save and its sharing rules decide the outcome."""
+    monkeypatch.setattr(
+        connector_test_run, "_RESOLVER", lambda host, port, type=None: [(None, None, None, "", ("93.184.216.20", 443))],
+    )
+    real = connector_test_run.httpx.AsyncClient
+    monkeypatch.setattr(
+        connector_test_run.httpx, "AsyncClient",
+        lambda **kwargs: real(**{**kwargs, "transport": httpx.MockTransport(lambda r: httpx.Response(200, json=ACME_ROWS))}),
+    )
 
 
 def _grant_step(name: str) -> SubmitFormRequest:
@@ -396,8 +398,19 @@ def _grant_step(name: str) -> SubmitFormRequest:
             "fields": [],
             "_extends_connection": name,
             "_existing_name": name,
+            "test_request": bearer_test_request("access_token", "https://acme.example.com/v1/items"),
         },
     )
+
+
+def _confirm_id(streamed: str) -> str:
+    """The id the stream hands the person to confirm the test's preview with."""
+    [frame] = [f for f in streamed.split("\n\n") if f.startswith("event: connector.test_preview")]
+    return json.loads(frame.split("data: ", 1)[1])["confirm_id"]
+
+
+async def _confirm(streamed: str, scope: TenantScope) -> dict:
+    return await submissions_ep.confirm_route(ConnectorTestAnswer(confirm_id=_confirm_id(streamed)), scope)
 
 
 async def _streamed(response) -> str:
@@ -409,14 +422,19 @@ def _vault_files(scope: TenantScope) -> dict[str, bytes]:
     return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}
 
 
-async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharing, accepting_probe, monkeypatch):
+async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharing, acme_api, monkeypatch):
     """Bob's vault reads Alice's shared connection, so its record would
     merge into his step. The submission answers 403 before anything is
-    staged; the save itself is refused too, so the probe saves nothing.
-    Alice's record and secrets stay byte for byte, and Bob's vault stays
-    empty."""
+    staged; the save itself is refused too, so a test he confirms saves
+    nothing. Alice's record and secrets stay byte for byte, and Bob's vault
+    stays empty."""
     _share_alices_acme(sharing)
     before = _vault_files(ALICE)
+    save_failures: list[BaseException | None] = []
+    monkeypatch.setattr(
+        submissions_ep, "logger",
+        SimpleNamespace(exception=lambda *args, **kwargs: save_failures.append(sys.exc_info()[1])),
+    )
 
     submission_id = submissions_ep.store.stage(
         form_id="fm_acmegrant1",
@@ -428,8 +446,11 @@ async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharin
     probed = "".join(
         [event async for event in ProbeHandler(scope=BOB).run(submission_id, "acme_crm", None, "acme", None)]
     )
-    assert f"Probe succeeded but save failed: {SHARED_CONNECTION_REFUSAL}" in probed
-    assert "Saved as" not in probed
+    answer = await _confirm(probed, BOB)
+    assert "saved_slug" not in answer
+    assert answer["patch"]["form_error"] == "Cowork could not save the connection. Submit the form again."
+    [failure] = save_failures
+    assert isinstance(failure, SharedConnectionError) and failure.detail == SHARED_CONNECTION_REFUSAL
     staged: list = []
     monkeypatch.setattr(submissions_ep.store, "stage", lambda **kwargs: staged.append(kwargs))
 
@@ -440,24 +461,24 @@ async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharin
     assert own_vault_for_scope(BOB).list_connections() == []
 
 
-async def test_alice_adds_a_later_step_to_her_own_shared_connection(sharing, accepting_probe):
+async def test_alice_adds_a_later_step_to_her_own_shared_connection(sharing, acme_api):
     _share_alices_acme(sharing)
 
     response = await submissions_ep.submit_form(_grant_step("acme"), ALICE)
 
-    assert "Saved as `acme`" in await _streamed(response)
+    assert (await _confirm(await _streamed(response), ALICE))["saved_slug"] == "acme"
     stored = _stored(ALICE, "acme", "acme_crm")
     assert {key: stored[key] for key in {**ACME_APP, **ACME_GRANT}} == {**ACME_APP, **ACME_GRANT}
     assert stored[CREATED_BY_FIELD] == SUB_A
     assert vault_for_scope(BOB).load("acme_crm", "acme")["access_token"] == ACME_GRANT["access_token"]
 
 
-async def test_a_later_step_adds_to_a_persons_own_connection(trusted, accepting_probe):
+async def test_a_later_step_adds_to_a_persons_own_connection(trusted, acme_api):
     persist_connection("acme_crm", "app", "acme", dict(ACME_APP), scope=BOB)
 
     response = await submissions_ep.submit_form(_grant_step("acme"), BOB)
 
-    assert "Saved as `acme`" in await _streamed(response)
+    assert (await _confirm(await _streamed(response), BOB))["saved_slug"] == "acme"
     assert [c["name"] for c in own_vault_for_scope(BOB).list_connections()] == ["acme"]
     stored = _stored(BOB, "acme", "acme_crm")
     assert {key: stored[key] for key in {**ACME_APP, **ACME_GRANT}} == {**ACME_APP, **ACME_GRANT}
@@ -469,7 +490,10 @@ async def test_bob_is_offered_no_later_step_for_alices_shared_connection(sharing
     Alice's shared connection. Its submission would answer 403, so no form
     renders for it; Alice still gets hers."""
     _share_alices_acme(sharing)
-    step = {"engine": "acme_crm", "title": "Finish", "extends_connection": "acme"}
+    step = {
+        "engine": "acme_crm", "title": "Finish", "extends_connection": "acme",
+        "test_request": bearer_test_request("client_secret", "https://acme.example.com/v1/items"),
+    }
 
     with use_settings_scope(BOB):
         bobs = await _cowork_request_credentials(None, dict(step))

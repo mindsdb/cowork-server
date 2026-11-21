@@ -5,8 +5,10 @@ database for definitions and a temp vault for credentials.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
@@ -19,7 +21,7 @@ from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResourc
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.handlers import probe as probe_handler
 from cowork.models.custom_connector import CustomConnector
-from cowork.schemas.connectors import SubmitFormRequest
+from cowork.schemas.connectors import ConnectorTestAnswer, SubmitFormRequest
 from cowork.services.connectors import connector_test_flow
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.harnesses.anton_harness import tools
@@ -27,6 +29,8 @@ from cowork.services.connectors.custom_connectors import CustomConnectorService,
 from cowork.services.connectors.probe import ProbeOutcome
 from cowork.services.connectors.submissions import store
 from tests._connector_test_request import with_test_request
+# The mock API the connection test is sent to.
+from tests.test_probe_test_request import api
 
 ORG = TenantScope(org_mode=True, org_id="org-a", user_id="user-a")
 SHARED_CONNECTIONS = TenantScope(
@@ -92,19 +96,27 @@ def vault(tmp_path, monkeypatch):
     _Probe.built = []
     vault = LocalDataVault(Path(tmp_path) / "vault")
     monkeypatch.setattr(probe_handler, "vault_for_scope", lambda scope: vault)
+    monkeypatch.setattr(connector_test_flow, "vault_for_scope", lambda scope: vault)
     monkeypatch.setattr(probe_handler, "CredentialProbe", _Probe)
     monkeypatch.setattr(probe_handler.ProbeHandler, "_build_llm_client", staticmethod(lambda settings=None: object()))
     monkeypatch.setattr("anton.workspace.Workspace", lambda path: SimpleNamespace(path=path))
     return vault
 
 
-async def _probe(form_spec: dict, values: dict, *, scope=LOCAL_SCOPE, method=None) -> str:
+async def _probe(form_spec: dict, values: dict, *, scope=LOCAL_SCOPE, method=None, conversation_id=None) -> str:
     submission_id = store.stage(
-        form_id=form_spec["form_id"], connector_id="httpbin", conversation_id=None,
+        form_id=form_spec["form_id"], connector_id="httpbin", conversation_id=conversation_id,
         values=values, form_spec=form_spec, checked_against_stored_spec=False,
     )
-    events = [e async for e in probe_handler.ProbeHandler(scope=scope).run(submission_id, "httpbin", method, "", None)]
+    events = [e async for e in probe_handler.ProbeHandler(scope=scope).run(submission_id, "httpbin", method, "", conversation_id)]
     return "".join(events)
+
+
+async def _confirm(stream: str, scope=LOCAL_SCOPE) -> dict:
+    """Confirm the preview a probe stream ended on, as the member's form does."""
+    [frame] = [f for f in stream.split("\n\n") if f.startswith("event: connector.test_preview")]
+    confirm_id = json.loads(frame.split("data: ", 1)[1])["confirm_id"]
+    return await submissions_endpoints.confirm_route(ConnectorTestAnswer(confirm_id=confirm_id), scope)
 
 
 class TestService:
@@ -149,76 +161,32 @@ class TestService:
                 )
 
 
-@pytest.mark.usefixtures("self_hosted_probe")
 class TestProbeStream:
     @pytest.mark.asyncio
-    async def test_a_passing_probe_saves_the_connection_and_the_definition(self, engine, vault):
-        _Probe.verdict = "success"
+    async def test_a_handcrafted_oauth_grant_is_listed_once_its_test_is_confirmed(self, engine, vault, api):
+        stream = await _probe(OAUTH_FORM, {"access_token": "t", "refresh_token": "r"}, method="oauth")
 
-        stream = await _probe(HTTPBIN_FORM, {"token": "any-token"})
-
-        assert _Probe.runs == 1
-        [connection] = vault.list_connections()
-        assert f"Saved as `{connection['name']}`" in stream
-        [row] = _rows(engine)
-        assert row.connector_id == "httpbin"
-        with Session(engine) as session:
-            spec = ConnectorCatalog(ScopedSession(session, LOCAL_SCOPE)).get_connector("httpbin")
-        assert spec.custom is True and spec.featured is True
-
-    @pytest.mark.asyncio
-    async def test_a_failing_probe_saves_nothing(self, engine, vault):
-        _Probe.verdict = "failure"
-
-        await _probe(HTTPBIN_FORM, {"token": "wrong"})
-
-        assert _Probe.runs == 1
-        assert vault.list_connections() == []
         assert _rows(engine) == []
+        answer = await _confirm(stream)
 
-    @pytest.mark.asyncio
-    async def test_in_org_mode_the_connection_is_saved_but_no_definition(self, engine, vault):
-        _Probe.verdict = "success"
-
-        await _probe(HTTPBIN_FORM, {"token": "any-token"}, scope=ORG)
-
-        assert len(vault.list_connections()) == 1
-        assert _rows(engine) == []
-
-    @pytest.mark.asyncio
-    async def test_a_second_connect_updates_the_definition(self, engine, vault):
-        _Probe.verdict = "success"
-
-        await _probe(HTTPBIN_FORM, {"token": "a"})
-        await _probe({**HTTPBIN_FORM, "subtitle": "Second"}, {"token": "b"})
-
-        [row] = _rows(engine)
-        assert row.description == "Second"
-
-    @pytest.mark.asyncio
-    async def test_a_handcrafted_oauth_grant_is_listed_once_its_token_passes_a_probe(self, engine, vault):
-        _Probe.verdict = "success"
-
-        await _probe(OAUTH_FORM, {"access_token": "t", "refresh_token": "r"}, method="oauth")
-
-        assert _Probe.runs == 1
+        assert answer["saved_slug"]
+        assert _Probe.runs == 0
         assert len(vault.list_connections()) == 1
         assert [r.connector_id for r in _rows(engine)] == ["httpbin"]
 
     @pytest.mark.asyncio
-    async def test_a_grant_whose_token_fails_its_probe_is_saved_but_not_listed(self, engine, vault):
-        _Probe.verdict = "failure"
+    async def test_a_grant_whose_token_fails_its_test_is_saved_but_not_listed(self, engine, vault, api):
+        api.rows = {"error": "invalid token"}
 
         stream = await _probe(OAUTH_FORM, {"access_token": "made-up", "refresh_token": "r"}, method="oauth")
 
-        assert _Probe.runs == 1
+        assert _Probe.runs == 0
         assert len(vault.list_connections()) == 1
         assert _rows(engine) == []
         assert "not added to your connectors list" in stream
 
     @pytest.mark.asyncio
-    async def test_a_stored_custom_form_still_masks_its_secret_fields(self, engine, vault):
-        _Probe.verdict = "success"
+    async def test_a_stored_custom_form_still_masks_its_secret_fields(self, engine, vault, api):
         form = with_test_request({**HTTPBIN_FORM, "fields": [
             {"name": "account_code", "label": "Account code", "type": "text", "secret": True},
         ]}, field="account_code")
@@ -230,76 +198,33 @@ class TestProbeStream:
             values={"account_code": "ac-123"}, custom_spec=stored.model_dump(),
         )
 
-        _ = [e async for e in probe_handler.ProbeHandler(scope=LOCAL_SCOPE).run(submission_id, "httpbin", None, "", None)]
+        stream = "".join([e async for e in probe_handler.ProbeHandler(scope=LOCAL_SCOPE).run(submission_id, "httpbin", None, "", None)])
+        await _confirm(stream)
 
         [connection] = vault.list_connections()
         record = vault.read_record("httpbin", connection["name"])
         assert "account_code" in record["secure_keys"]
 
     @pytest.mark.asyncio
-    async def test_a_scope_shared_by_several_people_saves_the_connection_but_no_definition(self, engine, vault):
-        _Probe.verdict = "success"
-        token = "9f3c2a7b+e5d/4c8a9f3c2a7b1e5d4c8a"
-        form = {
-            **HTTPBIN_FORM, "how_to": f"Paste {token}",
-            "connector": {**HTTPBIN_FORM["connector"], "description": token, "usage_notes": f"Key %2B {token}"},
-        }
-
-        stream = await _probe(form, {"token": token}, scope=SHARED_CONNECTIONS)
-
-        assert len(vault.list_connections()) == 1
-        assert _rows(engine) == []
-        assert "not added to your connectors list" in stream
-
-    @pytest.mark.asyncio
-    async def test_the_probe_falls_back_to_the_forms_notes_when_the_catalog_cannot_be_read(
-        self, engine, vault, monkeypatch,
+    async def test_a_scope_shared_by_several_people_saves_the_connection_but_no_definition(
+        self, engine, vault, api, monkeypatch, tmp_path
     ):
-        _Probe.verdict = "success"
+        outcomes: list[str] = []
+        conversation = probe_handler._ProbeConversation(id=uuid4(), workspace_path=Path(tmp_path))
+        monkeypatch.setattr(probe_handler, "_read_conversation", lambda session, conversation_id: conversation)
+        monkeypatch.setattr(probe_handler, "_save_probe_turn", lambda session, conversation_id, text, events: uuid4())
+        monkeypatch.setattr(connector_test_flow, "_save_outcome", lambda session, conversation_id, text: outcomes.append(text))
+        stream = await _probe(
+            HTTPBIN_FORM, {"token": "a-bearer-token"}, scope=SHARED_CONNECTIONS, conversation_id=str(conversation.id),
+        )
 
-        def failing_notes(self, engines):
-            raise RuntimeError("database unavailable")
+        await _confirm(stream, SHARED_CONNECTIONS)
 
-        monkeypatch.setattr(probe_handler.ConnectorCatalog, "usage_notes_for", failing_notes)
-
-        stream = await _probe(HTTPBIN_FORM, {"token": "a"})
-
-        # The handcrafted form's own notes stand in, as hints that cannot define a pass.
-        assert _Probe.built[-1]["usage_notes"] == "Call /bearer."
-        assert _Probe.built[-1]["notes_define_pass"] is False
-        assert "Saved as" in stream
-
-    @pytest.mark.asyncio
-    async def test_a_grant_whose_probe_cannot_start_is_saved_but_not_listed(self, engine, vault, monkeypatch):
-        monkeypatch.setattr(probe_handler.ProbeHandler, "_build_llm_client", staticmethod(lambda settings=None: None))
-
-        stream = await _probe(OAUTH_FORM, {"access_token": "t", "refresh_token": "r"}, method="oauth")
-
-        assert _Probe.runs == 0
         assert len(vault.list_connections()) == 1
         assert _rows(engine) == []
-        assert "not added to your connectors list" in stream
-
-    @pytest.mark.asyncio
-    async def test_the_probe_reads_a_custom_connectors_usage_notes(self, engine, vault):
-        _Probe.verdict = "success"
-        await _probe(HTTPBIN_FORM, {"token": "a"})
-
-        await _probe(HTTPBIN_FORM, {"token": "b"})
-
-        assert _Probe.built[-1]["usage_notes"] == "Call /bearer."
-
-    @pytest.mark.asyncio
-    async def test_a_custom_connectors_notes_never_define_a_pass(self, engine, vault):
-        # They are model-written, so they reach the probe without the rule that
-        # lets a built-in spec's notes say what counts as a pass.
-        _Probe.verdict = "success"
-        await _probe(HTTPBIN_FORM, {"token": "a"})
-
-        await _probe(HTTPBIN_FORM, {"token": "b"})
-
-        assert _Probe.built[-1]["usage_notes"] == "Call /bearer."
-        assert _Probe.built[-1]["notes_define_pass"] is False
+        [outcome] = outcomes
+        assert outcome.startswith("Saved as `")
+        assert "not added to your connectors list" in outcome
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(("connector_id", "defines_pass"), [("roam_research", True), ("airtable", False)])
@@ -316,49 +241,47 @@ class TestProbeStream:
         assert _Probe.built[-1]["notes_define_pass"] is defines_pass
 
 
-@pytest.mark.usefixtures("self_hosted_probe")
-class TestProbeIsNotSkippedByAModelFlag:
-    """Only a real OAuth grant on the selected method skips the live test."""
+class TestAModelFlagDoesNotSkipTheTest:
+    """Only a real OAuth grant on the selected method is saved before its test."""
 
     @pytest.mark.asyncio
-    async def test_a_form_level_oauth_flag_is_still_probed(self, engine, vault):
-        _Probe.verdict = "failure"
+    async def test_a_form_level_oauth_flag_is_still_tested(self, engine, vault, api):
         form = {**HTTPBIN_FORM, "form_id": "fm_eeeeeeeeee", "submit_action": "oauth_launch"}
 
         await _probe(form, {"token": "typed-key"})
 
-        assert _Probe.runs == 1
+        assert api.requests
         assert vault.list_connections() == []
         assert _rows(engine) == []
 
     @pytest.mark.asyncio
-    async def test_an_oauth_method_without_a_token_is_still_probed(self, engine, vault):
-        _Probe.verdict = "failure"
-        form = {
+    async def test_an_oauth_method_without_a_token_is_still_tested(self, engine, vault, api):
+        form = with_test_request({
             "form_id": "fm_ffffffffff", "engine": "httpbin", "title": "Connect httpbin",
             "methods": [{
                 "id": "oauth", "label": "Sign in", "submit_action": "oauth_launch",
                 "oauth": {"auth_url": "https://example.com/auth", "token_url": "https://example.com/token"},
                 "fields": [{"name": "api_key", "label": "API key", "type": "password"}],
             }],
-        }
+        }, field="api_key")
 
         await _probe(form, {"api_key": "typed-key"}, method="oauth")
 
-        assert _Probe.runs == 1
+        assert api.requests
+        assert vault.list_connections() == []
         assert _rows(engine) == []
 
     @pytest.mark.asyncio
-    async def test_an_oauth_flag_on_a_method_without_an_oauth_block_is_still_probed(self, engine, vault):
-        _Probe.verdict = "failure"
-        form = {
+    async def test_an_oauth_flag_on_a_method_without_an_oauth_block_is_still_tested(self, engine, vault, api):
+        form = with_test_request({
             "form_id": "fm_0000000000", "engine": "httpbin", "title": "Connect httpbin",
             "methods": [{"id": "oauth", "label": "Sign in", "submit_action": "oauth_launch"}],
-        }
+        }, field="access_token")
 
         await _probe(form, {"access_token": "t"}, method="oauth")
 
-        assert _Probe.runs == 1
+        assert api.requests
+        assert vault.list_connections() == []
         assert _rows(engine) == []
 
 

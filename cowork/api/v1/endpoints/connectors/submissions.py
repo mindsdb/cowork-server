@@ -11,8 +11,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, SingleUserOnly, require
-from cowork.db.scoped import TenantScope, get_tenant_scope, tenant_scope_required
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, SingleUserOnly, require
+from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_db
 from cowork.handlers.datasource_relay import relay_cloud_submission
 from cowork.handlers.probe import ProbeHandler
@@ -21,8 +21,10 @@ from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
 from cowork.services.connectors.custom_connectors import (
     NEEDS_REBUILD_FOR_MEMBER,
+    NO_CUSTOM_IN_ORG,
     UnstorableFormError,
     check_handcrafted_form,
+    custom_test_is_code_checked,
     handcrafted_form_allowed,
     has_test_requests,
 )
@@ -56,10 +58,6 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 _DATABASE_CATEGORY = "database"
 _GONE = "This test result is no longer waiting. Submit the form again."
-_NO_CUSTOM_IN_ORG = (
-    "Custom connectors cannot be connected in an organization yet. "
-    "Use a connector from Connect Apps and Data."
-)
 
 
 def _resolve_fields(spec, method_id: str | None) -> list:
@@ -161,7 +159,7 @@ async def allow_private_route(answer: ConnectorTestAnswer, scope: TenantScopeDep
         return {"patch": failed_patch(entry.form_id, exc.reason)}
 
 
-@router.post("/confirm", name="submission_confirm", dependencies=[Depends(require(SingleUserOnly))])
+@router.post("/confirm", name="submission_confirm", dependencies=[Depends(require(DesktopOnly))])
 async def confirm_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> dict:
     """Save the connection whose test result the member confirmed.
 
@@ -185,7 +183,7 @@ async def confirm_route(answer: ConnectorTestAnswer, scope: TenantScopeDep) -> d
 
 @router.post(
     "/cancel", name="submission_cancel", status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require(SingleUserOnly))],
+    dependencies=[Depends(require(DesktopOnly))],
 )
 async def cancel_route(answer: ConnectorTestAnswer, scope: TenantScopeDep, reason: str | None = None) -> None:
     """Drop a waiting test and the values it holds. Idempotent: an unknown id
@@ -260,7 +258,7 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScope) -> StreamingRe
     if scope.org_mode and (is_custom or (known is None and req.form_spec)):
         # Nothing tests a custom connector in an organization yet; refused
         # before anything is checked or staged, so no value is kept.
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_NO_CUSTOM_IN_ORG)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=NO_CUSTOM_IN_ORG)
     if known is not None and stamped and extends_name is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -271,7 +269,7 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScope) -> StreamingRe
         known=known is not None, custom=is_custom, extends=extends_name is not None,
         stored_test_request=stored_test_request,
     )
-    if stamped and stored_test_request is False and not tenant_scope_required():
+    if stamped and stored_test_request is False and custom_test_is_code_checked():
         # Saved before connection tests existed: it can never pass one.
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=NEEDS_REBUILD_FOR_MEMBER)
     if not stamped and not handcrafted:

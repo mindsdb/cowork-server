@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import pytest
 
-from cowork.services.connectors import custom_connectors
 from cowork.services.connectors.custom_connectors import handcrafted_form_allowed
 
 
@@ -29,6 +28,9 @@ def test_the_rule(known, custom, extends, stored_test_request, allowed):
     ) is allowed
 
 
-def test_self_hosted_keeps_an_old_custom_connector_as_it_is(monkeypatch):
-    monkeypatch.setattr(custom_connectors, "tenant_scope_required", lambda: True)
+def test_a_shared_deployment_lets_a_new_form_replace_an_old_custom_connector(personal_deployment):
+    assert handcrafted_form_allowed(known=True, custom=True, extends=False, stored_test_request=False) is True
+
+
+def test_org_mode_keeps_an_old_custom_connector_as_it_is(org_deployment):
     assert handcrafted_form_allowed(known=True, custom=True, extends=False, stored_test_request=False) is False
