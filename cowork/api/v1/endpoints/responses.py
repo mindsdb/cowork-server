@@ -21,7 +21,7 @@ from redis.exceptions import RedisError
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response as HTTPResponse
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, WindowProof, require
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.common.ui_locale import UI_LOCALE_HEADER, normalize_ui_locale
@@ -545,7 +545,7 @@ async def _extend_turn_key_window(correlation_id: str) -> bool:
     return False
 
 
-@router.post("/answer", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.post("/answer", dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(require(WindowProof))])
 async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     """Deliver the user's answer to a question a turn is blocked on.
 

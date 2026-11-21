@@ -317,6 +317,30 @@ def launch_environment_restored(monkeypatch):
 
 
 @pytest.fixture
+def nothing_held(monkeypatch):
+    """Neither a launch hand-off nor an app secret, as in a server started
+    from a terminal. monkeypatch puts back what the worker held before."""
+    from cowork import app_secret
+
+    monkeypatch.setattr(app_secret, "_secret", None)
+    monkeypatch.setattr(app_secret, "_handoff", None)
+
+
+@pytest.fixture
+def handoff_held(monkeypatch):
+    """The launch hand-off of a server the desktop app started with
+    COWORK_APP_SECRET_STDIN=2, holding tests/_launch_handoff.py's values.
+    monkeypatch puts back what the worker held before."""
+    from cowork import app_secret
+    from tests._launch_handoff import GOOD
+
+    handoff = app_secret.LaunchHandoff.model_validate(GOOD)
+    monkeypatch.setattr(app_secret, "_handoff", handoff)
+    monkeypatch.setattr(app_secret, "_secret", handoff.app_secret)
+    return handoff
+
+
+@pytest.fixture
 def landlock_kernel(monkeypatch):
     """stub_landlock_kernel for one test: a kernel at Landlock ABI 6 whose
     self-test passes."""

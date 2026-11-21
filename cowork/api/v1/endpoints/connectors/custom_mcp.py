@@ -18,7 +18,7 @@ from anton.core.mcp.errors import McpEgressBlocked, McpHostUnresolved, McpTokenR
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from cowork.api.v1.endpoints.connectors.connections import require_app_secret
-from cowork.api.v1.permissions import LoopbackDesktopOnly, require
+from cowork.api.v1.permissions import LoopbackDesktopOnly, WindowProof, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.custom_mcp import AllowedToolsRequest, CheckUrlRequest, CreateCustomMcpRequest, CustomMcpSettings
 from cowork.services.connectors import app_held
@@ -107,7 +107,7 @@ def check_url(body: CheckUrlRequest, scope: ScopeDep) -> dict[str, str]:
     return {"url": canonical_server_url(body.url)}
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require(WindowProof))])
 def create_connection(body: CreateCustomMcpRequest, scope: ScopeDep) -> dict[str, str]:
     """Create a custom MCP connection under the id the app drew, and hold its
     settings. 409 when the id exists: ids are never reused."""
@@ -126,7 +126,7 @@ def create_connection(body: CreateCustomMcpRequest, scope: ScopeDep) -> dict[str
     return {"id": body.id, "server_url": values["server_url"]}
 
 
-@router.put("/{name}/held")
+@router.put("/{name}/held", dependencies=[Depends(require(WindowProof))])
 def put_held(name: str, body: CustomMcpSettings, scope: ScopeDep) -> dict[str, str]:
     """Hold settings and token for an existing connection: at every server
     start, on reconnect and on refresh. 404 with its own body when the
@@ -137,7 +137,7 @@ def put_held(name: str, body: CustomMcpSettings, scope: ScopeDep) -> dict[str, s
     return {"server_url": entry.get("server_url", "")}
 
 
-@router.put("/{name}/allowed-tools")
+@router.put("/{name}/allowed-tools", dependencies=[Depends(require(WindowProof))])
 def put_allowed_tools(name: str, body: AllowedToolsRequest, scope: ScopeDep) -> dict[str, list[str]]:
     """Replace the tools Anton may use on this connection."""
     _require_protected(scope)
