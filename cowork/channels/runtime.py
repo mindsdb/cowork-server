@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import io
 import logging
 import os
 import stat
@@ -865,7 +866,7 @@ class AntonChannelRuntime:
                 scope=scope,
                 filename=upload_basename(name=attachment.filename) or "file",
                 content_type=attachment.mime_type,
-                data=data,
+                source=io.BytesIO(data),
                 purpose="channel",
             )
             if (attachment.mime_type or "").startswith("image/"):

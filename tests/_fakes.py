@@ -134,7 +134,10 @@ def stored_file(*, scoped, filename: str, content_type: str, data: bytes, purpos
     file = File(filename=filename, content_type=content_type, size=len(data), purpose=purpose, path="")
     scoped.add(file)
     try:
-        file.path = str(_write_upload(_files_root(scoped.scope) / str(file.id), filename, data))
+        written = _write_upload(
+            file_dir=_files_root(scoped.scope) / str(file.id), name=filename, source=io.BytesIO(data)
+        )
+        file.path = str(written.path)
     except Exception:
         scoped.rollback()
         raise

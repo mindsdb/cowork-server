@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import shutil
 import stat
 from functools import partial
 from pathlib import Path
+from typing import BinaryIO, NamedTuple
 from uuid import UUID
 
 from fastapi import UploadFile
@@ -33,6 +35,12 @@ from cowork.models.file import File
 from cowork.schemas.files import FileResponse, StoredFileContent
 
 logger = logging.getLogger(__name__)
+
+#: The size of the chunks an upload is copied to storage in. A copy holds one
+#: chunk in memory at a time, so its memory stays flat whatever the file's
+#: size. The project file upload (_write_bytes_at_project_root in
+#: cowork.api.v1.endpoints.project_files) copies in the same chunks.
+UPLOAD_COPY_CHUNK_BYTES = 1024 * 1024
 
 #: Removals of an upload's folder whose row was refused, held here until each
 #: ends so the event loop keeps a reference to it.
@@ -342,16 +350,27 @@ def upload_basename(*, name: str | None) -> str | None:
     return None if basename in ("", ".", "..") else basename
 
 
-def _write_upload(file_dir: Path, name: str, contents: bytes) -> Path:
-    """Write an upload into its own new folder, or leave no folder behind."""
+class _WrittenUpload(NamedTuple):
+    """Where _write_upload put an upload, and how many bytes it copied."""
+
+    path: Path
+    size: int
+
+
+def _write_upload(*, file_dir: Path, name: str, source: BinaryIO) -> _WrittenUpload:
+    """Copy ``source``, from where it stands to its end, into a new file in its
+    own new folder, in chunks of UPLOAD_COPY_CHUNK_BYTES. Any failure, one
+    halfway through the copy included, leaves no folder behind."""
     try:
         file_dir.mkdir(parents=True)
         dest = file_dir / name
-        dest.write_bytes(contents)
+        with dest.open("wb") as out:
+            shutil.copyfileobj(source, out, UPLOAD_COPY_CHUNK_BYTES)
+            size = out.tell()
     except Exception:
         shutil.rmtree(file_dir, ignore_errors=True)
         raise
-    return dest
+    return _WrittenUpload(path=dest, size=size)
 
 
 def _insert_file(session, *, file: File) -> File:
@@ -369,30 +388,43 @@ def _files_root(scope: TenantScope) -> Path:
 
 
 async def store_file(
-    *, scope: TenantScope, filename: str, content_type: str, data: bytes, purpose: str
+    *, scope: TenantScope, filename: str, content_type: str, source: BinaryIO, purpose: str
 ) -> File:
-    """Save ``data`` as a new file named ``filename``, which the caller has
-    already reduced to a safe basename (upload_basename), and return its
-    loaded row.
+    """Save what ``source`` holds, from where it stands to its end, as a new
+    file named ``filename``, which the caller has already reduced to a safe
+    basename (upload_basename), and return its loaded row.
 
     The storage root refuses a scope with no organization where files are
     partitioned (scoped_storage_root), so a missing principal fails before any
-    bytes hit disk. The bytes go to the file store, then the row to the
-    database, each in a worker thread of its own: no pooled connection waits on
-    the file server, and the event loop waits for neither.
+    bytes hit disk. The bytes are copied to the file store in chunks of
+    UPLOAD_COPY_CHUNK_BYTES, so memory stays flat whatever the file's size,
+    then the row goes to the database, each in a worker thread of its own: no
+    pooled connection waits on the file server, and the event loop waits for
+    neither. The row's size is the count of bytes copied.
+
+    When content safety is required, at most MAX_FILE_BYTES + 1 bytes are read
+    from ``source`` and checked (check_file_bytes refuses more than
+    MAX_FILE_BYTES with 413), and the store gets exactly those checked bytes,
+    never ``source`` again.
     """
-    from cowork.services.content_safety import check_file_bytes
-    await check_file_bytes(data, content_type=content_type or '', purpose='input', scope=scope)
+    from cowork.services.content_safety import ContentSafetySettings, MAX_FILE_BYTES, check_file_bytes
+    if ContentSafetySettings().required:
+        checked = source.read(MAX_FILE_BYTES + 1)
+        await check_file_bytes(checked, content_type=content_type or '', purpose='input', scope=scope)
+        source = io.BytesIO(checked)
     file = File(
         filename=filename,
         content_type=content_type or "application/octet-stream",
-        size=len(data),
+        size=0,
         purpose=purpose,
         path="",
     )
     file_dir = _files_root(scope) / str(file.id)
-    dest = await run_efs(partial(_write_upload, file_dir, filename, data), scope=scope)
-    file.path = str(dest)
+    written = await run_efs(
+        partial(_write_upload, file_dir=file_dir, name=filename, source=source), scope=scope
+    )
+    file.size = written.size
+    file.path = str(written.path)
     try:
         return await run_db(partial(_insert_file, file=file), scope=scope)
     except Exception:
@@ -404,13 +436,17 @@ async def store_file(
 
 
 async def save_upload(upload: UploadFile, *, purpose: str, scope: TenantScope) -> File:
-    """Save an uploaded file in ``scope`` (store_file) and return its row."""
-    contents = await upload.read()
+    """Save an uploaded file in ``scope`` (store_file) and return its row.
+
+    store_file copies the upload in chunks straight from its spool, the
+    temporary file Starlette's multipart parser wrote and rewound to its start
+    (starlette.formparsers.MultiPartParser), so memory stays flat whatever the
+    file's size."""
     return await store_file(
         scope=scope,
         filename=upload_basename(name=upload.filename) or "upload",
         content_type=upload.content_type,
-        data=contents,
+        source=upload.file,
         purpose=purpose,
     )
 

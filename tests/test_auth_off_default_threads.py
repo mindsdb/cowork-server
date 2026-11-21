@@ -739,8 +739,11 @@ async def test_a_skill_upload_with_every_connection_held_is_refused_as_a_busy_un
 
 async def test_a_project_upload_reads_each_file_only_once_its_project_is_found(org_deployment, monkeypatch):
     """The uploaded files are read from their spools on the file store's
-    threads, each just before its write, and not at all for a project that is
-    not found: a request holds at most one file's bytes in memory."""
+    threads, each in chunks inside its own write, one file at a time, and not
+    at all for a project that is not found: a request holds at most one chunk
+    of one file in memory."""
+    from itertools import groupby
+
     from cowork.api.v1.endpoints import project_files
 
     events: list[str] = []
@@ -753,7 +756,10 @@ async def test_a_project_upload_reads_each_file_only_once_its_project_is_found(o
 
     def write(*args, **kwargs):
         events.append("write")
-        return real_write(*args, **kwargs)
+        try:
+            return real_write(*args, **kwargs)
+        finally:
+            events.append("written")
 
     monkeypatch.setattr(tempfile.SpooledTemporaryFile, "read", read)
     monkeypatch.setattr(project_files, "_write_bytes_at_project_root", write)
@@ -771,4 +777,5 @@ async def test_a_project_upload_reads_each_file_only_once_its_project_is_found(o
     assert read_for_a_missing_project == []
     assert found.status_code == 200, found.text
     assert [result["size"] for result in found.json()["results"]] == [5, 6]
-    assert events == ["read", "write", "read", "write"]
+    # Each file's reads, however many chunks they take, fall inside its own write.
+    assert [event for event, _ in groupby(events)] == ["write", "read", "written", "write", "read", "written"]

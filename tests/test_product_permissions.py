@@ -1,3 +1,4 @@
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -704,7 +705,9 @@ def test_atomic_generic_write_keeps_original_bytes_and_cleans_failed_temporary(
     with project_files.pinned_dir(tmp_path) as root:
         with pytest.raises(OSError):
             project_files._write_bytes_at_project_root(
-                root, project_files._validated_project_path("notes.txt"), b"replacement"
+                root=root,
+                path=project_files._validated_project_path("notes.txt"),
+                source=BytesIO(b"replacement"),
             )
     assert original.read_text() == "original"
     assert list(tmp_path.iterdir()) == [original]
@@ -720,7 +723,9 @@ def test_atomic_write_supports_a_platform_without_descriptor_chmod(
     monkeypatch.delattr(project_files.os, "fchmod")
     with project_files.pinned_dir(tmp_path) as root:
         project_files._write_bytes_at_project_root(
-            root, project_files._validated_project_path("notes.txt"), b"replacement"
+            root=root,
+            path=project_files._validated_project_path("notes.txt"),
+            source=BytesIO(b"replacement"),
         )
     assert original.read_bytes() == b"replacement"
 

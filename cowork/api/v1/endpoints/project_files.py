@@ -6,6 +6,7 @@ compat stubs and may be refactored later.
 """
 
 import errno
+import io
 import logging
 import mimetypes
 import ntpath
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, NamedTuple
+from typing import Annotated, Any, BinaryIO, NamedTuple
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
@@ -99,6 +100,7 @@ from cowork.services.connectors.sharepoint import (
     SharePointError,
     SharePointErrorKind,
 )
+from cowork.services.files import UPLOAD_COPY_CHUNK_BYTES
 from cowork.services.projects import ProjectService
 from cowork.services.product_permissions import require_product_permission
 from cowork.services.shared_resources import (
@@ -922,9 +924,16 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def _write_bytes_at_project_root(
-    root: PinnedDir, path: _ValidatedProjectPath, data: bytes
+    *, root: PinnedDir, path: _ValidatedProjectPath, source: BinaryIO
 ) -> os.stat_result:
-    """Write a validated relative path below an already-pinned project root."""
+    """Write a validated relative path below an already-pinned project root.
+
+    Copies ``source``, from where it stands to its end, to a temporary entry
+    beside the target in chunks of UPLOAD_COPY_CHUNK_BYTES, so memory stays
+    flat whatever the file's size, then renames it into place. Any failure,
+    one halfway through the copy included, leaves the target as it was and
+    removes the temporary entry. Returns the written file's stat.
+    """
     dirs = tuple(os.path.basename(part) for part in path.parts[:-1])
     name = os.path.basename(path.parts[-1])
     if dirs != path.parts[:-1] or name != path.parts[-1]:
@@ -948,7 +957,8 @@ def _write_bytes_at_project_root(
             try:
                 if existing is not None and hasattr(os, "fchmod"):
                     os.fchmod(fd, mode)
-                _write_all(fd, data)
+                while chunk := source.read(UPLOAD_COPY_CHUNK_BYTES):
+                    _write_all(fd, chunk)
                 result = os.fstat(fd)
             finally:
                 os.close(fd)
@@ -1307,7 +1317,7 @@ def _write_project_bytes(
     scoped: ScopedSession,
 ) -> os.stat_result:
     with _opened_selected_project_directory(project_name, scoped) as directory:
-        return _write_bytes_at_project_root(directory, path, data)
+        return _write_bytes_at_project_root(root=directory, path=path, source=io.BytesIO(data))
 
 
 def _delete_project_entry(
@@ -2090,9 +2100,9 @@ async def upload_project_files(
     files: list[UploadFile] = File(...),
 ):
     # The project lookup and the writes run together on the file store's
-    # threads. Each upload is read there from its own spool, one at a time and
-    # only once the project is found, so a request holds at most one file's
-    # bytes in memory.
+    # threads. Each upload is copied there from its own spool in chunks of
+    # UPLOAD_COPY_CHUNK_BYTES, one file at a time and only once the project is
+    # found, so a request's memory stays flat whatever a file's size.
     from cowork.services.content_safety import ContentSafetySettings, MAX_FILE_BYTES, check_file_bytes
     if not ContentSafetySettings().required:
         return await run_efs_unit(partial(_write_uploads, project_name=project_name, uploads=files), scope=scope)
@@ -2146,11 +2156,10 @@ def _write_uploads(scoped: ScopedSession, *, project_name: str, uploads: list[Up
                 results.append(ProjectUploadResult(name=upload.filename, ok=False, error="invalid filename"))
                 continue
             try:
-                data = upload.file.read()
-                _write_bytes_at_project_root(
-                    directory, _ValidatedProjectPath((safe_name,)), data
+                written = _write_bytes_at_project_root(
+                    root=directory, path=_ValidatedProjectPath((safe_name,)), source=upload.file
                 )
-                results.append(ProjectUploadResult(name=safe_name, ok=True, size=len(data)))
+                results.append(ProjectUploadResult(name=safe_name, ok=True, size=written.st_size))
             except Exception as exc:
                 logger.error("Failed to write file %s: %s", safe_name, exc)
                 results.append(ProjectUploadResult(name=safe_name, ok=False, error="File write failed"))

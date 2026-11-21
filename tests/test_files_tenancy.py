@@ -433,7 +433,8 @@ async def test_a_cancel_while_the_uploads_row_commits_keeps_its_bytes(units_read
 
     monkeypatch.setattr(files_mod, "_insert_file", slow_insert)
     upload = asyncio.ensure_future(files_mod.store_file(
-        scope=_scope(ORG_A), filename="a.txt", content_type="text/plain", data=b"hi", purpose="assistants",
+        scope=_scope(ORG_A), filename="a.txt", content_type="text/plain", source=io.BytesIO(b"hi"),
+        purpose="assistants",
     ))
     deadline = time.monotonic() + 5
     while not inside.is_set():

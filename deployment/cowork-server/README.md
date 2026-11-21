@@ -190,6 +190,21 @@ Other desktop-only routes that hand out or write secrets declare it too, such as
 
 To prove the policy after a rollout, run the forged-header curl from a pod in another namespace and expect a timeout. A port-forward can't observe the policy, for the reason in the `networkPolicy` block of `values.yaml`.
 
+## Request size limits
+
+Every pod serves everyone in it from one uvicorn worker under a 1 GiB memory limit, so no request body is held in memory whole. In MindsHub mode, each request body has a cap. `BodyLimitMiddleware` (`cowork/api/body_limits.py`) answers 413 before the app reads a body whose `Content-Length` is over its route's cap. It counts a body sent without one and stops it once it passes the cap. The 413's `detail` is one sentence that names the limit, and the app shows it as it is.
+
+| Requests | Cap | Name in `cowork/api/body_limits.py` |
+| -- | -- | -- |
+| `POST /api/v1/files/`, `POST /api/v1/projects/{project}/files/upload`, `POST /api/v1/attachments/{project}/{session}/upload` | 500 MiB | `UPLOAD_MAX_BYTES` |
+| `POST /api/v1/skills/upload` | 208 MiB: the skill zip's 200 MB expansion bound plus room for its headers | `SKILL_UPLOAD_MAX_BYTES` |
+| `POST /api/v1/artifacts/workspace/{project}/{artifact}/comment-images` | 5 MiB plus 64 KiB of form framing | `COMMENT_IMAGE_UPLOAD_MAX_BYTES` |
+| Every other request | 32 MiB | `DEFAULT_BODY_MAX_BYTES` |
+
+The ingress annotation `nginx.ingress.kubernetes.io/proxy-body-size: 500m` in `values.yaml` is the largest cap, `UPLOAD_MAX_BYTES`, and the two change together. `tests/test_chart_values.py` pins the annotation in every environment to that cap. A smaller ingress limit would refuse an upload the server takes, with nginx's own page in place of the server's sentence.
+
+Under its cap, an upload is copied from Starlette's spool to the file store in 1 MiB chunks, so its size doesn't move the pod's memory. Starlette spools each file past 1 MiB to the container's own disk until the request ends. Two more limits hold in every mode. A skill zip whose central directory is over 4 MiB, about 40,000 files, answers 413 before the zip is opened, and so does a `SKILL.md` over 2 MiB, which anton's parser would read whole. The desktop app has no cap, because there one person's large file harms no one else.
+
 ## Probes
 
 The kubelet probes two routes, and neither reads the database, the file store or settings. A probe that can fail for an outside reason turns that outage into a pod restart, or into every replica leaving the service at once.
